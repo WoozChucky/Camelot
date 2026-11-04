@@ -231,11 +231,20 @@ fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '*' | '?')
 }
 
-fn lex(src: &str) -> Result<Vec<(Tok, usize)>, ScriptError> {
+/// The tokens of a script, each with its line, and for each whether it
+/// follows the one before with nothing between them, no space and no
+/// comment ([`Parser::name`] joins such runs).
+type Lexed = (Vec<(Tok, usize)>, Vec<bool>);
+
+fn lex(src: &str) -> Result<Lexed, ScriptError> {
     let mut toks = Vec::new();
+    let mut glued = Vec::new();
     let mut line = 1;
     let mut chars = src.chars().peekable();
+    // Whether the next token follows the last one directly.
+    let mut adjacent = false;
     while let Some(&c) = chars.peek() {
+        let before = toks.len();
         match c {
             '\n' => {
                 line += 1;
@@ -249,24 +258,23 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, ScriptError> {
                 if chars.clone().take(8).eq("DISCARD/".chars()) {
                     chars.nth(7);
                     toks.push((Tok::Word(OutputDesc::DISCARD.into()), line));
-                    continue;
-                }
-                if chars.peek() != Some(&'*') {
+                } else if chars.peek() != Some(&'*') {
                     return error(line, "unexpected '/' (only /* */ comments are supported)");
-                }
-                chars.next();
-                let start = line;
-                let mut prev = ' ';
-                loop {
-                    match chars.next() {
-                        Some('/') if prev == '*' => break,
-                        Some(c) => {
-                            if c == '\n' {
-                                line += 1;
+                } else {
+                    chars.next();
+                    let start = line;
+                    let mut prev = ' ';
+                    loop {
+                        match chars.next() {
+                            Some('/') if prev == '*' => break,
+                            Some(c) => {
+                                if c == '\n' {
+                                    line += 1;
+                                }
+                                prev = c;
                             }
-                            prev = c;
+                            None => return error(start, "unterminated comment"),
                         }
-                        None => return error(start, "unterminated comment"),
                     }
                 }
             }
@@ -320,8 +328,15 @@ fn lex(src: &str) -> Result<Vec<(Tok, usize)>, ScriptError> {
                 toks.push((Tok::Punct(p), line));
             }
         }
+        // White space and comments push nothing, and separate tokens.
+        if toks.len() > before {
+            glued.push(adjacent);
+            adjacent = true;
+        } else {
+            adjacent = false;
+        }
     }
-    Ok(toks)
+    Ok((toks, glued))
 }
 
 /// The `OUTPUT_FORMAT` name of a class: `elf32-littleriscv` or `elf64-littleriscv`.
@@ -348,24 +363,27 @@ fn format_class(name: &str) -> Option<Class> {
 /// with it. So the layout and [`crate::library`] need it before the script
 /// is parsed: the layout to know which class to parse the script for.
 pub fn declared_format(src: &str) -> Option<Class> {
-    let toks = lex(src).ok()?;
+    let (toks, glued) = lex(src).ok()?;
     // Commands are the words at the top level, outside every `( )` and
     // `{ }`; like the parser, take the first OUTPUT_FORMAT's first argument.
     let mut depth = 0usize;
-    for (i, (t, _)) in toks.iter().enumerate() {
+    let at = toks.iter().position(|(t, _)| {
         match t {
             Tok::Punct("(" | "{") => depth += 1,
             Tok::Punct(")" | "}") => depth = depth.saturating_sub(1),
-            Tok::Word(w) if depth == 0 && w == "OUTPUT_FORMAT" => {
-                return match (toks.get(i + 1), toks.get(i + 2)) {
-                    (Some((Tok::Punct("("), _)), Some((Tok::Word(f) | Tok::Str(f), _))) => format_class(f),
-                    _ => None,
-                };
-            }
+            Tok::Word(w) => return depth == 0 && w == "OUTPUT_FORMAT",
             _ => {}
         }
-    }
-    None
+        false
+    })?;
+    let mut p = Parser {
+        toks,
+        glued,
+        pos: at + 1,
+        class: Class::Elf64,
+    };
+    p.expect("(").ok()?;
+    format_class(&p.name_or_str("").ok()?)
 }
 
 /// Parses a number: decimal or `0x` hex, with an optional `K` or `M` suffix
@@ -397,6 +415,8 @@ pub fn parse_number(w: &str, class: Class) -> Option<u64> {
 
 struct Parser {
     toks: Vec<(Tok, usize)>,
+    /// [`Lexed`]'s: whether each token follows the one before directly.
+    glued: Vec<bool>,
     pos: usize,
     class: Class,
 }
@@ -445,13 +465,39 @@ impl Parser {
             t => error(line, format!("expected {what}, found {t}")),
         }
     }
-    /// A word or a quoted string, as in `OUTPUT_ARCH("riscv")`.
-    fn word_or_str(&mut self, what: &str) -> Result<String, ScriptError> {
+    /// A name: a section name, a pattern, a symbol an assignment sets, a
+    /// region, a format. ld.lld's lexer reads these outside expressions,
+    /// where `-` is a character of a name as letters are, so
+    /// `elf64-littleriscv` and `*(.text-x)` are one token each, while
+    /// inside an expression `a-b` is `a - b`. merlin-ld lexes `-` apart
+    /// and joins it back here: the name is the word or `-` there and every
+    /// word and `-` that follows it with nothing between them.
+    fn name(&mut self, what: &str) -> Result<String, ScriptError> {
         let line = self.line();
-        match self.next()? {
-            Tok::Word(w) | Tok::Str(w) => Ok(w),
-            t => error(line, format!("expected {what}, found {t}")),
+        let mut name = match self.next()? {
+            Tok::Word(w) => w,
+            Tok::Punct("-") => "-".to_string(),
+            t => return error(line, format!("expected {what}, found {t}")),
+        };
+        while self.glued.get(self.pos) == Some(&true) {
+            match self.peek() {
+                Some(Tok::Word(w)) => name.push_str(w),
+                Some(Tok::Punct("-")) => name.push('-'),
+                _ => break,
+            }
+            self.pos += 1;
         }
+        Ok(name)
+    }
+    /// A [`name`](Self::name) or a quoted string, as in
+    /// `OUTPUT_ARCH("riscv")`.
+    fn name_or_str(&mut self, what: &str) -> Result<String, ScriptError> {
+        if let Some(Tok::Str(s)) = self.peek() {
+            let s = s.clone();
+            self.pos += 1;
+            return Ok(s);
+        }
+        self.name(what)
     }
 
     fn script(&mut self) -> Result<Script, ScriptError> {
@@ -469,12 +515,12 @@ impl Parser {
             match kw.as_str() {
                 "ENTRY" => {
                     self.expect("(")?;
-                    script.entry = Some(self.word("an entry symbol")?);
+                    script.entry = Some(self.name("an entry symbol")?);
                     self.expect(")")?;
                 }
                 "OUTPUT_ARCH" => {
                     self.expect("(")?;
-                    let arch = self.word_or_str("an architecture")?;
+                    let arch = self.name_or_str("an architecture")?;
                     if !arch.eq_ignore_ascii_case("riscv") {
                         return error(line, format!("OUTPUT_ARCH({arch}): only riscv is supported"));
                     }
@@ -485,7 +531,7 @@ impl Parser {
                     // `OUTPUT_FORMAT(default, big, little)`: ld.lld goes by the
                     // first; merlin-ld also wants the others to be names it knows.
                     loop {
-                        let fmt = self.word_or_str("an output format")?;
+                        let fmt = self.name_or_str("an output format")?;
                         let Some(class) = format_class(&fmt) else {
                             return error(
                                 line,
@@ -528,7 +574,7 @@ impl Parser {
         let mut region = None;
         while !self.eat("}") {
             let line = self.line();
-            let name = self.word("a memory region name")?;
+            let name = self.name("a memory region name")?;
             if region.is_some() {
                 return error(line, "only one MEMORY region is supported");
             }
@@ -594,7 +640,7 @@ impl Parser {
         let mut cmds = Vec::new();
         while !self.eat("}") {
             let line = self.line();
-            let name = self.word("a section name, '.' or a symbol")?;
+            let name = self.name("a section name, '.' or a symbol")?;
             if self.is("=") || self.is("+=") {
                 cmds.push(Command::Assign(self.assign(name, line)?));
                 continue;
@@ -709,7 +755,7 @@ impl Parser {
         let mut items = Vec::new();
         while !self.eat("}") {
             let iline = self.line();
-            let w = self.word("an input section list or an assignment")?;
+            let w = self.name("an input section list or an assignment")?;
             if self.is("=") || self.is("+=") {
                 if discard {
                     return error(iline, "/DISCARD/ may only list input sections");
@@ -738,7 +784,7 @@ impl Parser {
             let mut patterns = Vec::new();
             while !self.eat(")") {
                 let pline = self.line();
-                let p = self.word("a section name pattern")?;
+                let p = self.name("a section name pattern")?;
                 if self.is("(") {
                     return error(
                         pline,
@@ -756,7 +802,7 @@ impl Parser {
             if discard {
                 return error(self.line(), "/DISCARD/ cannot go in a memory region");
             }
-            Some(self.word("a memory region name")?)
+            Some(self.name("a memory region name")?)
         } else {
             None
         };
@@ -819,9 +865,9 @@ impl Parser {
                 }
                 Expr::Align(Box::new(n))
             }
-            "ORIGIN" => Expr::Origin(self.word("a memory region name")?),
-            "LENGTH" => Expr::Length(self.word("a memory region name")?),
-            "ADDR" => Expr::Addr(self.word("a section name")?),
+            "ORIGIN" => Expr::Origin(self.name("a memory region name")?),
+            "LENGTH" => Expr::Length(self.name("a memory region name")?),
+            "ADDR" => Expr::Addr(self.name("a section name")?),
             _ => return error(line, format!("unsupported function '{w}' in expression")),
         };
         self.expect(")")?;
@@ -851,8 +897,14 @@ fn const_eval(e: &Expr, class: Class) -> Option<u64> {
 
 /// Parses a linker script for objects of class `class`.
 pub fn parse(src: &str, class: Class) -> Result<Script, ScriptError> {
-    let toks = lex(src)?;
-    let script = Parser { toks, pos: 0, class }.script()?;
+    let (toks, glued) = lex(src)?;
+    let script = Parser {
+        toks,
+        glued,
+        pos: 0,
+        class,
+    }
+    .script()?;
     // `> REGION` must name the region, and only when there is one.
     for c in &script.commands {
         if let Command::Output(o) = c {
@@ -1258,6 +1310,90 @@ mod tests {
         assert_eq!(
             err("OUTPUT_FORMAT(\"elf32-littleriscv\", \"elf64-bigriscv\")"),
             "1: OUTPUT_FORMAT(elf64-bigriscv): only elf32-littleriscv and elf64-littleriscv are supported"
+        );
+    }
+
+    #[test]
+    fn names_take_dashes_and_expressions_do_not() {
+        // Outside expressions ld.lld's tokens take `-` as they take letters,
+        // so an unquoted format name is one token, of either class.
+        for (src, class) in [
+            ("OUTPUT_FORMAT(elf64-littleriscv)", Class::Elf64),
+            ("OUTPUT_FORMAT(elf32-littleriscv)", Class::Elf32),
+        ] {
+            assert_eq!(parse(src, class).unwrap().format, Some(class), "{src}");
+            assert_eq!(declared_format(src), Some(class), "{src}");
+        }
+        assert_eq!(
+            err("OUTPUT_FORMAT(elf64-bigriscv)"),
+            "1: OUTPUT_FORMAT(elf64-bigriscv): only elf32-littleriscv and elf64-littleriscv are supported"
+        );
+        assert_eq!(
+            err("OUTPUT_ARCH(riscv-x)"),
+            "1: OUTPUT_ARCH(riscv-x): only riscv is supported"
+        );
+        // Section names, patterns, symbols an assignment sets, regions and
+        // the names ADDR, ORIGIN and LENGTH take.
+        let s = parse(
+            "ENTRY(my-start) MEMORY { R-AM : ORIGIN = 0x1000, LENGTH = 4K }\n\
+             SECTIONS { a-b = 1; -c = 2; .text-x : { *(.text-x .t-*) d-e = .; } > R-AM\n\
+             f = ADDR(.text-x) + ORIGIN(R-AM) + LENGTH(R-AM); }",
+            Class::Elf64,
+        )
+        .unwrap();
+        assert_eq!(s.entry.as_deref(), Some("my-start"));
+        assert_eq!(s.memory.as_ref().unwrap().name, "R-AM");
+        let Command::Assign(a) = &s.commands[0] else {
+            panic!()
+        };
+        assert_eq!(a.symbol.as_deref(), Some("a-b"));
+        let Command::Assign(c) = &s.commands[1] else {
+            panic!()
+        };
+        assert_eq!(c.symbol.as_deref(), Some("-c"));
+        let Command::Output(o) = &s.commands[2] else {
+            panic!()
+        };
+        assert_eq!(o.name, ".text-x");
+        assert_eq!(o.items[0], Item::Input(vec![".text-x".into(), ".t-*".into()]));
+        let Item::Assign(d) = &o.items[1] else { panic!() };
+        assert_eq!(d.symbol.as_deref(), Some("d-e"));
+        assert_eq!(o.region.as_deref(), Some("R-AM"));
+        let Command::Assign(f) = &s.commands[3] else {
+            panic!()
+        };
+        let addr = |n: &str| Box::new(Expr::Addr(n.into()));
+        let (origin, length) = (
+            Box::new(Expr::Origin("R-AM".into())),
+            Box::new(Expr::Length("R-AM".into())),
+        );
+        assert_eq!(
+            f.expr,
+            Expr::Add(Box::new(Expr::Add(addr(".text-x"), origin)), length)
+        );
+        // A space or a comment ends a name, and in an expression `-` is
+        // always the operator, glued or not.
+        let s = parse("SECTIONS { x = a-b; y = 3-1; .t /**/-x : { } }", Class::Elf64);
+        assert!(s.is_err());
+        let s = parse("SECTIONS { x = a-b; y = 3-1; }", Class::Elf64).unwrap();
+        let Command::Assign(x) = &s.commands[0] else {
+            panic!()
+        };
+        assert_eq!(
+            x.expr,
+            Expr::Sub(
+                Box::new(Expr::Symbol("a".into())),
+                Box::new(Expr::Symbol("b".into()))
+            )
+        );
+        let Command::Assign(y) = &s.commands[1] else {
+            panic!()
+        };
+        assert_eq!(const_eval(&y.expr, Class::Elf64), Some(2));
+        assert_eq!(
+            err("SECTIONS { .t - x : { } }"),
+            "1: unsupported syntax after '.t': found '-' (output sections are `name [(NOLOAD)] : \
+             [AT(lma)] [ALIGN(n)] { ... }`, without an address or other attributes)"
         );
     }
 

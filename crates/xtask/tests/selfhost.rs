@@ -792,6 +792,12 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
         // before .bss.
         "SECTIONS { . = 0x80000000; .text : { *(.text) } .x : { sym = .; } .data : { *(.data) }          . = . + 0x100; .bss : { *(.bss) } .rodata : { *(.rodata) *(.rodata.two) }          /DISCARD/ : { *(.text.gone) } }"
             .into(),
+        // Names with dashes, unquoted (`-` is a character of a name outside
+        // expressions, an operator in them).
+        format!(
+            "OUTPUT_FORMAT(elf32-littleriscv) ENTRY(_start) SECTIONS {{ . = 0x80000000; \
+             .text-x : {{ *(.text .text-none) }} a-b = ADDR(.text-x)-4; {rest} }}"
+        ),
     ];
     let mut links: Vec<(Vec<Vec<u8>>, String)> = scripts.into_iter().map(|s| (objects.to_vec(), s)).collect();
     // Empty orphans of every rank, one of a script section's name, without

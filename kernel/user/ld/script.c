@@ -59,17 +59,24 @@ struct tok {
     int kind;
     char *text;
     uint line;
+    /* Whether it follows the token before with nothing between them, no
+     * space and no comment (read_name joins such runs). */
+    int glued;
 };
 
 static struct tok *toks;
 static uint ntoks, captoks;
 static uint pos;
+/* Whether the next token follows the last one directly. */
+static int adjacent;
 
 static void push_tok(int kind, char *text, uint line) {
     toks = grow(toks, &captoks, ntoks + 1, sizeof(struct tok));
     toks[ntoks].kind = kind;
     toks[ntoks].text = text;
     toks[ntoks].line = line;
+    toks[ntoks].glued = adjacent;
+    adjacent = 1;
     ntoks++;
 }
 
@@ -103,14 +110,17 @@ static const char *const PUNCTS[] = {"{", "}", "(", ")", ":", ";", ",", "=", ">"
 static int lex(const char *src) {
     uint line = 1;
     ntoks = 0;
+    adjacent = 0;
     const char *p = src;
     while (*p) {
         int c = (uchar)*p;
         if (c == '\n') {
             line++;
             p++;
+            adjacent = 0;
         } else if (is_space(c)) {
             p++;
+            adjacent = 0;
         } else if (c == '/') {
             p++;
             if (strncmp(p, "DISCARD/", 8) == 0) {
@@ -137,6 +147,7 @@ static int lex(const char *src) {
                 }
                 prev = ch;
             }
+            adjacent = 0;
         } else if (c == '"') {
             p++;
             const char *s = p;
@@ -195,6 +206,8 @@ static int format_class(const char *name) {
     return FORMAT_NONE;
 }
 
+static int name_or_str(const char *what, char **out);
+
 /* The executable's class is the script's OUTPUT_FORMAT's when it names one,
  * and every object and library member must have it, so library.c needs it
  * before the script is parsed. Commands are the words at the top level,
@@ -212,9 +225,11 @@ int declared_format(const char *src) {
         } else if (t->kind == TK_PUNCT && (strcmp(t->text, ")") == 0 || strcmp(t->text, "}") == 0)) {
             depth = depth > 0 ? depth - 1 : 0;
         } else if (t->kind == TK_WORD && depth == 0 && strcmp(t->text, "OUTPUT_FORMAT") == 0) {
+            char *f;
+            pos = i + 2;
             if (i + 2 < ntoks && toks[i + 1].kind == TK_PUNCT && strcmp(toks[i + 1].text, "(") == 0 &&
-                (toks[i + 2].kind == TK_WORD || toks[i + 2].kind == TK_STR)) {
-                return format_class(toks[i + 2].text);
+                name_or_str("", &f)) {
+                return format_class(f);
             }
             return FORMAT_NONE;
         }
@@ -442,18 +457,43 @@ static int word(const char *what, char **out) {
     return fail(line, fmt("expected %s, found %s", what, shown(t)));
 }
 
-/* A word or a quoted string, as in OUTPUT_ARCH("riscv"). */
-static int word_or_str(const char *what, char **out) {
+static int is_dash(struct tok *t) {
+    return t->kind == TK_PUNCT && strcmp(t->text, "-") == 0;
+}
+
+/* A name: a section name, a pattern, a symbol an assignment sets, a region,
+ * a format. ld.lld's lexer reads these outside expressions, where `-` is a
+ * character of a name as letters are, so elf64-littleriscv and *(.text-x)
+ * are one token each, while inside an expression a-b is a - b. This lexer
+ * keeps `-` apart and joins it back here: the name is the word or `-` there
+ * and every word and `-` that follows it with nothing between them. */
+static int read_name(const char *what, char **out) {
     uint line = cur_line();
     struct tok *t = next();
     if (t == NULL) {
         return 0;
     }
-    if (t->kind == TK_WORD || t->kind == TK_STR) {
+    if (t->kind != TK_WORD && !is_dash(t)) {
+        return fail(line, fmt("expected %s, found %s", what, shown(t)));
+    }
+    char *name = t->text;
+    while (pos < ntoks && toks[pos].glued && (toks[pos].kind == TK_WORD || is_dash(&toks[pos]))) {
+        name = fmt("%s%s", name, toks[pos].text);
+        pos++;
+    }
+    *out = name;
+    return 1;
+}
+
+/* A name or a quoted string, as in OUTPUT_ARCH("riscv"). */
+static int name_or_str(const char *what, char **out) {
+    struct tok *t = peek();
+    if (t != NULL && t->kind == TK_STR) {
+        pos++;
         *out = t->text;
         return 1;
     }
-    return fail(line, fmt("expected %s, found %s", what, shown(t)));
+    return read_name(what, out);
 }
 
 static struct expr *new_expr(int kind) {
@@ -508,12 +548,12 @@ static int atom(struct expr **out) {
         }
     } else if (strcmp(w, "ORIGIN") == 0 || strcmp(w, "LENGTH") == 0) {
         e = new_expr(w[0] == 'O' ? X_ORIGIN : X_LENGTH);
-        if (!word("a memory region name", &e->name)) {
+        if (!read_name("a memory region name", &e->name)) {
             return 0;
         }
     } else if (strcmp(w, "ADDR") == 0) {
         e = new_expr(X_ADDR);
-        if (!word("a section name", &e->name)) {
+        if (!read_name("a section name", &e->name)) {
             return 0;
         }
     } else {
@@ -616,7 +656,7 @@ static int memory(struct script *s) {
     while (!eat("}")) {
         uint line = cur_line();
         char *name;
-        if (!word("a memory region name", &name)) {
+        if (!read_name("a memory region name", &name)) {
             return 0;
         }
         if (have) {
@@ -733,7 +773,7 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
     while (!eat("}")) {
         uint iline = cur_line();
         char *w;
-        if (!word("an input section list or an assignment", &w)) {
+        if (!read_name("an input section list or an assignment", &w)) {
             return 0;
         }
         if (is("=") || is("+=")) {
@@ -769,7 +809,7 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
         while (!eat(")")) {
             uint pline = cur_line();
             char *p;
-            if (!word("a section name pattern", &p)) {
+            if (!read_name("a section name pattern", &p)) {
                 return 0;
             }
             if (is("(")) {
@@ -791,7 +831,7 @@ static int output_section(char *name, int noload, uint line, struct output_desc 
         if (discard) {
             return fail(cur_line(), "/DISCARD/ cannot go in a memory region");
         }
-        if (!word("a memory region name", &o->region)) {
+        if (!read_name("a memory region name", &o->region)) {
             return 0;
         }
     }
@@ -807,7 +847,7 @@ static int sections(struct script *s) {
     while (!eat("}")) {
         uint line = cur_line();
         char *name;
-        if (!word("a section name, '.' or a symbol", &name)) {
+        if (!read_name("a section name, '.' or a symbol", &name)) {
             return 0;
         }
         s->commands = grow(s->commands, &cap, s->ncommands + 1, sizeof(struct command));
@@ -863,12 +903,12 @@ static int script(struct script *s) {
             return 0;
         }
         if (strcmp(kw, "ENTRY") == 0) {
-            if (!expect("(") || !word("an entry symbol", &s->entry) || !expect(")")) {
+            if (!expect("(") || !read_name("an entry symbol", &s->entry) || !expect(")")) {
                 return 0;
             }
         } else if (strcmp(kw, "OUTPUT_ARCH") == 0) {
             char *arch;
-            if (!expect("(") || !word_or_str("an architecture", &arch)) {
+            if (!expect("(") || !name_or_str("an architecture", &arch)) {
                 return 0;
             }
             char low[8];
@@ -891,7 +931,7 @@ static int script(struct script *s) {
              * merlin-ld also wants the others to be names it knows. */
             for (;;) {
                 char *f;
-                if (!word_or_str("an output format", &f)) {
+                if (!name_or_str("an output format", &f)) {
                     return 0;
                 }
                 int format = format_class(f);
