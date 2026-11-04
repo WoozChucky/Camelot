@@ -294,16 +294,15 @@ pub fn read_ours(file: &[u8]) -> Readelf {
 /// where (a section's name, or `ABS`). ld.lld keeps every object's that has
 /// a place in the executable, mapping symbols (`$x<isa>`, `$d`) included,
 /// those of the debug sections at their offsets there and those of
-/// `.riscv.attributes` absolute; but no `STT_FILE` symbol in merlin-ld's,
-/// which writes none (clang makes them of C files only, which the fixtures
-/// are not).
+/// `.riscv.attributes` absolute, and the `STT_FILE` symbols first in their
+/// object's.
 pub fn locals(file: &[u8]) -> Vec<(String, u64, u8, String)> {
     let e = elf::Elf::parse(file).unwrap();
     e.symbols()
         .unwrap()
         .into_iter()
         .skip(1)
-        .filter(|s| s.bind() == elf::STB_LOCAL && s.ty() != elf::STT_FILE)
+        .filter(|s| s.bind() == elf::STB_LOCAL)
         .map(|s| {
             let place = match s.shndx {
                 elf::SHN_ABS => "ABS".to_string(),

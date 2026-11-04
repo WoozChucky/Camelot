@@ -106,8 +106,8 @@
 
 use crate::layout::{Def, Layout};
 use crate::object::{
-    Class, SHF_EXECINSTR, SHF_MERGE, SHF_WRITE, SHN_ABS, SHN_LORESERVE, STB_GLOBAL, STB_LOCAL, STT_FILE,
-    STT_NOTYPE, STT_SECTION,
+    Class, SHF_EXECINSTR, SHF_MERGE, SHF_WRITE, SHN_ABS, SHN_LORESERVE, STB_GLOBAL, STB_LOCAL, STT_NOTYPE,
+    STT_SECTION,
 };
 use crate::relocate::Images;
 use elf::{
@@ -499,8 +499,10 @@ fn shoff_and_shnum_at(class: Class) -> (usize, usize) {
 /// (`includeInSymtab`, `shouldKeepInSymtab`): every one defined in a section
 /// that is in the executable, the loaded ones and the debug sections (whose
 /// symbols, such as the `$d` mapping symbols of merlin-as's objects, have
-/// their offsets in the output section for values), but no section or file
-/// symbol, and no `.L` label of a mergeable section (which the assembler
+/// their offsets in the output section for values), the file symbols
+/// (`STT_FILE`, absolute, first in their object's as the assembler writes
+/// them, and so in ld.lld's `sortSymTabSymbols`), but no section symbol,
+/// and no `.L` label of a mergeable section (which the assembler
 /// keeps only for its relocations). A symbol of `.riscv.attributes`, which
 /// ld.lld merges into a section of its own, is absolute there, its value
 /// its offset in its input section; merlin-ld writes no such section, but
@@ -536,7 +538,7 @@ fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
 
     for (oi, o) in layout.objects.iter().enumerate() {
         for (si, s) in o.symbols.iter().enumerate().skip(1) {
-            if !s.is_local() || s.ty == STT_SECTION || s.ty == STT_FILE || s.is_undefined() {
+            if !s.is_local() || s.ty == STT_SECTION || s.is_undefined() {
                 continue;
             }
             let input = (s.shndx < SHN_LORESERVE).then(|| &o.sections[s.shndx as usize]);

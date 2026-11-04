@@ -307,7 +307,8 @@ the symbol table only when a relocation still uses them. Every section
 marks where its code and data start with clang's mapping symbols, `$x<isa>`
 before a run of instructions and `$d` before a run of data
 (`Assembler::mapping_symbol`; spec section 10 has the rules), so a
-disassembler lists a `.word` among instructions as data. The object
+disassembler lists a `.word` among instructions as data; `.file "name"`
+is an `STT_FILE` symbol, the first of the locals as in clang. The object
 carries the same `.riscv.attributes` as clang's for its `-march`
 (`rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0`, and
 `rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0` on
@@ -328,7 +329,6 @@ input (spec section 10):
   reports it out of range.
 - A numeric label a relocation refers to is called `.L1$0` (`1:`, first
   definition) where clang says `.Ltmp0`.
-- `.file "t.c"` makes no `STT_FILE` symbol, where clang makes one.
 - Operand forms LLVM accepts and merlin-as doesn't: `jalr rd, rs`,
   `jalr off(rs)`, `jr off(rs)`, `jr rs, off`, `call rd, sym`, `jump sym, rt`,
   `%hi(sym)` in `.insn u`, named `.insn` opcodes (`.insn r OP, ...`),

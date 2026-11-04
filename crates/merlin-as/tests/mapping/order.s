@@ -1,10 +1,12 @@
 # The symbol table's order, clang's: a symbol has its place where the source
 # first names it, `.local`, `.type` and `.globl` included, but `.size` names
-# none (obj2, z); `.local` keeps an undefined symbol local (u).
+# none (obj2, z); `.local` keeps an undefined symbol local (u). The first
+# `.file "name"` is the first local symbol, the others where they are.
 # scripts/gen-mapping-golden.sh, tests/mapping.rs.
 	.data
 	.word	1
 	.type	obj,@object
+	.file	"order.c"
 	.size	obj2, 4
 	.local	loc1
 	.local	u
@@ -29,5 +31,7 @@ loc1:	.byte	1
 	.type	f,@function
 f:	ret
 	.size	f, .-f
+	.file	"other.h"
+	.file	"order.c"
 	.globl	h
 h:	.word	0

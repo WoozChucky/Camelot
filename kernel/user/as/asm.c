@@ -1069,7 +1069,16 @@ static int same_file(struct dfile *a, struct dfile *b) {
  * `.file N ["dir"] "name" [md5 0x...]`: file number N of the line table.
  * `.file 0` gives the compilation directory and the main file. */
 static void file_directive(struct dirarg *args, uint nargs) {
+    /* `.file "name"`: an STT_FILE symbol, here (merlin-as's file_directive). */
     if (nargs == 1 && args[0].kind == DA_STR) {
+        symbols = grow(symbols, &capsymbols, nsymbols + 1, sizeof(struct symbol));
+        struct symbol *f = &symbols[nsymbols++];
+        memset(f, 0, sizeof *f);
+        f->name = perm_strdup(tmp_strndup((char *)args[0].str, args[0].len));
+        f->section = -1;
+        f->defined = 1;
+        f->local = 1;
+        f->ty = SYM_FILE;
         return;
     }
     if (nargs == 0 || args[0].kind != DA_EXPR) {
@@ -2076,7 +2085,8 @@ struct object *asm_finish(void) {
         int dummy;
         int internal = starts_with(symbols[i].name, ".L") || symbols[i].ty == SYM_SECTION;
         if (!internal || map_get(&referenced, symbols[i].name, &dummy)) {
-            if (symbols[i].ty != SYM_MAPPING && !map_get(&first, symbols[i].name, &dummy)) {
+            int named = symbols[i].ty != SYM_MAPPING && symbols[i].ty != SYM_FILE;
+            if (named && !map_get(&first, symbols[i].name, &dummy)) {
                 map_put(&first, symbols[i].name, (int)obj->nsymbols);
             }
             obj->symbols[obj->nsymbols++] = symbols[i];

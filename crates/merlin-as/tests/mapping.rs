@@ -14,8 +14,7 @@
 //! * The line table corpus, `tests/debug_line` (clang's objects too, with
 //!   line tables): the same symbols, but for the labels clang makes for its
 //!   line table where merlin-as uses section symbols (`.L0 `,
-//!   `.Lline_table_start0`), and the `STT_FILE` symbol clang makes of
-//!   `.file "t.c"`, which merlin-as does not write.
+//!   `.Lline_table_start0`).
 //! * The encoder's corpus, `tests/golden/encode.s` (and `rv64/encode.s`),
 //!   instructions only: one `$x` at the start, as clang writes for it.
 
@@ -23,7 +22,6 @@ use merlin_as::{Options, Xlen};
 use std::path::{Path, PathBuf};
 
 const STT_SECTION: u8 = 3;
-const STT_FILE: u8 = 4;
 
 /// A symbol as `llvm-objdump -t` shows it: name, value, size, `st_info`,
 /// `st_other`, and where it is (a section's name, `ABS` or `UND`). A
@@ -186,15 +184,15 @@ fn mapping_symbols_are_clangs_on_rv64() {
     check_mapping_corpus(Xlen::Rv64);
 }
 
-/// The line table corpus: every symbol but the labels, section and file
-/// symbols that differ (module docs), the mapping symbols of the line table's own
+/// The line table corpus: every symbol but the labels and section symbols
+/// that differ (module docs), the mapping symbols of the line table's own
 /// sections included, in clang's order.
 fn check_debug_line_corpus(xlen: Xlen) {
     let names = names("debug_line", xlen);
     assert!(names.len() >= 4, "{names:?}");
     let comparable = |syms: Vec<Sym>| -> Vec<Sym> {
         syms.into_iter()
-            .filter(|s| !s.0.starts_with(".L") && ![STT_SECTION, STT_FILE].contains(&(s.3 & 0xf)))
+            .filter(|s| !s.0.starts_with(".L") && s.3 & 0xf != STT_SECTION)
             .collect()
     };
     for name in &names {

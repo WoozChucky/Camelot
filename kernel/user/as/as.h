@@ -245,8 +245,9 @@ int section_flags(const uchar *s, uint len, uint *out, uint *bad);
 int section_type(const uchar *s, uint len, uint *out);
 
 /* ---- The object (asm.c) ---- */
-/* SYM_MAPPING: a mapping symbol ($x<isa>, $d), which nothing refers to. */
-enum { SYM_NOTYPE, SYM_FUNC, SYM_OBJECT, SYM_SECTION, SYM_MAPPING };
+/* SYM_MAPPING: a mapping symbol ($x<isa>, $d); SYM_FILE: `.file "name"`'s
+ * STT_FILE symbol. Nothing refers to either. */
+enum { SYM_NOTYPE, SYM_FUNC, SYM_OBJECT, SYM_SECTION, SYM_MAPPING, SYM_FILE };
 
 struct reloc {
     uint offset;

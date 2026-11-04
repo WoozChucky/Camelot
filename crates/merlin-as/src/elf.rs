@@ -72,6 +72,7 @@ const STT_NOTYPE: u8 = 0;
 const STT_OBJECT: u8 = 1;
 const STT_FUNC: u8 = 2;
 const STT_SECTION: u8 = 3;
+const STT_FILE: u8 = 4;
 const EM_RISCV: u16 = 243;
 const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
@@ -253,6 +254,13 @@ pub fn write(obj: &Object) -> Vec<u8> {
     let mut order: Vec<usize> = (0..obj.symbols.len())
         .filter(|&i| !is_global(&obj.symbols[i]))
         .collect();
+    // The first `.file "name"`'s symbol comes before every other local, the
+    // others where the source has them: LLVM's ELFObjectWriter ("Make the
+    // first STT_FILE precede previous local symbols").
+    if let Some(k) = order.iter().position(|&i| obj.symbols[i].ty == SymType::File) {
+        let file = order.remove(k);
+        order.insert(0, file);
+    }
     let first_global = order.len() + 1;
     order.extend((0..obj.symbols.len()).filter(|&i| is_global(&obj.symbols[i])));
     let mut sym_index = vec![0u32; obj.symbols.len()];
@@ -266,11 +274,13 @@ pub fn write(obj: &Object) -> Vec<u8> {
             SymType::Object => STT_OBJECT,
             SymType::NoType | SymType::Mapping => STT_NOTYPE,
             SymType::Section => STT_SECTION,
+            SymType::File => STT_FILE,
         };
         // An `.equ` constant is an absolute symbol whose value is the
         // constant: cut to 32 bits in ELF32 (as LLVM does on riscv32), whole
         // in ELF64, so `.equ K, -1` is 0xffffffff or 0xffffffffffffffff.
         let (value, shndx) = match (s.constant, s.section) {
+            _ if s.ty == SymType::File => (0, SHN_ABS),
             (Some(c), _) => match obj.xlen {
                 Xlen::Rv32 => (u64::from(c as u32), SHN_ABS),
                 Xlen::Rv64 => (c as u64, SHN_ABS),
@@ -319,7 +329,7 @@ pub fn write(obj: &Object) -> Vec<u8> {
             let sym = sym_index[obj
                 .symbols
                 .iter()
-                .position(|x| x.name == r.symbol && x.ty != SymType::Mapping)
+                .position(|x| x.name == r.symbol && !matches!(x.ty, SymType::Mapping | SymType::File))
                 .expect("reloc symbol exists")];
             let ty = r.kind.elf_type();
             class.put_word(&mut out, r.offset.into());

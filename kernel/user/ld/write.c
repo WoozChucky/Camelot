@@ -274,7 +274,8 @@ static void sym_entry(struct buf *out, struct buf *strtab, const char *name, uin
 /* The symbol table: null, locals, then globals. Returns the first global's
  * index. The locals are those ld.lld keeps (merlin-ld's symtab): in a loaded
  * section, or in a debug section (at its offset there; not with -S, which
- * writes the link without them), no section or file symbol, no `.L` label
+ * writes the link without them), file symbols too (first in their object's),
+ * no section symbol, no `.L` label
  * of a mergeable section; one of .riscv.attributes is absolute, if ld.lld
  * would write that section. */
 static uint symtab(struct layout *l, int strip, struct buf *out, struct buf *strtab) {
@@ -285,7 +286,7 @@ static uint symtab(struct layout *l, int strip, struct buf *out, struct buf *str
         struct object *o = &l->objects[oi];
         for (uint si = 1; si < o->nsymbols; si++) {
             struct symbol *s = &o->symbols[si];
-            if (!sym_is_local(s) || s->type == STT_SECTION || s->type == STT_FILE || sym_is_undefined(s)) {
+            if (!sym_is_local(s) || s->type == STT_SECTION || sym_is_undefined(s)) {
                 continue;
             }
             struct section *in = s->shndx < SHN_LORESERVE ? &o->sections[s->shndx] : NULL;

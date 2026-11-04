@@ -112,19 +112,38 @@ void elf_write(struct object *obj, struct buf *out) {
     buf_zeros(&symtab, 16);
     uint n = 1;
     uint first_global = 0;
+    /* The first `.file "name"`'s symbol comes before every other local, the
+     * others where the source has them (LLVM's ELFObjectWriter). */
+    int first_file = -1;
+    for (uint i = 0; i < obj->nsymbols && first_file < 0; i++) {
+        if (obj->symbols[i].ty == SYM_FILE) {
+            first_file = (int)i;
+        }
+    }
     for (int pass = 0; pass < 2; pass++) {
         if (pass == 1) {
             first_global = n;
         }
-        for (uint i = 0; i < obj->nsymbols; i++) {
+        for (int k = pass == 0 && first_file >= 0 ? -1 : 0; k < (int)obj->nsymbols; k++) {
+            uint i = k < 0 ? (uint)first_file : (uint)k;
+            if (k >= 0 && (int)i == first_file) {
+                continue;
+            }
             struct symbol *s = &obj->symbols[i];
             if (is_global(s) != pass) {
                 continue;
             }
             index[i] = n++;
-            uint ty = s->ty == SYM_FUNC ? 2 : s->ty == SYM_OBJECT ? 1 : s->ty == SYM_SECTION ? 3 : 0;
+            uint ty = s->ty == SYM_FUNC      ? 2
+                      : s->ty == SYM_OBJECT  ? 1
+                      : s->ty == SYM_SECTION ? 3
+                      : s->ty == SYM_FILE    ? 4
+                                             : 0;
             uint value, shndx;
-            if (s->has_constant) {
+            if (s->ty == SYM_FILE) {
+                value = 0;
+                shndx = SHN_ABS;
+            } else if (s->has_constant) {
                 value = s->constant.lo;
                 shndx = SHN_ABS;
             } else if (s->section >= 0) {

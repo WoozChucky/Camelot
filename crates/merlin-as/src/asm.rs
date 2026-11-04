@@ -115,6 +115,11 @@ pub enum SymType {
     /// label, but nothing refers to it: a label the source names `$d` is
     /// another symbol (see [`Assembler::mapping_symbol`]).
     Mapping,
+    /// The source file's name, from `.file "name"` (`STT_FILE`, absolute,
+    /// value 0, local): the first one is the first local symbol of the
+    /// object, as clang writes it ([`crate::elf::write`]). Nothing refers to
+    /// it either.
+    File,
 }
 
 /// What a mapping symbol says follows it ([`SymType::Mapping`]).
@@ -1475,12 +1480,27 @@ impl Assembler {
         }
     }
 
-    /// `.file "name"` (the file's name, which merlin-as has no use for) or
-    /// `.file N ["dir"] "name" [md5 0x...]`: file number N of the line table.
-    /// `.file 0` gives the compilation directory and the main file.
+    /// `.file "name"`, the source file's name: an `STT_FILE` symbol, made
+    /// here, as LLVM's `emitFileDirective` records it (each one, a name
+    /// given twice too). Or `.file N ["dir"] "name" [md5 0x...]`: file
+    /// number N of the line table, no symbol. `.file 0` gives the
+    /// compilation directory and the main file.
     fn file_directive(&mut self, args: &[DirArg]) {
         let n = match args.first() {
-            Some(DirArg::Str(_)) if args.len() == 1 => return,
+            Some(DirArg::Str(name)) if args.len() == 1 => {
+                self.symbols.push(Symbol {
+                    name: String::from_utf8_lossy(name).into_owned(),
+                    section: None,
+                    value: 0,
+                    global: false,
+                    defined: true,
+                    constant: None,
+                    ty: SymType::File,
+                    size: 0,
+                    local: true,
+                });
+                return;
+            }
             Some(DirArg::Expr(e)) => match self.eval(e) {
                 Some(n) if (0..=u32::MAX as i64).contains(&n) => n as usize,
                 _ => return self.error(".file: expected a file number"),
