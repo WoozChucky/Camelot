@@ -371,6 +371,8 @@ pub struct Viewer {
     pub screen: Screen,
     /// Every frame's rectangle, in order.
     pub rects: Vec<Rect>,
+    /// Each `ScreenResized`: how many frames had come before it, and the new size.
+    pub resizes: Vec<(usize, u32, u32)>,
     /// Other events, in order.
     pub events: Vec<Message>,
     rx: Receiver<Message>,
@@ -411,6 +413,7 @@ impl Viewer {
             vm,
             screen: Screen::new(width, height),
             rects: Vec::new(),
+            resizes: Vec::new(),
             events: Vec::new(),
             rx,
         };
@@ -439,6 +442,18 @@ impl Viewer {
                 }
                 let rect = self.screen.apply_frame(&frame).unwrap();
                 self.rects.push(rect);
+                true
+            }
+            // A new screen, black, of the new size; the frames that follow fit it.
+            Ok(Message::ScreenResized {
+                vm,
+                width,
+                height,
+                format,
+            }) => {
+                assert_eq!((vm, format), (self.vm, avalon_proto::PIXEL_FORMAT_XRGB8888));
+                self.screen = Screen::new(width, height);
+                self.resizes.push((self.rects.len(), width, height));
                 true
             }
             Ok(other) => {
@@ -511,11 +526,11 @@ pub fn grail_screen(program: &[u8]) -> Vec<u8> {
     let mut m = grail::Machine::with_ram(16 * 1024 * 1024);
     m.load_elf(program).unwrap();
     assert_eq!(m.run(Some(100_000_000), |_| {}), grail::RunResult::Exited(0));
-    let fb = &m.cpu.bus.fb;
-    if fb.enabled() {
-        fb.vram.clone()
-    } else {
-        vec![0; fb.vram.len()]
+    // What the display shows, from VRAM or RAM, at its mode's size; black when off.
+    let frame = m.cpu.bus.frame();
+    match frame.pixels {
+        Some(pixels) => pixels.to_vec(),
+        None => vec![0; frame.width as usize * frame.height as usize * 4],
     }
 }
 

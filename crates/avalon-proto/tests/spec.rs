@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use MessageKind::{Event, Reply, Request};
 
 /// Section 6, the message catalogue: (code, name, kind).
-const SPEC_CATALOGUE: [(u16, &str, MessageKind); 51] = [
+const SPEC_CATALOGUE: [(u16, &str, MessageKind); 52] = [
     (0x0001, "Hello", Request),
     (0x0002, "Welcome", Reply),
     (0x0003, "Error", Reply),
@@ -39,6 +39,7 @@ const SPEC_CATALOGUE: [(u16, &str, MessageKind); 51] = [
     (0x0304, "KeyInput", Event),
     (0x0305, "ScreenDetach", Request),
     (0x0306, "PointerInput", Event),
+    (0x0307, "ScreenResized", Event),
     (0x0401, "BlockOpen", Request),
     (0x0402, "BlockOpened", Reply),
     (0x0403, "BlockRead", Request),
@@ -432,6 +433,15 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 .frame(0x0306),
         ),
         (
+            ScreenResized {
+                vm: 2,
+                width: 1024,
+                height: 768,
+                format: 0,
+            },
+            P::default().u32(2).u32(1024).u32(768).u32(0).frame(0x0307),
+        ),
+        (
             BlockOpen {
                 name: "d".into(),
                 read_only: true,
@@ -775,17 +785,17 @@ fn optional_fields_are_tagged() {
 
 #[test]
 fn doc_examples_are_exact() {
-    // Section 6.1: Hello version 7 from agent "rt".
+    // Section 6.1: Hello version 8 from agent "rt".
     assert_eq!(
         encode(&Message::Hello {
-            version: 7,
+            version: 8,
             agent: "rt".into()
         })
         .unwrap(),
-        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x07, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
+        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x08, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
     );
     // Section 7: the version this document describes.
-    assert_eq!(PROTOCOL_VERSION, 7);
+    assert_eq!(PROTOCOL_VERSION, 8);
     // Section 6.2: StartVm by id 5.
     assert_eq!(
         encode(&Message::StartVm { vm: VmRef::Id(5) }).unwrap(),

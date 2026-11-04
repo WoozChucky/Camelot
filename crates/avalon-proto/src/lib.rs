@@ -42,7 +42,7 @@ pub use screen::{Rect, Screen};
 
 /// Protocol version carried by the handshake. Both sides must speak the same one; any
 /// change to the message catalogue (a new message, field or enum value) bumps it.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// First four payload bytes of `Hello`, so a server can tell an Avalon client from a
 /// stray connection.
@@ -52,8 +52,9 @@ pub const MAGIC: [u8; 4] = *b"AVLN";
 pub const HEADER_LEN: usize = 6;
 
 /// Largest allowed value of a frame's length field (type + payload), 16 MiB. A full
-/// 640x480 XRGB8888 screen is 1.2 MB and a block request at most 1 MiB, so this leaves
-/// room for program images while bounding what one frame can make a peer allocate.
+/// screen in Grail's largest mode, 1920x1080 XRGB8888, is 8.3 MB and a block request at
+/// most 1 MiB, so this leaves room for program images while bounding what one frame can
+/// make a peer allocate.
 pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 /// Disk sector size for block I/O.

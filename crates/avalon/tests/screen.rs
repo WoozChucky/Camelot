@@ -118,6 +118,48 @@ fn colorbars_reach_a_viewer_as_grail_draws_them() {
     server.stop().unwrap();
 }
 
+/// A guest that changes modes (`examples/flip`, 800x600 from buffers in RAM, page
+/// flipped): a viewer attached at 640x480 is told the new size once, with
+/// `ScreenResized`, and sent the whole new screen right after it; it ends with
+/// exactly the last frame Grail shows. A viewer attaching afterwards is told the new
+/// size in `ScreenAttached`, and needs no resize.
+#[test]
+fn a_mode_change_resizes_the_viewers_and_sends_a_full_frame() {
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "flip", profile(16, None), example("flip"));
+    let mut viewer = Viewer::attach(&server, VmRef::Id(id));
+    assert_eq!((viewer.screen.width(), viewer.screen.height()), (640, 480));
+
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    viewer.wait_for_event(exited(id));
+    assert_eq!(viewer.resizes.len(), 1, "one mode change: {:?}", viewer.resizes);
+    let (before, width, height) = viewer.resizes[0];
+    assert_eq!((width, height), (800, 600));
+    let full = avalon_proto::Rect {
+        x: 0,
+        y: 0,
+        width: 800,
+        height: 600,
+    };
+    assert_eq!(
+        viewer.rects.get(before),
+        Some(&full),
+        "a full frame follows the resize"
+    );
+    assert!(
+        viewer.screen.pixels() == grail_screen(&example("flip")),
+        "the frames rebuild Grail's last frame"
+    );
+    assert_eq!(viewer.screen.pixel(0, 0), 0x00ffff, "the last frame's top band");
+
+    let late = Viewer::attach(&server, VmRef::Id(id));
+    assert_eq!((late.screen.width(), late.screen.height()), (800, 600));
+    assert!(late.resizes.is_empty());
+    assert!(late.screen == viewer.screen);
+    server.stop().unwrap();
+}
+
 /// A guest that waits for input with its screen drawn sends nothing more; a pointer
 /// change moves its cursor, which sends only the tiles that changed; Esc ends it.
 #[test]
