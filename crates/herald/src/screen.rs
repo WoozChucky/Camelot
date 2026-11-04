@@ -4,17 +4,18 @@
 //!
 //! [`ScreenSession`] is the streaming layer, and knows nothing of windows: it attaches
 //! over an Avalon [`Connection`], rebuilds the VM's screen from the frames the server
-//! sends ([`Screen::apply_frame`]), and runs one loop until the view is closed or the
-//! VM ends. Everything it needs from the window is the [`View`] trait, so the tests
+//! sends ([`Screen::apply_frame`]) and its cursor from the cursor messages
+//! ([`Cursor::apply`]), and runs one loop until the view is closed or the VM ends. Everything it needs from the window is the [`View`] trait, so the tests
 //! drive a session with a view that is a few vectors, on any platform. The Windows
 //! view is `crate::window`, Grail's own framebuffer window.
 
 use crate::{ended, out_of_step, End};
 use avalon_proto::{
-    kind_of, AttachKind, Connection, Error, Frame, KeyEvent, Message, MessageKind, PointerChange,
+    kind_of, AttachKind, Connection, Cursor, Error, Frame, KeyEvent, Message, MessageKind, PointerChange,
     PointerMotion, Screen, VmRef, VmState, VmSummary, PIXEL_FORMAT_XRGB8888, POINTER_BUTTONS,
     SCREEN_FRAME_OVERHEAD,
 };
+use grail::framebuffer::CursorPlane;
 use grail::pointer::Motion;
 use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -48,8 +49,9 @@ pub trait View {
 
     /// Shows `screen`, which may have another size than the last one drawn (the guest
     /// changed modes): the view then takes the new size, and its pointer input is in
-    /// the new screen's pixels from then on.
-    fn draw(&mut self, screen: &Screen);
+    /// the new screen's pixels from then on. `cursor` goes over it where it shows, as
+    /// [`frame`] blends it.
+    fn draw(&mut self, screen: &Screen, cursor: &Cursor);
 
     /// The VM is now in `state`, for the view to show (in its title, say).
     fn vm_state(&mut self, _state: VmState) {}
@@ -68,6 +70,8 @@ pub struct ScreenSession {
     pub vm: VmSummary,
     /// The VM's screen, as the frames received so far draw it.
     pub screen: Screen,
+    /// The VM's cursor, as the cursor messages received so far give it.
+    pub cursor: Cursor,
     /// Frames received so far, the full one after the attach included.
     pub frames: u64,
     /// Times the screen changed size (`ScreenResized`) so far.
@@ -111,6 +115,7 @@ impl ScreenSession {
             conn,
             vm,
             screen: Screen::new(width, height),
+            cursor: Cursor::default(),
             frames: 0,
             resizes: 0,
             detach_timeout: crate::DETACH_TIMEOUT,
@@ -124,8 +129,8 @@ impl ScreenSession {
     /// the view's keys and pointer changes to the VM. Returns when the view is closed
     /// (which detaches: [`End::Detached`]), or when the VM stops, exits or is destroyed;
     /// a VM that had already stopped or exited ends the session right after its last
-    /// frame is shown. `self.screen` keeps the last frame, for the caller to go on
-    /// showing.
+    /// frame is shown. `self.screen` keeps the last frame, and `self.cursor` the
+    /// cursor, for the caller to go on showing.
     ///
     /// Losing the connection, or a frame that does not fit the screen, is an error.
     /// Events this session does not need (other VMs', console output, ones that fail
@@ -136,12 +141,12 @@ impl ScreenSession {
         while self.conn.queued_events() > 0 {
             if let Ok(event) = self.conn.recv() {
                 if let Some(end) = self.on_server(event.type_code(), Ok(event), view)? {
-                    view.draw(&self.screen);
+                    view.draw(&self.screen, &self.cursor);
                     return Ok(end);
                 }
             }
         }
-        view.draw(&self.screen);
+        view.draw(&self.screen, &self.cursor);
         self.dirty = false;
         if ended(self.vm.state) {
             return Ok(End::VmEnded(self.vm.state));
@@ -206,13 +211,13 @@ impl ScreenSession {
             {
                 if let Some(end) = self.on_frame(frame, view)? {
                     if self.dirty {
-                        view.draw(&self.screen);
+                        view.draw(&self.screen, &self.cursor);
                     }
                     return Ok(end);
                 }
             }
             if std::mem::take(&mut self.dirty) | view.needs_redraw() {
-                view.draw(&self.screen);
+                view.draw(&self.screen, &self.cursor);
             }
         }
     }
@@ -266,6 +271,15 @@ impl ScreenSession {
                 self.resizes += 1;
                 self.dirty = true;
             }
+            // The cursor, apart from the frames: its image, or where it is now. It stays
+            // as it is across a resize, as the guest's cursor plane does.
+            (
+                Some(MessageKind::Event),
+                Ok(msg @ (Message::CursorShape { vm, .. } | Message::CursorPosition { vm, .. })),
+            ) if vm == id => {
+                self.cursor.apply(&msg);
+                self.dirty = true;
+            }
             (Some(MessageKind::Event), Ok(Message::VmStateChanged { vm, state })) if vm == id => {
                 self.vm.state = state;
                 view.vm_state(state);
@@ -292,6 +306,26 @@ impl ScreenSession {
             }
         }
         Ok(None)
+    }
+}
+
+/// What a view shows: `screen`, with `cursor` over it while it shows, as Grail's window
+/// shows a local machine's framebuffer and cursor plane (the cursor's image blended
+/// with premultiplied alpha, [`grail::framebuffer::CursorPlane::blend_into`]).
+pub fn frame<'a>(screen: &'a Screen, cursor: &'a Cursor) -> grail::framebuffer::Frame<'a> {
+    grail::framebuffer::Frame {
+        width: screen.width(),
+        height: screen.height(),
+        pixels: Some(screen.pixels()),
+        cursor: cursor.shown().map(|(image, x, y)| CursorPlane {
+            x,
+            y,
+            width: image.width,
+            height: image.height,
+            hot_x: image.hot_x,
+            hot_y: image.hot_y,
+            pixels: &image.pixels,
+        }),
     }
 }
 

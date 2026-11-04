@@ -3,11 +3,12 @@
 //! shows the remote screen stretched over its client area as Grail shows a local one,
 //! and its keys and mouse, already turned into keyboard events and pointer input in
 //! framebuffer pixels by that window, go to the VM. When the guest changes modes the
-//! screen comes in another size, and the window takes it, as Grail's does.
+//! screen comes in another size, and the window takes it, as Grail's does. The guest's
+//! cursor, which comes apart from the frames, is blended over the screen as Grail's
+//! window blends a local machine's cursor plane.
 
-use crate::screen::{key_from_grail, pointer_from_grail, Input, View};
-use avalon_proto::{Screen, VmState};
-use grail::framebuffer::Frame;
+use crate::screen::{frame, key_from_grail, pointer_from_grail, Input, View};
+use avalon_proto::{Cursor, Screen, VmState};
 use grail::window::Window;
 
 /// A window onto a VM's screen.
@@ -25,17 +26,18 @@ impl WindowView {
         })
     }
 
-    /// After the session: keeps showing `screen`, with `status` in the title, until the
-    /// window is closed. Input goes nowhere: there is nothing left to take it.
-    pub fn hold(&mut self, screen: &Screen, status: &str) {
+    /// After the session: keeps showing `screen` and `cursor`, with `status` in the
+    /// title, until the window is closed. Input goes nowhere: there is nothing left to
+    /// take it.
+    pub fn hold(&mut self, screen: &Screen, cursor: &Cursor, status: &str) {
         self.window
             .set_title(&format!("{} ({status}, close to quit)", self.title));
-        self.draw(screen);
+        self.draw(screen, cursor);
         while self.window.pump() {
             self.window.take_keys();
             self.window.take_pointer();
             if self.window.take_repaint() {
-                self.draw(screen);
+                self.draw(screen, cursor);
             }
             self.window.wait();
         }
@@ -71,13 +73,8 @@ impl View for WindowView {
         self.window.take_repaint()
     }
 
-    fn draw(&mut self, screen: &Screen) {
-        self.window.draw(Frame {
-            width: screen.width(),
-            height: screen.height(),
-            pixels: Some(screen.pixels()),
-            cursor: None,
-        });
+    fn draw(&mut self, screen: &Screen, cursor: &Cursor) {
+        self.window.draw(frame(screen, cursor));
     }
 
     fn vm_state(&mut self, state: VmState) {
