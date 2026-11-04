@@ -419,10 +419,16 @@ pub fn build_all(dir: &Path) -> Result<Vec<Program>, String> {
 
 /// clang's arguments for `src` (run in [`USER_DIR`]), writing to `out`.
 pub fn clang_args(src: &Source, out: &Path) -> Vec<String> {
+    // merlin-as assembles what clang writes, and its .attribute arch must
+    // name merlin-as's ISA, which has Zifencei: the kernel's flags leave it
+    // out (clang compiles the kernel's C to objects itself), these name it.
     let mut args: Vec<String> = TARGET_FLAGS
         .iter()
         .chain(C_FLAGS)
-        .map(|s| s.to_string())
+        .map(|s| match *s {
+            "-march=rv32ima_zicsr" => "-march=rv32ima_zicsr_zifencei".to_string(),
+            s => s.to_string(),
+        })
         .collect();
     args.push(src.file());
     args.push("-o".into());
@@ -906,6 +912,7 @@ mod tests {
         let args = clang_args(&src("sh", Lang::C), Path::new("out/sh.s"));
         for flag in [
             "--target=riscv32-unknown-elf",
+            "-march=rv32ima_zicsr_zifencei",
             "-mno-relax",
             "-ffreestanding",
             "-nostdinc",

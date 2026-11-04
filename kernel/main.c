@@ -219,11 +219,14 @@ static void memory_misuse(void) {
 #if __riscv_xlen == 64
 /* BOOT_FAULT_KSTACK_OVERFLOW's kernel process: each call takes a few hundred
  * bytes more of its stack, until the stack runs into its guard page. The
- * volatile accesses keep the compiler from folding the recursion away. */
+ * volatile accesses keep the compiler from folding the recursion away, and
+ * the volatile `deeper` from seeing that it never ends. */
+static volatile bool deeper = true;
+
 static u32 recurse(u32 depth) {
     volatile u8 frame[256];
     frame[0] = (u8)depth;
-    return recurse(depth + 1) + frame[0];
+    return (deeper ? recurse(depth + 1) : 0) + frame[0];
 }
 
 static void overflow_stack(void) {

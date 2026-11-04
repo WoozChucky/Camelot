@@ -8,14 +8,20 @@
 //! its symbols are link addresses, which [`Kernel::pa`] turns into the
 //! physical addresses the bus takes, and a pointer into the direct map
 //! goes back through `va_pa_offset`, the kernel's own variable.
+//!
+//! The same tests run on the reference builds (clang -O2 and ld.lld, with
+//! clang's or merlin-as's assembly) when LLVM is installed:
+//! `the_rv64_reference_builds_pass_the_same_tests`, ignored by default.
 
 mod common;
 
 use common::rv64::{CPU_HARTID, CPU_NOFF, CPU_PAGETABLE, CPU_SIZE, CPU_THREAD, LOCK_CPU};
 use grail::{Machine, MachineConfig, RunResult};
+use std::cell::RefCell;
 use std::collections::HashMap;
-use xtask::kernel::{self, BOOT_MAX_STEPS};
-use xtask::repo_root;
+use std::path::Path;
+use xtask::kernel::{self, Assembler, BOOT_MAX_STEPS};
+use xtask::{repo_root, tools};
 
 /// Where the image is linked (kernel/kernel64.ld) and loaded.
 const KERNEL_LINK_ADDR: u64 = 0xffff_ffff_8000_0000;
@@ -80,6 +86,18 @@ fn committed() -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+thread_local! {
+    /// The kernel the tests on this thread run: the committed one, or a
+    /// reference build (`the_rv64_reference_builds_pass_the_same_tests`).
+    static UNDER_TEST: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+/// The kernel under test. (The RV64 kernel has no user programs, so it is
+/// also the disk kernel.)
+fn under_test() -> Vec<u8> {
+    UNDER_TEST.with(|u| u.borrow().clone()).unwrap_or_else(committed)
+}
+
 /// Replaces the pc of a `[dbg] pc=` line with dots.
 fn mask_dbg_pc(out: &str) -> String {
     out.split_inclusive('\n')
@@ -100,7 +118,7 @@ impl Kernel {
     /// The committed RV64 kernel on a machine of `harts` harts and `ram`
     /// bytes of RAM, not started yet.
     fn load(harts: usize, ram: usize) -> Kernel {
-        Kernel::load_elf(&committed(), harts, ram)
+        Kernel::load_elf(&under_test(), harts, ram)
     }
 
     fn load_elf(file: &[u8], harts: usize, ram: usize) -> Kernel {
@@ -223,7 +241,7 @@ fn the_committed_rv64_kernels_are_what_our_toolchain_builds() {
 
 #[test]
 fn the_rv64_kernel_is_linked_high_and_loaded_low() {
-    let file = committed();
+    let file = under_test();
     let e = elf::Elf::parse(&file).unwrap();
     assert_eq!(e.header.entry, KERNEL_LINK_ADDR);
     let parsed = grail::elf::parse(&file).unwrap();
@@ -436,10 +454,12 @@ fn unmapped_load_and_text_store_page_fault() {
         pte_line.starts_with(&format!("  va {kmain:#018x} maps to pa {pa:#018x}, pte ")),
         "{pte_line}"
     );
-    assert!(
-        pte_line.ends_with(" DA-G-X-RV") || pte_line.ends_with(" -A--X-RV"),
-        "{pte_line}"
-    );
+    // R+X, not W, not U (A depends on whether that page ran since the
+    // switch to the kernel page table: its first instructions ran under
+    // the early one).
+    let flags = pte_line.rsplit(' ').next().unwrap();
+    assert_eq!(flags.len(), 8, "{pte_line}");
+    assert!(flags.starts_with('-') && flags.ends_with("-X-RV"), "{pte_line}");
 }
 
 /// The panics of the memory API's and the locks' misuses.
@@ -534,7 +554,7 @@ fn a_kernel_stack_overflow_hits_the_guard_page_and_is_reported() {
 /// /bin: there are no RV64 programs yet (#156).
 fn rv64_bootable_image(blocks: u32) -> (Vec<u8>, camelot_fs::boot::BootInfo) {
     let root = repo_root();
-    let kernel = std::fs::read(root.join("kernel").join(kernel::DISK_KERNEL_RV64)).unwrap();
+    let kernel = under_test();
     let opts = xtask::fs::bootable_layout(blocks, &kernel).unwrap();
     let mut fs = camelot_fs::mkfs::Mkfs::new(&opts).unwrap();
     fs.add_host_dir(&root.join(xtask::fs::ROOT_DIR), "/").unwrap();
@@ -595,5 +615,53 @@ fn the_rv64_kernel_boots_from_disk() {
         let lo = m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR).unwrap() as u64;
         let hi = m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR + 4).unwrap() as u64;
         assert_eq!(lo | hi << 32, LOAD_ADDR);
+    }
+}
+
+/// The RV64 reference build (`cargo xtask kernel --cc clang --xlen 64`) into
+/// a scratch directory, with `assembler` for the `.S` files.
+fn reference_build(assembler: Assembler, name: &str) -> Vec<u8> {
+    let clang = tools::find("clang").expect("clang (the official LLVM install, or on PATH)");
+    let lld = tools::find_beside("ld.lld", &clang).expect("ld.lld next to clang");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("kernel-rv64-tests")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = kernel::build_reference_for(
+        &repo_root(),
+        &clang,
+        &lld,
+        assembler,
+        &dir,
+        &dir.join("kernel.elf"),
+        false,
+        kernel::Xlen::Rv64,
+    )
+    .unwrap();
+    std::fs::read(out).unwrap()
+}
+
+#[test]
+#[ignore = "needs clang and ld.lld"]
+fn the_rv64_reference_builds_pass_the_same_tests() {
+    // clang -O2 and ld.lld, with clang's assembler and then with merlin-as:
+    // every test above but the one that compares the committed kernel with
+    // merlin's build, on this thread's kernel under test.
+    for (assembler, name) in [(Assembler::Clang, "clang"), (Assembler::Merlin, "merlin-as")] {
+        let elf = reference_build(assembler, name);
+        assert_ne!(elf, committed(), "{name}: the reference build is merlin's");
+        UNDER_TEST.with(|u| *u.borrow_mut() = Some(elf));
+        the_rv64_kernel_is_linked_high_and_loaded_low();
+        the_rv64_kernel_boots_through_its_self_tests();
+        the_page_table_maps_the_kernel_half_only();
+        the_rv64_kernel_runs_on_up_to_eight_harts();
+        the_rv64_kernel_takes_ram_from_sysinfo();
+        kernel_stacks_keep_a_margin();
+        illegal_instruction_panics_with_a_64_bit_register_dump();
+        unmapped_load_and_text_store_page_fault();
+        misuses_panic();
+        a_kernel_stack_overflow_hits_the_guard_page_and_is_reported();
+        the_rv64_kernel_boots_from_disk();
     }
 }
