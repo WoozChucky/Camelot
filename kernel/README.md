@@ -358,8 +358,8 @@ turns interrupts on under a `push_off()` before its `pop_off()`.
 
 The same sources build an RV64 kernel too, `kernel-rv64.elf` (and
 `kernel-disk-rv64.elf`, the same kernel for now: there are no RV64 user
-programs to build in until #156), with merlin's LP64 code and
-`kernel64.ld`. It runs as Linux's riscv64 kernel does (spec section 10,
+programs to build in until #156), with merlin's LP64 code and the same
+linker script, `kernel.lds.S`, preprocessed for RV64. It runs as Linux's riscv64 kernel does (spec section 10,
 "The RV64 kernel"):
 
 ```
@@ -368,7 +368,7 @@ grail --paging sv39 --harts 4 kernel/kernel-rv64.elf
 ```
 
 - The image is linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000
-  (`AT` in `kernel64.ld`). `entry.S` starts at the physical address with
+  (`AT` in `kernel.lds.S`). `entry.S` starts at the physical address with
   paging off; `setup_vm()` (`vm.c`) probes `satp` for Sv48, falling back to
   Sv39, and builds the early page table, which maps the image at both
   addresses; every hart turns paging on and jumps to the high address;
@@ -500,8 +500,7 @@ one process.
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `libgcc.c` | `__divdi3`, `__udivdi3`, `__moddi3`, `__umoddi3`, `__muldi3`: the C library's (`user/lib/libgcc.c`), for `long long` division on RV32 |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
-| `kernel.ld` | layout: `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end` |
-| `kernel64.ld` | the RV64 layout: linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000 (`AT`), the same sections, the boot stack 32 KiB aligned |
+| `kernel.lds.S` | the layout, one linker script for both widths, preprocessed first (`merlin -E -P`, as Linux's `vmlinux.lds.S`): `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end`; on RV64 linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000 (`AT`), the boot stack 32 KiB aligned |
 | `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct thread`, `struct user_program`, sleep and wakeup, the thread and futex calls), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
 | `kernel.elf` | the prebuilt image, with the user programs built in, committed so `cargo test` and Grail need no build |
 | `kernel-disk.elf` | the prebuilt disk kernel: the same objects without the user programs, which a bootable root image holds (`cargo xtask fs`) |
@@ -530,7 +529,8 @@ others, linked in its name order. Then it compiles every `*.c` and
 assembles every `*.S` in this directory, in name order (a `.S` file goes
 through the C preprocessor first, `merlin -E`, so that one source serves
 both widths: `#include <asm.h>` from the repository's `include/`, #193),
-and links with `kernel.ld`. By hand, from this directory, with the tools' command lines
+and links with `kernel.lds.S`, the linker script, preprocessed the same way
+but without line markers (`-P`), which a linker script can't have. By hand, from this directory, with the tools' command lines
 (`cargo run -p merlin --`, and so on), the kernel build is:
 
 ```
@@ -540,7 +540,8 @@ merlin -E -I ../include -I include entry.S -o entry.S.s   # and each other .S
 merlin-as entry.S.s -o entry.S.o
 merlin-as userprogs.s -o userprogs.s.o       # the generated one (in target/kernel/obj)
 merlin -g -fdebug-compilation-dir=kernel -I include net/arp.c -o net/arp.c.s   # the network stack's too
-merlin-ld -T kernel.ld -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.S.o \
+merlin -E -P -I ../include -I include kernel.lds.S -o kernel.lds
+merlin-ld -T kernel.lds -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.S.o \
        exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.S.o kprintf.c.o libgcc.c.o log.c.o machine.S.o \
        main.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o net/ip.c.o net/net.c.o \
        net/nic.c.o net/pbuf.c.o net/tcp.c.o net/udp.c.o pipe.c.o plic.c.o probe.S.o proc.c.o riscv.S.o \
@@ -581,7 +582,7 @@ clang --target=riscv32-unknown-elf -march=rv32ima_zicsr -mabi=ilp32 -mno-relax -
       -std=c11 -O2 -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-pic -fno-common -fno-ident \
       -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
       -Wall -Wextra -Werror -Iinclude -c main.c -o main.c.o        # and each other .c
-ld.lld -T kernel.ld -o kernel.elf bio.c.o blk.c.o ... vmtest.c.o     # the same objects as above
+ld.lld -T kernel.lds -o kernel.elf bio.c.o blk.c.o ... vmtest.c.o    # the same objects and script as above
 ```
 
 `--as merlin` assembles the `.s` files with merlin-as instead (bootstrapping

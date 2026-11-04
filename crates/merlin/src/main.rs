@@ -1,4 +1,4 @@
-//! `merlin [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-x LANG] [-E | --dump-ast] input.c...`
+//! `merlin [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-x LANG] [-E [-P] | --dump-ast] input.c...`
 
 use merlin::{CmdMacro, Lang, Options};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,8 @@ const USAGE: &str = "usage: merlin [options] input.c...
                     the directory -g says file names are relative to
                     (default: the current directory)
   -E                preprocess only: print the tokens after preprocessing
+  -P                with -E, no line markers in preprocessed assembly (for a
+                    linker script: kernel/kernel.lds.S); C's -E has none
   -x LANG           what the inputs after it are: c, or assembler-with-cpp
                     (assembly for merlin-as, only preprocessed: -E); without
                     it, .S files are assembler-with-cpp and the rest C
@@ -80,6 +82,7 @@ fn run() -> ExitCode {
         };
         match a.as_str() {
             "-E" => mode = Mode::Preprocess,
+            "-P" => opts.line_markers = false,
             "-g" => debug = true,
             _ if a.starts_with("-fdebug-compilation-dir") => {
                 match a.strip_prefix("-fdebug-compilation-dir").unwrap() {

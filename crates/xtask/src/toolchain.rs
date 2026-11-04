@@ -65,6 +65,7 @@ pub fn compile_c_for(
             comp_dir: comp_dir.into(),
         }),
         lang: merlin::Lang::C,
+        line_markers: true,
     };
     let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
     merlin::compile_with(file, &src, &opts, &load).map_err(|errors| {
@@ -87,11 +88,30 @@ fn merlin_xlen(xlen: Xlen) -> merlin::types::Xlen {
 /// `#if __riscv_xlen == 64` work, and the result has line markers that
 /// name `file`. Returns the text merlin-as assembles.
 pub fn preprocess_asm(dir: &Path, file: &str, include_dirs: &[&str], xlen: Xlen) -> Result<String, String> {
+    preprocess_with(dir, file, include_dirs, xlen, true)
+}
+
+/// [`preprocess_asm`] without line markers, as `merlin -E -P` writes it:
+/// for a linker script that goes through the C preprocessor (the kernel's
+/// `kernel.lds.S`, as Linux's `vmlinux.lds.S`), which merlin-ld and ld.lld
+/// read as it comes out.
+pub fn preprocess_lds(dir: &Path, file: &str, include_dirs: &[&str], xlen: Xlen) -> Result<String, String> {
+    preprocess_with(dir, file, include_dirs, xlen, false)
+}
+
+fn preprocess_with(
+    dir: &Path,
+    file: &str,
+    include_dirs: &[&str],
+    xlen: Xlen,
+    line_markers: bool,
+) -> Result<String, String> {
     let path = dir.join(file);
     let src = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let opts = merlin::Options {
         include_dirs: include_dirs.iter().map(PathBuf::from).collect(),
         xlen: merlin_xlen(xlen),
+        line_markers,
         ..merlin::Options::default()
     };
     let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
@@ -150,9 +170,21 @@ pub fn link_with(
 ) -> Result<Vec<u8>, String> {
     let path = dir.join(script);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    link_script(script, text, inputs, what, clang_objects)
+}
+
+/// [`link_with`] with the script's text given (`name` in errors): one that
+/// was preprocessed first ([`preprocess_lds`]).
+pub fn link_script(
+    name: &str,
+    text: String,
+    inputs: &[merlin_ld::Input],
+    what: &str,
+    clang_objects: bool,
+) -> Result<Vec<u8>, String> {
     let opts = merlin_ld::Options {
         script: Some(merlin_ld::ScriptSource {
-            name: script.into(),
+            name: name.into(),
             text,
         }),
         entry: None,

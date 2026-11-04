@@ -23,7 +23,7 @@ use std::path::Path;
 use xtask::kernel::{self, Assembler, BOOT_MAX_STEPS};
 use xtask::{repo_root, tools};
 
-/// Where the image is linked (kernel/kernel64.ld) and loaded.
+/// Where the image is linked (kernel/kernel.lds.S) and loaded.
 const KERNEL_LINK_ADDR: u64 = 0xffff_ffff_8000_0000;
 const LOAD_ADDR: u64 = 0x8000_0000;
 /// What depends on the paging mode the kernel chose (vm.h, Linux's

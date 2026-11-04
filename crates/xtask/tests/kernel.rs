@@ -4642,7 +4642,7 @@ fn clang_reference_build_behaves_like_merlins() {
 
 /// Bootstrapping steps 1 and 2 for the kernel: clang's C objects with the
 /// `.s` files assembled by merlin-as and linked by ld.lld, and the
-/// reference build's objects linked by merlin-ld (`kernel.ld` uses
+/// reference build's objects linked by merlin-ld (`kernel.lds.S` uses
 /// `ALIGN(n)` output section attributes, `NOLOAD` and `/DISCARD/`), both
 /// boot like the reference build.
 #[test]
@@ -4663,7 +4663,7 @@ fn merlin_as_and_merlin_ld_take_the_reference_builds_place() {
     let opts = merlin_ld::Options {
         script: Some(merlin_ld::ScriptSource {
             name: kernel::SCRIPT.into(),
-            text: std::fs::read_to_string(kernel_dir().join(kernel::SCRIPT)).unwrap(),
+            text: kernel::linker_script(&kernel_dir(), kernel::Xlen::Rv32).unwrap(),
         }),
         entry: None,
     };
@@ -4671,7 +4671,7 @@ fn merlin_as_and_merlin_ld_take_the_reference_builds_place() {
     // so it may warn and lay .rodata out bigger; it still runs the same.
     let linked = merlin_ld::link(&inputs, &opts).unwrap_or_else(|e| panic!("{e:?}"));
     assert_boots(&linked.elf);
-    // The layout follows kernel.ld like ld.lld's: same sections, .text
+    // The layout follows kernel.lds.S like ld.lld's: same sections, .text
     // where ld.lld put it, page-aligned .rodata and .data, NOBITS .bss and
     // .stack, nothing from /DISCARD/.
     let ours = elf::Elf::parse(&linked.elf).unwrap();

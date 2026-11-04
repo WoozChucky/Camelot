@@ -14,7 +14,7 @@
 # paging, once on, maps it there (identity).
 #
 # RV64: a higher-half kernel, as Linux's riscv64 head.S boots one. The image
-# is linked at 0xffff_ffff_8000_0000 (kernel64.ld) but runs here at its
+# is linked at 0xffff_ffff_8000_0000 (kernel.lds.S) but runs here at its
 # physical address, so until paging is on everything reaches its own symbols
 # pc-relatively (la, call: -mcmodel=medany), which works because the image
 # keeps its layout at both addresses. A link address is out of auipc's reach

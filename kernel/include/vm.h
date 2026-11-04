@@ -87,7 +87,7 @@ extern uintptr satp_mode;
  * root entries 256-511 in Sv48, which every process's root table copies,
  * #155). From the top:
  *
- *   KERNEL_LINK_ADDR  0xffff_ffff_8000_0000  the kernel image (kernel64.ld),
+ *   KERNEL_LINK_ADDR  0xffff_ffff_8000_0000  the kernel image (kernel.lds.S),
  *                                            the top 2 GiB, in both modes
  *   PAGE_OFFSET       Sv48 0xffff_af80_0000_0000 (64 TiB)
  *                     Sv39 0xffff_ffd6_0000_0000 (128 GiB)

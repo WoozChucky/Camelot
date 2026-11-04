@@ -7,17 +7,19 @@
 //! [`USERPROGS`], `userprogs.s`: the user programs of `kernel/user/` as data,
 //! which is not a file in `kernel/` but generated at build time
 //! ([`crate::userprogs`]). The objects are linked in name order with
-//! `kernel/kernel.ld`. Our own tools build it ([`Toolchain::Merlin`],
+//! `kernel/kernel.lds.S` ([`SCRIPT`]), a linker script that goes through the
+//! C preprocessor first, as Linux's `vmlinux.lds.S` (`merlin -E -P`,
+//! [`linker_script`]). Our own tools build it ([`Toolchain::Merlin`],
 //! [`build_merlin`]): merlin compiles each C file, merlin-as assembles it and
 //! the assembly files and merlin-ld links them, all in memory, with no LLVM.
 //! That is how the committed `kernel/kernel.elf` is made, and `cargo test`
 //! checks it is what the current sources and tools give.
 //!
-//! The same sources build for both widths while RV32 and RV64 exist side by
-//! side (#141): the RV32 kernel (`kernel.elf`, [`SCRIPT`]: everything at
-//! 0x8000_0000, identity mapped) and the RV64 one (`kernel-rv64.elf`,
-//! [`SCRIPT_RV64`]: a higher-half kernel linked at 0xffff_ffff_8000_0000 and
-//! loaded at 0x8000_0000, #154). The RV64 kernel has no user programs of its
+//! The same sources, the linker script too, build for both widths while RV32
+//! and RV64 exist side by side (#141): the RV32 kernel (`kernel.elf`:
+//! everything at 0x8000_0000, identity mapped) and the RV64 one
+//! (`kernel-rv64.elf`: a higher-half kernel linked at 0xffff_ffff_8000_0000
+//! and loaded at 0x8000_0000, #154). The RV64 kernel has no user programs of its
 //! own yet (#156): its `userprogs.s` is [`crate::userprogs::empty`].
 //!
 //! The reference build ([`Toolchain::Clang`], `cargo xtask kernel --cc
@@ -139,17 +141,31 @@ pub const ASM_INCLUDE_DIRS: &[&str] = &["../include", INCLUDE_DIR];
 /// directory of `-g`): `kernel`, relative to the repository root, so a
 /// debugger run there finds `kernel/main.c`.
 pub const DEBUG_DIR: &str = "kernel";
-/// The RV32 kernel's linker script, in the kernel directory.
-pub const SCRIPT: &str = "kernel.ld";
-/// The RV64 kernel's: linked high, loaded at the start of RAM (`AT`).
-pub const SCRIPT_RV64: &str = "kernel64.ld";
+/// The kernel's linker script, in the kernel directory: one for both widths,
+/// preprocessed for each ([`linker_script`]), as Linux's `vmlinux.lds.S`.
+/// RV32 links everything at 0x8000_0000; RV64 links high and loads at the
+/// start of RAM (`AT`).
+pub const SCRIPT: &str = "kernel.lds.S";
+/// The preprocessed script, in the object directory, for ld.lld (and for
+/// reading: merlin-ld links with it in memory).
+pub const SCRIPT_OUT: &str = "kernel.lds";
 
-/// The linker script for `xlen`.
-pub fn script(xlen: Xlen) -> &'static str {
-    match xlen {
-        Xlen::Rv32 => SCRIPT,
-        Xlen::Rv64 => SCRIPT_RV64,
-    }
+/// The text of [`SCRIPT`] for `xlen`: `merlin -E -P` (no line markers, which
+/// a linker script can't have) with the assembly's include directories, so
+/// it may include the headers that assembly does.
+pub fn linker_script(kernel_dir: &Path, xlen: Xlen) -> Result<String, String> {
+    toolchain::preprocess_lds(kernel_dir, SCRIPT, ASM_INCLUDE_DIRS, xlen)
+}
+
+/// Links `inputs` for `xlen` with [`linker_script`] (`what` in errors).
+fn link_kernel(
+    kernel_dir: &Path,
+    xlen: Xlen,
+    inputs: &[merlin_ld::Input],
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    let text = linker_script(kernel_dir, xlen)?;
+    toolchain::link_script(SCRIPT, text, inputs, what, false)
 }
 /// The generated source that holds the user programs
 /// ([`crate::userprogs::generate`]). It is a source of the kernel, linked in
@@ -305,6 +321,9 @@ fn list_sources(dir: &Path, prefix: &str, out: &mut Vec<Source>) -> Result<(), S
         };
         let lang = match Path::new(&name).extension().and_then(|x| x.to_str()) {
             Some("c") => Lang::C,
+            // A linker script that is preprocessed (kernel.lds.S) is no
+            // assembly.
+            Some("S") if name.ends_with(".lds.S") => continue,
             Some("s" | "S") => Lang::Asm,
             _ => continue,
         };
@@ -375,7 +394,7 @@ pub fn build_merlin(kernel_dir: &Path, userprogs: Option<&str>) -> Result<Built,
 /// merlin-ld, in memory: merlin compiles each C file (`-I include`) for
 /// `xlen`, merlin-as assembles that and each assembly file (a `.S` one
 /// preprocessed by merlin first), and merlin-ld links the objects in name
-/// order with [`script`]`(xlen)`. [`USERPROGS`] is `userprogs` if given (the
+/// order with [`linker_script`]`(xlen)`. [`USERPROGS`] is `userprogs` if given (the
 /// text of another build of the programs), or else [`userprogs_for`]. No
 /// LLVM; nothing is written.
 pub fn build_merlin_for(kernel_dir: &Path, userprogs: Option<&str>, xlen: Xlen) -> Result<Built, String> {
@@ -416,7 +435,7 @@ pub fn build_merlin_for(kernel_dir: &Path, userprogs: Option<&str>, xlen: Xlen) 
             data: o.obj.clone(),
         })
         .collect();
-    let elf = toolchain::link(kernel_dir, script(xlen), &inputs, "the kernel")?;
+    let elf = link_kernel(kernel_dir, xlen, &inputs, "the kernel")?;
     Ok(Built { objects, elf, xlen })
 }
 
@@ -450,7 +469,7 @@ pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> 
             },
         })
         .collect();
-    toolchain::link(kernel_dir, script(built.xlen), &inputs, "the disk kernel")
+    link_kernel(kernel_dir, built.xlen, &inputs, "the disk kernel")
 }
 
 /// The disk kernel's path for a kernel written to `out`: `kernel.elf` gives
@@ -473,7 +492,7 @@ pub fn disk_kernel_path(out: &Path) -> PathBuf {
 /// relative to it; pass absolute ones.
 #[derive(Clone, Debug)]
 pub struct Build {
-    /// Directory holding the sources, `include/` and `kernel.ld`.
+    /// Directory holding the sources, `include/` and [`SCRIPT`].
     pub kernel_dir: PathBuf,
     /// Where object files (and merlin's assembly) go.
     pub obj_dir: PathBuf,
@@ -529,10 +548,12 @@ impl Build {
 
     /// Linker arguments (run with the kernel directory as cwd): ld.lld's, and
     /// merlin-ld's, which takes the same.
+    /// The script is [`SCRIPT_OUT`], preprocessed into the object directory
+    /// ([`Build::write_script`]).
     pub fn link_args(&self, sources: &[Source]) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec![
             "-T".into(),
-            script(self.xlen).into(),
+            self.obj_dir.join(SCRIPT_OUT).into(),
             "-o".into(),
             self.out.clone().into(),
         ];
@@ -569,10 +590,31 @@ impl Build {
                         self.exec(clang, self.compile_args(src))?;
                     }
                 }
+                self.write_script()?;
                 self.exec(lld, self.link_args(&sources))?;
             }
         }
         Ok(self.out.clone())
+    }
+
+    /// Writes [`linker_script`] to [`SCRIPT_OUT`] in the object directory,
+    /// for ld.lld.
+    fn write_script(&self) -> Result<(), String> {
+        if self.verbose {
+            let march = match self.xlen {
+                Xlen::Rv32 => "",
+                Xlen::Rv64 => "-march=rv64ima_zicsr_zifencei ",
+            };
+            let incs: Vec<String> = ASM_INCLUDE_DIRS.iter().map(|d| format!("-I {d}")).collect();
+            eprintln!(
+                "merlin {march}-E -P {} {SCRIPT} -o {}",
+                incs.join(" "),
+                self.obj_dir.join(SCRIPT_OUT).display()
+            );
+        }
+        let path = self.kernel_dir.join(&self.obj_dir).join(SCRIPT_OUT);
+        std::fs::write(&path, linker_script(&self.kernel_dir, self.xlen)?)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))
     }
 
     /// [`USERPROGS`]'s text, if the kernel has one: [`Build::userprogs`]'s, or
@@ -658,6 +700,11 @@ impl Build {
                     eprintln!("merlin-as {march}{input} -o {}", obj(src.object_name()));
                 }
             }
+        }
+        // The script merlin-ld links with, for reading (and the command
+        // line's merlin-ld).
+        self.write_script()?;
+        if self.verbose {
             let args: Vec<String> = self
                 .link_args(sources)
                 .iter()
@@ -927,10 +974,12 @@ mod tests {
             .iter()
             .filter(|s| s.lang == Lang::Asm)
             .all(|s| s.is_preprocessed() != s.is_generated()));
-        // kernel.ld, kernel.elf and include/ are not sources.
+        // The linker script (a .S file, but no assembly), kernel.elf and
+        // include/ are not sources.
+        assert!(crate::repo_root().join("kernel").join(SCRIPT).is_file());
         assert!(!names
             .iter()
-            .any(|n| n.ends_with(".ld") || n.ends_with(".elf") || *n == "include"));
+            .any(|n| *n == SCRIPT || n.ends_with(".elf") || *n == "include"));
     }
 
     #[test]
@@ -1130,7 +1179,9 @@ mod tests {
             },
         ];
         let args = strings(&build().link_args(&srcs));
-        assert_eq!(args[..3], ["-T", "kernel.ld", "-o"]);
+        assert_eq!(args[0], "-T");
+        assert_eq!(PathBuf::from(&args[1]), Path::new("obj").join("kernel.lds"));
+        assert_eq!(args[2], "-o");
         assert_eq!(PathBuf::from(&args[3]), Path::new("out/kernel.elf"));
         assert_eq!(PathBuf::from(&args[4]), Path::new("obj").join("entry.s.o"));
         assert_eq!(PathBuf::from(&args[5]), Path::new("obj").join("main.c.o"));

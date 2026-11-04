@@ -1,4 +1,4 @@
-/* Physical memory: pages, and where the kernel image sits in RAM (kernel.ld).
+/* Physical memory: pages, and where the kernel image sits in RAM (kernel.lds.S).
  * RAM itself is discovered at boot from sysinfo (kalloc.c). */
 #ifndef CAMELOT_MEMLAYOUT_H
 #define CAMELOT_MEMLAYOUT_H
@@ -13,7 +13,7 @@
 #define PGROUNDUP(a) (((a) + PGSIZE - 1) & ~(PGSIZE - 1))
 #define PGROUNDDOWN(a) ((a) & ~(PGSIZE - 1))
 
-/* Linker symbols (kernel.ld, kernel64.ld), all page aligned. Only their
+/* Linker symbols (kernel.lds.S), all page aligned. Only their
  * addresses mean anything: text from __text_start (= _start, loaded at
  * 0x8000_0000: on RV32 also its address, on RV64 linked at
  * 0xffff_ffff_8000_0000), read-only data from __rodata_start, writable data,

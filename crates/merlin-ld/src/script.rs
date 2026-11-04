@@ -1009,10 +1009,27 @@ mod tests {
         );
     }
 
+    /// kernel/kernel.lds.S for `xlen`, preprocessed as `cargo xtask kernel`
+    /// does (`merlin -E -P`, with the assembly's include directories).
+    fn kernel_script(xlen: merlin::types::Xlen) -> String {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let kernel = root.join("kernel");
+        let src = std::fs::read_to_string(kernel.join("kernel.lds.S")).unwrap();
+        let opts = merlin::Options {
+            xlen,
+            include_dirs: vec!["../include".into(), "include".into()],
+            line_markers: false,
+            ..merlin::Options::default()
+        };
+        let load = |p: &std::path::Path| std::fs::read_to_string(kernel.join(p)).ok();
+        merlin::preprocess_asm("kernel.lds.S", &src, &opts, &load).unwrap()
+    }
+
     #[test]
     fn parses_the_kernels_script() {
-        // kernel/kernel.ld: ALIGN(n) after the colon, NOLOAD, /DISCARD/.
-        let s = parse(include_str!("../../../kernel/kernel.ld"), Class::Elf32).unwrap();
+        // kernel/kernel.lds.S for RV32: ALIGN(n) after the colon, NOLOAD,
+        // /DISCARD/, a MEMORY region.
+        let s = parse(&kernel_script(merlin::types::Xlen::Rv32), Class::Elf32).unwrap();
         let outs: Vec<&OutputDesc> = s
             .commands
             .iter()
@@ -1048,6 +1065,19 @@ mod tests {
         );
         assert_eq!(outs[0].region.as_deref(), Some("RAM"));
         assert_eq!(outs[5].region, None);
+        // For RV64: linked high, loaded at the start of RAM, no region.
+        let s = parse(&kernel_script(merlin::types::Xlen::Rv64), Class::Elf64).unwrap();
+        let outs: Vec<&OutputDesc> = s
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::Output(o) => Some(o),
+                Command::Assign(_) => None,
+            })
+            .collect();
+        assert_eq!(outs[0].name, ".text");
+        assert_eq!(outs[0].at, Some(Expr::Num(0x8000_0000)));
+        assert!(outs.iter().all(|o| o.region.is_none()));
         // `/DISCARD/` reads as one word wherever it is.
         let s = parse("SECTIONS{/DISCARD/:{*(.x)}}", Class::Elf32).unwrap();
         assert!(matches!(&s.commands[0], Command::Output(o) if o.is_discard()));

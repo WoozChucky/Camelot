@@ -129,10 +129,14 @@ pub struct Options {
     pub xlen: Xlen,
     /// `-x`: what the input is.
     pub lang: Lang,
+    /// Whether preprocessed assembly has line markers: `-P` turns them off,
+    /// for text that is no assembly, such as a linker script
+    /// ([`Output::print_asm`]).
+    pub line_markers: bool,
 }
 
 impl Default for Options {
-    /// No `-I`, `-D` or `-g`, C for RV32 (the default until #159).
+    /// No `-I`, `-D`, `-g` or `-P`, C for RV32 (the default until #159).
     fn default() -> Options {
         Options {
             include_dirs: Vec::new(),
@@ -140,6 +144,7 @@ impl Default for Options {
             debug: None,
             xlen: Xlen::Rv32,
             lang: Lang::C,
+            line_markers: true,
         }
     }
 }
@@ -406,7 +411,14 @@ impl Output {
     ///
     /// clang also writes markers for its `<built-in>` and `<command line>`
     /// macros, which merlin leaves out.
-    pub fn print_asm(&self) -> String {
+    ///
+    /// Without `line_markers` (`-P`, as clang's `-E -P` writes it, for text
+    /// that is no assembly, such as a linker script) there are no markers
+    /// and no blank lines: a token that starts a line goes on a new line if
+    /// the current one has tokens, or if it is the very next line (one
+    /// newline); otherwise it goes on as if on the same line. Only the first
+    /// token on a line that a newline started is indented to its column.
+    pub fn print_asm(&self, line_markers: bool) -> String {
         let mut p = Printer {
             out: String::new(),
             line: 1,
@@ -414,6 +426,7 @@ impl Output {
             files: &self.files,
             started: false,
             entered: true,
+            markers: line_markers,
         };
         p.line_marker(1, "");
         let mut marks = self.marks.iter().peekable();
@@ -422,7 +435,15 @@ impl Output {
             while let Some((_, mark)) = marks.next_if(|(at, _)| *at <= i) {
                 p.mark(*mark);
             }
-            let new_line = l.bol && (p.move_to_line(l.at.line) | std::mem::take(&mut p.entered));
+            // A token that starts a line is indented if the output moved to a
+            // new line for it, or if it is on the first line of a file that
+            // was just entered (clang's `IsFirstInFile`): there the output is
+            // at the start of a line already, after the marker (or nothing).
+            let new_line = l.bol && {
+                let moved = p.move_to_line(l.at.line);
+                let first_in_file = std::mem::take(&mut p.entered) && l.at.line == 1;
+                moved || first_in_file
+            };
             if new_line {
                 let mut col = l.at.col;
                 if col == 1 && l.lead {
@@ -472,17 +493,25 @@ struct Printer<'a> {
     files: &'a [String],
     /// Tokens have been written on the current line.
     started: bool,
-    /// No token has been written since a file was entered: the next one is
-    /// indented, even on the line of the marker.
+    /// No token has been written since a file was entered: the next one, if
+    /// it is on the file's first line, is indented, even on the line of the
+    /// marker.
     entered: bool,
+    /// Line markers are written (no `-P`).
+    markers: bool,
 }
 
 impl Printer<'_> {
     /// `# N "file"` and `extra` (` 1` entering a file, ` 2` leaving one),
     /// on a line of its own: the next line is line `line`.
+    /// Without markers (`-P`), only the newline that ends a line with tokens
+    /// (clang's `startNewLineIfNeeded`).
     fn line_marker(&mut self, line: u32, extra: &str) {
         if std::mem::take(&mut self.started) {
             self.out.push('\n');
+        }
+        if !self.markers {
+            return;
         }
         let name = escape(&self.files[self.file as usize]);
         self.out.push_str(&format!("# {line} \"{name}\"{extra}\n"));
@@ -490,13 +519,19 @@ impl Printer<'_> {
 
     /// Goes to line `line` of the current file (clang's `MoveToLine`): one
     /// newline to the next line, newlines up to 8 lines ahead, else a line
-    /// marker. Whether the output is now at the start of a line.
+    /// marker; without markers (`-P`), one newline if the current line has
+    /// tokens, else none. Whether the output is now at the start of a line.
     fn move_to_line(&mut self, line: u32) -> bool {
         let moved = if self.line == line {
             false
         } else if line == self.line + 1 {
             self.out.push('\n');
             true
+        } else if !self.markers {
+            if self.started {
+                self.out.push('\n');
+            }
+            self.started
         } else {
             if line > self.line && line - self.line <= 8 {
                 for _ in self.line..line {
@@ -2616,6 +2651,7 @@ puts( "The first, second, and third items." );
             macros: Vec::new(),
             debug: None,
             lang: Lang::C,
+            line_markers: true,
         };
         let src = "#include <d.h>\n#include \"d.h\"\n#include <c.h>\n#define H <b.h>\n#include H";
         let out = run(&files, src, &opts).unwrap();
@@ -2948,6 +2984,7 @@ puts( "The first, second, and third items." );
             ],
             debug: None,
             lang: Lang::C,
+            line_markers: true,
         };
         let out = run(&[], "ONE TWO F(3) GONE __merlin__ __STDC_VERSION__", &opts).unwrap();
         assert_eq!(words(&out.tokens), same("1 22 (3+1) GONE __merlin__ 199901L"));
@@ -2957,6 +2994,7 @@ puts( "The first, second, and third items." );
             macros: vec![CmdMacro::Define("1X".into())],
             debug: None,
             lang: Lang::C,
+            line_markers: true,
         };
         assert_eq!(
             run(&[], "", &opts).unwrap_err().render("main.c"),
@@ -3060,6 +3098,11 @@ puts( "The first, second, and third items." );
     /// `main.S` with these other files around it, preprocessed as assembly
     /// with `-I i2`, as text.
     fn asm(files: &[(&str, &str)], src: &str) -> String {
+        asm_with(files, src, true)
+    }
+
+    /// The same, with line markers or without (`-P`).
+    fn asm_with(files: &[(&str, &str)], src: &str, line_markers: bool) -> String {
         let files: HashMap<PathBuf, String> = files
             .iter()
             .map(|(name, text)| (normalize(Path::new(name)), text.to_string()))
@@ -3072,7 +3115,7 @@ puts( "The first, second, and third items." );
         };
         preprocess("main.S", src, &opts, &load)
             .unwrap_or_else(|e| panic!("{e}"))
-            .print_asm()
+            .print_asm(line_markers)
     }
 
     /// What clang 23's `-E -x assembler-with-cpp` prints for the same file
@@ -3144,6 +3187,44 @@ puts( "The first, second, and third items." );
         assert_eq!(source_line(&text, 21), Some(("other.S".into(), 31)));
         assert_eq!(source_line(&text, 23), Some(("other.S".into(), 41)));
         assert_eq!(source_line(&text, 24), None);
+    }
+
+    /// `-P`, as clang 23's `-E -P` writes the same sources: no markers, and
+    /// no blank lines but where a token is on the line right after one
+    /// that had none (a directive's, or a skipped one's); a line's first
+    /// token indented only where the output moved to a new line for it or
+    /// at the top of a file (`   first`, but ` y` after `#endif`).
+    #[test]
+    fn assembly_without_line_markers() {
+        let files = [
+            (
+                "i2/g.h",
+                "/* a guard */\n#ifndef G_H\n#define G_H\n#define SZ 8\n#endif\n",
+            ),
+            ("i2/t.h", "  .word SZ\n\n  .word 2\n"),
+            ("i2/h1.h", "  E x\n"),
+            ("i2/h3.h", "\n\n   late\n"),
+        ];
+        let src = "a\n#include \"i2/g.h\"\n#include <g.h>\n  .word SZ\n#include \"i2/t.h\"\nb\n\
+                   #define E\n#include \"i2/h1.h\"\n#line 20\n  E y\n#line 30 \"other.S\"\n\
+                   #define Q\n  y2\n\n\n\n\n\n\n\n\n\nc\n";
+        assert_eq!(
+            asm_with(&files, src, false),
+            "a\n\n  .word 8\n  .word 8\n  .word 2\nb\n    x\n y\n\n  y2\nc\n"
+        );
+        let src = "   first\n\n\n   third  x\n#define X\n   X fifth\n  sixth\n\n\n\n\n\n\n\n\n\n\n\n   far\n\
+                   # comment\n  .text : { *(.text) } > RAM\n#if 1\n  . = ALIGN(4096);\n#endif\n";
+        assert_eq!(
+            asm_with(&files, src, false),
+            "   first\n   third x\n     fifth\n  sixth\n   far\n # comment\n  .text : { *(.text) } > RAM\n  \
+             . = ALIGN(4096);\n"
+        );
+        let src = "#if 0\nx\n#endif\n   y\n#define F(a) a\nF(\n z\n)\n  k\n";
+        assert_eq!(asm_with(&files, src, false), " y\nz\n  k\n");
+        assert_eq!(
+            asm_with(&files, "#define E\n#include \"i2/h3.h\"\n  k\n", false),
+            "\n late\n k\n"
+        );
     }
 
     /// Which `#` lines are directives in assembly, and errors.
