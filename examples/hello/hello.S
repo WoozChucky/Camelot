@@ -7,6 +7,11 @@
 #   merlin-as examples/hello/hello.S -o hello.o
 #   merlin-ld -T examples/hello/link.ld hello.o -o examples/hello/hello.elf
 #
+# and, for RV64 (the same source: nothing in it depends on the width), the same as
+#
+#   merlin-as -march=rv64ima_zicsr_zifencei examples/hello/hello.S -o hello.o
+#   merlin-ld -T examples/hello/link.ld hello.o -o examples/hello/hello-rv64.elf
+#
 # Reference build with LLVM, only for comparison (same loaded bytes; the
 # differences elsewhere in the file are listed in docs/excalibur-spec.md
 # section 10, "Examples"):
@@ -14,6 +19,12 @@
 #   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
 #         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
 #         -T examples/hello/link.ld examples/hello/hello.S -o hello.elf
+#
+# and for RV64:
+#
+#   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
+#         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/hello/link.ld examples/hello/hello.S -o hello-rv64.elf
 
     .equ UART_BASE, 0x10000000
     .equ UART_LSR,  5

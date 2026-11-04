@@ -42,6 +42,11 @@ fn disk_elf() -> Vec<u8> {
     std::fs::read(examples().join("disk/disk.elf")).unwrap()
 }
 
+/// Its RV64 build (#151), for the version 2 registers.
+fn disk_elf_rv64() -> Vec<u8> {
+    std::fs::read(elf_path_rv64("disk")).unwrap()
+}
+
 /// A file in the temp directory, removed when dropped.
 struct TempFile(PathBuf);
 
@@ -75,9 +80,14 @@ fn with_disks(disks: Vec<DiskConfig>) -> MachineConfig {
 }
 
 /// Runs `examples/disk` on `m`: its exit and what it printed.
-fn run_example(mut m: Machine) -> (RunResult, String, Machine) {
+fn run_example(m: Machine) -> (RunResult, String, Machine) {
+    run_build(m, &disk_elf())
+}
+
+/// Runs `elf`, a build of `examples/disk`, on `m` (an ELF64 file makes it RV64).
+fn run_build(mut m: Machine, elf: &[u8]) -> (RunResult, String, Machine) {
     m.cpu.bus.uart.capture = true;
-    m.load_elf(&disk_elf()).unwrap();
+    m.load_elf(elf).unwrap();
     let result = m.run(Some(10_000_000), |_| {});
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
     (result, out, m)
@@ -145,20 +155,27 @@ fn example_on_an_image_file() {
 
 #[test]
 fn example_on_a_read_only_disk() {
-    let m = Machine::new(with_disks(vec![
-        DiskConfig::memory(disk_image()).with_read_only(true)
-    ]))
-    .unwrap();
-    let (result, out, mut m) = run_example(m);
-    assert_eq!(result, RunResult::Exited(0), "{out}");
-    assert_eq!(
-        out,
-        format!(
-            "disk 0x10001000, irq 3: 8 sectors (read-only)\nsector 0:\n{SECTOR0}\
-             read past the end: error 2\nread-only disk: write test skipped\n"
-        )
-    );
-    assert_eq!(disk_contents(&mut m, 0), disk_image());
+    // Each build finds the flag where its version of the registers has it:
+    // BLK_FLAGS is at 0x04 on RV32 and at 0x1c on RV64.
+    for (elf, base) in [
+        (disk_elf(), "0x10001000"),
+        (disk_elf_rv64(), "0x0000000010001000"),
+    ] {
+        let m = Machine::new(with_disks(vec![
+            DiskConfig::memory(disk_image()).with_read_only(true)
+        ]))
+        .unwrap();
+        let (result, out, mut m) = run_build(m, &elf);
+        assert_eq!(result, RunResult::Exited(0), "{out}");
+        assert_eq!(
+            out,
+            format!(
+                "disk {base}, irq 3: 8 sectors (read-only)\nsector 0:\n{SECTOR0}\
+                 read past the end: error 2\nread-only disk: write test skipped\n"
+            )
+        );
+        assert_eq!(disk_contents(&mut m, 0), disk_image());
+    }
 }
 
 #[test]
@@ -488,6 +505,15 @@ fn elf_path(name: &str) -> String {
         .to_string()
 }
 
+/// The example's RV64 build, `<name>-rv64.elf`: grail makes an RV64 machine for it.
+fn elf_path_rv64(name: &str) -> String {
+    examples()
+        .join(format!("{name}/{name}-rv64.elf"))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
 /// Makes a file read-only (the Windows attribute, or no write permission on
 /// Linux) and puts its permissions back when dropped, so the `TempFile` can
 /// remove it.
@@ -547,17 +573,24 @@ fn cli_disk_flags() {
     assert_eq!(String::from_utf8(out.stdout).unwrap(), example_output(8, SECTOR0));
     assert_eq!(file.read(), disk_image());
 
-    let out = grail(&["--disk-ro", file.path(), &elf_path("disk")]);
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        stdout.starts_with("disk 0x10001000, irq 3: 8 sectors (read-only)\n"),
-        "{stdout}"
-    );
-    assert!(
-        stdout.ends_with("read-only disk: write test skipped\n"),
-        "{stdout}"
-    );
+    // Both builds: the RV64 one reads BLK_FLAGS at version 2's 0x1c.
+    for (elf, base) in [
+        (elf_path("disk"), "0x10001000"),
+        (elf_path_rv64("disk"), "0x0000000010001000"),
+    ] {
+        let out = grail(&["--disk-ro", file.path(), &elf]);
+        assert!(out.status.success(), "{elf}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            stdout.starts_with(&format!("disk {base}, irq 3: 8 sectors (read-only)\n")),
+            "{stdout}"
+        );
+        assert!(
+            stdout.ends_with("read-only disk: write test skipped\n"),
+            "{stdout}"
+        );
+    }
+    assert_eq!(file.read(), disk_image());
 
     // Several disks, in order.
     let second = TempFile::new("cli2.img", &[0; 1024]);

@@ -6,11 +6,22 @@
 #   merlin-as examples/colorbars/colorbars.S -o colorbars.o
 #   merlin-ld -T examples/colorbars/link.ld colorbars.o -o examples/colorbars/colorbars.elf
 #
+# and, for RV64 (the same source: the framebuffer's registers and pixels are 32-bit words), the same as
+#
+#   merlin-as -march=rv64ima_zicsr_zifencei examples/colorbars/colorbars.S -o colorbars.o
+#   merlin-ld -T examples/colorbars/link.ld colorbars.o -o examples/colorbars/colorbars-rv64.elf
+#
 # Reference build with LLVM, only for comparison:
 #
 #   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
 #         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
 #         -T examples/colorbars/link.ld examples/colorbars/colorbars.S -o colorbars.elf
+#
+# and for RV64:
+#
+#   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
+#         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
+#         -T examples/colorbars/link.ld examples/colorbars/colorbars.S -o colorbars-rv64.elf
 #
 # Run it in a window (Windows):  grail --fb examples/colorbars/colorbars.elf
 # or headless, dumping frames:   grail --fb-dump out examples/colorbars/colorbars.elf
