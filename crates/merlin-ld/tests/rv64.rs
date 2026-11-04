@@ -199,7 +199,19 @@ fn rejects_bad_rv64_objects() {
         // ld.lld: "section sh_addralign is too large".
         (
             in_shdr(".text", 48, 1 << 32),
-            "x.o: section '.text' has sh_addralign 0x100000000, too large (at most 2^32 - 1)".into(),
+            "x.o: section '.text' has sh_addralign 0x100000000, too large".into(),
+        ),
+        // ld.lld: "x.o:(.text): sh_addralign is not a power of 2", also for
+        // 2^32 - 1, which fits in 32 bits.
+        (
+            in_shdr(".text", 48, 0xffff_ffff),
+            "x.o: section '.text' has sh_addralign 0xffffffff, not a power of 2".into(),
+        ),
+        // ld.lld: "section [index N] has an invalid sh_size (8) which is not
+        // a multiple of its sh_entsize (24)" (ELF64's sh_size at 32).
+        (
+            in_shdr(".symtab", 32, 8),
+            "x.o: section '.symtab' has sh_size 0x8, not a multiple of its sh_entsize (24)".into(),
         ),
         // A section header is read whole: a cut inside the third names its
         // 64 bytes.

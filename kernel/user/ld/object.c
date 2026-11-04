@@ -263,6 +263,16 @@ static int parse(const char *name, struct object *o, char **err) {
             *err = fmt("section '%s' is in a section group (COMDAT), not supported", sname);
             return 0;
         }
+        /* The alignment of a section that holds code or data (ld.lld checks
+         * no other), a power of two; 0 means 1. */
+        uint align = 1;
+        if (h->type != SHT_NULL && h->type != SHT_SYMTAB && h->type != SHT_STRTAB && h->type != SHT_RELA) {
+            align = h->align ? h->align : 1;
+            if (align & (align - 1)) {
+                *err = fmt("section '%s' has sh_addralign 0x%x, not a power of 2", sname, align);
+                return 0;
+            }
+        }
         sec->data = file;
         if (i != 0 && !contents(h, &sec->data)) {
             return 0;
@@ -271,7 +281,7 @@ static int parse(const char *name, struct object *o, char **err) {
         sec->type = h->type;
         sec->flags = h->flags;
         sec->size = h->size;
-        sec->align = h->align ? h->align : 1;
+        sec->align = align;
         sec->entsize = h->entsize;
         sec->out = -1;
     }
@@ -300,6 +310,11 @@ static int parse(const char *name, struct object *o, char **err) {
         uint strlen_ = contents_len(&hdrs[h->link]);
         if (h->entsize != 16) {
             *err = fmt("symbol table entry size is %u, expected 16", h->entsize);
+            return 0;
+        }
+        if (h->size % 16) {
+            *err = fmt("section '%s' has sh_size 0x%x, not a multiple of its sh_entsize (16)",
+                       o->sections[symtab].name, h->size);
             return 0;
         }
         uchar *data;

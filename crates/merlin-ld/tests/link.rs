@@ -1564,6 +1564,30 @@ fn rejects_bad_objects() {
             },
             "x.o: section '.rela.text.start' is SHT_REL; RISC-V objects use SHT_RELA",
         ),
+        // ld.lld: "x.o:(.text): sh_addralign is not a power of 2" (ELF32's
+        // sh_addralign at 32). A symbol table's alignment it does not check.
+        (
+            {
+                let mut b = good.clone();
+                let t = shdr(&b, ".text");
+                b[t + 32..t + 36].copy_from_slice(&12u32.to_le_bytes());
+                b
+            },
+            "x.o: section '.text' has sh_addralign 0xc, not a power of 2",
+        ),
+        // ld.lld: "section [index 5] has an invalid sh_size (N) which is not
+        // a multiple of its sh_entsize (16)" (ELF32's sh_size at 20).
+        (
+            {
+                let mut b = good.clone();
+                let s = shdr(&b, ".symtab");
+                let size = u32::from_le_bytes(b[s + 20..s + 24].try_into().unwrap());
+                b[s + 20..s + 24].copy_from_slice(&(size + 4).to_le_bytes());
+                b[s + 32..s + 36].copy_from_slice(&3u32.to_le_bytes());
+                b
+            },
+            "x.o: section '.symtab' has sh_size 0x",
+        ),
         (
             reject("nonalloc.o"),
             "x.o: global symbol 'g' is defined in section '.note.camelot', which is not loaded",

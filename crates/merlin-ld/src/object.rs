@@ -53,10 +53,12 @@ pub struct Section {
     pub data: Vec<u8>,
     /// Size in memory (`sh_size`), also for `SHT_NOBITS`.
     pub size: u64,
-    /// Alignment in bytes, at least 1. 32 bits on both classes: ld.lld keeps
-    /// an input section's alignment in 32 bits too, and refuses an ELF64
-    /// `sh_addralign` above 2^32 - 1 ("section sh_addralign is too large"),
-    /// as [`parse`] does.
+    /// Alignment in bytes, a power of two (`sh_addralign` 0 is 1). 32 bits
+    /// on both classes: ld.lld keeps an input section's alignment in 32 bits
+    /// too, and refuses an ELF64 `sh_addralign` above 2^32 - 1 ("section
+    /// sh_addralign is too large") and one that is not a power of two, as
+    /// [`parse`] does. 1 for the symbol and string tables and relocations,
+    /// whose alignment neither linker looks at.
     pub align: u32,
     /// `sh_entsize`: the entry size of a `SHF_MERGE` section.
     pub entsize: u64,
@@ -301,13 +303,24 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
                 "section '{sname}' is in a section group (COMDAT), not supported"
             ));
         }
-        // Only ELF64's sh_addralign can be this large (ld.lld: "section
-        // sh_addralign is too large").
-        let Ok(align) = u32::try_from(h.align) else {
-            return Err(format!(
-                "section '{sname}' has sh_addralign {:#x}, too large (at most 2^32 - 1)",
-                h.align
-            ));
+        // The alignment of a section that holds code or data (ld.lld checks
+        // no other: not the null section, the symbol and string tables or the
+        // relocations). Only ELF64's sh_addralign can be too large for 32
+        // bits (ld.lld: "section sh_addralign is too large"). 0 means no
+        // constraint, as 1 does; any other value must be a power of two, so
+        // at most 2^31 (ld.lld: "sh_addralign is not a power of 2").
+        let align = if matches!(h.ty, SHT_NULL | SHT_SYMTAB | SHT_STRTAB | SHT_RELA) {
+            1
+        } else {
+            let Ok(align) = u32::try_from(h.align) else {
+                return Err(format!("section '{sname}' has sh_addralign {:#x}, too large", h.align));
+            };
+            if align > 1 && !align.is_power_of_two() {
+                return Err(format!(
+                    "section '{sname}' has sh_addralign {align:#x}, not a power of 2"
+                ));
+            }
+            align.max(1)
         };
         let data = if i == 0 {
             Vec::new()
@@ -320,7 +333,7 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
             flags: h.flags,
             data,
             size: h.size,
-            align: align.max(1),
+            align,
             entsize: h.entsize,
             relocs: Vec::new(),
         });
@@ -345,6 +358,14 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
                 "symbol table entry size is {}, expected {}",
                 h.entsize,
                 class.sym_size()
+            ));
+        }
+        // ld.lld: "has an invalid sh_size (N) which is not a multiple of its
+        // sh_entsize (M)". The relocation sections' sizes it does not check.
+        if h.size % h.entsize != 0 {
+            return Err(format!(
+                "section '{}' has sh_size {:#x}, not a multiple of its sh_entsize ({})",
+                h.name, h.size, h.entsize
             ));
         }
         r.contents(h)?;

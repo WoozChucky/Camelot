@@ -576,6 +576,19 @@ fn mergeable(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
     obj
 }
 
+/// `obj` with the 32-bit field at `field` of section `name`'s ELF32 header
+/// set to `f` of its value.
+fn shdr_field(mut obj: Vec<u8>, name: &str, field: usize, f: impl Fn(u32) -> u32) -> Vec<u8> {
+    let at = {
+        let elf = elf::Elf::parse(&obj).unwrap();
+        let i = elf.sections.iter().position(|s| s.name == name).unwrap();
+        elf.header.shoff as usize + 40 * i + field
+    };
+    let v = u32::from_le_bytes(obj[at..at + 4].try_into().unwrap());
+    obj[at..at + 4].copy_from_slice(&f(v).to_le_bytes());
+    obj
+}
+
 /// A program for [`the_linker_on_camelot_links_scripts_as_merlin_ld_does`]:
 /// code, read-only data, data with `.dword` (R_RISCV_64) and `.word`
 /// pointers, a section the scripts throw away, and debug information
@@ -838,6 +851,10 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         ),
         (vec![b"not an object".to_vec()], script, ""),
         (vec![start.clone(), truncated], script, ""),
+        // An alignment that is not a power of two (sh_addralign at 32), a
+        // symbol table whose size is not a multiple of 16 (sh_size at 20).
+        (vec![shdr_field(start.clone(), ".text", 32, |_| 12)], script, ""),
+        (vec![shdr_field(start.clone(), ".symtab", 20, |size| size + 4)], script, ""),
         // Load addresses: two sections loaded over each other, a load range
         // past 4 GiB, AT after ALIGN, /DISCARD/ with an AT.
         (
