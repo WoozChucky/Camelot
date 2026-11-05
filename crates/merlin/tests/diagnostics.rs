@@ -450,6 +450,192 @@ fn clang_gives_the_tables_diagnostics() {
     );
 }
 
+/// A whole C program file to compare: where it is (from the workspace's
+/// root), the directories its headers are in (from its own), and whether
+/// it is the kernel's or a user program's, which have no C library
+/// (`-fno-builtin -nostdinc`, as their builds have).
+struct Program {
+    path: std::path::PathBuf,
+    include: Vec<&'static str>,
+    camelot: bool,
+}
+
+/// Every C file of merlin's whole-program tests (`tests/cases`,
+/// `tests/cases-merlin`, `tests/multi`), and of the Camelot kernel and its
+/// user programs.
+fn programs() -> Vec<Program> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let c_files = |dir: &str| -> Vec<std::path::PathBuf> {
+        let mut files: Vec<_> = std::fs::read_dir(root.join(dir))
+            .unwrap_or_else(|e| panic!("{dir}: {e}"))
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "c"))
+            .map(|p| Path::new(dir).join(p.file_name().unwrap()))
+            .collect();
+        files.sort();
+        files
+    };
+    let mut out = Vec::new();
+    for dir in ["crates/merlin/tests/cases", "crates/merlin/tests/cases-merlin"] {
+        for path in c_files(dir) {
+            out.push(Program {
+                path,
+                include: Vec::new(),
+                camelot: false,
+            });
+        }
+    }
+    let mut multi: Vec<_> = std::fs::read_dir(root.join("crates/merlin/tests/multi"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    multi.sort();
+    for name in multi {
+        let dir = format!("crates/merlin/tests/multi/{name}");
+        let include = if root.join(&dir).join("include").is_dir() {
+            vec!["include"]
+        } else {
+            Vec::new()
+        };
+        for path in c_files(&dir) {
+            out.push(Program {
+                path,
+                include: include.clone(),
+                camelot: false,
+            });
+        }
+    }
+    for (dir, include) in [
+        ("kernel", vec!["include"]),
+        ("kernel/net", vec!["../include"]),
+        ("kernel/user", vec![]),
+        ("kernel/user/lib", vec![".."]),
+        ("kernel/user/as", vec![".."]),
+        ("kernel/user/ld", vec![".."]),
+    ] {
+        for path in c_files(dir) {
+            out.push(Program {
+                path,
+                include: include.clone(),
+                camelot: true,
+            });
+        }
+    }
+    out
+}
+
+/// Every line merlin gives for the program `p` for the target `x`, as
+/// [`table_line`] writes them, the file named as it is from its directory.
+fn merlin_program_lines(p: &Program, x: Xlen) -> Vec<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = root.join(p.path.parent().unwrap());
+    let name = p.path.file_name().unwrap().to_string_lossy().into_owned();
+    let src = std::fs::read_to_string(root.join(&p.path)).unwrap();
+    let opts = merlin::Options {
+        xlen: x,
+        include_dirs: p.include.iter().map(std::path::PathBuf::from).collect(),
+        ..merlin::Options::default()
+    };
+    let load = |path: &Path| std::fs::read_to_string(dir.join(path)).ok();
+    let diagnostics = match merlin::compile_warned(&name, &src, &opts, &load) {
+        Ok((_, warnings)) => warnings,
+        Err(errors) => errors,
+    };
+    diagnostics
+        .iter()
+        .flat_map(|d| {
+            d.render(&name)
+                .lines()
+                .map(|l| plain_line(&table_line(l)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Every line clang gives for the program `p` for the target `x`, as
+/// [`merlin_program_lines`] writes merlin's.
+fn clang_program_lines(p: &Program, x: Xlen) -> Vec<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dir = root.join(p.path.parent().unwrap());
+    let mut c = clang(x);
+    c.args(["-std=c99", "-ffreestanding"]);
+    if p.camelot {
+        c.args(["-fno-builtin", "-nostdinc"]);
+    }
+    for i in &p.include {
+        c.arg(format!("-I{i}"));
+    }
+    let out = c
+        .arg(p.path.file_name().unwrap())
+        .current_dir(&dir)
+        .output()
+        .expect("clang on PATH");
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| {
+            [": error: ", ": fatal error: ", ": warning: ", ": note: "]
+                .iter()
+                .any(|k| l.contains(k))
+        })
+        .map(|l| plain_line(&table_line(l.trim_end())))
+        .collect()
+}
+
+/// A diagnostic's line with the file in it named by its plain path, `t.c`
+/// left in.
+fn plain_line(line: &str) -> String {
+    match line.split_once(':') {
+        Some((file, rest)) if !file.is_empty() && !file.starts_with(['<', ' ']) => {
+            format!("{}:{rest}", plain(file))
+        }
+        _ => line.to_string(),
+    }
+}
+
+/// On every whole program of merlin's tests and every C file of the kernel
+/// and its user programs, for each target, merlin gives the diagnostics
+/// clang gives, its default warnings above all (the programs compile).
+#[test]
+#[ignore = "needs clang on PATH"]
+fn clang_warns_as_merlin_does_on_the_programs() {
+    let programs = programs();
+    assert!(programs.len() > 150, "only {} programs", programs.len());
+    let jobs: Vec<(usize, Xlen)> = (0..programs.len())
+        .flat_map(|n| [(n, Xlen::Rv32), (n, Xlen::Rv64)])
+        .collect();
+    let failures: Vec<String> = std::thread::scope(|s| {
+        let handles: Vec<_> = jobs
+            .chunks(jobs.len().div_ceil(16))
+            .map(|chunk| {
+                let programs = &programs;
+                s.spawn(move || {
+                    chunk
+                        .iter()
+                        .filter_map(|&(n, x)| {
+                            let p = &programs[n];
+                            let (want, got) = (clang_program_lines(p, x), merlin_program_lines(p, x));
+                            (want != got).then(|| {
+                                format!(
+                                    "{} ({}):\n  clang  {want:?}\n  merlin {got:?}",
+                                    p.path.display(),
+                                    width(x)
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    assert!(
+        failures.is_empty(),
+        "{} differ from clang:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 /// The length of the string literal that starts `s` (at its `"`), its
 /// closing quote included.
 fn literal_len(s: &str) -> Option<usize> {

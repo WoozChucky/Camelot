@@ -2917,12 +2917,16 @@ fn same_operand(a: &Expr, b: &Expr) -> bool {
         (ExprKind::Deref(x), ExprKind::Deref(y)) if x.pos == a.pos && y.pos == b.pos => {
             match (&x.kind, &y.kind) {
                 (ExprKind::Binary(BinOp::Add, xa, xi), ExprKind::Binary(BinOp::Add, ya, yi)) => {
-                    same_operand(xa, ya) && same_operand(xi, yi)
+                    // An index may be the same number too.
+                    let index = match (&xi.kind, &yi.kind) {
+                        (ExprKind::Num(i), ExprKind::Num(j)) => i == j,
+                        _ => same_operand(xi, yi),
+                    };
+                    same_operand(xa, ya) && index
                 }
                 _ => false,
             }
         }
-        (ExprKind::Num(x), ExprKind::Num(y)) => x == y,
         _ => false,
     }
 }
