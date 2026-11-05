@@ -1,8 +1,7 @@
 //! RV64 harts (spec sections 4 to 6): what riscv-tests rv64ui, rv64um, rv64ua and
 //! rv64mi do not pin down on their own. The sign-extension rules (the W
 //! instructions, `lw` and `lwu`, the `.w` atomics), the RV32-only CSRs missing on
-//! RV64, `misa`, `mstatus`'s XLEN fields, `satp`'s WARL rule and the interrupt bit;
-//! and an RV32 hart's registers, which hold their values sign-extended.
+//! RV64, `misa`, `mstatus`'s XLEN fields, `satp`'s WARL rule and the interrupt bit.
 //!
 //! Each test puts hand-encoded instructions at `RAM_BASE` and steps them one at a
 //! time. Every encoding is checked against excalibur's disassembly first, so the
@@ -56,12 +55,8 @@ fn csrw(csr: u16, rs1: u32) -> u32 {
     (csr as u32) << 20 | rs1 << 15 | 1 << 12 | SYSTEM
 }
 
-fn machine(xlen: Xlen) -> Machine {
-    let mut m = Machine::new(MachineConfig {
-        xlen,
-        ..MachineConfig::with_ram(1 << 20)
-    })
-    .unwrap();
+fn machine() -> Machine {
+    let mut m = Machine::new(MachineConfig::with_ram(1 << 20)).unwrap();
     m.cpu.csr.mtvec = TRAP_VECTOR;
     m
 }
@@ -70,7 +65,7 @@ fn machine(xlen: Xlen) -> Machine {
 /// trap.
 fn run(m: &mut Machine, text: &str, word: u32) {
     assert_eq!(
-        excalibur::decode(word, m.cpu.xlen()).to_string(),
+        excalibur::decode(word, Xlen::Rv64).to_string(),
         text,
         "{word:#010x}"
     );
@@ -89,7 +84,7 @@ fn run(m: &mut Machine, text: &str, word: u32) {
 /// `mtval`.
 fn run_traps(m: &mut Machine, text: &str, word: u32, mcause: u64, mtval: u64) {
     assert_eq!(
-        excalibur::decode(word, m.cpu.xlen()).to_string(),
+        excalibur::decode(word, Xlen::Rv64).to_string(),
         text,
         "{word:#010x}"
     );
@@ -123,7 +118,7 @@ fn peek64(m: &mut Machine, addr: u64) -> u64 {
 
 #[test]
 fn lui_sign_extends_from_bit_31() {
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     run(&mut m, "lui a0, 0x80000", 0x8000_0000 | A0 << 7 | LUI);
     assert_eq!(x(&m, A0), 0xffff_ffff_8000_0000);
     run(&mut m, "lui a0, 0x7ffff", 0x7fff_f000 | A0 << 7 | LUI);
@@ -132,7 +127,7 @@ fn lui_sign_extends_from_bit_31() {
 
 #[test]
 fn w_instructions_compute_on_32_bits_and_sign_extend() {
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     // addiw: the upper 32 bits of rs1 are ignored, the 32-bit sum sign-extended.
     set(&mut m, A1, 0x1234_5678_7fff_ffff);
     run(&mut m, "addiw a0, a1, 1", i_type(1, A1, 0, A0, OP_IMM_32));
@@ -175,7 +170,7 @@ fn w_instructions_compute_on_32_bits_and_sign_extend() {
 
 #[test]
 fn rv64m_on_64_and_32_bits() {
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     let mul = |f3| r_type(1, A2, A1, f3, A0, OP);
     let mulw = |f3| r_type(1, A2, A1, f3, A0, OP_32);
 
@@ -230,7 +225,7 @@ fn rv64m_on_64_and_32_bits() {
 
 #[test]
 fn lw_sign_extends_and_lwu_zero_extends() {
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     poke64(&mut m, DATA, 0x1122_3344_8899_aabb);
     set(&mut m, A1, DATA);
     run(&mut m, "lw a0, 0(a1)", i_type(0, A1, 2, A0, LOAD));
@@ -273,10 +268,10 @@ fn lw_sign_extends_and_lwu_zero_extends() {
 /// An RV64 machine's sysinfo block is version 2 (spec section 9.5): its RAM size is a
 /// 64-bit register that one ld reads whole, and its 32-bit registers take no ld.
 #[test]
-fn sysinfo_is_version_2_on_rv64() {
-    use grail::sysinfo::{v2, REG_VERSION};
+fn sysinfo_is_version_2() {
+    use grail::sysinfo::{REG_RAM_SIZE, REG_VERSION};
     let sysinfo = grail::bus::SYSINFO_BASE;
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     set(&mut m, A1, sysinfo);
     run(
         &mut m,
@@ -284,28 +279,22 @@ fn sysinfo_is_version_2_on_rv64() {
         i_type(REG_VERSION as i32, A1, 2, A0, LOAD),
     );
     assert_eq!(x(&m, A0), 2);
-    let ram_size = v2::REG_RAM_SIZE as i32;
+    let ram_size = REG_RAM_SIZE as i32;
     run(&mut m, "ld a0, 16(a1)", i_type(ram_size, A1, 3, A0, LOAD));
     assert_eq!(x(&m, A0), m.config().ram_size as u64);
     run(&mut m, "lwu a0, 20(a1)", i_type(ram_size + 4, A1, 6, A0, LOAD));
     assert_eq!(x(&m, A0), m.config().ram_size as u64 >> 32);
     run_traps(&mut m, "ld a0, 0(a1)", i_type(0, A1, 3, A0, LOAD), 5, sysinfo);
-
-    // An ELF64 program makes an RV32 machine's block version 2 too.
-    let mut m = Machine::with_ram(1 << 20);
-    assert_eq!(m.cpu.bus.read(sysinfo + u64::from(REG_VERSION), 4), Ok(1));
-    m.load_elf(&simple(Xlen::Rv64)).unwrap();
-    assert_eq!(m.cpu.bus.read(sysinfo + u64::from(REG_VERSION), 4), Ok(2));
 }
 
-/// An RV64 machine's disks have version 2's registers (spec section 9.6): sd writes a
-/// 64-bit BLK_DMA whole, and a command reads into the buffer it names.
+/// The disks have version 2's registers (spec section 9.6): sd writes a 64-bit BLK_DMA
+/// whole, and a command reads into the buffer it names.
 #[test]
-fn disks_have_64_bit_registers_on_rv64() {
-    use grail::block::{v2, CMD_READ, SECTOR_SIZE};
+fn disks_have_64_bit_registers() {
+    use grail::block as v2;
+    use grail::block::{CMD_READ, SECTOR_SIZE};
     let image: Vec<u8> = (1..=2u8).flat_map(|n| [n; SECTOR_SIZE]).collect();
     let mut m = Machine::new(MachineConfig {
-        xlen: Xlen::Rv64,
         disks: vec![grail::DiskConfig::memory(image)],
         ..MachineConfig::with_ram(1 << 20)
     })
@@ -346,7 +335,7 @@ fn disks_have_64_bit_registers_on_rv64() {
 
 #[test]
 fn word_atomics_sign_extend_and_touch_32_bits() {
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     set(&mut m, A1, DATA);
 
     // lr.w sign-extends; sc.w stores the low 32 bits of rs2 and leaves the next word.
@@ -405,21 +394,17 @@ fn rv32_only_csrs_are_illegal_on_rv64() {
         PMPCFG0 + 3,
     ];
     for csr in csrs {
-        let mut m = machine(Xlen::Rv64);
+        let mut m = machine();
         let text = excalibur::decode(csrr(A0, csr), Xlen::Rv64).to_string();
         run_illegal(&mut m, &text, csrr(A0, csr));
         let text = excalibur::decode(csrw(csr, A0), Xlen::Rv64).to_string();
         run_illegal(&mut m, &text, csrw(csr, A0));
-        // They are there on RV32.
-        let mut m = machine(Xlen::Rv32);
-        let text = excalibur::decode(csrr(A0, csr), Xlen::Rv32).to_string();
-        run(&mut m, &text, csrr(A0, csr));
     }
 }
 
 #[test]
 fn counters_read_64_bits_on_rv64() {
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     m.cpu.csr.mcycle = 0x1_2345_6789;
     run(&mut m, "csrrs a0, mcycle, zero", csrr(A0, MCYCLE));
     // The read happens during the instruction's cycle, before it is counted.
@@ -430,23 +415,11 @@ fn counters_read_64_bits_on_rv64() {
     run(&mut m, "csrrw zero, mcycle, a1", csrw(MCYCLE, A1));
     // The write sets all 64 bits; the instruction's own cycle is still counted.
     assert_eq!(m.cpu.csr.mcycle, 0x5_0000_0001);
-
-    // RV32: the low half, and the high one through cycleh.
-    let mut m = machine(Xlen::Rv32);
-    m.cpu.csr.mcycle = 0x1_8000_0000;
-    run(&mut m, "csrrs a0, cycle, zero", csrr(A0, CYCLE));
-    assert_eq!(
-        x(&m, A0),
-        0xffff_ffff_8000_0000,
-        "an RV32 register holds it sign-extended"
-    );
-    run(&mut m, "csrrs a0, cycleh, zero", csrr(A0, CYCLEH));
-    assert_eq!(x(&m, A0), 1);
 }
 
 #[test]
 fn misa_mstatus_and_sstatus_show_the_width() {
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     run(&mut m, "csrrs a0, misa, zero", csrr(A0, MISA));
     assert_eq!(x(&m, A0), 0x8000_0000_0094_1101);
     run(&mut m, "csrrs a0, mstatus, zero", csrr(A0, MSTATUS));
@@ -466,17 +439,11 @@ fn misa_mstatus_and_sstatus_show_the_width() {
     run(&mut m, "csrrw zero, misa, a1", csrw(MISA, A1));
     run(&mut m, "csrrs a0, misa, zero", csrr(A0, MISA));
     assert_eq!(x(&m, A0), 0x8000_0000_0094_1101);
-
-    let mut m = machine(Xlen::Rv32);
-    run(&mut m, "csrrs a0, misa, zero", csrr(A0, MISA));
-    assert_eq!(x(&m, A0), 0x4094_1101);
-    run(&mut m, "csrrs a0, mstatus, zero", csrr(A0, MSTATUS));
-    assert_eq!(x(&m, A0), 0, "no UXL or SXL on RV32");
 }
 
 #[test]
 fn satp_keeps_only_what_the_hart_implements() {
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     // Bare, with ASID bits (there are no ASIDs) and a PPN wider than a 48-bit physical
     // address.
     set(&mut m, A1, 0x0fff_ffff_ffff_ffff);
@@ -499,7 +466,6 @@ fn satp_keeps_only_what_the_hart_implements() {
     // A hart without Sv48 (--paging sv39, #172) refuses MODE 9 like any other it
     // lacks, which is how a kernel finds out, and keeps Sv39.
     let mut m = Machine::new(MachineConfig {
-        xlen: Xlen::Rv64,
         paging: grail::Paging::Sv39,
         ..MachineConfig::with_ram(1 << 20)
     })
@@ -514,103 +480,31 @@ fn satp_keeps_only_what_the_hart_implements() {
     assert_eq!(grail::parse_paging("sv39"), Ok(grail::Paging::Sv39));
     assert_eq!(grail::parse_paging("sv48"), Ok(grail::Paging::Sv48));
     assert!(grail::parse_paging("sv57").is_err());
-
-    // RV32 keeps any value, MODE in bit 31.
-    let mut m = machine(Xlen::Rv32);
-    set(&mut m, A1, 0x8000_1234);
-    run(&mut m, "csrrw zero, satp, a1", csrw(SATP, A1));
-    assert_eq!(
-        m.cpu.csr.satp, 0x8000_1234,
-        "zero-extended, though a1 holds it sign-extended"
-    );
 }
 
 #[test]
-fn interrupts_set_the_top_bit_of_the_width() {
-    for (xlen, bit) in [(Xlen::Rv64, 1u64 << 63), (Xlen::Rv32, 1 << 31)] {
-        let mut m = machine(xlen);
-        // The timer fires at once: mtimecmp 0, mie.MTIE, mstatus.MIE.
-        m.cpu.bus.clint.mtimecmp[0] = 0;
-        m.cpu.csr.mie = 1 << 7;
-        m.cpu.csr.mstatus = MSTATUS_MIE;
-        m.cpu.pc = RAM_BASE;
-        m.cpu.step();
-        assert_eq!(m.cpu.pc, TRAP_VECTOR, "{xlen:?}");
-        assert_eq!(m.cpu.csr.mcause, bit | 7, "{xlen:?}");
-    }
+fn interrupts_set_bit_63() {
+    let mut m = machine();
+    // The timer fires at once: mtimecmp 0, mie.MTIE, mstatus.MIE.
+    m.cpu.bus.clint.mtimecmp[0] = 0;
+    m.cpu.csr.mie = 1 << 7;
+    m.cpu.csr.mstatus = MSTATUS_MIE;
+    m.cpu.pc = RAM_BASE;
+    m.cpu.step();
+    assert_eq!(m.cpu.pc, TRAP_VECTOR);
+    assert_eq!(m.cpu.csr.mcause, 1 << 63 | 7);
 }
 
-#[test]
-fn rv32_registers_hold_values_sign_extended() {
-    let mut m = machine(Xlen::Rv32);
-    run(&mut m, "lui a0, 0x80000", 0x8000_0000 | A0 << 7 | LUI);
-    assert_eq!(x(&m, A0), 0xffff_ffff_8000_0000);
-    // 32-bit arithmetic: 0x7fff_ffff + 1 wraps to 0x8000_0000, held sign-extended.
-    set(&mut m, A1, 0x7fff_ffff);
-    run(&mut m, "addi a0, a1, 1", i_type(1, A1, 0, A0, OP_IMM));
-    assert_eq!(x(&m, A0), 0xffff_ffff_8000_0000);
-    // Comparisons on the sign-extended values give the 32-bit answers.
-    set(&mut m, A2, 1);
-    run(&mut m, "sltu a0, a2, a0", r_type(0, A0, A2, 3, A0, OP));
-    assert_eq!(x(&m, A0), 1, "1 < 0x8000_0000 unsigned");
-    // A shift amount is 5 bits, and srl shifts the 32-bit value.
-    set(&mut m, A1, 0x8000_0000);
-    set(&mut m, A2, 33);
-    run(&mut m, "srl a0, a1, a2", r_type(0, A2, A1, 5, A0, OP));
-    assert_eq!(x(&m, A0), 0x4000_0000);
-    // mulhu: the upper 32 bits of the 64-bit product.
-    set(&mut m, A2, 0x8000_0000);
-    run(&mut m, "mulhu a0, a1, a2", r_type(1, A2, A1, 3, A0, OP));
-    assert_eq!(x(&m, A0), 0x4000_0000);
-    // lw gives the loaded word sign-extended, and set_reg cuts what it is given.
-    m.cpu.bus.write(DATA, 4, 0x8000_0001).unwrap();
-    set(&mut m, A1, DATA);
-    run(&mut m, "lw a0, 0(a1)", i_type(0, A1, 2, A0, LOAD));
-    assert_eq!(x(&m, A0), 0xffff_ffff_8000_0001);
-    set(&mut m, A0, 0x1_0000_0002);
-    assert_eq!(x(&m, A0), 2);
-    // RV64's instructions are illegal.
-    let ld = i_type(0, A1, 3, A0, LOAD);
-    run_illegal(&mut m, &format!(".word {ld:#010x}"), ld);
-    let addiw = i_type(1, A1, 0, A0, OP_IMM_32);
-    run_illegal(&mut m, &format!(".word {addiw:#010x}"), addiw);
-}
-
-#[test]
-fn rv32_addresses_wrap_at_4_gib() {
-    let mut m = machine(Xlen::Rv32);
-    // a1 holds 0x8000_7ff0 sign-extended; the sum is cut to its low 32 bits, DATA.
-    m.cpu.bus.write(DATA, 4, 0x1234_5678).unwrap();
-    set(&mut m, A1, DATA.wrapping_sub(16));
-    run(&mut m, "lw a0, 16(a1)", i_type(16, A1, 2, A0, LOAD));
-    assert_eq!(x(&m, A0), 0x1234_5678);
-    // A jump target is cut to 32 bits: 0xffff_ffff_8000_0102 & !1 is 0x8000_0102,
-    // misaligned, and mtval holds it cut.
-    set(&mut m, A1, 0xffff_ffff_8000_0102);
-    run_traps(
-        &mut m,
-        "jalr a0, 0(a1)",
-        i_type(0, A1, 0, A0, 0x67),
-        0,
-        0x8000_0102,
-    );
-}
-
-/// riscv-tests' `simple`, built for each width.
-fn simple(xlen: Xlen) -> Vec<u8> {
-    let path = match xlen {
-        Xlen::Rv32 => "tests/riscv-tests/rv32ui-p-simple",
-        Xlen::Rv64 => "tests/riscv-tests/rv64/rv64ui-p-simple",
-    };
+/// riscv-tests' `simple`.
+fn simple() -> Vec<u8> {
+    let path = "tests/riscv-tests/rv64ui-p-simple";
     std::fs::read(format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
 #[test]
-fn an_elf64_program_makes_the_machine_rv64() {
+fn an_elf64_program_runs_and_an_elf32_one_is_refused() {
     let mut m = Machine::with_ram(1 << 20);
-    assert_eq!(m.cpu.xlen(), Xlen::Rv32);
-    m.load_elf(&simple(Xlen::Rv64)).unwrap();
-    assert_eq!((m.cpu.xlen(), m.config().xlen), (Xlen::Rv64, Xlen::Rv64));
+    m.load_elf(&simple()).unwrap();
     // The boot ROM's stub reads the entry point with ld, so the program starts at
     // 0x8000_0000, not at its sign-extension.
     for _ in 0..4 {
@@ -618,15 +512,15 @@ fn an_elf64_program_makes_the_machine_rv64() {
     }
     assert_eq!(m.cpu.pc, RAM_BASE);
 
-    // An RV32 machine stays RV32 for an ELF32 program; an RV64 one refuses it.
-    let mut m = Machine::with_ram(1 << 20);
-    m.load_elf(&simple(Xlen::Rv32)).unwrap();
-    assert_eq!(m.cpu.xlen(), Xlen::Rv32);
-    let mut m = machine(Xlen::Rv64);
-    assert_eq!(
-        m.load_elf(&simple(Xlen::Rv32)),
-        Err("an RV32 program (ELF32) cannot run on an RV64 machine".into())
-    );
+    // An RV32 program: there is no RV32 mode (mstatus.UXL is hard-wired to 64).
+    let rv32 = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../elf/tests/llvm/rv32/prog.elf"
+    ))
+    .unwrap();
+    let mut m = machine();
+    let e = m.load_elf(&rv32).unwrap_err();
+    assert!(e.ends_with(grail::elf::NO_ELF32), "{e}");
 }
 
 /// `sb` and `sh` hand the bus only the bytes they store, never the rest of the
@@ -634,58 +528,49 @@ fn an_elf64_program_makes_the_machine_rv64() {
 /// exactly what was written.
 #[test]
 fn narrow_stores_write_only_their_bytes() {
-    for xlen in [Xlen::Rv32, Xlen::Rv64] {
-        let mut m = machine(xlen);
-        // sb of 0x5555 writes 0x55 to the test device: not its exit code 0x5555.
-        set(&mut m, A1, grail::bus::TEST_DEV_BASE);
-        set(&mut m, A2, 0x5555);
-        run(&mut m, "sb a2, 0(a1)", s_type(0, A2, A1, 0));
-        assert_eq!(m.exit_code(), None, "{xlen:?}");
-        run(&mut m, "sh a2, 0(a1)", s_type(0, A2, A1, 1));
-        assert_eq!(m.exit_code(), Some(0), "{xlen:?}: the halfword is 0x5555");
+    let mut m = machine();
+    // sb of 0x5555 writes 0x55 to the test device: not its exit code 0x5555.
+    set(&mut m, A1, grail::bus::TEST_DEV_BASE);
+    set(&mut m, A2, 0x5555);
+    run(&mut m, "sb a2, 0(a1)", s_type(0, A2, A1, 0));
+    assert_eq!(m.exit_code(), None);
+    run(&mut m, "sh a2, 0(a1)", s_type(0, A2, A1, 1));
+    assert_eq!(m.exit_code(), Some(0), "the halfword is 0x5555");
 
-        // sb of 0x100 writes a zero byte to tohost, which does not stop the machine.
-        let mut m = machine(xlen);
-        m.cpu.bus.tohost = Some(DATA);
-        set(&mut m, A1, DATA);
-        set(&mut m, A2, 0x100);
-        run(&mut m, "sb a2, 0(a1)", s_type(0, A2, A1, 0));
-        assert_eq!(m.exit_code(), None, "{xlen:?}");
-    }
+    // sb of 0x100 writes a zero byte to tohost, which does not stop the machine.
+    let mut m = machine();
+    m.cpu.bus.tohost = Some(DATA);
+    set(&mut m, A1, DATA);
+    set(&mut m, A2, 0x100);
+    run(&mut m, "sb a2, 0(a1)", s_type(0, A2, A1, 0));
+    assert_eq!(m.exit_code(), None);
 }
 
-/// An RV64 machine boots from disk through the RV64 disk loader (#151): the ROM holds
-/// the loader of the machine's width, which the stub reaches through the entry
-/// doubleword (`ld`). crates/grail/tests/disk_boot.rs boots blocks on both widths.
+/// A machine boots from disk through the ROM's disk loader (#151), which the stub
+/// reaches through the entry doubleword (`ld`). crates/grail/tests/disk_boot.rs boots
+/// blocks with it.
 #[test]
-fn an_rv64_machine_boots_from_disk_with_the_rv64_loader() {
+fn a_machine_boots_from_disk_with_the_roms_loader() {
     let disk = || grail::DiskConfig::memory(vec![0; 1 << 20]);
     let at = (grail::boot::DISK_BOOT_PC - grail::bus::BOOT_ROM_BASE) as usize;
-    for xlen in [Xlen::Rv32, Xlen::Rv64] {
-        let mut m = Machine::new(MachineConfig {
-            xlen,
-            disks: vec![disk()],
-            ..MachineConfig::default()
-        })
-        .unwrap();
-        assert_eq!(m.boot_from_disk(), Ok(()));
-        assert_eq!(
-            &m.cpu.bus.rom[at..],
-            &grail::boot::disk_loader(xlen)[..],
-            "{xlen:?}"
-        );
-    }
-    assert_eq!(
-        grail::elf::parse(grail::boot::DISKBOOT_RV64_ELF).unwrap().xlen,
-        Xlen::Rv64
+    let mut m = Machine::new(MachineConfig {
+        disks: vec![disk()],
+        ..MachineConfig::default()
+    })
+    .unwrap();
+    assert_eq!(m.boot_from_disk(), Ok(()));
+    assert_eq!(&m.cpu.bus.rom[at..], &grail::boot::disk_loader()[..]);
+    assert!(
+        grail::elf::parse(grail::boot::DISKBOOT_ELF).is_ok(),
+        "an ELF64 file"
     );
 }
 
-/// On a machine of several harts, loading an ELF64 program rebuilds the boot ROM for
-/// RV64: the stub and the park loop read the doubleword entry point with `ld`, so hart
-/// 0 and a hart woken by an IPI both start at 0x8000_0000, not at its sign-extension.
+/// On a machine of several harts, the stub and the park loop read the doubleword entry
+/// point with `ld`, so hart 0 and a hart woken by an IPI both start at 0x8000_0000, not
+/// at its sign-extension.
 #[test]
-fn the_park_loop_reads_the_entry_with_ld_on_rv64() {
+fn the_park_loop_reads_the_entry_with_ld() {
     const LW_T0: u32 = 0x0102_a283; // lw t0, 16(t0)
     const LD_T0: u32 = 0x0102_b283; // ld t0, 16(t0)
     let mut m = Machine::new(MachineConfig {
@@ -699,12 +584,7 @@ fn the_park_loop_reads_the_entry_with_ld_on_rv64() {
             .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
             .collect()
     };
-    assert_eq!(
-        rom_words(&m).iter().filter(|&&w| w == LW_T0).count(),
-        2,
-        "RV32 at first"
-    );
-    m.load_elf(&simple(Xlen::Rv64)).unwrap();
+    m.load_elf(&simple()).unwrap();
     let words = rom_words(&m);
     assert_eq!(
         words.iter().filter(|&&w| w == LD_T0).count(),
@@ -729,12 +609,12 @@ fn the_park_loop_reads_the_entry_with_ld_on_rv64() {
     panic!("hart 1 did not reach the entry: pc {:#x}", m.cpu.hart(1).pc);
 }
 
-/// The entry point at 0x1010 is the boot ROM's one writable location: on RV64 a
-/// doubleword, written whole by an 8-byte store (no 4-byte halves); on RV32 the word.
+/// The entry point at 0x1010 is the boot ROM's one writable location: a doubleword,
+/// written whole by an 8-byte store (no 4-byte halves).
 #[test]
 fn the_boot_entry_is_written_whole() {
     let entry = grail::boot::BOOT_ENTRY_ADDR;
-    let mut m = machine(Xlen::Rv64);
+    let mut m = machine();
     m.cpu.bus.set_boot_entry(0x1_2345_6780);
     assert_eq!(m.cpu.bus.read_mem(entry, 8), Ok(0x1_2345_6780), "above 4 GiB");
     set(&mut m, A1, entry);
@@ -746,26 +626,13 @@ fn the_boot_entry_is_written_whole() {
     run_traps(&mut m, "sw a2, 4(a1)", s_type(4, A2, A1, 2), 7, entry + 4);
     run_traps(&mut m, "sd a2, 8(a1)", s_type(8, A2, A1, 3), 7, entry + 8);
     assert_eq!(m.cpu.bus.read_mem(entry, 8), Ok(0x0000_00ab_8000_1000));
-
-    // RV32: the word, with a 4-byte store.
-    let mut m = machine(Xlen::Rv32);
-    m.cpu.bus.set_boot_entry(RAM_BASE);
-    set(&mut m, A1, entry);
-    set(&mut m, A2, 0x8000_2000);
-    run(&mut m, "sw a2, 0(a1)", s_type(0, A2, A1, 2));
-    assert_eq!(m.cpu.bus.read_mem(entry, 4), Ok(0x8000_2000));
-    run_traps(&mut m, "sh a2, 0(a1)", s_type(0, A2, A1, 1), 7, entry);
 }
 
 #[test]
 fn ld_and_sd_reach_ram_past_4_gib() {
     // 6 GiB of RAM, backed only where it is touched. In M-mode addresses are physical,
     // so `ld` and `sd` at RAM_BASE + 5 GiB use the whole 64-bit address.
-    let mut m = Machine::new(MachineConfig {
-        xlen: Xlen::Rv64,
-        ..MachineConfig::with_ram(6 << 30)
-    })
-    .unwrap();
+    let mut m = Machine::new(MachineConfig::with_ram(6 << 30)).unwrap();
     m.cpu.csr.mtvec = TRAP_VECTOR;
     let high = RAM_BASE + (5 << 30);
     set(&mut m, A1, high);

@@ -12,10 +12,18 @@ fn path(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
 }
 
-/// `grail --gdb 127.0.0.1:0 args...`, and the address it says it listens on.
+/// `grail --gdb 127.0.0.1:0 args...`, and the address it says it listens on. The
+/// kernel runs on the firmware, the command's default; the bare-metal programs (the
+/// examples, the tests' own) with `--bios none`.
 fn grail(args: &[&str], elf: &str) -> (Child, SocketAddr) {
+    let bios: &[&str] = if elf.starts_with("kernel/") {
+        &[]
+    } else {
+        &["--bios", "none"]
+    };
     let mut child = Command::new(env!("CARGO_BIN_EXE_grail"))
         .args(["--gdb", "127.0.0.1:0"])
+        .args(bios)
         .args(args)
         .arg(path(elf))
         .stdin(Stdio::piped())
@@ -86,18 +94,19 @@ impl Client {
     }
 }
 
-fn symbol(elf: &str, name: &str) -> u32 {
+fn symbol(elf: &str, name: &str) -> u64 {
     let file = std::fs::read(path(elf)).unwrap();
     let elf = elf::Elf::parse(&file).unwrap();
     let s = elf.symbols().unwrap();
-    s.iter().find(|s| s.name == name).unwrap().value as u32
+    s.iter().find(|s| s.name == name).unwrap().value
 }
 
-fn le(v: u32) -> String {
-    v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect()
+/// A register's value as the stub sends it: 8 bytes, little-endian, in hex.
+fn le(v: u64) -> String {
+    le64(v)
 }
 
-/// An RV64 register's value as the stub sends it: 8 bytes, little-endian, in hex.
+/// The same, for the tests that spell the width out.
 fn le64(v: u64) -> String {
     v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -153,15 +162,15 @@ fn gdb_wait_breaks_steps_and_runs_to_the_end() {
     let mut c = Client::connect(addr);
     assert!(c.ask("qSupported:swbreak+").contains("qXfer:features:read+"));
     // Stopped at the first instruction, the boot ROM's.
-    assert_eq!(c.ask("?"), "T02thread:1;20:00100000;");
+    assert_eq!(c.ask("?"), format!("T02thread:1;20:{};", le(0x1000)));
     assert_eq!(c.ask(&format!("Z0,{puts:x},4")), "OK");
     // A bad checksum is answered with '-', and the packet sent again.
     c.stream.write_all(b"$g#00").unwrap();
     assert_eq!(c.event(), Event::Nack);
     assert_eq!(c.ask("c"), format!("T05swbreak:;thread:1;20:{};", le(puts)));
     let g = c.ask("g");
-    assert_eq!(&g[32 * 8..], le(puts), "pc");
-    assert_eq!(&g[10 * 8..11 * 8], le(symbol(hello, "message")), "a0");
+    assert_eq!(&g[32 * 16..], le(puts), "pc");
+    assert_eq!(&g[10 * 16..11 * 16], le(symbol(hello, "message")), "a0");
     assert_eq!(c.ask(&format!("m{:x},5", symbol(hello, "message"))), "48656c6c6f");
     assert_eq!(c.ask("s"), format!("T05thread:1;20:{};", le(puts + 4)));
     // Into no-ack mode: no more '+'.
@@ -229,7 +238,7 @@ fn a_client_stops_a_running_machine_interrupts_and_kills_it() {
     c.stream.write_all(&[0x03]).unwrap();
     assert!(c.reply().starts_with("T02thread:1;"));
     // The machine is in the kernel or its idle loop, in S-mode (priv is 4161).
-    assert_eq!(c.ask("p1041"), "01000000");
+    assert_eq!(c.ask("p1041"), le(1));
     c.stream.write_all(&packet::frame(b"k")).unwrap();
     assert_eq!(c.event(), Event::Ack);
     // A reply LLDB waits for (GDB does not): ended by SIGKILL.
@@ -308,7 +317,10 @@ fn lldb_breaks_steps_and_reads_registers() {
         "register read pc a0".into(),
         "stepi".into(),
         "register read pc t0".into(),
-        "memory read --size 1 --count 5 --format x 0x80000050".into(),
+        format!(
+            "memory read --size 1 --count 5 --format x {:#x}",
+            symbol("examples/hello/hello.elf", "message")
+        ),
         "continue".into(),
     ];
     let mut cmd = Command::new(&lldb);
@@ -321,12 +333,21 @@ fn lldb_breaks_steps_and_reads_registers() {
     // Each check is a line holding all its parts: LLDB's spacing and how it shows
     // symbols change between versions (21: `pc = 0x80000020  hello.elf`puts`, 23:
     // `pc = 0x80000020 hello.elf`puts  hello.elf`puts`).
+    let (puts, message) = (
+        symbol("examples/hello/hello.elf", "puts"),
+        symbol("examples/hello/hello.elf", "message"),
+    );
+    let (pc, a0, pc4) = (
+        format!("pc = {puts:#018x}"),
+        format!("a0 = {message:#018x}"),
+        format!("pc = {:#018x}", puts + 4),
+    );
     let checks: [&[&str]; 7] = [
         &["stop reason = breakpoint 1.1"],
-        &["pc = 0x80000020", "hello.elf`puts"],
-        &["a0 = 0x80000050", "hello.elf`message"],
-        &["pc = 0x80000024", "hello.elf`puts + 4"],
-        &["t0 = 0x10000000"],
+        &[&pc, "hello.elf`puts"],
+        &[&a0, "hello.elf`message"],
+        &[&pc4, "hello.elf`puts + 4"],
+        &["t0 = 0x0000000010000000"],
         &["0x48 0x65 0x6c 0x6c 0x6f"],
         &["exited with status = 0"],
     ];
@@ -342,7 +363,7 @@ fn lldb_breaks_steps_and_reads_registers() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello from Camelot!\n");
 }
 
-/// LLDB attached to an RV64 machine, as to an RV32 one above: it breaks at an address,
+/// LLDB attached to a machine running a program of its own: it breaks at an address,
 /// reads 64-bit registers and steps. Ignored, for the same reasons.
 #[test]
 #[ignore]

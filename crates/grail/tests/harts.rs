@@ -115,7 +115,7 @@ fn harts_are_validated_and_counted() {
         assert_eq!(m.cpu.harts().len(), n);
         assert_eq!(m.cpu.bus.harts(), n);
         assert_eq!(m.config().harts, n);
-        assert_eq!(m.cpu.bus.read(SYSINFO_BASE + 0x20, 4), Ok(n as u64), "SYS_HARTS");
+        assert_eq!(m.cpu.bus.read(SYSINFO_BASE + 0x28, 4), Ok(n as u64), "SYS_HARTS");
         assert_eq!(m.cpu.bus.clint.msip.len(), n);
         assert_eq!(m.cpu.bus.plic.contexts(), 2 * n);
     }
@@ -155,7 +155,7 @@ fn a_one_hart_rom_is_the_old_stub() {
         .collect();
     assert_eq!(
         words,
-        [0x0000_0297, 0x0102_a283, 0x0000_0513, 0x0002_8067, 0x8000_0000]
+        [0x0000_0297, 0x0102_b283, 0x0000_0513, 0x0002_8067, 0x8000_0000, 0]
     );
 }
 
@@ -168,7 +168,7 @@ fn the_park_loop() {
     let text: Vec<String> = (PARK_PC..)
         .step_by(4)
         .map_while(|addr| m.cpu.bus.peek(addr))
-        .map(|w| excalibur::decode(w, excalibur::Xlen::Rv32).to_string())
+        .map(|w| excalibur::decode(w, excalibur::Xlen::Rv64).to_string())
         .collect();
     assert_eq!(
         text,
@@ -185,7 +185,7 @@ fn the_park_loop() {
             "sw zero, 0(t1)",
             "csrrw zero, mie, zero",
             "lui t0, 0x1",
-            "lw t0, 16(t0)",
+            "ld t0, 16(t0)",
             "jalr zero, 0(t0)",
         ]
     );
@@ -501,7 +501,7 @@ fn an_interrupt_breaks_only_its_own_harts_reservation() {
     let h1 = m.cpu.hart(1);
     assert_eq!(
         h1.csr.mcause,
-        1 << 31 | u64::from(IRQ_M_SOFT),
+        1 << 63 | u64::from(IRQ_M_SOFT),
         "hart 1 took the IPI"
     );
     assert_eq!(h1.pc, code(1) + 0x44, "and ran its handler's sc.w");

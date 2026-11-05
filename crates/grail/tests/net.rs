@@ -12,12 +12,12 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const PING_OUT: &str = "net 0x10009000, irq 12, mac 02:ca:00:00:00:01, link up
+const PING_OUT: &str = "net 0x0000000010009000, irq 12, mac 02:ca:00:00:00:01, link up
 sent 60 bytes to ff:ff:ff:ff:ff:ff
 received 60 bytes from 02:ca:00:00:00:02, type 0x88b5: Hello back from pong!
 ";
 
-const PONG_OUT: &str = "net 0x10009000, irq 12, mac 02:ca:00:00:00:02, link up
+const PONG_OUT: &str = "net 0x0000000010009000, irq 12, mac 02:ca:00:00:00:02, link up
 received 60 bytes from 02:ca:00:00:00:01, type 0x88b5: Hello from ping!
 sent 60 bytes to 02:ca:00:00:00:01
 ";
@@ -190,8 +190,9 @@ fn bare_machine(config: MachineConfig, code: &[u32]) -> Machine {
     let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
     let bus = &mut m.cpu.bus;
     bus.load(RAM_BASE, &bytes).unwrap();
-    bus.write(RX_RING, 4, RX_BUF).unwrap();
-    bus.write(RX_RING + 4, 4, 0x800).unwrap();
+    // A 16-byte descriptor: the buffer's address, then its length (spec section 9.8).
+    bus.write(RX_RING, 8, RX_BUF).unwrap();
+    bus.write(RX_RING + 8, 4, 0x800).unwrap();
     bus.write(card_reg(net::REG_RX_BASE), 4, RX_RING).unwrap();
     bus.write(card_reg(net::REG_RX_SIZE), 4, 1).unwrap();
     bus.write(card_reg(net::REG_RX_TAIL), 4, 1).unwrap();
@@ -220,7 +221,7 @@ fn received_frames_break_a_reservation() {
         // (reserved word, a frame arrives, sc.w succeeds, the word afterwards)
         (RX_BUF, true, false, 0xabab_abab),
         (RX_BUF + 56, true, false, 0xabab_abab), // the frame's last word
-        (RX_RING + 4, true, false, 60),          // the descriptor's length and status
+        (RX_RING + 8, true, false, 60),          // the descriptor's length and status
         (RX_BUF + 60, true, false, 0),           // past the frame, in its last line
         (RX_BUF + 64, true, true, SC),           // past the frame's lines
         (RX_RING, true, false, RX_BUF),          // the descriptor's address, in its line
@@ -265,7 +266,7 @@ fn received_frames_break_every_harts_reservation() {
     peer.send(&[0xab; 60]).unwrap();
     // Hart 1 reserves the frame's first word, hart 2 the line past it, hart 0 the
     // descriptor's length and status.
-    for (id, addr) in [(0, RX_RING + 4), (1, RX_BUF), (2, RX_BUF + 64)] {
+    for (id, addr) in [(0, RX_RING + 8), (1, RX_BUF), (2, RX_BUF + 64)] {
         let hart = m.cpu.hart_mut(id);
         hart.pc = RAM_BASE;
         hart.waiting = false;
@@ -405,8 +406,8 @@ fn transmit_completions_break_every_harts_reservation() {
         .collect();
     let bus = &mut m.cpu.bus;
     bus.load(RAM_BASE + 0x100, &ringer).unwrap();
-    bus.write(TX_RING, 4, TX_BUF).unwrap();
-    bus.write(TX_RING + 4, 4, 0xffff_0000 | 60).unwrap(); // length 60, status not yet set
+    bus.write(TX_RING, 8, TX_BUF).unwrap();
+    bus.write(TX_RING + 8, 4, 0xffff_0000 | 60).unwrap(); // length 60, status not yet set
     bus.write(card_reg(net::REG_TX_BASE), 4, TX_RING).unwrap();
     bus.write(card_reg(net::REG_TX_SIZE), 4, 1).unwrap();
     let h0 = m.cpu.hart_mut(0);
@@ -415,7 +416,7 @@ fn transmit_completions_break_every_harts_reservation() {
     h0.x[29] = card_reg(net::REG_TX_TAIL); // t4
                                            // Hart 1 reserves the descriptor's length and status, hart 2 the frame (only read,
                                            // and in another 64-byte line).
-    for (id, addr) in [(1, TX_RING + 4), (2, TX_BUF)] {
+    for (id, addr) in [(1, TX_RING + 8), (2, TX_BUF)] {
         let hart = m.cpu.hart_mut(id);
         hart.pc = RAM_BASE;
         hart.waiting = false;
@@ -434,7 +435,7 @@ fn transmit_completions_break_every_harts_reservation() {
     assert_eq!(word(&mut m, card_reg(net::REG_TX_HEAD)), 1, "the frame went");
     let sc: Vec<u64> = m.cpu.harts()[1..].iter().map(|h| h.x[T3]).collect();
     assert_eq!(sc, [1, 0], "only hart 2's line was not written");
-    assert_eq!(word(&mut m, TX_RING + 4), 60, "the card's length and status stay");
+    assert_eq!(word(&mut m, TX_RING + 8), 60, "the card's length and status stay");
     assert_eq!(word(&mut m, TX_BUF), 0x1111_1111);
 }
 
@@ -558,7 +559,7 @@ fn configured_capture_files() {
     exchange(&mut ping, &mut pong, 1_000);
     assert_eq!(
         output(&mut ping),
-        "net 0x10009000, irq 12, mac 02:ca:00:00:00:02, link up
+        "net 0x0000000010009000, irq 12, mac 02:ca:00:00:00:02, link up
 sent 60 bytes to ff:ff:ff:ff:ff:ff
 received 60 bytes from 02:00:00:00:00:99, type 0x88b5: Hello back from pong!
 "
@@ -587,7 +588,7 @@ fn frames_are_dropped_while_no_buffer_is_free() {
     assert_eq!(ping.run(Some(50_000_000), |_| {}), RunResult::Exited(3));
     assert_eq!(
         output(&mut ping),
-        "net 0x10009000, irq 12, mac 02:ca:00:00:00:01, link up
+        "net 0x0000000010009000, irq 12, mac 02:ca:00:00:00:01, link up
 sent 60 bytes to ff:ff:ff:ff:ff:ff
 no answer
 "
@@ -596,7 +597,7 @@ no answer
     assert_eq!(pong.cpu.bus.nets[0].rx_dropped(), 1);
     assert_eq!(
         output(&mut pong),
-        "net 0x10009000, irq 12, mac 02:ca:00:00:00:02, link up\n",
+        "net 0x0000000010009000, irq 12, mac 02:ca:00:00:00:02, link up\n",
         "still waiting"
     );
 }
@@ -606,7 +607,10 @@ fn examples_without_a_card() {
     for name in ["net-ping", "net-pong"] {
         let mut m = machine(name, MachineConfig::default(), Vec::new());
         assert_eq!(m.run(Some(1_000_000), |_| {}), RunResult::Exited(1), "{name}");
-        assert_eq!(output(&mut m), "no network card (try grail --net hub)\n");
+        assert_eq!(
+            output(&mut m),
+            "no network card (try grail --bios none --net hub)\n"
+        );
     }
 }
 
@@ -633,19 +637,19 @@ fn sysinfo_lists_the_cards() {
     let devices = out.split_once("13 devices:\n").expect(&out).1;
     assert_eq!(
         devices,
-        "  test      0x00100000 + 0x00001000
-  CLINT     0x02000000 + 0x00010000
-  PLIC      0x0c000000 + 0x04000000
-  UART      0x10000000 + 0x00000100  irq 1
-  block     0x10001000 + 0x00001000  irq 3
-  net       0x10009000 + 0x00001000  irq 12
-  net       0x1000a000 + 0x00001000  irq 13
-  net       0x1000b000 + 0x00001000  irq 14
-  fb-ctrl   0x30000000 + 0x00001000  irq 16
-  keyboard  0x30001000 + 0x00001000  irq 2
-  sysinfo   0x30002000 + 0x00001000
-  pointer   0x30003000 + 0x00001000  irq 11
-  fb-vram   0x31000000 + 0x0012c000
+        "  test      0x0000000000100000 + 0x0000000000001000
+  CLINT     0x0000000002000000 + 0x0000000000010000
+  PLIC      0x000000000c000000 + 0x0000000004000000
+  UART      0x0000000010000000 + 0x0000000000000100  irq 1
+  block     0x0000000010001000 + 0x0000000000001000  irq 3
+  net       0x0000000010009000 + 0x0000000000001000  irq 12
+  net       0x000000001000a000 + 0x0000000000001000  irq 13
+  net       0x000000001000b000 + 0x0000000000001000  irq 14
+  fb-ctrl   0x0000000030000000 + 0x0000000000001000  irq 16
+  keyboard  0x0000000030001000 + 0x0000000000001000  irq 2
+  sysinfo   0x0000000030002000 + 0x0000000000001000
+  pointer   0x0000000030003000 + 0x0000000000001000  irq 11
+  fb-vram   0x0000000031000000 + 0x000000000012c000
 "
     );
     // The host's port attached first (port 1), so the configured cards got ports 2 and 3.
@@ -688,8 +692,10 @@ fn bad_cards_are_machine_errors() {
     assert!(e.starts_with("network card 1: no/such/dir/x.pcap: "), "{e}");
 }
 
+/// The `grail` binary running `args` without firmware, as the bare-metal examples run.
 fn grail(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_grail"))
+        .args(["--bios", "none"])
         .args(args)
         .output()
         .expect("cannot run grail")
@@ -710,7 +716,7 @@ fn cli_net_and_pcap_flags() {
     assert_eq!(out.status.code(), Some(3), "nobody answers");
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "net 0x10009000, irq 12, mac 02:ca:00:00:00:01, link up
+        "net 0x0000000010009000, irq 12, mac 02:ca:00:00:00:01, link up
 sent 60 bytes to ff:ff:ff:ff:ff:ff
 no answer
 "
@@ -736,7 +742,7 @@ no answer
     assert_eq!(out.status.code(), Some(3));
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.starts_with("net 0x10009000, irq 12, mac 02:00:00:00:00:42, link up\n"),
+        stdout.starts_with("net 0x0000000010009000, irq 12, mac 02:00:00:00:00:42, link up\n"),
         "{stdout}"
     );
     let frames = pcap_frames(&std::fs::read(&file.0).unwrap());
@@ -789,6 +795,6 @@ fn cli_net_errors() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "no network card (try grail --net hub)\n"
+        "no network card (try grail --bios none --net hub)\n"
     );
 }

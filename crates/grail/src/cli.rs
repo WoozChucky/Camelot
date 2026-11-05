@@ -24,7 +24,8 @@ with --bios none the program, or the boot ROM's disk loader, starts in M-mode.
   --max-steps N   stop after N steps (exit code 124)
   --ram SIZE      RAM size: MiB, or a number with a unit, M/MiB or G/GiB, any
                   case (--ram 64, --ram 64M, --ram 16G); 1 MiB to 1 TiB (default
-                  4 MiB). Backed lazily: the host pays for what the guest touches
+                  128 MiB, as QEMU's virt machine). Backed lazily: the host pays
+                  for what the guest touches
   --clock FREQ    real time: run FREQ instructions per second, and mtime ticks at FREQ.
                   FREQ is a number with an optional unit, Hz, kHz or MHz (any case;
                   no unit = Hz); fractions are fine if the result is whole Hz:
@@ -83,6 +84,11 @@ with --bios none the program, or the boot ROM's disk loader, starts in M-mode.
 /// Where `--gdb-wait` alone listens.
 pub const GDB_DEFAULT: &str = "127.0.0.1:1234";
 
+/// The command's RAM without `--ram`: 128 MiB, QEMU's `virt` default (`-m 128M`), as
+/// its machine is QEMU's otherwise too, firmware first. (A [`MachineConfig`] built in
+/// code has [`crate::DEFAULT_RAM_SIZE`], the bare machine's 4 MiB.)
+pub const COMMAND_RAM_SIZE: usize = 128 << 20;
+
 /// What the command line asks for.
 pub struct Options {
     pub trace: bool,
@@ -120,10 +126,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
     let mut o = Options {
         trace: false,
         max_steps: None,
-        // Camelot's firmware unless --bios says otherwise, as QEMU's `virt` machine
-        // boots OpenSBI unless told `-bios none`.
+        // Camelot's firmware unless --bios says otherwise, and 128 MiB unless --ram
+        // does: QEMU's `virt` machine boots OpenSBI unless told `-bios none`, in 128 MiB
+        // unless told `-m`.
         config: MachineConfig {
             bios: Bios::Default,
+            ram_size: COMMAND_RAM_SIZE,
             ..MachineConfig::default()
         },
         program: None,

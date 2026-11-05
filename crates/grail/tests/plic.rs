@@ -11,8 +11,8 @@ use std::sync::mpsc::{channel, Sender};
 
 use excalibur::csr::{IRQ_M_EXT, IRQ_S_EXT, IRQ_S_SOFT, MIP, MSTATUS_MPP_SHIFT, MSTATUS_MPRV, MSTATUS_SIE};
 
-/// The interrupt bit of mcause and scause on an RV32 hart.
-const INTERRUPT_BIT: u64 = 1 << 31;
+/// The interrupt bit of mcause and scause: bit 63.
+const INTERRUPT_BIT: u64 = 1 << 63;
 const MEIP: u64 = 1 << IRQ_M_EXT;
 const SEIP: u64 = 1 << IRQ_S_EXT;
 const SSIP: u64 = 1 << IRQ_S_SOFT;
@@ -264,14 +264,16 @@ fn fetching_from_the_plic_is_an_access_fault_and_claims_nothing() {
 #[test]
 fn page_table_walks_into_the_plic_are_access_faults_and_claim_nothing() {
     // lw t0, 0(t1) from M-mode with MPRV and MPP = S, so the load is translated while the
-    // fetch is not. satp's root table is the page holding CLAIM0, and t1's VPN[1] = 1 picks
-    // the PTE at CLAIM0 itself.
+    // fetch is not. satp's root table (Sv39) is the page holding CLAIM0, and t1's
+    // VPN[2] = 0 picks the 8-byte PTE at the start of that page, whose high half is
+    // CLAIM0 itself.
     let mut m = machine_with_claimable_uart(&[load_insn(2, T0, T1, 0)]);
-    let vaddr: u64 = 1 << 22;
+    let vaddr: u64 = 0x40;
     m.cpu.x[T1 as usize] = vaddr;
     m.cpu.csr.mstatus = MSTATUS_MPRV | (1 << MSTATUS_MPP_SHIFT);
-    m.cpu.csr.satp = (1 << 31) | ((CLAIM0 & !0xfff) >> 12);
-    assert_eq!(((m.cpu.csr.satp & 0x3f_ffff) << 12) + (vaddr >> 22) * 4, CLAIM0);
+    m.cpu.csr.satp = (8 << 60) | ((CLAIM0 & !0xfff) >> 12);
+    let pte = ((m.cpu.csr.satp & ((1 << 44) - 1)) << 12) + (vaddr >> 30) * 8;
+    assert_eq!(pte + 4, CLAIM0);
 
     m.cpu.step();
     assert_eq!(m.cpu.csr.mcause, LOAD_ACCESS_FAULT);
@@ -303,7 +305,10 @@ fn run_echo(input: &[u8]) -> (RunResult, String) {
 fn echo_example_takes_one_interrupt_per_byte() {
     let (r, out) = run_echo(b"Hello, PLIC!\n\x04");
     assert_eq!(r, RunResult::Exited(0));
-    assert_eq!(out, "Hello, PLIC!\n[dbg] pc=800000ac s0 = 0x0000000e (14)\n");
+    assert_eq!(
+        out,
+        "Hello, PLIC!\n[dbg] pc=00000000800000b0 s0 = 0x000000000000000e (14)\n"
+    );
 }
 
 #[test]
@@ -326,13 +331,13 @@ fn echo_example_sleeps_until_input_arrives() {
 
     tx.send(4).unwrap();
     assert_eq!(m.run(Some(10_000), |_| {}), RunResult::Exited(0));
-    assert!(String::from_utf8_lossy(&m.cpu.bus.uart.captured).ends_with("s0 = 0x00000004 (4)\n"));
+    assert!(String::from_utf8_lossy(&m.cpu.bus.uart.captured).ends_with("s0 = 0x0000000000000004 (4)\n"));
 }
 
 #[test]
 fn echo_example_from_stdin_of_the_grail_binary() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_grail"))
-        .args(["--max-steps", "4000000000"])
+        .args(["--bios", "none", "--max-steps", "4000000000"])
         .arg(echo_elf())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -347,5 +352,5 @@ fn echo_example_from_stdin_of_the_grail_binary() {
     let status = child.wait().unwrap();
     assert!(status.success(), "grail exited with {status}: {err}");
     assert_eq!(out, "echo");
-    assert_eq!(err, "[dbg] pc=800000ac s0 = 0x00000005 (5)\n");
+    assert_eq!(err, "[dbg] pc=00000000800000b0 s0 = 0x0000000000000005 (5)\n");
 }

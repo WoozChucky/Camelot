@@ -43,31 +43,9 @@ impl Write for Shared {
     }
 }
 
-/// What `examples/sysinfo` prints on a machine with this RAM and clock.
+/// What `examples/sysinfo` prints on a machine with this RAM and clock: version 2 of
+/// the block, with addresses and sizes in 16 hex digits.
 fn sysinfo_output(ram_mib: u32, hz: u32, real_time: bool) -> String {
-    let kind = if real_time { "real time" } else { "nominal" };
-    format!(
-        "sysinfo v1
-RAM      {ram_mib} MiB at 0x80000000
-CPU      {hz} Hz ({kind})
-timebase {hz} Hz
-9 devices:
-  test      0x00100000 + 0x00001000
-  CLINT     0x02000000 + 0x00010000
-  PLIC      0x0c000000 + 0x04000000
-  UART      0x10000000 + 0x00000100  irq 1
-  fb-ctrl   0x30000000 + 0x00001000  irq 16
-  keyboard  0x30001000 + 0x00001000  irq 2
-  sysinfo   0x30002000 + 0x00001000
-  pointer   0x30003000 + 0x00001000  irq 11
-  fb-vram   0x31000000 + 0x0012c000
-"
-    )
-}
-
-/// What the RV64 build of `examples/sysinfo` prints: version 2 of the block, with
-/// addresses and sizes in 16 hex digits.
-fn sysinfo_output_rv64(ram_mib: u32, hz: u32, real_time: bool) -> String {
     let kind = if real_time { "real time" } else { "nominal" };
     format!(
         "sysinfo v2
@@ -181,8 +159,14 @@ fn uart_input_and_debug_output_are_per_machine() {
     assert_eq!(b.run(Some(1_000_000), |_| {}), RunResult::Exited(0));
     assert_eq!(a_uart.text(), "first");
     assert_eq!(b_uart.text(), "second one");
-    assert_eq!(a_debug.text(), "[dbg] pc=800000ac s0 = 0x00000006 (6)\n");
-    assert_eq!(b_debug.text(), "[dbg] pc=800000ac s0 = 0x0000000b (11)\n");
+    assert_eq!(
+        a_debug.text(),
+        "[dbg] pc=00000000800000b0 s0 = 0x0000000000000006 (6)\n"
+    );
+    assert_eq!(
+        b_debug.text(),
+        "[dbg] pc=00000000800000b0 s0 = 0x000000000000000b (11)\n"
+    );
 }
 
 #[test]
@@ -394,8 +378,10 @@ fn run_for_runs_everything_asked_without_a_clock() {
     assert_eq!(m.pace_delay(), None);
 }
 
+/// The `grail` binary running `args` without firmware, as the bare-metal examples run.
 fn grail(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_grail"))
+        .args(["--bios", "none"])
         .args(args)
         .output()
         .expect("cannot run grail")
@@ -419,21 +405,12 @@ fn cli_ram_and_clock_flags_reach_sysinfo() {
         sysinfo_output(2048, 10_000_000, false)
     );
 
-    // The RV64 build reads version 2's registers: SYS_FLAGS, with the real-time
-    // bit, at 0x20 rather than 0x18, and the 64-bit SYS_RAM_SIZE (8 GiB).
-    let rv64 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/sysinfo/sysinfo-rv64.elf");
-    let rv64 = rv64.to_str().unwrap();
-    let out = grail(&["--ram", "64", "--clock", "1.5MHz", rv64]);
+    // The 64-bit SYS_RAM_SIZE: 8 GiB.
+    let out = grail(&["--ram", "8G", elf]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        sysinfo_output_rv64(64, 1_500_000, true)
-    );
-    let out = grail(&["--ram", "8G", rv64]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(
-        String::from_utf8(out.stdout).unwrap(),
-        sysinfo_output_rv64(8192, 10_000_000, false)
+        sysinfo_output(8192, 10_000_000, false)
     );
 }
 
@@ -469,8 +446,6 @@ fn cli_rejects_bad_ram_and_clock_values() {
         ),
         (&["--ram", "1025G", elf], "--ram: 1025G is out of range"),
         (&["--ram", "lots", elf], "--ram: 'lots' is not a RAM size"),
-        // An RV32 program's machine has at most 2 GiB.
-        (&["--ram", "4G", elf], "an RV32 machine has at most 2 GiB"),
         (
             &["--clock", "0", elf],
             "--clock: the clock must be faster than 0 Hz",
@@ -517,10 +492,10 @@ fn cli_harts_flag() {
     assert_eq!(
         lines,
         [
-            "h0 M 00001000: auipc t0, 0x0",
-            "h1 M 00001020: csrrs a0, mhartid, zero",
-            "h0 M 00001004: lw t0, 16(t0)",
-            "h1 M 00001024: slli t1, a0, 2",
+            "h0 M 0000000000001000: auipc t0, 0x0",
+            "h1 M 0000000000001020: csrrs a0, mhartid, zero",
+            "h0 M 0000000000001004: ld t0, 16(t0)",
+            "h1 M 0000000000001024: slli t1, a0, 2",
         ]
     );
 
@@ -562,11 +537,13 @@ fn usage_documents_clock_and_its_units() {
     ] {
         assert!(usage.contains(text), "usage lacks {text:?}:\n{usage}");
     }
-    // The default RAM, as the machine has it: 4 MiB.
+    // The default RAM: the command's, QEMU virt's 128 MiB; a MachineConfig's, the bare
+    // machine's 4 MiB.
+    assert_eq!(grail::cli::COMMAND_RAM_SIZE, 128 << 20);
     assert_eq!(grail::DEFAULT_RAM_SIZE, 4 << 20);
     assert_eq!(grail::MachineConfig::default().ram_size, grail::DEFAULT_RAM_SIZE);
     assert!(
-        usage.contains("most 2 GiB (default 4 MiB). Backed lazily"),
+        usage.contains("(default\n                  128 MiB, as QEMU's virt machine)"),
         "{usage}"
     );
 }

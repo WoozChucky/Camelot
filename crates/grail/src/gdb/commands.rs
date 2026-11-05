@@ -778,7 +778,8 @@ mod tests {
     fn map_gigapage(m: &mut Machine) -> (u64, u64) {
         let root = RAM_BASE + 0x1000;
         let pte: u64 = (0x80000 << 10) | 0b1111; // V R W X
-        let slot = root + (0x4000_0000u64 >> 30) * 8;
+        let vpn2 = 0x4000_0000u64 >> 30;
+        let slot = root + vpn2 * 8;
         m.write_memory(slot, &pte.to_le_bytes(), Space::Physical);
         m.write_memory(RAM_BASE, &[0xaa, 0xbb], Space::Physical);
         assert!(m.set_csr(0x180, (8 << 60) | (root >> 12)), "Sv39");
