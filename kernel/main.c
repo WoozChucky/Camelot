@@ -1,5 +1,6 @@
 /* Camelot kernel: C entry point. entry.S sets up the stack and clears .bss,
- * start() drops to S-mode, then supervisor_entry calls kmain() on hart 0
+ * the SBI's coldboot (machine.S) enters S-mode, then supervisor_entry calls
+ * kmain() on hart 0
  * (on RV64 with paging already on, at the kernel's link addresses, through
  * the early page table); its return value becomes the exit code. After
  * booting, kmain starts the other harts, if the machine has any (smp.c),

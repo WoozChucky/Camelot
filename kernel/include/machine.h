@@ -1,13 +1,13 @@
 /* The M-mode layer (spec section 10, "Kernel traps"): Camelot's SBI
  * implementation on Grail (machine.S), the firmware the S-mode kernel
- * calls through include/sbi.h. Only machine.S and entry.S's M-mode code
- * use what is here: no S-mode code touches the CLINT, an M-mode CSR or a
- * scratch block. */
+ * calls through include/sbi.h. Only machine.S uses what is here: no
+ * S-mode code touches the CLINT, an M-mode CSR or a scratch block. */
 #ifndef CAMELOT_MACHINE_H
 #define CAMELOT_MACHINE_H
 
-/* Constants only, for machine.S: the scratch blocks' layout. */
-/* Each hart's block of machine_scratch, which its mscratch points at: slots
+/* Constants only, for machine.S: the scratch blocks' layout.
+ *
+ * Each hart's block of machine_scratch, which its mscratch points at: slots
  * a register wide (XLEN bits). machine.S uses these slot numbers, times
  * SZREG.
  *   - Slots 0-5 hold t0-t5 while machine_vec runs (it swaps t6 with
