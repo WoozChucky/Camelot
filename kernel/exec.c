@@ -119,12 +119,11 @@ int exec_replace(const char *path, const struct proc_args *args) {
     return load_and_run(&f, path, last_name(path), args);
 }
 
-/* Appends the string `s`, with its NUL, to `args`'s strings, which have
- * room for it (exec_init's are short). */
+/* Puts the string `s`, with its NUL, below `args`'s strings, which have
+ * room for it (exec_init's are short): copy_string_kernel's job on Linux. */
 static void add_string(struct proc_args *args, const char *s) {
-    usize n = strlen(s) + 1;
-    memcpy(args->strings + args->len, s, n);
-    args->len += (u32)n;
+    u32 n = (u32)strlen(s) + 1;
+    memcpy(proc_args_push(args, n), s, n);
 }
 
 int exec_init(const char *path, const char *name) {
@@ -142,15 +141,17 @@ int exec_init(const char *path, const char *name) {
         prog_close(&f);
         return -ENOMEM;
     }
-    /* argv { name }, then the environment Linux gives init (envp_init in
-     * init/main.c): its home, the root, and the terminal it runs on. */
+    /* argv { name } and the environment Linux gives init (envp_init in
+     * init/main.c): its home, the root, and the terminal it runs on. Put
+     * in from the top down as kernel_execve has copy_strings_kernel put
+     * them, envp's from the last, then argv's. */
     static const char *const init_env[] = {"HOME=/", "TERM=linux"};
-    add_string(args, name);
-    args->argc = 1;
-    for (u32 i = 0; i < sizeof init_env / sizeof init_env[0]; i++) {
+    args->envc = sizeof init_env / sizeof init_env[0];
+    for (u32 i = args->envc; i-- > 0;) {
         add_string(args, init_env[i]);
     }
-    args->envc = sizeof init_env / sizeof init_env[0];
+    add_string(args, name);
+    args->argc = 1;
     err = load_and_run(&f, path, name, args);
     kfree(args);
     return err;

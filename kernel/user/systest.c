@@ -955,13 +955,6 @@ static void test_environment(void) {
     check_eq(spawn("/bin/systest", argv, many), -E2BIG, "more than MAXARG environment strings");
     many[MAXARG] = NULL;
     check_eq(status_of(spawn("/bin/systest", argv, many)), 0, "MAXARG environment strings");
-    /* An error in argv comes first: envp isn't looked at. */
-    char *many_args[MAXARG + 2];
-    for (int i = 0; i <= MAXARG; i++) {
-        many_args[i] = "x";
-    }
-    many_args[MAXARG + 1] = NULL;
-    check_eq(spawn("/bin/echo", many_args, (char **)KERNEL_ADDR), -E2BIG, "argv's error before envp's");
 
     /* The strings of both, with their NULs, ARG_MAX bytes at most: an
      * environment string that makes exactly ARG_MAX, then one byte more. */
@@ -984,6 +977,39 @@ static void test_environment(void) {
     check_eq(spawn("/bin/systest", bytes_argv, big_env), -E2BIG, "arguments and environment over ARG_MAX bytes");
     check_eq(exec("/bin/systest", bytes_argv, big_env), -E2BIG, "exec of them too");
     check_eq(exec("/bin/systest", argv, (char **)KERNEL_ADDR), -EFAULT, "exec with a bad envp");
+
+    /* Errors in both arrays, in Linux's order (docs/camelot-syscalls.md,
+     * spawn): argv's pointers are counted, then envp's, then envp's
+     * strings are copied, then argv's, each array's from its last. `big`
+     * is a string too long for any array, `bad_arg` and `bad_env` hold a
+     * string that can't be read. */
+    memset(big, 'y', ARG_MAX);
+    big[ARG_MAX] = 0;
+    char *bad_arg[] = {"echo", (char *)KERNEL_ADDR, NULL};
+    char *bad_env[] = {"A=1", (char *)KERNEL_ADDR, NULL};
+    char *big_arg[] = {"echo", big, NULL};
+    char *many_args[MAXARG + 2];
+    for (int i = 0; i <= MAXARG; i++) {
+        many_args[i] = "x";
+    }
+    many_args[MAXARG + 1] = NULL;
+    many[MAXARG] = "V=x";
+    check_eq(spawn("/bin/echo", many_args, (char **)KERNEL_ADDR), -E2BIG, "argv is counted first");
+    check_eq(spawn("/bin/echo", bad_arg, many), -E2BIG, "then envp, before any string is read");
+    check_eq(exec("/bin/echo", bad_arg, many), -E2BIG, "exec counts them first too");
+    check_eq(spawn("/bin/echo", big_arg, (char **)KERNEL_ADDR), -EFAULT, "envp is counted before argv's strings");
+    check_eq(spawn("/bin/echo", bad_arg, big_env), -E2BIG, "envp's strings are copied before argv's");
+    check_eq(spawn("/bin/echo", big_arg, bad_env), -EFAULT, "and argv's after them");
+    check_eq(exec("/bin/echo", big_arg, bad_env), -EFAULT, "exec copies envp's first too");
+    check_eq(spawn("/bin/echo", (char *[]){"echo", (char *)KERNEL_ADDR, big, NULL}, NULL), -E2BIG,
+             "an array's strings are copied from its last");
+    check_eq(spawn("/bin/echo", (char *[]){"echo", big, (char *)KERNEL_ADDR, NULL}, NULL), -EFAULT,
+             "to its first");
+    /* A NULL argv's { path } goes in last, where argv's strings go: an
+     * environment of ARG_MAX bytes leaves it no room. */
+    big[ARG_MAX - 1] = 0;
+    check_eq(spawn("/bin/systest", NULL, (char *[]){big, NULL}), -E2BIG, "a NULL argv's path counts against ARG_MAX");
+    check_eq(wait(-1, NULL), -ECHILD, "none of them started");
 }
 
 /* The entry procs() gives for `pid` in `info` (`n` entries), or NULL. */

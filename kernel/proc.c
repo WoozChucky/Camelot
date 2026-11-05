@@ -206,9 +206,9 @@ static void set_name(struct proc *p, const char *name) {
  * then envp's, then argv's: copy_string_kernel and copy_strings in
  * fs/exec.c), each array's in its own order, so argv[0]'s string is the
  * lowest; create_elf_tables then fills the pointers in going up the
- * strings. Here they are in kernel memory already, one after another as
- * syscall.c copied them in (`args`: argv's, then envp's), and go up in one
- * copy.
+ * strings. Here they are in kernel memory already, put in from the top
+ * down in that same order (`args`, syscall.c's copy_args): one after
+ * another, argv's then envp's, they go up in one copy.
  *
  * sp, the lowest of it, is 16-byte aligned. a0 holds 0: the psABI's
  * address of a function for the program to register with atexit, the
@@ -272,7 +272,7 @@ static void push_start(struct trap_frame *f, u8 *stack, const struct proc_args *
     memcpy(stack + (at - USER_STACK), path, path_len);
     at -= args->len;
     uintptr strings = at;
-    memcpy(stack + (at - USER_STACK), args->strings, args->len);
+    memcpy(stack + (at - USER_STACK), proc_args_start(args), args->len);
     at = (at & ~(uintptr)15) - 16;
     uintptr random = at;
     random_bytes(stack + (at - USER_STACK), pa(stack));
@@ -287,12 +287,12 @@ static void push_start(struct trap_frame *f, u8 *stack, const struct proc_args *
     uintptr s = strings;
     for (u32 i = 0; i < args->argc; i++) {
         w[n++] = s;
-        s += strlen(args->strings + (s - strings)) + 1;
+        s += strlen(proc_args_start(args) + (s - strings)) + 1;
     }
     w[n++] = 0; /* argv's NULL */
     for (u32 i = 0; i < args->envc; i++) {
         w[n++] = s;
-        s += strlen(args->strings + (s - strings)) + 1;
+        s += strlen(proc_args_start(args) + (s - strings)) + 1;
     }
     w[n++] = 0; /* envp's */
     /* The vector, in Linux's order (the RISC-V entries it puts first,

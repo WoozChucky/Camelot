@@ -38,18 +38,24 @@ static long sys_sleep(struct trap_frame *f) {
     return 0;
 }
 
-/* Copies `array`, a user array of string pointers ending with a NULL (an
- * argv or an envp), into `args` after the strings it holds already, and
- * sets *count to how many it had. As Linux's copy_strings copies both of
- * execve's arrays: each holds at most MAXARG strings (MAX_ARG_STRINGS on
- * Linux), and every string of both, with its NUL, must fit in what is left
- * of ARG_MAX (so none is longer than that, Linux's MAX_ARG_STRLEN), or the
- * call fails with -E2BIG; a pointer or a string that can't be read is
- * -EFAULT. */
-static int copy_strings(pagetable_t pt, uintptr array, struct proc_args *args, u32 *count) {
+/* spawn's and exec's argv and envp are taken as Linux's execve takes them
+ * (do_execveat_common in fs/exec.c), in two passes. First both arrays are
+ * counted, argv's then envp's: every pointer is read, none of the strings
+ * (count()). Then the strings are copied, envp's then argv's, each array's
+ * from its last string to its first, each one below the ones before it
+ * (copy_strings()): so of two errors, the call's is the first one found in
+ * that order, as on Linux. */
+
+/* How many strings the user array `array` holds, in *count: string
+ * pointers, 4 or 8 bytes each, up to a NULL. As Linux's count(): -EFAULT
+ * if a pointer can't be read, -E2BIG if there are more than MAXARG
+ * (MAX_ARG_STRINGS on Linux). A NULL array holds none. */
+static int count_strings(pagetable_t pt, uintptr array, u32 *count) {
     *count = 0;
+    if (array == 0) {
+        return 0;
+    }
     for (;;) {
-        /* array[i]: a user pointer, 4 or 8 bytes. */
         uintptr ptr;
         if (copyin(pt, &ptr, array + sizeof ptr * *count, sizeof ptr) != 0) {
             return -EFAULT;
@@ -57,40 +63,71 @@ static int copy_strings(pagetable_t pt, uintptr array, struct proc_args *args, u
         if (ptr == 0) {
             return 0;
         }
-        if (*count == MAXARG || args->len == ARG_MAX) {
+        if (*count == MAXARG) {
             return -E2BIG;
         }
-        int n = copyinstr(pt, args->strings + args->len, ptr, ARG_MAX - args->len);
-        if (n == -1) {
-            return -EFAULT;
-        }
-        if (n < 0) {
-            return -E2BIG;
-        }
-        args->len += (u32)n + 1;
         (*count)++;
     }
 }
 
-/* Copies spawn's or exec's argv and envp into `args`: argv's strings, then
- * envp's (copy_strings()). A NULL argv stands for { path }; a NULL envp is
- * an empty environment, as Linux takes it. An error in argv is the call's,
- * and envp is not looked at then (Linux counts argv before envp). */
-static int copy_args(pagetable_t pt, uintptr argv, uintptr envp, const char *path, struct proc_args *args) {
-    args->argc = 0;
-    args->envc = 0;
-    args->len = 0;
-    if (argv == 0) {
-        args->argc = 1;
-        args->len = strlen(path) + 1;
-        memcpy(args->strings, path, args->len);
-    } else {
-        int err = copy_strings(pt, argv, args, &args->argc);
-        if (err != 0) {
-            return err;
+/* Copies the first `count` strings of user array `array` into `args`,
+ * below the strings it holds already, as Linux's copy_strings() copies
+ * them: from the last to the first, each measured (strnlen_user) and then
+ * put right below the one before, so that they lie in their order, the
+ * first lowest. A pointer or a string that can't be read is -EFAULT; a
+ * string that doesn't fit in what is left of ARG_MAX is -E2BIG (so none is
+ * longer than that, Linux's MAX_ARG_STRLEN). */
+static int copy_strings(pagetable_t pt, uintptr array, u32 count, struct proc_args *args) {
+    while (count-- > 0) {
+        /* Read again: another thread may have changed it since it was
+         * counted. A NULL now is a string at 0, which can't be read. */
+        uintptr ptr;
+        if (copyin(pt, &ptr, array + sizeof ptr * count, sizeof ptr) != 0) {
+            return -EFAULT;
         }
+        u32 len = strnlen_user(pt, ptr, ARG_MAX);
+        if (len == 0) {
+            return -EFAULT;
+        }
+        if (len > ARG_MAX - args->len) {
+            return -E2BIG;
+        }
+        char *to = proc_args_push(args, len);
+        if (copyin(pt, to, ptr, len) != 0) {
+            return -EFAULT; /* unmapped since it was measured */
+        }
+        /* Or changed: its last byte is its NUL, whatever it holds now, so
+         * that the strings stay `count` (push_start walks them). */
+        to[len - 1] = 0;
     }
-    return envp == 0 ? 0 : copy_strings(pt, envp, args, &args->envc);
+    return 0;
+}
+
+/* Copies spawn's or exec's argv and envp into `args` (above). A NULL argv
+ * stands for { path }, put in where argv's strings would go; a NULL envp
+ * is an empty environment, as Linux takes it. */
+static int copy_args(pagetable_t pt, uintptr argv, uintptr envp, const char *path, struct proc_args *args) {
+    args->len = 0;
+    int err = count_strings(pt, argv, &args->argc);
+    if (err == 0) {
+        err = count_strings(pt, envp, &args->envc);
+    }
+    if (err == 0) {
+        err = copy_strings(pt, envp, args->envc, args);
+    }
+    if (err != 0) {
+        return err;
+    }
+    if (argv != 0) {
+        return copy_strings(pt, argv, args->argc, args);
+    }
+    u32 len = (u32)strlen(path) + 1;
+    if (len > ARG_MAX - args->len) {
+        return -E2BIG;
+    }
+    memcpy(proc_args_push(args, len), path, len);
+    args->argc = 1;
+    return 0;
 }
 
 _Static_assert(sizeof(struct proc_args) <= PGSIZE, "spawn's arguments fit a page");

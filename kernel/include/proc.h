@@ -224,15 +224,32 @@ const struct user_program *user_program_find(const char *name);
 
 /* A new program's arguments and environment, in kernel memory, as Linux's
  * struct linux_binprm gathers them for execve: `argc` NUL-terminated
- * argument strings one after another in `strings`, then `envc` environment
- * strings (`NAME=value`), `len` bytes in all. proc_create() and
- * proc_exec_load() copy them to the top of the program's stack. */
+ * argument strings one after another, then `envc` environment strings
+ * (`NAME=value`), `len` bytes in all, at the end of `strings`. They are
+ * put there as Linux's copy_strings puts them on the new stack, from the
+ * top down (bprm->p): each string below the ones before it, envp's last
+ * first and argv's first last (proc_args_push()), so that they end up in
+ * the order they will have on the program's stack. proc_create() and
+ * proc_exec_load() copy them to the top of it. */
 struct proc_args {
     u32 argc;
     u32 envc;
     u32 len;
     char strings[ARG_MAX];
 };
+
+/* The lowest of `args`'s strings, argv[0]'s: they take the last `len`
+ * bytes of `strings`. */
+static inline const char *proc_args_start(const struct proc_args *args) {
+    return args->strings + ARG_MAX - args->len;
+}
+
+/* Makes room for a string of `n` bytes, its NUL included, below those
+ * `args` holds, which leave room for it, and returns where it goes. */
+static inline char *proc_args_push(struct proc_args *args, u32 n) {
+    args->len += n;
+    return args->strings + ARG_MAX - args->len;
+}
 
 /* Sets up the process table's lock. kmain calls it before anything starts a
  * process. */

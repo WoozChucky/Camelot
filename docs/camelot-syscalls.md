@@ -235,9 +235,17 @@ with a null pointer (the kernel copies any string, `=` or not: what a
 usually pass on from their own (`environ`, "The user library"); a null
 `envp` is an empty environment, as Linux takes it. The kernel copies the
 strings of both onto the child's stack ("Starting a program" below), so the
-caller's arrays can go as soon as `spawn` returns. Both are copied as
-Linux's `copy_strings` copies `execve`'s: argv first, then envp, and an
-error in argv is the call's without envp being looked at. Errors:
+caller's arrays can go as soon as `spawn` returns. Both are read as
+Linux's `execve` reads them (`do_execveat_common` in `fs/exec.c`), in two
+passes: first it counts argv's pointers, then envp's (`count`: an
+unreadable pointer is `-EFAULT`, more than `MAXARG` of them `-E2BIG`),
+before any string is looked at; then it copies the strings, envp's
+before argv's, each array's from its last string to its first
+(`copy_strings`). Of two errors, the call's is the first one found in
+that order: an unreadable argv string with 17 environment strings is
+`-E2BIG`, an unreadable argv string with an environment string too long
+to fit is `-E2BIG` too, and arguments over `ARG_MAX` with an unreadable
+envp are `-EFAULT`. Errors:
 
 - `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`: the path names nothing ("Paths");
 - `-EACCES`: it names a directory or a device;
