@@ -143,7 +143,8 @@ const STEPS: &[Step] = &[
         args: &["-p", "xtask", "--test", "kernel_rv64"],
     },
     Step {
-        what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused,                Linux's start",
+        what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
+               Linux's start",
         args: &[
             "-p",
             "xtask",
@@ -157,7 +158,8 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
-        what: "the committed examples, boot programs and hello are current; an RV64 boot block and the                RV64 root image boot",
+        what: "the committed examples, boot programs and hello are current; an RV64 boot block and the \
+               RV64 root image boot",
         args: &[
             "-p",
             "xtask",
