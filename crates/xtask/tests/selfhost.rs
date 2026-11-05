@@ -1425,6 +1425,18 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
                 .into(),
             "",
         ));
+        // RV64's hi/lo pairs reach -2^31 - 0x800 to 2^31 - 0x801: an
+        // address at 4 GiB is out of range for each kind, HI20 (its LO12_I
+        // with it), PCREL_HI20 (la) and CALL_PLT, the value reported the
+        // hi part.
+        cases.push((
+            vec![obj(
+                ".text\n.globl _start\n_start: lui a0, %hi(far)\n addi a0, a0, %lo(far)\n la a1, far\n \
+                 call far\n",
+            )],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } far = 0x100000000; }".into(),
+            "",
+        ));
     }
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut commands = Vec::new();
