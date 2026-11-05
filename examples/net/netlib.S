@@ -1,11 +1,10 @@
 # The network card driver and console helpers shared by examples/net/ping.S, pong.S
 # and user.S (spec section 9.8). Linked into each of them.
 #
-# The card keeps two rings of descriptors in RAM. On RV32 a descriptor is 8 bytes,
-# { u32 buffer address, u16 length, u16 status }; on RV64, whose card has the
-# registers of version 2 of its interface, 16 bytes, { u64 buffer address, u16
+# The card keeps two rings of descriptors in RAM. The card has the registers of
+# version 2 of its interface, and a descriptor is 16 bytes, { u64 buffer address, u16
 # length, u16 status, u32 reserved }, naturally aligned (a ring's base is a multiple
-# of 16). Each ring has a BASE (64-bit on RV64, written with REG_S, sd there), a SIZE
+# of 16). Each ring has a BASE (64-bit, written with REG_S, sd), a SIZE
 # (a power of two) and two free-running 32-bit counters: the descriptors from HEAD up
 # to (not including) TAIL belong to the card, and counter n is slot n % SIZE. The
 # driver hands descriptors over by advancing TAIL, the card hands them back by
@@ -18,8 +17,8 @@
 #             status into its descriptor, and moves RX_HEAD past it. When no buffer
 #             is free, the frame is dropped and counted in NET_RX_DROPPED.
 #
-# On RV64 a counter is a 32-bit value that lw sign-extends: one the driver computes
-# and compares with the card's register is kept in that form with addiw (ADDIW), so
+# A counter is a 32-bit value that lw sign-extends: one the driver computes
+# and compares with the card's register is kept in that form with addiw, so
 # that the two are equal across 2^31; one it only stores with sw (the low 32 bits)
 # and reads back with lw may be computed with addi. The card's address and the
 # buffers' are XLEN-wide (REG_L, REG_S), and the functions save ra and the s
@@ -27,29 +26,19 @@
 
 #include <asm.h>
 
-#if __riscv_xlen == 64
 #define DEC_END 20      /* put_dec's digits: sp+0 .. sp+19, the 20 of 2^64 - 1 */
-#else
-#define DEC_END 12      /* sp+2 .. sp+11, the 10 of 2^32 - 1 */
-#endif
 
     .equ UART_BASE,       0x10000000
     .equ UART_LSR,        5
     .equ LSR_THRE,        0x20
 
     .equ SYSINFO_BASE,    0x30002000
-#if __riscv_xlen == 64
     .equ SYS_DEV_COUNT,   0x24
     .equ SYS_DEV_TABLE,   0x40
     .equ DEV_ENTRY_SIZE,  24            # type, irq, base (64-bit), size (64-bit)
     .equ DEV_TYPE,        0x00
     .equ DEV_IRQ,         0x04
     .equ DEV_BASE,        0x08
-#else
-    .equ SYS_DEV_COUNT,   0x1c
-    .equ SYS_DEV_TABLE,   0x40
-    .equ DEV_ENTRY_SIZE,  16            # type, base, size, irq
-#endif
     .equ DEV_NET,         11            # device type code of a network card
 
     .equ NET_MAC_LO,      0x00          # MAC bytes 0-3 (byte 0 in bits 7:0)
@@ -57,7 +46,6 @@
     .equ NET_STATUS,      0x08          # bit 0: link up
     .equ NET_IRQ_ENABLE,  0x10
     .equ NET_IRQ_STATUS,  0x14          # write 1s to clear
-#if __riscv_xlen == 64
     .equ NET_TX_BASE,     0x20          # 64-bit
     .equ NET_TX_SIZE,     0x28
     .equ NET_TX_HEAD,     0x2c
@@ -66,36 +54,16 @@
     .equ NET_RX_SIZE,     0x40
     .equ NET_RX_HEAD,     0x44
     .equ NET_RX_TAIL,     0x48
-#else
-    .equ NET_TX_BASE,     0x20
-    .equ NET_TX_SIZE,     0x24
-    .equ NET_TX_HEAD,     0x28
-    .equ NET_TX_TAIL,     0x2c
-    .equ NET_RX_BASE,     0x30
-    .equ NET_RX_SIZE,     0x34
-    .equ NET_RX_HEAD,     0x38
-    .equ NET_RX_TAIL,     0x3c
-#endif
     .equ IRQ_RX,          1
     .equ IRQ_ALL,         7             # RX, TX, ERROR
 
     .equ RING_SIZE,       4             # descriptors per ring
     .equ RING_MASK,       3
-#if __riscv_xlen == 64
     .equ DESC_SIZE,       16
     .equ DESC_SHIFT,      4             # log2(DESC_SIZE)
     .equ DESC_ADDR,       0             # u64
     .equ DESC_LEN,        8             # u16
     .equ DESC_STATUS,     10            # u16
-#else
-    .equ DESC_SIZE,       8
-/* The rest of the layout as macros, not symbols: RV32's program had the numbers
-   written out, and its executable (and symbol table) stays what it was. */
-#define DESC_SHIFT 3
-#define DESC_ADDR 0
-#define DESC_LEN 4
-#define DESC_STATUS 6
-#endif
     .equ BUF_SIZE,        1536          # room for the longest frame, 1514 bytes
     .equ ETHERTYPE,       0x88b5        # IEEE "local experimental" EtherType
     .equ MIN_FRAME,       60            # what Ethernet pads short frames to
@@ -120,26 +88,17 @@ net_init:
     REG_S s1, 16-2*SZREG(sp)
 
     li    t0, SYSINFO_BASE
-    LWU   t1, SYS_DEV_COUNT(t0)
+    lwu   t1, SYS_DEV_COUNT(t0)
     addi  t0, t0, SYS_DEV_TABLE
     li    t2, DEV_NET
 1:  beqz  t1, no_card
-#if __riscv_xlen == 64
     lwu   t3, DEV_TYPE(t0)
-#else
-    lw    t3, 0(t0)
-#endif
     beq   t3, t2, 2f
     addi  t0, t0, DEV_ENTRY_SIZE
     addi  t1, t1, -1
     j     1b
-#if __riscv_xlen == 64
 2:  ld    s1, DEV_BASE(t0)          # s1 = the card's registers
     lwu   t1, DEV_IRQ(t0)
-#else
-2:  lw    s1, 4(t0)                 # s1 = the card's registers
-    lw    t1, 12(t0)
-#endif
     la    t2, net_base
     REG_S s1, 0(t2)
     la    t2, net_irq
@@ -232,7 +191,7 @@ net_send:
     REG_S a0, DESC_ADDR(t2)
     sh    a1, DESC_LEN(t2)
     sh    zero, DESC_STATUS(t2)
-    ADDIW t1, t1, 1                 # sign-extended (RV64), as lw reads TX_HEAD
+    addiw t1, t1, 1                 # sign-extended, as lw reads TX_HEAD
     sw    t1, NET_TX_TAIL(t0)       # the doorbell: the card sends it now
 1:  lw    t3, NET_TX_HEAD(t0)       # done once HEAD has moved past it
     bne   t3, t1, 1b
@@ -452,8 +411,8 @@ put_text:
     addi  sp, sp, 16
     ret
 
-# put_dec(a0 = unsigned value): decimal, no padding, up to the 10 digits of
-# 2^32 - 1, or the 20 of 2^64 - 1 on RV64.
+# put_dec(a0 = unsigned value): decimal, no padding, up to the 20 digits of
+# 2^64 - 1.
     .globl put_dec
 put_dec:
     addi  sp, sp, -32
@@ -475,7 +434,7 @@ put_dec:
     addi  sp, sp, 32
     ret
 
-# put_hex(a0 = value): "0x" and XLEN/4 lowercase hex digits (8, or 16 on RV64).
+# put_hex(a0 = value): "0x" and XLEN/4 lowercase hex digits, 16.
 put_hex:
     addi  sp, sp, -16
     REG_S ra, 16-SZREG(sp)
@@ -551,11 +510,7 @@ s_sent:         .asciz "sent "
 s_bytes_to:     .asciz " bytes to "
 
     .section .bss
-#if __riscv_xlen == 64
     .balign 16                      # what the card requires of a ring's base
-#else
-    .balign 8
-#endif
 tx_ring:    .space RING_SIZE * DESC_SIZE
 rx_ring:    .space RING_SIZE * DESC_SIZE
 rx_bufs:    .space RING_SIZE * BUF_SIZE

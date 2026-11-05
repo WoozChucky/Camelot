@@ -7,7 +7,7 @@
 /* As Linux's riscv memset (arch/riscv/lib/memset.S), which its clear_page()
  * is: bytes up to a register-size boundary, then whole registers, unrolled
  * (eight stores a round here, Linux's thirty-two), then the bytes left. A
- * page of zeros is 512 stores on RV64 (1024 on RV32), not 4096. */
+ * page of zeros is 512 stores, not 4096. */
 void *memset(void *dst, int c, usize n) {
     u8 *d = (u8 *)dst;
     u8 byte = (u8)c;

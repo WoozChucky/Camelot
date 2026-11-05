@@ -81,7 +81,6 @@ impl Hart {
     /// `lr.w`/`lr.d`: loads `size` bytes and reserves the line holding them. Faults
     /// like a load.
     pub(super) fn load_reserved(&mut self, bus: &mut Bus, vaddr: u64, size: u32) -> Result<u64, Trap> {
-        let vaddr = self.addr(vaddr);
         let paddr = self.atomic_paddr(bus, vaddr, size, Access::Load)?;
         let v = self
             .read_phys(bus, paddr, size)
@@ -106,7 +105,6 @@ impl Hart {
         size: u32,
         val: u64,
     ) -> Result<u64, Trap> {
-        let vaddr = self.addr(vaddr);
         if vaddr & (size as u64 - 1) != 0 {
             return Err(Trap::new(Access::Store.misaligned(), vaddr));
         }
@@ -134,7 +132,6 @@ impl Hart {
         size: u32,
         src: u64,
     ) -> Result<u64, Trap> {
-        let vaddr = self.addr(vaddr);
         let paddr = self.atomic_paddr(bus, vaddr, size, Access::Store)?;
         let fault = |_| Trap::new(Access::Store.access_fault(), vaddr);
         let old = self.read_phys(bus, paddr, size).map_err(fault)?;

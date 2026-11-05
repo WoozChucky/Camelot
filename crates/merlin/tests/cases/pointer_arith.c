@@ -1,7 +1,6 @@
-// expect: 119
-// expect-lp64: 131
+// expect: 131
 // Pointer arithmetic counts elements, whatever their size; the difference of
-// two pointers counts elements too. (A long is 8 bytes on LP64.)
+// two pointers counts elements too. (A long is 8 bytes.)
 int main() {
     char c[8];
     short s[8];
@@ -11,9 +10,9 @@ int main() {
     short *ps = s + 3;
     int *pi = i + 3;
     long *pl = l + 3;
-    // Byte distances: 3, 6, 12, 12.
+    // Byte distances: 3, 6, 12, 24.
     int bytes = ((char *)pc - (char *)c) + ((char *)ps - (char *)s) + ((char *)pi - (char *)i)
-                + ((char *)pl - (char *)l);                       // 33
+                + ((char *)pl - (char *)l);                       // 45
     int k;
     for (k = 0; k < 8; k++)
         i[k] = k * k;
@@ -27,5 +26,5 @@ int main() {
     int after = *q++;                                              // 0, then q = &i[1]
     int here = *q;                                                 // 1
     int order = (q < end) + (end > q) + (q <= q) + (end >= end) + (q > end);   // 4
-    return bytes + sum + n + before + after + here + order + (pc - c) * 4;     // 33+63+6+0+0+1+4+12
+    return bytes + sum + n + before + after + here + order + (pc - c) * 4;     // 45+63+6+0+0+1+4+12
 }

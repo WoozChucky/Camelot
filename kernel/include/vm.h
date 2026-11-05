@@ -10,17 +10,12 @@
  * with A and D set (PTE_KERNEL, below), as Linux makes them, and the user
  * leaves with A, and D if writable (PTE_USER_AD).
  *
- * - RV32, Sv32: two levels of 1024 4-byte PTEs. A virtual address splits
- *   10/10/12: VPN[1] (bits 31:22) indexes the root, VPN[0] (bits 21:12) a
- *   second-level table, the low 12 bits are the offset in the page. A PTE
- *   holds a 22-bit physical page number in bits 31:10. A leaf in the root
- *   maps a 4 MiB megapage.
- * - RV64, Sv48 or Sv39: four or three levels (PT_LEVELS, chosen at boot,
- *   below) of 512 8-byte PTEs. A virtual address splits 9/9/9/9/12 (Sv48) or
- *   9/9/9/12 (Sv39), and must be canonical: bits 63 down to the top one
- *   used (47 or 38) all equal. A PTE holds a 44-bit physical page number in
- *   bits 53:10. A leaf at level 1 maps a 2 MiB page, at level 2 a 1 GiB
- *   one, at level 3 (Sv48) 512 GiB.
+ * Sv48 or Sv39: four or three levels (PT_LEVELS, chosen at boot, below) of
+ * 512 8-byte PTEs. A virtual address splits 9/9/9/9/12 (Sv48) or 9/9/9/12
+ * (Sv39), and must be canonical: bits 63 down to the top one used (47 or 38)
+ * all equal. A PTE holds a 44-bit physical page number in bits 53:10. A leaf
+ * at level 1 maps a 2 MiB page, at level 2 a 1 GiB one, at level 3 (Sv48)
+ * 512 GiB.
  *
  * The kernel makes superpages only in its own address space (kvminit), for
  * the stretches of RAM and devices a range covers whole. Nothing ever
@@ -38,11 +33,7 @@
 #ifndef __ASSEMBLER__
 #include "types.h"
 
-#if __riscv_xlen == 64
 typedef u64 pte_t;
-#else
-typedef u32 pte_t;
-#endif
 typedef pte_t *pagetable_t; /* one page: PTES_PER_TABLE PTEs */
 #endif
 
@@ -68,7 +59,7 @@ typedef pte_t *pagetable_t; /* one page: PTES_PER_TABLE PTEs */
 #define PTE_KERNEL (PTE_G | PTE_A | PTE_D)
 
 /* What map_pages() adds to a user leaf with permissions `perm`, as Linux's
- * riscv user protections do on both widths: A always (its _PAGE_BASE has
+ * riscv user protections do: A always (its _PAGE_BASE has
  * _PAGE_ACCESSED), and D on a writable page, which Linux maps dirty when it
  * makes an anonymous page for a write (do_anonymous_page()'s pte_mkdirty()).
  * Every user page here is anonymous memory, made when it is mapped (the
@@ -83,7 +74,6 @@ typedef pte_t *pagetable_t; /* one page: PTES_PER_TABLE PTEs */
 #define PAGE_KERNEL_READ_EXEC (PTE_R | PTE_X | PTE_KERNEL)
 #define PAGE_KERNEL_EXEC (PTE_R | PTE_W | PTE_X | PTE_KERNEL)
 
-#if __riscv_xlen == 64
 #define PTES_PER_TABLE 512
 #define VPN_BITS 9
 /* Physical address <-> PTE: the PPN is bits 53:10. */
@@ -101,15 +91,6 @@ extern uintptr satp_mode;
 #define PT_LEVELS pt_levels
 /* satp value that turns paging on with root table `pt`, a kernel pointer. */
 #define MAKE_SATP(pt) (satp_mode | (pa(pt) >> PGSHIFT))
-#else
-#define PTES_PER_TABLE 1024
-#define VPN_BITS 10
-#define PA2PTE(pa) (((u32)(pa) >> 12) << 10)
-#define PTE2PA(pte) (((pte) >> 10) << 12)
-#define VPN(va, level) (((u32)(va) >> (12 + 10 * (level))) & 0x3ff)
-#define PT_LEVELS 2
-#define MAKE_SATP(pt) (SATP_SV32 | (pa(pt) >> PGSHIFT))
-#endif
 
 /* The bytes a leaf at `level` maps: 4 KiB at level 0, then PTES_PER_TABLE
  * times as much per level. */
@@ -117,10 +98,7 @@ extern uintptr satp_mode;
 
 /* ---- The kernel's address space ----
  *
- * RV32: the kernel's mappings are the identity, so a physical address is a
- * kernel pointer and pa()/va() change nothing.
- *
- * RV64: the upper half of the address space is the kernel's, laid out as
+ * The upper half of the address space is the kernel's, laid out as
  * Linux's riscv64 kernel lays it out (Documentation/arch/riscv/vm-layout.rst;
  * root entries 256-511, which every process's root table copies,
  * uvm_create()). From the top:
@@ -149,7 +127,6 @@ extern uintptr satp_mode;
  * The values that depend on the mode are variables, set at boot, as Linux's
  * kernel_map and PAGE_OFFSET are: the image's link address is the same in
  * both modes, so the kernel is linked once. */
-#if __riscv_xlen == 64
 #define KERNEL_LINK_ADDR _UL(0xffffffff80000000)
 #define PAGE_OFFSET_SV48 0xffffaf8000000000ull
 #define PAGE_OFFSET_SV39 0xffffffd600000000ull
@@ -214,19 +191,14 @@ phys_addr_t kernel_pa(uintptr v);
 /* The kernel's pointer to physical address `p` of RAM: its direct-map
  * address, as Linux's __va(). */
 #define va(p) ((void *)((uintptr)(p) + va_pa_offset))
-#else
-#define pa(v) ((phys_addr_t)(uintptr)(v))
-#define va(p) ((void *)(uintptr)(p))
-#endif
 
 /* The kernel's address of the `size` device registers at physical address
- * `p`, anywhere in the physical address space: on RV64 a new mapping of
- * them, whole pages, in free room of the vmalloc area (from IOREMAP_START),
- * aligned to their size up to a 1 GiB leaf so that they get the largest
- * leaves their physical address allows (the PLIC's 64 MiB in 2 MiB ones),
- * as Linux's ioremap() finds room with get_vm_area() and maps with huge
- * pages; on RV32, where kvminit() maps every device the kernel uses at its
- * physical address, `p` itself. Never unmapped (no driver goes away).
+ * `p`, anywhere in the physical address space: a new mapping of them, whole
+ * pages, in free room of the vmalloc area (from IOREMAP_START), aligned to
+ * their size up to a 1 GiB leaf so that they get the largest leaves their
+ * physical address allows (the PLIC's 64 MiB in 2 MiB ones), as Linux's
+ * ioremap() finds room with get_vm_area() and maps with huge pages. Never
+ * unmapped (no driver goes away).
  * After kvminit(), with no spinlock held but kmem's; panics if the area is
  * full. */
 #ifndef __ASSEMBLER__
@@ -235,18 +207,14 @@ uintptr ioremap(phys_addr_t p, usize size);
 
 /* ---- Kernel stacks ----
  *
- * RV64: KSTACK_SIZE, 16 KiB per kernel thread (Linux riscv64's THREAD_SIZE),
+ * KSTACK_SIZE, 16 KiB per kernel thread (Linux riscv64's THREAD_SIZE),
  * in the vmalloc area with an unmapped guard page below (Linux's VMAP_STACK).
  * Each stack is the lower half of a KSTACK_SLOT of twice its size, aligned
  * to that, so a stack pointer below the stack has bit KSTACK_SHIFT set:
  * kernel_vec tests that bit, and a trap whose frame would land in the guard
  * page is reported as a kernel stack overflow (kstack_overflow()) instead of
  * faulting again and again. The trap frame of a process's thread sits at the
- * top of its stack.
- *
- * RV32: one page from kalloc, without a guard (the kernel's mappings are the
- * identity there, and RV32 goes in #159). */
-#if __riscv_xlen == 64
+ * top of its stack. */
 #define KSTACK_SHIFT 14
 #define KSTACK_SIZE (_UL(1) << KSTACK_SHIFT)
 #define KSTACK_SLOT (2 * KSTACK_SIZE)
@@ -270,21 +238,18 @@ uintptr ioremap(phys_addr_t p, usize size);
 #ifndef __ASSEMBLER__
 extern u8 overflow_stacks[];
 #endif
-#else
-#define KSTACK_SIZE PGSIZE
-#endif
 
 /* A kernel stack: returns its lowest address (the stack is the KSTACK_SIZE
  * bytes from there; its top is that plus KSTACK_SIZE), or NULL if no memory
- * (or, on RV64, no slot) is left. Must be called with no spinlock held (it
- * maps pages, and first unmaps the freed ones, kstack_reclaim()). On RV64
- * one this hart freed, if it has one cached, else a new one in a free slot. */
+ * (or no slot) is left. Must be called with no spinlock held (it maps
+ * pages, and first unmaps the freed ones, kstack_reclaim()). One this hart
+ * freed, if it has one cached, else a new one in a free slot. */
 #ifndef __ASSEMBLER__
 void *kstack_alloc(void);
 
 /* Gives back a stack from kstack_alloc(), which nothing may run on any
  * more. May be called with spinlocks held (threads are freed holding
- * proc_lock). On RV64 the stack stays mapped: this hart keeps up to
+ * proc_lock). The stack stays mapped: this hart keeps up to
  * NR_CACHED_STACKS for its next kstack_alloc(), as Linux caches freed thread
  * stacks per CPU; any other is unmapped and its pages freed by
  * kstack_reclaim(), later, since unmapping needs a TLB shootdown, which
@@ -296,11 +261,11 @@ void kstack_free(void *stack);
  * shootdown. Called with no spinlock held: by kstack_alloc(), and by the
  * scheduler after each switch back to it, once it has let go of proc_lock,
  * so that the memory of threads that ended comes back without waiting for
- * a new one. Nothing on RV32. */
+ * a new one. */
 void kstack_reclaim(void);
 
-/* The kernel stacks there are on RV64, for the self-test: mapped (in use,
- * cached or deferred), cached by the harts, and deferred. All 0 on RV32. */
+/* The kernel stacks there are, for the self-test: mapped (in use, cached or
+ * deferred), cached by the harts, and deferred. */
 struct kstack_counts {
     u32 mapped;
     u32 cached;
@@ -310,8 +275,7 @@ void kstack_count(struct kstack_counts *n);
 
 /* The deepest use of any kernel stack so far, in bytes: every stack is
  * zeroed when it is first made, and the lowest non-zero word of each is how
- * far down it has been used (Linux's CONFIG_DEBUG_STACK_USAGE). RV64 only
- * keeps track; RV32 returns 0. */
+ * far down it has been used (Linux's CONFIG_DEBUG_STACK_USAGE). */
 usize kstack_max_used(void);
 
 /* ---- Page tables ---- */
@@ -350,7 +314,6 @@ void unmap_pages(pagetable_t pt, uintptr va, usize size, bool free_pages);
 void pagetable_free(pagetable_t pt);
 #endif
 
-#if __riscv_xlen == 64
 /* The early page table's lower tables (vm.c, setup_vm()), a page each, in
  * .bss after early_pg_dir, the root (entry.S). Sv48 needs at most twelve:
  * two under the root for each of the image's two addresses (2 MiB leaves),
@@ -360,10 +323,8 @@ void pagetable_free(pagetable_t pt);
  * and 4 KiB leaves for its end, and three for the fixmap's pages. Sv39
  * needs seven. */
 #define EARLY_TABLES 12
-#endif
 
 #ifndef __ASSEMBLER__
-#if __riscv_xlen == 64
 /* With paging off, on hart 0, before anything else in S-mode (entry.S):
  * probes the paging mode, reads RAM from sysinfo and builds the early page
  * table, which maps the kernel image at its physical address and at its
@@ -378,19 +339,16 @@ extern uintptr early_satp;
 /* satp for kernel_pagetable, set by kvminit(): what the other harts switch
  * to in entry.S before they use their stacks, which only it maps. */
 extern uintptr kernel_satp;
-#endif
 
 /* Builds kernel_pagetable, every leaf with PTE_KERNEL: the kernel image
- * (text R+X, rodata R, the rest R+W) and all of RAM (R+W). On RV32 at their
- * physical addresses, with every device in the sysinfo table that S-mode
- * uses (R+W: all but the CLINT and the test device, which only M-mode
- * touches); on RV64 in the kernel half, the image at its link address, RAM
- * in the direct map and the fixmap, with no identity mapping left: the
- * devices are mapped as their drivers ask (ioremap()). */
+ * (text R+X, rodata R, the rest R+W) and all of RAM (R+W), in the kernel
+ * half: the image at its link address, RAM in the direct map and the
+ * fixmap, with no identity mapping left. The devices are mapped as their
+ * drivers ask (ioremap()). */
 void kvminit(void);
 
-/* Turns paging on with kernel_pagetable (satp, then sfence.vma). On RV64 this
- * drops the early page table, and with it the identity mapping of the image. */
+/* Turns paging on with kernel_pagetable (satp, then sfence.vma). This drops
+ * the early page table, and with it the identity mapping of the image. */
 void kvminithart(void);
 
 /* For page fault reports: prints how `pt` maps `va`, as
@@ -403,35 +361,20 @@ pagetable_t vm_active_pagetable(void);
 
 /* User address spaces (spec section 10, "Kernel processes").
  *
- * RV32: user space is the low 192 MiB, root entries 0 to 47, up to the PLIC,
- * the lowest device the kernel uses (the test device and the CLINT below it
- * are M-mode's):
- *
- *   USER_TOP          0x0c000000
- *                     the stack, grown down on demand (proc_grow_stack),
- *                     at most USER_STACK_MAX
- *   USER_STACK_LIMIT  0x0b800000
- *                     an unmapped guard page
- *   USER_LOAD_TOP     0x0b7ff000
- *                     the heap (sbrk), up from the program
- *                     the program's segments, from USER_BASE
- *   USER_BASE         0x00001000
- *                     page 0, never mapped, so a null pointer faults
- *
- * RV64: user space is the lower half of the address space, root entries 0
- * to 255 in Sv48 (Linux's TASK_SIZE: 128 TiB), 0 to 255 in Sv39 too (256
- * GiB), with the same order of stack, guard page, heap and program, and the
- * same 8 MiB stack limit; the numbers for Sv48:
+ * User space is the lower half of the address space, root entries 0 to 255
+ * in Sv48 (Linux's TASK_SIZE: 128 TiB), 0 to 255 in Sv39 too (256 GiB),
+ * with an 8 MiB stack limit; the numbers for Sv48:
  *
  *   USER_TOP          0x0000_8000_0000_0000 (Sv39 0x40_0000_0000)
- *                     the stack, grown down on demand, at most USER_STACK_MAX
+ *                     the stack, grown down on demand (proc_grow_stack),
+ *                     at most USER_STACK_MAX
  *   USER_STACK_LIMIT  0x0000_7fff_ff80_0000
  *                     an unmapped guard page
  *   USER_LOAD_TOP     0x0000_7fff_ff7f_f000
  *                     the heap (sbrk), up from the program
  *                     the program's segments, from USER_BASE
  *   USER_BASE         0x0000_0000_0000_1000
- *                     page 0, never mapped
+ *                     page 0, never mapped, so a null pointer faults
  *
  * Every address above USER_TOP is the kernel's: in Sv48 and Sv39 the ones
  * between the two halves are not canonical, and an access faults.
@@ -440,7 +383,6 @@ pagetable_t vm_active_pagetable(void);
  * (none with U) are there in every process and a trap from U-mode needs no
  * satp switch. */
 #define USER_BASE PGSIZE
-#if __riscv_xlen == 64
 /* The top of user space for the paging mode: 2^47 (Sv48) or 2^38 (Sv39),
  * set by setup_vm(). */
 #ifndef __ASSEMBLER__
@@ -448,11 +390,6 @@ extern uintptr user_top;
 #endif
 #define USER_TOP user_top
 #define USER_ROOT_ENTRIES (PTES_PER_TABLE / 2)
-#else
-#define USER_TOP 0x0c000000u
-/* Root entries that belong to user space (VPN[1] of USER_TOP). */
-#define USER_ROOT_ENTRIES (USER_TOP >> 22)
-#endif
 /* How far the stack may grow: Linux's default limit. */
 #define USER_STACK_MAX (8u << 20)
 /* The stack's lowest address: it never grows below this. */

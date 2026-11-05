@@ -298,12 +298,6 @@ fn create(api: &Api, name: &str, program: &Path, start: bool) -> u64 {
     n(&r, "id")
 }
 
-/// The RV64 build of the example `name`, beside the RV32 one in the tests that run
-/// both side by side.
-fn rv64(name: &str) -> std::path::PathBuf {
-    example_of(name, avalon_proto::Xlen::Rv64)
-}
-
 /// The VM's console from the start, until it ends with `want`.
 fn console_until(api: &Api, id: u64, want: &str) -> String {
     let start = Instant::now();
@@ -326,62 +320,60 @@ fn console_until(api: &Api, id: u64, want: &str) -> String {
 /// then a close frame (1000) answered by the page's own.
 #[test]
 fn a_vms_screen_reaches_the_canvas() {
-    on_both_widths(|| {
-        let platform = Platform::start("screen", 64);
-        let api = platform.api();
-        let id = create(&api, "bars", &example("colorbars"), false);
-        let mut page = Page::open(&api, "bars");
-        let mut canvas = Canvas::new();
-        match page.recv() {
-            Some(Msg::Text(json)) => {
-                assert_eq!(
-                    json.encode(),
-                    format!(r#"{{"type":"screen","vm":{id},"width":640,"height":480}}"#)
-                );
-                canvas.resize(&json);
-            }
-            other => panic!("{other:?}"),
+    let platform = Platform::start("screen", 64);
+    let api = platform.api();
+    let id = create(&api, "bars", &example("colorbars"), false);
+    let mut page = Page::open(&api, "bars");
+    let mut canvas = Canvas::new();
+    match page.recv() {
+        Some(Msg::Text(json)) => {
+            assert_eq!(
+                json.encode(),
+                format!(r#"{{"type":"screen","vm":{id},"width":640,"height":480}}"#)
+            );
+            canvas.resize(&json);
         }
-        let state = page.text_of("state", &mut canvas);
-        assert_eq!(
-            state.encode(),
-            r#"{"type":"state","state":"created","state_text":"created","exit_code":null}"#
-        );
-        // The full frame that follows the attach: black.
-        match page.recv() {
-            Some(Msg::Rect(0, 0, 640, 480, px)) => assert!(px.chunks(4).all(|p| p == [0, 0, 0, 0xff])),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(n(&api.expect(200, api.get("overview")), "screens"), 1);
+        other => panic!("{other:?}"),
+    }
+    let state = page.text_of("state", &mut canvas);
+    assert_eq!(
+        state.encode(),
+        r#"{"type":"state","state":"created","state_text":"created","exit_code":null}"#
+    );
+    // The full frame that follows the attach: black.
+    match page.recv() {
+        Some(Msg::Rect(0, 0, 640, 480, px)) => assert!(px.chunks(4).all(|p| p == [0, 0, 0, 0xff])),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(n(&api.expect(200, api.get("overview")), "screens"), 1);
 
-        api.expect(200, api.action(&format!("vms/{id}/start")));
-        assert_eq!(s(&page.text_of("state", &mut canvas), "state"), "running");
-        let exited = page.text_of("state", &mut canvas);
-        assert_eq!((s(&exited, "state"), n(&exited, "exit_code")), ("exited", 0));
-        let end = page.text_of("end", &mut canvas);
-        assert_eq!(s(&end, "reason"), "the VM has exited (code 0)");
-        assert_eq!(
-            page.recv(),
-            Some(Msg::Close(Some(1000), "the VM has exited (code 0)".into()))
-        );
-        page.send_frame(OP_CLOSE, &close_payload(1000, ""));
-        assert_eq!(page.recv(), None, "Pendragon closes the connection");
-        assert!(
-            canvas.rgba == grail_screen(&example("colorbars")),
-            "the canvas shows what Grail does"
-        );
-        wait_for("the screen to close", || {
-            (n(&api.expect(200, api.get("overview")), "screens") == 0).then_some(())
-        });
-
-        // Opened after the end: the last frame, then the end at once.
-        let mut late = Page::open(&api, &id.to_string());
-        let mut canvas = Canvas::new();
-        let state = page_end(&mut late, &mut canvas);
-        assert_eq!(state, "the VM has exited (code 0)");
-        assert!(canvas.rgba == grail_screen(&example("colorbars")));
-        platform.stop();
+    api.expect(200, api.action(&format!("vms/{id}/start")));
+    assert_eq!(s(&page.text_of("state", &mut canvas), "state"), "running");
+    let exited = page.text_of("state", &mut canvas);
+    assert_eq!((s(&exited, "state"), n(&exited, "exit_code")), ("exited", 0));
+    let end = page.text_of("end", &mut canvas);
+    assert_eq!(s(&end, "reason"), "the VM has exited (code 0)");
+    assert_eq!(
+        page.recv(),
+        Some(Msg::Close(Some(1000), "the VM has exited (code 0)".into()))
+    );
+    page.send_frame(OP_CLOSE, &close_payload(1000, ""));
+    assert_eq!(page.recv(), None, "Pendragon closes the connection");
+    assert!(
+        canvas.rgba == grail_screen(&example("colorbars")),
+        "the canvas shows what Grail does"
+    );
+    wait_for("the screen to close", || {
+        (n(&api.expect(200, api.get("overview")), "screens") == 0).then_some(())
     });
+
+    // Opened after the end: the last frame, then the end at once.
+    let mut late = Page::open(&api, &id.to_string());
+    let mut canvas = Canvas::new();
+    let state = page_end(&mut late, &mut canvas);
+    assert_eq!(state, "the VM has exited (code 0)");
+    assert!(canvas.rgba == grail_screen(&example("colorbars")));
+    platform.stop();
 }
 
 /// Takes the page's messages to its end; returns the end's reason.
@@ -396,75 +388,69 @@ fn page_end(page: &mut Page, canvas: &mut Canvas) -> String {
 /// Grail shows.
 #[test]
 fn a_mode_change_resizes_the_canvas() {
-    on_both_widths(|| {
-        let platform = Platform::start("flip", 64);
-        let api = platform.api();
-        let id = create(&api, "flip", &example("flip"), false);
-        let mut page = Page::open(&api, &id.to_string());
-        let mut canvas = Canvas::new();
-        page.text_of("state", &mut canvas);
-        api.expect(200, api.action(&format!("vms/{id}/start")));
-        assert_eq!(page_end(&mut page, &mut canvas), "the VM has exited (code 0)");
-        assert_eq!((canvas.width, canvas.height, canvas.resizes), (800, 600, 2));
-        assert!(canvas.rgba == grail_screen(&example("flip")));
-        platform.stop();
-    });
+    let platform = Platform::start("flip", 64);
+    let api = platform.api();
+    let id = create(&api, "flip", &example("flip"), false);
+    let mut page = Page::open(&api, &id.to_string());
+    let mut canvas = Canvas::new();
+    page.text_of("state", &mut canvas);
+    api.expect(200, api.action(&format!("vms/{id}/start")));
+    assert_eq!(page_end(&mut page, &mut canvas), "the VM has exited (code 0)");
+    assert_eq!((canvas.width, canvas.height, canvas.resizes), (800, 600, 2));
+    assert!(canvas.rgba == grail_screen(&example("flip")));
+    platform.stop();
 }
 
 /// Keys reach a raw-mode guest as physical keys: kbd-echo switches to raw mode on
 /// F12 and prints each event's HID usage. Shift alone shows, a key's release carries
 /// its press's usage, the browser's auto-repeat is dropped in raw mode, and losing
-/// the focus releases every key held. RV32 and RV64 guests alike.
+/// the focus releases every key held.
 #[test]
 fn keys_reach_a_raw_mode_guest_as_physical_keys() {
     let platform = Platform::start("keys", 64);
     let api = platform.api();
-    for (name, program) in [
-        ("kbd", example_of("kbd-echo", avalon_proto::Xlen::Rv32)),
-        ("kbd64", rv64("kbd-echo")),
-    ] {
-        let id = create(&api, name, &program, true);
-        let mut page = Page::open(&api, name);
-        // ASCII mode first: 'q' types itself; F12 switches.
-        page.tap("KeyQ", "q");
-        page.key(true, "F12", "F12");
-        assert_eq!(console_until(&api, id, "q\n"), "q\n");
-        page.key(false, "F12", "F12");
-        page.key(true, "ShiftLeft", "Shift");
-        page.key(true, "KeyQ", "Q");
-        page.key(true, "KeyQ", "Q"); // auto-repeat
-        page.key(false, "KeyQ", "Q");
-        page.key(false, "ShiftLeft", "Shift");
-        assert_eq!(console_until(&api, id, "-e1 "), "q\n-45 +e1 +14 -14 -e1 ");
-        // The page loses the focus with Left Alt and 'q' down.
-        page.key(true, "AltLeft", "Alt");
-        page.key(true, "KeyQ", "q");
-        page.send(r#"{"type":"release"}"#);
-        // The key-ups the browser sends later belong to another window: nothing.
-        page.key(false, "KeyQ", "q");
-        page.key(false, "AltLeft", "Alt");
-        page.tap("Backquote", "`");
-        assert_eq!(
-            console_until(&api, id, "-35 "),
-            "q\n-45 +e1 +14 -14 -e1 +e2 +14 -e2 -14 +35 -35 "
-        );
-        // The page closes with Right Ctrl held: Avalon lets go of it.
-        page.key(true, "ControlRight", "Control");
-        assert!(console_until(&api, id, "+e4 ").ends_with("+35 -35 +e4 "));
-        page.send_frame(OP_CLOSE, &close_payload(1001, "the page left"));
-        let msgs = page.until("the close", |m| matches!(m, Msg::Close(..)));
-        assert_eq!(
-            msgs.last(),
-            Some(&Msg::Close(Some(1001), String::new())),
-            "its code back"
-        );
-        assert!(console_until(&api, id, "-e4 ").ends_with("+e4 -e4 "));
+    let (name, program) = ("kbd", example("kbd-echo"));
+    let id = create(&api, name, &program, true);
+    let mut page = Page::open(&api, name);
+    // ASCII mode first: 'q' types itself; F12 switches.
+    page.tap("KeyQ", "q");
+    page.key(true, "F12", "F12");
+    assert_eq!(console_until(&api, id, "q\n"), "q\n");
+    page.key(false, "F12", "F12");
+    page.key(true, "ShiftLeft", "Shift");
+    page.key(true, "KeyQ", "Q");
+    page.key(true, "KeyQ", "Q"); // auto-repeat
+    page.key(false, "KeyQ", "Q");
+    page.key(false, "ShiftLeft", "Shift");
+    assert_eq!(console_until(&api, id, "-e1 "), "q\n-45 +e1 +14 -14 -e1 ");
+    // The page loses the focus with Left Alt and 'q' down.
+    page.key(true, "AltLeft", "Alt");
+    page.key(true, "KeyQ", "q");
+    page.send(r#"{"type":"release"}"#);
+    // The key-ups the browser sends later belong to another window: nothing.
+    page.key(false, "KeyQ", "q");
+    page.key(false, "AltLeft", "Alt");
+    page.tap("Backquote", "`");
+    assert_eq!(
+        console_until(&api, id, "-35 "),
+        "q\n-45 +e1 +14 -14 -e1 +e2 +14 -e2 -14 +35 -35 "
+    );
+    // The page closes with Right Ctrl held: Avalon lets go of it.
+    page.key(true, "ControlRight", "Control");
+    assert!(console_until(&api, id, "+e4 ").ends_with("+35 -35 +e4 "));
+    page.send_frame(OP_CLOSE, &close_payload(1001, "the page left"));
+    let msgs = page.until("the close", |m| matches!(m, Msg::Close(..)));
+    assert_eq!(
+        msgs.last(),
+        Some(&Msg::Close(Some(1001), String::new())),
+        "its code back"
+    );
+    assert!(console_until(&api, id, "-e4 ").ends_with("+e4 -e4 "));
 
-        let mut again = Page::open(&api, name);
-        again.key(true, "Escape", "Escape");
-        let mut canvas = Canvas::new();
-        assert_eq!(page_end(&mut again, &mut canvas), "the VM has exited (code 0)");
-    }
+    let mut again = Page::open(&api, name);
+    again.key(true, "Escape", "Escape");
+    let mut canvas = Canvas::new();
+    assert_eq!(page_end(&mut again, &mut canvas), "the VM has exited (code 0)");
     platform.stop();
 }
 
@@ -475,30 +461,26 @@ fn keys_reach_a_raw_mode_guest_as_physical_keys() {
 fn the_pointer_reaches_the_guest() {
     let platform = Platform::start("pointer", 64);
     let api = platform.api();
-    for (name, program) in [
-        ("ptr", example_of("pointer", avalon_proto::Xlen::Rv32)),
-        ("ptr64", rv64("pointer")),
-    ] {
-        create(&api, name, &program, true);
-        let mut page = Page::open(&api, name);
-        let mut canvas = Canvas::new();
-        canvas.wait_for_pixel(&mut page, 320, 240, BACKGROUND);
-        for x in 0..=100 {
-            page.pointer(x, x / 2, 0);
-        }
-        page.pointer(100, 50, 1);
-        canvas.wait_for_pixel(&mut page, 100, 50, 0xff0000);
-        // A drag off the bottom right: the cursor at the corner's pixel, gone from
-        // where it was.
-        page.pointer(5000, 5000, 1);
-        canvas.wait_for_pixel(&mut page, 639, 479, 0xff0000);
-        assert_eq!(canvas.pixel(100, 50), BACKGROUND);
-        // Released: white.
-        page.pointer(10, 10, 0);
-        canvas.wait_for_pixel(&mut page, 10, 10, 0xffffff);
-        page.tap("Escape", "Escape");
-        assert_eq!(page_end(&mut page, &mut canvas), "the VM has exited (code 0)");
+    let (name, program) = ("ptr", example("pointer"));
+    create(&api, name, &program, true);
+    let mut page = Page::open(&api, name);
+    let mut canvas = Canvas::new();
+    canvas.wait_for_pixel(&mut page, 320, 240, BACKGROUND);
+    for x in 0..=100 {
+        page.pointer(x, x / 2, 0);
     }
+    page.pointer(100, 50, 1);
+    canvas.wait_for_pixel(&mut page, 100, 50, 0xff0000);
+    // A drag off the bottom right: the cursor at the corner's pixel, gone from
+    // where it was.
+    page.pointer(5000, 5000, 1);
+    canvas.wait_for_pixel(&mut page, 639, 479, 0xff0000);
+    assert_eq!(canvas.pixel(100, 50), BACKGROUND);
+    // Released: white.
+    page.pointer(10, 10, 0);
+    canvas.wait_for_pixel(&mut page, 10, 10, 0xffffff);
+    page.tap("Escape", "Escape");
+    assert_eq!(page_end(&mut page, &mut canvas), "the VM has exited (code 0)");
     platform.stop();
 }
 
@@ -598,8 +580,8 @@ impl PageCursor {
     }
 }
 
-/// The guest's cursor reaches the page apart from the frames (`examples/cursor`, RV32
-/// and RV64): its image once, in a `cursor_shape` before the first `cursor_position`,
+/// The guest's cursor reaches the page apart from the frames (`examples/cursor`): its
+/// image once, in a `cursor_shape` before the first `cursor_position`,
 /// and no frame once it shows. Its places are Grail's cursor registers at the vertical
 /// blanks that moved it (Avalon looks at the screen at its own pace, so the page may
 /// miss a place, never get one out of turn) and it ends at the last; the canvas with
@@ -609,100 +591,96 @@ impl PageCursor {
 fn the_cursor_reaches_the_page_apart_from_the_frames() {
     let platform = Platform::start("cursor", 64);
     let api = platform.api();
-    for (name, program) in [
-        ("cursor", example_of("cursor", avalon_proto::Xlen::Rv32)),
-        ("cursor64", rv64("cursor")),
-    ] {
-        let (places, picture) = grail_cursor(&program);
-        let id = create(&api, name, &program, false);
-        let mut page = Page::open(&api, name);
-        let mut canvas = Canvas::new();
-        page.text_of("state", &mut canvas);
-        api.expect(200, api.action(&format!("vms/{id}/start")));
-        let mut cursor = PageCursor::default();
-        let mut shapes = 0;
-        let mut shown = Vec::new();
-        let mut frames_after = 0;
-        loop {
-            match page.recv() {
-                Some(Msg::Rect(x, y, w, h, px)) => {
-                    canvas.draw(x, y, w, h, &px);
-                    if shapes > 0 {
-                        frames_after += 1;
-                    }
+    let (name, program) = ("cursor", example("cursor"));
+    let (places, picture) = grail_cursor(&program);
+    let id = create(&api, name, &program, false);
+    let mut page = Page::open(&api, name);
+    let mut canvas = Canvas::new();
+    page.text_of("state", &mut canvas);
+    api.expect(200, api.action(&format!("vms/{id}/start")));
+    let mut cursor = PageCursor::default();
+    let mut shapes = 0;
+    let mut shown = Vec::new();
+    let mut frames_after = 0;
+    loop {
+        match page.recv() {
+            Some(Msg::Rect(x, y, w, h, px)) => {
+                canvas.draw(x, y, w, h, &px);
+                if shapes > 0 {
+                    frames_after += 1;
                 }
-                Some(Msg::Text(json)) if cursor.apply(&json) => {
-                    if s(&json, "type") == "cursor_shape" {
-                        shapes += 1;
-                    } else {
-                        assert_eq!(shapes, 1, "the image before the place: {json}");
-                        assert!(cursor.visible, "never hidden: {json}");
-                        shown.push((cursor.x as i32, cursor.y as i32));
-                    }
-                }
-                Some(Msg::Text(json)) if s(&json, "type") == "screen" => canvas.resize(&json),
-                Some(Msg::Text(json)) if s(&json, "type") == "end" => break,
-                Some(Msg::Text(_)) => {}
-                other => panic!("{other:?}"),
             }
-        }
-        assert_eq!(shapes, 1, "{name}: the image once");
-        assert_eq!(frames_after, 0, "{name}: no frame once the cursor shows");
-        let mut path = places.iter();
-        assert!(
-            shown.iter().all(|place| path.any(|p| p == place)),
-            "{name}: {shown:?} in the order of Grail's {places:?}"
-        );
-        assert_eq!(shown.last(), places.last(), "{name}: the last place");
-        let (w, h, px) = cursor.image.clone().unwrap();
-        assert_eq!((w, h), (64, 64));
-        let pixel = |x: usize, y: usize| &px[(y * 64 + x) * 4..][..4];
-        assert_eq!(pixel(0, 0), [0, 0, 0, 0xff], "the tip, opaque black");
-        assert_eq!(pixel(1, 2), [0xff; 4], "inside, opaque white");
-        assert_eq!(
-            pixel(0, 16),
-            [0, 0, 0xff, 0x80],
-            "the tail, straight blue half covered"
-        );
-        assert_eq!(pixel(40, 40), [0; 4], "clear");
-        assert!(
-            cursor.over(&canvas) == picture,
-            "{name}: the page shows what Grail does"
-        );
-
-        // Opened after the end: the full frame, the cursor's image and place, the end.
-        let mut late = Page::open(&api, name);
-        let mut canvas = Canvas::new();
-        let mut cursor = PageCursor::default();
-        let mut order = Vec::new();
-        loop {
-            match late.recv() {
-                Some(Msg::Rect(x, y, w, h, px)) => {
-                    canvas.draw(x, y, w, h, &px);
-                    order.push("frame".to_string());
+            Some(Msg::Text(json)) if cursor.apply(&json) => {
+                if s(&json, "type") == "cursor_shape" {
+                    shapes += 1;
+                } else {
+                    assert_eq!(shapes, 1, "the image before the place: {json}");
+                    assert!(cursor.visible, "never hidden: {json}");
+                    shown.push((cursor.x as i32, cursor.y as i32));
                 }
-                Some(Msg::Text(json)) => {
-                    let kind = s(&json, "type").to_string();
-                    match kind.as_str() {
-                        "screen" => canvas.resize(&json),
-                        "end" => break,
-                        _ => {
-                            cursor.apply(&json);
-                        }
-                    }
-                    order.push(kind);
-                }
-                other => panic!("{other:?}"),
             }
+            Some(Msg::Text(json)) if s(&json, "type") == "screen" => canvas.resize(&json),
+            Some(Msg::Text(json)) if s(&json, "type") == "end" => break,
+            Some(Msg::Text(_)) => {}
+            other => panic!("{other:?}"),
         }
-        assert_eq!(
-            order,
-            ["screen", "state", "frame", "cursor_shape", "cursor_position"],
-            "{name}"
-        );
-        assert_eq!((cursor.x as i32, cursor.y as i32), *places.last().unwrap());
-        assert!(cursor.over(&canvas) == picture, "{name}: the late page too");
     }
+    assert_eq!(shapes, 1, "{name}: the image once");
+    assert_eq!(frames_after, 0, "{name}: no frame once the cursor shows");
+    let mut path = places.iter();
+    assert!(
+        shown.iter().all(|place| path.any(|p| p == place)),
+        "{name}: {shown:?} in the order of Grail's {places:?}"
+    );
+    assert_eq!(shown.last(), places.last(), "{name}: the last place");
+    let (w, h, px) = cursor.image.clone().unwrap();
+    assert_eq!((w, h), (64, 64));
+    let pixel = |x: usize, y: usize| &px[(y * 64 + x) * 4..][..4];
+    assert_eq!(pixel(0, 0), [0, 0, 0, 0xff], "the tip, opaque black");
+    assert_eq!(pixel(1, 2), [0xff; 4], "inside, opaque white");
+    assert_eq!(
+        pixel(0, 16),
+        [0, 0, 0xff, 0x80],
+        "the tail, straight blue half covered"
+    );
+    assert_eq!(pixel(40, 40), [0; 4], "clear");
+    assert!(
+        cursor.over(&canvas) == picture,
+        "{name}: the page shows what Grail does"
+    );
+
+    // Opened after the end: the full frame, the cursor's image and place, the end.
+    let mut late = Page::open(&api, name);
+    let mut canvas = Canvas::new();
+    let mut cursor = PageCursor::default();
+    let mut order = Vec::new();
+    loop {
+        match late.recv() {
+            Some(Msg::Rect(x, y, w, h, px)) => {
+                canvas.draw(x, y, w, h, &px);
+                order.push("frame".to_string());
+            }
+            Some(Msg::Text(json)) => {
+                let kind = s(&json, "type").to_string();
+                match kind.as_str() {
+                    "screen" => canvas.resize(&json),
+                    "end" => break,
+                    _ => {
+                        cursor.apply(&json);
+                    }
+                }
+                order.push(kind);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(
+        order,
+        ["screen", "state", "frame", "cursor_shape", "cursor_position"],
+        "{name}"
+    );
+    assert_eq!((cursor.x as i32, cursor.y as i32), *places.last().unwrap());
+    assert!(cursor.over(&canvas) == picture, "{name}: the late page too");
     platform.stop();
 }
 
@@ -711,77 +689,75 @@ fn the_cursor_reaches_the_page_apart_from_the_frames() {
 /// any page may open a WebSocket to any server); then the handshake's own rules.
 #[test]
 fn refused_handshakes() {
-    on_both_widths(|| {
-        let platform = Platform::start("refusals", 64);
-        let api = platform.api();
-        create(&api, "spin", &example("pointer"), false);
-        let addr = api.addr;
-        let good = handshake(addr, "spin", &protocols(&api.token), "");
-        let other = "f".repeat(64);
-        for (request, status, says) in [
-            (
-                good.replace(&format!("Host: {addr}"), "Host: evil.example"),
-                403,
-                "is not this server",
+    let platform = Platform::start("refusals", 64);
+    let api = platform.api();
+    create(&api, "spin", &example("pointer"), false);
+    let addr = api.addr;
+    let good = handshake(addr, "spin", &protocols(&api.token), "");
+    let other = "f".repeat(64);
+    for (request, status, says) in [
+        (
+            good.replace(&format!("Host: {addr}"), "Host: evil.example"),
+            403,
+            "is not this server",
+        ),
+        (handshake(addr, "spin", "pendragon.screen", ""), 403, "no token"),
+        (
+            handshake(addr, "spin", &protocols(&other), ""),
+            403,
+            "wrong token",
+        ),
+        // The token's subprotocol counts on the screen's route only: an upgrade to
+        // another one is a request without the token.
+        (good.replace("/screen HTTP", " HTTP"), 403, "no token"),
+        (
+            good.replace(&format!("Origin: http://{addr}"), "Origin: http://evil.example"),
+            403,
+            "not accepted",
+        ),
+        // A plain GET (not a WebSocket, so the token goes in its header).
+        (
+            good.replace(
+                "Upgrade: websocket\r\n",
+                &format!("X-Pendragon-Token: {}\r\n", api.token),
             ),
-            (handshake(addr, "spin", "pendragon.screen", ""), 403, "no token"),
-            (
-                handshake(addr, "spin", &protocols(&other), ""),
-                403,
-                "wrong token",
-            ),
-            // The token's subprotocol counts on the screen's route only: an upgrade to
-            // another one is a request without the token.
-            (good.replace("/screen HTTP", " HTTP"), 403, "no token"),
-            (
-                good.replace(&format!("Origin: http://{addr}"), "Origin: http://evil.example"),
-                403,
-                "not accepted",
-            ),
-            // A plain GET (not a WebSocket, so the token goes in its header).
-            (
-                good.replace(
-                    "Upgrade: websocket\r\n",
-                    &format!("X-Pendragon-Token: {}\r\n", api.token),
-                ),
-                426,
-                "Upgrade: websocket",
-            ),
-            (good.replace("Version: 13", "Version: 8"), 426, "version 13"),
-            (good.replace("GET ", "POST "), 405, "takes GET"),
-            (
-                handshake(addr, "spin", &format!("chat, pendragon.token.{}", api.token), ""),
-                400,
-                "pendragon.screen",
-            ),
-            (
-                handshake(addr, "nosuch", &protocols(&api.token), ""),
-                404,
-                "no such VM",
-            ),
-        ] {
-            let (got, head, mut page) = Page::try_open(addr, &request);
-            assert_eq!(got, status, "{request}\n{head}");
-            let mut body = std::mem::take(&mut page.buf);
-            let _ = page.stream.read_to_end(&mut body);
-            let body = String::from_utf8_lossy(&body);
-            assert!(body.contains(says), "{status}: {body}");
-            if status == 426 && says.contains("version") {
-                assert!(head.contains("Sec-WebSocket-Version: 13\r\n"), "{head}");
-            }
-            if status == 426 && says.contains("Upgrade") {
-                assert!(head.contains("Upgrade: websocket\r\n"), "{head}");
-            }
+            426,
+            "Upgrade: websocket",
+        ),
+        (good.replace("Version: 13", "Version: 8"), 426, "version 13"),
+        (good.replace("GET ", "POST "), 405, "takes GET"),
+        (
+            handshake(addr, "spin", &format!("chat, pendragon.token.{}", api.token), ""),
+            400,
+            "pendragon.screen",
+        ),
+        (
+            handshake(addr, "nosuch", &protocols(&api.token), ""),
+            404,
+            "no such VM",
+        ),
+    ] {
+        let (got, head, mut page) = Page::try_open(addr, &request);
+        assert_eq!(got, status, "{request}\n{head}");
+        let mut body = std::mem::take(&mut page.buf);
+        let _ = page.stream.read_to_end(&mut body);
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains(says), "{status}: {body}");
+        if status == 426 && says.contains("version") {
+            assert!(head.contains("Sec-WebSocket-Version: 13\r\n"), "{head}");
         }
-        // A client that can set headers may send the token in X-Pendragon-Token, and
-        // offer no subprotocol; it then gets none.
-        let request = handshake(addr, "spin", "", &format!("X-Pendragon-Token: {}\r\n", api.token))
-            .replace("Sec-WebSocket-Protocol: \r\n", "");
-        let (got, head, _) = Page::try_open(addr, &request);
-        assert_eq!(got, 101, "{head}");
-        assert!(!head.contains("Sec-WebSocket-Protocol"), "{head}");
-        platform.stop();
-    });
+        if status == 426 && says.contains("Upgrade") {
+            assert!(head.contains("Upgrade: websocket\r\n"), "{head}");
+        }
+    }
+    // A client that can set headers may send the token in X-Pendragon-Token, and
+    // offer no subprotocol; it then gets none.
+    let request = handshake(addr, "spin", "", &format!("X-Pendragon-Token: {}\r\n", api.token))
+        .replace("Sec-WebSocket-Protocol: \r\n", "");
+    let (got, head, _) = Page::try_open(addr, &request);
+    assert_eq!(got, 101, "{head}");
+    assert!(!head.contains("Sec-WebSocket-Protocol"), "{head}");
+    platform.stop();
 }
 
 /// A page that breaks the rules is closed with the code that says how: an unmasked
@@ -789,27 +765,25 @@ fn refused_handshakes() {
 /// too large (1009).
 #[test]
 fn a_page_that_breaks_the_rules_is_closed() {
-    on_both_widths(|| {
-        let platform = Platform::start("rules", 64);
-        let api = platform.api();
-        create(&api, "ptr", &example("pointer"), false);
-        let unmasked = [0x81, 0x02, b'{', b'}'].to_vec();
-        let bad_json = client_frame(true, OP_TEXT, MASK, br#"{"type":"jump"}"#);
-        let binary = client_frame(true, OP_BINARY, MASK, b"x");
-        let large = client_frame(true, OP_TEXT, MASK, &[b' '; 5000]);
-        for (frame, code) in [(unmasked, 1002), (bad_json, 1008), (binary, 1003), (large, 1009)] {
-            let mut page = Page::open(&api, "ptr");
-            page.stream.write_all(&frame).unwrap();
-            let msgs = page.until("the close", |m| matches!(m, Msg::Close(..)));
-            match msgs.last() {
-                Some(Msg::Close(Some(got), why)) => assert_eq!(*got, code, "{why}"),
-                other => panic!("{other:?}"),
-            }
-            page.send_frame(OP_CLOSE, &close_payload(code, ""));
-            assert_eq!(page.recv(), None);
+    let platform = Platform::start("rules", 64);
+    let api = platform.api();
+    create(&api, "ptr", &example("pointer"), false);
+    let unmasked = [0x81, 0x02, b'{', b'}'].to_vec();
+    let bad_json = client_frame(true, OP_TEXT, MASK, br#"{"type":"jump"}"#);
+    let binary = client_frame(true, OP_BINARY, MASK, b"x");
+    let large = client_frame(true, OP_TEXT, MASK, &[b' '; 5000]);
+    for (frame, code) in [(unmasked, 1002), (bad_json, 1008), (binary, 1003), (large, 1009)] {
+        let mut page = Page::open(&api, "ptr");
+        page.stream.write_all(&frame).unwrap();
+        let msgs = page.until("the close", |m| matches!(m, Msg::Close(..)));
+        match msgs.last() {
+            Some(Msg::Close(Some(got), why)) => assert_eq!(*got, code, "{why}"),
+            other => panic!("{other:?}"),
         }
-        platform.stop();
-    });
+        page.send_frame(OP_CLOSE, &close_payload(code, ""));
+        assert_eq!(page.recv(), None);
+    }
+    platform.stop();
 }
 
 /// A page that falls silent is pinged, and closed (1001) when it does not answer; one
@@ -817,104 +791,102 @@ fn a_page_that_breaks_the_rules_is_closed() {
 /// `max_screens` are open (409).
 #[test]
 fn pings_limits_and_shutdown() {
-    on_both_widths(|| {
-        let mut platform = Platform::start("pings", 64);
-        let config = pendragon::Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            avalon: platform.avalon.addr().to_string(),
-            lake: platform.lake_addr(),
-            screens: pendragon::ScreenLimits {
-                max_screens: 2,
-                ping: Duration::from_millis(300),
-            },
-            log: false,
-            ..pendragon::Config::default()
-        };
-        let old = std::mem::replace(&mut platform.pendragon, pendragon_with(config));
-        old.stop().unwrap();
-        let api = platform.api();
-        create(&api, "ptr", &example("pointer"), false);
+    let mut platform = Platform::start("pings", 64);
+    let config = pendragon::Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        avalon: platform.avalon.addr().to_string(),
+        lake: platform.lake_addr(),
+        screens: pendragon::ScreenLimits {
+            max_screens: 2,
+            ping: Duration::from_millis(300),
+        },
+        log: false,
+        ..pendragon::Config::default()
+    };
+    let old = std::mem::replace(&mut platform.pendragon, pendragon_with(config));
+    old.stop().unwrap();
+    let api = platform.api();
+    create(&api, "ptr", &example("pointer"), false);
 
-        let mut silent = Page::open(&api, "ptr");
-        // The answering page answers from the moment it opens, as a browser does, on a
-        // thread of its own: its pings come while the test waits for the silent page's
-        // close. Every message it reads comes to the test, the pings among them.
-        let answering = Page::open(&api, "ptr");
-        let (to_test, answered) = std::sync::mpsc::channel();
-        let answerer = std::thread::spawn(move || {
-            let mut page = answering;
-            while let Some(msg) = page.recv() {
-                match &msg {
-                    Msg::Ping(payload) => page.send_frame(OP_PONG, payload),
-                    Msg::Close(..) => {
-                        page.send_frame(OP_CLOSE, &close_payload(1000, ""));
-                        let _ = to_test.send(msg);
-                        return;
-                    }
-                    _ => {}
+    let mut silent = Page::open(&api, "ptr");
+    // The answering page answers from the moment it opens, as a browser does, on a
+    // thread of its own: its pings come while the test waits for the silent page's
+    // close. Every message it reads comes to the test, the pings among them.
+    let answering = Page::open(&api, "ptr");
+    let (to_test, answered) = std::sync::mpsc::channel();
+    let answerer = std::thread::spawn(move || {
+        let mut page = answering;
+        while let Some(msg) = page.recv() {
+            match &msg {
+                Msg::Ping(payload) => page.send_frame(OP_PONG, payload),
+                Msg::Close(..) => {
+                    page.send_frame(OP_CLOSE, &close_payload(1000, ""));
+                    let _ = to_test.send(msg);
+                    return;
                 }
-                let _ = to_test.send(msg);
-            }
-        });
-        let next = || {
-            answered
-                .recv_timeout(SLOW)
-                .expect("a message to the answering page")
-        };
-        let (status, _, mut third) =
-            Page::try_open(api.addr, &handshake(api.addr, "ptr", &protocols(&api.token), ""));
-        assert_eq!(status, 409);
-        let mut body = std::mem::take(&mut third.buf);
-        let _ = third.stream.read_to_end(&mut body);
-        assert!(
-            String::from_utf8_lossy(&body).contains(r#""code":"over budget""#),
-            "{}",
-            String::from_utf8_lossy(&body)
-        );
-
-        let msgs = silent.until("the close", |m| matches!(m, Msg::Close(..)));
-        assert!(msgs.contains(&Msg::Ping(vec![])), "{msgs:?}");
-        assert_eq!(
-            msgs.last(),
-            Some(&Msg::Close(Some(1001), "no answer to a ping".into()))
-        );
-
-        // The answering page outlives a few pings (it has had one at least by the time
-        // the silent page was closed for not answering its own).
-        let mut pings = 0;
-        while pings < 3 {
-            match next() {
-                Msg::Ping(_) => pings += 1,
-                other @ Msg::Close(..) => panic!("the answering page was closed: {other:?}"),
                 _ => {}
             }
+            let _ = to_test.send(msg);
         }
-        // A slot is free again: the silent page's.
-        wait_for("the silent page's slot", || {
-            (n(&api.expect(200, api.get("overview")), "screens") == 1).then_some(())
-        });
-
-        let pendragon = std::mem::replace(
-            &mut platform.pendragon,
-            pendragon_for(&dead_addr(), &dead_addr(), 64 * MIB),
-        );
-        pendragon.stop().unwrap();
-        let mut msgs = Vec::new();
-        while !matches!(msgs.last(), Some(Msg::Close(..))) {
-            msgs.push(next());
-        }
-        answerer.join().unwrap();
-        let end = msgs.iter().find_map(|m| match m {
-            Msg::Text(json) if s(json, "type") == "end" => Some(s(json, "reason").to_string()),
-            _ => None,
-        });
-        assert_eq!(end.as_deref(), Some("Pendragon is shutting down"));
-        assert_eq!(
-            msgs.last(),
-            Some(&Msg::Close(Some(1001), "Pendragon is shutting down".into()))
-        );
-        platform.stop();
     });
+    let next = || {
+        answered
+            .recv_timeout(SLOW)
+            .expect("a message to the answering page")
+    };
+    let (status, _, mut third) =
+        Page::try_open(api.addr, &handshake(api.addr, "ptr", &protocols(&api.token), ""));
+    assert_eq!(status, 409);
+    let mut body = std::mem::take(&mut third.buf);
+    let _ = third.stream.read_to_end(&mut body);
+    assert!(
+        String::from_utf8_lossy(&body).contains(r#""code":"over budget""#),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let msgs = silent.until("the close", |m| matches!(m, Msg::Close(..)));
+    assert!(msgs.contains(&Msg::Ping(vec![])), "{msgs:?}");
+    assert_eq!(
+        msgs.last(),
+        Some(&Msg::Close(Some(1001), "no answer to a ping".into()))
+    );
+
+    // The answering page outlives a few pings (it has had one at least by the time
+    // the silent page was closed for not answering its own).
+    let mut pings = 0;
+    while pings < 3 {
+        match next() {
+            Msg::Ping(_) => pings += 1,
+            other @ Msg::Close(..) => panic!("the answering page was closed: {other:?}"),
+            _ => {}
+        }
+    }
+    // A slot is free again: the silent page's.
+    wait_for("the silent page's slot", || {
+        (n(&api.expect(200, api.get("overview")), "screens") == 1).then_some(())
+    });
+
+    let pendragon = std::mem::replace(
+        &mut platform.pendragon,
+        pendragon_for(&dead_addr(), &dead_addr(), 64 * MIB),
+    );
+    pendragon.stop().unwrap();
+    let mut msgs = Vec::new();
+    while !matches!(msgs.last(), Some(Msg::Close(..))) {
+        msgs.push(next());
+    }
+    answerer.join().unwrap();
+    let end = msgs.iter().find_map(|m| match m {
+        Msg::Text(json) if s(json, "type") == "end" => Some(s(json, "reason").to_string()),
+        _ => None,
+    });
+    assert_eq!(end.as_deref(), Some("Pendragon is shutting down"));
+    assert_eq!(
+        msgs.last(),
+        Some(&Msg::Close(Some(1001), "Pendragon is shutting down".into()))
+    );
+    platform.stop();
 }
 
 /// An Avalon that cannot be reached is a 502 before the upgrade.

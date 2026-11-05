@@ -1,30 +1,23 @@
 #!/bin/bash
-# Builds riscv-tests (p env) for RV32 and RV64 with clang/lld.
+# Builds riscv-tests (p env) for RV64 with clang/lld.
 # Usage: build-riscv-tests.sh <riscv-tests dir> <out dir> [suite ...]
 #
 # Clone riscv-tests with its env submodule (git clone --recursive) at the
 # commit named in tests/riscv-tests/README.md. With no suites given, builds
-# rv32ui rv32um rv32ua rv32mi rv32si rv64ui rv64um rv64ua rv64mi rv64si.
+# rv64ui rv64um rv64ua rv64mi rv64si.
 #
-# Writes each RV32 test as an ELF linked by ld.lld (<out dir>/rv32ui-p-add, ...)
+# Writes each test as an ELF linked by ld.lld (<out dir>/rv64ui-p-add, ...)
 # and, for merlin-ld's relink test, the object it was linked from
-# (<out dir>/obj/rv32ui-p-add.o) plus the env's linker script (obj/link.ld).
-# The RV64 suites go the same way into <out dir>/rv64/ (rv64/rv64ui-p-add,
-# rv64/obj/rv64ui-p-add.o, rv64/obj/link.ld).
+# (<out dir>/obj/rv64ui-p-add.o) plus the env's linker script (obj/link.ld).
 # Everything is built with -mno-relax: merlin-ld does no linker relaxation.
-#
-# rv32ua needs the A extension; the other RV32 suites are built without it (as
-# they were before Excalibur had A), so rebuilding them gives the committed
-# bytes. The RV64 suites are built as RV64 programs are (spec section 8):
+# The suites are built as RV64 programs are (spec section 8):
 # -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany.
 set -u
 RT=$(realpath "$1"); OUT=$(realpath -m "$2"); shift 2; TMP=$(mktemp -d)
-SUITES=${*:-rv32ui rv32um rv32ua rv32mi rv32si rv64ui rv64um rv64ua rv64mi rv64si}
+SUITES=${*:-rv64ui rv64um rv64ua rv64mi rv64si}
 for s in $SUITES; do
   case $s in
-    rv32ua) FLAGS="--target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32"; DIR=$OUT ;;
-    rv32*) FLAGS="--target=riscv32 -march=rv32im_zicsr_zifencei -mabi=ilp32"; DIR=$OUT ;;
-    rv64*) FLAGS="--target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany"; DIR=$OUT/rv64 ;;
+    rv64*) FLAGS="--target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany"; DIR=$OUT ;;
     *) echo "unknown suite $s"; continue ;;
   esac
   mkdir -p "$DIR/obj"

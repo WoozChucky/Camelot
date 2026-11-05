@@ -42,11 +42,6 @@ fn disk_elf() -> Vec<u8> {
     std::fs::read(examples().join("disk/disk.elf")).unwrap()
 }
 
-/// Its RV64 build (#151), for the version 2 registers.
-fn disk_elf_rv64() -> Vec<u8> {
-    std::fs::read(elf_path_rv64("disk")).unwrap()
-}
-
 /// A file in the temp directory, removed when dropped.
 struct TempFile(PathBuf);
 
@@ -84,7 +79,7 @@ fn run_example(m: Machine) -> (RunResult, String, Machine) {
     run_build(m, &disk_elf())
 }
 
-/// Runs `elf`, a build of `examples/disk`, on `m` (an ELF64 file makes it RV64).
+/// Runs `elf`, a build of `examples/disk`, on `m`.
 fn run_build(mut m: Machine, elf: &[u8]) -> (RunResult, String, Machine) {
     m.cpu.bus.uart.capture = true;
     m.load_elf(elf).unwrap();
@@ -97,7 +92,7 @@ fn run_build(mut m: Machine, elf: &[u8]) -> (RunResult, String, Machine) {
 /// (read-write), at disk slot 0.
 fn example_output(sectors: u32, sector0: &str) -> String {
     format!(
-        "disk 0x10001000, irq 3: {sectors} sectors\nsector 0:\n{sector0}read past the end: error 2\n\
+        "disk 0x0000000010001000, irq 3: {sectors} sectors\nsector 0:\n{sector0}read past the end: error 2\n\
          write/read-back of sector {}: ok\n",
         sectors - 1
     )
@@ -155,34 +150,31 @@ fn example_on_an_image_file() {
 
 #[test]
 fn example_on_a_read_only_disk() {
-    // Each build finds the flag where its version of the registers has it:
-    // BLK_FLAGS is at 0x04 on RV32 and at 0x1c on RV64.
-    for (elf, base) in [
-        (disk_elf(), "0x10001000"),
-        (disk_elf_rv64(), "0x0000000010001000"),
-    ] {
-        let m = Machine::new(with_disks(vec![
-            DiskConfig::memory(disk_image()).with_read_only(true)
-        ]))
-        .unwrap();
-        let (result, out, mut m) = run_build(m, &elf);
-        assert_eq!(result, RunResult::Exited(0), "{out}");
-        assert_eq!(
-            out,
-            format!(
-                "disk {base}, irq 3: 8 sectors (read-only)\nsector 0:\n{SECTOR0}\
-                 read past the end: error 2\nread-only disk: write test skipped\n"
-            )
-        );
-        assert_eq!(disk_contents(&mut m, 0), disk_image());
-    }
+    // The example finds the flag in BLK_FLAGS, at 0x1c (version 2 of the registers).
+    let m = Machine::new(with_disks(vec![
+        DiskConfig::memory(disk_image()).with_read_only(true)
+    ]))
+    .unwrap();
+    let (result, out, mut m) = run_build(m, &disk_elf());
+    assert_eq!(result, RunResult::Exited(0), "{out}");
+    assert_eq!(
+        out,
+        format!(
+            "disk 0x0000000010001000, irq 3: 8 sectors (read-only)\nsector 0:\n{SECTOR0}\
+             read past the end: error 2\nread-only disk: write test skipped\n"
+        )
+    );
+    assert_eq!(disk_contents(&mut m, 0), disk_image());
 }
 
 #[test]
 fn example_without_a_disk() {
     let (result, out, _) = run_example(Machine::new(MachineConfig::default()).unwrap());
     assert_eq!(result, RunResult::Exited(1));
-    assert_eq!(out, "no disk (try grail --disk examples/disk/disk.img)\n");
+    assert_eq!(
+        out,
+        "no disk (try grail --bios none --disk examples/disk/disk.img)\n"
+    );
 }
 
 #[test]
@@ -296,7 +288,7 @@ fn backend_failures_reach_the_program_as_error_5() {
     let m = Machine::with_backends(MachineConfig::default(), vec![Box::new(Broken)]).unwrap();
     let (result, out, _) = run_example(m);
     assert_eq!(result, RunResult::Exited(2));
-    assert_eq!(out, "disk 0x10001000, irq 3: 8 sectors\ndisk error 5\n");
+    assert_eq!(out, "disk 0x0000000010001000, irq 3: 8 sectors\ndisk error 5\n");
 }
 
 #[test]
@@ -365,7 +357,7 @@ fn completion_interrupt_traps_into_m_mode() {
     m.cpu.step();
     assert_eq!(
         m.cpu.csr.mcause,
-        0x8000_0000 | u64::from(IRQ_M_EXT),
+        1 << 63 | u64::from(IRQ_M_EXT),
         "machine external interrupt"
     );
     assert_eq!(m.cpu.pc, RAM_BASE + 0x20, "at the handler");
@@ -475,23 +467,26 @@ fn sysinfo_lists_the_disks() {
     let devices = out.split_once("11 devices:\n").expect(&out).1;
     assert_eq!(
         devices,
-        "  test      0x00100000 + 0x00001000
-  CLINT     0x02000000 + 0x00010000
-  PLIC      0x0c000000 + 0x04000000
-  UART      0x10000000 + 0x00000100  irq 1
-  block     0x10001000 + 0x00001000  irq 3
-  block     0x10002000 + 0x00001000  irq 4
-  fb-ctrl   0x30000000 + 0x00001000  irq 16
-  keyboard  0x30001000 + 0x00001000  irq 2
-  sysinfo   0x30002000 + 0x00001000
-  pointer   0x30003000 + 0x00001000  irq 11
-  fb-vram   0x31000000 + 0x0012c000
+        "  test      0x0000000000100000 + 0x0000000000001000
+  CLINT     0x0000000002000000 + 0x0000000000010000
+  PLIC      0x000000000c000000 + 0x0000000004000000
+  UART      0x0000000010000000 + 0x0000000000000100  irq 1
+  block     0x0000000010001000 + 0x0000000000001000  irq 3
+  block     0x0000000010002000 + 0x0000000000001000  irq 4
+  fb-ctrl   0x0000000030000000 + 0x0000000000001000  irq 16
+  keyboard  0x0000000030001000 + 0x0000000000001000  irq 2
+  sysinfo   0x0000000030002000 + 0x0000000000001000
+  pointer   0x0000000030003000 + 0x0000000000001000  irq 11
+  fb-vram   0x0000000031000000 + 0x000000000012c000
 "
     );
 }
 
+/// The `grail` binary running `args` on a machine without firmware, as the bare-metal
+/// examples run.
 fn grail(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_grail"))
+        .args(["--bios", "none"])
         .args(args)
         .output()
         .expect("cannot run grail")
@@ -500,15 +495,6 @@ fn grail(args: &[&str]) -> std::process::Output {
 fn elf_path(name: &str) -> String {
     examples()
         .join(format!("{name}/{name}.elf"))
-        .to_str()
-        .unwrap()
-        .to_string()
-}
-
-/// The example's RV64 build, `<name>-rv64.elf`: grail makes an RV64 machine for it.
-fn elf_path_rv64(name: &str) -> String {
-    examples()
-        .join(format!("{name}/{name}-rv64.elf"))
         .to_str()
         .unwrap()
         .to_string()
@@ -573,23 +559,18 @@ fn cli_disk_flags() {
     assert_eq!(String::from_utf8(out.stdout).unwrap(), example_output(8, SECTOR0));
     assert_eq!(file.read(), disk_image());
 
-    // Both builds: the RV64 one reads BLK_FLAGS at version 2's 0x1c.
-    for (elf, base) in [
-        (elf_path("disk"), "0x10001000"),
-        (elf_path_rv64("disk"), "0x0000000010001000"),
-    ] {
-        let out = grail(&["--disk-ro", file.path(), &elf]);
-        assert!(out.status.success(), "{elf}");
-        let stdout = String::from_utf8(out.stdout).unwrap();
-        assert!(
-            stdout.starts_with(&format!("disk {base}, irq 3: 8 sectors (read-only)\n")),
-            "{stdout}"
-        );
-        assert!(
-            stdout.ends_with("read-only disk: write test skipped\n"),
-            "{stdout}"
-        );
-    }
+    // Read-only: BLK_FLAGS says so.
+    let out = grail(&["--disk-ro", file.path(), &elf_path("disk")]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.starts_with("disk 0x0000000010001000, irq 3: 8 sectors (read-only)\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.ends_with("read-only disk: write test skipped\n"),
+        "{stdout}"
+    );
     assert_eq!(file.read(), disk_image());
 
     // Several disks, in order.
@@ -605,7 +586,7 @@ fn cli_disk_flags() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("11 devices:\n"), "{stdout}");
     assert!(
-        stdout.contains("  block     0x10002000 + 0x00001000  irq 4\n"),
+        stdout.contains("  block     0x0000000010002000 + 0x0000000000001000  irq 4\n"),
         "{stdout}"
     );
 }
@@ -638,6 +619,6 @@ fn cli_disk_errors() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "no disk (try grail --disk examples/disk/disk.img)\n"
+        "no disk (try grail --bios none --disk examples/disk/disk.img)\n"
     );
 }

@@ -79,9 +79,13 @@ static struct thread threads[NTHREAD];
  * between a thread and a scheduler. */
 static struct spinlock proc_lock;
 
+/* The first process's pid, as Linux's init has it, whatever kernel
+ * processes the boot's self-tests ran before it. */
+#define INIT_PID 1
+
 /* The next pid or tid: one counter for both, so that no thread's id is
- * another process's pid. */
-static u32 next_pid = 1;
+ * another process's pid. It starts after INIT_PID. */
+static u32 next_pid = INIT_PID + 1;
 
 /* Where the next round-robin search starts: the slot after the thread that
  * ran last (NULL: slot 0). A pointer rather than an index, like the loops
@@ -217,7 +221,7 @@ static void set_name(struct proc *p, const char *name) {
 
 /* The ISA the kernel runs programs on, as AT_HWCAP gives it, Linux's way: a
  * bit for each single-letter extension, 'X' - 'A' (Zicsr and Zifencei have
- * no letter). RV32IMA and RV64IMA: the base, M and A. */
+ * no letter). RV64IMA: the base, M and A. */
 #define HWCAP_ISA(letter) (1ul << ((letter) - 'A'))
 #define HWCAP (HWCAP_ISA('I') | HWCAP_ISA('M') | HWCAP_ISA('A'))
 
@@ -425,15 +429,19 @@ static void kick_idle(u32 n) {
     }
 }
 
-/* Gives a fully set up `p` its pid, name and parent, and its first thread
- * `t` the pid as its tid, and makes the thread runnable. Returns the
- * pid. */
+/* Gives a fully set up `p` its pid (INIT_PID for the first process, the
+ * next one for any other), name and parent, and its first thread `t` the
+ * pid as its tid, and makes the thread runnable. Returns the pid. */
 static int proc_ready(struct proc *p, struct thread *t, const char *name, struct proc *parent) {
     acquire(&proc_lock);
-    int pid = (int)next_pid;
-    p->pid = next_pid;
-    t->tid = next_pid;
-    next_pid++;
+    u32 id = INIT_PID;
+    if (p != init_proc) {
+        id = next_pid;
+        next_pid++;
+    }
+    int pid = (int)id;
+    p->pid = id;
+    t->tid = id;
     set_name(p, name);
     p->parent = parent;
     p->nthreads = 1;

@@ -35,7 +35,7 @@ fn contents(conn: &mut Connection<TcpStream>, name: &str) -> Vec<u8> {
     data
 }
 
-/// Runs `examples/disk`, of the current width, on `m`: its exit and what it printed.
+/// Runs `examples/disk` on `m`: its exit and what it printed.
 fn run_example(mut m: Machine) -> (RunResult, String, Machine) {
     m.cpu.bus.uart.capture = true;
     let elf = example_in("disk", "disk");
@@ -45,36 +45,33 @@ fn run_example(mut m: Machine) -> (RunResult, String, Machine) {
     (result, out, m)
 }
 
-/// A 1 MiB machine of the current width with `disks`.
+/// A 1 MiB machine with `disks`.
 fn machine(disks: Vec<DiskConfig>) -> Result<Machine, String> {
     Machine::new(MachineConfig {
         disks,
-        xlen: xlen(),
         ..MachineConfig::with_ram(1 << 20)
     })
 }
 
 /// Writes the registers of a transfer of `count` sectors at `sector` into RAM's base
-/// and the command `cmd` to `dev`, a disk of the current width ([`blk_regs`]), and
-/// returns `BLK_ERROR`.
+/// and the command `cmd` to `dev`, and returns `BLK_ERROR`. `BLK_SECTOR` and `BLK_DMA`
+/// are 64-bit registers.
 fn transfer(dev: &mut BlockDevice, ram: &mut [u8], sector: u64, count: u64, cmd: u32) -> u32 {
-    let r = blk_regs();
+    use grail::block::{REG_CMD, REG_COUNT, REG_DMA, REG_ERROR, REG_SECTOR};
     for (reg, size, val) in [
-        (r.sector, r.wide, sector),
-        (r.count, 4, count),
-        (r.dma, r.wide, RAM_BASE),
-        (r.cmd, 4, cmd.into()),
+        (REG_SECTOR, 8, sector),
+        (REG_COUNT, 4, count),
+        (REG_DMA, 8, RAM_BASE),
+        (REG_CMD, 4, cmd.into()),
     ] {
         dev.write(reg, size, val, ram).unwrap();
     }
-    dev.read(r.error, 4).unwrap() as u32
+    dev.read(REG_ERROR, 4).unwrap() as u32
 }
 
-/// A disk device on `backend` with the registers of the current width.
+/// A disk device on `backend`.
 fn device(backend: Box<dyn BlockBackend>) -> BlockDevice {
-    let mut dev = BlockDevice::new(backend).unwrap();
-    dev.set_xlen(xlen());
-    dev
+    BlockDevice::new(backend).unwrap()
 }
 
 const SECTOR0: &str =
@@ -82,59 +79,57 @@ const SECTOR0: &str =
 
 #[test]
 fn example_disk_runs_on_a_lake_disk() {
-    on_both_widths(|| {
-        let dir = TempDir::new("example");
-        let server = lake(&dir);
-        let mut rt = connect(&server);
-        let image = upload_example_image(&mut rt, "disk");
-        let addr = server.addr().to_string();
+    let dir = TempDir::new("example");
+    let server = lake(&dir);
+    let mut rt = connect(&server);
+    let image = upload_example_image(&mut rt, "disk");
+    let addr = server.addr().to_string();
 
-        let m = machine(vec![DiskConfig::lake(&addr, "disk")]).unwrap();
-        // The machine holds the image while it exists.
-        assert!(disk_info(&mut rt, "disk").writer);
-        let (result, out, m) = run_example(m);
+    let m = machine(vec![DiskConfig::lake(&addr, "disk")]).unwrap();
+    // The machine holds the image while it exists.
+    assert!(disk_info(&mut rt, "disk").writer);
+    let (result, out, m) = run_example(m);
+    assert_eq!(result, RunResult::Exited(0), "{out}");
+    assert_eq!(
+        out,
+        format!(
+            "disk {}, irq 3: 8 sectors\nsector 0:\n{SECTOR0}read past the end: error 2\n\
+         write/read-back of sector 7: ok\n",
+            addr_text(0x1000_1000)
+        )
+    );
+    assert!(!m.cpu.bus.disks[0].done(), "every completion was acknowledged");
+    drop(m);
+    // Dropping the machine detached the image before it returned.
+    assert!(!disk_info(&mut rt, "disk").writer);
+    assert_eq!(contents(&mut rt, "disk"), image, "sector 7 was restored");
+
+    // Read-only, by two machines at once.
+    let ro = || machine(vec![DiskConfig::lake(&addr, "disk").with_read_only(true)]).unwrap();
+    let (a, b) = (ro(), ro());
+    assert_eq!(disk_info(&mut rt, "disk").readers, 2);
+    let rt_busy = error_of(
+        &mut rt,
+        &Message::BlockOpen {
+            name: "disk".into(),
+            read_only: false,
+        },
+    );
+    assert_eq!(rt_busy, avalon_proto::ErrorCode::Busy);
+    for m in [a, b] {
+        let (result, out, _) = run_example(m);
         assert_eq!(result, RunResult::Exited(0), "{out}");
-        assert_eq!(
-            out,
-            format!(
-                "disk {}, irq 3: 8 sectors\nsector 0:\n{SECTOR0}read past the end: error 2\n\
-             write/read-back of sector 7: ok\n",
+        assert!(
+            out.starts_with(&format!(
+                "disk {}, irq 3: 8 sectors (read-only)\n",
                 addr_text(0x1000_1000)
-            )
+            )),
+            "{out}"
         );
-        assert!(!m.cpu.bus.disks[0].done(), "every completion was acknowledged");
-        drop(m);
-        // Dropping the machine detached the image before it returned.
-        assert!(!disk_info(&mut rt, "disk").writer);
-        assert_eq!(contents(&mut rt, "disk"), image, "sector 7 was restored");
-
-        // Read-only, by two machines at once.
-        let ro = || machine(vec![DiskConfig::lake(&addr, "disk").with_read_only(true)]).unwrap();
-        let (a, b) = (ro(), ro());
-        assert_eq!(disk_info(&mut rt, "disk").readers, 2);
-        let rt_busy = error_of(
-            &mut rt,
-            &Message::BlockOpen {
-                name: "disk".into(),
-                read_only: false,
-            },
-        );
-        assert_eq!(rt_busy, avalon_proto::ErrorCode::Busy);
-        for m in [a, b] {
-            let (result, out, _) = run_example(m);
-            assert_eq!(result, RunResult::Exited(0), "{out}");
-            assert!(
-                out.starts_with(&format!(
-                    "disk {}, irq 3: 8 sectors (read-only)\n",
-                    addr_text(0x1000_1000)
-                )),
-                "{out}"
-            );
-            assert!(out.ends_with("read-only disk: write test skipped\n"), "{out}");
-        }
-        assert_eq!(disk_info(&mut rt, "disk").readers, 0);
-        server.stop().unwrap();
-    });
+        assert!(out.ends_with("read-only disk: write test skipped\n"), "{out}");
+    }
+    assert_eq!(disk_info(&mut rt, "disk").readers, 0);
+    server.stop().unwrap();
 }
 
 #[test]
@@ -180,78 +175,74 @@ fn big_transfers_are_split_into_requests() {
 
 #[test]
 fn attaching_follows_lakes_rule() {
-    on_both_widths(|| {
-        let dir = TempDir::new("rule");
-        let server = lake(&dir);
-        let mut rt = connect(&server);
-        create_disk(&mut rt, "d", 8);
-        let addr = server.addr().to_string();
+    let dir = TempDir::new("rule");
+    let server = lake(&dir);
+    let mut rt = connect(&server);
+    create_disk(&mut rt, "d", 8);
+    let addr = server.addr().to_string();
 
-        let writer = machine(vec![DiskConfig::lake(&addr, "d")]).unwrap();
-        for read_only in [false, true] {
-            let e = machine(vec![DiskConfig::lake(&addr, "d").with_read_only(read_only)])
-                .err()
-                .unwrap();
-            assert!(e.starts_with(&format!("disk 0: lake://{addr}/d: busy: ")), "{e}");
-        }
-        // Disks keep their order: the Lake disk is disk 1, after a memory disk.
-        let e = machine(vec![
-            DiskConfig::memory(vec![0; 512]),
-            DiskConfig::lake(&addr, "d"),
-        ])
-        .err()
-        .unwrap();
-        assert!(e.starts_with("disk 1: "), "{e}");
-        drop(writer);
+    let writer = machine(vec![DiskConfig::lake(&addr, "d")]).unwrap();
+    for read_only in [false, true] {
+        let e = machine(vec![DiskConfig::lake(&addr, "d").with_read_only(read_only)])
+            .err()
+            .unwrap();
+        assert!(e.starts_with(&format!("disk 0: lake://{addr}/d: busy: ")), "{e}");
+    }
+    // Disks keep their order: the Lake disk is disk 1, after a memory disk.
+    let e = machine(vec![
+        DiskConfig::memory(vec![0; 512]),
+        DiskConfig::lake(&addr, "d"),
+    ])
+    .err()
+    .unwrap();
+    assert!(e.starts_with("disk 1: "), "{e}");
+    drop(writer);
 
-        // Dropping a machine detaches at once: the next one never finds it busy.
-        for _ in 0..20 {
-            let m = machine(vec![DiskConfig::lake(&addr, "d")]).unwrap();
-            drop(m);
-        }
+    // Dropping a machine detaches at once: the next one never finds it busy.
+    for _ in 0..20 {
+        let m = machine(vec![DiskConfig::lake(&addr, "d")]).unwrap();
+        drop(m);
+    }
 
-        let e = machine(vec![DiskConfig::lake(&addr, "missing")]).err().unwrap();
-        assert!(e.contains("no such disk"), "{e}");
-        server.stop().unwrap();
-    });
+    let e = machine(vec![DiskConfig::lake(&addr, "missing")]).err().unwrap();
+    assert!(e.contains("no such disk"), "{e}");
+    server.stop().unwrap();
 }
 
 #[test]
 fn a_server_that_goes_away_is_an_io_error() {
-    on_both_widths(|| {
-        let dir = TempDir::new("gone");
-        let server = lake(&dir);
-        let mut rt = connect(&server);
-        create_disk(&mut rt, "d", 8);
-        let disk = LakeDisk::open(&server.addr().to_string(), "d", false).unwrap();
-        let mut dev = device(Box::new(disk));
-        let mut ram = vec![0; 4 * SECTOR_SIZE];
-        let mut cmd = |dev: &mut BlockDevice, cmd: u32| transfer(dev, &mut ram, 1, 2, cmd);
-        assert_eq!(cmd(&mut dev, block::CMD_WRITE), block::error::NONE);
-        assert_eq!(cmd(&mut dev, block::CMD_READ), block::error::NONE);
-        drop(rt);
-        server.stop().unwrap();
+    let dir = TempDir::new("gone");
+    let server = lake(&dir);
+    let mut rt = connect(&server);
+    create_disk(&mut rt, "d", 8);
+    let disk = LakeDisk::open(&server.addr().to_string(), "d", false).unwrap();
+    let mut dev = device(Box::new(disk));
+    let mut ram = vec![0; 4 * SECTOR_SIZE];
+    let mut cmd = |dev: &mut BlockDevice, cmd: u32| transfer(dev, &mut ram, 1, 2, cmd);
+    assert_eq!(cmd(&mut dev, block::CMD_WRITE), block::error::NONE);
+    assert_eq!(cmd(&mut dev, block::CMD_READ), block::error::NONE);
+    drop(rt);
+    server.stop().unwrap();
 
-        // Every command now fails with BLK_ERROR 5, and nothing hangs or panics.
-        for c in [
-            block::CMD_READ,
-            block::CMD_WRITE,
-            block::CMD_FLUSH,
-            block::CMD_READ,
-        ] {
-            assert_eq!(cmd(&mut dev, c), block::error::IO, "command {c}");
-        }
-        // The device's own checks still come first.
-        assert_eq!(
-            transfer(&mut dev, &mut ram, 100, 2, block::CMD_READ),
-            block::error::OUT_OF_RANGE
-        );
-        drop(dev);
+    // Every command now fails with BLK_ERROR 5, and nothing hangs or panics.
+    for c in [
+        block::CMD_READ,
+        block::CMD_WRITE,
+        block::CMD_FLUSH,
+        block::CMD_READ,
+    ] {
+        assert_eq!(cmd(&mut dev, c), block::error::IO, "command {c}");
+    }
+    // The device's own checks still come first.
+    assert_eq!(
+        transfer(&mut dev, &mut ram, 100, 2, block::CMD_READ),
+        block::error::OUT_OF_RANGE
+    );
+    drop(dev);
 
-        // And with no server at all, the disk cannot be opened.
-        let e = LakeDisk::open(&server_addr_gone(), "d", false).unwrap_err();
-        assert!(e.starts_with("lake://"), "{e}");
-    });
+    // And with no server at all, the disk cannot be opened.
+    let e = LakeDisk::open(&server_addr_gone(), "d", false).unwrap_err();
+    assert!(e.starts_with("lake://"), "{e}");
 }
 
 /// An address nobody listens on.
@@ -347,64 +338,62 @@ fn command(dev: &mut BlockDevice, ram: &mut [u8], sector: u64, cmd: u32) -> u32 
 
 #[test]
 fn a_server_that_answers_too_late_fails_the_disk_for_good() {
-    on_both_widths(|| {
-        const TIMEOUT: Duration = Duration::from_millis(200);
-        // Answers a write to sector 0 only after the disk has given up waiting for it, and
-        // everything else at once.
-        let late = Arc::new(AtomicU32::new(0));
-        let other_writes = Arc::new(AtomicU32::new(0));
-        let (l, o) = (Arc::clone(&late), Arc::clone(&other_writes));
-        let addr = fake_lake(move |msg| match msg {
-            Message::BlockOpen { .. } => Message::BlockOpened {
-                handle: 1,
-                sectors: 8,
-                read_only: false,
-            },
-            Message::BlockWrite { sector: 0, .. } => {
-                std::thread::sleep(TIMEOUT * 3);
-                l.fetch_add(1, Ordering::SeqCst);
-                Message::Ok
-            }
-            Message::BlockWrite { .. } => {
-                o.fetch_add(1, Ordering::SeqCst);
-                Message::Ok
-            }
-            _ => Message::Ok,
-        });
-        // Until the late answer has been sent, and has had time to arrive.
-        let wait_for_late = |n| {
-            wait_until("the late answer", || late.load(Ordering::SeqCst) == n);
-            std::thread::sleep(TIMEOUT / 2);
-        };
-
-        let mut disk = LakeDisk::open(&addr, "d", false).unwrap();
-        disk.set_io_timeout(TIMEOUT).unwrap();
-        disk.write(1, &[1; SECTOR_SIZE]).unwrap();
-        disk.write(0, &[0; SECTOR_SIZE]).unwrap_err();
-        assert!(disk.broken().is_some());
-        wait_for_late(1);
-        // The late `Ok` is waiting on the socket. It must not pass for the answer to the
-        // next write: that write fails without being sent.
-        let e = disk.write(1, &[1; SECTOR_SIZE]).unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "{e}");
-        assert!(disk.flush().is_err());
-        assert!(disk.read(1, &mut [0; SECTOR_SIZE]).is_err());
-        assert_eq!(other_writes.load(Ordering::SeqCst), 1);
-        drop(disk);
-
-        // What the guest sees: BLK_ERROR 5 for the write that timed out and every command
-        // after it.
-        let mut disk = LakeDisk::open(&addr, "d", false).unwrap();
-        disk.set_io_timeout(TIMEOUT).unwrap();
-        let mut dev = device(Box::new(disk));
-        let mut ram = vec![0; SECTOR_SIZE];
-        assert_eq!(command(&mut dev, &mut ram, 0, block::CMD_WRITE), block::error::IO);
-        wait_for_late(2);
-        for c in [block::CMD_WRITE, block::CMD_READ, block::CMD_FLUSH] {
-            assert_eq!(command(&mut dev, &mut ram, 1, c), block::error::IO, "command {c}");
+    const TIMEOUT: Duration = Duration::from_millis(200);
+    // Answers a write to sector 0 only after the disk has given up waiting for it, and
+    // everything else at once.
+    let late = Arc::new(AtomicU32::new(0));
+    let other_writes = Arc::new(AtomicU32::new(0));
+    let (l, o) = (Arc::clone(&late), Arc::clone(&other_writes));
+    let addr = fake_lake(move |msg| match msg {
+        Message::BlockOpen { .. } => Message::BlockOpened {
+            handle: 1,
+            sectors: 8,
+            read_only: false,
+        },
+        Message::BlockWrite { sector: 0, .. } => {
+            std::thread::sleep(TIMEOUT * 3);
+            l.fetch_add(1, Ordering::SeqCst);
+            Message::Ok
         }
-        assert_eq!(other_writes.load(Ordering::SeqCst), 1);
+        Message::BlockWrite { .. } => {
+            o.fetch_add(1, Ordering::SeqCst);
+            Message::Ok
+        }
+        _ => Message::Ok,
     });
+    // Until the late answer has been sent, and has had time to arrive.
+    let wait_for_late = |n| {
+        wait_until("the late answer", || late.load(Ordering::SeqCst) == n);
+        std::thread::sleep(TIMEOUT / 2);
+    };
+
+    let mut disk = LakeDisk::open(&addr, "d", false).unwrap();
+    disk.set_io_timeout(TIMEOUT).unwrap();
+    disk.write(1, &[1; SECTOR_SIZE]).unwrap();
+    disk.write(0, &[0; SECTOR_SIZE]).unwrap_err();
+    assert!(disk.broken().is_some());
+    wait_for_late(1);
+    // The late `Ok` is waiting on the socket. It must not pass for the answer to the
+    // next write: that write fails without being sent.
+    let e = disk.write(1, &[1; SECTOR_SIZE]).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "{e}");
+    assert!(disk.flush().is_err());
+    assert!(disk.read(1, &mut [0; SECTOR_SIZE]).is_err());
+    assert_eq!(other_writes.load(Ordering::SeqCst), 1);
+    drop(disk);
+
+    // What the guest sees: BLK_ERROR 5 for the write that timed out and every command
+    // after it.
+    let mut disk = LakeDisk::open(&addr, "d", false).unwrap();
+    disk.set_io_timeout(TIMEOUT).unwrap();
+    let mut dev = device(Box::new(disk));
+    let mut ram = vec![0; SECTOR_SIZE];
+    assert_eq!(command(&mut dev, &mut ram, 0, block::CMD_WRITE), block::error::IO);
+    wait_for_late(2);
+    for c in [block::CMD_WRITE, block::CMD_READ, block::CMD_FLUSH] {
+        assert_eq!(command(&mut dev, &mut ram, 1, c), block::error::IO, "command {c}");
+    }
+    assert_eq!(other_writes.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -433,5 +422,5 @@ fn dropping_a_disk_detaches_its_image_before_returning() {
 
 #[test]
 fn lake_images_fit_a_grail_disk() {
-    assert_eq!(lake::MAX_IMAGE_SECTORS, block::V1_MAX_SECTORS);
+    const { assert!(lake::MAX_IMAGE_SECTORS <= block::MAX_SECTORS) };
 }

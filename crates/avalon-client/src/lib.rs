@@ -5,16 +5,15 @@
 //!   pause, resume, stop, destroy) and the virtual network (switches, plugging cards
 //!   into them, captures) talk to Avalon; disk management (create, list, delete) talks
 //!   to Lake. Each operation is one request and its typed reply.
-//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, widths and
-//!   paging modes, disk sources, disk sizes and network cards, so every front end
-//!   accepts the same syntax (`--ram`, `--clock`, `--xlen` and `--paging` are Grail's
-//!   own parsers).
-//! - [`show`]: the same values as text again (sizes, frequencies, widths, device
-//!   names, MAC addresses).
+//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, paging
+//!   modes, disk sources, disk sizes and network cards, so every front end accepts
+//!   the same syntax (`--ram`, `--clock` and `--paging` are Grail's own parsers).
+//! - [`show`]: the same values as text again (sizes, frequencies, the architecture,
+//!   device names, MAC addresses).
 //! - [`VmAction::allowed_in`], [`holds_disks`] and [`lake_disks`]: what a VM's state
 //!   and profile mean for what a person may do with it and its disks.
 //! - [`create_camelot_vm`]: a VM that boots Camelot from its own copy of Lake's
-//!   base image of its width ([`base_image`]), with no program to upload.
+//!   base image ([`BASE_IMAGE`]), with no program to upload.
 //! - [`DebugTunnel`]: a debugger's end of a VM's GDB stub, the GDB remote serial
 //!   protocol's bytes over a session (merlin-dbg's `--vm`).
 //!
@@ -23,7 +22,7 @@
 
 use avalon_proto::{
     validate_name, Bios, Connection, DeviceSpec, DiskInfo, DiskSource, DiskSpec, ErrorCode, HardwareProfile,
-    Message, NatConfig, SwitchInfo, VmDetails, VmRef, VmState, VmSummary, Xlen,
+    Message, NatConfig, SwitchInfo, VmDetails, VmRef, VmState, VmSummary,
 };
 use std::collections::VecDeque;
 use std::fmt;
@@ -37,7 +36,7 @@ pub mod show;
 
 pub use parse::{
     parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net,
-    parse_paging, parse_ram, parse_xlen,
+    parse_paging, parse_ram,
 };
 pub use show::{arch_text, device_name, disk_source_text, format_hz, format_size, mac_text};
 
@@ -217,56 +216,32 @@ pub fn lake_disks(profile: &HardwareProfile) -> impl Iterator<Item = (&str, &str
     })
 }
 
-/// The Lake image an RV32 Camelot VM's disk is a copy of: a bootable Camelot root
+/// The Lake image a Camelot VM's disk is a copy of: a bootable Camelot root
 /// filesystem, the one `cargo xtask fs` builds. `cargo xtask up` puts it in Lake's
 /// images directory. A neutral name, not the OS's: it is the base image of the VMs.
 pub const BASE_IMAGE: &str = "os-base";
 
-/// The Lake image an RV64 Camelot VM's disk is a copy of: the RV64 root image,
-/// `cargo xtask fs --xlen 64`'s, with its RV64 bootloader, kernel and programs, which
-/// `cargo xtask up` puts beside [`BASE_IMAGE`] (until #159 leaves one width). A boot
-/// block runs on the boot ROM of one width, so each width has an image of its own.
-pub const BASE_IMAGE_RV64: &str = "os-base-rv64";
-
-/// The base image of a Camelot VM of width `xlen`: [`BASE_IMAGE`] or
-/// [`BASE_IMAGE_RV64`].
-pub fn base_image(xlen: Xlen) -> &'static str {
-    match xlen {
-        Xlen::Rv32 => BASE_IMAGE,
-        Xlen::Rv64 => BASE_IMAGE_RV64,
-    }
+/// The firmware a Camelot VM boots unless its creator says otherwise: Camelot's own
+/// (`Bios::Default`, as QEMU's `virt` runs OpenSBI by default), since the root
+/// image's bootloader and kernel run in S-mode on an SBI.
+pub fn camelot_bios() -> Bios {
+    Bios::Default
 }
 
-/// The firmware a Camelot VM of width `xlen` boots unless its creator says otherwise:
-/// on RV64 Camelot's own (`Bios::Default`, as QEMU's `virt` runs OpenSBI by
-/// default), since the RV64 root image's bootloader and kernel run in S-mode on an
-/// SBI; on RV32 none, as the RV32 kernel carries its own M-mode layer (until #159).
-pub fn camelot_bios(xlen: Xlen) -> Bios {
-    match xlen {
-        Xlen::Rv32 => Bios::None,
-        Xlen::Rv64 => Bios::Default,
-    }
-}
-
-/// The RAM a Camelot VM of width `xlen` has unless its creator says otherwise: the
-/// platform's default, 4 MiB ([`avalon_proto::DEFAULT_RAM_SIZE`]), and on RV64 the
-/// 2 MiB its firmware keeps at the start of RAM on top (Excalibur spec section 7,
-/// "Firmware"), so that the kernel has the RAM an RV32 VM's kernel has. Less does
-/// not boot: Grail puts the device tree at the last 2 MiB boundary below the end of
-/// RAM, as QEMU does, which must be above the kernel's boot block at 0x8020_0000.
-pub fn camelot_ram(xlen: Xlen) -> u64 {
-    match xlen {
-        Xlen::Rv32 => avalon_proto::DEFAULT_RAM_SIZE,
-        Xlen::Rv64 => avalon_proto::DEFAULT_RAM_SIZE + CAMELOT_FIRMWARE_RAM,
-    }
-}
+/// The RAM a Camelot VM has unless its creator says otherwise: the platform's
+/// default, 4 MiB ([`avalon_proto::DEFAULT_RAM_SIZE`]), and the 2 MiB its firmware
+/// keeps at the start of RAM on top (Excalibur spec section 7, "Firmware"). Less
+/// does not boot: Grail puts the device tree at the last 2 MiB boundary below the
+/// end of RAM, as QEMU does, which must be above the kernel's boot block at
+/// 0x8020_0000.
+pub const CAMELOT_RAM: u64 = avalon_proto::DEFAULT_RAM_SIZE + CAMELOT_FIRMWARE_RAM;
 
 /// The RAM Camelot's firmware keeps for itself: 0x8000_0000 to 0x801f_ffff
 /// (`grail::firmware::FW_SIZE`).
 pub const CAMELOT_FIRMWARE_RAM: u64 = 2 << 20;
 
-/// The disk a Camelot VM named `vm` boots from: its own copy of its width's
-/// [`base_image`], `<vm>-disk0` (its disk 0).
+/// The disk a Camelot VM named `vm` boots from: its own copy of
+/// [`BASE_IMAGE`], `<vm>-disk0` (its disk 0).
 pub fn vm_disk(vm: &str) -> String {
     format!("{vm}-disk0")
 }
@@ -276,7 +251,7 @@ pub fn vm_disk(vm: &str) -> String {
 pub enum CamelotError {
     /// The VM's name is not valid, or leaves no room for `-disk0` in a disk name.
     Name(String),
-    /// The Lake server has no base image `image` ([`base_image`]).
+    /// The Lake server has no base image `image` ([`BASE_IMAGE`]).
     NoBaseImage { lake: String, image: &'static str },
     /// Lake refused to copy the image (its name is taken, the base image has a
     /// writer), or failed.
@@ -314,9 +289,8 @@ impl fmt::Display for CamelotError {
 
 impl std::error::Error for CamelotError {}
 
-/// Creates a VM that boots Camelot: copies the base image of `profile`'s width
-/// ([`base_image`]: [`BASE_IMAGE`], or [`BASE_IMAGE_RV64`] for an RV64 VM) on the Lake
-/// server at `lake_addr` (the address Avalon will reach it at too) to
+/// Creates a VM that boots Camelot: copies the base image ([`BASE_IMAGE`]) on the
+/// Lake server at `lake_addr` (the address Avalon will reach it at too) to
 /// [`vm_disk`]`(name)`, puts that disk first in `profile` (disk 0, read-write) and
 /// creates the VM with no program, so it boots from the disk (protocol doc,
 /// `CreateVm`). The VM is left in state created. If Avalon refuses the VM, the copy is
@@ -338,7 +312,7 @@ pub fn create_camelot_vm(
     })?;
     let source = DiskSource::parse(&format!("{}{lake_addr}/{disk}", avalon_proto::LAKE_SCHEME))
         .map_err(CamelotError::Name)?;
-    let image = base_image(profile.xlen);
+    let image = BASE_IMAGE;
     if let Err(e) = lake.clone_disk(&disk, image, None) {
         // Only the source can be missing in a clone.
         return Err(match e.code() {

@@ -118,17 +118,10 @@ void buf_pad(struct buf *b, uint len) {
 static void put_number(struct buf *b, uint64_t v, uint base, uint width, int zero) {
     char digits[24];
     int n = 0;
-    /* In 64 bits while the value needs them (on RV32 a 64-bit division is a
-     * call to libgcc's routine), in 32 for the rest. */
-    while (v > UINT32_MAX) {
+    do {
         digits[n++] = "0123456789abcdef"[v % base];
         v /= base;
-    }
-    uint w = (uint)v;
-    do {
-        digits[n++] = "0123456789abcdef"[w % base];
-        w /= base;
-    } while (w != 0);
+    } while (v != 0);
     while ((uint)n < width) {
         buf_byte(b, zero ? '0' : ' ');
         width--;

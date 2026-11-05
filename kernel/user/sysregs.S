@@ -12,18 +12,14 @@
 # exits 0; or, at the first register that changed, exits with 32 times the
 # case's index plus the register's number (a0's for a wrong result).
 
-# Both widths: every field of a case is a register wide (RISCV_PTR, asm.h),
-# loaded whole (REG_L), and so is the cursor, a pointer.
+# Every field of a case is a register wide (RISCV_PTR, asm.h), loaded whole
+# (REG_L), and so is the cursor, a pointer.
 #include <asm.h>
 
-# Register xN's pattern, as in regs.S: N in each byte, and on RV64 N + 0x80
-# in each byte of the upper half, so that a register the kernel saved or
+# Register xN's pattern, as in regs.S: N in each byte, and N + 0x80 in each
+# byte of the upper half, so that a register the kernel saved or
 # restored as 32 bits comes back different.
-#if __riscv_xlen == 64
 #define PATTERN(n, high) 0x##high##high##high##high##n##n##n##n
-#else
-#define PATTERN(n, high) 0x##n##n##n##n
-#endif
 
     .equ SYS_write, 2
     .equ SYS_read, 3

@@ -4,16 +4,15 @@
 //! [`Link`]: a TCP connection to `grail --gdb`, or a VM's stub tunnelled through an
 //! Avalon session ([`avalon_client::DebugTunnel`], `merlin-dbg --vm`).
 //!
-//! ## The target's width
+//! ## The target
 //!
-//! The stub says how wide the machine's registers are, as it tells GDB: in its
-//! target description (`qXfer:features:read:target.xml`), whose `<architecture>` is
-//! `riscv:rv32` or `riscv:rv64`. A stub with no description is asked for its
-//! registers instead, and the length of the `g` reply (33 registers, `x0`-`x31` and
-//! `pc`, of 4 or 8 bytes each) gives the width. Registers, addresses and lengths
-//! are `u64` here: on RV32, 32-bit values zero-extended, as the stub sends them.
+//! The machine must be RV64, as Excalibur is: the stub says so as it tells GDB, in
+//! its target description (`qXfer:features:read:target.xml`), whose
+//! `<architecture>` is `riscv:rv64`. A stub with no description is asked for its
+//! registers instead, and the length of the `g` reply must be 33 registers
+//! (`x0`-`x31` and `pc`) of 8 bytes. Another target (`riscv:rv32`, a `g` reply of
+//! 4-byte registers) is refused, as an unknown one: [`check_target`].
 
-use excalibur::Xlen;
 use grail::gdb::packet::{self, Decoder, Event};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -107,39 +106,39 @@ pub struct Remote {
     no_ack: bool,
     /// How many harts the machine has (its threads).
     pub harts: usize,
-    /// The width of its registers and addresses (see the module's documentation).
-    pub xlen: Xlen,
 }
 
 /// The number of registers in a `g` packet: `x0`-`x31` and `pc`.
 const GENERAL_REGS: usize = 33;
 
-/// `v` cut to `xlen`'s width: address arithmetic wraps at 2^32 on RV32.
-pub fn wrap(xlen: Xlen, v: u64) -> u64 {
-    match xlen {
-        Xlen::Rv32 => v & 0xffff_ffff,
-        Xlen::Rv64 => v,
-    }
+/// The size of a register, in bytes.
+const REG_BYTES: usize = 8;
+
+/// A register's value or an address in hex with all its digits:
+/// `0x0000000080000024`.
+pub fn hex_value(v: u64) -> String {
+    format!("{v:#018x}")
 }
 
-/// A register's value or an address in hex with all its digits: `0x80000024` on
-/// RV32, `0x0000000080000024` on RV64.
-pub fn hex_value(v: u64, xlen: Xlen) -> String {
-    let width = 2 + xlen.bits() as usize / 4;
-    format!("{v:#0width$x}")
-}
-
-/// The width a target description's `<architecture>` names, if it names one.
-pub fn xml_xlen(xml: &str) -> Option<Xlen> {
+/// The `<architecture>` a target description names, if it names one.
+pub fn xml_arch(xml: &str) -> Option<&str> {
     let arch = xml
         .split("<architecture>")
         .nth(1)?
         .split("</architecture>")
         .next()?;
-    match arch.trim() {
-        "riscv:rv32" => Some(Xlen::Rv32),
-        "riscv:rv64" => Some(Xlen::Rv64),
-        _ => None,
+    Some(arch.trim())
+}
+
+/// Whether the stub's target, as its description names it, is the one merlin-dbg
+/// debugs: `riscv:rv64`. Its error says what the target is.
+pub fn check_target(arch: &str) -> Result<()> {
+    if arch == "riscv:rv64" {
+        Ok(())
+    } else {
+        Err(format!(
+            "the stub's machine is {arch}: merlin-dbg debugs RV64 (riscv:rv64) machines only"
+        ))
     }
 }
 
@@ -155,8 +154,8 @@ impl Remote {
     }
 
     /// Talks to the stub at the other end of `stream`, agreeing on the protocol:
-    /// `swbreak` stop reasons, no acks if the stub can, the target's width and the list
-    /// of harts.
+    /// `swbreak` stop reasons, no acks if the stub can, the target (it must be RV64) and
+    /// the list of harts.
     pub fn over(stream: Box<dyn Link>) -> Result<Remote> {
         let mut r = Remote {
             stream,
@@ -164,7 +163,6 @@ impl Remote {
             events: VecDeque::new(),
             no_ack: false,
             harts: 1,
-            xlen: Xlen::Rv32,
         };
         let features = r.request("qSupported:swbreak+")?;
         let supports = |f: &str| features.split(';').any(|g| g == f);
@@ -173,14 +171,18 @@ impl Remote {
             r.no_ack = true;
         }
         let described = if xml {
-            r.target_xml().ok().as_deref().and_then(xml_xlen)
+            r.target_xml()
+                .ok()
+                .as_deref()
+                .and_then(xml_arch)
+                .map(str::to_string)
         } else {
             None
         };
-        r.xlen = match described {
-            Some(x) => x,
-            None => r.xlen_from_registers()?,
-        };
+        match described {
+            Some(arch) => check_target(&arch)?,
+            None => r.check_registers()?,
+        }
         let threads = r.request("qfThreadInfo")?;
         r.harts = threads
             .strip_prefix('m')
@@ -209,21 +211,19 @@ impl Remote {
         }
     }
 
-    /// The width a `g` reply's length says: 33 registers of 4 or 8 bytes.
-    fn xlen_from_registers(&mut self) -> Result<Xlen> {
+    /// Checks that a `g` reply is RV64's, without a target description: 33 registers
+    /// of 8 bytes.
+    fn check_registers(&mut self) -> Result<()> {
         let g = self.request("g")?;
         match g.len() / 2 {
-            n if n == GENERAL_REGS * 4 => Ok(Xlen::Rv32),
-            n if n == GENERAL_REGS * 8 => Ok(Xlen::Rv64),
-            n => Err(format!(
-                "a register packet of {n} bytes, neither RV32's nor RV64's"
-            )),
+            n if n == GENERAL_REGS * REG_BYTES => Ok(()),
+            n if n == GENERAL_REGS * 4 => Err(
+                "a register packet of 4-byte registers (an RV32 machine): merlin-dbg debugs RV64 \
+                 machines only"
+                    .into(),
+            ),
+            n => Err(format!("a register packet of {n} bytes, not RV64's")),
         }
-    }
-
-    /// The size of a register, in bytes.
-    fn reg_bytes(&self) -> usize {
-        self.xlen.bits() as usize / 8
     }
 
     /// Sends a packet and returns the reply's payload. `E` replies are errors; an empty
@@ -328,7 +328,7 @@ impl Remote {
     pub fn registers(&mut self) -> Result<[u64; GENERAL_REGS]> {
         let g = self.request("g")?;
         let bytes = unhex(&g).ok_or("a malformed register packet")?;
-        let size = self.reg_bytes();
+        let size = REG_BYTES;
         if bytes.len() != GENERAL_REGS * size {
             return Err(format!("a register packet of {} bytes", bytes.len()));
         }
@@ -343,14 +343,14 @@ impl Remote {
     pub fn register(&mut self, n: usize) -> Result<u64> {
         let p = self.request(&format!("p{n:x}"))?;
         match unhex(&p) {
-            Some(bytes) if bytes.len() == self.reg_bytes() => Ok(le(&bytes)),
+            Some(bytes) if bytes.len() == REG_BYTES => Ok(le(&bytes)),
             _ => Err("a malformed register value".into()),
         }
     }
 
     pub fn set_register(&mut self, n: usize, v: u64) -> Result<()> {
         let bytes = v.to_le_bytes();
-        self.request(&format!("P{n:x}={}", hex(&bytes[..self.reg_bytes()])))
+        self.request(&format!("P{n:x}={}", hex(&bytes[..REG_BYTES])))
             .map(drop)
     }
 
@@ -359,7 +359,7 @@ impl Remote {
     pub fn read_memory(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
-            let at = wrap(self.xlen, addr.wrapping_add(out.len() as u64));
+            let at = addr.wrapping_add(out.len() as u64);
             let want = (len - out.len()).min(0x800);
             let reply = match self.request(&format!("m{at:x},{want:x}")) {
                 Ok(r) => r,
@@ -396,10 +396,10 @@ impl Remote {
         (b.len() == 4).then(|| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    /// A register's worth of memory (a saved register, a pointer): 4 bytes on RV32,
-    /// 8 on RV64, if they can be read.
+    /// A register's worth of memory (a saved register, a pointer): 8 bytes, if they can
+    /// be read.
     pub fn read_xword(&mut self, addr: u64) -> Option<u64> {
-        let size = self.reg_bytes();
+        let size = REG_BYTES;
         let b = self.read_memory(addr, size).ok()?;
         (b.len() == size).then(|| le(&b))
     }
@@ -481,7 +481,6 @@ impl Physical<'_> {
     /// Up to `len` bytes at physical address `addr`: fewer when the memory ends, an
     /// error when not even the first byte can be read.
     pub fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
-        // In u64: a physical address can be past 4 GiB on RV32 (Sv32's 34 bits).
         let mut out = Vec::with_capacity(len);
         let mut failed = None;
         while out.len() < len {
@@ -691,28 +690,32 @@ mod tests {
     }
 
     #[test]
-    fn the_width_from_the_registers() {
-        for (width, xlen) in [(4, Xlen::Rv32), (8, Xlen::Rv64)] {
-            let mut r = Remote::connect(plain_stub(width)).unwrap();
-            assert_eq!(r.xlen, xlen);
-            assert_eq!(r.registers().unwrap()[32], 0x8000_0000);
-        }
+    fn the_target_from_the_registers() {
+        // Without a target description: RV64's 8-byte registers, and nothing else.
+        let mut r = Remote::connect(plain_stub(8)).unwrap();
+        assert_eq!(r.registers().unwrap()[32], 0x8000_0000);
+        let e = Remote::connect(plain_stub(4)).err().unwrap();
+        assert_eq!(
+            e,
+            "a register packet of 4-byte registers (an RV32 machine): merlin-dbg debugs RV64 machines only"
+        );
         let e = Remote::connect(plain_stub(2)).err().unwrap();
-        assert_eq!(e, "a register packet of 66 bytes, neither RV32's nor RV64's");
+        assert_eq!(e, "a register packet of 66 bytes, not RV64's");
     }
 
     #[test]
-    fn widths() {
+    fn targets() {
         let xml = "<?xml version=\"1.0\"?>\n<target version=\"1.0\">\n\
                    <architecture>riscv:rv64</architecture>\n<feature name=\"org.gnu.gdb.riscv.cpu\">";
-        assert_eq!(xml_xlen(xml), Some(Xlen::Rv64));
-        assert_eq!(xml_xlen(&xml.replace("rv64", "rv32")), Some(Xlen::Rv32));
-        assert_eq!(xml_xlen(&xml.replace("riscv:rv64", "i386")), None);
-        assert_eq!(xml_xlen("<target/>"), None);
-        assert_eq!(wrap(Xlen::Rv32, 0x1_0000_0004), 4);
-        assert_eq!(wrap(Xlen::Rv64, 0x1_0000_0004), 0x1_0000_0004);
-        assert_eq!(hex_value(0x8000_0024, Xlen::Rv32), "0x80000024");
-        assert_eq!(hex_value(0x8000_0024, Xlen::Rv64), "0x0000000080000024");
-        assert_eq!(hex_value(0, Xlen::Rv32), "0x00000000");
+        assert_eq!(xml_arch(xml), Some("riscv:rv64"));
+        assert_eq!(check_target("riscv:rv64"), Ok(()));
+        assert_eq!(
+            check_target(xml_arch(&xml.replace("rv64", "rv32")).unwrap()),
+            Err("the stub's machine is riscv:rv32: merlin-dbg debugs RV64 (riscv:rv64) machines only".into())
+        );
+        assert_eq!(xml_arch(&xml.replace("riscv:rv64", "i386")), Some("i386"));
+        assert_eq!(xml_arch("<target/>"), None);
+        assert_eq!(hex_value(0x8000_0024), "0x0000000080000024");
+        assert_eq!(hex_value(0), "0x0000000000000000");
     }
 }

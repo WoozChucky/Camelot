@@ -15,9 +15,8 @@
  * instruction each way when there is only one thread. */
 #include "../user.h"
 
-/* A pointer and a size: 8 bytes on RV32, 16 on RV64, which is also the
- * alignment every block gets: on RV64 the ABI's largest, 16, as glibc's
- * malloc gives. */
+/* A pointer and a size: 16 bytes, which is also the alignment every block
+ * gets: the ABI's largest, as glibc's malloc gives. */
 struct header {
     struct header *next; /* the next free block, while this one is free */
     size_t units;        /* the block's size, in headers, its own included */

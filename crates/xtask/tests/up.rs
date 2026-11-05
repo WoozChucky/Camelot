@@ -58,36 +58,36 @@ impl Output {
     }
 }
 
-/// The root images `up` builds, RV32's and RV64's, built once (with the binaries) for
-/// every test.
-fn root_images() -> &'static up::RootImages {
-    static IMAGES: OnceLock<up::RootImages> = OnceLock::new();
-    IMAGES.get_or_init(|| {
+/// The root image `up` builds, built once (with the binaries) for every test.
+fn root_image() -> &'static [u8] {
+    static IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
+    IMAGE.get_or_init(|| {
         let dir = TempDir::new("build");
         let mut options = Options::new(&xtask::repo_root());
         options.image = dir.0.join("camelot-fs.img");
-        options.image_rv64 = dir.0.join("camelot-fs-rv64.img");
-        let images = up::build(&options, &mut |line| eprintln!("{line}")).unwrap();
-        assert_eq!(std::fs::read(&options.image).unwrap(), images.rv32);
-        assert_eq!(std::fs::read(&options.image_rv64).unwrap(), images.rv64);
-        images
+        let image = up::build(&options, &mut |line| eprintln!("{line}")).unwrap();
+        assert_eq!(std::fs::read(&options.image).unwrap(), image);
+        image
     })
 }
 
-/// The RV32 root image `up` builds.
-fn root_image() -> &'static [u8] {
-    &root_images().rv32
+/// A Camelot VM's hardware, as Round Table's `--camelot` and `up`'s demo make it:
+/// Camelot's firmware, and its 2 MiB on top of the default 4 MiB of RAM.
+fn camelot_profile() -> avalon_proto::HardwareProfile {
+    avalon_proto::HardwareProfile {
+        ram_size: avalon_client::CAMELOT_RAM,
+        bios: avalon_client::camelot_bios(),
+        ..avalon_proto::HardwareProfile::default()
+    }
 }
 
 /// `up`'s options for a test: ephemeral ports, everything under `dir`, nothing to
-/// build (the images are [`root_images`]).
+/// build (the image is [`root_image`]).
 fn options(dir: &TempDir) -> Options {
     let mut o = Options::new(&xtask::repo_root());
     o.images = dir.0.join("images");
     o.image = dir.0.join("camelot-fs.img");
-    o.image_rv64 = dir.0.join("camelot-fs-rv64.img");
-    std::fs::write(&o.image, &root_images().rv32).unwrap();
-    std::fs::write(&o.image_rv64, &root_images().rv64).unwrap();
+    std::fs::write(&o.image, root_image()).unwrap();
     o.build = false;
     let any = "127.0.0.1:0".parse().unwrap();
     (o.lake, o.avalon, o.pendragon) = (any, any, any);
@@ -136,9 +136,7 @@ fn all_answer(platform: &Platform) {
     let mut lake = Client::connect(&platform.lake.to_string(), "test").unwrap();
     assert!(lake.server().starts_with("lake "), "{}", lake.server());
     let disks = lake.list_disks().unwrap();
-    for image in ["os-base", "os-base-rv64"] {
-        assert!(disks.iter().any(|d| d.name == image), "{disks:?}");
-    }
+    assert!(disks.iter().any(|d| d.name == "os-base"), "{disks:?}");
     let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
     assert!(avalon.server().starts_with("avalon "), "{}", avalon.server());
     avalon.list_vms().unwrap();
@@ -307,10 +305,6 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         std::fs::read(options.images.join("os-base")).unwrap(),
         root_image()
     );
-    assert_eq!(
-        std::fs::read(options.images.join("os-base-rv64")).unwrap(),
-        root_images().rv64
-    );
     let mut platform = Platform::start(&options, &RUNNING, log).unwrap();
     for addr in [platform.lake, platform.avalon, platform.pendragon] {
         assert!(addr.ip().is_loopback() && addr.port() != 0, "{addr}");
@@ -318,7 +312,8 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     all_answer(&platform);
 
     // The demo: a NAT switch and a VM, vm001, that boots Camelot from its own copy
-    // of the root image, to the shell, with the default hardware: 4 MiB of RAM.
+    // of the root image, to the shell, with a Camelot VM's hardware: the firmware and
+    // 6 MiB of RAM.
     assert_eq!(
         root_image().len(),
         xtask::fs::IMAGE_SIZE as usize * camelot_fs::BSIZE
@@ -334,15 +329,15 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
     let vm = avalon.vm_info(&VmRef::Id(id)).unwrap();
     assert_eq!(vm.vm.name, "vm001");
-    assert_eq!(vm.vm.profile.ram_size, 4 << 20);
-    // The defaults, but for its disk and its card.
+    assert_eq!(vm.vm.profile.ram_size, 6 << 20);
+    // A Camelot VM's hardware, but for its disk and its card.
     assert_eq!(vm.vm.profile.devices.len(), 2);
     assert_eq!(
         avalon_proto::HardwareProfile {
             devices: Vec::new(),
             ..vm.vm.profile.clone()
         },
-        avalon_proto::HardwareProfile::default()
+        camelot_profile()
     );
     let switches = avalon.list_switches().unwrap();
     assert_eq!(switches.len(), 1);
@@ -352,7 +347,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     one.wait_for_end(PROMPT);
     assert!(one.output.contains("Camelot v"), "{}", one.output);
     assert!(
-        one.output.contains("\nram: 4 MiB at 0x80000000\n"),
+        one.output.contains("\nram: 6 MiB at 0x80000000\n"),
         "{}",
         one.output
     );
@@ -377,7 +372,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         &mut lake,
         &platform.lake.to_string(),
         "second",
-        avalon_proto::HardwareProfile::default(),
+        camelot_profile(),
     )
     .unwrap();
     assert_eq!(disk, "second-disk0");
@@ -397,7 +392,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     // Nothing is named after the OS.
     let mut names: Vec<&str> = disks.iter().map(|d| d.name.as_str()).collect();
     names.sort();
-    assert_eq!(names, ["os-base", "os-base-rv64", "second-disk0", "vm001-disk0"]);
+    assert_eq!(names, ["os-base", "second-disk0", "vm001-disk0"]);
     let mut names: Vec<String> = vms.iter().map(|vm| vm.name.clone()).collect();
     names.sort();
     assert_eq!(names, ["second", "vm001"]);
@@ -411,10 +406,10 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     )));
     assert!(summary.contains(&format!("cargo run --release -p herald -- --tcp {shd}")));
     assert!(
-        summary.contains("create --name web64 --camelot --xlen 64 --start\n"),
+        summary.contains("create --name web --camelot --start\n"),
         "{summary}"
     );
-    check_summary(&summary, 5);
+    check_summary(&summary, 4);
 
     // Ctrl-C: the flag `up`'s handler sets.
     let stop = AtomicBool::new(true);
@@ -470,8 +465,8 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     one.type_line("cat /kept");
     one.wait_for_end("kept\n$ ");
     drop(one);
-    check_summary(&platform.summary(true), 5);
-    check_summary(&platform.summary(false), 4);
+    check_summary(&platform.summary(true), 4);
+    check_summary(&platform.summary(false), 3);
     platform.stop(log);
 }
 
@@ -527,19 +522,17 @@ fn first_frame(avalon: SocketAddr, vm: u32) -> (u32, u32, Vec<u8>) {
     }
 }
 
-/// RV64 VMs on the platform `up` brings up, made the two ways a person makes one:
-/// Round Table's `create --camelot --xlen 64` (Sv48 and Sv39, the default) and
-/// Pendragon's form, through its API (`"xlen": "64"`, here with Sv39 alone). Each
-/// boots RV64 Camelot from its own copy of Lake's `os-base-rv64`, which `up` seeded
-/// beside the RV32 `os-base`, on Camelot's firmware with 6 MiB of RAM, its 2 MiB on top
-/// of the 4 MiB the demo VM has (a Camelot VM's defaults), as the demo VM boots RV32
-/// Camelot (the test above), and works as that one does: its console runs the shell,
-/// its screen is served, its card on a switch with a NAT gateway reaches its `shd`
-/// through a forwarded port, and what it writes to its disk is in Lake's image once
-/// it is stopped.
+/// Camelot VMs on the platform `up` brings up, made the two ways a person makes one:
+/// Round Table's `create --camelot` (Sv48 and Sv39, the default) and Pendragon's
+/// form, through its API (here with Sv39 alone). Each boots Camelot from its own copy
+/// of Lake's `os-base`, which `up` seeded, on Camelot's firmware with 6 MiB of RAM,
+/// its 2 MiB on top of the default 4 MiB (a Camelot VM's defaults), and works as the
+/// demo VM does (the test above): its console runs the shell, its screen is served,
+/// its card on a switch with a NAT gateway reaches its `shd` through a forwarded
+/// port, and what it writes to its disk is in Lake's image once it is stopped.
 #[test]
-fn rv64_vms_from_round_table_and_pendragon_boot_camelot() {
-    let dir = TempDir::new("rv64");
+fn camelot_vms_from_round_table_and_pendragon_boot_camelot() {
+    let dir = TempDir::new("camelot");
     let out = Output::default();
     let log = &mut |line: &str| out.push(line);
     let options = options(&dir);
@@ -547,7 +540,7 @@ fn rv64_vms_from_round_table_and_pendragon_boot_camelot() {
     assert!(
         out.lines()
             .iter()
-            .any(|l| l.starts_with("up: image os-base-rv64 in ") && l.ends_with(": created")),
+            .any(|l| l.starts_with("up: image os-base in ") && l.ends_with(": created")),
         "{:#?}",
         out.lines()
     );
@@ -568,18 +561,8 @@ fn rv64_vms_from_round_table_and_pendragon_boot_camelot() {
     }
     // Round Table's VM, with Sv48 and Sv39 (the default).
     assert_eq!(
-        rt(&[
-            "create",
-            "--name",
-            "rt64",
-            "--camelot",
-            "--xlen",
-            "64",
-            "--net",
-            "rt",
-            "--start"
-        ]),
-        "created disk rt64-disk0 (a copy of os-base-rv64)\ncreated VM 1 (rt64)\nstarted VM 1 (rt64)\n"
+        rt(&["create", "--name", "rtvm", "--camelot", "--net", "rt", "--start"]),
+        "created disk rtvm-disk0 (a copy of os-base)\ncreated VM 1 (rtvm)\nstarted VM 1 (rtvm)\n"
     );
     // Pendragon's, with Sv39 alone.
     let token = token(&platform.url);
@@ -588,53 +571,48 @@ fn rv64_vms_from_round_table_and_pendragon_boot_camelot() {
         "POST",
         "/api/vms",
         token,
-        r#"{"name": "pd64", "camelot": true, "xlen": "64", "paging": "sv39", "nets": [{"switch": "pd"}], "start": true}"#,
+        r#"{"name": "pdvm", "camelot": true, "paging": "sv39", "nets": [{"switch": "pd"}], "start": true}"#,
     );
     assert_eq!(status, 201, "{body}");
     assert!(
-        body.contains(r#""id":2"#) && body.contains(r#""disk":"pd64-disk0""#),
+        body.contains(r#""id":2"#) && body.contains(r#""disk":"pdvm-disk0""#),
         "{body}"
     );
-    let vms = [("rt64", 1, "rt", "Sv48"), ("pd64", 2, "pd", "Sv39")];
+    let vms = [("rtvm", 1, "rt", "Sv48"), ("pdvm", 2, "pd", "Sv39")];
 
-    // What the clients show of them: RV64, and each one's paging.
+    // What the clients show of them: each one's paging.
     assert_eq!(
         rt(&["list"]),
         "\
-ID  NAME  STATE    ARCH  RAM    CLOCK       DISKS  NETS
-1   rt64  running  RV64  6 MiB  full speed  1      1
-2   pd64  running  RV64  6 MiB  full speed  1      1
+ID  NAME  STATE    RAM    CLOCK       DISKS  NETS
+1   rtvm  running  6 MiB  full speed  1      1
+2   pdvm  running  6 MiB  full speed  1      1
 "
     );
-    let info = rt(&["info", "rt64"]);
+    let info = rt(&["info", "rtvm"]);
     assert!(
         info.contains("\narch     RV64 (Sv48 and Sv39 paging)\nfirmware default\nRAM      6 MiB\n"),
         "{info}"
     );
-    let (status, pd) = http(platform.pendragon, "/api/vms/pd64", token);
+    let (status, pd) = http(platform.pendragon, "/api/vms/pdvm", token);
     assert_eq!(status, 200, "{pd}");
     assert!(
-        pd.contains(
-            r#""xlen":64,"paging":"sv39","arch":"RV64","arch_text":"RV64 (Sv39 paging)","bios":"default""#
-        ),
+        pd.contains(r#""paging":"sv39","arch_text":"RV64 (Sv39 paging)","bios":"default""#),
         "{pd}"
     );
     let (status, disks) = http(platform.pendragon, "/api/disks", token);
     assert_eq!(status, 200, "{disks}");
-    assert!(
-        disks.contains(r#""camelot_image":"os-base","camelot_image_rv64":"os-base-rv64""#),
-        "{disks}"
-    );
+    assert!(disks.contains(r#""camelot_image":"os-base""#), "{disks}");
     let lake_disks = rt(&["disk", "list"]);
     for line in [
-        "os-base-rv64  4 MiB  8192     no\n",
-        "pd64-disk0    4 MiB  8192     read-write\n",
-        "rt64-disk0    4 MiB  8192     read-write\n",
+        "os-base     4 MiB  8192     no\n",
+        "pdvm-disk0  4 MiB  8192     read-write\n",
+        "rtvm-disk0  4 MiB  8192     read-write\n",
     ] {
         assert!(lake_disks.contains(line), "{line:?} in {lake_disks}");
     }
 
-    // The console: RV64 Camelot booted to its shell, with the paging the VM has (and
+    // The console: Camelot booted to its shell, with the paging the VM has (and
     // 64-bit pointers in the kernel's self-test).
     let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
     let switches = avalon.list_switches().unwrap();
@@ -683,12 +661,12 @@ ID  NAME  STATE    ARCH  RAM    CLOCK       DISKS  NETS
     }
 
     // The disks: stopped, each VM lets go of its copy, which holds what it wrote.
-    assert_eq!(rt(&["stop", "rt64"]), "stopped VM rt64\n");
-    let (status, body) = http_request(platform.pendragon, "POST", "/api/vms/pd64/stop", token, "");
+    assert_eq!(rt(&["stop", "rtvm"]), "stopped VM rtvm\n");
+    let (status, body) = http_request(platform.pendragon, "POST", "/api/vms/pdvm/stop", token, "");
     assert_eq!(status, 200, "{body}");
     let start = Instant::now();
-    while !rt(&["disk", "list"]).contains("pd64-disk0    4 MiB  8192     no\n")
-        || !rt(&["disk", "list"]).contains("rt64-disk0    4 MiB  8192     no\n")
+    while !rt(&["disk", "list"]).contains("pdvm-disk0  4 MiB  8192     no\n")
+        || !rt(&["disk", "list"]).contains("rtvm-disk0  4 MiB  8192     no\n")
     {
         assert!(start.elapsed() < SLOW, "the disks are still attached");
         std::thread::sleep(Duration::from_millis(20));
@@ -763,7 +741,7 @@ fn a_taken_shd_address_leaves_the_demo_without_shd() {
     all_answer(&platform);
     let summary = platform.summary(true);
     assert!(!tells_of_shd(&summary), "{summary}");
-    check_summary(&summary, 4);
+    check_summary(&summary, 3);
 
     // start_shd with nobody's shell at the address it is given (the listener, which
     // accepts and says nothing): it types `shd &`, which starts, and gives up when its
@@ -800,7 +778,7 @@ fn a_disk_without_shd_leaves_the_demo_without_shd() {
         &mut lake,
         &platform.lake.to_string(),
         "vm001",
-        avalon_proto::HardwareProfile::default(),
+        camelot_profile(),
     )
     .unwrap();
     assert_eq!(disk, "vm001-disk0");
@@ -831,7 +809,7 @@ fn a_disk_without_shd_leaves_the_demo_without_shd() {
     assert!(platform.shd.is_some());
     let summary = platform.summary(true);
     assert!(!tells_of_shd(&summary), "{summary}");
-    check_summary(&summary, 4);
+    check_summary(&summary, 3);
     // The platform carries on.
     let mut console = Console::attach(platform.avalon, id);
     console.type_line("echo still up");
@@ -971,10 +949,9 @@ fn ctrl_c_while_starting_stops_what_started() {
 fn ending_xtask_up_ends_the_servers() {
     let dir = TempDir::new("process");
     let options = options(&dir);
-    // `--no-build` seeds target/camelot-fs.img and target/camelot-fs-rv64.img when they
-    // are there; without them, the images already in the directory do.
+    // `--no-build` seeds target/camelot-fs.img when it is there; without it, the image
+    // already in the directory does.
     up::seed(&options.images, "os-base", root_image()).unwrap();
-    up::seed(&options.images, "os-base-rv64", &root_images().rv64).unwrap();
     let any = "127.0.0.1:0";
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_xtask"))
         .args([
@@ -1070,31 +1047,19 @@ fn a_new_image_says_the_demo_disk_is_older() {
     std::fs::write(options.images.join("vm001-disk0"), [0; 512]).unwrap();
     up::prepare(&options, log).unwrap();
     assert!(!note(&out));
-    // A new RV64 image says nothing of the demo disk, which is RV32's copy.
-    up::seed(&options.images, "os-base-rv64", &[0; 512]).unwrap();
-    up::prepare(&options, log).unwrap();
-    assert!(!note(&out));
-    assert!(
-        out.lines()
-            .iter()
-            .any(|l| l.starts_with("up: image os-base-rv64 in ")
-                && l.ends_with(": replaced with the new build")),
-        "{:#?}",
-        out.lines()
-    );
     // A new image and the old demo disk.
     up::seed(&options.images, "os-base", &[0; 512]).unwrap();
     up::prepare(&options, log).unwrap();
     assert!(note(&out), "{:#?}", out.lines());
-    // Said after the RV32 image's line, before the RV64 one's.
+    // Said after the image's line.
     let lines = out.lines();
     let at = lines
         .iter()
         .rposition(|l| l.starts_with("up: note: the demo VM's disk"))
         .unwrap();
-    assert!(lines[at - 1].starts_with("up: image os-base in "), "{lines:#?}");
     assert!(
-        lines[at + 1].starts_with("up: image os-base-rv64 in "),
+        lines[at - 1].starts_with("up: image os-base in ")
+            && lines[at - 1].ends_with(": replaced with the new build"),
         "{lines:#?}"
     );
     assert_eq!(
@@ -1116,25 +1081,16 @@ fn no_build_needs_what_a_build_makes() {
     let log = &mut |line: &str| eprintln!("{line}");
     options.image = dir.0.join("missing.img");
     let e = up::prepare(&options, log).unwrap_err();
-    assert!(e.starts_with("there is no "), "{e}");
-    assert!(e.contains("as the image os-base: "), "{e}");
-    // A base image already in the directory is enough.
-    up::seed(&options.images, "os-base", &[0; 512]).unwrap();
-    up::prepare(&options, log).unwrap();
-    // So it is for RV64's.
-    options.image_rv64 = dir.0.join("missing-rv64.img");
-    std::fs::remove_file(options.images.join("os-base-rv64")).unwrap();
-    let e = up::prepare(&options, log).unwrap_err();
     assert_eq!(
         e,
         format!(
-            "there is no {} to put in {} as the image os-base-rv64: run cargo xtask up without \
-             --no-build",
-            options.image_rv64.display(),
+            "there is no {} to put in {} as the image os-base: run cargo xtask up without --no-build",
+            options.image.display(),
             options.images.display()
         )
     );
-    up::seed(&options.images, "os-base-rv64", &[0; 512]).unwrap();
+    // A base image already in the directory is enough.
+    up::seed(&options.images, "os-base", &[0; 512]).unwrap();
     up::prepare(&options, log).unwrap();
     options.bin_dir = dir.0.join("nowhere");
     let e = up::prepare(&options, log).unwrap_err();

@@ -17,8 +17,15 @@
 //! The tests watch every hart's turn with `Cpu::step_traced`, as smp.rs's
 //! do, and read the kernel's tables from memory (the layouts are in the
 //! constants below and in common/mod.rs, with the headers they come from).
+//! They count the pages as kstacks.rs does (a kernel stack stays mapped in
+//! its hart's cache once its thread ends), after a first run of the command
+//! that has made the tables the kernel stacks' slots need, filled the
+//! caches and grown the shell's stack.
 
 mod common;
+
+#[path = "../../grail/tests/common/kstacks.rs"]
+mod kstacks;
 
 use camelot_fs::mkfs::Options;
 use camelot_fs::{fsck, SECTOR_SIZE};
@@ -31,25 +38,25 @@ use std::ops::Range;
 use xtask::repo_root;
 
 /// `struct thread` (kernel/include/proc.h): its size, and its state, tid,
-/// process and kernel stack.
-const THREAD_SIZE: u32 = 96;
-const NTHREAD: u32 = 16;
-const THREAD_STATE: u32 = 0;
-const THREAD_TID: u32 = 4;
-const THREAD_PROC: u32 = 8;
-const THREAD_KSTACK: u32 = 12;
+/// process and kernel stack (the pointers 8 bytes).
+const THREAD_SIZE: u64 = 184;
+const NTHREAD: u64 = 16;
+const THREAD_STATE: u64 = 0;
+const THREAD_TID: u64 = 4;
+const THREAD_PROC: u64 = 8;
+const THREAD_KSTACK: u64 = 16;
 /// Thread states (kernel/include/proc.h).
 const THREAD_UNUSED: u32 = 0;
 const THREAD_ZOMBIE: u32 = 3;
-/// `struct proc`: its size, state, name (16 bytes) and page table.
-const PROC_SIZE: u32 = 172;
-const NPROC: u32 = 8;
-const PROC_STATE: u32 = 0;
-const PROC_PAGETABLE: u32 = 32;
+/// `struct proc`: its size and state (its name and page table are in
+/// common/mod.rs).
+const PROC_SIZE: u64 = 304;
+const NPROC: u64 = 8;
+const PROC_STATE: u64 = 0;
 
 /// The slots of the thread table in use, as (state, tid, process, kernel
 /// stack).
-fn threads_in_use(m: &Machine, elf: &grail::elf::Elf) -> Vec<(u32, u32, u32, u32)> {
+fn threads_in_use(m: &Machine, elf: &grail::elf::Elf) -> Vec<(u32, u32, u64, u64)> {
     let table = sym(elf, "threads");
     (0..NTHREAD)
         .map(|i| table + i * THREAD_SIZE)
@@ -57,8 +64,8 @@ fn threads_in_use(m: &Machine, elf: &grail::elf::Elf) -> Vec<(u32, u32, u32, u32
             (
                 peek(&m.cpu, t + THREAD_STATE),
                 peek(&m.cpu, t + THREAD_TID),
-                peek(&m.cpu, t + THREAD_PROC),
-                peek(&m.cpu, t + THREAD_KSTACK),
+                peek64(&m.cpu, t + THREAD_PROC),
+                peek64(&m.cpu, t + THREAD_KSTACK),
             )
         })
         .filter(|&(state, ..)| state != THREAD_UNUSED)
@@ -88,11 +95,11 @@ fn check_only_the_shell(m: &Machine, elf: &grail::elf::Elf) {
 /// whether two of its threads ever ran at the same time, on different
 /// harts with the process's page table in satp.
 struct SideBySide {
-    cpus: u32,
+    cpus: u64,
     name: &'static str,
     harts: usize,
     /// Per hart, this step: the thread running in U-mode, and its process.
-    on: [(u32, u32); grail::MAX_HARTS],
+    on: [(u64, u64); grail::MAX_HARTS],
     /// The most of the process's threads seen in U-mode at once.
     most: usize,
 }
@@ -110,25 +117,25 @@ impl SideBySide {
 
     fn step(&mut self, cpu: &Cpu) {
         let h = cpu.id as usize;
-        let me = self.cpus + cpu.id * CPU_SIZE;
+        let me = self.cpus + u64::from(cpu.id) * CPU_SIZE;
         self.on[h] = (0, 0);
         if cpu.mode == Mode::U {
-            let p = peek(cpu, me + CPU_PROC);
+            let p = peek64(cpu, me + CPU_PROC);
             if p != 0 && proc_name(cpu, p) == self.name {
                 // The hart runs on the process's own page table.
-                assert_eq!(peek(cpu, me + CPU_PAGETABLE), peek(cpu, p + PROC_PAGETABLE));
-                self.on[h] = (peek(cpu, me + CPU_THREAD), p);
+                assert_eq!(peek64(cpu, me + CPU_PAGETABLE), peek64(cpu, p + PROC_PAGETABLE));
+                self.on[h] = (peek64(cpu, me + CPU_THREAD), p);
             }
         }
         // The last hart's turn: every hart's state is from this step.
         if h == self.harts - 1 {
-            let running: Vec<(u32, u32)> = self.on[..self.harts]
+            let running: Vec<(u64, u64)> = self.on[..self.harts]
                 .iter()
                 .copied()
                 .filter(|t| t.0 != 0)
                 .collect();
-            let threads: HashSet<u32> = running.iter().map(|t| t.0).collect();
-            let procs: HashSet<u32> = running.iter().map(|t| t.1).collect();
+            let threads: HashSet<u64> = running.iter().map(|t| t.0).collect();
+            let procs: HashSet<u64> = running.iter().map(|t| t.1).collect();
             if procs.len() == 1 && threads.len() == running.len() {
                 self.most = self.most.max(threads.len());
             }
@@ -140,10 +147,10 @@ impl SideBySide {
 #[derive(Clone, Copy)]
 struct Shootdown {
     /// Where the call returns to, and its sp.
-    ra: u32,
-    sp: u32,
+    ra: u64,
+    sp: u64,
     /// The page table shot down.
-    pt: u32,
+    pt: u64,
     /// The other harts that have had `pt` in satp (cpus[i].pagetable)
     /// without a break from the call's start to its IPI (or its return, if
     /// it sends none): the call must target each, as it looks at every
@@ -167,13 +174,13 @@ struct Shootdown {
 /// other harts that ran the table through one call's start and IPI (so
 /// that the check above had something to check).
 struct Shootdowns {
-    entry: u32,
-    body: Range<u32>,
-    ipi: u32,
-    sfence: u32,
-    serve: Range<u32>,
-    kernel_pt: u32,
-    cpus: u32,
+    entry: u64,
+    body: Range<u64>,
+    ipi: u64,
+    sfence: u64,
+    serve: Range<u64>,
+    kernel_pt: u64,
+    cpus: u64,
     harts: usize,
     /// Per requesting hart.
     active: [Option<Shootdown>; grail::MAX_HARTS],
@@ -189,7 +196,7 @@ impl Shootdowns {
             ipi: sym(elf, "sbi_send_ipi"),
             sfence: sym(elf, "sfence_vma"),
             serve: function("tlb_serve"),
-            kernel_pt: m.cpu.bus.peek(sym(elf, "kernel_pagetable").into()).unwrap(),
+            kernel_pt: peek64(&m.cpu, sym(elf, "kernel_pagetable")),
             cpus: sym(elf, "cpus"),
             harts,
             active: [None; grail::MAX_HARTS],
@@ -199,19 +206,19 @@ impl Shootdowns {
     }
 
     /// The harts whose cpus[i].pagetable is `pt`.
-    fn running(&self, cpu: &Cpu, pt: u32) -> u32 {
-        (0..self.harts as u32)
-            .filter(|&i| peek(cpu, self.cpus + i * CPU_SIZE + CPU_PAGETABLE) == pt)
+    fn running(&self, cpu: &Cpu, pt: u64) -> u32 {
+        (0..self.harts as u64)
+            .filter(|&i| peek64(cpu, self.cpus + i * CPU_SIZE + CPU_PAGETABLE) == pt)
             .fold(0, |set, i| set | 1 << i)
     }
 
     fn step(&mut self, cpu: &Cpu) {
         let h = cpu.id as usize;
-        if cpu.pc as u32 == self.entry && cpu.x[10] as u32 != self.kernel_pt {
-            let pt = cpu.x[10] as u32;
+        if cpu.pc == self.entry && cpu.x[10] != self.kernel_pt {
+            let pt = cpu.x[10];
             self.active[h] = Some(Shootdown {
-                ra: cpu.x[1] as u32,
-                sp: cpu.x[2] as u32,
+                ra: cpu.x[1],
+                sp: cpu.x[2],
                 pt,
                 running: self.running(cpu, pt) & !(1 << h),
                 sent: false,
@@ -230,11 +237,11 @@ impl Shootdowns {
             }
         }
         if let Some(mut s) = self.active[h] {
-            if cpu.pc as u32 == self.ipi && self.body.contains(&(cpu.x[1] as u32)) {
+            if cpu.pc == self.ipi && self.body.contains(&cpu.x[1]) {
                 s.targets = cpu.x[10] as u32;
                 s.sent = true;
                 self.active[h] = Some(s);
-            } else if cpu.pc as u32 == s.ra && cpu.x[2] as u32 == s.sp {
+            } else if cpu.pc == s.ra && cpu.x[2] == s.sp {
                 assert_eq!(
                     s.running & s.targets,
                     s.running,
@@ -258,7 +265,7 @@ impl Shootdowns {
         // A flush for another hart's request: any from when the request
         // began, as a target may serve its ticket before the IPI goes out
         // (another request's IPI woke it).
-        if cpu.pc as u32 == self.sfence && self.serve.contains(&(cpu.x[1] as u32)) {
+        if cpu.pc == self.sfence && self.serve.contains(&cpu.x[1]) {
             for (k, a) in self.active.iter_mut().enumerate() {
                 if let Some(s) = a {
                     if k != h {
@@ -275,8 +282,8 @@ impl Shootdowns {
 /// more (the scheduler freed it as the thread switched away for the last
 /// time). `joined` counts them.
 struct Joins {
-    free: u32,
-    join: Range<u32>,
+    free: u64,
+    join: Range<u64>,
     joined: u32,
 }
 
@@ -290,18 +297,27 @@ impl Joins {
     }
 
     fn step(&mut self, cpu: &Cpu) {
-        if cpu.pc as u32 != self.free || !self.join.contains(&(cpu.x[1] as u32)) {
+        if cpu.pc != self.free || !self.join.contains(&cpu.x[1]) {
             return;
         }
-        let t = cpu.x[10] as u32;
+        let t = cpu.x[10];
         assert_eq!(peek(cpu, t + THREAD_STATE), THREAD_ZOMBIE);
         assert_eq!(
-            peek(cpu, t + THREAD_KSTACK),
+            peek64(cpu, t + THREAD_KSTACK),
             0,
             "an ended thread kept its kernel stack"
         );
         self.joined += 1;
     }
+}
+
+/// Runs `line` once and checks it printed `last` as its last line, so that
+/// the run counted afterwards starts with every table it needs already
+/// made, the kernel stack caches full and the shell's stack grown.
+fn warm_up(m: &mut Machine, tx: &std::sync::mpsc::Sender<u8>, line: &str, last: &str) {
+    run_command(m, tx, line, |_| {});
+    let out = printed(m);
+    assert_eq!(command_output(&out, line).last().copied(), Some(last), "{out}");
 }
 
 #[test]
@@ -315,7 +331,9 @@ fn threads_add_up_under_a_mutex_on_one_and_four_harts() {
         let (tx, rx) = std::sync::mpsc::channel();
         let (mut m, elf) = load(harts, rx);
         step_to_prompt(&mut m);
-        let before = free_pages(&m, &elf);
+        let want = "threads: 4 threads, 300 rounds: counter 1200, spun 1200: ok";
+        warm_up(&mut m, &tx, LINE, want);
+        let before = kstacks::pages(&mut m, &committed_elf());
         check_only_the_shell(&m, &elf);
         let mut locks = LockWatch::new(&elf);
         let mut side = SideBySide::new(&elf, "threads", harts);
@@ -324,12 +342,12 @@ fn threads_add_up_under_a_mutex_on_one_and_four_harts() {
             side.step(cpu);
         });
         let out = printed(&m);
+        assert_eq!(command_output(&out, LINE), [want], "{harts} harts");
         assert_eq!(
-            command_output(&out, LINE),
-            ["threads: 4 threads, 300 rounds: counter 1200, spun 1200: ok"],
-            "{harts} harts"
+            kstacks::pages(&mut m, &committed_elf()),
+            before,
+            "{harts} harts: pages leaked"
         );
-        assert_eq!(free_pages(&m, &elf), before, "{harts} harts: pages leaked");
         check_only_the_shell(&m, &elf);
         if harts == 1 {
             assert_eq!(side.most, 1);
@@ -354,7 +372,9 @@ fn threadtest_passes_on_one_and_four_harts() {
         let (tx, rx) = std::sync::mpsc::channel();
         let (mut m, elf) = load(harts, rx);
         step_to_prompt(&mut m);
-        let before = free_pages(&m, &elf);
+        let checks = format!("threadtest: {THREADTEST_CHECKS} checks, 0 failed");
+        warm_up(&mut m, &tx, "threadtest", &checks);
+        let before = kstacks::pages(&mut m, &committed_elf());
         let mut locks = LockWatch::new(&elf);
         let mut shootdowns = Shootdowns::new(&elf, &m, harts);
         let mut joins = Joins::new(&elf);
@@ -370,15 +390,18 @@ fn threadtest_passes_on_one_and_four_harts() {
             lines[0].starts_with("pid ") && lines[0].ends_with(" (threadtest) killed: store page fault"),
             "{lines:#?}"
         );
-        assert!(lines[1].starts_with("  scause 0x0000000f  sepc 0x"), "{lines:#?}");
-        assert!(lines[1].ends_with("  stval 0x00000000"), "{lines:#?}");
-        assert_eq!(lines[2], "  va 0x00000000 is not mapped");
-        assert_eq!(
-            lines[3],
-            format!("threadtest: {THREADTEST_CHECKS} checks, 0 failed"),
-            "{harts} harts: {lines:#?}"
+        assert!(
+            lines[1].starts_with("  scause 0x000000000000000f  sepc 0x"),
+            "{lines:#?}"
         );
-        assert_eq!(free_pages(&m, &elf), before, "{harts} harts: pages leaked");
+        assert!(lines[1].ends_with("  stval 0x0000000000000000"), "{lines:#?}");
+        assert_eq!(lines[2], "  va 0x0000000000000000 is not mapped");
+        assert_eq!(lines[3], checks, "{harts} harts: {lines:#?}");
+        assert_eq!(
+            kstacks::pages(&mut m, &committed_elf()),
+            before,
+            "{harts} harts: pages leaked"
+        );
         check_only_the_shell(&m, &elf);
         assert!(joins.joined > 30, "{} joins", joins.joined);
         if harts > 1 {
@@ -424,16 +447,18 @@ fn threads_using_the_filesystem_end_with_their_process_on_one_and_four_harts() {
         let disk = MemDisk::from_image(image.clone()).unwrap();
         let (mut m, elf) = load_with(harts, rx, vec![Box::new(disk)]);
         step_to_prompt(&mut m);
-        let pages = free_pages(&m, &elf);
+        let checks = format!("threadtest fs: {THREADTEST_FS_CHECKS} checks, 0 failed");
+        warm_up(&mut m, &tx, "threadtest fs", &checks);
+        let pages = kstacks::pages(&mut m, &committed_elf());
         let mut locks = LockWatch::new(&elf);
         run_command(&mut m, &tx, "threadtest fs", |cpu| locks.step(cpu));
         let out = printed(&m);
+        assert_eq!(command_output(&out, "threadtest fs"), [&checks], "{harts} harts");
         assert_eq!(
-            command_output(&out, "threadtest fs"),
-            [format!("threadtest fs: {THREADTEST_FS_CHECKS} checks, 0 failed")],
-            "{harts} harts"
+            kstacks::pages(&mut m, &committed_elf()),
+            pages,
+            "{harts} harts: pages leaked"
         );
-        assert_eq!(free_pages(&m, &elf), pages, "{harts} harts: pages leaked");
         check_only_the_shell(&m, &elf);
         exit_shell(&mut m, &tx);
         let d = &mut m.cpu.bus.disks[0];

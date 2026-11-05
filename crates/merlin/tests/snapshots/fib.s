@@ -1,54 +1,55 @@
     .file "fib.c"
     .text
 
-    # int fib(int n): frame 16 bytes
-    #     -12(s0)  param int n
+    # int fib(int n): frame 32 bytes
+    #     -20(s0)  param int n
     .globl fib
     .type fib, @function
 fib:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -16
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slt   a0, a1, a0
     beqz  a0, .L.end.1
-    lw    a0, -12(s0)
+    lw    a0, -20(s0)
     j     .L.return.fib
 .L.end.1:
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
     call  fib
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
-    addi  sp, sp, -12
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
+    addi  sp, sp, -8
     call  fib
-    addi  sp, sp, 12
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    addi  sp, sp, 8
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
 .L.return.fib:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size fib, . - fib
@@ -58,15 +59,15 @@ fib:
     .type main, @function
 main:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
     li    a0, 20
     call  fib
 .L.return.main:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size main, . - main

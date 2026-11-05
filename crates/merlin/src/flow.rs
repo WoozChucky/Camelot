@@ -19,7 +19,6 @@
 
 use crate::ast::*;
 use crate::consteval::{self, Const};
-use crate::types::Xlen;
 
 use std::collections::HashSet;
 
@@ -35,11 +34,10 @@ pub struct Flow {
 }
 
 /// Walks a function's checked body.
-pub fn analyze(body: &[Stmt], x: Xlen) -> Flow {
+pub fn analyze(body: &[Stmt]) -> Flow {
     let mut labels = HashSet::new();
     loop {
         let mut w = Walk {
-            x,
             labels: &labels,
             gotos: HashSet::new(),
             live: HashSet::new(),
@@ -66,22 +64,22 @@ pub fn analyze(body: &[Stmt], x: Xlen) -> Flow {
 /// variable with constants together ([`incorrect_logic`]: `x > 5 || x <=
 /// 5` is true); otherwise, whatever constant folding gives (an object's
 /// address is not null).
-fn truth(e: &Expr, x: Xlen) -> Option<bool> {
+fn truth(e: &Expr) -> Option<bool> {
     if let ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r) = &e.kind {
         let or = *op == BinOp::LogOr;
-        return match (truth(l, x), truth(r, x)) {
+        return match (truth(l), truth(r)) {
             (Some(a), _) if a == or => Some(a),
             (Some(_), Some(b)) => Some(b),
             (Some(_), None) => None,
             (None, Some(b)) if b == or => Some(b),
             (None, Some(_)) => None,
-            (None, None) => incorrect_logic(*op, l, r, x),
+            (None, None) => incorrect_logic(*op, l, r),
         };
     }
     if e.ty.is_integer() {
-        return consteval::cfg_condition(e, x).map(|v| v != 0);
+        return consteval::cfg_condition(e).map(|v| v != 0);
     }
-    match consteval::eval(e, x)? {
+    match consteval::eval(e)? {
         consteval::Const::Int(v, _) => Some(v != 0),
         consteval::Const::Addr { base: Some(_), .. } => Some(true),
         consteval::Const::Addr { base: None, offset } => Some(offset != 0),
@@ -94,7 +92,7 @@ fn truth(e: &Expr, x: Xlen) -> Option<bool> {
 /// every value of `x`. It tries what decides them: a value below both
 /// constants, each of them, one just above the smaller, one above both
 /// (in the constants' type).
-fn incorrect_logic(op: BinOp, l: &Expr, r: &Expr, x: Xlen) -> Option<bool> {
+fn incorrect_logic(op: BinOp, l: &Expr, r: &Expr) -> Option<bool> {
     let (v1, op1, c1) = normalized(l)?;
     let (v2, op2, c2) = normalized(r)?;
     if !crate::sema::same_operand(v1, v2) || !same_kind(c1, c2) {
@@ -106,17 +104,17 @@ fn incorrect_logic(op: BinOp, l: &Expr, r: &Expr, x: Xlen) -> Option<bool> {
             x: inner,
             implicit: true,
             ..
-        } => consteval::eval(inner, x),
-        _ => consteval::eval(e, x),
+        } => consteval::eval(inner),
+        _ => consteval::eval(e),
     };
     let (Some(Const::Int(a, ka)), Some(Const::Int(b, kb))) = (own(c1), own(c2)) else {
         return None;
     };
-    if ka.signed() != kb.signed() || ka.size(x) != kb.size(x) {
+    if ka.signed() != kb.signed() || ka.size() != kb.size() {
         return None;
     }
-    let (min, max) = ka.range(x);
-    let values = [min, a, ka.wrap(a.min(b) + 1, x), b, max];
+    let (min, max) = ka.range();
+    let values = [min, a, ka.wrap(a.min(b) + 1), b, max];
     let test = |op: BinOp, v: i128, c: i128| match op {
         BinOp::Lt => v < c,
         BinOp::Le => v <= c,
@@ -203,7 +201,6 @@ fn same_kind(a: &Expr, b: &Expr) -> bool {
 
 /// One walk of a body, with the labels found reached so far.
 struct Walk<'a> {
-    x: Xlen,
     labels: &'a HashSet<String>,
     /// The labels a reachable `goto` names.
     gotos: HashSet<String>,
@@ -262,7 +259,7 @@ impl Walk<'_> {
             }
             StmtKind::If { cond, then, els } => {
                 self.expr(cond, live);
-                let t = truth(cond, self.x);
+                let t = truth(cond);
                 let then_out = self.stmt(then, live && t != Some(false));
                 let else_live = live && t != Some(true);
                 let else_out = match els {
@@ -273,7 +270,7 @@ impl Walk<'_> {
             }
             StmtKind::While { cond, body } => {
                 self.expr(cond, live);
-                let t = truth(cond, self.x);
+                let t = truth(cond);
                 let (_, broke, _) = self.in_loop(|w| w.stmt(body, live && t != Some(false)));
                 (live && t != Some(true)) || broke
             }
@@ -281,7 +278,7 @@ impl Walk<'_> {
                 let (out, broke, went_on) = self.in_loop(|w| w.stmt(body, live));
                 let cond_live = out || went_on;
                 self.expr(cond, cond_live);
-                (cond_live && truth(cond, self.x) != Some(true)) || broke
+                (cond_live && truth(cond) != Some(true)) || broke
             }
             StmtKind::For {
                 init,
@@ -297,7 +294,7 @@ impl Walk<'_> {
                 let t = match cond {
                     Some(c) => {
                         self.expr(c, live);
-                        truth(c, self.x)
+                        truth(c)
                     }
                     None => Some(true),
                 };
@@ -315,7 +312,7 @@ impl Walk<'_> {
                 covered,
             } => {
                 self.expr(cond, live);
-                let v = consteval::int(cond, self.x);
+                let v = consteval::int(cond);
                 // A switch that covers its enum takes a case or nothing:
                 // clang's CFG has no edge to `default`, nor past the switch.
                 let matched = *covered || v.is_some_and(|v| cases.iter().any(|&(c, _)| c == v));
@@ -401,7 +398,7 @@ impl Walk<'_> {
         match &e.kind {
             ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), a, b) => {
                 self.expr(a, live);
-                let t = truth(a, self.x);
+                let t = truth(a);
                 let decided = if *op == BinOp::LogAnd {
                     Some(false)
                 } else {
@@ -411,7 +408,7 @@ impl Walk<'_> {
             }
             ExprKind::Cond(c, a, b) => {
                 self.expr(c, live);
-                let t = truth(c, self.x);
+                let t = truth(c);
                 self.expr(a, live && t != Some(false));
                 self.expr(b, live && t != Some(true));
             }

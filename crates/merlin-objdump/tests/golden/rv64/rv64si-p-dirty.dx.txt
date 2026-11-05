@@ -1,5 +1,5 @@
 
-tests/riscv-tests/rv64/rv64si-p-dirty:	file format elf64-littleriscv
+tests/riscv-tests/rv64si-p-dirty:	file format elf64-littleriscv
 architecture: riscv64
 start address: 0x0000000080000000
 

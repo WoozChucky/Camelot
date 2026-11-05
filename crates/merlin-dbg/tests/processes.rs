@@ -10,14 +10,13 @@
 //! so every run of it does the same; the console of each debugged run is the
 //! undebugged run's.
 //!
-//! At both widths: the RV32 kernel under Sv32, and the RV64 one, from an RV64 image
-//! with RV64 programs, under Sv48 and under Sv39 (a hart without Sv48). Only a real
-//! kernel takes the RV64 paths: the process table's 8-byte pointers read through the
-//! kernel's DWARF, a high-half kernel pointer translated through the hart's Sv48 or
-//! Sv39 table, satp's modes 9 and 8.
+//! Under Sv48 and under Sv39 (a hart without Sv48). Only a real kernel takes these
+//! paths: the process table's 8-byte pointers read through the kernel's DWARF, a
+//! high-half kernel pointer translated through the hart's Sv48 or Sv39 table, satp's
+//! modes 9 and 8.
 
 use grail::gdb::Outcome;
-use grail::{DiskConfig, Machine, MachineConfig, Paging, RunResult, Xlen};
+use grail::{DiskConfig, Machine, MachineConfig, Paging, RunResult};
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -32,69 +31,42 @@ fn path(rel: &str) -> PathBuf {
 /// What the shell is given: the pipeline, then `exit`, which halts the kernel.
 const INPUT: &[u8] = b"cat /README /README /README | cat\nexit\n";
 
-/// The machine a run boots: its width, its harts' paging, its disk kernel, and the
-/// MODE field of satp `info processes` shows for every process.
+/// The machine a run boots: its harts' paging, and the MODE field of satp `info
+/// processes` shows for every process.
 #[derive(Clone, Copy)]
 struct Setup {
     /// For the runs' caches.
     index: usize,
-    xlen: Xlen,
     paging: Paging,
-    kernel: &'static str,
-    /// The top of satp: Sv32's bit 31 (MODE 1), or MODE 9 (Sv48) or 8 (Sv39) in
-    /// bits 63:60.
+    /// MODE 9 (Sv48) or 8 (Sv39), in satp's bits 63:60.
     mode: u64,
 }
 
-const SV32: Setup = Setup {
-    index: 0,
-    xlen: Xlen::Rv32,
-    paging: Paging::Sv48,
-    kernel: "kernel/kernel-disk.elf",
-    mode: 1 << 31,
-};
-
 const SV48: Setup = Setup {
-    index: 1,
-    xlen: Xlen::Rv64,
+    index: 0,
     paging: Paging::Sv48,
-    kernel: "kernel/kernel-disk-rv64.elf",
     mode: 9 << 60,
 };
 
 const SV39: Setup = Setup {
-    index: 2,
-    xlen: Xlen::Rv64,
+    index: 1,
     paging: Paging::Sv39,
-    kernel: "kernel/kernel-disk-rv64.elf",
     mode: 8 << 60,
 };
 
-/// The bootable root image of the setup's width, built once: as `cargo xtask fs`
-/// builds it, for RV32; for RV64, the same of RV64 programs, the RV64 bootloader in
-/// its boot block and the RV64 disk kernel after the filesystem.
-fn image(s: Setup) -> &'static [u8] {
-    static IMAGES: [OnceLock<Vec<u8>>; 2] = [OnceLock::new(), OnceLock::new()];
-    let root = path(".");
-    IMAGES[s.xlen as usize].get_or_init(|| match s.xlen {
-        Xlen::Rv32 => xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap(),
-        Xlen::Rv64 => {
-            let kernel = std::fs::read(path(s.kernel)).unwrap();
-            let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
-            let mut image = xtask::fs::build_for(&root, &opts, Xlen::Rv64).unwrap();
-            let boot = xtask::boot::bootloader_rv64(&root).unwrap();
-            camelot_fs::boot::install(&mut image, &boot, &kernel).unwrap();
-            image
-        }
-    })
+/// The disk kernel, as the image holds it.
+const KERNEL: &str = "kernel/kernel-disk.elf";
+
+/// The bootable root image, built once, as `cargo xtask fs` builds it.
+fn image() -> &'static [u8] {
+    static IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
+    IMAGE.get_or_init(|| xtask::fs::build_bootable(&path("."), xtask::fs::IMAGE_SIZE).unwrap())
 }
 
-/// cat of the setup's width with its debugging information, and the program `/bin`
-/// holds, the same code.
-fn cat(s: Setup) -> &'static xtask::userprogs::Program {
-    static CATS: [OnceLock<xtask::userprogs::Program>; 2] = [OnceLock::new(), OnceLock::new()];
-    CATS[s.xlen as usize]
-        .get_or_init(|| xtask::userprogs::build_named_for(&path("kernel/user"), "cat", s.xlen).unwrap())
+/// cat with its debugging information, and the program `/bin` holds, the same code.
+fn cat() -> &'static xtask::userprogs::Program {
+    static CAT: OnceLock<xtask::userprogs::Program> = OnceLock::new();
+    CAT.get_or_init(|| xtask::userprogs::build_named(&path("kernel/user"), "cat").unwrap())
 }
 
 #[derive(Clone, Default)]
@@ -116,20 +88,15 @@ impl Console {
     }
 }
 
-/// A machine booting the root image, the shell's input waiting: an RV64 one
+/// A machine booting the root image, the shell's input waiting: a Camelot VM's,
 /// on Camelot's firmware, which boots the disk, with its 2 MiB on top of the
-/// 4 MiB an RV32 one has.
+/// default 4 MiB.
 fn machine(s: Setup) -> (Machine, Console) {
-    let (bios, ram_size) = match s.xlen {
-        Xlen::Rv32 => (grail::Bios::None, 4 << 20),
-        Xlen::Rv64 => (grail::Bios::Default, 6 << 20),
-    };
     let config = MachineConfig {
-        xlen: s.xlen,
         paging: s.paging,
-        bios,
-        ram_size,
-        disks: vec![DiskConfig::memory(image(s).to_vec())],
+        bios: grail::Bios::Default,
+        ram_size: 6 << 20,
+        disks: vec![DiskConfig::memory(image().to_vec())],
         ..MachineConfig::default()
     };
     let mut m = Machine::new(config).unwrap();
@@ -142,7 +109,7 @@ fn machine(s: Setup) -> (Machine, Console) {
 
 /// The console of the run without a debugger, run once.
 fn undebugged(s: Setup) -> &'static str {
-    static RUNS: [OnceLock<String>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static RUNS: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
     RUNS[s.index].get_or_init(|| {
         let (mut m, console) = machine(s);
         assert_eq!(m.run(Some(2_000_000_000), |_| {}), RunResult::Exited(0));
@@ -159,7 +126,7 @@ fn debugged(s: Setup, commands: &str) -> String {
     let addr = listener.local_addr().unwrap();
     let stub = std::thread::spawn(move || grail::gdb::serve(&mut m, listener, true, &mut |_| {}).unwrap());
     let mut child = Command::new(env!("CARGO_BIN_EXE_merlin-dbg"))
-        .args(["--connect", &addr.to_string(), s.kernel])
+        .args(["--connect", &addr.to_string(), KERNEL])
         .current_dir(path("."))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -203,8 +170,8 @@ impl Drop for CatFile {
 
 /// cat's debug ELF in a file of its own, for `add-symbol-file`: one per test, which
 /// run at once.
-fn cat_file(s: Setup) -> CatFile {
-    elf_file("cat", &cat(s).debug)
+fn cat_file() -> CatFile {
+    elf_file("cat", &cat().debug)
 }
 
 fn elf_file(name: &str, elf: &[u8]) -> CatFile {
@@ -284,26 +251,21 @@ fn printed(block: &[String]) -> String {
 }
 
 #[test]
-fn breaking_in_one_of_two_processes_running_cat() {
-    cat_pipeline(SV32);
-}
-
-#[test]
-fn breaking_in_one_of_two_rv64_processes_under_sv48() {
+fn breaking_in_one_of_two_processes_running_cat_under_sv48() {
     cat_pipeline(SV48);
 }
 
 #[test]
-fn breaking_in_one_of_two_rv64_processes_under_sv39() {
+fn breaking_in_one_of_two_processes_running_cat_under_sv39() {
     cat_pipeline(SV39);
 }
 
 fn cat_pipeline(s: Setup) {
-    let cat_elf = cat_file(s);
+    let cat_elf = cat_file();
     let cat_file = cat_elf.0.display().to_string();
     // The loaded program is the one on the image: -g changes no loaded byte.
     assert!(
-        image(s).windows(cat(s).elf.len()).any(|w| w == cat(s).elf),
+        image().windows(cat().elf.len()).any(|w| w == cat().elf),
         "/bin/cat is not this cat"
     );
     let main = line_of("kernel/user/cat.c", "if (argc < 2) {");
@@ -313,7 +275,7 @@ fn cat_pipeline(s: Setup) {
     // that writes, each in its turn. The writer (`cat /README /README /README`) runs
     // first, to its main; then the reader (`cat`, its input the pipe) reaches its
     // main, before or after some of the writer's writes (the scheduler decides, and
-    // decides otherwise at each width and paging mode). Each stop after the writer's
+    // decides otherwise in each paging mode). Each stop after the writer's
     // main is one of them: which, `breakpoint N` says.
     let mut commands = format!(
         "add-symbol-file {cat_file} program cat\n\
@@ -330,7 +292,7 @@ fn cat_pipeline(s: Setup) {
     let out = debugged(s, &commands);
     // The cat symbols are cat's alone: the breakpoint stops only where cat runs.
     assert!(
-        out.contains(&format!("breakpoint 1 at {:#x} <main+", main_addr(s)))
+        out.contains(&format!("breakpoint 1 at {:#x} <main+", main_addr()))
             && out.contains(&format!(": kernel/user/cat.c:{main}, program cat\n")),
         "{out}"
     );
@@ -370,11 +332,7 @@ fn cat_pipeline(s: Setup) {
     assert_eq!(reader_listed.harts, "hart 0");
     let reader_satp = reader_listed.satp.clone();
     let satp = u64::from_str_radix(reader_satp.trim_start_matches("0x"), 16).unwrap();
-    let mode_bits = match s.xlen {
-        Xlen::Rv32 => 1 << 31,
-        Xlen::Rv64 => 0xf << 60,
-    };
-    assert_eq!(satp & mode_bits, s.mode, "satp's mode: {out}");
+    assert_eq!(satp & 0xf << 60, s.mode, "satp's mode: {out}");
     assert_ne!(listed.iter().find(|p| p.pid == writer).unwrap().satp, reader_satp);
     let writer_stops = stops.iter().filter(|s| s.0 == writer).count();
     let reader_stops: Vec<&(u64, String)> = stops.iter().filter(|s| s.0 == reader).collect();
@@ -437,7 +395,7 @@ fn cat_pipeline(s: Setup) {
     assert!(
         out.contains(&format!(
             "<copy+{}>: kernel/user/cat.c:{write}, process {reader}, program cat\n",
-            copy_offset(s)
+            copy_offset()
         )),
         "{out}"
     );
@@ -544,9 +502,9 @@ fn cat_pipeline(s: Setup) {
 /// where the shell does.
 #[test]
 fn a_location_in_two_programs_is_a_breakpoint_in_each() {
-    let s = SV32;
-    let cat_elf = cat_file(s);
-    let sh = xtask::userprogs::build_named_for(&path("kernel/user"), "sh", s.xlen).unwrap();
+    let s = SV48;
+    let cat_elf = cat_file();
+    let sh = xtask::userprogs::build_named(&path("kernel/user"), "sh").unwrap();
     let sh_elf = elf_file("sh", &sh.debug);
     let commands = format!(
         "add-symbol-file {} program cat\n\
@@ -566,7 +524,7 @@ fn a_location_in_two_programs_is_a_breakpoint_in_each() {
     let set = after(&out, "break main", 0);
     assert_eq!(set.len(), 2, "{out}");
     assert!(
-        set[0].starts_with(&format!("breakpoint 1 at {:#x} <main+", main_addr(s)))
+        set[0].starts_with(&format!("breakpoint 1 at {:#x} <main+", main_addr()))
             && set[0].ends_with(", program cat"),
         "{out}"
     );
@@ -588,20 +546,20 @@ fn a_location_in_two_programs_is_a_breakpoint_in_each() {
 }
 
 /// cat's `main` past its prologue, where `break main` stops.
-fn main_addr(s: Setup) -> u64 {
-    let symbols = merlin_dbg::symbols::Symbols::from_elf(&cat(s).debug).unwrap();
+fn main_addr() -> u64 {
+    let symbols = merlin_dbg::symbols::Symbols::from_elf(&cat().debug).unwrap();
     let mut lines = merlin_dbg::source::Lines::default();
-    lines.add_elf(&cat(s).debug).unwrap();
+    lines.add_elf(&cat().debug).unwrap();
     let entry = symbols.lookup("main").unwrap();
     let (start, end) = symbols.range(entry).unwrap();
     lines.prologue_end(start, end).unwrap()
 }
 
 /// How far into `copy` its write line's code starts.
-fn copy_offset(s: Setup) -> u64 {
-    let symbols = merlin_dbg::symbols::Symbols::from_elf(&cat(s).debug).unwrap();
+fn copy_offset() -> u64 {
+    let symbols = merlin_dbg::symbols::Symbols::from_elf(&cat().debug).unwrap();
     let mut lines = merlin_dbg::source::Lines::default();
-    lines.add_elf(&cat(s).debug).unwrap();
+    lines.add_elf(&cat().debug).unwrap();
     let write = line_of("kernel/user/cat.c", "int w = write(STDOUT");
     let copy = symbols.lookup("copy").unwrap();
     let (addrs, _) = lines

@@ -5,7 +5,7 @@
 //!   [`Function::locals`] gets every parameter and local, and every variable
 //!   reference and declarator its [`VarRef`]. A function's name is a global
 //!   of function type, which decays to a pointer to the function.
-//! * Every expression gets its C type, by C99's rules with ILP32 sizes (see
+//! * Every expression gets its C type, by C99's rules with LP64 sizes (see
 //!   [`crate::types`]). Operands must make sense for their operator (no
 //!   arithmetic on `void *`, no pointer plus pointer, `*` only on pointers,
 //!   `.` only on structs), assignments, arguments and returns must convert as
@@ -37,7 +37,7 @@ use crate::abi;
 use crate::ast::*;
 use crate::consteval;
 use crate::types::{
-    common, distinct_enums, enum_of, ptr_size, EnumType, FuncType, IntKind, Spelled, Spelling, Type, Xlen,
+    common, distinct_enums, enum_of, EnumType, FuncType, IntKind, Spelled, Spelling, Type, PTR_SIZE,
 };
 use crate::{Error, Pos};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -109,7 +109,6 @@ fn checked(prog: &mut Program, earlier: &[Pos], cut: Option<Pos>) -> (Vec<Error>
         late: None,
         literals: Vec::new(),
         written: std::mem::take(&mut prog.written),
-        xlen: prog.xlen,
     };
     // What the parser evaluated away at file scope is checked where it was,
     // after the items before it.
@@ -162,23 +161,22 @@ fn checked(prog: &mut Program, earlier: &[Pos], cut: Option<Pos>) -> (Vec<Error>
 /// both operands already decayed; `None` if C doesn't allow the operands.
 /// Comparisons and `&&`/`||` always give `int`. Code generation uses this too,
 /// to know the type a compound assignment computes in.
-pub fn arith_type(op: BinOp, l: &Type, r: &Type, x: Xlen) -> Option<Type> {
+pub fn arith_type(op: BinOp, l: &Type, r: &Type) -> Option<Type> {
     // Pointer arithmetic needs to know the size of what is pointed to.
-    let sized = |t: &Type| t.step(x).is_some();
+    let sized = |t: &Type| t.step().is_some();
     match (op, l.unqual(), r.unqual()) {
         (_, Type::Int(a), Type::Int(b)) => Some(Type::Int(match op {
             BinOp::Shl | BinOp::Shr => a.promoted(),
-            _ => common(*a, *b, x),
+            _ => common(*a, *b),
         })),
         (BinOp::Add | BinOp::Sub, Type::Ptr(_), Type::Int(_)) if sized(l) => Some(l.clone()),
         (BinOp::Add, Type::Int(_), Type::Ptr(_)) if sized(r) => Some(r.clone()),
-        // The difference of two pointers counts elements: `ptrdiff_t`, `int`
-        // on ILP32 and `long` on LP64. What they point to must be compatible
-        // but for qualifiers.
+        // The difference of two pointers counts elements: `ptrdiff_t`, LP64's
+        // `long`. What they point to must be compatible but for qualifiers.
         (BinOp::Sub, Type::Ptr(a), Type::Ptr(b))
             if a.without_quals().compatible(&b.without_quals()) && sized(l) =>
         {
-            Some(Type::Int(IntKind::ptrdiff_t(x)))
+            Some(Type::Int(IntKind::ptrdiff_t()))
         }
         _ => None,
     }
@@ -252,11 +250,11 @@ fn expr_loc(e: &Expr) -> Pos {
 }
 
 /// Whether evaluating the constant `e` overflows a signed type somewhere.
-fn overflows(e: &Expr, x: Xlen) -> bool {
-    let int = |e: &Expr| consteval::int(e, x);
+fn overflows(e: &Expr) -> bool {
+    let int = |e: &Expr| consteval::int(e);
     let out = |v: i128, t: &Type| {
         t.int_kind()
-            .is_some_and(|k| k.signed() && (v < k.range(x).0 || v > k.range(x).1))
+            .is_some_and(|k| k.signed() && (v < k.range().0 || v > k.range().1))
     };
     let here = match &e.kind {
         ExprKind::Binary(op, l, r) => match (int(l), int(r)) {
@@ -271,7 +269,7 @@ fn overflows(e: &Expr, x: Xlen) -> bool {
         ExprKind::Unary(UnOp::Neg, v) => int(v).is_some_and(|a| out(-a, &e.ty)),
         _ => false,
     };
-    here || children(e).into_iter().any(|c| overflows(c, x))
+    here || children(e).into_iter().any(overflows)
 }
 
 /// Of pointers to `a` and to `b`, whether they are the signed and the
@@ -666,8 +664,6 @@ struct Checker {
     literals: Vec<Declarator>,
     /// How the source was written, for clang's warnings of it.
     written: Written,
-    /// The target, for sizes and conversions.
-    xlen: Xlen,
 }
 
 impl Checker {
@@ -775,7 +771,7 @@ impl Checker {
         }
         // A definition needs complete parameter and result types.
         for p in &f.params {
-            if p.ty.is_record() && p.ty.size(self.xlen).is_none() {
+            if p.ty.is_record() && p.ty.size().is_none() {
                 let mut e = Error::new(p.pos, format!("variable has incomplete type '{}'", p.ty));
                 if let Some(r) = p.ty.record() {
                     e = e.note(r.pos, format!("forward declaration of '{}'", r.name()));
@@ -783,7 +779,7 @@ impl Checker {
                 self.errors.push(e);
             }
         }
-        let ret_complete = !f.ret.is_record() || f.ret.size(self.xlen).is_some();
+        let ret_complete = !f.ret.is_record() || f.ret.size().is_some();
         if !ret_complete {
             let mut e = Error::new(
                 f.pos,
@@ -837,7 +833,6 @@ impl Checker {
             registers: HashSet::new(),
             linked: Vec::new(),
             invalid: HashSet::new(),
-            xlen: self.xlen,
         };
         for p in &f.params {
             let id = c.declare(&p.name, &p.ty, p.pos, "parameter ");
@@ -850,7 +845,7 @@ impl Checker {
             }
         }
         // A big struct result goes where the caller says: keep that address.
-        f.ret_ptr = (ret_complete && abi::returns_in_memory(&f.ret, self.xlen))
+        f.ret_ptr = (ret_complete && abi::returns_in_memory(&f.ret))
             .then(|| c.temp(&Type::ptr(f.ret.clone()), "result address", f.pos));
         // The body's outermost block shares the parameters' scope, as in C.
         c.block(body);
@@ -878,7 +873,7 @@ impl Checker {
         if erred || c.errors.iter().any(|e| !e.is_warning()) {
             c.errors.extend(pending.into_iter().map(|(e, _)| e));
         } else {
-            let flow = crate::flow::analyze(body, self.xlen);
+            let flow = crate::flow::analyze(body);
             c.errors.extend(
                 pending
                     .into_iter()
@@ -1006,7 +1001,6 @@ impl Checker {
             &self.written,
             &mut self.errors,
             self.literals.len(),
-            self.xlen,
         );
         fc.init_spelled = d.spelled.clone();
         let checked = fc.init_object(&mut d.ty, d_init, true, d.pos);
@@ -1023,7 +1017,7 @@ impl Checker {
             // not defined here: there is nothing to emit.
             g.init = g.init.filter(|&i| i != at);
             g.tentative = g.tentative.filter(|&i| i != at);
-        } else if g.ty.size(self.xlen).is_none() {
+        } else if g.ty.size().is_none() {
             // The initializer completed an array's size.
             g.ty = d.ty.clone();
         }
@@ -1040,7 +1034,6 @@ impl Checker {
                 &self.written,
                 &mut self.errors,
                 self.literals.len(),
-                self.xlen,
             );
             fc.unevaluated(us[from..to].iter_mut().map(|(_, u)| u));
         }
@@ -1056,7 +1049,6 @@ impl Checker {
                 &self.written,
                 &mut self.errors,
                 self.literals.len(),
-                self.xlen,
             )
             .unevaluated(us);
         }
@@ -1089,7 +1081,7 @@ impl Checker {
                 unreachable!("recorded from a declaration")
             };
             let d = &mut decls[j];
-            let mut ty = if init && d.ty.size(self.xlen).is_some() {
+            let mut ty = if init && d.ty.size().is_some() {
                 d.ty.clone()
             } else {
                 ty
@@ -1097,7 +1089,7 @@ impl Checker {
             match &mut ty {
                 // `int a[];` and nothing more: C99 6.9.2p5's example, an
                 // array of one element, with clang's warning.
-                Type::Array(elem, n @ None) if elem.size(self.xlen).is_some() => {
+                Type::Array(elem, n @ None) if elem.size().is_some() => {
                     self.errors.push(Error::warning(
                         d.pos,
                         "tentative array definition assumed to have one element",
@@ -1105,7 +1097,7 @@ impl Checker {
                     ));
                     *n = Some(1);
                 }
-                t if t.size(self.xlen).is_none() => {
+                t if t.size().is_none() => {
                     let msg = format!("tentative definition has type '{t}' that is never completed");
                     let mut e = Error::new(d.pos, msg);
                     if let Some(r) = t.record() {
@@ -1160,14 +1152,14 @@ impl Conv {
 /// the address with &` when `e` is an lvalue and `to` points to what
 /// `from` is; in either case, the target at least as qualified. Not to
 /// dereference a null pointer: what is 0 under its casts (`(int *)0`).
-fn conversion_hint(e: &Expr, from: &Type, to: &Type, x: Xlen) -> &'static str {
+fn conversion_hint(e: &Expr, from: &Type, to: &Type) -> &'static str {
     // `to` is `from` but for qualifiers it has more of.
     let fits = |to: &Type, from: &Type| to.unqual() == from.unqual() && to.quals().contains(from.quals());
     let mut bare = e;
     while let ExprKind::Cast { x: inner, .. } = &bare.kind {
         bare = inner;
     }
-    let null = bare.ty.is_integer() && consteval::int(bare, x) == Some(0);
+    let null = bare.ty.is_integer() && consteval::int(bare) == Some(0);
     match (from.unqual(), to.unqual()) {
         (Type::Ptr(p), _) if fits(to, p) && !null => "; dereference with *",
         (_, Type::Ptr(p)) if is_lvalue(e) && fits(p, from) => "; take the address with &",
@@ -1400,8 +1392,6 @@ struct FnChecker<'a> {
     /// one (`int h(char);`, then `int h();` in a block): clang marks them
     /// invalid, and says nothing more of what uses them.
     invalid: HashSet<Pos>,
-    /// The target, for sizes and conversions.
-    xlen: Xlen,
 }
 
 impl<'a> FnChecker<'a> {
@@ -1411,7 +1401,6 @@ impl<'a> FnChecker<'a> {
         written: &'a Written,
         errors: &'a mut Vec<Error>,
         literal_base: usize,
-        xlen: Xlen,
     ) -> Self {
         FnChecker {
             globals,
@@ -1451,7 +1440,6 @@ impl<'a> FnChecker<'a> {
             registers: HashSet::new(),
             linked: Vec::new(),
             invalid: HashSet::new(),
-            xlen,
         }
     }
 
@@ -1516,7 +1504,7 @@ impl<'a> FnChecker<'a> {
                     Some((at, what)) if !t.is_integer() => self.err(at, format!("{what} '{t}'")),
                     _ => {
                         let mut e = Error::new(*pos, msg.clone());
-                        if let Some((at, note)) = consteval::why_not(&u.expr, self.xlen) {
+                        if let Some((at, note)) = consteval::why_not(&u.expr) {
                             e = e.note(at, note);
                         }
                         self.errors.push(e);
@@ -1791,13 +1779,13 @@ impl<'a> FnChecker<'a> {
                 } else if checked.is_err() {
                     self.switches.last_mut().expect("checked above").incomplete = true;
                 } else {
-                    match consteval::int(expr, self.xlen).filter(|_| expr.ty.is_integer()) {
+                    match consteval::int(expr).filter(|_| expr.ty.is_integer()) {
                         None => {
                             let mut e = Error::new(
                                 self.begin_written(expr),
                                 "expression is not an integer constant expression",
                             );
-                            if let Some((at, note)) = consteval::why_not(expr, self.xlen) {
+                            if let Some((at, note)) = consteval::why_not(expr) {
                                 e = e.note(at, note);
                             }
                             self.errors.push(e);
@@ -1808,7 +1796,7 @@ impl<'a> FnChecker<'a> {
                             self.next_case += 1;
                             let (begin, loc) = (self.begin_written(expr), self.loc_written(expr));
                             let sw = self.switches.last_mut().expect("checked above");
-                            *value = sw.kind.wrap(v, self.xlen);
+                            *value = sw.kind.wrap(v);
                             sw.labels.push(CaseLabel {
                                 value: *value,
                                 id: *id,
@@ -1899,7 +1887,7 @@ impl<'a> FnChecker<'a> {
         // A constant condition no case matches, with no default.
         let mut constant = false;
         if ctx.default.is_none() {
-            if let Some(v) = consteval::int(cond, self.xlen) {
+            if let Some(v) = consteval::int(cond) {
                 constant = true;
                 if !ctx.labels.iter().any(|l| l.value == v) {
                     let msg = format!("no case matching constant switch condition '{v}'");
@@ -1916,7 +1904,7 @@ impl<'a> FnChecker<'a> {
         let mut constants: Vec<(i128, &str)> = en
             .constants
             .iter()
-            .map(|(n, v)| (ctx.kind.wrap(*v, self.xlen), n.as_str()))
+            .map(|(n, v)| (ctx.kind.wrap(*v), n.as_str()))
             .collect();
         constants.sort_by_key(|&(v, _)| v);
         constants.dedup_by_key(|&mut (v, _)| v);
@@ -2230,7 +2218,7 @@ impl<'a> FnChecker<'a> {
             ExprKind::Binary(BinOp::Shl, l, _) => {
                 let always = match literal(l) {
                     Some(0) => Some(false),
-                    Some(_) => consteval::int(e, self.xlen).map(|v| v != 0),
+                    Some(_) => consteval::int(e).map(|v| v != 0),
                     None => None,
                 };
                 if let Some(always) = always {
@@ -2410,7 +2398,7 @@ impl<'a> FnChecker<'a> {
                 self.scopes.last_mut().unwrap().insert(d.name.clone(), binding);
             }
         }
-        if d.ty.size(self.xlen).is_none() {
+        if d.ty.size().is_none() {
             self.incomplete_variable(d.pos, &d.ty);
         }
     }
@@ -2427,7 +2415,7 @@ impl<'a> FnChecker<'a> {
                     // A list is one full expression of unsequenced items.
                     let checked = self.init(ty, init, constant, Some(at));
                     if checked.is_ok() && self.unevaluated == 0 {
-                        for f in crate::sequence::check_init(init, self.xlen) {
+                        for f in crate::sequence::check_init(init) {
                             self.runtime(Error::warning(f.at, f.msg, "unsequenced"), f.of);
                         }
                     }
@@ -2951,7 +2939,7 @@ impl<'a> FnChecker<'a> {
                     ));
                 };
                 self.expr(e)?;
-                let Some(i) = consteval::int(e, self.xlen).filter(|_| e.ty.is_integer()) else {
+                let Some(i) = consteval::int(e).filter(|_| e.ty.is_integer()) else {
                     return Err(self.err(e.pos, "expression is not an integer constant expression"));
                 };
                 if i < 0 {
@@ -2965,7 +2953,7 @@ impl<'a> FnChecker<'a> {
                 }
                 // Each element up to the designated one gets an item, so the
                 // index must be reasonable even when the array is big.
-                let size = i128::from(elem.size(self.xlen).unwrap_or(1).max(1));
+                let size = i128::from(elem.size().unwrap_or(1).max(1));
                 if i >= MAX_DESIGNATED || (i + 1) * size > i128::from(i32::MAX) {
                     let msg = format!(
                         "array designator index ({i}) is too large: merlin supports up to {}",
@@ -3114,7 +3102,7 @@ impl<'a> FnChecker<'a> {
                 if decl.is_some() {
                     self.bounds(e);
                 }
-                if constant && consteval::eval(e, self.xlen).is_none() {
+                if constant && consteval::eval(e).is_none() {
                     return Err(self.err(expr_loc(e), "initializer element is not a compile-time constant"));
                 }
                 Ok(())
@@ -3128,7 +3116,7 @@ impl<'a> FnChecker<'a> {
     /// assignment ([`Self::convert_value`]), with clang's diagnostics at
     /// `at`.
     fn convert(&mut self, e: &Expr, to: &Type, to_spelled: &Spelled, how: Conv, at: Pos) -> Checked {
-        let null = consteval::is_null_pointer(e, self.xlen);
+        let null = consteval::is_null_pointer(e);
         let from = e.ty.clone();
         let from_spelled = self.spelled_of(e);
         let named = from.named(&from_spelled);
@@ -3244,7 +3232,7 @@ impl<'a> FnChecker<'a> {
             (Type::Int(_), Type::Int(_)) => return Ok(()),
             (Type::Int(IntKind::Bool), Type::Ptr(_)) => return Ok(()),
             (Type::Record(a), Type::Record(b)) if a == b => {
-                if to.size(self.xlen).is_none() {
+                if to.size().is_none() {
                     let msg = format!("incomplete type '{to}' cannot be copied");
                     return Err(self.err(at, msg));
                 }
@@ -3312,7 +3300,7 @@ impl<'a> FnChecker<'a> {
             ),
             _ => ("", None),
         };
-        let hint = conversion_hint(e, from, to, self.xlen);
+        let hint = conversion_hint(e, from, to);
         let msg = if problem.is_empty() {
             format!("{}{hint}", how.incompatible(&to_named, named))
         } else {
@@ -3622,19 +3610,16 @@ impl<'a> FnChecker<'a> {
         let (lv, rv) = (l.decay(), r.decay());
         match (op, lv.unqual(), rv.unqual()) {
             // The difference of pointers to different types.
-            (BinOp::Sub, Type::Ptr(_), Type::Ptr(_))
-                if lv.step(self.xlen).is_some() && rv.step(self.xlen).is_some() =>
-            {
-                self.err(
+            (BinOp::Sub, Type::Ptr(_), Type::Ptr(_)) if lv.step().is_some() && rv.step().is_some() => self
+                .err(
                     pos,
                     format!("'{lv}' and '{rv}' are not pointers to compatible types"),
-                )
-            }
+                ),
             // Arithmetic on a pointer to an incomplete type.
             (BinOp::Add | BinOp::Sub, Type::Ptr(to), Type::Int(_))
             | (BinOp::Add, Type::Int(_), Type::Ptr(to))
             | (BinOp::Sub, Type::Ptr(to), Type::Ptr(_))
-                if lv.step(self.xlen).is_none() || rv.step(self.xlen).is_none() =>
+                if lv.step().is_none() || rv.step().is_none() =>
             {
                 let to = to.clone();
                 self.incomplete_arithmetic(pos, &to)
@@ -3772,7 +3757,7 @@ impl<'a> FnChecker<'a> {
                         // would: clang checks that conversion, of the value
                         // `v` with the type of `t op v`.
                         let (t, v) = (target.ty.decay(), value.ty.decay());
-                        let Some(r) = arith_type(*op, &t, &v, self.xlen) else {
+                        let Some(r) = arith_type(*op, &t, &v) else {
                             return Err(self.invalid_operands(*op, pos, &target.ty, &value.ty));
                         };
                         // A pointer difference is clang's `__ptrdiff_t`, as
@@ -3806,7 +3791,7 @@ impl<'a> FnChecker<'a> {
                 self.expr(target)?;
                 match target.ty.unqual() {
                     Type::Int(_) => {}
-                    Type::Ptr(to) if target.ty.step(self.xlen).is_none() => {
+                    Type::Ptr(to) if target.ty.step().is_none() => {
                         return Err(self.incomplete_arithmetic(pos, to));
                     }
                     Type::Ptr(_) => {}
@@ -3887,7 +3872,7 @@ impl<'a> FnChecker<'a> {
                             while let ExprKind::Cast { x, .. } = &inner.kind {
                                 inner = x;
                             }
-                            inner.ty.is_integer() && consteval::int(inner, self.xlen) == Some(0)
+                            inner.ty.is_integer() && consteval::int(inner) == Some(0)
                         } {
                             let msg = "indirection of non-volatile null pointer will be deleted, not trap";
                             let note =
@@ -3927,7 +3912,7 @@ impl<'a> FnChecker<'a> {
                 }
                 // A pointer to an integer narrower than it loses the address.
                 if let (Type::Int(k), Type::Ptr(_)) = (to.unqual(), &from) {
-                    if *k != IntKind::Bool && k.size(self.xlen) < from.size(self.xlen).unwrap_or(0) {
+                    if *k != IntKind::Bool && k.size() < from.size().unwrap_or(0) {
                         let msg = format!("cast to smaller integer type '{to}' from '{from}'");
                         let flag = if from.pointee().is_some_and(Type::is_void) {
                             "void-pointer-to-int-cast"
@@ -3942,8 +3927,8 @@ impl<'a> FnChecker<'a> {
                 // `checkIntToPointerCast`).
                 if let (Type::Ptr(p), Type::Int(k)) = (to.unqual(), &from) {
                     let spelled = self.spelled_of(x);
-                    let narrower = k.size(self.xlen) < ptr_size(self.xlen);
-                    let constant = consteval::int(x, self.xlen).is_some();
+                    let narrower = k.size() < PTR_SIZE;
+                    let constant = consteval::int(x).is_some();
                     if narrower && *k != IntKind::Bool && !constant && enum_of(&spelled, &from).is_none() {
                         let named = from.named(&spelled);
                         let msg = format!("cast to '{to}' from smaller integer type {named}");
@@ -4194,7 +4179,7 @@ impl<'a> FnChecker<'a> {
                     self.bounds(a);
                     coerce(a, p);
                     // A struct too big for registers is passed as the address of a copy.
-                    if p.is_record() && abi::classify(p, self.xlen) == abi::Pass::Ref {
+                    if p.is_record() && abi::classify(p) == abi::Pass::Ref {
                         arg_copies[i] = Some(self.temp(p, "argument copy", a.pos));
                     }
                 }
@@ -4204,7 +4189,7 @@ impl<'a> FnChecker<'a> {
                     return Err(Reported);
                 }
                 if ft.ret.is_record() {
-                    if ft.ret.size(self.xlen).is_none() {
+                    if ft.ret.size().is_none() {
                         let mut e = match sig {
                             Some((name, sig)) => {
                                 let msg =
@@ -4263,10 +4248,7 @@ impl<'a> FnChecker<'a> {
     /// Checks a compound literal's type: any complete object type, or an
     /// array of unknown size (which the list completes).
     fn literal_type(&mut self, ty: &Type, pos: Pos) -> Checked {
-        if ty.is_func()
-            || ty.is_void()
-            || (ty.size(self.xlen).is_none() && !matches!(ty, Type::Array(_, None)))
-        {
+        if ty.is_func() || ty.is_void() || (ty.size().is_none() && !matches!(ty, Type::Array(_, None))) {
             return Err(self.incomplete_variable(pos, ty));
         }
         Ok(())
@@ -4315,7 +4297,7 @@ impl<'a> FnChecker<'a> {
         let mut ok = true;
         for (a, copy) in args.iter_mut().zip(copies) {
             let t = a.ty.decay();
-            if t.is_void() || (t.is_record() && t.size(self.xlen).is_none()) {
+            if t.is_void() || (t.is_record() && t.size().is_none()) {
                 let mut e = Error::new(a.pos, format!("argument type '{t}' is incomplete"));
                 if let Some(r) = t.record() {
                     e = e.note(r.pos, format!("forward declaration of '{}'", r.name()));
@@ -4329,7 +4311,7 @@ impl<'a> FnChecker<'a> {
                 t => t,
             };
             coerce(a, &promoted);
-            if promoted.is_record() && abi::classify(&promoted, self.xlen) == abi::Pass::Ref {
+            if promoted.is_record() && abi::classify(&promoted) == abi::Pass::Ref {
                 *copy = Some(self.temp(&promoted, "argument copy", a.pos));
             }
         }
@@ -4380,7 +4362,7 @@ impl<'a> FnChecker<'a> {
             );
             return Err(self.err(self.begin_written(ap), msg));
         }
-        if t.is_void() || t.is_func() || t.size(self.xlen).is_none() {
+        if t.is_void() || t.is_func() || t.size().is_none() {
             let mut e = Error::new(
                 at,
                 format!("second argument to 'va_arg' is of incomplete type '{t}'"),
@@ -4466,8 +4448,7 @@ impl<'a> FnChecker<'a> {
         Ok(())
     }
 
-    /// Replaces a `sizeof` with its value, a `size_t`: `unsigned int` on ILP32,
-    /// `unsigned long` on LP64.
+    /// Replaces a `sizeof` with its value, a `size_t`: LP64's `unsigned long`.
     /// `void` and a function are 1 byte, a GNU extension clang takes
     /// without a word (as `-Wpointer-arith`, which is not on by default,
     /// would say).
@@ -4502,7 +4483,7 @@ impl<'a> FnChecker<'a> {
         let size = if t.is_void() || t.is_func() {
             Some(1)
         } else {
-            t.size(self.xlen)
+            t.size()
         };
         let Some(size) = size else {
             let mut d = Error::new(
@@ -4516,7 +4497,7 @@ impl<'a> FnChecker<'a> {
             return Err(Reported);
         };
         e.kind = ExprKind::Num(size.into());
-        e.ty = Type::Int(IntKind::size_t(self.xlen));
+        e.ty = Type::Int(IntKind::size_t());
         Ok(())
     }
 
@@ -4550,17 +4531,14 @@ impl<'a> FnChecker<'a> {
                     // A string literal compared with anything but a null
                     // pointer constant compares its address.
                     let literal = |e: &Expr| matches!(strip_implicit(e).kind, ExprKind::Str(_));
-                    let null = |e: &Expr| consteval::is_null_pointer(e, self.xlen);
+                    let null = |e: &Expr| consteval::is_null_pointer(e);
                     if (literal(l) && !null(r)) || (literal(r) && !null(l)) {
                         let msg = "result of comparison against a string literal is unspecified (use an \
                                    explicit string comparison function instead)";
                         self.errors.push(Error::warning(pos, msg, "string-compare"));
                     }
                 }
-                let (lnull, rnull) = (
-                    consteval::is_null_pointer(l, self.xlen),
-                    consteval::is_null_pointer(r, self.xlen),
-                );
+                let (lnull, rnull) = (consteval::is_null_pointer(l), consteval::is_null_pointer(r));
                 let equality = matches!(op, BinOp::Eq | BinOp::Ne);
                 if equality && (lnull || rnull) {
                     let other = if rnull { &*l } else { &*r };
@@ -4637,8 +4615,8 @@ impl<'a> FnChecker<'a> {
                         );
                     }
                 }
-                let ty = arith_type(op, &lt, &rt, self.xlen)
-                    .ok_or_else(|| self.invalid_operands(op, pos, &l.ty, &r.ty))?;
+                let ty =
+                    arith_type(op, &lt, &rt).ok_or_else(|| self.invalid_operands(op, pos, &l.ty, &r.ty))?;
                 self.bad_shift_or_divisor(op, pos, id, &lt, r);
                 if op == BinOp::Shl {
                     self.shift_of_constant(pos, id, &lt, l, r);
@@ -4985,8 +4963,8 @@ impl<'a> FnChecker<'a> {
         let Some(k) = lt.int_kind().map(IntKind::promoted).filter(|k| k.signed()) else {
             return;
         };
-        let width = i128::from(k.size(self.xlen)) * 8;
-        let (Some(a), Some(n)) = (consteval::int(l, self.xlen), consteval::int(r, self.xlen)) else {
+        let width = i128::from(k.size()) * 8;
+        let (Some(a), Some(n)) = (consteval::int(l), consteval::int(r)) else {
             return;
         };
         if !(0..width).contains(&n) {
@@ -5022,7 +5000,7 @@ impl<'a> FnChecker<'a> {
         if !integer(lt) || !integer(&r.ty.decay()) {
             return;
         }
-        if !consteval::int(r, self.xlen).is_some_and(|v| v != 0 && v != 1) {
+        if !consteval::int(r).is_some_and(|v| v != 0 && v != 1) {
             return;
         }
         // Not of an enumerator (clang's `EnumConstantInBoolContext`), nor of
@@ -5034,7 +5012,7 @@ impl<'a> FnChecker<'a> {
         {
             inner = x;
         }
-        if matches!(inner.kind, ExprKind::Enumerator { .. }) || overflows(inner, self.xlen) {
+        if matches!(inner.kind, ExprKind::Enumerator { .. }) || overflows(inner) {
             return;
         }
         let (logical, bitwise) = if op == BinOp::LogAnd {
@@ -5059,14 +5037,12 @@ impl<'a> FnChecker<'a> {
     /// and of dividing by a constant zero: what the code does when it runs
     /// ([`Self::runtime`]).
     fn bad_shift_or_divisor(&mut self, op: BinOp, pos: Pos, of: ExprId, lt: &Type, r: &Expr) {
-        let Some(v) = r.ty.is_integer().then(|| consteval::int(r, self.xlen)).flatten() else {
+        let Some(v) = r.ty.is_integer().then(|| consteval::int(r)).flatten() else {
             return;
         };
         let warning = match op {
             BinOp::Shl | BinOp::Shr => {
-                let bits = lt
-                    .int_kind()
-                    .map_or(0, |k| i128::from(k.promoted().size(self.xlen)) * 8);
+                let bits = lt.int_kind().map_or(0, |k| i128::from(k.promoted().size()) * 8);
                 if v < 0 {
                     Some(("shift count is negative", "shift-count-negative"))
                 } else if v >= bits {
@@ -5093,8 +5069,7 @@ impl<'a> FnChecker<'a> {
         if self.unevaluated > 0 {
             return;
         }
-        let x = self.xlen;
-        let int = |e: &Expr| consteval::int(e, x);
+        let int = |e: &Expr| consteval::int(e);
         match &e.kind {
             ExprKind::Cond(c, a, b) => {
                 self.overflow(c);
@@ -5137,7 +5112,7 @@ impl<'a> FnChecker<'a> {
 
     /// [`Self::overflow`] of the operator `e` itself, at it.
     fn overflowed(&mut self, e: &Expr) {
-        if let Some((value, k)) = consteval::overflow_at(e, self.xlen, true, false) {
+        if let Some((value, k)) = consteval::overflow_at(e, true, false) {
             let (value, ty) = (digit_groups(value), Type::Int(k));
             let msg = format!("overflow in expression; result is {value} with type '{ty}'");
             self.errors.push(Error::warning(e.pos, msg, "integer-overflow"));
@@ -5150,7 +5125,7 @@ impl<'a> FnChecker<'a> {
         self.full(e);
         // An item of a list is no full expression of its own.
         if self.unevaluated == 0 && self.list_depth == 0 {
-            for f in crate::sequence::check(e, self.xlen) {
+            for f in crate::sequence::check(e) {
                 self.runtime(Error::warning(f.at, f.msg, "unsequenced"), f.of);
             }
         }
@@ -5211,7 +5186,7 @@ impl<'a> FnChecker<'a> {
             return;
         };
         let n = i128::from(*n);
-        let Some(v) = consteval::int(index, self.xlen) else {
+        let Some(v) = consteval::int(index) else {
             return;
         };
         let msg = if v < 0 {
@@ -5264,13 +5239,12 @@ impl<'a> FnChecker<'a> {
     /// always the same, as the other operand's type before it is converted
     /// for the comparison says.
     fn out_of_range(&mut self, op: BinOp, pos: Pos, of: ExprId, l: &Expr, r: &Expr) {
-        let x = self.xlen;
         let (Some(lk), Some(rk)) = (l.ty.decay().int_kind(), r.ty.decay().int_kind()) else {
             return;
         };
-        let common = common(lk, rk, x);
+        let common = common(lk, rk);
         for (c, other, left) in [(l, r, true), (r, l, false)] {
-            let (Some(v), None) = (consteval::int(c, x), consteval::int(other, x)) else {
+            let (Some(v), None) = (consteval::int(c), consteval::int(other)) else {
                 continue;
             };
             let mut inner = other;
@@ -5284,12 +5258,12 @@ impl<'a> FnChecker<'a> {
                 continue;
             };
             // Only where every value of `t` is the same in the common type.
-            let (min, max) = t.range(x);
-            let (cmin, cmax) = common.range(x);
+            let (min, max) = t.range();
+            let (cmin, cmax) = common.range();
             if min < cmin || max > cmax {
                 continue;
             }
-            let v = common.wrap(v, x);
+            let v = common.wrap(v);
             let below = v < min;
             if !below && v <= max {
                 // A `_Bool` compared with one of its own two values, where
@@ -5342,11 +5316,10 @@ impl<'a> FnChecker<'a> {
     /// it, what it warns of when the code runs ([`Self::runtime`]); of one
     /// exactly as wide that becomes negative, at once.
     fn constant_conversion(&mut self, e: &Expr, to: &Type) {
-        let x = self.xlen;
         let (Some(from), Some(k)) = (e.ty.decay().int_kind(), to.unqual().int_kind()) else {
             return;
         };
-        let Some(v) = consteval::int(e, x).filter(|_| k != IntKind::Bool) else {
+        let Some(v) = consteval::int(e).filter(|_| k != IntKind::Bool) else {
             // Each operand a `?:` may give, the right one of a comma.
             match &e.kind {
                 ExprKind::Cond(_, a, b) => {
@@ -5370,8 +5343,8 @@ impl<'a> FnChecker<'a> {
         } else {
             129 - (!v).leading_zeros()
         };
-        let bits = k.size(x) * 8;
-        let changed = k.wrap(v, x);
+        let bits = k.size() * 8;
+        let changed = k.wrap(v);
         let msg = format!(
             "implicit conversion from '{}' to '{}' changes value from {v} to {changed}",
             e.ty.decay(),
@@ -5401,13 +5374,13 @@ impl<'a> FnChecker<'a> {
         let (at, bt) = (a.ty.decay(), b.ty.decay());
         let (sa, sb) = (self.spelled_of(a), self.spelled_of(b));
         let ty = match (&at, &bt) {
-            (Type::Int(x), Type::Int(y)) => Type::Int(common(*x, *y, self.xlen)),
+            (Type::Int(x), Type::Int(y)) => Type::Int(common(*x, *y)),
             (Type::Void, _) | (_, Type::Void) => Type::Void,
             (Type::Record(x), Type::Record(y)) if x == y => at.clone(),
             // A null pointer constant takes the other pointer's type, even
             // when it is `(void *)0` (C99 6.5.15p6).
-            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(a, self.xlen) => bt.clone(),
-            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(b, self.xlen) => at.clone(),
+            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(a) => bt.clone(),
+            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(b) => at.clone(),
             // Otherwise both point to the same type, but for the qualifiers
             // of what they point to (an array's elements' are its own), or
             // one to void and the other to an object, and the result points
@@ -5432,7 +5405,7 @@ impl<'a> FnChecker<'a> {
                 // Only an integer that is a null pointer constant takes the
                 // pointer's type silently (not `5` with `(void *)0`).
                 let int = if at.is_ptr() { &*b } else { &*a };
-                if !consteval::is_null_pointer(int, self.xlen) {
+                if !consteval::is_null_pointer(int) {
                     // The operands as clang names them: promoted.
                     let (at, bt) = (promoted(&at), promoted(&bt));
                     let msg = format!(
@@ -5618,7 +5591,6 @@ fn is_char_array(t: &Type) -> bool {
 mod tests {
     use super::{symbol_key, LITERAL};
     use crate::ast::*;
-    use crate::types::Xlen;
 
     fn ok(src: &str) -> Program {
         crate::parse(src).unwrap_or_else(|e| panic!("{src}: {e:?}"))
@@ -5729,15 +5701,15 @@ mod tests {
                 .collect()
         };
         for (sym, want) in [
-            ("v", vec![".word 0"]),
+            ("v", vec![".quad 0"]),
             ("m", vec![".word 5"]),
-            ("p", vec![".word g"]),
-            ("l", vec![".word 3"]),
+            ("p", vec![".quad g"]),
+            ("l", vec![".quad 3"]),
             ("m2", vec![".word 6"]),
-            ("ps", vec![".word 0", ".word g"]),
-            ("pp", vec![".word g+4"]),
+            ("ps", vec![".quad 0", ".quad g"]),
+            ("pp", vec![".quad g+4"]),
             ("z", vec![".word 1"]),
-            ("pz", vec![".word 0"]),
+            ("pz", vec![".quad 0"]),
             ("st", vec![".word 8", ".word 9"]),
             ("ia", vec![".word 1", ".word 2"]),
             ("ia3", vec![".word 4", ".word 5", ".word 6"]),
@@ -5748,8 +5720,8 @@ mod tests {
             ("ib", vec![".zero 4", ".word 4"]),
             ("wi", vec![".word 5"]),
             ("w", vec![".word 6"]),
-            ("pm", vec![".word .compoundliteral+4"]),
-            ("f.sp", vec![".word g"]),
+            ("pm", vec![".quad .compoundliteral+4"]),
+            ("f.sp", vec![".quad g"]),
             ("f.ss", vec![".word 3", ".word 4"]),
             ("f.s6", vec![".word 5"]),
         ] {
@@ -5956,14 +5928,14 @@ mod tests {
         let Some(Init::Expr(e)) = &ds[0].init else {
             panic!()
         };
-        assert_eq!(crate::consteval::int(e, Xlen::Rv32), Some(4));
+        assert_eq!(crate::consteval::int(e), Some(4));
         // An array the initializer completes is incomplete inside it, as in C,
         // and complete after it.
         let p = ok("int f() { static int a[] = {1, 2, 3}; return sizeof a; }");
         let StmtKind::Return(Some(e)) = &func(&p, "f").body.as_ref().unwrap()[1].kind else {
             panic!()
         };
-        assert_eq!(crate::consteval::int(e, Xlen::Rv32), Some(12));
+        assert_eq!(crate::consteval::int(e), Some(12));
         // And a global's.
         ok("void *self = &self; int f() { return self == &self; }");
         ok("int *ring[2] = {(int *)&ring[1], (int *)&ring[0]};");
@@ -6058,49 +6030,38 @@ mod tests {
         // An address converted to an integer as wide as a pointer is one,
         // moved by adding or subtracting an integer; any other width or
         // arithmetic is not constant, as clang has it.
-        let err_on = |x: Xlen, src: &str| -> Option<String> {
-            let opts = crate::Options {
-                xlen: x,
-                ..crate::Options::default()
-            };
-            crate::parse_with("t.c", src, &opts, &crate::no_files)
+        let err_on = |src: &str| -> Option<String> {
+            crate::parse_with("t.c", src, &crate::Options::default(), &crate::no_files)
                 .err()
                 .map(|e| e.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "))
         };
         const NOT_CONSTANT: &str = "initializer element is not a compile-time constant";
-        for (src, rv32, rv64) in [
-            ("int a; long b = (long)&a;", true, true),
-            ("int a; unsigned long b = (unsigned long)&a + 4;", true, true),
-            ("int a; long b = 4 + (long)&a - 8;", true, true),
-            ("int a; int *b = (int *)((long)&a + 4);", true, true),
+        for (src, ok) in [
+            ("int a; long b = (long)&a;", true),
+            ("int a; unsigned long b = (unsigned long)&a + 4;", true),
+            ("int a; long b = 4 + (long)&a - 8;", true),
+            ("int a; int *b = (int *)((long)&a + 4);", true),
             (
                 "int a[2]; long b = (long)a, c = (long)\"s\", d = (long)&a[1];",
                 true,
-                true,
             ),
-            ("void f(void); long b = (long)f;", true, true),
-            ("int a; int b = (int)&a;", true, false),
-            ("int a; unsigned b = (unsigned)&a;", true, false),
-            ("int a; int b = (int)(long)&a;", true, false),
-            ("int a; long long b = (long long)&a;", false, true),
-            (
-                "int a; unsigned long long b = (unsigned long long)&a;",
-                false,
-                true,
-            ),
-            ("int a; short b = (short)&a;", false, false),
-            ("int a; char b = (char)&a;", false, false),
-            ("int a; long b = (long)&a * 2;", false, false),
-            ("int a; long b = (long)&a | 1;", false, false),
-            ("int a; long b = -(long)&a;", false, false),
-            ("int a; long b = 4 - (long)&a;", false, false),
-            ("int a; long b = (long)&a - (long)&a;", false, false),
+            ("void f(void); long b = (long)f;", true),
+            ("int a; long long b = (long long)&a;", true),
+            ("int a; unsigned long long b = (unsigned long long)&a;", true),
+            ("int a; int b = (int)&a;", false),
+            ("int a; unsigned b = (unsigned)&a;", false),
+            ("int a; int b = (int)(long)&a;", false),
+            ("int a; short b = (short)&a;", false),
+            ("int a; char b = (char)&a;", false),
+            ("int a; long b = (long)&a * 2;", false),
+            ("int a; long b = (long)&a | 1;", false),
+            ("int a; long b = -(long)&a;", false),
+            ("int a; long b = 4 - (long)&a;", false),
+            ("int a; long b = (long)&a - (long)&a;", false),
         ] {
-            for (x, ok) in [(Xlen::Rv32, rv32), (Xlen::Rv64, rv64)] {
-                match err_on(x, src) {
-                    None => assert!(ok, "{src} ({x:?}) compiles"),
-                    Some(e) => assert!(!ok && e.ends_with(NOT_CONSTANT), "{src} ({x:?}): {e}"),
-                }
+            match err_on(src) {
+                None => assert!(ok, "{src} compiles"),
+                Some(e) => assert!(!ok && e.ends_with(NOT_CONSTANT), "{src}: {e}"),
             }
         }
         // Locals may be initialized with anything.
@@ -6123,7 +6084,7 @@ mod tests {
                     Init::List(items, _) => {
                         format!("{{{}}}", items.iter().map(show).collect::<Vec<_>>().join(", "))
                     }
-                    Init::Expr(e) => match crate::consteval::int(e, Xlen::Rv32) {
+                    Init::Expr(e) => match crate::consteval::int(e) {
                         Some(v) => v.to_string(),
                         None => "s".into(),
                     },
@@ -6173,7 +6134,7 @@ mod tests {
         assert_eq!(ty("char c", "-c"), "int");
         assert_eq!(ty("char c", "~c"), "int");
         assert_eq!(ty("unsigned u, int i", "u + i"), "unsigned int");
-        assert_eq!(ty("unsigned u, long l", "u * l"), "unsigned long");
+        assert_eq!(ty("unsigned u, long l", "u * l"), "long");
         assert_eq!(ty("unsigned short u, int i", "u + i"), "int");
         assert_eq!(ty("unsigned u, int i", "u < i"), "int");
         assert_eq!(
@@ -6184,7 +6145,7 @@ mod tests {
         assert_eq!(ty("unsigned u", "u >> 1"), "unsigned int");
         assert_eq!(ty("int *p", "p + 1"), "int *");
         assert_eq!(ty("int *p", "1 + p"), "int *");
-        assert_eq!(ty("int *p, int *q", "p - q"), "int");
+        assert_eq!(ty("int *p, int *q", "p - q"), "long");
         assert_eq!(ty("int *p", "*p"), "int");
         assert_eq!(ty("int *p", "&p"), "int **");
         assert_eq!(ty("int *p", "p[2]"), "int");
@@ -6192,7 +6153,7 @@ mod tests {
         assert_eq!(ty("int x", "buf + 1"), "char *");
         assert_eq!(ty("int x", "&buf"), "char (*)[8]");
         assert_eq!(ty("int x", "*buf"), "char");
-        assert_eq!(ty("int x", "sizeof buf"), "unsigned int");
+        assert_eq!(ty("int x", "sizeof buf"), "unsigned long");
         // A null pointer constant takes the other side's type, even as `(void *)0`.
         assert_eq!(ty("int *p, int c", "c ? (void *)0 : p"), "int *");
         assert_eq!(ty("int *p, int c", "c ? p : (void *)0"), "int *");
@@ -6227,8 +6188,8 @@ mod tests {
         let StmtKind::Return(Some(e)) = &func(&p, "f").body.as_ref().unwrap()[1].kind else {
             panic!()
         };
-        // 15 + 5 + 4 + 2 + 4 + 4; `p++` is not evaluated.
-        assert_eq!(crate::consteval::int(e, Xlen::Rv32), Some(34));
+        // 15 + 5 + 8 + 2 + 4 + 8; `p++` is not evaluated.
+        assert_eq!(crate::consteval::int(e), Some(42));
     }
 
     #[test]
@@ -6350,7 +6311,7 @@ mod tests {
     #[test]
     fn struct_calls_get_hidden_locals() {
         let p = ok(
-            "struct big { int v[3]; }; struct big g(struct big a, struct big b);
+            "struct big { int v[5]; }; struct big g(struct big a, struct big b);
                     int f(struct big x) { return g(x, x).v[0]; }",
         );
         let f = func(&p, "f");
@@ -6369,7 +6330,7 @@ mod tests {
             ]
         );
         // A definition returning a big struct keeps the result's address.
-        let p = ok("struct big { int v[3]; }; struct big g(int a) { struct big b; b.v[0] = a; return b; }");
+        let p = ok("struct big { int v[5]; }; struct big g(int a) { struct big b; b.v[0] = a; return b; }");
         let g = func(&p, "g");
         assert_eq!(g.locals[g.ret_ptr.unwrap().0].ty.to_string(), "struct big *");
         // Small structs travel in registers: no copies.
@@ -6438,7 +6399,7 @@ mod tests {
                 .unwrap();
             let Some(Init::Expr(e)) = &d.init else { panic!() };
             assert_eq!(
-                crate::consteval::eval(e, Xlen::Rv32),
+                crate::consteval::eval(e),
                 Some(crate::consteval::Const::Addr {
                     base: Some(crate::consteval::Base::Sym(symbol_key(LITERAL, i))),
                     offset: 0
@@ -6463,7 +6424,7 @@ mod tests {
 
     #[test]
     fn variadic_calls() {
-        let p = ok("int f(int n, ...); struct s { int v[4]; } x; \
+        let p = ok("int f(int n, ...); struct s { int v[5]; } x; \
                     int g(char c) { return f(1, c, \"s\", x, (short)2); }");
         let Some(StmtKind::Return(Some(e))) = func(&p, "g").body.as_ref().unwrap().first().map(|s| &s.kind)
         else {
@@ -6493,7 +6454,7 @@ mod tests {
         ok("int f(char *s) { const char *t = s; const char **u = &t; volatile int v = 1; return *t + v; }");
         ok("const int k = 3; int f(const int *p) { return *p + k; }");
         // Comparisons and differences ignore what the pointers' targets add.
-        assert_eq!(ty("const int *p, int *q", "p - q"), "int");
+        assert_eq!(ty("const int *p, int *q", "p - q"), "long");
         assert_eq!(ty("const int *p, int *q", "p == q"), "int");
         assert_eq!(
             ty("const int *p, volatile int *q, int c", "c ? p : q"),

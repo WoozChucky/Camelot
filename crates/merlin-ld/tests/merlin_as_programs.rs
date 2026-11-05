@@ -1,14 +1,13 @@
 //! Programs built entirely with our own tools: assembled by merlin-as, linked
-//! by merlin-ld, run in Grail, for RV32 and RV64. (Every example is also
-//! built and run by `crates/xtask/tests/examples.rs`.)
+//! by merlin-ld, run in Grail. (Every example is also built and run by
+//! `crates/xtask/tests/examples.rs`.)
 
-use excalibur::Xlen;
 use grail::{Machine, RunResult};
 use merlin_ld::{Input, Options};
 use std::path::Path;
 use std::process::Command;
 
-/// `examples/muldiv/muldiv.S`, one source for both widths (#193).
+/// `examples/muldiv/muldiv.S`.
 const MULDIV_S: &str = include_str!("../../../examples/muldiv/muldiv.S");
 
 /// The repository's `examples` directory.
@@ -17,65 +16,19 @@ fn examples_dir() -> std::path::PathBuf {
 }
 
 /// An example's `.S` source (`name`, in `examples/`) as merlin's preprocessor
-/// makes it for `xlen`, with `-I include`: what merlin-as assembles.
-fn preprocessed(name: &str, src: &str, xlen: Xlen) -> String {
+/// makes it, with `-I include`: what merlin-as assembles.
+fn preprocessed(name: &str, src: &str) -> String {
     let opts = merlin::Options {
-        xlen: match xlen {
-            Xlen::Rv32 => merlin::types::Xlen::Rv32,
-            Xlen::Rv64 => merlin::types::Xlen::Rv64,
-        },
         include_dirs: vec![examples_dir().join("../include")],
         ..merlin::Options::default()
     };
     merlin::preprocess_asm(name, src, &opts, &merlin::read_file).unwrap_or_else(|e| panic!("{name}: {e:?}"))
 }
 
-/// muldiv.S preprocessed for `xlen`. Whitespace inside a line is one space
-/// there (`li t0, -5`).
-fn muldiv(xlen: Xlen) -> String {
-    preprocessed("muldiv.S", MULDIV_S, xlen)
-}
-
-/// Assembles, links and runs `src`; returns how it ended and what it printed.
-fn build_and_run(src: &str) -> (RunResult, String) {
-    let obj = merlin_as::assemble(src).unwrap_or_else(|e| panic!("merlin-as: {e:?}"));
-    let input = Input {
-        name: "prog.o".into(),
-        data: merlin_as::elf::write(&obj),
-    };
-    let linked =
-        merlin_ld::link(&[input], &Options::default()).unwrap_or_else(|e| panic!("merlin-ld: {e:?}"));
-    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
-    m.cpu.bus.uart.capture = true;
-    m.load_elf(&linked.elf).unwrap();
-    let r = m.run(Some(100_000), |_| {});
-    let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-    (r, out)
-}
-
-/// Issue #9: every M instruction, including division by zero and
-/// `INT_MIN / -1`, gives the result the RISC-V spec requires.
-#[test]
-fn muldiv_example_passes_in_grail() {
-    let (r, out) = build_and_run(&muldiv(Xlen::Rv32));
-    assert_eq!(r, RunResult::Exited(0), "output: {out}");
-    // All 17 cases ran (xcal.dbg prints the count just before halting).
-    assert!(out.ends_with("a0 = 0x00000011 (17)\n"), "{out}");
-}
-
-/// The self-check really checks: a wrong expectation stops at that case.
-#[test]
-fn muldiv_example_reports_the_failing_case() {
-    let muldiv = muldiv(Xlen::Rv32);
-    let wrong = muldiv.replace("li t0, -5", "li t0, -4"); // case 8: -21 / 4
-    assert_ne!(wrong, muldiv);
-    let (r, out) = build_and_run(&wrong);
-    assert_eq!(r, RunResult::Exited(8), "output: {out}");
-
-    // Division by zero must not trap: the quotient is all ones.
-    let wrong = muldiv.replacen("li t0, 0xffffffff", "li t0, 0", 1); // case 13
-    let (r, _) = build_and_run(&wrong);
-    assert_eq!(r, RunResult::Exited(13));
+/// muldiv.S preprocessed. Whitespace inside a line is one space there
+/// (`li t0, -5`).
+fn muldiv() -> String {
+    preprocessed("muldiv.S", MULDIV_S)
 }
 
 /// Runs the merlin-ld binary in `dir`; returns its stderr.
@@ -92,33 +45,34 @@ fn merlin_ld(dir: &Path, args: &[&str]) -> String {
 
 /// The commands at the top of `examples/multiobj/main.S`, with the merlin-ld
 /// binary: two objects and a script in, the committed executable out (which
-/// `cargo xtask examples` builds by linking in memory), for RV32 and then for
-/// RV64 (`multiobj-rv64.elf`): the sources preprocessed, `main.o` and
-/// `print.o` assembled for each width.
+/// `cargo xtask examples` builds by linking in memory): the sources
+/// preprocessed, `main.o` and `print.o` assembled.
 #[test]
 fn multiobj_example_with_the_merlin_ld_binary() {
     let example = examples_dir().join("multiobj");
-    for (xlen, out) in [(Xlen::Rv32, "multiobj.elf"), (Xlen::Rv64, "multiobj-rv64.elf")] {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("merlin-as-programs-{xlen:?}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let opts = merlin_as::Options { xlen };
-        for src in ["main", "print"] {
-            let name = format!("{src}.S");
-            let text = std::fs::read_to_string(example.join(&name)).unwrap();
-            let text = preprocessed(&name, &text, xlen);
-            let obj =
-                merlin_as::assemble_to_elf_with(&text, &opts).unwrap_or_else(|e| panic!("{src}.S: {e:?}"));
-            std::fs::write(dir.join(format!("{src}.o")), obj).unwrap();
-        }
-        std::fs::copy(example.join("link.ld"), dir.join("link.ld")).unwrap();
-
-        let err = merlin_ld(&dir, &["-T", "link.ld", "main.o", "print.o", "-o", out]);
-        assert_eq!(err, "");
-        let ours = std::fs::read(dir.join(out)).unwrap();
-        let committed = std::fs::read(example.join(out)).unwrap();
-        assert!(ours == committed, "examples/multiobj/{out} is not the CLI's link");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("merlin-as-programs-multiobj");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for src in ["main", "print"] {
+        let name = format!("{src}.S");
+        let text = std::fs::read_to_string(example.join(&name)).unwrap();
+        let text = preprocessed(&name, &text);
+        let obj = merlin_as::assemble_to_elf(&text).unwrap_or_else(|e| panic!("{src}.S: {e:?}"));
+        std::fs::write(dir.join(format!("{src}.o")), obj).unwrap();
     }
+    std::fs::copy(example.join("link.ld"), dir.join("link.ld")).unwrap();
+
+    let err = merlin_ld(
+        &dir,
+        &["-T", "link.ld", "main.o", "print.o", "-o", "multiobj.elf"],
+    );
+    assert_eq!(err, "");
+    let ours = std::fs::read(dir.join("multiobj.elf")).unwrap();
+    let committed = std::fs::read(example.join("multiobj.elf")).unwrap();
+    assert!(
+        ours == committed,
+        "examples/multiobj/multiobj.elf is not the CLI's link"
+    );
     // (No output section of multiobj takes input from both objects, so the
     // object order does not move anything it loads; concatenating the same
     // section from several objects is covered by the fixtures in
@@ -126,18 +80,15 @@ fn multiobj_example_with_the_merlin_ld_binary() {
 }
 
 // ---------------------------------------------------------------------------
-// RV64: merlin-as objects assembled for `rv64ima_zicsr_zifencei`, linked
-// into ELF64 executables with the default layout (pc-relative code at
-// 0x8000_0000) and run on an RV64 Grail machine, which an ELF64 file makes:
-// the RV64 build of examples/muldiv (#151), then programs of this file that
-// check what no example does, `ld`/`sd` of a symbol's address and `.dword`
-// pointers from each object into the other.
+// merlin-as objects linked into executables with the default layout
+// (pc-relative code at 0x8000_0000) and run on a Grail machine:
+// examples/muldiv (#151), then programs of this file that check what no
+// example does, `ld`/`sd` of a symbol's address and `.dword` pointers from
+// each object into the other.
 
-/// Assembles `src` for RV64 into an object named `name`.
-fn rv64_object(name: &str, src: &str) -> Input {
-    let opts = merlin_as::Options { xlen: Xlen::Rv64 };
-    let data =
-        merlin_as::assemble_to_elf_with(src, &opts).unwrap_or_else(|e| panic!("merlin-as {name}: {e:?}"));
+/// Assembles `src` into an object named `name`.
+fn object(name: &str, src: &str) -> Input {
+    let data = merlin_as::assemble_to_elf(src).unwrap_or_else(|e| panic!("merlin-as {name}: {e:?}"));
     Input {
         name: name.into(),
         data,
@@ -148,35 +99,33 @@ fn rv64_object(name: &str, src: &str) -> Input {
 /// executable, how it ended and what it printed.
 fn link_and_run(objs: &[Input]) -> (Vec<u8>, RunResult, String) {
     let linked = merlin_ld::link(objs, &Options::default()).unwrap_or_else(|e| panic!("merlin-ld: {e:?}"));
-    assert_eq!(linked.layout.class, elf::Class::Elf64);
     let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(&linked.elf).unwrap();
-    assert_eq!(m.cpu.xlen(), Xlen::Rv64, "an ELF64 file makes an RV64 machine");
     let r = m.run(Some(100_000), |_| {});
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
     (linked.elf, r, out)
 }
 
-/// `examples/muldiv/muldiv.S`, RV64 build: every M instruction at 64 bits and the W
-/// ones, including division by zero, `INT64_MIN / -1` and `INT32_MIN / -1`,
-/// gives the result the RISC-V spec requires; and a wrong expectation stops at
-/// its case.
+/// Issue #9: `examples/muldiv/muldiv.S`, every M instruction at 64 bits and
+/// the W ones, including division by zero, `INT64_MIN / -1` and
+/// `INT32_MIN / -1`, gives the result the RISC-V spec requires; and a wrong
+/// expectation stops at its case.
 #[test]
-fn muldiv_rv64_example_passes_in_grail() {
-    let muldiv = muldiv(Xlen::Rv64);
-    let (_, r, out) = link_and_run(&[rv64_object("muldiv.o", &muldiv)]);
+fn muldiv_example_passes_in_grail() {
+    let muldiv = muldiv();
+    let (_, r, out) = link_and_run(&[object("muldiv.o", &muldiv)]);
     assert_eq!(r, RunResult::Exited(0), "output: {out}");
     assert!(out.ends_with("a0 = 0x000000000000001d (29)\n"), "{out}");
 
     let wrong = muldiv.replacen("li t0, -5", "li t0, -4", 1); // case 10: -21 / 4
     assert_ne!(wrong, muldiv);
-    let (_, r, _) = link_and_run(&[rv64_object("muldiv.o", &wrong)]);
+    let (_, r, _) = link_and_run(&[object("muldiv.o", &wrong)]);
     assert_eq!(r, RunResult::Exited(10));
     // Division by zero must not trap: the quotient is all ones (case 19).
     let wrong = muldiv.replacen("li t0, 0xffffffffffffffff", "li t0, 0", 1);
     assert_ne!(wrong, muldiv);
-    let (_, r, _) = link_and_run(&[rv64_object("muldiv.o", &wrong)]);
+    let (_, r, _) = link_and_run(&[object("muldiv.o", &wrong)]);
     assert_eq!(r, RunResult::Exited(19));
 }
 
@@ -185,7 +134,7 @@ fn muldiv_rv64_example_passes_in_grail() {
 /// instructions (32-bit results, sign-extended to 64 bits), branches. Each
 /// check halts with its number on a mismatch; at the end xcal.dbg shows how
 /// many ran.
-const RV64_ONE: &str = "
+const ONE: &str = "
     .text
     .globl _start
 _start:
@@ -225,22 +174,22 @@ ptr:
 ";
 
 #[test]
-fn rv64_program_runs_in_grail() {
-    let (_, r, out) = link_and_run(&[rv64_object("one.o", RV64_ONE)]);
+fn program_runs_in_grail() {
+    let (_, r, out) = link_and_run(&[object("one.o", ONE)]);
     assert_eq!(r, RunResult::Exited(0), "output: {out}");
     // xcal.dbg prints 64-bit registers: 16 digits.
     assert!(out.ends_with("a0 = 0x0000000000000004 (4)\n"), "{out}");
     // The checks check: addw's result is sign-extended, not 0xfffffffe.
-    let wrong = RV64_ONE.replace("li    t2, -2", "li    t2, 0xfffffffe");
-    assert_ne!(wrong, RV64_ONE);
-    let (_, r, _) = link_and_run(&[rv64_object("one.o", &wrong)]);
+    let wrong = ONE.replace("li    t2, -2", "li    t2, 0xfffffffe");
+    assert_ne!(wrong, ONE);
+    let (_, r, _) = link_and_run(&[object("one.o", &wrong)]);
     assert_eq!(r, RunResult::Exited(2));
 }
 
 /// Two objects: calls both ways, a store into and loads from the other
 /// object's data (pc-relative `sd`/`ld`), and `.dword` pointers into each
 /// other (R_RISCV_64).
-const RV64_MAIN: &str = "
+const MAIN: &str = "
     .text
     .globl _start
 _start:
@@ -280,7 +229,7 @@ twice_ptr:
     .dword twice
 ";
 
-const RV64_OTHER: &str = "
+const OTHER: &str = "
     .text
     .globl twice, read_shared
 twice:                              # a0 * 2
@@ -300,25 +249,19 @@ main_ptr:
 ";
 
 #[test]
-fn rv64_objects_call_and_point_into_each_other() {
-    let objs = [
-        rv64_object("main.o", RV64_MAIN),
-        rv64_object("other.o", RV64_OTHER),
-    ];
+fn objects_call_and_point_into_each_other() {
+    let objs = [object("main.o", MAIN), object("other.o", OTHER)];
     let (_, r, out) = link_and_run(&objs);
     assert_eq!(r, RunResult::Exited(0), "output: {out}");
     assert!(out.ends_with("a0 = 0x0000000000000004 (4)\n"), "{out}");
 }
 
-/// The merlin-ld binary links the two RV64 objects into the file
+/// The merlin-ld binary links the two objects into the file
 /// `merlin_ld::link` makes in memory, and says nothing.
 #[test]
-fn rv64_objects_with_the_merlin_ld_binary() {
-    let objs = [
-        rv64_object("main.o", RV64_MAIN),
-        rv64_object("other.o", RV64_OTHER),
-    ];
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("merlin-as-programs-rv64");
+fn objects_with_the_merlin_ld_binary() {
+    let objs = [object("main.o", MAIN), object("other.o", OTHER)];
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("merlin-as-programs-two");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     for o in &objs {

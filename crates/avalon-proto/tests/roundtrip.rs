@@ -92,7 +92,6 @@ fn field_layouts_match_the_protocol_doc() {
             clock_hz: Some(5),
             nominal_hz: 7,
             harts: 2,
-            xlen: Xlen::Rv64,
             paging: Paging::Sv39,
             bios: Bios::Default,
             devices: vec![DeviceSpec::Disk(DiskSpec {
@@ -105,13 +104,12 @@ fn field_layouts_match_the_protocol_doc() {
     .unwrap();
     #[rustfmt::skip]
     let want = [
-        48, 0, 0, 0, 0x01, 0x01,
+        47, 0, 0, 0, 0x01, 0x01,
         1, 0, 0, 0, b'a',                       // name
         0, 0x10, 0, 0, 0, 0, 0, 0,              // ram_size u64
         1, 5, 0, 0, 0,                          // clock_hz Some(5)
         7, 0, 0, 0,                             // nominal_hz
         2, 0, 0, 0,                             // harts
-        64,                                     // xlen: RV64
         8,                                      // paging: satp.MODE 8, Sv39 alone
         1,                                      // bios: default
         1, 0, 0, 0,                             // 1 device

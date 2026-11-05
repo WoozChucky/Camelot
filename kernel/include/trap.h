@@ -11,8 +11,8 @@
 
 /* What kernel_vec (kernelvec.S) saves on the stack, and user_vec (uservec.S)
  * in a process's trap frame: every slot a register wide (XLEN bits). The
- * offsets are a contract with both, in slots of SZREG bytes (4 on RV32, 8 on
- * RV64): regs[i] at slot i, then sepc (32), scause (33), stval (34), sstatus
+ * offsets are a contract with both, in slots of SZREG bytes (8): regs[i] at
+ * slot i, then sepc (32), scause (33), stval (34), sstatus
  * (35) and kernel_tp (36), the FRAME_ offsets below. Both write sepc and
  * sstatus back before sret, so a handler may change where execution
  * resumes. */
@@ -27,13 +27,9 @@ struct trap_frame {
      * a process that moves to another hart takes that hart's id with it.
      * Not used in kernel_vec's frames, where tp is the kernel's already. */
     uintptr kernel_tp;
-    /* To a multiple of 16 bytes, for the stack below: 37 slots make 148
-     * bytes on RV32 and 296 on RV64. */
-#if __riscv_xlen == 64
+    /* To a multiple of 16 bytes, for the stack below: 37 slots make 296
+     * bytes. */
     uintptr pad[1];
-#else
-    uintptr pad[3];
-#endif
 };
 
 #endif
@@ -41,13 +37,8 @@ struct trap_frame {
 /* The frame's layout, which kernelvec.S and uservec.S use: its size, a
  * multiple of 16, and the CSRs' offsets, after the 32 registers, in slots a
  * register wide (FRAME_SLOT). */
-#if __riscv_xlen == 64
 #define TRAP_FRAME_SIZE 304
 #define FRAME_SLOT 8
-#else
-#define TRAP_FRAME_SIZE 160
-#define FRAME_SLOT 4
-#endif
 #define FRAME_SEPC (32 * FRAME_SLOT)
 #define FRAME_SCAUSE (33 * FRAME_SLOT)
 #define FRAME_STVAL (34 * FRAME_SLOT)
@@ -103,13 +94,11 @@ void kernel_vec(void);
 /* Called by kernel_vec with the saved registers. */
 void kernel_trap(struct trap_frame *f);
 
-#if __riscv_xlen == 64
 /* Called by kernel_vec, on this hart's overflow stack, when a trap's frame
  * would not fit on the kernel stack it came on (the stack ran into its guard
  * page, or is about to): reports a kernel stack overflow, with the thread's
  * name and the registers of the trap, and panics. Never returns. */
 void kstack_overflow(struct trap_frame *f);
-#endif
 
 /* Register numbers in struct trap_frame's regs[]. */
 #define REG_SP 2
@@ -155,9 +144,8 @@ const char *trap_cause_name(uintptr cause);
 void panic(const char *msg);
 
 /* Executes an illegal instruction (unimp) after setting every register but sp
- * to its own number in each byte (x5 = 0x05050505 on RV32,
- * 0x0505050505050505 on RV64), so a test can check the panic's register
- * dump. Never returns. */
+ * to its own number in each byte (x5 = 0x0505050505050505), so a test can
+ * check the panic's register dump. Never returns. */
 void illegal_instruction(void);
 #endif
 

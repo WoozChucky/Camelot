@@ -7,9 +7,8 @@
 # the new stack, where thread_entry finds them, calls the function, and
 # ends the thread with what it returns.
 #
-# Both widths: the two slots are pointers, a register wide, stored and
-# loaded with REG_S and REG_L (asm.h, Linux's names): sw and lw on RV32, sd
-# and ld on RV64.
+# The two slots are pointers, a register wide, stored and loaded with
+# REG_S and REG_L (asm.h, Linux's names): sd and ld.
 
 #include <asm.h>
 

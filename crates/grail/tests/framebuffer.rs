@@ -39,7 +39,9 @@ fn scratch(name: &str) -> PathBuf {
 /// blocks on its write and would never exit if they were read only after it
 /// had.
 fn grail(args: &[&str]) -> std::process::Output {
+    // The examples are bare-metal programs: no firmware.
     let mut child = Command::new(env!("CARGO_BIN_EXE_grail"))
+        .args(["--bios", "none"])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -405,10 +407,9 @@ fn display_run_follows_a_real_time_clock() {
     check_colorbars_ppm(&std::fs::read(dir.join("frame-0001.ppm")).unwrap());
 }
 
-/// `examples/flip`, for an RV32 or an RV64 machine.
-fn flip_elf(rv64: bool) -> PathBuf {
-    let name = if rv64 { "flip-rv64.elf" } else { "flip.elf" };
-    repo_root().join("examples/flip").join(name)
+/// `examples/flip`.
+fn flip_elf() -> PathBuf {
+    repo_root().join("examples/flip/flip.elf")
 }
 
 /// Frames `examples/flip` shows, and the bands it draws: row `y` of frame `k` is
@@ -450,30 +451,24 @@ fn check_flip_dumps(dir: &Path) {
     }
 }
 
-/// `examples/flip` through `grail --fb-dump`, at both widths: one dump per frame it
+/// `examples/flip` through `grail --fb-dump`: one dump per frame it
 /// shows, at 800x600, in order.
 #[test]
 fn flip_dumps_every_frame_it_shows() {
-    for rv64 in [false, true] {
-        let dir = scratch(&format!("flip-{}", if rv64 { 64 } else { 32 }));
-        let out = grail(&[
-            "--fb-dump",
-            dir.to_str().unwrap(),
-            flip_elf(rv64).to_str().unwrap(),
-        ]);
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        check_flip_dumps(&dir);
-    }
+    let dir = scratch("flip");
+    let out = grail(&["--fb-dump", dir.to_str().unwrap(), flip_elf().to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    check_flip_dumps(&dir);
 }
 
 /// Acceptance of #176: `examples/flip` switches to 800x600 and double-buffers in RAM
 /// with page flips on the vertical-blank interrupt, and shows its moving bands with no
-/// tearing, at both widths.
+/// tearing.
 ///
 /// The display scans out the buffer it shows for a whole frame, from one vertical blank
 /// to the next, so a frame is torn if that buffer is drawn into meanwhile. The machine
@@ -491,65 +486,59 @@ fn the_display_never_shows_a_buffer_being_drawn() {
         let ppm = m.cpu.bus.frame().to_ppm();
         frames.iter().position(|f| *f == ppm).map(|k| k as u32)
     };
-    for rv64 in [false, true] {
-        let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
-        m.load_elf(&std::fs::read(flip_elf(rv64)).unwrap()).unwrap();
-        // The frame shown since the current frame began; None before the modeset.
-        let mut current: Option<u32> = None;
-        let mut seen = Vec::new();
-        let (mut ends, mut first_vblank) = (0u64, 0u64);
-        let mut steps = 0u64;
-        while m.exit_code().is_none() {
-            assert!(steps < 50_000_000, "never halts");
-            let fb = &m.cpu.bus.fb;
-            if let Some(k) = current.filter(|_| fb.ticks_to_vblank() == 1) {
-                // The end of a frame: the buffer shown all along it is still the same
-                // frame, whole.
-                assert_eq!(
-                    shown(&m),
-                    Some(k),
-                    "torn: the end of the frame before vertical blank {} (rv64 {rv64})",
-                    fb.vblanks + 1
-                );
-                ends += 1;
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    m.load_elf(&std::fs::read(flip_elf()).unwrap()).unwrap();
+    // The frame shown since the current frame began; None before the modeset.
+    let mut current: Option<u32> = None;
+    let mut seen = Vec::new();
+    let (mut ends, mut first_vblank) = (0u64, 0u64);
+    let mut steps = 0u64;
+    while m.exit_code().is_none() {
+        assert!(steps < 50_000_000, "never halts");
+        let fb = &m.cpu.bus.fb;
+        if let Some(k) = current.filter(|_| fb.ticks_to_vblank() == 1) {
+            // The end of a frame: the buffer shown all along it is still the same
+            // frame, whole.
+            assert_eq!(
+                shown(&m),
+                Some(k),
+                "torn: the end of the frame before vertical blank {}",
+                fb.vblanks + 1
+            );
+            ends += 1;
+        }
+        let (modesets, vblanks) = (fb.modesets, fb.vblanks);
+        m.cpu.step();
+        steps += 1;
+        let fb = &m.cpu.bus.fb;
+        if fb.modesets != modesets || (current.is_some() && fb.vblanks != vblanks) {
+            // A frame begins, with the buffer the modeset or the flip latched.
+            if current.is_none() {
+                first_vblank = fb.vblanks;
             }
-            let (modesets, vblanks) = (fb.modesets, fb.vblanks);
-            m.cpu.step();
-            steps += 1;
-            let fb = &m.cpu.bus.fb;
-            if fb.modesets != modesets || (current.is_some() && fb.vblanks != vblanks) {
-                // A frame begins, with the buffer the modeset or the flip latched.
-                if current.is_none() {
-                    first_vblank = fb.vblanks;
-                }
-                let k = shown(&m).unwrap_or_else(|| {
-                    panic!(
-                        "torn: the start of the frame at vertical blank {} (rv64 {rv64})",
-                        fb.vblanks
-                    )
-                });
-                assert!(
-                    current.is_none_or(|last| k >= last),
-                    "frame {k} after frame {current:?}"
-                );
-                current = Some(k);
-                if seen.last() != Some(&k) {
-                    seen.push(k);
-                }
+            let k = shown(&m)
+                .unwrap_or_else(|| panic!("torn: the start of the frame at vertical blank {}", fb.vblanks));
+            assert!(
+                current.is_none_or(|last| k >= last),
+                "frame {k} after frame {current:?}"
+            );
+            current = Some(k);
+            if seen.last() != Some(&k) {
+                seen.push(k);
             }
         }
-        assert_eq!(m.exit_code(), Some(0));
-        let fb = &m.cpu.bus.fb;
-        assert_eq!((fb.mode().width, fb.mode().height), (800, 600));
-        assert_eq!(
-            seen,
-            (0..FLIP_FRAMES).collect::<Vec<_>>(),
-            "each frame shown, in order"
-        );
-        // Every frame since the modeset was checked at its end: no idle jump skipped one.
-        assert!(ends > u64::from(FLIP_FRAMES), "{ends} frames");
-        assert_eq!(ends, fb.vblanks - first_vblank, "a frame's end was skipped");
     }
+    assert_eq!(m.exit_code(), Some(0));
+    let fb = &m.cpu.bus.fb;
+    assert_eq!((fb.mode().width, fb.mode().height), (800, 600));
+    assert_eq!(
+        seen,
+        (0..FLIP_FRAMES).collect::<Vec<_>>(),
+        "each frame shown, in order"
+    );
+    // Every frame since the modeset was checked at its end: no idle jump skipped one.
+    assert!(ends > u64::from(FLIP_FRAMES), "{ends} frames");
+    assert_eq!(ends, fb.vblanks - first_vblank, "a frame's end was skipped");
 }
 
 /// A hart waiting in `wfi` for the vertical blank wakes at each one: the jump over
@@ -558,35 +547,33 @@ fn the_display_never_shows_a_buffer_being_drawn() {
 /// skipped rather than run a tick per step.
 #[test]
 fn a_waiting_hart_wakes_at_every_vertical_blank() {
-    for rv64 in [false, true] {
-        let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
-        m.load_elf(&std::fs::read(flip_elf(rv64)).unwrap()).unwrap();
-        // Frame 0 is drawn before the interrupt is enabled: those vertical blanks
-        // interrupt nobody.
-        let mut steps = 0u64;
-        while !m.cpu.bus.fb.vblank_irq_enabled() {
-            m.cpu.step();
-            steps += 1;
-            assert!(steps < 10_000_000, "the interrupt is never enabled");
-        }
-        let before = m.cpu.bus.fb.vblanks;
-        assert_eq!(m.run(Some(50_000_000), |_| steps += 1), RunResult::Exited(0));
-        let fb = &m.cpu.bus.fb;
-        assert_eq!((fb.modesets, fb.flips), (1, u64::from(FLIP_FRAMES) - 1));
-        assert_eq!((fb.mode().width, fb.mode().height), (800, 600));
-        let interrupts = m.cpu.x[24]; // s8
-        assert!(interrupts > 0);
-        assert_eq!(
-            interrupts,
-            fb.vblanks - before,
-            "one interrupt per vertical blank"
-        );
-        assert!(m.cpu.bus.clint.mtime > steps, "idle time skipped");
-        // The last frame is what the display shows, from RAM.
-        let frame = m.cpu.bus.frame();
-        assert_eq!((frame.width, frame.height), (800, 600));
-        assert!(frame.to_ppm() == flip_ppm(FLIP_FRAMES - 1));
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    m.load_elf(&std::fs::read(flip_elf()).unwrap()).unwrap();
+    // Frame 0 is drawn before the interrupt is enabled: those vertical blanks
+    // interrupt nobody.
+    let mut steps = 0u64;
+    while !m.cpu.bus.fb.vblank_irq_enabled() {
+        m.cpu.step();
+        steps += 1;
+        assert!(steps < 10_000_000, "the interrupt is never enabled");
     }
+    let before = m.cpu.bus.fb.vblanks;
+    assert_eq!(m.run(Some(50_000_000), |_| steps += 1), RunResult::Exited(0));
+    let fb = &m.cpu.bus.fb;
+    assert_eq!((fb.modesets, fb.flips), (1, u64::from(FLIP_FRAMES) - 1));
+    assert_eq!((fb.mode().width, fb.mode().height), (800, 600));
+    let interrupts = m.cpu.x[24]; // s8
+    assert!(interrupts > 0);
+    assert_eq!(
+        interrupts,
+        fb.vblanks - before,
+        "one interrupt per vertical blank"
+    );
+    assert!(m.cpu.bus.clint.mtime > steps, "idle time skipped");
+    // The last frame is what the display shows, from RAM.
+    let frame = m.cpu.bus.frame();
+    assert_eq!((frame.width, frame.height), (800, 600));
+    assert!(frame.to_ppm() == flip_ppm(FLIP_FRAMES - 1));
 }
 
 /// Paced by a real-time clock, the vertical blank wakes the waiting hart too (the
@@ -598,7 +585,7 @@ fn flip_follows_a_real_time_clock() {
         ..MachineConfig::default()
     })
     .unwrap();
-    m.load_elf(&std::fs::read(flip_elf(false)).unwrap()).unwrap();
+    m.load_elf(&std::fs::read(flip_elf()).unwrap()).unwrap();
     let dir = scratch("flip-clock");
     let opts = DisplayOptions {
         dump_dir: Some(dir.clone()),
@@ -615,10 +602,9 @@ fn flip_follows_a_real_time_clock() {
     check_flip_dumps(&dir);
 }
 
-/// `examples/cursor`, for an RV32 or an RV64 machine.
-fn cursor_elf(rv64: bool) -> PathBuf {
-    let name = if rv64 { "cursor-rv64.elf" } else { "cursor.elf" };
-    repo_root().join("examples/cursor").join(name)
+/// `examples/cursor`.
+fn cursor_elf() -> PathBuf {
+    repo_root().join("examples/cursor/cursor.elf")
 }
 
 /// The places `examples/cursor` puts its cursor's top left corner at, in order.
@@ -678,101 +664,92 @@ fn cursor_ppm(at: Option<(i32, i32)>) -> Vec<u8> {
     out
 }
 
-/// Acceptance of #203: `examples/cursor` through `grail --fb-dump`, at both widths:
+/// Acceptance of #203: `examples/cursor` through `grail --fb-dump`:
 /// the frame it presents once, then one dump per place the cursor is shown at, each the
 /// frame with the cursor blended over it there (off the corners too), then the last
 /// again at exit.
 #[test]
 fn cursor_dumps_every_place_it_moves_to() {
-    for rv64 in [false, true] {
-        let dir = scratch(&format!("cursor-{}", if rv64 { 64 } else { 32 }));
-        let out = grail(&[
-            "--fb-dump",
-            dir.to_str().unwrap(),
-            cursor_elf(rv64).to_str().unwrap(),
-        ]);
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let mut names: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        let want: Vec<String> = (0..CURSOR_PATH.len() + 2)
-            .map(|i| format!("frame-{i:04}.ppm"))
-            .collect();
-        assert_eq!(names, want, "{}", if rv64 { "RV64" } else { "RV32" });
-        let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    let dir = scratch("cursor");
+    let out = grail(&["--fb-dump", dir.to_str().unwrap(), cursor_elf().to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let want: Vec<String> = (0..CURSOR_PATH.len() + 2)
+        .map(|i| format!("frame-{i:04}.ppm"))
+        .collect();
+    assert_eq!(names, want);
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    assert!(
+        read(&names[0]) == cursor_ppm(None),
+        "the frame, before the cursor"
+    );
+    for (k, &at) in CURSOR_PATH.iter().enumerate() {
+        let name = &names[k + 1];
         assert!(
-            read(&names[0]) == cursor_ppm(None),
-            "the frame, before the cursor"
-        );
-        for (k, &at) in CURSOR_PATH.iter().enumerate() {
-            let name = &names[k + 1];
-            assert!(
-                read(name) == cursor_ppm(Some(at)),
-                "{name} is not the cursor at {at:?}"
-            );
-        }
-        assert!(
-            read(&names[CURSOR_PATH.len() + 1]) == cursor_ppm(Some(CURSOR_PATH[5])),
-            "at exit"
+            read(name) == cursor_ppm(Some(at)),
+            "{name} is not the cursor at {at:?}"
         );
     }
+    assert!(
+        read(&names[CURSOR_PATH.len() + 1]) == cursor_ppm(Some(CURSOR_PATH[5])),
+        "at exit"
+    );
 }
 
 /// Acceptance of #203: `examples/cursor` moves its cursor over a still frame, and the
 /// frame is not redrawn. Run in slices, as a host runs it: a slice ends where the
 /// cursor changed, at a vertical blank, and there the cursor is at the next place of
 /// the path; the program presents once, flips and sets no mode, and VRAM is the same
-/// from the present to the end. At both widths, each place shown at the first vertical
+/// from the present to the end. Each place shown at the first vertical
 /// blank after its write, woken by its interrupt.
 #[test]
 fn cursor_moves_over_a_frame_that_is_not_redrawn() {
-    for rv64 in [false, true] {
-        let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
-        m.load_elf(&std::fs::read(cursor_elf(rv64)).unwrap()).unwrap();
-        let mut frame: Option<Vec<u8>> = None;
-        let mut places = Vec::new();
-        let mut slices = 0;
-        while m.exit_code().is_none() {
-            m.run_for(1_000_000, &mut |_| {});
-            slices += 1;
-            assert!(slices < 10_000, "the program does not end");
-            let fb = &mut m.cpu.bus.fb;
-            if fb.take_present() {
-                assert!(frame.is_none(), "presented again");
-                frame = Some(fb.vram.clone());
-            }
-            if fb.take_cursor_update() {
-                let c = fb.cursor();
-                assert!(c.on);
-                assert_eq!((c.hot_x, c.hot_y), (0, 0));
-                assert_eq!(fb.ticks_to_vblank(), fb.frame_ticks(), "at a vertical blank");
-                places.push((c.x, c.y));
-            }
+    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    m.load_elf(&std::fs::read(cursor_elf()).unwrap()).unwrap();
+    let mut frame: Option<Vec<u8>> = None;
+    let mut places = Vec::new();
+    let mut slices = 0;
+    while m.exit_code().is_none() {
+        m.run_for(1_000_000, &mut |_| {});
+        slices += 1;
+        assert!(slices < 10_000, "the program does not end");
+        let fb = &mut m.cpu.bus.fb;
+        if fb.take_present() {
+            assert!(frame.is_none(), "presented again");
+            frame = Some(fb.vram.clone());
         }
-        let width = if rv64 { "RV64" } else { "RV32" };
-        assert_eq!(m.exit_code(), Some(0), "{width}");
-        assert_eq!(places, CURSOR_PATH, "{width}");
-        let fb = &m.cpu.bus.fb;
-        assert_eq!((fb.presents, fb.flips, fb.modesets), (1, 0, 0), "one frame");
-        assert_eq!((fb.shown(), fb.cursor_updates), (1, CURSOR_PATH.len() as u64));
-        assert!(
-            frame.as_deref() == Some(&fb.vram[..]),
-            "VRAM changed after the present"
-        );
-        assert_eq!(fb.scanout(), 0);
-        assert!(m.cpu.bus.frame().to_ppm() == cursor_ppm(Some(CURSOR_PATH[5])));
-        assert_eq!(m.cpu.x[9], CURSOR_PATH.len() as u64, "s1: the places shown");
-        assert_eq!(
-            m.cpu.x[24],
-            CURSOR_PATH.len() as u64,
-            "s8: one vertical blank a place"
-        );
+        if fb.take_cursor_update() {
+            let c = fb.cursor();
+            assert!(c.on);
+            assert_eq!((c.hot_x, c.hot_y), (0, 0));
+            assert_eq!(fb.ticks_to_vblank(), fb.frame_ticks(), "at a vertical blank");
+            places.push((c.x, c.y));
+        }
     }
+    assert_eq!(m.exit_code(), Some(0));
+    assert_eq!(places, CURSOR_PATH);
+    let fb = &m.cpu.bus.fb;
+    assert_eq!((fb.presents, fb.flips, fb.modesets), (1, 0, 0), "one frame");
+    assert_eq!((fb.shown(), fb.cursor_updates), (1, CURSOR_PATH.len() as u64));
+    assert!(
+        frame.as_deref() == Some(&fb.vram[..]),
+        "VRAM changed after the present"
+    );
+    assert_eq!(fb.scanout(), 0);
+    assert!(m.cpu.bus.frame().to_ppm() == cursor_ppm(Some(CURSOR_PATH[5])));
+    assert_eq!(m.cpu.x[9], CURSOR_PATH.len() as u64, "s1: the places shown");
+    assert_eq!(
+        m.cpu.x[24],
+        CURSOR_PATH.len() as u64,
+        "s8: one vertical blank a place"
+    );
 }

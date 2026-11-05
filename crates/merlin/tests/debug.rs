@@ -3,7 +3,6 @@
 //! case compiles to the same loaded bytes, relocations and symbols with and
 //! without it.
 
-use merlin::types::Xlen;
 use merlin::{DebugInfo, Options};
 use std::path::{Path, PathBuf};
 
@@ -21,17 +20,9 @@ fn debug_opts(comp_dir: &str) -> Options {
     }
 }
 
-/// [`debug_opts`] for RV64.
-fn debug_opts_rv64(comp_dir: &str) -> Options {
-    Options {
-        xlen: Xlen::Rv64,
-        ..debug_opts(comp_dir)
-    }
-}
-
-/// Assembles for RV64.
-fn assemble_rv64(asm: &str) -> Vec<u8> {
-    merlin_as::assemble_to_elf_with(asm, &merlin_as::Options { xlen: Xlen::Rv64 }).unwrap()
+/// Assembles `asm` with merlin-as.
+fn assemble(asm: &str) -> Vec<u8> {
+    merlin_as::assemble_to_elf(asm).unwrap()
 }
 
 /// The parts of an object that end up loaded: each allocated section's name,
@@ -90,41 +81,33 @@ fn cases() -> Vec<PathBuf> {
 fn debug_information_changes_no_code() {
     let cases = cases();
     assert!(cases.len() > 50);
-    for x in [Xlen::Rv32, Xlen::Rv64] {
-        let plain_opts = Options {
-            xlen: x,
-            ..Options::default()
-        };
-        let debug_opts = Options {
-            xlen: x,
-            ..debug_opts("tests/cases")
-        };
-        let as_opts = merlin_as::Options { xlen: x };
-        for path in &cases {
-            let src = std::fs::read_to_string(path).unwrap();
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let plain = merlin::compile_with(&name, &src, &plain_opts, &merlin::no_files).unwrap();
-            let debug = merlin::compile_with(&name, &src, &debug_opts, &merlin::no_files).unwrap();
-            assert!(debug.contains(".loc 0 "), "{name}: no line information");
-            let plain = merlin_as::assemble_to_elf_with(&plain, &as_opts).unwrap();
-            let debug =
-                merlin_as::assemble_to_elf_with(&debug, &as_opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-            assert_eq!(loaded(&plain), loaded(&debug), "{name} ({x:?})");
-        }
+    let plain_opts = Options { ..Options::default() };
+    let debug_opts = Options {
+        ..debug_opts("tests/cases")
+    };
+    for path in &cases {
+        let src = std::fs::read_to_string(path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let plain = merlin::compile_with(&name, &src, &plain_opts, &merlin::no_files).unwrap();
+        let debug = merlin::compile_with(&name, &src, &debug_opts, &merlin::no_files).unwrap();
+        assert!(debug.contains(".loc 0 "), "{name}: no line information");
+        let plain = merlin_as::assemble_to_elf(&plain).unwrap();
+        let debug = merlin_as::assemble_to_elf(&debug).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(loaded(&plain), loaded(&debug), "{name}");
     }
 }
 
-/// On RV64 the compile unit's addresses are 8 bytes: its header says so, and
+/// The compile unit's addresses are 8 bytes: its header says so, and
 /// so does `.debug_addr`'s, whose addresses (`DW_FORM_addrx` indexes them) are
-/// `.quad`s (R_RISCV_64 relocations). The line table reads back as on RV32.
+/// `.quad`s (R_RISCV_64 relocations), and the line table reads back.
 #[test]
-fn rv64_addresses_are_eight_bytes() {
+fn addresses_are_eight_bytes() {
     let src = "int f(int n) {\n    return n + 1;\n}\nlong g(long x) {\n    return f(x);\n}\n";
-    let asm = merlin::compile_with("w.c", src, &debug_opts_rv64("dir"), &merlin::no_files).unwrap();
+    let asm = merlin::compile_with("w.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
     assert!(asm.contains("    .byte 8    # address size\n"), "{asm}");
     assert!(asm.contains("    .quad f\n"), "{asm}");
     assert!(!asm.contains(".word f\n"), "{asm}");
-    let obj = assemble_rv64(&asm);
+    let obj = assemble(&asm);
     let elf = elf::Elf::parse(&obj).unwrap();
     let info = elf.sections.iter().find(|s| s.name == ".debug_info").unwrap();
     let data = elf.section_data(info).unwrap();
@@ -589,215 +572,209 @@ fn spell(u: &elf::dies::InfoUnit, i: Option<usize>) -> String {
 /// The entries merlin writes for [`VARS`], read back with `elf::dies` from the
 /// object (its relocations applied): a function's parameters and locals where
 /// its frame has them, the blocks around the code that declares them, globals
-/// at their symbols, and every type, at both widths.
+/// at their symbols, and every type.
 #[test]
 fn variables_and_types_are_described() {
     use elf::dies::{dw, Attr, Die, InfoUnit};
-    for x in [Xlen::Rv32, Xlen::Rv64] {
-        let opts = Options {
-            xlen: x,
-            ..debug_opts("dir")
-        };
-        let asm = merlin::compile_with("v.c", VARS, &opts, &merlin::no_files).unwrap();
-        let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
-        let elf = elf::Elf::parse(&obj).unwrap();
-        let units = elf.debug_entries().unwrap();
-        assert_eq!(units.len(), 1);
-        let u: &InfoUnit = &units[0];
-        let ptr = u64::from(x.bits() / 8);
-        assert_eq!(u.addr_size as u64, ptr);
-        let at = |i: usize| &u.dies[i];
-        let named = |tag: u64, name: &str| {
-            u.dies
-                .iter()
-                .position(|d| d.tag == tag && d.name() == Some(name))
-                .unwrap_or_else(|| panic!("no {name} ({x:?}) in\n{asm}"))
-        };
-        let ty = |d: &Die| u.index_of(d.reference(dw::AT_TYPE).expect("a type")).unwrap();
-        let type_of = |i: usize| spell(u, Some(ty(at(i))));
+    let opts = Options { ..debug_opts("dir") };
+    let asm = merlin::compile_with("v.c", VARS, &opts, &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let elf = elf::Elf::parse(&obj).unwrap();
+    let units = elf.debug_entries().unwrap();
+    assert_eq!(units.len(), 1);
+    let u: &InfoUnit = &units[0];
+    let ptr = 8u64;
+    assert_eq!(u.addr_size as u64, ptr);
+    let at = |i: usize| &u.dies[i];
+    let named = |tag: u64, name: &str| {
+        u.dies
+            .iter()
+            .position(|d| d.tag == tag && d.name() == Some(name))
+            .unwrap_or_else(|| panic!("no {name} in\n{asm}"))
+    };
+    let ty = |d: &Die| u.index_of(d.reference(dw::AT_TYPE).expect("a type")).unwrap();
+    let type_of = |i: usize| spell(u, Some(ty(at(i))));
 
-        // The function: its frame base is s0, and each parameter and local is
-        // where the assembly's header comment says its slot is.
-        let walk = named(dw::TAG_SUBPROGRAM, "walk");
-        assert_eq!(at(walk).block(dw::AT_FRAME_BASE), Some(&[0x58][..]));
-        assert_eq!(type_of(walk), "long");
-        assert!(at(walk).flag(dw::AT_EXTERNAL));
-        // `int old()` has no prototype, as clang says by leaving it out.
-        assert!(at(walk).flag(dw::AT_PROTOTYPED));
-        assert!(!at(named(dw::TAG_SUBPROGRAM, "old")).flag(dw::AT_PROTOTYPED));
-        // A symbol's address: DW_OP_addrx and its index in .debug_addr.
-        let address = |loc: &[u8]| {
-            assert_eq!((loc[0], loc.len()), (0xa1, 2), "DW_OP_addrx");
-            u.addr_pool[usize::from(loc[1])]
-        };
-        let slot = |what: &str| -> Vec<u8> {
-            let line = asm
-                .lines()
-                .find(|l| l.contains(&format!("(s0)  {what}")))
-                .unwrap_or_else(|| panic!("no slot for {what} in\n{asm}"));
-            let off: i64 = line
-                .trim_start_matches(['#', ' '])
-                .split('(')
-                .next()
-                .unwrap()
-                .parse()
-                .unwrap();
-            let mut b = vec![0x91];
-            let mut v = off;
-            loop {
-                let byte = (v & 0x7f) as u8;
-                v >>= 7;
-                if (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0) {
-                    b.push(byte);
-                    return b;
-                }
-                b.push(byte | 0x80);
+    // The function: its frame base is s0, and each parameter and local is
+    // where the assembly's header comment says its slot is.
+    let walk = named(dw::TAG_SUBPROGRAM, "walk");
+    assert_eq!(at(walk).block(dw::AT_FRAME_BASE), Some(&[0x58][..]));
+    assert_eq!(type_of(walk), "long");
+    assert!(at(walk).flag(dw::AT_EXTERNAL));
+    // `int old()` has no prototype, as clang says by leaving it out.
+    assert!(at(walk).flag(dw::AT_PROTOTYPED));
+    assert!(!at(named(dw::TAG_SUBPROGRAM, "old")).flag(dw::AT_PROTOTYPED));
+    // A symbol's address: DW_OP_addrx and its index in .debug_addr.
+    let address = |loc: &[u8]| {
+        assert_eq!((loc[0], loc.len()), (0xa1, 2), "DW_OP_addrx");
+        u.addr_pool[usize::from(loc[1])]
+    };
+    let slot = |what: &str| -> Vec<u8> {
+        let line = asm
+            .lines()
+            .find(|l| l.contains(&format!("(s0)  {what}")))
+            .unwrap_or_else(|| panic!("no slot for {what} in\n{asm}"));
+        let off: i64 = line
+            .trim_start_matches(['#', ' '])
+            .split('(')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut b = vec![0x91];
+        let mut v = off;
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0) {
+                b.push(byte);
+                return b;
             }
-        };
-        let children = |i: usize| at(i).children.clone();
-        let kids = children(walk);
-        let list = kids[0];
-        assert_eq!(
-            (at(list).tag, at(list).name()),
-            (dw::TAG_FORMAL_PARAMETER, Some("list"))
-        );
-        assert_eq!(
-            at(list).block(dw::AT_LOCATION).unwrap(),
-            slot("param struct node *list").as_slice()
-        );
-        assert_eq!(type_of(list), "Node *");
-        assert_eq!(type_of(kids[1]), "color_t");
-        assert_eq!(at(kids[1]).unsigned(dw::AT_DECL_LINE), Some(13));
-        // The local in the frame, then the blocks, then the function's static
-        // locals, its block's too, in the order they are declared, at their
-        // symbols (clang's order, though `calls` is declared first).
-        assert_eq!(at(kids[2]).name(), Some("sum"));
-        assert_eq!(
-            at(kids[2]).block(dw::AT_LOCATION).unwrap(),
-            slot("local long sum").as_slice()
-        );
-        assert_eq!(kids.len(), 6);
-        let symbols = elf.symbols().unwrap();
-        let symbol = |name: &str| symbols.iter().find(|s| s.name.contains(name)).unwrap().value;
-        for (i, name) in [(4, "calls"), (5, "seen")] {
-            let s = kids[i];
-            assert_eq!(at(s).name(), Some(name));
-            assert_eq!(address(at(s).block(dw::AT_LOCATION).unwrap()), symbol(name));
+            b.push(byte | 0x80);
         }
-        // The block of `w`, and in it the `for`'s, with `i` and its body's,
-        // with `p`: each inside the one around it.
-        let block = kids[3];
-        assert_eq!(at(block).tag, dw::TAG_LEXICAL_BLOCK);
-        let (wlo, whi) = at(walk).ranges[0];
-        let inside = |inner: usize, outer: (u64, u64)| {
-            let (lo, hi) = at(inner).ranges[0];
-            assert!(outer.0 <= lo && lo < hi && hi <= outer.1, "{x:?}");
-            (lo, hi)
-        };
-        let b1 = inside(block, (wlo, whi));
-        let w = children(block)[0];
-        assert_eq!((at(w).name(), type_of(w).as_str()), (Some("w"), "union word"));
-        let for_block = children(block)[1];
-        let b2 = inside(for_block, b1);
-        assert_eq!(at(children(for_block)[0]).name(), Some("i"));
-        let body = children(for_block)[1];
-        inside(body, b2);
-        let p = children(body)[0];
-        assert_eq!((at(p).name(), type_of(p).as_str()), (Some("p"), "Node *"));
-        assert_eq!(
-            at(p).block(dw::AT_LOCATION).unwrap(),
-            slot("local struct node *p").as_slice()
-        );
-
-        // The globals, at their symbols (relocated in the object: section
-        // offsets), with their types.
-        for (name, spelled) in [
-            ("head", "Node"),
-            ("grid", "short[2][3]"),
-            // A volatile pointer to const char (the test's spelling is
-            // prefix, outermost first).
-            ("name", "volatile const char *"),
-            ("pick", "int(int, ...) *"),
-        ] {
-            let g = named(dw::TAG_VARIABLE, name);
-            assert_eq!(at(g).parent, Some(0));
-            assert_eq!(type_of(g), spelled, "{name}");
-            let loc = at(g).block(dw::AT_LOCATION).unwrap();
-            let sym = symbols.iter().find(|s| s.name == name).unwrap();
-            assert_eq!(address(loc), sym.value, "{name}");
-            assert_eq!(at(g).flag(dw::AT_EXTERNAL), name != "grid", "{name}");
-        }
-
-        // The struct, the union and the enum, laid out for the target.
-        let node = named(dw::TAG_STRUCTURE_TYPE, "node");
-        assert_eq!(at(node).unsigned(dw::AT_BYTE_SIZE), Some(2 * ptr));
-        let members: Vec<(String, String, Option<u64>)> = children(node)
-            .iter()
-            .map(|&m| {
-                let d = at(m);
-                (
-                    d.name().unwrap().to_string(),
-                    type_of(m),
-                    d.unsigned(dw::AT_DATA_MEMBER_LOCATION),
-                )
-            })
-            .collect();
-        assert_eq!(
-            members,
-            [
-                ("value".to_string(), "int".to_string(), Some(0)),
-                ("next".to_string(), "struct node *".to_string(), Some(ptr)),
-            ]
-        );
-        // A union's members are at 0, which clang says too.
-        let word = named(dw::TAG_UNION_TYPE, "word");
-        assert_eq!(at(word).unsigned(dw::AT_BYTE_SIZE), Some(4));
-        assert!(children(word)
-            .iter()
-            .all(|&m| at(m).unsigned(dw::AT_DATA_MEMBER_LOCATION) == Some(0)));
-        assert_eq!(type_of(children(word)[1]), "unsigned char[4]");
-        // The anonymous struct and enum of box's members are inside box, each
-        // after the member that is of it, as clang has them.
-        let bx = named(dw::TAG_STRUCTURE_TYPE, "box");
-        let tags: Vec<(u64, Option<&str>)> =
-            children(bx).iter().map(|&c| (at(c).tag, at(c).name())).collect();
-        assert_eq!(
-            tags,
-            [
-                (dw::TAG_MEMBER, Some("k")),
-                (dw::TAG_MEMBER, Some("in")),
-                (dw::TAG_STRUCTURE_TYPE, None),
-                (dw::TAG_MEMBER, Some("state")),
-                (dw::TAG_ENUMERATION_TYPE, None),
-            ]
-        );
-        assert_eq!(ty(at(children(bx)[1])), children(bx)[2]);
-        assert_eq!(ty(at(children(bx)[3])), children(bx)[4]);
-        let color = named(dw::TAG_ENUMERATION_TYPE, "color");
-        assert_eq!(type_of(color), "unsigned int");
-        let constants: Vec<(&str, Option<i64>)> = children(color)
-            .iter()
-            .map(|&e| {
-                (
-                    at(e).name().unwrap(),
-                    at(e).attr(dw::AT_CONST_VALUE).and_then(Attr::signed),
-                )
-            })
-            .collect();
-        assert_eq!(
-            constants,
-            [("RED", Some(0)), ("GREEN", Some(5)), ("BLUE", Some(6))]
-        );
-        assert_eq!(type_of(named(dw::TAG_TYPEDEF, "color_t")), "enum color");
-        // Plain char is unsigned on RISC-V; every type is described once.
-        let char_ = named(dw::TAG_BASE_TYPE, "char");
-        assert_eq!(at(char_).unsigned(dw::AT_ENCODING), Some(dw::ATE_UNSIGNED_CHAR));
-        let ints = u
-            .dies
-            .iter()
-            .filter(|d| d.tag == dw::TAG_BASE_TYPE && d.name() == Some("int"));
-        assert_eq!(ints.count(), 1);
+    };
+    let children = |i: usize| at(i).children.clone();
+    let kids = children(walk);
+    let list = kids[0];
+    assert_eq!(
+        (at(list).tag, at(list).name()),
+        (dw::TAG_FORMAL_PARAMETER, Some("list"))
+    );
+    assert_eq!(
+        at(list).block(dw::AT_LOCATION).unwrap(),
+        slot("param struct node *list").as_slice()
+    );
+    assert_eq!(type_of(list), "Node *");
+    assert_eq!(type_of(kids[1]), "color_t");
+    assert_eq!(at(kids[1]).unsigned(dw::AT_DECL_LINE), Some(13));
+    // The local in the frame, then the blocks, then the function's static
+    // locals, its block's too, in the order they are declared, at their
+    // symbols (clang's order, though `calls` is declared first).
+    assert_eq!(at(kids[2]).name(), Some("sum"));
+    assert_eq!(
+        at(kids[2]).block(dw::AT_LOCATION).unwrap(),
+        slot("local long sum").as_slice()
+    );
+    assert_eq!(kids.len(), 6);
+    let symbols = elf.symbols().unwrap();
+    let symbol = |name: &str| symbols.iter().find(|s| s.name.contains(name)).unwrap().value;
+    for (i, name) in [(4, "calls"), (5, "seen")] {
+        let s = kids[i];
+        assert_eq!(at(s).name(), Some(name));
+        assert_eq!(address(at(s).block(dw::AT_LOCATION).unwrap()), symbol(name));
     }
+    // The block of `w`, and in it the `for`'s, with `i` and its body's,
+    // with `p`: each inside the one around it.
+    let block = kids[3];
+    assert_eq!(at(block).tag, dw::TAG_LEXICAL_BLOCK);
+    let (wlo, whi) = at(walk).ranges[0];
+    let inside = |inner: usize, outer: (u64, u64)| {
+        let (lo, hi) = at(inner).ranges[0];
+        assert!(outer.0 <= lo && lo < hi && hi <= outer.1, "64-bit");
+        (lo, hi)
+    };
+    let b1 = inside(block, (wlo, whi));
+    let w = children(block)[0];
+    assert_eq!((at(w).name(), type_of(w).as_str()), (Some("w"), "union word"));
+    let for_block = children(block)[1];
+    let b2 = inside(for_block, b1);
+    assert_eq!(at(children(for_block)[0]).name(), Some("i"));
+    let body = children(for_block)[1];
+    inside(body, b2);
+    let p = children(body)[0];
+    assert_eq!((at(p).name(), type_of(p).as_str()), (Some("p"), "Node *"));
+    assert_eq!(
+        at(p).block(dw::AT_LOCATION).unwrap(),
+        slot("local struct node *p").as_slice()
+    );
+
+    // The globals, at their symbols (relocated in the object: section
+    // offsets), with their types.
+    for (name, spelled) in [
+        ("head", "Node"),
+        ("grid", "short[2][3]"),
+        // A volatile pointer to const char (the test's spelling is
+        // prefix, outermost first).
+        ("name", "volatile const char *"),
+        ("pick", "int(int, ...) *"),
+    ] {
+        let g = named(dw::TAG_VARIABLE, name);
+        assert_eq!(at(g).parent, Some(0));
+        assert_eq!(type_of(g), spelled, "{name}");
+        let loc = at(g).block(dw::AT_LOCATION).unwrap();
+        let sym = symbols.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(address(loc), sym.value, "{name}");
+        assert_eq!(at(g).flag(dw::AT_EXTERNAL), name != "grid", "{name}");
+    }
+
+    // The struct, the union and the enum, laid out for the target.
+    let node = named(dw::TAG_STRUCTURE_TYPE, "node");
+    assert_eq!(at(node).unsigned(dw::AT_BYTE_SIZE), Some(2 * ptr));
+    let members: Vec<(String, String, Option<u64>)> = children(node)
+        .iter()
+        .map(|&m| {
+            let d = at(m);
+            (
+                d.name().unwrap().to_string(),
+                type_of(m),
+                d.unsigned(dw::AT_DATA_MEMBER_LOCATION),
+            )
+        })
+        .collect();
+    assert_eq!(
+        members,
+        [
+            ("value".to_string(), "int".to_string(), Some(0)),
+            ("next".to_string(), "struct node *".to_string(), Some(ptr)),
+        ]
+    );
+    // A union's members are at 0, which clang says too.
+    let word = named(dw::TAG_UNION_TYPE, "word");
+    assert_eq!(at(word).unsigned(dw::AT_BYTE_SIZE), Some(4));
+    assert!(children(word)
+        .iter()
+        .all(|&m| at(m).unsigned(dw::AT_DATA_MEMBER_LOCATION) == Some(0)));
+    assert_eq!(type_of(children(word)[1]), "unsigned char[4]");
+    // The anonymous struct and enum of box's members are inside box, each
+    // after the member that is of it, as clang has them.
+    let bx = named(dw::TAG_STRUCTURE_TYPE, "box");
+    let tags: Vec<(u64, Option<&str>)> = children(bx).iter().map(|&c| (at(c).tag, at(c).name())).collect();
+    assert_eq!(
+        tags,
+        [
+            (dw::TAG_MEMBER, Some("k")),
+            (dw::TAG_MEMBER, Some("in")),
+            (dw::TAG_STRUCTURE_TYPE, None),
+            (dw::TAG_MEMBER, Some("state")),
+            (dw::TAG_ENUMERATION_TYPE, None),
+        ]
+    );
+    assert_eq!(ty(at(children(bx)[1])), children(bx)[2]);
+    assert_eq!(ty(at(children(bx)[3])), children(bx)[4]);
+    let color = named(dw::TAG_ENUMERATION_TYPE, "color");
+    assert_eq!(type_of(color), "unsigned int");
+    let constants: Vec<(&str, Option<i64>)> = children(color)
+        .iter()
+        .map(|&e| {
+            (
+                at(e).name().unwrap(),
+                at(e).attr(dw::AT_CONST_VALUE).and_then(Attr::signed),
+            )
+        })
+        .collect();
+    assert_eq!(
+        constants,
+        [("RED", Some(0)), ("GREEN", Some(5)), ("BLUE", Some(6))]
+    );
+    assert_eq!(type_of(named(dw::TAG_TYPEDEF, "color_t")), "enum color");
+    // Plain char is unsigned on RISC-V; every type is described once.
+    let char_ = named(dw::TAG_BASE_TYPE, "char");
+    assert_eq!(at(char_).unsigned(dw::AT_ENCODING), Some(dw::ATE_UNSIGNED_CHAR));
+    let ints = u
+        .dies
+        .iter()
+        .filter(|d| d.tag == dw::TAG_BASE_TYPE && d.name() == Some("int"));
+    assert_eq!(ints.count(), 1);
 }
 
 /// llvm-dwarfdump finds nothing wrong with the debug information of any test
@@ -810,42 +787,38 @@ fn llvm_dwarfdump_verifies_every_case() {
     let tool = std::env::var("LLVM_DWARFDUMP").unwrap_or_else(|_| "llvm-dwarfdump".into());
     let dir = std::env::temp_dir().join(format!("merlin-verify-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    for x in [Xlen::Rv32, Xlen::Rv64] {
-        let opts = Options {
-            xlen: x,
-            ..debug_opts("tests/cases")
-        };
-        let as_opts = merlin_as::Options { xlen: x };
-        let mut sources: Vec<(String, String)> = cases()
-            .iter()
-            .map(|p| {
-                let name = p.file_name().unwrap().to_string_lossy().into_owned();
-                (name, std::fs::read_to_string(p).unwrap())
-            })
-            .collect();
-        sources.push(("v.c".into(), VARS.into()));
-        for (name, src) in sources {
-            let asm = merlin::compile_with(&name, &src, &opts, &merlin::no_files).unwrap();
-            let obj = merlin_as::assemble_to_elf_with(&asm, &as_opts).unwrap();
-            let file = dir.join(format!("{name}-{}.o", x.bits()));
-            std::fs::write(&file, &obj).unwrap();
-            let out = std::process::Command::new(&tool)
-                .arg("--verify")
-                .arg(&file)
-                .output()
-                .unwrap_or_else(|e| panic!("cannot run {tool}: {e}"));
-            let text = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                out.status.success() && text.contains("No errors."),
-                "{name} ({x:?}):\n{text}"
-            );
-        }
+    let opts = Options {
+        ..debug_opts("tests/cases")
+    };
+    let mut sources: Vec<(String, String)> = cases()
+        .iter()
+        .map(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read_to_string(p).unwrap())
+        })
+        .collect();
+    sources.push(("v.c".into(), VARS.into()));
+    for (name, src) in sources {
+        let asm = merlin::compile_with(&name, &src, &opts, &merlin::no_files).unwrap();
+        let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+        let file = dir.join(format!("{name}-{}.o", 64));
+        std::fs::write(&file, &obj).unwrap();
+        let out = std::process::Command::new(&tool)
+            .arg("--verify")
+            .arg(&file)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {tool}: {e}"));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && text.contains("No errors."),
+            "{name}:\n{text}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Every attribute merlin writes for [`VARS`] has the form clang gives it, in
-/// the order clang writes it, at both widths: entry by entry, the tag and its
+/// the order clang writes it: entry by entry, the tag and its
 /// `DW_AT_* [DW_FORM_*]` pairs, in order, that llvm-dwarfdump -v shows for
 /// merlin's object are those it shows for clang's (clang -O0 -g; its own, such
 /// as the producer's, are the same forms). The order is the abbreviation's,
@@ -883,40 +856,34 @@ fn the_forms_are_clangs() {
         }
         entries
     };
-    for x in [Xlen::Rv32, Xlen::Rv64] {
-        let bits = x.bits();
-        let opts = Options {
-            xlen: x,
-            ..debug_opts("dir")
-        };
-        let asm = merlin::compile_with("v.c", VARS, &opts, &merlin::no_files).unwrap();
-        let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
-        let ours = dir.join(format!("merlin-{bits}.o"));
-        std::fs::write(&ours, obj).unwrap();
-        let theirs = dir.join(format!("clang-{bits}.o"));
-        let abi = if bits == 64 { "lp64" } else { "ilp32" };
-        let out = std::process::Command::new(&clang)
-            .args([
-                &format!("--target=riscv{bits}"),
-                &format!("-march=rv{bits}ima_zicsr_zifencei"),
-                &format!("-mabi={abi}"),
-                "-O0",
-                "-g",
-                "-c",
-            ])
-            .arg(&source)
-            .arg("-o")
-            .arg(&theirs)
-            .output()
-            .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        let (ours, theirs) = (forms(&ours), forms(&theirs));
-        assert!(
-            ours.iter().any(|e| e.contains("DW_AT_name [DW_FORM_strx1]")),
-            "{ours:#?}"
-        );
-        assert_eq!(ours, theirs, "merlin's (left) and clang's (right), {x:?}");
-    }
+    let opts = Options { ..debug_opts("dir") };
+    let asm = merlin::compile_with("v.c", VARS, &opts, &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let ours = dir.join("merlin.o");
+    std::fs::write(&ours, obj).unwrap();
+    let theirs = dir.join("clang.o");
+    let abi = "lp64";
+    let out = std::process::Command::new(&clang)
+        .args([
+            "--target=riscv64",
+            "-march=rv64ima_zicsr_zifencei",
+            &format!("-mabi={abi}"),
+            "-O0",
+            "-g",
+            "-c",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&theirs)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (ours, theirs) = (forms(&ours), forms(&theirs));
+    assert!(
+        ours.iter().any(|e| e.contains("DW_AT_name [DW_FORM_strx1]")),
+        "{ours:#?}"
+    );
+    assert_eq!(ours, theirs, "merlin's (left) and clang's (right)");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -924,7 +891,7 @@ fn the_forms_are_clangs() {
 fn base_types(src: &str) -> Vec<String> {
     use elf::dies::dw;
     let asm = merlin::compile_with("c.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
-    let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options::default()).unwrap();
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
     let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
     units[0]
         .dies
@@ -981,7 +948,7 @@ fn casts_not_evaluated_are_not_kept() {
 /// The names of the entries of `tag` that `src` describes, in order.
 fn named(src: &str, tag: u64) -> Vec<String> {
     let asm = merlin::compile_with("c.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
-    let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options::default()).unwrap();
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
     let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
     units[0]
         .dies
@@ -1209,39 +1176,34 @@ const row gr;
                }
                int (*g1)(arr3 b, const mat cm);
 ";
-    for x in [Xlen::Rv32, Xlen::Rv64] {
-        let opts = Options {
-            xlen: x,
-            ..debug_opts("dir")
-        };
-        let asm = merlin::compile_with("c.c", src, &opts, &merlin::no_files).unwrap();
-        let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
-        let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
-        let u = &units[0];
-        let type_of = |d: &elf::dies::Die| spell(u, d.reference(dw::AT_TYPE).and_then(|o| u.index_of(o)));
-        let typed: Vec<(&str, String)> = u
-            .dies
-            .iter()
-            .filter(|d| matches!(d.tag, dw::TAG_FORMAL_PARAMETER | dw::TAG_VARIABLE))
-            .map(|d| (d.name().unwrap_or(""), type_of(d)))
-            .collect();
-        assert_eq!(
-            typed,
-            [
-                ("b", "u32 *".to_string()),
-                ("m", "row *".into()),
-                ("r", "const u32 *".into()),
-                ("c", "u32 *".into()),
-                ("cm", "const row *".into()),
-                ("d", "arr3 *".into()),
-                ("gr", "const row".into()),
-                ("g1", "int(u32 *, const row *) *".into()),
-                ("", "u32 *".into()),
-                ("", "const row *".into()),
-            ],
-            "{x:?}"
-        );
-    }
+    let opts = Options { ..debug_opts("dir") };
+    let asm = merlin::compile_with("c.c", src, &opts, &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+    let u = &units[0];
+    let type_of = |d: &elf::dies::Die| spell(u, d.reference(dw::AT_TYPE).and_then(|o| u.index_of(o)));
+    let typed: Vec<(&str, String)> = u
+        .dies
+        .iter()
+        .filter(|d| matches!(d.tag, dw::TAG_FORMAL_PARAMETER | dw::TAG_VARIABLE))
+        .map(|d| (d.name().unwrap_or(""), type_of(d)))
+        .collect();
+    assert_eq!(
+        typed,
+        [
+            ("b", "u32 *".to_string()),
+            ("m", "row *".into()),
+            ("r", "const u32 *".into()),
+            ("c", "u32 *".into()),
+            ("cm", "const row *".into()),
+            ("d", "arr3 *".into()),
+            ("gr", "const row".into()),
+            ("g1", "int(u32 *, const row *) *".into()),
+            ("", "u32 *".into()),
+            ("", "const row *".into()),
+        ],
+        "64-bit"
+    );
 }
 
 /// clang emits an array whose initializers hold more than 16 bytes as a
@@ -1256,7 +1218,7 @@ fn big_arrays_are_described_as_constants() {
                void take(char **);\nvoid ti(int *);\n\
                int f(void) {\n\
                    take((char *[]){\"a\", \"b\", \"c\", \"d\", (V1)0});\n\
-                   take((char *[]){\"a\", \"b\", (V2)0});\n\
+                   take((char *[]){\"a\", (V2)0});\n\
                    ti((int[]){A, B, 1, 2, 3});\n\
                    ti((int[]){D, 1});\n\
                    return 0;\n\
@@ -1275,7 +1237,7 @@ fn a_functions_types_are_its_own() {
                int f(void) {\n    typedef int T;\n    T t = 1;\n    struct pt { int q; } loc;\n    loc.q = t;\n    \
                {\n        struct in { char c; } b;\n        b.c = 2;\n    }\n    return loc.q;\n}\n";
     let asm = merlin::compile_with("l.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
-    let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options::default()).unwrap();
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
     let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
     let u = &units[0];
     let f = u.dies.iter().position(|d| d.name() == Some("f")).unwrap();
@@ -1431,47 +1393,41 @@ fn the_entries_are_clangs_in_clangs_order() {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         sources.push((name, std::fs::read_to_string(&p).unwrap()));
     }
-    for x in [Xlen::Rv32, Xlen::Rv64] {
-        let bits = x.bits();
-        let abi = if bits == 64 { "lp64" } else { "ilp32" };
-        let opts = Options {
-            xlen: x,
-            ..debug_opts("dir")
-        };
-        for (name, src) in &sources {
-            let source = dir.join(name);
-            std::fs::write(&source, src).unwrap();
-            let asm = merlin::compile_with(name, src, &opts, &merlin::no_files).unwrap();
-            let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
-            let ours = dir.join(format!("{name}-merlin-{bits}.o"));
-            std::fs::write(&ours, obj).unwrap();
-            let theirs = dir.join(format!("{name}-clang-{bits}.o"));
-            let out = std::process::Command::new(&clang)
-                .args([
-                    &format!("--target=riscv{bits}"),
-                    &format!("-march=rv{bits}ima_zicsr_zifencei"),
-                    &format!("-mabi={abi}"),
-                    "-O0",
-                    "-g",
-                    "-ffreestanding",
-                    "-fno-builtin",
-                    "-w",
-                    "-c",
-                ])
-                .arg(&source)
-                .arg("-o")
-                .arg(&theirs)
-                .output()
-                .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
-            assert!(
-                out.status.success(),
-                "{name}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let (ours, theirs) = (entry_tree(&tool, &ours), entry_tree(&tool, &theirs));
-            assert!(ours.len() > 2, "{name}: {ours:#?}");
-            assert_eq!(ours, theirs, "{name}: merlin's (left) and clang's (right), {x:?}");
-        }
+    let abi = "lp64";
+    let opts = Options { ..debug_opts("dir") };
+    for (name, src) in &sources {
+        let source = dir.join(name);
+        std::fs::write(&source, src).unwrap();
+        let asm = merlin::compile_with(name, src, &opts, &merlin::no_files).unwrap();
+        let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+        let ours = dir.join(format!("{name}-merlin.o"));
+        std::fs::write(&ours, obj).unwrap();
+        let theirs = dir.join(format!("{name}-clang.o"));
+        let out = std::process::Command::new(&clang)
+            .args([
+                "--target=riscv64",
+                "-march=rv64ima_zicsr_zifencei",
+                &format!("-mabi={abi}"),
+                "-O0",
+                "-g",
+                "-ffreestanding",
+                "-fno-builtin",
+                "-w",
+                "-c",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&theirs)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (ours, theirs) = (entry_tree(&tool, &ours), entry_tree(&tool, &theirs));
+        assert!(ours.len() > 2, "{name}: {ours:#?}");
+        assert_eq!(ours, theirs, "{name}: merlin's (left) and clang's (right)");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1620,58 +1576,54 @@ fn the_files_are_numbered_as_clangs() {
     for f in ["fs.c", "pipe.c", "proc.c", "bio.c", "file.c"] {
         units.push((kernel.clone(), f, true));
     }
-    for x in [Xlen::Rv32, Xlen::Rv64] {
-        let bits = x.bits();
-        let abi = if bits == 64 { "lp64" } else { "ilp32" };
-        for (k, (at, name, kernel)) in units.iter().enumerate() {
-            let includes: Vec<&str> = if *kernel { vec!["include"] } else { Vec::new() };
-            let opts = Options {
-                xlen: x,
-                include_dirs: includes.iter().map(PathBuf::from).collect(),
-                ..debug_opts("dir")
-            };
-            let load = |p: &Path| std::fs::read_to_string(at.join(p)).ok();
-            let src = load(Path::new(name)).unwrap();
-            let asm = merlin::compile_with(name, &src, &opts, &load).unwrap();
-            let ours = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
-            let theirs = dir.join(format!("{k}-clang-{bits}.o"));
-            let out = std::process::Command::new(&clang)
-                .args([
-                    &format!("--target=riscv{bits}"),
-                    &format!("-march=rv{bits}ima_zicsr_zifencei"),
-                    &format!("-mabi={abi}"),
-                    "-mno-relax",
-                    "-O0",
-                    "-g",
-                    "-ffreestanding",
-                    "-fno-builtin",
-                    "-w",
-                    "-c",
-                ])
-                .args(includes.iter().map(|i| format!("-I{i}")))
-                .arg(name)
-                .arg("-o")
-                .arg(&theirs)
-                .current_dir(at)
-                .output()
-                .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
-            assert!(
-                out.status.success(),
-                "{name}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let theirs = std::fs::read(&theirs).unwrap();
-            let (ours, theirs) = (file_numbers(&ours), file_numbers(&theirs));
-            assert!(ours.0.len() > 1, "{name}: {ours:#?}");
-            assert_eq!(
-                ours.0, theirs.0,
-                "{name}: merlin's files (left) and clang's (right), {x:?}"
-            );
-            assert_eq!(
-                ours.1, theirs.1,
-                "{name}: merlin's entries (left) and clang's (right), {x:?}"
-            );
-        }
+    let abi = "lp64";
+    for (k, (at, name, kernel)) in units.iter().enumerate() {
+        let includes: Vec<&str> = if *kernel { vec!["include"] } else { Vec::new() };
+        let opts = Options {
+            include_dirs: includes.iter().map(PathBuf::from).collect(),
+            ..debug_opts("dir")
+        };
+        let load = |p: &Path| std::fs::read_to_string(at.join(p)).ok();
+        let src = load(Path::new(name)).unwrap();
+        let asm = merlin::compile_with(name, &src, &opts, &load).unwrap();
+        let ours = merlin_as::assemble_to_elf(&asm).unwrap();
+        let theirs = dir.join(format!("{k}-clang.o"));
+        let out = std::process::Command::new(&clang)
+            .args([
+                "--target=riscv64",
+                "-march=rv64ima_zicsr_zifencei",
+                &format!("-mabi={abi}"),
+                "-mno-relax",
+                "-O0",
+                "-g",
+                "-ffreestanding",
+                "-fno-builtin",
+                "-w",
+                "-c",
+            ])
+            .args(includes.iter().map(|i| format!("-I{i}")))
+            .arg(name)
+            .arg("-o")
+            .arg(&theirs)
+            .current_dir(at)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let theirs = std::fs::read(&theirs).unwrap();
+        let (ours, theirs) = (file_numbers(&ours), file_numbers(&theirs));
+        assert!(ours.0.len() > 1, "{name}: {ours:#?}");
+        assert_eq!(
+            ours.0, theirs.0,
+            "{name}: merlin's files (left) and clang's (right)"
+        );
+        assert_eq!(
+            ours.1, theirs.1,
+            "{name}: merlin's entries (left) and clang's (right)"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1805,8 +1757,9 @@ fn the_file_directives_are_clangs() {
         let clang_run = |out: &str| {
             let out = std::process::Command::new(&clang)
                 .args([
-                    "--target=riscv32",
-                    "-march=rv32ima_zicsr_zifencei",
+                    "--target=riscv64",
+                    "-march=rv64ima_zicsr_zifencei",
+                    "-mabi=lp64",
                     "-mno-relax",
                     "-O0",
                     "-g",
@@ -1864,8 +1817,7 @@ fn file_symbols(obj: &[u8]) -> Vec<(usize, elf::Symbol)> {
 /// `sub/n.c`, `sub/../m.c`, an absolute name, `café.c`, quoted in octal,
 /// and on Windows `sub\n.c`),
 /// whatever `#line` says; and merlin-as makes of it clang -c's `STT_FILE`
-/// symbol, the object's first, local and absolute, the only one, on both
-/// widths.
+/// symbol, the object's first, local and absolute, the only one.
 ///
 /// Ignored: it needs clang (`CLANG` names it if it is not on the PATH).
 #[test]
@@ -1895,59 +1847,57 @@ fn the_file_symbol_is_clangs() {
         names.push("sub\\n.c");
     }
     for name in names {
-        for xlen in [Xlen::Rv32, Xlen::Rv64] {
-            for g in [false, true] {
-                let opts = Options {
-                    xlen,
-                    ..if g { debug_opts("src") } else { Options::default() }
-                };
-                let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
-                let src = load(Path::new(name)).unwrap();
-                let ours = merlin::compile_with(name, &src, &opts, &load).unwrap();
-                let (target, march, abi) = match xlen {
-                    Xlen::Rv32 => ("riscv32", "rv32ima_zicsr_zifencei", "ilp32"),
-                    Xlen::Rv64 => ("riscv64", "rv64ima_zicsr_zifencei", "lp64"),
-                };
-                let clang_run = |out: &str| {
-                    let mut cmd = std::process::Command::new(&clang);
-                    cmd.arg(format!("--target={target}"))
-                        .arg(format!("-march={march}"))
-                        .arg(format!("-mabi={abi}"))
-                        .args(["-mno-relax", "-O0", "-fdebug-compilation-dir=src", out, "-o", "-"]);
-                    if g {
-                        cmd.arg("-g");
-                    }
-                    let out = cmd
-                        .arg(name)
-                        .current_dir(&dir)
-                        .output()
-                        .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
-                    assert!(
-                        out.status.success(),
-                        "{name}: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                    out.stdout
-                };
-                let what = format!("{name}, {xlen:?}, -g {g}: merlin's (left) and clang's (right)");
-                let theirs = String::from_utf8(clang_run("-S")).unwrap();
-                assert_eq!(file_symbol_lines(&ours), file_symbol_lines(&theirs), "{what}");
-                // It is the first line, as clang's is after its
-                // `.attribute`s, which merlin leaves to the assembler.
-                let words = |l: &str| l.split_whitespace().collect::<Vec<_>>().join(" ");
-                let first = theirs
-                    .lines()
-                    .find(|l| !l.trim_start().starts_with(".attribute"))
-                    .map(words);
-                assert_eq!(ours.lines().next().map(words), first, "{what}");
-                let obj = merlin_as::assemble_to_elf_with(&ours, &merlin_as::Options { xlen }).unwrap();
-                let syms = file_symbols(&obj);
-                assert_eq!(syms, file_symbols(&clang_run("-c")), "{what}");
-                assert_eq!(syms.len(), 1, "{what}");
-                assert_eq!(syms[0].0, 1, "{what}");
-                assert_eq!(syms[0].1.shndx, elf::SHN_ABS, "{what}");
-                assert_eq!(syms[0].1.bind(), elf::STB_LOCAL, "{what}");
-            }
+        for g in [false, true] {
+            let opts = if g { debug_opts("src") } else { Options::default() };
+            let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
+            let src = load(Path::new(name)).unwrap();
+            let ours = merlin::compile_with(name, &src, &opts, &load).unwrap();
+            let clang_run = |out: &str| {
+                let mut cmd = std::process::Command::new(&clang);
+                cmd.args([
+                    "--target=riscv64",
+                    "-march=rv64ima_zicsr_zifencei",
+                    "-mabi=lp64",
+                    "-mno-relax",
+                    "-O0",
+                    "-fdebug-compilation-dir=src",
+                    out,
+                    "-o",
+                    "-",
+                ]);
+                if g {
+                    cmd.arg("-g");
+                }
+                let out = cmd
+                    .arg(name)
+                    .current_dir(&dir)
+                    .output()
+                    .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+                assert!(
+                    out.status.success(),
+                    "{name}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                out.stdout
+            };
+            let what = format!("{name}, -g {g}: merlin's (left) and clang's (right)");
+            let theirs = String::from_utf8(clang_run("-S")).unwrap();
+            assert_eq!(file_symbol_lines(&ours), file_symbol_lines(&theirs), "{what}");
+            // It is the first line, as clang's is after its
+            // `.attribute`s, which merlin leaves to the assembler.
+            let words = |l: &str| l.split_whitespace().collect::<Vec<_>>().join(" ");
+            let first = theirs
+                .lines()
+                .find(|l| !l.trim_start().starts_with(".attribute"))
+                .map(words);
+            assert_eq!(ours.lines().next().map(words), first, "{what}");
+            let obj = merlin_as::assemble_to_elf(&ours).unwrap();
+            let syms = file_symbols(&obj);
+            assert_eq!(syms, file_symbols(&clang_run("-c")), "{what}");
+            assert_eq!(syms.len(), 1, "{what}");
+            assert_eq!(syms[0].0, 1, "{what}");
+            assert_eq!(syms[0].1.shndx, elf::SHN_ABS, "{what}");
+            assert_eq!(syms[0].1.bind(), elf::STB_LOCAL, "{what}");
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

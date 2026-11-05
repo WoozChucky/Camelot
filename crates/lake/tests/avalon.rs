@@ -17,8 +17,7 @@ const MESSAGE: &str = "Written by VM 'writer' to a Lake disk, read back by anoth
 
 /// Copies `MESSAGE` (with its NUL) into a buffer in RAM, writes it to sector 3 of the
 /// first disk and flushes, prints `written`, then spins, keeping the disk attached
-/// until the VM is destroyed. A disk error halts with 100 + `BLK_ERROR`. Its disk's
-/// registers are the VM's width's ([`blk_equates`]).
+/// until the VM is destroyed. A disk error halts with 100 + `BLK_ERROR` ([`blk_equates`]).
 fn writer() -> Vec<u8> {
     guest(&format!(
         r#"
@@ -38,10 +37,10 @@ _start:
     addi  t1, t1, 1
     bnez  t2, 1b
     li    t0, 3
-    {wide}    t0, BLK_SECTOR(s0)
+    sd    t0, BLK_SECTOR(s0)
     li    t0, 1
     sw    t0, BLK_COUNT(s0)
-    {wide}    s1, BLK_DMA(s0)
+    sd    s1, BLK_DMA(s0)
     li    t0, 2
     sw    t0, BLK_CMD(s0)           # write
     lw    a0, BLK_ERROR(s0)
@@ -71,7 +70,6 @@ msg:  .asciz "{message}"
 done: .asciz "written\n"
 "#,
         equates = blk_equates(),
-        wide = wide_store(),
         message = MESSAGE.escape_default()
     ))
 }
@@ -90,10 +88,10 @@ _start:
     li    s0, BLK
     li    s1, BUF
     li    t0, 3
-    {wide}    t0, BLK_SECTOR(s0)
+    sd    t0, BLK_SECTOR(s0)
     li    t0, 1
     sw    t0, BLK_COUNT(s0)
-    {wide}    s1, BLK_DMA(s0)
+    sd    s1, BLK_DMA(s0)
     li    t0, 1
     sw    t0, BLK_CMD(s0)           # read
     lw    a0, BLK_ERROR(s0)
@@ -111,11 +109,10 @@ fail:
     xcal.halt a0
 "#,
         equates = blk_equates(),
-        wide = wide_store(),
     ))
 }
 
-/// A 1 MiB machine of the current width with one Lake disk.
+/// A 1 MiB machine with one Lake disk.
 fn profile(lake: &str, disk: &str, read_only: bool) -> HardwareProfile {
     HardwareProfile {
         devices: vec![DeviceSpec::Disk(DiskSpec {
@@ -125,7 +122,6 @@ fn profile(lake: &str, disk: &str, read_only: bool) -> HardwareProfile {
             },
             read_only,
         })],
-        xlen: profile_xlen(),
         ..HardwareProfile::with_ram(1 << 20)
     }
 }
@@ -217,123 +213,119 @@ fn create_fails(conn: &mut Connection<TcpStream>, profile: HardwareProfile) -> (
 
 #[test]
 fn a_vm_writes_a_lake_disk_and_another_reads_it_back() {
-    on_both_widths(|| {
-        let dir = TempDir::new("e2e");
-        let lake = lake(&dir);
-        let lake_addr = lake.addr().to_string();
-        let avalon = avalon();
-        let mut storage = connect(&lake);
-        let mut rt = connect_avalon(&avalon);
-        create_disk(&mut storage, "shared", 16);
+    let dir = TempDir::new("e2e");
+    let lake = lake(&dir);
+    let lake_addr = lake.addr().to_string();
+    let avalon = avalon();
+    let mut storage = connect(&lake);
+    let mut rt = connect_avalon(&avalon);
+    create_disk(&mut storage, "shared", 16);
 
-        // The writer attaches the disk read-write when it is created.
-        let w = create_vm(&mut rt, "writer", profile(&lake_addr, "shared", false), writer());
-        let info = disk_info(&mut storage, "shared");
-        assert!(info.writer && info.readers == 0, "{info:?}");
-        // So no other VM may attach it, read-write or read-only.
-        for read_only in [false, true] {
-            let (code, message) = create_fails(&mut rt, profile(&lake_addr, "shared", read_only));
-            assert_eq!(code, ErrorCode::InvalidProfile);
-            assert!(
-                message.contains(&format!("lake://{lake_addr}/shared: busy: ")),
-                "{message}"
-            );
-        }
+    // The writer attaches the disk read-write when it is created.
+    let w = create_vm(&mut rt, "writer", profile(&lake_addr, "shared", false), writer());
+    let info = disk_info(&mut storage, "shared");
+    assert!(info.writer && info.readers == 0, "{info:?}");
+    // So no other VM may attach it, read-write or read-only.
+    for read_only in [false, true] {
+        let (code, message) = create_fails(&mut rt, profile(&lake_addr, "shared", read_only));
+        assert_eq!(code, ErrorCode::InvalidProfile);
+        assert!(
+            message.contains(&format!("lake://{lake_addr}/shared: busy: ")),
+            "{message}"
+        );
+    }
 
-        let mut out = console(&avalon, w);
-        start(&mut rt, w);
-        output_until(&mut out, |_, out| out == "written\n");
-        // The writer is still running, holding the disk, when it is destroyed.
-        assert!(disk_info(&mut storage, "shared").writer);
-        destroy(&mut rt, w);
-        // Destroyed means detached: nothing to wait for.
-        let info = disk_info(&mut storage, "shared");
-        assert!(!info.writer && info.readers == 0, "{info:?}");
-        // The data is on the disk: in Lake's image, and in its file.
-        let (h, _) = open(&mut storage, "shared", true);
-        let sector = read(&mut storage, h, 3, 1);
-        assert_eq!(&sector[..MESSAGE.len()], MESSAGE.as_bytes());
-        assert_eq!(sector[MESSAGE.len()], 0);
-        storage.request_ok(&Message::BlockClose { handle: h }).unwrap();
-        let file = std::fs::read(dir.path().join("shared")).unwrap();
-        assert_eq!(&file[3 * 512..][..MESSAGE.len()], MESSAGE.as_bytes());
+    let mut out = console(&avalon, w);
+    start(&mut rt, w);
+    output_until(&mut out, |_, out| out == "written\n");
+    // The writer is still running, holding the disk, when it is destroyed.
+    assert!(disk_info(&mut storage, "shared").writer);
+    destroy(&mut rt, w);
+    // Destroyed means detached: nothing to wait for.
+    let info = disk_info(&mut storage, "shared");
+    assert!(!info.writer && info.readers == 0, "{info:?}");
+    // The data is on the disk: in Lake's image, and in its file.
+    let (h, _) = open(&mut storage, "shared", true);
+    let sector = read(&mut storage, h, 3, 1);
+    assert_eq!(&sector[..MESSAGE.len()], MESSAGE.as_bytes());
+    assert_eq!(sector[MESSAGE.len()], 0);
+    storage.request_ok(&Message::BlockClose { handle: h }).unwrap();
+    let file = std::fs::read(dir.path().join("shared")).unwrap();
+    assert_eq!(&file[3 * 512..][..MESSAGE.len()], MESSAGE.as_bytes());
 
-        // A new VM attaches the same image, read-write, at once, and reads the data back.
-        let r = create_vm(&mut rt, "reader", profile(&lake_addr, "shared", false), reader());
-        let mut out = console(&avalon, r);
-        start(&mut rt, r);
+    // A new VM attaches the same image, read-write, at once, and reads the data back.
+    let r = create_vm(&mut rt, "reader", profile(&lake_addr, "shared", false), reader());
+    let mut out = console(&avalon, r);
+    start(&mut rt, r);
+    let printed = output_until(&mut out, |state, _| state == VmState::Exited(0));
+    assert_eq!(printed, MESSAGE);
+    destroy(&mut rt, r);
+
+    // Any number of VMs can share it read-only.
+    let readers: Vec<u32> = (0..3)
+        .map(|i| {
+            create_vm(
+                &mut rt,
+                &format!("ro-{i}"),
+                profile(&lake_addr, "shared", true),
+                reader(),
+            )
+        })
+        .collect();
+    assert_eq!(disk_info(&mut storage, "shared").readers, 3);
+    let (code, _) = create_fails(&mut rt, profile(&lake_addr, "shared", false));
+    assert_eq!(
+        code,
+        ErrorCode::InvalidProfile,
+        "no writer while there are readers"
+    );
+    for &vm in &readers {
+        let mut out = console(&avalon, vm);
+        start(&mut rt, vm);
         let printed = output_until(&mut out, |state, _| state == VmState::Exited(0));
         assert_eq!(printed, MESSAGE);
-        destroy(&mut rt, r);
-
-        // Any number of VMs can share it read-only.
-        let readers: Vec<u32> = (0..3)
-            .map(|i| {
-                create_vm(
-                    &mut rt,
-                    &format!("ro-{i}"),
-                    profile(&lake_addr, "shared", true),
-                    reader(),
-                )
-            })
-            .collect();
-        assert_eq!(disk_info(&mut storage, "shared").readers, 3);
-        let (code, _) = create_fails(&mut rt, profile(&lake_addr, "shared", false));
-        assert_eq!(
-            code,
-            ErrorCode::InvalidProfile,
-            "no writer while there are readers"
-        );
-        for &vm in &readers {
-            let mut out = console(&avalon, vm);
-            start(&mut rt, vm);
-            let printed = output_until(&mut out, |state, _| state == VmState::Exited(0));
-            assert_eq!(printed, MESSAGE);
-        }
-        // An exited VM's machine is dropped as its thread ends (just after the state
-        // change is sent), and its attachment with it.
-        wait_until("the exited readers to detach", || {
-            disk_info(&mut storage, "shared").readers == 0
-        });
-        for vm in readers {
-            destroy(&mut rt, vm);
-        }
-
-        // The disk can be deleted once no VM has it.
-        storage
-            .request_ok(&Message::DiskDelete {
-                name: "shared".into(),
-            })
-            .unwrap();
-        avalon.stop().unwrap();
-        lake.stop().unwrap();
+    }
+    // An exited VM's machine is dropped as its thread ends (just after the state
+    // change is sent), and its attachment with it.
+    wait_until("the exited readers to detach", || {
+        disk_info(&mut storage, "shared").readers == 0
     });
+    for vm in readers {
+        destroy(&mut rt, vm);
+    }
+
+    // The disk can be deleted once no VM has it.
+    storage
+        .request_ok(&Message::DiskDelete {
+            name: "shared".into(),
+        })
+        .unwrap();
+    avalon.stop().unwrap();
+    lake.stop().unwrap();
 }
 
 #[test]
 fn missing_and_unreachable_lake_disks_are_errors() {
-    on_both_widths(|| {
-        let dir = TempDir::new("missing");
-        let lake = lake(&dir);
-        let lake_addr = lake.addr().to_string();
-        let avalon = avalon();
-        let mut rt = connect_avalon(&avalon);
-        let (code, message) = create_fails(&mut rt, profile(&lake_addr, "nope", false));
-        assert_eq!(code, ErrorCode::InvalidProfile);
-        assert!(message.contains("no such disk"), "{message}");
-        let (code, message) = create_fails(&mut rt, profile(&lake_addr, "Bad", false));
-        assert_eq!(code, ErrorCode::InvalidProfile);
-        assert!(message.contains("lake://"), "{message}");
-        lake.stop().unwrap();
-        let (code, _) = create_fails(&mut rt, profile(&lake_addr, "nope", false));
-        assert_eq!(code, ErrorCode::InvalidProfile);
-        // Avalon carries on.
-        assert_eq!(
-            rt.request(&Message::ListVms).unwrap(),
-            Message::VmList { vms: vec![] }
-        );
-        avalon.stop().unwrap();
-    });
+    let dir = TempDir::new("missing");
+    let lake = lake(&dir);
+    let lake_addr = lake.addr().to_string();
+    let avalon = avalon();
+    let mut rt = connect_avalon(&avalon);
+    let (code, message) = create_fails(&mut rt, profile(&lake_addr, "nope", false));
+    assert_eq!(code, ErrorCode::InvalidProfile);
+    assert!(message.contains("no such disk"), "{message}");
+    let (code, message) = create_fails(&mut rt, profile(&lake_addr, "Bad", false));
+    assert_eq!(code, ErrorCode::InvalidProfile);
+    assert!(message.contains("lake://"), "{message}");
+    lake.stop().unwrap();
+    let (code, _) = create_fails(&mut rt, profile(&lake_addr, "nope", false));
+    assert_eq!(code, ErrorCode::InvalidProfile);
+    // Avalon carries on.
+    assert_eq!(
+        rt.request(&Message::ListVms).unwrap(),
+        Message::VmList { vms: vec![] }
+    );
+    avalon.stop().unwrap();
 }
 
 /// The README's Lake example is the test below, but for the server's address: each of

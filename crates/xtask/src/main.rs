@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use xtask::kernel::{Assembler, Build, Toolchain, Xlen};
+use xtask::kernel::{Assembler, Build, Toolchain};
 use xtask::{examples, repo_root, tools};
 
 /// The usage text, with `{image_size}` where [`usage`] puts the root image's default
@@ -10,49 +10,38 @@ use xtask::{examples, repo_root, tools};
 const USAGE: &str = "usage: cargo xtask <task> [options]
 
 tasks:
-  up           bring the Avalon platform up: build it, put the Camelot root images in Lake's
-               images directory (target/platform/images) as the images os-base (RV32) and
-               os-base-rv64 (RV64), and run Lake, Avalon and Pendragon until Ctrl-C. --demo
-               also starts a Camelot VM, vm001;
-               cargo xtask up --help lists the options
-  examples     build every example (or the ones named) with merlin-as + merlin-ld, for
-               RV32 into examples/<dir>/<name>.elf and for RV64 into
-               examples/<dir>/<name>-rv64.elf; no LLVM needed. Objects go to
-               target/examples (RV64: target/examples/rv64).
+  up           bring the Avalon platform up: build it, put the Camelot root image in Lake's
+               images directory (target/platform/images) as the image os-base, and run
+               Lake, Avalon and Pendragon until Ctrl-C. --demo also starts a Camelot VM,
+               vm001; cargo xtask up --help lists the options
+  examples     build every example (or the ones named) with merlin-as + merlin-ld into
+               examples/<dir>/<name>.elf; no LLVM needed. Objects go to target/examples.
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
   kernel       build kernel/kernel.elf with our own toolchain (merlin, merlin-as, merlin-ld;
-               no LLVM), with the user programs of kernel/user built the same way and embedded
-               as data (their generated userprogs.s goes to target/kernel/obj with the objects),
-               and kernel/kernel-disk.elf, the same kernel without the user programs built in
-               (it runs them from /bin: the kernel of a bootable root image); then the same
-               for RV64, kernel/kernel-rv64.elf and kernel/kernel-disk-rv64.elf, a
-               higher-half kernel, with the user programs built for RV64
+               no LLVM), a higher-half kernel, with the user programs of kernel/user built
+               the same way and embedded as data (their generated userprogs.s goes to
+               target/kernel/obj with the objects), and kernel/kernel-disk.elf, the same
+               kernel without the user programs built in (it runs them from /bin: the kernel
+               of a bootable root image)
                --cc clang: the reference build instead (clang -O2 + ld.lld from the official
                LLVM install, the user programs' C compiled by clang too), in target/kernel/clang
-               (RV64: target/kernel/clang/rv64)
   fs           build the root filesystem image (target/camelot-fs.img): kernel/fs/ at /,
                the user programs in /bin (merlin, merlin-as, merlin-ld; no LLVM), /dev/console,
                made bootable with kernel/boot/boot.elf and kernel/kernel-disk.elf
-               (grail --disk target/camelot-fs.img boots it, in the default 4 MiB of RAM);
-               then the same for RV64, target/camelot-fs-rv64.img, with the programs built
-               for RV64, kernel/boot/boot-rv64.elf and
-               kernel/kernel-disk-rv64.elf (grail --xlen 64 --disk target/camelot-fs-rv64.img)
-               --xlen 32|64: build only the RV32 or the RV64 image (with -o, RV32 by default)
+               (grail --ram 6 --disk target/camelot-fs.img boots it)
                -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default
                {image_size}), the filesystem filling what the kernel leaves;
                --no-boot: the filesystem alone, N blocks (the same default)
-  boot         build the boot ROM's disk loaders (crates/grail/rom/diskboot.elf, and
-               diskboot-rv64.elf for RV64 machines) and Camelot's bootloader
+  boot         build the boot ROM's disk loader (crates/grail/rom/diskboot.elf), Camelot's
+               firmware (crates/grail/rom/firmware.elf) and Camelot's bootloader
                (kernel/boot/boot.elf) with merlin-as + merlin-ld
                --check: build in memory and report stale .elf files instead of writing
                -v: print the equivalent merlin-as/merlin-ld command lines
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
-               with ld.lld into crates/merlin-as/tests/golden/hello.elf, and the same for
-               RV64 into crates/merlin-as/tests/golden/rv64/hello.elf; takes --lld and -v
-  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures, the RV32 set and the RV64 set in
-               fixtures/rv64 (clang, ld.lld, llvm-readobj, llvm-objdump);
-               takes --clang, --lld and -v like kernel
+               with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
+  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj,
+               llvm-objdump); takes --clang, --lld and -v like kernel
                --out DIR: regenerate into DIR (new or empty) from copies of the sources instead,
                leaving the committed files as they are (diff -r shows what would change)
   ci           the tests GitHub's CI runs: the important, quick ones (unit tests, the
@@ -64,14 +53,12 @@ kernel options:
   --clang PATH       clang to use (default: PATH, then C:\\Program Files\\LLVM\\bin)
   --lld PATH         ld.lld to use (default: next to clang, then the same search)
   --as clang|merlin  assembler for the .S files with --cc clang (default: clang)
-  --xlen 32|64       build only the RV32 or the RV64 kernel (default: both with merlin;
-                     with --cc clang, -o or --run, RV32)
-  -o PATH            output file (default: kernel/kernel.elf, kernel/kernel-rv64.elf; with
-                     --cc clang, target/kernel/clang/kernel.elf, .../clang/rv64/kernel.elf).
-                     The merlin build writes the disk kernel next to it, named with -disk
-                     (kernel-disk.elf, kernel-disk-rv64.elf)
-  --run              run the result on Grail afterwards, with this terminal as its
-                     console (type exit to stop it); exit with its exit code
+  -o PATH            output file (default: kernel/kernel.elf; with --cc clang,
+                     target/kernel/clang/kernel.elf). The merlin build writes the disk
+                     kernel next to it, named with -disk (kernel-disk.elf)
+  --run              run the result on Grail afterwards (Camelot's firmware, 8 MiB), with
+                     this terminal as its console (type exit to stop it); exit with its
+                     exit code
   -v, --verbose      print each command (for merlin, its command-line equivalent)";
 
 /// [`USAGE`] with the default root image size filled in.
@@ -99,7 +86,6 @@ struct KernelArgs {
     out: Option<PathBuf>,
     run: bool,
     verbose: bool,
-    xlen: Option<Xlen>,
 }
 
 fn parse_kernel_args(args: &[String]) -> Result<KernelArgs, String> {
@@ -123,13 +109,6 @@ fn parse_kernel_args(args: &[String]) -> Result<KernelArgs, String> {
                     "merlin" => Cc::Merlin,
                     "clang" => Cc::Clang,
                     other => return Err(format!("unknown compiler {other} (merlin or clang)")),
-                })
-            }
-            "--xlen" => {
-                k.xlen = Some(match value("--xlen")?.as_str() {
-                    "32" => Xlen::Rv32,
-                    "64" => Xlen::Rv64,
-                    other => return Err(format!("unknown width {other} (32 or 64)")),
                 })
             }
             "--run" => k.run = true,
@@ -195,8 +174,6 @@ struct FsArgs {
     out: Option<PathBuf>,
     size: Option<u32>,
     no_boot: bool,
-    /// The one width to build; both when `None` (RV32 alone with `-o`).
-    xlen: Option<Xlen>,
 }
 
 fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
@@ -211,13 +188,6 @@ fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
                 f.size = Some(v.parse().map_err(|_| format!("bad size {v} (blocks)"))?);
             }
             "--no-boot" => f.no_boot = true,
-            "--xlen" => {
-                f.xlen = Some(match value("--xlen")?.as_str() {
-                    "32" => Xlen::Rv32,
-                    "64" => Xlen::Rv64,
-                    other => return Err(format!("unknown width {other} (32 or 64)")),
-                })
-            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -354,9 +324,8 @@ fn up(options: xtask::up::Options) -> ExitCode {
 }
 
 /// `cargo xtask examples`: merlin-as + merlin-ld for every example (or the
-/// named ones), at both widths. Writes each object to `target/examples/<dir>/`
-/// (RV64: `target/examples/rv64/<dir>/`) and each executable over the
-/// committed `examples/<dir>/<name>.elf` (RV64: `<name>-rv64.elf`); with
+/// named ones). Writes each object to `target/examples/<dir>/` and each
+/// executable over the committed `examples/<dir>/<name>.elf`; with
 /// `--check`, writes nothing and fails if a committed executable is not what
 /// the current tools build.
 fn build_examples(args: ExamplesArgs) -> ExitCode {
@@ -366,17 +335,14 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
     } else {
         args.names.iter().filter_map(|n| examples::find(n)).collect()
     };
-    let builds = selected
-        .into_iter()
-        .flat_map(|ex| examples::XLENS.map(|xlen| (ex, xlen)));
     let mut failed = false;
-    for (ex, xlen) in builds {
+    for ex in selected {
         if args.verbose {
-            for cmd in examples::commands(ex, xlen, &examples::obj_dir_name(ex, xlen)) {
+            for cmd in examples::commands(ex, &examples::obj_dir_name(ex)) {
                 eprintln!("{cmd}");
             }
         }
-        let built = match examples::build(&root, ex, xlen) {
+        let built = match examples::build(&root, ex) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("{e}");
@@ -388,12 +354,12 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
             eprintln!("merlin-ld: warning: {w}");
         }
         if args.check {
-            match examples::check(&root, ex, xlen, &built) {
-                examples::Status::UpToDate => eprintln!("{} is up to date", ex.elf_name(xlen)),
+            match examples::check(&root, ex, &built) {
+                examples::Status::UpToDate => eprintln!("{} is up to date", ex.elf_name()),
                 examples::Status::Stale => {
                     eprintln!(
                         "{} is out of date: run `cargo xtask examples {}`",
-                        ex.elf_name(xlen),
+                        ex.elf_name(),
                         ex.name
                     );
                     failed = true;
@@ -405,8 +371,8 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
             }
             continue;
         }
-        match examples::write(&root, ex, xlen, &built) {
-            Ok(()) => eprintln!("built {}", ex.elf_name(xlen)),
+        match examples::write(&root, ex, &built) {
+            Ok(()) => eprintln!("built {}", ex.elf_name()),
             Err(e) => {
                 eprintln!("xtask: cannot write {}: {e}", ex.name);
                 failed = true;
@@ -420,7 +386,7 @@ fn build_examples(args: ExamplesArgs) -> ExitCode {
     }
 }
 
-/// `cargo xtask boot`: the boot ROM's disk loader and Camelot's bootloader,
+/// `cargo xtask boot`: the boot ROM's disk loader, the firmware and Camelot's bootloader,
 /// written over their committed `.elf` files; with `--check`, writes nothing
 /// and fails if a committed file is not what the current tools build.
 fn build_boot(args: ExamplesArgs) -> ExitCode {
@@ -473,31 +439,11 @@ fn build_boot(args: ExamplesArgs) -> ExitCode {
     }
 }
 
-/// `cargo xtask fs`: the root filesystem images, bootable unless
-/// `--no-boot`, each checked with fsck after it is built: the RV32 one and
-/// the RV64 one, or the one `--xlen` (or `-o`, RV32) asks for.
+/// `cargo xtask fs`: the root filesystem image, bootable unless
+/// `--no-boot`, checked with fsck after it is built.
 fn build_fs(f: FsArgs) -> ExitCode {
-    let xlens = match (f.xlen, &f.out) {
-        (Some(x), _) => vec![x],
-        (None, Some(_)) => vec![Xlen::Rv32],
-        (None, None) => xtask::kernel::XLENS.to_vec(),
-    };
-    for xlen in xlens {
-        let code = build_fs_for(&f, xlen);
-        if code != ExitCode::SUCCESS {
-            return code;
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-/// [`build_fs`]'s `xlen` image.
-fn build_fs_for(f: &FsArgs, xlen: Xlen) -> ExitCode {
     let root = repo_root();
-    let out = f
-        .out
-        .clone()
-        .unwrap_or_else(|| xtask::fs::default_out_for(&root, xlen));
+    let out = f.out.clone().unwrap_or_else(|| xtask::fs::default_out(&root));
     let built = if f.no_boot {
         // As big as the root image by default, so that every program fits
         // with the room it has there.
@@ -505,9 +451,9 @@ fn build_fs_for(f: &FsArgs, xlen: Xlen) -> ExitCode {
             size: f.size.unwrap_or(xtask::fs::IMAGE_SIZE),
             ..camelot_fs::mkfs::Options::default()
         };
-        xtask::fs::build_for(&root, &opts, xlen)
+        xtask::fs::build(&root, &opts)
     } else {
-        xtask::fs::build_bootable_for(&root, f.size.unwrap_or(xtask::fs::IMAGE_SIZE), xlen)
+        xtask::fs::build_bootable(&root, f.size.unwrap_or(xtask::fs::IMAGE_SIZE))
     };
     let image = match built {
         Ok(image) => image,
@@ -553,25 +499,20 @@ fn hello(k: KernelArgs) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let root = repo_root();
-    for xlen in examples::XLENS {
-        let work = match xlen {
-            examples::Xlen::Rv32 => root.join("target").join("hello"),
-            examples::Xlen::Rv64 => root.join("target").join("hello").join("rv64"),
-        };
-        let elf = match xtask::hello::build(&root, &lld, &work, xlen, k.verbose) {
-            Ok(elf) => elf,
-            Err(e) => {
-                eprintln!("xtask: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let out = root.join(xtask::hello::golden(xlen));
-        if let Err(e) = std::fs::write(&out, elf) {
-            eprintln!("xtask: cannot write {}: {e}", out.display());
+    let work = root.join("target").join("hello");
+    let elf = match xtask::hello::build(&root, &lld, &work, k.verbose) {
+        Ok(elf) => elf,
+        Err(e) => {
+            eprintln!("xtask: {e}");
             return ExitCode::FAILURE;
         }
-        eprintln!("built {}", out.display());
+    };
+    let out = root.join(xtask::hello::GOLDEN);
+    if let Err(e) = std::fs::write(&out, elf) {
+        eprintln!("xtask: cannot write {}: {e}", out.display());
+        return ExitCode::FAILURE;
     }
+    eprintln!("built {}", out.display());
     ExitCode::SUCCESS
 }
 
@@ -646,46 +587,20 @@ fn kernel(k: KernelArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // One width, or (the merlin build with no -o or --run) both.
-    let single = k.cc.unwrap_or_default() == Cc::Clang || out.is_some() || k.run;
-    let xlens: Vec<Xlen> = match k.xlen {
-        Some(x) => vec![x],
-        None if single => vec![Xlen::Rv32],
-        None => xtask::kernel::XLENS.to_vec(),
-    };
     let built = match k.cc.unwrap_or_default() {
-        Cc::Merlin => {
-            // The user programs' assembly (userprogs.s) is generated into the
-            // object directory first: their images are part of the kernel.
-            let mut last = Err("no kernel built".to_string());
-            for &xlen in &xlens {
-                let obj = match xlen {
-                    Xlen::Rv32 => root.join("target").join("kernel").join("obj"),
-                    Xlen::Rv64 => root.join("target").join("kernel").join("rv64").join("obj"),
-                };
-                last = Build {
-                    out: out
-                        .clone()
-                        .unwrap_or_else(|| kernel_dir.join(xtask::kernel::kernel_elf(xlen))),
-                    obj_dir: obj,
-                    kernel_dir: kernel_dir.clone(),
-                    toolchain: Toolchain::Merlin,
-                    userprogs: None,
-                    verbose: k.verbose,
-                    xlen,
-                }
-                .run();
-                match &last {
-                    Ok(path) if xlens.len() > 1 && xlen != *xlens.last().unwrap() => {
-                        eprintln!("built {}", path.display());
-                        eprintln!("built {}", xtask::kernel::disk_kernel_path(path).display());
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-            last
+        // The user programs' assembly (userprogs.s) is generated into the
+        // object directory first: their images are part of the kernel.
+        Cc::Merlin => Build {
+            out: out
+                .clone()
+                .unwrap_or_else(|| kernel_dir.join(xtask::kernel::KERNEL_ELF)),
+            obj_dir: root.join("target").join("kernel").join("obj"),
+            kernel_dir: kernel_dir.clone(),
+            toolchain: Toolchain::Merlin,
+            userprogs: None,
+            verbose: k.verbose,
         }
+        .run(),
         Cc::Clang => {
             let Some(clang) = k.clang.or_else(|| tools::find("clang")) else {
                 eprintln!(
@@ -708,11 +623,10 @@ fn kernel(k: KernelArgs) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            let xlen = xlens[0];
-            let work = root.join(xtask::kernel::reference_dir(xlen));
+            let work = root.join(xtask::kernel::REFERENCE_DIR);
             let out = out.unwrap_or_else(|| work.join("kernel.elf"));
             let assembler = k.assembler.unwrap_or(Assembler::Clang);
-            xtask::kernel::build_reference_for(&root, &clang, &lld, assembler, &work, &out, k.verbose, xlen)
+            xtask::kernel::build_reference(&root, &clang, &lld, assembler, &work, &out, k.verbose)
         }
     };
     let out = match built {
@@ -754,7 +668,7 @@ fn kernel(k: KernelArgs) -> ExitCode {
         }
         Ok((grail::RunResult::Exited(code), _)) => ExitCode::from(code.min(255) as u8),
         Ok((grail::RunResult::StepLimit, m)) => {
-            eprintln!("xtask: step limit reached at pc={:#010x}", m.cpu.pc);
+            eprintln!("xtask: step limit reached at pc={:#018x}", m.cpu.pc);
             ExitCode::from(124)
         }
     }
@@ -800,7 +714,6 @@ mod tests {
     fn all_options() {
         let k = parse(&[
             "--cc", "clang", "--clang", "c", "--lld", "l", "--as", "merlin", "-o", "k.elf", "--run", "-v",
-            "--xlen", "64",
         ])
         .unwrap();
         assert_eq!(
@@ -813,12 +726,13 @@ mod tests {
                 out: Some("k.elf".into()),
                 run: true,
                 verbose: true,
-                xlen: Some(Xlen::Rv64),
             }
         );
         assert_eq!(check_kernel_args(&k), Ok(()));
-        assert_eq!(parse(&["--xlen", "32"]).unwrap().xlen, Some(Xlen::Rv32));
-        assert!(parse(&["--xlen", "16"]).unwrap_err().contains("unknown width 16"));
+        // One kernel, RV64's: no width to choose.
+        assert!(parse(&["--xlen", "64"])
+            .unwrap_err()
+            .contains("unknown option --xlen"));
         assert_eq!(
             parse(&["--as", "clang"]).unwrap().assembler,
             Some(Assembler::Clang)
@@ -894,13 +808,12 @@ mod tests {
                 out: Some("d.img".into()),
                 size: Some(512),
                 no_boot: false,
-                xlen: None,
             }
         );
         assert!(parse(&["--no-boot"]).unwrap().no_boot);
-        assert_eq!(parse(&["--xlen", "64"]).unwrap().xlen, Some(Xlen::Rv64));
-        assert_eq!(parse(&["--xlen", "32"]).unwrap().xlen, Some(Xlen::Rv32));
-        assert!(parse(&["--xlen", "128"]).unwrap_err().contains("unknown width"));
+        assert!(parse(&["--xlen", "64"])
+            .unwrap_err()
+            .contains("unknown option --xlen"));
         assert!(parse(&["--size", "1M"]).unwrap_err().contains("bad size"));
         assert!(parse(&["-v"]).unwrap_err().contains("unknown option"));
     }

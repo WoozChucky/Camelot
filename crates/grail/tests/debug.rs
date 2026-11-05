@@ -50,8 +50,14 @@ impl Output {
 /// `elf` loaded on a machine of `harts` harts, `ram` MiB, its UART input already all
 /// there (so when the program reads it does not depend on timing).
 fn machine(elf: &[u8], harts: usize, ram: usize, input: &[u8]) -> (Machine, Output) {
+    machine_on(elf, harts, ram, input, grail::Bios::None)
+}
+
+/// [`machine`] on firmware `bios`.
+fn machine_on(elf: &[u8], harts: usize, ram: usize, input: &[u8], bios: grail::Bios) -> (Machine, Output) {
     let config = MachineConfig {
         harts,
+        bios,
         ..MachineConfig::with_ram(ram << 20)
     };
     let mut m = Machine::new(config).unwrap();
@@ -203,17 +209,31 @@ fn watchpoints_stop_after_the_access() {
     };
     assert_eq!((hit.kind, hit.addr), (WatchKind::Access, 0x1000_0005));
     assert!(m.set_watchpoint(0, 0, WatchKind::Write).is_err());
-    assert!(m.set_watchpoint(0xffff_fffc, 8, WatchKind::Write).is_err());
+    assert!(m
+        .set_watchpoint(0xffff_ffff_ffff_fffc, 8, WatchKind::Write)
+        .is_err());
 }
 
 /// Debugs `elf` with breakpoints at `stops`, stepping `steps` instructions at each
 /// stop, and checks the run is the one an undebugged machine makes: the same turns,
 /// output and exit code.
+/// The kernel, linked to load after the firmware's 2 MiB, runs on the firmware; the
+/// examples, linked at the start of RAM, without.
 fn same_run_debugged(elf: &[u8], harts: usize, ram: usize, input: &[u8], stops: &[u64], steps: usize) {
-    let (mut plain, plain_out) = machine(elf, harts, ram, input);
+    let loads_after_firmware = grail::elf::parse(elf)
+        .unwrap()
+        .segments
+        .iter()
+        .all(|s| s.paddr >= grail::firmware::FW_JUMP_ADDR);
+    let bios = if loads_after_firmware {
+        grail::Bios::Default
+    } else {
+        grail::Bios::None
+    };
+    let (mut plain, plain_out) = machine_on(elf, harts, ram, input, bios.clone());
     let (code, expected) = undebugged(&mut plain);
 
-    let (mut m, out) = machine(elf, harts, ram, input);
+    let (mut m, out) = machine_on(elf, harts, ram, input, bios);
     let mut turns = Turns::new();
     for &pc in stops {
         m.set_breakpoint(pc).unwrap();
@@ -254,7 +274,7 @@ fn a_debugged_run_is_the_undebugged_run() {
 fn a_debugged_kernel_runs_as_it_would() {
     let kernel = read("kernel/kernel.elf");
     let stops = [symbol(&kernel, "kmain"), symbol(&kernel, "timer_start")];
-    same_run_debugged(&kernel, 1, 4, b"hello\nexit\n", &stops, 5);
+    same_run_debugged(&kernel, 1, 8, b"hello\nexit\n", &stops, 5);
 }
 
 #[test]

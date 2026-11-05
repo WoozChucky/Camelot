@@ -1,8 +1,7 @@
-// expect: 77
-// expect-lp64: 81
+// expect: 81
 // Compound literals at file scope are objects with static storage that the
 // globals' initializers point into; `sizeof expr` sizes arrays (pointers
-// are 8 bytes on LP64).
+// are 8 bytes).
 
 struct point {
     int x, y;
@@ -32,8 +31,8 @@ int main(void) {
     }
     sum += sizeof copy; // 3: 43
     sum += sizeof name_buf; // 6: 49
-    sum += sizeof point_bytes; // 8: 57
+    sum += sizeof point_bytes; // 4 + 8: 61
     // Local compound literals still live on the stack, one per evaluation.
     int *local = (int[]){20};
-    return sum + *local; // 77
+    return sum + *local; // 81
 }

@@ -31,7 +31,7 @@ int main() {
     r += 8 * (1024L * 1024L) == l8 * (l1024 * l1024);                 // 3
     r += (0ul - 1) / 3 == (ul0 - one) / three;                        // 4
     r += (0ul - 1) >> 1 == (ul0 - one) >> one;                        // 5
-    r += (-1L < 1u) == (lm1 < u1);    // 6: unsigned long on RV32, long on RV64
+    r += (-1L < 1u) == (lm1 < u1);    // 6: in long
     r += (-8L >> 1) == -4L;                                           // 7
     r += (unsigned long)-1 == ul0 - 1;                                // 8
 

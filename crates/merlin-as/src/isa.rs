@@ -6,10 +6,10 @@
 //! extension for the code after it (and a new `$x<isa>` mapping symbol
 //! names it), `.attribute arch, "..."` sets the object's `Tag_RISCV_arch`
 //! and the name of every `$x`. merlin-as has no other extensions than
-//! `-march`'s (`rv32ima_zicsr_zifencei` or `rv64ima_zicsr_zifencei`), so one
-//! that names another ISA is an error; one that names the same ISA, as
-//! clang's `-S` output does (`.attribute 5, "rv32i2p1_m2p0_..."`), is
-//! accepted and changes nothing.
+//! `-march`'s (`rv64ima_zicsr_zifencei`), so one that names another ISA (an
+//! RV32 one among them) is an error; one that names the same ISA, as clang's
+//! `-S` output does (`.attribute 5, "rv64i2p1_m2p0_..."`), is accepted and
+//! changes nothing.
 //!
 //! Two ISAs are the same when they have the same base width and the same
 //! extensions at the same versions, once each has the extensions the others
@@ -17,14 +17,13 @@
 //! `zalrsc`, and `zaamo` with `zalrsc` makes `a` (so `.option arch, -a`
 //! changes nothing, as in LLVM, which writes no new `$x` for it).
 
-use excalibur::Xlen;
 use std::collections::BTreeMap;
 
 /// An ISA: its extensions and their versions (major, minor).
 type Exts = BTreeMap<String, (u32, u32)>;
 
-/// merlin-as's extensions, at LLVM 23's versions: what
-/// [`crate::elf::arch`] spells.
+/// merlin-as's extensions, at LLVM 23's versions: what [`crate::elf::ARCH`]
+/// spells.
 const OURS: [(&str, u32, u32); 8] = [
     ("i", 2, 1),
     ("m", 2, 0),
@@ -77,7 +76,7 @@ fn split_version(s: &str) -> (&str, Option<(u32, u32)>) {
     }
 }
 
-/// A full ISA string (`rv32ima_zicsr`, `rv32i2p1_m2p0_..._zalrsc1p0`): its
+/// A full ISA string (`rv64ima_zicsr`, `rv64i2p1_m2p0_..._zalrsc1p0`): its
 /// width and its extensions with what they imply. None if it is no ISA
 /// string LLVM would take with merlin-as's extensions: then it names some
 /// other ISA, or none.
@@ -125,27 +124,23 @@ fn parse(s: &str) -> Option<(u32, Exts)> {
     Some((bits, exts))
 }
 
-fn bits(xlen: Xlen) -> u32 {
-    match xlen {
-        Xlen::Rv32 => 32,
-        Xlen::Rv64 => 64,
-    }
-}
+/// The base width of merlin-as's ISA: RV64.
+const BITS: u32 = 64;
 
 /// The error for a directive that names another ISA than `-march`'s.
-fn other(directive: &str, xlen: Xlen) -> String {
+fn other(directive: &str) -> String {
     format!(
         "{directive}: merlin-as assembles only -march's ISA ({}), and this names another",
-        crate::elf::arch(xlen)
+        crate::elf::ARCH
     )
 }
 
 /// `.attribute arch, "isa"` (`.attribute 5, "isa"`): Ok if `isa` is
 /// `-march`'s ISA.
-pub fn check_attribute(isa: &str, xlen: Xlen) -> Result<(), String> {
+pub fn check_attribute(isa: &str) -> Result<(), String> {
     match parse(isa) {
-        Some((b, e)) if b == bits(xlen) && e == ours() => Ok(()),
-        _ => Err(other(".attribute arch", xlen)),
+        Some((b, e)) if b == BITS && e == ours() => Ok(()),
+        _ => Err(other(".attribute arch")),
     }
 }
 
@@ -155,14 +150,14 @@ pub fn check_attribute(isa: &str, xlen: Xlen) -> Result<(), String> {
 /// after `+` (`+m2p0`) is "extension version number parsing not currently
 /// implemented", and taking away an extension another one needs (`-zmmul`
 /// with `m`) is "can't disable".
-pub fn check_option_arch(items: &[String], xlen: Xlen) -> Result<(), String> {
+pub fn check_option_arch(items: &[String]) -> Result<(), String> {
     let mut exts = ours();
     match items {
         [] => return Err(".option arch: expected an ISA, or extensions after + or -".into()),
         [full] if full.starts_with("rv") => {
             return match parse(full) {
-                Some((b, e)) if b == bits(xlen) && e == exts => Ok(()),
-                _ => Err(other(".option arch", xlen)),
+                Some((b, e)) if b == BITS && e == exts => Ok(()),
+                _ => Err(other(".option arch")),
             };
         }
         _ => {}
@@ -173,7 +168,7 @@ pub fn check_option_arch(items: &[String], xlen: Xlen) -> Result<(), String> {
                 return Err("extension version number parsing not currently implemented".into());
             }
             let Some(v) = default_version(name) else {
-                return Err(other(".option arch", xlen));
+                return Err(other(".option arch"));
             };
             exts.insert(name.to_string(), v);
         } else if let Some(name) = item.strip_prefix('-') {
@@ -199,13 +194,13 @@ pub fn check_option_arch(items: &[String], xlen: Xlen) -> Result<(), String> {
     if exts == ours() {
         Ok(())
     } else {
-        Err(other(".option arch", xlen))
+        Err(other(".option arch"))
     }
 }
 
 /// `.option rvc`: the C extension, which merlin-as does not have.
-pub fn rvc(xlen: Xlen) -> String {
-    other(".option rvc", xlen)
+pub fn rvc() -> String {
+    other(".option rvc")
 }
 
 #[cfg(test)]
@@ -219,17 +214,17 @@ mod tests {
     #[test]
     fn the_same_isa_however_it_is_written() {
         for isa in [
-            "rv32ima_zicsr_zifencei",
-            "rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0",
-            "rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0",
-            "rv32ima2p1_zicsr_zifencei",
-            "rv32im_zicsr_zifencei_zaamo_zalrsc",
-            "rv32i_zicsr_zifencei_zaamo_zalrsc_m",
+            "rv64ima_zicsr_zifencei",
+            "rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0",
+            "rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0",
+            "rv64ima2p1_zicsr_zifencei",
+            "rv64im_zicsr_zifencei_zaamo_zalrsc",
+            "rv64i_zicsr_zifencei_zaamo_zalrsc_m",
         ] {
-            assert_eq!(check_attribute(isa, Xlen::Rv32), Ok(()), "{isa}");
-            assert_eq!(check_option_arch(&items(&[isa]), Xlen::Rv32), Ok(()), "{isa}");
+            assert_eq!(check_attribute(isa), Ok(()), "{isa}");
+            assert_eq!(check_option_arch(&items(&[isa])), Ok(()), "{isa}");
         }
-        assert_eq!(check_attribute(crate::elf::ARCH_RV64, Xlen::Rv64), Ok(()));
+        assert_eq!(check_attribute(crate::elf::ARCH), Ok(()));
         for list in [
             &["+m"][..],
             &["+zmmul"],
@@ -237,34 +232,34 @@ mod tests {
             &["+m", "+zmmul", "-c"],
             &["-a"],
         ] {
-            assert_eq!(check_option_arch(&items(list), Xlen::Rv32), Ok(()), "{list:?}");
+            assert_eq!(check_option_arch(&items(list)), Ok(()), "{list:?}");
         }
     }
 
     #[test]
     fn another_isa_is_refused() {
         for isa in [
-            "rv32i2p1_m2p0",
-            "rv64ima_zicsr_zifencei",
-            "rv32imac_zicsr_zifencei",
-            "rv32ima_zicsr",
-            "rv32gc",
-            "rv32i2p0_m2p0_a2p1_zicsr2p0_zifencei2p0",
-            "rv32ima_zicsr_zifencei_zicond",
-            "RV32IMA_ZICSR_ZIFENCEI",
+            "rv64i2p1_m2p0",
+            "rv32ima_zicsr_zifencei",
+            "rv64imac_zicsr_zifencei",
+            "rv64ima_zicsr",
+            "rv64gc",
+            "rv64i2p0_m2p0_a2p1_zicsr2p0_zifencei2p0",
+            "rv64ima_zicsr_zifencei_zicond",
+            "RV64IMA_ZICSR_ZIFENCEI",
             "",
         ] {
-            assert!(check_attribute(isa, Xlen::Rv32).is_err(), "{isa}");
+            assert!(check_attribute(isa).is_err(), "{isa}");
         }
-        for list in [&["+zicond"][..], &["-m"], &["-zicsr"], &["+c"], &["rv32imac"]] {
-            assert!(check_option_arch(&items(list), Xlen::Rv32).is_err(), "{list:?}");
+        for list in [&["+zicond"][..], &["-m"], &["-zicsr"], &["+c"], &["rv64imac"]] {
+            assert!(check_option_arch(&items(list)).is_err(), "{list:?}");
         }
         assert_eq!(
-            check_option_arch(&items(&["-zmmul"]), Xlen::Rv32),
+            check_option_arch(&items(&["-zmmul"])),
             Err("can't disable zmmul extension; m extension requires zmmul extension".into())
         );
         assert_eq!(
-            check_option_arch(&items(&["+m2p0"]), Xlen::Rv32),
+            check_option_arch(&items(&["+m2p0"])),
             Err("extension version number parsing not currently implemented".into())
         );
     }

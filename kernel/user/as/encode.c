@@ -9,13 +9,12 @@
  * wrong is an error message, in the order merlin-as checks the operands, so
  * that a line with several mistakes gets the same message.
  *
- * The two widths (`xlen`) differ little, as merlin-as's module docs say:
- * RV64 adds the 32-bit operations (OP-32, OP-IMM-32: addw, addiw, mulw...),
- * ld, lwu, sd and the .d atomics, from tables of their own looked up only on
- * RV64; its shift amounts are 6 bits; its `li` takes any 64-bit constant, in
- * up to 8 instructions (li_steps); and it has no RV32-only counters and CSRs
- * (rdcycleh, cycleh, mstatush...). Every place that looks at the width tests
- * RV64 (xlen == 64). */
+ * What RV64 has beyond the base set, as merlin-as's module docs say: the
+ * 32-bit operations (OP-32, OP-IMM-32: addw, addiw, mulw...), ld, lwu, sd
+ * and the .d atomics, from tables of their own; shift amounts of 6 bits; an
+ * `li` of any 64-bit constant, in up to 8 instructions (li_steps); and none
+ * of RV32's high halves of the counters and CSRs (rdcycleh, cycleh,
+ * mstatush...), which are errors that say so, as LLVM's are. */
 #include "as.h"
 #include "tables.h"
 
@@ -87,9 +86,6 @@ void hi_lo64(int64_t value, uint *hi, int *lo) {
     *lo = (int)((uint)value << 20) >> 20;
     *hi = (uint)((uint64_t)WRAP_ADD(value, 0x800) >> 12) & 0xfffff;
 }
-
-/* Whether the instruction is being assembled for RV64. */
-#define RV64 (xlen == 64)
 
 /* ---- Errors ---- */
 
@@ -184,16 +180,6 @@ static void emit_auipc_low(uint word, int kind) {
     e->auipc = 0;
 }
 
-/* A 32-bit value, signed or unsigned: -1 and 0xffffffff are the same word. */
-static int word32(int64_t v, const char *what, int *out) {
-    if (v >= INT32_MIN && v <= UINT32_MAX) {
-        *out = (int)(uint)v;
-        return 1;
-    }
-    msgbuf = fmt("%s %lld does not fit in 32 bits", what, v);
-    return fail(msgbuf);
-}
-
 static int signed_field(int64_t v, uint bits, const char *what, int *out) {
     int64_t half = (int64_t)1 << (bits - 1);
     if (v >= -half && v < half) {
@@ -248,17 +234,8 @@ static int imm(struct expr *e, struct imm *out) {
     if (e->kind == E_MOD) {
         const char *m = modifier_name(e->op);
         if (ctx_constant(e->a, &v)) {
-            /* `%hi(0x12345678)`: no symbol, so split the number here. RV64
-             * takes any constant, as LLVM does (on both widths); RV32 keeps
-             * merlin-as's check that the value is a 32-bit word. */
-            if (!RV64) {
-                char *what = fmt("%s() value", m);
-                int w;
-                if (!word32(v, what, &w)) {
-                    return 0;
-                }
-                v = w;
-            }
+            /* `%hi(0x12345678)`: no symbol, so split the number here: any
+             * constant, as LLVM takes it. */
             uint hi;
             int lo;
             hi_lo64(v, &hi, &lo);
@@ -478,10 +455,10 @@ static int csr_addr(struct operand *op, uint *out) {
         msgbuf = fmt("CSR number %lld out of range (0..=0xfff)", v);
         return fail(msgbuf);
     }
-    /* Not a name on this width but one on RV32: so this is RV64, and the
-     * name is the high half of a 64-bit CSR (`cycleh`, `mstatush`) or an odd
-     * `pmpcfg`, which RV64 does not have (LLVM: "system register 'cycleh' is
-     * RV32 only"). Its number is still accepted, as in LLVM. */
+    /* Not a name here but one on RV32: the high half of a 64-bit CSR
+     * (`cycleh`, `mstatush`) or an odd `pmpcfg`, which RV64 does not have
+     * (LLVM: "system register 'cycleh' is RV32 only"). Its number is still
+     * accepted, as in LLVM. */
     if (e->kind == E_SYM && find2(CSR_NAMES, e->sym) != NULL) {
         msgbuf = fmt("CSR '%s' exists only on RV32", e->sym);
         return fail(msgbuf);
@@ -564,21 +541,11 @@ static int csr_rv32_only(uint addr) {
 
 int csr_parse(const char *name, uint *addr) {
     const struct as_op2 *c = find2(CSR_NAMES, name);
-    if (c == NULL || (RV64 && csr_rv32_only(c->value))) {
+    if (c == NULL || csr_rv32_only(c->value)) {
         return 0;
     }
     *addr = c->value;
     return 1;
-}
-
-/* The RV64-only tables, seen only on RV64: on RV32 these mnemonics
- * find nothing and end up as unknown instructions. */
-static const struct as_op3 *find3_rv64(const struct as_op3 *t, const char *m) {
-    return RV64 ? find3(t, m) : NULL;
-}
-
-static const struct as_op2 *find2_rv64(const struct as_op2 *t, const char *m) {
-    return RV64 ? find2(t, m) : NULL;
 }
 
 /* ---- The instructions with more to them ---- */
@@ -722,9 +689,9 @@ static int csr_op(uint funct3, uint rd, struct operand *csr, struct operand *src
  *
  * Exactly LLVM's choice, RISCVMatInt::generateInstSeq for the base ISA
  * (merlin-as's li_steps, which explains each rule with examples): with no
- * Zba, Zbb, Zbs or C, a sequence costs its length. An RV32 value is one or
- * two instructions; an RV64 one up to 8 (lui, addi, then slli + addi three
- * times). The length depends only on the value. */
+ * Zba, Zbb, Zbs or C, a sequence costs its length: up to 8 instructions
+ * (lui, addi, then slli + addi three times). The length depends only on the
+ * value. */
 
 /* A step: one instruction. The first starts from zero (lui from nothing),
  * the others work on rd. */
@@ -769,8 +736,8 @@ static uint leading_zeros64(uint64_t v) {
 
 /* LLVM's generateInstSeqImpl (merlin-as's li_base): a 32-bit value is lui
  * hi + addi lo, either left out when zero (addi stays if both are), the
- * addi an addiw on RV64 when the 64-bit sum would leave the 32-bit range;
- * a wider one (RV64) has its low 12 bits as an addi at the end, and the
+ * addi an addiw when the 64-bit sum would leave the 32-bit range; a wider
+ * one has its low 12 bits as an addi at the end, and the
  * rest shifted right past its trailing zeros, built the same way, then
  * shifted back. */
 static void li_base(int64_t value, struct seq *q) {
@@ -783,7 +750,7 @@ static void li_base(int64_t value, struct seq *q) {
         }
         if (lo12 != 0 || hi20 == 0) {
             int64_t lui = (int)(hi20 << 12); /* what lui leaves, sign-extended */
-            int addiw = RV64 && hi20 != 0 && !fits(lui + lo12, 32);
+            int addiw = hi20 != 0 && !fits(lui + lo12, 32);
             seq_push(q, addiw ? STEP_ADDIW : STEP_ADDI, lo12);
         }
         return;
@@ -1045,7 +1012,7 @@ static int is(const char *m, const char *name) {
 }
 
 /* The A extension's mnemonics: a base (`amoadd.w`), its funct5, its width
- * as funct3 (F_AMO_W, or F_AMO_D for a doubleword on RV64) and the ordering
+ * as funct3 (F_AMO_W, or F_AMO_D for a doubleword) and the ordering
  * bits aq|rl of its suffix. A `.d` form is its `.w` form with funct3 011,
  * so ATOMIC_FUNCT5 lists only the `.w` names. */
 static int atomic(const char *m, char *base, uint *funct5, uint *width, uint *aqrl) {
@@ -1071,9 +1038,9 @@ static int atomic(const char *m, char *base, uint *funct5, uint *width, uint *aq
         *width = F_AMO_W;
         return 1;
     }
-    /* `amoadd.d`: on RV64, the funct5 of `amoadd.w`. */
+    /* `amoadd.d`: the funct5 of `amoadd.w`. */
     uint b = (uint)strlen(base);
-    if (!RV64 || b < 2 || strcmp(base + b - 2, ".d") != 0) {
+    if (b < 2 || strcmp(base + b - 2, ".d") != 0) {
         return 0;
     }
     char w[40];
@@ -1198,15 +1165,9 @@ static int encode_named(const char *m, struct operand *ops, uint nops) {
         if (!reg(&ops[0], &rd) || !expr_of(&ops[1], &e) || !imm(e, &im)) {
             return 0;
         }
-        /* The value LLVM's li takes: a 32-bit word, signed or unsigned, on
-         * RV32 (`li a0, 0xffffffff` is -1), read signed, as the hart's
-         * register holds it; any 64-bit value on RV64. */
+        /* The value LLVM's li takes: any 64-bit value. */
         if (im.kind == IMM_NUM) {
-            int v;
-            if (RV64) {
-                return li(rd, im.num);
-            }
-            return word32(im.num, "li value", &v) && li(rd, v);
+            return li(rd, im.num);
         }
         if (im.kind == IMM_LABEL && ctx_undefined(im.name)) {
             return not_yet_constant(im.name, " (li loads a number; la loads an address)");
@@ -1254,7 +1215,7 @@ static int encode_named(const char *m, struct operand *ops, uint nops) {
         emit_word(r_type(OPC_OP, is(m, "sgt") ? 2 : 3, 0, rd, rt, rs));
         return 1;
     }
-    if (RV64 && (is(m, "sext.w") || is(m, "negw") || is(m, "zext.w"))) {
+    if (is(m, "sext.w") || is(m, "negw") || is(m, "zext.w")) {
         /* RV64's 32-bit forms: sext.w is addiw rd, rs, 0; negw is subw rd,
          * zero, rs; zext.w, without Zba's add.uw, two shifts as LLVM
          * expands it: slli rd, rs, 32; srli rd, rd, 32. */
@@ -1392,7 +1353,7 @@ static int encode_named(const char *m, struct operand *ops, uint nops) {
                                            : CSR_INSTRETH;
         /* The h forms read the high half of a 64-bit counter on RV32. RV64
          * has no such CSRs: its rdcycle reads the whole counter. */
-        if (RV64 && csr_rv32_only(counter)) {
+        if (csr_rv32_only(counter)) {
             char *full = tmp_strndup(m, (uint)strlen(m) - 1);
             msgbuf = fmt("'%s' exists only on RV32 (on RV64, %s reads all 64 bits)", m, full);
             return fail(msgbuf);
@@ -1431,8 +1392,8 @@ int encode(const char *m, struct operand *ops, uint nops, struct emit *out, char
     int ok;
 
     uint opcode;
-    if ((t3 = find3(OP_FUNCT, m)) != NULL || (t3 = find3_rv64(OP_32_FUNCT, m)) != NULL) {
-        /* R-type: OP and M, and their 32-bit forms OP-32 (RV64). */
+    if ((t3 = find3(OP_FUNCT, m)) != NULL || (t3 = find3(OP_32_FUNCT, m)) != NULL) {
+        /* R-type: OP and M, and their 32-bit forms OP-32. */
         opcode = find3(OP_FUNCT, m) != NULL ? OPC_OP : OPC_OP_32;
         if (nops != 3) {
             ok = usage("rd, rs1, rs2");
@@ -1442,8 +1403,8 @@ int encode(const char *m, struct operand *ops, uint nops, struct emit *out, char
                 emit_word(r_type(opcode, t3->a, t3->b, rd, rs1, rs2));
             }
         }
-    } else if ((t2 = find2(OP_IMM_FUNCT3, m)) != NULL || (t2 = find2_rv64(OP_IMM_32_FUNCT3, m)) != NULL) {
-        /* I-type: OP-IMM, and OP-IMM-32's addiw (RV64). */
+    } else if ((t2 = find2(OP_IMM_FUNCT3, m)) != NULL || (t2 = find2(OP_IMM_32_FUNCT3, m)) != NULL) {
+        /* I-type: OP-IMM, and OP-IMM-32's addiw. */
         opcode = find2(OP_IMM_FUNCT3, m) != NULL ? OPC_OP_IMM : OPC_OP_IMM_32;
         struct expr *e;
         struct field f;
@@ -1455,16 +1416,16 @@ int encode(const char *m, struct operand *ops, uint nops, struct emit *out, char
                 emit_field(i_type(opcode, t2->value, rd, rs1, f.value), &f);
             }
         }
-    } else if ((t3 = find3(SHIFT_FUNCT, m)) != NULL || (t3 = find3_rv64(SHIFT_32_FUNCT, m)) != NULL) {
+    } else if ((t3 = find3(SHIFT_FUNCT, m)) != NULL || (t3 = find3(SHIFT_32_FUNCT, m)) != NULL) {
         /* Shifts by an immediate: the shift amount has the bits it takes to
-         * count the value's, 6 for RV64's registers, 5 for RV32's and for
-         * OP-IMM-32's 32-bit shifts (slliw...). funct7 sits in imm[11:5],
-         * the amount in imm[4:0] (RV64: imm[5:0], funct7's bit 0 clear). */
+         * count the value's, 6 for a register, 5 for OP-IMM-32's 32-bit
+         * shifts (slliw...). funct7 sits in imm[11:5], the amount in
+         * imm[5:0] (funct7's bit 0 clear), imm[4:0] for the 32-bit ones. */
         uint bits = 5;
         opcode = OPC_OP_IMM_32;
         if (find3(SHIFT_FUNCT, m) != NULL) {
             opcode = OPC_OP_IMM;
-            bits = RV64 ? 6 : 5;
+            bits = 6;
         }
         struct expr *e;
         uint shamt;
@@ -1478,11 +1439,11 @@ int encode(const char *m, struct operand *ops, uint nops, struct emit *out, char
                 emit_word(i_type(opcode, t3->a, rd, rs1, (int)(t3->b << 5 | shamt)));
             }
         }
-    } else if ((t2 = find2(LOAD_FUNCT3, m)) != NULL || (t2 = find2_rv64(LOAD_RV64_FUNCT3, m)) != NULL) {
-        /* Loads; RV64 adds ld and lwu. */
+    } else if ((t2 = find2(LOAD_FUNCT3, m)) != NULL || (t2 = find2(LOAD_RV64_FUNCT3, m)) != NULL) {
+        /* Loads, ld and lwu among them. */
         ok = load(m, t2->value, ops, nops);
-    } else if ((t2 = find2(STORE_FUNCT3, m)) != NULL || (t2 = find2_rv64(STORE_RV64_FUNCT3, m)) != NULL) {
-        /* Stores; RV64 adds sd. */
+    } else if ((t2 = find2(STORE_FUNCT3, m)) != NULL || (t2 = find2(STORE_RV64_FUNCT3, m)) != NULL) {
+        /* Stores, sd among them. */
         ok = store(m, t2->value, ops, nops);
     } else if ((t2 = find2(BRANCH_FUNCT3, m)) != NULL) {
         if (nops != 3) {
@@ -1508,7 +1469,7 @@ int encode(const char *m, struct operand *ops, uint nops, struct emit *out, char
         uint funct5, width, aqrl;
         if (atomic(m, base, &funct5, &width, &aqrl)) {
             /* A extension: funct7 is funct5 then aq and rl; funct3 the
-             * width, 010 (word) or 011 (doubleword, RV64). lr has no rs2.
+             * width, 010 (word) or 011 (doubleword). lr has no rs2.
              * rs2 is checked first, then the address, then rd, as in
              * merlin-as. */
             uint base_reg;

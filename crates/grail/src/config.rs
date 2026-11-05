@@ -5,10 +5,9 @@
 //! same reason: every front end accepts the same `--ram` and `--clock` syntax.
 
 use crate::block::{BlockBackend, FileDisk, MemDisk, MAX_SECTORS, SECTOR_SIZE};
-use crate::bus::{MAX_DISKS, MAX_NETS, RAM_BASE};
+use crate::bus::{MAX_DISKS, MAX_NETS};
 use crate::lake::LakeDisk;
 use crate::net::{Hub, MacAddr, NetBackend, Pcap};
-use excalibur::Xlen;
 use gateway::{Gateway, HostFwd};
 use std::path::PathBuf;
 
@@ -20,9 +19,6 @@ pub const DEFAULT_RAM_SIZE: usize = 4 * MIB;
 /// ending at 0x100_7FFF_FFFF, well inside the 48-bit physical address space. Backed
 /// lazily ([`crate::ram::Ram`]), so it costs the host what the guest touches.
 pub const MAX_RAM_SIZE: usize = 1 << 40;
-/// The most an RV32 machine has: everything from `RAM_BASE` to the top of its 32-bit
-/// address space, 2 GiB.
-pub const MAX_RAM_SIZE_RV32: usize = (u32::MAX as u64 - RAM_BASE) as usize + 1;
 /// RAM is handed out in whole 4 KiB pages.
 pub const RAM_GRANULE: usize = 4096;
 /// Clock frequency the machine reports when it is not paced to a real-time clock.
@@ -38,7 +34,7 @@ pub const MAX_HARTS: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineConfig {
     /// RAM size in bytes, mapped at `RAM_BASE`. A non-zero multiple of 4 KiB, at most
-    /// [`max_ram_size`] for the machine's width (1 TiB, or 2 GiB on RV32).
+    /// [`MAX_RAM_SIZE`] (1 TiB).
     pub ram_size: usize,
     /// Real-time mode: run this many steps (instructions, and so `mtime` ticks) per
     /// wall-clock second. `None` runs at full speed, deterministically.
@@ -57,22 +53,20 @@ pub struct MachineConfig {
     /// and interrupts on PLIC source `NET_IRQ + i`. At most [`MAX_NETS`], counting any
     /// backends handed to [`crate::Machine::with_devices`].
     pub nets: Vec<NetConfig>,
-    /// The harts' width, RV32 or RV64. Loading an ELF64 program makes the machine RV64
-    /// ([`crate::Machine::load_elf`]). RV32 by default while both widths exist (#159
-    /// removes RV32).
-    pub xlen: Xlen,
-    /// The paging modes an RV64 hart implements: Sv39 and Sv48 by default, or Sv39
-    /// only, as on most RV64 boards (`--paging sv39`, #172): `satp` then refuses a
-    /// write of MODE 9 (WARL, spec section 5), which is how software finds out. An
-    /// RV32 hart has Sv32 whatever this says.
+    /// The paging modes the harts implement: Sv39 and Sv48 by default, or Sv39 only, as
+    /// on most RV64 boards (`--paging sv39`, #172): `satp` then refuses a write of MODE
+    /// 9 (WARL, spec section 5), which is how software finds out.
     pub paging: Paging,
-    /// The firmware the machine boots, QEMU's `-bios` (`--bios`, #174): none by
-    /// default, so the program runs in M-mode; Camelot's built-in firmware or one
-    /// from a file, which starts the program in S-mode. RV64 machines only.
+    /// The firmware the machine boots, QEMU's `-bios` (`--bios`, #174): Camelot's
+    /// built-in firmware or one from a file, which starts the program in S-mode, or
+    /// none, so the program runs in M-mode. None in a `MachineConfig` built here (the
+    /// bare machine a host builds for its own program); the `grail` command and the
+    /// platform's front ends default to Camelot's firmware, as QEMU's `virt` machine
+    /// boots OpenSBI unless told `-bios none` (spec section 7, "Firmware").
     pub bios: Bios,
 }
 
-/// What [`MachineConfig::paging`] lets an RV64 hart translate with.
+/// What [`MachineConfig::paging`] lets a hart translate with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Paging {
     /// Sv48 and Sv39 (and Bare).
@@ -87,11 +81,13 @@ pub enum Paging {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Bios {
     /// No firmware (`--bios none`): the boot ROM starts the program, or its disk
-    /// loader the disk's boot block, in M-mode. The default: riscv-tests, the
-    /// bare-metal examples and the RV32 kernel run in M-mode.
+    /// loader the disk's boot block, in M-mode, as riscv-tests and the bare-metal
+    /// examples run. A [`MachineConfig`]'s default; the `grail` command's is
+    /// [`Bios::Default`].
     #[default]
     None,
-    /// Camelot's firmware, built into Grail (`--bios default`,
+    /// Camelot's firmware, built into Grail (`--bios default`, the `grail` command's
+    /// default,
     /// [`crate::firmware::FIRMWARE_ELF`]): it runs in M-mode, implements the SBI,
     /// and starts the program, or the disk's boot block, in S-mode.
     Default,
@@ -327,7 +323,6 @@ impl Default for MachineConfig {
             harts: 1,
             disks: Vec::new(),
             nets: Vec::new(),
-            xlen: Xlen::Rv32,
             paging: Paging::Sv48,
             bios: Bios::None,
         }
@@ -351,14 +346,10 @@ impl MachineConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         let ram = self.ram_size;
-        let max = max_ram_size(self.xlen);
+        let max = MAX_RAM_SIZE;
         if ram == 0 || ram > max || !ram.is_multiple_of(RAM_GRANULE) {
-            let width = match self.xlen {
-                Xlen::Rv32 => "an RV32 machine has at most 2 GiB",
-                Xlen::Rv64 => "a machine has at most 1 TiB",
-            };
             return Err(format!(
-                "RAM size {ram:#x} must be a non-zero multiple of 4 KiB, at most {max:#x} ({width})"
+                "RAM size {ram:#x} must be a non-zero multiple of 4 KiB, at most {max:#x} (a machine has at most 1 TiB)"
             ));
         }
         if self.clock_hz == Some(0) || self.nominal_hz == 0 {
@@ -400,15 +391,6 @@ impl MachineConfig {
     }
 }
 
-/// The most RAM a machine of width `xlen` has: [`MAX_RAM_SIZE`], or
-/// [`MAX_RAM_SIZE_RV32`] on RV32.
-pub fn max_ram_size(xlen: Xlen) -> usize {
-    match xlen {
-        Xlen::Rv32 => MAX_RAM_SIZE_RV32,
-        Xlen::Rv64 => MAX_RAM_SIZE,
-    }
-}
-
 /// A size of memory as people type it: a whole number of MiB, or a whole number with a
 /// unit, `M`/`MiB`, `G`/`GiB` or `T`/`TiB` in any case (`64`, `64M`, `16G`, `2TiB`).
 /// `Ok(None)` if it is one but does not fit in 64 bits.
@@ -442,23 +424,12 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
 
 /// Parses a `--ram` value (spec section 7, "RAM"): a whole number of MiB, or a whole
 /// number with a unit, `M`/`MiB`, `G`/`GiB` or `T`/`TiB` in any case (`64`, `64M`,
-/// `16G`, `16GiB`, `1T`). From 1 MiB to 1 TiB; an RV32 machine takes at most 2 GiB,
-/// which the machine's validation says ([`MachineConfig::validate`]). Returns the size
-/// in bytes.
+/// `16G`, `16GiB`, `1T`). From 1 MiB to 1 TiB. Returns the size in bytes.
 pub fn parse_ram_size(s: &str) -> Result<usize, String> {
     let s = s.trim();
     match size_in_bytes(s)? {
         Some(size) if (MIB as u64..=MAX_RAM_SIZE as u64).contains(&size) => Ok(size as usize),
         _ => Err(format!("{s} is out of range (1 MiB to 1 TiB)")),
-    }
-}
-
-/// Parses an `--xlen` value: `32` (RV32) or `64` (RV64).
-pub fn parse_xlen(s: &str) -> Result<Xlen, String> {
-    match s.trim() {
-        "32" => Ok(Xlen::Rv32),
-        "64" => Ok(Xlen::Rv64),
-        s => Err(format!("'{s}' is not a register width (32 or 64)")),
     }
 }
 
@@ -564,29 +535,25 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_sizes_and_zero_clocks() {
-        assert_eq!(MAX_RAM_SIZE_RV32, 0x8000_0000);
         assert_eq!(MAX_RAM_SIZE, 0x100_0000_0000);
         // RAM ends at 0x100_7FFF_FFFF at most: 48-bit physical addresses.
-        assert_eq!(RAM_BASE + MAX_RAM_SIZE as u64 - 1, 0x100_7fff_ffff);
-        let rv64 = |ram_size| MachineConfig {
-            ram_size,
-            xlen: Xlen::Rv64,
-            ..MachineConfig::default()
-        };
-        for ram in [4096, 64 * 1024, MIB, MAX_RAM_SIZE_RV32] {
-            assert_eq!(MachineConfig::with_ram(ram).validate(), Ok(()), "{ram:#x}");
-            assert_eq!(rv64(ram).validate(), Ok(()), "{ram:#x}");
-        }
-        for ram in [MAX_RAM_SIZE_RV32 + RAM_GRANULE, 16 * GIB, MAX_RAM_SIZE] {
-            assert_eq!(rv64(ram).validate(), Ok(()), "{ram:#x}");
-            let e = MachineConfig::with_ram(ram).validate().unwrap_err();
-            assert!(e.contains("an RV32 machine has at most 2 GiB"), "{e}");
+        assert_eq!(crate::bus::RAM_BASE + MAX_RAM_SIZE as u64 - 1, 0x100_7fff_ffff);
+        let config = MachineConfig::with_ram;
+        for ram in [
+            4096,
+            64 * 1024,
+            MIB,
+            2 * GIB,
+            2 * GIB + RAM_GRANULE,
+            16 * GIB,
+            MAX_RAM_SIZE,
+        ] {
+            assert_eq!(config(ram).validate(), Ok(()), "{ram:#x}");
         }
         for ram in [0, 1, 4095, 4097] {
-            assert!(MachineConfig::with_ram(ram).validate().is_err(), "{ram:#x}");
-            assert!(rv64(ram).validate().is_err(), "{ram:#x}");
+            assert!(config(ram).validate().is_err(), "{ram:#x}");
         }
-        let e = rv64(MAX_RAM_SIZE + RAM_GRANULE).validate().unwrap_err();
+        let e = config(MAX_RAM_SIZE + RAM_GRANULE).validate().unwrap_err();
         assert!(e.contains("a machine has at most 1 TiB"), "{e}");
         let zero_clock = MachineConfig {
             clock_hz: Some(0),

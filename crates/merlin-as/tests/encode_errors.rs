@@ -1,10 +1,9 @@
 //! Bad instructions must be rejected with an error on their own source line,
-//! never silently encoded with truncated fields. `CASES` are RV32's; `CASES64`
-//! are what RV64 changes: wider shift amounts, the RV64-only instructions'
-//! ranges, and the CSRs and counter reads that exist on RV32 only.
+//! never silently encoded with truncated fields. `CASES` are the base set's;
+//! `CASES64` RV64's own: the shift amounts, the 32-bit and doubleword
+//! instructions' ranges, and the CSRs and counter reads that exist on RV32 only.
 
 use merlin_as::elf::riscv_attributes;
-use merlin_as::{Options, Xlen};
 use std::process::Command;
 
 /// Each case is assembled on line 3, after two lines that cannot fail.
@@ -52,12 +51,6 @@ const CASES: &[(&str, &str, &str)] = &[
         "sb a0, -2049(sp)",
         "store offset out of range",
         "immediate -2049 out of range",
-    ),
-    // Shift amounts: 0..=31 on RV32
-    (
-        "slli a0, a0, 32",
-        "shamt above 31",
-        "shift amount 32 out of range (0..=31)",
     ),
     (
         "srli a0, a0, -1",
@@ -148,17 +141,6 @@ const CASES: &[(&str, &str, &str)] = &[
         "csrwi mstatus, 32",
         "CSR immediate above 31",
         "CSR immediate 32 out of range",
-    ),
-    // li takes a 32-bit value (signed or unsigned)
-    (
-        "li a0, 0x100000000",
-        "li value wider than 32 bits",
-        "li value 4294967296 does not fit in 32 bits",
-    ),
-    (
-        "li a0, -2147483649",
-        "li value below -2^31",
-        "li value -2147483649 does not fit in 32 bits",
     ),
     // Wrong operand count or kind
     ("add a0, a1", "missing operand", "usage: add rd, rs1, rs2"),
@@ -278,11 +260,6 @@ const CASES: &[(&str, &str, &str)] = &[
         "call needs a symbol, not a number",
     ),
     (
-        "lui a0, %hi(0x100000000)",
-        "%hi of a number wider than 32 bits",
-        "%hi() value 4294967296 does not fit in 32 bits",
-    ),
-    (
         "addi a0, a0, %pcrel_lo(0x10)",
         "%pcrel_lo of a number",
         "%pcrel_lo() needs a symbol, not a number",
@@ -360,9 +337,9 @@ const CASES: &[(&str, &str, &str)] = &[
         "unknown instruction 'frobnicate'",
     ),
     (
-        "mulw a0, a1, a2",
-        "RV64-only mnemonic",
-        "unknown instruction 'mulw'",
+        "mulhw a0, a1, a2",
+        "no such M mnemonic (mulh has no 32-bit form)",
+        "unknown instruction 'mulhw'",
     ),
     (
         "c.addi a0, 1",
@@ -370,9 +347,9 @@ const CASES: &[(&str, &str, &str)] = &[
         "unknown instruction 'c.addi'",
     ),
     (
-        "amoadd.d a0, a1, (a2)",
-        "RV64-only A mnemonic",
-        "unknown instruction 'amoadd.d'",
+        "amoadd.q a0, a1, (a2)",
+        "a 128-bit A mnemonic (RV128)",
+        "unknown instruction 'amoadd.q'",
     ),
     (
         "amocas.w a0, a1, (a2)",
@@ -607,18 +584,18 @@ fn source(case: &str) -> String {
 
 #[test]
 fn bad_instructions_are_rejected_on_their_line() {
-    check_cases(CASES, Xlen::Rv32);
+    check_cases(CASES);
 }
 
 #[test]
 fn bad_rv64_instructions_are_rejected_on_their_line() {
-    check_cases(CASES64, Xlen::Rv64);
+    check_cases(CASES64);
 }
 
-fn check_cases(cases: &[(&str, &str, &str)], xlen: Xlen) {
+fn check_cases(cases: &[(&str, &str, &str)]) {
     let mut fails = Vec::new();
     for &(case, why, says) in cases {
-        match merlin_as::assemble_with(&source(case), &Options { xlen }) {
+        match merlin_as::assemble(&source(case)) {
             Ok(_) => fails.push(format!("  {case:<30} assembled, but should fail: {why}")),
             Err(errs) => {
                 if let Some(e) = errs.iter().find(|e| e.line != LINE) {
@@ -685,17 +662,16 @@ fn atomic_offsets_are_a_literal_zero() {
 /// An unknown mnemonic is named in the error.
 #[test]
 fn unknown_mnemonics_are_named() {
-    for m in ["frobnicate", "mulw", "c.addi", "amoadd.d"] {
+    for m in ["frobnicate", "mulhw", "c.addi", "amoadd.q"] {
         let errs = merlin_as::assemble(&format!("    {m} a0, a1, a2\n")).unwrap_err();
         assert_eq!(errs[0].msg, format!("unknown instruction '{m}'"));
     }
 }
 
-/// On RV32 an RV64-only mnemonic is just not an instruction: the same error
-/// as any unknown mnemonic, whatever its operands. On RV64 each of the same
-/// lines assembles.
+/// RV64's own instructions (the 32-bit operations, the doubleword loads,
+/// stores and atomics, and their pseudo-instructions) assemble.
 #[test]
-fn rv64_instructions_are_unknown_on_rv32() {
+fn rv64_instructions_assemble() {
     let lines = [
         "addiw a0, a1, 1",
         "slliw a0, a1, 1",
@@ -733,15 +709,7 @@ fn rv64_instructions_are_unknown_on_rv32() {
         "zext.w a0, a1",
     ];
     for line in lines {
-        let m = line.split_whitespace().next().unwrap();
-        let errs = merlin_as::assemble(&format!("    {line}\n")).unwrap_err();
-        assert_eq!(
-            (errs.len(), errs[0].line, errs[0].msg.as_str()),
-            (1, 1, format!("unknown instruction '{m}'").as_str()),
-            "{line}"
-        );
-        let rv64 = Options { xlen: Xlen::Rv64 };
-        assert!(merlin_as::assemble_with(line, &rv64).is_ok(), "{line} on RV64");
+        assert!(merlin_as::assemble(line).is_ok(), "{line}");
     }
 }
 
@@ -830,13 +798,13 @@ fn cli_reports_file_and_line() {
     assert!(!wrote_object, "no object should be written on error");
 }
 
-/// `-march=` picks the width for the whole file: `cycleh`, the high half of
-/// the cycle counter, is a CSR on RV32 only, so the same source assembles for
-/// one width and not the other, and an RV64 source that assembles is written
-/// as an ELF64 object. An ISA merlin-as does not implement is a usage error
-/// (status 2), not an assembly error.
+/// `-march=` names the ISA, RV64's, which is also the default: an RV64 source
+/// is written as an ELF64 object, and `cycleh`, the high half of the cycle
+/// counter, a CSR on RV32 only, is an error. An ISA merlin-as does not
+/// implement, an RV32 one among them, is a usage error (status 2), not an
+/// assembly error.
 #[test]
-fn cli_takes_the_width_from_march() {
+fn cli_takes_the_isa_from_march() {
     let dir = std::env::temp_dir().join(format!("merlin-as-march-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cycleh = dir.join("cycleh.s");
@@ -856,36 +824,41 @@ fn cli_takes_the_width_from_march() {
             std::fs::read(&output).ok(),
         )
     };
-    let default = run(None, &cycleh);
-    let rv32 = run(Some("-march=rv32ima_zicsr_zifencei"), &cycleh);
-    let rv64 = run(Some("-march=rv64ima_zicsr_zifencei"), &cycleh);
-    let other = run(Some("-march=rv64gc"), &cycleh);
+    let cycleh_rv64 = run(Some("-march=rv64ima_zicsr_zifencei"), &cycleh);
+    let cycleh_default = run(None, &cycleh);
+    let rv32 = run(Some("-march=rv32ima_zicsr_zifencei"), &ld);
+    let other = run(Some("-march=rv64gc"), &ld);
     let rv64_ld = run(Some("-march=rv64ima_zicsr_zifencei"), &ld);
+    let default_ld = run(None, &ld);
     let _ = std::fs::remove_dir_all(&dir);
 
-    // Without -march and with RV32's: an ELF32 object (EI_CLASS 1).
-    for (code, stderr, object) in [default, rv32] {
-        assert_eq!((code, stderr.as_str()), (Some(0), ""));
-        assert_eq!(object.expect("an object")[4], 1, "ELFCLASS32");
+    for (code, stderr, object) in [cycleh_rv64, cycleh_default] {
+        assert_eq!((code, object), (Some(1), None), "stderr: {stderr}");
+        assert!(
+            stderr.starts_with(&format!("{}:1: error: ", cycleh.display())),
+            "{stderr:?}"
+        );
+        assert!(stderr.contains("'cycleh'"), "{stderr:?}");
     }
-    let (code, stderr, object) = rv64;
-    assert_eq!((code, object), (Some(1), None), "stderr: {stderr}");
-    assert!(
-        stderr.starts_with(&format!("{}:1: error: ", cycleh.display())),
-        "{stderr:?}"
-    );
-    assert!(stderr.contains("'cycleh'"), "{stderr:?}");
-    let (code, stderr, object) = other;
-    assert_eq!((code, object), (Some(2), None), "stderr: {stderr}");
-    assert!(stderr.contains("unsupported -march 'rv64gc'"), "{stderr:?}");
+    for (code, stderr, object, march) in [
+        (rv32.0, rv32.1, rv32.2, "rv32ima_zicsr_zifencei"),
+        (other.0, other.1, other.2, "rv64gc"),
+    ] {
+        assert_eq!((code, object), (Some(2), None), "stderr: {stderr}");
+        assert_eq!(
+            stderr.trim_end(),
+            format!("merlin-as: unsupported -march '{march}' (merlin-as takes rv64ima_zicsr_zifencei)")
+        );
+    }
 
-    // RV64's ld: an ELF64 object (EI_CLASS 2) whose .riscv.attributes names
-    // the RV64 ISA, as clang's does for the same -march.
-    let (code, stderr, object) = rv64_ld;
-    assert_eq!((code, stderr.as_str()), (Some(0), ""));
-    let bytes = object.expect("an object");
-    assert_eq!(bytes[4], 2, "ELFCLASS64");
-    assert_eq!(attributes(&bytes), riscv_attributes(merlin_as::elf::ARCH_RV64));
+    // ld: an ELF64 object (EI_CLASS 2) whose .riscv.attributes names the RV64
+    // ISA, as clang's does for the same -march, with -march or without.
+    for (code, stderr, object) in [rv64_ld, default_ld] {
+        assert_eq!((code, stderr.as_str()), (Some(0), ""));
+        let bytes = object.expect("an object");
+        assert_eq!(bytes[4], 2, "ELFCLASS64");
+        assert_eq!(attributes(&bytes), riscv_attributes(merlin_as::elf::ARCH));
+    }
 }
 
 /// The contents of an object's `.riscv.attributes`.
@@ -897,85 +870,62 @@ fn attributes(object: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
-/// The width and the ISA come only from the options. In LLVM `.option arch`,
+/// The ISA comes only from the options. In LLVM `.option arch`,
 /// `.option rvc`, `.attribute arch` and `.attribute 5` change the ISA (a new
 /// `$x<isa>`, another `Tag_RISCV_arch`); merlin-as has no other ISA than
 /// `-march`'s, so one that names another is an error on its line, and one
-/// that names the same (clang's `-S` output: `.attribute 5, "rv32i2p1_..."`,
+/// that names the same (clang's `-S` output: `.attribute 5, "rv64i2p1_..."`,
 /// or `.option arch, -a`, which changes nothing in LLVM either) is accepted
-/// and changes nothing: the object's `.riscv.attributes` is the ISA of its
-/// width, and the other width's instructions stay unknown.
+/// and changes nothing: the object's `.riscv.attributes` is -march's ISA.
 #[test]
-fn option_and_attribute_leave_the_width_alone() {
-    for xlen in [Xlen::Rv32, Xlen::Rv64] {
-        let options = Options { xlen };
-        let (bits, other) = match xlen {
-            Xlen::Rv32 => ("32", "rv64ima_zicsr_zifencei"),
-            Xlen::Rv64 => ("64", "rv32ima_zicsr_zifencei"),
-        };
-        let march = format!("rv{bits}ima_zicsr_zifencei");
-        let arch = merlin_as::elf::arch(xlen);
-        // The same ISA, in every spelling: no error, and -march's attributes.
-        let same = format!(
-            "    .option arch, {march}\n    .option arch, +m, -c\n    .option arch, -a\n    .option push\n    \
-             .option norvc\n    .option pop\n    .attribute arch, \"{arch}\"\n    .attribute 5, \"{march}\"\n    \
-             .attribute 4, 16\n    nop\n"
-        );
-        let object = merlin_as::assemble_to_elf_with(&same, &options);
-        let object = object.unwrap_or_else(|e| panic!("{xlen:?}: {e:?}"));
-        let class = match xlen {
-            Xlen::Rv32 => 1,
-            Xlen::Rv64 => 2,
-        };
-        assert_eq!(object[4], class, "{xlen:?}: EI_CLASS");
-        assert_eq!(attributes(&object), riscv_attributes(arch), "{xlen:?}");
+fn option_and_attribute_leave_the_isa_alone() {
+    let (march, other) = ("rv64ima_zicsr_zifencei", "rv32ima_zicsr_zifencei");
+    let arch = merlin_as::elf::ARCH;
+    // The same ISA, in every spelling: no error, and -march's attributes.
+    let same = format!(
+        "    .option arch, {march}\n    .option arch, +m, -c\n    .option arch, -a\n    .option push\n    \
+         .option norvc\n    .option pop\n    .attribute arch, \"{arch}\"\n    .attribute 5, \"{march}\"\n    \
+         .attribute 4, 16\n    nop\n"
+    );
+    let object = merlin_as::assemble_to_elf(&same).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(object[4], 2, "EI_CLASS: ELFCLASS64");
+    assert_eq!(attributes(&object), riscv_attributes(arch));
 
-        // Another ISA, each line an error of its own; the other width among
-        // them, whose instructions stay unknown after it.
-        let another = [
-            format!(".option arch, {other}"),
-            ".option arch, +zicond".into(),
-            ".option arch, -m".into(),
-            format!(".option arch, rv{bits}imac_zicsr_zifencei"),
-            ".option rvc".into(),
-            format!(".attribute arch, \"{other}\""),
-            format!(".attribute 5, \"rv{bits}i2p1_m2p0\""),
-        ];
-        let src: String = another.iter().map(|l| format!("    {l}\n")).collect();
-        let theirs = match xlen {
-            Xlen::Rv32 => "ld a0, 0(a1)",
-            Xlen::Rv64 => "rdcycleh a0",
+    // Another ISA, each line an error of its own; RV32 among them, whose
+    // `rdcycleh` stays an error after it.
+    let another = [
+        format!(".option arch, {other}"),
+        ".option arch, +zicond".into(),
+        ".option arch, -m".into(),
+        ".option arch, rv64imac_zicsr_zifencei".to_string(),
+        ".option rvc".into(),
+        format!(".attribute arch, \"{other}\""),
+        ".attribute 5, \"rv64i2p1_m2p0\"".to_string(),
+    ];
+    let src: String = another.iter().map(|l| format!("    {l}\n")).collect();
+    let errs = merlin_as::assemble(&format!("{src}    rdcycleh a0\n")).unwrap_err();
+    let lines: Vec<usize> = errs.iter().map(|e| e.line).collect();
+    assert_eq!(lines, (1..=another.len() + 1).collect::<Vec<_>>(), "{errs:?}");
+    for (e, line) in errs.iter().zip(&another) {
+        let directive = if line.starts_with(".option rvc") {
+            ".option rvc"
+        } else if line.starts_with(".option") {
+            ".option arch"
+        } else {
+            ".attribute arch"
         };
-        let errs = merlin_as::assemble_with(&format!("{src}    {theirs}\n"), &options).unwrap_err();
-        let lines: Vec<usize> = errs.iter().map(|e| e.line).collect();
-        assert_eq!(
-            lines,
-            (1..=another.len() + 1).collect::<Vec<_>>(),
-            "{xlen:?}: {errs:?}"
-        );
-        for (e, line) in errs.iter().zip(&another) {
-            let directive = if line.starts_with(".option rvc") {
-                ".option rvc"
-            } else if line.starts_with(".option") {
-                ".option arch"
-            } else {
-                ".attribute arch"
-            };
-            let msg = format!(
-                "{directive}: merlin-as assembles only -march's ISA ({arch}), and this names another"
-            );
-            assert_eq!(e.msg, msg, "{xlen:?}: {line}");
-        }
-        // LLVM's own errors.
-        let errs = merlin_as::assemble_with("    .option arch, -zmmul\n    .option arch, +m2p0\n", &options)
-            .unwrap_err();
-        let msgs: Vec<&str> = errs.iter().map(|e| e.msg.as_str()).collect();
-        assert_eq!(
-            msgs,
-            [
-                "can't disable zmmul extension; m extension requires zmmul extension",
-                "extension version number parsing not currently implemented"
-            ]
-        );
+        let msg =
+            format!("{directive}: merlin-as assembles only -march's ISA ({arch}), and this names another");
+        assert_eq!(e.msg, msg, "{line}");
     }
+    // LLVM's own errors.
+    let errs = merlin_as::assemble("    .option arch, -zmmul\n    .option arch, +m2p0\n").unwrap_err();
+    let msgs: Vec<&str> = errs.iter().map(|e| e.msg.as_str()).collect();
+    assert_eq!(
+        msgs,
+        [
+            "can't disable zmmul extension; m extension requires zmmul extension",
+            "extension version number parsing not currently implemented"
+        ]
+    );
 }

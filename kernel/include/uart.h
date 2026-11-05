@@ -5,8 +5,6 @@
 #ifndef CAMELOT_UART_H
 #define CAMELOT_UART_H
 
-/* Assembly includes this file too (machine.S, for the debug console's
- * registers): the C is under #ifndef __ASSEMBLER__ (const.h). */
 #ifndef __ASSEMBLER__
 #include "spinlock.h"
 #include "types.h"
@@ -30,9 +28,9 @@
 #define UART_RX_SIZE 128
 
 #ifndef __ASSEMBLER__
-/* Where the registers are reached: UART_BASE (RV32, and RV64 with paging
- * off), the fixmap's page (RV64, from setup_vm(), vm.h), then the kernel's
- * ioremap() of it (uart_map()). */
+/* Where the registers are reached: UART_BASE (with paging off), the
+ * fixmap's page (from setup_vm(), vm.h), then the kernel's ioremap() of it
+ * (uart_map()). */
 extern uintptr uart_regs;
 
 /* 8N1 with the receive interrupt on, through uart_regs as it is: the first

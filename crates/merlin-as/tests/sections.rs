@@ -1,5 +1,5 @@
 //! The section headers `.section` makes, read back with the `elf` crate and
-//! compared with clang's for the same source, on both widths: the type,
+//! compared with clang's for the same source: the type,
 //! flags, entry size, alignment and size of every section (see
 //! `crates/merlin-as/src/section.rs` for LLVM's rules).
 //!
@@ -7,14 +7,11 @@
 //! clang 23 with
 //!
 //! ```text
-//! clang --target=riscv32 -march=rv32ima_zicsr_zifencei -mno-relax -c
 //! clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mno-relax -c
 //! ```
 //!
-//! which give the same rows for both. Only the order of the sections that
+//! Only the order of the sections that
 //! are not the source's differs (clang puts `.strtab` first).
-
-use merlin_as::{Options, Xlen};
 
 /// Names LLVM gives attributes to, flags, every way of writing the type,
 /// mergeable sections with their entry sizes, names with no flags at all,
@@ -108,18 +105,16 @@ const CLANG: &[(&str, u32, u64, u64, u64, u64)] = &[
 
 #[test]
 fn section_headers_are_clangs() {
-    for xlen in [Xlen::Rv32, Xlen::Rv64] {
-        let bytes = merlin_as::assemble_to_elf_with(SRC, &Options { xlen }).expect("assembles");
-        let file = elf::Elf::parse(&bytes).unwrap();
-        // The source's sections come first, after the null one.
-        let rows: Vec<_> = file.sections[1..=CLANG.len()]
-            .iter()
-            .map(|s| (s.name.as_str(), s.ty, s.flags, s.entsize, s.align, s.size))
-            .collect();
-        assert_eq!(rows, CLANG, "{xlen:?}");
-        // A NOBITS section takes no room in the file.
-        let bss = &file.sections[1 + CLANG.iter().position(|r| r.0 == ".mybss").unwrap()];
-        let next = &file.sections[2 + CLANG.iter().position(|r| r.0 == ".mybss").unwrap()];
-        assert_eq!(bss.offset, next.offset, "{xlen:?}");
-    }
+    let bytes = merlin_as::assemble_to_elf(SRC).expect("assembles");
+    let file = elf::Elf::parse(&bytes).unwrap();
+    // The source's sections come first, after the null one.
+    let rows: Vec<_> = file.sections[1..=CLANG.len()]
+        .iter()
+        .map(|s| (s.name.as_str(), s.ty, s.flags, s.entsize, s.align, s.size))
+        .collect();
+    assert_eq!(rows, CLANG);
+    // A NOBITS section takes no room in the file.
+    let bss = &file.sections[1 + CLANG.iter().position(|r| r.0 == ".mybss").unwrap()];
+    let next = &file.sections[2 + CLANG.iter().position(|r| r.0 == ".mybss").unwrap()];
+    assert_eq!(bss.offset, next.offset);
 }

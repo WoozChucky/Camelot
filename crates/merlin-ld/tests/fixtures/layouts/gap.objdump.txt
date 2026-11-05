@@ -1,9 +1,9 @@
 
-gap.lld.elf:	file format elf32-littleriscv
+gap.lld.elf:	file format elf64-littleriscv
 
 Disassembly of section .text:
 
-80000000 <_start>:
+0000000080000000 <_start>:
 80000000: 100002b7     	lui	t0, 0x10000
 80000004: 04f00313     	li	t1, 0x4f
 80000008: 00628023     	sb	t1, 0x0(t0)

@@ -82,35 +82,11 @@ static char digit(uint d) {
 
 /* Divides *n by `base` (2 to 65536), leaves the quotient in *n and returns
  * the remainder: Linux's do_div, which its printf divides digits off with
- * (lib/vsprintf.c, lib/math/div64.c). On RV64 that is a divu and a remu.
- * On RV32, where a long long is two registers, a 64-bit division would be
- * a call to __udivdi3 (lib/libgcc.c), a loop of 64 steps; this does it as
- * long division by hand, in three 32-bit divisions: the high word, then
- * each half of the low word with the remainder before it (the remainder is
- * below `base`, so it and 16 more bits fit in 32). */
+ * (lib/vsprintf.c, lib/math/div64.c): a divu and a remu. */
 static uint do_div(unsigned long long *n, uint base) {
-#ifdef _LP64
     uint r = (uint)(*n % base);
     *n /= base;
     return r;
-#else
-    uint hi = (uint)(*n >> 32);
-    uint lo = (uint)*n;
-    if (hi == 0) {
-        *n = lo / base;
-        return lo % base;
-    }
-    uint q_hi = hi / base;
-    uint r = hi % base;
-    uint mid = r << 16 | lo >> 16;
-    uint q_mid = mid / base; /* below 2^16: mid is below base * 2^16 */
-    r = mid % base;
-    uint low = r << 16 | (lo & 0xffff);
-    uint q_low = low / base;
-    r = low % base;
-    *n = (unsigned long long)q_hi << 32 | q_mid << 16 | q_low;
-    return r;
-#endif
 }
 
 /* `val` in `base` (10 or 16) with an optional minus sign. An unsigned long
@@ -172,8 +148,8 @@ static void vformat(struct out *o, const char *fmt, va_list ap) {
             fmt++;
         }
         /* The length: the argument's type for d, u and x. None: an int (or
-         * unsigned int), 32 bits on both widths. 'l': a long, as wide as
-         * a register. 'll': a long long, 64 bits on both. 'z': a size_t
+         * unsigned int), 32 bits. 'l': a long, as wide as a register.
+         * 'll': a long long, 64 bits too. 'z': a size_t
          * (ssize_t for d), as wide as a long, as on Linux. */
         int length = 0; /* 0: int, 1: long (and z), 2: long long */
         if (*fmt == 'l') {
@@ -196,8 +172,7 @@ static void vformat(struct out *o, const char *fmt, va_list ap) {
         if (conv == 'd' || conv == 'u' || conv == 'x') {
             /* The argument at its type, made a long long the way C
              * converts it: sign-extended for d, zero-extended for u and x
-             * (an unsigned int, or an unsigned long on RV32, has no sign
-             * to extend). */
+             * (an unsigned int has no sign to extend). */
             long long v;
             int is_signed = conv == 'd';
             if (length == 2) {
@@ -215,7 +190,7 @@ static void vformat(struct out *o, const char *fmt, va_list ap) {
             unsigned long long u = (unsigned long long)v;
             emit_number(o, negative ? 0ull - u : u, conv == 'x' ? 16 : 10, negative, &sp);
         } else if (conv == 'p') {
-            /* Every digit of a pointer: 8 on RV32, 16 on RV64. */
+            /* Every digit of a pointer: 16. */
             struct spec hex = {2 * (int)sizeof(void *), 0, 1};
             emit(o, '0');
             emit(o, 'x');

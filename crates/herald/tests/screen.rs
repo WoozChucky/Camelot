@@ -195,40 +195,38 @@ fn create(server: &avalon::ServerThread, name: &str, program: Vec<u8>) -> u32 {
 /// draws, and the session ends with the program, the last frame drawn.
 #[test]
 fn the_framebuffer_example_reaches_the_view() {
-    on_both_widths(|| {
-        let server = server();
-        let id = create(&server, "bars", example("colorbars"));
-        let session = attach(&server, VmRef::Name("bars".into()));
-        assert_eq!((session.vm.id, session.vm.state), (id, VmState::Created));
-        assert_eq!((session.screen.width(), session.screen.height()), (640, 480));
-        let running = Running::start(session);
-        wait_until("the first drawing", || running.view.draws() > 0);
-        assert_eq!(running.view.pixel(0, 0), Some(0), "black before the start");
+    let server = server();
+    let id = create(&server, "bars", example("colorbars"));
+    let session = attach(&server, VmRef::Name("bars".into()));
+    assert_eq!((session.vm.id, session.vm.state), (id, VmState::Created));
+    assert_eq!((session.screen.width(), session.screen.height()), (640, 480));
+    let running = Running::start(session);
+    wait_until("the first drawing", || running.view.draws() > 0);
+    assert_eq!(running.view.pixel(0, 0), Some(0), "black before the start");
 
-        connect(&server)
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let view = running.view.clone();
-        let (end, session) = running.end();
-        assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
-        let expected = grail_screen(&example("colorbars"));
-        assert_eq!(session.screen.pixels(), expected);
-        let st = view.0.lock().unwrap();
-        assert_eq!(st.drawn.as_ref().unwrap().pixels(), expected, "drawn as received");
-        assert_eq!(
-            st.states,
-            [VmState::Created, VmState::Running, VmState::Exited(0)]
-        );
-        drop(st);
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let view = running.view.clone();
+    let (end, session) = running.end();
+    assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
+    let expected = grail_screen(&example("colorbars"));
+    assert_eq!(session.screen.pixels(), expected);
+    let st = view.0.lock().unwrap();
+    assert_eq!(st.drawn.as_ref().unwrap().pixels(), expected, "drawn as received");
+    assert_eq!(
+        st.states,
+        [VmState::Created, VmState::Running, VmState::Exited(0)]
+    );
+    drop(st);
 
-        // Attached after the end: the last frame, then the session ends at once.
-        let mut late = attach(&server, VmRef::Id(id));
-        let mut view = FakeView::default();
-        assert_eq!(late.run(&mut view).unwrap(), End::VmEnded(VmState::Exited(0)));
-        assert_eq!(late.screen.pixels(), expected);
-        assert_eq!(late.frames, 1);
-        server.stop().unwrap();
-    });
+    // Attached after the end: the last frame, then the session ends at once.
+    let mut late = attach(&server, VmRef::Id(id));
+    let mut view = FakeView::default();
+    assert_eq!(late.run(&mut view).unwrap(), End::VmEnded(VmState::Exited(0)));
+    assert_eq!(late.screen.pixels(), expected);
+    assert_eq!(late.frames, 1);
+    server.stop().unwrap();
 }
 
 /// A guest that changes modes (`examples/flip`, 800x600 page flipped from RAM): the
@@ -236,30 +234,28 @@ fn the_framebuffer_example_reaches_the_view() {
 /// last frame Grail shows.
 #[test]
 fn a_mode_change_resizes_the_view() {
-    on_both_widths(|| {
-        let server = server();
-        let id = create(&server, "flip", example("flip"));
-        let session = attach(&server, VmRef::Id(id));
-        assert_eq!((session.screen.width(), session.screen.height()), (640, 480));
-        let running = Running::start(session);
-        wait_until("the first drawing", || running.view.draws() > 0);
-        connect(&server)
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let view = running.view.clone();
-        let (end, session) = running.end();
-        assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
-        assert_eq!(session.resizes, 1);
-        assert_eq!((session.screen.width(), session.screen.height()), (800, 600));
-        let expected = grail_screen(&example("flip"));
-        assert!(session.screen.pixels() == expected);
-        let st = view.0.lock().unwrap();
-        let drawn = st.drawn.as_ref().unwrap();
-        assert_eq!((drawn.width(), drawn.height()), (800, 600));
-        assert!(drawn.pixels() == expected, "drawn as received");
-        drop(st);
-        server.stop().unwrap();
-    });
+    let server = server();
+    let id = create(&server, "flip", example("flip"));
+    let session = attach(&server, VmRef::Id(id));
+    assert_eq!((session.screen.width(), session.screen.height()), (640, 480));
+    let running = Running::start(session);
+    wait_until("the first drawing", || running.view.draws() > 0);
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let view = running.view.clone();
+    let (end, session) = running.end();
+    assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
+    assert_eq!(session.resizes, 1);
+    assert_eq!((session.screen.width(), session.screen.height()), (800, 600));
+    let expected = grail_screen(&example("flip"));
+    assert!(session.screen.pixels() == expected);
+    let st = view.0.lock().unwrap();
+    let drawn = st.drawn.as_ref().unwrap();
+    assert_eq!((drawn.width(), drawn.height()), (800, 600));
+    assert!(drawn.pixels() == expected, "drawn as received");
+    drop(st);
+    server.stop().unwrap();
 }
 
 /// Acceptance of #203, Herald shows the cursor: a guest that moves the framebuffer's
@@ -269,34 +265,32 @@ fn a_mode_change_resizes_the_view() {
 /// Grail's frame without it, and its cursor the guest's.
 #[test]
 fn the_view_shows_the_cursor() {
-    on_both_widths(|| {
-        let server = server();
-        let id = create(&server, "cursor", example("cursor"));
-        let running = Running::start(attach(&server, VmRef::Id(id)));
-        wait_until("the first drawing", || running.view.draws() > 0);
-        connect(&server)
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let view = running.view.clone();
-        let (end, session) = running.end();
-        assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
-        assert!(
-            session.screen.pixels() == grail_screen(&example("cursor")),
-            "no cursor in the frames"
-        );
-        let (image, x, y) = session.cursor.shown().expect("the cursor shows");
-        assert_eq!((image.width, image.height, x, y), (64, 64, 0, 0));
-        let picture = grail_picture(&example("cursor"));
-        assert!(
-            picture != grail_screen(&example("cursor")),
-            "the cursor changes the picture"
-        );
-        let st = view.0.lock().unwrap();
-        assert!(st.shown == picture, "the view shows Grail's picture");
-        assert_eq!(st.cursor, session.cursor);
-        drop(st);
-        server.stop().unwrap();
-    });
+    let server = server();
+    let id = create(&server, "cursor", example("cursor"));
+    let running = Running::start(attach(&server, VmRef::Id(id)));
+    wait_until("the first drawing", || running.view.draws() > 0);
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let view = running.view.clone();
+    let (end, session) = running.end();
+    assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
+    assert!(
+        session.screen.pixels() == grail_screen(&example("cursor")),
+        "no cursor in the frames"
+    );
+    let (image, x, y) = session.cursor.shown().expect("the cursor shows");
+    assert_eq!((image.width, image.height, x, y), (64, 64, 0, 0));
+    let picture = grail_picture(&example("cursor"));
+    assert!(
+        picture != grail_screen(&example("cursor")),
+        "the cursor changes the picture"
+    );
+    let st = view.0.lock().unwrap();
+    assert!(st.shown == picture, "the view shows Grail's picture");
+    assert_eq!(st.cursor, session.cursor);
+    drop(st);
+    server.stop().unwrap();
 }
 
 /// The mouse moved and clicked over the view reaches the guest's pointer device (its
@@ -304,78 +298,74 @@ fn the_view_shows_the_cursor() {
 /// nothing changes, nothing more is drawn.
 #[test]
 fn typing_and_the_mouse_reach_the_guest() {
-    on_both_widths(|| {
-        let server = server();
-        let id = create(&server, "ptr", example("pointer"));
-        connect(&server)
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let running = Running::start(attach(&server, VmRef::Id(id)));
-        let view = running.view.clone();
-        view.wait_for_pixel(320, 240, 0x203048);
+    let server = server();
+    let id = create(&server, "ptr", example("pointer"));
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let running = Running::start(attach(&server, VmRef::Id(id)));
+    let view = running.view.clone();
+    view.wait_for_pixel(320, 240, 0x203048);
 
-        // An unchanged screen: no frames, so nothing new to draw.
-        std::thread::sleep(Duration::from_millis(200));
-        let draws = view.draws();
-        std::thread::sleep(Duration::from_millis(500));
-        assert_eq!(view.draws(), draws, "nothing changed, nothing drawn");
-        // Unless the window asks.
-        view.0.lock().unwrap().redraw = true;
-        wait_until("the redraw", || view.draws() == draws + 1);
+    // An unchanged screen: no frames, so nothing new to draw.
+    std::thread::sleep(Duration::from_millis(200));
+    let draws = view.draws();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(view.draws(), draws, "nothing changed, nothing drawn");
+    // Unless the window asks.
+    view.0.lock().unwrap().redraw = true;
+    wait_until("the redraw", || view.draws() == draws + 1);
 
-        // Many moves, as a mouse sends them, then a click where they end.
-        for x in 0..=100 {
-            view.send(Input::Pointer(PointerChange {
-                motion: PointerMotion::To { x, y: x / 2 },
-                buttons: 0,
-                wheel: 0,
-            }));
-        }
+    // Many moves, as a mouse sends them, then a click where they end.
+    for x in 0..=100 {
         view.send(Input::Pointer(PointerChange {
-            motion: PointerMotion::To { x: 100, y: 50 },
-            buttons: POINTER_LEFT,
+            motion: PointerMotion::To { x, y: x / 2 },
+            buttons: 0,
             wheel: 0,
         }));
-        view.wait_for_pixel(100, 50, 0xff0000);
-        assert_eq!(
-            view.pixel(0, 0),
-            Some(0x203048),
-            "the cursor left its first place"
-        );
+    }
+    view.send(Input::Pointer(PointerChange {
+        motion: PointerMotion::To { x: 100, y: 50 },
+        buttons: POINTER_LEFT,
+        wheel: 0,
+    }));
+    view.wait_for_pixel(100, 50, 0xff0000);
+    assert_eq!(
+        view.pixel(0, 0),
+        Some(0x203048),
+        "the cursor left its first place"
+    );
 
-        view.send(key(0x1b));
-        let (end, _) = running.end();
-        assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
-        server.stop().unwrap();
-    });
+    view.send(key(0x1b));
+    let (end, _) = running.end();
+    assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
+    server.stop().unwrap();
 }
 
 /// Closing the view detaches; the VM carries on, and another viewer still works.
 #[test]
 fn closing_the_view_detaches() {
-    on_both_widths(|| {
-        let server = server();
-        let id = create(&server, "ptr", example("pointer"));
-        connect(&server)
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let running = Running::start(attach(&server, VmRef::Id(id)));
-        running.view.wait_for_pixel(320, 240, 0x203048);
-        assert_eq!(server.debug_vm(id).unwrap().viewers, 1);
-        running.view.close();
-        let (end, _) = running.end();
-        assert_eq!(end.unwrap(), End::Detached);
-        wait_until("the server to let go of the screen", || {
-            server.debug_vm(id).unwrap().viewers == 0
-        });
-        assert_eq!(state(&server, id), VmState::Running);
-
-        let again = Running::start(attach(&server, VmRef::Id(id)));
-        again.view.wait_for_pixel(320, 240, 0x203048);
-        again.view.send(key(0x1b));
-        assert_eq!(again.end().0.unwrap(), End::VmEnded(VmState::Exited(0)));
-        server.stop().unwrap();
+    let server = server();
+    let id = create(&server, "ptr", example("pointer"));
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let running = Running::start(attach(&server, VmRef::Id(id)));
+    running.view.wait_for_pixel(320, 240, 0x203048);
+    assert_eq!(server.debug_vm(id).unwrap().viewers, 1);
+    running.view.close();
+    let (end, _) = running.end();
+    assert_eq!(end.unwrap(), End::Detached);
+    wait_until("the server to let go of the screen", || {
+        server.debug_vm(id).unwrap().viewers == 0
     });
+    assert_eq!(state(&server, id), VmState::Running);
+
+    let again = Running::start(attach(&server, VmRef::Id(id)));
+    again.view.wait_for_pixel(320, 240, 0x203048);
+    again.view.send(key(0x1b));
+    assert_eq!(again.end().0.unwrap(), End::VmEnded(VmState::Exited(0)));
+    server.stop().unwrap();
 }
 
 /// The input of the pump that closes the view still goes out, before the detach: a
@@ -383,58 +373,54 @@ fn closing_the_view_detaches() {
 /// held as it went. Here the last key is the Esc that ends the guest.
 #[test]
 fn input_taken_as_the_view_closes_goes_out() {
-    on_both_widths(|| {
-        let server = server();
-        let id = create(&server, "ptr", example("pointer"));
-        connect(&server)
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let running = Running::start(attach(&server, VmRef::Id(id)));
-        running.view.wait_for_pixel(320, 240, 0x203048);
-        {
-            let mut st = running.view.0.lock().unwrap();
-            st.input.push(key(0x1b));
-            st.closed = true;
-        }
-        // The Esc goes before the detach, so the guest may end before the server answers
-        // it: either way the session is over.
-        let (end, _) = running.end();
-        let end = end.unwrap();
-        assert!(
-            matches!(end, End::Detached | End::VmEnded(VmState::Exited(0))),
-            "{end:?}"
-        );
-        wait_until("the guest to take the Esc", || {
-            state(&server, id) == VmState::Exited(0)
-        });
-        server.stop().unwrap();
+    let server = server();
+    let id = create(&server, "ptr", example("pointer"));
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let running = Running::start(attach(&server, VmRef::Id(id)));
+    running.view.wait_for_pixel(320, 240, 0x203048);
+    {
+        let mut st = running.view.0.lock().unwrap();
+        st.input.push(key(0x1b));
+        st.closed = true;
+    }
+    // The Esc goes before the detach, so the guest may end before the server answers
+    // it: either way the session is over.
+    let (end, _) = running.end();
+    let end = end.unwrap();
+    assert!(
+        matches!(end, End::Detached | End::VmEnded(VmState::Exited(0))),
+        "{end:?}"
+    );
+    wait_until("the guest to take the Esc", || {
+        state(&server, id) == VmState::Exited(0)
     });
+    server.stop().unwrap();
 }
 
 /// Pausing is reported to the view; destroying the VM ends the session.
 #[test]
 fn pause_and_destroy() {
-    on_both_widths(|| {
-        let server = server();
-        let id = create(&server, "ptr", example("pointer"));
-        let mut rt = connect(&server);
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-        let running = Running::start(attach(&server, VmRef::Id(id)));
-        running.view.wait_for_pixel(320, 240, 0x203048);
-        rt.request_ok(&Message::PauseVm { vm: VmRef::Id(id) }).unwrap();
-        wait_until("the pause", || {
-            running.view.0.lock().unwrap().states.contains(&VmState::Paused)
-        });
-        rt.request_ok(&Message::DestroyVm { vm: VmRef::Id(id) }).unwrap();
-        let (end, _) = running.end();
-        let end = end.unwrap();
-        // Destroying a paused VM stops it first, which the session may hear about first.
-        assert!(
-            matches!(end, End::Destroyed | End::VmEnded(VmState::Stopped)),
-            "{end:?}"
-        );
-        server.stop().unwrap();
+    let server = server();
+    let id = create(&server, "ptr", example("pointer"));
+    let mut rt = connect(&server);
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let running = Running::start(attach(&server, VmRef::Id(id)));
+    running.view.wait_for_pixel(320, 240, 0x203048);
+    rt.request_ok(&Message::PauseVm { vm: VmRef::Id(id) }).unwrap();
+    wait_until("the pause", || {
+        running.view.0.lock().unwrap().states.contains(&VmState::Paused)
     });
+    rt.request_ok(&Message::DestroyVm { vm: VmRef::Id(id) }).unwrap();
+    let (end, _) = running.end();
+    let end = end.unwrap();
+    // Destroying a paused VM stops it first, which the session may hear about first.
+    assert!(
+        matches!(end, End::Destroyed | End::VmEnded(VmState::Stopped)),
+        "{end:?}"
+    );
+    server.stop().unwrap();
 }
 
 /// Attaching to a VM that does not exist fails with the server's error.

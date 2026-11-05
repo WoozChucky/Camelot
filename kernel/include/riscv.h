@@ -1,53 +1,37 @@
 /* Privileged architecture: CSR bits (spec sections 5 and 6) and the CSR
  * accessors implemented in riscv.S (no inline asm, #15).
  *
- * A CSR is a register's width, XLEN bits: 32 on RV32, 64 on RV64, so the
- * accessors take and return a uintptr, as Linux's csr_read() an unsigned
- * long. Writing a CSR back from a narrower value would clear its upper
- * bits: mstatus's SXL and UXL (the S- and U-mode widths) and SD, say. */
+ * A CSR is a register's width, 64 bits, so the accessors take and return a
+ * uintptr, as Linux's csr_read() an unsigned long. Writing a CSR back from a
+ * narrower value would clear its upper bits: sstatus's UXL (U-mode's width)
+ * and SD, say. */
 #ifndef CAMELOT_RISCV_H
 #define CAMELOT_RISCV_H
 
 #include "const.h"
 
-/* Assembly includes this file too (machine.S, spinlock.S), for the bits and
- * causes: the accessors are under #ifndef __ASSEMBLER__ (const.h). */
+/* Assembly includes this file too (spinlock.S), for the bits and causes:
+ * the accessors are under #ifndef __ASSEMBLER__ (const.h). */
 #ifndef __ASSEMBLER__
 #include "types.h"
 #endif
 
-/* mstatus / sstatus */
-#define MSTATUS_SIE (_UL(1) << 1)
-#define MSTATUS_MIE (_UL(1) << 3)
-#define MSTATUS_SPIE (_UL(1) << 5)
-#define MSTATUS_MPIE (_UL(1) << 7)
-#define MSTATUS_SPP (_UL(1) << 8)
-#define MSTATUS_MPP_MASK (_UL(3) << 11)
-#define MSTATUS_MPP_S (_UL(1) << 11)
-#define SSTATUS_SIE MSTATUS_SIE
-#define SSTATUS_SPIE MSTATUS_SPIE
-#define SSTATUS_SPP MSTATUS_SPP
+/* sstatus: S-mode's view of mstatus, the bits the kernel uses. */
+#define SSTATUS_SIE (_UL(1) << 1)
+#define SSTATUS_SPIE (_UL(1) << 5)
+#define SSTATUS_SPP (_UL(1) << 8)
 
-/* Interrupt numbers: bit positions in mie/mip/sie/sip and the low bits of
- * xcause when its top bit is set. */
+/* Interrupt numbers: bit positions in sie/sip and the low bits of scause
+ * when its top bit is set (M-mode's are the firmware's). */
 #define IRQ_S_SOFT 1
-#define IRQ_M_SOFT 3
 #define IRQ_S_TIMER 5
-#define IRQ_M_TIMER 7
 #define IRQ_S_EXT 9
-#define IRQ_M_EXT 11
 
-#define MIE_MSIE (_UL(1) << IRQ_M_SOFT)
-#define MIE_MTIE (_UL(1) << IRQ_M_TIMER)
 #define SIE_SSIE (_UL(1) << IRQ_S_SOFT)
 #define SIE_STIE (_UL(1) << IRQ_S_TIMER)
 #define SIE_SEIE (_UL(1) << IRQ_S_EXT)
+/* S-mode can clear SSIP itself, but not STIP: the SBI's set_timer does. */
 #define SIP_SSIP (_UL(1) << IRQ_S_SOFT)
-/* The same bits in mip, which M-mode sets to raise the S-mode software and
- * timer interrupts (machine.S). S-mode can clear SSIP itself, but not
- * STIP: the SBI's set_timer does. */
-#define MIP_SSIP (_UL(1) << IRQ_S_SOFT)
-#define MIP_STIP (_UL(1) << IRQ_S_TIMER)
 
 /* Exception causes (spec section 6). */
 #define CAUSE_INSTR_MISALIGNED 0
@@ -60,16 +44,13 @@
 #define CAUSE_STORE_ACCESS_FAULT 7
 #define CAUSE_ECALL_U 8
 #define CAUSE_ECALL_S 9
-#define CAUSE_ECALL_M 11
 #define CAUSE_INSTR_PAGE_FAULT 12
 #define CAUSE_LOAD_PAGE_FAULT 13
 #define CAUSE_STORE_PAGE_FAULT 15
 
-/* Top bit of xcause: the trap is an interrupt. Bit XLEN-1: 31 on RV32, 63
- * on RV64. */
+/* Top bit of scause, bit XLEN-1 (63): the trap is an interrupt. */
 #define CAUSE_INTERRUPT (_UL(1) << (__riscv_xlen - 1))
 
-#if __riscv_xlen == 64
 /* satp: MODE in bits 63:60 (0 Bare, 8 Sv39, 9 Sv48), ASID in 59:44 (Camelot
  * uses 0), and the root page table's physical page number in 43:0. */
 #define SATP_MODE_SHIFT 60
@@ -77,13 +58,6 @@
 #define SATP_MODE_SV48 (_UL(9) << SATP_MODE_SHIFT)
 #define SATP_MODE_MASK (_UL(0xf) << SATP_MODE_SHIFT)
 #define SATP_PPN_MASK _ULL(0x00000fffffffffff)
-#else
-/* satp: MODE (bit 31) = 1 selects Sv32; PPN (bits 21:0) is the physical page
- * number of the root page table. */
-#define SATP_SV32 (_UL(1) << 31)
-#define SATP_MODE_MASK SATP_SV32
-#define SATP_PPN_MASK _U(0x003fffff)
-#endif
 
 #ifndef __ASSEMBLER__
 /* S-mode CSRs. */
@@ -98,9 +72,8 @@ void w_stvec(uintptr v);
 uintptr r_satp(void);
 void w_satp(uintptr v);
 
-/* `time` (rdtime), the CLINT's mtime, all 64 bits (on RV32 read as two
- * halves, timeh and time, until the high half holds still): how S-mode reads
- * the clock, with no CLINT mapping (the SBI lets it, through mcounteren:
+/* `time` (rdtime), the CLINT's mtime: how S-mode reads the clock, with no
+ * CLINT mapping (the SBI lets it, through mcounteren:
  * firmware/sbi.S's sbi_hart_init). */
 u64 r_time(void);
 

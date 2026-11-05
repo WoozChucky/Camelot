@@ -1,5 +1,5 @@
-//! Camelot under the real OpenSBI (#174): the committed RV64 kernel,
-//! `kernel/kernel-rv64.elf`, booted on Grail with OpenSBI's `fw_jump` for
+//! Camelot under the real OpenSBI (#174): the committed kernel,
+//! `kernel/kernel.elf`, booted on Grail with OpenSBI's `fw_jump` for
 //! the generic platform as its firmware (`--bios FILE`), as QEMU's `virt`
 //! boots Linux with `-bios`.
 //!
@@ -21,7 +21,7 @@
 
 use grail::{Bios, Machine, MachineConfig, RunResult};
 use std::sync::mpsc::{self, Sender};
-use xtask::kernel::{BOOT_MAX_STEPS, KERNEL_ELF_RV64};
+use xtask::kernel::{BOOT_MAX_STEPS, KERNEL_ELF};
 use xtask::repo_root;
 
 const PROMPT: &str = "$ ";
@@ -51,11 +51,10 @@ struct Session {
 }
 
 impl Session {
-    /// Boots the committed RV64 kernel on `harts` harts with `bios` as its
+    /// Boots the committed kernel on `harts` harts with `bios` as its
     /// firmware, and runs it to the shell's first prompt.
     fn boot(bios: Bios, harts: usize) -> Session {
         let mut m = Machine::new(MachineConfig {
-            xlen: grail::Xlen::Rv64,
             ram_size: RAM,
             harts,
             bios,
@@ -63,7 +62,7 @@ impl Session {
         })
         .unwrap();
         m.cpu.bus.uart.capture = true;
-        let elf = std::fs::read(repo_root().join("kernel").join(KERNEL_ELF_RV64)).unwrap();
+        let elf = std::fs::read(repo_root().join("kernel").join(KERNEL_ELF)).unwrap();
         m.load_elf(&elf).unwrap();
         // Nothing is typed until the shell asks: OpenSBI's 8250 driver
         // reads the receive buffer once as it sets the UART up

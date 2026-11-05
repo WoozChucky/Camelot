@@ -1,25 +1,16 @@
-//! C types as merlin knows them, with their sizes for the target: RISC-V's
-//! `ilp32` on RV32 and `lp64` on RV64 ([`Xlen`] says which). `char` is 1
-//! byte, `short` 2, `int` 4 and `long long` 8 on both; `long` and pointers
-//! are 4 bytes on RV32 and 8 on RV64, each aligned to its size (so a `long
-//! long` is 8-aligned on RV32 too, as the psABI says). Plain `char` is unsigned,
-//! as on every RISC-V target, so `(char)200` stays 200 and `char` loads use
-//! `lbu`.
-//!
-//! The target is a parameter of everything that depends on it
-//! ([`IntKind::size`], [`IntKind::range`], [`IntKind::wrap`], [`common`],
-//! [`Type::size`], [`Type::align`], [`Record::complete`]) rather than a
-//! global, so one process may compile for both widths at once (the tests
-//! do). The parser records it in the [`crate::ast::Program`] it makes, and
-//! sema, consteval and codegen read it from there.
+//! C types as merlin knows them, with their sizes on Excalibur: RISC-V's
+//! `lp64`. `char` is 1 byte, `short` 2, `int` 4, and `long`, `long long`
+//! and pointers 8, each aligned to its size. Plain `char` is unsigned, as on
+//! every RISC-V target, so `(char)200` stays 200 and `char` loads use `lbu`.
+//! (Until #159 merlin compiled for RV32's `ilp32` too, where `long` and
+//! pointers are 4 bytes.)
 //!
 //! The integer rules follow C99 6.3.1: *integer promotion* turns `_Bool`,
 //! `char` and `short` (signed or not) into `int`, since `int` holds all their
 //! values, and the *usual arithmetic conversions* bring two operands to a
-//! common type by rank and range ([`common`]). On ILP32, where `int` and
-//! `long` have the same width, `unsigned int` and `long` meet at `unsigned
-//! long`, since `long` cannot hold every `unsigned int`; on LP64 they meet
-//! at `long`, which can.
+//! common type by rank and range ([`common`]): `unsigned int` and `long`
+//! meet at `long`, which holds every `unsigned int`, but `long long` and
+//! `unsigned long`, both 64 bits, meet at `unsigned long long`.
 //!
 //! Structs and unions ([`Record`]) are laid out the way clang lays them out:
 //! each member at the next offset aligned for its type, the whole aligned to
@@ -28,14 +19,13 @@
 //! needs no type of its own.
 //!
 //! Constant values are `i128`s, which hold every value of every integer type
-//! (an LP64 `unsigned long` goes up to 2^64 - 1) as the number it is.
+//! (an `unsigned long` goes up to 2^64 - 1) as the number it is.
 //!
 //! `const` and `volatile` wrap a type in [`Type::Qual`]. Qualifiers of an
 //! array apply to its elements (C99 6.7.3p8), so a `Qual` never wraps an
 //! array, nor another `Qual`: [`Type::qualified`] keeps that form.
 
 use crate::Pos;
-pub use excalibur::Xlen;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
@@ -56,25 +46,22 @@ pub enum IntKind {
     UInt,
     Long,
     ULong,
-    /// `long long`: 64 bits on both widths, as C99 requires (on RV32 a
-    /// register pair, see [`crate::codegen`]).
+    /// `long long`: 64 bits, as C99 requires; the same size as `long`, of a
+    /// higher rank.
     LongLong,
     ULongLong,
 }
 
-/// The size of a pointer, and of `long`, on the target: 4 bytes on RV32
-/// (ILP32), 8 on RV64 (LP64).
-pub fn ptr_size(x: Xlen) -> u32 {
-    x.bits() / 8
-}
+/// The size of a pointer, and of `long`: 8 bytes (LP64).
+pub const PTR_SIZE: u32 = 8;
 
 impl IntKind {
-    pub fn size(self, x: Xlen) -> u32 {
+    pub fn size(self) -> u32 {
         match self {
             IntKind::Bool | IntKind::Char | IntKind::SChar | IntKind::UChar => 1,
             IntKind::Short | IntKind::UShort => 2,
             IntKind::Int | IntKind::UInt => 4,
-            IntKind::Long | IntKind::ULong => ptr_size(x),
+            IntKind::Long | IntKind::ULong => PTR_SIZE,
             IntKind::LongLong | IntKind::ULongLong => 8,
         }
     }
@@ -93,22 +80,16 @@ impl IntKind {
         }
     }
 
-    /// `size_t`, what `sizeof` gives: `unsigned int` on ILP32, `unsigned
-    /// long` on LP64 (clang's `__SIZE_TYPE__`).
-    pub fn size_t(x: Xlen) -> IntKind {
-        match x {
-            Xlen::Rv32 => IntKind::UInt,
-            Xlen::Rv64 => IntKind::ULong,
-        }
+    /// `size_t`, what `sizeof` gives: `unsigned long` (clang's
+    /// `__SIZE_TYPE__`).
+    pub fn size_t() -> IntKind {
+        IntKind::ULong
     }
 
-    /// `ptrdiff_t`, the difference of two pointers: `int` on ILP32, `long`
-    /// on LP64 (clang's `__PTRDIFF_TYPE__`).
-    pub fn ptrdiff_t(x: Xlen) -> IntKind {
-        match x {
-            Xlen::Rv32 => IntKind::Int,
-            Xlen::Rv64 => IntKind::Long,
-        }
+    /// `ptrdiff_t`, the difference of two pointers: `long` (clang's
+    /// `__PTRDIFF_TYPE__`).
+    pub fn ptrdiff_t() -> IntKind {
+        IntKind::Long
     }
 
     /// The unsigned type of the same rank (for `int` and wider).
@@ -156,11 +137,11 @@ impl IntKind {
     }
 
     /// The smallest and largest value of the type.
-    pub fn range(self, x: Xlen) -> (i128, i128) {
+    pub fn range(self) -> (i128, i128) {
         if self == IntKind::Bool {
             return (0, 1);
         }
-        let bits = self.size(x) * 8;
+        let bits = self.size() * 8;
         if self.signed() {
             (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
         } else {
@@ -172,11 +153,11 @@ impl IntKind {
     /// if the type is signed (C's conversion rules, with the implementation-
     /// defined signed case done the two's complement way, as clang does).
     /// For `_Bool` it is `v != 0`.
-    pub fn wrap(self, v: i128, x: Xlen) -> i128 {
+    pub fn wrap(self, v: i128) -> i128 {
         if self == IntKind::Bool {
             return (v != 0) as i128;
         }
-        let bits = self.size(x) * 8;
+        let bits = self.size() * 8;
         let v = v & ((1i128 << bits) - 1);
         if self.signed() && v >> (bits - 1) != 0 {
             v - (1i128 << bits)
@@ -190,9 +171,10 @@ impl IntKind {
 /// operands meet at, after promotion. Two signed or two unsigned types meet
 /// at the one of greater rank. Otherwise the unsigned type wins if its rank
 /// is not lower; else the signed type wins if it holds every value of the
-/// unsigned one (`long` and `unsigned int` on LP64), and if it does not (the
-/// same two on ILP32) they meet at the signed type's unsigned counterpart.
-pub fn common(a: IntKind, b: IntKind, x: Xlen) -> IntKind {
+/// unsigned one (`long` and `unsigned int`), and if it does not (`long
+/// long` and `unsigned long`) they meet at the signed type's unsigned
+/// counterpart.
+pub fn common(a: IntKind, b: IntKind) -> IntKind {
     let (a, b) = (a.promoted(), b.promoted());
     if a.signed() == b.signed() {
         return if a.rank() >= b.rank() { a } else { b };
@@ -200,7 +182,7 @@ pub fn common(a: IntKind, b: IntKind, x: Xlen) -> IntKind {
     let (s, u) = if a.signed() { (a, b) } else { (b, a) };
     if u.rank() >= s.rank() {
         u
-    } else if s.range(x).1 >= u.range(x).1 {
+    } else if s.range().1 >= u.range().1 {
         s
     } else {
         s.to_unsigned()
@@ -326,30 +308,25 @@ impl Record {
     /// Lays out `members` (name and type, in order) the way clang does for
     /// the target and completes the type. Every member type must be complete.
     /// Returns `false` if the type was already complete.
-    pub fn complete(&self, members: Vec<(String, Type)>, x: Xlen) -> bool {
+    pub fn complete(&self, members: Vec<(String, Type)>) -> bool {
         let pos = self.pos;
         let members = members
             .into_iter()
             .map(|(n, t)| (n, t, Spelled::default(), pos, pos))
             .collect();
-        self.complete_spelled(members, pos, x)
+        self.complete_spelled(members, pos)
     }
 
     /// [`Record::complete`], with each member's spelling, position and
     /// where its declaration begins, and the definition's position, which
     /// only `-g` reads.
-    pub fn complete_spelled(
-        &self,
-        members: Vec<(String, Type, Spelled, Pos, Pos)>,
-        pos: Pos,
-        x: Xlen,
-    ) -> bool {
+    pub fn complete_spelled(&self, members: Vec<(String, Type, Spelled, Pos, Pos)>, pos: Pos) -> bool {
         let mut offset = 0u64;
         let mut size = 0u64;
         let mut align = 1;
         let mut laid_out = Vec::with_capacity(members.len());
         for (name, ty, spelled, pos, begin) in members {
-            let (msize, malign) = (u64::from(ty.size(x).expect("complete member")), ty.align(x));
+            let (msize, malign) = (u64::from(ty.size().expect("complete member")), ty.align());
             align = align.max(malign);
             let at = if self.union { 0 } else { align_up(offset, malign) };
             offset = at + msize;
@@ -777,26 +754,26 @@ impl Type {
 
     /// `sizeof`: `None` for `void`, functions, arrays of unknown size and
     /// incomplete structs and unions.
-    pub fn size(&self, x: Xlen) -> Option<u32> {
+    pub fn size(&self) -> Option<u32> {
         match self {
             Type::Void | Type::Func(_) => None,
-            Type::Int(k) => Some(k.size(x)),
-            Type::Ptr(_) => Some(ptr_size(x)),
-            Type::Array(elem, n) => Some(elem.size(x)? * (*n)?),
+            Type::Int(k) => Some(k.size()),
+            Type::Ptr(_) => Some(PTR_SIZE),
+            Type::Array(elem, n) => Some(elem.size()? * (*n)?),
             Type::Record(r) => r.body().map(|b| b.size),
-            Type::Qual(t, _) => t.size(x),
+            Type::Qual(t, _) => t.size(),
         }
     }
 
     /// The alignment: an integer's or a pointer's is its size.
-    pub fn align(&self, x: Xlen) -> u32 {
+    pub fn align(&self) -> u32 {
         match self {
             Type::Void | Type::Func(_) => 1,
-            Type::Int(k) => k.size(x),
-            Type::Ptr(_) => ptr_size(x),
-            Type::Array(elem, _) => elem.align(x),
+            Type::Int(k) => k.size(),
+            Type::Ptr(_) => PTR_SIZE,
+            Type::Array(elem, _) => elem.align(),
             Type::Record(r) => r.body().map_or(1, |b| b.align),
-            Type::Qual(t, _) => t.align(x),
+            Type::Qual(t, _) => t.align(),
         }
     }
 
@@ -877,12 +854,12 @@ impl Type {
     /// type moves it: the size of what it points to, or 1 for `void` and
     /// a function, the GNU extension clang takes without a word (as
     /// `-Wpointer-arith`, which is not on by default, would say).
-    pub fn step(&self, x: Xlen) -> Option<u32> {
+    pub fn step(&self) -> Option<u32> {
         let to = self.pointee()?;
         if to.is_void() || to.is_func() {
             return Some(1);
         }
-        to.size(x)
+        to.size()
     }
 
     /// What a pointer (or a decayed array) points to.
@@ -1075,30 +1052,25 @@ mod tests {
     use super::*;
     use IntKind::*;
 
-    const R32: Xlen = Xlen::Rv32;
-
     #[test]
     fn sizes_and_alignment() {
-        assert_eq!(Type::CHAR.size(R32), Some(1));
-        assert_eq!(Type::BOOL.size(R32), Some(1));
-        assert_eq!(Type::Int(UShort).size(R32), Some(2));
-        assert_eq!(Type::Int(Long).size(R32), Some(4));
-        assert_eq!(Type::ptr(Type::Void).size(R32), Some(4));
-        assert_eq!(Type::Void.size(R32), None);
+        assert_eq!(Type::CHAR.size(), Some(1));
+        assert_eq!(Type::BOOL.size(), Some(1));
+        assert_eq!(Type::Int(UShort).size(), Some(2));
+        assert_eq!(Type::Int(Long).size(), Some(8));
+        assert_eq!(Type::ptr(Type::Void).size(), Some(8));
+        assert_eq!(Type::Void.size(), None);
         let m = Type::array(Type::array(Type::Int(Short), Some(3)), Some(5));
-        assert_eq!(m.size(R32), Some(30));
-        assert_eq!(m.align(R32), 2);
-        assert_eq!(Type::array(Type::INT, None).size(R32), None);
-        assert_eq!(Type::func(Type::INT, vec![]).size(R32), None);
-        assert_eq!(Type::INT.qualified(Quals::CONST).size(R32), Some(4));
+        assert_eq!(m.size(), Some(30));
+        assert_eq!(m.align(), 2);
+        assert_eq!(Type::array(Type::INT, None).size(), None);
+        assert_eq!(Type::func(Type::INT, vec![]).size(), None);
+        assert_eq!(Type::INT.qualified(Quals::CONST).size(), Some(4));
     }
 
     fn record(union: bool, members: &[(&str, Type)]) -> Type {
         let r = Record::new(union, Some("s".into()), Pos::default());
-        assert!(r.complete(
-            members.iter().map(|(n, t)| (n.to_string(), t.clone())).collect(),
-            R32
-        ));
+        assert!(r.complete(members.iter().map(|(n, t)| (n.to_string(), t.clone())).collect()));
         Type::Record(r)
     }
 
@@ -1114,28 +1086,32 @@ mod tests {
     }
 
     #[test]
-    fn struct_layout_matches_ilp32() {
+    fn struct_layout_matches_lp64() {
         // char, then int aligned to 4, then short: 12 bytes, aligned to 4.
         let s = record(
             false,
             &[("c", Type::CHAR), ("i", Type::INT), ("h", Type::Int(Short))],
         );
         assert_eq!(offsets(&s), [0, 4, 8]);
-        assert_eq!((s.size(R32), s.align(R32)), (Some(12), 4));
+        assert_eq!((s.size(), s.align()), (Some(12), 4));
         // Tail padding up to the alignment: { short; char; } is 4 bytes.
         let t = record(false, &[("h", Type::Int(Short)), ("c", Type::CHAR)]);
-        assert_eq!((t.size(R32), t.align(R32)), (Some(4), 2));
+        assert_eq!((t.size(), t.align()), (Some(4), 2));
         // Only chars: no padding at all.
         let c = record(false, &[("a", Type::array(Type::CHAR, Some(3)))]);
-        assert_eq!((c.size(R32), c.align(R32)), (Some(3), 1));
+        assert_eq!((c.size(), c.align()), (Some(3), 1));
         // Nested: the inner struct aligns the outer.
         let n = record(false, &[("c", Type::CHAR), ("in", s.clone()), ("d", Type::CHAR)]);
         assert_eq!(offsets(&n), [0, 4, 16]);
-        assert_eq!(n.size(R32), Some(20));
+        assert_eq!(n.size(), Some(20));
         // A union is as big as its biggest member, rounded to its alignment.
         let u = record(true, &[("c", Type::array(Type::CHAR, Some(5))), ("i", Type::INT)]);
         assert_eq!(offsets(&u), [0, 0]);
-        assert_eq!((u.size(R32), u.align(R32)), (Some(8), 4));
+        assert_eq!((u.size(), u.align()), (Some(8), 4));
+        // A pointer after an int: aligned to 8.
+        let p = record(false, &[("i", Type::INT), ("p", Type::ptr(Type::Void))]);
+        assert_eq!(offsets(&p), [0, 8]);
+        assert_eq!((p.size(), p.align()), (Some(16), 8));
     }
 
     #[test]
@@ -1144,107 +1120,96 @@ mod tests {
         let b = Record::new(false, Some("s".into()), Pos::default());
         assert_eq!(Type::Record(a.clone()), Type::Record(a.clone()));
         assert_ne!(Type::Record(a.clone()), Type::Record(b));
-        assert_eq!(Type::Record(a.clone()).size(R32), None, "incomplete");
-        assert!(a.complete(vec![("x".into(), Type::INT)], R32));
-        assert!(
-            !a.complete(vec![("x".into(), Type::INT)], R32),
-            "already complete"
-        );
-        assert_eq!(Type::Record(a).size(R32), Some(4));
+        assert_eq!(Type::Record(a.clone()).size(), None, "incomplete");
+        assert!(a.complete(vec![("x".into(), Type::INT)]));
+        assert!(!a.complete(vec![("x".into(), Type::INT)]), "already complete");
+        assert_eq!(Type::Record(a).size(), Some(4));
     }
 
     #[test]
     fn char_is_unsigned_on_riscv() {
         assert!(!Char.signed());
         assert!(SChar.signed());
-        assert_eq!(Char.wrap(-1, R32), 255);
-        assert_eq!(SChar.wrap(200, R32), -56);
-        assert_eq!(UShort.wrap(70000, R32), 4464);
-        assert_eq!(Int.wrap(0x8000_0000, R32), i32::MIN.into());
-        assert_eq!(UInt.wrap(-1, R32), 0xffff_ffff);
-        assert_eq!(Short.range(R32), (-32768, 32767));
+        assert_eq!(Char.wrap(-1), 255);
+        assert_eq!(SChar.wrap(200), -56);
+        assert_eq!(UShort.wrap(70000), 4464);
+        assert_eq!(Int.wrap(0x8000_0000), i32::MIN.into());
+        assert_eq!(UInt.wrap(-1), 0xffff_ffff);
+        assert_eq!(Short.range(), (-32768, 32767));
     }
 
     #[test]
     fn bool_converts_to_zero_or_one() {
-        assert_eq!(Bool.wrap(0, R32), 0);
-        assert_eq!(Bool.wrap(256, R32), 1, "not truncated: any nonzero value is true");
-        assert_eq!(Bool.wrap(-1, R32), 1);
-        assert_eq!(Bool.range(R32), (0, 1));
+        assert_eq!(Bool.wrap(0), 0);
+        assert_eq!(Bool.wrap(256), 1, "not truncated: any nonzero value is true");
+        assert_eq!(Bool.wrap(-1), 1);
+        assert_eq!(Bool.range(), (0, 1));
         assert_eq!(Bool.promoted(), Int);
-        assert_eq!(common(Bool, Bool, R32), Int);
+        assert_eq!(common(Bool, Bool), Int);
     }
 
     #[test]
     fn usual_arithmetic_conversions() {
-        assert_eq!(common(Char, Char, R32), Int);
-        assert_eq!(common(UChar, UShort, R32), Int);
-        assert_eq!(common(Int, UInt, R32), UInt);
-        assert_eq!(common(Long, Int, R32), Long);
-        assert_eq!(common(UInt, Long, R32), ULong);
-        assert_eq!(common(SChar, ULong, R32), ULong);
+        assert_eq!(common(Char, Char), Int);
+        assert_eq!(common(UChar, UShort), Int);
+        assert_eq!(common(Int, UInt), UInt);
+        assert_eq!(common(Long, Int), Long);
+        assert_eq!(common(SChar, ULong), ULong);
         assert!(!Type::Int(UChar).is_unsigned(), "promotes to int");
         assert!(Type::UINT.is_unsigned());
         assert!(Type::ptr(Type::INT).is_unsigned());
     }
 
     #[test]
-    fn long_long_is_64_bits_on_both_widths() {
-        for x in [R32, Xlen::Rv64] {
-            assert_eq!(Type::Int(LongLong).size(x), Some(8));
-            assert_eq!(Type::Int(ULongLong).align(x), 8);
-            assert_eq!(ULongLong.range(x), (0, u64::MAX.into()));
-            assert_eq!(LongLong.wrap(1 << 63, x), i64::MIN.into());
-            assert_eq!(common(ULongLong, Int, x), ULongLong);
-        }
-        // On ILP32 a long long holds every unsigned long; on LP64 it does not.
-        assert_eq!(common(LongLong, ULong, R32), LongLong);
-        assert_eq!(common(LongLong, ULong, Xlen::Rv64), ULongLong);
-        assert_eq!(common(LongLong, UInt, R32), LongLong);
-        assert_eq!(common(LongLong, Long, Xlen::Rv64), LongLong);
-        // 8-aligned on RV32 too: { int; long long } is 16 bytes.
+    fn long_long_is_64_bits() {
+        assert_eq!(Type::Int(LongLong).size(), Some(8));
+        assert_eq!(Type::Int(ULongLong).align(), 8);
+        assert_eq!(ULongLong.range(), (0, u64::MAX.into()));
+        assert_eq!(LongLong.wrap(1 << 63), i64::MIN.into());
+        assert_eq!(common(ULongLong, Int), ULongLong);
+        // A long long does not hold every unsigned long: they meet at
+        // unsigned long long.
+        assert_eq!(common(LongLong, ULong), ULongLong);
+        assert_eq!(common(LongLong, UInt), LongLong);
+        assert_eq!(common(LongLong, Long), LongLong);
+        // 8-aligned: { int; long long } is 16 bytes.
         let r = Record::new(false, Some("s".into()), Pos::default());
-        assert!(r.complete(
-            vec![("i".into(), Type::INT), ("ll".into(), Type::Int(LongLong))],
-            R32
-        ));
+        assert!(r.complete(vec![("i".into(), Type::INT), ("ll".into(), Type::Int(LongLong))]));
         let s = Type::Record(r);
         assert_eq!(offsets(&s), [0, 8]);
-        assert_eq!((s.size(R32), s.align(R32)), (Some(16), 8));
+        assert_eq!((s.size(), s.align()), (Some(16), 8));
         assert_eq!(Type::Int(ULongLong).to_string(), "unsigned long long");
     }
 
     #[test]
     fn lp64() {
-        const R64: Xlen = Xlen::Rv64;
         // `long` and pointers are 8 bytes, aligned to 8; `int` stays 4.
-        assert_eq!(Type::INT.size(R64), Some(4));
-        assert_eq!(Type::Int(Long).size(R64), Some(8));
-        assert_eq!(Type::Int(ULong).align(R64), 8);
-        assert_eq!(Type::ptr(Type::CHAR).size(R64), Some(8));
-        assert_eq!(Type::ptr(Type::Void).align(R64), 8);
-        assert_eq!(Type::array(Type::ptr(Type::INT), Some(3)).size(R64), Some(24));
+        assert_eq!(Type::INT.size(), Some(4));
+        assert_eq!(Type::Int(Long).size(), Some(8));
+        assert_eq!(Type::Int(ULong).align(), 8);
+        assert_eq!(Type::ptr(Type::CHAR).size(), Some(8));
+        assert_eq!(Type::ptr(Type::Void).align(), 8);
+        assert_eq!(Type::array(Type::ptr(Type::INT), Some(3)).size(), Some(24));
         // A long next to an int: 16 bytes, aligned to 8.
         let r = Record::new(false, Some("s".into()), Pos::default());
-        assert!(r.complete(vec![("i".into(), Type::INT), ("l".into(), Type::Int(Long))], R64));
+        assert!(r.complete(vec![("i".into(), Type::INT), ("l".into(), Type::Int(Long))]));
         let s = Type::Record(r);
         assert_eq!(offsets(&s), [0, 8]);
-        assert_eq!((s.size(R64), s.align(R64)), (Some(16), 8));
+        assert_eq!((s.size(), s.align()), (Some(16), 8));
         // Ranges and wrapping in 64 bits.
-        assert_eq!(Long.range(R64), (i64::MIN.into(), i64::MAX.into()));
-        assert_eq!(ULong.range(R64), (0, u64::MAX.into()));
-        assert_eq!(ULong.wrap(-1, R64), u64::MAX.into());
-        assert_eq!(Long.wrap(1 << 63, R64), i64::MIN.into());
-        assert_eq!(Int.wrap(1 << 32, R64), 0, "int stays 32 bits");
-        // `long` holds every `unsigned int` on LP64: they meet at `long`.
-        assert_eq!(common(UInt, Long, R64), Long);
-        assert_eq!(common(Long, UInt, R64), Long);
-        assert_eq!(common(Int, ULong, R64), ULong);
-        assert_eq!(common(Int, UInt, R64), UInt);
-        assert_eq!(common(Long, ULong, R64), ULong);
-        assert_eq!(IntKind::size_t(R64), ULong);
-        assert_eq!(IntKind::ptrdiff_t(R64), Long);
-        assert_eq!((IntKind::size_t(R32), IntKind::ptrdiff_t(R32)), (UInt, Int));
+        assert_eq!(Long.range(), (i64::MIN.into(), i64::MAX.into()));
+        assert_eq!(ULong.range(), (0, u64::MAX.into()));
+        assert_eq!(ULong.wrap(-1), u64::MAX.into());
+        assert_eq!(Long.wrap(1 << 63), i64::MIN.into());
+        assert_eq!(Int.wrap(1 << 32), 0, "int stays 32 bits");
+        // `long` holds every `unsigned int`: they meet at `long`.
+        assert_eq!(common(UInt, Long), Long);
+        assert_eq!(common(Long, UInt), Long);
+        assert_eq!(common(Int, ULong), ULong);
+        assert_eq!(common(Int, UInt), UInt);
+        assert_eq!(common(Long, ULong), ULong);
+        assert_eq!(IntKind::size_t(), ULong);
+        assert_eq!(IntKind::ptrdiff_t(), Long);
     }
 
     #[test]

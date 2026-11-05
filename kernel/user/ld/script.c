@@ -2,8 +2,7 @@
  * "Linker scripts"):
  *
  *     OUTPUT_ARCH(riscv)                       optional; must say riscv
- *     OUTPUT_FORMAT("elf32-littleriscv")       optional; elf32-littleriscv or
- *                                              elf64-littleriscv, the objects' class
+ *     OUTPUT_FORMAT("elf64-littleriscv")       optional; must say elf64-littleriscv
  *     ENTRY(symbol)
  *     MEMORY { RAM (rwx) : ORIGIN = expr, LENGTH = expr }      at most one region
  *     SECTIONS
@@ -24,11 +23,9 @@
  * section's address, as in Linux's `AT(ADDR(.text) - LOAD_OFFSET)`. layout.c
  * explains what they mean.
  *
- * A script is read for the class of the objects (script_parse's elf64), as
- * merlin-ld reads it: for ELF64 its values are any u64 and its arithmetic
- * wraps modulo 2^64, as ld.lld's; for ELF32 (RV32, until #159) they are
- * exact 64-bit numbers up to 2^63 - 1, an overflow an error, and the 4 GiB
- * address space is checked where a value is used (layout.c). */
+ * Values are 64-bit addresses, as the ELF64 (RV64) objects' are: numbers go
+ * up to 2^64 - 1 and + and - wrap modulo 2^64, as in ld.lld (merlin-ld's
+ * script.rs). */
 #include "ld.h"
 
 const char DEFAULT_SCRIPT[] = "\n"
@@ -45,9 +42,6 @@ const char DEFAULT_SCRIPT[] = "\n"
 /* The error of a failed parse. */
 static uint err_line;
 static char *err_msg;
-
-/* Whether the script is read for ELF64 (script_parse's elf64). */
-static int elf64;
 
 static int fail(uint line, char *msg) {
     err_line = line;
@@ -194,31 +188,20 @@ static int lex(const char *src) {
 
 /* ---- Output formats ---- */
 
-const char *format_name(int format) {
-    return format == FORMAT_ELF64 ? "elf64-littleriscv" : "elf32-littleriscv";
-}
-
-/* The class an OUTPUT_FORMAT name stands for; FORMAT_NONE if merlin-ld does
- * not know it. ld.lld takes a -freebsd suffix too. */
-static int format_class(const char *name) {
+/* Whether an OUTPUT_FORMAT name is the class merlin-ld writes, ELF64
+ * (elf64-littleriscv). ld.lld takes a -freebsd suffix too. */
+static int format_known(const char *name) {
     uint n = (uint)strlen(name);
     if (n > 8 && strcmp(name + n - 8, "-freebsd") == 0) {
         n -= 8;
     }
-    if (n == 17 && strncmp(name, "elf32-littleriscv", 17) == 0) {
-        return FORMAT_ELF32;
-    }
-    if (n == 17 && strncmp(name, "elf64-littleriscv", 17) == 0) {
-        return FORMAT_ELF64;
-    }
-    return FORMAT_NONE;
+    return n == 17 && strncmp(name, "elf64-littleriscv", 17) == 0;
 }
 
 /* ---- Numbers and globs ---- */
 
-/* parse_number, for an ELF64 script (wide) or an ELF32 one: any u64, or
- * up to i64::MAX, the type ELF32 scripts are evaluated in. */
-static int number(const char *w, uint64_t *out, int wide) {
+/* parse_number: any u64. */
+static int number(const char *w, uint64_t *out) {
     uint n = (uint)strlen(w);
     if (n == 0) {
         return 0;
@@ -231,9 +214,9 @@ static int number(const char *w, uint64_t *out, int wide) {
         mult = 1024 * 1024;
         n--;
     }
-    /* The most either form may be before the multiplier, and a tenth of it. */
-    uint64_t max = wide ? UINT64_MAX : (uint64_t)INT64_MAX;
-    uint64_t tenth = wide ? 0x1999999999999999ULL : 0x0cccccccccccccccULL;
+    /* The most a number may be before the multiplier, and a tenth of it. */
+    uint64_t max = UINT64_MAX;
+    uint64_t tenth = 0x1999999999999999ULL;
     uint64_t v = 0;
     if (n >= 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) {
         if (n == 2) {
@@ -279,8 +262,8 @@ static int number(const char *w, uint64_t *out, int wide) {
     return 1;
 }
 
-int parse_number(const char *w, uint64_t *out, int wide) {
-    return number(w, out, wide);
+int parse_number(const char *w, uint64_t *out) {
+    return number(w, out);
 }
 
 int glob_match(const char *p, const char *n) {
@@ -498,7 +481,7 @@ static int atom(struct expr **out) {
     }
     if (w[0] >= '0' && w[0] <= '9') {
         struct expr *e = new_expr(X_NUM);
-        if (!number(w, &e->num, elf64)) {
+        if (!number(w, &e->num)) {
             return fail(line, fmt("bad number '%s'", w));
         }
         *out = e;
@@ -568,25 +551,9 @@ static int expr(struct expr **out) {
     }
 }
 
-/* a + b (sub: a - b) in a script's arithmetic: ELF64 modulo 2^64; ELF32
- * exact, as i64s, Rust's checked_add and checked_sub (0 on an overflow). */
-int script_add(uint64_t a, uint64_t b, int sub, int wide, uint64_t *out) {
-    uint64_t r = sub ? a - b : a + b;
-    if (!wide) {
-        /* A signed overflow: the operands' signs agree (for a - b, a's and
-         * the opposite of b's) and the result's does not. */
-        int na = (int64_t)a < 0, nb = ((int64_t)b < 0) ^ sub, nr = (int64_t)r < 0;
-        if (sub && b == (uint64_t)INT64_MIN) {
-            /* -i64::MIN does not exist: a - MIN overflows unless a < 0. */
-            if (!na) {
-                return 0;
-            }
-        } else if (na == nb && nr != na) {
-            return 0;
-        }
-    }
-    *out = r;
-    return 1;
+/* a + b (sub: a - b) in a script's arithmetic: modulo 2^64. */
+uint64_t script_add(uint64_t a, uint64_t b, int sub) {
+    return sub ? a - b : a + b;
 }
 
 /* Evaluates an expression made only of numbers. */
@@ -602,7 +569,8 @@ static int const_eval(struct expr *e, uint64_t *out) {
     if (!const_eval(e->a, &a) || !const_eval(e->b, &b)) {
         return 0;
     }
-    return script_add(a, b, e->kind == X_SUB, elf64, out);
+    *out = script_add(a, b, e->kind == X_SUB);
+    return 1;
 }
 
 /* `ORIGIN = constant-expr` (or one of the other names). */
@@ -631,11 +599,6 @@ static int region_field(const char *const *names, uint64_t *out) {
 
 static const char *const ORIGIN_NAMES[] = {"ORIGIN", "org", "o", NULL};
 static const char *const LENGTH_NAMES[] = {"LENGTH", "len", "l", NULL};
-
-/* An ELF32 script's value, read as an i64, fits in 32 bits unsigned. */
-static int fits_u32(uint64_t v) {
-    return v <= UINT32_MAX;
-}
 
 static int memory(struct script *s) {
     if (!expect("{")) {
@@ -670,24 +633,11 @@ static int memory(struct script *s) {
             !region_field(LENGTH_NAMES, &length)) {
             return 0;
         }
-        if (elf64) {
-            /* ELF64: the region ends below 2^64. ld.lld computes its end
-             * modulo 2^64, so one that reaches 2^64 ends at 0 and no
-             * section fits in it; an error here says why. */
-            if (origin + length < origin) {
-                return fail(line, fmt("MEMORY region %s extends past the 64-bit address space", name));
-            }
-        } else {
-            /* ELF32: within 4 GiB, which it may end at exactly. */
-            if (!fits_u32(origin)) {
-                return fail(line, fmt("MEMORY ORIGIN 0x%llx does not fit in 32 bits", origin));
-            }
-            if (!fits_u32(length)) {
-                return fail(line, fmt("MEMORY LENGTH 0x%llx does not fit in 32 bits", length));
-            }
-            if (origin + length > (uint64_t)1 << 32) {
-                return fail(line, fmt("MEMORY region %s extends past 4 GiB", name));
-            }
+        /* The region ends below 2^64. ld.lld computes its end modulo
+         * 2^64, so one that reaches 2^64 ends at 0 and no section fits in
+         * it; an error here says why. */
+        if (origin + length < origin) {
+            return fail(line, fmt("MEMORY region %s extends past the 64-bit address space", name));
         }
         have = 1;
         s->has_memory = 1;
@@ -885,14 +835,13 @@ static int sections(struct script *s) {
 }
 
 /* One argument of OUTPUT_FORMAT, a name merlin-ld knows. */
-static int format_arg(uint line, int *format) {
+static int format_arg(uint line) {
     char *f;
     if (!name_or_str("an output format", &f)) {
         return 0;
     }
-    *format = format_class(f);
-    if (*format == FORMAT_NONE) {
-        return fail(line, fmt("OUTPUT_FORMAT(%s): only elf32-littleriscv and elf64-littleriscv are supported", f));
+    if (!format_known(f)) {
+        return fail(line, fmt("OUTPUT_FORMAT(%s): only elf64-littleriscv is supported", f));
     }
     return 1;
 }
@@ -933,21 +882,16 @@ static int script(struct script *s) {
             /* OUTPUT_FORMAT(name) or OUTPUT_FORMAT(default, big, little), one
              * argument or three, as ld.lld takes them: it goes by the first;
              * merlin-ld also wants the others to be names it knows. */
-            int first;
-            if (!format_arg(line, &first)) {
+            if (!format_arg(line)) {
                 return 0;
             }
             if (eat(",")) {
-                int other;
-                if (!format_arg(line, &other) || !expect(",") || !format_arg(line, &other)) {
+                if (!format_arg(line) || !expect(",") || !format_arg(line)) {
                     return 0;
                 }
             }
             if (!expect(")")) {
                 return 0;
-            }
-            if (s->format == FORMAT_NONE) {
-                s->format = first;
             }
         } else if (strcmp(kw, "MEMORY") == 0) {
             if (seen_memory) {
@@ -975,9 +919,8 @@ static int script(struct script *s) {
     return 1;
 }
 
-int script_parse(const char *src, struct script *out, uint *line, char **msg, int for_elf64) {
+int script_parse(const char *src, struct script *out, uint *line, char **msg) {
     memset(out, 0, sizeof *out);
-    elf64 = for_elf64;
     pos = 0;
     if (!lex(src) || !script(out)) {
         *line = err_line;

@@ -1,36 +1,22 @@
 # Camelot kernel entry.
 #
-# RV32: the boot ROM (or the bootloader) jumps here, to the start of RAM
-# (0x8000_0000), in M-mode with interrupts off and paging off: hart 0 at
-# reset, every other hart when hart 0's SBI coldboot wakes it from the boot
-# ROM's park loop with an IPI (spec section 7, "Boot"). The RV32 kernel
-# carries its SBI (machine.S, the firmware's sbi.S) until #159.
-#
-# RV64: the firmware (spec section 7, "Firmware": Camelot's, which Grail
-# loads with --bios default, or OpenSBI) starts the boot hart here, at the
+# The firmware (spec section 7, "Firmware": Camelot's, which Grail loads
+# with --bios default, or OpenSBI) starts the boot hart here, at the
 # kernel's physical load address 0x8020_0000, in S-mode with paging off, a0
 # = its hart id and a1 = the device tree's physical address, as OpenSBI's
 # fw_jump starts Linux (Documentation/arch/riscv/boot.rst). The other harts
-# wait in the firmware for a hart_start. The RV64 kernel has no M-mode code.
+# wait in the firmware for a hart_start. The kernel has no M-mode code.
 #
-# The file has two halves:
-#   * RV32's M-mode: _start, which sends hart 0 to the SBI's coldboot and
-#     every other hart to wait for a hart_start (machine.S), and early_trap.
-#   * S-mode: _start on RV64, supervisor_entry and secondary_entry, where the
-#     SBI enters the kernel, as OpenSBI enters Linux (arch/riscv/kernel/
-#     head.S's _start_kernel and secondary_start_sbi): a0 = the hart's id,
-#     a1 = the device tree (hart 0) or hart_start's opaque value (the
-#     others), paging off. From there on the kernel reaches M-mode only
-#     through SBI calls (include/sbi.h).
+# _start, supervisor_entry and secondary_entry are where the SBI enters the
+# kernel, as OpenSBI enters Linux (arch/riscv/kernel/head.S's _start_kernel
+# and secondary_start_sbi): a0 = the hart's id, a1 = the device tree (hart
+# 0) or hart_start's opaque value (the others), paging off. From there on
+# the kernel reaches M-mode only through SBI calls (include/sbi.h).
 #
-# One source for both widths (#193): <asm.h> names the instructions that
-# differ (REG_L, REG_S, SZREG), and #if __riscv_xlen marks the code that
-# does.
+# <asm.h> names the register-wide loads and stores (REG_L, REG_S, SZREG),
+# as Linux's assembly does.
 #
-# RV32: the kernel runs where it is linked, at its physical address, and
-# paging, once on, maps it there (identity).
-#
-# RV64: a higher-half kernel, as Linux's riscv64 head.S boots one. The image
+# A higher-half kernel, as Linux's riscv64 head.S boots one. The image
 # is linked at 0xffff_ffff_8000_0000 (kernel.lds.S) but runs here at its
 # physical address, so until paging is on everything reaches its own symbols
 # pc-relatively (la, call: -mcmodel=medany), which works because the image
@@ -59,34 +45,6 @@
     .section .text.start
     .globl _start
 _start:
-#if __riscv_xlen == 32
-    la    t0, early_trap
-    csrw  mtvec, t0
-    csrr  t0, mhartid
-    bnez  t0, 3f
-    la    sp, __stack_top
-
-    # Zero .bss (the linker script aligns both ends to a register's size).
-    la    t0, __bss_start
-    la    t1, __bss_end
-1:  bgeu  t0, t1, 2f
-    REG_S zero, 0(t0)
-    addi  t0, t0, SZREG
-    j     1b
-
-    # The SBI's coldboot (machine.S): it sets M-mode up, readies the other
-    # harts and enters the kernel in S-mode at supervisor_entry, with a1 =
-    # 0, no device tree. sp stays the boot stack, which supervisor_entry
-    # runs on.
-2:  la    a0, supervisor_entry
-    li    a1, 0
-    j     sbi_coldboot
-
-# Any other hart, which the coldboot has woken: .bss is hart 0's by now,
-# leave it. Its own M-mode, then STOPPED until a hart_start.
-3:  call  sbi_hart_init
-    j     sbi_hart_wait
-#else
     # The boot hart, from the firmware, as Linux's _start_kernel begins:
     # nothing enabled or pending from what ran before.
     csrw  sie, zero
@@ -109,12 +67,11 @@ _start:
 2:  la    t0, dtb_early_pa
     REG_S a1, 0(t0)
     j     supervisor_entry
-#endif
 
     .text
 
-# Hart 0 in S-mode: a0 = 0, a1 = the device tree (RV32: none), on the boot
-# stack at its physical address. Then kmain(), and the machine stops with
+# Hart 0 in S-mode: a0 = 0, a1 = the device tree, on the boot stack at its
+# physical address. Then kmain(), and the machine stops with
 # its return value as the exit code. tp = the hart's id, for good: mycpu()
 # is &cpus[tp] (spinlock.h); only user programs change it, which user_vec
 # undoes.
@@ -124,7 +81,6 @@ supervisor_entry:
     # The outermost frame: a backtrace by frame pointer stops here, whatever
     # the SBI left in s0 (it defines a0 and a1 only).
     li    s0, 0
-#if __riscv_xlen == 64
     # Paging off, at the physical address. A trap here is a bug: stop.
     la    t0, early_s_trap
     csrw  stvec, t0
@@ -133,7 +89,6 @@ supervisor_entry:
     # High from here: pc-relative addresses are link addresses now. The
     # boot stack, at its link address.
     la    sp, __stack_top
-#endif
     # The S-mode trap vector (trap.h), at its link address.
     la    t0, kernel_vec
     csrw  stvec, t0
@@ -149,22 +104,16 @@ supervisor_entry:
 secondary_entry:
     # As Linux's secondary_start_sbi: nothing enabled or pending from
     # whatever ran before, a trap vector that needs nothing (Linux's
-    # .Lsecondary_park; on RV64 early_s_trap, which uses no stack), then tp
-    # and sp, all with paging still off. On RV32 the stack is a page at its
-    # physical address, which paging maps where it is, so kernel_vec can use
-    # it from the start; sstatus.SIE is 0, and nothing before it can trap.
-    # On RV64 it is at its link address in the vmalloc area, usable only
-    # once kernel_satp is in satp.
+    # .Lsecondary_park; here early_s_trap, which uses no stack), then tp and
+    # sp, all with paging still off. The stack is at its link address in the
+    # vmalloc area, usable only once kernel_satp is in satp.
     csrw  sie, zero
     csrw  sip, zero
-#if __riscv_xlen == 64
     la    t0, early_s_trap
     csrw  stvec, t0
-#endif
     mv    tp, a0
     mv    sp, a1
     li    s0, 0                 # the outermost frame, as on hart 0
-#if __riscv_xlen == 64
     call  relocate_enable_mmu
     # High. The trap vector goes high first: early_s_trap at its link
     # address, which the early page table and the kernel's both map, as
@@ -179,13 +128,11 @@ secondary_entry:
     REG_L t0, 0(t0)
     csrw  satp, t0
     sfence.vma
-#endif
     la    t0, kernel_vec
     csrw  stvec, t0
     call  hart_main
 1:  j     1b
 
-#if __riscv_xlen == 64
 # Turns paging on with the early page table, which maps the image at its
 # physical address too, so this code keeps running after the satp write,
 # and returns to the caller's link address: ra plus the distance between
@@ -200,7 +147,6 @@ relocate_enable_mmu:
     csrw  satp, t0
     sfence.vma
     ret
-#endif
 
 # void xcal_dbg(u32 val)
     .globl xcal_dbg
@@ -208,26 +154,7 @@ xcal_dbg:
     .word 0x0005000b            # xcal.dbg a0
     ret
 
-#if __riscv_xlen == 32
-# A trap in M-mode before sbi_hart_init installs machine_vec is a bug (one
-# machine_vec doesn't handle goes to the SBI's sbi_trap_error, which does
-# the same). Show mcause, mepc and mtval on the debug console and stop with
-# exit code 0xff.
-    .align 2
-    .globl early_trap
-early_trap:
-    csrr  a0, mcause
-    .word 0x0005000b            # xcal.dbg a0
-    csrr  a0, mepc
-    .word 0x0005000b            # xcal.dbg a0
-    csrr  a0, mtval
-    .word 0x0005000b            # xcal.dbg a0
-    li    a0, EXIT_UNEXPECTED_TRAP
-    .word 0x0005100b            # xcal.halt a0
-1:  j     1b
-#endif
 
-#if __riscv_xlen == 64
 # A trap in S-mode before stvec points at kernel_vec, at the high address
 # (paging off, or going on): a bug. Show scause, sepc and stval on the debug
 # console and stop with exit code 0xff, through the SBI. No stack: a hart
@@ -274,4 +201,3 @@ overflow_stacks:
     .globl dtb_early_pa
 dtb_early_pa:
     .zero 8
-#endif

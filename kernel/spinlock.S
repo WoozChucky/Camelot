@@ -9,8 +9,8 @@
 # LOCK_CPU (name after it, only read by C). struct cpu: proc at 0, the u32s
 # noff and intena at CPU_NOFF and CPU_INTENA, CPU_SIZE bytes per entry of
 # cpus[], indexed by tp, the hart id. spinlock.h defines them, and its
-# _Static_asserts check them against the structures: on RV64 the pointers
-# are 8 bytes, 8-aligned.
+# _Static_asserts check them against the structures: the pointers are 8
+# bytes, 8-aligned.
 #
 # The C each function stands for is in a C comment, not a # one: this file
 # goes through the C preprocessor, which would take `#  if (...)` for a
@@ -24,13 +24,13 @@
 
 /* u32 r_tp(void)
  *
- * A u32 result is returned sign-extended from bit 31 on RV64, as the ABI
+ * A u32 result is returned sign-extended from bit 31, as the ABI
  * keeps every 32-bit value in a register (and the compiler's comparisons
- * rely on it): ADDIW (asm.h) makes one of tp, whatever its upper half holds
+ * rely on it): addiw makes one of tp, whatever its upper half holds
  * (illegal_instruction() fills tp with a pattern before it faults). */
     .globl r_tp
 r_tp:
-    ADDIW a0, tp, 0
+    addiw a0, tp, 0
     ret
 
 /* struct cpu *mycpu(void) { return &cpus[tp]; }

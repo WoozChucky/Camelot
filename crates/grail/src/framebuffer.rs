@@ -649,11 +649,9 @@ impl Framebuffer {
 
     /// Reads a register, at the widths of spec section 9 ([`mmio::access`]): 32-bit
     /// registers take 4-byte accesses, `FB_SCANOUT` and `FB_CURSOR_ADDR` an 8-byte one or
-    /// either 4-byte half, and unused offsets read as 0 at 4 and 8 bytes. Those two are
-    /// 64-bit on an RV32 machine too (they have no version 1 layout), so the device takes
-    /// 8-byte accesses at both widths.
+    /// either 4-byte half, and unused offsets read as 0 at 4 and 8 bytes.
     pub fn read(&mut self, off: u32, size: u32) -> Result<u64, BusFault> {
-        let access = mmio::access(off, size, true, Self::field)?;
+        let access = mmio::access(off, size, Self::field)?;
         Ok(access.read(|reg| self.value(reg)))
     }
 
@@ -661,7 +659,7 @@ impl Framebuffer {
     /// read-only registers and unused offsets are ignored. `ram_len` is the size of RAM,
     /// which a scanout buffer must lie in.
     pub fn write(&mut self, off: u32, size: u32, val: u64, ram_len: u64) -> Result<(), BusFault> {
-        let access = mmio::access(off, size, true, Self::field)?;
+        let access = mmio::access(off, size, Self::field)?;
         // For the vertical blank, which checks the cursor's address against RAM.
         self.ram_len = ram_len;
         let Some(reg) = access.reg() else {
@@ -1510,7 +1508,7 @@ mod tests {
         assert_eq!((fb.cursor().x, fb.cursor_updates), (7, 5));
         assert!(fb.take_cursor_update());
         // A write of the address it holds is a new image (one redrawn in place), at the
-        // blank, as a write of Intel's CURBASE is; on RV32, written by halves, it is one.
+        // blank, as a write of Intel's CURBASE is; written by halves, it is one.
         fb.write(REG_CURSOR_ADDR, 8, image, RAM).unwrap();
         fb.advance(99);
         assert_eq!(fb.cursor_updates, 5, "not yet");

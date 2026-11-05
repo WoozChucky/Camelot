@@ -146,13 +146,13 @@ fn polling_example_echoes_presses() {
     assert_eq!(m.run(Some(1_000_000), |_| {}), RunResult::Exited(0));
     assert_eq!(
         output(&mut m),
-        format!("Hi^c!\x08 \x08[80][83][90][9a]\t\n[dbg] pc={DONE_PC} s1 = 0x0000000c (12)\n")
+        format!("Hi^c!\x08 \x08[80][83][90][9a]\t\n[dbg] pc={DONE_PC} s1 = 0x000000000000000c (12)\n")
     );
     assert_eq!(m.cpu.bus.kbd.len(), 1, "only the release of Esc is left");
 }
 
 /// Where `examples/kbd-echo/kbd-echo.elf` shows its count, as `xcal.dbg` prints it.
-const DONE_PC: &str = "800000f0";
+const DONE_PC: &str = "00000000800000f0";
 
 /// A key as Grail's window reports it: its ASCII-mode code and its usage.
 fn key(code: u8, usage: u16) -> KeyEvent {
@@ -176,7 +176,8 @@ fn up(ev: KeyEvent) -> KeyEvent {
 #[test]
 fn polling_example_switches_to_raw_mode_and_back() {
     use grail::keyboard::usage;
-    for name in ["kbd-echo.elf", "kbd-echo-rv64.elf"] {
+    {
+        let name = "kbd-echo.elf";
         let mut m = load(name);
         let f12 = key(code::F12, usage::F12);
         let a = key(b'a', usage::A);
@@ -220,7 +221,7 @@ fn polling_example_switches_to_raw_mode_and_back() {
         // Presses: a, F12, Shift, A, Right Alt, GUI, Home, keypad Enter, F12, b, F12, Esc.
         let dbg = output(&mut m);
         assert!(dbg.starts_with("[dbg] pc="), "{dbg}");
-        assert!(dbg.ends_with("s1 = 0x0000000c (12)\n") || dbg.ends_with("s1 = 0x000000000000000c (12)\n"));
+        assert!(dbg.ends_with("s1 = 0x000000000000000c (12)\n"), "{dbg}");
     }
 }
 
@@ -241,7 +242,7 @@ fn polling_example_waits_for_keys_between_slices() {
     }
     m.key_event(KeyEvent::press(code::ESC));
     assert_eq!(m.run(Some(10_000), |_| {}), RunResult::Exited(0));
-    assert!(output(&mut m).ends_with("s1 = 0x00000004 (4)\n"));
+    assert!(output(&mut m).ends_with("s1 = 0x0000000000000004 (4)\n"));
 }
 
 #[test]
@@ -274,7 +275,7 @@ fn interrupt_example_takes_one_interrupt_per_event() {
     // 7 taps (14 events) plus the Esc press.
     assert_eq!(
         output(&mut m),
-        "Hello[81]\n[dbg] pc=800000b0 s0 = 0x0000000f (15)\n"
+        "Hello[81]\n[dbg] pc=00000000800000b4 s0 = 0x000000000000000f (15)\n"
     );
 }
 
@@ -293,7 +294,7 @@ fn interrupt_example_sleeps_until_a_key_arrives() {
     }
     assert!(m.key_event(KeyEvent::press(code::ESC)));
     assert_eq!(m.run(Some(10_000), |_| {}), RunResult::Exited(0));
-    assert!(output(&mut m).ends_with("s0 = 0x00000007 (7)\n"));
+    assert!(output(&mut m).ends_with("s0 = 0x0000000000000007 (7)\n"));
 }
 
 #[test]
@@ -303,7 +304,7 @@ fn without_a_window_the_keyboard_stays_empty() {
     for args in [&[][..], &["--fb", "--headless"][..]] {
         let out = Command::new(env!("CARGO_BIN_EXE_grail"))
             .args(args)
-            .args(["--max-steps", "200000"])
+            .args(["--bios", "none", "--max-steps", "200000"])
             .arg(example("kbd-echo.elf"))
             .stdin(std::process::Stdio::null())
             .output()

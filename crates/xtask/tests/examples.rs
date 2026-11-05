@@ -1,20 +1,18 @@
 //! Every example built with our own tools, merlin-as + merlin-ld, as
-//! `cargo xtask examples` builds it (roadmap step 6, issue #8), for RV32 and
-//! for RV64 (#151). No LLVM:
+//! `cargo xtask examples` builds it (roadmap step 6, issue #8). No LLVM:
 //!
-//! * the committed `examples/<dir>/<name>.elf` and `<name>-rv64.elf` files are
-//!   exactly what the current tools build from the sources;
-//! * each freshly built program runs in Grail, on a machine of its width, with
-//!   input where it reads some (UART bytes, key events, pointer input, a disk,
+//! * the committed `examples/<dir>/<name>.elf` files are exactly what the
+//!   current tools build from the sources;
+//! * each freshly built program runs in Grail, on a machine without firmware
+//!   (`--bios none`: the examples are bare-metal M-mode programs), with input
+//!   where it reads some (UART bytes, key events, pointer input, a disk,
 //!   another machine on a network), and prints what it should and exits with
-//!   the right code. Both widths print the same, apart from what the width
-//!   changes: `xcal.dbg`'s 16-digit pc and register, the addresses the
-//!   programs print in 16 hex digits, sysinfo's version 2, muldiv's cases;
+//!   the right code;
 //! * `hello` and `multiobj` load byte for byte like ld.lld's link of clang's
 //!   objects (the references in `crates/merlin-ld/tests/fixtures`, made by
-//!   `cargo xtask ld-fixtures`), and merlin-objdump's disassembly of the RV32
-//!   ones is llvm-objdump's of ld.lld's. What differs outside the loaded bytes
-//!   is pinned down here and listed in docs/excalibur-spec.md section 10.
+//!   `cargo xtask ld-fixtures`), and merlin-objdump's disassembly of them is
+//!   llvm-objdump's of ld.lld's. What differs outside the loaded bytes is
+//!   pinned down here and listed in docs/excalibur-spec.md section 10.
 
 use elf::{Elf, PT_GNU_STACK, PT_LOAD, PT_RISCV_ATTRIBUTES, SHF_ALLOC, SHT_SYMTAB};
 use grail::block::SECTOR_SIZE;
@@ -25,14 +23,14 @@ use grail::{DiskConfig, Machine, MachineConfig, NetConfig, RunResult};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
-use xtask::examples::{self, Example, Xlen, EXAMPLES, XLENS};
+use xtask::examples::{self, Example, EXAMPLES};
 use xtask::repo_root;
 
 /// Enough for colorbars, which writes every pixel of the 640x480 framebuffer.
 const MAX_STEPS: u64 = 20_000_000;
 
-fn build(ex: &Example, xlen: Xlen) -> examples::Built {
-    examples::build(&repo_root(), ex, xlen).unwrap_or_else(|e| panic!("{} ({xlen:?}): {e}", ex.name))
+fn build(ex: &Example) -> examples::Built {
+    examples::build(&repo_root(), ex).unwrap_or_else(|e| panic!("{}: {e}", ex.name))
 }
 
 fn example(name: &str) -> &'static Example {
@@ -66,14 +64,6 @@ fn typed(text: &str) -> Vec<KeyEvent> {
     keys
 }
 
-/// What `name` gets and must do on an `xlen` machine.
-fn scenario(name: &str, xlen: Xlen) -> Scenario {
-    match xlen {
-        Xlen::Rv32 => scenario_rv32(name),
-        Xlen::Rv64 => scenario_rv64(name),
-    }
-}
-
 /// A scenario with no input.
 fn plain(output: &'static str, exit: u32) -> Scenario {
     Scenario {
@@ -100,99 +90,16 @@ fn pointer_input(output: &'static str) -> Scenario {
     }
 }
 
-fn scenario_rv32(name: &str) -> Scenario {
-    match name {
-        "hello" => plain("Hello from Camelot!\n[dbg] pc=80000018 a0 = 0x00000014 (20)\n", 0),
-        // Both strings (47 bytes, counted in print.S's .bss), then exit code
-        // 42 from main.S's .data.
-        "multiobj" => plain(
-            "Hello from two objects!\nputs lives in print.S.\n[dbg] pc=80000034 a0 = 0x0000002f (47)\n",
-            42,
-        ),
-        // All 17 cases passed.
-        "muldiv" => plain("[dbg] pc=80000168 a0 = 0x00000011 (17)\n", 0),
-        "sysinfo" => plain(
-            "sysinfo v1\n\
-             RAM      4 MiB at 0x80000000\n\
-             CPU      10000000 Hz (nominal)\n\
-             timebase 10000000 Hz\n\
-             9 devices:\n  \
-             test      0x00100000 + 0x00001000\n  \
-             CLINT     0x02000000 + 0x00010000\n  \
-             PLIC      0x0c000000 + 0x04000000\n  \
-             UART      0x10000000 + 0x00000100  irq 1\n  \
-             fb-ctrl   0x30000000 + 0x00001000  irq 16\n  \
-             keyboard  0x30001000 + 0x00001000  irq 2\n  \
-             sysinfo   0x30002000 + 0x00001000\n  \
-             pointer   0x30003000 + 0x00001000  irq 11\n  \
-             fb-vram   0x31000000 + 0x0012c000\n",
-            0,
-        ),
-        // Sector 0's text, the failed read past the end, and the write test on
-        // the last sector.
-        "disk" => Scenario {
-            disk: Some(DISK_IMG),
-            ..plain(
-                "disk 0x10001000, irq 3: 8 sectors\n\
-                 sector 0:\n\
-                 Hello from sector 0 of disk.img!\n\
-                 This text is on the disk image, not in the program.\n\
-                 read past the end: error 2\n\
-                 write/read-back of sector 7: ok\n",
-                0,
-            )
-        },
-        // One interrupt per byte, EOT included (and not echoed).
-        "uart-echo" => Scenario {
-            stdin: b"hi\n\x04",
-            ..plain("hi\n[dbg] pc=800000ac s0 = 0x00000004 (4)\n", 0)
-        },
-        // Draws into the framebuffer; checked in `examples_run_in_grail`.
-        "colorbars" => plain("", 0),
-        // Presses seen, Esc included.
-        "kbd-echo" => Scenario {
-            keys: typed("ok"),
-            ..plain("ok[dbg] pc=800000f0 s1 = 0x00000003 (3)\n", 0)
-        },
-        // One interrupt per event: two taps and the Esc press.
-        "kbd-echo-irq" => Scenario {
-            keys: typed("ok"),
-            ..plain("ok[dbg] pc=800000b0 s0 = 0x00000005 (5)\n", 0)
-        },
-        // The cursor is checked in `examples_run_in_grail`.
-        "pointer" => pointer_input("[dbg] pc=8000017c s4 = 0x00000003 (3)\n"),
-        // Eight frames shown; the frames are checked in `examples_run_in_grail`.
-        "flip" => plain("[dbg] pc=8000013c s4 = 0x00000008 (8)\n", 0),
-        // Six places of the cursor over one frame; `crates/grail/tests/framebuffer.rs`
-        // checks what the display shows at each.
-        "cursor" => plain("[dbg] pc=80000194 s1 = 0x00000006 (6)\n", 0),
-        // One hart: every count is its own, and no store-conditional can fail.
-        // `smp_example_runs_on_every_hart_count` runs it on more.
-        "smp" => plain(
-            "harts: 1\n\
-             amoadd: 1000 = 1 x 1000\n\
-             lr/sc: 1000 = 1 x 1000, 0 retries\n\
-             ipi: 3 interrupts, 3 on each hart\n",
-            0,
-        ),
-        // Alone, without a network card; `net_examples_talk_over_a_hub` connects them.
-        "net-ping" | "net-pong" => plain("no network card (try grail --net hub)\n", 1),
-        // Alone too; crates/grail/tests/net_user.rs runs it behind the NAT gateway.
-        "net-user" => plain("no network card (try grail --net user)\n", 1),
-        other => panic!("no scenario for example {other}: add one"),
-    }
-}
-
-/// The RV64 builds: what the RV32 ones print, but `xcal.dbg` shows the 64-bit pc and
-/// register, the programs print addresses and sizes in 16 hex digits, sysinfo is
-/// version 2, and muldiv has its RV64 cases. A pc can differ where the RV64 code
-/// does (`li` of a 64-bit interrupt cause takes one instruction more).
-fn scenario_rv64(name: &str) -> Scenario {
+/// What `name` gets and must do. `xcal.dbg` shows the 64-bit pc and register,
+/// and the programs print addresses and sizes in 16 hex digits.
+fn scenario(name: &str) -> Scenario {
     match name {
         "hello" => plain(
             "Hello from Camelot!\n[dbg] pc=0000000080000018 a0 = 0x0000000000000014 (20)\n",
             0,
         ),
+        // Both strings (47 bytes, counted in print.S's .bss), then exit code
+        // 42 from main.S's .data.
         "multiobj" => plain(
             "Hello from two objects!\nputs lives in print.S.\n\
              [dbg] pc=0000000080000034 a0 = 0x000000000000002f (47)\n",
@@ -217,6 +124,8 @@ fn scenario_rv64(name: &str) -> Scenario {
              fb-vram   0x0000000031000000 + 0x000000000012c000\n",
             0,
         ),
+        // Sector 0's text, the failed read past the end, and the write test on
+        // the last sector.
         "disk" => Scenario {
             disk: Some(DISK_IMG),
             ..plain(
@@ -229,43 +138,63 @@ fn scenario_rv64(name: &str) -> Scenario {
                 0,
             )
         },
+        // One interrupt per byte, EOT included (and not echoed).
         "uart-echo" => Scenario {
             stdin: b"hi\n\x04",
             ..plain("hi\n[dbg] pc=00000000800000b0 s0 = 0x0000000000000004 (4)\n", 0)
         },
+        // Draws into the framebuffer; checked in `examples_run_in_grail`.
         "colorbars" => plain("", 0),
+        // Presses seen, Esc included.
         "kbd-echo" => Scenario {
             keys: typed("ok"),
             ..plain("ok[dbg] pc=00000000800000f0 s1 = 0x0000000000000003 (3)\n", 0)
         },
+        // One interrupt per event: two taps and the Esc press.
         "kbd-echo-irq" => Scenario {
             keys: typed("ok"),
             ..plain("ok[dbg] pc=00000000800000b4 s0 = 0x0000000000000005 (5)\n", 0)
         },
+        // The cursor is checked in `examples_run_in_grail`.
         "pointer" => pointer_input("[dbg] pc=0000000080000180 s4 = 0x0000000000000003 (3)\n"),
+        // Eight frames shown; the frames are checked in `examples_run_in_grail`.
         "flip" => plain("[dbg] pc=000000008000013c s4 = 0x0000000000000008 (8)\n", 0),
+        // Six places of the cursor over one frame; `crates/grail/tests/framebuffer.rs`
+        // checks what the display shows at each.
         "cursor" => plain("[dbg] pc=000000008000019c s1 = 0x0000000000000006 (6)\n", 0),
-        "smp" | "net-ping" | "net-pong" | "net-user" => scenario_rv32(name),
-        other => panic!("no RV64 scenario for example {other}: add one"),
+        // One hart: every count is its own, and no store-conditional can fail.
+        // `smp_example_runs_on_every_hart_count` runs it on more.
+        "smp" => plain(
+            "harts: 1\n\
+             amoadd: 1000 = 1 x 1000\n\
+             lr/sc: 1000 = 1 x 1000, 0 retries\n\
+             ipi: 3 interrupts, 3 on each hart\n",
+            0,
+        ),
+        // Alone, without a network card; `net_examples_talk_over_a_hub` connects them.
+        "net-ping" | "net-pong" => plain("no network card (try grail --bios none --net hub)\n", 1),
+        // Alone too; crates/grail/tests/net_user.rs runs it behind the NAT gateway.
+        "net-user" => plain("no network card (try grail --bios none --net user)\n", 1),
+        other => panic!("no scenario for example {other}: add one"),
     }
 }
 
 /// The image `examples/disk` reads, relative to the repository root.
 const DISK_IMG: &str = "examples/disk/disk.img";
 
-/// Runs `elf` on a default machine of its width whose RAM starts as garbage (so
+/// Runs `elf` on a default machine (no firmware) whose RAM starts as garbage (so
 /// `.bss` must really be zeroed by the loader) with the scenario's input.
-fn run(elf: &[u8], xlen: Xlen, s: &Scenario) -> (RunResult, String, Machine) {
+fn run(elf: &[u8], s: &Scenario) -> (RunResult, String, Machine) {
     let disks = match s.disk {
         Some(img) => vec![DiskConfig::memory(std::fs::read(repo_root().join(img)).unwrap())],
         None => Vec::new(),
     };
     let mut m = Machine::new(MachineConfig {
-        xlen,
         disks,
         ..MachineConfig::default()
     })
     .unwrap();
+    assert_eq!(m.config().bios, grail::Bios::None);
     m.cpu.bus.ram.fill(0xa5);
     m.cpu.bus.uart.capture = true;
     m.load_elf(elf).unwrap();
@@ -281,7 +210,6 @@ fn run(elf: &[u8], xlen: Xlen, s: &Scenario) -> (RunResult, String, Machine) {
         assert!(m.key_event(k), "keyboard FIFO full");
     }
     let r = m.run(Some(MAX_STEPS), |_| {});
-    assert_eq!(m.cpu.xlen(), xlen, "the program is as wide as the machine");
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
     (r, out, m)
 }
@@ -319,18 +247,16 @@ fn every_example_source_is_built() {
 }
 
 /// The command lines at the top of each example's first source are the ones
-/// `cargo xtask examples -v` prints for it, at each width, with the objects in
-/// the current directory: one source gives both builds.
+/// `cargo xtask examples -v` prints for it, with the objects in the current
+/// directory.
 #[test]
 fn the_sources_give_their_build_commands() {
     for ex in EXAMPLES {
-        for xlen in XLENS {
-            let first = ex.sources[0];
-            let text = std::fs::read_to_string(ex.dir(&repo_root()).join(first)).unwrap();
-            for cmd in examples::commands(ex, xlen, "OBJ") {
-                let cmd = cmd.replace("OBJ/", "");
-                assert!(text.contains(&format!("#   {cmd}\n")), "{first}: {cmd}");
-            }
+        let first = ex.sources[0];
+        let text = std::fs::read_to_string(ex.dir(&repo_root()).join(first)).unwrap();
+        for cmd in examples::commands(ex, "OBJ") {
+            let cmd = cmd.replace("OBJ/", "");
+            assert!(text.contains(&format!("#   {cmd}\n")), "{first}: {cmd}");
         }
     }
 }
@@ -338,38 +264,32 @@ fn the_sources_give_their_build_commands() {
 #[test]
 fn committed_examples_are_current() {
     for ex in EXAMPLES {
-        for xlen in XLENS {
-            let built = build(ex, xlen);
-            assert!(built.warnings.is_empty(), "{}: {:?}", ex.name, built.warnings);
-            let path = ex.elf_path(&repo_root(), xlen);
-            let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            assert!(
-                committed == built.elf,
-                "{} is not what merlin-as + merlin-ld build: run `cargo xtask examples {}` and commit it",
-                ex.elf_name(xlen),
-                ex.name
-            );
-            let class = Elf::parse(&committed).unwrap().class;
-            let want = match xlen {
-                Xlen::Rv32 => elf::Class::Elf32,
-                Xlen::Rv64 => elf::Class::Elf64,
-            };
-            assert_eq!(class, want, "{}", ex.elf_name(xlen));
-        }
+        let built = build(ex);
+        assert!(built.warnings.is_empty(), "{}: {:?}", ex.name, built.warnings);
+        let path = ex.elf_path(&repo_root());
+        let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(
+            committed == built.elf,
+            "{} is not what merlin-as + merlin-ld build: run `cargo xtask examples {}` and commit it",
+            ex.elf_name(),
+            ex.name
+        );
+        let class = Elf::parse(&committed).unwrap().class;
+        assert_eq!(class, elf::Class::Elf64, "{}", ex.elf_name());
     }
 }
 
-/// Acceptance of #8, and of #151 for RV64: every example, built from source with
-/// our tools, runs.
+/// Acceptance of #8 and #151: every example, built from source with our tools,
+/// runs.
 #[test]
 fn examples_run_in_grail() {
-    for (ex, xlen) in EXAMPLES.iter().flat_map(|e| XLENS.map(|x| (e, x))) {
-        let s = scenario(ex.name, xlen);
-        let (r, out, mut m) = run(&build(ex, xlen).elf, xlen, &s);
+    for ex in EXAMPLES {
+        let s = scenario(ex.name);
+        let (r, out, mut m) = run(&build(ex).elf, &s);
         assert_eq!(
             (r, out.as_str()),
             (RunResult::Exited(s.exit), s.output),
-            "{} ({xlen:?})",
+            "{}",
             ex.name
         );
         if ex.name == "colorbars" {
@@ -426,70 +346,56 @@ fn examples_run_in_grail() {
 #[test]
 fn interactive_examples_wait_for_input() {
     for name in ["uart-echo", "kbd-echo", "kbd-echo-irq", "pointer"] {
-        for xlen in XLENS {
-            let idle = plain("", 0);
-            let (r, out, _) = run(&build(example(name), xlen).elf, xlen, &idle);
-            assert_eq!((r, out.as_str()), (RunResult::StepLimit, ""), "{name} ({xlen:?})");
-        }
+        let idle = plain("", 0);
+        let (r, out, _) = run(&build(example(name)).elf, &idle);
+        assert_eq!((r, out.as_str()), (RunResult::StepLimit, ""), "{name}");
     }
 }
 
 /// `examples/net`: ping and pong, freshly built, on two machines connected by a
-/// hub, at each width (the RV64 card has 16-byte descriptors and a 64-bit
-/// address, printed in 16 digits). Pong starts first, so its card has buffers
-/// when ping's frame comes.
+/// hub (the card has 16-byte descriptors and a 64-bit address, printed in 16
+/// digits). Pong starts first, so its card has buffers when ping's frame comes.
 #[test]
 fn net_examples_talk_over_a_hub() {
-    for xlen in XLENS {
-        let hub = Hub::new();
-        let boot = |name: &str| {
-            let config = MachineConfig {
-                xlen,
-                nets: vec![NetConfig::hub(&hub)],
-                ..MachineConfig::default()
-            };
-            let mut m = Machine::new(config).unwrap();
-            m.cpu.bus.uart.capture = true;
-            m.load_elf(&build(example(name), xlen).elf).unwrap();
-            m
+    let hub = Hub::new();
+    let boot = |name: &str| {
+        let config = MachineConfig {
+            nets: vec![NetConfig::hub(&hub)],
+            ..MachineConfig::default()
         };
-        let mut ping = boot("net-ping");
-        let mut pong = boot("net-pong");
-        pong.run_for(20_000, &mut |_| {});
-        for _ in 0..1000 {
-            ping.run_for(1000, &mut |_| {});
-            pong.run_for(1000, &mut |_| {});
-        }
-        let out = |m: &mut Machine| String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-        let card = match xlen {
-            Xlen::Rv32 => "net 0x10009000",
-            Xlen::Rv64 => "net 0x0000000010009000",
-        };
-        assert_eq!(
-            (ping.exit_code(), out(&mut ping)),
-            (
-                Some(0),
-                format!(
-                    "{card}, irq 12, mac 02:ca:00:00:00:01, link up\n\
-                     sent 60 bytes to ff:ff:ff:ff:ff:ff\n\
-                     received 60 bytes from 02:ca:00:00:00:02, type 0x88b5: Hello back from pong!\n"
-                )
-            ),
-            "{xlen:?}"
-        );
-        assert_eq!(
-            (pong.exit_code(), out(&mut pong)),
-            (
-                Some(0),
-                format!(
-                    "{card}, irq 12, mac 02:ca:00:00:00:02, link up\n\
-                     received 60 bytes from 02:ca:00:00:00:01, type 0x88b5: Hello from ping!\n\
-                     sent 60 bytes to 02:ca:00:00:00:01\n"
-                )
-            ),
-            "{xlen:?}"
-        );
+        let mut m = Machine::new(config).unwrap();
+        m.cpu.bus.uart.capture = true;
+        m.load_elf(&build(example(name)).elf).unwrap();
+        m
+    };
+    let mut ping = boot("net-ping");
+    let mut pong = boot("net-pong");
+    pong.run_for(20_000, &mut |_| {});
+    for _ in 0..1000 {
+        ping.run_for(1000, &mut |_| {});
+        pong.run_for(1000, &mut |_| {});
     }
+    let out = |m: &mut Machine| String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
+    assert_eq!(
+        (ping.exit_code(), out(&mut ping)),
+        (
+            Some(0),
+            "net 0x0000000010009000, irq 12, mac 02:ca:00:00:00:01, link up\n\
+             sent 60 bytes to ff:ff:ff:ff:ff:ff\n\
+             received 60 bytes from 02:ca:00:00:00:02, type 0x88b5: Hello back from pong!\n"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        (pong.exit_code(), out(&mut pong)),
+        (
+            Some(0),
+            "net 0x0000000010009000, irq 12, mac 02:ca:00:00:00:02, link up\n\
+             received 60 bytes from 02:ca:00:00:00:01, type 0x88b5: Hello from ping!\n\
+             sent 60 bytes to 02:ca:00:00:00:01\n"
+                .to_string()
+        )
+    );
 }
 
 /// `examples/smp`, freshly built, on 2 to 8 harts: hart 0 wakes the others with
@@ -498,13 +404,9 @@ fn net_examples_talk_over_a_hub() {
 /// share of the IPIs.
 #[test]
 fn smp_example_runs_on_every_hart_count() {
-    for (xlen, harts) in XLENS
-        .into_iter()
-        .flat_map(|x| (2..=grail::MAX_HARTS).map(move |h| (x, h)))
-    {
-        let elf = build(example("smp"), xlen).elf;
+    let elf = build(example("smp")).elf;
+    for harts in 2..=grail::MAX_HARTS {
         let mut m = Machine::new(MachineConfig {
-            xlen,
             harts,
             ..MachineConfig::default()
         })
@@ -534,24 +436,17 @@ fn smp_example_runs_on_every_hart_count() {
 /// disk is what it reads.
 #[test]
 fn disk_example_needs_its_disk() {
-    for xlen in XLENS {
-        let (r, _, _) = run(&build(example("disk"), xlen).elf, xlen, &plain("", 1));
-        assert_eq!(r, RunResult::Exited(1), "{xlen:?}");
-    }
+    let (r, _, _) = run(&build(example("disk")).elf, &plain("", 1));
+    assert_eq!(r, RunResult::Exited(1));
 }
 
 /// The multi-object example breaks if a cross-object reference is wrong: the
 /// strings, the counter in the other object's .bss and the .data pointers.
 #[test]
 fn multiobj_needs_both_objects() {
-    for (xlen, main_o) in [(Xlen::Rv32, "main.o"), (Xlen::Rv64, "main.o")] {
-        multiobj_needs_both(xlen, main_o);
-    }
-}
-
-fn multiobj_needs_both(xlen: Xlen, main_o: &str) {
+    let main_o = "main.o";
     let ex = example("multiobj");
-    let built = build(ex, xlen);
+    let built = build(ex);
     assert_eq!(
         built.objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(),
         [main_o, "print.o"]
@@ -587,16 +482,10 @@ fn multiobj_needs_both(xlen: Xlen, main_o: &str) {
 // ---------------------------------------------------------------------------
 // Against ld.lld.
 
-/// `file` of the fixture directory `dir` of the `xlen` set (RV64's in
-/// `fixtures/rv64`).
-fn fixture(xlen: Xlen, dir: &str, file: &str) -> PathBuf {
-    let set = match xlen {
-        Xlen::Rv32 => xtask::ld_fixtures::RV32.dir,
-        Xlen::Rv64 => xtask::ld_fixtures::RV64.dir,
-    };
+/// `file` of the fixture directory `dir`.
+fn fixture(dir: &str, file: &str) -> PathBuf {
     repo_root()
         .join(xtask::ld_fixtures::FIXTURES)
-        .join(set)
         .join(dir)
         .join(file)
 }
@@ -660,14 +549,10 @@ fn llvm_style_disassembly(name: &str, elf: &[u8]) -> String {
 
 /// Acceptance of #8: the merlin-built example against clang + ld.lld (both
 /// with relaxation off; see the reference command at the top of each source).
-///
-/// At each width: the RV64 build against the RV64 set's link of clang's RV64
-/// objects (`fixtures/rv64`). Its disassembly is compared from #150, when
-/// merlin-objdump reads ELF64; the loaded bytes already are.
-fn assert_like_ld_lld(name: &str, xlen: Xlen) {
+fn assert_like_ld_lld(name: &str) {
     let ex = example(name);
-    let ours_bytes = build(ex, xlen).elf;
-    let lld_bytes = std::fs::read(fixture(xlen, ex.dir, "link.lld.elf")).unwrap();
+    let ours_bytes = build(ex).elf;
+    let lld_bytes = std::fs::read(fixture(ex.dir, "link.lld.elf")).unwrap();
     let (ours, lld) = (Elf::parse(&ours_bytes).unwrap(), Elf::parse(&lld_bytes).unwrap());
     assert_eq!(ours.class, lld.class, "{name}: class");
 
@@ -677,16 +562,14 @@ fn assert_like_ld_lld(name: &str, xlen: Xlen) {
     assert_eq!(alloc_sections(&ours), alloc_sections(&lld), "{name}: sections");
 
     // The disassembly is the same text (llvm-objdump -d of ld.lld's output).
-    if xlen == Xlen::Rv32 {
-        let want = std::fs::read_to_string(fixture(xlen, ex.dir, "link.objdump.txt"))
-            .unwrap()
-            .replace("\r\n", "\n");
-        assert_eq!(
-            llvm_style_disassembly("link.lld.elf", &ours_bytes),
-            want,
-            "{name}: disassembly"
-        );
-    }
+    let want = std::fs::read_to_string(fixture(ex.dir, "link.objdump.txt"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert_eq!(
+        llvm_style_disassembly("link.lld.elf", &ours_bytes),
+        want,
+        "{name}: disassembly"
+    );
 
     // Symbols: the same names and values, except the mapping symbols.
     let (ours_syms, lld_syms) = (symbols(&ours), symbols(&lld));
@@ -709,30 +592,22 @@ fn assert_like_ld_lld(name: &str, xlen: Xlen) {
 
 #[test]
 fn hello_is_like_ld_lld() {
-    for xlen in XLENS {
-        assert_like_ld_lld("hello", xlen);
-    }
+    assert_like_ld_lld("hello");
 }
 
 #[test]
 fn multiobj_is_like_ld_lld() {
-    for xlen in XLENS {
-        assert_like_ld_lld("multiobj", xlen);
-    }
+    assert_like_ld_lld("multiobj");
 }
 
 /// Bootstrapping step 1 (merlin-as output linked by ld.lld, the committed
-/// `cargo xtask hello` images) and the full chain load the same image, at
-/// each width.
+/// `cargo xtask hello` image) and the full chain load the same image.
 #[test]
 fn hello_linked_by_ld_lld_or_merlin_ld_loads_the_same() {
-    for xlen in XLENS {
-        let ours = build(example("hello"), xlen).elf;
-        let lld = std::fs::read(repo_root().join(xtask::hello::golden(xlen))).unwrap();
-        assert_eq!(
-            xtask::hello::loaded_image(&ours).unwrap(),
-            xtask::hello::loaded_image(&lld).unwrap(),
-            "{xlen:?}"
-        );
-    }
+    let ours = build(example("hello")).elf;
+    let lld = std::fs::read(repo_root().join(xtask::hello::GOLDEN)).unwrap();
+    assert_eq!(
+        xtask::hello::loaded_image(&ours).unwrap(),
+        xtask::hello::loaded_image(&lld).unwrap()
+    );
 }

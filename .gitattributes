@@ -3,7 +3,9 @@
 *.o binary
 *.img binary
 *.pcap binary
-tests/riscv-tests/rv32* binary
+tests/riscv-tests/rv* binary
+# RV32 riscv-tests, which merlin-objdump still reads.
+crates/merlin-objdump/tests/fixtures/rv32/* binary
 tests/opensbi/*.bin binary
 *.S text eol=lf
 *.sh text eol=lf

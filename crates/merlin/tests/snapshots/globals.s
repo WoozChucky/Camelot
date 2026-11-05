@@ -9,13 +9,13 @@
 base:
     .word 40
 
-    # int *pbase: 4 bytes
+    # int *pbase: 8 bytes
     .globl pbase
-    .balign 4
+    .balign 8
     .type pbase, @object
-    .size pbase, 4
+    .size pbase, 8
 pbase:
-    .word base
+    .quad base
 
     # int table[4]: 16 bytes
     .globl table
@@ -28,21 +28,21 @@ table:
     .word 3
     .word 4
 
-    # int *third: 4 bytes
+    # int *third: 8 bytes
     .globl third
-    .balign 4
+    .balign 8
     .type third, @object
-    .size third, 4
+    .size third, 8
 third:
-    .word table+8
+    .quad table+8
 
-    # int *past: 4 bytes
+    # int *past: 8 bytes
     .globl past
-    .balign 4
+    .balign 8
     .type past, @object
-    .size past, 4
+    .size past, 8
 past:
-    .word table+16
+    .quad table+16
 
     .text
 
@@ -51,38 +51,38 @@ past:
     .type bump, @function
 bump:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
     la    a0, counter
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    ld    a0, 0(sp)
     lw    a0, 0(a0)
-    addi  a0, a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    addiw a0, a0, 1
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     sw    a0, 0(a1)
-    addi  a0, a0, -1
+    addiw a0, a0, -1
     la    a0, later
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    ld    a0, 0(sp)
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     sw    a0, 0(a1)
     li    a0, 0
 .L.return.bump:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size bump, . - bump
@@ -109,123 +109,125 @@ later:
 
     .text
 
-    # int main(void): frame 16 bytes
-    #     -12(s0)  local int r
+    # int main(void): frame 32 bytes
+    #     -20(s0)  local int r
     .globl main
     .type main, @function
 main:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
+    addi  sp, sp, -16
     call  bump
     call  bump
     la    a0, pbase
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    ld    a0, 0(sp)
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, 0(sp)
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     sw    a0, 0(a1)
     la    a0, counter
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, later
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, base
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, hidden
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, third
+    ld    a0, 0(a0)
     lw    a0, 0(a0)
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, past
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, third
-    lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a0, 0(a0)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     sub   a0, a1, a0
     srai  a0, a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    sext.w a0, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, past
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, -1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, pbase
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, base
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
 .L.return.main:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size main, . - main

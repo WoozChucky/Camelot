@@ -1,5 +1,6 @@
 //! The Camelot kernel (`kernel/kernel.elf`, committed) run through the `grail`
-//! binary, with `--max-steps` as a guard: booting with paging on (with several
+//! binary, on its firmware and in its 128 MiB of RAM (the command's defaults, QEMU
+//! `virt`'s), with `--max-steps` as a guard: booting with paging on (with several
 //! `--ram` sizes), the timer ticks, the user-space shell driven through
 //! stdin, the panics from its deliberate faults, user programs taking turns or
 //! getting killed, and image files attached with `--disk`. The kernel's own
@@ -10,9 +11,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Far more than a run needs (a boot is about 3 million steps with the default 4 MiB
-/// of RAM, 16 million with 128 MiB, most of them setting up memory; `wfi` skips ahead to each
-/// tick), so hitting it means the kernel hung. Generous because stdin reaches
+/// Far more than a run needs (a boot is about 16 million steps with the command's
+/// 128 MiB of RAM, most of them setting up memory; `wfi` skips ahead to each tick),
+/// so hitting it means the kernel hung. Generous because stdin reaches
 /// the machine through a thread: until the bytes arrive the kernel idles
 /// through timer ticks, which costs steps.
 const MAX_STEPS: &str = "200000000";
@@ -31,7 +32,20 @@ const BOOT_FAULT_STORE_TEXT: u32 = 4;
 
 /// What the kernel prints once paging is on (kernel/main.c, kernel/vmtest.c).
 fn memory_lines(ram_mib: u32) -> String {
-    format!("ram: {ram_mib} MiB at 0x80000000\npaging: on (Sv32)\nvm self-test: 26/26 passed\n")
+    format!("ram: {ram_mib} MiB at 0x80000000\npaging: on (Sv48)\nvm self-test: 26/26 passed\n")
+}
+
+/// The command's RAM, QEMU `virt`'s (`grail::cli::COMMAND_RAM_SIZE`).
+const RAM_MIB: u32 = 128;
+
+/// What the kernel prints after the ticks and before the shell: its kernel stacks'
+/// self-test, and how much of a stack it used (kernel/vm.c), taken from `out`.
+fn kstack_lines(out: &str) -> &str {
+    let at = out
+        .find("kstack self-test: 3/3 passed\nkstack: ")
+        .unwrap_or_else(|| panic!("no kernel stack self-test:\n{out}"));
+    let end = at + out[at..].find(" bytes used at most\n").expect(out) + " bytes used at most\n".len();
+    &out[at..end]
 }
 
 fn kernel_elf() -> PathBuf {
@@ -128,9 +142,10 @@ fn kernel_ticks_ten_times_then_starts_the_shell() {
     assert!(out.contains("|_|\n\nCamelot v0.1.0 booting...\n"), "{out}");
     assert!(
         out.ends_with(&format!(
-            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{SHELL_BANNER}{PROMPT}exit\n",
-            memory_lines(4),
-            ticks()
+            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
+            memory_lines(RAM_MIB),
+            ticks(),
+            kstack_lines(&out)
         )),
         "{out}"
     );
@@ -257,16 +272,18 @@ fn exec_replaces_the_shell() {
 fn kernel_boots_with_paging_on_any_ram_size() {
     // The page allocator takes the RAM size from sysinfo, so --ram changes
     // what the kernel manages; the self-tests and the ticks run with paging
-    // on either way, and so does the shell. 3 MiB is the smallest machine
-    // the kernel fits in: its image, with the user programs it embeds,
-    // takes a little over 2 MiB.
-    for mib in ["3", "16", "300"] {
+    // on either way, and so does the shell. 8 MiB is the smallest machine the
+    // kernel boots in: the firmware's 2 MiB, then its image, with the user
+    // programs it embeds, a little over 2 MiB, then the device tree, at a 2 MiB
+    // boundary (QEMU's place).
+    for mib in ["8", "16", "300"] {
         let (code, out) = grail_with(&["--ram", mib], &kernel_elf(), b"exit\n");
         assert_eq!(code, Some(0), "--ram {mib}, output:\n{out}");
         let want = format!(
-            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{SHELL_BANNER}{PROMPT}exit\n",
+            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
             memory_lines(mib.parse().unwrap()),
-            ticks()
+            ticks(),
+            kstack_lines(&out)
         );
         assert!(out.ends_with(&want), "--ram {mib}:\n{out}");
     }
@@ -277,14 +294,14 @@ fn illegal_instruction_panics() {
     let (code, out) = grail(&kernel_with_fault(BOOT_FAULT_ILLEGAL), b"");
     assert_eq!(code, Some(PANIC_EXIT), "output:\n{out}");
     let report = format!(
-        "{}panic: illegal instruction\n  scause 0x00000002  sepc 0x",
+        "{}panic: illegal instruction\n  scause 0x0000000000000002  sepc 0x",
         ticks()
     );
     assert!(out.contains(&report), "{out}");
-    assert!(out.contains("  stval 0xc0001073  "), "{out}");
+    assert!(out.contains("  stval 0x00000000c0001073  "), "{out}");
     // The register dump, with the values illegal_instruction put there.
-    assert!(out.contains("   ra 01010101"), "{out}");
-    assert!(out.contains("  t6 1f1f1f1f\n"), "{out}");
+    assert!(out.contains("   ra 0101010101010101"), "{out}");
+    assert!(out.contains("  t6 1f1f1f1f1f1f1f1f\n"), "{out}");
 }
 
 #[test]
@@ -292,17 +309,23 @@ fn unmapped_load_panics() {
     let (code, out) = grail(&kernel_with_fault(BOOT_FAULT_LOAD), b"");
     assert_eq!(code, Some(PANIC_EXIT), "output:\n{out}");
     // Paging is on: an address the page table doesn't map is a page fault.
-    let report = format!("{}panic: load page fault\n  scause 0x0000000d  sepc 0x", ticks());
+    let report = format!(
+        "{}panic: load page fault\n  scause 0x000000000000000d  sepc 0x",
+        ticks()
+    );
     assert!(out.contains(&report), "{out}");
-    assert!(out.contains("  stval 0x00000100  "), "{out}");
-    assert!(out.contains("\n  va 0x00000100 is not mapped\n"), "{out}");
+    assert!(out.contains("  stval 0x0000000000000100  "), "{out}");
+    assert!(out.contains("\n  va 0x0000000000000100 is not mapped\n"), "{out}");
 }
 
 #[test]
 fn store_to_kernel_text_panics() {
     let (code, out) = grail(&kernel_with_fault(BOOT_FAULT_STORE_TEXT), b"");
     assert_eq!(code, Some(PANIC_EXIT), "output:\n{out}");
-    let report = format!("{}panic: store page fault\n  scause 0x0000000f  sepc 0x", ticks());
+    let report = format!(
+        "{}panic: store page fault\n  scause 0x000000000000000f  sepc 0x",
+        ticks()
+    );
     assert!(out.contains(&report), "{out}");
     // The page is mapped, read and execute only, and the line shows the PTE
     // as the kernel page table held it when the store faulted. (Whether A is
@@ -313,25 +336,40 @@ fn store_to_kernel_text_panics() {
     let va = out
         .lines()
         .find_map(|l| l.strip_prefix("  va 0x")?.split_once(' ').map(|(va, _)| va))
-        .map(|va| u32::from_str_radix(va, 16).unwrap())
+        .map(|va| u64::from_str_radix(va, 16).unwrap())
         .unwrap_or_else(|| panic!("no mapping line:\n{out}"));
     let file = std::fs::read(kernel_with_fault(BOOT_FAULT_STORE_TEXT)).unwrap();
-    let mut m = grail::Machine::new(grail::MachineConfig::default()).unwrap();
+    let mut m = grail::Machine::new(grail::MachineConfig {
+        bios: grail::Bios::Default,
+        ..grail::MachineConfig::with_ram(8 << 20)
+    })
+    .unwrap();
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
     const STORE_PAGE_FAULT: u64 = 15;
-    // (The vm self-test's probes make store page faults too, elsewhere.)
+    // (The vm self-test's probes make store page faults too, elsewhere.) The walk
+    // from satp's root, Sv48 or Sv39, down to the leaf that maps `va`, a 4 KiB page
+    // or a superpage.
     let mut at_fault = None;
     let r = m.run(Some(MAX_STEPS.parse().unwrap()), |cpu| {
-        if at_fault.is_none() && cpu.csr.scause == STORE_PAGE_FAULT && cpu.csr.stval == u64::from(va) {
-            let peek = |addr: u32| cpu.bus.peek(addr.into()).unwrap();
-            let root = (cpu.csr.satp as u32 & 0x3f_ffff) << 12;
-            let table = (peek(root + 4 * (va >> 22)) >> 10) << 12;
-            at_fault = Some(peek(table + 4 * (va >> 12 & 0x3ff)));
+        if at_fault.is_none() && cpu.csr.scause == STORE_PAGE_FAULT && cpu.csr.stval == va {
+            let read = |addr: u64| cpu.bus.read_mem(addr, 8).unwrap();
+            let levels = if cpu.csr.satp >> 60 == 9 { 4 } else { 3 };
+            let mut table = (cpu.csr.satp & ((1 << 44) - 1)) << 12;
+            for level in (0..levels).rev() {
+                let pte = read(table + 8 * (va >> (12 + 9 * level) & 0x1ff));
+                if pte & 0b1010 != 0 {
+                    // R or X: a leaf.
+                    let offset = va & ((1 << (12 + 9 * level)) - 1);
+                    at_fault = Some((pte, (pte >> 10) << 12 | offset));
+                    break;
+                }
+                table = (pte >> 10) << 12;
+            }
         }
     });
     assert_eq!(r, grail::RunResult::Exited(PANIC_EXIT as u32));
-    let pte = at_fault.expect("no store page fault on that page in-process");
+    let (pte, pa) = at_fault.expect("no store page fault on that page in-process");
     let flags: String = "DAGUXWRV"
         .chars()
         .enumerate()
@@ -339,8 +377,8 @@ fn store_to_kernel_text_panics() {
         .collect();
     // R+X, and A, D and G, which the kernel sets on its own leaves (vm.h's
     // PTE_KERNEL): no access through them waits for the hardware to.
-    assert_eq!(flags, "DAG-X-RV", "pte {pte:#010x}");
-    let line = format!("  va {va:#010x} maps to pa {va:#010x}, pte {pte:#010x} {flags}\n");
+    assert_eq!(flags, "DAG-X-RV", "pte {pte:#018x}");
+    let line = format!("  va {va:#018x} maps to pa {pa:#018x}, pte {pte:#018x} {flags}\n");
     assert!(out.contains(&line), "want {line}in:\n{out}");
 }
 
@@ -370,12 +408,14 @@ fn user_programs_run_interleaved() {
     // the background and waits for dong, then collects ding with `wait`.
     let (code, out) = grail(&kernel_elf(), b"ding & dong\nwait\nexit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
-    // The shell's `[2]` comes first, or after ding's first line if a tick
-    // lands in the shell's fork (likely with merlin's unoptimized kernel).
+    // The shell's `[PID]` comes first, or after ding's first line if a tick
+    // lands in the shell's fork (likely with merlin's unoptimized kernel). (The
+    // kernel stacks' self-test took the first pids, its threads'.)
     let lines = command_output(&out, "ding & dong");
-    assert_eq!(lines.iter().filter(|&&l| l == "[2]").count(), 1, "{out}");
-    assert!(lines[..2].contains(&"[2]"), "{out}");
-    let printed: Vec<&str> = lines.iter().copied().filter(|&l| l != "[2]").collect();
+    let is_job = |l: &str| l.starts_with('[') && l.ends_with(']');
+    assert_eq!(lines.iter().filter(|&&l| is_job(l)).count(), 1, "{out}");
+    let job = *lines[..2].iter().find(|&&l| is_job(l)).expect(&out);
+    let printed: Vec<&str> = lines.iter().copied().filter(|&l| l != job).collect();
     assert_eq!(printed.len(), 8, "{out}");
     // Each in order, and they take turns more than once.
     for name in ["ding", "dong"] {
@@ -385,7 +425,11 @@ fn user_programs_run_interleaved() {
     }
     let turns = printed.windows(2).filter(|w| w[0][..4] != w[1][..4]).count();
     assert!(turns >= 3, "only {turns} switches:\n{out}");
-    assert_eq!(command_output(&out, "wait"), ["[2] ding: exit 0"], "{out}");
+    assert_eq!(
+        command_output(&out, "wait"),
+        [format!("{job} ding: exit 0")],
+        "{out}"
+    );
 }
 
 #[test]
@@ -393,45 +437,48 @@ fn faulting_user_programs_are_killed_and_the_kernel_carries_on() {
     // badload reads kernel memory (mapped in its page table, but without U),
     // badhalt executes xcal.halt (M-mode only). Both die, the kernel says
     // why, the shell reports their status, hello still runs, and so does the
-    // shell afterwards.
+    // shell afterwards. The kernel's first page is in a 2 MiB leaf (the image is
+    // mapped with them): the report shows its PTE (A, D and G, as the kernel makes
+    // its leaves) and the physical address, the image's load address, 0x8020_0000.
+    // (The pids follow the kernel stacks' self-test's threads.)
     let (code, out) = grail(&kernel_elf(), b"badload\nbadhalt\nhello\nticks\nexit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
     let lines = command_output(&out, "badload");
     assert_eq!(lines.len(), 4, "{out}");
-    assert_eq!(lines[0], "pid 2 (badload) killed: load page fault");
-    assert!(lines[1].starts_with("  scause 0x0000000d  sepc 0x"), "{out}");
-    assert!(lines[1].ends_with("  stval 0x80000000"), "{out}");
+    let pid = |l: &str| -> u32 {
+        l.strip_prefix("pid ")
+            .and_then(|r| r.split_once(' '))
+            .unwrap()
+            .0
+            .parse()
+            .unwrap()
+    };
+    let badload = pid(lines[0]);
+    assert_eq!(
+        lines[0],
+        format!("pid {badload} (badload) killed: load page fault")
+    );
+    assert!(
+        lines[1].starts_with("  scause 0x000000000000000d  sepc 0x"),
+        "{out}"
+    );
+    assert!(lines[1].ends_with("  stval 0xffffffff80000000"), "{out}");
     assert_eq!(
         lines[2],
-        "  va 0x80000000 maps to pa 0x80000000, pte 0x200000eb DAG-X-RV"
+        "  va 0xffffffff80000000 maps to pa 0x0000000080200000, pte 0x00000000200800eb DAG-X-RV"
     );
     assert_eq!(lines[3], "badload: exit -1");
     let lines = command_output(&out, "badhalt");
     assert_eq!(lines.len(), 3, "{out}");
-    assert_eq!(lines[0], "pid 3 (badhalt) killed: illegal instruction");
-    assert!(lines[1].ends_with("  stval 0x0005100b"), "{out}");
+    assert_eq!(
+        lines[0],
+        format!("pid {} (badhalt) killed: illegal instruction", badload + 1)
+    );
+    assert!(lines[1].ends_with("  stval 0x000000000005100b"), "{out}");
     assert_eq!(lines[2], "badhalt: exit -1");
     assert_eq!(command_output(&out, "hello"), ["hello from user mode"]);
     assert!(out.contains(&format!("{PROMPT}ticks\nticks: ")), "{out}");
     assert!(out.ends_with(&format!("{PROMPT}exit\n")), "{out}");
-}
-
-#[test]
-fn a_fault_in_a_megapage_reports_its_mapping() {
-    // The kernel maps the 64 MiB PLIC with 4 MiB megapages. `badload plic`
-    // loads 2 MiB into one of them from U-mode: the report shows the
-    // megapage's PTE (A, D and G, as the kernel makes its leaves) and the
-    // physical address with the whole 22-bit offset.
-    let (code, out) = grail(&kernel_elf(), b"badload plic\nhello\nexit\n");
-    assert_eq!(code, Some(0), "output:\n{out}");
-    let lines = command_output(&out, "badload plic");
-    assert_eq!(lines[0], "pid 2 (badload) killed: load page fault");
-    assert!(lines[1].ends_with("  stval 0x0c201000"), "{out}");
-    assert_eq!(
-        lines[2],
-        "  va 0x0c201000 maps to pa 0x0c201000, pte 0x030000e7 DAG--WRV"
-    );
-    assert_eq!(lines[3], "badload: exit -1");
 }
 
 #[test]
@@ -492,7 +539,8 @@ fn kernel_tests_an_image_file_disk_and_leaves_it_as_it_was() {
     assert!(blk_selftest_passed(&out) > 10, "{out}");
     assert!(
         out.ends_with(&format!(
-            " passed\nfs: no filesystem on disk 0\n{SHELL_BANNER}{PROMPT}exit\n"
+            " passed\nfs: no filesystem on disk 0\n{}{SHELL_BANNER}{PROMPT}exit\n",
+            kstack_lines(&out)
         )),
         "{out}"
     );

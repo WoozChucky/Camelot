@@ -11,7 +11,7 @@
 #            hostfwd), echo every byte back until the host closes, then close
 #   q        exit
 #
-#   printf 'c 8000\nq\n' | grail --net user examples/net/net-user.elf
+#   printf 'c 8000\nq\n' | grail --bios none --net user examples/net/net-user.elf
 #
 # with something listening on the host's port 8000 prints
 #
@@ -21,7 +21,7 @@
 #   received: (what the host sent)
 #   closed
 #
-# and `printf 'l 7\n' | grail --net user,hostfwd=tcp::5555-:7 ...` echoes for a
+# and `printf 'l 7\n' | grail --bios none --net user,hostfwd=tcp::5555-:7 ...` echoes for a
 # client of the host's port 5555 (crates/grail/tests/net_user.rs does both).
 #
 # The TCP here is the least that works on the gateway's link, which delivers the
@@ -35,9 +35,9 @@
 # Exit code 0 after `q`, 1 without a network card, 2 on a DHCP NAK, a refused or reset
 # connection or a send error.
 #
-# On RV64 machines (net-user-rv64.elf) the functions save ra and the s registers
-# with REG_S (sd), in frames of SZREG-sized slots, and the TCP sequence numbers,
-# 32-bit words, are added with addw and addiw (ADDW, ADDIW), modulo 2^32 like the
+# The functions save ra and the s registers with REG_S (sd), in frames of
+# SZREG-sized slots, and the TCP sequence numbers,
+# 32-bit words, are added with addw and addiw, modulo 2^32 like the
 # fields they go to.
 #
 # Built with our own tools by `cargo xtask examples net-user`, which does the same as
@@ -48,34 +48,16 @@
 #   merlin-as netlib.s -o netlib.o
 #   merlin-ld -T examples/net/link.ld user.o netlib.o -o examples/net/net-user.elf
 #
-# and, for RV64, the same as
-#
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/net/user.S -o user.s
-#   merlin-as -march=rv64ima_zicsr_zifencei user.s -o user.o
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/net/netlib.S -o netlib.s
-#   merlin-as -march=rv64ima_zicsr_zifencei netlib.s -o netlib.o
-#   merlin-ld -T examples/net/link.ld user.o netlib.o -o examples/net/net-user-rv64.elf
-#
 # Reference build with LLVM, only for comparison:
-#
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
-#         -T examples/net/link.ld examples/net/user.S examples/net/netlib.S -o net-user.elf
-#
-# and for RV64:
 #
 #   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
 #         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
 #         -I include -T examples/net/link.ld examples/net/user.S examples/net/netlib.S \
-#         -o net-user-rv64.elf
+#         -o net-user.elf
 
 #include <asm.h>
 
-#if __riscv_xlen == 64
 #define IP_FRAME 48     /* ip_header's frame: five registers, 16-byte aligned */
-#else
-#define IP_FRAME 32
-#endif
 
     .equ UART_BASE,       0x10000000
     .equ UART_RBR,        0             # receive buffer
@@ -544,7 +526,7 @@ tcp_client:
     beqz  t0, 1b
     la    t0, seg_seq
     lw    t1, 0(t0)
-    ADDIW t1, t1, 1                 # their SYN takes one sequence number
+    addiw t1, t1, 1                 # their SYN takes one sequence number
     la    t0, rcv_nxt
     sw    t1, 0(t0)
     li    a0, TCP_ACK               # connected
@@ -634,7 +616,7 @@ tcp_server:
     call  memcpy
     la    t0, seg_seq
     lw    t1, 0(t0)
-    ADDIW t1, t1, 1
+    addiw t1, t1, 1
     la    t0, rcv_nxt
     sw    t1, 0(t0)
     la    a0, s_accepted            # "accepted from 10.0.2.2:PORT"
@@ -765,12 +747,12 @@ tcp_send:
     bnez  a0, send_failed
     la    t0, snd_nxt               # the sequence numbers used
     lw    t1, 0(t0)
-    ADDW  t1, t1, s3
+    addw  t1, t1, s3
     andi  t2, s1, TCP_FIN
-    ADDW  t1, t1, t2
+    addw  t1, t1, t2
     srli  t2, s1, 1                 # TCP_SYN is bit 1
     andi  t2, t2, 1
-    ADDW  t1, t1, t2
+    addw  t1, t1, t2
     sw    t1, 0(t0)
     REG_L s3, 32-4*SZREG(sp)
     REG_L s2, 32-3*SZREG(sp)
@@ -885,9 +867,9 @@ tcp_take:
     la    t0, rcv_nxt
     lw    t3, 0(t0)
     bne   t2, t3, 1f
-    ADDW  t3, t3, t1                # past the data
+    addw  t3, t3, t1                # past the data
     andi  t2, a0, TCP_FIN
-    ADDW  t3, t3, t2                # and the FIN
+    addw  t3, t3, t2                # and the FIN
     sw    t3, 0(t0)
     mv    a1, t1
     j     2f
@@ -1051,7 +1033,7 @@ host_ip:        .byte 10, 0, 2, 2   # the host, through the gateway
 ip_broadcast:   .byte 255, 255, 255, 255
 mac_broadcast:  .byte 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 s_greeting:     .ascii "Hello from the guest!\n"
-s_no_card:      .asciz "no network card (try grail --net user)\n"
+s_no_card:      .asciz "no network card (try grail --bios none --net user)\n"
 s_dhcp:         .asciz "dhcp: address "
 s_server:       .asciz ", server "
 s_nak:          .asciz "dhcp: refused\n"

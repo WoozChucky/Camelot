@@ -48,9 +48,9 @@ fn main() -> ExitCode {
         if tracing {
             let word = cpu.bus.peek(cpu.pc);
             let text = word.map_or("<unmapped>".to_string(), |w| {
-                excalibur::decode(w, cpu.xlen()).to_string()
+                excalibur::decode(w, excalibur::Xlen::Rv64).to_string()
             });
-            let digits = cpu.xlen().bits() as usize / 4;
+            let digits = 16;
             if several_harts {
                 eprintln!("h{} {:?} {:0digits$x}: {}", cpu.id, cpu.mode, cpu.pc, text);
             } else {

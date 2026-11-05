@@ -2,14 +2,15 @@
  * kernel asks M-mode for what only M-mode can do (spec section 10, "Kernel
  * traps"). The kernel makes every such request through these calls, as
  * Linux does (arch/riscv/kernel/sbi.c), so that the same S-mode kernel runs
- * on Camelot's own SBI on Grail (machine.S) and under OpenSBI on a board.
+ * on Camelot's own SBI on Grail (firmware/sbi.S, Grail's --bios default)
+ * and under OpenSBI on a board.
  *
  * The calling convention: `ecall` from S-mode with the extension ID (EID) in
  * a7, the function ID (FID) in a6 and the arguments in a0-a5. The call
  * returns an error code in a0 (SBI_SUCCESS or a negative SBI_ERR_*) and a
  * value in a1, struct sbiret, and leaves every other register as it was.
  *
- * Assembly includes this file too (machine.S, entry.S), for the numbers:
+ * Assembly includes this file too (entry.S), for the numbers:
  * the C is under #ifndef __ASSEMBLER__ (const.h). */
 #ifndef CAMELOT_SBI_H
 #define CAMELOT_SBI_H
@@ -19,7 +20,8 @@
 #include "errno.h"
 #endif
 
-/* The version this kernel and machine.S implement: the major number in bits
+/* The version this kernel takes, and Camelot's SBI implements: the major
+ * number in bits
  * 30:24, the minor one in bits 23:0. */
 #define SBI_SPEC_VERSION 0x02000000
 #define SBI_SPEC_VERSION_MAJOR_SHIFT 24
@@ -43,9 +45,8 @@
 #define SBI_BASE_GET_MARCHID 5
 #define SBI_BASE_GET_MIMPID 6
 
-/* TIME: set_timer(stime_value), an absolute `time` value (on RV32 its low
- * half in a0, its high half in a1). It also clears the pending supervisor
- * timer interrupt. */
+/* TIME: set_timer(stime_value), an absolute `time` value in a0. It also
+ * clears the pending supervisor timer interrupt. */
 #define SBI_TIME_SET_TIMER 0
 
 /* IPI: send_ipi(hart_mask, hart_mask_base), a supervisor software interrupt
@@ -86,7 +87,7 @@
 #define SBI_SRST_REASON_NONE 0
 #define SBI_SRST_REASON_SYSFAIL 1
 /* 0xE000_0000 to 0xEFFF_FFFF: reasons each SBI implementation defines.
- * Camelot's (machine.S) makes reason 0xE000_0000 | code exit code `code` of
+ * Camelot's (firmware/sbi.S) makes reason 0xE000_0000 | code exit code `code` of
  * the machine. */
 #define SBI_SRST_REASON_SBI_START 0xE0000000
 #define SBI_SRST_REASON_SBI_END 0xEFFFFFFF
@@ -115,7 +116,7 @@
 #define SBI_ERR_IO (-13)
 #define SBI_ERR_DENIED_LOCKED (-14)
 
-/* Camelot's SBI implementation (machine.S): its ID, which no registry has
+/* Camelot's SBI implementation (firmware/sbi.S): its ID, which no registry has
  * given it (the SBI spec lists BBL as 0, OpenSBI as 1, and so on up from
  * there), so a large one well clear of those, "CMLT" in ASCII as the EIDs
  * spell theirs; and its version, whose encoding is the implementation's

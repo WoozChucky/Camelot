@@ -1,47 +1,37 @@
 //! Booting Camelot from its disk (issue #69, spec section 7, "Boot from disk"):
 //! the committed boot programs are what `cargo xtask boot` builds, and the root
 //! image of `cargo xtask fs`, made bootable, boots the kernel on Grail with no
-//! program, whose shell then runs programs from the disk's `/bin`. An RV64
-//! machine boots an RV64 boot block built with merlin-as and merlin-ld through
-//! the RV64 disk loader (#151; Camelot's RV64 bootloader and kernel boot from
-//! disk in tests/kernel_rv64.rs, #154). The image
-//! (`xtask::fs::IMAGE_SIZE` blocks, the size the spec gives) holds the disk kernel, which has no programs of its own (issue #108):
-//! it boots in a machine of the default 4 MiB, and panics when there is no shell
-//! to run. The RV64 root image (`cargo xtask fs --xlen 64`, #156) does the
-//! same on an RV64 machine of the default 4 MiB, in an image of the same size.
+//! program, through Camelot's firmware, whose shell then runs programs from the
+//! disk's `/bin`. A machine without firmware boots a boot block built with
+//! merlin-as and merlin-ld through the boot ROM's disk loader (#151). The image
+//! (`xtask::fs::IMAGE_SIZE` blocks, the size the spec gives) holds the disk
+//! kernel, which has no programs of its own (issue #108): it boots on a Camelot
+//! VM's hardware (the firmware and `avalon_client::CAMELOT_RAM`, the default
+//! 4 MiB and the firmware's 2 MiB), and panics when there is no shell to run.
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::{boot, fsck, read::Fs, BSIZE};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::collections::BTreeSet;
-use xtask::examples::Xlen;
 use xtask::kernel::BOOT_MAX_STEPS;
 use xtask::repo_root;
 
-/// Boots `image` on a machine of the default hardware with no program, `input`
-/// typed for the shell. Returns how it ended, what it printed, and the disk.
-fn boot_image(image: Vec<u8>, input: &[u8]) -> (RunResult, String, Vec<u8>, Machine) {
-    boot_image_on(Xlen::Rv32, image, input)
+/// A Camelot VM's machine (Pendragon's and `cargo xtask up`'s): Camelot's
+/// firmware, which boots the disk, and its 2 MiB on top of the default 4 MiB.
+fn camelot_vm(disks: Vec<DiskConfig>) -> MachineConfig {
+    MachineConfig {
+        bios: grail::Bios::Default,
+        ram_size: avalon_client::CAMELOT_RAM as usize,
+        disks,
+        ..MachineConfig::default()
+    }
 }
 
-/// [`boot_image`] on an `xlen` machine: an RV64 one on Camelot's firmware,
-/// which boots the disk, with its 2 MiB on top of the 4 MiB an RV32 one
-/// has.
-fn boot_image_on(xlen: Xlen, image: Vec<u8>, input: &[u8]) -> (RunResult, String, Vec<u8>, Machine) {
-    let config = match xlen {
-        Xlen::Rv32 => MachineConfig {
-            disks: vec![DiskConfig::memory(image)],
-            ..MachineConfig::default()
-        },
-        Xlen::Rv64 => MachineConfig {
-            xlen: grail::Xlen::Rv64,
-            bios: grail::Bios::Default,
-            ram_size: 6 << 20,
-            disks: vec![DiskConfig::memory(image)],
-            ..MachineConfig::default()
-        },
-    };
-    let mut m = Machine::new(config).unwrap();
+/// Boots `image` on a Camelot VM's machine ([`camelot_vm`]) with no program,
+/// `input` typed for the shell. Returns how it ended, what it printed, and the
+/// disk.
+fn boot_image(image: Vec<u8>, input: &[u8]) -> (RunResult, String, Vec<u8>, Machine) {
+    let mut m = Machine::new(camelot_vm(vec![DiskConfig::memory(image)])).unwrap();
     m.boot_from_disk().unwrap();
     m.cpu.bus.uart.capture = true;
     m.set_uart_input(xtask::kernel::typed(input));
@@ -66,15 +56,15 @@ fn committed_boot_programs_are_up_to_date() {
             p.elf_name()
         );
     }
-    // Grail's ROM is the committed loader of each width, and mkfs takes the
-    // bootloader.
+    // Grail's ROM is the committed loader, its firmware the committed
+    // firmware, and mkfs takes the bootloader.
     assert_eq!(
         grail::boot::DISKBOOT_ELF,
         &std::fs::read(xtask::boot::DISKBOOT.elf_path(&root)).unwrap()[..]
     );
     assert_eq!(
-        grail::boot::DISKBOOT_RV64_ELF,
-        &std::fs::read(xtask::boot::DISKBOOT_RV64.elf_path(&root)).unwrap()[..]
+        grail::firmware::FIRMWARE_ELF,
+        &std::fs::read(xtask::boot::FIRMWARE.elf_path(&root)).unwrap()[..]
     );
     let code = boot::boot_code(&xtask::boot::bootloader(&root).unwrap()).unwrap();
     assert!(code.len() <= boot::MAX_BOOT_CODE);
@@ -91,17 +81,14 @@ fn the_commands_match_the_build() {
         ]
     );
     assert_eq!(
-        xtask::boot::DISKBOOT_RV64.commands(),
+        xtask::boot::DISKBOOT.commands(),
         [
-            "merlin -E -march=rv64ima_zicsr_zifencei -I include crates/grail/rom/diskboot.S \
-             -o target/boot/rv64/diskboot.s",
-            "merlin-as -march=rv64ima_zicsr_zifencei target/boot/rv64/diskboot.s \
-             -o target/boot/rv64/diskboot.o",
-            "merlin-ld -T crates/grail/rom/link.ld target/boot/rv64/diskboot.o \
-             -o crates/grail/rom/diskboot-rv64.elf"
+            "merlin -E -I include crates/grail/rom/diskboot.S -o target/boot/diskboot.s",
+            "merlin-as target/boot/diskboot.s -o target/boot/diskboot.o",
+            "merlin-ld -T crates/grail/rom/link.ld target/boot/diskboot.o -o crates/grail/rom/diskboot.elf"
         ]
     );
-    // The command lines in the loader's comments are these, for both widths.
+    // The command lines in the programs' comments are these.
     let root = repo_root();
     for p in xtask::boot::PROGRAMS {
         let source = std::fs::read_to_string(root.join(p.dir).join(p.sources[0])).unwrap();
@@ -116,12 +103,12 @@ fn the_commands_match_the_build() {
     }
 }
 
-/// An RV64 boot block (#151's acceptance): built with merlin-as and merlin-ld,
-/// sealed into sectors 0 and 1 of a disk, it boots an RV64 machine with no
-/// program through the RV64 disk loader, and runs where the loader put it,
-/// with what the loader passes in a0-a2 and the 64-bit registers of version
-/// 2 of the devices (spec sections 7, 9.5 and 9.6).
-const RV64_BOOT_BLOCK: &str = r#"
+/// A boot block (#151's acceptance): built with merlin-as and merlin-ld,
+/// sealed into sectors 0 and 1 of a disk, it boots a machine with no program
+/// and no firmware through the boot ROM's disk loader, and runs where the
+/// loader put it, with what the loader passes in a0-a2 and the devices'
+/// 64-bit registers (spec sections 7, 9.5 and 9.6).
+const BOOT_BLOCK: &str = r#"
     .equ UART_BASE,    0x10000000
     .equ SYS_RAM_SIZE, 0x10             # 64-bit
     .equ BLK_CAPACITY, 0x00             # 64-bit
@@ -191,7 +178,7 @@ put_hex:
     addi  sp, sp, 16
     ret
 
-s_at:      .asciz "RV64 boot block at "
+s_at:      .asciz "boot block at "
 s_hart:    .asciz ", hart "
 s_ram:     .asciz "\nRAM "
 s_disk:    .asciz ", disk 0 of "
@@ -199,19 +186,13 @@ s_sectors: .asciz " sectors\n"
 "#;
 
 #[test]
-fn an_rv64_boot_block_boots_through_the_rv64_rom() {
+fn a_boot_block_boots_through_the_rom() {
     // 4 GiB and 64 KiB of RAM: the boot area, the last 64 KiB, starts at
     // 0x1_8000_0000, past 4 GiB, which only a 64-bit SYS_RAM_SIZE, BLK_DMA and
     // pc reach.
     let ram: u64 = (4 << 30) + (64 << 10);
     let base = 0x8000_0000 + ram - u64::from(grail::boot::BOOT_AREA_SIZE);
-    let obj = merlin_as::assemble_to_elf_with(
-        RV64_BOOT_BLOCK,
-        &merlin_as::Options {
-            xlen: merlin_as::Xlen::Rv64,
-        },
-    )
-    .unwrap();
+    let obj = merlin_as::assemble_to_elf(BOOT_BLOCK).unwrap();
     let opts = merlin_ld::Options {
         script: Some(merlin_ld::ScriptSource {
             name: "boot.ld".into(),
@@ -226,7 +207,7 @@ fn an_rv64_boot_block_boots_through_the_rv64_rom() {
     let linked = merlin_ld::link(&[input], &opts).unwrap();
     assert!(linked.layout.warnings.is_empty(), "{:?}", linked.layout.warnings);
     let elf = grail::elf::parse(&linked.elf).unwrap();
-    assert_eq!((elf.xlen, elf.entry), (grail::Xlen::Rv64, base));
+    assert_eq!(elf.entry, base);
 
     // The loaded bytes, at the start of a sealed boot block.
     let mut block = [0u8; grail::boot::BOOT_BLOCK_SIZE];
@@ -243,7 +224,6 @@ fn an_rv64_boot_block_boots_through_the_rv64_rom() {
     disk[..block.len()].copy_from_slice(&block);
 
     let config = MachineConfig {
-        xlen: grail::Xlen::Rv64,
         ram_size: ram as usize,
         disks: vec![DiskConfig::memory(disk)],
         ..MachineConfig::default()
@@ -255,7 +235,7 @@ fn an_rv64_boot_block_boots_through_the_rv64_rom() {
     assert_eq!(
         String::from_utf8_lossy(&m.cpu.bus.uart.captured),
         format!(
-            "RV64 boot block at {base:#018x}, hart 0x0000000000000000\n\
+            "boot block at {base:#018x}, hart 0x0000000000000000\n\
              RAM {ram:#018x}, disk 0 of 0x0000000000000010 sectors\n"
         )
     );
@@ -263,24 +243,15 @@ fn an_rv64_boot_block_boots_through_the_rv64_rom() {
 
 #[test]
 fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
-    root_image_boots(Xlen::Rv32);
-}
-
-#[test]
-fn the_rv64_root_image_boots_from_disk_and_runs_programs_from_bin() {
-    root_image_boots(Xlen::Rv64);
-}
-
-/// The `xlen` root image, `cargo xtask fs`'s: its layout, the room left in
-/// its filesystem, and a boot on an `xlen` machine of the default 4 MiB (RV64:
-/// 6 MiB, on Camelot's firmware, which keeps 2 MiB),
-/// whose shell runs programs from `/bin` and writes to the disk.
-fn root_image_boots(xlen: Xlen) {
+    // The root image, `cargo xtask fs`'s: its layout, the room left in its
+    // filesystem, and a boot on a Camelot VM's machine (6 MiB, on Camelot's
+    // firmware, which keeps 2 MiB), whose shell runs programs from `/bin` and
+    // writes to the disk.
     let root = repo_root();
-    let image = xtask::fs::build_bootable_for(&root, xtask::fs::IMAGE_SIZE, xlen).unwrap();
-    let kernel = std::fs::read(root.join(xtask::fs::kernel_for(xlen))).unwrap();
+    let image = xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap();
+    let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
     let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
-    let plain = xtask::fs::build_for(&root, &opts, xlen).unwrap();
+    let plain = xtask::fs::build(&root, &opts).unwrap();
 
     // IMAGE_SIZE blocks in all: the filesystem, the same as without booting, and
     // the disk kernel after it, as much of it as the bootloader loads (no symbols).
@@ -304,7 +275,7 @@ fn root_image_boots(xlen: Xlen) {
     // programs in /bin grow with every one added to kernel/user: when they take
     // too much, this says so, and xtask::fs::IMAGE_SIZE must grow.
     eprintln!(
-        "the {} KiB {xlen:?} root image: a filesystem of {} blocks, {} free; a kernel of {} blocks",
+        "the {} KiB root image: a filesystem of {} blocks, {} free; a kernel of {} blocks",
         image.len() / 1024,
         report.sb.size,
         report.free_blocks,
@@ -312,15 +283,16 @@ fn root_image_boots(xlen: Xlen) {
     );
     assert!(
         report.free_blocks * 5 >= report.sb.size && report.free_blocks > 269,
-        "the programs in /bin leave {} of the root filesystem's {} blocks free, less than a fifth:          make the image bigger (xtask::fs::IMAGE_SIZE)",
+        "the programs in /bin leave {} of the root filesystem's {} blocks free, less than a fifth: \
+         make the image bigger (xtask::fs::IMAGE_SIZE)",
         report.free_blocks,
         report.sb.size
     );
 
-    // The default machine: 4 MiB of RAM.
+    // The default machine's 4 MiB of RAM, and the firmware's 2 MiB.
     assert_eq!(MachineConfig::default().ram_size, 4 << 20);
-    let (result, out, disk, m) = boot_image_on(
-        xlen,
+    assert_eq!(avalon_client::CAMELOT_RAM, 6 << 20);
+    let (result, out, disk, m) = boot_image(
         image,
         b"echo from the disk\nls /bin | wc > /count\ncat /count\nexit\n",
     );
@@ -333,16 +305,8 @@ fn root_image_boots(xlen: Xlen) {
         )),
         "{out}"
     );
-    // RV64: the firmware's 2 MiB on top.
-    let mib = match xlen {
-        Xlen::Rv32 => 4,
-        Xlen::Rv64 => 6,
-    };
-    assert!(
-        out.contains(&format!("\nram: {mib} MiB at 0x80000000\n")),
-        "{out}"
-    );
-    // Every program, on both widths.
+    assert!(out.contains("\nram: 6 MiB at 0x80000000\n"), "{out}");
+    // Every program.
     let programs: Vec<String> = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root)).unwrap();
     assert!(
         out.contains(&format!(
@@ -366,13 +330,10 @@ fn root_image_boots(xlen: Xlen) {
         )),
         "{out}"
     );
-    // RV32: the bootloader pointed the ROM's entry word at the kernel's
-    // physical entry point, so harts the kernel wakes with an IPI go there
-    // from the park loop, as after an ELF boot. RV64: the bootloader ran in
-    // S-mode, the firmware's next stage, and left the ROM alone (its entry
-    // doubleword is the hand-off to the firmware, where the kernel's harts
-    // wait for hart_start); the kernel is linked high and loaded at
-    // 0x8020_0000.
+    // The bootloader ran in S-mode, the firmware's next stage, and left the
+    // ROM alone (its entry doubleword is the hand-off to the firmware, where
+    // the kernel's harts wait for hart_start); the kernel is linked high and
+    // loaded at 0x8020_0000.
     let k = elf::Elf::parse(&kernel).unwrap();
     let entry = k.header.entry;
     let entry = k
@@ -382,14 +343,9 @@ fn root_image_boots(xlen: Xlen) {
         .map(|s| s.paddr + (entry - s.vaddr))
         .unwrap();
     let lo = u64::from(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR).unwrap());
-    match xlen {
-        Xlen::Rv32 => assert_eq!(lo, entry),
-        Xlen::Rv64 => {
-            let hi = u64::from(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR + 4).unwrap());
-            assert_eq!(lo | hi << 32, grail::boot::FW_HANDOFF_PC);
-            assert_eq!(entry, grail::firmware::FW_JUMP_ADDR);
-        }
-    }
+    let hi = u64::from(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR + 4).unwrap());
+    assert_eq!(lo | hi << 32, grail::boot::FW_HANDOFF_PC);
+    assert_eq!(entry, grail::firmware::FW_JUMP_ADDR);
 }
 
 #[test]
@@ -483,21 +439,22 @@ fn the_disk_kernel_panics_without_a_shell() {
     );
 
     // Not a filesystem at all: the kernel is loaded as a program, with a blank disk.
-    let config = MachineConfig {
-        disks: vec![DiskConfig::memory(vec![0; 64 * 512])],
-        ..MachineConfig::default()
-    };
-    let mut m = Machine::new(config).unwrap();
+    let mut m = Machine::new(camelot_vm(vec![DiskConfig::memory(vec![0; 64 * 512])])).unwrap();
     m.cpu.bus.uart.capture = true;
     m.load_elf(&kernel).unwrap();
     m.set_uart_input(xtask::kernel::typed(b"exit\n"));
     let result = m.run(Some(BOOT_MAX_STEPS), |_| {});
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     assert_eq!(result, RunResult::Exited(0xfe), "{out}");
+    // The kernel stacks' self-test and their deepest use come between.
+    assert!(
+        out.contains("fs: no filesystem on disk 0\nkstack self-test: 3/3 passed\nkstack: "),
+        "{out}"
+    );
     assert!(
         out.ends_with(
-            "fs: no filesystem on disk 0\ncannot start /bin/sh: error 2\npanic: no root filesystem, and no \
-             programs built into the kernel\n"
+            " bytes used at most\ncannot start /bin/sh: error 2\npanic: no root filesystem, and no programs \
+             built into the kernel\n"
         ),
         "{out}"
     );
@@ -523,43 +480,42 @@ fn has_equ(source: &str, name: &str) -> bool {
         .any(|l| l.trim_start().starts_with(&format!(".equ {name},")))
 }
 
-/// The names the RV64 sources give version 2's device registers and their
-/// values, and Grail's value of each: the sysinfo block's (spec section 9.5),
-/// the disk's (9.6) and the network card's (9.8), with the bits and codes
-/// read from them. Every name is defined by at least one RV64 source.
-const V2_REGISTERS: &[(&str, u32)] = {
-    use grail::block::{self, v2 as blk};
-    use grail::net::{self, v2 as nic};
-    use grail::sysinfo::{self, v2 as sys, DeviceType};
+/// The names the assembly sources give the device registers and their values,
+/// and Grail's value of each: the sysinfo block's (spec section 9.5), the
+/// disk's (9.6) and the network card's (9.8), with the bits and codes read
+/// from them. Every name is defined by at least one source.
+const REGISTERS: &[(&str, u32)] = {
+    use grail::sysinfo::{self, DeviceType};
+    use grail::{block, net};
     &[
         ("SYSINFO_MAGIC", sysinfo::SYSINFO_MAGIC),
         ("SYS_MAGIC", sysinfo::REG_MAGIC),
         ("SYS_VERSION", sysinfo::REG_VERSION),
-        ("SYS_RAM_BASE", sys::REG_RAM_BASE),
-        ("SYS_RAM_SIZE", sys::REG_RAM_SIZE),
-        ("SYS_TIMEBASE_HZ", sys::REG_TIMEBASE_HZ),
-        ("SYS_CPU_HZ", sys::REG_CPU_HZ),
-        ("SYS_FLAGS", sys::REG_FLAGS),
-        ("SYS_DEV_COUNT", sys::REG_DEV_COUNT),
-        ("SYS_HARTS", sys::REG_HARTS),
+        ("SYS_RAM_BASE", sysinfo::REG_RAM_BASE),
+        ("SYS_RAM_SIZE", sysinfo::REG_RAM_SIZE),
+        ("SYS_TIMEBASE_HZ", sysinfo::REG_TIMEBASE_HZ),
+        ("SYS_CPU_HZ", sysinfo::REG_CPU_HZ),
+        ("SYS_FLAGS", sysinfo::REG_FLAGS),
+        ("SYS_DEV_COUNT", sysinfo::REG_DEV_COUNT),
+        ("SYS_HARTS", sysinfo::REG_HARTS),
         ("SYS_DEV_TABLE", sysinfo::DEV_TABLE),
-        ("DEV_ENTRY_SIZE", sys::DEV_ENTRY_SIZE),
-        ("DEV_TYPE", sys::DEV_TYPE),
-        ("DEV_IRQ", sys::DEV_IRQ),
-        ("DEV_BASE", sys::DEV_BASE),
-        ("DEV_SIZE", sys::DEV_SIZE),
+        ("DEV_ENTRY_SIZE", sysinfo::DEV_ENTRY_SIZE),
+        ("DEV_TYPE", sysinfo::DEV_TYPE),
+        ("DEV_IRQ", sysinfo::DEV_IRQ),
+        ("DEV_BASE", sysinfo::DEV_BASE),
+        ("DEV_SIZE", sysinfo::DEV_SIZE),
         ("FLAG_REAL_TIME", sysinfo::FLAG_REAL_TIME),
         ("DEV_BLOCK", DeviceType::Block as u32),
         ("DEV_NET", DeviceType::Net as u32),
-        ("BLK_CAPACITY", blk::REG_CAPACITY),
-        ("BLK_SECTOR", blk::REG_SECTOR),
-        ("BLK_DMA", blk::REG_DMA),
-        ("BLK_COUNT", blk::REG_COUNT),
-        ("BLK_FLAGS", blk::REG_FLAGS),
-        ("BLK_CMD", blk::REG_CMD),
-        ("BLK_STATUS", blk::REG_STATUS),
-        ("BLK_ERROR", blk::REG_ERROR),
-        ("BLK_CTRL", blk::REG_CTRL),
+        ("BLK_CAPACITY", block::REG_CAPACITY),
+        ("BLK_SECTOR", block::REG_SECTOR),
+        ("BLK_DMA", block::REG_DMA),
+        ("BLK_COUNT", block::REG_COUNT),
+        ("BLK_FLAGS", block::REG_FLAGS),
+        ("BLK_CMD", block::REG_CMD),
+        ("BLK_STATUS", block::REG_STATUS),
+        ("BLK_ERROR", block::REG_ERROR),
+        ("BLK_CTRL", block::REG_CTRL),
         ("CMD_READ", block::CMD_READ),
         ("CMD_WRITE", block::CMD_WRITE),
         ("CMD_FLUSH", block::CMD_FLUSH),
@@ -572,15 +528,15 @@ const V2_REGISTERS: &[(&str, u32)] = {
         ("NET_STATUS", net::REG_STATUS),
         ("NET_IRQ_ENABLE", net::REG_IRQ_ENABLE),
         ("NET_IRQ_STATUS", net::REG_IRQ_STATUS),
-        ("NET_TX_BASE", nic::REG_TX_BASE),
-        ("NET_TX_SIZE", nic::REG_TX_SIZE),
-        ("NET_TX_HEAD", nic::REG_TX_HEAD),
-        ("NET_TX_TAIL", nic::REG_TX_TAIL),
-        ("NET_RX_BASE", nic::REG_RX_BASE),
-        ("NET_RX_SIZE", nic::REG_RX_SIZE),
-        ("NET_RX_HEAD", nic::REG_RX_HEAD),
-        ("NET_RX_TAIL", nic::REG_RX_TAIL),
-        ("DESC_SIZE", nic::DESC_SIZE),
+        ("NET_TX_BASE", net::REG_TX_BASE),
+        ("NET_TX_SIZE", net::REG_TX_SIZE),
+        ("NET_TX_HEAD", net::REG_TX_HEAD),
+        ("NET_TX_TAIL", net::REG_TX_TAIL),
+        ("NET_RX_BASE", net::REG_RX_BASE),
+        ("NET_RX_SIZE", net::REG_RX_SIZE),
+        ("NET_RX_HEAD", net::REG_RX_HEAD),
+        ("NET_RX_TAIL", net::REG_RX_TAIL),
+        ("DESC_SIZE", net::DESC_SIZE),
         ("IRQ_RX", net::IRQ_RX),
     ]
 };
@@ -605,8 +561,8 @@ fn define(header: &str, name: &str) -> u64 {
 #[test]
 fn the_firmware_grail_the_kernel_and_the_documents_agree() {
     // The firmware's layout and hand-off (spec section 7, "Firmware"), as
-    // Grail lays the machine out, the firmware's sources and the RV64
-    // bootloader and kernel assume it.
+    // Grail lays the machine out, the firmware's sources and the bootloader
+    // and kernel assume it.
     let root = repo_root();
     let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
     let fw = read("firmware/fw.h");
@@ -629,26 +585,24 @@ fn the_firmware_grail_the_kernel_and_the_documents_agree() {
     assert_eq!(define(&fw, "UART_BASE"), grail::bus::UART_BASE);
     assert_eq!(define(&fw, "SYSINFO_BASE"), grail::bus::SYSINFO_BASE);
     assert_eq!(define(&fw, "DISK0"), grail::bus::BLK_BASE);
-    // fw.h's RV64 definitions come after its `#if __riscv_xlen == 64`.
-    let fw64 = &fw[fw.find("#if __riscv_xlen == 64\n#define SYS_RAM_BASE").unwrap()..];
-    use grail::sysinfo::v2;
+    use grail::sysinfo;
     assert_eq!(
-        define(fw64, "SYS_RESERVED_BASE"),
-        u64::from(v2::REG_RESERVED_BASE)
+        define(&fw, "SYS_RESERVED_BASE"),
+        u64::from(sysinfo::REG_RESERVED_BASE)
     );
     assert_eq!(
-        define(fw64, "SYS_RESERVED_SIZE"),
-        u64::from(v2::REG_RESERVED_SIZE)
+        define(&fw, "SYS_RESERVED_SIZE"),
+        u64::from(sysinfo::REG_RESERVED_SIZE)
     );
-    assert_eq!(define(fw64, "SYS_HARTS"), u64::from(v2::REG_HARTS));
+    assert_eq!(define(&fw, "SYS_HARTS"), u64::from(sysinfo::REG_HARTS));
     for (name, reg) in [
-        ("BLK_CAPACITY", grail::block::v2::REG_CAPACITY),
-        ("BLK_SECTOR", grail::block::v2::REG_SECTOR),
-        ("BLK_DMA", grail::block::v2::REG_DMA),
-        ("BLK_COUNT", grail::block::v2::REG_COUNT),
-        ("BLK_CMD", grail::block::v2::REG_CMD),
-        ("BLK_STATUS", grail::block::v2::REG_STATUS),
-        ("BLK_ERROR", grail::block::v2::REG_ERROR),
+        ("BLK_CAPACITY", grail::block::REG_CAPACITY),
+        ("BLK_SECTOR", grail::block::REG_SECTOR),
+        ("BLK_DMA", grail::block::REG_DMA),
+        ("BLK_COUNT", grail::block::REG_COUNT),
+        ("BLK_CMD", grail::block::REG_CMD),
+        ("BLK_STATUS", grail::block::REG_STATUS),
+        ("BLK_ERROR", grail::block::REG_ERROR),
     ] {
         assert_eq!(define(&fw, name), u64::from(reg), "{name}");
     }
@@ -656,26 +610,25 @@ fn the_firmware_grail_the_kernel_and_the_documents_agree() {
     let sysinfo_h = read("kernel/include/sysinfo.h");
     assert_eq!(
         define(&sysinfo_h, "SYS_RESERVED_BASE"),
-        u64::from(v2::REG_RESERVED_BASE)
+        u64::from(sysinfo::REG_RESERVED_BASE)
     );
     assert_eq!(
         define(&sysinfo_h, "SYS_RESERVED_SIZE"),
-        u64::from(v2::REG_RESERVED_SIZE)
+        u64::from(sysinfo::REG_RESERVED_SIZE)
     );
     // The firmware checks a boot block as the ROM does.
-    let assembly = |path: &str, xlen| {
-        xtask::examples::assembly_of(&root, path, &[xtask::examples::INCLUDE_DIR], xlen).unwrap()
-    };
-    let disk = assembly("firmware/disk.S", Xlen::Rv64);
+    let assembly =
+        |path: &str| xtask::examples::assembly_of(&root, path, &[xtask::examples::INCLUDE_DIR]).unwrap();
+    let disk = assembly("firmware/disk.S");
     assert_eq!(equ(&disk, "BOOT_MAGIC"), grail::boot::BOOT_MAGIC);
     assert_eq!(equ(&disk, "BOOT_SIZE") as usize, grail::boot::BOOT_BLOCK_SIZE);
     assert_eq!(equ(&disk, "BOOT_SIG") as usize, boot::MAGIC_AT);
-    // The RV64 bootloader runs where the firmware starts its next stage, and
-    // the RV64 kernel loads there.
-    let loader64 = assembly("kernel/boot/boot.S", Xlen::Rv64);
-    assert_eq!(u64::from(equ(&loader64, "FW_JUMP_ADDR")), gf::FW_JUMP_ADDR);
-    assert_eq!(equ(&loader64, "BOOT_AREA"), grail::boot::BOOT_AREA_SIZE);
-    assert_eq!(equ(&loader64, "BOOT_SIZE") as usize, grail::boot::BOOT_BLOCK_SIZE);
+    // The bootloader runs where the firmware starts its next stage, and the
+    // kernel loads there.
+    let loader = assembly("kernel/boot/boot.S");
+    assert_eq!(u64::from(equ(&loader, "FW_JUMP_ADDR")), gf::FW_JUMP_ADDR);
+    assert_eq!(equ(&loader, "BOOT_AREA"), grail::boot::BOOT_AREA_SIZE);
+    assert_eq!(equ(&loader, "BOOT_SIZE") as usize, grail::boot::BOOT_BLOCK_SIZE);
     assert!(read("kernel/kernel.lds.S").contains("AT(0x80200000)"));
     // And the spec says so.
     let spec = read("docs/excalibur-spec.md");
@@ -698,14 +651,11 @@ fn the_firmware_grail_the_kernel_and_the_documents_agree() {
 fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     let root = repo_root();
     let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
-    // A `.S` source as merlin-as gets it at each width: preprocessed.
-    let assembly = |path: &str, xlen| {
-        xtask::examples::assembly_of(&root, path, &[xtask::examples::INCLUDE_DIR], xlen).unwrap()
-    };
-    let rom = assembly("crates/grail/rom/diskboot.S", Xlen::Rv32);
-    let rom64 = assembly("crates/grail/rom/diskboot.S", Xlen::Rv64);
-    let loader = assembly("kernel/boot/boot.S", Xlen::Rv32);
-    let loader64 = assembly("kernel/boot/boot.S", Xlen::Rv64);
+    // A `.S` source as merlin-as gets it: preprocessed.
+    let assembly =
+        |path: &str| xtask::examples::assembly_of(&root, path, &[xtask::examples::INCLUDE_DIR]).unwrap();
+    let rom = assembly("crates/grail/rom/diskboot.S");
+    let loader = assembly("kernel/boot/boot.S");
     let spec = read("docs/excalibur-spec.md");
     let fs_doc = read("docs/camelot-fs.md");
 
@@ -718,59 +668,42 @@ fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     assert_eq!(equ(&rom, "BOOT_AREA"), grail::boot::BOOT_AREA_SIZE);
     assert_eq!(equ(&rom, "EXIT_BOOT_FAILED"), grail::boot::EXIT_BOOT_FAILED);
     assert_eq!(u64::from(equ(&rom, "PARK_PC")), grail::bus::PARK_PC);
-    // The two loaders agree on everything but the registers' layout.
-    for name in [
-        "PARK_PC",
-        "RAM_BASE",
-        "BOOT_AREA",
-        "BOOT_SIZE",
-        "BOOT_SECTORS",
-        "BOOT_SIG",
-        "BOOT_MAGIC",
-        "EXIT_BOOT_FAILED",
-        "UART_BASE",
-        "SYSINFO_BASE",
-        "DISK0",
-        "CMD_READ",
-        "STATUS_DONE",
-    ] {
-        assert_eq!(equ(&rom64, name), equ(&rom, name), "{name}");
-    }
-    // The RV64 loader's and the RV64 examples' device registers (their RV64
-    // builds) are where version 2 of each interface has them (spec sections
-    // 9.5, 9.6, 9.8).
-    let mut rv64 = vec![("crates/grail/rom/diskboot.S".to_string(), rom64.clone())];
+    // The machine's layout, as Grail has it.
+    assert_eq!(u64::from(equ(&rom, "RAM_BASE")), grail::bus::RAM_BASE);
+    assert_eq!(
+        equ(&rom, "BOOT_SECTORS") as usize,
+        boot::BOOT_BLOCK_SIZE / grail::block::SECTOR_SIZE
+    );
+    assert_eq!(u64::from(equ(&rom, "UART_BASE")), grail::bus::UART_BASE);
+    assert_eq!(u64::from(equ(&rom, "SYSINFO_BASE")), grail::bus::SYSINFO_BASE);
+    assert_eq!(u64::from(equ(&rom, "DISK0")), grail::bus::BLK_BASE);
+    // The loader's and the examples' device registers are where Grail has
+    // them (spec sections 9.5, 9.6, 9.8).
+    let mut sources = vec![("crates/grail/rom/diskboot.S".to_string(), rom.clone())];
     for ex in xtask::examples::EXAMPLES {
         for s in ex.sources {
             let path = format!("{}/{s}", ex.dir_name());
-            let text = assembly(&path, Xlen::Rv64);
-            rv64.push((path, text));
+            let text = assembly(&path);
+            sources.push((path, text));
         }
     }
-    let mut unchecked: BTreeSet<&str> = V2_REGISTERS.iter().map(|&(name, _)| name).collect();
-    for (path, source) in &rv64 {
-        for &(name, value) in V2_REGISTERS {
+    let mut unchecked: BTreeSet<&str> = REGISTERS.iter().map(|&(name, _)| name).collect();
+    for (path, source) in &sources {
+        for &(name, value) in REGISTERS {
             if has_equ(source, name) {
                 assert_eq!(equ(source, name), value, "{path}: {name}");
                 unchecked.remove(name);
             }
         }
     }
-    assert!(unchecked.is_empty(), "no RV64 source defines {unchecked:?}");
+    assert!(unchecked.is_empty(), "no source defines {unchecked:?}");
     assert!(spec.contains("exit code 0xFD") && spec.contains("0x544F_4F42"));
-    // The fields the bootloader reads are where mkfs writes them, at both
-    // widths, and the ELF layouts each width's loader reads are the elf
-    // crate's.
-    for loader in [&loader, &loader64] {
-        assert_eq!(equ(loader, "KERNEL_SECTOR") as usize, boot::KERNEL_SECTOR_AT);
-        assert_eq!(equ(loader, "KERNEL_SECTORS") as usize, boot::KERNEL_SECTORS_AT);
-        assert_eq!(equ(loader, "HEADERS_SIZE") as usize, boot::KERNEL_HEADERS);
-        assert_eq!(u64::from(equ(loader, "BOOT_ENTRY")), grail::boot::BOOT_ENTRY_ADDR);
-        assert_eq!(equ(loader, "RAM_BASE"), boot::RAM_BASE);
-        assert_eq!(equ(loader, "EXIT_BOOT_FAILED"), 0xfc);
-    }
-    assert_eq!(equ(&loader, "PHDR_SIZE") as usize, elf::PHDR_SIZE);
-    assert_eq!(equ(&loader64, "PHDR_SIZE") as usize, elf::PHDR64_SIZE);
+    // The fields the bootloader reads are where mkfs writes them, and the
+    // ELF64 layout it reads is the elf crate's.
+    assert_eq!(equ(&loader, "KERNEL_SECTOR") as usize, boot::KERNEL_SECTOR_AT);
+    assert_eq!(equ(&loader, "KERNEL_SECTORS") as usize, boot::KERNEL_SECTORS_AT);
+    assert_eq!(equ(&loader, "HEADERS_SIZE") as usize, boot::KERNEL_HEADERS);
+    assert_eq!(equ(&loader, "PHDR_SIZE") as usize, elf::PHDR64_SIZE);
     for (at, field) in [
         (boot::KERNEL_SECTOR_AT, "kernel_sector"),
         (boot::KERNEL_SECTORS_AT, "kernel_sectors"),

@@ -15,13 +15,9 @@
 # Anything else returns SBI_ERR_NOT_SUPPORTED. No S-mode code touches the
 # CLINT, an M-mode CSR or a scratch block: only these calls.
 #
-# Two programs carry this file:
-#   * the firmware image (firmware.elf, RV64), whose entry.S starts it on
-#     every hart;
-#   * the RV32 kernel, whose M-mode layer it is until #159 removes RV32
-#     (kernel/machine.S includes it; the RV64 kernel has no M-mode code).
-# So it is written for both widths (<asm.h>), and it assumes nothing of
-# what runs next: the coldboot takes the next stage's address.
+# The firmware image (firmware.elf) carries it, and its entry.S starts it on
+# every hart. It assumes nothing of what runs next: the coldboot takes the
+# next stage's address.
 #
 # Booting:
 #   * The boot hart's coldboot (sbi_coldboot, hart 0, with a0 = the next
@@ -52,11 +48,10 @@
 # at the hart's scratch block (fw.h) and a0-a7 stay what the caller passed,
 # and saves t0-t5 there: the SBI preserves every register but a0 and a1,
 # the result. M-mode does not translate addresses, so everything here is at
-# its physical address: the scratch blocks, the CLINT, the code itself (in
-# the RV32 kernel too, which runs where it is linked).
+# its physical address: the scratch blocks, the CLINT, the code itself.
 #
 # The Xcal instructions are written as .word, as in the kernel's assembly,
-# which clang assembles too in the RV32 kernel's reference build:
+# so that clang assembles them too:
 #   xcal.dbg  a0 = 0x0005000b   (rs1 = a0 = x10, funct3 = 000, custom-0)
 #   xcal.halt a0 = 0x0005100b   (rs1 = a0 = x10, funct3 = 001, custom-0)
 
@@ -99,8 +94,8 @@
     .globl sbi_coldboot
 sbi_coldboot:
     # What the machine has, from sysinfo (spec section 9.5): the harts (1
-    # to FW_MAX_HARTS, the scratch blocks there are), RAM, and on RV64 the
-    # region it reserves for the firmware, which S-mode may neither start a
+    # to FW_MAX_HARTS, the scratch blocks there are), RAM, and the region
+    # it reserves for the firmware, which S-mode may neither start a
     # hart in (hart_start's check) nor hand the console (sbi_check_buffer),
     # as an OpenSBI domain keeps its own region from S-mode. Without sysinfo: one hart and no
     # RAM, so nothing can be started (a kernel stops at once anyway: it
@@ -112,15 +107,13 @@ sbi_coldboot:
     lw    t1, SYS_MAGIC(t0)
     li    t2, SYSINFO_MAGIC
     bne   t1, t2, 2f
-#if __riscv_xlen == 64
     ld    t1, SYS_RESERVED_BASE(t0)
     la    t2, sbi_reserved_base
     sd    t1, 0(t2)
     ld    t1, SYS_RESERVED_SIZE(t0)
     la    t2, sbi_reserved_size
     sd    t1, 0(t2)
-#endif
-    LWU   t3, SYS_HARTS(t0)
+    lwu   t3, SYS_HARTS(t0)
     REG_L t4, SYS_RAM_BASE(t0)
     REG_L t5, SYS_RAM_SIZE(t0)
     li    t2, FW_MAX_HARTS
@@ -148,7 +141,7 @@ sbi_coldboot:
 4:  call  sbi_hart_init
 
     # Wake the other harts out of the boot ROM's park loop: each comes
-    # through its entry (the firmware's _start, the RV32 kernel's) to
+    # through its entry (the firmware's _start) to
     # sbi_hart_wait. They must see the states above, so the stores to
     # normal memory go before the device stores (RVWMO: msip is I/O, which
     # only a fence with the I/O bits orders, #170).
@@ -240,8 +233,8 @@ sbi_hart_wait:
 # sstatus.SIE 0, a0 = the hart's id, a1 as the caller set it.
 sbi_enter_supervisor:
     csrw  mepc, t0
-    # A whole-register update of mstatus: on RV64 its upper half holds SXL,
-    # UXL and SD.
+    # A whole-register update of mstatus: its upper half holds SXL, UXL and
+    # SD.
     li    t0, MSTATUS_MPP
     csrc  mstatus, t0
     li    t0, MSTATUS_MPP_S
@@ -419,8 +412,8 @@ sbi_base:
     csrr  a1, mimpid
     j     sbi_value
 
-# TIME set_timer(stime_value): this hart's mtimecmp = the value (on RV32 a0
-# is its low half and a1 its high one), no supervisor timer interrupt
+# TIME set_timer(stime_value): this hart's mtimecmp = the value (a0), no
+# supervisor timer interrupt
 # pending any more, and the machine timer enabled, to raise it when the
 # value comes.
 sbi_time:
@@ -429,16 +422,7 @@ sbi_time:
     slli  t0, t0, 3
     li    t1, CLINT_MTIMECMP0
     add   t0, t0, t1            # t0 = &mtimecmp[this hart]
-#if __riscv_xlen == 64
     sd    a0, 0(t0)
-#else
-    # Two halves: the high word at its maximum while the low one changes,
-    # so that no value in between is in the past.
-    li    t1, -1
-    sw    t1, 4(t0)
-    sw    a0, 0(t0)
-    sw    a1, 4(t0)
-#endif
     li    t0, MIP_STIP
     csrc  mip, t0
     li    t0, MIE_MTIE
@@ -540,7 +524,7 @@ sbi_hart_start:
     la    t1, sbi_ram_size
     REG_L t1, 0(t1)
     bgeu  t0, t1, sbi_invalid_address
-    # And not in the firmware's own region (nothing reserved on RV32).
+    # And not in the firmware's own region.
     la    t0, sbi_reserved_base
     REG_L t0, 0(t0)
     sub   t0, a1, t0            # its offset into the region
@@ -590,12 +574,7 @@ sbi_hart_stop:
     li    t1, CLINT_MTIMECMP0
     add   t0, t0, t1
     li    t1, -1                # mtimecmp at "never"
-#if __riscv_xlen == 64
     sd    t1, 0(t0)
-#else
-    sw    t1, 4(t0)
-    sw    t1, 0(t0)
-#endif
     csrw  mie, zero
     li    t0, MIP_S_PENDING
     csrc  mip, t0
@@ -624,12 +603,8 @@ sbi_hart_get_status:
 # to do: not supported. The other types are reserved or a platform's own,
 # which this one has none of.
 sbi_hart_suspend:
-#if __riscv_xlen == 64
     slli  t0, a0, 32            # suspend_type is 32 bits
     srli  t0, t0, 32
-#else
-    mv    t0, a0
-#endif
     beqz  t0, 1f
     li    t1, SBI_HSM_SUSPEND_NON_RET_DEFAULT
     beq   t0, t1, sbi_not_supported
@@ -649,15 +624,10 @@ sbi_hart_suspend:
 # types and reasons, and a vendor's, are invalid.
 sbi_srst:
     bnez  a6, sbi_not_supported
-#if __riscv_xlen == 64
     slli  t0, a0, 32
     srli  t0, t0, 32            # t0 = reset_type
     slli  t1, a1, 32
     srli  t1, t1, 32            # t1 = reset_reason
-#else
-    mv    t0, a0
-    mv    t1, a1
-#endif
     li    t2, SBI_SRST_TYPE_WARM_REBOOT
     bgtu  t0, t2, sbi_invalid_param
     li    t3, 0                 # t3 = the exit code
@@ -771,7 +741,7 @@ sbi_check_buffer:
 machine_scratch:
     .zero FW_MAX_HARTS * SCRATCH_BYTES
 # The firmware's region of RAM, which S-mode may not use (sysinfo's
-# SYS_RESERVED_BASE and SYS_RESERVED_SIZE on RV64; nothing on RV32).
+# SYS_RESERVED_BASE and SYS_RESERVED_SIZE).
     .globl sbi_reserved_base
 sbi_reserved_base:
     .zero SZREG

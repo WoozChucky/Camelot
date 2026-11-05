@@ -25,7 +25,6 @@
 
 use crate::ast::*;
 use crate::consteval;
-use crate::types::Xlen;
 use crate::Pos;
 use std::collections::HashMap;
 
@@ -110,25 +109,24 @@ struct Checker {
     /// walked, with what they replaced, to make them values after it.
     side_effects: Option<Vec<(VarRef, Option<Usage>)>>,
     found: Vec<Found>,
-    xlen: Xlen,
 }
 
 /// The `-Wunsequenced` warnings of the full expression `e`, in order.
-pub fn check(e: &Expr, xlen: Xlen) -> Vec<Found> {
-    let mut c = checker(xlen);
+pub fn check(e: &Expr) -> Vec<Found> {
+    let mut c = checker();
     c.value(e);
     c.found
 }
 
 /// Of a declaration's list `init`, one full expression whose items C
 /// leaves unsequenced (clang's `VisitInitListExpr` in C): `{i++, i++}`.
-pub fn check_init(init: &Init, xlen: Xlen) -> Vec<Found> {
-    let mut c = checker(xlen);
+pub fn check_init(init: &Init) -> Vec<Found> {
+    let mut c = checker();
     c.init(init);
     c.found
 }
 
-fn checker(xlen: Xlen) -> Checker {
+fn checker() -> Checker {
     Checker {
         tree: Tree {
             nodes: vec![(0, false)],
@@ -137,7 +135,6 @@ fn checker(xlen: Xlen) -> Checker {
         usages: HashMap::new(),
         side_effects: None,
         found: Vec::new(),
-        xlen,
     }
 }
 
@@ -325,7 +322,7 @@ impl Checker {
                 self.region = left;
                 self.sequenced(|c| c.value(l));
                 // The right operand, unless the left one decides it.
-                let decided = consteval::int(l, self.xlen).map(|v| v != 0);
+                let decided = consteval::int(l).map(|v| v != 0);
                 if decided != Some(*op == BinOp::LogOr) {
                     self.region = right;
                     self.value(r);
@@ -344,7 +341,7 @@ impl Checker {
                 );
                 self.region = cond;
                 self.sequenced(|s| s.value(c));
-                let decided = consteval::int(c, self.xlen).map(|v| v != 0);
+                let decided = consteval::int(c).map(|v| v != 0);
                 if decided != Some(false) {
                     self.region = yes;
                     self.value(a);

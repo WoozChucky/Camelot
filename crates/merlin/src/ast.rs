@@ -19,7 +19,7 @@
 //! Typedefs, struct tags and enum constants are gone even earlier: the parser
 //! resolves them, so the tree only has types and numbers.
 
-use crate::types::{Spelled, Spellings, Type, Xlen};
+use crate::types::{Spelled, Spellings, Type};
 use crate::Pos;
 use std::fmt::Write;
 
@@ -27,9 +27,6 @@ use std::fmt::Write;
 pub struct Program {
     /// Top-level declarations and function definitions, in source order.
     pub items: Vec<Item>,
-    /// The target the program is for: its types' sizes, and the code
-    /// generated for it ([`crate::types`]).
-    pub xlen: Xlen,
     /// The expressions of the file's scope the parser evaluated away that
     /// no declarator or function keeps ([`Declarator::sized`],
     /// [`Function::unevaluated`]), each after how many items it comes, for
@@ -728,17 +725,13 @@ impl Expr {
 /// Expressions show their type after a colon; resolved variables show where they
 /// live (`#n` for local `n`, `@name` for a global symbol).
 pub fn dump(prog: &Program) -> String {
-    let mut d = Dumper {
-        out: String::new(),
-        xlen: prog.xlen,
-    };
+    let mut d = Dumper { out: String::new() };
     d.program(prog);
     d.out
 }
 
 struct Dumper {
     out: String,
-    xlen: Xlen,
 }
 
 impl Dumper {
@@ -833,7 +826,7 @@ impl Dumper {
                     match ds {
                         Designator::Member(name, ..) => text += &format!(".{name}"),
                         Designator::Index(e, _) => {
-                            text += &format!("[{}]", crate::consteval::int(e, self.xlen).unwrap_or(0))
+                            text += &format!("[{}]", crate::consteval::int(e).unwrap_or(0))
                         }
                     }
                 }

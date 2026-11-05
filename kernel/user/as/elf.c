@@ -1,7 +1,6 @@
-/* as: the relocatable object (merlin-as's elf.rs): ELF32 for RV32, ELF64
- * for RV64.
+/* as: the relocatable object (merlin-as's elf.rs), ELF64.
  *
- *   ELF header (52 or 64 bytes)
+ *   ELF header (64 bytes)
  *   section contents (.text, .data, ... then .rela.*, .symtab, .strtab, .shstrtab)
  *   section header table
  *
@@ -11,13 +10,12 @@
  * .shstrtab. Symbols: null, the locals, then the globals, each in the order
  * they were made.
  *
- * The two classes: ELF64 is ELF32 with the fields that hold an address, an
- * offset or a size widened to 8 bytes (put_word); the counts, indices and
- * types stay 4 or 2 bytes. Two records change shape beyond that: a symbol
- * (Elf64_Sym) puts st_info, st_other and st_shndx before st_value and
- * st_size, and a relocation (Elf64_Rela) packs its symbol and type as
- * sym << 32 | type, with the whole 64-bit addend. The tables of 8-byte
- * fields (.rela.*, .symtab, the section headers) start 8-aligned. */
+ * The fields that hold an address, an offset or a size are 8 bytes (buf_u64);
+ * the counts, indices and types 4 or 2 bytes. Two records are laid out for
+ * that: a symbol (Elf64_Sym) puts st_info, st_other and st_shndx before
+ * st_value and st_size, and a relocation (Elf64_Rela) packs its symbol and
+ * type as sym << 32 | type, with the whole 64-bit addend. The tables of
+ * 8-byte fields (.rela.*, .symtab, the section headers) start 8-aligned. */
 #include "as.h"
 #include "tables.h"
 
@@ -30,45 +28,24 @@
 #define SHN_UNDEF 0
 #define SHN_ABS 0xfff1
 #define EM_RISCV 243
-#define ELFCLASS32 1
 #define ELFCLASS64 2
 
-/* What differs between the classes (merlin-as's Class): the bytes of an
- * address, offset or size field (also the alignment of the tables made of
- * them), the ELF header, a section header, a symbol and a relocation. */
-struct class {
-    uint ident;
-    uint word;
-    uint ehsize;
-    uint shentsize;
-    uint sym;
-    uint rela;
-};
-
-static const struct class ELF32 = {ELFCLASS32, 4, 52, 40, 16, 12};
-static const struct class ELF64 = {ELFCLASS64, 8, 64, 64, 24, 24};
-
-/* This object's class. */
-static const struct class *class;
+/* The bytes of an address, offset or size field (also the alignment of the
+ * tables made of them), of the ELF header, a section header, a symbol and a
+ * relocation (merlin-as's WORD, EHSIZE, SHENTSIZE, SYM and RELA). */
+#define WORD 8
+#define EHSIZE 64
+#define SHENTSIZE 64
+#define SYM 24
+#define RELA 24
 
 const char *riscv_arch(void) {
-    return xlen == 64 ? RISCV_ARCH_RV64 : RISCV_ARCH;
+    return RISCV_ARCH;
 }
 
 static void buf_u64(struct buf *b, uint64_t v) {
     buf_u32(b, (uint)v);
     buf_u32(b, (uint)(v >> 32));
-}
-
-/* An address, offset or size field: 4 bytes in ELF32, 8 in ELF64. What goes
- * in an ELF32 one fits in 32 bits (an RV32 constant or symbol size is cut
- * before it gets here). */
-static void put_word(struct buf *b, uint64_t v) {
-    if (class->word == 4) {
-        buf_u32(b, (uint)v);
-    } else {
-        buf_u64(b, v);
-    }
 }
 
 /* A string table, as merlin-as builds them: "" is offset 0, and a string
@@ -89,8 +66,8 @@ static uint strtab_add(struct buf *t, struct strmap *seen, const char *s) {
 }
 
 /* A section header; sh_addr is always 0 in a relocatable file. Every value
- * here fits in 32 bits (section sizes and file offsets are 32-bit), and
- * put_word widens the address-sized ones for ELF64. */
+ * here fits in 32 bits (section sizes and file offsets are 32-bit), and the
+ * address-sized ones are written 8 bytes wide. */
 struct shdr {
     uint name, ty, flags, offset, size, link, info, align, entsize;
 };
@@ -106,8 +83,8 @@ static struct shdr *new_shdr(void) {
 }
 
 /* .riscv.attributes: `A`, then the vendor subsection "riscv" holding one
- * Tag_File subsubsection with Tag_RISCV_arch = riscv_arch() (the two
- * widths' strings have the same length). Lengths count themselves. */
+ * Tag_File subsubsection with Tag_RISCV_arch = riscv_arch(). Lengths count
+ * themselves. */
 void riscv_attributes(struct buf *out) {
     const char *name = riscv_arch();
     uint arch = (uint)strlen(name);
@@ -127,7 +104,6 @@ static int is_global(struct symbol *s) {
 }
 
 void elf_write(struct object *obj, struct buf *out) {
-    class = xlen == 64 ? &ELF64 : &ELF32;
     struct buf shstr, strtab, symtab;
     struct strmap shstr_seen, strtab_seen;
     memset(&shstr_seen, 0, sizeof shstr_seen);
@@ -137,7 +113,7 @@ void elf_write(struct object *obj, struct buf *out) {
     memset(&symtab, 0, sizeof symtab);
     buf_byte(&shstr, 0);
     buf_byte(&strtab, 0);
-    buf_zeros(out, class->ehsize); /* the header, filled in at the end */
+    buf_zeros(out, EHSIZE); /* the header, filled in at the end */
     new_shdr();
 
     for (uint i = 0; i < obj->nsections; i++) {
@@ -163,7 +139,7 @@ void elf_write(struct object *obj, struct buf *out) {
     if (index == NULL) {
         die("out of memory");
     }
-    buf_zeros(&symtab, class->sym);
+    buf_zeros(&symtab, SYM);
     uint n = 1;
     uint first_global = 0;
     /* The first `.file "name"`'s symbol comes before every other local, the
@@ -200,10 +176,8 @@ void elf_write(struct object *obj, struct buf *out) {
                 shndx = SHN_ABS;
             } else if (s->has_constant) {
                 /* An `.equ` constant is an absolute symbol whose value is
-                 * the constant: cut to 32 bits in ELF32 (as LLVM does on
-                 * riscv32), whole in ELF64, so `.equ K, -1` is 0xffffffff
-                 * or 0xffffffffffffffff. */
-                value = xlen == 64 ? (uint64_t)s->constant : (uint)s->constant;
+                 * the constant, whole: `.equ K, -1` is 0xffffffffffffffff. */
+                value = (uint64_t)s->constant;
                 shndx = SHN_ABS;
             } else if (s->section >= 0) {
                 value = s->value;
@@ -215,25 +189,14 @@ void elf_write(struct object *obj, struct buf *out) {
             /* A section symbol has no name: it stands for its section. */
             uint name = s->ty == SYM_SECTION ? 0 : strtab_add(&strtab, &strtab_seen, s->name);
             uint info = (uint)pass << 4 | ty;
-            if (xlen == 64) {
-                /* Elf64_Sym: st_name, st_info, st_other, st_shndx, st_value,
-                 * st_size. */
-                buf_u32(&symtab, name);
-                buf_byte(&symtab, info);
-                buf_byte(&symtab, 0);
-                buf_u16(&symtab, shndx);
-                buf_u64(&symtab, value);
-                buf_u64(&symtab, s->size);
-            } else {
-                /* Elf32_Sym: st_name, st_value, st_size (cut to 32 bits, as
-                 * LLVM writes it), st_info, st_other, st_shndx. */
-                buf_u32(&symtab, name);
-                buf_u32(&symtab, (uint)value);
-                buf_u32(&symtab, (uint)s->size);
-                buf_byte(&symtab, info);
-                buf_byte(&symtab, 0);
-                buf_u16(&symtab, shndx);
-            }
+            /* Elf64_Sym: st_name, st_info, st_other, st_shndx, st_value,
+             * st_size. */
+            buf_u32(&symtab, name);
+            buf_byte(&symtab, info);
+            buf_byte(&symtab, 0);
+            buf_u16(&symtab, shndx);
+            buf_u64(&symtab, value);
+            buf_u64(&symtab, s->size);
         }
     }
 
@@ -252,38 +215,31 @@ void elf_write(struct object *obj, struct buf *out) {
         if (s->nrelocs == 0) {
             continue;
         }
-        buf_align(out, class->word);
+        buf_align(out, WORD);
         uint offset = out->len;
         for (uint k = 0; k < s->nrelocs; k++) {
             struct reloc *r = &s->relocs[k];
             uint sym = index[r->sym];
-            put_word(out, r->offset);
-            if (xlen == 64) {
-                /* ELF64_R_INFO(sym, type), and the whole 64-bit addend. */
-                buf_u32(out, (uint)r->kind);
-                buf_u32(out, sym);
-                buf_u64(out, (uint64_t)r->addend);
-            } else {
-                /* ELF32_R_INFO(sym, type); the addend field holds 32 bits,
-                 * so a wider addend loses its high bits, as LLVM cuts it. */
-                buf_u32(out, sym << 8 | (uint)r->kind);
-                buf_u32(out, (uint)r->addend);
-            }
+            buf_u64(out, r->offset);
+            /* ELF64_R_INFO(sym, type), and the whole 64-bit addend. */
+            buf_u32(out, (uint)r->kind);
+            buf_u32(out, sym);
+            buf_u64(out, (uint64_t)r->addend);
         }
         struct shdr *h = new_shdr();
         h->name = strtab_add(&shstr, &shstr_seen, fmt(".rela%s", s->name));
         h->ty = SHT_RELA;
         h->flags = SHF_INFO_LINK;
         h->offset = offset;
-        h->size = class->rela * s->nrelocs;
+        h->size = RELA * s->nrelocs;
         h->link = symtab_index;
         h->info = i + 1;
-        h->align = class->word;
-        h->entsize = class->rela;
+        h->align = WORD;
+        h->entsize = RELA;
     }
     free(index);
 
-    buf_align(out, class->word);
+    buf_align(out, WORD);
     struct shdr *h = new_shdr();
     h->name = strtab_add(&shstr, &shstr_seen, ".symtab");
     h->ty = SHT_SYMTAB;
@@ -291,8 +247,8 @@ void elf_write(struct object *obj, struct buf *out) {
     h->size = symtab.len;
     h->link = symtab_index + 1;
     h->info = first_global;
-    h->align = class->word;
-    h->entsize = class->sym;
+    h->align = WORD;
+    h->entsize = SYM;
     buf_put(out, symtab.data, symtab.len);
 
     h = new_shdr();
@@ -311,30 +267,29 @@ void elf_write(struct object *obj, struct buf *out) {
     h->align = 1;
     buf_put(out, shstr.data, shstr.len);
 
-    /* The section headers: the same fields in the same order in both
-     * classes, the address-sized ones (flags, addr, offset, size,
-     * addralign, entsize) 4 or 8 bytes. */
-    buf_align(out, class->word);
+    /* The section headers, the address-sized fields (flags, addr, offset,
+     * size, addralign, entsize) 8 bytes. */
+    buf_align(out, WORD);
     uint shoff = out->len;
     for (uint i = 0; i < nshdrs; i++) {
         struct shdr *s = &shdrs[i];
         buf_u32(out, s->name);
         buf_u32(out, s->ty);
-        put_word(out, s->flags);
-        put_word(out, 0); /* sh_addr */
-        put_word(out, s->offset);
-        put_word(out, s->size);
+        buf_u64(out, s->flags);
+        buf_u64(out, 0); /* sh_addr */
+        buf_u64(out, s->offset);
+        buf_u64(out, s->size);
         buf_u32(out, s->link);
         buf_u32(out, s->info);
-        put_word(out, s->align);
-        put_word(out, s->entsize);
+        buf_u64(out, s->align);
+        buf_u64(out, s->entsize);
     }
 
     /* The ELF header. */
     struct buf hdr;
     memset(&hdr, 0, sizeof hdr);
     buf_put(&hdr, "\177ELF", 4);
-    buf_byte(&hdr, class->ident);
+    buf_byte(&hdr, ELFCLASS64);
     buf_byte(&hdr, 1); /* little-endian */
     buf_byte(&hdr, 1); /* version 1 */
     buf_byte(&hdr, 0); /* SysV ABI */
@@ -342,16 +297,16 @@ void elf_write(struct object *obj, struct buf *out) {
     buf_u16(&hdr, 1); /* ET_REL */
     buf_u16(&hdr, EM_RISCV);
     buf_u32(&hdr, 1); /* e_version */
-    put_word(&hdr, 0); /* e_entry */
-    put_word(&hdr, 0); /* e_phoff */
-    put_word(&hdr, shoff);
-    buf_u32(&hdr, 0); /* e_flags: the soft-float ABI (ilp32 or lp64), no RVC */
-    buf_u16(&hdr, class->ehsize);
+    buf_u64(&hdr, 0); /* e_entry */
+    buf_u64(&hdr, 0); /* e_phoff */
+    buf_u64(&hdr, shoff);
+    buf_u32(&hdr, 0); /* e_flags: the soft-float ABI (lp64), no RVC */
+    buf_u16(&hdr, EHSIZE);
     buf_u16(&hdr, 0); /* e_phentsize */
     buf_u16(&hdr, 0); /* e_phnum */
-    buf_u16(&hdr, class->shentsize);
+    buf_u16(&hdr, SHENTSIZE);
     buf_u16(&hdr, nshdrs);
     buf_u16(&hdr, nshdrs - 1);
-    memcpy(out->data, hdr.data, class->ehsize);
+    memcpy(out->data, hdr.data, EHSIZE);
     free(hdr.data);
 }

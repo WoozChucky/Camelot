@@ -9,9 +9,9 @@
 # through sscratch.
 #
 # Every slot is a register wide (SZREG, asm.h): regs[i] at i*SZREG, then the
-# CSRs. The same source builds for RV32 and RV64 (#193).
+# CSRs.
 #
-# On RV64 the kernel stacks are 16 KiB each with an unmapped guard page
+# The kernel stacks are 16 KiB each with an unmapped guard page
 # below (vm.h, "Kernel stacks"), and a stack that overflows faults into its
 # guard page: a trap whose frame would have to go there is caught before
 # anything is stored, as Linux's handle_exception does under CONFIG_VMAP_STACK
@@ -33,14 +33,12 @@
     .align 2
     .globl kernel_vec
 kernel_vec:
-#if __riscv_xlen == 64
     csrw  sscratch, t0
     addi  t0, sp, -TRAP_FRAME_SIZE
     srli  t0, t0, KSTACK_SHIFT
     andi  t0, t0, 1
     bnez  t0, kernel_stack_overflow
     csrr  t0, sscratch
-#endif
     addi  sp, sp, -TRAP_FRAME_SIZE
     # regs[0] is x0 (always 0) and regs[2] the sp from before the trap;
     # both are stored once a temporary is free.
@@ -126,7 +124,6 @@ kernel_vec:
     addi  sp, sp, TRAP_FRAME_SIZE
     sret
 
-#if __riscv_xlen == 64
 # The frame doesn't fit: t0 is in sscratch and sp is the stack pointer that
 # ran out, both as the trap found them. The frame goes at the top of this
 # hart's overflow stack, overflow_stacks + (tp + 1) * OVERFLOW_STACK_SIZE
@@ -186,16 +183,14 @@ kernel_stack_overflow:
     mv    a0, sp
     call  kstack_overflow       # panics
 1:  j     1b
-#endif
 
 # void illegal_instruction(void): for testing the panic path. Fills every
-# register but sp with its own number in each byte (x1 = 0x01010101, ...,
-# x31 = 0x1f1f1f1f on RV32; x1 = 0x0101010101010101 on RV64), then executes
+# register but sp with its own number in each byte (x1 = 0x0101010101010101,
+# ..., x31 = 0x1f1f1f1f1f1f1f1f), then executes
 # unimp, which is `csrrw zero, cycle, zero`: a write to a read-only CSR, so
 # illegal in every mode.
     .globl illegal_instruction
 illegal_instruction:
-#if __riscv_xlen == 64
     li    ra, 0x0101010101010101
     li    gp, 0x0303030303030303
     li    t0, 0x0505050505050505
@@ -228,37 +223,5 @@ illegal_instruction:
     # tp last: the kernel's tp is the hart's id, which an interrupt handler
     # taken in between (interrupts are on) would need for its locks.
     li    tp, 0x0404040404040404
-#else
-    li    ra, 0x01010101
-    li    gp, 0x03030303
-    li    t0, 0x05050505
-    li    t1, 0x06060606
-    li    t2, 0x07070707
-    li    s0, 0x08080808
-    li    s1, 0x09090909
-    li    a0, 0x0a0a0a0a
-    li    a1, 0x0b0b0b0b
-    li    a2, 0x0c0c0c0c
-    li    a3, 0x0d0d0d0d
-    li    a4, 0x0e0e0e0e
-    li    a5, 0x0f0f0f0f
-    li    a6, 0x10101010
-    li    a7, 0x11111111
-    li    s2, 0x12121212
-    li    s3, 0x13131313
-    li    s4, 0x14141414
-    li    s5, 0x15151515
-    li    s6, 0x16161616
-    li    s7, 0x17171717
-    li    s8, 0x18181818
-    li    s9, 0x19191919
-    li    s10, 0x1a1a1a1a
-    li    s11, 0x1b1b1b1b
-    li    t3, 0x1c1c1c1c
-    li    t4, 0x1d1d1d1d
-    li    t5, 0x1e1e1e1e
-    li    t6, 0x1f1f1f1f
-    li    tp, 0x04040404
-#endif
     .word 0xc0001073            # unimp
 1:  j     1b

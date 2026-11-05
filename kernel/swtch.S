@@ -9,7 +9,7 @@
 # registers need no saving: the compiler already assumes swtch clobbers them.
 #
 # struct context (include/context.h): ra, sp, then s0-s11, a register's
-# width each (SZREG, asm.h: 4 bytes on RV32, 8 on RV64).
+# width each (SZREG, asm.h: 8 bytes).
 
 #include <asm.h>
 

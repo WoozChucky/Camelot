@@ -1,8 +1,6 @@
 // expect: 40
-// long long and unsigned long long are 64 bits on both widths: on RV32 a
-// register pair, with carries, borrows, products and shifts across the two
-// words, and division by the C library's __divdi3 and friends; on RV64 a
-// register. Each check that holds counts one.
+// long long and unsigned long long are 64 bits, a register each. Each check
+// that holds counts one.
 long long id(long long x) {
     return x;
 }

@@ -228,79 +228,42 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
         ),
         ("invalid UTF-8", ty::DISK_DELETE, cat(&[&le(2), &[0xc3, 0x28]])),
         ("option tag", ty::CREATE_VM, cat(&[&le(0), &[0; 8], &[2]])),
-        // A register width is 32 or 64, a paging mode satp's 9 (Sv48) or 8 (Sv39).
-        (
-            "register width 0",
-            ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[0, 9], &le(0), &le(0)]),
-        ),
-        (
-            "register width 128",
-            ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[128, 9], &le(0), &le(0)]),
-        ),
+        // A paging mode is satp's 9 (Sv48) or 8 (Sv39).
         (
             "paging mode 10 (Sv57)",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[64, 10], &le(0), &le(0)]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[10], &le(0), &le(0)]),
         ),
         (
             "paging mode 1 (Sv32)",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[64, 1], &le(0), &le(0)]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[1], &le(0), &le(0)]),
         ),
         // A firmware is none (0), default (1) or a file (2).
         (
             "firmware tag 3",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[64, 9, 3], &le(0), &le(0)]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[9, 3], &le(0), &le(0)]),
         ),
         (
             "device tag",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[32, 9, 0], &le(1), &[9]]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[9, 0], &le(1), &[9]]),
         ),
         (
             "disk source tag",
             ty::CREATE_VM,
-            cat(&[
-                &le(0),
-                &[0; 8],
-                &[0],
-                &le(1),
-                &le(1),
-                &[32, 9, 0],
-                &le(1),
-                &[1, 7],
-            ]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[9, 0], &le(1), &[1, 7]]),
         ),
         (
             "card switch option tag",
             ty::CREATE_VM,
-            cat(&[
-                &le(0),
-                &[0; 8],
-                &[0],
-                &le(1),
-                &le(1),
-                &[32, 9, 0],
-                &le(1),
-                &[2, 7],
-            ]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[9, 0], &le(1), &[2, 7]]),
         ),
         (
             "card MAC option tag",
             ty::CREATE_VM,
-            cat(&[
-                &le(0),
-                &[0; 8],
-                &[0],
-                &le(1),
-                &le(1),
-                &[32, 9, 0],
-                &le(1),
-                &[2, 0, 3],
-            ]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[9, 0], &le(1), &[2, 0, 3]]),
         ),
         (
             "port owner tag",

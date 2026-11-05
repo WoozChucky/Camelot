@@ -1,9 +1,7 @@
 /* Fixed-width types for the kernel. No libc: these replace <stdint.h>,
- * <stddef.h> and <stdbool.h>. The kernel builds for both widths while RV32
- * and RV64 exist side by side (#141): RV32 is ILP32 (int, long and pointers
- * are 32 bits), RV64 LP64 (int is 32 bits, long and pointers 64). u64 and
- * i64 are 64 bits on both, as Linux's are: `long long`, which merlin has
- * since #152 (on RV32 in register pairs, with libgcc.c's helpers). */
+ * <stddef.h> and <stdbool.h>. The kernel is LP64, as Linux's riscv64 is:
+ * int is 32 bits, long and pointers 64. u64 and i64 are `long long`, as
+ * Linux's are. */
 #ifndef CAMELOT_TYPES_H
 #define CAMELOT_TYPES_H
 
@@ -22,20 +20,16 @@ typedef signed long isize;
 typedef unsigned long uintptr;
 
 /* The system call ABI's types (docs/camelot-syscalls.md): a file offset
- * (off_t) and a time in seconds (time_t) are a `long`, so 64 bits on RV64
- * (LP64), as Linux's. On RV32 (ILP32) that makes them 32 bits, where an
- * offset past 2^31 - 1 has no value: not riscv32 Linux's ABI, whose glibc
- * has only a 64-bit off_t and time_t, but a stopgap until RV32 goes
- * (#159). A user address is a uintptr, a byte count a usize and a count or
- * an error an isize (size_t and ssize_t). */
+ * (off_t) and a time in seconds (time_t) are a `long`, 64 bits, as Linux's.
+ * A user address is a uintptr, a byte count a usize and a count or an error
+ * an isize (size_t and ssize_t). */
 typedef long off_t;
 typedef long time_t;
 
 /* A physical address, as page-table entries, satp and the devices' DMA
  * registers take them; a kernel pointer is a virtual address, and pa() and
  * va() (vm.h) convert between the two, as Linux's phys_addr_t, __pa and
- * __va. On RV32 the kernel's mappings are the identity, and the two are the
- * same number. */
+ * __va. */
 typedef uintptr phys_addr_t;
 
 typedef int bool;

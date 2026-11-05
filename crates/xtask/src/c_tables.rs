@@ -4,10 +4,9 @@
 //! self-hosting tests (`tests/selfhost.rs`) check it.
 //!
 //! - The assembler (`kernel/user/as`): the mnemonics' encodings and the
-//!   funct3 values the pseudo-instructions use (merlin-as's `encode`, the
-//!   RV64-only tables included, which the C assembler looks up only on
-//!   RV64 as merlin-as does), the relocation types (`reloc`), the ISA
-//!   strings of `.riscv.attributes`, one per width (`elf`), the section
+//!   funct3 values the pseudo-instructions use (merlin-as's `encode`, RV64's
+//!   own tables included), the relocation types (`reloc`), the ISA string
+//!   of `.riscv.attributes` (`elf`), the section
 //!   types and flags, `.section`'s flag letters and type names and the
 //!   sections LLVM predefines (`section`), and the major opcodes, register
 //!   and CSR names, with the CSRs only RV32 has (`excalibur`).
@@ -141,8 +140,8 @@ pub fn generate_ld_c() -> String {
 /// Rows of a name and two values (`struct as_op3`).
 type Op3Rows = &'static [(&'static str, u32, u32)];
 
-/// The tables of a name and two values, by C name: RV32's (and RV64's),
-/// then RV64's own.
+/// The tables of a name and two values, by C name: the base set's, then
+/// RV64's own (OP-32's).
 fn tables3() -> [(&'static str, Op3Rows); 4] {
     [
         ("OP_FUNCT", encode::OP_FUNCT),
@@ -152,10 +151,10 @@ fn tables3() -> [(&'static str, Op3Rows); 4] {
     ]
 }
 
-/// The CSR tables, written apart from the encodings: every name RV32 has
-/// (RV64's are those but the RV32-only ones), and the RV32-only ones
-/// (`excalibur::csr::rv32_only`: the high halves of 64-bit CSRs and the odd
-/// `pmpcfg`s), which on RV64 are no name, as in merlin-as.
+/// The CSR tables, written apart from the encodings: every name excalibur
+/// knows, and the ones only RV32 has (`excalibur::csr::rv32_only`: the high
+/// halves of 64-bit CSRs and the odd `pmpcfg`s), which are no name here, and
+/// which merlin-as reports as RV32's, as LLVM does.
 const CSR_TABLES: [&str; 2] = ["CSR_NAMES", "CSR_RV32_ONLY"];
 
 /// The tables of a name and one value (`struct as_op2`), by C name.
@@ -248,7 +247,7 @@ pub fn generate_h() -> String {
 
     s.push_str(
         "\n/* The encodings of the real instructions, by format (merlin-as's encode.rs); the\n \
-         * _32_ and _RV64_ ones are RV64's own, looked up only when assembling for RV64. */\n",
+         * _32_ and _RV64_ ones are RV64's own, beyond the base set. */\n",
     );
     for (name, _) in tables3() {
         let _ = writeln!(s, "extern const struct as_op3 {name}[];");
@@ -261,8 +260,9 @@ pub fn generate_h() -> String {
     s.push_str("extern const char *const REG_NAMES[32];\n");
 
     s.push_str(
-        "\n/* CSR names and numbers (excalibur's csr.rs): every one RV32 has, and those of them\n \
-         * only RV32 has, which are no name on RV64; and the counters' numbers. */\n",
+        "\n/* CSR names and numbers (excalibur's csr.rs): every one excalibur knows, and those\n \
+         * of them only RV32 has, which are no name here (an error says they are RV32's, as\n \
+         * LLVM's does); and the counters' numbers. */\n",
     );
     s.push_str("extern const struct as_op2 CSR_NAMES[];\nextern const struct as_op2 CSR_RV32_ONLY[];\n");
     for (name, v) in [
@@ -296,13 +296,11 @@ pub fn generate_h() -> String {
         let _ = writeln!(s, "#define {} {}", k.name(), k.elf_type());
     }
 
-    // merlin-as writes `elf::arch(xlen)`, one string per width.
     let _ = writeln!(
         s,
-        "\n/* Tag_RISCV_arch in every object's .riscv.attributes (merlin-as's elf.rs), by width. */\n\
-         #define RISCV_ARCH \"{}\"\n#define RISCV_ARCH_RV64 \"{}\"\n\n#endif",
-        merlin_as::elf::ARCH,
-        merlin_as::elf::ARCH_RV64
+        "\n/* Tag_RISCV_arch in every object's .riscv.attributes (merlin-as's elf.rs). */\n\
+         #define RISCV_ARCH \"{}\"\n\n#endif",
+        merlin_as::elf::ARCH
     );
     s
 }

@@ -1,8 +1,7 @@
 /* Camelot's firmware (spec section 7, "Firmware"): what it knows of itself
  * and of the machine it runs on, Grail's. Constants only, for assembly: the
- * firmware is all assembly (entry.S, sbi.S, disk.S), and so is the RV32
- * kernel's M-mode layer, which is sbi.S itself until #159
- * (kernel/machine.S includes it). <asm.h> gives the width's instructions. */
+ * firmware is all assembly (entry.S, sbi.S, disk.S), with <asm.h>'s names
+ * for a register's worth. */
 #ifndef CAMELOT_FW_H
 #define CAMELOT_FW_H
 
@@ -56,11 +55,7 @@
 #define SCRATCH_START_ADDR 7    /* the physical address hart_start asked for, or 0 */
 #define SCRATCH_START_ARG 8     /* hart_start's opaque, which the hart gets in a1 */
 #define SCRATCH_WORDS 16        /* a power of two: a block is at hart << SCRATCH_SHIFT */
-#if __riscv_xlen == 64
 #define SCRATCH_SHIFT 7         /* log2(16 slots of 8 bytes) */
-#else
-#define SCRATCH_SHIFT 6         /* log2(16 slots of 4 bytes) */
-#endif
 
 /* ---- Grail's devices (spec sections 7 and 9) ---- */
 
@@ -77,25 +72,19 @@
 #define UART_LSR_DR 0x01
 #define UART_LSR_THRE 0x20
 
-/* Sysinfo (spec section 9.5): version 2 on RV64, 1 on RV32. */
+/* Sysinfo (spec section 9.5): version 2. */
 #define SYSINFO_BASE 0x30002000
 #define SYSINFO_MAGIC 0x53595349 /* "SYSI" */
 #define SYS_MAGIC 0x00
-#if __riscv_xlen == 64
 #define SYS_RAM_BASE 0x08       /* 64-bit */
 #define SYS_RAM_SIZE 0x10       /* 64-bit */
 #define SYS_HARTS 0x28
 #define SYS_RESERVED_BASE 0x30  /* 64-bit: this firmware's region, from Grail */
 #define SYS_RESERVED_SIZE 0x38  /* 64-bit: 0 without firmware */
-#else
-#define SYS_RAM_BASE 0x08
-#define SYS_RAM_SIZE 0x0c
-#define SYS_HARTS 0x20
-#endif
 
-/* Disk 0's registers (spec section 9.6): version 2 on RV64, with the 64-bit
- * BLK_CAPACITY, BLK_SECTOR and BLK_DMA. The firmware is RV64 only (RV32
- * machines have none), and only it reads a disk. */
+/* Disk 0's registers (spec section 9.6): version 2, with the 64-bit
+ * BLK_CAPACITY, BLK_SECTOR and BLK_DMA. Only the firmware's disk.S reads a
+ * disk. */
 #define DISK0 0x10001000
 #define BLK_CAPACITY 0x00       /* 64-bit */
 #define BLK_SECTOR 0x08         /* 64-bit */

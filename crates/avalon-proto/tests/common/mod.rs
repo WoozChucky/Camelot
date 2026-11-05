@@ -12,7 +12,6 @@ pub fn profile() -> HardwareProfile {
         clock_hz: Some(2_000_000),
         nominal_hz: 10_000_000,
         harts: 4,
-        xlen: Xlen::Rv64,
         paging: Paging::Sv39,
         bios: Bios::File("C:\\fw\\fw_jump.bin".into()),
         devices: vec![

@@ -39,18 +39,10 @@
 #define EXT_MAX_BLOCKS 0xffffffffu
 
 /* The largest file the kernel reads or writes, in bytes (Linux's
- * s_maxbytes). On RV64 ext4's: EXT_MAX_BLOCKS blocks, 1 KiB short of
- * 4 TiB. On RV32 what its 32-bit off_t reaches, 2^31 - 1 bytes: a bigger
- * file (only mkfs, or an RV64 kernel, could make one) fails to open with
- * -EOVERFLOW. That off_t is a stopgap until RV32 goes (#159), not riscv32
- * Linux's, which is 64-bit (types.h). The kernel's offsets and sizes are
- * u64 on both (the inode's size, readi(), writei(), an open file's
- * offset), as Linux's loff_t is. */
-#if __riscv_xlen == 64
+ * s_maxbytes): ext4's, EXT_MAX_BLOCKS blocks, 1 KiB short of 4 TiB. The
+ * kernel's offsets and sizes are u64 (the inode's size, readi(), writei(),
+ * an open file's offset), as Linux's loff_t is. */
 #define MAXFILE_BYTES ((u64)EXT_MAX_BLOCKS * BSIZE)
-#else
-#define MAXFILE_BYTES 0x7fffffffull
-#endif
 #define DIRSIZ 14
 
 /* Inode types. */
@@ -274,8 +266,8 @@ void iupdate(struct inode *ip);
 void itrunc(struct inode *ip);
 
 /* Whether locked inode `ip` is bigger than the kernel handles
- * (MAXFILE_BYTES): open() refuses it with -EOVERFLOW (only on RV32 can a
- * file in the format be). */
+ * (MAXFILE_BYTES): open() refuses it with -EOVERFLOW (only a damaged inode,
+ * whose size is past what its blocks can hold, is). */
 bool inode_too_big(const struct inode *ip);
 
 /* Reads up to `n` bytes at `off` of locked inode `ip` into kernel memory

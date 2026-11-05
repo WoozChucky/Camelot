@@ -1,5 +1,5 @@
 
-tests/riscv-tests/rv32si-p-dirty:	file format elf32-littleriscv
+crates/merlin-objdump/tests/fixtures/rv32/rv32si-p-dirty:	file format elf32-littleriscv
 architecture: riscv32
 start address: 0x80000000
 

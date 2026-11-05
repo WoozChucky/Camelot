@@ -24,26 +24,20 @@
  *   R_RISCV_RELAX, NONE      nothing
  *
  * S and P are u64 addresses and A an i64 addend, and every value is
- * computed as the hardware adds: S + A (and S + A - P) modulo 2^64, then
- * read as signed for the range checks. On RV32 S and P are below 2^32 and
- * A is a 32-bit addend, so that is the exact value; on RV64 it wraps at
- * 2^64 as auipc and jal do, which is what ld.lld computes on both widths.
+ * computed as the hardware adds: S + A (and S + A - P) modulo 2^64, as
+ * auipc and jal do and as ld.lld computes, then read as signed for the range
+ * checks.
  *
- *   - A hi/lo pair builds a 32-bit value. On RV32 it wraps modulo 2^32 and
- *     reaches every address: never out of range. On RV64 lui and auipc
- *     sign-extend hi << 12, so a pair reaches -2^31 - 0x800 to
- *     2^31 - 0x801: HI20, PCREL_HI20 and CALL(_PLT) are checked against
- *     that window (check_hi_window), the LO12 halves never.
- *   - BRANCH and JAL: +-4 KiB and +-1 MiB on both widths.
+ *   - A hi/lo pair builds a 32-bit value. lui and auipc sign-extend
+ *     hi << 12, so a pair reaches -2^31 - 0x800 to 2^31 - 0x801: HI20,
+ *     PCREL_HI20 and CALL(_PLT) are checked against that window
+ *     (check_hi_window), the LO12 halves never.
+ *   - BRANCH and JAL: +-4 KiB and +-1 MiB.
  *   - SET32 and 32_PCREL must fit 32 bits read as signed; the other ADD,
  *     SUB and SET types keep the low bits of their value.
  *   - R_RISCV_32 must fit 32 bits read as unsigned (an address) or signed
- *     (a negative offset; on RV64 also a higher-half address).
- *   - R_RISCV_64 (`.dword sym`, which assemblers emit on RV32 too) holds any
- *     value. On RV32, in a section that is not loaded (debug information,
- *     ctx->debug), it and the other 64-bit data fields get the 32-bit value
- *     sign-extended, as ld.lld's relocateNonAlloc does: `.dword _start` at
- *     0x80000000 is 0xffffffff80000000 there, and 0x80000000 in .data.
+ *     (a negative offset, or a higher-half address).
+ *   - R_RISCV_64 (`.dword sym`) holds any value.
  *
  * R_RISCV_ALIGN is refused: ld.lld deletes the padding beyond what the
  * alignment needs, and merlin-ld does not. */
@@ -95,7 +89,7 @@ static uint set_j(uint inst, uint imm) {
 
 /* The %hi / %lo split: the low 12 bits are sign-extended by the instruction
  * that adds them, so the high part rounds up when bit 11 is set. Only the
- * low 32 bits of `value` reach the fields, on both widths. */
+ * low 32 bits of `value` reach the fields. */
 static uint hi20(uint64_t value) {
     return (uint)((value + 0x800) >> 12) & 0xfffff;
 }
@@ -105,14 +99,10 @@ static uint lo12(uint64_t value) {
 }
 
 /* The range check of a hi/lo pair's value `v` (S + A for HI20, S + A - P for
- * PCREL_HI20 and CALL(_PLT)): none on RV32, where the pair wraps modulo 2^32
- * and reaches everything; on RV64, the high part (v + 0x800) >> 12 must be
- * a signed 20-bit number, or lui/auipc would sign-extend it into another
+ * PCREL_HI20 and CALL(_PLT)): the high part (v + 0x800) >> 12 must be a
+ * signed 20-bit number, or lui/auipc would sign-extend it into another
  * value (ld.lld's checkInt(hi, 20)), and the error gives that high part. */
-static int check_hi_window(int64_t v, struct reloc_context *ctx, struct reloc_error *e) {
-    if (!ctx->elf64) {
-        return RE_OK;
-    }
+static int check_hi_window(int64_t v, struct reloc_error *e) {
     /* Arithmetic shift: the sign of v + 0x800 stays. The addition wraps as
      * ld.lld's does on its uint64_t. */
     int64_t hi = (int64_t)((uint64_t)v + 0x800) >> 12;
@@ -213,8 +203,7 @@ static int apply_data(uint type, uint n, uint64_t v, uchar *bytes, struct reloc_
 int reloc_apply(uint type, uint64_t place, uint64_t sym, int64_t addend, uchar *bytes, uint64_t have,
                 struct reloc_context *ctx, struct reloc_error *e) {
     /* The two values of every formula, S + A and S + A - P, modulo 2^64 as
-     * the hardware adds, read as signed for the range checks. On RV32 they
-     * are exact (S and P below 2^32, A a 32-bit addend). */
+     * the hardware adds, read as signed for the range checks. */
     uint64_t abs = sym + (uint64_t)addend;
     uint64_t pcrel = abs - place;
     uint need;
@@ -241,22 +230,13 @@ int reloc_apply(uint type, uint64_t place, uint64_t sym, int64_t addend, uchar *
         e->have = have;
         return RE_TRUNCATED;
     }
-    /* On RV32, in a section that is not loaded, ld.lld's relocateNonAlloc
-     * sign-extends the 32-bit value of every relocation it applies there:
-     * it shows in the 64-bit fields, R_RISCV_64 and ADD64/SUB64. */
-    int nonalloc = !ctx->elf64 && ctx->debug;
     if (data_field(type)) {
-        uint64_t v = type == R_RISCV_32_PCREL ? pcrel : abs;
-        if (nonalloc) {
-            v = (uint64_t)(int64_t)(int)(uint)v;
-        }
-        return apply_data(type, need, v, bytes, e);
+        return apply_data(type, need, type == R_RISCV_32_PCREL ? pcrel : abs, bytes, e);
     }
     if (type == R_RISCV_64) {
         /* A doubleword holding an address, never out of range. */
-        uint64_t v = nonalloc ? (uint64_t)(int64_t)(int)(uint)abs : abs;
-        write32(bytes, (uint)v);
-        write32(bytes + 4, (uint)(v >> 32));
+        write32(bytes, (uint)abs);
+        write32(bytes + 4, (uint)(abs >> 32));
         return RE_OK;
     }
     uint inst = read32(bytes);
@@ -264,7 +244,7 @@ int reloc_apply(uint type, uint64_t place, uint64_t sym, int64_t addend, uchar *
     int r;
     if (type == R_RISCV_32) {
         /* A data word holding an address: it must fit 32 bits, read as
-         * unsigned (an address) or signed (a negative offset, and on RV64 a
+         * unsigned (an address) or signed (a negative offset, or a
          * higher-half address 0xffff_ffff_8xxx_xxxx). */
         int64_t v = (int64_t)abs;
         if (v < INT32_MIN || v > (int64_t)UINT32_MAX) {
@@ -286,14 +266,14 @@ int reloc_apply(uint type, uint64_t place, uint64_t sym, int64_t addend, uchar *
          * the auipc's address: the jalr adds to ra (P + hi), so both halves
          * use the same off. The range is checked before the jalr is
          * written, so that on error neither word changes. */
-        r = check_hi_window((int64_t)pcrel, ctx, e);
+        r = check_hi_window((int64_t)pcrel, e);
         if (r != RE_OK) {
             return r;
         }
         write32(bytes + 4, set_i(read32(bytes + 4), lo12(pcrel)));
         patched = set_u(inst, hi20(pcrel));
     } else if (type == R_RISCV_PCREL_HI20) {
-        r = check_hi_window((int64_t)pcrel, ctx, e);
+        r = check_hi_window((int64_t)pcrel, e);
         if (r != RE_OK) {
             return r;
         }
@@ -313,7 +293,7 @@ int reloc_apply(uint type, uint64_t place, uint64_t sym, int64_t addend, uchar *
         patched = type == R_RISCV_PCREL_LO12_I ? set_i(inst, lo12(value)) : set_s(inst, lo12(value));
     } else if (type == R_RISCV_HI20) {
         /* The HI20 carries the range check of the absolute pair. */
-        r = check_hi_window((int64_t)abs, ctx, e);
+        r = check_hi_window((int64_t)abs, e);
         if (r != RE_OK) {
             return r;
         }

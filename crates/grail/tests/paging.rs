@@ -125,7 +125,7 @@ struct Paged {
 impl Paged {
     fn new(sv: Sv) -> Self {
         let bus = Bus::new(&MachineConfig::with_ram(RAM_SIZE), Vec::new());
-        let mut hart = Hart::new(0, RAM, Xlen::Rv64);
+        let mut hart = Hart::new(0, RAM);
         let tables = Tables::new(sv);
         hart.mode = Mode::S;
         hart.csr.satp = tables.satp();
@@ -372,45 +372,6 @@ fn m_mode_and_bare_do_not_translate() {
     assert_eq!(p.translate(1 << 47, Access::Load), Ok(1 << 47), "Bare");
 }
 
-#[test]
-fn sv32_pages_and_tables_above_4_gib_do_not_wrap() {
-    // Sv32's 22-bit PPNs make 34-bit physical addresses. Nothing is above 4 GiB, so a
-    // page there is an access fault, not the page 4 GiB below it.
-    let mut bus = Bus::new(&MachineConfig::with_ram(RAM_SIZE), Vec::new());
-    let mut hart = Hart::new(0, RAM, Xlen::Rv32);
-    hart.mode = Mode::S;
-    hart.csr.satp = 1 << 31 | ROOT >> 12;
-    let va = 0x0040_3000u64; // VPN[1] = 1, VPN[0] = 3
-    let table = ROOT + 0x1000;
-    let pte32 = |pa: u64, flags: u64| (pa >> 12) << 10 | flags | V;
-    bus.write(ROOT + 4, 4, pte32(table, 0)).unwrap();
-
-    // A leaf whose PPN has bit 20 set.
-    bus.write(table + 3 * 4, 4, pte32(1 << 32 | RAM, RWXAD)).unwrap();
-    assert_eq!(hart.translate(&mut bus, va, Access::Load), Ok(1 << 32 | RAM));
-    assert_eq!(
-        hart.load(&mut bus, va, 4),
-        Err(Trap::new(Exception::LoadAccessFault, va))
-    );
-
-    // A pointer with A, D or U set is a page fault in Sv32 too.
-    for bit in [A, D, U] {
-        bus.write(ROOT + 4, 4, pte32(table, bit)).unwrap();
-        assert_eq!(
-            hart.translate(&mut bus, va, Access::Load),
-            Err(Trap::new(Exception::LoadPageFault, va)),
-            "{bit:#x}"
-        );
-    }
-
-    // A pointer to a table above 4 GiB: the walk's read of it is the access fault.
-    bus.write(ROOT + 4, 4, pte32(1 << 32 | table, 0)).unwrap();
-    assert_eq!(
-        hart.translate(&mut bus, va, Access::Load),
-        Err(Trap::new(Exception::LoadAccessFault, va))
-    );
-}
-
 // Instructions, on a machine: fetches through the tables, sfence.vma, and an access
 // above the physical address width.
 
@@ -428,11 +389,7 @@ const SFENCE_VMA: u32 = 0x1200_0073;
 /// An RV64 machine in S-mode with Sv48 on, running `code` at `CODE_VA` (mapped to
 /// `RAM`), with `a1` = `DATA_VA`.
 fn machine(code: &[(u32, &str)]) -> (Machine, Tables) {
-    let mut m = Machine::new(MachineConfig {
-        xlen: Xlen::Rv64,
-        ..MachineConfig::with_ram(RAM_SIZE)
-    })
-    .unwrap();
+    let mut m = Machine::new(MachineConfig::with_ram(RAM_SIZE)).unwrap();
     let mut tables = Tables::new(Sv::Sv48);
     for (i, &(word, text)) in code.iter().enumerate() {
         assert_eq!(

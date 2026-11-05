@@ -1,6 +1,7 @@
-//! The A extension in Grail (spec section 4.1): what riscv-tests rv32ua does not
+//! The A extension in Grail (spec section 4.1): what riscv-tests rv64ua does not
 //! cover. AMO results with every register aliasing, the LR/SC reservation (what
-//! breaks it), misaligned and device addresses, and Sv32 permissions and A/D bits.
+//! breaks it), misaligned and device addresses, and Sv39 permissions and A/D bits.
+//! The `.w` forms throughout: rv64.rs checks the `.d` ones.
 //!
 //! Each test puts a few hand-encoded instructions at `RAM_BASE`, sets registers
 //! and steps the hart one instruction at a time.
@@ -57,7 +58,8 @@ fn machine(code: &[u32]) -> Machine {
     m
 }
 
-/// Register `r` as the RV32 hart sees it: its low 32 bits (`x` holds them sign-extended).
+/// The word in register `r`: its low 32 bits, which a `.w` instruction's result
+/// fills (sign-extended to 64).
 fn reg(m: &Machine, r: u32) -> u64 {
     u64::from(m.cpu.x[r as usize] as u32)
 }
@@ -94,11 +96,11 @@ fn step_traps(m: &mut Machine, cause: u64, tval: u64) {
 
 #[test]
 fn misa_reports_a() {
-    // csrr a0, misa: RV32 with A, I, M, S, U and X.
+    // csrr a0, misa: RV64 with A, I, M, S, U and X.
     let mut m = machine(&[0x3010_2573]);
     step(&mut m);
-    assert_eq!(reg(&m, A0), 0x4094_1101);
-    assert_ne!(reg(&m, A0) & 1, 0, "A is bit 0");
+    assert_eq!(m.cpu.x[A0 as usize], 0x8000_0000_0094_1101);
+    assert_ne!(m.cpu.x[A0 as usize] & 1, 0, "A is bit 0");
 }
 
 #[test]
@@ -124,6 +126,10 @@ fn every_amo_returns_the_old_word_and_writes_the_result() {
         set(&mut m, A1, src);
         step(&mut m);
         assert_eq!(reg(&m, A2), before, "funct5 {funct5:05b}: rd gets the old word");
+        assert_eq!(
+            m.cpu.x[A2 as usize], before as i32 as u64,
+            "funct5 {funct5:05b}: sign-extended"
+        );
         assert_eq!(word(&mut m, DATA), after, "funct5 {funct5:05b}: memory");
         assert_eq!(reg(&m, A1), src);
     }
@@ -184,9 +190,12 @@ fn sc_without_a_reservation_fails_and_writes_nothing() {
 
 #[test]
 fn sc_to_another_word_fails_and_drops_the_reservation() {
-    let mut m = machine(&[lr(A2, A0), sc(A2, A1, A2), sc(A2, A1, A0)]);
-    set(&mut m, A0, DATA);
-    poke(&mut m, DATA, DATA + 4); // lr loads the other word's address into a2
+    // lr.d, of the doubleword at DATA + 8: the other word's address is above 2 GiB,
+    // which lr.w would sign-extend.
+    let lr_d = lr(A2, A0) | 1 << 12;
+    let mut m = machine(&[lr_d, sc(A2, A1, A2), sc(A2, A1, A0)]);
+    set(&mut m, A0, DATA + 8);
+    m.cpu.bus.write(DATA + 8, 8, DATA + 4).unwrap(); // lr loads the other word's address into a2
     poke(&mut m, DATA + 4, 5);
     set(&mut m, A1, 99);
     step(&mut m);
@@ -194,7 +203,7 @@ fn sc_to_another_word_fails_and_drops_the_reservation() {
     assert_eq!((reg(&m, A2), word(&mut m, DATA + 4)), (1, 5));
     step(&mut m);
     assert_eq!(
-        (reg(&m, A2), word(&mut m, DATA)),
+        (reg(&m, A2), word(&mut m, DATA + 8)),
         (1, DATA + 4),
         "the failed sc dropped it"
     );
@@ -256,7 +265,7 @@ fn traps_break_the_reservation() {
     m.cpu.csr.mie = 1 << 7;
     m.cpu.csr.mstatus |= 1 << 3;
     m.cpu.step();
-    assert_eq!(m.cpu.csr.mcause, 0x8000_0007);
+    assert_eq!(m.cpu.csr.mcause, 1 << 63 | 7);
     assert_eq!(m.cpu.reservation().held(), None);
 }
 
@@ -340,7 +349,8 @@ fn atomics_work_on_vram() {
 
 const ROOT: u64 = RAM_BASE + 0x1000;
 const LEAF_TABLE: u64 = RAM_BASE + 0x2000;
-/// Virtual pages, all in the 4 MiB region at 0x4000_0000 (one leaf table).
+const MID_TABLE: u64 = RAM_BASE + 0x3000;
+/// Virtual pages, all in the 2 MiB region at 0x4000_0000 (one leaf table).
 const VA: u64 = 0x4000_0000;
 /// Physical page behind them.
 const PAGE: u64 = RAM_BASE + 0x8000;
@@ -351,18 +361,24 @@ const PTE_W: u64 = 4;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
 
-/// Maps virtual page `VA + 4 KiB * i` to `PAGE` with `flags` (`PTE_V` added), and
-/// returns the PTE's address.
+/// Maps virtual page `VA + 4 KiB * i` to `PAGE` with `flags` (`PTE_V` added), through
+/// Sv39's three levels, and returns the leaf PTE's address.
 fn map(m: &mut Machine, i: u64, flags: u64) -> u64 {
-    poke(m, ROOT + (VA >> 22) * 4, (LEAF_TABLE >> 12) << 10 | PTE_V);
-    let pte = LEAF_TABLE + i * 4;
-    poke(m, pte, (PAGE >> 12) << 10 | flags | PTE_V);
+    let poke64 = |m: &mut Machine, addr: u64, v: u64| m.cpu.bus.write(addr, 8, v).unwrap();
+    poke64(m, ROOT + (VA >> 30) * 8, (MID_TABLE >> 12) << 10 | PTE_V);
+    poke64(
+        m,
+        MID_TABLE + (VA >> 21 & 0x1ff) * 8,
+        (LEAF_TABLE >> 12) << 10 | PTE_V,
+    );
+    let pte = LEAF_TABLE + i * 8;
+    poke64(m, pte, (PAGE >> 12) << 10 | flags | PTE_V);
     pte
 }
 
 fn paged_machine(code: &[u32]) -> Machine {
     let mut m = machine(code);
-    m.cpu.csr.satp = 1 << 31 | ROOT >> 12;
+    m.cpu.csr.satp = 8 << 60 | ROOT >> 12; // Sv39
     m.cpu.csr.mstatus |= 1 << 17 | (Mode::S as u64) << 11; // MPRV, MPP = S
     m
 }

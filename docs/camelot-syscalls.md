@@ -19,17 +19,10 @@ The numbers in the tables below are checked against `syscall.h`, `usys.s`
 and `user.h` by `cargo test` (`crates/xtask/tests/kernel.rs`): change all of
 them together.
 
-Camelot runs on RV32 and RV64 while the switch to 64 bits happens (#141):
-the same calls, with Linux's widths for each but for RV32's `off_t` and
-`time_t` (below). An RV32 program is ILP32
-(`int`, `long` and pointers 32 bits), an RV64 one LP64 (`int` 32 bits,
-`long` and pointers 64), and every type below is the C type it says, at
-that width: `size_t`, `ssize_t`, `off_t` and `time_t` are a `long` wide, so
-64-bit on RV64, as on Linux. On RV32 that leaves `off_t` and `time_t` 32-bit,
-which riscv32 Linux's are not (its glibc has only 64-bit ones): a stopgap
-until RV32 goes (#159), which limits RV32's files to 2^31 - 1 bytes
-(`open`). "Structures" gives what the widths make of each structure's
-size.
+Camelot is RV64, and a program LP64 (`int` 32 bits, `long` and pointers
+64), as riscv64 Linux's are; every type below is the C type it says:
+`size_t`, `ssize_t`, `off_t` and `time_t` are a `long` wide, 64 bits.
+"Structures" gives each structure's size.
 
 ## Calling convention
 
@@ -85,23 +78,22 @@ there is a filesystem to look it up in.
 ## Structures
 
 What the calls store and read, as `user.h` and `kernel/include/syscall.h`
-declare them, in bytes. The ones made of fixed-width fields are the same on
-both widths, as their Linux counterparts are; the three with a `long`, a
-`size_t` or an `off_t` grow on RV64, each such field 8-byte aligned. The
-test that checks the tables compiles both headers for both widths and
-checks each size.
+declare them, in bytes, LP64's: a `long`, a `size_t` or an `off_t` is 8
+bytes, 8-byte aligned, and the fixed-width fields are as their Linux
+counterparts have them. The test that checks the table compiles both
+headers and checks each size.
 
-| Structure | RV32 | RV64 | What |
-|-----------|------|------|------|
-| `struct stat` | 16 | 24 | `fstat`'s: `size` is an `off_t` |
-| `struct dirent` | 16 | 16 | a directory's entries, as `read` gives them |
-| `struct procinfo` | 32 | 40 | `procs`': `size` is a `size_t` |
-| `struct hartinfo` | 16 | 16 | `harts`' |
-| `struct net_stats` | 108 | 108 | the network's counters |
-| `struct netinfo` | 132 | 132 | `netinfo`'s |
-| `struct ping_reply` | 16 | 16 | `ping`'s |
-| `struct timeval` | 8 | 16 | `SO_RCVTIMEO`'s: two `long`s, `tv_sec` a `time_t` |
-| `struct sockaddr_in` | 16 | 16 | an IPv4 address and port |
+| Structure | Bytes | What |
+|-----------|-------|------|
+| `struct stat` | 24 | `fstat`'s: `size` is an `off_t` |
+| `struct dirent` | 16 | a directory's entries, as `read` gives them |
+| `struct procinfo` | 40 | `procs`': `size` is a `size_t` |
+| `struct hartinfo` | 16 | `harts`' |
+| `struct net_stats` | 108 | the network's counters |
+| `struct netinfo` | 132 | `netinfo`'s |
+| `struct ping_reply` | 16 | `ping`'s |
+| `struct timeval` | 16 | `SO_RCVTIMEO`'s: two `long`s, `tv_sec` a `time_t` |
+| `struct sockaddr_in` | 16 | an IPv4 address and port |
 
 ## Calls
 
@@ -187,8 +179,7 @@ is `send`: on UDP that is an empty datagram). To a file on the disk, the bytes g
 at the descriptor's offset, which moves past them, and the file grows if they
 run past its end; a write that can write nothing fails with what stopped it:
 `-ENOSPC` (the disk is full), `-EFBIG` (the file would pass the largest the
-kernel writes: on RV64 ext4's, 2^32 - 1 blocks; on RV32 2^31 - 1 bytes,
-what its `off_t` reaches), `-EINVAL` (the offset is past the end of the
+kernel writes: ext4's, 2^32 - 1 blocks), `-EINVAL` (the offset is past the end of the
 file, which another descriptor has emptied meanwhile), `-ENOMEM` (no page
 free for copying through). To the console, the bytes are printed. To a
 pipe, they wait in it for a reader ("Pipes"); `-EPIPE` if no read end is
@@ -281,7 +272,7 @@ towards the stack: new pages are mapped R+W and read zero, including bytes
 given back by an earlier shrink and grown again. A negative `increment`
 shrinks it, unmapping and freeing the pages no longer used. Errors:
 `-ENOMEM` when the heap would reach the guard page under the stack's limit
-(`USER_LOAD_TOP`: 0x0B7F_F000 on RV32, 0x7FFF_FF7F_F000 in Sv48), when it
+(`USER_LOAD_TOP`: 0x7FFF_FF7F_F000 in Sv48, 0x3F_FF7F_F000 in Sv39), when it
 would map more new pages than the whole of RAM has (those from the old
 end's page boundary to the new end's: refused at once, as Linux's default
 overcommit check refuses it), or when memory runs out
@@ -311,12 +302,10 @@ opens:
   read-only filesystem; a node whose major number has no driver is
   `-ENODEV`.
 
-On RV32, a file bigger than 2^31 - 1 bytes is `-EOVERFLOW`: its `off_t` is
-32-bit, so `lseek` could not reach all of it. That `off_t` is this
-kernel's stopgap until RV32 goes (#159), not riscv32 Linux's, which is
-64-bit and so opens such a file. The filesystem allows
-files far bigger (docs/camelot-fs.md, "Inodes"), which an RV64 kernel,
-whose `off_t` is 64-bit, opens, reads and writes (or mkfs makes).
+A file bigger than the kernel reads or writes, 2^32 - 1 blocks (ext4's
+`s_maxbytes`), is `-EOVERFLOW`: only a damaged inode can be one, as the
+format's largest file is one block more (docs/camelot-fs.md, "Inodes"), and
+no filesystem holds anything near it.
 
 Errors: the path's (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`), those above,
 `-ENOSPC` (no free inode or block to make the file with), `-EMFILE` (all 16
@@ -344,7 +333,7 @@ file is too: the whole `off_t` counts, so on RV64 2^32 + 100 is past the
 end of a small file, not 100.
 
 **fstat(fd, st)** stores what the open file behind `fd` is in the `struct
-stat` at `st` (16 bytes on RV32, 24 on RV64, `user.h`): `ino` (its inode, 0 for a pipe and for
+stat` at `st` (24 bytes, `user.h`): `ino` (its inode, 0 for a pipe and for
 the console the kernel gave the shell), `type` (`T_DIR` 1, `T_FILE` 2,
 `T_DEVICE` 3, `T_PIPE` 4), `nlink` (the names it has; 0 for a file whose
 last name was removed while it is open), `size` (bytes; for a pipe, the
@@ -449,7 +438,7 @@ own processes or for the first process, the shell, whose end would be
 Camelot's (it ends only by its own `exit`).
 
 **procs(buf, max)** describes the processes, in pid order, in the array of
-`max` `struct procinfo` (32 bytes each on RV32, 40 on RV64, `user.h`) at `buf`, and returns how
+`max` `struct procinfo` (40 bytes each, `user.h`) at `buf`, and returns how
 many processes there are, which may be more than `max`: only the first
 `max` are stored then, and `procs(NULL, 0)` just counts them. Each entry
 holds `pid`; `ppid`, its parent's pid, or 0 for a process without one (the
@@ -639,7 +628,7 @@ connected.
 **setsockopt(fd, level, option, value, len)** sets an option; the one there
 is is `SO_RCVTIMEO` (20) at level `SOL_SOCKET` (1), how long `recv`,
 `recvfrom` and `accept` wait: `value` is a `struct timeval` (`tv_sec`,
-`tv_usec`, two `long`s: 8 bytes on RV32, 16 on RV64, `len`), rounded up to
+`tv_usec`, two `long`s: 16 bytes, `len`), rounded up to
 whole timer ticks, 0 for no limit (the default). Errors: `-EINVAL` (`len`
 is not the structure's size, or a negative time, or
 `tv_usec` of a second or more), `-EFAULT` (`value` is not readable),
@@ -867,30 +856,14 @@ started as `/bin/sh`, from the filesystem when there is one and it has a
 
 ## Starting a program
 
-A program is an ELF executable of the kernel's own width, ELF32 for the
-RV32 kernel and ELF64 for the RV64 one (an RV64 kernel runs no RV32
-program: there is no compat mode, #141; anything else is `-ENOEXEC`),
-linked with `kernel/user/user.ld`: code from
-0x1000 (page 0 is never mapped, so a null pointer faults), each output
-section on a page boundary so the kernel can map each with its own
-permissions, and a heap after the last one. On RV32, user space is the low 192 MiB:
-
-```
-0x0000_0000  unmapped
-0x0000_1000  .text (R+X), .rodata (R), .data and .bss (R+W)
-             heap (R+W), grown by sbrk
-             ...
-0x0B7F_F000  guard page, unmapped (USER_LOAD_TOP)
-0x0B80_0000  the stack's limit (USER_STACK_LIMIT): 8 MiB of stack at most
-             ...
-             the stack (R+W), grown down on demand
-0x0BFF_F000  the stack's first page, mapped from the start
-0x0C00_0000  USER_TOP: nothing above is accessible from U-mode
-```
-
-On RV64, user space is the lower half of the address space, as Linux's
-riscv64 `TASK_SIZE`: 128 TiB in Sv48, 256 GiB in Sv39 (on a hart without
-Sv48), with the same order and the same 8 MiB stack limit. In Sv48:
+A program is an ELF64 executable, RV64 code (an ELF32 one, RV32 code, is
+refused: there is no compat mode; anything else is `-ENOEXEC`), linked
+with `kernel/user/user.ld`: code from 0x1000 (page 0 is never mapped, so a
+null pointer faults), each output section on a page boundary so the kernel
+can map each with its own permissions, and a heap after the last one. User
+space is the lower half of the address space, as Linux's riscv64
+`TASK_SIZE`: 128 TiB in Sv48, 256 GiB in Sv39 (on a hart without Sv48),
+with a stack of 8 MiB at most at its top. In Sv48:
 
 ```
 0x0000_0000_0000_0000  unmapped
@@ -898,8 +871,9 @@ Sv48), with the same order and the same 8 MiB stack limit. In Sv48:
                        heap (R+W), grown by sbrk
                        ...
 0x0000_7FFF_FF7F_F000  guard page, unmapped (USER_LOAD_TOP)
-0x0000_7FFF_FF80_0000  the stack's limit (USER_STACK_LIMIT)
+0x0000_7FFF_FF80_0000  the stack's limit (USER_STACK_LIMIT): 8 MiB of stack at most
                        ...
+                       the stack (R+W), grown down on demand
 0x0000_7FFF_FFFF_F000  the stack's first page, mapped from the start
 0x0000_8000_0000_0000  USER_TOP (Sv39: 0x0000_0040_0000_0000); above it
                        the kernel's half, from 0xFFFF_8000_0000_0000
@@ -913,13 +887,12 @@ process. So is running out of RAM while it grows; the kernel says so first.
 
 Whether from `spawn` or `exec`, the kernel starts the program as Linux
 starts an ELF program (`create_elf_tables` in `fs/binfmt_elf.c`) and the
-RISC-V psABI describes it ("Process Initialization"), at both widths: at
+RISC-V psABI describes it ("Process Initialization"): at
 its ELF entry point, crt0's `_start`, with every register zero except
 `sp`, which is 16-byte aligned and points at `argc`. `a0` is zero too: the
 psABI's address of a function for the program to register with `atexit`
 (a dynamic linker's), and there is none. Everything is at the top of the
-stack's first page, each word a `long`, a pointer's size (4 bytes on RV32,
-8 on RV64):
+stack's first page, each word a `long`, a pointer's size (8 bytes):
 
 ```
 USER_TOP     a word of zeros, the end marker
@@ -957,7 +930,7 @@ signals, no platform string):
 | 6 | `AT_PAGESZ` | 4096 |
 | 17 | `AT_CLKTCK` | how often `uptime` ticks a second: 10 |
 | 3 | `AT_PHDR` | the address of the program headers, in the `PT_LOAD` segment whose file bytes hold them, as Linux finds them; 0 if none does (`user.ld` starts the first segment at 0x1000, past them) |
-| 4 | `AT_PHENT` | a program header's size: 32 (ELF32) or 56 (ELF64) |
+| 4 | `AT_PHENT` | a program header's size: 56 (ELF64) |
 | 5 | `AT_PHNUM` | how many there are |
 | 7 | `AT_BASE` | 0: no interpreter, the programs are static |
 | 8 | `AT_FLAGS` | 0 |
@@ -1048,7 +1021,7 @@ returns its `long` result.
 ## Building programs
 
 Each `kernel/user/X.c`, `X.s` or `X.S` (assembly that goes through the C
-preprocessor first, for each width: `#if __riscv_xlen == 64`) is a program called `X`, linked with the
+preprocessor first, with `include/asm.h`) is a program called `X`, linked with the
 runtime, `crt0.S` and `usys.s`, and with the members of the library
 (`kernel/user/lib/*.c`) it needs: like an archive's, a member goes in only
 if it defines something the program (or another member that went in)

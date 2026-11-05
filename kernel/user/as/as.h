@@ -19,11 +19,9 @@
  *             declares the tables and defines the numbers, tables.c holds
  *             the tables, once for the program
  *
- * It assembles for either width, as merlin-as does: RV32 (ELF32 objects)
- * or RV64 (ELF64), chosen by `-march=` (`xlen`), RV32 the default until
- * #159. The program itself runs on both: its numbers are merlin-as's types,
- * int64_t for Rust's i64 and uint64_t for its u64, the same on both widths
- * (on RV32 merlin makes a long long a pair of registers).
+ * It assembles RV64, ELF64 objects, as merlin-as does: `-march=` takes the
+ * one ISA. Its numbers are merlin-as's types, int64_t for Rust's i64 and
+ * uint64_t for its u64.
  *
  * Unlike merlin-as, which holds every token of the file at once, this one
  * reads a statement, assembles it and forgets it: a machine has 4 MiB of RAM
@@ -33,9 +31,6 @@
 
 #include "../user.h"
 
-/* The width being assembled for, 32 or 64 (merlin-as's Options::xlen, from
- * `-march=`), for the whole file: main.c sets it before the first line. */
-extern uint xlen;
 
 /* Rust's wrapping arithmetic on i64 (wrapping_add...), which merlin-as's
  * expressions and addends use: through uint64_t, whose arithmetic wraps
@@ -218,8 +213,8 @@ struct emit {
 /* The most words one instruction takes: RV64's longest `li`. */
 #define MAX_EMITS 8
 
-/* Encodes one instruction into words (at most MAX_EMITS) for the width
- * `xlen`. Returns how many, or 0 with the message in *err. */
+/* Encodes one instruction into words (at most MAX_EMITS). Returns how many,
+ * or 0 with the message in *err. */
 int encode(const char *m, struct operand *ops, uint nops, struct emit *out, char **err);
 
 /* What the encoder asks the assembler (asm.c), merlin-as's Ctx. */
@@ -227,8 +222,8 @@ int ctx_constant(struct expr *e, int64_t *v);
 int ctx_symbol(struct expr *e, char **name, int64_t *addend);
 int ctx_undefined(const char *name);
 int ctx_csr(struct expr *e, uint *addr);
-/* A CSR's number from its name, as the width `xlen` has it: on RV64 the
- * RV32-only CSRs (CSR_RV32_ONLY: cycleh, mstatush...) are no name. */
+/* A CSR's number from its name: RV32's own CSRs (CSR_RV32_ONLY: cycleh,
+ * mstatush...) are no name. */
 int csr_parse(const char *name, uint *addr);
 
 /* The immediate scramblers, which asm.c also uses to patch resolved labels. */
@@ -240,7 +235,7 @@ uint j_imm(int imm);
 /* value = (hi << 12) + lo, lo the sign-extended low 12 bits. */
 void hi_lo(int value, uint *hi, int *lo);
 /* The same split of a 64-bit value, as LLVM computes %hi and %lo of a
- * constant on both widths: the bits above 31 are dropped. */
+ * constant: the bits above 31 are dropped. */
 void hi_lo64(int64_t value, uint *hi, int *lo);
 
 /* ---- Sections' ELF attributes (section.c) ---- */
@@ -363,8 +358,7 @@ struct row {
 
 /* A field of `.debug_line` (at `at`, from the section's start) for the
  * linker to fill in: offset `off` of `.debug_line_str` (section -1, a 4-byte
- * DWARF32 offset on both widths) or of a code section (an address: 4 bytes
- * on RV32, 8 on RV64). */
+ * DWARF32 offset) or of a code section (an address, 8 bytes). */
 struct dfixup {
     uint at;
     int section;
@@ -391,10 +385,9 @@ void dwarf_encode(struct dfile *root, struct dfile *files, uint nfiles, struct r
                   struct line_table *t);
 
 /* ---- The ELF file (elf.c) ---- */
-/* The object, ELF32 for RV32 and ELF64 for RV64 (the width `xlen`). */
+/* The object, ELF64. */
 void elf_write(struct object *obj, struct buf *out);
-/* The width's Tag_RISCV_arch: RISCV_ARCH or RISCV_ARCH_RV64 (merlin-as's
- * elf::arch). */
+/* The Tag_RISCV_arch: RISCV_ARCH (merlin-as's elf::ARCH). */
 const char *riscv_arch(void);
 /* The contents of `.riscv.attributes` (merlin-as's elf::riscv_attributes):
  * Tag_RISCV_arch = riscv_arch(). */

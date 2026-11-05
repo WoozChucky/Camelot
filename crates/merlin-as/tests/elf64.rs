@@ -11,10 +11,6 @@
 //! clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mno-relax -c
 //! ```
 
-use merlin_as::{Options, Xlen};
-
-const RV64: Options = Options { xlen: Xlen::Rv64 };
-
 /// Code with pc-relative and call relocations, data with 64-bit addresses
 /// and addends (and a 32-bit one), two absolute constants whose 64-bit
 /// values a 32-bit symbol would cut, a function with its type and size, and
@@ -53,7 +49,7 @@ fn hex(s: &str) -> Vec<u8> {
 }
 
 fn object(src: &str) -> Vec<u8> {
-    merlin_as::assemble_to_elf_with(src, &RV64).expect("assembles")
+    merlin_as::assemble_to_elf(src).expect("assembles")
 }
 
 fn section<'a>(file: &'a elf::Elf, name: &str) -> &'a elf::Section {
@@ -122,10 +118,7 @@ fn sections_are_clangs() {
     assert_eq!(file.section_data(section(&file, ".text")).unwrap(), text);
     assert_eq!(file.section_data(section(&file, ".data")).unwrap(), [0; 0x20]);
     let attributes = file.section_data(section(&file, ".riscv.attributes")).unwrap();
-    assert_eq!(
-        attributes,
-        merlin_as::elf::riscv_attributes(merlin_as::elf::ARCH_RV64)
-    );
+    assert_eq!(attributes, merlin_as::elf::riscv_attributes(merlin_as::elf::ARCH));
 }
 
 #[test]
@@ -144,8 +137,8 @@ fn symbols_are_clangs() {
         .collect();
     // llvm-readelf -s, in its order: the mapping symbols ($xrv64i2p1_...
     // where the code starts, $d where data does) among the other locals,
-    // each made when the line that needs it is read. The constants are their whole 64-bit values, sign-extended: an ELF32
-    // object holds 0xffffffff and 0x80000000. `f` is a FUNC of 24 bytes
+    // each made when the line that needs it is read. The constants are their
+    // whole 64-bit values, sign-extended. `f` is a FUNC of 24 bytes
     // (.type and .size), `buf` an OBJECT of 16 (.comm's size).
     use elf::{STB_GLOBAL as GLOBAL, STB_LOCAL as LOCAL};
     use elf::{STT_FUNC as FUNC, STT_NOTYPE as NOTYPE, STT_OBJECT as OBJECT};
@@ -180,14 +173,13 @@ fn symbols_are_clangs() {
 }
 
 #[test]
-fn symbol_sizes_are_as_wide_as_the_class() {
-    // `.size` takes any constant, as clang does, and st_size holds its bits:
-    // all 64 in ELF64, the low 32 in ELF32 (llvm-readelf -s of clang's
-    // objects for riscv64 and riscv32).
+fn symbol_sizes_take_64_bits() {
+    // `.size` takes any constant, as clang does, and st_size holds all its 64
+    // bits (llvm-readelf -s of clang's object for riscv64).
     let src = "a: nop\nb: nop\nc: nop\nd: nop\n\
                .size a, 0x100000000\n.size b, 0x1ffffffff\n.size c, -4\n.size d, . - d\n";
-    let sizes = |xlen| {
-        let bytes = merlin_as::assemble_to_elf_with(src, &Options { xlen }).expect("assembles");
+    let sizes = || {
+        let bytes = merlin_as::assemble_to_elf(src).expect("assembles");
         let file = elf::Elf::parse(&bytes).expect("parses");
         let symbols = file.symbols().unwrap();
         symbols[1..]
@@ -204,10 +196,9 @@ fn symbol_sizes_are_as_wide_as_the_class() {
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        sizes(Xlen::Rv64),
+        sizes(),
         want([0x1_0000_0000, 0x1_ffff_ffff, 0xffff_ffff_ffff_fffc, 4])
     );
-    assert_eq!(sizes(Xlen::Rv32), want([0, 0xffff_ffff, 0xffff_fffc, 4]));
 }
 
 #[test]
@@ -239,8 +230,7 @@ fn relocations_are_clangs() {
             (0xc, "R_RISCV_PCREL_LO12_I", ".Lpcrel_hi0", 0),
         ])
     );
-    // A 64-bit address with a 64-bit addend, which an ELF32 Rela would cut
-    // to 32 bits; a .word stays R_RISCV_32 on RV64.
+    // A 64-bit address with a 64-bit addend; a .word stays R_RISCV_32.
     assert_eq!(
         relocs(".rela.data"),
         expected(&[

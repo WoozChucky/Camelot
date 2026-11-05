@@ -24,26 +24,16 @@ static void emit_pad(struct out *o, char pad, int n) {
 }
 
 /* Prints `val` in `base` (10 or 16) with an optional minus sign, padded to
- * `width` with spaces before the sign or zeros after it. A value that fits
- * in 32 bits is divided as a u32: on RV32 a 64-bit division is a call to
- * __udivdi3 (libgcc.c), many times slower, and nearly every number the
- * kernel prints is small. */
+ * `width` with spaces before the sign or zeros after it. */
 static void emit_number(struct out *o, u64 val, u32 base, bool negative, int width, bool zero_pad) {
     char digits[20]; /* 18446744073709551615 has 20 digits; 2^64 - 1 in hex 16 */
     int n = 0;
-    while (val >> 32 != 0) {
+    do {
         u32 d = (u32)(val % base);
         digits[n] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
         n++;
         val /= base;
-    }
-    u32 low = (u32)val;
-    do {
-        u32 d = low % base;
-        digits[n] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
-        n++;
-        low /= base;
-    } while (low != 0);
+    } while (val != 0);
 
     int len = n + (negative ? 1 : 0);
     if (!zero_pad) {
@@ -85,9 +75,9 @@ int kvformat(kputc_fn put, void *ctx, const char *fmt, va_list ap) {
             width = width * 10 + (*fmt - '0');
             fmt++;
         }
-        /* Length: none (int), `l` (long: a register's width, 32 or 64
-         * bits) or `ll` (long long: 64 bits on both widths), as in C's
-         * printf and Linux's printk. */
+        /* Length: none (int), `l` (long: a register's width, 64 bits) or
+         * `ll` (long long: 64 bits too), as in C's printf and Linux's
+         * printk. */
         int longs = 0;
         while (*fmt == 'l' && longs < 2) {
             longs++;
@@ -135,7 +125,7 @@ int kvformat(kputc_fn put, void *ctx, const char *fmt, va_list ap) {
             break;
         }
         case 'p':
-            /* Every hex digit of a pointer: 8 on RV32, 16 on RV64. */
+            /* Every hex digit of a pointer: 16. */
             emit(&o, '0');
             emit(&o, 'x');
             emit_number(&o, (uintptr)va_arg(ap, void *), 16, false, (int)(2 * sizeof(void *)), true);

@@ -1,16 +1,11 @@
 //! Helpers for Herald's tests: an in-process Avalon server with guest VMs, Herald
 //! sessions driven through channels and buffers, and a scripted fake server.
-//!
-//! The tests of VMs run twice ([`on_both_widths`]): with RV32 VMs, then with RV64
-//! ones, the examples and the kernel being that width's builds. Herald itself does not
-//! look at the width: a console is bytes and a screen pixels on both.
 
 #![allow(dead_code)]
 
 use avalon::{Config, Server, ServerThread};
-use avalon_proto::{Connection, HardwareProfile, Message, VmRef, VmState, Xlen};
+use avalon_proto::{Connection, HardwareProfile, Message, VmRef, VmState};
 use herald::{End, Session};
-use std::cell::Cell;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -20,67 +15,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const MIB: u64 = 1024 * 1024;
-
-thread_local! {
-    /// The width of the VMs this thread's test makes: set by [`on_both_widths`], and
-    /// carried into the threads the test starts by [`spawn`]; `None` elsewhere.
-    static XLEN: Cell<Option<Xlen>> = const { Cell::new(None) };
-}
-
-/// Runs `test` with RV32 VMs, then with RV64 ones. A failure says which width failed:
-/// the panic is raised again with the width before its message.
-pub fn on_both_widths(test: impl Fn()) {
-    for xlen in [Xlen::Rv32, Xlen::Rv64] {
-        XLEN.with(|x| x.set(Some(xlen)));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
-        XLEN.with(|x| x.set(None));
-        if let Err(payload) = result {
-            let message = if let Some(s) = payload.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "a panic with no message".to_string()
-            };
-            panic!("on {xlen}: {message}");
-        }
-    }
-}
-
-/// The width of the VMs the current test makes (RV32 outside [`on_both_widths`]).
-///
-/// A thread the test starts has the width if [`spawn`] started it. In a thread
-/// `std::thread::spawn` starts the width is not set, and RV32 there would make RV32
-/// guests in an RV64 test without a word: asking there panics. Such a thread is told
-/// from the test's own by its name: libtest runs each test in a thread named after it,
-/// and `std::thread::spawn`'s threads have none.
-pub fn xlen() -> Xlen {
-    XLEN.with(Cell::get).unwrap_or_else(|| {
-        assert!(
-            std::thread::current().name().is_some(),
-            "a thread that asks for the width is started with common::spawn, which gives it the test's width"
-        );
-        Xlen::Rv32
-    })
-}
-
-/// Starts a thread as `std::thread::spawn` does, with the width of the thread that
-/// starts it: what the thread makes ([`xlen`]) is of the test's width.
-pub fn spawn<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> std::thread::JoinHandle<T> {
-    let xlen = xlen();
-    std::thread::spawn(move || {
-        XLEN.with(|x| x.set(Some(xlen)));
-        f()
-    })
-}
-
-/// A file's name for the current width: `<stem>.elf`, or `<stem>-rv64.elf`.
-fn elf_of(stem: &str) -> String {
-    match xlen() {
-        Xlen::Rv32 => format!("{stem}.elf"),
-        Xlen::Rv64 => format!("{stem}-rv64.elf"),
-    }
-}
 
 /// Generous ceiling for anything that should take well under a second, so a loaded
 /// machine does not make the tests flaky.
@@ -107,38 +41,28 @@ pub fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// `examples/<name>/<name>.elf`, or its RV64 build, `<name>-rv64.elf`.
+/// `examples/<name>/<name>.elf`.
 pub fn example(name: &str) -> Vec<u8> {
-    std::fs::read(repo().join("examples").join(name).join(elf_of(name))).unwrap()
+    std::fs::read(repo().join("examples").join(name).join(format!("{name}.elf"))).unwrap()
 }
 
-/// The Camelot kernel of the current width, `kernel/kernel.elf` or
-/// `kernel/kernel-rv64.elf`.
+/// The Camelot kernel, `kernel/kernel.elf`.
 pub fn kernel() -> Vec<u8> {
-    std::fs::read(repo().join("kernel").join(elf_of("kernel"))).unwrap()
+    std::fs::read(repo().join("kernel/kernel.elf")).unwrap()
 }
 
-/// Creates VM `name` of the current width running `program` with `ram_mib` MiB at full
-/// speed, and starts it.
+/// Creates VM `name` running `program` with `ram_mib` MiB at full speed, and starts
+/// it.
 pub fn start_vm(server: &ServerThread, name: &str, ram_mib: u64, program: Vec<u8>) -> u32 {
-    let profile = HardwareProfile {
-        xlen: xlen(),
-        ..HardwareProfile::with_ram(ram_mib * MIB)
-    };
-    start_vm_with(server, name, profile, program)
+    start_vm_with(server, name, HardwareProfile::with_ram(ram_mib * MIB), program)
 }
 
-/// Creates VM `name` running the Camelot kernel of the current width, and starts
-/// it: the RV32 kernel on 4 MiB; the RV64 one on Camelot's firmware, whose 2 MiB
-/// and the image's 2.1 MiB from 0x8020_0000 take 8 MiB.
+/// Creates VM `name` running the Camelot kernel, and starts it: on Camelot's
+/// firmware, whose 2 MiB and the image's 2.1 MiB from 0x8020_0000 take 8 MiB.
 pub fn start_kernel_vm(server: &ServerThread, name: &str) -> u32 {
-    let profile = match xlen() {
-        Xlen::Rv32 => HardwareProfile::with_ram(4 * MIB),
-        Xlen::Rv64 => HardwareProfile {
-            xlen: Xlen::Rv64,
-            bios: avalon_proto::Bios::Default,
-            ..HardwareProfile::with_ram(8 * MIB)
-        },
+    let profile = HardwareProfile {
+        bios: avalon_proto::Bios::Default,
+        ..HardwareProfile::with_ram(8 * MIB)
     };
     start_vm_with(server, name, profile, kernel())
 }

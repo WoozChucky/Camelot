@@ -2,15 +2,10 @@
 # Regenerates merlin-as's encoder goldens with clang's integrated assembler
 # and llvm-mc (LLVM 23), for crates/merlin-as/tests/encode_golden.rs:
 #
-#   crates/merlin-as/tests/golden/encode.golden       RV32: encode.s
-#   crates/merlin-as/tests/golden/rv64/encode.golden  RV64: encode.s, then rv64/encode.s
+#   crates/merlin-as/tests/golden/encode.golden  every line of encode.s
 #
-# `gen-encode-golden.sh rv32` or `gen-encode-golden.sh rv64` makes only one.
-# The RV64 golden starts with every line of encode.s, assembled for RV64: the
-# same source must give the same words on both widths, except where the ISA
-# says otherwise (`li a0, 0x80000000` is one instruction on RV32, two on
-# RV64). The RV64-only lines are in rv64/encode.s, because encode.s is also
-# assembled by Camelot's /bin/as, which is RV32 (crates/xtask/tests/selfhost.rs).
+# encode.s is also assembled by Camelot's /bin/as (crates/xtask/tests/selfhost.rs),
+# which must give the same words.
 #
 # Output format, one line per instruction:
 #   <source> | <word> <word> ... | <offset>:<R_RISCV_TYPE>:<symbol>[+addend] ...
@@ -49,12 +44,11 @@ branch_word() {
   printf '%s' "$word"
 }
 
-# gen <xlen> <out> <in>...: one golden line per instruction of the inputs.
+# gen <out> <in>...: one golden line per instruction of the inputs.
 gen() {
-  local xlen=$1 out=$2 line src words relocs enc sym
-  shift 2
-  local target=riscv$xlen march=rv${xlen}ima_zicsr_zifencei mabi=ilp32
-  [ "$xlen" = 64 ] && mabi=lp64
+  local out=$1 line src words relocs enc sym
+  shift
+  local target=riscv64 march=rv64ima_zicsr_zifencei mabi=lp64
   : > "$out"
   cat "$@" | while IFS= read -r line; do
     src=$(echo "$line" | sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//')
@@ -79,14 +73,4 @@ gen() {
   echo "wrote $(wc -l < "$out") lines to $out"
 }
 
-want=${1:-both}
-case "$want" in
-  rv32|rv64|both) ;;
-  *) echo "usage: $0 [rv32|rv64]" >&2; exit 2 ;;
-esac
-if [ "$want" != rv64 ]; then
-  gen 32 "$DIR/encode.golden" "$DIR/encode.s"
-fi
-if [ "$want" != rv32 ]; then
-  gen 64 "$DIR/rv64/encode.golden" "$DIR/encode.s" "$DIR/rv64/encode.s"
-fi
+gen "$DIR/encode.golden" "$DIR/encode.s"

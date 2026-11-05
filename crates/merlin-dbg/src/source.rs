@@ -57,8 +57,8 @@ pub struct Lines {
 }
 
 impl Lines {
-    /// Adds the line tables of an executable (none if it has no `.debug_line`), of
-    /// either width: an ELF64 file's tables have 8-byte addresses.
+    /// Adds the line tables of an executable (none if it has no `.debug_line`): an
+    /// ELF64 file's, whose tables have 8-byte addresses.
     pub fn add_elf(&mut self, file: &[u8]) -> Result<(), String> {
         let elf = elf::Elf::parse(file).map_err(|e| e.to_string())?;
         for table in elf.line_tables().map_err(|e| e.to_string())? {

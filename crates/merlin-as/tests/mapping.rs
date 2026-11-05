@@ -5,7 +5,7 @@
 //!
 //! * `tests/mapping/*.s`, made for this (the code and data switches,
 //!   padding, empty data, `.insn`, `.option`, `.comm`, every section kind),
-//!   against clang's objects next to them, `*.o` and `rv64/*.o`
+//!   against clang's objects next to them, `*.o`
 //!   (scripts/gen-mapping-golden.sh): the whole symbol table, every field,
 //!   in clang's order, and every section's header and contents (the
 //!   padding of `align.s`'s alignments with a fill and a maximum). And
@@ -15,10 +15,9 @@
 //!   line tables): the same symbols, but for the labels clang makes for its
 //!   line table where merlin-as uses section symbols (`.L0 `,
 //!   `.Lline_table_start0`).
-//! * The encoder's corpus, `tests/golden/encode.s` (and `rv64/encode.s`),
+//! * The encoder's corpus, `tests/golden/encode.s`,
 //!   instructions only: one `$x` at the start, as clang writes for it.
 
-use merlin_as::{Options, Xlen};
 use std::path::{Path, PathBuf};
 
 const STT_SECTION: u8 = 3;
@@ -72,43 +71,32 @@ fn is_mapping(s: &Sym) -> bool {
 }
 
 /// clang's name for each mapping symbol of code, per width: `$x` and the
-/// ISA of `-march=rv{32,64}ima_zicsr_zifencei`, as `.riscv.attributes`
-/// spells it.
-fn code(xlen: Xlen) -> String {
-    format!("$x{}", merlin_as::elf::arch(xlen))
+/// ISA of `-march=rv64ima_zicsr_zifencei`, as `.riscv.attributes` spells it.
+fn code() -> String {
+    format!("$x{}", merlin_as::elf::ARCH)
 }
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")
 }
 
-/// Where clang's objects for `xlen` are, under `tests/<set>`.
-fn objects(set: &str, xlen: Xlen) -> PathBuf {
-    match xlen {
-        Xlen::Rv32 => root().join(set),
-        Xlen::Rv64 => root().join(set).join("rv64"),
-    }
+/// Where clang's objects are: `tests/<set>`.
+fn objects(set: &str) -> PathBuf {
+    root().join(set)
 }
 
-/// The source of object `name` in `set` for `xlen`: its own in the
-/// objects' directory, or the shared one.
-fn source(set: &str, name: &str, xlen: Xlen) -> String {
-    let own = objects(set, xlen).join(format!("{name}.s"));
-    let path = if own.exists() {
-        own
-    } else {
-        root().join(set).join(format!("{name}.s"))
-    };
-    std::fs::read_to_string(path).unwrap()
+/// The source of object `name` in `set`.
+fn source(set: &str, name: &str) -> String {
+    std::fs::read_to_string(objects(set).join(format!("{name}.s"))).unwrap()
 }
 
-fn assemble(src: &str, xlen: Xlen) -> Vec<u8> {
-    merlin_as::assemble_to_elf_with(src, &Options { xlen }).unwrap_or_else(|e| panic!("{xlen:?}: {e:?}"))
+fn assemble(src: &str) -> Vec<u8> {
+    merlin_as::assemble_to_elf(src).unwrap_or_else(|e| panic!("{e:?}"))
 }
 
-/// The objects of `set` for `xlen`, by name.
-fn names(set: &str, xlen: Xlen) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(objects(set, xlen))
+/// The objects of `set`, by name.
+fn names(set: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(objects(set))
         .unwrap()
         .filter_map(|e| {
             let name = e.unwrap().file_name().into_string().unwrap();
@@ -138,24 +126,21 @@ fn clang_names(mut syms: Vec<Sym>) -> Vec<Sym> {
     syms
 }
 
-fn check_mapping_corpus(xlen: Xlen) {
-    let names = names("mapping", xlen);
-    assert_eq!(names, ["align", "dot", "mapping", "order"], "{xlen:?}");
+#[test]
+fn mapping_symbols_are_clangs() {
+    let names = names("mapping");
+    assert_eq!(names, ["align", "dot", "mapping", "order"]);
     for name in &names {
-        let ours = assemble(&source("mapping", name, xlen), xlen);
-        let clang = std::fs::read(objects("mapping", xlen).join(format!("{name}.o"))).unwrap();
+        let ours = assemble(&source("mapping", name));
+        let clang = std::fs::read(objects("mapping").join(format!("{name}.o"))).unwrap();
         let (o, c) = (clang_names(symbols(&ours)), symbols(&clang));
-        assert!(
-            o.iter().any(|s| s.0 == code(xlen)),
-            "{name} {xlen:?}: no {}",
-            code(xlen)
-        );
-        assert_eq!(listing(&o), listing(&c), "{name}.s, {xlen:?}: symbols");
-        assert_eq!(sections(&ours), sections(&clang), "{name}.s, {xlen:?}: sections");
+        assert!(o.iter().any(|s| s.0 == code()), "{name}: no {}", code());
+        assert_eq!(listing(&o), listing(&c), "{name}.s: symbols");
+        assert_eq!(sections(&ours), sections(&clang), "{name}.s: sections");
 
         // The listing: the same data among the same instructions, labels
         // and relocations, and the padding's bytes.
-        let txt = objects("mapping", xlen).join(format!("{name}.d.txt"));
+        let txt = objects("mapping").join(format!("{name}.d.txt"));
         if name == "dot" {
             assert!(
                 !txt.exists(),
@@ -170,25 +155,16 @@ fn check_mapping_corpus(xlen: Xlen) {
         };
         let ours = merlin_objdump::dump(&format!("{name}.o"), &ours, &opts).unwrap();
         let want = std::fs::read_to_string(&txt).unwrap().replace("\r\n", "\n");
-        assert_eq!(ours, want, "{name}.s, {xlen:?}: merlin-objdump -d -r");
+        assert_eq!(ours, want, "{name}.s: merlin-objdump -d -r");
     }
-}
-
-#[test]
-fn mapping_symbols_are_clangs() {
-    check_mapping_corpus(Xlen::Rv32);
-}
-
-#[test]
-fn mapping_symbols_are_clangs_on_rv64() {
-    check_mapping_corpus(Xlen::Rv64);
 }
 
 /// The line table corpus: every symbol but the labels and section symbols
 /// that differ (module docs), the mapping symbols of the line table's own
 /// sections included, in clang's order.
-fn check_debug_line_corpus(xlen: Xlen) {
-    let names = names("debug_line", xlen);
+#[test]
+fn line_table_objects_have_clangs_mapping_symbols() {
+    let names = names("debug_line");
     assert!(names.len() >= 4, "{names:?}");
     let comparable = |syms: Vec<Sym>| -> Vec<Sym> {
         syms.into_iter()
@@ -196,22 +172,12 @@ fn check_debug_line_corpus(xlen: Xlen) {
             .collect()
     };
     for name in &names {
-        let ours = assemble(&source("debug_line", name, xlen), xlen);
-        let clang = std::fs::read(objects("debug_line", xlen).join(format!("{name}.o"))).unwrap();
+        let ours = assemble(&source("debug_line", name));
+        let clang = std::fs::read(objects("debug_line").join(format!("{name}.o"))).unwrap();
         let (o, c) = (comparable(symbols(&ours)), comparable(symbols(&clang)));
         assert!(o.iter().any(is_mapping), "{name}");
-        assert_eq!(listing(&o), listing(&c), "{name}.s, {xlen:?}");
+        assert_eq!(listing(&o), listing(&c), "{name}.s");
     }
-}
-
-#[test]
-fn line_table_objects_have_clangs_mapping_symbols() {
-    check_debug_line_corpus(Xlen::Rv32);
-}
-
-#[test]
-fn line_table_objects_have_clangs_mapping_symbols_on_rv64() {
-    check_debug_line_corpus(Xlen::Rv64);
 }
 
 /// The encoder's corpus is instructions only: clang's object of it (with
@@ -219,19 +185,17 @@ fn line_table_objects_have_clangs_mapping_symbols_on_rv64() {
 /// `.riscv.attributes`.
 #[test]
 fn instructions_alone_have_one_mapping_symbol() {
-    let golden = root().join("golden");
-    let rv32 = std::fs::read_to_string(golden.join("encode.s")).unwrap();
-    let rv64 = rv32.clone() + &std::fs::read_to_string(golden.join("rv64/encode.s")).unwrap();
-    for (src, xlen) in [(rv32, Xlen::Rv32), (rv64, Xlen::Rv64)] {
-        let mapping: Vec<(String, u64, String)> = symbols(&assemble(&src, xlen))
+    let src = std::fs::read_to_string(root().join("golden/encode.s")).unwrap();
+    {
+        let mapping: Vec<(String, u64, String)> = symbols(&assemble(&src))
             .into_iter()
             .filter(is_mapping)
             .map(|s| (s.0, s.1, s.5))
             .collect();
         let want = [
-            (code(xlen), 0, ".text".to_string()),
+            (code(), 0, ".text".to_string()),
             ("$d".to_string(), 0, ".riscv.attributes".to_string()),
         ];
-        assert_eq!(mapping, want, "{xlen:?}");
+        assert_eq!(mapping, want);
     }
 }

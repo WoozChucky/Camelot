@@ -164,7 +164,6 @@ static void trap_panic(struct trap_frame *f) {
     halt_after_panic();
 }
 
-#if __riscv_xlen == 64
 void kstack_overflow(struct trap_frame *f) {
     panic_begin();
     /* The stack sp was on, or ran out of: the KSTACK_SIZE bytes at a
@@ -183,7 +182,6 @@ void kstack_overflow(struct trap_frame *f) {
     trap_report(f);
     halt_after_panic();
 }
-#endif
 
 /* A supervisor external interrupt: claim the source from the PLIC, service
  * the device, complete. sip.SEIP follows the PLIC's line, so there is nothing

@@ -2,12 +2,12 @@
 //! symbol ended up.
 //!
 //! This is merlin-ld's own format, not ld.lld's. Addresses and sizes are
-//! printed as wide as the executable's: 8 hex digits for ELF32, 16 for ELF64
-//! (`0x80000000`, `0x0000000080000000`). A section loaded somewhere else
+//! printed as wide as the executable's: 16 hex digits (`0x0000000080000000`).
+//! A section loaded somewhere else
 //! than it runs (`AT(lma)`) says where: `(load 0x...)`.
 
 use crate::layout::{Def, Layout};
-use crate::object::{Class, STT_FILE, STT_SECTION};
+use crate::object::{STT_FILE, STT_SECTION};
 use std::fmt::Write;
 
 /// Symbols worth listing: skips section/file symbols, assembler temporaries
@@ -21,11 +21,8 @@ fn listed(name: &str, ty: u8) -> bool {
 }
 
 pub fn map(layout: &Layout) -> String {
-    // `0x` and 8 or 16 digits: the width of an address in the executable.
-    let width = match layout.class {
-        Class::Elf32 => 10,
-        Class::Elf64 => 18,
-    };
+    // `0x` and 16 digits: the width of an address in the executable.
+    let width = 18;
     let hex = |v: u64| format!("{v:#0width$x}");
     let mut m = String::new();
     let _ = writeln!(m, "merlin-ld link map\n");

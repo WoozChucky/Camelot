@@ -748,9 +748,9 @@ static void write_test(void) {
         iunlockput(ip);
     }
     end_op();
-    /* Files past what the kernel's offsets reach (on RV32, 2^31 - 1 bytes,
-     * which only mkfs or an RV64 kernel could make; on RV64 the format's
-     * limit): open() refuses them, and a write at the largest file's end
+    /* Files past what the kernel's offsets reach (the format's limit, which
+     * only a damaged inode's size passes): open() refuses them, and a write
+     * at the largest file's end
      * goes no further. An inode in memory only: its size is all writei()
      * looks at before it refuses. */
     struct inode big_one;

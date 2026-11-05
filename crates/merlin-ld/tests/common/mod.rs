@@ -1,12 +1,10 @@
-//! Helpers shared by the end-to-end tests of both fixture sets: `link.rs`
-//! (RV32, `tests/fixtures`) and `rv64.rs` (RV64, `tests/fixtures/rv64`),
-//! both made by `cargo xtask ld-fixtures` (crates/xtask/src/ld_fixtures.rs).
+//! Helpers of the end-to-end tests (`link.rs`) against the fixtures in
+//! `tests/fixtures`, made by `cargo xtask ld-fixtures`
+//! (crates/xtask/src/ld_fixtures.rs).
 //!
-//! A set is named by its directory under `tests/fixtures` ([`RV32`],
-//! [`RV64`]); a fixture by its path in the set, `norelocs/link`. Our
-//! executables are read with the elf crate, which reads both classes, and
-//! ld.lld's through its `llvm-readelf -S -l -s` listing (`.expected.txt`),
-//! whose layout is the same for both but for the width of the numbers.
+//! A fixture is named by its path there, `norelocs/link`. Our executables
+//! are read with the elf crate, and ld.lld's through its
+//! `llvm-readelf -S -l -s` listing (`.expected.txt`).
 
 // Each test crate uses its own part of these.
 #![allow(dead_code)]
@@ -16,20 +14,13 @@ use merlin_ld::{Input, Options, ScriptSource};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// The RV32 fixture set: `tests/fixtures` itself.
-pub const RV32: &str = "";
-/// The RV64 fixture set: `tests/fixtures/rv64`.
-pub const RV64: &str = "rv64";
-
 pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The directory of a fixture set.
-pub fn fixtures(set: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(set)
+/// The fixtures directory.
+pub fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
 pub fn input(path: &Path) -> Input {
@@ -39,11 +30,11 @@ pub fn input(path: &Path) -> Input {
     }
 }
 
-/// The objects `names` of a set's fixture directory `dir`.
-pub fn inputs(set: &str, dir: &str, names: &[&str]) -> Vec<Input> {
+/// The objects `names` of the fixture directory `dir`.
+pub fn inputs(dir: &str, names: &[&str]) -> Vec<Input> {
     names
         .iter()
-        .map(|n| input(&fixtures(set).join(dir).join(n)))
+        .map(|n| input(&fixtures().join(dir).join(n)))
         .collect()
 }
 
@@ -72,9 +63,9 @@ pub fn errors(r: Result<impl std::fmt::Debug, Vec<merlin_ld::Error>>) -> Vec<Str
 }
 
 /// The objects a fixture script names in its `/* objects: ... */` comment
-/// (paths relative to the set's directory), and the script itself.
-pub fn case(set: &str, script: &str) -> (Vec<Input>, Options) {
-    let path = fixtures(set).join(script);
+/// (paths relative to the fixtures directory), and the script itself.
+pub fn case(script: &str) -> (Vec<Input>, Options) {
+    let path = fixtures().join(script);
     let opts = Options {
         script: script_file(&path),
         entry: None,
@@ -88,7 +79,7 @@ pub fn case(set: &str, script: &str) -> (Vec<Input>, Options) {
     let objs = match list {
         Some(list) => list
             .split_whitespace()
-            .map(|o| input(&fixtures(set).join(o)))
+            .map(|o| input(&fixtures().join(o)))
             .collect(),
         // Without the comment: every object in the script's directory, in
         // name order (as `cargo xtask ld-fixtures` links them).
@@ -107,8 +98,8 @@ pub fn case(set: &str, script: &str) -> (Vec<Input>, Options) {
 }
 
 /// The relocation types a fixture object carries, by name.
-pub fn reloc_types(set: &str, path: &str) -> HashMap<String, usize> {
-    let data = std::fs::read(fixtures(set).join(path)).unwrap();
+pub fn reloc_types(path: &str) -> HashMap<String, usize> {
+    let data = std::fs::read(fixtures().join(path)).unwrap();
     let obj = merlin_ld::object::parse(path, &data).unwrap();
     let mut n = HashMap::new();
     for s in &obj.sections {
@@ -157,8 +148,7 @@ pub struct Readelf {
     pub locals: Vec<(String, u64)>,
 }
 
-/// A hex number of the listing, 8 digits for ELF32 or 16 for ELF64
-/// (`0xffffffff80000000`).
+/// A hex number of the listing (`0xffffffff80000000`).
 pub fn hex(s: &str) -> u64 {
     u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
 }
@@ -205,14 +195,14 @@ pub fn parse_readelf(text: &str) -> Readelf {
     r
 }
 
-/// `<set>/<name>.expected.txt`, e.g. `expected(RV32, "norelocs/link")`.
-pub fn expected(set: &str, name: &str) -> Readelf {
-    let path = fixtures(set).join(format!("{name}.expected.txt"));
+/// `<name>.expected.txt`, e.g. `expected("norelocs/link")`.
+pub fn expected(name: &str) -> Readelf {
+    let path = fixtures().join(format!("{name}.expected.txt"));
     parse_readelf(&std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
 }
 
 // ---------------------------------------------------------------------------
-// Reading our own ELF output the same way, with the elf crate (either class).
+// Reading our own ELF output the same way, with the elf crate.
 
 /// `R E`-style permissions, as the listing prints them (without the spaces).
 fn segment_flags(f: u32) -> String {
@@ -347,9 +337,9 @@ fn disassembly_body(text: &str) -> Vec<String> {
 ///   which llvm-objdump names after an absolute symbol, may be named after
 ///   a global absolute symbol the script assigned where ld.lld's file has
 ///   another (the same address, `<call_min>` for `<missing+0xffa3c>`).
-pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked) {
+pub fn assert_same_disassembly(name: &str, linked: &merlin_ld::Linked) {
     let elf = &linked.elf;
-    let lld_elf = std::fs::read(fixtures(set).join(format!("{name}.lld.elf"))).unwrap();
+    let lld_elf = std::fs::read(fixtures().join(format!("{name}.lld.elf"))).unwrap();
     // The value of the one symbol named `sym` in `file` that `keep` accepts:
     // none if there are several (a `.Lpcrel_hiN` of two objects), so that a
     // duplicated local name cannot stand for the wrong address.
@@ -401,7 +391,7 @@ pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked
         ..Default::default()
     };
     let ours = disassembly_body(&merlin_objdump::dump("ours.elf", elf, &opts).unwrap());
-    let path = fixtures(set).join(format!("{name}.objdump.txt"));
+    let path = fixtures().join(format!("{name}.objdump.txt"));
     let lld = disassembly_body(&std::fs::read_to_string(&path).unwrap());
     assert!(lld.len() > 3, "{name}: empty llvm-objdump listing");
     assert_eq!(ours.len(), lld.len(), "{name}: disassembly length");
@@ -431,12 +421,12 @@ pub fn assert_same_disassembly(set: &str, name: &str, linked: &merlin_ld::Linked
     }
 }
 
-/// Links fixture script `<set>/name.ld` with the objects it lists, checks
+/// Links fixture script `name.ld` with the objects it lists, checks
 /// the result against ld.lld's (`name.expected.txt`, `name.lld.elf`,
 /// `name.objdump.txt`) and runs it in Grail, which must print `output` and
 /// exit with `exit`.
-pub fn assert_matches_ld_lld_exit(set: &str, name: &str, output: &str, exit: u32) -> merlin_ld::Linked {
-    let (objs, opts) = case(set, &format!("{name}.ld"));
+pub fn assert_matches_ld_lld_exit(name: &str, output: &str, exit: u32) -> merlin_ld::Linked {
+    let (objs, opts) = case(&format!("{name}.ld"));
     let linked = merlin_ld::link(&objs, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
     assert!(
         linked.layout.warnings.is_empty(),
@@ -444,13 +434,13 @@ pub fn assert_matches_ld_lld_exit(set: &str, name: &str, output: &str, exit: u32
         linked.layout.warnings
     );
     let ours = read_ours(&linked.elf);
-    let lld = expected(set, name);
+    let lld = expected(name);
     assert_eq!(ours.entry, lld.entry, "{name}: entry");
     assert_eq!(ours.sections, lld.sections, "{name}: sections");
     assert_eq!(ours.loads, lld.loads, "{name}: PT_LOADs");
     assert_eq!(ours.phdr, lld.phdr, "{name}: PT_PHDR");
     assert_eq!(ours.globals, lld.globals, "{name}: global symbols");
-    let lld_elf = std::fs::read(fixtures(set).join(format!("{name}.lld.elf"))).unwrap();
+    let lld_elf = std::fs::read(fixtures().join(format!("{name}.lld.elf"))).unwrap();
     assert_eq!(locals(&linked.elf), locals(&lld_elf), "{name}: local symbols");
 
     // Byte for byte: every loaded byte, relocated code and data included,
@@ -476,7 +466,7 @@ pub fn assert_matches_ld_lld_exit(set: &str, name: &str, output: &str, exit: u32
             );
         }
     }
-    assert_same_disassembly(set, name, &linked);
+    assert_same_disassembly(name, &linked);
 
     let (_, r, out) = run(&linked.elf);
     assert_eq!(
@@ -487,8 +477,7 @@ pub fn assert_matches_ld_lld_exit(set: &str, name: &str, output: &str, exit: u32
     linked
 }
 
-/// Loads `elf` into a Grail machine (RV32 or RV64, as the file's class says)
-/// and runs it; returns the machine, how it ended and what it printed.
+/// Loads `elf` into a Grail machine and runs it; returns the machine, how it ended and what it printed.
 pub fn run(elf: &[u8]) -> (Machine, RunResult, String) {
     let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     // Garbage in RAM, so .bss zeroing by the loader is actually checked.
@@ -508,8 +497,8 @@ pub fn ram(m: &Machine, addr: u64, len: usize) -> &[u8] {
 /// Debug information of one object that refers to `gone`, a global another
 /// object defines in code `/DISCARD/` throws away ([`TOMBSTONES_GONE`]),
 /// and to `wu`, a weak reference nobody defines (merlin-as has no `.weak`:
-/// [`weaken`] makes it one). Linked by ld.lld 23 with [`TOMBSTONES_LD`], on
-/// RV32 and RV64 alike, its sections hold the tombstone, 0, except in
+/// [`weaken`] makes it one). Linked by ld.lld 23 with [`TOMBSTONES_LD`], its
+/// sections hold the tombstone, 0, except in
 /// `.debug_ranges` and `.debug_loc`, where it is 1 ([`TOMBSTONES_WANT`]).
 pub const TOMBSTONES: &str = "
         .text
@@ -607,30 +596,25 @@ pub const DIFFS_RELOCS: [(u32, u64); 18] = [
 ];
 pub const DIFFS_LD: &str = "SECTIONS { g = 0x100; . = 0x80000000; .text : { *(.text) } .data : { *(.data) } \
                             /DISCARD/ : { *(.text.gone) } }";
-/// ld.lld 23's `.data` for [`DIFFS`] (from 0x8000_0004), on both widths.
+/// ld.lld 23's `.data` for [`DIFFS`] (from 0x8000_0004).
 pub const DIFFS_DATA: [u8; 29] = [
     0xfc, 0, 0, 0x80, 0xff, 0xff, 0xff, 0xff, 0xf4, 0, 0, 0x80, 0xf0, 0, 0xee, 0xf1, 0, 0, 0x80, 4, 1, 0, 0,
     4, 1, 4, 0xc4, 0xff, 0xff,
 ];
 
-/// `obj` (ELF32 or ELF64) with its relocations, in section order, given the
-/// types and offsets of `relocs`.
+/// `obj` with its relocations, in section order, given the types and
+/// offsets of `relocs`.
 pub fn retype(mut obj: Vec<u8>, relocs: &[(u32, u64)]) -> Vec<u8> {
     let elf = elf::Elf::parse(&obj).unwrap();
-    let wide = elf.class == elf::Class::Elf64;
     let mut at = Vec::new();
     for s in elf.sections.iter().filter(|s| s.ty == elf::SHT_RELA) {
         at.extend((0..s.size / s.entsize).map(|i| (s.offset + i * s.entsize) as usize));
     }
     assert_eq!(at.len(), relocs.len(), "relocations");
+    // Elf64_Rela: r_offset, then r_info, its type in the low 32 bits.
     for (&e, &(ty, off)) in at.iter().zip(relocs) {
-        if wide {
-            obj[e..e + 8].copy_from_slice(&off.to_le_bytes());
-            obj[e + 8..e + 12].copy_from_slice(&ty.to_le_bytes());
-        } else {
-            obj[e..e + 4].copy_from_slice(&(off as u32).to_le_bytes());
-            obj[e + 4] = ty as u8;
-        }
+        obj[e..e + 8].copy_from_slice(&off.to_le_bytes());
+        obj[e + 8..e + 12].copy_from_slice(&ty.to_le_bytes());
     }
     obj
 }
@@ -638,7 +622,7 @@ pub fn retype(mut obj: Vec<u8>, relocs: &[(u32, u64)]) -> Vec<u8> {
 /// Links [`DIFFS`] and checks `.data` against ld.lld's bytes, and that the
 /// discarded `gone` is 0 in the label difference and the SET32 of
 /// `.debug_ranges` (no tombstone for these types, as in ld.lld). Returns
-/// `.debug_ranges`, which differs between the widths.
+/// `.debug_ranges`.
 pub fn assert_diffs(obj: Vec<u8>) -> Vec<u8> {
     let objs = [Input {
         name: "a.o".into(),
@@ -653,14 +637,13 @@ pub fn assert_diffs(obj: Vec<u8>) -> Vec<u8> {
     elf.section_data(ranges).unwrap()[..12].to_vec()
 }
 
-/// `obj` (ELF32 or ELF64) with its global symbol `name` made weak.
+/// `obj` with its global symbol `name` made weak.
 pub fn weaken(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
     let elf = elf::Elf::parse(&obj).unwrap();
     let symtab = elf.sections.iter().find(|s| s.ty == elf::SHT_SYMTAB).unwrap();
     let strtab = elf.sections[symtab.link as usize].offset as usize;
-    // st_info: after st_name in ELF64; after st_name, st_value and st_size
-    // in ELF32.
-    let info = if elf.class == elf::Class::Elf64 { 4 } else { 12 };
+    // Elf64_Sym: st_info right after st_name.
+    let info = 4;
     let at = (0..symtab.size / symtab.entsize)
         .map(|i| (symtab.offset + i * symtab.entsize) as usize)
         .find(|&e| {

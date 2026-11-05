@@ -4,22 +4,21 @@
 //!
 //! * Grail's boot ROM disk loader, `crates/grail/rom/diskboot.S`: reads the
 //!   boot block of disk 0 and jumps to it, on a machine with no firmware
-//!   (spec section 7, "Boot from disk"). One source for both widths (#193),
-//!   preprocessed for each as the examples are: Grail includes the RV32
-//!   build, `diskboot.elf`, in the boot ROM of an RV32 machine, and the RV64
-//!   one, `diskboot-rv64.elf`, in an RV64 machine's (#151).
+//!   (spec section 7, "Boot from disk"), preprocessed as the examples are:
+//!   Grail includes `diskboot.elf` in its boot ROM.
 //! * Camelot's firmware, `firmware/` (#174, spec section 7, "Firmware"): the
 //!   M-mode SBI implementation, its entry and its disk loader, linked at
 //!   0x8000_0000 into `crates/grail/rom/firmware.elf`, which Grail includes
-//!   and loads with `--bios default`. RV64 only.
-//! * Camelot's bootloader, `kernel/boot/boot.S`: the boot block, which loads
-//!   the kernel ELF stored after the filesystem. `camelot-fs mkfs --boot`
-//!   (and `cargo xtask fs`) install the linked `boot.elf`.
+//!   and loads with `--bios default`.
+//! * Camelot's bootloader, `kernel/boot/boot.S`: the boot block, the
+//!   firmware's next stage, which loads the kernel ELF stored after the
+//!   filesystem. `camelot-fs mkfs --boot` (and `cargo xtask fs`) install the
+//!   linked `boot.elf`.
 //!
 //! The `.elf` files are committed, and `cargo test` checks they are what the
 //! current sources and tools build.
 
-use crate::examples::{self, Built, Xlen};
+use crate::examples::{self, Built};
 use std::path::{Path, PathBuf};
 
 /// One program: sources and a linker script in `dir`, linked to `elf` in
@@ -38,11 +37,9 @@ pub struct Program {
     pub elf_dir: &'static str,
     /// The linked executable's file name in `elf_dir`.
     pub elf: &'static str,
-    /// The width it is assembled for.
-    pub xlen: Xlen,
 }
 
-/// The boot ROM's disk loader, for RV32 machines.
+/// The boot ROM's disk loader.
 pub const DISKBOOT: Program = Program {
     name: "diskboot",
     dir: "crates/grail/rom",
@@ -50,22 +47,9 @@ pub const DISKBOOT: Program = Program {
     script: "link.ld",
     elf_dir: "crates/grail/rom",
     elf: "diskboot.elf",
-    xlen: Xlen::Rv32,
 };
 
-/// The boot ROM's disk loader, for RV64 machines: the same source and linker
-/// script.
-pub const DISKBOOT_RV64: Program = Program {
-    name: "diskboot-rv64",
-    dir: "crates/grail/rom",
-    sources: &["diskboot.S"],
-    script: "link.ld",
-    elf_dir: "crates/grail/rom",
-    elf: "diskboot-rv64.elf",
-    xlen: Xlen::Rv64,
-};
-
-/// Camelot's firmware, for RV64 machines: Grail's `--bios default`.
+/// Camelot's firmware: Grail's `--bios default`.
 pub const FIRMWARE: Program = Program {
     name: "firmware",
     dir: "firmware",
@@ -73,10 +57,10 @@ pub const FIRMWARE: Program = Program {
     script: "firmware.ld",
     elf_dir: "crates/grail/rom",
     elf: "firmware.elf",
-    xlen: Xlen::Rv64,
 };
 
-/// Camelot's bootloader, for RV32 machines and kernels.
+/// Camelot's bootloader, which loads the kernel (ELF64) in S-mode, the
+/// firmware's next stage.
 pub const BOOTLOADER: Program = Program {
     name: "boot",
     dir: "kernel/boot",
@@ -84,23 +68,9 @@ pub const BOOTLOADER: Program = Program {
     script: "link.ld",
     elf_dir: "kernel/boot",
     elf: "boot.elf",
-    xlen: Xlen::Rv32,
 };
 
-/// Camelot's bootloader for RV64 machines, which loads the RV64 kernel
-/// (ELF64) in S-mode, the firmware's next stage: the same source and linker
-/// script.
-pub const BOOTLOADER_RV64: Program = Program {
-    name: "boot-rv64",
-    dir: "kernel/boot",
-    sources: &["boot.S"],
-    script: "link.ld",
-    elf_dir: "kernel/boot",
-    elf: "boot-rv64.elf",
-    xlen: Xlen::Rv64,
-};
-
-pub const PROGRAMS: &[Program] = &[DISKBOOT, DISKBOOT_RV64, FIRMWARE, BOOTLOADER, BOOTLOADER_RV64];
+pub const PROGRAMS: &[Program] = &[DISKBOOT, FIRMWARE, BOOTLOADER];
 
 impl Program {
     /// The committed executable under `root`.
@@ -114,13 +84,9 @@ impl Program {
     }
 
     /// Where the commands leave the preprocessed sources and the objects:
-    /// `target/boot`, and `target/boot/rv64` for RV64 (one source serves
-    /// both widths).
+    /// `target/boot`.
     pub fn obj_dir(&self) -> &'static str {
-        match self.xlen {
-            Xlen::Rv32 => "target/boot",
-            Xlen::Rv64 => "target/boot/rv64",
-        }
+        "target/boot"
     }
 
     /// The equivalent command lines: each source preprocessed and
@@ -133,7 +99,6 @@ impl Program {
                 self.dir,
                 source,
                 &[examples::INCLUDE_DIR],
-                self.xlen,
                 obj_dir,
             ));
         }
@@ -162,18 +127,12 @@ pub fn build(root: &Path, p: &Program) -> Result<Built, String> {
         p.sources,
         &[examples::INCLUDE_DIR],
         Some(p.script),
-        p.xlen,
     )
 }
 
 /// The bootloader's executable as the current source builds it.
 pub fn bootloader(root: &Path) -> Result<Vec<u8>, String> {
     Ok(build(root, &BOOTLOADER)?.elf)
-}
-
-/// The RV64 bootloader's executable as the current source builds it.
-pub fn bootloader_rv64(root: &Path) -> Result<Vec<u8>, String> {
-    Ok(build(root, &BOOTLOADER_RV64)?.elf)
 }
 
 /// The firmware's executable as the current sources build it.

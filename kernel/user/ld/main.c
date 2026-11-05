@@ -250,28 +250,20 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ld.lld's order (merlin-ld's layout::read): the script first, read for
-     * ELF64 as ld.lld reads it (64-bit values whatever the class), so its
-     * errors come first; then every file, in command-line order; and only
-     * when all of that read, the classes, the script's OUTPUT_FORMAT's if it
-     * names one. layout_build reads the script again for the class: the
-     * same script for ELF64, and for ELF32 with its exact arithmetic and
-     * its 4 GiB limits. */
-    struct script read64;
+    /* ld.lld's order (merlin-ld's layout::read): the script first, so its
+     * errors come first; then every file, in command-line order.
+     * layout_build reads the script again for the layout. */
+    struct script read;
     uint line;
     char *msg;
-    int format = FORMAT_NONE;
-    if (script_parse(script_text != NULL ? script_text : DEFAULT_SCRIPT, &read64, &line, &msg, 1)) {
-        format = read64.format;
-    } else {
+    if (!script_parse(script_text != NULL ? script_text : DEFAULT_SCRIPT, &read, &line, &msg)) {
         error(fmt("%s:%u: %s", script != NULL ? script : "<default layout>", line, msg));
     }
     uint nobjects;
-    int class;
-    struct object *objects = parse_with_needed(files, lazy, nnames, format, &nobjects, &class);
+    struct object *objects = parse_with_needed(files, lazy, nnames, &nobjects);
     struct layout layout;
     uchar **images, **debug;
-    if (objects == NULL || !layout_build(objects, nobjects, class, script, script_text, entry, &layout) ||
+    if (objects == NULL || !layout_build(objects, nobjects, script, script_text, entry, &layout) ||
         !relocate(&layout, &images, &debug)) {
         print_errors();
         return 1;

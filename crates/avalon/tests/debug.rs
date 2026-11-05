@@ -118,7 +118,7 @@ impl Gdb {
     }
 }
 
-/// The pc in a stop reply (`...;20:PC;`), little-endian hex of 4 bytes on RV32.
+/// The pc in a stop reply (`...;20:PC;`), little-endian hex of 8 bytes.
 fn stop_pc(reply: &str) -> u64 {
     let hex = reply.split("20:").nth(1).unwrap().split(';').next().unwrap();
     let bytes: Vec<u8> = (0..hex.len())
@@ -134,104 +134,102 @@ fn changed(vm: u32, state: VmState) -> Message {
 
 #[test]
 fn a_debugger_stops_the_vm_breaks_steps_and_detaches() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut control = connect(&server);
-        let id = create(&mut control, "spin", profile(4, None), spinner());
-        // Attached first, so that the spinner's `L` is output, not scrollback.
-        let mut console = Console::attach(&server, VmRef::Id(id));
-        control
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        console.wait_for("L");
+    let server = server(None);
+    let mut control = connect(&server);
+    let id = create(&mut control, "spin", profile(4, None), spinner());
+    // Attached first, so that the spinner's `L` is output, not scrollback.
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    control
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    console.wait_for("L");
 
-        // Attaching stops the VM as QEMU's stub stops it for a GDB connection: paused.
-        let mut gdb = Gdb::attach(&server, VmRef::Name("spin".into()));
-        assert_eq!(gdb.vm, id);
-        assert_eq!(state(&mut control, id), VmState::Paused);
-        assert!(server.debug_vm(id).unwrap().debugged);
-        console.wait_for_event(changed(id, VmState::Paused));
-        // The debugger hears of it too, before its reply.
-        assert!(
-            gdb.messages.contains(&changed(id, VmState::Paused)),
-            "{:?}",
-            gdb.messages
-        );
-        // Stopped, the machine runs no step.
-        let steps = info(&mut control, id).steps;
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(info(&mut control, id).steps, steps);
+    // Attaching stops the VM as QEMU's stub stops it for a GDB connection: paused.
+    let mut gdb = Gdb::attach(&server, VmRef::Name("spin".into()));
+    assert_eq!(gdb.vm, id);
+    assert_eq!(state(&mut control, id), VmState::Paused);
+    assert!(server.debug_vm(id).unwrap().debugged);
+    console.wait_for_event(changed(id, VmState::Paused));
+    // The debugger hears of it too, before its reply.
+    assert!(
+        gdb.messages.contains(&changed(id, VmState::Paused)),
+        "{:?}",
+        gdb.messages
+    );
+    // Stopped, the machine runs no step.
+    let steps = info(&mut control, id).steps;
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(info(&mut control, id).steps, steps);
 
-        // The stub is Grail's: acks until no-ack mode, a new client's stop is an interrupt.
-        let stop = gdb.ask("?");
-        assert!(stop.starts_with("T02thread:1;20:"), "{stop}");
-        assert_eq!(gdb.acks(), 1, "the stub acks the packet");
-        assert_eq!(gdb.ask("QStartNoAckMode"), "OK");
-        // The loop of the spinner, `addi t2, t2, 1`, is the fourth instruction.
-        let at = 0x8000_000cu64;
-        assert_eq!(gdb.ask(&format!("Z0,{at:x},4")), "OK");
-        gdb.send("vCont;c");
-        let hit = gdb.reply();
-        assert!(hit.starts_with("T05"), "{hit}");
-        assert_eq!(stop_pc(&hit), at);
-        // Resumed, then stopped at the breakpoint: debug. The notices of a VM with a
-        // debugger are rate-limited, but the last one comes.
-        assert_eq!(state(&mut control, id), VmState::Debug);
-        gdb.wait_for(&changed(id, VmState::Debug));
-        console.wait_for_event(changed(id, VmState::Debug));
-        // A step runs the VM and stops it again, at debug.
-        let stepped = gdb.ask("vCont;s:1");
-        assert_eq!(stop_pc(&stepped), at + 4, "{stepped}");
-        assert_eq!(state(&mut control, id), VmState::Debug);
-        // The VM is the debugger's: it is not running, and the debugger resumes it.
-        assert_eq!(
-            error_of(&mut control, &Message::PauseVm { vm: VmRef::Id(id) }),
-            ErrorCode::InvalidState
-        );
-        assert_eq!(
-            error_of(&mut control, &Message::ResumeVm { vm: VmRef::Id(id) }),
-            ErrorCode::InvalidState
-        );
+    // The stub is Grail's: acks until no-ack mode, a new client's stop is an interrupt.
+    let stop = gdb.ask("?");
+    assert!(stop.starts_with("T02thread:1;20:"), "{stop}");
+    assert_eq!(gdb.acks(), 1, "the stub acks the packet");
+    assert_eq!(gdb.ask("QStartNoAckMode"), "OK");
+    // The loop of the spinner, `addi t2, t2, 1`, is the fourth instruction.
+    let at = 0x8000_000cu64;
+    assert_eq!(gdb.ask(&format!("Z0,{at:x},4")), "OK");
+    gdb.send("vCont;c");
+    let hit = gdb.reply();
+    assert!(hit.starts_with("T05"), "{hit}");
+    assert_eq!(stop_pc(&hit), at);
+    // Resumed, then stopped at the breakpoint: debug. The notices of a VM with a
+    // debugger are rate-limited, but the last one comes.
+    assert_eq!(state(&mut control, id), VmState::Debug);
+    gdb.wait_for(&changed(id, VmState::Debug));
+    console.wait_for_event(changed(id, VmState::Debug));
+    // A step runs the VM and stops it again, at debug.
+    let stepped = gdb.ask("vCont;s:1");
+    assert_eq!(stop_pc(&stepped), at + 4, "{stepped}");
+    assert_eq!(state(&mut control, id), VmState::Debug);
+    // The VM is the debugger's: it is not running, and the debugger resumes it.
+    assert_eq!(
+        error_of(&mut control, &Message::PauseVm { vm: VmRef::Id(id) }),
+        ErrorCode::InvalidState
+    );
+    assert_eq!(
+        error_of(&mut control, &Message::ResumeVm { vm: VmRef::Id(id) }),
+        ErrorCode::InvalidState
+    );
 
-        // Running for the debugger, PauseVm stops it as QEMU's `stop` does: paused, and the
-        // debugger's stop reply, an interrupt. Paused so, it is still the debugger's.
-        assert_eq!(gdb.ask(&format!("z0,{at:x},4")), "OK");
-        gdb.send("c");
-        wait_for_state(&mut control, id, |s| s == VmState::Running);
-        control
-            .request_ok(&Message::PauseVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let paused = gdb.reply();
-        assert!(paused.starts_with("T02"), "{paused}");
-        assert_eq!(state(&mut control, id), VmState::Paused);
-        assert_eq!(
-            error_of(&mut control, &Message::ResumeVm { vm: VmRef::Id(id) }),
-            ErrorCode::InvalidState
-        );
-        // Its Ctrl-C stops it the same way.
-        gdb.send("c");
-        wait_for_state(&mut control, id, |s| s == VmState::Running);
-        let ran = info(&mut control, id).steps;
-        wait_until("the VM to run", SLOW, || info(&mut control, id).steps > ran);
-        gdb.raw(&[0x03]);
-        let interrupted = gdb.reply();
-        assert!(interrupted.starts_with("T02"), "{interrupted}");
-        assert_eq!(state(&mut control, id), VmState::Paused);
+    // Running for the debugger, PauseVm stops it as QEMU's `stop` does: paused, and the
+    // debugger's stop reply, an interrupt. Paused so, it is still the debugger's.
+    assert_eq!(gdb.ask(&format!("z0,{at:x},4")), "OK");
+    gdb.send("c");
+    wait_for_state(&mut control, id, |s| s == VmState::Running);
+    control
+        .request_ok(&Message::PauseVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let paused = gdb.reply();
+    assert!(paused.starts_with("T02"), "{paused}");
+    assert_eq!(state(&mut control, id), VmState::Paused);
+    assert_eq!(
+        error_of(&mut control, &Message::ResumeVm { vm: VmRef::Id(id) }),
+        ErrorCode::InvalidState
+    );
+    // Its Ctrl-C stops it the same way.
+    gdb.send("c");
+    wait_for_state(&mut control, id, |s| s == VmState::Running);
+    let ran = info(&mut control, id).steps;
+    wait_until("the VM to run", SLOW, || info(&mut control, id).steps > ran);
+    gdb.raw(&[0x03]);
+    let interrupted = gdb.reply();
+    assert!(interrupted.starts_with("T02"), "{interrupted}");
+    assert_eq!(state(&mut control, id), VmState::Paused);
 
-        // `D`: the VM runs on, without the debugger's breakpoints.
-        assert_eq!(gdb.ask(&format!("Z0,{at:x},4")), "OK");
-        assert_eq!(gdb.ask("D"), "OK");
-        wait_for_state(&mut control, id, |s| s == VmState::Running);
-        assert!(!server.debug_vm(id).unwrap().debugged);
-        let ran = info(&mut control, id).steps;
-        wait_until("the VM to run past the breakpoint", SLOW, || {
-            info(&mut control, id).steps > ran + 1_000_000
-        });
-        assert_eq!(state(&mut control, id), VmState::Running);
-        // The console was never detached.
-        assert_eq!(console.output, b"L");
-        server.stop().unwrap();
+    // `D`: the VM runs on, without the debugger's breakpoints.
+    assert_eq!(gdb.ask(&format!("Z0,{at:x},4")), "OK");
+    assert_eq!(gdb.ask("D"), "OK");
+    wait_for_state(&mut control, id, |s| s == VmState::Running);
+    assert!(!server.debug_vm(id).unwrap().debugged);
+    let ran = info(&mut control, id).steps;
+    wait_until("the VM to run past the breakpoint", SLOW, || {
+        info(&mut control, id).steps > ran + 1_000_000
     });
+    assert_eq!(state(&mut control, id), VmState::Running);
+    // The console was never detached.
+    assert_eq!(console.output, b"L");
+    server.stop().unwrap();
 }
 
 /// A debugger whose connection ends without `D` leaves the VM as it was, as QEMU does:
@@ -240,69 +238,67 @@ fn a_debugger_stops_the_vm_breaks_steps_and_detaches() {
 /// no debugger, and the next debugger's `?` takes the breakpoints away.
 #[test]
 fn a_debugger_that_goes_without_detaching_leaves_the_vm_as_it_was() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut control = connect(&server);
-        let id = create(&mut control, "spin", profile(4, None), spinner());
-        control
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
+    let server = server(None);
+    let mut control = connect(&server);
+    let id = create(&mut control, "spin", profile(4, None), spinner());
+    control
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
 
-        // Gone while the VM was stopped for it: it stays paused.
-        let gdb = Gdb::attach(&server, VmRef::Id(id));
-        assert_eq!(state(&mut control, id), VmState::Paused);
-        drop(gdb);
-        wait_until("the debugger to go", SLOW, || {
-            !server.debug_vm(id).unwrap().debugged
-        });
-        let steps = info(&mut control, id).steps;
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(info(&mut control, id).steps, steps);
-        assert_eq!(state(&mut control, id), VmState::Paused);
-        control
-            .request_ok(&Message::ResumeVm { vm: VmRef::Id(id) })
-            .unwrap();
-        assert_eq!(state(&mut control, id), VmState::Running);
-
-        // Gone while the VM ran for it: its breakpoint stops the VM, state debug.
-        let at = 0x8000_000cu64;
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        assert_eq!(gdb.ask(&format!("Z0,{at:x},4")), "OK");
-        gdb.send("c");
-        gdb.hang_up();
-        wait_for_state(&mut control, id, |s| s == VmState::Debug);
-        drop(gdb);
-        wait_until("the debugger to go", SLOW, || {
-            !server.debug_vm(id).unwrap().debugged
-        });
-        // With no debugger, ResumeVm runs it, as QEMU's `cont`; the breakpoint is still
-        // there, in the spinner's loop, and stops it again.
-        let steps = info(&mut control, id).steps;
-        control
-            .request_ok(&Message::ResumeVm { vm: VmRef::Id(id) })
-            .unwrap();
-        wait_until("the breakpoint to stop the VM again", SLOW, || {
-            state(&mut control, id) == VmState::Debug && info(&mut control, id).steps > steps
-        });
-
-        // The next debugger finds it in state debug, at the breakpoint; its `?` takes the
-        // breakpoint away, so the VM runs until it is interrupted.
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        assert_eq!(state(&mut control, id), VmState::Debug);
-        let stop = gdb.ask("?");
-        assert_eq!(stop_pc(&stop), at, "{stop}");
-        gdb.send("c");
-        let ran = info(&mut control, id).steps;
-        wait_until("the VM to run", SLOW, || {
-            info(&mut control, id).steps > ran + 1_000_000
-        });
-        gdb.raw(&[0x03]);
-        let interrupted = gdb.reply();
-        assert!(interrupted.starts_with("T02"), "{interrupted}");
-        assert_eq!(gdb.ask("D"), "OK");
-        wait_for_state(&mut control, id, |s| s == VmState::Running);
-        server.stop().unwrap();
+    // Gone while the VM was stopped for it: it stays paused.
+    let gdb = Gdb::attach(&server, VmRef::Id(id));
+    assert_eq!(state(&mut control, id), VmState::Paused);
+    drop(gdb);
+    wait_until("the debugger to go", SLOW, || {
+        !server.debug_vm(id).unwrap().debugged
     });
+    let steps = info(&mut control, id).steps;
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(info(&mut control, id).steps, steps);
+    assert_eq!(state(&mut control, id), VmState::Paused);
+    control
+        .request_ok(&Message::ResumeVm { vm: VmRef::Id(id) })
+        .unwrap();
+    assert_eq!(state(&mut control, id), VmState::Running);
+
+    // Gone while the VM ran for it: its breakpoint stops the VM, state debug.
+    let at = 0x8000_000cu64;
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    assert_eq!(gdb.ask(&format!("Z0,{at:x},4")), "OK");
+    gdb.send("c");
+    gdb.hang_up();
+    wait_for_state(&mut control, id, |s| s == VmState::Debug);
+    drop(gdb);
+    wait_until("the debugger to go", SLOW, || {
+        !server.debug_vm(id).unwrap().debugged
+    });
+    // With no debugger, ResumeVm runs it, as QEMU's `cont`; the breakpoint is still
+    // there, in the spinner's loop, and stops it again.
+    let steps = info(&mut control, id).steps;
+    control
+        .request_ok(&Message::ResumeVm { vm: VmRef::Id(id) })
+        .unwrap();
+    wait_until("the breakpoint to stop the VM again", SLOW, || {
+        state(&mut control, id) == VmState::Debug && info(&mut control, id).steps > steps
+    });
+
+    // The next debugger finds it in state debug, at the breakpoint; its `?` takes the
+    // breakpoint away, so the VM runs until it is interrupted.
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    assert_eq!(state(&mut control, id), VmState::Debug);
+    let stop = gdb.ask("?");
+    assert_eq!(stop_pc(&stop), at, "{stop}");
+    gdb.send("c");
+    let ran = info(&mut control, id).steps;
+    wait_until("the VM to run", SLOW, || {
+        info(&mut control, id).steps > ran + 1_000_000
+    });
+    gdb.raw(&[0x03]);
+    let interrupted = gdb.reply();
+    assert!(interrupted.starts_with("T02"), "{interrupted}");
+    assert_eq!(gdb.ask("D"), "OK");
+    wait_for_state(&mut control, id, |s| s == VmState::Running);
+    server.stop().unwrap();
 }
 
 /// What a debugger sent just before its connection ended still reaches the stub, as
@@ -312,29 +308,27 @@ fn a_debugger_that_goes_without_detaching_leaves_the_vm_as_it_was() {
 /// with nobody to debug it.
 #[test]
 fn a_debuggers_last_bytes_reach_the_stub() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut control = connect(&server);
-        let id = create(&mut control, "spin", profile(4, None), spinner());
-        control
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        assert_eq!(state(&mut control, id), VmState::Paused);
-        gdb.send("c");
-        wait_for_state(&mut control, id, |s| s == VmState::Running);
-        gdb.raw(&[0x03]);
-        gdb.hang_up();
-        wait_until("the debugger to go", SLOW, || {
-            !server.debug_vm(id).unwrap().debugged
-        });
-        wait_for_state(&mut control, id, |s| s == VmState::Paused);
-        let steps = info(&mut control, id).steps;
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(info(&mut control, id).steps, steps);
-        drop(gdb);
-        server.stop().unwrap();
+    let server = server(None);
+    let mut control = connect(&server);
+    let id = create(&mut control, "spin", profile(4, None), spinner());
+    control
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    assert_eq!(state(&mut control, id), VmState::Paused);
+    gdb.send("c");
+    wait_for_state(&mut control, id, |s| s == VmState::Running);
+    gdb.raw(&[0x03]);
+    gdb.hang_up();
+    wait_until("the debugger to go", SLOW, || {
+        !server.debug_vm(id).unwrap().debugged
     });
+    wait_for_state(&mut control, id, |s| s == VmState::Paused);
+    let steps = info(&mut control, id).steps;
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(info(&mut control, id).steps, steps);
+    drop(gdb);
+    server.stop().unwrap();
 }
 
 /// The steps of a `next` are each two run states, running and debug: a client attached
@@ -342,244 +336,233 @@ fn a_debuggers_last_bytes_reach_the_stub() {
 /// rate-limits its noisy events, and the last notice gives the state the VM is in.
 #[test]
 fn a_debuggers_steps_do_not_flood_the_clients() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut control = connect(&server);
-        let id = create(&mut control, "spin", profile(4, None), spinner());
-        // Attached first, so that the spinner's `L` is output, not scrollback.
-        let mut console = Console::attach(&server, VmRef::Id(id));
-        control
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        console.wait_for("L");
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        console.wait_for_event(changed(id, VmState::Paused));
-        assert_eq!(gdb.ask("QStartNoAckMode"), "OK");
-        let start = Instant::now();
-        let steps = 2000;
-        for _ in 0..steps {
-            assert!(gdb.ask("s").starts_with("T05"));
-        }
-        let took = start.elapsed();
-        assert_eq!(state(&mut control, id), VmState::Debug);
-        // The held notice comes once the second is over.
-        console.wait_for_event(changed(id, VmState::Debug));
-        let notices = console
+    let server = server(None);
+    let mut control = connect(&server);
+    let id = create(&mut control, "spin", profile(4, None), spinner());
+    // Attached first, so that the spinner's `L` is output, not scrollback.
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    control
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    console.wait_for("L");
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    console.wait_for_event(changed(id, VmState::Paused));
+    assert_eq!(gdb.ask("QStartNoAckMode"), "OK");
+    let start = Instant::now();
+    let steps = 2000;
+    for _ in 0..steps {
+        assert!(gdb.ask("s").starts_with("T05"));
+    }
+    let took = start.elapsed();
+    assert_eq!(state(&mut control, id), VmState::Debug);
+    // The held notice comes once the second is over.
+    console.wait_for_event(changed(id, VmState::Debug));
+    let notices = console
+        .events
+        .iter()
+        .filter(|e| matches!(e, Message::VmStateChanged { .. }))
+        .count();
+    // Running (StartVm), paused, then at most one a second while it stepped, and the
+    // last.
+    let most = 3 + took.as_secs() as usize + 1;
+    assert!(
+        notices <= most,
+        "{notices} notices for {steps} steps in {took:?}: {:?}",
+        console.events
+    );
+    assert_eq!(
+        console
             .events
             .iter()
-            .filter(|e| matches!(e, Message::VmStateChanged { .. }))
-            .count();
-        // Running (StartVm), paused, then at most one a second while it stepped, and the
-        // last.
-        let most = 3 + took.as_secs() as usize + 1;
-        assert!(
-            notices <= most,
-            "{notices} notices for {steps} steps in {took:?}: {:?}",
-            console.events
-        );
-        assert_eq!(
-            console
-                .events
-                .iter()
-                .rev()
-                .find(|e| matches!(e, Message::VmStateChanged { .. })),
-            Some(&changed(id, VmState::Debug))
-        );
-        // Without a debugger, a notice goes out at once.
-        let runs = |c: &Console| {
-            c.events
-                .iter()
-                .filter(|e| **e == changed(c.vm, VmState::Running))
-                .count()
-        };
-        let before = runs(&console);
-        assert_eq!(gdb.ask("D"), "OK");
-        console.wait_until(|c| runs(c) > before, "running after the detach");
-        control
-            .request_ok(&Message::PauseVm { vm: VmRef::Id(id) })
-            .unwrap();
-        control
-            .request_ok(&Message::ResumeVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let at = Instant::now();
-        console.wait_until(|c| runs(c) > before + 1, "running after ResumeVm");
-        assert!(
-            at.elapsed() < Duration::from_millis(500),
-            "held: {:?}",
-            at.elapsed()
-        );
-        server.stop().unwrap();
-    });
+            .rev()
+            .find(|e| matches!(e, Message::VmStateChanged { .. })),
+        Some(&changed(id, VmState::Debug))
+    );
+    // Without a debugger, a notice goes out at once.
+    let runs = |c: &Console| {
+        c.events
+            .iter()
+            .filter(|e| **e == changed(c.vm, VmState::Running))
+            .count()
+    };
+    let before = runs(&console);
+    assert_eq!(gdb.ask("D"), "OK");
+    console.wait_until(|c| runs(c) > before, "running after the detach");
+    control
+        .request_ok(&Message::PauseVm { vm: VmRef::Id(id) })
+        .unwrap();
+    control
+        .request_ok(&Message::ResumeVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let at = Instant::now();
+    console.wait_until(|c| runs(c) > before + 1, "running after ResumeVm");
+    assert!(
+        at.elapsed() < Duration::from_millis(500),
+        "held: {:?}",
+        at.elapsed()
+    );
+    server.stop().unwrap();
 }
 
 #[test]
 fn a_created_vm_waits_for_its_debugger_and_ends_under_it() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut control = connect(&server);
-        let id = create(&mut control, "bye", profile(4, None), exits_with(3));
-        let mut console = Console::attach(&server, VmRef::Id(id));
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        assert_eq!(state(&mut control, id), VmState::Paused);
-        // Before its first instruction, in the boot ROM, as `grail --gdb-wait` waits:
-        // pc 0x1000, in target byte order, as wide as the VM's registers.
-        let rom = match xlen() {
-            avalon_proto::Xlen::Rv32 => "00100000",
-            avalon_proto::Xlen::Rv64 => "0010000000000000",
-        };
-        assert_eq!(gdb.ask("p20"), rom);
-        assert_eq!(info(&mut control, id).steps, 0);
-        assert_eq!(gdb.ask("c"), "W03");
-        gdb.wait_for(&Message::Detached {
-            vm: id,
-            kind: AttachKind::Debug,
-        });
-        assert_eq!(state(&mut control, id), VmState::Exited(3));
-        console.wait_for("bye");
-        assert!(!server.debug_vm(id).unwrap().debugged);
-        // An ended VM has nothing to debug.
-        let mut other = connect(&server);
-        assert_eq!(
-            error_of(&mut other, &Message::DebugAttach { vm: VmRef::Id(id) }),
-            ErrorCode::InvalidState
-        );
-
-        // Stepping to the exit ends the session the same way.
-        let id = create(&mut control, "step", profile(4, None), exits_with(4));
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        // The ROM's few instructions, then the program's eight.
-        let mut last = String::new();
-        for _ in 0..100 {
-            last = gdb.ask("s");
-            if last.starts_with('W') {
-                break;
-            }
-        }
-        assert_eq!(last, "W04");
-        gdb.wait_for(&Message::Detached {
-            vm: id,
-            kind: AttachKind::Debug,
-        });
-        assert_eq!(state(&mut control, id), VmState::Exited(4));
-        server.stop().unwrap();
+    let server = server(None);
+    let mut control = connect(&server);
+    let id = create(&mut control, "bye", profile(4, None), exits_with(3));
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    assert_eq!(state(&mut control, id), VmState::Paused);
+    // Before its first instruction, in the boot ROM, as `grail --gdb-wait` waits:
+    // pc 0x1000, in target byte order, as wide as the VM's registers.
+    let rom = "0010000000000000";
+    assert_eq!(gdb.ask("p20"), rom);
+    assert_eq!(info(&mut control, id).steps, 0);
+    assert_eq!(gdb.ask("c"), "W03");
+    gdb.wait_for(&Message::Detached {
+        vm: id,
+        kind: AttachKind::Debug,
     });
+    assert_eq!(state(&mut control, id), VmState::Exited(3));
+    console.wait_for("bye");
+    assert!(!server.debug_vm(id).unwrap().debugged);
+    // An ended VM has nothing to debug.
+    let mut other = connect(&server);
+    assert_eq!(
+        error_of(&mut other, &Message::DebugAttach { vm: VmRef::Id(id) }),
+        ErrorCode::InvalidState
+    );
+
+    // Stepping to the exit ends the session the same way.
+    let id = create(&mut control, "step", profile(4, None), exits_with(4));
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    // The ROM's few instructions, then the program's eight.
+    let mut last = String::new();
+    for _ in 0..100 {
+        last = gdb.ask("s");
+        if last.starts_with('W') {
+            break;
+        }
+    }
+    assert_eq!(last, "W04");
+    gdb.wait_for(&Message::Detached {
+        vm: id,
+        kind: AttachKind::Debug,
+    });
+    assert_eq!(state(&mut control, id), VmState::Exited(4));
+    server.stop().unwrap();
 }
 
 #[test]
 fn stopping_or_killing_a_debugged_vm_ends_the_attachment() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut control = connect(&server);
+    let server = server(None);
+    let mut control = connect(&server);
 
-        // StopVm while the debugger waits for a stop reply: `X09`, then `Detached`.
-        let id = create(&mut control, "a", profile(4, None), spinner());
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        gdb.send("c");
-        wait_for_state(&mut control, id, |s| s == VmState::Running);
-        control
-            .request_ok(&Message::StopVm { vm: VmRef::Id(id) })
-            .unwrap();
-        assert_eq!(gdb.reply(), "X09");
-        gdb.wait_for(&Message::Detached {
-            vm: id,
-            kind: AttachKind::Debug,
-        });
-        assert_eq!(state(&mut control, id), VmState::Stopped);
-
-        // StopVm of a VM stopped for its debugger: no stop reply is owed.
-        let id = create(&mut control, "b", profile(4, None), spinner());
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        control
-            .request_ok(&Message::StopVm { vm: VmRef::Id(id) })
-            .unwrap();
-        gdb.wait_for(&Message::Detached {
-            vm: id,
-            kind: AttachKind::Debug,
-        });
-        assert!(gdb.events.iter().all(|e| !matches!(e, Event::Packet(_))));
-        assert_eq!(state(&mut control, id), VmState::Stopped);
-
-        // `k` stops the VM as StopVm does.
-        let id = create(&mut control, "c", profile(4, None), spinner());
-        control
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        assert_eq!(gdb.ask("k"), "X09");
-        gdb.wait_for(&Message::Detached {
-            vm: id,
-            kind: AttachKind::Debug,
-        });
-        assert_eq!(state(&mut control, id), VmState::Stopped);
-
-        // DestroyVm: `Detached` too.
-        let id = create(&mut control, "d", profile(4, None), spinner());
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        control
-            .request_ok(&Message::DestroyVm { vm: VmRef::Id(id) })
-            .unwrap();
-        gdb.wait_for(&Message::Detached {
-            vm: id,
-            kind: AttachKind::Debug,
-        });
-        server.stop().unwrap();
+    // StopVm while the debugger waits for a stop reply: `X09`, then `Detached`.
+    let id = create(&mut control, "a", profile(4, None), spinner());
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    gdb.send("c");
+    wait_for_state(&mut control, id, |s| s == VmState::Running);
+    control
+        .request_ok(&Message::StopVm { vm: VmRef::Id(id) })
+        .unwrap();
+    assert_eq!(gdb.reply(), "X09");
+    gdb.wait_for(&Message::Detached {
+        vm: id,
+        kind: AttachKind::Debug,
     });
+    assert_eq!(state(&mut control, id), VmState::Stopped);
+
+    // StopVm of a VM stopped for its debugger: no stop reply is owed.
+    let id = create(&mut control, "b", profile(4, None), spinner());
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    control
+        .request_ok(&Message::StopVm { vm: VmRef::Id(id) })
+        .unwrap();
+    gdb.wait_for(&Message::Detached {
+        vm: id,
+        kind: AttachKind::Debug,
+    });
+    assert!(gdb.events.iter().all(|e| !matches!(e, Event::Packet(_))));
+    assert_eq!(state(&mut control, id), VmState::Stopped);
+
+    // `k` stops the VM as StopVm does.
+    let id = create(&mut control, "c", profile(4, None), spinner());
+    control
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    assert_eq!(gdb.ask("k"), "X09");
+    gdb.wait_for(&Message::Detached {
+        vm: id,
+        kind: AttachKind::Debug,
+    });
+    assert_eq!(state(&mut control, id), VmState::Stopped);
+
+    // DestroyVm: `Detached` too.
+    let id = create(&mut control, "d", profile(4, None), spinner());
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    control
+        .request_ok(&Message::DestroyVm { vm: VmRef::Id(id) })
+        .unwrap();
+    gdb.wait_for(&Message::Detached {
+        vm: id,
+        kind: AttachKind::Debug,
+    });
+    server.stop().unwrap();
 }
 
 #[test]
 fn one_debugger_at_a_time_and_only_its_input() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut control = connect(&server);
-        assert_eq!(
-            error_of(&mut control, &Message::DebugAttach { vm: VmRef::Id(9) }),
-            ErrorCode::NoSuchVm
-        );
-        let id = create(&mut control, "spin", profile(4, None), spinner());
-        control
-            .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
-            .unwrap();
-        let mut gdb = Gdb::attach(&server, VmRef::Id(id));
-        // A second debugger, on another connection or on the same one.
-        assert_eq!(
-            error_of(&mut control, &Message::DebugAttach { vm: VmRef::Id(id) }),
-            ErrorCode::Busy
-        );
-        assert_eq!(
-            error_of(&mut gdb.conn, &Message::DebugAttach { vm: VmRef::Id(id) }),
-            ErrorCode::Busy
-        );
-        // Detaching what it does not debug.
-        assert_eq!(
-            error_of(&mut control, &Message::DebugDetach { vm: id }),
-            ErrorCode::InvalidState
-        );
-        assert_eq!(
-            error_of(&mut control, &Message::DebugDetach { vm: 77 }),
-            ErrorCode::NoSuchVm
-        );
-        // Input from anyone else is dropped: this `k` would stop the VM.
-        control
-            .send(&Message::DebugInput {
-                vm: id,
-                data: packet::frame(b"k"),
-            })
-            .unwrap();
-        assert_eq!(gdb.ask("qC"), "QC1");
-        assert_eq!(state(&mut control, id), VmState::Paused);
-        // A malformed packet gets a `-`, and the stream goes on.
-        gdb.raw(b"$g#00");
-        gdb.send("qAttached");
-        assert_eq!(gdb.reply(), "1");
-        assert!(gdb.events.contains(&Event::Nack), "{:?}", gdb.events);
-        // DebugDetach is `D`: the VM runs on.
-        gdb.conn.request_ok(&Message::DebugDetach { vm: id }).unwrap();
-        assert_eq!(state(&mut control, id), VmState::Running);
-        assert!(!server.debug_vm(id).unwrap().debugged);
-        // And then another client may debug it.
-        let other = Gdb::attach(&server, VmRef::Id(id));
-        assert_eq!(state(&mut control, id), VmState::Paused);
-        drop(other);
-        server.stop().unwrap();
-    });
+    let server = server(None);
+    let mut control = connect(&server);
+    assert_eq!(
+        error_of(&mut control, &Message::DebugAttach { vm: VmRef::Id(9) }),
+        ErrorCode::NoSuchVm
+    );
+    let id = create(&mut control, "spin", profile(4, None), spinner());
+    control
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    // A second debugger, on another connection or on the same one.
+    assert_eq!(
+        error_of(&mut control, &Message::DebugAttach { vm: VmRef::Id(id) }),
+        ErrorCode::Busy
+    );
+    assert_eq!(
+        error_of(&mut gdb.conn, &Message::DebugAttach { vm: VmRef::Id(id) }),
+        ErrorCode::Busy
+    );
+    // Detaching what it does not debug.
+    assert_eq!(
+        error_of(&mut control, &Message::DebugDetach { vm: id }),
+        ErrorCode::InvalidState
+    );
+    assert_eq!(
+        error_of(&mut control, &Message::DebugDetach { vm: 77 }),
+        ErrorCode::NoSuchVm
+    );
+    // Input from anyone else is dropped: this `k` would stop the VM.
+    control
+        .send(&Message::DebugInput {
+            vm: id,
+            data: packet::frame(b"k"),
+        })
+        .unwrap();
+    assert_eq!(gdb.ask("qC"), "QC1");
+    assert_eq!(state(&mut control, id), VmState::Paused);
+    // A malformed packet gets a `-`, and the stream goes on.
+    gdb.raw(b"$g#00");
+    gdb.send("qAttached");
+    assert_eq!(gdb.reply(), "1");
+    assert!(gdb.events.contains(&Event::Nack), "{:?}", gdb.events);
+    // DebugDetach is `D`: the VM runs on.
+    gdb.conn.request_ok(&Message::DebugDetach { vm: id }).unwrap();
+    assert_eq!(state(&mut control, id), VmState::Running);
+    assert!(!server.debug_vm(id).unwrap().debugged);
+    // And then another client may debug it.
+    let other = Gdb::attach(&server, VmRef::Id(id));
+    assert_eq!(state(&mut control, id), VmState::Paused);
+    drop(other);
+    server.stop().unwrap();
 }

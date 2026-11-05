@@ -236,7 +236,7 @@ fn example_cursor_follows_the_mouse() {
     assert_eq!(m.run(Some(100_000), |_| {}), RunResult::Exited(0));
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
     assert!(
-        out.ends_with(&format!("s4 = 0x{events:08x} ({events})\n")),
+        out.ends_with(&format!("s4 = 0x{events:016x} ({events})\n")),
         "{out}"
     );
 }
@@ -275,7 +275,7 @@ fn example_catches_up_after_an_overflow() {
     assert!(m.key_event(KeyEvent::press(code::ESC)));
     assert_eq!(m.run(Some(100_000), |_| {}), RunResult::Exited(0));
     let out = String::from_utf8(std::mem::take(&mut m.cpu.bus.uart.captured)).unwrap();
-    assert!(out.ends_with("s4 = 0x00000040 (64)\n"), "{out}");
+    assert!(out.ends_with("s4 = 0x0000000000000040 (64)\n"), "{out}");
 }
 
 #[test]

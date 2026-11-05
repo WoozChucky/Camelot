@@ -1,18 +1,18 @@
-//! Booting from disk (spec section 7, "Boot from disk"): the boot ROM's disk loader
-//! with hand-made boot blocks on in-memory disks (where the block lands, the registers
-//! it starts with, every way the ROM refuses a disk, a trap in the boot block, the
-//! writable entry point and the parked harts), on RV32 and RV64 machines, each with
-//! the loader of its width, then the `grail` binary booting the Camelot kernel from an
-//! image that `camelot-fs` made bootable with the committed bootloader
-//! (`kernel/boot/boot.elf`) and kernel, with no program argument, and an RV64 machine
-//! booting a hand-made RV64 boot block.
+//! Booting from disk without firmware (spec section 7, "Boot from disk"): the boot
+//! ROM's disk loader with hand-made boot blocks on in-memory disks (where the block
+//! lands, the registers it starts with, every way the ROM refuses a disk, a trap in the
+//! boot block, the writable entry point and the parked harts), then the `grail` binary
+//! booting a hand-made boot block with `--bios none`, and Camelot from an image that
+//! `camelot-fs` made bootable with the committed bootloader (`kernel/boot/boot.elf`)
+//! and kernel, through the firmware, with no program argument. Camelot's bootloader
+//! itself, the firmware's next stage, is checked in firmware.rs.
 //!
 //! Every run has a step limit: a ROM that hung instead of failing would hit it.
 
 use grail::block::BlockBackend;
 use grail::boot::{self, BOOT_BLOCK_SIZE, DISK_BOOT_PC, EXIT_BOOT_FAILED};
 use grail::bus::{BLK_BASE, BOOT_ROM_BASE, PARK_PC, SYSINFO_BASE};
-use grail::{DiskConfig, Machine, MachineConfig, RunResult, Xlen};
+use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,9 +24,6 @@ const A1: u32 = 11;
 const A2: u32 = 12;
 const A3: u32 = 13;
 const ZERO: u32 = 0;
-
-/// Both widths: each test runs on an RV32 and on an RV64 machine.
-const XLENS: [Xlen; 2] = [Xlen::Rv32, Xlen::Rv64];
 
 /// 1 MiB of RAM: the boot block goes at 0x800f_0000.
 const RAM: usize = 1 << 20;
@@ -50,44 +47,21 @@ fn store(funct3: u32, rs2: u32, rs1: u32, imm: u32) -> u32 {
 fn sw(rs2: u32, rs1: u32, imm: u32) -> u32 {
     store(2, rs2, rs1, imm)
 }
-/// A store of a register's whole width: `sw` on RV32, `sd` on RV64. The ROM's entry
-/// point takes only that one (spec section 7).
-fn sx(xlen: Xlen, rs2: u32, rs1: u32, imm: u32) -> u32 {
-    match xlen {
-        Xlen::Rv32 => store(2, rs2, rs1, imm),
-        Xlen::Rv64 => store(3, rs2, rs1, imm),
-    }
+/// `sd`: the one store the ROM's entry point takes (spec section 7).
+fn sd(rs2: u32, rs1: u32, imm: u32) -> u32 {
+    store(3, rs2, rs1, imm)
 }
 /// `j .`
 const STOP: u32 = 0x0000_006f;
 /// `xcal.halt zero`: exit code 0.
 const HALT: u32 = 0x0000_100b;
 
-/// The width of the ROM's entry point and of a register, in bytes.
-fn width(xlen: Xlen) -> u32 {
-    match xlen {
-        Xlen::Rv32 => 4,
-        Xlen::Rv64 => 8,
-    }
-}
+/// `BLK_STATUS` (spec section 9.6).
+const BLK_STATUS: u64 = grail::block::REG_STATUS as u64;
 
-/// `BLK_STATUS`: where the disk's registers put it (spec section 9.6: version 1 on
-/// RV32 machines, 2 on RV64 ones).
-fn blk_status(xlen: Xlen) -> u64 {
-    match xlen {
-        Xlen::Rv32 => 0x18,
-        Xlen::Rv64 => 0x24,
-    }
-}
-
-/// A register as wide as the machine: an RV32 hart's low 32 bits (it keeps them
-/// sign-extended), an RV64 hart's whole register.
+/// Register `r` of hart `hart`.
 fn reg(m: &Machine, hart: usize, r: u32) -> u64 {
-    let v = m.cpu.hart(hart).x[r as usize];
-    match m.cpu.xlen() {
-        Xlen::Rv32 => v & 0xffff_ffff,
-        Xlen::Rv64 => v,
-    }
+    m.cpu.hart(hart).x[r as usize]
 }
 
 /// A boot block holding `code` (at its start), signed and checksummed.
@@ -107,11 +81,10 @@ fn disk(start: &[u8], sectors: usize) -> Vec<u8> {
     d
 }
 
-/// An `xlen` machine of `harts` harts with `image` as disk 0, set to boot from it,
-/// its UART captured.
-fn machine(xlen: Xlen, harts: usize, image: Vec<u8>) -> Machine {
+/// A machine of `harts` harts with `image` as disk 0, set to boot from it, its UART
+/// captured.
+fn machine(harts: usize, image: Vec<u8>) -> Machine {
     let config = MachineConfig {
-        xlen,
         ram_size: RAM,
         harts,
         disks: vec![DiskConfig::memory(image)],
@@ -135,56 +108,36 @@ fn refused(m: &mut Machine, message: &str) {
 
 #[test]
 fn loads_the_boot_block_and_jumps_to_it() {
-    for xlen in XLENS {
-        // auipc t0, 0: where it runs. Then stop with exit code 0.
-        let block = boot_block(&[auipc(T0), HALT]);
-        let mut m = machine(xlen, 1, disk(&block, 8));
-        assert_eq!(m.cpu.xlen(), xlen);
-        assert_eq!(m.cpu.bus.read(BOOT_ROM_BASE + 16, width(xlen)), Ok(DISK_BOOT_PC));
-        let loader = boot::disk_loader(xlen);
-        let at = DISK_BOOT_PC as usize - BOOT_ROM_BASE as usize;
-        assert_eq!(
-            &m.cpu.bus.rom[at..],
-            &loader[..],
-            "{xlen:?}: the loader of its width"
-        );
-        assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
-        assert_eq!(uart(&m), "", "nothing to say");
-        assert_eq!(
-            reg(&m, 0, T0),
-            LOAD_ADDR.into(),
-            "{xlen:?}: the last 64 KiB of RAM"
-        );
-        assert_eq!(boot::boot_block_addr(RAM), Some(LOAD_ADDR.into()));
-        assert_eq!(reg(&m, 0, A0), 0, "the hart id");
-        assert_eq!(reg(&m, 0, A1), SYSINFO_BASE);
-        assert_eq!(reg(&m, 0, A2), BLK_BASE, "disk 0's registers");
-        // The whole block is in RAM, and nothing after it.
-        let at = (LOAD_ADDR - 0x8000_0000) as usize;
-        assert_eq!(&m.cpu.bus.ram[at..at + BOOT_BLOCK_SIZE], &block[..]);
-        assert!(m.cpu.bus.ram[at + BOOT_BLOCK_SIZE..].iter().all(|&b| b == 0));
-        // The ROM's trap handler is still in place, and the disk's DONE acknowledged.
-        let h = m.cpu.hart(0);
-        assert!((DISK_BOOT_PC..BOOT_ROM_BASE + 0x1000).contains(&h.csr.mtvec));
-        assert_eq!(m.cpu.bus.read(BLK_BASE + blk_status(xlen), 4), Ok(0), "{xlen:?}");
-    }
+    // auipc t0, 0: where it runs. Then stop with exit code 0.
+    let block = boot_block(&[auipc(T0), HALT]);
+    let mut m = machine(1, disk(&block, 8));
+    assert_eq!(m.cpu.bus.read(BOOT_ROM_BASE + 16, 8), Ok(DISK_BOOT_PC));
+    let loader = boot::disk_loader();
+    let at = DISK_BOOT_PC as usize - BOOT_ROM_BASE as usize;
+    assert_eq!(&m.cpu.bus.rom[at..], &loader[..], "the loader");
+    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
+    assert_eq!(uart(&m), "", "nothing to say");
+    assert_eq!(reg(&m, 0, T0), LOAD_ADDR.into(), "the last 64 KiB of RAM");
+    assert_eq!(boot::boot_block_addr(RAM), Some(LOAD_ADDR.into()));
+    assert_eq!(reg(&m, 0, A0), 0, "the hart id");
+    assert_eq!(reg(&m, 0, A1), SYSINFO_BASE);
+    assert_eq!(reg(&m, 0, A2), BLK_BASE, "disk 0's registers");
+    // The whole block is in RAM, and nothing after it.
+    let at = (LOAD_ADDR - 0x8000_0000) as usize;
+    assert_eq!(&m.cpu.bus.ram[at..at + BOOT_BLOCK_SIZE], &block[..]);
+    assert!(m.cpu.bus.ram[at + BOOT_BLOCK_SIZE..].iter().all(|&b| b == 0));
+    // The ROM's trap handler is still in place, and the disk's DONE acknowledged.
+    let h = m.cpu.hart(0);
+    assert!((DISK_BOOT_PC..BOOT_ROM_BASE + 0x1000).contains(&h.csr.mtvec));
+    assert_eq!(m.cpu.bus.read(BLK_BASE + BLK_STATUS, 4), Ok(0));
 }
 
 #[test]
 fn the_boot_area_follows_the_ram_size() {
     let block = boot_block(&[auipc(T0), HALT]);
-    // RV64 reads the 64-bit SYS_RAM_SIZE: 5 GiB puts the block past 4 GiB.
-    for (xlen, mib) in [
-        (Xlen::Rv32, 1),
-        (Xlen::Rv32, 3),
-        (Xlen::Rv32, 128),
-        (Xlen::Rv64, 1),
-        (Xlen::Rv64, 3),
-        (Xlen::Rv64, 128),
-        (Xlen::Rv64, 5 << 10),
-    ] {
+    // The loader reads the 64-bit SYS_RAM_SIZE: 5 GiB puts the block past 4 GiB.
+    for mib in [1, 3, 128, 5 << 10] {
         let config = MachineConfig {
-            xlen,
             ram_size: mib << 20,
             disks: vec![DiskConfig::memory(disk(&block, 2))],
             ..MachineConfig::default()
@@ -193,55 +146,47 @@ fn the_boot_area_follows_the_ram_size() {
         m.boot_from_disk().unwrap();
         assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
         let want = 0x8000_0000 + ((mib as u64) << 20) - 0x1_0000;
-        assert_eq!(reg(&m, 0, T0), want, "{xlen:?}, {mib} MiB");
+        assert_eq!(reg(&m, 0, T0), want, "{mib} MiB");
         assert_eq!(boot::boot_block_addr(mib << 20), Some(want));
     }
 }
 
 #[test]
 fn an_empty_disk_is_not_bootable() {
-    for xlen in XLENS {
-        let mut m = machine(xlen, 1, vec![0; 4096]);
-        refused(&mut m, "disk 0 is not bootable (no boot signature)");
-    }
+    let mut m = machine(1, vec![0; 4096]);
+    refused(&mut m, "disk 0 is not bootable (no boot signature)");
 }
 
 #[test]
 fn a_corrupt_boot_block_is_refused() {
-    for xlen in XLENS {
-        let mut block = boot_block(&[auipc(T0), HALT]);
-        block[4] ^= 0x10; // one bit of the code
-        let mut m = machine(xlen, 1, disk(&block, 2));
-        refused(&mut m, "the boot block on disk 0 is corrupt (bad checksum)");
+    let mut block = boot_block(&[auipc(T0), HALT]);
+    block[4] ^= 0x10; // one bit of the code
+    let mut m = machine(1, disk(&block, 2));
+    refused(&mut m, "the boot block on disk 0 is corrupt (bad checksum)");
 
-        // Random bytes have no signature either.
-        let noise: Vec<u8> = (0..2048u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect();
-        let mut m = machine(xlen, 1, noise);
-        refused(&mut m, "disk 0 is not bootable (no boot signature)");
-    }
+    // Random bytes have no signature either.
+    let noise: Vec<u8> = (0..2048u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut m = machine(1, noise);
+    refused(&mut m, "disk 0 is not bootable (no boot signature)");
 }
 
-/// The checksum is modulo 2^32 at both widths. Two words of 0x8000_0000 (data after
-/// the code) add up to 0 in 32 bits, but to -2^32 once RV64's `lw` has sign-extended
-/// them: the RV64 loader adds with `addw`, and boots the block.
+/// The checksum is modulo 2^32. Two words of 0x8000_0000 (data after the code) add up
+/// to 0 in 32 bits, but to -2^32 once `lw` has sign-extended them: the loader adds with
+/// `addw`, and boots the block.
 #[test]
-fn the_checksum_is_32_bit_on_both_widths() {
-    for xlen in XLENS {
-        let block = boot_block(&[auipc(T0), HALT, 0x8000_0000, 0x8000_0000]);
-        let mut m = machine(xlen, 1, disk(&block, 2));
-        assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0), "{xlen:?}");
-        assert_eq!(uart(&m), "", "{xlen:?}");
-    }
+fn the_checksum_is_32_bit() {
+    let block = boot_block(&[auipc(T0), HALT, 0x8000_0000, 0x8000_0000]);
+    let mut m = machine(1, disk(&block, 2));
+    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
+    assert_eq!(uart(&m), "");
 }
 
 #[test]
 fn a_disk_of_one_sector_is_too_small() {
-    for xlen in XLENS {
-        let mut m = machine(xlen, 1, vec![0; 512]);
-        refused(&mut m, "disk 0 is too small to hold a boot block");
-    }
+    let mut m = machine(1, vec![0; 512]);
+    refused(&mut m, "disk 0 is too small to hold a boot block");
 }
 
 /// A disk whose reads all fail (an I/O error on the host side).
@@ -267,16 +212,11 @@ impl BlockBackend for Broken {
 
 #[test]
 fn a_read_error_is_reported() {
-    for xlen in XLENS {
-        let config = MachineConfig {
-            xlen,
-            ..MachineConfig::with_ram(RAM)
-        };
-        let mut m = Machine::with_backends(config, vec![Box::new(Broken)]).unwrap();
-        m.boot_from_disk().unwrap();
-        m.cpu.bus.uart.capture = true;
-        refused(&mut m, "cannot read the boot block from disk 0");
-    }
+    let config = MachineConfig::with_ram(RAM);
+    let mut m = Machine::with_backends(config, vec![Box::new(Broken)]).unwrap();
+    m.boot_from_disk().unwrap();
+    m.cpu.bus.uart.capture = true;
+    refused(&mut m, "cannot read the boot block from disk 0");
 }
 
 #[test]
@@ -284,13 +224,7 @@ fn a_trap_in_the_boot_block_is_reported() {
     // A signed block of zeros: its first word is an illegal instruction. The values
     // are as wide as the machine's registers.
     let block = boot_block(&[]);
-    let mut m = machine(Xlen::Rv32, 1, disk(&block, 2));
-    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(EXIT_BOOT_FAILED));
-    assert_eq!(
-        uart(&m),
-        format!("boot ROM: unexpected trap, mcause 0x00000002, mepc {LOAD_ADDR:#010x}, mtval 0x00000000\n")
-    );
-    let mut m = machine(Xlen::Rv64, 1, disk(&block, 2));
+    let mut m = machine(1, disk(&block, 2));
     assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(EXIT_BOOT_FAILED));
     assert_eq!(
         uart(&m),
@@ -303,14 +237,8 @@ fn a_trap_in_the_boot_block_is_reported() {
 
 #[test]
 fn no_disk_no_disk_boot() {
-    for xlen in XLENS {
-        let config = MachineConfig {
-            xlen,
-            ..MachineConfig::with_ram(RAM)
-        };
-        let mut m = Machine::new(config).unwrap();
-        assert!(m.boot_from_disk().unwrap_err().contains("no disk"));
-    }
+    let mut m = Machine::new(MachineConfig::with_ram(RAM)).unwrap();
+    assert!(m.boot_from_disk().unwrap_err().contains("no disk"));
 }
 
 /// The boot area is the last 64 KiB of RAM: a smaller machine cannot boot from disk,
@@ -319,80 +247,71 @@ fn no_disk_no_disk_boot() {
 #[test]
 fn disk_boot_takes_64_kib_of_ram() {
     let block = boot_block(&[auipc(T0), HALT]);
-    for xlen in XLENS {
-        for kib in [4, 32, 60] {
-            let config = MachineConfig {
-                xlen,
-                ram_size: kib << 10,
-                disks: vec![DiskConfig::memory(disk(&block, 2))],
-                ..MachineConfig::default()
-            };
-            let mut m = Machine::new(config).unwrap();
-            let err = m.boot_from_disk().unwrap_err();
-            assert!(err.contains("at least 64 KiB of RAM"), "{kib} KiB: {err}");
-        }
+    for kib in [4, 32, 60] {
         let config = MachineConfig {
-            xlen,
-            ram_size: 64 << 10,
+            ram_size: kib << 10,
             disks: vec![DiskConfig::memory(disk(&block, 2))],
             ..MachineConfig::default()
         };
         let mut m = Machine::new(config).unwrap();
-        m.boot_from_disk().unwrap();
-        assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
-        assert_eq!(reg(&m, 0, T0), 0x8000_0000, "all of RAM is the boot area");
+        let err = m.boot_from_disk().unwrap_err();
+        assert!(err.contains("at least 64 KiB of RAM"), "{kib} KiB: {err}");
     }
+    let config = MachineConfig {
+        ram_size: 64 << 10,
+        disks: vec![DiskConfig::memory(disk(&block, 2))],
+        ..MachineConfig::default()
+    };
+    let mut m = Machine::new(config).unwrap();
+    m.boot_from_disk().unwrap();
+    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
+    assert_eq!(reg(&m, 0, T0), 0x8000_0000, "all of RAM is the boot area");
 }
 
 /// The boot block of a two-hart machine points the ROM's entry point at code of its
 /// own and wakes hart 1, as Camelot's bootloader does for its kernel: hart 1 leaves
 /// the park loop for that code. An IPI that came before (here, from the test, before
 /// anything ran) sends hart 1 back to the park loop instead of booting twice. The
-/// entry point is a word on RV32 and a doubleword on RV64, written whole.
+/// entry point is a doubleword, written whole.
 #[test]
 fn the_boot_block_can_start_the_other_harts() {
-    for xlen in XLENS {
-        let block = boot_block(&[
-            auipc(T0),            // 0x00
-            addi(T0, T0, 0x20),   //      t0 = hart 1's code, at 0x20
-            lui(T1, 1),           //      t1 = the boot ROM
-            sx(xlen, T0, T1, 16), //    the entry point
-            lui(T1, 0x2000),      //      the CLINT
-            addi(A3, ZERO, 1),    //
-            sw(A3, T1, 4),        //      msip of hart 1
-            STOP,                 // 0x1c
-            addi(A1, A0, 0x10),   // 0x20: hart 1, with a0 = 1
-            HALT,
-        ]);
-        let mut m = machine(xlen, 2, disk(&block, 2));
-        m.cpu.bus.write(0x0200_0004, 4, 1).unwrap(); // an early IPI
-        for _ in 0..40 {
-            m.cpu.step();
-        }
-        let h1 = m.cpu.hart(1);
-        assert!(
-            h1.waiting && (PARK_PC..PARK_PC + 0x40).contains(&h1.pc),
-            "{xlen:?}: parked again"
-        );
-        assert_eq!(m.cpu.bus.read(0x0200_0004, 4), Ok(0), "the early IPI was taken");
-
-        assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0), "{xlen:?}");
-        let entry = u64::from(LOAD_ADDR + 0x20);
-        assert_eq!(
-            m.cpu.bus.read(BOOT_ROM_BASE + 16, width(xlen)),
-            Ok(entry),
-            "{xlen:?}"
-        );
-        assert_eq!(reg(&m, 1, A1), 0x11, "{xlen:?}: hart 1 ran the code with a0 = 1");
-        assert_eq!(
-            m.cpu.hart(0).pc,
-            u64::from(LOAD_ADDR + 0x1c),
-            "hart 0 waits at its j ."
-        );
+    let block = boot_block(&[
+        auipc(T0),          // 0x00
+        addi(T0, T0, 0x20), //      t0 = hart 1's code, at 0x20
+        lui(T1, 1),         //      t1 = the boot ROM
+        sd(T0, T1, 16),     //    the entry point
+        lui(T1, 0x2000),    //      the CLINT
+        addi(A3, ZERO, 1),  //
+        sw(A3, T1, 4),      //      msip of hart 1
+        STOP,               // 0x1c
+        addi(A1, A0, 0x10), // 0x20: hart 1, with a0 = 1
+        HALT,
+    ]);
+    let mut m = machine(2, disk(&block, 2));
+    m.cpu.bus.write(0x0200_0004, 4, 1).unwrap(); // an early IPI
+    for _ in 0..40 {
+        m.cpu.step();
     }
+    let h1 = m.cpu.hart(1);
+    assert!(
+        h1.waiting && (PARK_PC..PARK_PC + 0x40).contains(&h1.pc),
+        "parked again"
+    );
+    assert_eq!(m.cpu.bus.read(0x0200_0004, 4), Ok(0), "the early IPI was taken");
+
+    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
+    let entry = u64::from(LOAD_ADDR + 0x20);
+    assert_eq!(m.cpu.bus.read(BOOT_ROM_BASE + 16, 8), Ok(entry));
+    assert_eq!(reg(&m, 1, A1), 0x11, "hart 1 ran the code with a0 = 1");
+    assert_eq!(
+        m.cpu.hart(0).pc,
+        u64::from(LOAD_ADDR + 0x1c),
+        "hart 0 waits at its j ."
+    );
 }
 
-// The `grail` binary, booting the Camelot kernel.
+// The `grail` binary: a hand-made boot block without firmware, and the Camelot
+// kernel through the firmware, its default.
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -438,13 +357,20 @@ fn grail(args: &[&str], stdin: &[u8]) -> (Option<i32>, String, String) {
 
 const SHELL: &str = "Type help for the list of commands.\n$ ";
 
+/// `grail --disk IMG` with no program: the firmware, the command's default, boots the
+/// disk's bootloader, which loads the kernel. 8 MiB: the kernel loads at 0x8020_0000,
+/// after the firmware's 2 MiB, and must fit below the bootloader, which moves itself
+/// below the device tree, near the end of RAM.
 #[test]
 fn grail_boots_the_kernel_from_disk_with_no_program() {
     let img = scratch("root.img");
     let image = bootable_image();
     std::fs::write(&img, &image).unwrap();
     for harts in ["1", "2"] {
-        let (code, out, _) = grail(&["--harts", harts, "--disk", img.to_str().unwrap()], b"exit\n");
+        let (code, out, _) = grail(
+            &["--harts", harts, "--ram", "8", "--disk", img.to_str().unwrap()],
+            b"exit\n",
+        );
         assert_eq!(code, Some(0), "{harts} harts:\n{out}");
         // The bootloader's line, then the kernel as if Grail had loaded its ELF.
         assert!(
@@ -464,14 +390,19 @@ fn grail_boots_the_kernel_from_disk_with_no_program() {
 fn grail_refuses_a_disk_that_is_not_bootable() {
     let img = scratch("empty.img");
     std::fs::write(&img, vec![0u8; 64 * 1024]).unwrap();
-    let (code, out, _) = grail(&["--disk", img.to_str().unwrap()], b"");
+    let img = img.to_str().unwrap();
+    // The firmware says why, and so does the boot ROM without one.
+    let (code, out, _) = grail(&["--ram", "6", "--disk", img], b"");
+    assert_eq!(code, Some(EXIT_BOOT_FAILED as i32));
+    assert_eq!(out, "firmware: disk 0 is not bootable (no boot signature)\n");
+    let (code, out, _) = grail(&["--bios", "none", "--disk", img], b"");
     assert_eq!(code, Some(EXIT_BOOT_FAILED as i32));
     assert_eq!(out, "boot ROM: disk 0 is not bootable (no boot signature)\n");
 
     // A filesystem with no bootloader: block 0 is empty.
     let plain = scratch("plain.img");
     std::fs::write(&plain, camelot_fs::mkfs::mkfs(&Default::default(), None).unwrap()).unwrap();
-    let (code, out, _) = grail(&["--disk", plain.to_str().unwrap()], b"");
+    let (code, out, _) = grail(&["--bios", "none", "--disk", plain.to_str().unwrap()], b"");
     assert_eq!(code, Some(EXIT_BOOT_FAILED as i32));
     assert_eq!(out, "boot ROM: disk 0 is not bootable (no boot signature)\n");
 
@@ -484,12 +415,11 @@ fn grail_refuses_a_disk_that_is_not_bootable() {
     );
 }
 
-/// `grail --xlen 64 --disk IMG`: an RV64 machine with no program boots through the
-/// RV64 loader. The boot block reads sysinfo's 64-bit `SYS_RAM_SIZE` with `ld` and
-/// stops with the RAM's size in MiB as the exit code. On an RV32 machine the same block
-/// is not code (`ld` is an RV64 instruction): the RV32 loader reports the trap.
+/// `grail --bios none --disk IMG`: a machine with no program and no firmware boots
+/// through the ROM's loader, in M-mode. The boot block reads sysinfo's 64-bit
+/// `SYS_RAM_SIZE` with `ld` and stops with the RAM's size in MiB as the exit code.
 #[test]
-fn grail_boots_an_rv64_machine_from_disk() {
+fn grail_boots_a_machine_from_disk_without_firmware() {
     const LD_T1_RAM_SIZE: u32 = 0x10 << 20 | A1 << 15 | 3 << 12 | T1 << 7 | 0x03; // ld t1, 16(a1)
     const SRLI_T1_20: u32 = 20 << 20 | T1 << 15 | 5 << 12 | T1 << 7 | 0x13; // srli t1, t1, 20
     const HALT_T1: u32 = T1 << 15 | HALT; // xcal.halt t1
@@ -497,22 +427,29 @@ fn grail_boots_an_rv64_machine_from_disk() {
     let block = boot_block(&[LD_T1_RAM_SIZE, SRLI_T1_20, HALT_T1]);
     std::fs::write(&img, disk(&block, 2)).unwrap();
     let img = img.to_str().unwrap();
-    for (args, ram) in [
-        (vec!["--xlen", "64"], 4),
-        (vec!["--xlen", "64", "--ram", "64"], 64),
-    ] {
-        let (code, out, err) = grail(&[&args[..], &["--disk", img]].concat(), b"");
+    // The command's default RAM, and 64 MiB.
+    let default = (grail::cli::COMMAND_RAM_SIZE >> 20) as i32;
+    for (args, ram) in [(vec![], default), (vec!["--ram", "64"], 64)] {
+        let (code, out, err) = grail(&[&args[..], &["--bios", "none", "--disk", img]].concat(), b"");
         assert_eq!(code, Some(ram), "{args:?}:\n{out}{err}");
         assert_eq!(out, "");
     }
-    let (code, out, _) = grail(&["--disk", img], b"");
-    assert_eq!(code, Some(EXIT_BOOT_FAILED as i32));
-    assert_eq!(
-        out,
-        format!(
-            "boot ROM: unexpected trap, mcause 0x00000002, mepc 0x803f0000, mtval {LD_T1_RAM_SIZE:#010x}\n"
-        )
-    );
+}
+
+/// A machine with Camelot's firmware booting `image` from disk, its UART captured: the
+/// firmware starts the bootloader, its next stage, in S-mode.
+fn firmware_machine(ram: usize, harts: usize, image: Vec<u8>) -> Machine {
+    let config = MachineConfig {
+        ram_size: ram,
+        harts,
+        disks: vec![DiskConfig::memory(image)],
+        bios: grail::Bios::Default,
+        ..MachineConfig::default()
+    };
+    let mut m = Machine::new(config).unwrap();
+    m.boot_from_disk().unwrap();
+    m.cpu.bus.uart.capture = true;
+    m
 }
 
 /// What Camelot's bootloader says when the kernel it was told about is not there or
@@ -525,9 +462,9 @@ fn the_bootloader_reports_a_bad_kernel() {
         let block: &mut [u8; BOOT_BLOCK_SIZE] = (&mut image[..BOOT_BLOCK_SIZE]).try_into().unwrap();
         boot::seal(block);
     }
-    // The kernel's ELF header, and its first program header.
+    // The kernel's ELF64 header, and its first program header.
     const KERNEL_AT: usize = 2048 * 512;
-    const PHDR: usize = KERNEL_AT + 52;
+    const PHDR: usize = KERNEL_AT + 64;
     // What the bootloader says first: where the kernel is.
     const AT_2048: &str = "boot: kernel at sector 0x00000800\n";
     // What is said before the error, the error, and how the image is damaged.
@@ -547,52 +484,80 @@ fn the_bootloader_reports_a_bad_kernel() {
         ),
         (
             AT_2048,
+            "the kernel is not an Excalibur ELF executable",
+            |i| i[KERNEL_AT + 4] = 1, // ELFCLASS32: an RV32 kernel
+        ),
+        (
+            AT_2048,
             "a kernel segment runs past the end of the kernel",
             |i| reseal(i, 1012, 8), // only 4 KiB of it
         ),
         (
             AT_2048,
             "a kernel segment is not in free RAM",
-            |i| i[PHDR + 12..PHDR + 16].copy_from_slice(&0x1000u32.to_le_bytes()), // p_paddr
+            |i| i[PHDR + 24..PHDR + 32].copy_from_slice(&0x8000_0000u64.to_le_bytes()), // p_paddr: the firmware's
         ),
         (
             AT_2048,
             "a kernel segment is not at a sector boundary",
-            |i| i[PHDR + 4..PHDR + 8].copy_from_slice(&0x1004u32.to_le_bytes()), // p_offset
+            |i| i[PHDR + 8..PHDR + 16].copy_from_slice(&0x1004u64.to_le_bytes()), // p_offset
         ),
     ];
     for (i, (first, message, damage)) in cases.iter().enumerate() {
         let mut image = good.clone();
         damage(&mut image);
-        let config = MachineConfig {
-            disks: vec![DiskConfig::memory(image)],
-            ..MachineConfig::default()
-        };
-        let mut m = Machine::new(config).unwrap();
-        m.boot_from_disk().unwrap();
-        m.cpu.bus.uart.capture = true;
+        let mut m = firmware_machine(8 << 20, 1, image);
         assert_eq!(
             m.run(Some(20_000_000), |_| {}),
             RunResult::Exited(0xfc),
-            "case {i}"
+            "case {i}: {}",
+            uart(&m)
         );
         assert_eq!(uart(&m), format!("{first}boot: {message}\n"), "case {i}");
     }
 }
 
-/// The kernel is too big for a machine whose RAM ends just past it: its segments
-/// would run into the bootloader.
+/// A kernel too big for the machine's RAM: its segment would run into the bootloader,
+/// which moved itself to the 64 KiB below the device tree (at 0x8040_0000 in 6 MiB).
 #[test]
 fn the_kernel_must_fit_below_the_bootloader() {
-    let config = MachineConfig {
-        ram_size: 512 << 10,
-        disks: vec![DiskConfig::memory(bootable_image())],
-        ..MachineConfig::default()
+    const BASE: u64 = 0x8020_0000;
+    let room = 0x8040_0000 - 0x1_0000 - BASE;
+    let kernel = |memsz| {
+        kernel_elf(
+            BASE,
+            &[(0x200, BASE, 4, memsz)],
+            &[(0x200, &STOP.to_le_bytes())],
+            0x400,
+        )
     };
-    let mut m = Machine::new(config).unwrap();
-    m.boot_from_disk().unwrap();
-    m.cpu.bus.uart.capture = true;
-    assert_eq!(m.run(Some(20_000_000), |_| {}), RunResult::Exited(0xfc));
+    let image = |elf: &[u8]| {
+        let opts = camelot_fs::mkfs::Options {
+            size: 1024,
+            ..Default::default()
+        };
+        let mut image = camelot_fs::mkfs::mkfs(&opts, None).unwrap();
+        let boot = std::fs::read(repo().join("kernel/boot/boot.elf")).unwrap();
+        camelot_fs::boot::install(&mut image, &boot, elf).unwrap();
+        image
+    };
+    // Just fits: it runs.
+    let mut m = firmware_machine(6 << 20, 1, image(&kernel(room)));
+    assert_eq!(
+        m.run(Some(40_000_000), |_| {}),
+        RunResult::StepLimit,
+        "{}",
+        uart(&m)
+    );
+    assert_eq!(m.cpu.hart(0).pc, BASE, "{}", uart(&m));
+    // A byte more does not.
+    let mut m = firmware_machine(6 << 20, 1, image(&kernel(room + 1)));
+    assert_eq!(
+        m.run(Some(20_000_000), |_| {}),
+        RunResult::Exited(0xfc),
+        "{}",
+        uart(&m)
+    );
     assert!(
         uart(&m).ends_with("boot: a kernel segment is not in free RAM\n"),
         "{}",
@@ -600,32 +565,25 @@ fn the_kernel_must_fit_below_the_bootloader() {
     );
 }
 
-/// `bnez rs1, offset` (`bne rs1, zero, offset`), for a small forward offset.
-fn bnez(rs1: u32, offset: u32) -> u32 {
-    assert!(offset < 0x800 && offset.is_multiple_of(2));
-    (offset >> 5 & 0x3f) << 25 | rs1 << 15 | 1 << 12 | (offset & 0x1e) << 7 | 0x63
-}
-
-/// A minimal ELF32 RISC-V executable: the header, `phdrs` program headers (offset,
+/// A minimal ELF64 RISC-V executable: the header, `phdrs` program headers (offset,
 /// paddr, filesz, memsz) right after it, then `data` placed at each file offset given.
-fn kernel_elf(entry: u32, phdrs: &[(u32, u32, u32, u32)], data: &[(usize, &[u8])], size: usize) -> Vec<u8> {
+fn kernel_elf(entry: u64, phdrs: &[(u64, u64, u64, u64)], data: &[(usize, &[u8])], size: usize) -> Vec<u8> {
     let mut f = vec![0u8; size];
-    f[..7].copy_from_slice(b"ELF");
+    f[..16].copy_from_slice(b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0");
     f[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
     f[18..20].copy_from_slice(&243u16.to_le_bytes()); // EM_RISCV
     f[20..24].copy_from_slice(&1u32.to_le_bytes());
-    f[24..28].copy_from_slice(&entry.to_le_bytes());
-    f[28..32].copy_from_slice(&52u32.to_le_bytes()); // e_phoff
-    f[40..42].copy_from_slice(&52u16.to_le_bytes());
-    f[42..44].copy_from_slice(&32u16.to_le_bytes());
-    f[44..46].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+    f[24..32].copy_from_slice(&entry.to_le_bytes());
+    f[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    f[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    f[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    f[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
     for (i, &(offset, paddr, filesz, memsz)) in phdrs.iter().enumerate() {
-        let at = 52 + 32 * i;
-        for (j, v) in [1, offset, paddr, paddr, filesz, memsz, 7, 0x1000]
-            .iter()
-            .enumerate()
-        {
-            f[at + 4 * j..at + 4 * j + 4].copy_from_slice(&v.to_le_bytes());
+        let at = 64 + 56 * i;
+        f[at..at + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        f[at + 4..at + 8].copy_from_slice(&7u32.to_le_bytes()); // RWX
+        for (j, v) in [offset, paddr, paddr, filesz, memsz, 0x1000].iter().enumerate() {
+            f[at + 8 + 8 * j..at + 16 + 8 * j].copy_from_slice(&v.to_le_bytes());
         }
     }
     for &(at, bytes) in data {
@@ -634,30 +592,18 @@ fn kernel_elf(entry: u32, phdrs: &[(u32, u32, u32, u32)], data: &[(usize, &[u8])
     f
 }
 
-/// Camelot's real bootloader with a small kernel of our own, on a two-hart machine
-/// whose RAM is filled with 0xee first (a reset leaves zeros, which would hide a
-/// bootloader that did not zero .bss). The bootloader must copy exactly the file
+/// Camelot's real bootloader with a small kernel of our own, on a machine whose RAM
+/// above the firmware is filled with 0xee first (a reset leaves zeros, which would hide
+/// a bootloader that did not zero .bss). The bootloader must copy exactly the file
 /// bytes (a partial last sector included, nothing after it), zero .bss (also for a
 /// .bss-only segment at a file offset that is not a multiple of 512, as merlin-ld
-/// places one), write the entry point to the ROM's entry word, and start the kernel
-/// on hart 0, which wakes hart 1: hart 1 leaves the park loop for the kernel too.
+/// places one), and start the kernel at its entry's load address, in S-mode, with
+/// a0 = 0 and a1 = the device tree, as the firmware gave it.
 #[test]
-fn the_bootloader_loads_segments_and_hands_the_entry_word_over() {
-    const BASE: u32 = 0x8000_0000;
-    // The kernel's code: hart 0 sends hart 1 an IPI and waits; hart 1 stops the
-    // machine with exit code 0 and a1 = 0x10 + its hart id.
-    let code: Vec<u8> = [
-        bnez(A0, 0x14),     // 0x00: hart 1 goes to 0x14
-        lui(T1, 0x2000),    //       t1 = the CLINT
-        addi(A3, ZERO, 1),  //
-        sw(A3, T1, 4),      //       msip of hart 1
-        STOP,               // 0x10
-        addi(A1, A0, 0x10), // 0x14: hart 1
-        HALT,
-    ]
-    .iter()
-    .flat_map(|w| w.to_le_bytes())
-    .collect();
+fn the_bootloader_loads_segments_and_starts_the_kernel() {
+    const BASE: u64 = 0x8020_0000;
+    // The kernel's code: wait at its first word (`j .`).
+    let code = STOP.to_le_bytes();
     // Segment 1: code and data, one sector and a bit (0x234 bytes) at 0x200 in the
     // file, then .bss up to 0x400. Segment 2: 0x10 bytes, all in a tail sector whose
     // other bytes (0x55) must stay on the disk. Segment 3: .bss only, 0x40 bytes.
@@ -689,21 +635,30 @@ fn the_bootloader_loads_segments_and_hands_the_entry_word_over() {
     let boot = std::fs::read(repo().join("kernel/boot/boot.elf")).unwrap();
     camelot_fs::boot::install(&mut image, &boot, &elf).unwrap();
 
-    let mut m = machine(Xlen::Rv32, 2, image);
-    m.cpu.bus.ram[..0x4000].fill(0xee);
-    assert_eq!(
-        m.run(Some(1_000_000), |_| {}),
-        RunResult::Exited(0),
-        "{}",
-        uart(&m)
-    );
-    assert_eq!(
-        uart(&m),
-        "boot: kernel at sector 0x00000800
-"
-    );
+    let mut m = firmware_machine(8 << 20, 1, image);
+    let fdt = m.cpu.bus.read_mem(grail::boot::FDT_ADDR_ADDR, 8).unwrap();
+    // The kernel's RAM, before the bootloader runs: past the firmware's 2 MiB (the
+    // boot block, loaded there, moves itself away first).
+    let at = (BASE - 0x8000_0000) as usize;
+    m.cpu.bus.ram[at + BOOT_BLOCK_SIZE..at + 0x4000].fill(0xee);
+    // The bootloader runs at BASE first, then from its new place; the kernel at BASE
+    // once it has said where the kernel is.
+    let mut steps = 0;
+    while uart(&m).is_empty() || m.cpu.hart(0).pc != BASE {
+        m.cpu.step();
+        steps += 1;
+        assert!(steps < 2_000_000, "the kernel never started: {}", uart(&m));
+    }
+    for _ in 0..10 {
+        m.cpu.step();
+    }
+    assert_eq!(uart(&m), "boot: kernel at sector 0x00000800\n");
+    let h0 = m.cpu.hart(0);
+    assert_eq!(h0.pc, BASE, "the kernel waits at its j .");
+    assert_eq!(h0.mode, grail::cpu::Mode::S);
+    assert_eq!((h0.x[A0 as usize], h0.x[A1 as usize]), (0, fdt));
 
-    let ram = &m.cpu.bus.ram;
+    let ram = &m.cpu.bus.ram[at..];
     let all = |range: std::ops::Range<usize>, b: u8| ram[range].iter().all(|&x| x == b);
     assert_eq!(&ram[..0x234], &text[..], "segment 1's file bytes");
     assert!(all(0x234..0x400, 0), "segment 1's .bss");
@@ -715,11 +670,4 @@ fn the_bootloader_loads_segments_and_hands_the_entry_word_over() {
     );
     assert!(all(0x3010..0x3050, 0), "segment 3, .bss only");
     assert!(all(0x3050..0x4000, 0xee), "nothing past segment 3");
-
-    // The entry word points at the kernel, and hart 1 got there through it.
-    assert_eq!(m.cpu.bus.peek(BOOT_ROM_BASE + 16), Some(BASE));
-    let (h0, h1) = (m.cpu.hart(0), m.cpu.hart(1));
-    assert_eq!(h0.pc, u64::from(BASE + 0x10), "hart 0 waits at its j .");
-    assert_eq!((h0.x[A0 as usize], h0.x[A1 as usize]), (0, SYSINFO_BASE));
-    assert_eq!(h1.x[A1 as usize], 0x11, "hart 1 ran the kernel with a0 = 1");
 }

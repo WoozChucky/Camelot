@@ -18,7 +18,7 @@ use std::collections::HashSet;
 /// section that is not loaded): that is reported once, at the `PCREL_HI20`,
 /// so the `PCREL_LO12` paired with it says nothing more.
 pub fn context(layout: &Layout) -> (Context, HashSet<u64>) {
-    let mut ctx = Context::new(layout.class);
+    let mut ctx = Context::new();
     let mut failed = HashSet::new();
     for os in &layout.sections {
         for i in &os.inputs {
@@ -85,7 +85,7 @@ pub fn relocate(layout: &Layout) -> Result<Images, Vec<Error>> {
 /// selects a base address), so ld.lld writes 1, as GNU ld does in
 /// `.debug_ranges`.
 fn debug(layout: &Layout, errors: &mut Vec<Error>) -> Vec<Vec<u8>> {
-    let ctx = Context::debug(layout.class);
+    let ctx = Context::new();
     let mut images = Vec::new();
     for ds in &layout.debug {
         let tombstone: u64 = if ds.name == ".debug_loc" || ds.name == ".debug_ranges" {

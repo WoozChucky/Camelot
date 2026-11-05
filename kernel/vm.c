@@ -1,11 +1,7 @@
 /* Page tables and the kernel address space (include/vm.h).
  *
- * RV32 (Sv32): physical memory is identity mapped in the kernel page table,
- * so a physical address (a page table, a page from kalloc) is also a usable
- * pointer with paging on.
- *
- * RV64 (Sv48, or Sv39 on a hart without Sv48): a higher-half kernel in
- * Linux's layout. The kernel starts with paging off at its physical address
+ * Sv48, or Sv39 on a hart without Sv48: a higher-half kernel in Linux's
+ * layout. The kernel starts with paging off at its physical address
  * (entry.S); setup_vm() builds the early page table that maps the image at
  * both addresses, entry.S turns paging on and jumps to the high ones, and
  * kvminit() builds the final table, which has no identity mapping: from
@@ -38,23 +34,16 @@
 #include "trap.h"
 #include "uart.h"
 
-#if __riscv_xlen == 64
 /* The largest leaf the kernel makes: 1 GiB (level 2), as Linux's direct map
  * uses PUD leaves; it never makes 512 GiB ones. */
 #define MAX_LEAF_LEVEL 2
 #define SUPERPAGE "superpage"
-#else
-/* A 4 MiB megapage, in the root. */
-#define MAX_LEAF_LEVEL 1
-#define SUPERPAGE "megapage"
-#endif
 
 pagetable_t kernel_pagetable;
 
 /* Every user copy, against unmap_pages() (above). */
 static struct spinlock uvm_lock;
 
-#if __riscv_xlen == 64
 /* The vmalloc area's state, under vmalloc_lock, which also keeps two harts
  * from making the same table under its root entry at once (Linux's
  * init_mm.page_table_lock): a leaf of the lock order but for kalloc's.
@@ -83,9 +72,7 @@ static uintptr ioremap_next;
  * unmapped (kstack_alloc() returns NULL if they are all taken). */
 _Static_assert(KSTACK_SLOTS >= NTHREAD + NCPU + NCPU * NR_CACHED_STACKS + NCPU,
                "a slot for every kernel stack");
-#endif
 
-#if __riscv_xlen == 64
 u32 pt_levels;
 uintptr satp_mode;
 uintptr page_offset;
@@ -101,9 +88,7 @@ uintptr kernel_satp;
  * come from, in .bss (entry.S, page aligned). */
 extern pte_t early_pg_dir[];
 extern pte_t early_tables[];
-#endif
 
-#if __riscv_xlen == 64
 phys_addr_t kernel_pa(uintptr v) {
     if (v >= KERNEL_LINK_ADDR && v <= (uintptr)__kernel_end) {
         return v - va_kernel_pa_offset;
@@ -115,9 +100,7 @@ phys_addr_t kernel_pa(uintptr v) {
     panic("pa: no physical address");
     return 0; /* not reached: panic() stops the machine */
 }
-#endif
 
-#if __riscv_xlen == 64
 /* RAM [base, base + size) as the direct map holds it: all of it but the
  * firmware's region [rbase, rbase + rsize) (sysinfo's SYS_RESERVED_BASE and
  * _SIZE), which the device tree marks no-map, /reserved-memory/firmware@
@@ -147,7 +130,6 @@ static void direct_map_ranges(phys_addr_t base, u64 size, phys_addr_t rbase, u64
     start[1] = rend < end ? rend : end;
     len[1] = end - start[1];
 }
-#endif
 
 pagetable_t pagetable_create(void) {
     return kzalloc();
@@ -341,7 +323,6 @@ static void kvmmap(uintptr va, phys_addr_t pa, usize size, u32 perm) {
 }
 
 uintptr ioremap(phys_addr_t p, usize size) {
-#if __riscv_xlen == 64
     if (kernel_pagetable == NULL) {
         panic("ioremap: before kvminit");
     }
@@ -373,10 +354,6 @@ uintptr ioremap(phys_addr_t p, usize size) {
      * switch to the kernel page table fences. */
     sfence_vma();
     return va + (p - first);
-#else
-    (void)size;
-    return p;
-#endif
 }
 
 void kvminit(void) {
@@ -386,8 +363,8 @@ void kvminit(void) {
         panic("kvminit: out of memory");
     }
 
-    /* The kernel image, at its link address (the identity on RV32), in 4 KiB
-     * pages so each part gets its permissions. */
+    /* The kernel image, at its link address, in 4 KiB pages so each part
+     * gets its permissions. */
     uintptr text = (uintptr)__text_start;
     uintptr rodata = (uintptr)__rodata_start;
     uintptr data = (uintptr)__data_start;
@@ -396,7 +373,6 @@ void kvminit(void) {
         map_pages(kernel_pagetable, rodata, pa(rodata), data - rodata, PAGE_KERNEL_READ) != 0) {
         panic("kvminit: out of memory");
     }
-#if __riscv_xlen == 64
     /* The rest of the image, but for the page below hart 0's boot stack:
      * its guard page (kernel.lds.S keeps it clear of .bss), so that the
      * boot stack overflows into an unmapped page, as every kernel stack
@@ -425,31 +401,7 @@ void kvminit(void) {
     u32 fix = VPN(fix_to_virt(FIX_SYSINFO), PT_LEVELS - 1);
     kernel_pagetable[fix] = early_pg_dir[fix];
     /* The devices: their drivers ioremap() them, from the vmalloc area. */
-#else
-    /* Every free page after the image: kinit has checked that the image
-     * starts RAM, and RAM is mapped where it is. */
-    (void)end;
-    kvmmap(data, data, ram_size - (data - ram_base), PAGE_KERNEL);
 
-    /* Every MMIO range the machine has that S-mode uses, whole pages, never
-     * executable: not the CLINT and the test device, which only M-mode
-     * touches (Camelot's SBI, machine.S, at their physical addresses), as
-     * Linux under an SBI never maps them. The table doesn't promise that devices
-     * are page aligned, so two of them can share a page: kvmmap() skips
-     * pages already mapped. */
-    u32 count = sysinfo_device_count();
-    for (u32 i = 0; i < count; i++) {
-        struct sysinfo_device dev;
-        sysinfo_device(i, &dev);
-        if (dev.size != 0 && dev.type != DEV_CLINT && dev.type != DEV_TEST) {
-            phys_addr_t first = PGROUNDDOWN(dev.base);
-            usize size = PGROUNDUP(dev.base + dev.size) - first;
-            kvmmap(first, first, size, PAGE_KERNEL);
-        }
-    }
-#endif
-
-#if __riscv_xlen == 64
     /* The vmalloc area's root entry gets its table now, so that what is
      * mapped there later (kernel stacks, devices), whatever the process, is
      * in every process's root table, which copies the kernel's root entries
@@ -461,7 +413,6 @@ void kvminit(void) {
     initlock(&vmalloc_lock, "vmalloc");
     ioremap_next = IOREMAP_START;
     kernel_satp = MAKE_SATP(kernel_pagetable);
-#endif
 }
 
 void kvminithart(void) {
@@ -503,7 +454,6 @@ void vm_print_mapping(pagetable_t pt, uintptr va) {
 
 /* ---- Kernel stacks ---- */
 
-#if __riscv_xlen == 64
 /* The address of slot `i`'s stack, and the slot of a stack. */
 #define KSTACK_OF(i) (KSTACK_AREA + (uintptr)(i) * KSTACK_SLOT)
 #define SLOT_OF(stack) (((uintptr)(stack) - KSTACK_AREA) / KSTACK_SLOT)
@@ -678,32 +628,9 @@ usize kstack_max_used(void) {
     release(&vmalloc_lock);
     return most;
 }
-#else
-void *kstack_alloc(void) {
-    return kalloc();
-}
 
-void kstack_free(void *stack) {
-    kfree(stack);
-}
+/* ---- The early page table, with paging off ---- */
 
-void kstack_reclaim(void) {
-}
-
-void kstack_count(struct kstack_counts *n) {
-    n->mapped = 0;
-    n->cached = 0;
-    n->deferred = 0;
-}
-
-usize kstack_max_used(void) {
-    return 0;
-}
-#endif
-
-/* ---- The early page table (RV64), with paging off ---- */
-
-#if __riscv_xlen == 64
 static u32 early_used;
 
 /* Everything below runs with paging off, at the image's physical address:
@@ -857,7 +784,6 @@ void setup_vm(void) {
     sysinfo_regs = fix_to_virt(FIX_SYSINFO);
     uart_regs = fix_to_virt(FIX_UART);
 }
-#endif
 
 /* ---- User address spaces ---- */
 
@@ -922,8 +848,7 @@ bool uvm_range_ok(pagetable_t pt, uintptr va, usize len, u32 perm) {
 }
 
 /* The kernel's pointer to user address `va` in `pt`, which must be mapped:
- * the user page's physical address, through the direct map (on RV32 the
- * kernel's identity map). */
+ * the user page's physical address, through the direct map. */
 static u8 *user_ptr(pagetable_t pt, uintptr va) {
     return (u8 *)va(PTE2PA(*walk(pt, va, false))) + va % PGSIZE;
 }

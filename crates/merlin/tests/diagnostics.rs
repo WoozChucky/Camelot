@@ -7,21 +7,20 @@
 //! lines; a line in a header names it (`h.h:1:9: error: ...`).
 //!
 //! * `merlin_gives_the_tables_diagnostics` (run by `cargo test`, no
-//!   external tools): merlin, compiling each source for RV32 and RV64,
-//!   gives exactly the diagnostics of its row.
+//!   external tools): merlin, compiling each source, gives exactly the
+//!   diagnostics of its row.
 //! * `clang_gives_the_tables_diagnostics` (ignored: needs clang on `PATH`):
-//!   clang 23 (`clang --target=riscv32 -mabi=ilp32` and `--target=riscv64
-//!   -mabi=lp64`, with `-std=c99 -ffreestanding -fsyntax-only`, merlin's
-//!   language) gives the same errors and warnings, with the notes the row
-//!   has among its own; and so, merlin's diagnostics are clang's.
+//!   clang 23 (`clang --target=riscv64 -mabi=lp64`, with `-std=c99
+//!   -ffreestanding -fsyntax-only`, merlin's language) gives the same
+//!   errors and warnings, with the notes the row has among its own; and
+//!   so, merlin's diagnostics are clang's.
 //!
 //!       cargo test -p merlin --test diagnostics -- --ignored
 //!
 //!   With `MERLIN_BLESS=1`, a row clang disagrees with is rewritten to
 //!   clang's lines, with the notes merlin gives (and so is one where merlin
 //!   gives more of clang's notes than the row has); rows with `.then`,
-//!   `.merlin` or `.partial`, of one width, or that span lines are left to
-//!   edit by hand:
+//!   `.merlin` or `.partial`, or that span lines are left to edit by hand:
 //!
 //!       MERLIN_BLESS=1 cargo test -p merlin --test diagnostics -- --ignored clang_gives
 //!
@@ -31,7 +30,7 @@
 //!   kernel and its user programs, merlin and clang give the same
 //!   diagnostics, the default warnings clang gives on them included.
 //!
-//! A row may say four more things (the spec, "Diagnostics", says why each
+//! A row may say three more things (the spec, "Diagnostics", says why each
 //! is so):
 //!
 //! * `.then(...)`: what clang reports after a syntax error, at which
@@ -42,8 +41,6 @@
 //! * `.partial(why)`: the row's notes are some of clang's, in order, where
 //!   merlin gives fewer (of where a macro was expanded); otherwise a row's
 //!   notes are exactly clang's.
-//! * `.rv32()`, `.rv64()`: a row of one target, where clang's diagnostics
-//!   differ with the width.
 //!
 //! merlin's implementation limits (how deep expressions and statements
 //! nest, how many parameters, how large a frame or a function) are not
@@ -63,7 +60,6 @@ mod sema;
 #[path = "diagnostics/warnings.rs"]
 mod warnings;
 
-use merlin::types::Xlen;
 use std::path::{Component, Path};
 use std::process::Command;
 
@@ -80,15 +76,13 @@ pub struct Case {
     merlin: Option<&'static str>,
     /// Why the row's notes are only some of clang's (merlin gives fewer).
     partial: Option<&'static str>,
-    /// The one target the row is for, or both.
-    xlen: Option<Xlen>,
     /// `-D` and `-U` options, in order (`-DN=1`, `-UN`).
     args: Vec<&'static str>,
     /// Where the row is written, for `MERLIN_BLESS`.
     at: &'static std::panic::Location<'static>,
 }
 
-/// A row of both targets.
+/// A row.
 #[track_caller]
 pub fn case(src: impl Into<String>, want: &[&str]) -> Case {
     Case {
@@ -99,7 +93,6 @@ pub fn case(src: impl Into<String>, want: &[&str]) -> Case {
         then: Vec::new(),
         merlin: None,
         partial: None,
-        xlen: None,
         args: Vec::new(),
     }
 }
@@ -133,31 +126,10 @@ impl Case {
         }
     }
 
-    pub fn rv32(self) -> Case {
-        Case {
-            xlen: Some(Xlen::Rv32),
-            ..self
-        }
-    }
-
-    pub fn rv64(self) -> Case {
-        Case {
-            xlen: Some(Xlen::Rv64),
-            ..self
-        }
-    }
-
     pub fn args(self, args: &[&'static str]) -> Case {
         Case {
             args: args.to_vec(),
             ..self
-        }
-    }
-
-    fn widths(&self) -> Vec<Xlen> {
-        match self.xlen {
-            Some(x) => vec![x],
-            None => vec![Xlen::Rv32, Xlen::Rv64],
         }
     }
 }
@@ -174,13 +146,6 @@ fn table() -> Vec<Case> {
     .into_iter()
     .flatten()
     .collect()
-}
-
-fn width(x: Xlen) -> &'static str {
-    match x {
-        Xlen::Rv32 => "rv32",
-        Xlen::Rv64 => "rv64",
-    }
 }
 
 /// A path as the table writes it: `/` between its parts, no `.` among them.
@@ -214,9 +179,9 @@ fn table_line(line: &str) -> String {
     }
 }
 
-/// What merlin says of a row's source for the target `x`: every line of
-/// every diagnostic, notes included.
-fn merlin_lines(c: &Case, x: Xlen) -> Vec<String> {
+/// What merlin says of a row's source: every line of every diagnostic,
+/// notes included.
+fn merlin_lines(c: &Case) -> Vec<String> {
     let files: Vec<(String, &str)> = c.files.iter().map(|&(n, t)| (plain(n), t)).collect();
     let load = move |p: &Path| {
         let p = plain(&p.to_string_lossy());
@@ -232,7 +197,6 @@ fn merlin_lines(c: &Case, x: Xlen) -> Vec<String> {
         })
         .collect();
     let opts = merlin::Options {
-        xlen: x,
         macros,
         ..merlin::Options::default()
     };
@@ -251,20 +215,17 @@ fn merlin_gives_the_tables_diagnostics() {
     let mut failures = Vec::new();
     let mut count = 0;
     for c in table() {
-        for x in c.widths() {
-            count += 1;
-            let got = merlin_lines(&c, x);
-            if got != c.want {
-                failures.push(format!(
-                    "{}:{}: {} ({}):\n  want {:?}\n  got  {:?}",
-                    c.at.file(),
-                    c.at.line(),
-                    c.src,
-                    width(x),
-                    c.want,
-                    got
-                ));
-            }
+        count += 1;
+        let got = merlin_lines(&c);
+        if got != c.want {
+            failures.push(format!(
+                "{}:{}: {}:\n  want {:?}\n  got  {:?}",
+                c.at.file(),
+                c.at.line(),
+                c.src,
+                c.want,
+                got
+            ));
         }
     }
     assert!(count > 400, "only {count} rows");
@@ -276,19 +237,16 @@ fn merlin_gives_the_tables_diagnostics() {
     );
 }
 
-/// clang's options for the target `x`, as the harness gives them, with
-/// merlin's language: C99, freestanding.
-fn clang(x: Xlen) -> Command {
+/// clang's options for merlin's target, as the harness gives them: C99,
+/// freestanding, is the language.
+fn clang() -> Command {
     let mut c = Command::new("clang");
-    match x {
-        Xlen::Rv32 => c.args(["--target=riscv32", "-march=rv32ima_zicsr_zifencei", "-mabi=ilp32"]),
-        Xlen::Rv64 => c.args([
-            "--target=riscv64",
-            "-march=rv64ima_zicsr_zifencei",
-            "-mabi=lp64",
-            "-mcmodel=medany",
-        ]),
-    };
+    c.args([
+        "--target=riscv64",
+        "-march=rv64ima_zicsr_zifencei",
+        "-mabi=lp64",
+        "-mcmodel=medany",
+    ]);
     c.args([
         "-fsyntax-only",
         "-fno-caret-diagnostics",
@@ -337,10 +295,10 @@ fn grouped(lines: &[String]) -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// What clang says of a row's source for the target `x`, written to a
-/// directory of its own under `scratch`.
-fn clang_diagnostics(c: &Case, x: Xlen, scratch: &Path, n: usize) -> Vec<(String, Vec<String>)> {
-    let dir = scratch.join(format!("{n}-{}", width(x)));
+/// What clang says of a row's source, written to a directory of its own
+/// under `scratch`.
+fn clang_diagnostics(c: &Case, scratch: &Path, n: usize) -> Vec<(String, Vec<String>)> {
+    let dir = scratch.join(n.to_string());
     std::fs::create_dir_all(&dir).unwrap();
     for (name, text) in &c.files {
         let path = dir.join(name);
@@ -348,7 +306,7 @@ fn clang_diagnostics(c: &Case, x: Xlen, scratch: &Path, n: usize) -> Vec<(String
         std::fs::write(path, text).unwrap();
     }
     std::fs::write(dir.join("t.c"), &c.src).unwrap();
-    let out = clang(x)
+    let out = clang()
         .args(["-std=c99", "-ffreestanding"])
         .args(&c.args)
         .arg("t.c")
@@ -388,24 +346,19 @@ fn agrees(c: &Case, got: &[(String, Vec<String>)]) -> bool {
         })
 }
 
-/// Each row's diagnostics are clang's, for each of its targets. With
-/// `MERLIN_BLESS=1`, a row that clang disagrees with is rewritten to say
-/// what clang says (with the notes merlin gives that clang gives too),
-/// unless it has `.then` or `.merlin`, or clang's differ with the width,
-/// or the row is not a `case("...", &[...])` on one line: those are left
-/// to edit by hand.
+/// Each row's diagnostics are clang's. With `MERLIN_BLESS=1`, a row that
+/// clang disagrees with is rewritten to say what clang says (with the notes
+/// merlin gives that clang gives too), unless it has `.then` or `.merlin`,
+/// or the row is not a `case("...", &[...])` on one line: those are left to
+/// edit by hand.
 #[test]
 #[ignore = "needs clang on PATH"]
 fn clang_gives_the_tables_diagnostics() {
     let dir = scratch("diagnostics");
     let rows = table();
-    let jobs: Vec<_> = rows
-        .iter()
-        .enumerate()
-        .flat_map(|(n, c)| c.widths().into_iter().map(move |x| (n, x)))
-        .collect();
+    let jobs: Vec<usize> = (0..rows.len()).collect();
     type Got = Vec<(String, Vec<String>)>;
-    let results: Vec<(usize, Xlen, Got)> = std::thread::scope(|s| {
+    let results: Vec<(usize, Got)> = std::thread::scope(|s| {
         let handles: Vec<_> = jobs
             .chunks(jobs.len().div_ceil(16))
             .map(|chunk| {
@@ -413,7 +366,7 @@ fn clang_gives_the_tables_diagnostics() {
                 s.spawn(move || {
                     chunk
                         .iter()
-                        .map(|&(n, x)| (n, x, clang_diagnostics(&rows[n], x, dir, n)))
+                        .map(|&n| (n, clang_diagnostics(&rows[n], dir, n)))
                         .collect::<Vec<_>>()
                 })
             })
@@ -425,15 +378,12 @@ fn clang_gives_the_tables_diagnostics() {
     let mut failures = Vec::new();
     let mut blessed = Vec::new();
     for (n, c) in rows.iter().enumerate() {
-        let got: Vec<_> = results.iter().filter(|r| r.0 == n).collect();
-        let wrong: Vec<_> = got.iter().filter(|(_, _, g)| !agrees(c, g)).collect();
-        let same = got.iter().all(|r| r.2 == got[0].2);
+        let got = &results.iter().find(|r| r.0 == n).expect("every row ran").1;
         // Blessing rewrites a row clang agrees with too, when merlin gives
         // more of clang's notes than the row has.
-        if bless_mode && c.then.is_empty() && c.merlin.is_none() && same {
-            let merlin = merlin_lines(c, got[0].1);
-            let lines: Vec<String> = got[0]
-                .2
+        if bless_mode && c.then.is_empty() && c.merlin.is_none() {
+            let merlin = merlin_lines(c);
+            let lines: Vec<String> = got
                 .iter()
                 .flat_map(|(l, notes)| {
                     std::iter::once(l.clone()).chain(notes.iter().filter(|n| merlin.contains(n)).cloned())
@@ -450,26 +400,23 @@ fn clang_gives_the_tables_diagnostics() {
                 Err(e) => failures.push(format!("{}:{}: cannot bless: {e}", c.at.file(), c.at.line())),
             }
         }
-        if wrong.is_empty() {
+        if agrees(c, got) {
             continue;
         }
-        for (_, x, g) in wrong {
-            failures.push(format!(
-                "{}:{}: {} ({}){}:\n  want {:?}{}\n  clang {:?}",
-                c.at.file(),
-                c.at.line(),
-                c.src,
-                width(*x),
-                c.merlin.map(|_| " (merlin's own)").unwrap_or_default(),
-                c.want,
-                if c.then.is_empty() {
-                    String::new()
-                } else {
-                    format!(" then {:?}", c.then)
-                },
-                g
-            ));
-        }
+        failures.push(format!(
+            "{}:{}: {}{}:\n  want {:?}{}\n  clang {:?}",
+            c.at.file(),
+            c.at.line(),
+            c.src,
+            c.merlin.map(|_| " (merlin's own)").unwrap_or_default(),
+            c.want,
+            if c.then.is_empty() {
+                String::new()
+            } else {
+                format!(" then {:?}", c.then)
+            },
+            got
+        ));
     }
     assert!(
         failures.is_empty(),
@@ -558,15 +505,14 @@ fn programs() -> Vec<Program> {
     out
 }
 
-/// Every line merlin gives for the program `p` for the target `x`, as
-/// [`table_line`] writes them, the file named as it is from its directory.
-fn merlin_program_lines(p: &Program, x: Xlen) -> Vec<String> {
+/// Every line merlin gives for the program `p`, as [`table_line`] writes
+/// them, the file named as it is from its directory.
+fn merlin_program_lines(p: &Program) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let dir = root.join(p.path.parent().unwrap());
     let name = p.path.file_name().unwrap().to_string_lossy().into_owned();
     let src = std::fs::read_to_string(root.join(&p.path)).unwrap();
     let opts = merlin::Options {
-        xlen: x,
         include_dirs: p.include.iter().map(std::path::PathBuf::from).collect(),
         ..merlin::Options::default()
     };
@@ -586,12 +532,12 @@ fn merlin_program_lines(p: &Program, x: Xlen) -> Vec<String> {
         .collect()
 }
 
-/// Every line clang gives for the program `p` for the target `x`, as
-/// [`merlin_program_lines`] writes merlin's.
-fn clang_program_lines(p: &Program, x: Xlen) -> Vec<String> {
+/// Every line clang gives for the program `p`, as [`merlin_program_lines`]
+/// writes merlin's.
+fn clang_program_lines(p: &Program) -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let dir = root.join(p.path.parent().unwrap());
-    let mut c = clang(x);
+    let mut c = clang();
     c.args(["-std=c99", "-ffreestanding"]);
     if p.camelot {
         c.args(["-fno-builtin", "-nostdinc"]);
@@ -627,16 +573,14 @@ fn plain_line(line: &str) -> String {
 }
 
 /// On every whole program of merlin's tests and every C file of the kernel
-/// and its user programs, for each target, merlin gives the diagnostics
-/// clang gives, its default warnings above all (the programs compile).
+/// and its user programs, merlin gives the diagnostics clang gives, its
+/// default warnings above all (the programs compile).
 #[test]
 #[ignore = "needs clang on PATH"]
 fn clang_warns_as_merlin_does_on_the_programs() {
     let programs = programs();
     assert!(programs.len() > 150, "only {} programs", programs.len());
-    let jobs: Vec<(usize, Xlen)> = (0..programs.len())
-        .flat_map(|n| [(n, Xlen::Rv32), (n, Xlen::Rv64)])
-        .collect();
+    let jobs: Vec<usize> = (0..programs.len()).collect();
     let failures: Vec<String> = std::thread::scope(|s| {
         let handles: Vec<_> = jobs
             .chunks(jobs.len().div_ceil(16))
@@ -645,15 +589,11 @@ fn clang_warns_as_merlin_does_on_the_programs() {
                 s.spawn(move || {
                     chunk
                         .iter()
-                        .filter_map(|&(n, x)| {
+                        .filter_map(|&n| {
                             let p = &programs[n];
-                            let (want, got) = (clang_program_lines(p, x), merlin_program_lines(p, x));
+                            let (want, got) = (clang_program_lines(p), merlin_program_lines(p));
                             (want != got).then(|| {
-                                format!(
-                                    "{} ({}):\n  clang  {want:?}\n  merlin {got:?}",
-                                    p.path.display(),
-                                    width(x)
-                                )
+                                format!("{}:\n  clang  {want:?}\n  merlin {got:?}", p.path.display())
                             })
                         })
                         .collect::<Vec<_>>()

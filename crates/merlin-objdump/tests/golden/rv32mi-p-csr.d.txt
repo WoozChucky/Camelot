@@ -1,5 +1,5 @@
 
-tests/riscv-tests/rv32mi-p-csr:	file format elf32-littleriscv
+crates/merlin-objdump/tests/fixtures/rv32/rv32mi-p-csr:	file format elf32-littleriscv
 
 Disassembly of section .text.init:
 

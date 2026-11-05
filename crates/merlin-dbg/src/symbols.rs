@@ -1,9 +1,8 @@
 //! The program's symbols, from its ELF symbol table (through `elf`): names for
-//! addresses (`break main`) and addresses for names (`0x80000024 <puts+4>`). Programs
-//! of either width: an ELF32 file's addresses are 32-bit, an ELF64 one's 64-bit.
+//! addresses (`break main`) and addresses for names (`0x80000024 <puts+4>`). The
+//! programs are RV64's, ELF64 files ([`check_program`]).
 
 use crate::remote::hex_value;
-use excalibur::Xlen;
 use std::collections::HashMap;
 
 /// `STT_SECTION` and `STT_FILE`: symbols that name no place in the program.
@@ -14,26 +13,16 @@ const STT_FUNC: u8 = 2;
 /// `STB_LOCAL`.
 const STB_LOCAL: u8 = 0;
 
-/// The width a program is for: its ELF class (ELF32 for RV32, ELF64 for RV64).
-pub fn elf_xlen(file: &[u8]) -> Result<Xlen, String> {
+/// Checks that a program is one merlin-dbg debugs: an ELF64 file, for an RV64
+/// machine. An ELF32 one is RV32 code, which no Excalibur machine runs.
+pub fn check_program(file: &[u8]) -> Result<(), String> {
     let elf = elf::Elf::parse(file).map_err(|e| e.to_string())?;
-    Ok(match elf.class {
-        elf::Class::Elf32 => Xlen::Rv32,
-        elf::Class::Elf64 => Xlen::Rv64,
-    })
-}
-
-/// The error for a program of the other width than the machine's.
-pub fn check_xlen(file: &[u8], machine: Xlen) -> Result<(), String> {
-    let program = elf_xlen(file)?;
-    if program == machine {
-        return Ok(());
+    match elf.class {
+        elf::Class::Elf64 => Ok(()),
+        elf::Class::Elf32 => {
+            Err("an RV32 program (ELF32): merlin-dbg debugs RV64 (ELF64) programs only".into())
+        }
     }
-    let bits = program.bits();
-    Err(format!(
-        "an RV{bits} program (ELF{bits}), but the machine is RV{}",
-        machine.bits()
-    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -174,11 +163,11 @@ impl Symbols {
         })
     }
 
-    /// `0x80000024 <puts+4>`, or the bare address when no symbol holds it, with as
-    /// many digits as an `xlen` address has (`0x0000000080000024 <puts+4>` on RV64,
-    /// as GDB shows a 64-bit target's code addresses).
-    pub fn show(&self, addr: u64, xlen: Xlen) -> String {
-        self.with_name(hex_value(addr, xlen), addr)
+    /// `0x0000000080000024 <puts+4>`, or the bare address when no symbol holds it,
+    /// with all of a 64-bit address's digits, as GDB shows a 64-bit target's code
+    /// addresses.
+    pub fn show(&self, addr: u64) -> String {
+        self.with_name(hex_value(addr), addr)
     }
 
     /// The same without leading zeros (`0x1000`, `0x80000024 <puts+4>`), as GDB
@@ -203,57 +192,43 @@ mod tests {
         std::fs::read(format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
-    /// hello's symbols, RV32 (ELF32) and RV64 (ELF64): the same addresses.
+    /// hello's symbols.
     #[test]
     fn names_and_addresses() {
-        for (file, xlen) in [
-            ("examples/hello/hello.elf", Xlen::Rv32),
-            ("examples/hello/hello-rv64.elf", Xlen::Rv64),
-        ] {
-            let elf = read(file);
-            assert_eq!(elf_xlen(&elf), Ok(xlen));
-            let s = Symbols::from_elf(&elf).unwrap();
-            assert_eq!(s.lookup("_start"), Some(0x8000_0000));
-            assert_eq!(s.lookup("puts"), Some(0x8000_0020));
-            assert_eq!(s.lookup("message"), Some(0x8000_0050));
-            assert_eq!(s.lookup("UART_BASE"), None, "absolute");
-            assert_eq!(s.lookup(".Lpcrel_hi0"), None, "local label");
-            assert_eq!(s.describe(0x8000_0000).as_deref(), Some("_start"));
-            assert_eq!(s.describe(0x8000_0018).as_deref(), Some("_start+24"));
-            assert_eq!(s.describe(0x8000_0024).as_deref(), Some("puts+4"));
-            assert_eq!(s.describe(0x7fff_fffc), None);
-            // message, a label without a size, ends with .rodata: past it (the
-            // stack) has no name, as with GDB.
-            assert_eq!(s.describe(0x8000_0064).as_deref(), Some("message+20"));
-            assert_eq!(s.describe(0x8001_0000), None);
-            assert_eq!(s.code("puts"), Some(0x8000_0020));
-            assert_eq!(s.code("message"), None, "data");
-            assert_eq!(s.code("nowhere"), None);
-            assert_eq!(s.size("message"), None, "a label has no size");
-        }
+        let elf = read("examples/hello/hello.elf");
+        assert_eq!(check_program(&elf), Ok(()));
+        let s = Symbols::from_elf(&elf).unwrap();
+        assert_eq!(s.lookup("_start"), Some(0x8000_0000));
+        assert_eq!(s.lookup("puts"), Some(0x8000_0020));
+        assert_eq!(s.lookup("message"), Some(0x8000_0050));
+        assert_eq!(s.lookup("UART_BASE"), None, "absolute");
+        assert_eq!(s.lookup(".Lpcrel_hi0"), None, "local label");
+        assert_eq!(s.describe(0x8000_0000).as_deref(), Some("_start"));
+        assert_eq!(s.describe(0x8000_0018).as_deref(), Some("_start+24"));
+        assert_eq!(s.describe(0x8000_0024).as_deref(), Some("puts+4"));
+        assert_eq!(s.describe(0x7fff_fffc), None);
+        // message, a label without a size, ends with .rodata: past it (the
+        // stack) has no name, as with GDB.
+        assert_eq!(s.describe(0x8000_0064).as_deref(), Some("message+20"));
+        assert_eq!(s.describe(0x8001_0000), None);
+        assert_eq!(s.code("puts"), Some(0x8000_0020));
+        assert_eq!(s.code("message"), None, "data");
+        assert_eq!(s.code("nowhere"), None);
+        assert_eq!(s.size("message"), None, "a label has no size");
         let s = Symbols::from_elf(&read("examples/hello/hello.elf")).unwrap();
-        assert_eq!(s.show(0x8000_0024, Xlen::Rv32), "0x80000024 <puts+4>");
-        assert_eq!(s.show(0x1000, Xlen::Rv32), "0x00001000");
-        assert_eq!(s.show(0x8000_0024, Xlen::Rv64), "0x0000000080000024 <puts+4>");
-        assert_eq!(s.show(0x1000, Xlen::Rv64), "0x0000000000001000");
+        assert_eq!(s.show(0x8000_0024), "0x0000000080000024 <puts+4>");
+        assert_eq!(s.show(0x1000), "0x0000000000001000");
         assert_eq!(s.show_plain(0x8000_0024), "0x80000024 <puts+4>");
         assert_eq!(s.show_plain(0x1000), "0x1000");
     }
 
-    /// A program of the other width is refused against the machine's.
+    /// An RV32 program (clang's, `crates/elf/tests/llvm`) is refused.
     #[test]
-    fn widths_must_agree() {
-        let rv32 = read("examples/hello/hello.elf");
-        let rv64 = read("examples/hello/hello-rv64.elf");
-        assert_eq!(check_xlen(&rv32, Xlen::Rv32), Ok(()));
-        assert_eq!(check_xlen(&rv64, Xlen::Rv64), Ok(()));
+    fn programs_are_rv64() {
+        assert_eq!(check_program(&read("examples/hello/hello.elf")), Ok(()));
         assert_eq!(
-            check_xlen(&rv32, Xlen::Rv64),
-            Err("an RV32 program (ELF32), but the machine is RV64".into())
-        );
-        assert_eq!(
-            check_xlen(&rv64, Xlen::Rv32),
-            Err("an RV64 program (ELF64), but the machine is RV32".into())
+            check_program(&read("crates/elf/tests/llvm/rv32/prog.elf")),
+            Err("an RV32 program (ELF32): merlin-dbg debugs RV64 (ELF64) programs only".into())
         );
     }
 

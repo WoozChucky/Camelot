@@ -1,8 +1,7 @@
 // expect: 6
-// long long division where C leaves it undefined gives RISC-V's results on
-// both widths: div and rem on RV64, the C library's __divdi3 and friends on
-// RV32 (kernel/user/lib/libgcc.c). Dividing by zero gives a quotient of all
-// ones and the dividend as the remainder; LLONG_MIN / -1 wraps.
+// long long division where C leaves it undefined gives RISC-V's results
+// (div and rem): dividing by zero gives a quotient of all ones and the
+// dividend as the remainder; LLONG_MIN / -1 wraps.
 long long nothing(void) {
     return 0;
 }

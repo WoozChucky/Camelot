@@ -60,18 +60,14 @@
 #define CONSOLE 1
 #define PAGE 4096
 /* Where the heap may grow to (USER_LOAD_TOP in kernel/include/vm.h): a
- * guard page under the stack's 8 MiB under USER_TOP. USER_TOP is 0x0c000000
- * on RV32, and on RV64 depends on the paging mode, so main() finds it: the
- * arguments are in the stack's last page. */
+ * guard page under the stack's 8 MiB under USER_TOP. USER_TOP depends on
+ * the paging mode, so main() finds it: the arguments are in the stack's
+ * last page. */
 static unsigned long user_top;
 #define USER_LOAD_TOP (user_top - (8ul << 20) - PAGE)
-/* An address in the kernel's part of the address space: its first page on
- * RV32, the kernel image's link address on RV64 (the upper half). */
-#ifdef _LP64
+/* An address in the kernel's part of the address space: the kernel image's
+ * link address (the upper half). */
 #define KERNEL_ADDR 0xffffffff80000000ul
-#else
-#define KERNEL_ADDR 0x80000000ul
-#endif
 
 static int checks;
 static int failures;
@@ -456,8 +452,8 @@ static int start_fault(int argc, char **argv, char **envp, const char *path) {
     if (value[AT_HWCAP] != hwcap || value[AT_PAGESZ] != PAGE || value[AT_CLKTCK] != 10) {
         return 5;
     }
-    /* An ELF32 program header is 32 bytes, an ELF64 one 56. */
-    if (value[AT_PHENT] != (sizeof(void *) == 8 ? 56 : 32) || value[AT_PHNUM] < 1 || value[AT_PHNUM] > 16) {
+    /* An ELF64 program header is 56 bytes. */
+    if (value[AT_PHENT] != 56 || value[AT_PHNUM] < 1 || value[AT_PHNUM] > 16) {
         return 6;
     }
     /* user.ld starts the first segment at 0x1000, after the headers, so no
@@ -547,10 +543,8 @@ static void test_simple_calls(void) {
     check(r == -(long)EBADF && r < 0, "a negative result is a negative long");
     check(read(STDOUT, &c, 1) == -(ssize_t)EBADF, "and a negative ssize_t");
     check((unsigned long)r >> (8 * sizeof(long) - 1) == 1, "its top bit set");
-#ifdef _LP64
     /* The number is all of a7, as on Linux: 2^32 + 4 is not getpid (4). */
     check_eq(syscall(0x100000004l, 0, 0, 0), -ENOSYS, "call 2^32 + 4");
-#endif
 }
 
 static void test_files(void) {

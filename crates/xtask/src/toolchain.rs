@@ -15,7 +15,6 @@
 //! loaded, so it changes no byte the machine runs ([`without_debug_info`]
 //! builds without it, for the test that checks this).
 
-pub use merlin_as::Xlen;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
@@ -43,24 +42,11 @@ pub fn without_debug_info<T>(f: impl FnOnce() -> T) -> T {
 /// root). `include_dirs` are relative to `dir`. Returns the assembly; errors
 /// read `file.c:line:col: error: ...`, one per line.
 pub fn compile_c(dir: &Path, file: &str, include_dirs: &[&str], comp_dir: &str) -> Result<String, String> {
-    compile_c_for(dir, file, include_dirs, comp_dir, Xlen::Rv32)
-}
-
-/// [`compile_c`] for `xlen`: merlin's ILP32 RV32 code, or its LP64 RV64 code
-/// (`-march=rv64ima_zicsr_zifencei`).
-pub fn compile_c_for(
-    dir: &Path,
-    file: &str,
-    include_dirs: &[&str],
-    comp_dir: &str,
-    xlen: Xlen,
-) -> Result<String, String> {
     let path = dir.join(file);
     let src = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let opts = merlin::Options {
         include_dirs: include_dirs.iter().map(PathBuf::from).collect(),
         macros: Vec::new(),
-        xlen: merlin_xlen(xlen),
         debug: DEBUG_INFO.get().then(|| merlin::DebugInfo {
             comp_dir: comp_dir.into(),
         }),
@@ -74,43 +60,32 @@ pub fn compile_c_for(
     })
 }
 
-/// merlin's name for a width.
-fn merlin_xlen(xlen: Xlen) -> merlin::types::Xlen {
-    match xlen {
-        Xlen::Rv32 => merlin::types::Xlen::Rv32,
-        Xlen::Rv64 => merlin::types::Xlen::Rv64,
-    }
-}
-
-/// Preprocesses `file`, a `.S` file in `dir`, with merlin for `xlen`, the
-/// way `merlin -E [-march=rv64ima_zicsr_zifencei] -I <inc>... file` run
-/// inside `dir` would: assembler-with-cpp, so `#include <asm.h>` and
-/// `#if __riscv_xlen == 64` work, and the result has line markers that
-/// name `file`. Returns the text merlin-as assembles.
-pub fn preprocess_asm(dir: &Path, file: &str, include_dirs: &[&str], xlen: Xlen) -> Result<String, String> {
-    preprocess_with(dir, file, include_dirs, xlen, true)
+/// Preprocesses `file`, a `.S` file in `dir`, with merlin, the way
+/// `merlin -E -I <inc>... file` run inside `dir` would: assembler-with-cpp,
+/// so `#include <asm.h>` works, and the result has line markers that name
+/// `file`. Returns the text merlin-as assembles.
+pub fn preprocess_asm(dir: &Path, file: &str, include_dirs: &[&str]) -> Result<String, String> {
+    preprocess_with(dir, file, include_dirs, true)
 }
 
 /// [`preprocess_asm`] without line markers, as `merlin -E -P` writes it:
 /// for a linker script that goes through the C preprocessor (the kernel's
 /// `kernel.lds.S`, as Linux's `vmlinux.lds.S`), which merlin-ld and ld.lld
 /// read as it comes out.
-pub fn preprocess_lds(dir: &Path, file: &str, include_dirs: &[&str], xlen: Xlen) -> Result<String, String> {
-    preprocess_with(dir, file, include_dirs, xlen, false)
+pub fn preprocess_lds(dir: &Path, file: &str, include_dirs: &[&str]) -> Result<String, String> {
+    preprocess_with(dir, file, include_dirs, false)
 }
 
 fn preprocess_with(
     dir: &Path,
     file: &str,
     include_dirs: &[&str],
-    xlen: Xlen,
     line_markers: bool,
 ) -> Result<String, String> {
     let path = dir.join(file);
     let src = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let opts = merlin::Options {
         include_dirs: include_dirs.iter().map(PathBuf::from).collect(),
-        xlen: merlin_xlen(xlen),
         line_markers,
         ..merlin::Options::default()
     };
@@ -121,18 +96,12 @@ fn preprocess_with(
     })
 }
 
-/// Assembles `text` (shown as `name` in errors) with merlin-as into an RV32
-/// ELF object. Errors read `name:line: error: ...`, one per line.
+/// Assembles `text` (shown as `name` in errors) with merlin-as into an ELF64
+/// object. Errors read `name:line: error: ...`, one per line. When `text`
+/// came from [`preprocess_asm`], an error names the line of the `.S` file it
+/// comes from, through the line markers.
 pub fn assemble(name: &str, text: &str) -> Result<Vec<u8>, String> {
-    assemble_for(name, text, Xlen::Rv32)
-}
-
-/// [`assemble`] for `xlen`: an ELF32 RV32 object or an ELF64 RV64 one. When
-/// `text` came from [`preprocess_asm`], an error names the line of the `.S`
-/// file it comes from, through the line markers.
-pub fn assemble_for(name: &str, text: &str, xlen: Xlen) -> Result<Vec<u8>, String> {
-    let opts = merlin_as::Options { xlen };
-    merlin_as::assemble_to_elf_with(text, &opts).map_err(|errors| {
+    merlin_as::assemble_to_elf(text).map_err(|errors| {
         let lines: Vec<String> = errors
             .iter()
             .map(|e| match e.line {

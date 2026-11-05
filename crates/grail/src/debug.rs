@@ -15,9 +15,7 @@
 //!   ([`Machine::select_hart`]), memory through its address translation or physical
 //!   ([`Space`]).
 //!
-//! Addresses and values are `u64`, as wide as an RV64 hart's. On an RV32 machine they
-//! are its 32-bit values: registers, the pc and CSRs read as their low 32 bits
-//! (zero-extended), and virtual addresses past 4 GiB are not in its address space.
+//! Addresses and values are `u64`, as wide as a hart's.
 //!
 //! Debugging does not change what the machine does: a debugged run executes exactly the
 //! instructions an undebugged one does, in the same order, with the same results. The
@@ -27,7 +25,6 @@
 
 use crate::cpu::{Cpu, Mode};
 use crate::Machine;
-use excalibur::Xlen;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -155,13 +152,9 @@ impl Default for Debug {
 
 impl Machine {
     /// Sets a breakpoint at virtual address `pc`: a hart about to execute the
-    /// instruction there stops the machine. Returns false if there was one already; an
-    /// error for an address past the machine's address space (4 GiB on RV32), which no
-    /// hart could ever reach.
+    /// instruction there stops the machine. Returns false if there was one already.
+    /// (Every 64-bit address is one a hart can reach: the result is never an error.)
     pub fn set_breakpoint(&mut self, pc: u64) -> Result<bool, String> {
-        if pc & !self.width_mask() != 0 {
-            return Err(format!("{pc:#x} is past the end of the address space"));
-        }
         Ok(self.debug.breakpoints.insert(pc))
     }
 
@@ -176,11 +169,10 @@ impl Machine {
     }
 
     /// Watches `[addr, addr + len)` (virtual addresses) for `kind` accesses by any hart.
-    /// An error for an empty range or one past the end of the machine's address space
-    /// (2^64, or 2^32 on RV32).
+    /// An error for an empty range or one past the end of the address space (2^64).
     pub fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Result<(), String> {
         let end = u128::from(addr) + u128::from(len);
-        if len == 0 || end > 1u128 << self.config().xlen.bits() {
+        if len == 0 || end > 1u128 << 64 {
             return Err(format!("cannot watch {len} bytes at {addr:#x}"));
         }
         let w = Watchpoint { addr, len, kind };
@@ -244,34 +236,23 @@ impl Machine {
         self.debug.hart
     }
 
-    /// The machine's values as a debugger sees them: all 64 bits, or the low 32 on RV32
-    /// (whose registers the harts keep sign-extended).
-    fn width_mask(&self) -> u64 {
-        match self.config().xlen {
-            Xlen::Rv32 => u32::MAX.into(),
-            Xlen::Rv64 => u64::MAX,
-        }
-    }
-
     /// Register `x<r>` of the selected hart (`r` < 32).
     pub fn reg(&self, r: usize) -> u64 {
-        self.cpu.hart(self.debug.hart).x[r] & self.width_mask()
+        self.cpu.hart(self.debug.hart).x[r]
     }
 
-    /// Writes register `x<r>` of the selected hart (its low 32 bits on RV32). Writes to
-    /// `x0` are ignored.
+    /// Writes register `x<r>` of the selected hart. Writes to `x0` are ignored.
     pub fn set_reg(&mut self, r: usize, v: u64) {
         self.cpu.hart_mut(self.debug.hart).set_reg(r as u8, v);
     }
 
     /// The selected hart's pc: the instruction it executes next.
     pub fn pc(&self) -> u64 {
-        self.cpu.hart(self.debug.hart).pc & self.width_mask()
+        self.cpu.hart(self.debug.hart).pc
     }
 
     pub fn set_pc(&mut self, pc: u64) {
-        let mask = self.width_mask();
-        self.cpu.hart_mut(self.debug.hart).pc = pc & mask;
+        self.cpu.hart_mut(self.debug.hart).pc = pc;
     }
 
     /// The selected hart's privilege mode.
@@ -286,11 +267,7 @@ impl Machine {
     /// CSR `addr` of the selected hart, whatever its privilege mode. `None` if Grail has
     /// no such CSR.
     pub fn csr(&self, addr: u16) -> Option<u64> {
-        let mask = self.width_mask();
-        self.cpu
-            .hart(self.debug.hart)
-            .csr_value(&self.cpu.bus, addr)
-            .map(|v| v & mask)
+        self.cpu.hart(self.debug.hart).csr_value(&self.cpu.bus, addr)
     }
 
     /// Writes CSR `addr` of the selected hart, with the CSR's WARL rules. Returns false if
@@ -300,11 +277,9 @@ impl Machine {
     }
 
     /// The physical address of `addr` in `space`, as [`Machine::read_memory`] sees it.
-    /// A virtual address an RV32 hart cannot form (past 4 GiB) has none.
     pub fn translate(&self, addr: u64, space: Space) -> Option<u64> {
         match space {
             Space::Physical => Some(addr),
-            Space::Virtual if addr & !self.width_mask() != 0 => None,
             Space::Virtual => self
                 .cpu
                 .hart(self.debug.hart)
@@ -435,7 +410,7 @@ impl Machine {
         }
         let hart = self.cpu.next_hart();
         let h = self.cpu.hart(hart);
-        let pc = h.pc & self.width_mask();
+        let pc = h.pc;
         (self.debug.breakpoints.contains(&pc) && h.will_execute(&self.cpu.bus))
             .then_some(Stop::Breakpoint { hart, pc })
     }

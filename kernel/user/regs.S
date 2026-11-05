@@ -8,16 +8,12 @@
 
 #include <asm.h>
 
-# Register xN's pattern: N in each byte, and on RV64 N + 0x80 in each byte
-# of the upper half (x1's is 0x8181818101010101), so that every bit of the
+# Register xN's pattern: N in each byte, and N + 0x80 in each byte of the
+# upper half (x1's is 0x8181818101010101), so that every bit of the
 # register counts. An upper half that is neither zero nor the low half's
 # sign extended: a register the kernel saved with sw and restored with ld,
 # or saved whole and restored with lw, comes back different.
-#if __riscv_xlen == 64
 #define PATTERN(n, high) 0x##high##high##high##high##n##n##n##n
-#else
-#define PATTERN(n, high) 0x##n##n##n##n
-#endif
 
     .equ SPIN, 1500000
 

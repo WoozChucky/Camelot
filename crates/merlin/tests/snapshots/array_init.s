@@ -44,457 +44,459 @@ word:
 
     .text
 
-    # int main(void): frame 64 bytes
-    #     -32(s0)  local int a[6]
-    #     -36(s0)  local char s[4]
-    #     -40(s0)  local char exact[3]
-    #     -48(s0)  local short h[4]
-    #     -52(s0)  local int total
-    #     -56(s0)  local int k
+    # int main(void): frame 80 bytes
+    #     -40(s0)  local int a[6]
+    #     -48(s0)  local char s[4]
+    #     -56(s0)  local char exact[3]
+    #     -64(s0)  local short h[4]
+    #     -68(s0)  local int total
+    #     -72(s0)  local int k
     .globl main
     .type main, @function
 main:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
-    addi  sp, sp, -48
+    addi  sp, sp, -64
     # int a[6] = ...
-    sw    zero, -32(s0)
-    sw    zero, -28(s0)
-    sw    zero, -24(s0)
-    sw    zero, -20(s0)
-    sw    zero, -16(s0)
-    sw    zero, -12(s0)
+    sd    zero, -40(s0)
+    sd    zero, -32(s0)
+    sd    zero, -24(s0)
     li    a0, 5
-    sw    a0, -32(s0)
+    sw    a0, -40(s0)
     li    a0, 6
-    sw    a0, -28(s0)
+    sw    a0, -36(s0)
     li    a0, 7
-    sw    a0, -24(s0)
+    sw    a0, -32(s0)
     # char s[4] = ...
-    sw    zero, -36(s0)
+    sb    zero, -48(s0)
+    sb    zero, -47(s0)
+    sb    zero, -46(s0)
+    sb    zero, -45(s0)
     li    a0, 97
-    sb    a0, -36(s0)
+    sb    a0, -48(s0)
     li    a0, 98
-    sb    a0, -35(s0)
+    sb    a0, -47(s0)
     li    a0, 99
-    sb    a0, -34(s0)
+    sb    a0, -46(s0)
     # char exact[3] = ...
-    sb    zero, -40(s0)
-    sb    zero, -39(s0)
-    sb    zero, -38(s0)
+    sb    zero, -56(s0)
+    sb    zero, -55(s0)
+    sb    zero, -54(s0)
     li    a0, 120
-    sb    a0, -40(s0)
+    sb    a0, -56(s0)
     li    a0, 121
-    sb    a0, -39(s0)
+    sb    a0, -55(s0)
     li    a0, 122
-    sb    a0, -38(s0)
+    sb    a0, -54(s0)
     # short h[4] = ...
-    sw    zero, -48(s0)
-    sw    zero, -44(s0)
+    sd    zero, -64(s0)
     li    a0, -1
-    sh    a0, -48(s0)
+    sh    a0, -64(s0)
     li    a0, 300
-    sh    a0, -46(s0)
+    sh    a0, -62(s0)
     li    a0, 0
-    sw    a0, -52(s0)
+    sw    a0, -68(s0)
     li    a0, 0
-    sw    a0, -56(s0)
+    sw    a0, -72(s0)
 .L.loop.1:
-    lw    a0, -56(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    lw    a0, -72(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 6
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slt   a0, a1, a0
     beqz  a0, .L.break.3
-    lw    a0, -52(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -32
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, -56(s0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    lw    a0, -68(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -40
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    lw    a0, -72(s0)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -52(s0)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -68(s0)
 .L.continue.2:
-    lw    a0, -56(s0)
-    addi  a0, a0, 1
-    sw    a0, -56(s0)
-    addi  a0, a0, -1
+    lw    a0, -72(s0)
+    addiw a0, a0, 1
+    sw    a0, -72(s0)
+    addiw a0, a0, -1
     j     .L.loop.1
 .L.break.3:
-    lw    a0, -52(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    lw    a0, -68(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, g
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, g
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, g
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, g
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 4
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -52(s0)
-    lw    a0, -52(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -68(s0)
+    lw    a0, -68(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 4
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, inferred
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 3
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
-    sw    a0, -52(s0)
-    lw    a0, -52(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    sext.w a0, a0
+    sw    a0, -68(s0)
+    lw    a0, -68(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, grid
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     li    t0, 12
     mul   a0, a0, t0
     add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, grid
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     li    t0, 12
     mul   a0, a0, t0
     add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, grid
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     li    t0, 12
     mul   a0, a0, t0
     add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -52(s0)
-    lw    a0, -52(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -68(s0)
+    lw    a0, -68(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 4
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -36
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -48
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 3
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -36
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -48
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 97
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
-    sw    a0, -52(s0)
-    lw    a0, -52(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    sext.w a0, a0
+    sw    a0, -68(s0)
+    lw    a0, -68(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, word
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 121
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, word
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 3
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, word
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 7
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -52(s0)
-    lw    a0, -52(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -40
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -68(s0)
+    lw    a0, -68(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -56
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 122
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 3
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
-    sw    a0, -52(s0)
-    lw    a0, -52(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -48
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    sext.w a0, a0
+    sw    a0, -68(s0)
+    lw    a0, -68(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -64
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 1
     add   a0, a1, a0
     lh    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -48
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -64
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 1
     add   a0, a1, a0
     lh    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 10
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    div   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -48
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    divw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -64
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 3
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 1
     add   a0, a1, a0
     lh    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -52(s0)
-    lw    a0, -52(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -48
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -68(s0)
+    lw    a0, -68(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -64
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 1
     add   a0, a1, a0
     lh    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
 .L.return.main:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size main, . - main

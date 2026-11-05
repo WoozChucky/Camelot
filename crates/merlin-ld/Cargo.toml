@@ -1,6 +1,6 @@
 [package]
 name = "merlin-ld"
-description = "Merlin linker: ELF32 or ELF64 RISC-V relocatable objects to an Excalibur executable of their class"
+description = "Merlin linker: ELF64 RISC-V relocatable objects to an Excalibur executable"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

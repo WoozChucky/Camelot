@@ -56,12 +56,7 @@ void sbi_init(void) {
 }
 
 void sbi_set_timer(u64 stime) {
-#if __riscv_xlen == 64
     sbi_ecall(SBI_EXT_TIME, SBI_TIME_SET_TIMER, stime, 0, 0, 0, 0, 0);
-#else
-    /* On RV32 the 64-bit value takes two registers, the low half first. */
-    sbi_ecall(SBI_EXT_TIME, SBI_TIME_SET_TIMER, (uintptr)stime, (uintptr)(stime >> 32), 0, 0, 0, 0);
-#endif
 }
 
 long sbi_send_ipi(uintptr mask, uintptr base) {

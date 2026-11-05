@@ -1,13 +1,13 @@
     .file "symbol_names.c"
     .data
 
-    # const char *greeting: 4 bytes
+    # const char *greeting: 8 bytes
     .globl greeting
-    .balign 4
+    .balign 8
     .type greeting, @object
-    .size greeting, 4
+    .size greeting, 8
 greeting:
-    .word .L.str
+    .quad .L.str
 
     # static int .compoundliteral[2]: 8 bytes
     .balign 4
@@ -17,21 +17,21 @@ greeting:
     .word 1
     .word 1
 
-    # int *ones: 4 bytes
+    # int *ones: 8 bytes
     .globl ones
-    .balign 4
+    .balign 8
     .type ones, @object
-    .size ones, 4
+    .size ones, 8
 ones:
-    .word .compoundliteral
+    .quad .compoundliteral
 
-    # const char *farewell: 4 bytes
+    # const char *farewell: 8 bytes
     .globl farewell
-    .balign 4
+    .balign 8
     .type farewell, @object
-    .size farewell, 4
+    .size farewell, 8
 farewell:
-    .word .L.str.1
+    .quad .L.str.1
 
     # static int .compoundliteral.2[1]: 4 bytes
     .balign 4
@@ -40,21 +40,21 @@ farewell:
 .compoundliteral.2:
     .word 2
 
-    # int *twos: 4 bytes
+    # int *twos: 8 bytes
     .globl twos
-    .balign 4
+    .balign 8
     .type twos, @object
-    .size twos, 4
+    .size twos, 8
 twos:
-    .word .compoundliteral.2
+    .quad .compoundliteral.2
 
-    # const char *again: 4 bytes
+    # const char *again: 8 bytes
     .globl again
-    .balign 4
+    .balign 8
     .type again, @object
-    .size again, 4
+    .size again, 8
 again:
-    .word .L.str
+    .quad .L.str
 
     .text
 
@@ -63,46 +63,46 @@ again:
     .type count, @function
 count:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
     la    a0, count.n.4
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    ld    a0, 0(sp)
     lw    a0, 0(a0)
-    addi  a0, a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    addiw a0, a0, 1
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     sw    a0, 0(a1)
-    addi  a0, a0, -1
+    addiw a0, a0, -1
     la    a0, count.n
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, count.tag
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 99
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
 .L.return.count:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size count, . - count
@@ -116,12 +116,12 @@ count:
 count.n:
     .word 5
 
-    # static const char *tag: 4 bytes
-    .balign 4
+    # static const char *tag: 8 bytes
+    .balign 8
     .type count.tag, @object
-    .size count.tag, 4
+    .size count.tag, 8
 count.tag:
-    .word .L.str.3
+    .quad .L.str.3
 
     # static int n: 4 bytes
     .balign 4
@@ -137,33 +137,33 @@ count.n.4:
     .type other, @function
 other:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
     la    a0, other.n.5
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    ld    a0, 0(sp)
     lw    a0, 0(a0)
-    addi  a0, a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    addiw a0, a0, 1
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     sw    a0, 0(a1)
-    addi  a0, a0, -1
+    addiw a0, a0, -1
     la    a0, other.n
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, late
+    ld    a0, 0(a0)
     lw    a0, 0(a0)
-    lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
 .L.return.other:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size other, . - other
@@ -188,97 +188,98 @@ other.n.5:
 
     .data
 
-    # static struct pair *late: 4 bytes
-    .balign 4
+    # static struct pair *late: 8 bytes
+    .balign 8
     .type late, @object
-    .size late, 4
+    .size late, 8
 late:
-    .word .compoundliteral.14
+    .quad .compoundliteral.14
 
     .text
 
-    # int copies(int k): frame 144 bytes
-    #     -12(s0)  param int k
-    #     -24(s0)  local int small[3]
-    #     -36(s0)  local int small[3]
-    #     -76(s0)  local int few[10]
-    #     -88(s0)  local struct named nm
-    #     -92(s0)  local int *five
-    #    -112(s0)  temp int[5] (compound literal)
-    #    -116(s0)  local int *more
+    # int copies(int k): frame 176 bytes
+    #     -20(s0)  param int k
+    #     -32(s0)  local int small[3]
+    #     -48(s0)  local int small[3]
+    #     -88(s0)  local int few[10]
+    #    -104(s0)  local struct named nm
+    #    -112(s0)  local int *five
     #    -136(s0)  temp int[5] (compound literal)
+    #    -144(s0)  local int *more
+    #    -168(s0)  temp int[5] (compound literal)
     .globl copies
     .type copies, @function
 copies:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
-    addi  sp, sp, -128
-    sw    a0, -12(s0)
-    # int small[3] = ...
-    sw    zero, -24(s0)
-    sw    zero, -20(s0)
-    sw    zero, -16(s0)
-    li    a0, 1
-    sw    a0, -24(s0)
-    li    a0, 2
+    addi  sp, sp, -160
     sw    a0, -20(s0)
-    li    a0, 3
-    sw    a0, -16(s0)
     # int small[3] = ...
-    sw    zero, -36(s0)
-    sw    zero, -32(s0)
-    sw    zero, -28(s0)
-    li    a0, 4
-    sw    a0, -36(s0)
-    li    a0, 5
+    sd    zero, -32(s0)
+    sb    zero, -24(s0)
+    sb    zero, -23(s0)
+    sb    zero, -22(s0)
+    sb    zero, -21(s0)
+    li    a0, 1
     sw    a0, -32(s0)
-    li    a0, 6
+    li    a0, 2
     sw    a0, -28(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -36
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    li    a0, 3
+    sw    a0, -24(s0)
+    # int small[3] = ...
+    sd    zero, -48(s0)
+    sb    zero, -40(s0)
+    sb    zero, -39(s0)
+    sb    zero, -38(s0)
+    sb    zero, -37(s0)
+    li    a0, 4
+    sw    a0, -48(s0)
+    li    a0, 5
+    sw    a0, -44(s0)
+    li    a0, 6
+    sw    a0, -40(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -48
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 4
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -12(s0)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
     # int few[10] = ...
-    sw    zero, -76(s0)
-    sw    zero, -72(s0)
-    sw    zero, -68(s0)
-    sw    zero, -64(s0)
-    sw    zero, -60(s0)
-    sw    zero, -56(s0)
-    sw    zero, -52(s0)
-    sw    zero, -48(s0)
-    sw    zero, -44(s0)
-    sw    zero, -40(s0)
+    sd    zero, -88(s0)
+    sd    zero, -80(s0)
+    sd    zero, -72(s0)
+    sd    zero, -64(s0)
+    sd    zero, -56(s0)
     li    a0, 1
-    sw    a0, -76(s0)
+    sw    a0, -88(s0)
     li    a0, 2
-    sw    a0, -72(s0)
+    sw    a0, -84(s0)
     # struct named nm = ...
-    sw    zero, -88(s0)
-    sw    zero, -84(s0)
-    sw    zero, -80(s0)
+    sd    zero, -104(s0)
+    sb    zero, -96(s0)
+    sb    zero, -95(s0)
+    sb    zero, -94(s0)
+    sb    zero, -93(s0)
     la    a0, .L.str.7
-    addi  a1, s0, -88
+    addi  a1, s0, -104
     lbu   t0, 0(a0)
     sb    t0, 0(a1)
     lbu   t0, 1(a0)
@@ -295,170 +296,173 @@ copies:
     sb    t0, 6(a1)
     lbu   t0, 7(a0)
     sb    t0, 7(a1)
-    lw    a0, -12(s0)
-    sw    a0, -80(s0)
-    # compound literal (int[5])
-    sw    zero, -112(s0)
-    sw    zero, -108(s0)
-    sw    zero, -104(s0)
-    sw    zero, -100(s0)
-    sw    zero, -96(s0)
-    li    a0, 1
-    sw    a0, -112(s0)
-    li    a0, 2
-    sw    a0, -108(s0)
-    li    a0, 3
-    sw    a0, -104(s0)
-    li    a0, 4
-    sw    a0, -100(s0)
-    li    a0, 5
+    lw    a0, -20(s0)
     sw    a0, -96(s0)
-    addi  a0, s0, -112
-    sw    a0, -92(s0)
     # compound literal (int[5])
-    sw    zero, -136(s0)
-    sw    zero, -132(s0)
-    sw    zero, -128(s0)
-    sw    zero, -124(s0)
-    sw    zero, -120(s0)
-    li    a0, 5
+    sd    zero, -136(s0)
+    sd    zero, -128(s0)
+    sb    zero, -120(s0)
+    sb    zero, -119(s0)
+    sb    zero, -118(s0)
+    sb    zero, -117(s0)
+    li    a0, 1
     sw    a0, -136(s0)
-    li    a0, 4
+    li    a0, 2
     sw    a0, -132(s0)
     li    a0, 3
     sw    a0, -128(s0)
-    li    a0, 2
+    li    a0, 4
     sw    a0, -124(s0)
-    li    a0, 1
+    li    a0, 5
     sw    a0, -120(s0)
     addi  a0, s0, -136
-    sw    a0, -116(s0)
-    addi  a0, s0, -24
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    sd    a0, -112(s0)
+    # compound literal (int[5])
+    sd    zero, -168(s0)
+    sd    zero, -160(s0)
+    sb    zero, -152(s0)
+    sb    zero, -151(s0)
+    sb    zero, -150(s0)
+    sb    zero, -149(s0)
+    li    a0, 5
+    sw    a0, -168(s0)
+    li    a0, 4
+    sw    a0, -164(s0)
+    li    a0, 3
+    sw    a0, -160(s0)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    slli  a0, a0, 2
-    add   a0, a1, a0
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -76
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    sw    a0, -156(s0)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    sw    a0, -152(s0)
+    addi  a0, s0, -168
+    sd    a0, -144(s0)
+    addi  a0, s0, -32
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    li    a0, 2
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     addi  a0, s0, -88
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    slli  a0, a0, 2
+    add   a0, a1, a0
+    lw    a0, 0(a0)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -104
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    li    a0, 1
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 98
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  a0, s0, -88
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  a0, s0, -104
     addi  a0, a0, 8
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, -92(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    ld    a0, -112(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 4
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, -116(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    ld    a0, -144(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 5
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
 .L.return.copies:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size copies, . - copies
 
-    # int dead(int k): frame 16 bytes
-    #     -12(s0)  param int k
-    #     -16(s0)  local int m
+    # int dead(int k): frame 32 bytes
+    #     -20(s0)  param int k
+    #     -24(s0)  local int m
     .globl dead
     .type dead, @function
 dead:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
+    addi  sp, sp, -16
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
     li    t0, 1
     beq   a0, t0, .L.case.dead.0
     j     .L.case.dead.1
 .L.case.dead.0:
     la    a0, .L.str.9
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 111
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
     j     .L.return.dead
 .L.case.dead.1:
     j     .L.break.1
 .L.break.1:
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
     beqz  a0, .L.else.2
@@ -468,15 +472,15 @@ dead:
     j     .L.label.dead.out
 .L.label.dead.out:
 .L.loop.4:
-    lw    a0, -12(s0)
-    addi  a0, a0, 1
-    sw    a0, -12(s0)
-    addi  a0, a0, -1
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    lw    a0, -20(s0)
+    addiw a0, a0, 1
+    sw    a0, -20(s0)
+    addiw a0, a0, -1
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 3
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slt   a0, a0, a1
     beqz  a0, .L.end.7
     j     .L.break.6
@@ -486,37 +490,37 @@ dead:
     j     .L.loop.4
 .L.break.6:
 .L.continue.8:
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, .L.str.11
     lbu   a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 108
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, dead.n.10
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 4
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
 .L.return.dead:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size dead, . - dead
@@ -539,219 +543,218 @@ dead.n.10:
 
     .text
 
-    # int main(void): frame 16 bytes
-    #     -12(s0)  local int sum
+    # int main(void): frame 32 bytes
+    #     -20(s0)  local int sum
     .globl main
     .type main, @function
 main:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
+    addi  sp, sp, -16
     la    a0, greeting
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 104
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, farewell
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 121
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, again
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     add   a0, a1, a0
     lbu   a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 105
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, ones
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, ones
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, twos
-    lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  sp, sp, -12
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  sp, sp, -8
     call  count
-    addi  sp, sp, 12
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    addi  sp, sp, -12
+    addi  sp, sp, 8
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    addi  sp, sp, -8
     call  other
-    addi  sp, sp, 12
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, 8
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    addi  sp, sp, -12
+    addi  sp, sp, -8
     call  copies
-    addi  sp, sp, 12
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, 8
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    addi  sp, sp, -12
-    call  dead
-    addi  sp, sp, 12
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 5
     addi  sp, sp, -8
     call  dead
     addi  sp, sp, 8
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    li    a0, 5
+    call  dead
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, table
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     slli  a0, a0, 2
     add   a0, a1, a0
     lw    a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 2
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, late
-    lw    a0, 0(a0)
+    ld    a0, 0(a0)
     addi  a0, a0, 4
     lw    a0, 0(a0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, .L.str.12
     lbu   a0, 0(a0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 120
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
     xor   a0, a1, a0
     seqz  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
 .L.return.main:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size main, . - main

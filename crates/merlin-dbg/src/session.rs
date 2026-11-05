@@ -17,7 +17,7 @@
 use crate::camelot;
 use crate::frames::{self, Regs};
 use crate::paging;
-use crate::remote::{self, hex_value, wrap, Remote, StopEvent, Watch};
+use crate::remote::{self, hex_value, Remote, StopEvent, Watch};
 use crate::source::{Lines, Place};
 use crate::symbols::{self, Symbols};
 use crate::vars::{self, Debug, Eval, Target};
@@ -173,9 +173,6 @@ pub enum OnQuit {
 
 pub struct Session<'a, W: Write> {
     remote: Remote,
-    /// The machine's width, which the stub gave: how its code decodes, how wide its
-    /// registers and addresses are.
-    xlen: Xlen,
     symbols: Symbols,
     lines: Lines,
     debug: Debug,
@@ -268,7 +265,6 @@ impl<'a, W: Write> Session<'a, W> {
             None => (Vec::new(), Symbols::default(), Lines::default(), Debug::default()),
         };
         Session {
-            xlen: remote.xlen,
             remote,
             symbols,
             lines,
@@ -475,9 +471,8 @@ impl<'a, W: Write> Session<'a, W> {
     // ---- Expressions ----
 
     /// An address or a value: a number (`0x80000000`, `1234`), a symbol, a register
-    /// (`$sp`, `$a0`, `$x5`, `$pc`), each optionally `+N` or `-N`. As wide as the
-    /// machine's addresses: on RV32 the arithmetic wraps at 2^32, and a number
-    /// must fit in 32 bits.
+    /// (`$sp`, `$a0`, `$x5`, `$pc`), each optionally `+N` or `-N`, in 64 bits as the
+    /// machine's addresses: the arithmetic wraps at 2^64.
     fn eval(&mut self, expr: &str) -> Result<u64> {
         let expr = expr.trim();
         if let Some(i) = expr.rfind(['+', '-']).filter(|&i| i > 0) {
@@ -488,16 +483,13 @@ impl<'a, W: Write> Session<'a, W> {
             } else {
                 base.wrapping_sub(off)
             };
-            return Ok(wrap(self.xlen, v));
+            return Ok(v);
         }
         if let Some(reg) = expr.strip_prefix('$') {
-            let n = register_number(reg, self.xlen).ok_or_else(|| format!("no register ${reg}"))?;
+            let n = register_number(reg).ok_or_else(|| format!("no register ${reg}"))?;
             return self.remote.register(n);
         }
         if let Some(n) = parse_number(expr) {
-            if wrap(self.xlen, n) != n {
-                return Err(format!("{expr} is past the end of a 32-bit address space"));
-            }
             return Ok(n);
         }
         self.symbols
@@ -667,7 +659,7 @@ impl<'a, W: Write> Session<'a, W> {
             .unwrap_or((entry, entry.wrapping_add(1)));
         match self.lines.prologue_end(start, end) {
             Some(body) => body.max(entry),
-            None => frames::scan_prologue(&mut self.remote, entry, self.xlen),
+            None => frames::scan_prologue(&mut self.remote, entry),
         }
     }
 
@@ -680,10 +672,10 @@ impl<'a, W: Write> Session<'a, W> {
         }
     }
 
-    /// `0x80000024 <puts+4>` with all of an address's digits (16 on RV64), as GDB
+    /// `0x0000000080000024 <puts+4>` with all of an address's 16 digits, as GDB
     /// shows a code address in a frame and in disassembly.
     fn show(&self, addr: u64) -> String {
-        self.symbols.show(addr, self.xlen)
+        self.symbols.show(addr)
     }
 
     /// `0x80000024 <puts+4>` without leading zeros, as GDB shows an address
@@ -694,7 +686,7 @@ impl<'a, W: Write> Session<'a, W> {
 
     /// A register's value in hex, with all its digits.
     fn hex(&self, v: u64) -> String {
-        hex_value(v, self.xlen)
+        hex_value(v)
     }
 
     /// `add-symbol-file FILE [program NAME]`: FILE's symbols, in every address space,
@@ -709,7 +701,7 @@ impl<'a, W: Write> Session<'a, W> {
             _ => return Err("add-symbol-file FILE [program NAME]".into()),
         };
         let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-        symbols::check_xlen(&file, self.xlen).map_err(|e| format!("{path}: {e}"))?;
+        symbols::check_program(&file).map_err(|e| format!("{path}: {e}"))?;
         // Each of them parses it, so that a broken file is refused here.
         let mut set = Syms::default();
         set.symbols.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
@@ -830,13 +822,11 @@ impl<'a, W: Write> Session<'a, W> {
     /// How many bytes `watch ADDR` watches without a length. GDB watches an
     /// expression's value, as many bytes as its type has: here, when ADDR is a
     /// symbol with a size in the symbol table (a C variable), that size, at most 8
-    /// (a register's worth on RV64, what `long` and pointers take); else a
-    /// register's worth, 4 bytes on RV32 and 8 on RV64.
+    /// (a register's worth, what `long` and pointers take); else a register's worth.
     fn watch_len(&self, expr: &str) -> u64 {
-        let register = u64::from(self.xlen.bits() / 8);
         match self.symbols.size(expr.trim()) {
             Some(size) => size.min(8),
-            None => register,
+            None => 8,
         }
     }
 
@@ -977,7 +967,6 @@ impl<'a, W: Write> Session<'a, W> {
             symbols: &self.symbols,
             target: &mut self.remote,
             frame: None,
-            xlen: self.xlen,
         }
     }
 
@@ -996,13 +985,13 @@ impl<'a, W: Write> Session<'a, W> {
     /// in every process's table), and in the hart's paging mode.
     fn space_of(&mut self, pagetable: u64) -> Result<(u64, paging::Space)> {
         let satp = self.remote.register(remote::csr(SATP))?;
-        let hart = paging::space(satp, self.xlen)?;
+        let hart = paging::space(satp)?;
         let mut phys = self.remote.physical()?;
         let root = paging::translate(hart, pagetable, &mut |a, size| phys.word(a, size));
         phys.finish()?;
         let root = root.ok_or_else(|| format!("the page table at {pagetable:#x} is not mapped"))?;
-        let value = paging::satp_for(satp, root, self.xlen);
-        Ok((value, paging::space(value, self.xlen)?))
+        let value = paging::satp_for(satp, root);
+        Ok((value, paging::space(value)?))
     }
 
     /// `info processes`: the process table, as `lx-ps` lists Linux's tasks: each
@@ -1197,16 +1186,16 @@ impl<'a, W: Write> Session<'a, W> {
         Ok(Some(pc))
     }
 
-    /// The instruction at `pc`, decoded for the machine's width.
+    /// The instruction at `pc`.
     fn inst_at(&mut self, pc: u64) -> Option<Inst> {
         let word = self.remote.read_word(pc)?;
-        Some(excalibur::decode(word, self.xlen))
+        Some(excalibur::decode(word, Xlen::Rv64))
     }
 
     /// The address `n` bytes past `addr` (code or data), wrapping as the machine's
     /// addresses do.
     fn advance(&self, addr: u64, n: u64) -> u64 {
-        wrap(self.xlen, addr.wrapping_add(n))
+        addr.wrapping_add(n)
     }
 
     /// Where a call at `pc` returns to: after a `jal`/`jalr` that links (`call`,
@@ -1260,7 +1249,7 @@ impl<'a, W: Write> Session<'a, W> {
                 Some(ret) => {
                     // Into the call: one step for `jal`/`jalr`, two for `auipc` + `jalr`.
                     let mut at = pc;
-                    for _ in 0..wrap(self.xlen, ret.wrapping_sub(pc)) / 4 {
+                    for _ in 0..ret.wrapping_sub(pc) / 4 {
                         match self.step_quietly()? {
                             Some(next) => at = next,
                             None => return Ok(false),
@@ -1410,16 +1399,13 @@ impl<'a, W: Write> Session<'a, W> {
         Ok(())
     }
 
-    /// A register's value as a signed number of the register's width.
+    /// A register's value as a signed number.
     fn signed(&self, v: u64) -> i64 {
-        match self.xlen {
-            Xlen::Rv32 => i64::from(v as u32 as i32),
-            Xlen::Rv64 => v as i64,
-        }
+        v as i64
     }
 
     /// `x/N[b|h|w|g] ADDR`: GDB's unit letters, a byte, a halfword, a word (the
-    /// default) and a giant (8 bytes), at both widths; `x`, hex, is the only format,
+    /// default) and a giant (8 bytes),; `x`, hex, is the only format,
     /// and may come before or after the unit. As many on a line as GDB puts.
     fn examine(&mut self, format: &str, addr: &str) -> Result<()> {
         let format = format.strip_prefix('/').unwrap_or(format);
@@ -1469,10 +1455,10 @@ impl<'a, W: Write> Session<'a, W> {
         let at = self.show(pc);
         match self.remote.read_word(pc) {
             Some(word) => {
-                let d = excalibur::decode(word, self.xlen).format(Some(pc), Syntax::objdump(self.xlen));
+                let d = excalibur::decode(word, Xlen::Rv64).format(Some(pc), Syntax::objdump(Xlen::Rv64));
                 let target = d
                     .target
-                    .and_then(|t| self.symbols.describe(wrap(self.xlen, t)))
+                    .and_then(|t| self.symbols.describe(t))
                     .map_or(String::new(), |s| format!(" <{s}>"));
                 format!("{mark} {at}:  {d}{target}")
             }
@@ -1506,7 +1492,6 @@ impl<'a, W: Write> Session<'a, W> {
             pc: r[32],
             ra: r[1],
             fp: r[8],
-            xlen: self.xlen,
         };
         let symbols = &self.symbols;
         Ok(frames::backtrace(&mut self.remote, regs, |pc| {
@@ -1549,7 +1534,6 @@ impl<'a, W: Write> Session<'a, W> {
                     symbols: &self.symbols,
                     target: &mut self.remote,
                     frame: Some(ctx.clone()),
-                    xlen: self.xlen,
                 };
                 (name, eval.show_args(f))
             }
@@ -1612,7 +1596,6 @@ impl<'a, W: Write> Session<'a, W> {
                 space: self.process.map(|(_, s)| s),
             },
             frame,
-            xlen: self.xlen,
         })
     }
 
@@ -1845,8 +1828,8 @@ pub fn parse_number(s: &str) -> Option<u64> {
 }
 
 /// GDB's number for a register name: `pc`, `x0`-`x31`, an ABI name (`fp` too), a CSR
-/// name (those the machine's width has: RV64 has no `cycleh`), or `priv`.
-pub fn register_number(name: &str, xlen: Xlen) -> Option<usize> {
+/// name (RV64's: no `cycleh`), or `priv`.
+pub fn register_number(name: &str) -> Option<usize> {
     match name {
         "pc" => return Some(remote::PC),
         "fp" => return Some(8),
@@ -1859,7 +1842,7 @@ pub fn register_number(name: &str, xlen: Xlen) -> Option<usize> {
     if let Some(r) = excalibur::reg::parse(name) {
         return Some(r as usize);
     }
-    excalibur::csr::parse(name, xlen).map(remote::csr)
+    excalibur::csr::parse(name, Xlen::Rv64).map(remote::csr)
 }
 
 #[cfg(test)]
@@ -1884,19 +1867,16 @@ mod tests {
         assert_eq!(parse_number("42"), Some(42));
         assert_eq!(parse_number("0xffffffff80000000"), Some(0xffff_ffff_8000_0000));
         assert_eq!(parse_number("main"), None);
-        for xlen in [Xlen::Rv32, Xlen::Rv64] {
-            assert_eq!(register_number("sp", xlen), Some(2));
-            assert_eq!(register_number("x31", xlen), Some(31));
-            assert_eq!(register_number("x32", xlen), None);
-            assert_eq!(register_number("fp", xlen), Some(8));
-            assert_eq!(register_number("s0", xlen), Some(8));
-            assert_eq!(register_number("pc", xlen), Some(32));
-            assert_eq!(register_number("mstatus", xlen), Some(65 + 0x300));
-            assert_eq!(register_number("priv", xlen), Some(4161));
-            assert_eq!(register_number("nope", xlen), None);
-        }
-        // The high halves of the counters are RV32's alone.
-        assert_eq!(register_number("cycleh", Xlen::Rv32), Some(65 + 0xc80));
-        assert_eq!(register_number("cycleh", Xlen::Rv64), None);
+        assert_eq!(register_number("sp"), Some(2));
+        assert_eq!(register_number("x31"), Some(31));
+        assert_eq!(register_number("x32"), None);
+        assert_eq!(register_number("fp"), Some(8));
+        assert_eq!(register_number("s0"), Some(8));
+        assert_eq!(register_number("pc"), Some(32));
+        assert_eq!(register_number("mstatus"), Some(65 + 0x300));
+        assert_eq!(register_number("priv"), Some(4161));
+        assert_eq!(register_number("nope"), None);
+        // The high halves of the counters are RV32's alone, which has no machine.
+        assert_eq!(register_number("cycleh"), None);
     }
 }

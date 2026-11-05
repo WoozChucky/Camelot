@@ -1,7 +1,7 @@
 //! What people type, as protocol values. Every front end (Round Table's flags,
 //! Pendragon's forms) parses with these, so they all accept the same syntax.
 
-use avalon_proto::{validate_name, DiskSource, FwdProto, NetSpec, Paging, PortForward, Xlen, SECTOR_SIZE};
+use avalon_proto::{validate_name, DiskSource, FwdProto, NetSpec, Paging, PortForward, SECTOR_SIZE};
 use grail::net::MacAddr;
 use std::net::{IpAddr, SocketAddr};
 
@@ -10,19 +10,9 @@ use std::net::{IpAddr, SocketAddr};
 pub use grail::parse_clock;
 
 /// Parses a `--ram` value as Grail's `--ram` does: MiB, or a number with a unit,
-/// `M`/`MiB`, `G`/`GiB` or `T`/`TiB` in any case, 1 MiB to 1 TiB (an RV32 VM takes at
-/// most 2 GiB: the server says so, since an ELF64 program makes a VM RV64). Returns
-/// bytes.
+/// `M`/`MiB`, `G`/`GiB` or `T`/`TiB` in any case, 1 MiB to 1 TiB. Returns bytes.
 pub fn parse_ram(s: &str) -> Result<u64, String> {
     grail::parse_ram_size(s).map(|bytes| bytes as u64)
-}
-
-/// Parses an `--xlen` value as Grail's `--xlen` does: `32` (RV32) or `64` (RV64).
-pub fn parse_xlen(s: &str) -> Result<Xlen, String> {
-    Ok(match grail::config::parse_xlen(s)? {
-        grail::Xlen::Rv32 => Xlen::Rv32,
-        grail::Xlen::Rv64 => Xlen::Rv64,
-    })
 }
 
 /// Parses a `--paging` value as Grail's `--paging` does: `sv48` (Sv48 and Sv39) or
@@ -108,8 +98,7 @@ pub fn parse_disk_source(s: &str) -> Result<DiskSource, String> {
 /// Parses a disk size: a whole number with an optional unit, any case: none or `B`
 /// for bytes, `K`/`KiB`, `M`/`MiB`, `G`/`GiB` (powers of 1024), or `S`/`sector(s)` for
 /// 512-byte sectors (`64MiB`, `1G`, `2048s`). The size must be a non-zero whole number
-/// of sectors, at most what a Grail disk shows an RV32 machine (2^32 - 1 sectors, which
-/// is also Lake's largest image). Returns sectors.
+/// of sectors, at most Lake's largest image ([`MAX_DISK_SECTORS`]). Returns sectors.
 pub fn parse_disk_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let bad = || format!("'{s}' is not a disk size (examples: 64MiB, 512K, 1G, 2048s)");
@@ -125,12 +114,7 @@ pub fn parse_disk_size(s: &str) -> Result<u64, String> {
         _ => return Err(bad()),
     };
     let n: u64 = number.parse().map_err(|_| bad())?;
-    let too_big = || {
-        format!(
-            "{s} is too big (at most {} sectors)",
-            grail::block::V1_MAX_SECTORS
-        )
-    };
+    let too_big = || format!("{s} is too big (at most {} sectors)", MAX_DISK_SECTORS);
     let bytes = n.checked_mul(scale).ok_or_else(too_big)?;
     if bytes == 0 || !bytes.is_multiple_of(SECTOR_SIZE as u64) {
         return Err(format!(
@@ -138,11 +122,15 @@ pub fn parse_disk_size(s: &str) -> Result<u64, String> {
         ));
     }
     let sectors = bytes / SECTOR_SIZE as u64;
-    if sectors > grail::block::V1_MAX_SECTORS {
+    if sectors > MAX_DISK_SECTORS {
         return Err(too_big());
     }
     Ok(sectors)
 }
+
+/// The largest disk [`parse_disk_size`] takes: Lake's largest image,
+/// `lake::MAX_IMAGE_SECTORS`, 2^32 - 1 sectors (just under 2 TiB).
+pub const MAX_DISK_SECTORS: u64 = u32::MAX as u64;
 
 /// Parses a network card for a VM's hardware profile: `SWITCH[,mac=ADDR]`, the switch
 /// on Avalon to plug it into (`-` for none: the card starts unplugged) and optionally
@@ -197,27 +185,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn widths_and_paging_modes() {
-        assert_eq!(parse_xlen("32"), Ok(Xlen::Rv32));
-        assert_eq!(parse_xlen(" 64 "), Ok(Xlen::Rv64));
+    fn paging_modes_and_ram() {
         assert_eq!(parse_paging("sv48"), Ok(Paging::Sv48));
         assert_eq!(parse_paging("sv39"), Ok(Paging::Sv39));
         // What the clients show parses back.
-        for xlen in [Xlen::Rv32, Xlen::Rv64] {
-            assert_eq!(parse_xlen(&xlen.bits().to_string()), Ok(xlen));
-        }
         for paging in [Paging::Sv48, Paging::Sv39] {
             assert_eq!(parse_paging(&paging.to_string()), Ok(paging));
         }
         assert_eq!(
-            parse_xlen("128").unwrap_err(),
-            "'128' is not a register width (32 or 64)"
-        );
-        assert_eq!(
             parse_paging("sv57").unwrap_err(),
             "'sv57' is not a paging mode (sv39 or sv48)"
         );
-        // RAM up to RV64's 1 TiB; an RV32 VM's 2 GiB is the server's to say.
+        // RAM up to 1 TiB.
         assert_eq!(parse_ram("1T"), Ok(1 << 40));
         assert_eq!(parse_ram("16G"), Ok(16 << 30));
         assert_eq!(
@@ -397,7 +376,7 @@ mod tests {
         ok("1 sector", 1);
         ok("1Sector", 1);
         ok("2047GiB", 2047 << 21);
-        ok("4294967295s", grail::block::V1_MAX_SECTORS);
+        ok("4294967295s", MAX_DISK_SECTORS);
         for bad in [
             "",
             "0",

@@ -8,7 +8,7 @@
 //!   This covers what the golden file can't (Xcal, CSRs by name, `li` splits,
 //!   explicit `%pcrel_hi`/`%pcrel_lo` pairs on user labels) and spells out the
 //!   operation and operands of every mnemonic in the golden file.
-//! * `CLANG_WORDS`: lines the golden file doesn't have (every `.insn` form,
+//! * `CLANG_WORDS64`: lines the golden file doesn't have (every `.insn` form,
 //!   counter reads, short forms, `li` edges) must give clang's exact words.
 //! * `disasm`: every word LLVM produced for the golden file (plus a few
 //!   more from clang), decoded and printed with the disassembler, must
@@ -16,29 +16,25 @@
 //!   reassembles, and catches bits `decode` ignores, like fence's pred/succ.
 //!   Words patched by a relocation are left out: their fields are zero.
 //!
-//! Each check runs for both widths. On RV64 the decoder and the disassembler
-//! are given `Xlen::Rv64`, the RV64-only instructions have tables of their
-//! own (`expected64`, `CLANG_WORDS64`, the `.d` atomics, rv64/encode.golden),
-//! and the RV32 rows the width changes are left out (`WIDTH_DEPENDENT`).
+//! The decoder and the disassembler are given `Xlen::Rv64`; RV64's own
+//! instructions have tables of their own (`expected64`, the `.d` atomics).
 
 use excalibur::{
     AluOp, AmoOp, AmoWidth, BranchOp, CsrOp, CsrSrc, Inst, LoadOp, MulOp, Ordering, StoreOp, Syntax, Xlen,
 };
 use merlin_as::reloc::RelocKind;
-use merlin_as::Options;
 
-const RV32: Xlen = Xlen::Rv32;
 const RV64: Xlen = Xlen::Rv64;
 
-fn decode(w: u32, xlen: Xlen) -> Inst {
-    excalibur::decode(w, xlen)
+fn decode(w: u32) -> Inst {
+    excalibur::decode(w, RV64)
 }
 
 /// The disassembler's plain text for `inst` (decimal immediates, no
-/// pseudo-instructions), which merlin-as must accept. The width matters for
-/// CSR names only: `cycleh` is a name on RV32 and a number on RV64.
-fn disasm(inst: Inst, xlen: Xlen) -> String {
-    inst.format(None, Syntax::plain(xlen)).to_string()
+/// pseudo-instructions), which merlin-as must accept: RV64's, where `cycleh`
+/// is a number, not a name.
+fn disasm(inst: Inst) -> String {
+    inst.format(None, Syntax::plain(RV64)).to_string()
 }
 
 /// One word of `.text` and the relocation that will patch it, if any.
@@ -64,9 +60,9 @@ enum To {
     Auipc(u32),
 }
 
-/// The words of `.text` for `xlen`, or the first error.
-fn assemble(src: &str, xlen: Xlen) -> Result<Vec<Word>, String> {
-    let obj = merlin_as::assemble_with(src, &Options { xlen }).map_err(|errs| errs[0].to_string())?;
+/// The words of `.text`, or the first error.
+fn assemble(src: &str) -> Result<Vec<Word>, String> {
+    let obj = merlin_as::assemble(src).map_err(|errs| errs[0].to_string())?;
     let text = &obj.sections[0];
     let reloc_at = |offset: u32| {
         let r = text.relocs.iter().find(|r| r.offset == offset)?;
@@ -417,12 +413,6 @@ fn expected() -> Rows {
         ("rdcycle a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc00)]),
         ("rdtime a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc01)]),
         ("rdinstret a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc02)]),
-        ("rdcycleh a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc80)]),
-        ("rdtimeh a0", vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc81)]),
-        (
-            "rdinstreth a0",
-            vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc82)],
-        ),
         // CSRs, by name and by number
         (
             "csrrw a0, mstatus, a1",
@@ -645,13 +635,6 @@ fn expected() -> Rows {
             ],
         ),
         (
-            "li a0, 0x80000000",
-            vec![Lui {
-                rd: A0,
-                imm: 0x8000_0000u32 as i32,
-            }],
-        ),
-        (
             "li a0, 0x12345678",
             vec![
                 Lui {
@@ -680,16 +663,6 @@ fn expected() -> Rows {
                     imm: 0xffff_f000u32 as i32,
                 },
                 i(AluOp::Add, A0, A0, 2047),
-            ],
-        ),
-        (
-            "li a0, 0x7ffff800",
-            vec![
-                Lui {
-                    rd: A0,
-                    imm: 0x8000_0000u32 as i32,
-                },
-                i(AluOp::Add, A0, A0, -2048),
             ],
         ),
         // .equ constants are plain numbers to the encoder.
@@ -858,16 +831,6 @@ fn expected_relocs() -> RelocRows {
     ]
 }
 
-/// The rows of `expected()` that encode differently on RV64, or not at all,
-/// and why. `roundtrip_expected_on_rv64` leaves them out.
-const WIDTH_DEPENDENT: &[(&str, &str)] = &[
-    ("rdcycleh a0", "RV32 only"),
-    ("rdtimeh a0", "RV32 only"),
-    ("rdinstreth a0", "RV32 only"),
-    ("li a0, 0x80000000", "positive on RV64: addi 1; slli 31"),
-    ("li a0, 0x7ffff800", "lui alone would sign-extend it: lui; addiw"),
-];
-
 /// RV64-only source lines and the instructions `decode` must return for them.
 fn expected64() -> Rows {
     use Inst::*;
@@ -924,7 +887,7 @@ fn expected64() -> Rows {
             "csrr a0, 0xc80",
             vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc80)],
         ),
-        // li, as LLVM's RISCVMatInt builds 64-bit values (rv64/li.golden has
+        // li, as LLVM's RISCVMatInt builds 64-bit values (golden/li.golden has
         // many more, word for word): addiw only where addi would be wrong,
         // then shifts, a final srli for leading zeros, xori for leading ones.
         (
@@ -997,26 +960,16 @@ fn expected_relocs64() -> RelocRows {
     ]
 }
 
-/// The rows and relocations `roundtrip_expected` checks on `xlen`.
-fn rows(xlen: Xlen) -> (Rows, RelocRows) {
-    match xlen {
-        Xlen::Rv32 => (expected(), expected_relocs()),
-        Xlen::Rv64 => {
-            let same = |src: &str| !WIDTH_DEPENDENT.iter().any(|(s, _)| *s == src);
-            let mut rows: Vec<_> = expected().into_iter().filter(|(src, _)| same(src)).collect();
-            rows.extend(expected64());
-            let mut relocs: Vec<_> = expected_relocs()
-                .into_iter()
-                .filter(|(src, _)| same(src))
-                .collect();
-            relocs.extend(expected_relocs64());
-            (rows, relocs)
-        }
-    }
+/// The rows and relocations `roundtrip_expected` checks.
+fn rows() -> (Rows, RelocRows) {
+    let mut rows = expected();
+    rows.extend(expected64());
+    let mut relocs = expected_relocs();
+    relocs.extend(expected_relocs64());
+    (rows, relocs)
 }
 
-/// A typo in `expected_relocs` or `WIDTH_DEPENDENT` would silently drop
-/// their checks.
+/// A typo in `expected_relocs` would silently drop its checks.
 #[test]
 fn every_expected_reloc_row_is_in_the_table() {
     for (table, relocs) in [
@@ -1033,36 +986,23 @@ fn every_expected_reloc_row_is_in_the_table() {
             );
         }
     }
-    let rows: Vec<&str> = expected().iter().map(|(src, _)| *src).collect();
-    for (src, _) in WIDTH_DEPENDENT {
-        assert!(rows.contains(src), "'{src}' is not in expected()");
-    }
 }
 
 #[test]
 fn roundtrip_expected() {
-    check_expected(RV32);
-}
-
-#[test]
-fn roundtrip_expected_on_rv64() {
-    check_expected(RV64);
-}
-
-fn check_expected(xlen: Xlen) {
     let mut rep = Report::new("decode(encode(x)) == x");
-    let (rows, relocs) = rows(xlen);
+    let (rows, relocs) = rows();
     for (src, want) in rows {
         rep.total += 1;
         let shown = src.replace('\n', "; ");
-        let words = match assemble(src, xlen) {
+        let words = match assemble(src) {
             Ok(w) => w,
             Err(e) => {
                 rep.fails.push(format!("  {shown:<34} error: {e}"));
                 continue;
             }
         };
-        let got: Vec<Inst> = words.iter().map(|w| decode(w.word, xlen)).collect();
+        let got: Vec<Inst> = words.iter().map(|w| decode(w.word)).collect();
         if got != want {
             rep.fails
                 .push(format!("  {shown:<34} got {got:?}\n  {:<34} want {want:?}", ""));
@@ -1088,21 +1028,15 @@ fn check_expected(xlen: Xlen) {
 }
 
 /// Every A mnemonic with every ordering suffix, with registers that vary per
-/// line, decodes to the instruction it names: the `.w` forms on both widths,
-/// the `.d` forms on RV64. The mnemonic-to-operation table here is the
-/// test's own.
+/// line, decodes to the instruction it names: the `.w` and the `.d` forms.
+/// The mnemonic-to-operation table here is the test's own.
 #[test]
 fn roundtrip_atomics() {
-    check_atomics(RV32, AmoWidth::W);
+    check_atomics(AmoWidth::W);
+    check_atomics(AmoWidth::D);
 }
 
-#[test]
-fn roundtrip_atomics_on_rv64() {
-    check_atomics(RV64, AmoWidth::W);
-    check_atomics(RV64, AmoWidth::D);
-}
-
-fn check_atomics(xlen: Xlen, width: AmoWidth) {
+fn check_atomics(width: AmoWidth) {
     let mut rep = Report::new("A extension: decode(encode(x)) == x");
     let w = match width {
         AmoWidth::W => "w",
@@ -1169,16 +1103,16 @@ fn check_atomics(xlen: Xlen, width: AmoWidth) {
                 }
             };
             rep.total += 1;
-            match assemble(&src, xlen) {
-                Ok(words) if words.len() == 1 && decode(words[0].word, xlen) == want => {
+            match assemble(&src) {
+                Ok(words) if words.len() == 1 && decode(words[0].word) == want => {
                     // And the disassembly is the source back.
-                    let text = disasm(want, xlen);
+                    let text = disasm(want);
                     if text != src {
                         rep.fails.push(format!("  {src:<36} disassembles to '{text}'"));
                     }
                 }
                 Ok(words) => {
-                    let got: Vec<Inst> = words.iter().map(|w| decode(w.word, xlen)).collect();
+                    let got: Vec<Inst> = words.iter().map(|w| decode(w.word)).collect();
                     rep.fails.push(format!("  {src:<36} got {got:?}, want {want:?}"));
                 }
                 Err(e) => rep.fails.push(format!("  {src:<36} error: {e}")),
@@ -1191,57 +1125,15 @@ fn check_atomics(xlen: Xlen, width: AmoWidth) {
 
 // ----- exact words from clang -----
 
-/// Lines not in the golden file, with the words clang 21.1.5 gives for each
-/// (`clang --target=riscv32 -march=rv32im_zicsr_zifencei -mno-relax -c`,
-/// one line per file, read back with `llvm-objdump -d`). Pins the encodings
-/// that `expected()` can't tell apart through `decode` or doesn't list: every
-/// `.insn` form, the counter reads, `zext.b`, the `jalr`/`csrw`/`sfence.vma`
-/// short forms and the edges of `li`'s shift form.
-const CLANG_WORDS: &[(&str, &[u32])] = &[
-    (".insn r 0x33, 0, 0x20, a0, a1, a2", &[0x40c5_8533]),
-    (".insn r 0x0b, 7, 0x7f, t6, s0, a5", &[0xfef4_7f8b]),
-    (".insn i 0x13, 0, a0, a1, -5", &[0xffb5_8513]),
-    (".insn i 0x03, 2, a0, 8(a1)", &[0x0085_a503]),
-    (".insn i 0x67, 0, ra, -16(t0)", &[0xff02_80e7]),
-    (".insn s 0x23, 2, a1, 12(a0)", &[0x00b5_2623]),
-    (".insn s 0x23, 0, t1, -2048(sp)", &[0x8061_0023]),
-    (".insn b 0x63, 1, a0, a1, 16", &[0x00b5_1863]),
-    (".insn b 0x63, 4, t0, t1, -4096", &[0x8062_c063]),
-    (".insn u 0x37, a0, 0x12345", &[0x1234_5537]),
-    (".insn u 0x17, t0, 0xfffff", &[0xffff_f297]),
-    (".insn 0x00b50533", &[0x00b5_0533]),
-    (".insn 4, 0x40b50533", &[0x40b5_0533]),
-    ("zext.b a0, a1", &[0x0ff5_f513]),
-    ("rdcycle a0", &[0xc000_2573]),
-    ("rdtime a1", &[0xc010_25f3]),
-    ("rdinstret a2", &[0xc020_2673]),
-    ("rdcycleh a3", &[0xc800_26f3]),
-    ("rdtimeh a4", &[0xc810_2773]),
-    ("rdinstreth a5", &[0xc820_27f3]),
-    ("jalr ra, t0, 8", &[0x0082_80e7]),
-    ("jalr a0, a1, -2048", &[0x8005_8567]),
-    ("jalr t0", &[0x0002_80e7]),
-    // A number where a csrw/csrs/csrc wants a register: the immediate form.
-    ("csrw mstatus, 8", &[0x3004_5073]),
-    ("csrs sie, 31", &[0x104f_e073]),
-    ("csrc sstatus, 2", &[0x1001_7073]),
-    ("sfence.vma a0", &[0x1205_0073]),
-    // li's shift form takes c in -32..=31 only: 33 << 11 and -33 << 11 are
-    // lui + addi, 31 << 11 and -31 << 11 are addi + slli.
-    ("li a0, 0x10800", &[0x0001_1537, 0x8005_0513]),
-    ("li a0, -0x10800", &[0xffff_0537, 0x8005_0513]),
-    ("li a0, 0xf800", &[0x01f0_0513, 0x00b5_1513]),
-    ("li a0, -0xf800", &[0xfe10_0513, 0x00b5_1513]),
-    ("li a0, -3968", &[0xfe10_0513, 0x0075_1513]), // -31 << 7
-    ("li a0, -4224", &[0xffff_f537, 0xf805_0513]), // -33 << 7
-    ("li a0, 0x7ff800", &[0x0080_0537, 0x8005_0513]),
-];
-
-/// The same for RV64 (`clang --target=riscv64 -march=rv64ima_zicsr_zifencei
-/// -mabi=lp64 -mno-relax -c`, LLVM 23.1.4): `CLANG_WORDS` without the RV32-only
-/// counter reads, the `.insn` forms of the RV64 opcodes and of `ld`/`lwu`/`sd`,
-/// RV32-only CSRs by number, `%hi`/`%lo` of constants wider than 32 bits, and
-/// `li` of values written in ways that wrap or shift in 64 bits.
+/// Lines the golden file doesn't have and their words from clang
+/// (`clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64
+/// -mno-relax -c`, LLVM 23.1.4, one line per file, read back with
+/// `llvm-objdump -d`). Pins the encodings that `expected()` can't tell apart
+/// through `decode` or doesn't list: every `.insn` form (the RV64 opcodes' and
+/// `ld`/`lwu`/`sd`'s too), the counter reads, `zext.b`, the
+/// `jalr`/`csrw`/`sfence.vma` short forms, RV32-only CSRs by number, `%hi`/`%lo`
+/// of constants wider than 32 bits, and `li` of values at the edges of its shift
+/// form or written in ways that wrap or shift in 64 bits.
 const CLANG_WORDS64: &[(&str, &[u32])] = &[
     (".insn r 0x33, 0, 0x20, a0, a1, a2", &[0x40c5_8533]),
     (".insn r 0x0b, 7, 0x7f, t6, s0, a5", &[0xfef4_7f8b]),
@@ -1280,7 +1172,7 @@ const CLANG_WORDS64: &[(&str, &[u32])] = &[
     ("csrrs a0, 0x310, zero", &[0x3100_2573]),
     ("csrr a0, pmpcfg2", &[0x3a20_2573]),
     ("csrr a1, cycle", &[0xc000_25f3]),
-    // The shift form's edges, as on RV32.
+    // The shift form's edges.
     ("li a0, 0x10800", &[0x0001_1537, 0x8005_0513]),
     ("li a0, -0x10800", &[0xffff_0537, 0x8005_0513]),
     ("li a0, 0xf800", &[0x01f0_0513, 0x00b5_1513]),
@@ -1315,19 +1207,10 @@ const CLANG_WORDS64: &[(&str, &[u32])] = &[
 
 #[test]
 fn matches_clang_words() {
-    check_clang_words(CLANG_WORDS, RV32);
-}
-
-#[test]
-fn matches_clang_words_on_rv64() {
-    check_clang_words(CLANG_WORDS64, RV64);
-}
-
-fn check_clang_words(lines: &[(&str, &[u32])], xlen: Xlen) {
     let mut rep = Report::new("words == clang's");
-    for &(src, want) in lines {
+    for &(src, want) in CLANG_WORDS64 {
         rep.total += 1;
-        match assemble(src, xlen) {
+        match assemble(src) {
             Ok(words) => {
                 let got: Vec<u32> = words.iter().map(|w| w.word).collect();
                 if got != want || words.iter().any(|w| w.reloc.is_some()) {
@@ -1370,12 +1253,11 @@ fn golden_words(golden: &'static str) -> Vec<(&'static str, Vec<u32>)> {
         .collect()
 }
 
-/// Re-assembles the plain disassembly of `w` for `xlen`. Err: why it doesn't
-/// round-trip.
-fn reassemble(w: u32, xlen: Xlen) -> Result<u32, String> {
+/// Re-assembles the plain disassembly of `w`. Err: why it doesn't round-trip.
+fn reassemble(w: u32) -> Result<u32, String> {
     // The disassembler's syntax, which merlin-as accepts.
-    let text = disasm(decode(w, xlen), xlen);
-    match assemble(&text, xlen) {
+    let text = disasm(decode(w));
+    match assemble(&text) {
         Ok(again) if again.len() == 1 => Ok(again[0].word),
         Ok(again) => {
             let again: Vec<String> = again.iter().map(|w| format!("{:08x}", w.word)).collect();
@@ -1390,17 +1272,9 @@ fn reassemble(w: u32, xlen: Xlen) -> Result<u32, String> {
 
 #[test]
 fn roundtrip_disasm() {
-    check_disasm(include_str!("golden/encode.golden"), CLANG_WORDS, RV32);
-}
-
-#[test]
-fn roundtrip_disasm_on_rv64() {
-    check_disasm(include_str!("golden/rv64/encode.golden"), CLANG_WORDS64, RV64);
-}
-
-fn check_disasm(golden: &'static str, clang: &[(&'static str, &[u32])], xlen: Xlen) {
+    let golden = include_str!("golden/encode.golden");
     let mut rep = Report::new("encode(disasm(decode(w))) == w");
-    // Not in the golden files, and the same on both widths. Words from clang
+    // Not in the golden file. Words from clang
     // (Xcal written as `.insn i 0x0b, ...`).
     let extra = [
         ("xcal.dbg a0", vec![0x0005_000b]),
@@ -1411,13 +1285,13 @@ fn check_disasm(golden: &'static str, clang: &[(&'static str, &[u32])], xlen: Xl
         ("fence.tso", vec![0x8330_000f]),
         ("unimp", vec![0xc000_1073]),
     ];
-    let clang = clang.iter().map(|&(src, words)| (src, words.to_vec()));
+    let clang = CLANG_WORDS64.iter().map(|&(src, words)| (src, words.to_vec()));
     for (src, words) in golden_words(golden).into_iter().chain(extra).chain(clang) {
         rep.total += 1;
         // Words are compared, not decoded `Inst`s: `decode` ignores some bits
         // (fence's pred/succ, for one) that must still come out right.
         for w in words {
-            match reassemble(w, xlen) {
+            match reassemble(w) {
                 Ok(again) if again == w => {}
                 Ok(again) => {
                     rep.fails
@@ -1437,19 +1311,10 @@ fn check_disasm(golden: &'static str, clang: &[(&'static str, &[u32])], xlen: Xl
 /// The same round trip on a large pseudo-random sample of instruction words:
 /// every word the decoder accepts must disassemble to text that assembles to
 /// an instruction decoding the same way, and to the very same word unless it
-/// is a fence (whose reserved fields the decoder ignores). On RV64 too, where
-/// more words are instructions (OP-32, OP-IMM-32, ld, 6-bit shifts...).
+/// is a fence (whose reserved fields the decoder ignores). RV64's words
+/// included (OP-32, OP-IMM-32, ld, 6-bit shifts...).
 #[test]
 fn roundtrip_random_words() {
-    check_random_words(RV32);
-}
-
-#[test]
-fn roundtrip_random_words_on_rv64() {
-    check_random_words(RV64);
-}
-
-fn check_random_words(xlen: Xlen) {
     let mut rep = Report::new("random words");
     let mut x: u32 = 0x1234_5678;
     let mut valid = 0;
@@ -1461,18 +1326,18 @@ fn check_random_words(xlen: Xlen) {
         // Force a 32-bit instruction, and pick the major opcode from the low
         // bits so every format gets a fair share.
         let w = x | 3;
-        let inst = decode(w, xlen);
+        let inst = decode(w);
         if matches!(inst, Inst::Illegal(_)) {
             continue;
         }
         valid += 1;
         rep.total += 1;
-        match reassemble(w, xlen) {
+        match reassemble(w) {
             Ok(again) if again == w => {}
-            Ok(again) if w & 0x7f == 0b0001111 && decode(again, xlen) == inst => {}
+            Ok(again) if w & 0x7f == 0b0001111 && decode(again) == inst => {}
             Ok(again) => rep.fails.push(format!(
                 "  {w:08x} ({}) assembles back to {again:08x}",
-                disasm(inst, xlen)
+                disasm(inst)
             )),
             Err(why) => rep.fails.push(format!("  {why}")),
         }

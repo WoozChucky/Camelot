@@ -11,7 +11,7 @@ use crate::switch::generated_mac;
 use avalon_proto::{DeviceSpec, DiskSource, DiskSpec, HardwareProfile, NetSpec};
 use grail::bus::MAX_NETS;
 use grail::net::MacAddr;
-use grail::{DiskConfig, MachineConfig, Xlen};
+use grail::{DiskConfig, MachineConfig};
 
 /// One network card of a profile, as the server builds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,26 +62,20 @@ pub fn card_configs(vm: &str, profile: &HardwareProfile) -> Result<Vec<CardConfi
 /// exists. Only the disk names are checked here; whether an image exists and can be
 /// attached is Lake's to say, when the machine is built.
 ///
-/// The VM is as wide as the profile says (protocol doc, section 3, "The width"),
-/// unless its `program` is ELF64: that makes an RV32 VM RV64, as `Machine::load_elf`
-/// will when it loads it, so the RAM is checked against the width the VM will have
-/// (Grail's `max_ram_size`: 1 TiB, 2 GiB on RV32). An ELF32 program on an RV64 VM is
-/// left for `load_elf` to refuse (`InvalidProgram`). A VM that boots from disk (no
-/// program) has the profile's width, and its boot ROM with it.
+/// Every VM is RV64 (protocol doc, section 3, "The width"): an ELF32 program is left
+/// for `Machine::load_elf` to refuse (`InvalidProgram`).
 ///
-/// Firmware (`bios`) is checked here too, as the hardware it is: an RV32 VM (an RV32
-/// profile whose program, if any, is not ELF64) has none, and the firmware must be
-/// one Grail can load (`grail::firmware::Image::of`: a file that can be read, an ELF
-/// of RV64 or a raw binary, that fits in the firmware's 2 MiB). A file is on Avalon's
+/// Firmware (`bios`) is checked here too, as the hardware it is: it must be one
+/// Grail can load (`grail::firmware::Image::of`: a file that can be read, an ELF of
+/// RV64 or a raw binary, that fits in the firmware's 2 MiB). A file is on Avalon's
 /// host, relative to its working directory, as a disk image's; and as a disk image
 /// that cannot be opened, firmware that cannot be loaded is `InvalidProfile`.
-pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<MachineConfig, String> {
+pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String> {
     let HardwareProfile {
         ram_size,
         clock_hz,
         nominal_hz,
         harts,
-        xlen,
         paging,
         bios,
         devices,
@@ -110,12 +104,6 @@ pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<Machi
         disks,
         // The server makes the cards (`card_configs`).
         nets: Vec::new(),
-        xlen: match (grail::elf::class(program), xlen) {
-            // What loading it will make the machine.
-            (Some(Xlen::Rv64), _) => Xlen::Rv64,
-            (_, avalon_proto::Xlen::Rv32) => Xlen::Rv32,
-            (_, avalon_proto::Xlen::Rv64) => Xlen::Rv64,
-        },
         paging: match paging {
             avalon_proto::Paging::Sv48 => grail::Paging::Sv48,
             avalon_proto::Paging::Sv39 => grail::Paging::Sv39,
@@ -124,15 +112,8 @@ pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<Machi
     };
     config.validate()?;
     if config.bios.is_some() {
-        if config.xlen == Xlen::Rv32 {
-            return Err(
-                "firmware (bios) is for RV64 VMs only: an RV32 VM, which an RV32 profile is \
-                        unless its program is ELF64, boots its program or disk in M-mode (bios none)"
-                    .into(),
-            );
-        }
         // Loaded and dropped: the machine loads it again when it is built.
-        grail::firmware::Image::of(&config.bios, Xlen::Rv64)?;
+        grail::firmware::Image::of(&config.bios)?;
     }
     Ok(config)
 }
@@ -144,15 +125,6 @@ pub fn machine_bios(bios: &avalon_proto::Bios) -> grail::Bios {
         avalon_proto::Bios::None => grail::Bios::None,
         avalon_proto::Bios::Default => grail::Bios::Default,
         avalon_proto::Bios::File(path) => grail::Bios::File(path.into()),
-    }
-}
-
-/// The protocol's name for Grail's width `xlen`: what a VM's profile says once its
-/// machine is built (an ELF64 program has made it RV64).
-pub fn profile_xlen(xlen: Xlen) -> avalon_proto::Xlen {
-    match xlen {
-        Xlen::Rv32 => avalon_proto::Xlen::Rv32,
-        Xlen::Rv64 => avalon_proto::Xlen::Rv64,
     }
 }
 
@@ -168,7 +140,6 @@ mod tests {
             clock_hz: Some(2_000_000),
             nominal_hz: 5,
             harts: 4,
-            xlen: avalon_proto::Xlen::Rv64,
             paging: avalon_proto::Paging::Sv39,
             bios: avalon_proto::Bios::Default,
             devices: vec![
@@ -190,7 +161,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            machine_config(&profile, &[]).unwrap(),
+            machine_config(&profile).unwrap(),
             MachineConfig {
                 ram_size: 64 * MIB,
                 clock_hz: Some(2_000_000),
@@ -202,13 +173,12 @@ mod tests {
                     DiskConfig::file("b.img").with_read_only(true)
                 ],
                 nets: Vec::new(),
-                xlen: Xlen::Rv64,
                 paging: grail::Paging::Sv39,
                 bios: grail::Bios::Default,
             }
         );
         assert_eq!(
-            machine_config(&HardwareProfile::default(), &[]).unwrap(),
+            machine_config(&HardwareProfile::default()).unwrap(),
             MachineConfig::default()
         );
     }
@@ -253,7 +223,7 @@ mod tests {
             ]
         );
         // The disks are the machine's; the cards are not in its config.
-        let config = machine_config(&profile, &[]).unwrap();
+        let config = machine_config(&profile).unwrap();
         assert_eq!(config.disks, [DiskConfig::file("a.img")]);
         assert!(config.nets.is_empty());
         assert_eq!(card_configs("web", &HardwareProfile::default()), Ok(Vec::new()));
@@ -287,52 +257,20 @@ mod tests {
     }
 
     #[test]
-    fn a_vm_is_as_wide_as_its_program() {
-        // An ELF64 program makes the VM RV64, which takes more than RV32's 2 GiB; only
-        // the header's class is read here.
-        let big = HardwareProfile::with_ram(16 << 30);
-        let elf64 = b"\x7fELF\x02\x01\x01";
-        let config = machine_config(&big, elf64).unwrap();
-        assert_eq!((config.xlen, config.ram_size), (Xlen::Rv64, 16 << 30));
-        for program in [&b"\x7fELF\x01\x01\x01"[..], &[]] {
-            let e = machine_config(&big, program).unwrap_err();
-            assert!(e.contains("an RV32 machine has at most 2 GiB"), "{e}");
-        }
-        assert_eq!(
-            machine_config(&HardwareProfile::default(), &[]).unwrap().xlen,
-            Xlen::Rv32
-        );
-    }
-
-    #[test]
-    fn a_profile_sets_the_width_and_the_paging() {
-        let rv64 = HardwareProfile {
-            xlen: avalon_proto::Xlen::Rv64,
+    fn a_profile_sets_the_paging() {
+        let sv39 = HardwareProfile {
             paging: avalon_proto::Paging::Sv39,
             ..HardwareProfile::with_ram(16 << 30)
         };
-        // Booting from disk, or with an ELF64 program: RV64 with Sv39 alone.
-        for program in [&[][..], b"\x7fELF\x02\x01\x01"] {
-            let config = machine_config(&rv64, program).unwrap();
-            assert_eq!(
-                (config.xlen, config.paging, config.ram_size),
-                (Xlen::Rv64, grail::Paging::Sv39, 16 << 30)
-            );
-        }
-        // An ELF32 program stays on an RV64 machine, which refuses it when it loads it.
-        assert_eq!(
-            machine_config(&rv64, b"\x7fELF\x01\x01\x01").unwrap().xlen,
-            Xlen::Rv64
-        );
-        // Past RV64's 1 TiB.
+        let config = machine_config(&sv39).unwrap();
+        assert_eq!((config.paging, config.ram_size), (grail::Paging::Sv39, 16 << 30));
+        // Past 1 TiB.
         let huge = HardwareProfile {
             ram_size: (1 << 40) + 4096,
-            ..rv64
+            ..sv39
         };
-        let e = machine_config(&huge, &[]).unwrap_err();
+        let e = machine_config(&huge).unwrap_err();
         assert!(e.contains("1 TiB"), "{e}");
-        assert_eq!(profile_xlen(Xlen::Rv64), avalon_proto::Xlen::Rv64);
-        assert_eq!(profile_xlen(Xlen::Rv32), avalon_proto::Xlen::Rv32);
     }
 
     #[test]
@@ -346,7 +284,7 @@ mod tests {
         for (profile, why) in [
             (HardwareProfile::with_ram(0), "multiple of 4 KiB"),
             (HardwareProfile::with_ram(4097), "multiple of 4 KiB"),
-            (HardwareProfile::with_ram(4 << 30), "2 GiB"),
+            (HardwareProfile::with_ram((1 << 40) + 4096), "1 TiB"),
             (HardwareProfile::with_ram(u64::MAX), ""),
             (
                 HardwareProfile {
@@ -401,7 +339,7 @@ mod tests {
                 "lake://127.0.0.1:7401/Root",
             ),
         ] {
-            let err = machine_config(&profile, &[]).unwrap_err();
+            let err = machine_config(&profile).unwrap_err();
             assert!(err.contains(why), "{profile:?}: {err}");
         }
     }

@@ -6,8 +6,8 @@
 # a1, which is where a C function returns a struct of two registers, and
 # keeps every other register: nothing to do after the ecall but return.
 #
-# S-mode, either width: every register here is a whole register, and ext
-# and fid, 32-bit ints, arrive sign-extended as the SBI wants them.
+# Every register here is a whole register, and ext and fid, 32-bit ints,
+# arrive sign-extended as the SBI wants them.
 
     .text
     .globl sbi_ecall

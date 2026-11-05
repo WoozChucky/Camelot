@@ -4,14 +4,14 @@
 //! the machine, QEMU `virt`'s nodes for Grail's devices; sysinfo's reserved range;
 //! Camelot's built-in firmware starting a program, or a disk's boot block, in S-mode at
 //! 0x8020_0000; and what a machine with firmware refuses. The Camelot kernel on the
-//! firmware is xtask's tests (kernel_rv64.rs, sbi.rs, and opensbi.rs on OpenSBI's).
+//! firmware is xtask's tests (kernel.rs, sbi.rs, and opensbi.rs on OpenSBI's).
 
 use grail::boot::{BOOT_BLOCK_SIZE, BOOT_ENTRY_ADDR, FDT_ADDR_ADDR, FW_HANDOFF_PC};
 use grail::bus::{BLK_BASE, SYSINFO_BASE};
 use grail::cpu::Mode;
 use grail::fdt::{self, Node};
 use grail::firmware::{FW_BASE, FW_JUMP_ADDR, FW_SIZE};
-use grail::{Bios, DiskConfig, Machine, MachineConfig, NetConfig, Paging, RunResult, Xlen};
+use grail::{Bios, DiskConfig, Machine, MachineConfig, NetConfig, Paging, RunResult};
 
 const A0: u32 = 10;
 const A1: u32 = 11;
@@ -73,12 +73,11 @@ fn elf64(at: u64, code: &[u8]) -> Vec<u8> {
     f
 }
 
-/// An RV64 machine with `harts` harts, `ram` bytes and firmware `bios`.
+/// A machine with `harts` harts, `ram` bytes and firmware `bios`.
 fn rv64(harts: usize, ram: usize, bios: Bios) -> MachineConfig {
     MachineConfig {
         harts,
         ram_size: ram,
-        xlen: Xlen::Rv64,
         bios,
         ..MachineConfig::default()
     }
@@ -431,17 +430,14 @@ fn a_machine_refuses_firmware_it_cannot_run() {
             None => m.boot_from_disk().unwrap_err(),
         }
     };
-    // RV32 machines have none, and an ELF32 program keeps its machine RV32.
-    let rv32 = MachineConfig {
-        bios: Bios::Default,
-        ..MachineConfig::with_ram(8 << 20)
-    };
-    let hello = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello/hello.elf");
-    let elf32 = std::fs::read(&hello).unwrap();
-    let err = refused(rv32.clone(), Some(&elf32));
-    assert!(err.contains("RV64 machines only"), "{err}");
-    // An ELF64 program makes the machine RV64, firmware and all.
-    let mut m = Machine::new(rv32).unwrap();
+    // An ELF32 (RV32) program is refused as the next stage, as without firmware.
+    let elf32 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../elf/tests/llvm/rv32/prog.elf");
+    let err = refused(
+        rv64(1, 8 << 20, Bios::Default),
+        Some(&std::fs::read(&elf32).unwrap()),
+    );
+    assert!(err.ends_with(grail::elf::NO_ELF32), "{err}");
+    let mut m = Machine::new(rv64(1, 8 << 20, Bios::Default)).unwrap();
     m.load_elf(&program).unwrap();
     assert_eq!(read64(&m, BOOT_ENTRY_ADDR), FW_HANDOFF_PC);
     // A program in the firmware's 2 MiB.
@@ -470,19 +466,16 @@ fn a_machine_refuses_firmware_it_cannot_run() {
     let big = TempFile::new("big.bin", &vec![0; FW_SIZE as usize + 4]);
     let err = refused(rv64(1, 8 << 20, Bios::File(big.0.clone())), Some(&program));
     assert!(err.contains("outside the firmware's RAM"), "{err}");
-    // An ELF firmware of the wrong width.
-    let err = refused(rv64(1, 8 << 20, Bios::File(hello)), Some(&program));
-    assert!(
-        err.contains("an RV32 (ELF32) firmware cannot run on an RV64 machine"),
-        "{err}"
-    );
+    // An ELF32 firmware.
+    let err = refused(rv64(1, 8 << 20, Bios::File(elf32)), Some(&program));
+    assert!(err.ends_with(grail::elf::NO_ELF32), "{err}");
 }
 
 #[test]
 fn grail_takes_bios() {
     // The command line: --bios none, default or a file.
     let parse = |s: &str| grail::cli::parse(s.split_whitespace().map(String::from)).map(|o| o.config.bios);
-    assert_eq!(parse("p.elf").unwrap(), Bios::None);
+    assert_eq!(parse("p.elf").unwrap(), Bios::Default, "QEMU's virt machine's");
     assert_eq!(parse("--bios none p.elf").unwrap(), Bios::None);
     assert_eq!(parse("--bios default p.elf").unwrap(), Bios::Default);
     assert_eq!(
@@ -503,9 +496,15 @@ fn grail_takes_bios() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The firmware is the default, in QEMU's 128 MiB.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_grail"))
+        .arg(&program.0)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
     // Too little RAM: grail says why.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_grail"))
-        .args(["--bios", "default"])
+        .args(["--bios", "default", "--ram", "4"])
         .arg(&program.0)
         .output()
         .unwrap();

@@ -9,19 +9,13 @@
 #include "riscv.h"
 #include "vm.h"
 
-/* Nothing lives at these addresses, so the tests can map them freely: on
- * RV32 holes in the memory map (spec section 7), on RV64 the vmalloc area's
- * part for tests (VM_TEST_AREA, vm.h), where the kernel has made no table
- * below the root's yet. The two pages at SPLIT_VA straddle a boundary of
- * what one lowest-level table maps (4 MiB on RV32, 2 MiB on RV64): they use
- * two of them. */
-#if __riscv_xlen == 64
+/* Nothing lives at these addresses, so the tests can map them freely: the
+ * vmalloc area's part for tests (VM_TEST_AREA, vm.h), where the kernel has
+ * made no table below the root's yet. The two pages at SPLIT_VA straddle a
+ * boundary of what one lowest-level table maps (2 MiB): they use two of
+ * them. */
 #define ALIAS_VA (VM_TEST_AREA + LEVEL_SIZE(1))
 #define RANGE_VA (VM_TEST_AREA + 16 * LEVEL_SIZE(1))
-#else
-#define ALIAS_VA 0x40000000u
-#define RANGE_VA 0x50000000u
-#endif
 #define SPLIT_VA (ALIAS_VA - PGSIZE)
 
 static int passed;
@@ -213,7 +207,6 @@ int vm_selftest(void) {
     return failed;
 }
 
-#if __riscv_xlen == 64
 /* A kernel process that ends at once: what kstack_selftest() runs. */
 static void kstack_noop(void) {
 }
@@ -255,4 +248,3 @@ int kstack_selftest(void) {
     kprintf("kstack self-test: %d/%d passed\n", passed, passed + failed);
     return failed;
 }
-#endif

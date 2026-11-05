@@ -1,8 +1,8 @@
 /* The ELF executables the kernel loads into user space (elf.c), from a
- * file or from the kernel image: ELF32 on RV32, ELF64 on RV64, the class of
- * the kernel's own width only (as Linux's binfmt_elf takes ELF_CLASS, and
- * without a compat mode an RV64 kernel runs no RV32 program). Only what the
- * loader reads: the file header and the program headers. */
+ * file or from the kernel image: ELF64 only, the kernel's own class (as
+ * Linux's binfmt_elf takes ELF_CLASS, and without a compat mode an RV64
+ * kernel runs no ELF32 program). Only what the loader reads: the file header
+ * and the program headers. */
 #ifndef CAMELOT_ELF_H
 #define CAMELOT_ELF_H
 
@@ -97,17 +97,10 @@ _Static_assert(sizeof(struct elf64_ehdr) == 64 && sizeof(struct elf64_phdr) == 5
 
 /* The class the kernel loads, by Linux's names (elfhdr, elf_phdr,
  * ELF_CLASS): its own width's. */
-#if __riscv_xlen == 64
 #define ELF_CLASS ELFCLASS64
 #define ELF_CLASS_BITS "64-bit"
 typedef struct elf64_ehdr elfhdr;
 typedef struct elf64_phdr elf_phdr;
-#else
-#define ELF_CLASS ELFCLASS32
-#define ELF_CLASS_BITS "32-bit"
-typedef struct elf32_ehdr elfhdr;
-typedef struct elf32_phdr elf_phdr;
-#endif
 
 /* What elf_load() returns when it runs out of pages (any other reason is
  * something wrong with the image). */

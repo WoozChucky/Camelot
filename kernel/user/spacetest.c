@@ -18,18 +18,12 @@
 
 /* User space (USER_TOP, USER_STACK_LIMIT, USER_LOAD_TOP in vm.h): the
  * stack's 8 MiB under USER_TOP, a guard page under that, the heap below.
- * USER_TOP is 0x0c000000 on RV32; on RV64 it depends on the paging mode
- * (2^47 in Sv48, 2^38 in Sv39), so main() finds it: the arguments are at
- * the top of the stack, in its last page. */
-#ifdef _LP64
+ * USER_TOP depends on the paging mode (2^47 in Sv48, 2^38 in Sv39), so
+ * main() finds it: the arguments are at the top of the stack, in its last
+ * page. */
 static uintptr_t USER_TOP;
 static uintptr_t USER_STACK_LIMIT;
 static uintptr_t USER_LOAD_TOP;
-#else
-#define USER_TOP 0x0c000000ul
-#define USER_STACK_LIMIT 0x0b800000ul
-#define USER_LOAD_TOP 0x0b7ff000ul
-#endif
 
 static int checks;
 static int failed;
@@ -159,11 +153,9 @@ static int forever(int n) {
 }
 
 int main(int argc, char **argv) {
-#ifdef _LP64
     USER_TOP = ((uintptr_t)argv[0] + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
     USER_STACK_LIMIT = USER_TOP - 8 * MIB;
     USER_LOAD_TOP = USER_STACK_LIMIT - PAGE;
-#endif
     if (argc == 2 && strcmp(argv[1], "overflow") == 0) {
         return forever(0);
     }

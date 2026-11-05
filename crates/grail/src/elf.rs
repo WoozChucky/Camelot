@@ -1,11 +1,12 @@
 //! Loads executables: PT_LOAD segments, the entry point and symbol values.
-//! The parsing lives in the shared `elf` crate.
+//! The parsing lives in the shared `elf` crate, which reads ELF32 too; a machine runs
+//! ELF64 (RV64) programs only, as an RV64 hart has no 32-bit mode (`mstatus.UXL` is
+//! hard-wired to 64).
 //!
 //! This module is `grail::elf`; inside it, `elf::...` names the crate (a
 //! module's own name is not in scope within it), as in `elf::Elf::parse`.
 
 pub use elf::Error as ElfError;
-use excalibur::Xlen;
 
 /// A `PT_LOAD` segment.
 pub struct Segment {
@@ -19,8 +20,6 @@ pub struct Segment {
 }
 
 pub struct Elf {
-    /// The program's width: RV64 for an ELF64 file, RV32 for an ELF32 one.
-    pub xlen: Xlen,
     /// `e_entry`, a virtual address (see [`Elf::physical_entry`]).
     pub entry: u64,
     pub segments: Vec<Segment>,
@@ -28,24 +27,16 @@ pub struct Elf {
     pub symbols: Vec<(String, u64)>,
 }
 
-/// The width `file` is for, from its ELF header's class alone (`EI_CLASS`): RV64 for
-/// ELF64, RV32 for ELF32; `None` if it is not an ELF file of either class. Front ends
-/// read it before they build a machine for the program, so that the machine is checked
-/// against its width's limits (RAM) from the start; [`parse`] checks the rest.
-pub fn class(file: &[u8]) -> Option<Xlen> {
-    match file {
-        [0x7f, b'E', b'L', b'F', 1, ..] => Some(Xlen::Rv32),
-        [0x7f, b'E', b'L', b'F', 2, ..] => Some(Xlen::Rv64),
-        _ => None,
-    }
-}
+/// Why an ELF32 program does not run.
+pub const NO_ELF32: &str =
+    "an ELF32 (RV32) program: Excalibur is RV64, and a machine runs ELF64 programs only";
 
+/// Reads an executable for the machine: an ELF64 file ([`NO_ELF32`] for an ELF32 one).
 pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
     let elf = elf::Elf::parse(file)?;
-    let xlen = match elf.class {
-        elf::Class::Elf32 => Xlen::Rv32,
-        elf::Class::Elf64 => Xlen::Rv64,
-    };
+    if elf.class == elf::Class::Elf32 {
+        return Err(ElfError(NO_ELF32.into()));
+    }
     let mut segments = Vec::new();
     for p in elf.segments.iter().filter(|p| p.ty == elf::PT_LOAD) {
         segments.push(Segment {
@@ -66,7 +57,6 @@ pub fn parse(file: &[u8]) -> Result<Elf, ElfError> {
     defined.sort_by_key(|s| s.bind() == elf::STB_LOCAL);
     let symbols = defined.into_iter().map(|s| (s.name, s.value)).collect();
     Ok(Elf {
-        xlen,
         entry: elf.header.entry,
         segments,
         symbols,
@@ -96,29 +86,30 @@ mod tests {
     use super::*;
     use elf::*;
 
-    /// A section-header-only ELF whose .symtab holds `syms` (name, value,
+    /// A section-header-only ELF64 file whose .symtab holds `syms` (name, value,
     /// binding), every one defined (SHN_ABS), after the null symbol.
-    fn elf_with_symbols(syms: &[(&str, u32, u8)]) -> Vec<u8> {
+    fn elf_with_symbols(syms: &[(&str, u64, u8)]) -> Vec<u8> {
         let mut strtab = vec![0u8];
-        let mut symtab = vec![0u8; SYM_SIZE];
+        let mut symtab = vec![0u8; SYM64_SIZE];
         for &(name, value, bind) in syms {
+            // An ELF64 symbol: name, info, other, shndx, value, size.
             symtab.extend_from_slice(&(strtab.len() as u32).to_le_bytes());
             strtab.extend_from_slice(name.as_bytes());
             strtab.push(0);
-            symtab.extend_from_slice(&value.to_le_bytes());
-            symtab.extend_from_slice(&0u32.to_le_bytes());
             symtab.extend_from_slice(&[(bind << 4) | STT_FUNC, 0]);
             symtab.extend_from_slice(&SHN_ABS.to_le_bytes());
+            symtab.extend_from_slice(&value.to_le_bytes());
+            symtab.extend_from_slice(&0u64.to_le_bytes());
         }
         let shstrtab = b"\0.symtab\0.strtab\0.shstrtab\0";
-        let mut out = vec![0u8; EHDR_SIZE];
-        let symtab_off = out.len() as u32;
+        let mut out = vec![0u8; EHDR64_SIZE];
+        let symtab_off = out.len() as u64;
         out.extend_from_slice(&symtab);
-        let strtab_off = out.len() as u32;
+        let strtab_off = out.len() as u64;
         out.extend_from_slice(&strtab);
-        let shstrtab_off = out.len() as u32;
+        let shstrtab_off = out.len() as u64;
         out.extend_from_slice(shstrtab);
-        let shoff = out.len() as u32;
+        let shoff = out.len() as u64;
         // sh_info of a .symtab: one past the last local symbol.
         let locals = 1 + syms.iter().take_while(|s| s.2 == STB_LOCAL).count() as u32;
         // (name, type, offset, size, link, info, entsize)
@@ -128,52 +119,64 @@ mod tests {
                 1,
                 SHT_SYMTAB,
                 symtab_off,
-                symtab.len() as u32,
+                symtab.len() as u64,
                 2,
                 locals,
-                SYM_SIZE as u32,
+                SYM64_SIZE as u64,
             ),
-            (9, SHT_STRTAB, strtab_off, strtab.len() as u32, 0, 0, 0),
-            (17, SHT_STRTAB, shstrtab_off, shstrtab.len() as u32, 0, 0, 0),
+            (9, SHT_STRTAB, strtab_off, strtab.len() as u64, 0, 0, 0),
+            (17, SHT_STRTAB, shstrtab_off, shstrtab.len() as u64, 0, 0, 0),
         ];
         for (name, ty, off, size, link, info, entsize) in shdrs {
-            for v in [name, ty, 0, 0, off, size, link, info, 4, entsize] {
+            // An ELF64 section header: name, type (4 bytes each), flags, addr, offset,
+            // size (8), link, info (4), addralign, entsize (8).
+            for v in [name, ty] {
                 out.extend_from_slice(&v.to_le_bytes());
             }
+            for v in [0, 0, off, size] {
+                out.extend_from_slice(&u64::to_le_bytes(v));
+            }
+            for v in [link, info] {
+                out.extend_from_slice(&u32::to_le_bytes(v));
+            }
+            for v in [8, entsize] {
+                out.extend_from_slice(&u64::to_le_bytes(v));
+            }
         }
-        let mut h = b"\x7fELF\x01\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
+        let mut h = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
         for v in [ET_EXEC, EM_RISCV] {
             h.extend_from_slice(&v.to_le_bytes());
         }
-        for v in [1u32, 0x8000_0000, 0, shoff, 0] {
+        h.extend_from_slice(&1u32.to_le_bytes());
+        for v in [0x8000_0000u64, 0, shoff] {
             h.extend_from_slice(&v.to_le_bytes());
         }
-        for v in [EHDR_SIZE, PHDR_SIZE, 0, SHDR_SIZE, shdrs.len(), 3] {
+        h.extend_from_slice(&0u32.to_le_bytes());
+        for v in [EHDR64_SIZE, PHDR64_SIZE, 0, SHDR64_SIZE, shdrs.len(), 3] {
             h.extend_from_slice(&(v as u16).to_le_bytes());
         }
-        out[..EHDR_SIZE].copy_from_slice(&h);
+        out[..EHDR64_SIZE].copy_from_slice(&h);
         out
     }
 
-    /// The class says the program's width: the same C program built by clang for
-    /// each, linked at 0x8000_0000.
+    /// A C program built by clang and linked at 0x8000_0000 loads there; the same
+    /// program built for RV32 (ELF32) is refused.
     #[test]
-    fn both_classes_are_read_with_their_width() {
-        let read = |path: &str| parse(&std::fs::read(path).unwrap()).unwrap();
+    fn elf64_programs_load_and_elf32_ones_are_refused() {
+        let read = |path: &str| parse(&std::fs::read(path).unwrap());
         let rv64 = read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../elf/tests/llvm/rv64/prog.elf"
-        ));
+        ))
+        .unwrap();
+        assert!(rv64.segments.iter().any(|s| s.paddr == 0x8000_0000));
+        let entry = rv64.physical_entry().unwrap();
+        assert_eq!(entry, rv64.entry, "linked where it loads");
         let rv32 = read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../elf/tests/llvm/rv32/prog.elf"
         ));
-        assert_eq!((rv64.xlen, rv32.xlen), (Xlen::Rv64, Xlen::Rv32));
-        for elf in [rv64, rv32] {
-            assert!(elf.segments.iter().any(|s| s.paddr == 0x8000_0000));
-            let entry = elf.physical_entry().unwrap();
-            assert_eq!(entry, elf.entry, "linked where it loads");
-        }
+        assert_eq!(rv32.err().unwrap().0, NO_ELF32);
     }
 
     fn segment(vaddr: u64, paddr: u64, mem_size: u64) -> Segment {
@@ -191,7 +194,6 @@ mod tests {
     fn the_entry_point_is_translated_through_its_segment() {
         let high = 0xffff_ffc0_0000_0000;
         let mut elf = super::Elf {
-            xlen: Xlen::Rv64,
             entry: high + 0x1010,
             segments: vec![
                 segment(0x1000, 0x1000, 0x10),

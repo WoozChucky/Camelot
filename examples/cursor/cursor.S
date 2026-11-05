@@ -27,11 +27,10 @@
 # Run it with the framebuffer window (Windows), at a real-time clock so that the
 # cursor goes by at 60 places a second:
 #
-#   cargo run --release -p grail -- --fb --clock 50MHz examples/cursor/cursor.elf
+#   cargo run --release -p grail -- --bios none --fb --clock 50MHz examples/cursor/cursor.elf
 #
 # or headless, dumping a frame each time the cursor moves (one for the present first,
-# one at exit last):  grail --fb-dump out examples/cursor/cursor.elf
-# (cursor-rv64.elf on an RV64 machine).
+# one at exit last):  grail --bios none --fb-dump out examples/cursor/cursor.elf
 #
 # Built with our own tools by `cargo xtask examples cursor`, which does the same as
 #
@@ -39,25 +38,11 @@
 #   merlin-as cursor.s -o cursor.o
 #   merlin-ld -T examples/cursor/link.ld cursor.o -o examples/cursor/cursor.elf
 #
-# and, for RV64 (the same code: mcause's interrupt bit, CAUSE_MEI, is bit 63, and
-# FB_CURSOR_ADDR, a 64-bit register, is written whole with sd instead of by its
-# halves), the same as
-#
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/cursor/cursor.S -o cursor.s
-#   merlin-as -march=rv64ima_zicsr_zifencei cursor.s -o cursor.o
-#   merlin-ld -T examples/cursor/link.ld cursor.o -o examples/cursor/cursor-rv64.elf
-#
 # Reference build with LLVM, only for comparison:
-#
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
-#         -T examples/cursor/link.ld examples/cursor/cursor.S -o cursor.elf
-#
-# and for RV64:
 #
 #   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
 #         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
-#         -I include -T examples/cursor/link.ld examples/cursor/cursor.S -o cursor-rv64.elf
+#         -I include -T examples/cursor/link.ld examples/cursor/cursor.S -o cursor.elf
 
 #include <asm.h>
 
@@ -83,11 +68,7 @@
 
     .equ MIE_MEIE,      0x800           # mie bit 11
     .equ MSTATUS_MIE,   0x8
-#if __riscv_xlen == 64
     .equ CAUSE_MEI,     0x800000000000000b # interrupt bit 63, cause 11
-#else
-    .equ CAUSE_MEI,     0x8000000b
-#endif
 
     .equ WIDTH,         640
     .equ HEIGHT,        480
@@ -194,12 +175,7 @@ _start:
     # The cursor: its image, hotspot, first place and the plane on, all taken by the
     # next vertical blank.
     la    a0, cursor
-#if __riscv_xlen == 64
     sd    a0, FB_CURSOR_ADDR(s0)
-#else
-    sw    a0, FB_CURSOR_ADDR(s0)        # the low half
-    sw    zero, FB_CURSOR_ADDR+4(s0)    # and the high half
-#endif
     sw    zero, FB_CURSOR_HOT(s0)       # the tip, (0, 0)
     la    s2, path
     li    s1, 0

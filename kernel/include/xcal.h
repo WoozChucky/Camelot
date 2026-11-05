@@ -11,6 +11,6 @@ void xcal_dbg(u32 val);
 
 /* xcal.halt is M-only: the kernel stops the machine through the SBI
  * (machine_power_off(), include/sbi.h), whose implementation on Grail ends
- * with it (machine.S). */
+ * with it (firmware/sbi.S). */
 
 #endif

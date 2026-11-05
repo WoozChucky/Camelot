@@ -6,8 +6,8 @@
 //! Harts are the protocol's threads: hart `i` is thread `i + 1` (thread ids are
 //! positive; 0 means "any" and -1 "all").
 //!
-//! Registers travel as wide as the machine's harts: 4 bytes on RV32, 8 on RV64, each
-//! little-endian in hex ([`target::reg_bytes`]). Addresses are up to 64 bits.
+//! Registers travel as wide as the harts': 8 bytes, each
+//! little-endian in hex ([`target::REG_BYTES`]). Addresses are up to 64 bits.
 //!
 //! Memory packets go through the selected hart's translation, or to physical addresses
 //! once the client has asked for them as QEMU's stub has it (`Qqemu.PhyMemMode:1`,
@@ -23,7 +23,7 @@ use super::packet;
 use super::target::{self, Reg, GENERAL_REGS};
 use crate::cpu::Mode;
 use crate::debug::{Space, Stop, WatchKind};
-use crate::{Machine, Xlen};
+use crate::Machine;
 
 /// What to do after a packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,7 +128,7 @@ impl Stub {
             StopReason::Interrupted => (2, String::new()),
         };
         // The pc comes along (register 0x20), saving the client a round trip.
-        let pc = hex_reg(m, m.pc());
+        let pc = hex_reg(m.pc());
         format!("T{signal:02x}{why}thread:{:x};20:{pc};", m.selected_hart() + 1).into_bytes()
     }
 
@@ -304,7 +304,7 @@ impl Stub {
             // LLDB's register descriptions, one per packet. LLDB builds without XML
             // support (its Windows builds) ask for these instead of target.xml.
             _ if name.starts_with("qRegisterInfo") => match usize::from_str_radix(&name[13..], 16) {
-                Ok(n) => match target::lldb_register_info(n, target::reg_bytes(m)) {
+                Ok(n) => match target::lldb_register_info(n, target::REG_BYTES) {
                     Some(info) => reply(&info),
                     None => Action::Reply(error(0x45)),
                 },
@@ -312,12 +312,9 @@ impl Stub {
             },
             // LLDB's: what the target is, since there is no host OS to ask.
             "qHostInfo" | "qProcessInfo" => {
-                let triple = match m.config().xlen {
-                    Xlen::Rv32 => hex_bytes(b"riscv32-unknown-unknown-elf"),
-                    Xlen::Rv64 => hex_bytes(b"riscv64-unknown-unknown-elf"),
-                };
+                let triple = hex_bytes(b"riscv64-unknown-unknown-elf");
                 let pid = if name == "qProcessInfo" { "pid:1;" } else { "" };
-                let ptrsize = target::reg_bytes(m);
+                let ptrsize = target::REG_BYTES;
                 reply(&format!("{pid}triple:{triple};endian:little;ptrsize:{ptrsize};"))
             }
             _ => reply(""),
@@ -346,18 +343,18 @@ fn read_xml(m: &Machine, range: &str) -> Action {
 
 /// `g`: `x0`-`x31` and `pc`, each little-endian in hex.
 fn read_general(m: &Machine) -> Action {
-    let mut s = String::with_capacity(GENERAL_REGS * 2 * target::reg_bytes(m));
+    let mut s = String::with_capacity(GENERAL_REGS * 2 * target::REG_BYTES);
     for r in 0..32 {
-        s.push_str(&hex_reg(m, m.reg(r)));
+        s.push_str(&hex_reg(m.reg(r)));
     }
-    s.push_str(&hex_reg(m, m.pc()));
+    s.push_str(&hex_reg(m.pc()));
     reply(&s)
 }
 
 /// `G data`: writes as many of `g`'s registers as `data` holds.
 fn write_general(m: &mut Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
     let bytes = unhex_bytes(args).ok_or_else(malformed)?;
-    let width = target::reg_bytes(m);
+    let width = target::REG_BYTES;
     if !bytes.len().is_multiple_of(width) || bytes.len() > GENERAL_REGS * width {
         return Err(malformed());
     }
@@ -381,7 +378,7 @@ fn read_register(m: &Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
         Reg::Csr(a) => m.csr(a).ok_or_else(|| error(1))?,
         Reg::Priv => m.mode() as u64,
     };
-    Ok(reply(&hex_reg(m, v)))
+    Ok(reply(&hex_reg(v)))
 }
 
 /// `P n=value`.
@@ -389,7 +386,7 @@ fn write_register(m: &mut Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
     let i = args.iter().position(|&b| b == b'=').ok_or_else(malformed)?;
     let n = hex(&args[..i]).ok_or_else(malformed)? as usize;
     let bytes = unhex_bytes(&args[i + 1..]).ok_or_else(malformed)?;
-    if bytes.len() != target::reg_bytes(m) {
+    if bytes.len() != target::REG_BYTES {
         return Err(malformed());
     }
     let v = le(&bytes);
@@ -517,9 +514,9 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A register's value as `m`'s harts hold it: its 4 or 8 bytes, little-endian, in hex.
-fn hex_reg(m: &Machine, v: u64) -> String {
-    hex_bytes(&v.to_le_bytes()[..target::reg_bytes(m)])
+/// A register's value as the harts hold it: its 8 bytes, little-endian, in hex.
+fn hex_reg(v: u64) -> String {
+    hex_bytes(&v.to_le_bytes()[..target::REG_BYTES])
 }
 
 /// Little-endian bytes (at most 8) as a number.
@@ -543,7 +540,7 @@ mod tests {
 
     const RAM_BASE: u64 = crate::bus::RAM_BASE;
 
-    /// A 32-bit register's value as an RV32 machine's packets carry it.
+    /// A 32-bit value as the packets carry it: a word of memory.
     fn hex_word(v: u32) -> String {
         hex_bytes(&v.to_le_bytes())
     }
@@ -644,11 +641,11 @@ mod tests {
         assert_eq!(ask(&mut m, &mut stub, "qThreadExtraInfo,5"), "E16");
         assert_eq!(
             ask(&mut m, &mut stub, "qRegisterInfo0"),
-            "name:zero;alt-name:x0;bitsize:32;offset:0;encoding:uint;format:hex;set:General Purpose Registers;dwarf:0;"
+            "name:zero;alt-name:x0;bitsize:64;offset:0;encoding:uint;format:hex;set:General Purpose Registers;dwarf:0;"
         );
         assert_eq!(
             ask(&mut m, &mut stub, "qRegisterInfo20"),
-            "name:pc;bitsize:32;offset:128;encoding:uint;format:hex;set:General Purpose Registers;generic:pc;"
+            "name:pc;bitsize:64;offset:256;encoding:uint;format:hex;set:General Purpose Registers;generic:pc;"
         );
         assert!(ask(&mut m, &mut stub, "qRegisterInfoa").contains("generic:arg1;"));
         assert_eq!(ask(&mut m, &mut stub, "qRegisterInfo21"), "E45");
@@ -687,17 +684,17 @@ mod tests {
         let (mut m, mut stub) = setup(1);
         m.set_reg(1, 0x1122_3344);
         let g = ask(&mut m, &mut stub, "g");
-        assert_eq!(g.len(), 33 * 8);
-        assert_eq!(&g[..8], "00000000");
-        assert_eq!(&g[8..16], "44332211");
-        assert_eq!(&g[32 * 8..], "00100000", "pc = 0x1000");
-        assert_eq!(ask(&mut m, &mut stub, "p1"), "44332211");
-        assert_eq!(ask(&mut m, &mut stub, "p20"), "00100000");
+        assert_eq!(g.len(), 33 * 16);
+        assert_eq!(&g[..16], "0000000000000000");
+        assert_eq!(&g[16..32], "4433221100000000");
+        assert_eq!(&g[32 * 16..], "0010000000000000", "pc = 0x1000");
+        assert_eq!(ask(&mut m, &mut stub, "p1"), "4433221100000000");
+        assert_eq!(ask(&mut m, &mut stub, "p20"), "0010000000000000");
         // mhartid, misa and priv.
-        assert_eq!(ask(&mut m, &mut stub, &format!("p{:x}", 65 + 0xf14)), "00000000");
+        assert_eq!(ask(&mut m, &mut stub, &format!("p{:x}", 65 + 0xf14)), hex_reg(0));
         let misa = ask(&mut m, &mut stub, &format!("p{:x}", 65 + 0x301));
-        assert_eq!(misa, hex_word(crate::cpu::misa(crate::Xlen::Rv32) as u32));
-        assert_eq!(ask(&mut m, &mut stub, "p1041"), "03000000", "M-mode");
+        assert_eq!(misa, hex_reg(crate::cpu::MISA_VALUE));
+        assert_eq!(ask(&mut m, &mut stub, "p1041"), hex_reg(3), "M-mode");
         assert_eq!(ask(&mut m, &mut stub, "p21"), "E01", "no f0");
         assert_eq!(
             ask(&mut m, &mut stub, &format!("p{:x}", 65 + 0x7c0)),
@@ -705,37 +702,37 @@ mod tests {
             "no such CSR"
         );
 
-        assert_eq!(ask(&mut m, &mut stub, "P5=78563412"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "P5=7856341200000000"), "OK");
         assert_eq!(m.reg(5), 0x1234_5678);
-        assert_eq!(ask(&mut m, &mut stub, "P0=78563412"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "P0=7856341200000000"), "OK");
         assert_eq!(m.reg(0), 0, "x0 stays 0");
-        assert_eq!(ask(&mut m, &mut stub, "P20=00000080"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "P20=0000008000000000"), "OK");
         assert_eq!(m.pc(), RAM_BASE);
         // mscratch, then a read-only CSR.
         assert_eq!(
-            ask(&mut m, &mut stub, &format!("P{:x}=efbeadde", 65 + 0x340)),
+            ask(&mut m, &mut stub, &format!("P{:x}=efbeadde00000000", 65 + 0x340)),
             "OK"
         );
         assert_eq!(m.csr(0x340), Some(0xdead_beef));
         assert_eq!(
-            ask(&mut m, &mut stub, &format!("P{:x}=01000000", 65 + 0xf14)),
+            ask(&mut m, &mut stub, &format!("P{:x}=0100000000000000", 65 + 0xf14)),
             "E01"
         );
-        assert_eq!(ask(&mut m, &mut stub, "P1041=01000000"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "P1041=0100000000000000"), "OK");
         assert_eq!(m.mode(), Mode::S);
 
-        let mut all = "00000000".to_string();
-        for r in 1..32u32 {
-            all.push_str(&hex_word(r * 0x100));
+        let mut all = hex_reg(0);
+        for r in 1..32u64 {
+            all.push_str(&hex_reg(r * 0x100));
         }
-        all.push_str(&hex_word(RAM_BASE as u32 + 8));
+        all.push_str(&hex_reg(RAM_BASE + 8));
         assert_eq!(ask(&mut m, &mut stub, &format!("G{all}")), "OK");
         assert_eq!(m.reg(31), 0x1f00);
         assert_eq!(m.pc(), RAM_BASE + 8);
         assert_eq!(ask(&mut m, &mut stub, "g"), all);
         // A shorter G writes the registers it has.
-        assert_eq!(ask(&mut m, &mut stub, "G00000000ffffffff"), "OK");
-        assert_eq!(m.reg(1), 0xffff_ffff);
+        assert_eq!(ask(&mut m, &mut stub, "G0000000000000000ffffffffffffffff"), "OK");
+        assert_eq!(m.reg(1), u64::MAX);
         assert_eq!(m.reg(2), 0x200);
     }
 
@@ -775,24 +772,31 @@ mod tests {
         );
     }
 
+    /// An Sv39 page table at RAM + 0x1000 whose one 1 GiB gigapage maps virtual
+    /// 0x4000_0000 onto RAM (PPN 0x80000), readable, and the hart in S-mode with paging
+    /// on. Returns where its PTE is, and the PTE.
+    fn map_gigapage(m: &mut Machine) -> (u64, u64) {
+        let root = RAM_BASE + 0x1000;
+        let pte: u64 = (0x80000 << 10) | 0b1111; // V R W X
+        let vpn2 = 0x4000_0000u64 >> 30;
+        let slot = root + vpn2 * 8;
+        m.write_memory(slot, &pte.to_le_bytes(), Space::Physical);
+        m.write_memory(RAM_BASE, &[0xaa, 0xbb], Space::Physical);
+        assert!(m.set_csr(0x180, (8 << 60) | (root >> 12)), "Sv39");
+        m.set_mode(Mode::S);
+        (slot, pte)
+    }
+
     #[test]
     fn memory_goes_through_the_selected_harts_translation() {
         let (mut m, mut stub) = setup(1);
-        // A page table at RAM + 0x1000 whose one 4 MiB superpage maps virtual
-        // 0x4000_0000 onto RAM (PPN 0x80000), readable, in S-mode with paging on.
-        let root = RAM_BASE + 0x1000;
-        let pte: u32 = (0x80000 << 10) | 0b1111; // V R W X
-        let slot = root + (0x4000_0000u64 >> 22) * 4;
-        m.write_memory(slot, &pte.to_le_bytes(), Space::Physical);
-        m.write_memory(RAM_BASE, &[0xaa, 0xbb], Space::Physical);
-        assert!(m.set_csr(0x180, (1 << 31) | (root >> 12)));
-        m.set_mode(Mode::S);
+        let (slot, pte) = map_gigapage(&mut m);
         assert_eq!(ask(&mut m, &mut stub, "m40000000,2"), "aabb");
         assert_eq!(ask(&mut m, &mut stub, "m80000000,2"), "E0e", "not mapped");
         // Reading set no A bit.
-        let mut back = [0; 4];
+        let mut back = [0; 8];
         m.read_memory(slot, &mut back, Space::Physical);
-        assert_eq!(u32::from_le_bytes(back), pte);
+        assert_eq!(u64::from_le_bytes(back), pte);
         // In M-mode, addresses are physical.
         m.set_mode(Mode::M);
         assert_eq!(ask(&mut m, &mut stub, "m80000000,2"), "aabb");
@@ -801,17 +805,8 @@ mod tests {
     #[test]
     fn qemus_physical_memory_mode() {
         let (mut m, mut stub) = setup(1);
-        // Virtual 0x4000_0000 is RAM's first page, through a 4 MiB superpage, in S-mode.
-        let root = RAM_BASE + 0x1000;
-        let pte: u32 = (0x80000 << 10) | 0b1111;
-        m.write_memory(
-            root + (0x4000_0000u64 >> 22) * 4,
-            &pte.to_le_bytes(),
-            Space::Physical,
-        );
-        m.write_memory(RAM_BASE, &[0xaa, 0xbb], Space::Physical);
-        assert!(m.set_csr(0x180, (1 << 31) | (root >> 12)));
-        m.set_mode(Mode::S);
+        // Virtual 0x4000_0000 is RAM's first page, through a gigapage, in S-mode.
+        map_gigapage(&mut m);
         assert_eq!(ask(&mut m, &mut stub, "qqemu.Supported"), "PhyMemMode");
         assert_eq!(ask(&mut m, &mut stub, "qqemu.PhyMemMode"), "0");
         assert_eq!(ask(&mut m, &mut stub, "m80000000,2"), "E0e", "not mapped");
@@ -861,10 +856,7 @@ mod tests {
         assert_eq!(ask(&mut m, &mut stub, "Hg2"), "OK");
         assert_eq!(m.selected_hart(), 1);
         assert_eq!(ask(&mut m, &mut stub, "qC"), "QC2");
-        assert_eq!(
-            ask(&mut m, &mut stub, "p20"),
-            hex_word(crate::bus::PARK_PC as u32)
-        );
+        assert_eq!(ask(&mut m, &mut stub, "p20"), hex_reg(crate::bus::PARK_PC));
         assert_eq!(ask(&mut m, &mut stub, "Hg0"), "OK", "any: unchanged");
         assert_eq!(m.selected_hart(), 1);
         assert_eq!(ask(&mut m, &mut stub, "Hg3"), "E16");
@@ -891,19 +883,15 @@ mod tests {
         assert_eq!(stub.handle(&mut m, b"D;1"), Action::Detach);
     }
 
-    /// An RV64 machine of `ram` bytes, and its stub.
+    /// A machine of `ram` bytes, and its stub.
     fn setup64(ram: usize) -> (Machine, Stub) {
-        let m = Machine::new(MachineConfig {
-            xlen: crate::Xlen::Rv64,
-            ..MachineConfig::with_ram(ram)
-        })
-        .unwrap();
+        let m = Machine::new(MachineConfig::with_ram(ram)).unwrap();
         let stub = Stub::new();
         (m, stub)
     }
 
     #[test]
-    fn an_rv64_machine_has_64_bit_registers_and_addresses() {
+    fn registers_and_addresses_are_64_bit() {
         // 6 GiB of RAM (lazily backed: only what is touched costs), so that memory
         // past 4 GiB can be read and written.
         let (mut m, mut stub) = setup64(6 << 30);
@@ -915,10 +903,7 @@ mod tests {
         assert_eq!(ask(&mut m, &mut stub, "p1"), "8877665544332211");
         // misa: MXL = 2 in its top bits.
         let misa = ask(&mut m, &mut stub, &format!("p{:x}", 65 + 0x301));
-        assert_eq!(
-            misa,
-            hex_bytes(&crate::cpu::misa(crate::Xlen::Rv64).to_le_bytes())
-        );
+        assert_eq!(misa, hex_reg(crate::cpu::MISA_VALUE));
         assert_eq!(ask(&mut m, &mut stub, "p1041"), "0300000000000000", "M-mode");
         assert_eq!(ask(&mut m, &mut stub, "P5=efcdab8967452301"), "OK");
         assert_eq!(m.reg(5), 0x0123_4567_89ab_cdef);
@@ -988,61 +973,38 @@ mod tests {
     fn the_description_is_the_machines_as_it_is_asked_for() {
         // The stub keeps no description of its own: it describes the machine it is
         // handed at each request, so it cannot describe a machine that is no longer so.
-        let (mut m32, mut stub) = setup(1);
-        let (mut m64, _) = setup64(64 * 1024);
-        let xml = read_description(&mut m32, &mut stub);
-        assert!(xml.contains("<architecture>riscv:rv32</architecture>"));
-        assert_eq!(xml, target::xml(&m32));
-        let xml = read_description(&mut m64, &mut stub);
-        assert!(xml.contains("<architecture>riscv:rv64</architecture>"));
-        assert_eq!(xml, target::xml(&m64));
-    }
-
-    #[test]
-    fn an_rv32_machine_has_no_addresses_past_4_gib() {
         let (mut m, mut stub) = setup(1);
-        assert_eq!(ask(&mut m, &mut stub, "m100001000,4"), "E0e");
-        assert_eq!(ask(&mut m, &mut stub, "Z2,fffffffc,4"), "OK");
-        assert_eq!(ask(&mut m, &mut stub, "Z2,fffffffe,4"), "E16", "past 2^32");
-        assert_eq!(ask(&mut m, &mut stub, "Z0,fffffffc,4"), "OK");
-        assert_eq!(
-            ask(&mut m, &mut stub, "Z0,100001000,4"),
-            "E16",
-            "a breakpoint past 2^32"
-        );
-        assert_eq!(m.breakpoints().collect::<Vec<_>>(), [0xffff_fffc]);
-        assert_eq!(
-            ask(&mut m, &mut stub, "P5=efcdab8967452301"),
-            "E01",
-            "8 bytes for a 32-bit register"
-        );
-        // A value too wide for the hart's registers keeps its low 32 bits.
-        m.set_reg(6, 0x1_2345_6789);
-        assert_eq!(m.reg(6), 0x2345_6789);
-        assert_eq!(ask(&mut m, &mut stub, "p6"), "89674523");
+        let xml = read_description(&mut m, &mut stub);
+        assert!(xml.contains("<architecture>riscv:rv64</architecture>"));
+        assert_eq!(xml, target::xml(&m));
+        let (mut other, _) = setup64(64 * 1024);
+        assert_eq!(read_description(&mut other, &mut stub), target::xml(&other));
     }
 
     #[test]
     fn stop_replies() {
         let (mut m, mut stub) = setup(2);
-        assert_eq!(ask(&mut m, &mut stub, "?"), "T02thread:1;20:00100000;");
+        assert_eq!(ask(&mut m, &mut stub, "?"), "T02thread:1;20:0010000000000000;");
         let r = stub.stopped(
             &mut m,
             StopReason::Machine(Stop::Breakpoint { hart: 1, pc: 0x1020 }),
         );
-        assert_eq!(r, b"T05thread:2;20:20100000;");
+        assert_eq!(r, b"T05thread:2;20:2010000000000000;");
         assert_eq!(m.selected_hart(), 1);
         ask(&mut m, &mut stub, "qSupported:swbreak+");
-        assert_eq!(ask(&mut m, &mut stub, "?"), "T05swbreak:;thread:2;20:20100000;");
+        assert_eq!(
+            ask(&mut m, &mut stub, "?"),
+            "T05swbreak:;thread:2;20:2010000000000000;"
+        );
         let hit = crate::debug::WatchHit {
             hart: 0,
             kind: WatchKind::Read,
             addr: 0x8000_1000,
         };
         let r = stub.stopped(&mut m, StopReason::Machine(Stop::Watchpoint(hit)));
-        assert_eq!(r, b"T05rwatch:80001000;thread:1;20:00100000;");
+        assert_eq!(r, b"T05rwatch:80001000;thread:1;20:0010000000000000;");
         let r = stub.stopped(&mut m, StopReason::Machine(Stop::Stepped { hart: 1 }));
-        assert_eq!(r, b"T05thread:2;20:20100000;");
+        assert_eq!(r, b"T05thread:2;20:2010000000000000;");
         assert_eq!(stub.stopped(&mut m, StopReason::Machine(Stop::Exited(3))), b"W03");
         assert_eq!(ask(&mut m, &mut stub, "?"), "W03");
     }

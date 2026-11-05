@@ -1,10 +1,8 @@
-//! Writes the linked image as an ELF executable (`ET_EXEC`), little-endian,
-//! of the layout's class ([`Layout::class`], its objects'): ELF32 for RV32,
-//! ELF64 for RV64.
+//! Writes the linked image as an ELF64 executable (`ET_EXEC`), little-endian.
 //!
 //! ```text
-//! ELF header (52 bytes ELF32, 64 bytes ELF64)
-//! program headers (32 or 56 bytes each): PT_PHDR if the headers are loaded,
+//! ELF header (64 bytes)
+//! program headers (56 bytes each): PT_PHDR if the headers are loaded,
 //!   one PT_LOAD per segment, in the room ld.lld leaves for its own (see "The headers")
 //! segment contents, each at a file offset congruent to its address mod its p_align
 //! .symtab, .strtab, the debug sections (.debug_line, ...), .shstrtab
@@ -62,11 +60,10 @@
 //!    was sized for: the first segment at the first offset past it that is
 //!    congruent to its address.
 //!
-//! So with three segments of ELF32 (0x114 bytes: 52 for the ELF header, 7
-//! program headers of 32), a first section at 0x8000_0000 is at file offset
-//! 0x1000, one at 0x8000_0100 at 0x1100 (no room below it for 0x114 bytes),
-//! and one at 0x8000_0400 at 0x400, after headers loaded at 0x8000_0000.
-//! ELF64 needs 0x1c8 bytes (64 + 7 × 56) for the same.
+//! So with three segments (0x1c8 bytes: 64 for the ELF header, 7 program
+//! headers of 56), a first section at 0x8000_0000 is at file offset 0x1000,
+//! one at 0x8000_0100 at 0x1100 (no room below it for 0x1c8 bytes), and one
+//! at 0x8000_0400 at 0x400, after headers loaded at 0x8000_0000.
 //!
 //! merlin-ld writes only the `PT_PHDR` and the `PT_LOAD`s, but it leaves the
 //! same room ([`Headers`]), so that every segment is where ld.lld puts it:
@@ -78,31 +75,26 @@
 //! headers too, read-only, when they are loaded: a link script keeps them
 //! out with a first section at the start of a page.
 //!
-//! ## The two classes
+//! ## ELF64
 //!
-//! ELF32 and ELF64 hold the same records; ELF64 widens every address, offset
-//! and size to 8 bytes and reorders two records so that those stay aligned:
+//! Every address, offset and size is 8 bytes, and two records are ordered so
+//! that those stay aligned:
 //!
-//! | record | ELF32 | ELF64 |
-//! |---|---|---|
-//! | ELF header | 52 bytes | 64 bytes: `e_entry`, `e_phoff`, `e_shoff` 8 bytes each |
-//! | program header | 32 bytes | 56 bytes: `p_flags` moves up, after `p_type` |
-//! | section header | 40 bytes | 64 bytes: six fields of 8 bytes (\*) |
-//! | symbol | 16 bytes | 24 bytes: `st_info`, `st_other`, `st_shndx` move before `st_value` and `st_size` |
+//! | record | size |
+//! |---|---|
+//! | ELF header | 64 bytes: `e_entry`, `e_phoff`, `e_shoff` 8 bytes each |
+//! | program header | 56 bytes: `p_flags` right after `p_type` |
+//! | section header | 64 bytes: six fields of 8 bytes (\*) |
+//! | symbol | 24 bytes: `st_info`, `st_other`, `st_shndx` before `st_value` and `st_size` |
 //!
 //! (\*) `sh_flags`, `sh_addr`, `sh_offset`, `sh_size`, `sh_addralign` and
 //! `sh_entsize`.
 //!
 //! `.symtab` and the section header table are aligned to the size of an
-//! address (4 or 8 bytes), as ld.lld aligns them. Everything else is the
-//! same for both, the 4 KiB page included: ld.lld's RISC-V maximum page
-//! size is 0x1000 for RV64 as for RV32, so `p_align` is at least 0x1000 for
-//! both. `e_flags` is 0 for both: the soft-float ABI (ilp32 or lp64)
+//! address, 8 bytes, as ld.lld aligns them. ld.lld's RISC-V maximum page size
+//! is 0x1000, so `p_align` is at least 0x1000. `e_flags` is 0: the soft-float ABI (lp64)
 //! without compressed instructions, the only one merlin-ld links.
-//!
-//! The layout's addresses and sizes are `u64`. An ELF32 link stays below
-//! 4 GiB (the layout checks it), so narrowing them to ELF32's 4-byte fields
-//! ([`put_word`]) loses nothing.
+//! (merlin-ld wrote ELF32 for RV32 too until #159.)
 
 use crate::layout::{Def, Layout};
 use crate::object::{
@@ -116,7 +108,7 @@ use elf::{
 };
 use std::collections::HashMap;
 
-/// The page size segments are aligned to: ld.lld's for RISC-V, both classes.
+/// The page size segments are aligned to: ld.lld's for RISC-V.
 pub const PAGE: u64 = 0x1000;
 
 /// A `PT_LOAD` segment: a run of output sections.
@@ -165,7 +157,6 @@ fn pflags(shflags: u64) -> u32 {
 /// The `PT_LOAD` segments, the headers' one first if they are loaded, and
 /// where the headers go (see "The headers").
 pub fn segments(layout: &Layout) -> (Headers, Vec<Segment>) {
-    let class = layout.class;
     let mut segs = runs(layout);
 
     // 1. ld.lld's program header table, sized for every header it makes:
@@ -180,18 +171,14 @@ pub fn segments(layout: &Layout) -> (Headers, Vec<Segment>) {
     let joins = !layout.memory && segs.first().is_some_and(|s| s.flags == PF_R);
     let relro = relro_runs(layout);
     let count = 2 + segs.len() - usize::from(joins) + relro + 1 + usize::from(layout.riscv_attributes);
-    let size = (class.ehdr_size() + class.phdr_size() * count) as u64;
+    let size = (CLASS.ehdr_size() + CLASS.phdr_size() * count) as u64;
 
     // 2. Are they loaded? Only if they fit between the start of the page of
     // the lowest section and that section (allocateHeaders: "only allocate
     // program headers if that would not add a page"). Without sections
     // ld.lld's lowest address is the top of the address space (its `min`
-    // starts at UINT64_MAX, and an ELF32 field keeps the low 32 bits).
-    let top = match class {
-        Class::Elf32 => u32::MAX.into(),
-        Class::Elf64 => u64::MAX,
-    };
-    let lowest = layout.sections.iter().map(|s| s.addr).min().unwrap_or(top);
+    // starts at UINT64_MAX).
+    let lowest = layout.sections.iter().map(|s| s.addr).min().unwrap_or(u64::MAX);
     let page = lowest - lowest % PAGE;
     let addr = (size <= lowest - page).then_some(page);
     if let Some(page) = addr {
@@ -298,7 +285,7 @@ fn relro_runs(layout: &Layout) -> usize {
 /// when the read-only first section shares the headers' segment, which
 /// starts at the page below it (see "The headers"), but its load address
 /// (`AT`) is less than its distance from that page. ld.lld wraps `p_paddr`
-/// around (and cuts it to 32 bits for ELF32); as with a section's load
+/// around; as with a section's load
 /// address range, merlin-ld reports it.
 pub fn check(layout: &Layout) -> Vec<String> {
     let (headers, segs) = segments(layout);
@@ -330,17 +317,13 @@ fn put64(b: &mut Vec<u8>, v: u64) {
     b.extend_from_slice(&v.to_le_bytes());
 }
 
-/// Appends an address, offset or size field: 4 bytes in ELF32, 8 in ELF64.
-/// An ELF32 value fits in 4 bytes: the layout keeps an ELF32 link below
-/// 4 GiB, and its file is smaller than that.
-fn put_word(class: Class, b: &mut Vec<u8>, v: u64) {
-    match class {
-        Class::Elf32 => {
-            debug_assert!(u32::try_from(v).is_ok(), "{v:#x} in a 4-byte ELF32 field");
-            put32(b, v as u32);
-        }
-        Class::Elf64 => put64(b, v),
-    }
+/// The class merlin-ld writes: ELF64, for RV64 (until #159 it wrote ELF32
+/// for RV32 objects too).
+const CLASS: Class = Class::Elf64;
+
+/// Appends an address, offset or size field: 8 bytes.
+fn put_word(b: &mut Vec<u8>, v: u64) {
+    put64(b, v);
 }
 
 fn pad_to(b: &mut Vec<u8>, len: usize) {
@@ -363,8 +346,7 @@ impl StrTab {
     }
 }
 
-/// A section header, its fields as wide as ELF64's ([`Shdr::put`] narrows
-/// the address-sized ones for ELF32).
+/// A section header.
 #[derive(Debug, Clone, Default)]
 struct Shdr {
     name: u32,
@@ -380,20 +362,19 @@ struct Shdr {
 }
 
 impl Shdr {
-    /// Appends the header in `class`'s layout. The order of the fields is
-    /// the same in both; `sh_flags`, `sh_addr`, `sh_offset`, `sh_size`,
+    /// Appends the header. `sh_flags`, `sh_addr`, `sh_offset`, `sh_size`,
     /// `sh_addralign` and `sh_entsize` are address-sized.
-    fn put(&self, class: Class, out: &mut Vec<u8>) {
+    fn put(&self, out: &mut Vec<u8>) {
         put32(out, self.name);
         put32(out, self.ty);
-        put_word(class, out, self.flags);
-        put_word(class, out, self.addr);
-        put_word(class, out, self.offset);
-        put_word(class, out, self.size);
+        put_word(out, self.flags);
+        put_word(out, self.addr);
+        put_word(out, self.offset);
+        put_word(out, self.size);
         put32(out, self.link);
         put32(out, self.info);
-        put_word(class, out, self.align);
-        put_word(class, out, self.entsize);
+        put_word(out, self.align);
+        put_word(out, self.entsize);
     }
 
     /// The header as the elf crate read it (`name` is set by the caller:
@@ -414,27 +395,15 @@ impl Shdr {
     }
 }
 
-/// Appends a symbol table entry in `class`'s layout: ELF32 has
-/// `name, value, size, info, other, shndx`; ELF64 moves the three narrow
-/// fields before the two 8-byte ones, `name, info, other, shndx, value, size`.
-fn put_symbol(class: Class, out: &mut Vec<u8>, name: u32, value: u64, size: u64, info: u8, shndx: u16) {
+/// Appends a symbol table entry: the three narrow fields before the two
+/// 8-byte ones, `name, info, other, shndx, value, size`.
+fn put_symbol(out: &mut Vec<u8>, name: u32, value: u64, size: u64, info: u8, shndx: u16) {
     put32(out, name);
-    match class {
-        Class::Elf32 => {
-            put_word(class, out, value);
-            put_word(class, out, size);
-            out.push(info);
-            out.push(0); // st_other: STV_DEFAULT
-            put16(out, shndx);
-        }
-        Class::Elf64 => {
-            out.push(info);
-            out.push(0); // st_other: STV_DEFAULT
-            put16(out, shndx);
-            put64(out, value);
-            put64(out, size);
-        }
-    }
+    out.push(info);
+    out.push(0); // st_other: STV_DEFAULT
+    put16(out, shndx);
+    put64(out, value);
+    put64(out, size);
 }
 
 /// A program header: `PT_LOAD` or `PT_PHDR`.
@@ -464,32 +433,29 @@ impl Phdr {
         }
     }
 
-    /// Appends the header in `class`'s layout. ELF64 moves `p_flags` up to
-    /// follow `p_type`, so that the six address-sized fields after it are
-    /// 8-aligned.
-    fn put(&self, class: Class, out: &mut Vec<u8>) {
+    /// Appends the header: `p_flags` follows `p_type`, so that the six
+    /// address-sized fields after it are 8-aligned.
+    fn put(&self, out: &mut Vec<u8>) {
         put32(out, self.ty);
-        if class == Class::Elf64 {
-            put32(out, self.flags);
+        put32(out, self.flags);
+        for v in [
+            self.offset,
+            self.vaddr,
+            self.paddr,
+            self.filesz,
+            self.memsz,
+            self.align,
+        ] {
+            put_word(out, v);
         }
-        for v in [self.offset, self.vaddr, self.paddr, self.filesz, self.memsz] {
-            put_word(class, out, v);
-        }
-        if class == Class::Elf32 {
-            put32(out, self.flags);
-        }
-        put_word(class, out, self.align);
     }
 }
 
 /// Where `e_shoff` and `e_shnum` are in the ELF header (`e_shstrndx`
-/// follows `e_shnum`): after the three address-sized fields `e_entry`,
-/// `e_phoff` and `e_shoff`, which are 4 or 8 bytes.
-fn shoff_and_shnum_at(class: Class) -> (usize, usize) {
-    match class {
-        Class::Elf32 => (32, 48),
-        Class::Elf64 => (40, 60),
-    }
+/// follows `e_shnum`): after the three 8-byte fields `e_entry`, `e_phoff`
+/// and `e_shoff`.
+fn shoff_and_shnum_at() -> (usize, usize) {
+    (40, 60)
 }
 
 /// Symbol table entries: null, locals, then globals. Returns the table and
@@ -509,8 +475,7 @@ fn shoff_and_shnum_at(class: Class) -> (usize, usize) {
 /// keeps the symbol as ld.lld does when it writes one
 /// ([`Layout::riscv_attributes`]).
 fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
-    let class = layout.class;
-    let mut out = vec![0u8; class.sym_size()];
+    let mut out = vec![0u8; CLASS.sym_size()];
     // The section header index of each debug input section's output
     // section: after the loaded ones, .symtab and .strtab.
     let mut debug_index: HashMap<(usize, usize), u16> = HashMap::new();
@@ -533,7 +498,7 @@ fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
     };
     let mut entry = |out: &mut Vec<u8>, name: &str, value: u64, size: u64, info: u8, shndx: u16| {
         let name = strtab.add(name);
-        put_symbol(class, out, name, value, size, info, shndx);
+        put_symbol(out, name, value, size, info, shndx);
     };
 
     for (oi, o) in layout.objects.iter().enumerate() {
@@ -559,7 +524,7 @@ fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
             entry(&mut out, &s.name, value, s.size, info, shndx);
         }
     }
-    let first_global = (out.len() / class.sym_size()) as u32;
+    let first_global = (out.len() / CLASS.sym_size()) as u32;
     for (name, def) in &layout.globals {
         match *def {
             Def::Script(v) => entry(&mut out, name, v, 0, (STB_GLOBAL << 4) | STT_NOTYPE, SHN_ABS),
@@ -580,11 +545,10 @@ fn symtab(layout: &Layout, strtab: &mut StrTab) -> (Vec<u8>, u32) {
 
 /// Serializes the executable. `images` comes from [`crate::relocate::relocate`].
 pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
-    let class = layout.class;
     let debug = images.debug.as_slice();
     let images = images.sections.as_slice();
     let (headers, segs) = segments(layout);
-    let phoff = class.ehdr_size();
+    let phoff = CLASS.ehdr_size();
     // The room ld.lld leaves for the headers (see "The headers"), which
     // holds ours: PT_PHDR if they are loaded, then the PT_LOADs.
     let mut out = vec![0u8; headers.size as usize];
@@ -643,7 +607,7 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
             paddr: segs[0].paddr.wrapping_add(phoff as u64),
             filesz: room,
             memsz: room,
-            align: class.addr_size() as u64,
+            align: CLASS.addr_size() as u64,
         });
     }
     table.extend(
@@ -651,9 +615,9 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
             .zip(&seg_offset)
             .map(|(seg, &off)| Phdr::load(seg, off)),
     );
-    let mut phdrs = Vec::with_capacity(class.phdr_size() * table.len());
+    let mut phdrs = Vec::with_capacity(CLASS.phdr_size() * table.len());
     for p in &table {
-        p.put(class, &mut phdrs);
+        p.put(&mut phdrs);
     }
     debug_assert!(
         phoff + phdrs.len() <= headers.size as usize,
@@ -663,7 +627,7 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
 
     // Symbol and string tables. `.symtab` is aligned to its entries'
     // widest field, an address (ld.lld: sh_addralign 4 or 8).
-    let word = class.addr_size();
+    let word = CLASS.addr_size();
     let mut strtab = StrTab(vec![0]);
     let mut shstrtab = StrTab(vec![0]);
     let (syms, first_global) = symtab(layout, &mut strtab);
@@ -702,7 +666,7 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
         link: symtab_index + 1, // .strtab, next
         info: first_global,
         align: word as u64,
-        entsize: class.sym_size() as u64,
+        entsize: CLASS.sym_size() as u64,
         ..Shdr::default()
     });
     shdrs.push(Shdr {
@@ -738,40 +702,36 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
     out.resize(out.len().next_multiple_of(word), 0);
     let shoff = out.len() as u64;
     for h in &shdrs {
-        h.put(class, &mut out);
+        h.put(&mut out);
     }
 
     // ELF header.
-    let mut hdr = Vec::with_capacity(class.ehdr_size());
+    let mut hdr = Vec::with_capacity(CLASS.ehdr_size());
     hdr.extend_from_slice(b"\x7fELF");
-    let ident_class = match class {
-        Class::Elf32 => elf::ELFCLASS32,
-        Class::Elf64 => elf::ELFCLASS64,
-    };
     // Class, little-endian, version 1, System V ABI.
-    hdr.extend_from_slice(&[ident_class, elf::ELFDATA2LSB, 1, 0]);
+    hdr.extend_from_slice(&[elf::ELFCLASS64, elf::ELFDATA2LSB, 1, 0]);
     hdr.extend_from_slice(&[0; 8]);
     put16(&mut hdr, ET_EXEC);
     put16(&mut hdr, EM_RISCV);
     put32(&mut hdr, 1); // e_version
-    put_word(class, &mut hdr, layout.entry);
-    put_word(class, &mut hdr, if table.is_empty() { 0 } else { phoff as u64 });
-    put_word(class, &mut hdr, shoff);
+    put_word(&mut hdr, layout.entry);
+    put_word(&mut hdr, if table.is_empty() { 0 } else { phoff as u64 });
+    put_word(&mut hdr, shoff);
     put32(&mut hdr, 0); // e_flags: ilp32 or lp64 soft-float, no RVC
-    put16(&mut hdr, class.ehdr_size() as u16);
-    put16(&mut hdr, class.phdr_size() as u16);
+    put16(&mut hdr, CLASS.ehdr_size() as u16);
+    put16(&mut hdr, CLASS.phdr_size() as u16);
     put16(&mut hdr, table.len() as u16);
-    put16(&mut hdr, class.shdr_size() as u16);
+    put16(&mut hdr, CLASS.shdr_size() as u16);
     put16(&mut hdr, shdrs.len() as u16);
     put16(&mut hdr, shdrs.len() as u16 - 1); // e_shstrndx: .shstrtab, last
-    debug_assert_eq!(hdr.len(), class.ehdr_size());
+    debug_assert_eq!(hdr.len(), CLASS.ehdr_size());
     out[..hdr.len()].copy_from_slice(&hdr);
     out
 }
 
 /// The executable `elf` without its debug sections (`.debug_*`, not
 /// loaded), for a program that is installed rather than debugged. For a file
-/// [`write`] made, of either class, the result is what it writes for the
+/// [`write`] made, the result is what it writes for the
 /// same link without debug information: the bytes up to the symbol table
 /// stay as they are (the program headers among them), then come the symbol
 /// and string tables without the symbols of the debug sections (the `$d`
@@ -781,7 +741,9 @@ pub fn write(layout: &Layout, images: &Images) -> Vec<u8> {
 /// error.
 pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, String> {
     let parsed = elf::Elf::parse(elf).map_err(|e| e.to_string())?;
-    let class = parsed.class;
+    if parsed.class != CLASS {
+        return Err("an ELF32 (RV32) executable: merlin-ld writes, and takes apart, ELF64 ones".into());
+    }
     let is_debug = |s: &elf::Section| !s.is_alloc() && s.name.starts_with(".debug_");
     if !parsed.sections.iter().any(is_debug) {
         return Ok(elf.to_vec());
@@ -798,7 +760,7 @@ pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, String> {
         .iter()
         .filter(|s| !s.is_nobits())
         .map(|s| (s.offset + s.size) as usize);
-    let headers_end = class.ehdr_size() + class.phdr_size() * parsed.segments.len();
+    let headers_end = CLASS.ehdr_size() + CLASS.phdr_size() * parsed.segments.len();
     let cut = ends.max().unwrap_or(0).max(headers_end);
     // Right before them, .symtab and its .strtab, after everything loaded.
     let symtab_index = first.checked_sub(2).filter(|&i| i > 0);
@@ -825,7 +787,7 @@ pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = elf[..symtab.offset as usize].to_vec();
     // The symbols but the debug sections', in their order, their names in a
     // new string table: what write() makes of the link without them.
-    let mut syms = vec![0u8; class.sym_size()];
+    let mut syms = vec![0u8; CLASS.sym_size()];
     let mut strtab = StrTab(vec![0]);
     let mut first_global = 1;
     let symbols = parsed.symbols_in(symtab).map_err(|e| e.to_string())?;
@@ -837,7 +799,7 @@ pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, String> {
             first_global += 1;
         }
         let name = strtab.add(&s.name);
-        put_symbol(class, &mut syms, name, s.value, s.size, s.info, s.shndx);
+        put_symbol(&mut syms, name, s.value, s.size, s.info, s.shndx);
     }
     out.extend_from_slice(&syms);
     let strtab_off = out.len() as u64;
@@ -866,14 +828,14 @@ pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, String> {
     h.size = names.0.len() as u64;
     headers.push(h);
     out.extend_from_slice(&names.0);
-    out.resize(out.len().next_multiple_of(class.addr_size()), 0);
+    out.resize(out.len().next_multiple_of(CLASS.addr_size()), 0);
     let shoff = out.len() as u64;
     for h in &headers {
-        h.put(class, &mut out);
+        h.put(&mut out);
     }
-    let (shoff_at, shnum_at) = shoff_and_shnum_at(class);
+    let (shoff_at, shnum_at) = shoff_and_shnum_at();
     let mut field = Vec::new();
-    put_word(class, &mut field, shoff);
+    put_word(&mut field, shoff);
     out[shoff_at..shoff_at + field.len()].copy_from_slice(&field);
     out[shnum_at..shnum_at + 2].copy_from_slice(&(headers.len() as u16).to_le_bytes());
     out[shnum_at + 2..shnum_at + 4].copy_from_slice(&(headers.len() as u16 - 1).to_le_bytes());
@@ -902,14 +864,10 @@ _start:
     /// address, load address, file size, size in memory, permissions.
     type Ph = (&'static str, u64, u64, u64, u64, u64, &'static str);
 
-    /// The program headers of `src`, assembled by merlin-as for `class`
-    /// and linked with `script`.
-    fn program_headers(class: Class, src: &str, script: &str) -> Vec<Ph> {
-        let xlen = match class {
-            Class::Elf32 => excalibur::Xlen::Rv32,
-            Class::Elf64 => excalibur::Xlen::Rv64,
-        };
-        let data = merlin_as::assemble_to_elf_with(src, &merlin_as::Options { xlen }).unwrap();
+    /// The program headers of `src`, assembled by merlin-as and linked with
+    /// `script`.
+    fn program_headers(src: &str, script: &str) -> Vec<Ph> {
+        let data = merlin_as::assemble_to_elf(src).unwrap();
         let opts = Options {
             script: Some(ScriptSource {
                 name: "test.ld".into(),
@@ -942,18 +900,18 @@ _start:
 
     /// `PROGRAM` linked from `start`, its three sections in a row, and
     /// `more` at the end of `SECTIONS`.
-    fn at(class: Class, start: u64, more: &str) -> Vec<Ph> {
+    fn at(start: u64, more: &str) -> Vec<Ph> {
         let script = format!(
             "SECTIONS {{ . = {start:#x}; .text : {{ *(.text) }} .rodata : {{ *(.rodata) }} \
              .data : {{ *(.data) }} {more} }}"
         );
-        program_headers(class, PROGRAM, &script)
+        program_headers(PROGRAM, &script)
     }
 
     /// ld.lld's PT_PHDR and the headers' PT_LOAD at 0x8000_0000, for
     /// `room` bytes of headers.
-    fn loaded(class: Class, room: u64) -> [Ph; 2] {
-        let ehdr = class.ehdr_size() as u64;
+    fn loaded(room: u64) -> [Ph; 2] {
+        let ehdr = CLASS.ehdr_size() as u64;
         let table = room - ehdr;
         [
             (
@@ -970,8 +928,8 @@ _start:
     }
 
     /// `loaded`, then `segments`.
-    fn after_headers(class: Class, room: u64, segments: &[Ph]) -> Vec<Ph> {
-        [&loaded(class, room)[..], segments].concat()
+    fn after_headers(room: u64, segments: &[Ph]) -> Vec<Ph> {
+        [&loaded(room)[..], segments].concat()
     }
 
     /// The three segments of `PROGRAM` from `start`, the first at file
@@ -987,27 +945,19 @@ _start:
     /// Where the first segment goes and whether the headers are loaded, on
     /// either side of their size: the ELF header and the 7 program headers
     /// ld.lld counts (PT_PHDR, the headers' PT_LOAD, the three PT_LOADs,
-    /// PT_GNU_STACK and PT_RISCV_ATTRIBUTES), 0x114 bytes for ELF32 and
-    /// 0x1c8 for ELF64. Every number in these tests is ld.lld's for the same
-    /// object and script.
+    /// PT_GNU_STACK and PT_RISCV_ATTRIBUTES), 0x1c8 bytes. Every number in
+    /// these tests is ld.lld's for the same object and script.
     #[test]
     fn the_headers_are_loaded_when_they_fit_below_the_first_section() {
-        let class = Class::Elf32;
-        assert_eq!(at(class, 0x8000_0110, ""), three(0x8000_0110, 0x1110));
+        assert_eq!(at(0x8000_0114, ""), three(0x8000_0114, 0x1114));
+        assert_eq!(at(0x8000_01c4, ""), three(0x8000_01c4, 0x11c4));
         assert_eq!(
-            at(class, 0x8000_0114, ""),
-            after_headers(class, 0x114, &three(0x8000_0114, 0x114))
-        );
-        let class = Class::Elf64;
-        assert_eq!(at(class, 0x8000_0114, ""), three(0x8000_0114, 0x1114));
-        assert_eq!(at(class, 0x8000_01c4, ""), three(0x8000_01c4, 0x11c4));
-        assert_eq!(
-            at(class, 0x8000_01c8, ""),
-            after_headers(class, 0x1c8, &three(0x8000_01c8, 0x1c8))
+            at(0x8000_01c8, ""),
+            after_headers(0x1c8, &three(0x8000_01c8, 0x1c8))
         );
         // At the start of a page there is no room below: the first segment
         // goes a page in.
-        assert_eq!(at(class, 0x8000_0000, ""), three(0x8000_0000, 0x1000));
+        assert_eq!(at(0x8000_0000, ""), three(0x8000_0000, 0x1000));
     }
 
     /// The room is for what ld.lld counts, not for what merlin-ld writes: no
@@ -1020,17 +970,10 @@ _start:
     #[test]
     fn the_room_is_for_the_headers_ld_lld_counts() {
         let discard = "/DISCARD/ : { *(.riscv.attributes) }";
-        let class = Class::Elf32;
-        assert_eq!(at(class, 0x8000_00f0, discard), three(0x8000_00f0, 0x10f0));
+        assert_eq!(at(0x8000_0150, discard), three(0x8000_0150, 0x1150));
         assert_eq!(
-            at(class, 0x8000_00f4, discard),
-            after_headers(class, 0xf4, &three(0x8000_00f4, 0xf4))
-        );
-        let class = Class::Elf64;
-        assert_eq!(at(class, 0x8000_0150, discard), three(0x8000_0150, 0x1150));
-        assert_eq!(
-            at(class, 0x8000_0190, discard),
-            after_headers(class, 0x190, &three(0x8000_0190, 0x190))
+            at(0x8000_0190, discard),
+            after_headers(0x190, &three(0x8000_0190, 0x190))
         );
 
         // .empty, read-only between the code and the data, is a run of its
@@ -1048,18 +991,8 @@ _start:
                 ("LOAD", off + 8, start + 8, start + 8, 4, 4, "R"),
             ]
         };
-        let class = Class::Elf32;
         assert_eq!(
-            program_headers(class, PROGRAM, &script(0x8000_0114)),
-            runs(0x8000_0114, 0x1114)
-        );
-        assert_eq!(
-            program_headers(class, PROGRAM, &script(0x8000_0190)),
-            after_headers(class, 52 + 8 * 32, &runs(0x8000_0190, 0x190))
-        );
-        let class = Class::Elf64;
-        assert_eq!(
-            program_headers(class, PROGRAM, &script(0x8000_01c8)),
+            program_headers(PROGRAM, &script(0x8000_01c8)),
             runs(0x8000_01c8, 0x11c8)
         );
     }
@@ -1070,12 +1003,9 @@ _start:
     /// In a MEMORY region the section has a PT_LOAD of its own.
     #[test]
     fn a_read_only_first_section_shares_the_headers_segment() {
-        for class in [Class::Elf32, Class::Elf64] {
-            let room = match class {
-                Class::Elf32 => 0x114,
-                Class::Elf64 => 0x1c8,
-            };
-            let [phdr, _] = loaded(class, room);
+        {
+            let room = 0x1c8;
+            let [phdr, _] = loaded(room);
             let script = |noload: &str| {
                 format!(
                     "SECTIONS {{ . = 0x80000400; .ro {noload} : {{ . += 0x10; }} .text : {{ *(.text) }} \
@@ -1092,11 +1022,11 @@ _start:
                 ]
             };
             assert_eq!(
-                program_headers(class, PROGRAM, &script("")),
+                program_headers(PROGRAM, &script("")),
                 with(("LOAD", 0, 0x8000_0000, 0x8000_0000, 0x410, 0x410, "R"))
             );
             assert_eq!(
-                program_headers(class, PROGRAM, &script("(NOLOAD)")),
+                program_headers(PROGRAM, &script("(NOLOAD)")),
                 with(("LOAD", 0, 0x8000_0000, 0x8000_0000, room, 0x410, "R"))
             );
             let memory = "MEMORY { RAM (rwx) : ORIGIN = 0x80000400, LENGTH = 1M } SECTIONS { \
@@ -1107,21 +1037,13 @@ _start:
                 ("LOAD", 0x404, 0x8000_0404, 0x8000_0404, 4, 4, "R E"),
                 ("LOAD", 0x408, 0x8000_0408, 0x8000_0408, 4, 4, "RW"),
             ];
-            assert_eq!(
-                program_headers(class, PROGRAM, memory),
-                after_headers(class, room, &own)
-            );
+            assert_eq!(program_headers(PROGRAM, memory), after_headers(room, &own));
         }
     }
 
-    /// `src` assembled for `class` and linked with `script`, or the link's
-    /// errors.
-    fn link(class: Class, src: &str, script: &str) -> Result<Vec<u8>, Vec<String>> {
-        let xlen = match class {
-            Class::Elf32 => excalibur::Xlen::Rv32,
-            Class::Elf64 => excalibur::Xlen::Rv64,
-        };
-        let data = merlin_as::assemble_to_elf_with(src, &merlin_as::Options { xlen }).unwrap();
+    /// `src` assembled and linked with `script`, or the link's errors.
+    fn link(src: &str, script: &str) -> Result<Vec<u8>, Vec<String>> {
+        let data = merlin_as::assemble_to_elf(src).unwrap();
         let opts = Options {
             script: Some(ScriptSource {
                 name: "test.ld".into(),
@@ -1140,8 +1062,8 @@ _start:
 
     /// The allocated sections of `src` linked with `script`: name, address,
     /// file offset.
-    fn sections(class: Class, src: &str, script: &str) -> Vec<(String, u64, u64)> {
-        let linked = link(class, src, script).unwrap();
+    fn sections(src: &str, script: &str) -> Vec<(String, u64, u64)> {
+        let linked = link(src, script).unwrap();
         let elf = elf::Elf::parse(&linked).unwrap();
         elf.sections
             .iter()
@@ -1171,17 +1093,17 @@ _start:
                 ("LOAD", off + 12, start + 12, start + 12, 4, 4, "RW"),
             ]
         };
-        for class in [Class::Elf32, Class::Elf64] {
+        {
             assert_eq!(
-                program_headers(class, src, &script(0x8000_0000)),
+                program_headers(src, &script(0x8000_0000)),
                 runs(0x8000_0000, 0x1000)
             );
             // PT_PHDR, the headers' PT_LOAD, three PT_LOADs, PT_GNU_RELRO,
             // PT_GNU_STACK and PT_RISCV_ATTRIBUTES: 8.
-            let room = (class.ehdr_size() + 8 * class.phdr_size()) as u64;
+            let room = (CLASS.ehdr_size() + 8 * CLASS.phdr_size()) as u64;
             assert_eq!(
-                program_headers(class, src, &script(0x8000_0400)),
-                after_headers(class, room, &runs(0x8000_0400, 0x400))
+                program_headers(src, &script(0x8000_0400)),
+                after_headers(room, &runs(0x8000_0400, 0x400))
             );
         }
 
@@ -1193,11 +1115,9 @@ _start:
         let script =
             "SECTIONS { . = 0x80000400; .text : { *(.text) } .ctors : { *(.a) } .data : { *(.data) } \
                       .dtors : { *(.b) } .d2 : { *(.c) } /DISCARD/ : { *(.riscv.attributes) } }";
-        let class = Class::Elf64;
         assert_eq!(
-            program_headers(class, src, script),
+            program_headers(src, script),
             after_headers(
-                class,
                 64 + 9 * 56,
                 &[
                     ("LOAD", 0x400, 0x8000_0400, 0x8000_0400, 4, 4, "R E"),
@@ -1218,15 +1138,13 @@ _start:
                       .data : { *(.data) } }";
         let want = "the headers' load address range would start below 0: they share a segment with section \
                     .rodata, loaded at 0x10, 0x400 bytes after them";
-        for class in [Class::Elf32, Class::Elf64] {
-            assert_eq!(link(class, PROGRAM, script).unwrap_err(), [want]);
-        }
+        assert_eq!(link(PROGRAM, script).unwrap_err(), [want]);
         // Loaded high enough, they are at its load address less 0x400.
         let script = script.replace("AT(0x10)", "AT(0x400)");
-        let [phdr, load, ..] = program_headers(Class::Elf32, PROGRAM, &script)[..] else {
+        let [phdr, load, ..] = program_headers(PROGRAM, &script)[..] else {
             panic!()
         };
-        assert_eq!((phdr.3, load.3), (0x34, 0));
+        assert_eq!((phdr.3, load.3), (0x40, 0));
     }
 
     /// The file offsets of sections that take no file space, as ld.lld's
@@ -1236,24 +1154,21 @@ _start:
     #[test]
     fn nobits_and_empty_sections_are_at_the_file_end_so_far() {
         let src = format!("{PROGRAM}    .bss\n    .zero 8\n");
-        let class = Class::Elf32;
         // .bss after a gap in the data's segment.
         let script = "SECTIONS { . = 0x80000000; .text : { *(.text) } .data : { *(.data) } . = . + 0x100; \
                       .bss : { *(.bss) } .rodata : { *(.rodata) } .empty : { *(.empty) } }";
-        let bss = sections(class, &src, script).into_iter().find(|s| s.0 == ".bss");
+        let bss = sections(&src, script).into_iter().find(|s| s.0 == ".bss");
         assert_eq!(bss, Some((".bss".into(), 0x8000_0108, 0x1008)));
         // A NOLOAD section in the headers' segment.
         let script = "SECTIONS { . = 0x80000400; .rodata (NOLOAD) : { *(.rodata) } .text : { *(.text) } \
                       .data : { *(.data) } .bss : { *(.bss) } .empty : { *(.empty) } }";
-        let ro = sections(class, &src, script)
-            .into_iter()
-            .find(|s| s.0 == ".rodata");
-        assert_eq!(ro, Some((".rodata".into(), 0x8000_0400, 0x114)));
+        let ro = sections(&src, script).into_iter().find(|s| s.0 == ".rodata");
+        assert_eq!(ro, Some((".rodata".into(), 0x8000_0400, 0x1c8)));
         // An empty section alone in its run, which is dropped.
         let script =
             "SECTIONS { . = 0x80000000; .text : { *(.text) } .x : { sym = .; } .data : { *(.data) } \
                       .bss : { *(.bss) } .rodata : { *(.rodata) } .empty : { *(.empty) } }";
-        let x = sections(class, &src, script).into_iter().find(|s| s.0 == ".x");
+        let x = sections(&src, script).into_iter().find(|s| s.0 == ".x");
         assert_eq!(x, Some((".x".into(), 0x8000_0004, 0x1004)));
     }
 
@@ -1269,17 +1184,16 @@ _start:
              .p2align 4\n    .section .sdata, \"aw\"\n    .section .eb, \"aw\", @nobits\n    \
              .section .ctors, \"aw\"\n"
         );
-        let names = |class: Class, script: &str| -> Vec<String> {
-            sections(class, &src, script).into_iter().map(|s| s.0).collect()
-        };
+        let names =
+            |script: &str| -> Vec<String> { sections(&src, script).into_iter().map(|s| s.0).collect() };
         let d = "/DISCARD/ : { *(.riscv.attributes) }";
-        for class in [Class::Elf32, Class::Elf64] {
+        {
             let script = format!(
                 "SECTIONS {{ . = 0x80000000; .text : {{ *(.text) }} \
                  .data : {{ *(.data) *(.rodata) *(.bss) }} {d} }}"
             );
             assert_eq!(
-                names(class, &script),
+                names(&script),
                 [".empty", ".er", ".text", ".ex", ".ctors", ".data", ".sdata", ".eb"]
             );
             // With MEMORY, after the section most like it.
@@ -1289,7 +1203,7 @@ _start:
                  .data : {{ *(.data) *(.rodata) *(.bss) }} > RAM {d} }}"
             );
             assert_eq!(
-                names(class, &script),
+                names(&script),
                 [".text", ".ex", ".empty", ".er", ".data", ".sdata", ".eb", ".ctors"]
             );
             // After a symbol assignment, which then does not see the
@@ -1298,13 +1212,13 @@ _start:
                 "SECTIONS {{ . = 0x80000001; .text : {{ *(.text) }} foo = .; \
                  .data : {{ *(.data) *(.rodata) *(.bss) }} .er : {{ *(.nothing) }} {d} }}"
             );
-            let all = sections(class, &src, &script);
+            let all = sections(&src, &script);
             let at = |name: &str| all.iter().find(|s| s.0 == name).unwrap().1;
             assert_eq!(
                 (at(".text"), at(".ex"), at(".data")),
                 (0x8000_0004, 0x8000_0010, 0x8000_0010)
             );
-            let linked = link(class, &src, &script).unwrap();
+            let linked = link(&src, &script).unwrap();
             let symbols = elf::Elf::parse(&linked).unwrap().symbols().unwrap();
             let foo = symbols.iter().find(|s| s.name == "foo").unwrap().value;
             assert_eq!(foo, 0x8000_0008);
@@ -1317,14 +1231,14 @@ _start:
             "    .section .rodata, \"a\"\n    .globl _start\n_start:\n    .word 1\n    .data\n    .word 2\n";
         let script = "SECTIONS { . = 0x800000e0; .rodata : { *(.rodata) } .data : { *(.data) } }";
         assert_eq!(
-            program_headers(Class::Elf32, src, script),
+            program_headers(src, script),
             [
                 ("LOAD", 0x10e0, 0x8000_00e0, 0x8000_00e0, 4, 4, "R"),
                 ("LOAD", 0x10e4, 0x8000_00e4, 0x8000_00e4, 4, 4, "RW"),
             ]
         );
         assert_eq!(
-            sections(Class::Elf32, src, script),
+            sections(src, script),
             [
                 (".rodata".into(), 0x8000_00e0, 0x10e0),
                 (".text".into(), 0x8000_00e4, 0x10e4),
@@ -1339,16 +1253,9 @@ _start:
     fn without_sections_the_headers_go_in_the_last_page() {
         let src = "    .globl _start\n    .set _start, 0x80000000\n";
         let script = "SECTIONS { /DISCARD/ : { *(.text) } }";
-        assert_eq!(
-            program_headers(Class::Elf32, src, script),
-            [
-                ("PHDR", 52, 0xffff_f034, 0xffff_f034, 0x80, 0x80, "R"),
-                ("LOAD", 0, 0xffff_f000, 0xffff_f000, 0xb4, 0xb4, "R"),
-            ]
-        );
         let page = 0xffff_ffff_ffff_f000;
         assert_eq!(
-            program_headers(Class::Elf64, src, script),
+            program_headers(src, script),
             [
                 ("PHDR", 64, page + 64, page + 64, 0xe0, 0xe0, "R"),
                 ("LOAD", 0, page, page, 0x120, 0x120, "R"),

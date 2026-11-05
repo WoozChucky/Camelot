@@ -13,8 +13,7 @@
 #define BLK_MAX_DISKS 8
 
 /* Register offsets in a disk's page. */
-#if __riscv_xlen == 64
-/* Version 2 of the interface (RV64 machines): BLK_CAPACITY, BLK_SECTOR and
+/* Version 2 of the interface (spec section 9.6): BLK_CAPACITY, BLK_SECTOR and
  * BLK_DMA are 64-bit, the rest 32-bit. */
 #define BLK_CAPACITY 0x00 /* size in sectors (read-only) */
 #define BLK_SECTOR 0x08   /* first sector of the transfer */
@@ -25,18 +24,6 @@
 #define BLK_STATUS 0x24   /* bit 0 BUSY, bit 1 DONE (write 1 to clear) */
 #define BLK_ERROR 0x28    /* outcome of the last command */
 #define BLK_CTRL 0x2c     /* bit 0: completion interrupt enable */
-#else
-/* Version 1 (RV32 machines): every register 32-bit. */
-#define BLK_CAPACITY 0x00
-#define BLK_FLAGS 0x04
-#define BLK_SECTOR 0x08
-#define BLK_DMA 0x0c
-#define BLK_COUNT 0x10
-#define BLK_CMD 0x14
-#define BLK_STATUS 0x18
-#define BLK_ERROR 0x1c
-#define BLK_CTRL 0x20
-#endif
 
 #define BLK_FLAG_READ_ONLY 0x1
 #define BLK_CMD_READ 1

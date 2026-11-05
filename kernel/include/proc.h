@@ -104,15 +104,9 @@ struct thread {
 /* The kernel tests walk threads[] by THREAD_SIZE and read the fields up to
  * `kstack` at their offsets: state 0, tid 4, then the pointers, a
  * register wide (proc at THREAD_PROC, kstack at THREAD_KSTACK). */
-#if __riscv_xlen == 64
 #define THREAD_PROC 8
 #define THREAD_KSTACK 16
 #define THREAD_SIZE 184
-#else
-#define THREAD_PROC 8
-#define THREAD_KSTACK 12
-#define THREAD_SIZE 96
-#endif
 _Static_assert(sizeof(struct thread) == THREAD_SIZE, "the tests index threads[] by THREAD_SIZE");
 _Static_assert(offsetof(struct thread, proc) == THREAD_PROC, "the tests read proc there");
 _Static_assert(offsetof(struct thread, kstack) == THREAD_KSTACK, "the tests read kstack there");
@@ -189,13 +183,8 @@ _Static_assert(NOFILE <= 32, "a bit of proc.cloexec for each descriptor");
 
 /* The tests walk procs[] by PROC_SIZE, and read the page table at
  * PROC_PAGETABLE. */
-#if __riscv_xlen == 64
 #define PROC_PAGETABLE 40
 #define PROC_SIZE 304
-#else
-#define PROC_PAGETABLE 32
-#define PROC_SIZE 172
-#endif
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 _Static_assert(offsetof(struct proc, parent) == 24, "the tests read parent there");
 _Static_assert(offsetof(struct proc, pagetable) == PROC_PAGETABLE, "the tests read pagetable there");
@@ -203,18 +192,14 @@ _Static_assert(offsetof(struct proc, pagetable) == PROC_PAGETABLE, "the tests re
 /* A user program embedded in the kernel image as an ELF executable
  * (userprogs.s, generated from kernel/user/ by `cargo xtask kernel`):
  * what spawn and exec run when there is no root filesystem (exec.c). Its
- * entries are 12 bytes on RV32, 24 on RV64 (two pointers and the size,
- * padded to a pointer's alignment): the generator writes them so. */
+ * entries are 24 bytes (two pointers and the size, padded to a pointer's
+ * alignment): the generator writes them so. */
 struct user_program {
     const char *name;
     const u8 *elf;
     u32 size;
 };
-#if __riscv_xlen == 64
 _Static_assert(sizeof(struct user_program) == 24, "userprogs.s lays out 24-byte entries");
-#else
-_Static_assert(sizeof(struct user_program) == 12, "userprogs.s lays out 12-byte entries");
-#endif
 
 extern const struct user_program user_programs[];
 extern const u32 user_program_count;
@@ -435,7 +420,7 @@ void thread_exit(int status);
 int thread_join(int tid, uintptr status);
 
 /* futex_wait(): if the 32-bit word at user address `addr` still holds `val`
- * (a futex is 32 bits on both widths, as Linux's),
+ * (a futex is 32 bits, as Linux's),
  * sleeps until a futex_wake() on the same address (0), else returns
  * -EAGAIN at once. The check and the sleep are one step as far as
  * futex_wake() can see, so a wake that comes after the value changed is
