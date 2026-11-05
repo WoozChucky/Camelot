@@ -381,7 +381,7 @@ mod tests {
         std::fs::read(format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
-    /// RV64: the RV64 kernel (ELF64, linked high, loaded at 0x8000_0000) is
+    /// RV64: the RV64 kernel (ELF64, linked high, loaded at 0x8020_0000) is
     /// checked and stripped at ELF64's offsets, and goes with the RV64
     /// bootloader only; the RV32 bootloader takes only ELF32 kernels.
     #[test]
