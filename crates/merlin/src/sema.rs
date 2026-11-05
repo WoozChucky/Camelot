@@ -957,6 +957,10 @@ impl<'a> FnChecker<'a> {
     }
 
     fn bind(&mut self, name: &str, var: VarRef, ty: &Type, pos: Pos, what: &str) {
+        // An unnamed parameter (`int f(int) { ... }`) is no name.
+        if name.is_empty() {
+            return;
+        }
         let scope = self.scopes.last_mut().expect("at least one scope");
         if let Some((_, _, prev)) = scope.insert(name.to_string(), (var, ty.clone(), pos)) {
             // clang's note on a parameter is of its declaration, but a local
@@ -1245,6 +1249,19 @@ impl<'a> FnChecker<'a> {
     }
 
     fn local_var(&mut self, d: &mut Declarator) {
+        // A block's `extern` declaration, or a function's: in the block the
+        // name is the object or function outside it, which it defines
+        // nothing of.
+        if d.storage == Storage::Extern || d.ty.is_func() {
+            let var = VarRef::Global(d.name.clone());
+            self.bind(&d.name, var.clone(), &d.ty, d.pos, "");
+            d.var = Some(var);
+            if d.init.is_some() {
+                let msg = "declaration of block scope identifier with linkage cannot have an initializer";
+                self.err(d.pos, msg);
+            }
+            return;
+        }
         if d.ty.is_void() {
             self.err(d.pos, "variable has incomplete type 'void'");
             return;
@@ -1437,6 +1454,16 @@ impl<'a> FnChecker<'a> {
             return self.init_expr(ty, e, constant, false, None);
         };
         let pos = *pos;
+        // `{}` for a scalar (C23's, which clang takes in C99 too) means 0.
+        if items.is_empty() && !ty.is_array() && !ty.is_record() {
+            *init = Init::Expr(Expr {
+                kind: ExprKind::Num(0),
+                ty: Type::INT,
+                pos,
+            });
+            let Init::Expr(e) = init else { unreachable!() };
+            return self.init_expr(ty, e, constant, false, None);
+        }
         // `{ x }` for a scalar, or `{ "text" }` for a char array, means `x`.
         let unwrap = match &items[..] {
             [Init::Expr(_)] if !ty.is_array() && !ty.is_record() => true,
@@ -1459,11 +1486,6 @@ impl<'a> FnChecker<'a> {
                 let msg =
                     format!("initialization of non-aggregate type '{ty}' with a designated initializer list");
                 return Err(self.err(decl.unwrap_or(pos), msg));
-            }
-            // `{}` is zero.
-            if items.is_empty() {
-                *init = zero(ty, pos);
-                return self.init(ty, init, constant, None);
             }
             // `{{1}}` for a scalar is `1`, `{1, 2}` is `1`: clang warns.
             if let Init::List(_, at) = &items[0] {

@@ -1902,6 +1902,11 @@ impl<'a> FuncGen<'a, '_> {
                 // a static local's data first, then its entry
                 // (`EmitStaticVarDecl`).
                 for d in decls {
+                    // A block's `extern` declaration, or a function's,
+                    // defines nothing.
+                    if d.storage == Storage::Extern || d.ty.is_func() {
+                        continue;
+                    }
                     // A local the code declares has a slot, used or not.
                     if let Some(VarRef::Local(id)) = d.var {
                         self.used[id.0].set(true);
