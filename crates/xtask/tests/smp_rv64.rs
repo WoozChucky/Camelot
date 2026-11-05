@@ -41,6 +41,7 @@ fn load(harts: usize, input: Receiver<u8>, disks: Vec<DiskConfig>) -> Machine {
         harts,
         ram_size: 16 * MIB,
         xlen: grail::Xlen::Rv64,
+        bios: grail::Bios::Default,
         disks,
         ..MachineConfig::default()
     })
@@ -62,7 +63,7 @@ fn printed(m: &Machine) -> String {
 /// tables of the kernel's page table that mapping a stack slot no thread
 /// had used before makes: they stay, as Linux's kernel page tables do. So
 /// a test runs its command once before it counts ([`warm_up`]).
-fn pages(m: &Machine) -> kstacks::Pages {
+fn pages(m: &mut Machine) -> kstacks::Pages {
     kstacks::pages(m, &committed())
 }
 
@@ -247,12 +248,12 @@ fn stress_holds_up_on_four_harts() {
     let mut m = load(4, rx, Vec::new());
     step_to_prompt(&mut m);
     warm_up(&mut m, &tx, LINE, "stress: 6 workers, 3 rounds, 3600 bytes: ok");
-    let before = pages(&m);
+    let before = pages(&mut m);
     let mut user = UserHarts::new(4);
     run_command(&mut m, &tx, LINE, |cpu| user.step(cpu));
     let out = printed(&m);
     check_stress_output(&command_output(&out, LINE), 6, 3);
-    assert_eq!(pages(&m), before, "pages leaked");
+    assert_eq!(pages(&mut m), before, "pages leaked");
     assert_eq!(user.ran.len(), 4, "stress ran on harts {:?}", user.ran);
     exit_shell(&mut m, &tx);
 }
@@ -299,6 +300,8 @@ fn the_disk_kernel_runs_programs_from_bin_on_four_harts() {
     let mut m = Machine::new(MachineConfig {
         harts: 4,
         xlen: grail::Xlen::Rv64,
+        bios: grail::Bios::Default,
+        ram_size: 6 << 20,
         disks: vec![DiskConfig::memory(image)],
         ..MachineConfig::default()
     })
@@ -338,7 +341,7 @@ fn threads_add_up_under_a_mutex_on_one_and_four_harts() {
             LINE,
             "threads: 4 threads, 300 rounds: counter 1200, spun 1200: ok",
         );
-        let before = pages(&m);
+        let before = pages(&mut m);
         let mut user = UserHarts::new(harts);
         run_command(&mut m, &tx, LINE, |cpu| user.step(cpu));
         let out = printed(&m);
@@ -347,7 +350,7 @@ fn threads_add_up_under_a_mutex_on_one_and_four_harts() {
             ["threads: 4 threads, 300 rounds: counter 1200, spun 1200: ok"],
             "{harts} harts"
         );
-        assert_eq!(pages(&m), before, "{harts} harts: pages leaked");
+        assert_eq!(pages(&mut m), before, "{harts} harts: pages leaked");
         if harts == 1 {
             assert_eq!(user.most, 1);
         } else {
@@ -378,7 +381,7 @@ fn threads_using_the_filesystem_end_with_their_process_on_one_and_four_harts() {
         step_to_prompt(&mut m);
         let fs_line = format!("threadtest fs: {THREADTEST_FS_CHECKS} checks, 0 failed");
         warm_up(&mut m, &tx, "threadtest fs", &fs_line);
-        let start = pages(&m);
+        let start = pages(&mut m);
         run_command(&mut m, &tx, "threadtest fs", |_| {});
         let out = printed(&m);
         assert_eq!(
@@ -386,7 +389,7 @@ fn threads_using_the_filesystem_end_with_their_process_on_one_and_four_harts() {
             [format!("threadtest fs: {THREADTEST_FS_CHECKS} checks, 0 failed")],
             "{harts} harts"
         );
-        assert_eq!(pages(&m), start, "{harts} harts: pages leaked");
+        assert_eq!(pages(&mut m), start, "{harts} harts: pages leaked");
         exit_shell(&mut m, &tx);
         let d = &mut m.cpu.bus.disks[0];
         let mut disk = vec![0; d.capacity() as usize * 512];

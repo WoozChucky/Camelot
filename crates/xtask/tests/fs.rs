@@ -202,6 +202,7 @@ fn boot(image: Vec<u8>, how: Boot) -> Run {
     let config = MachineConfig {
         ram_size: RAM,
         xlen: width::machine(),
+        bios: width::bios(),
         ..MachineConfig::default()
     };
     let mut m = Machine::with_backends(config, vec![Box::new(disk)]).unwrap();

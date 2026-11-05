@@ -13,12 +13,25 @@
 //! stack no one freed would keep that total the same too, mapped but in use
 //! by no thread: so the stacks in use, those mapped but neither cached nor
 //! deferred (what kstack_count() reports), must come back as well.
+//!
+//! Those counts agree only between the kernel's changes to a stack's state.
+//! kstack_reclaim() takes the deferred stacks off their list, marks their
+//! slots KSTACK_BUSY and then unmaps each one, kfree()ing its pages before
+//! it marks the slot KSTACK_FREE: in between, the pages are in `nfree` and
+//! still counted as the slot's, 4 too many (kstack_alloc() is the same the
+//! other way round). The shell's prompt is no such moment: the hart that
+//! ran a process's last thread reclaims its stack after switching away from
+//! it, which on several harts may be after the shell, on another, has
+//! printed the prompt. So [`pages`] first lets the machine run until every
+//! hart idles in wfi, as Linux's accounting of a freed task stack settles
+//! once the work that vfree()s it has run.
 
 use grail::Machine;
 
-/// Where the RV64 kernel image is linked, and where it is loaded.
+/// Where the RV64 kernel image is linked, and where it is loaded: after the
+/// firmware's 2 MiB.
 const KERNEL_LINK_ADDR: u64 = 0xffff_ffff_8000_0000;
-const LOAD_ADDR: u64 = 0x8000_0000;
+const LOAD_ADDR: u64 = 0x8020_0000;
 const PGSIZE: u64 = 4096;
 /// A kernel stack's size (vm.h's KSTACK_SIZE): 4 pages.
 const KSTACK_SIZE: u64 = 4 * PGSIZE;
@@ -33,10 +46,28 @@ pub struct Pages {
     pub stacks_in_use: u64,
 }
 
-/// The RV64 kernel `kernel` (its ELF file)'s pages in `m`'s RAM. Read at a
-/// quiet moment (the shell waiting at its prompt), when no hart is
-/// changing the stacks' state.
-pub fn pages(m: &Machine, kernel: &[u8]) -> Pages {
+/// Steps for every hart to finish what it is doing and idle ([`settle`]):
+/// a few unmappings with their shootdowns, far fewer than this.
+const SETTLE_MAX_STEPS: u64 = 10_000_000;
+
+/// Steps `m` until every hart waits in wfi: the kernel's idle loop, the only
+/// place it waits while it runs (its other wfi is a halt). Then no hart is
+/// between two changes to a stack's state, nor to anything else.
+fn settle(m: &mut Machine) {
+    for _ in 0..SETTLE_MAX_STEPS {
+        if m.cpu.harts().iter().all(|h| h.waiting) {
+            return;
+        }
+        m.cpu.step();
+    }
+    panic!("the harts never all idled");
+}
+
+/// The RV64 kernel `kernel` (its ELF file)'s pages in `m`'s RAM, once its
+/// harts have settled ([`settle`]): `m` runs on until they all idle.
+pub fn pages(m: &mut Machine, kernel: &[u8]) -> Pages {
+    settle(m);
+    let m = &*m;
     let symbols = elf::Elf::parse(kernel).unwrap().symbols().unwrap();
     let symbol = |name: &str| {
         let s = symbols
@@ -48,8 +79,15 @@ pub fn pages(m: &Machine, kernel: &[u8]) -> Pages {
     let read = |pa: u64, size: u32| m.cpu.bus.read_mem(pa, size).unwrap();
 
     let free = read(symbol("nfree").0, 4);
-    // kstack_state: a byte per slot, KSTACK_FREE (0) for an unmapped one.
+    // kstack_state: a byte per slot, KSTACK_FREE (0) for an unmapped one,
+    // KSTACK_BUSY (2) for one being mapped or unmapped, which no slot is
+    // once the harts have settled.
     let (state, slots) = symbol("kstack_state");
+    let busy: Vec<u64> = (0..slots).filter(|&i| read(state + i, 1) == 2).collect();
+    assert!(
+        busy.is_empty(),
+        "kernel stack slots {busy:?} busy with every hart idle"
+    );
     let mapped = (0..slots).filter(|&i| read(state + i, 1) != 0).count() as u64;
     // kstack_cached[NCPU][NR_CACHED_STACKS]: a stack's address, or 0.
     let (cached_at, size) = symbol("kstack_cached");

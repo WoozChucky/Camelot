@@ -2,7 +2,10 @@
 
 The Camelot OS kernel, in C with a little assembly. It runs in S-mode on an
 SBI, the RISC-V Supervisor Binary Interface that Linux uses and OpenSBI
-provides on boards: Camelot's own on Grail (`machine.S`, in M-mode) sets up
+provides on boards: Camelot's own on Grail (`firmware/sbi.S`, in M-mode: the
+RV64 kernel runs on Camelot's firmware, `grail --bios default`, and has no
+M-mode code; the RV32 kernel carries the same source in its image as
+`machine.S` until #159) sets up
 trap delegation and forwards the timer and IPIs, starts the other harts and
 stops the machine, and the kernel asks for those only through SBI calls
 (`sbi.c`; spec section 10, "Kernel traps"). It prints a banner, what the SBI
@@ -103,15 +106,16 @@ the filesystem the rest; its size is in the spec, section 10, "Root image");
 builds the RV64 system's image too, `target/camelot-fs-rv64.img`: the
 programs built for RV64 in `/bin`, `boot/boot-rv64.elf` and
 `kernel-disk-rv64.elf` (about 380 blocks),
-in an image of the same size, which an RV64 machine of 4 MiB boots;
-`--xlen 32` or `--xlen 64` builds just one of them.
+in an image of the same size, which an RV64 machine of 6 MiB boots through
+Camelot's firmware (`--bios default`: the firmware's 2 MiB below the
+kernel's 4); `--xlen 32` or `--xlen 64` builds just one of them.
 
 ```
 cargo xtask fs
 cargo run --release -p grail -- --disk target/camelot-fs.img
 cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
-cargo run --release -p grail -- --xlen 64 --disk target/camelot-fs-rv64.img
-cargo run --release -p grail -- --xlen 64 --disk target/camelot-fs-rv64.img kernel/kernel-rv64.elf
+cargo run --release -p grail -- --xlen 64 --bios default --ram 6 --disk target/camelot-fs-rv64.img
+cargo run --release -p grail -- --bios default --ram 8 --disk target/camelot-fs-rv64.img kernel/kernel-rv64.elf
 ```
 
 ```
@@ -379,18 +383,24 @@ linker script, `kernel.lds.S`, preprocessed for RV64. It runs as Linux's riscv64
 "The RV64 kernel" and "RV64 processes"):
 
 ```
-grail kernel/kernel-rv64.elf                     # Sv48, the default hart
-grail --paging sv39 --harts 4 kernel/kernel-rv64.elf
+grail --bios default --ram 8 kernel/kernel-rv64.elf        # Sv48, the default hart
+grail --bios default --ram 8 --paging sv39 --harts 4 kernel/kernel-rv64.elf
 ```
 
-- The image is linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000
-  (`AT` in `kernel.lds.S`). `entry.S` starts at the physical address with
+- It runs in S-mode only, on Camelot's firmware (`--bios default`, spec
+  section 7, "Firmware"), which keeps the first 2 MiB of RAM: 8 MiB in all
+  for the image and its programs (6 MiB for the disk kernel, from a disk).
+- The image is linked at 0xffff_ffff_8000_0000 and loaded at 0x8020_0000
+  (`AT` in `kernel.lds.S`). `entry.S` starts at the physical address in
+  S-mode with
   paging off; `setup_vm()` (`vm.c`) probes `satp` for Sv48, falling back to
   Sv39, and builds the early page table, which maps the image at both
   addresses; every hart turns paging on and jumps to the high address;
   `kvminit()` builds the final table, which drops the identity mapping.
 - All of RAM is in a direct map at `PAGE_OFFSET` (0xffff_af80_0000_0000 in
-  Sv48); the kernel stacks at the start of the vmalloc area, then the
+  Sv48), but the firmware's 2 MiB, which the device tree marks `no-map`
+  and which Linux's linear map leaves out too; the device tree's pages are
+  never handed out, as Linux reserves them; the kernel stacks at the start of the vmalloc area, then the
   devices, mapped as their drivers ask (`ioremap()`, which finds them room,
   as Linux's does); sysinfo and the UART in the fixmap for the boot. `pa()` and `va()` convert
   between kernel pointers and physical addresses, as Linux's `__pa` and
@@ -494,8 +504,8 @@ one process.
 
 | File | What it does |
 |---|---|
-| `entry.S` | `_start` (M-mode): early trap vector; hart 0: boot stack, zero `.bss`, the SBI's coldboot; the others: their M-mode set up, then STOPPED in the SBI. `supervisor_entry` (S-mode, where the coldboot enters, a0 = the hart id, a1 = the device tree): `tp`, `stvec`, `kmain`, then `machine_power_off` with its return value. `secondary_entry` (where `hart_start` starts the other harts, a1 = their stack): as Linux's `secondary_start_sbi`, `sie` and `sip` cleared, a trap vector that needs no stack (`early_s_trap` on RV64), `tp` and `sp`, then paging (on RV64 `early_s_trap`'s high address in `stvec` before `kernel_satp` goes in `satp`), `kernel_vec`, `hart_main`. Also `xcal_dbg` for C and the early trap handler (prints `mcause`, `mepc`, `mtval`, exits 0xff). On RV64, with paging off: `setup_vm()` on hart 0, `relocate_enable_mmu` (`satp` = the early table, return to the link address, adding `va_kernel_pa_offset`), the high stack, `stvec`. The early page tables and the harts' overflow stacks |
-| `machine.S` | Camelot's SBI on Grail, in M-mode (spec section 10, "Kernel traps"): the coldboot (`sbi_coldboot`: sysinfo's harts and RAM, every other hart STOPPED and woken out of the boot ROM), each hart's M-mode (`sbi_hart_init`: delegation, `mtvec`, `mscratch`), a stopped hart's wait for `hart_start` (`sbi_hart_wait`), and `machine_vec`: the machine timer forwarded as STIP, IPIs as SSIP (`msip` cleared, then a `fence o, rw`), and the SBI calls BASE, TIME (`set_timer`), IPI (`send_ipi`: `SBI_ERR_INVALID_PARAM` for a hart the machine doesn't have, and of the harts named only the STARTED or SUSPENDED ones interrupted, the others skipped without an error, as OpenSBI's 110f28518a, which fixed 37eaca4ab3; after a `fence rw, o`), HSM (`hart_start`, `hart_stop`, `hart_get_status`, `hart_suspend`), SRST (`system_reset`: the exit code) and DBCN (the UART); anything else is `SBI_ERR_NOT_SUPPORTED` |
+| `entry.S` | `_start`: on RV32 in M-mode, early trap vector; hart 0: boot stack, zero `.bss`, the SBI's coldboot; the others: their M-mode set up, then STOPPED in the SBI. On RV64 in S-mode at 0x8020_0000, where the firmware starts the boot hart (a0 = its id, a1 = the device tree), as Linux's `_start_kernel`: `sie` and `sip` cleared, boot stack, zero `.bss` and the stack, the device tree's address in `dtb_early_pa`. `supervisor_entry` (S-mode, a0 = the hart id, a1 = the device tree): `tp`, `s0` = 0 (the outermost frame), `stvec`, `kmain`, then `machine_power_off` with its return value. `secondary_entry` (where `hart_start` starts the other harts, a1 = their stack): as Linux's `secondary_start_sbi`, `sie` and `sip` cleared, a trap vector that needs no stack (`early_s_trap` on RV64), `tp` and `sp`, then paging (on RV64 `early_s_trap`'s high address in `stvec` before `kernel_satp` goes in `satp`), `kernel_vec`, `hart_main`. Also `xcal_dbg` for C and the early trap handler (prints `mcause`, `mepc`, `mtval`, exits 0xff). On RV64, with paging off: `setup_vm()` on hart 0, `relocate_enable_mmu` (`satp` = the early table, return to the link address, adding `va_kernel_pa_offset`), the high stack, `stvec`. The early page tables and the harts' overflow stacks |
+| `machine.S` | RV32 only (empty on RV64, which has no M-mode code): the RV32 kernel's M-mode layer until #159, which is the firmware's `firmware/sbi.S`, included: Camelot's SBI on Grail, in M-mode (spec section 10, "Kernel traps"): the coldboot (`sbi_coldboot`: sysinfo's harts and RAM, every other hart STOPPED and woken out of the boot ROM), each hart's M-mode (`sbi_hart_init`: delegation, `mtvec`, `mscratch`), a stopped hart's wait for `hart_start` (`sbi_hart_wait`), and `machine_vec`: the machine timer forwarded as STIP, IPIs as SSIP (`msip` cleared, then a `fence o, rw`), and the SBI calls BASE, TIME (`set_timer`), IPI (`send_ipi`: `SBI_ERR_INVALID_PARAM` for a hart the machine doesn't have, and of the harts named only the STARTED or SUSPENDED ones interrupted, the others skipped without an error, as OpenSBI's 110f28518a, which fixed 37eaca4ab3; after a `fence rw, o`), HSM (`hart_start`, `hart_stop`, `hart_get_status`, `hart_suspend`), SRST (`system_reset`: the exit code) and DBCN (the UART); anything else is `SBI_ERR_NOT_SUPPORTED` |
 | `sbi.c` | the kernel's SBI calls, as Linux's `sbi.c`: `sbi_init()` (the version and the extensions, checked at boot), `sbi_set_timer()`, `sbi_send_ipi()` (a failure reported as Linux's `__sbi_send_ipi_v02()` reports it, the error mapped to an errno), `sbi_hart_start()`, `sbi_hart_stop()`, `sbi_hart_get_status()` and `sbi_hart_state_name()`, `sbi_system_reset()`, `machine_power_off()` (an exit code as a shutdown's reason, with a warning for each refused one, Linux's `sbi_srst_reset()` warning), `sbi_strerror()`; `sbi.h` has `sbi_err_map_linux_errno()` inline, as Linux's header (an SBI error as minus an errno, as Linux maps them) |
 | `sbi_ecall.S` | `sbi_ecall()`: an SBI call, the arguments moved to a0-a5, a6 and a7, `struct sbiret` back in a0 and a1 |
 | `kernelvec.S` | `kernel_vec`, the trap vector for traps from S-mode: saves x1-x31 and the trap CSRs as a `struct trap_frame` on the stack, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests. On RV64 it checks first that the frame fits on the stack (one bit of `sp`, the stacks being 32 KiB aligned) and sends a kernel stack overflow to the hart's overflow stack and `kstack_overflow()` |
@@ -514,7 +524,7 @@ one process.
 | `file.c` | open files (xv6's): the table of 64, `filealloc()`/`filedup()`/`fileclose()`, reading and writing an inode (writes 3 KiB per transaction), a device (`devsw`: the console) or a pipe, `filelseek()`, `filestat()` |
 | `pipe.c` | pipes (xv6's): a 512-byte buffer in a page, readers and writers sleeping on each other, end of input when the writers are gone, `-EPIPE` when the readers are |
 | `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.S`, `usys.s`, `user.h`), the C library (`lib/`) and linker script `user.ld`, built with merlin, merlin-as and merlin-ld and embedded in `kernel.elf` through `userprogs.s`, which the build generates (not a file here: see "Building") |
-| `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo and frees every page from `__kernel_end` to the end of RAM; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()` |
+| `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo, and on RV64 the firmware's reserved range, and frees every page of RAM but the image's and the firmware's; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()` |
 | `vm.c` | page tables (Sv32; on RV64 Sv48 or Sv39, with the levels the boot chose): `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on; user address spaces: `uvm_create()`/`uvm_free()`, `uvm_range_ok()`, `copyin()`, `copyout()`, `copyinstr()`; `ioremap()`; the kernel stacks (`kstack_alloc()`: on RV64 16 KiB in the vmalloc area with a guard page); on RV64 `setup_vm()`, the early page table and the `satp` probe |
 | `vmtest.c` | the memory self-tests: allocate and free every page, `kzalloc()` and `pagetable_create()` clear a reused dirty page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |
 | `probe.S` | `probe_load()`/`probe_store()`: a word access that returns the trap cause instead of panicking (`kernel_trap` resumes them at `probe_fault`) |
@@ -537,8 +547,8 @@ one process.
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `libgcc.c` | `__divdi3`, `__udivdi3`, `__moddi3`, `__umoddi3`, `__muldi3`: the C library's (`user/lib/libgcc.c`), for `long long` division on RV32 |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself); `memset` stores whole registers, as Linux's riscv one, the rest a byte at a time |
-| `kernel.lds.S` | the layout, one linker script for both widths, preprocessed first (`merlin -E -P`, as Linux's `vmlinux.lds.S`): `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end`; on RV64 linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000 (`AT`), the boot stack 32 KiB aligned |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct thread`, `struct user_program`, sleep and wakeup, the thread and futex calls), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `errno.h` (`syscall.h`'s error numbers and the kernel's own: `EIO`, `ERANGE`, `ENOTSUPP`), `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
+| `kernel.lds.S` | the layout, one linker script for both widths, preprocessed first (`merlin -E -P`, as Linux's `vmlinux.lds.S`): `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end`; on RV64 linked at 0xffff_ffff_8000_0000 and loaded at 0x8020_0000 (`AT`), after the firmware's 2 MiB, the boot stack 32 KiB aligned |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct thread`, `struct user_program`, sleep and wakeup, the thread and futex calls), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `errno.h` (`syscall.h`'s error numbers and the kernel's own: `EIO`, `ERANGE`, `ENOTSUPP`), `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
 | `kernel.elf` | the prebuilt image, with the user programs built in, committed so `cargo test` and Grail need no build |
 | `kernel-disk.elf` | the prebuilt disk kernel: the same objects without the user programs, which a bootable root image holds (`cargo xtask fs`) |
 

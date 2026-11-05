@@ -309,6 +309,9 @@ pub struct HardwareProfile {
     pub xlen: Xlen,
     /// The paging modes an RV64 VM's harts implement; an RV32 VM has Sv32.
     pub paging: Paging,
+    /// The firmware the VM boots, as QEMU's `-bios`: none (the program runs in
+    /// M-mode), Camelot's, or one in a file on the server's host. RV64 VMs only.
+    pub bios: Bios,
     /// Optional hardware beyond the fixed machine (spec section 7), in the order the
     /// guest should see it.
     pub devices: Vec<DeviceSpec>,
@@ -323,7 +326,48 @@ impl Default for HardwareProfile {
             harts: DEFAULT_HARTS,
             xlen: Xlen::default(),
             paging: Paging::default(),
+            bios: Bios::default(),
             devices: Vec::new(),
+        }
+    }
+}
+
+/// A VM's firmware, as `grail::Bios`: QEMU's `-bios none`, `-bios default` or
+/// `-bios FILE` (Excalibur spec section 7, "Firmware"). On the wire a `u8` tag, 0, 1
+/// or 2, the last followed by the file's path as a string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum Bios {
+    /// No firmware: the boot ROM starts the program, or the disk's boot block, in
+    /// M-mode.
+    #[default]
+    None,
+    /// Camelot's firmware, which Grail carries: an SBI in M-mode that starts the
+    /// program, or the disk's boot block, in S-mode.
+    Default,
+    /// The firmware in this file on the server's host (an ELF, or a raw binary loaded
+    /// at the start of RAM), as a disk's `File` source is.
+    File(String),
+}
+
+impl Bios {
+    /// The firmware a `--bios` value names: `none`, `default`, or a file's path.
+    pub fn parse(s: &str) -> std::result::Result<Bios, String> {
+        match s {
+            "" => Err("give none, default or a firmware file".into()),
+            "none" => Ok(Bios::None),
+            "default" => Ok(Bios::Default),
+            path => Ok(Bios::File(path.into())),
+        }
+    }
+}
+
+impl fmt::Display for Bios {
+    /// `none`, `default` or the file's path, as `--bios` takes it.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Bios::None => f.write_str("none"),
+            Bios::Default => f.write_str("default"),
+            Bios::File(path) => f.write_str(path),
         }
     }
 }
@@ -1798,6 +1842,14 @@ fn put_profile(w: &mut Writer, p: &HardwareProfile) {
     w.u32(p.harts);
     w.u8(p.xlen.bits());
     w.u8(p.paging.satp_mode());
+    match &p.bios {
+        Bios::None => w.u8(0),
+        Bios::Default => w.u8(1),
+        Bios::File(path) => {
+            w.u8(2);
+            w.str(path);
+        }
+    }
     w.list(&p.devices, |w, d| match d {
         DeviceSpec::Disk(disk) => {
             w.u8(1);
@@ -1837,6 +1889,12 @@ fn get_profile(r: &mut Reader) -> Result<HardwareProfile> {
             let mode = r.u8()?;
             Paging::from_satp_mode(mode)
                 .ok_or_else(|| Error::Invalid(format!("paging mode {mode}, not 9 (Sv48) or 8 (Sv39)")))?
+        },
+        bios: match r.u8()? {
+            0 => Bios::None,
+            1 => Bios::Default,
+            2 => Bios::File(r.string()?),
+            t => return Err(bad_tag("firmware", t)),
         },
         devices: r.list(|r| match r.u8()? {
             1 => {

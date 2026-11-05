@@ -768,6 +768,74 @@ fn the_readme_client_example() -> Result<(), Box<dyn std::error::Error>> {
 /// disk"): here a boot block that says `bye` and halts with exit code 3. A VM whose
 /// disk has no boot block stops with the boot ROM's message and exit code.
 #[test]
+fn firmware_is_for_rv64_vms_and_must_load() {
+    // The profile's firmware is hardware, as its disks are: firmware on an RV32 VM, or
+    // a firmware file Grail cannot load, is InvalidProfile, as a disk image that cannot
+    // be opened is (protocol doc, section 3, `bios`).
+    use avalon_proto::{Bios, Xlen};
+    let dir = std::env::temp_dir().join(format!("avalon-firmware-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img");
+    std::fs::write(&image, [0u8; 4096]).unwrap();
+    let big = dir.join("big.bin");
+    std::fs::write(&big, vec![0u8; (2 * MIB + 4) as usize]).unwrap();
+    let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
+    let with_disk = |xlen, bios| HardwareProfile {
+        xlen,
+        bios,
+        devices: vec![DeviceSpec::Disk(DiskSpec {
+            source: DiskSource::File(path(&image)),
+            read_only: true,
+        })],
+        ..HardwareProfile::with_ram(16 * MIB)
+    };
+    let server = server(None);
+    let mut conn = connect(&server);
+    let mut refused = |profile: HardwareProfile, program: Vec<u8>| match conn.request(&Message::CreateVm {
+        name: "refused".into(),
+        profile,
+        program,
+    }) {
+        Err(avalon_proto::Error::Remote { code, message }) => (code, message),
+        other => panic!("{other:?}"),
+    };
+    // An RV32 profile with firmware: booting from disk, or with an ELF32 program.
+    for program in [Vec::new(), spinner()] {
+        let (code, message) = refused(with_disk(Xlen::Rv32, Bios::Default), program);
+        assert_eq!(code, ErrorCode::InvalidProfile, "{message}");
+        assert!(message.contains("for RV64 VMs only"), "{message}");
+    }
+    // A firmware file that is not there, and one too big for the firmware's 2 MiB.
+    let missing = Bios::File(path(&dir.join("no-such-fw.bin")));
+    let (code, message) = refused(with_disk(Xlen::Rv64, missing), Vec::new());
+    assert_eq!(code, ErrorCode::InvalidProfile, "{message}");
+    assert!(message.starts_with("cannot read the firmware"), "{message}");
+    let (code, message) = refused(with_disk(Xlen::Rv64, Bios::File(path(&big))), Vec::new());
+    assert_eq!(code, ErrorCode::InvalidProfile, "{message}");
+    assert!(message.contains("outside the firmware's RAM"), "{message}");
+    // Firmware that loads on an RV64 VM, or on an RV32 profile that an ELF64 program
+    // makes RV64, is a VM.
+    create(
+        &mut conn,
+        "rv64",
+        with_disk(Xlen::Rv64, Bios::Default),
+        Vec::new(),
+    );
+    let id = create(
+        &mut conn,
+        "widened",
+        HardwareProfile {
+            bios: Bios::Default,
+            ..HardwareProfile::with_ram(16 * MIB)
+        },
+        firmware_spinner(),
+    );
+    assert_eq!(info(&mut conn, id).vm.profile.xlen, Xlen::Rv64);
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_vm_with_no_program_boots_from_its_disk() {
     on_both_widths(|| {
         let dir = std::env::temp_dir().join(format!("avalon-disk-boot-{}", std::process::id()));

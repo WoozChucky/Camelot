@@ -1,3 +1,4 @@
+    .file "globals.c"
     .data
 
     # int base: 4 bytes

@@ -211,6 +211,17 @@ _start:
 /// The smallest RV64 program: an ELF64 file with one `PT_LOAD` segment at the start of
 /// RAM, its entry, holding `addi a0, zero, 7` and `j .`.
 pub fn rv64_spinner() -> Vec<u8> {
+    rv64_spinner_at(0x8000_0000)
+}
+
+/// [`rv64_spinner`] at 0x8020_0000, where a VM with firmware loads its program (the
+/// firmware has the 2 MiB below it).
+pub fn firmware_spinner() -> Vec<u8> {
+    rv64_spinner_at(grail::firmware::FW_JUMP_ADDR)
+}
+
+/// [`rv64_spinner`] at `at`, its entry.
+fn rv64_spinner_at(at: u64) -> Vec<u8> {
     let code: Vec<u8> = [0x0070_0513u32, 0x0000_006f]
         .iter()
         .flat_map(|w| w.to_le_bytes())
@@ -220,7 +231,7 @@ pub fn rv64_spinner() -> Vec<u8> {
     f[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
     f[18..20].copy_from_slice(&243u16.to_le_bytes()); // EM_RISCV
     f[20..24].copy_from_slice(&1u32.to_le_bytes());
-    f[24..32].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // e_entry
+    f[24..32].copy_from_slice(&at.to_le_bytes()); // e_entry
     f[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
     f[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
     f[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
@@ -230,8 +241,8 @@ pub fn rv64_spinner() -> Vec<u8> {
     ph[..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
     ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // R + X
     ph[8..16].copy_from_slice(&120u64.to_le_bytes()); // p_offset
-    ph[16..24].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // p_vaddr
-    ph[24..32].copy_from_slice(&0x8000_0000u64.to_le_bytes()); // p_paddr
+    ph[16..24].copy_from_slice(&at.to_le_bytes()); // p_vaddr
+    ph[24..32].copy_from_slice(&at.to_le_bytes()); // p_paddr
     ph[32..40].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_filesz
     ph[40..48].copy_from_slice(&(code.len() as u64).to_le_bytes()); // p_memsz
     ph[48..56].copy_from_slice(&4u64.to_le_bytes()); // p_align

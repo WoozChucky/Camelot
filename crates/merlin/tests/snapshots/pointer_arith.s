@@ -1,3 +1,4 @@
+    .file "pointer_arith.c"
     .text
 
     # int main(void): frame 160 bytes

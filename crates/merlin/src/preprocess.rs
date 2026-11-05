@@ -115,6 +115,7 @@
 //! the output back to the file and line it came from, for its errors.
 
 use crate::lexer::{self, PpKind, PpToken};
+use crate::md5::md5;
 use crate::types::Xlen;
 use crate::{Error, Pos, Severity};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -369,6 +370,10 @@ pub struct Output {
     /// and the name in the `#include`) and the predefined and command-line
     /// macros (`<built-in>`, `<command line>`).
     pub files: Vec<String>,
+    /// The MD5 checksum of each file, by [`Pos::file`] as `files`: of its
+    /// bytes as read, for the debug information's `.file` directives. A
+    /// name `#line` gives has none, as in clang.
+    pub checksums: Vec<Option<[u8; 16]>>,
     /// How each token is laid out, for [`Output::print_asm`].
     layout: Vec<Layout>,
     /// Where files start and end and `#line` renumbers, after how many tokens.
@@ -793,6 +798,7 @@ pub fn preprocess_recovering(
         files: vec![File {
             name: name.to_string(),
             path: normalize(Path::new(name)),
+            md5: Some(md5(src.as_bytes())),
         }],
         macros: HashMap::new(),
         once: HashSet::new(),
@@ -813,6 +819,7 @@ pub fn preprocess_recovering(
     };
     let result = pp.run(src);
     let mut diagnostics = std::mem::take(&mut pp.diagnostics);
+    let checksums = pp.files.iter().map(|f| f.md5).collect();
     let files: Vec<String> = pp.files.into_iter().map(|f| f.name).collect();
     name_files(&files, &mut diagnostics);
     match result {
@@ -836,6 +843,7 @@ pub fn preprocess_recovering(
                 tokens: toks.into_iter().map(|t| t.t).collect(),
                 end,
                 files,
+                checksums,
                 layout,
                 marks: pp.marks,
                 diagnostics,
@@ -1025,6 +1033,8 @@ struct File {
     name: String,
     /// For `#pragma once` and for finding the files it includes.
     path: PathBuf,
+    /// Its contents' MD5 ([`Output::checksums`]).
+    md5: Option<[u8; 16]>,
 }
 
 /// A file being read.
@@ -1156,7 +1166,7 @@ impl Pp<'_> {
 
     /// Reads a made-up file holding only directives; its number.
     fn read_directives(&mut self, name: &str, text: &str) -> Result<u32, Error> {
-        let id = self.new_file(name.to_string(), PathBuf::from(name));
+        let id = self.new_file(name.to_string(), PathBuf::from(name), Some(md5(text.as_bytes())));
         let (toks, _) = lexer::lex_pp(text, id)?;
         self.enter(toks, text, id);
         match self.next()? {
@@ -1165,8 +1175,8 @@ impl Pp<'_> {
         }
     }
 
-    fn new_file(&mut self, name: String, path: PathBuf) -> u32 {
-        self.files.push(File { name, path });
+    fn new_file(&mut self, name: String, path: PathBuf, md5: Option<[u8; 16]>) -> u32 {
+        self.files.push(File { name, path, md5 });
         (self.files.len() - 1) as u32
     }
 
@@ -2077,7 +2087,7 @@ impl Pp<'_> {
         if self.stack.len() >= MAX_INCLUDE_DEPTH {
             return Err(Error::new(pos, "#include nested too deeply"));
         }
-        let id = self.new_file(name, path.clone());
+        let id = self.new_file(name, path.clone(), Some(md5(text.as_bytes())));
         let (toks, _) = self.lex(&text, id)?;
         if let Some(g) = guard(&toks) {
             self.guards.insert(path, g);
@@ -2318,7 +2328,9 @@ impl Pp<'_> {
         let cur = self.stack.last().expect("a file");
         let written = i64::from(directive.pos.line) - cur.line_delta;
         let path = self.files[cur.file as usize].path.clone();
-        let renamed = rename.map(|name| self.new_file(name, path));
+        // A name `#line` gives has no checksum, as clang's: its contents are
+        // not what is read (`getPresumedLoc` gives no file for it).
+        let renamed = rename.map(|name| self.new_file(name, path, None));
         let cur = self.stack.last_mut().expect("a file");
         cur.line_delta = i64::from(n) - (written + 1);
         if let Some(id) = renamed {

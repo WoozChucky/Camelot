@@ -87,9 +87,19 @@ pub fn kernel_elf() -> Vec<u8> {
     .unwrap()
 }
 
-/// Where the RV64 kernel image is linked, and where it is loaded.
+/// The firmware the kernel under test boots on: none for RV32, whose kernel
+/// has its own M-mode layer; Camelot's for RV64, whose kernel is S-mode only.
+pub fn bios() -> grail::Bios {
+    match xlen() {
+        Xlen::Rv32 => grail::Bios::None,
+        Xlen::Rv64 => grail::Bios::Default,
+    }
+}
+
+/// Where the RV64 kernel image is linked, and where it is loaded: after the
+/// firmware's 2 MiB.
 const KERNEL_LINK_ADDR_RV64: u64 = 0xffff_ffff_8000_0000;
-const LOAD_ADDR: u64 = 0x8000_0000;
+const LOAD_ADDR: u64 = 0x8020_0000;
 
 /// The physical address of `va`, an address in the kernel image: the same
 /// on RV32, where the kernel runs where it is loaded; on RV64 its load
@@ -152,6 +162,7 @@ impl Vm {
     ) -> Vm {
         let config = MachineConfig {
             xlen: xlen(),
+            bios: bios(),
             ..config
         };
         let mut m = Machine::with_devices(config, Vec::new(), cards).unwrap();
@@ -199,14 +210,14 @@ impl Vm {
     /// free ones (`nfree`, kernel/kalloc.c), a kernel stack being a page of
     /// free RAM; on RV64 those and the pages of every mapped kernel stack,
     /// and the stacks in use.
-    pub fn pages(&self) -> kstacks::Pages {
+    pub fn pages(&mut self) -> kstacks::Pages {
         if xlen() == Xlen::Rv32 {
             return kstacks::Pages {
                 total: self.read_var("nfree").into(),
                 stacks_in_use: 0,
             };
         }
-        kstacks::pages(&self.m, &kernel_elf())
+        kstacks::pages(&mut self.m, &kernel_elf())
     }
 }
 

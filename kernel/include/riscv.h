@@ -85,9 +85,6 @@
 #define SATP_PPN_MASK _U(0x003fffff)
 #endif
 
-/* Which counters S-mode may read: bit 1 (TM) is `time` (machine.S). */
-#define MCOUNTEREN_TM (_UL(1) << 1)
-
 #ifndef __ASSEMBLER__
 /* S-mode CSRs. */
 uintptr r_sstatus(void);
@@ -104,7 +101,7 @@ void w_satp(uintptr v);
 /* `time` (rdtime), the CLINT's mtime, all 64 bits (on RV32 read as two
  * halves, timeh and time, until the high half holds still): how S-mode reads
  * the clock, with no CLINT mapping (the SBI lets it, through mcounteren:
- * machine.S). */
+ * firmware/sbi.S's sbi_hart_init). */
 u64 r_time(void);
 
 /* sfence.vma zero, zero: orders earlier page-table writes before later

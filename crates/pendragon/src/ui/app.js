@@ -359,6 +359,18 @@ function newVmPage(main, ctx, disk) {
   const ram = el("input", { type: "text", value: "4" });
   const clock = el("input", { type: "text", placeholder: "full speed" });
   const harts = el("input", { type: "text", value: "1" });
+  // The firmware, as Round Table's --bios takes it: none (the program, or the disk's
+  // boot block, starts in M-mode), default (Camelot's firmware, an SBI that starts it
+  // in S-mode at 0x80200000, as the RV64 kernel kernel-rv64.elf needs) or a file on
+  // Avalon's host. RV64 VMs only.
+  const bios = el("input", {
+    type: "text",
+    class: "bios",
+    list: "bios-choices",
+    autocomplete: "off",
+    placeholder: "a Camelot VM's own, else none",
+  });
+  const biosChoices = el("datalist", { id: "bios-choices" }, el("option", { value: "none" }), el("option", { value: "default" }));
   const program = el("input", { type: "file", accept: ".elf,application/octet-stream" });
   const start = el("input", { type: "checkbox", checked: true });
   const submit = el("button", { type: "submit", class: "primary" }, "Create");
@@ -371,11 +383,34 @@ function newVmPage(main, ctx, disk) {
   const camelotHint = el("span", { class: "muted" }, " Lake's image is copied to a disk of the VM's own, NAME-disk0");
   const programField = field("Program", program, "an Excalibur ELF executable; without one the VM boots from its first disk");
   const pagingField = field("Paging", paging, "an RV64 VM's; an RV32 VM has Sv32");
+  const biosField = field(
+    "Firmware",
+    bios,
+    "an RV64 VM's: none, default (Camelot's SBI, which kernel-rv64.elf runs on) or a firmware file on Avalon's host",
+  );
   // Lake's images, and the Camelot image of each width (from the disks list).
   let images = null;
+  // The RAM follows the choice until it is typed in: a Camelot VM's of its width
+  // (an RV64 one's firmware keeps 2 MiB on top), else the platform's 4 MiB.
+  let ramTyped = false;
+  ram.addEventListener("input", () => { ramTyped = true; });
+  // So does the firmware: a Camelot VM's of its width (Camelot's own on RV64, which
+  // the RV64 image boots through), else none, as the server chooses when it is
+  // left empty.
+  let biosTyped = false;
+  bios.addEventListener("input", () => { biosTyped = true; });
   const showBoot = () => {
     programField.hidden = bootCamelot.checked;
     pagingField.hidden = xlen.value !== "64";
+    biosField.hidden = xlen.value !== "64";
+    if (images && !ramTyped) {
+      const camelotRam = xlen.value === "64" ? images.camelot_ram_rv64 : images.camelot_ram;
+      ram.value = String(bootCamelot.checked ? camelotRam : 4);
+    }
+    if (images && !biosTyped) {
+      const camelotBios = xlen.value === "64" ? images.camelot_bios_rv64 : images.camelot_bios;
+      bios.value = bootCamelot.checked ? camelotBios : "none";
+    }
     if (images) {
       const image = xlen.value === "64" ? images.camelot_image_rv64 : images.camelot_image;
       camelotHint.textContent = images.disks.some((d) => d.name === image)
@@ -401,6 +436,8 @@ function newVmPage(main, ctx, disk) {
     field("Name", name, "lowercase letters, digits, '.', '_' and '-'"),
     field("Width", xlen, "an ELF64 program makes the VM RV64; a Camelot VM boots its width's image"),
     pagingField,
+    biosField,
+    biosChoices,
     field("RAM", ram, "MiB, or 512M, 16G, 1T; 1 MiB to 1 TiB, an RV32 VM at most 2 GiB"),
     field("Clock", clock, "e.g. 10MHz, 500kHz, 5Hz; empty runs at full speed"),
     field("Harts", harts, "cores, 1 to 8; each runs at the clock"),
@@ -425,6 +462,8 @@ function newVmPage(main, ctx, disk) {
         name: name.value.trim(),
         xlen: xlen.value,
         paging: paging.value,
+        // An RV32 VM has no firmware: its field is hidden, and left to the server.
+        bios: xlen.value === "64" ? bios.value.trim() : "",
         ram: ram.value,
         clock: clock.value,
         harts: harts.value,

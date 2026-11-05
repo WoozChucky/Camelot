@@ -34,6 +34,7 @@ pub mod debug;
 pub mod elide;
 pub mod flow;
 pub mod lexer;
+pub mod md5;
 pub mod parser;
 pub mod preprocess;
 pub mod sema;
@@ -328,13 +329,45 @@ pub fn compile_warned(
     load: Loader,
 ) -> Result<(String, Vec<Error>), Vec<Error>> {
     let pp = preprocess::preprocess_recovering(name, src, opts, load)?;
-    let debug = opts.debug.as_ref().map(|d| (d, pp.files.as_slice()));
+    let debug = opts.debug.as_ref().map(|d| {
+        let sources = debug::Sources {
+            names: &pp.files,
+            md5: &pp.checksums,
+        };
+        (d, sources)
+    });
     let prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
     let warnings = pp.name_files(prog.warnings.clone());
     match codegen::generate_with(&prog, debug) {
-        Ok(asm) => Ok((asm, warnings)),
+        Ok(asm) => Ok((format!("{}\n{asm}", file_directive(name)), warnings)),
         Err(e) => Err(warnings.into_iter().chain(pp.name_files(vec![e])).collect()),
     }
+}
+
+/// `.file "NAME"`, the first line of the assembly, as clang writes it with
+/// or without `-g` (`AsmPrinter::doInitialization`, for an ELF target):
+/// the base name of the file being compiled (`m.c` for `sub/m.c`, an
+/// absolute name or `./m.c`), whatever `#line` says. The assembler makes
+/// it the object's `STT_FILE` symbol, its first local symbol, which the
+/// linker keeps in the executable's symbol table, so a reader can tell
+/// which object each local symbol after it came from. It has nothing to do
+/// with the numbered `.file`s of a line table ([`debug`]).
+///
+/// The base name is LLVM's `sys::path::filename` in the host's style, as
+/// clang runs it on the name it was given: on Windows `\` separates names
+/// too, and a drive (`C:`) is no part of the name.
+fn file_directive(name: &str) -> String {
+    let mut path = name;
+    let unified;
+    if cfg!(windows) {
+        unified = name.replace('\\', "/");
+        path = &unified;
+        let b = path.as_bytes();
+        if b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            path = &path[2..];
+        }
+    }
+    format!("    .file {}", debug::quoted(merlin_as::dwarf::file_name(path)))
 }
 
 /// The front end after the preprocessor: tokens, syntax tree, checks. The
@@ -452,4 +485,30 @@ pub fn parse(src: &str) -> Result<ast::Program, Vec<Error>> {
 /// [`compile_with`] for a source on its own: no headers, no `-D`.
 pub fn compile(src: &str) -> Result<String, Vec<Error>> {
     compile_with(INPUT_NAME, src, &Options::default(), &no_files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `.file "NAME"` names the file by its base name, as clang does
+    /// (checked against clang by the ignored `the_file_symbol_is_clangs`).
+    #[test]
+    fn the_file_directive_has_the_base_name() {
+        for (name, base) in [
+            ("m.c", "m.c"),
+            ("./m.c", "m.c"),
+            ("sub/n.c", "n.c"),
+            ("sub/../m.c", "m.c"),
+            ("/src/m.c", "m.c"),
+            (INPUT_NAME, INPUT_NAME),
+        ] {
+            assert_eq!(file_directive(name), format!("    .file \"{base}\""), "{name}");
+        }
+        // On Windows `\` separates names too, and a drive is no part of one.
+        let windows = if cfg!(windows) { "n.c" } else { "sub\\\\n.c" };
+        assert_eq!(file_directive("sub\\n.c"), format!("    .file \"{windows}\""));
+        let drive = if cfg!(windows) { "m.c" } else { "C:m.c" };
+        assert_eq!(file_directive("C:m.c"), format!("    .file \"{drive}\""));
+    }
 }

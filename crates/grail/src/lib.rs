@@ -14,8 +14,11 @@ pub mod console;
 pub mod cpu;
 pub mod debug;
 pub mod devices;
+pub mod devicetree;
 pub mod display;
 pub mod elf;
+pub mod fdt;
+pub mod firmware;
 pub mod framebuffer;
 pub mod gdb;
 pub mod keyboard;
@@ -37,9 +40,13 @@ pub mod window;
 use block::{BlockBackend, BlockDevice};
 use bus::{Bus, Exit, MAX_DISKS, MAX_NETS};
 pub use config::{
-    max_ram_size, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_size, parse_xlen, DiskConfig,
-    MachineConfig, NetConfig, Paging, DEFAULT_RAM_SIZE, MAX_HARTS,
+    max_ram_size, parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_size, parse_xlen,
+    Bios, DiskConfig, MachineConfig, NetConfig, Paging, DEFAULT_RAM_SIZE, MAX_HARTS,
 };
+
+/// Why an RV32 machine cannot have firmware.
+const NO_RV32_FIRMWARE: &str = "firmware (--bios default or a file) runs on RV64 machines only: an RV32 \
+                                machine boots its program in M-mode (--bios none)";
 use cpu::Cpu;
 pub use excalibur::Xlen;
 use keyboard::KeyEvent;
@@ -186,6 +193,23 @@ impl Machine {
             return Err("an RV32 program (ELF32) cannot run on an RV64 machine".into());
         }
         let entry = elf.physical_entry().map_err(|e| e.to_string())?;
+        if self.config.bios.is_some() {
+            // The program is the firmware's next stage: it loads after the firmware's
+            // RAM, at FW_JUMP_ADDR or above (spec section 7, "Firmware").
+            if elf.xlen != Xlen::Rv64 {
+                return Err(NO_RV32_FIRMWARE.into());
+            }
+            if let Some(seg) = elf.segments.iter().find(|s| s.paddr < firmware::FW_JUMP_ADDR) {
+                return Err(format!(
+                    "the segment at {:#x} is in the firmware's RAM ({:#x}-{:#x}): with firmware \
+                     (--bios), a program loads at {:#x} or above",
+                    seg.paddr,
+                    firmware::FW_BASE,
+                    firmware::FW_JUMP_ADDR - 1,
+                    firmware::FW_JUMP_ADDR
+                ));
+            }
+        }
         let bus = &mut self.cpu.bus;
         for seg in &elf.segments {
             bus.load_zeroed(seg.paddr, &seg.data, seg.mem_size)
@@ -197,7 +221,56 @@ impl Machine {
         }
         let bus = &mut self.cpu.bus;
         bus.tohost = elf.symbol("tohost");
-        bus.set_boot_entry(entry);
+        if self.config.bios.is_some() {
+            let end = elf
+                .segments
+                .iter()
+                .map(|s| s.paddr + s.mem_size)
+                .max()
+                .unwrap_or(0);
+            self.install_firmware(entry, end)
+        } else {
+            bus.set_boot_entry(entry);
+            Ok(())
+        }
+    }
+
+    /// Loads the firmware of [`MachineConfig::bios`] and the device tree, and points the
+    /// boot ROM at the firmware (spec section 7, "Firmware"): the firmware into its 2 MiB
+    /// at the start of RAM, sysinfo's reserved range set to them, the tree where QEMU
+    /// would put it ([`firmware::fdt_addr`]), which must be above the next stage, whose
+    /// entry is `next_addr` (0 for none: the firmware boots from disk) and whose bytes
+    /// end at `next_end`.
+    fn install_firmware(&mut self, next_addr: u64, next_end: u64) -> Result<(), String> {
+        if self.config.xlen != Xlen::Rv64 {
+            return Err(NO_RV32_FIRMWARE.into());
+        }
+        let image = firmware::Image::of(&self.config.bios, Xlen::Rv64)?.expect("the machine has firmware");
+        let bus = &mut self.cpu.bus;
+        for (at, data, size) in &image.segments {
+            bus.load_zeroed(*at, data, *size)
+                .map_err(|_| format!("the firmware's segment at {at:#x} is outside RAM"))?;
+        }
+        bus.sysinfo.set_reserved(firmware::FW_BASE, firmware::FW_SIZE);
+        let fdt = devicetree::generate(&self.config, &self.cpu.bus);
+        let ram = self.cpu.bus.ram.len() as u64;
+        let floor = next_end.max(firmware::FW_JUMP_ADDR);
+        let at = firmware::fdt_addr(ram, fdt.len() as u64)
+            .filter(|&at| at >= floor)
+            .ok_or_else(|| {
+                format!(
+                    "{} KiB of RAM leaves no room for the device tree above the firmware's next \
+                     stage, which ends at {floor:#x}: give the machine more RAM",
+                    ram >> 10
+                )
+            })?;
+        let bus = &mut self.cpu.bus;
+        bus.load(at, &fdt).expect("the device tree is in RAM");
+        bus.set_firmware_boot(&firmware::Handoff {
+            entry: image.entry,
+            fdt: at,
+            next_addr,
+        });
         Ok(())
     }
 
@@ -209,9 +282,18 @@ impl Machine {
     /// ([`boot::BOOT_AREA_SIZE`], 64 KiB) the boot block is loaded into. The ROM's
     /// loader is the one of the machine's width (RV32 or RV64), and so must be the boot
     /// block's code.
+    ///
+    /// With firmware ([`MachineConfig::bios`]) the firmware boots from the disk instead,
+    /// and the boot block is its next stage: at [`firmware::FW_JUMP_ADDR`], in S-mode
+    /// (spec section 7, "Firmware"). An error then if the RAM has no room for the
+    /// device tree above the block.
     pub fn boot_from_disk(&mut self) -> Result<(), String> {
         if self.cpu.bus.disks.is_empty() {
             return Err("no disk to boot from".into());
+        }
+        if self.config.bios.is_some() {
+            self.cpu.bus.tohost = None;
+            return self.install_firmware(0, firmware::FW_JUMP_ADDR + boot::BOOT_BLOCK_SIZE as u64);
         }
         if boot::boot_block_addr(self.cpu.bus.ram.len()).is_none() {
             return Err(format!(
