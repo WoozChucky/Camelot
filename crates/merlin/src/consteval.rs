@@ -2,7 +2,8 @@
 //!
 //! Three users: the parser sizes arrays (`int a[4 * sizeof(int)]`), sema finds
 //! null pointer constants and checks that global initializers are constant,
-//! and code generation turns those initializers into data.
+//! and code generation turns those initializers into data and folds every
+//! integer constant expression in code into one constant, as clang does.
 //!
 //! Integer constants carry their C type and wrap the way the generated code
 //! would at run time on the target (each function takes it: an `int` is 32
