@@ -18,7 +18,7 @@
 //!   `/poweroff`'s `syscon-poweroff`, which writes 0x5555), and Grail's own devices
 //!   with `camelot,*` compatibles: the disks, the network cards (with
 //!   `local-mac-address`), the display, the keyboard, the pointer and sysinfo;
-//! - `/chosen`: `stdout-path`, the UART.
+//! - `/aliases`: `serial0`, the UART, and `/chosen`: `stdout-path`, the UART.
 //!
 //! The PLIC sources are Grail's (spec section 7.1), not `virt`'s: a driver reads them
 //! from `interrupts` here, or from sysinfo.
@@ -61,8 +61,15 @@ pub fn generate(config: &MachineConfig, bus: &Bus) -> Vec<u8> {
     w.prop_str("model", "Camelot Grail");
 
     if let Some(uart) = find(DeviceType::Uart) {
+        // As QEMU's create_fdt_uarts(): the UART is the console (stdout-path) and
+        // serial0 (the alias by which Linux's serial core numbers it port 0,
+        // ttyS0). virt has no other alias, and neither has Grail.
+        let uart = format!("/soc/serial@{:x}", uart.base);
+        w.begin_node("aliases");
+        w.prop_str("serial0", &uart);
+        w.end_node();
         w.begin_node("chosen");
-        w.prop_str("stdout-path", &format!("/soc/serial@{:x}", uart.base));
+        w.prop_str("stdout-path", &uart);
         w.end_node();
     }
 

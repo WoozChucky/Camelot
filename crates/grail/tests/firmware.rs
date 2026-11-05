@@ -207,6 +207,10 @@ fn the_device_tree_describes_the_machine_as_qemu_virt_does() {
         root.find("chosen").unwrap().str("stdout-path").as_deref(),
         Some("/soc/serial@10000000")
     );
+    // QEMU's /aliases: the UART is serial0, nothing else has an alias.
+    let aliases = root.find("aliases").expect("an /aliases node");
+    assert_eq!(aliases.str("serial0").as_deref(), Some("/soc/serial@10000000"));
+    assert_eq!(aliases.props.len(), 1, "{aliases:?}");
     assert_eq!(
         root.find("memory@80000000").unwrap().u64s("reg"),
         Some(vec![0x8000_0000, 64 << 20])
