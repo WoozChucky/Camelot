@@ -116,11 +116,19 @@ impl Console {
     }
 }
 
-/// A machine booting the root image, the shell's input waiting.
+/// A machine booting the root image, the shell's input waiting: an RV64 one
+/// on Camelot's firmware, which boots the disk, with its 2 MiB on top of the
+/// 4 MiB an RV32 one has.
 fn machine(s: Setup) -> (Machine, Console) {
+    let (bios, ram_size) = match s.xlen {
+        Xlen::Rv32 => (grail::Bios::None, 4 << 20),
+        Xlen::Rv64 => (grail::Bios::Default, 6 << 20),
+    };
     let config = MachineConfig {
         xlen: s.xlen,
         paging: s.paging,
+        bios,
+        ram_size,
         disks: vec![DiskConfig::memory(image(s).to_vec())],
         ..MachineConfig::default()
     };

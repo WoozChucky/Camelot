@@ -24,6 +24,23 @@ pub const DISK_BOOT_PC: u64 = BOOT_ROM_BASE + 0x100;
 /// ones), so that a bootloader can point harts woken later at the kernel it started.
 pub const BOOT_ENTRY_ADDR: u64 = BOOT_ROM_BASE + 0x10;
 
+/// Where the ROM's hand-off to firmware starts (spec section 7, "Firmware"): with
+/// `--bios`, the entry point the stub and the park loop jump to, in the place of the
+/// disk loader, which a machine with firmware does not have (its firmware boots the
+/// disk). See [`crate::bus::Bus::set_firmware_boot`].
+pub const FW_HANDOFF_PC: u64 = BOOT_ROM_BASE + 0x100;
+
+/// The doubleword the hand-off loads into a1: the device tree's physical address
+/// (QEMU's reset vector's `fdt_laddr`). 0 on a machine without firmware.
+pub const FDT_ADDR_ADDR: u64 = BOOT_ROM_BASE + 0x18;
+
+/// The doubleword holding the firmware's entry point, after the hand-off's code.
+pub const FW_ENTRY_ADDR: u64 = BOOT_ROM_BASE + 0x120;
+
+/// The `struct fw_dynamic_info` (six doublewords) whose address the hand-off puts in
+/// a2, as QEMU's reset vector does ([`crate::firmware::Handoff::dynamic_info`]).
+pub const FW_DYNAMIC_INFO_ADDR: u64 = BOOT_ROM_BASE + 0x128;
+
 /// The boot block: sectors 0 and 1 of disk 0.
 pub const BOOT_BLOCK_SIZE: usize = 1024;
 

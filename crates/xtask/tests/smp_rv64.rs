@@ -41,6 +41,7 @@ fn load(harts: usize, input: Receiver<u8>, disks: Vec<DiskConfig>) -> Machine {
         harts,
         ram_size: 16 * MIB,
         xlen: grail::Xlen::Rv64,
+        bios: grail::Bios::Default,
         disks,
         ..MachineConfig::default()
     })
@@ -299,6 +300,8 @@ fn the_disk_kernel_runs_programs_from_bin_on_four_harts() {
     let mut m = Machine::new(MachineConfig {
         harts: 4,
         xlen: grail::Xlen::Rv64,
+        bios: grail::Bios::Default,
+        ram_size: 6 << 20,
         disks: vec![DiskConfig::memory(image)],
         ..MachineConfig::default()
     })

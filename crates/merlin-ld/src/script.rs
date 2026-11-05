@@ -1065,7 +1065,8 @@ mod tests {
         );
         assert_eq!(outs[0].region.as_deref(), Some("RAM"));
         assert_eq!(outs[5].region, None);
-        // For RV64: linked high, loaded at the start of RAM, no region.
+        // For RV64: linked high, loaded at 0x8020_0000, where the firmware
+        // starts its next stage (OpenSBI's FW_JUMP_ADDR), no region.
         let s = parse(&kernel_script(merlin::types::Xlen::Rv64), Class::Elf64).unwrap();
         let outs: Vec<&OutputDesc> = s
             .commands
@@ -1076,7 +1077,7 @@ mod tests {
             })
             .collect();
         assert_eq!(outs[0].name, ".text");
-        assert_eq!(outs[0].at, Some(Expr::Num(0x8000_0000)));
+        assert_eq!(outs[0].at, Some(Expr::Num(0x8020_0000)));
         assert!(outs.iter().all(|o| o.region.is_none()));
         // `/DISCARD/` reads as one word wherever it is.
         let s = parse("SECTIONS{/DISCARD/:{*(.x)}}", Class::Elf32).unwrap();

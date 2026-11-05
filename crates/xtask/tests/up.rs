@@ -531,7 +531,8 @@ fn first_frame(avalon: SocketAddr, vm: u32) -> (u32, u32, Vec<u8>) {
 /// Round Table's `create --camelot --xlen 64` (Sv48 and Sv39, the default) and
 /// Pendragon's form, through its API (`"xlen": "64"`, here with Sv39 alone). Each
 /// boots RV64 Camelot from its own copy of Lake's `os-base-rv64`, which `up` seeded
-/// beside the RV32 `os-base`, with the default 4 MiB of RAM, as the demo VM boots RV32
+/// beside the RV32 `os-base`, on Camelot's firmware with 6 MiB of RAM, its 2 MiB on top
+/// of the 4 MiB the demo VM has (a Camelot VM's defaults), as the demo VM boots RV32
 /// Camelot (the test above), and works as that one does: its console runs the shell,
 /// its screen is served, its card on a switch with a NAT gateway reaches its `shd`
 /// through a forwarded port, and what it writes to its disk is in Lake's image once
@@ -601,19 +602,21 @@ fn rv64_vms_from_round_table_and_pendragon_boot_camelot() {
         rt(&["list"]),
         "\
 ID  NAME  STATE    ARCH  RAM    CLOCK       DISKS  NETS
-1   rt64  running  RV64  4 MiB  full speed  1      1
-2   pd64  running  RV64  4 MiB  full speed  1      1
+1   rt64  running  RV64  6 MiB  full speed  1      1
+2   pd64  running  RV64  6 MiB  full speed  1      1
 "
     );
     let info = rt(&["info", "rt64"]);
     assert!(
-        info.contains("\narch     RV64 (Sv48 and Sv39 paging)\nRAM      4 MiB\n"),
+        info.contains("\narch     RV64 (Sv48 and Sv39 paging)\nfirmware default\nRAM      6 MiB\n"),
         "{info}"
     );
     let (status, pd) = http(platform.pendragon, "/api/vms/pd64", token);
     assert_eq!(status, 200, "{pd}");
     assert!(
-        pd.contains(r#""xlen":64,"paging":"sv39","arch":"RV64","arch_text":"RV64 (Sv39 paging)""#),
+        pd.contains(
+            r#""xlen":64,"paging":"sv39","arch":"RV64","arch_text":"RV64 (Sv39 paging)","bios":"default""#
+        ),
         "{pd}"
     );
     let (status, disks) = http(platform.pendragon, "/api/disks", token);
@@ -641,7 +644,7 @@ ID  NAME  STATE    ARCH  RAM    CLOCK       DISKS  NETS
         for line in [
             "Camelot v",
             "p=0x0000000080000000 ",
-            "\nram: 4 MiB at 0x80000000\n",
+            "\nram: 6 MiB at 0x80000000\n",
             &format!("\npaging: on ({paging})\n"),
             ", the kernel none\n",
         ] {

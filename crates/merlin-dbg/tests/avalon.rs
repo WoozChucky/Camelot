@@ -155,9 +155,18 @@ fn debug_a_vm(kernel: &str, xlen: Xlen) {
     let mut control = connect(&server);
     let id = match control.request(&Message::CreateVm {
         name: "vm001".into(),
-        profile: HardwareProfile {
-            xlen,
-            ..HardwareProfile::with_ram(4 * 1024 * 1024)
+        // The RV64 kernel runs in S-mode on Camelot's firmware, whose 2 MiB
+        // and its 2.1 MiB image from 0x8020_0000 take 8 MiB.
+        profile: match xlen {
+            Xlen::Rv32 => HardwareProfile {
+                xlen,
+                ..HardwareProfile::with_ram(4 * 1024 * 1024)
+            },
+            _ => HardwareProfile {
+                xlen,
+                bios: avalon_proto::Bios::Default,
+                ..HardwareProfile::with_ram(8 * 1024 * 1024)
+            },
         },
         program: std::fs::read(path(kernel)).unwrap(),
     }) {
