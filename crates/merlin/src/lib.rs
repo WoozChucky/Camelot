@@ -98,6 +98,9 @@ pub struct Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Error,
+    /// An error after which clang gives up the compilation (`'x.h' file
+    /// not found`): `fatal error:`.
+    Fatal,
     Warning,
     /// What follows an error or a warning, to explain it.
     Note,
@@ -120,6 +123,23 @@ impl Error {
         Error {
             severity: Severity::Warning,
             flag: Some(flag),
+            ..Error::new(pos, msg)
+        }
+    }
+
+    /// A warning clang gives with no flag (`character constant too long
+    /// for its type`).
+    pub fn warning_unflagged(pos: Pos, msg: impl Into<String>) -> Self {
+        Error {
+            severity: Severity::Warning,
+            ..Error::new(pos, msg)
+        }
+    }
+
+    /// A fatal error: clang stops there.
+    pub fn fatal(pos: Pos, msg: impl Into<String>) -> Self {
+        Error {
+            severity: Severity::Fatal,
             ..Error::new(pos, msg)
         }
     }
@@ -162,6 +182,7 @@ impl Error {
         let file = self.file.as_deref().unwrap_or(file);
         let what = match self.severity {
             Severity::Error => "error",
+            Severity::Fatal => "fatal error",
             Severity::Warning => "warning",
             Severity::Note => "note",
         };
@@ -239,7 +260,7 @@ pub fn preprocess(
     opts: &Options,
     load: Loader,
 ) -> Result<preprocess::Output, Vec<Error>> {
-    preprocess::preprocess(name, src, opts, load).map_err(|e| vec![e])
+    preprocess::preprocess(name, src, opts, load)
 }
 
 /// Preprocesses an assembly source (a `.S` file, `-x assembler-with-cpp`)
@@ -291,7 +312,14 @@ pub fn compile_warned(
 /// The front end after the preprocessor: tokens, syntax tree, checks. The
 /// errors come with the warnings, in the order of their positions.
 fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec<Error>> {
-    let toks = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| vec![e])?;
+    // The lexer's diagnostics, then everything after: clang goes on after
+    // an error in a literal, or a token that is none, and so does merlin.
+    let mut diagnostics = pp.warnings.clone();
+    let (toks, lexed) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|mut e| {
+        diagnostics.append(&mut e);
+        diagnostics.clone()
+    })?;
+    diagnostics.extend(lexed);
     let mut prog = match parser::parse_salvaging(&toks, xlen) {
         Ok(prog) => prog,
         Err(salvaged) => {
@@ -299,17 +327,22 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
             // The warnings of what came before a syntax error come with it,
             // as clang gives them; not the errors of what it cut short.
             let _ = sema::check(&mut partial);
-            let mut errors = partial.warnings;
-            errors.push(e);
-            errors.sort_by_key(|e| e.pos);
-            return Err(errors);
+            diagnostics.extend(partial.warnings);
+            diagnostics.push(e);
+            diagnostics.sort_by_key(|e| e.pos);
+            return Err(diagnostics);
         }
     };
-    if let Err(mut errors) = sema::check(&mut prog) {
-        errors.extend(prog.warnings);
-        errors.sort_by_key(|e| e.pos);
-        return Err(errors);
+    let checked = sema::check(&mut prog);
+    diagnostics.append(&mut prog.warnings);
+    if let Err(errors) = checked {
+        diagnostics.extend(errors);
     }
+    diagnostics.sort_by_key(|e| e.pos);
+    if diagnostics.iter().any(|d| !d.is_warning()) {
+        return Err(diagnostics);
+    }
+    prog.warnings = diagnostics;
     Ok(prog)
 }
 

@@ -1,0 +1,61 @@
+//! The lexer's diagnostics: literals, characters that make no token,
+//! comments, trigraphs.
+
+use super::{case, Case};
+
+#[rustfmt::skip]
+pub fn cases() -> Vec<Case> {
+    vec![
+        // Integer literals: too large for any type, or a decimal one past
+        // `long long` (unsigned, as clang takes it), bad suffixes and digits.
+        case("int x = 99999999999999999999;", &["1:9: error: integer literal is too large to be represented in any integer type", "1:9: warning: implicit conversion from 'unsigned long long' to 'int' changes value from 7766279631452241919 to 1661992959 [-Wconstant-conversion]"]),
+        case("unsigned long long x = 9223372036854775808;", &["1:24: warning: integer literal is too large to be represented in a signed integer type, interpreting as unsigned [-Wimplicitly-unsigned-literal]"]),
+        case("long long x = 10lL;", &["1:17: error: invalid suffix 'lL' on integer constant"]),
+        case("long long x = 10lll;", &["1:17: error: invalid suffix 'lll' on integer constant"]),
+        case("int x = 09;", &["1:10: error: invalid digit '9' in octal constant"]),
+        case("int x = 12abc;", &["1:11: error: invalid digit 'a' in decimal constant"]),
+        case("int x = 0x;", &["1:10: error: invalid suffix 'x' on integer constant"]),
+        case("int x = 1uu;", &["1:10: error: invalid suffix 'uu' on integer constant"]),
+        case("int x = 0x1g;", &["1:12: error: invalid suffix 'g' on integer constant"]),
+        // Character constants.
+        case("int c = '';", &["1:9: warning: empty character constant [-Winvalid-pp-token]", "1:9: error: expected expression"]),
+        case("int c = 'ab';", &["1:9: warning: multi-character character constant [-Wmultichar]"]),
+        case("int c = 'abcde';", &["1:9: warning: multi-character character constant [-Wmultichar]", "1:9: warning: character constant too long for its type"]),
+        case("int c = 'a;", &["1:9: warning: missing terminating ' character [-Winvalid-pp-token]", "1:9: error: expected expression", "1:12: error: expected ';' after top level declarator"]),
+        case("int c = '\\q';", &["1:10: warning: unknown escape sequence '\\q' [-Wunknown-escape-sequence]"]),
+        case("int c = '\\x100';", &["1:10: error: hex escape sequence out of range"]),
+        case("int c = '\\400';", &["1:10: error: octal escape sequence out of range"]),
+        case("int c = '\\x';", &["1:10: error: \\x used with no following hex digits"]),
+        // String literals.
+        case("char *s = \"abc\nd\";", &["1:11: warning: missing terminating '\"' character [-Winvalid-pp-token]", "1:11: error: expected expression", "2:2: warning: missing terminating '\"' character [-Winvalid-pp-token]", "2:4: error: expected ';' after top level declarator"]),
+        case("char *s = \"abc", &["1:11: warning: missing terminating '\"' character [-Winvalid-pp-token]", "1:11: error: expected expression", "1:15: error: expected ';' after top level declarator"]),
+        case("char *s = \"\\q\";", &["1:12: warning: unknown escape sequence '\\q' [-Wunknown-escape-sequence]"]),
+        // What makes no token, or no token outside a directive.
+        case("int x;\n  /* oops", &["2:3: error: unterminated /* comment"]),
+        case("int x = 1 @ 2;", &["1:10: error: expected ';' after top level declarator"]),
+        case("int x = 1 \\ 2;", &["1:10: error: expected ';' after top level declarator"]),
+        case("int x = 1 # 2;", &["1:10: error: expected ';' after top level declarator"]),
+        case("int x = 1 ## 2;", &["1:10: error: expected ';' after top level declarator"]),
+        case("int f(void) { return 1 ` 2; }", &["1:23: error: expected ';' after return statement"]),
+        case("#include <x.h>", &["1:10: fatal error: 'x.h' file not found"]),
+        // What merlin's language has not, which clang takes.
+        case("int f(void) { float s; return 0; }", &[]).merlin("no floating point"),
+        case("int x = 1.5;", &[]).merlin("no floating point"),
+        case("int x = .5;", &[]).merlin("no floating point"),
+        case("int x = 1e5;", &[]).merlin("no floating point"),
+        case("int x = 0x1p3;", &[]).merlin("no floating point"),
+        // Trigraphs, which C99 replaces before anything else: merlin has
+        // none, and errs where one would change the meaning.
+        case("char *s = \"a??=\";", &[]).merlin("trigraphs"),
+        case("int c = '??'';", &[]).merlin("trigraphs"),
+        case("char *s = \"\\??/\";", &[]).merlin("trigraphs"),
+        case("int x = 1 ??- 2;", &[]).merlin("trigraphs"),
+        case("int x; // note ??/  \r\nint y = 2;", &[]).merlin("trigraphs"),
+        case("??=define N 1", &[]).merlin("trigraphs"),
+        // `register` is a storage class of objects in a block (or of
+        // parameters), whose address cannot be taken.
+        case("register int x;", &["1:14: error: illegal storage class on file-scoped variable"]),
+        case("int f(void) { register int x = 1; return *&x; }", &["1:43: error: address of register variable requested"]),
+        case("int f(register int x) { int *p = &x; return *p; }", &["1:34: error: address of register variable requested"]),
+    ]
+}

@@ -352,6 +352,9 @@ pub struct Output {
     layout: Vec<Layout>,
     /// Where files start and end and `#line` renumbers, after how many tokens.
     marks: Vec<(usize, Mark)>,
+    /// The warnings clang gives while preprocessing (`'N' macro
+    /// redefined`), in order.
+    pub warnings: Vec<Error>,
 }
 
 /// Where a token of the output goes, for [`Output::print_asm`].
@@ -687,8 +690,9 @@ fn name_files(files: &[String], errors: &mut [Error]) {
 
 /// Preprocesses the source `src` of the file `name` (its name for
 /// `__FILE__` and errors; `#include "..."` looks next to it). An error in a
-/// header has its [`Error::file`] set.
-pub fn preprocess(name: &str, src: &str, opts: &Options, load: Loader) -> Result<Output, Error> {
+/// header has its [`Error::file`] set. An error stops it: `Err` has the
+/// warnings before it, then the error.
+pub fn preprocess(name: &str, src: &str, opts: &Options, load: Loader) -> Result<Output, Vec<Error>> {
     let mut pp = Pp {
         opts,
         load,
@@ -708,9 +712,12 @@ pub fn preprocess(name: &str, src: &str, opts: &Options, load: Loader) -> Result
         emitted: 0,
         marks: Vec::new(),
         carry: (false, false, false),
+        warnings: Vec::new(),
     };
     let result = pp.run(src);
+    let mut warnings = std::mem::take(&mut pp.warnings);
     let files: Vec<String> = pp.files.into_iter().map(|f| f.name).collect();
+    name_files(&files, &mut warnings);
     match result {
         Ok((toks, end)) => {
             let layout = toks
@@ -728,11 +735,13 @@ pub fn preprocess(name: &str, src: &str, opts: &Options, load: Loader) -> Result
                 files,
                 layout,
                 marks: pp.marks,
+                warnings,
             })
         }
         Err(mut e) => {
             name_files(&files, std::slice::from_mut(&mut e));
-            Err(e)
+            warnings.push(e);
+            Err(warnings)
         }
     }
 }
@@ -965,6 +974,8 @@ struct Pp<'a> {
     guards: HashMap<PathBuf, String>,
     /// How many tokens have come out so far, where [`Pp::marks`] are.
     emitted: usize,
+    /// The warnings so far.
+    warnings: Vec<Error>,
     /// Where files start and end, after how many tokens.
     marks: Vec<(usize, Mark)>,
     /// A macro that expanded to nothing started a line, or had a space
@@ -1799,7 +1810,7 @@ impl Pp<'_> {
         }
         let rename = match &toks[1..] {
             [] => None,
-            [t] if t.kind == PpKind::Str => Some(lexer::decode(&t.text, t.pos)?),
+            [t] if t.kind == PpKind::Str => Some(lexer::decode(&t.text, t.pos, &mut self.warnings)?),
             _ => return Err(bad()),
         };
         // The directive's own line, as the lexer numbered it.
@@ -1942,6 +1953,7 @@ impl Pp<'_> {
             toks: &toks,
             i: 0,
             end: args.last().map_or(directive.end, |t| t.end),
+            warnings: Vec::new(),
         };
         if toks.is_empty() {
             return Err(Error::new(
@@ -1949,7 +1961,9 @@ impl Pp<'_> {
                 format!("#{} with no expression", directive.text),
             ));
         }
-        let v = e.cond(true)?;
+        let v = e.cond(true);
+        self.warnings.append(&mut e.warnings);
+        let v = v?;
         if let Some(t) = toks.get(e.i) {
             return Err(Error::new(
                 t.pos,
@@ -2160,6 +2174,8 @@ struct Eval<'t> {
     i: usize,
     /// Where the expression ends, for "expected value" at the end.
     end: Pos,
+    /// The warnings of its literals.
+    warnings: Vec<Error>,
 }
 
 impl Eval<'_> {
@@ -2275,9 +2291,9 @@ impl Eval<'_> {
                     unsigned: lit.unsigned || bits > i64::MAX as u64,
                 })
             }
-            PpKind::Char => match lexer::decode(&t.text, t.pos)?[..] {
-                [b] => Ok(Val::signed(i64::from(b))),
-                _ => Err(Error::new(t.pos, "character constants hold one byte in merlin")),
+            PpKind::Char => match lexer::char_constant(&t.text, t.pos, &mut self.warnings)? {
+                lexer::Tok::Num(v, _) => Ok(Val::signed(v as i64)),
+                _ => unreachable!("a character constant is a number"),
             },
             PpKind::Ident if t.text == "defined" => Err(Error::new(
                 t.pos,
@@ -2358,7 +2374,7 @@ mod tests {
             .map(|(name, text)| (normalize(Path::new(name)), text.to_string()))
             .collect();
         let load = move |p: &Path| files.get(p).cloned();
-        preprocess("main.c", src, opts, &load)
+        preprocess("main.c", src, opts, &load).map_err(|mut e| e.pop().expect("the error"))
     }
 
     /// The tokens, each followed by one space: layout aside, what the
@@ -3115,7 +3131,7 @@ puts( "The first, second, and third items." );
             ..Options::default()
         };
         preprocess("main.S", src, &opts, &load)
-            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|e| panic!("{e:?}"))
             .print_asm(line_markers)
     }
 
@@ -3253,7 +3269,7 @@ puts( "The first, second, and third items." );
         };
         let e = preprocess("main.S", "# if the disk is there\n", &opts, &crate::no_files).unwrap_err();
         assert_eq!(
-            e.render("main.S"),
+            e.last().unwrap().render("main.S"),
             "main.S:1:10: error: unexpected 'disk' in preprocessor expression"
         );
         // C keeps its errors: an unknown directive, a bad paste, a trigraph.
