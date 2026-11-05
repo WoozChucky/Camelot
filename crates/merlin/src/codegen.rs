@@ -842,6 +842,7 @@ impl FileGen {
                 }
             }
             (_, Init::Expr(e)) => {
+                self.initializer_casts(e);
                 let value = consteval::eval(e, self.xlen).expect("sema: static initializers are constant");
                 // `.quad` for 8 bytes, as clang writes it (merlin-as also
                 // reads `.dword` and `.8byte`).
@@ -879,6 +880,38 @@ impl FileGen {
                 out.push(format!("{directive} {operand}"));
             }
             _ => unreachable!("sema checked initializer shapes"),
+        }
+    }
+
+    /// `-g`: the explicit casts of a static initializer's element whose
+    /// types clang keeps. Its front end emits an initializer with its
+    /// `ConstExprEmitter` first, which keeps the type of each explicit cast
+    /// it visits (`EmitExplicitCastExprType`), and evaluates what that
+    /// emitter gives up on. The emitter visits casts, and goes on into a
+    /// cast's operand when the cast changes nothing (the same type but for
+    /// its qualifiers: `CK_NoOp`) or converts an integer to another
+    /// integer type (`CK_IntegralCast`, not to `_Bool`), and into the
+    /// operand of a unary `-`; it gives up on anything else (`+`, `~`, a
+    /// binary operator, `?:`, `&`, an address converted to an integer). So
+    /// of `long a = (long)&x;` and `long n = -(T)(U)3;` the types are kept,
+    /// of `long b = (long)&x + 4;` and `int *p = (int *)(T)&x;`'s `T` not.
+    fn initializer_casts(&mut self, e: &Expr) {
+        if self.debug.is_none() {
+            return;
+        }
+        match &e.kind {
+            ExprKind::Cast { x, implicit, spelled } => {
+                if !implicit {
+                    self.debug.as_mut().expect("-g").cast(&e.ty, spelled);
+                }
+                let (from, to) = (x.ty.unqual(), e.ty.unqual());
+                let integral = from.is_integer() && to.is_integer() && *to != Type::Int(IntKind::Bool);
+                if from == to || integral {
+                    self.initializer_casts(x);
+                }
+            }
+            ExprKind::Unary(UnOp::Neg, x) => self.initializer_casts(x),
+            _ => {}
         }
     }
 

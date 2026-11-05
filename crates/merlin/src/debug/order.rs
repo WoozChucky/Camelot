@@ -287,9 +287,16 @@ impl Lines {
                 }
             } else {
                 for e in events(k) {
-                    if let Event::Literal(l) = e {
-                        make(self.literals[*l].ty, &mut locals);
-                        globals.push(Child::Literal(*l));
+                    match e {
+                        Event::Literal(l) => {
+                            make(self.literals[*l].ty, &mut locals);
+                            globals.push(Child::Literal(*l));
+                        }
+                        Event::Cast(t) => {
+                            make(*t, &mut locals);
+                            retained.extend(t.filter(|t| !retained.contains(t)));
+                        }
+                        _ => {}
                     }
                 }
                 make(self.globals[i].var.ty, &mut locals);

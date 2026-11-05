@@ -742,6 +742,46 @@ fn casts_not_evaluated_are_not_kept() {
     );
 }
 
+/// The typedefs `src` describes, in order.
+fn typedefs(src: &str) -> Vec<String> {
+    use elf::dies::dw;
+    let asm = merlin::compile_with("c.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options::default()).unwrap();
+    let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+    units[0]
+        .dies
+        .iter()
+        .filter(|d| d.tag == dw::TAG_TYPEDEF)
+        .filter_map(|d| d.name().map(str::to_string))
+        .collect()
+}
+
+/// In a static initializer, clang keeps the types of the explicit casts its
+/// `ConstExprEmitter` visits (clang 23): an element's own cast, and the casts
+/// inside a cast that changes nothing or converts an integer to an integer,
+/// or inside a unary `-`; not those under any other operator, `?:` or a
+/// cast of an address to an integer.
+#[test]
+fn initializer_casts_are_kept_as_clang_keeps_them() {
+    let names = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"];
+    let mut src: String = names.iter().map(|n| format!("typedef long {n};\n")).collect();
+    src.push_str(
+        "int x[4];\nstruct s { long a, b; };\n\
+         long a = (A)&x;\n\
+         long b = (B)&x + 4;\n\
+         long c[2] = {(C)&x, 0};\n\
+         struct s d = {(D)&x, 0};\n\
+         int *e = (int *)(E)&x;\n\
+         long f = (F)(G)&x;\n\
+         long g = 1 ? (H)&x : 0;\n\
+         long h = -(I)3;\n\
+         int i = (J)3;\n\
+         long j = ~(K)3;\n\
+         int main(void) { return 0; }\n",
+    );
+    assert_eq!(typedefs(&src), ["A", "C", "D", "F", "G", "I", "J"]);
+}
+
 /// The types a function defines (a typedef, a struct, one in an inner block)
 /// are described in its entry, after its variables and blocks, as clang has
 /// them; a file-scope type of the same tag is the unit's.
@@ -839,25 +879,14 @@ fn entry_tree(tool: &str, obj: &Path) -> Vec<String> {
 ///   code and entries are in the order the functions come;
 /// - `enums.c`, `designated.c`: clang describes an enum whose constant its
 ///   generated code uses, even with no variable of it; merlin's parser makes
-///   constants numbers;
-/// - `static_address_casts.c`: clang keeps the type of a cast its code
-///   generator visits, which takes in some in constant initializers; merlin
-///   keeps the explicit casts its code evaluates (in a folded constant, those
-///   clang visits: not the operands `?:`, `&&` and `||` leave out; nor what a
-///   constant condition leaves out, where merlin generates what clang does).
+///   constants numbers.
 ///
 /// Ignored: it needs clang and llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP`
 /// name them if they are not on the PATH).
 #[test]
 #[ignore]
 fn the_entries_are_clangs_in_clangs_order() {
-    const DIFFERENT: [&str; 5] = [
-        "func_ptrs.c",
-        "inline.c",
-        "enums.c",
-        "designated.c",
-        "static_address_casts.c",
-    ];
+    const DIFFERENT: [&str; 4] = ["func_ptrs.c", "inline.c", "enums.c", "designated.c"];
     let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
     let tool = std::env::var("LLVM_DWARFDUMP").unwrap_or_else(|_| "llvm-dwarfdump".into());
     let dir = std::env::temp_dir().join(format!("merlin-order-{}", std::process::id()));
