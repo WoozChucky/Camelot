@@ -1,9 +1,10 @@
-/* ld: the linked image as an ELF32 little-endian executable (merlin-ld's
- * write.rs, which explains each rule at length):
+/* ld: the linked image as a little-endian executable of the layout's class,
+ * ELF32 for RV32 and ELF64 for RV64 (merlin-ld's write.rs, which explains
+ * each rule at length):
  *
- *   ELF header (52 bytes)
- *   program headers (32 bytes each): PT_PHDR if the headers are loaded, one
- *     PT_LOAD per segment, in the room ld.lld leaves for its own
+ *   ELF header (52 or 64 bytes)
+ *   program headers (32 or 56 bytes each): PT_PHDR if the headers are
+ *     loaded, one PT_LOAD per segment, in the room ld.lld leaves for its own
  *   segment contents, each at a file offset congruent to its address mod its p_align
  *   .symtab, .strtab, the debug sections (.debug_line, ...), .shstrtab
  *   section headers: null, output sections, .symtab, .strtab, debug sections, .shstrtab
@@ -41,18 +42,48 @@
  *
  * merlin-ld, and so this, writes only the PT_PHDR and the PT_LOADs, with
  * zeros for the rest of the room, so that every segment is where ld.lld
- * puts it. */
+ * puts it.
+ *
+ * The two classes hold the same records; ELF64 widens every address,
+ * offset and size to 8 bytes and reorders two records so that those stay
+ * aligned: a program header's p_flags follows p_type, a symbol's st_info,
+ * st_other and st_shndx come before st_value and st_size. .symtab and the
+ * section header table are aligned to the size of an address. The page,
+ * 4 KiB, and e_flags, 0, are the same for both. */
 #include "ld.h"
 
 #define PAGE 0x1000
 
+/* What differs between the classes for the writer: the bytes of an
+ * address, offset or size field (also the alignment of .symtab and the
+ * section header table), and of the ELF header, a program header, a
+ * section header and a symbol. */
+struct class {
+    uint ident;
+    uint word;
+    uint ehdr;
+    uint phdr;
+    uint shdr;
+    uint sym;
+};
+
+static const struct class ELF32 = {1, 4, 52, 32, 40, 16};
+static const struct class ELF64 = {2, 8, 64, 56, 64, 24};
+
+/* The executable's class. */
+static const struct class *class;
+
+static void set_class(struct layout *l) {
+    class = l->class == FORMAT_ELF64 ? &ELF64 : &ELF32;
+}
+
 struct segment {
-    uint vaddr;
-    uint paddr; /* the load address: its first section's */
-    uint filesz;
-    uint memsz;
+    uint64_t vaddr;
+    uint64_t paddr; /* the load address: its first section's */
+    uint64_t filesz;
+    uint64_t memsz;
     uint flags;
-    uint align; /* p_align: its file offset is congruent to vaddr modulo this */
+    uint64_t align; /* p_align: its file offset is congruent to vaddr modulo this */
     uint first; /* the sections [first, first + n) of the layout */
     uint n;
     /* It loads the ELF header and the program headers: it starts at the
@@ -65,10 +96,10 @@ struct segment {
 struct headers {
     uint size;
     int loaded;
-    uint addr;
+    uint64_t addr;
 };
 
-static uint pflags(uint shflags) {
+static uint pflags(uint64_t shflags) {
     uint f = PF_R;
     if (shflags & SHF_WRITE) {
         f |= PF_W;
@@ -89,19 +120,20 @@ static uint runs(struct layout *l, struct segment *segs) {
         int start_new = n == 0;
         if (!start_new) {
             struct output_section *prev = &l->sections[segs[n - 1].first + segs[n - 1].n - 1];
-            i64 prev_end = i64_add(i64_u(prev->addr), i64_u(prev->size));
+            /* No overflow: every section ends below 2^64 (the layout refuses
+             * one that would not). */
+            uint64_t prev_end = prev->addr + prev->size;
             /* Going backward can't be one segment. A section with its own
              * load address starts one: a segment has one p_paddr, and its
              * sections are loaded contiguously from there. So does the
              * section after a run of RELRO sections (ld.lld's relroEnd). */
-            start_new = segs[n - 1].flags != flags || i64_cmp(i64_u(s->addr), prev_end) < 0 || s->at ||
+            start_new = segs[n - 1].flags != flags || s->addr < prev_end || s->at ||
                         (is_relro(prev->name, prev->flags) && !is_relro(s->name, s->flags));
         }
         if (start_new) {
             memset(&segs[n], 0, sizeof segs[n]);
             segs[n].vaddr = s->addr;
-            /* Below 4 GiB: the layout checks every load range. */
-            segs[n].paddr = s->lma.lo;
+            segs[n].paddr = s->lma;
             segs[n].flags = flags;
             segs[n].align = PAGE;
             segs[n].first = i;
@@ -111,7 +143,7 @@ static uint runs(struct layout *l, struct segment *segs) {
         seg->n++;
         /* Every section counts, an empty or NOBITS one too (ld.lld). */
         seg->align = s->align > seg->align ? s->align : seg->align;
-        uint end = s->addr - seg->vaddr + s->size;
+        uint64_t end = s->addr - seg->vaddr + s->size;
         seg->memsz = end;
         if (!s->nobits) {
             seg->filesz = end;
@@ -150,26 +182,19 @@ static uint segments(struct layout *l, struct segment *out, struct headers *h) {
      * out). */
     int joins = !l->memory && n > 0 && segs[0].flags == PF_R;
     uint count = 2 + n - (uint)joins + relro_runs(l) + 1 + (uint)(l->riscv_attributes != 0);
-    h->size = 52 + 32 * count;
+    h->size = class->ehdr + class->phdr * count;
 
     /* 2. Are they loaded? Only if they fit between the start of the page of
      * the lowest section and that section ("only allocate program headers
      * if that would not add a page"). Without sections ld.lld's lowest
-     * address is the top of the address space. An empty section at
-     * exactly 4 GiB (addr_hi) is above every other one; if it is the
-     * lowest, it starts its page and nothing fits below it. */
-    uint lowest = 0xffffffffu;
-    int low = 0, top = 0;
+     * address is the top of the address space (its `min` starts at
+     * UINT64_MAX, which an ELF32 field cuts to 32 bits). */
+    uint64_t lowest = class == &ELF64 ? UINT64_MAX : UINT32_MAX;
     for (uint i = 0; i < l->nsections; i++) {
-        if (l->sections[i].addr_hi != 0) {
-            top = 1;
-            continue;
-        }
-        low = 1;
-        lowest = l->sections[i].addr < lowest ? l->sections[i].addr : lowest;
+        lowest = l->sections[i].addr < lowest || i == 0 ? l->sections[i].addr : lowest;
     }
-    uint page = lowest - lowest % PAGE;
-    h->loaded = (low || !top) && h->size <= lowest - page;
+    uint64_t page = lowest - lowest % PAGE;
+    h->loaded = h->size <= lowest - page;
     h->addr = page;
     struct segment *first = segs;
     uint total = n;
@@ -179,7 +204,7 @@ static uint segments(struct layout *l, struct segment *out, struct headers *h) {
              * gap up to its first section, its sections. Its file size runs
              * to its last section with file contents, or to the end of the
              * headers if none has any; its load address moves down too. */
-            uint below = segs[0].vaddr - page;
+            uint64_t below = segs[0].vaddr - page;
             int file = 0;
             for (uint i = segs[0].first; i < segs[0].first + segs[0].n; i++) {
                 file |= !l->sections[i].nobits;
@@ -220,16 +245,17 @@ static uint segments(struct layout *l, struct segment *out, struct headers *h) {
  * shares it but is loaded (AT) less far up than its distance from the page
  * the headers start. */
 void write_check(struct layout *l) {
+    set_class(l);
     struct segment *segs = xcalloc((l->nsections + 2) * sizeof(struct segment));
     struct headers hd;
     uint n = segments(l, segs, &hd);
     if (hd.loaded && n > 0 && segs[0].headers && segs[0].n > 0) {
         struct output_section *s = &l->sections[segs[0].first];
-        uint below = s->addr - hd.addr;
-        if (i64_cmp(s->lma, i64_u(below)) < 0) {
+        uint64_t below = s->addr - hd.addr;
+        if (s->lma < below) {
             error(fmt("the headers' load address range would start below 0: they share a segment with section %s, "
-                      "loaded at 0x%x, 0x%x bytes after them",
-                      s->name, s->lma.lo, below));
+                      "loaded at 0x%llx, 0x%llx bytes after them",
+                      s->name, s->lma, below));
         }
     }
     free(segs);
@@ -261,14 +287,40 @@ static int shndx_of(struct layout *l, uint obj, uint sec, uint *out) {
     return 1;
 }
 
-static void sym_entry(struct buf *out, struct buf *strtab, const char *name, uint value, uint size, uint info,
+static void buf_u64(struct buf *b, uint64_t v) {
+    buf_u32(b, (uint)v);
+    buf_u32(b, (uint)(v >> 32));
+}
+
+/* An address, offset or size field: 4 bytes in ELF32, 8 in ELF64. An ELF32
+ * value fits in 4 bytes: the layout keeps an ELF32 link below 4 GiB. */
+static void buf_word(struct buf *b, uint64_t v) {
+    if (class->word == 8) {
+        buf_u64(b, v);
+    } else {
+        buf_u32(b, (uint)v);
+    }
+}
+
+/* A symbol table entry: Elf32_Sym is name, value, size, info, other,
+ * shndx; Elf64_Sym moves the three narrow fields before the two 8-byte
+ * ones. */
+static void sym_entry(struct buf *out, struct buf *strtab, const char *name, uint64_t value, uint64_t size, uint info,
                       uint shndx) {
     buf_u32(out, str_add(strtab, name));
-    buf_u32(out, value);
-    buf_u32(out, size);
-    buf_byte(out, info);
-    buf_byte(out, 0);
-    buf_u16(out, shndx);
+    if (class->word == 8) {
+        buf_byte(out, info);
+        buf_byte(out, 0);
+        buf_u16(out, shndx);
+        buf_u64(out, value);
+        buf_u64(out, size);
+    } else {
+        buf_u32(out, (uint)value);
+        buf_u32(out, (uint)size);
+        buf_byte(out, info);
+        buf_byte(out, 0);
+        buf_u16(out, shndx);
+    }
 }
 
 /* The symbol table: null, locals, then globals. Returns the first global's
@@ -279,7 +331,7 @@ static void sym_entry(struct buf *out, struct buf *strtab, const char *name, uin
  * of a mergeable section; one of .riscv.attributes is absolute, if ld.lld
  * would write that section. */
 static uint symtab(struct layout *l, int strip, struct buf *out, struct buf *strtab) {
-    for (uint i = 0; i < 16; i++) {
+    for (uint i = 0; i < class->sym; i++) {
         buf_byte(out, 0);
     }
     for (uint oi = 0; oi < l->nobjects; oi++) {
@@ -300,7 +352,8 @@ static uint symtab(struct layout *l, int strip, struct buf *out, struct buf *str
                 }
                 continue;
             }
-            uint shndx, value;
+            uint shndx;
+            uint64_t value;
             if (!shndx_of(l, oi, s->shndx, &shndx)) {
                 if (in == NULL || in->placed != PLACED_DEBUG || strip) {
                     continue; /* in a section the executable does not have */
@@ -314,7 +367,7 @@ static uint symtab(struct layout *l, int strip, struct buf *out, struct buf *str
             sym_entry(out, strtab, s->name, value, s->size, info, shndx);
         }
     }
-    uint first_global = out->len / 16;
+    uint first_global = out->len / class->sym;
     for (uint g = 0; g < l->nglobals; g++) {
         struct global *gl = &l->globals[g];
         if (gl->obj < 0) {
@@ -322,7 +375,8 @@ static uint symtab(struct layout *l, int strip, struct buf *out, struct buf *str
             continue;
         }
         struct symbol *s = &l->objects[gl->obj].symbols[gl->sym];
-        uint value, shndx;
+        uint shndx;
+        uint64_t value;
         /* A global whose section /DISCARD/ threw away is left out. */
         if (!object_symbol(l, (uint)gl->obj, gl->sym, &value)) {
             continue;
@@ -335,32 +389,53 @@ static uint symtab(struct layout *l, int strip, struct buf *out, struct buf *str
     return first_global;
 }
 
-static void put_word(struct buf *b, uint at, uint v) {
-    b->data[at] = (uchar)v;
-    b->data[at + 1] = (uchar)(v >> 8);
-    b->data[at + 2] = (uchar)(v >> 16);
-    b->data[at + 3] = (uchar)(v >> 24);
-}
-
-static void shdr(struct buf *h, uint name, uint type, uint flags, uint addr, uint offset, uint size, uint link,
-                 uint info, uint align, uint entsize) {
+/* A section header: the same fields in the same order in both classes,
+ * sh_flags, sh_addr, sh_offset, sh_size, sh_addralign and sh_entsize
+ * address-sized. */
+static void shdr(struct buf *h, uint name, uint type, uint64_t flags, uint64_t addr, uint offset, uint64_t size,
+                 uint link, uint info, uint64_t align, uint64_t entsize) {
     buf_u32(h, name);
     buf_u32(h, type);
-    buf_u32(h, flags);
-    buf_u32(h, addr);
-    buf_u32(h, offset);
-    buf_u32(h, size);
+    buf_word(h, flags);
+    buf_word(h, addr);
+    buf_word(h, offset);
+    buf_word(h, size);
     buf_u32(h, link);
     buf_u32(h, info);
-    buf_u32(h, align);
-    buf_u32(h, entsize);
+    buf_word(h, align);
+    buf_word(h, entsize);
+}
+
+/* A program header, PT_LOAD or PT_PHDR. ELF64 moves p_flags up to follow
+ * p_type, so that the six address-sized fields after it are 8-aligned. */
+static void phdr(struct buf *b, uint type, uint flags, uint64_t offset, uint64_t vaddr, uint64_t paddr,
+                 uint64_t filesz, uint64_t memsz, uint64_t align) {
+    buf_u32(b, type);
+    if (class->word == 8) {
+        buf_u32(b, flags);
+    }
+    buf_word(b, offset);
+    buf_word(b, vaddr);
+    buf_word(b, paddr);
+    buf_word(b, filesz);
+    buf_word(b, memsz);
+    if (class->word == 4) {
+        buf_u32(b, flags);
+    }
+    buf_word(b, align);
+}
+
+/* `len` rounded up to a multiple of `a`. */
+static uint align_len(uint len, uint a) {
+    return (len + a - 1) / a * a;
 }
 
 void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struct buf *out) {
+    set_class(l);
     struct segment *segs = xcalloc((l->nsections + 2) * sizeof(struct segment));
     struct headers hd;
     uint nsegs = segments(l, segs, &hd);
-    uint phoff = 52;
+    uint phoff = class->ehdr;
     memset(out, 0, sizeof *out);
     /* The room ld.lld leaves for the headers, which holds ours. */
     buf_pad(out, hd.size);
@@ -372,7 +447,8 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
      * segment maps the start of the file); another NOBITS section at the end
      * so far; another section at the segment's offset plus its distance from
      * the segment's start; a section in no segment (an empty one whose
-     * segment was dropped) at the end so far, aligned to its alignment. */
+     * segment was dropped) at the end so far, aligned to its alignment.
+     * Every offset is inside the file being written, a uint. */
     uint *sec_offset = xcalloc((l->nsections + 1) * sizeof(uint));
     /* The headers' segment, the only one that can be without sections, is
      * at offset 0. */
@@ -392,60 +468,45 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
         int k = seg_of[i];
         if (k >= 0 && segs[k].n > 0 && segs[k].first == i && !segs[k].headers) {
             /* The smallest offset >= the end with offset = vaddr (mod p_align). */
-            uint a = segs[k].align;
-            seg_offset[k] = cur + (segs[k].vaddr % a + a - cur % a) % a;
+            uint64_t a = segs[k].align;
+            seg_offset[k] = (uint)(cur + (segs[k].vaddr % a + a - cur % a) % a);
             o = seg_offset[k];
         } else if (s->nobits) {
             o = cur;
         } else if (k < 0) {
-            o = (cur + s->align - 1) / s->align * s->align;
+            o = align_len(cur, s->align);
         } else {
-            o = seg_offset[k] + (s->addr - segs[k].vaddr);
+            o = seg_offset[k] + (uint)(s->addr - segs[k].vaddr);
         }
         sec_offset[i] = o;
         buf_pad(out, o);
         if (!s->nobits) {
-            buf_put(out, images[i], s->size);
+            buf_put(out, images[i], (uint)s->size);
         }
     }
     free(seg_of);
     /* Program headers. With the headers loaded, a PT_PHDR first: the table
      * in the headers' segment (the first one), all of the room after the
-     * ELF header, at the address and load address it has there. */
+     * ELF header, at the address and load address it has there; its
+     * alignment the size of an address. */
+    struct buf ph;
+    memset(&ph, 0, sizeof ph);
     uint nphdrs = 0;
     if (hd.loaded) {
-        uint ph[8];
-        ph[0] = PT_PHDR;
-        ph[1] = phoff;
-        ph[2] = hd.addr + phoff;
-        ph[3] = segs[0].paddr + phoff;
-        ph[4] = hd.size - phoff;
-        ph[5] = hd.size - phoff;
-        ph[6] = PF_R;
-        ph[7] = 4; /* the size of an address */
-        for (uint w = 0; w < 8; w++) {
-            put_word(out, phoff + 4 * w, ph[w]);
-        }
+        uint room = hd.size - phoff;
+        phdr(&ph, PT_PHDR, PF_R, phoff, hd.addr + phoff, segs[0].paddr + phoff, room, room, class->word);
         nphdrs++;
     }
     for (uint k = 0; k < nsegs; k++) {
-        uint at = phoff + 32 * nphdrs;
-        uint ph[8];
-        ph[0] = PT_LOAD;
-        ph[1] = seg_offset[k];
-        ph[2] = segs[k].vaddr;
-        ph[3] = segs[k].paddr;
-        ph[4] = segs[k].filesz;
-        ph[5] = segs[k].memsz;
-        ph[6] = segs[k].flags;
-        ph[7] = segs[k].align;
-        for (uint w = 0; w < 8; w++) {
-            put_word(out, at + 4 * w, ph[w]);
-        }
+        phdr(&ph, PT_LOAD, segs[k].flags, seg_offset[k], segs[k].vaddr, segs[k].paddr, segs[k].filesz, segs[k].memsz,
+             segs[k].align);
         nphdrs++;
     }
+    memcpy(out->data + phoff, ph.data, ph.len);
+    free(ph.data);
 
-    /* Symbol and string tables, and the debug sections. */
+    /* Symbol and string tables, and the debug sections. .symtab is aligned
+     * to its entries' widest field, an address. */
     struct buf strtab, shstrtab, syms;
     memset(&strtab, 0, sizeof strtab);
     memset(&shstrtab, 0, sizeof shstrtab);
@@ -453,7 +514,7 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     buf_byte(&strtab, 0);
     buf_byte(&shstrtab, 0);
     uint first_global = symtab(l, strip, &syms, &strtab);
-    buf_pad(out, (out->len + 3) & ~3u);
+    buf_pad(out, align_len(out->len, class->word));
     uint symtab_off = out->len;
     buf_put(out, syms.data, syms.len);
     uint strtab_off = out->len;
@@ -461,10 +522,9 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     uint ndebug = strip ? 0 : l->ndebug;
     uint *debug_off = xcalloc((ndebug + 1) * sizeof(uint));
     for (uint k = 0; k < ndebug; k++) {
-        uint a = l->debug[k].align;
-        buf_pad(out, (out->len + a - 1) / a * a);
+        buf_pad(out, align_len(out->len, l->debug[k].align));
         debug_off[k] = out->len;
-        buf_put(out, debug[k], l->debug[k].size);
+        buf_put(out, debug[k], (uint)l->debug[k].size);
     }
 
     /* Section headers. */
@@ -477,8 +537,8 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
              sec_offset[i], s->size, 0, 0, s->align, 0);
     }
     uint symtab_index = l->nsections + 1;
-    shdr(&h, str_add(&shstrtab, ".symtab"), SHT_SYMTAB, 0, 0, symtab_off, syms.len, symtab_index + 1, first_global, 4,
-         16);
+    shdr(&h, str_add(&shstrtab, ".symtab"), SHT_SYMTAB, 0, 0, symtab_off, syms.len, symtab_index + 1, first_global,
+         class->word, class->sym);
     shdr(&h, str_add(&shstrtab, ".strtab"), SHT_STRTAB, 0, 0, strtab_off, strtab.len, 0, 0, 1, 0);
     for (uint k = 0; k < ndebug; k++) {
         struct debug_section *d = &l->debug[k];
@@ -487,26 +547,34 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     }
     uint shstrtab_name = str_add(&shstrtab, ".shstrtab");
     shdr(&h, shstrtab_name, SHT_STRTAB, 0, 0, out->len, shstrtab.len, 0, 0, 1, 0);
-    uint nshdrs = h.len / 40;
+    uint nshdrs = h.len / class->shdr;
     buf_put(out, shstrtab.data, shstrtab.len);
-    buf_pad(out, (out->len + 3) & ~3u);
+    buf_pad(out, align_len(out->len, class->word));
     uint shoff = out->len;
     buf_put(out, h.data, h.len);
 
-    /* The ELF header. */
-    static const uchar ident[16] = {0x7f, 'E', 'L', 'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    memcpy(out->data, ident, 16);
-    uint e[9];
-    e[0] = ET_EXEC | EM_RISCV << 16; /* e_type, e_machine */
-    e[1] = 1;             /* e_version */
-    e[2] = l->entry;
-    e[3] = nphdrs == 0 ? 0 : phoff;
-    e[4] = shoff;
-    e[5] = 0;                   /* e_flags: ilp32 soft-float, no RVC */
-    e[6] = 52 | 32 << 16;       /* e_ehsize, e_phentsize */
-    e[7] = nphdrs | 40 << 16;   /* e_phnum, e_shentsize */
-    e[8] = nshdrs | (nshdrs - 1) << 16; /* e_shnum, e_shstrndx */
-    for (uint w = 0; w < 9; w++) {
-        put_word(out, 16 + 4 * w, e[w]);
-    }
+    /* The ELF header: class, little-endian, version 1, System V ABI. */
+    struct buf e;
+    memset(&e, 0, sizeof e);
+    buf_put(&e, "\177ELF", 4);
+    buf_byte(&e, class->ident);
+    buf_byte(&e, 1);
+    buf_byte(&e, 1);
+    buf_byte(&e, 0);
+    buf_pad(&e, 16);
+    buf_u16(&e, ET_EXEC);
+    buf_u16(&e, EM_RISCV);
+    buf_u32(&e, 1); /* e_version */
+    buf_word(&e, l->entry);
+    buf_word(&e, nphdrs == 0 ? 0 : phoff);
+    buf_word(&e, shoff);
+    buf_u32(&e, 0); /* e_flags: ilp32 or lp64 soft-float, no RVC */
+    buf_u16(&e, class->ehdr);
+    buf_u16(&e, class->phdr);
+    buf_u16(&e, nphdrs);
+    buf_u16(&e, class->shdr);
+    buf_u16(&e, nshdrs);
+    buf_u16(&e, nshdrs - 1); /* e_shstrndx: .shstrtab, last */
+    memcpy(out->data, e.data, e.len);
+    free(e.data);
 }

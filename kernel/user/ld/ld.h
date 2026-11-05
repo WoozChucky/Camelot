@@ -18,10 +18,15 @@
  *   tables.h    the relocation types' numbers and names, generated from
  *   tables.c    the elf crate's (crates/xtask/src/c_tables.rs)
  *
- * The 64-bit arithmetic merlin-ld does with Rust's i64 and u64 (addresses
- * up to 4 GiB exactly, load addresses, relocation ranges, R_RISCV_64) is
- * lib/i64.c's. Not here: the link map (merlin-ld's --Map), and RV64
- * (ELF64 objects and executables, #157). */
+ * It links RV32 (ELF32) and RV64 (ELF64) objects into an executable of
+ * their class, as merlin-ld does. Its numbers are merlin-ld's: addresses,
+ * sizes, symbol values and relocation offsets are uint64_t (Rust's u64)
+ * and addends int64_t (i64) on both widths, an ELF32 file's fields
+ * widened as they are read, and the class (`elf64`, object.c's
+ * struct class) says where the two differ: how far addresses go and how
+ * a script computes (layout.c), how a hi/lo pair reaches (reloc.c), and
+ * how the records are laid out (object.c, write.c). Not here: the link map
+ * (merlin-ld's --Map). */
 #ifndef LD_H
 #define LD_H
 
@@ -37,8 +42,8 @@ char *xstrndup(const char *s, uint n);
 /* A growable array: grow(ptr, &cap, count + 1, size) makes room. */
 void *grow(void *p, uint *cap, uint need, uint size);
 /* A formatted message, as long as it needs to be (malloc'd): %s %d %u %x
- * %c %%, and a width with 0 for %x (%08x). 64-bit numbers are passed as
- * strings (i64_dec, i64_hex). */
+ * %c %%, %lld %llu %llx for 64-bit numbers, and a width with 0 for %x
+ * (%08x, %016llx). */
 char *fmt(const char *f, ...);
 
 struct buf {
@@ -75,27 +80,28 @@ struct strmap {
 int map_get(struct strmap *m, const char *key, int *value);
 void map_put(struct strmap *m, char *key, int value);
 
-/* A uint -> int map. */
+/* A uint64_t -> int map (addresses to indices). */
 struct uintmap {
-    uint *keys;
+    uint64_t *keys;
     int *values;
     uchar *used;
     uint cap;
     uint count;
 };
-int umap_get(struct uintmap *m, uint key, int *value);
-void umap_put(struct uintmap *m, uint key, int value);
+int umap_get(struct uintmap *m, uint64_t key, int *value);
+void umap_put(struct uintmap *m, uint64_t key, int value);
 
 /* ---- Objects (object.c) ---- */
 /* The ELF constants (SHT_*, SHF_*, SHN_*, STB_*, STT_*, PT_*, PF_*) are
  * tables.h's, generated from the elf crate's. */
 
-/* One Elf32_Rela. */
+/* One Elf32_Rela or Elf64_Rela, at ELF64's widths (an ELF32 addend
+ * sign-extended). */
 struct rela {
-    uint offset;
+    uint64_t offset;
     uint type;
     uint sym;
-    int addend;
+    int64_t addend;
 };
 
 /* Where the layout put an input section. */
@@ -104,12 +110,12 @@ enum { NOT_PLACED, PLACED, PLACED_DEBUG };
 struct section {
     char *name;
     uint type;
-    uint flags;
+    uint64_t flags;
     uchar *data; /* the file's bytes */
     uint datalen; /* how many: size, or 0 for NOBITS and the null section */
-    uint size;
+    uint64_t size;
     uint align;
-    uint entsize;
+    uint64_t entsize;
     struct rela *relocs;
     uint nrelocs;
     uint caprelocs;
@@ -118,7 +124,7 @@ struct section {
      * section holds it (-1: none); whether /DISCARD/ matched it. */
     int assigned;
     int placed;
-    uint addr;
+    uint64_t addr;
     int out;
     int discarded;
     /* A debug input section's: which of the layout's debug sections holds
@@ -128,15 +134,20 @@ struct section {
 
 struct symbol {
     char *name;
-    uint value;
-    uint size;
+    uint64_t value;
+    uint64_t size;
     uint bind;
     uint type;
     uint shndx;
 };
 
+/* The classes of ELF files: an object's, an executable's, what an
+ * OUTPUT_FORMAT names. */
+enum { FORMAT_NONE, FORMAT_ELF32, FORMAT_ELF64 };
+
 struct object {
     char *name;
+    int class; /* FORMAT_ELF32 or FORMAT_ELF64 */
     struct section *sections;
     uint nsections;
     struct symbol *symbols;
@@ -165,17 +176,18 @@ struct input {
  * are library members, compares their classes and picks the members the
  * others need (merlin-ld's layout::read, check_classes and library::pulled):
  * the files that are not members, in order, then the members needed, in
- * library order. `format` is the class the script's OUTPUT_FORMAT names,
- * which every file must have. Returns the objects and their count in *count,
- * or NULL after adding errors; NULL too when errors were added before (the
- * script's), once every file is parsed. */
-struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, int format, uint *count);
+ * library order. The executable's class, in *class, is `format`, the one
+ * the script's OUTPUT_FORMAT names, or else the first file's (a member's
+ * too), and every file must have it. Returns the objects and their count in
+ * *count, or NULL after adding errors; NULL too when errors were added
+ * before (the script's), once every file is parsed. */
+struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, int format, uint *count, int *class);
 
 /* ---- Linker scripts (script.c) ---- */
 enum { X_NUM, X_DOT, X_SYMBOL, X_ALIGN, X_ORIGIN, X_LENGTH, X_ADDR, X_ADD, X_SUB };
 struct expr {
     int kind;
-    i64 num;
+    uint64_t num;
     char *name; /* X_SYMBOL; X_ORIGIN, X_LENGTH: the region; X_ADDR: the output section */
     struct expr *a;
     struct expr *b;
@@ -214,16 +226,13 @@ struct command {
     struct output_desc out;
 };
 
-/* The classes OUTPUT_FORMAT names: elf32-littleriscv, elf64-littleriscv. */
-enum { FORMAT_NONE, FORMAT_ELF32, FORMAT_ELF64 };
-
 struct script {
     char *entry;
     int format; /* OUTPUT_FORMAT's first argument; FORMAT_NONE: none */
     int has_memory;
     char *region_name;
-    uint origin;
-    uint length;
+    uint64_t origin;
+    uint64_t length;
     struct command *commands;
     uint ncommands;
 };
@@ -237,8 +246,12 @@ extern const char DEFAULT_SCRIPT[];
 int script_parse(const char *src, struct script *out, uint *line, char **msg, int elf64);
 /* "elf32-littleriscv" or "elf64-littleriscv". */
 const char *format_name(int format);
-/* A number: decimal or 0x hex, with an optional K or M. */
-int parse_number(const char *w, i64 *out);
+/* A number: decimal or 0x hex, with an optional K or M; any u64 for
+ * ELF64 (elf64 set), up to i64::MAX for ELF32. */
+int parse_number(const char *w, uint64_t *out, int elf64);
+/* a + b, or a - b if `sub`, in a script's arithmetic: modulo 2^64 for ELF64
+ * (elf64 set); for ELF32 exact, the values read as i64s, 0 on an overflow. */
+int script_add(uint64_t a, uint64_t b, int sub, int elf64, uint64_t *out);
 int glob_match(const char *pattern, const char *name);
 int expr_uses_dot(struct expr *e);
 /* Whether the value depends on a symbol (ld.lld keeps an empty section
@@ -252,24 +265,22 @@ int script_names_addr(struct script *s, const char *name);
 struct input_ref {
     uint object;
     uint section;
-    uint addr;
+    uint64_t addr;
 };
 
 struct output_section {
     char *name;
-    uint addr;
-    /* 1 for an empty section at exactly 4 GiB (addr is then 0), the one
-     * address past 32 bits a section may have on ELF32: merlin-ld keeps it
-     * 64-bit, and so it is above every other section, not below. */
-    uint addr_hi;
-    uint size;
+    /* Its address: on ELF32 below 4 GiB, or exactly 4 GiB for an empty
+     * section there. */
+    uint64_t addr;
+    uint64_t size;
     /* The load address (LMA, the segment's p_paddr): addr unless the script
-     * says otherwise with AT. 64 bits, as merlin-ld's u64: a load range past
-     * 4 GiB is an error, and the section is still placed. */
-    i64 lma;
+     * says otherwise with AT. A load range past the address space is an
+     * error, and the section is still placed. */
+    uint64_t lma;
     int at; /* the section has an AT of its own: it starts a segment */
     uint align;
-    uint flags;
+    uint64_t flags;
     int nobits;
     struct input_ref *inputs;
     uint ninputs;
@@ -280,10 +291,10 @@ struct output_section {
  * offset in it. */
 struct debug_section {
     char *name;
-    uint size;
+    uint64_t size;
     uint align;
-    uint flags;
-    uint entsize;
+    uint64_t flags;
+    uint64_t entsize;
     struct input_ref *inputs;
     uint ninputs;
     uint capinputs;
@@ -295,10 +306,12 @@ struct global {
     char *name;
     int obj;
     uint sym;
-    uint value;
+    uint64_t value;
 };
 
 struct layout {
+    /* The executable's class, its objects' (FORMAT_ELF32, FORMAT_ELF64). */
+    int class;
     struct object *objects;
     uint nobjects;
     struct output_section *sections;
@@ -308,7 +321,7 @@ struct layout {
     struct global *globals;
     uint nglobals;
     struct strmap global_index;
-    uint entry;
+    uint64_t entry;
     /* The script has a MEMORY region, which every output section is in:
      * such a section never shares a segment with the headers (write.c). */
     int memory;
@@ -317,18 +330,19 @@ struct layout {
     int riscv_attributes;
 };
 
-/* merlin-ld's layout::build: 0 after adding errors. */
-int layout_build(struct object *objects, uint nobjects, const char *script_name, const char *script_text,
-                 const char *entry_opt, struct layout *l);
+/* merlin-ld's layout::build_from, for `class`'s objects: 0 after adding
+ * errors. */
+int layout_build(struct object *objects, uint nobjects, int class, const char *script_name,
+                 const char *script_text, const char *entry_opt, struct layout *l);
 /* Values: 1 with *out set, or 0 (none). */
-int object_symbol(struct layout *l, uint obj, uint sym, uint *out);
-int global_value(struct layout *l, const char *name, uint *out);
+int object_symbol(struct layout *l, uint obj, uint sym, uint64_t *out);
+int global_value(struct layout *l, const char *name, uint64_t *out);
 int in_dropped_section(struct layout *l, uint obj, uint sym);
 int is_undefined_weak(struct layout *l, uint obj, uint sym);
 /* ld.lld makes an output section of this name and these flags RELRO. */
-int is_relro(const char *name, uint flags);
+int is_relro(const char *name, uint64_t flags);
 /* S for a relocation in `obj` against `sym`: 1, or 0 with *err. */
-int reloc_symbol(struct layout *l, uint obj, uint sym, uint *out, char **err);
+int reloc_symbol(struct layout *l, uint obj, uint sym, uint64_t *out, char **err);
 
 /* ---- Relocations (reloc.c, relocate.c) ---- */
 enum { RE_OK, RE_UNSUPPORTED, RE_ALIGN_PADDING, RE_OUT_OF_RANGE, RE_MISALIGNED, RE_RANGE_AND_ALIGN, RE_TRUNCATED,
@@ -339,21 +353,25 @@ enum { RE_OK, RE_UNSUPPORTED, RE_ALIGN_PADDING, RE_OUT_OF_RANGE, RE_MISALIGNED, 
  * by 2 too), the value and the alignment, in min (MISALIGNED), the bytes
  * needed and left (TRUNCATED). */
 struct reloc_error {
-    i64 value;
-    i64 min;
-    i64 max;
-    uint need;
-    uint have;
+    int64_t value;
+    int64_t min;
+    int64_t max;
+    uint64_t need;
+    uint64_t have;
 };
 
 /* The PCREL_HI20 sites by place, for the PCREL_LO12s: index into his. */
 struct hi_site {
-    uint sym;
-    int addend;
+    uint64_t sym;
+    int64_t addend;
 };
 struct reloc_context {
+    /* The class of the executable: whose instructions compute addresses
+     * in 32 or 64 bits. */
+    int elf64;
     /* The relocations patch a section that is not loaded (debug
-     * information), where R_RISCV_64 is sign-extended from 32 bits. */
+     * information), where on RV32 R_RISCV_64 is sign-extended from 32
+     * bits. */
     int debug;
     struct uintmap by_place;
     struct hi_site *sites;
@@ -362,11 +380,11 @@ struct reloc_context {
 };
 
 /* Patches `bytes` (`have` of them, from the place to the end of the input
- * section) for one relocation. S, `sym`, is 64 bits, as merlin-ld's u64: an
- * address, or -A for debug information of discarded code. Returns RE_OK or
+ * section) for one relocation: P `place`, S `sym` (an address, or -A for
+ * debug information of discarded code) and A `addend`. Returns RE_OK or
  * what is wrong (nothing is written then). */
-int reloc_apply(uint type, uint place, i64 sym, int addend, uchar *bytes, uint have, struct reloc_context *ctx,
-                struct reloc_error *e);
+int reloc_apply(uint type, uint64_t place, uint64_t sym, int64_t addend, uchar *bytes, uint64_t have,
+                struct reloc_context *ctx, struct reloc_error *e);
 /* A relocation type's psABI name (or "relocation type N"). */
 const char *reloc_type_name(uint type);
 

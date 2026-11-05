@@ -20,8 +20,16 @@
  *      offset there.
  *   6. Undefined globals, then the entry point.
  *
- * The location counter is a 64-bit number (merlin-ld's u64): a section may
- * end exactly at 4 GiB, and going past it is an error, not a wrap.
+ * The two classes, as merlin-ld's layout.rs has them: addresses and sizes
+ * are uint64_t for both. ELF64 (RV64) has the whole 64-bit address space,
+ * and its script arithmetic is modulo 2^64, as ld.lld's; a section may not
+ * run past 2^64. ELF32 (RV32, until #159) has 4 GiB: the location counter,
+ * script symbols, section ends, the MEMORY region and the entry point must
+ * stay within it (a section may end exactly at 4 GiB), and script
+ * arithmetic is exact, the values read as i64s, an overflow an error. At
+ * the top level of SECTIONS the location counter moves anywhere, backward
+ * and round 2^64 on ELF64 too; only inside an output section must it move
+ * forward.
  *
  * Load addresses (AT), as merlin-ld's layout.rs explains them: a section
  * runs at its address (VMA) and is loaded at its load address (LMA, its
@@ -29,25 +37,25 @@
  * is the section's aligned start. The difference LMA - VMA (modulo 2^64)
  * carries on to every later section without an AT, NOLOAD and empty ones
  * too; a dropped section evaluates nothing. A section with an AT starts a
- * segment of its own (write.c). Load ranges must stay within 4 GiB and not
- * overlap. ADDR(.x) is the address of output section .x: one already
- * placed, or the one being placed (in its AT and its assignments).
+ * segment of its own (write.c). Load ranges must stay within the address
+ * space and not overlap. ADDR(.x) is the address of output section .x: one
+ * already placed, or the one being placed (in its AT and its assignments).
  *
- * The executable's class is the objects', ELF32 (object.c reads no other,
- * until #157). A script whose OUTPUT_FORMAT says elf64-littleriscv is
- * refused before the layout, with the objects (library.c), as merlin-ld's
- * link_with_library does. */
+ * The executable's class is the objects' (library.c checks they all have
+ * it, the script's OUTPUT_FORMAT's if it names one). */
 #include "ld.h"
 
 /* The link's state while it is laid out. */
 static struct layout *L;
 static struct script S;
 static const char *script_name;
+/* The executable is ELF64 (RV64), else ELF32 (RV32). */
+static int elf64;
 /* The output section being placed and its start, once that is known: what
  * ADDR of it is, in its AT and among its assignments. */
 static int has_current;
 static const char *current_name;
-static i64 current_start;
+static uint64_t current_start;
 
 static void script_err(uint line, char *msg) {
     error(fmt("%s:%u: %s", script_name, line, msg));
@@ -57,33 +65,32 @@ static int is_alloc(struct section *s) {
     return (s->flags & SHF_ALLOC) != 0;
 }
 
-/* align_up(v, a) for v >= 0 and a > 0: the next multiple of a. */
-static i64 align_up(i64 v, i64 a) {
-    i64 r;
-    i64_rem(v, a, &r);
-    if (r.lo == 0 && r.hi == 0) {
-        return v;
-    }
-    return i64_add(v, i64_sub(a, r));
-}
-
-/* Whether a, as 64 bits, is a power of two. */
-static int is_pow2(i64 a) {
-    return !i64_eq(a, i64_u(0)) && i64_eq(i64_and(a, i64_sub(a, i64_u(1))), i64_u(0));
+/* Whether a is a power of two. */
+static int is_pow2(uint64_t a) {
+    return a != 0 && (a & (a - 1)) == 0;
 }
 
 /* v rounded up to a multiple of a, a power of two (2^63 too): (v + a - 1)
- * & !(a - 1) modulo 2^64, as ld.lld aligns the location counter. */
-static i64 align_pow2(i64 v, i64 a) {
-    i64 m = i64_sub(a, i64_u(1));
-    return i64_and(i64_add(v, m), i64_not(m));
+ * & !(a - 1) modulo 2^64, ld.lld's alignToPowerOf2, which the location
+ * counter goes through, so an ELF64 address near the top aligns to 0. */
+static uint64_t align_pow2(uint64_t v, uint64_t a) {
+    uint64_t m = a - 1;
+    return (v + m) & ~m;
 }
 
-static i64 four_gib(void) {
-    i64 v;
-    v.lo = 0;
-    v.hi = 1;
-    return v;
+#define FOUR_GIB ((uint64_t)1 << 32)
+
+/* The address of a symbol `value` bytes into a section at `base`. ELF32:
+ * addresses are 32 bits and wrap at 4 GiB, as they always have in
+ * merlin-ld (a symbol defined far past its section's end). */
+static uint64_t symbol_address(uint64_t base, uint64_t value) {
+    return elf64 ? base + value : (uint)(base + value);
+}
+
+/* A script value as a message shows it in decimal: signed on ELF32, where
+ * values are i64s, unsigned on ELF64. */
+static char *show(uint64_t v) {
+    return elf64 ? fmt("%llu", v) : fmt("%lld", (int64_t)v);
 }
 
 /* ---- Symbols ---- */
@@ -95,7 +102,7 @@ static struct section *section_of(uint obj, uint sec) {
 
 /* Where an input section starts: its address if it is loaded, its offset in
  * its output section if it is debug information. */
-static int section_base(uint obj, uint sec, uint *out) {
+static int section_base(uint obj, uint sec, uint64_t *out) {
     struct section *s = section_of(obj, sec);
     if (s == NULL || s->placed == NOT_PLACED) {
         return 0;
@@ -104,7 +111,7 @@ static int section_base(uint obj, uint sec, uint *out) {
     return 1;
 }
 
-int object_symbol(struct layout *l, uint obj, uint sym, uint *out) {
+int object_symbol(struct layout *l, uint obj, uint sym, uint64_t *out) {
     struct symbol *s = &l->objects[obj].symbols[sym];
     if (s->shndx == SHN_UNDEF) {
         return 0;
@@ -113,15 +120,15 @@ int object_symbol(struct layout *l, uint obj, uint sym, uint *out) {
         *out = s->value;
         return 1;
     }
-    uint base;
+    uint64_t base;
     if (!section_base(obj, s->shndx, &base)) {
         return 0;
     }
-    *out = base + s->value;
+    *out = symbol_address(base, s->value);
     return 1;
 }
 
-static int global_def_value(struct global *g, uint *out) {
+static int global_def_value(struct global *g, uint64_t *out) {
     if (g->obj < 0) {
         *out = g->value;
         return 1;
@@ -129,7 +136,7 @@ static int global_def_value(struct global *g, uint *out) {
     return object_symbol(L, (uint)g->obj, g->sym, out);
 }
 
-int global_value(struct layout *l, const char *name, uint *out) {
+int global_value(struct layout *l, const char *name, uint64_t *out) {
     int i;
     if (!map_get(&l->global_index, name, &i)) {
         return 0;
@@ -143,7 +150,7 @@ int global_value(struct layout *l, const char *name, uint *out) {
  * nobody defines. Debug information gets ld.lld's tombstone there. */
 int in_dropped_section(struct layout *l, uint obj, uint sym) {
     struct symbol *s = &l->objects[obj].symbols[sym];
-    uint base;
+    uint64_t base;
     if (sym != 0 && !sym_is_local(s)) {
         int i;
         if (!map_get(&l->global_index, s->name, &i)) {
@@ -171,7 +178,7 @@ static const char *unplaced(uint obj, uint sec) {
     return s != NULL && s->discarded ? "was discarded by /DISCARD/" : "is not loaded";
 }
 
-int reloc_symbol(struct layout *l, uint obj, uint sym, uint *out, char **err) {
+int reloc_symbol(struct layout *l, uint obj, uint sym, uint64_t *out, char **err) {
     struct object *o = &l->objects[obj];
     struct symbol *s = &o->symbols[sym];
     if (sym == 0) {
@@ -213,7 +220,7 @@ int reloc_symbol(struct layout *l, uint obj, uint sym, uint *out, char **err) {
 
 static uint capglobals;
 
-static void add_global(char *name, int obj, uint sym, uint value) {
+static void add_global(char *name, int obj, uint sym, uint64_t value) {
     map_put(&L->global_index, name, (int)L->nglobals);
     L->globals = grow(L->globals, &capglobals, L->nglobals + 1, sizeof(struct global));
     struct global *g = &L->globals[L->nglobals++];
@@ -225,10 +232,12 @@ static void add_global(char *name, int obj, uint sym, uint value) {
 
 /* ---- The script's expressions ---- */
 
-static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
-    i64 a, b;
+/* The value of a script expression with the location counter at `dot`: a
+ * u64 on both classes. ELF64 reads it as one, a 64-bit address; ELF32 reads
+ * its bits as an i64, so `0 - 1` is -1, which the uses then refuse. */
+static int eval(struct expr *e, uint64_t dot, uint64_t *out, char **err) {
+    uint64_t a, b, v;
     int i;
-    uint v;
     switch (e->kind) {
     case X_NUM:
         *out = e->num;
@@ -247,10 +256,10 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
                 struct symbol *s = &L->objects[g->obj].symbols[g->sym];
                 struct section *sec = section_of((uint)g->obj, s->shndx);
                 known = s->shndx == SHN_ABS || (sec != NULL && sec->placed == PLACED);
-                v = s->shndx == SHN_ABS ? s->value : known ? sec->addr + s->value : 0;
+                v = s->shndx == SHN_ABS ? s->value : known ? symbol_address(sec->addr, s->value) : 0;
             }
             if (known) {
-                *out = i64_u(v);
+                *out = v;
                 return 1;
             }
             *err = fmt("symbol '%s' is used before its section is placed", e->name);
@@ -263,12 +272,13 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
             return 0;
         }
         /* ld.lld's checkAlignment: 0 is 1, the rest must be powers of two
-         * (a negative value, read as 64 bits, is none but -2^63). */
-        if (!is_pow2(i64_eq(a, i64_u(0)) ? i64_u(1) : a)) {
-            *err = fmt("ALIGN(%s): alignment must be power of 2", i64_dec(a));
+         * (on ELF32 a negative value, read as 64 bits, is none but -2^63).
+         * Past 2^64 it wraps to 0, as ld.lld's does. */
+        if (!is_pow2(a == 0 ? 1 : a)) {
+            *err = fmt("ALIGN(%s): alignment must be power of 2", show(a));
             return 0;
         }
-        *out = align_pow2(dot, i64_eq(a, i64_u(0)) ? i64_u(1) : a);
+        *out = align_pow2(dot, a == 0 ? 1 : a);
         return 1;
     case X_ORIGIN:
     case X_LENGTH:
@@ -276,7 +286,7 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
             *err = fmt("unknown memory region '%s'", e->name);
             return 0;
         }
-        *out = i64_u(e->kind == X_ORIGIN ? S.origin : S.length);
+        *out = e->kind == X_ORIGIN ? S.origin : S.length;
         return 1;
     case X_ADDR:
         /* The address of an output section: one already placed, or the
@@ -290,7 +300,7 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
         }
         for (uint k = 0; k < L->nsections; k++) {
             if (strcmp(L->sections[k].name, e->name) == 0) {
-                *out = i64_u(L->sections[k].addr);
+                *out = L->sections[k].addr;
                 return 1;
             }
         }
@@ -299,7 +309,7 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
             if (cmd->is_output && strcmp(cmd->out.name, e->name) == 0) {
                 /* /DISCARD/ has no address: 0, as in ld.lld. */
                 if (strcmp(e->name, DISCARD_NAME) == 0) {
-                    *out = i64_u(0);
+                    *out = 0;
                     return 1;
                 }
                 *err = fmt("section '%s' is used before it is placed", e->name);
@@ -314,66 +324,63 @@ static int eval(struct expr *e, i64 dot, i64 *out, char **err) {
         if (!eval(e->a, dot, &a, err) || !eval(e->b, dot, &b, err)) {
             return 0;
         }
-        /* checked_add / checked_sub */
-        i64 r = e->kind == X_ADD ? i64_add(a, b) : i64_sub(a, b);
-        int na = i64_is_neg(a), nb = i64_is_neg(b), nr = i64_is_neg(r);
-        int overflow = e->kind == X_ADD ? (na == nb && nr != na) : (na != nb && nr != na);
-        if (overflow) {
+        /* ELF64 modulo 2^64, ELF32 exact (script_add). */
+        if (!script_add(a, b, e->kind == X_SUB, elf64, out)) {
             *err = "arithmetic overflow";
             return 0;
         }
-        *out = r;
         return 1;
     }
 }
 
 /* Runs one assignment, at the top level of SECTIONS or inside an output
  * section (in_section). Returns the new location counter. */
-static i64 assign(struct assign *a, i64 dot, int in_section) {
-    i64 v;
+static uint64_t assign(struct assign *a, uint64_t dot, int in_section) {
+    uint64_t v;
     char *err;
     if (!eval(a->e, dot, &v, &err)) {
         script_err(a->line, err);
         return dot;
     }
     if (a->symbol == NULL) {
-        i64 n = v;
-        if (a->add) {
-            n = i64_add(dot, v);
-            /* dot >= 0: only a positive v can overflow. */
-            if (!i64_is_neg(v) && i64_is_neg(n)) {
-                script_err(a->line, "arithmetic overflow");
-                return dot;
-            }
+        uint64_t n = v;
+        if (a->add && !script_add(dot, v, 0, elf64, &n)) {
+            script_err(a->line, "arithmetic overflow");
+            return dot;
         }
-        /* Inside an output section `.` only moves forward (a negative value
-         * is a move backward too), and as in ld.lld it still takes the new
-         * value. At the top level it moves anywhere, as in ld.lld: sections
-         * over each other are an error once all are placed. */
-        if (in_section && i64_cmp(n, dot) < 0) {
-            script_err(a->line, fmt("cannot move the location counter backward (from %s to %s)", i64_hex(dot),
-                                    i64_hex(n)));
+        /* Inside an output section `.` only moves forward, and as in ld.lld
+         * it still takes the new value. ELF32: compared as i64s, so a
+         * negative value is a move backward. ELF64: a `. += n` or an ALIGN
+         * that wraps past 2^64 comes out below `dot`, backward too. At the
+         * top level it moves anywhere, as in ld.lld: sections over each
+         * other are an error once all are placed. */
+        int backward = elf64 ? n < dot : (int64_t)n < (int64_t)dot;
+        if (in_section && backward) {
+            script_err(a->line,
+                       fmt("cannot move the location counter backward (from 0x%llx to 0x%llx)", dot, n));
             return n;
         }
-        /* 4 GiB of address space; a negative value, read as 64 bits, is
-         * past it too. */
-        if (i64_is_neg(n) || i64_cmp(n, four_gib()) > 0) {
-            script_err(a->line, fmt("location counter %s is past the 4 GiB address space", i64_hex(n)));
+        /* ELF32: 4 GiB of address space, which `.` may reach exactly; a
+         * negative value, read as 64 bits, is past it too. */
+        if (!elf64 && n > FOUR_GIB) {
+            script_err(a->line, fmt("location counter 0x%llx is past the 4 GiB address space", n));
             return dot;
         }
         return n;
     }
-    if (v.hi != 0) {
-        script_err(a->line, fmt("value %s of '%s' does not fit in 32 bits", i64_hex(v), a->symbol));
+    /* ELF32: a symbol's value is 32 bits (ld.lld would truncate it), read
+     * as an i64, so -1 does not fit either. */
+    if (!elf64 && v > UINT32_MAX) {
+        script_err(a->line, fmt("value 0x%llx of '%s' does not fit in 32 bits", v, a->symbol));
         return dot;
     }
     /* A script assignment overrides an object's definition (as in ld.lld). */
     int i;
     if (map_get(&L->global_index, a->symbol, &i)) {
         L->globals[i].obj = -1;
-        L->globals[i].value = v.lo;
+        L->globals[i].value = v;
     } else {
-        add_global(a->symbol, -1, 0, v.lo);
+        add_global(a->symbol, -1, 0, v);
     }
     return dot;
 }
@@ -382,15 +389,15 @@ static i64 assign(struct assign *a, i64 dot, int in_section) {
 
 /* An entry of a mergeable section, for finding the duplicates. */
 struct merge_entry {
-    uint flags;
-    uint entsize;
+    uint64_t flags;
+    uint64_t entsize;
     uint align;
     uchar *p;
     uint len;
 };
 
 static uint bytes_hash(struct merge_entry *e) {
-    uint h = 2166136261u ^ e->flags ^ (e->entsize << 8) ^ (e->align << 16);
+    uint h = 2166136261u ^ (uint)e->flags ^ ((uint)e->entsize << 8) ^ (e->align << 16);
     for (uint i = 0; i < e->len; i++) {
         h = (h ^ e->p[i]) * 16777619u;
     }
@@ -412,7 +419,7 @@ static void merge_warnings(void) {
             if (!(sec->flags & SHF_MERGE) || sec->type == SHT_NOBITS || sec->entsize == 0) {
                 continue;
             }
-            uint e = sec->entsize;
+            uint e = sec->entsize > sec->datalen ? sec->datalen : (uint)sec->entsize;
             uint at = 0;
             while (at < sec->datalen) {
                 uint rest = sec->datalen - at;
@@ -526,7 +533,7 @@ static const char *const relro_names[] = {".data.rel.ro", ".bss.rel.ro", ".ctors
                                           ".jcr",         ".eh_frame",   ".fini_array", ".init_array",
                                           ".preinit_array", ".dynamic",  ".toc"};
 
-int is_relro(const char *name, uint flags) {
+int is_relro(const char *name, uint64_t flags) {
     if (!(flags & SHF_WRITE)) {
         return 0;
     }
@@ -542,7 +549,7 @@ int is_relro(const char *name, uint flags) {
  * section_rank: read-only, executable, writable and executable, RELRO,
  * writable, NOBITS last within each. Never 0 (bit 27 is always set), so 0
  * below means "no rank". */
-static uint section_rank(const char *name, uint flags, int nobits) {
+static uint section_rank(const char *name, uint64_t flags, int nobits) {
     uint rank = 1u << 27;
     int w = (flags & SHF_WRITE) != 0, x = (flags & SHF_EXECINSTR) != 0;
     if (!w && !x) {
@@ -568,7 +575,8 @@ static uint command_rank(struct command *cmd, struct rule *r) {
     if (!cmd->is_output || strcmp(cmd->out.name, DISCARD_NAME) == 0) {
         return 0;
     }
-    uint flags = SHF_ALLOC, ninputs = 0;
+    uint64_t flags = SHF_ALLOC;
+    uint ninputs = 0;
     int nobits = 1;
     for (uint it = 0; it < cmd->out.nitems; it++) {
         for (uint k = 0; k < r[it].n; k++) {
@@ -826,22 +834,25 @@ static void assign_inputs(int have_script) {
 
 static uint capsections;
 
-/* Whether a section loaded at `lma` with `size` bytes is within the 4 GiB
- * address space, as its address range must be (ld.lld would truncate
- * p_paddr to 32 bits). `lma` is 64 bits: an AT may move it anywhere. */
-static int load_range_fits(i64 lma, uint size) {
-    if (lma.hi == 0) {
-        return i64_cmp(i64_add(lma, i64_u(size)), four_gib()) <= 0;
+/* Whether a section loaded at `lma` with `size` bytes fits the class's
+ * address space, as its address range must: ELF32 within 4 GiB, which
+ * ld.lld does not check (it truncates p_paddr to 32 bits); ELF64 below
+ * 2^64, which ld.lld does not check either (p_paddr + p_memsz would wrap),
+ * and merlin-ld says so rather than write a segment that ends before it
+ * starts. */
+static int load_range_fits(uint64_t lma, uint64_t size) {
+    uint64_t end = lma + size;
+    if (end < lma) {
+        return 0;
     }
-    /* At 4 GiB exactly, only an empty range ends there. */
-    return lma.hi == 1 && lma.lo == 0 && size == 0;
+    return elf64 || end <= FOUR_GIB;
 }
 
 /* One output section of the walk (merlin-ld's Command::Output arm).
  * *dot, *cursor, *dot_moved, *prev_flags and *lma_offset are the walk's
  * state. */
-static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor, i64 *cursor, uint *dot_moved,
-                         uint *prev_flags, i64 *lma_offset) {
+static void place_output(uint c, struct output_desc *o, uint64_t *dot, int has_cursor, uint64_t *cursor,
+                         uint *dot_moved, uint64_t *prev_flags, uint64_t *lma_offset) {
     struct rule *r = rules[c];
     uint ninputs = 0;
     int has_assign = 0;
@@ -865,27 +876,32 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
     }
     /* `.name : ALIGN(n) { ... }`: at least n. */
     if (o->align != NULL) {
-        i64 n;
+        uint64_t n;
         char *err;
         if (eval(o->align, *dot, &n, &err)) {
-            /* ld.lld's checkAlignment (0 is 1), then at most 2^31. */
-            i64 a = i64_eq(n, i64_u(0)) ? i64_u(1) : n;
+            /* ld.lld's checkAlignment (0 is 1), then at most 2^31 on both
+             * classes: ld.lld keeps a section's alignment in 32 bits on
+             * RV64 too. */
+            uint64_t a = n == 0 ? 1 : n;
             if (!is_pow2(a)) {
                 script_err(o->line,
-                           fmt("ALIGN(%s) of section %s: alignment must be power of 2", i64_dec(n), o->name));
-            } else if (a.hi != 0 || a.lo > 0x80000000u) {
+                           fmt("ALIGN(%s) of section %s: alignment must be power of 2", show(n), o->name));
+            } else if (a > 0x80000000u) {
                 script_err(o->line, fmt("ALIGN(%s) of section %s: alignment must be at most 2^31 (ld.lld keeps 32 "
                                         "bits of a section's alignment and would ignore this one)",
-                                        i64_dec(n), o->name));
+                                        show(n), o->name));
             } else {
-                align = a.lo > align ? a.lo : align;
+                align = (uint)a > align ? (uint)a : align;
             }
         } else {
             script_err(o->line, err);
         }
     }
-    i64 base = has_cursor ? *cursor : *dot;
-    i64 start = align_pow2(base, i64_u(align));
+    /* Aligned as ld.lld aligns the location counter, modulo 2^64: an ELF64
+     * section at 0xffff_ffff_ffff_fff8 that wants 16 goes at 0, and one
+     * whose inputs run past 2^64 is reported below, with its size. */
+    uint64_t base = has_cursor ? *cursor : *dot;
+    uint64_t start = align_pow2(base, align);
     /* From here on ADDR of this section is `start`. */
     has_current = 1;
     current_name = o->name;
@@ -895,20 +911,20 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
      * keep. */
     int at = 0;
     if (o->at != NULL) {
-        i64 v;
+        uint64_t v;
         char *err;
         if (eval(o->at, start, &v, &err)) {
-            *lma_offset = i64_sub(v, start);
+            *lma_offset = v - start;
             at = 1;
         } else {
             script_err(o->line, err);
         }
     }
-    i64 lma = i64_add(start, *lma_offset);
-    i64 d = start;
+    uint64_t lma = start + *lma_offset;
+    uint64_t d = start;
     struct output_section os;
     memset(&os, 0, sizeof os);
-    uint flags = SHF_ALLOC;
+    uint64_t flags = SHF_ALLOC;
     int nobits = 1;
     for (uint it = 0; it < o->nitems; it++) {
         if (o->items[it].is_assign) {
@@ -917,28 +933,33 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
         }
         for (uint k = 0; k < r[it].n; k++) {
             struct section *sec = &L->objects[r[it].in[k].obj].sections[r[it].in[k].sec];
-            d = align_pow2(d, i64_u(sec->align));
+            d = align_pow2(d, sec->align);
             sec->placed = PLACED;
-            sec->addr = d.lo;
+            sec->addr = d;
             sec->out = -1;
             os.inputs = grow(os.inputs, &os.capinputs, os.ninputs + 1, sizeof(struct input_ref));
             os.inputs[os.ninputs].object = r[it].in[k].obj;
             os.inputs[os.ninputs].section = r[it].in[k].sec;
-            os.inputs[os.ninputs].addr = d.lo;
+            os.inputs[os.ninputs].addr = d;
             os.ninputs++;
-            d = i64_add(d, i64_u(sec->size));
+            /* Wrapping, as ld.lld's location counter: an ELF64 section that
+             * runs past 2^64 is reported once its size is known, below. */
+            d += sec->size;
             flags |= sec->flags & (SHF_WRITE | SHF_EXECINSTR);
             nobits &= sec->type == SHT_NOBITS;
         }
     }
-    /* d may be exactly 4 GiB, but the size must fit in 32 bits; ld.lld's
-     * words. The link fails, but as in ld.lld the location counter goes on
-     * from the section's end, so the sections after it are placed, and
+    /* The address space, as ld.lld's checkSections sees it, with its words
+     * on both classes. ELF32: d may be exactly 4 GiB, but the size must fit
+     * in 32 bits. ELF64: the section must end below 2^64. The link fails,
+     * but as in ld.lld the location counter goes on from the section's end
+     * (wrapped on ELF64), so the sections after it are placed, and
      * reported, where ld.lld places them. */
-    i64 size = i64_sub(d, start);
-    if (size.hi != 0 || i64_cmp(d, four_gib()) > 0) {
-        script_err(o->line, fmt("section %s at %s of size %s exceeds available address space", o->name,
-                                i64_hex(start), i64_hex(size)));
+    uint64_t size = d - start;
+    int past = elf64 ? start + size < start : size > UINT32_MAX || d > FOUR_GIB;
+    if (past) {
+        script_err(o->line, fmt("section %s at 0x%llx of size 0x%llx exceeds available address space", o->name,
+                                start, size));
         *dot = d;
         if (has_cursor) {
             *cursor = d;
@@ -948,8 +969,9 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
     /* The load address range must fit as the address range does. The
      * section is still placed: its addresses are right, and the sections
      * after it go where they should. */
-    if (!load_range_fits(lma, size.lo)) {
-        script_err(o->line, fmt("section %s load address range extends past the 4 GiB address space", o->name));
+    if (!load_range_fits(lma, size)) {
+        script_err(o->line, fmt("section %s load address range extends past %s address space", o->name,
+                                elf64 ? "the 64-bit" : "the 4 GiB"));
     }
     if (os.ninputs == 0) {
         /* Only assignments: like ld.lld, PROGBITS with the previous flags,
@@ -965,15 +987,16 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
         nobits = 1;
     }
     if (has_cursor) {
-        if (*dot_moved != 0 && !i64_eq(*dot, *cursor)) {
+        if (*dot_moved != 0 && *dot != *cursor) {
             script_err(*dot_moved, fmt("'.' is moved before output section %s, which is placed at the next free "
                                        "address of MEMORY region %s instead; move the assignment inside the section",
                                        o->name, S.region_name));
         }
-        i64 end = i64_add(i64_u(S.origin), i64_u(S.length));
-        if (i64_cmp(d, end) > 0) {
-            script_err(o->line, fmt("section %s overflows MEMORY region %s by %s bytes", o->name, S.region_name,
-                                    i64_dec(i64_sub(d, end))));
+        /* script.c made sure this does not overflow. */
+        uint64_t end = S.origin + S.length;
+        if (d > end) {
+            script_err(o->line, fmt("section %s overflows MEMORY region %s by %llu bytes", o->name, S.region_name,
+                                    d - end));
         }
         *cursor = d;
     }
@@ -981,9 +1004,8 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
         L->objects[os.inputs[k].object].sections[os.inputs[k].section].out = (int)L->nsections;
     }
     os.name = o->name;
-    os.addr = start.lo;
-    os.addr_hi = start.hi;
-    os.size = size.lo;
+    os.addr = start;
+    os.size = size;
     os.lma = lma;
     os.at = at;
     os.align = align;
@@ -998,35 +1020,35 @@ static void place_output(uint c, struct output_desc *o, i64 *dot, int has_cursor
 static void walk(void) {
     /* The location counter starts at 0, also with MEMORY (as in ld.lld):
      * only output sections go at the region's next free address. */
-    i64 dot = i64_u(0);
-    i64 cursor = i64_u(S.origin);
+    uint64_t dot = 0;
+    uint64_t cursor = S.origin;
     /* Line of the last top-level `.` move since the previous output section. */
     uint dot_moved = 0;
     /* Flags of the last output section that had input sections. */
-    uint prev_flags = SHF_ALLOC;
+    uint64_t prev_flags = SHF_ALLOC;
     /* LMA - VMA (modulo 2^64): 0 until a section has an AT; every section
      * after it without one keeps its difference. */
-    i64 lma_offset = i64_u(0);
+    uint64_t lma_offset = 0;
     for (uint c = 0; c < S.ncommands; c++) {
         struct command *cmd = &S.commands[c];
         has_current = 0;
         if (!cmd->is_output) {
-            i64 before = dot;
+            uint64_t before = dot;
             dot = assign(&cmd->assign, dot, 0);
-            if (cmd->assign.symbol == NULL && !i64_eq(dot, before)) {
+            if (cmd->assign.symbol == NULL && dot != before) {
                 dot_moved = cmd->assign.line;
             }
         } else if (strcmp(cmd->out.name, DISCARD_NAME) == 0) {
             /* ld.lld ignores a /DISCARD/'s AT and NOLOAD, but its ALIGN
              * goes through checkAlignment. */
             if (cmd->out.align != NULL) {
-                i64 n;
+                uint64_t n;
                 char *err;
                 if (!eval(cmd->out.align, dot, &n, &err)) {
                     script_err(cmd->out.line, err);
-                } else if (!is_pow2(i64_eq(n, i64_u(0)) ? i64_u(1) : n)) {
+                } else if (!is_pow2(n == 0 ? 1 : n)) {
                     script_err(cmd->out.line,
-                               fmt("ALIGN(%s) of section %s: alignment must be power of 2", i64_dec(n), DISCARD_NAME));
+                               fmt("ALIGN(%s) of section %s: alignment must be power of 2", show(n), DISCARD_NAME));
                 }
             }
             for (uint it = 0; it < cmd->out.nitems; it++) {
@@ -1045,12 +1067,13 @@ static void walk(void) {
  * where their range starts (the load address, or the address), each
  * compared with the next one, the lower one named first, with ld.lld's
  * ranges on the same line. The sort is stable: sections that start together
- * stay in script order. Every range is below 4 GiB. */
+ * stay in script order. Every range ends below 2^64: start + size does not
+ * overflow. */
 static void overlaps(const char *what, uint *order, uint n, int by_lma) {
     for (uint i = 1; i < n; i++) {
         uint k = order[i];
         uint j = i;
-        while (j > 0 && (by_lma ? L->sections[order[j - 1]].lma.lo > L->sections[k].lma.lo
+        while (j > 0 && (by_lma ? L->sections[order[j - 1]].lma > L->sections[k].lma
                                 : L->sections[order[j - 1]].addr > L->sections[k].addr)) {
             order[j] = order[j - 1];
             j--;
@@ -1060,11 +1083,11 @@ static void overlaps(const char *what, uint *order, uint n, int by_lma) {
     for (uint i = 0; i + 1 < n; i++) {
         struct output_section *a = &L->sections[order[i]];
         struct output_section *b = &L->sections[order[i + 1]];
-        i64 as = by_lma ? a->lma : i64_u(a->addr);
-        i64 bs = by_lma ? b->lma : i64_u(b->addr);
-        if (i64_cmp(bs, i64_add(as, i64_u(a->size))) < 0) {
-            error(fmt("section %s %s range overlaps with %s (%s is [0x%x, 0x%x], %s is [0x%x, 0x%x])", a->name, what,
-                      b->name, a->name, as.lo, as.lo + a->size - 1, b->name, bs.lo, bs.lo + b->size - 1));
+        uint64_t as = by_lma ? a->lma : a->addr;
+        uint64_t bs = by_lma ? b->lma : b->addr;
+        if (bs < as + a->size) {
+            error(fmt("section %s %s range overlaps with %s (%s is [0x%llx, 0x%llx], %s is [0x%llx, 0x%llx])",
+                      a->name, what, b->name, a->name, as, as + a->size - 1, b->name, bs, bs + b->size - 1));
         }
     }
 }
@@ -1129,7 +1152,7 @@ static int is_debug(struct section *s) {
 
 static void place_debug(void) {
     uint cap = 0;
-    uint merge = SHF_MERGE | SHF_STRINGS;
+    uint64_t merge = SHF_MERGE | SHF_STRINGS;
     for (uint oi = 0; oi < L->nobjects; oi++) {
         struct object *o = &L->objects[oi];
         for (uint si = 0; si < o->nsections; si++) {
@@ -1156,7 +1179,8 @@ static void place_debug(void) {
                 out->flags = 0;
                 out->entsize = 0;
             }
-            uint at = align_up(i64_u(out->size), i64_u(sec->align)).lo;
+            /* Debug sections hold file contents: far below 2^64. */
+            uint64_t at = align_pow2(out->size, sec->align);
             out->align = sec->align > out->align ? sec->align : out->align;
             out->inputs = grow(out->inputs, &out->capinputs, out->ninputs + 1, sizeof(struct input_ref));
             out->inputs[out->ninputs].object = oi;
@@ -1227,11 +1251,12 @@ static void undefined_references(void) {
 static void entry_point(const char *entry_opt) {
     int explicit = entry_opt != NULL;
     const char *entry = entry_opt != NULL ? entry_opt : S.entry != NULL ? S.entry : "_start";
-    i64 n;
-    uint v;
-    if (parse_number(entry, &n)) {
-        if (n.hi == 0) {
-            L->entry = n.lo;
+    uint64_t n, v;
+    if (parse_number(entry, &n, elf64)) {
+        /* ELF32: e_entry is 32 bits (ld.lld would truncate it). ELF64
+         * takes any address, `-e 0xffffffff80000000` too. */
+        if (elf64 || n <= UINT32_MAX) {
+            L->entry = n;
         } else {
             error(fmt("entry address %s does not fit in 32 bits", entry));
         }
@@ -1240,7 +1265,7 @@ static void entry_point(const char *entry_opt) {
     } else if (explicit) {
         error(fmt("entry symbol '%s' is not defined", entry));
     } else {
-        uint fallback = 0;
+        uint64_t fallback = 0;
         int found = 0;
         for (uint k = 0; k < L->nsections && !found; k++) {
             if (L->sections[k].flags & SHF_EXECINSTR) {
@@ -1252,14 +1277,19 @@ static void entry_point(const char *entry_opt) {
             fallback = L->sections[0].addr;
         }
         L->entry = fallback;
-        add_message(&warnings, fmt("cannot find entry symbol '%s'; defaulting to 0x%08x", entry, fallback));
+        /* An address as wide as the class's: 8 or 16 hex digits. */
+        add_message(&warnings, fmt(elf64 ? "cannot find entry symbol '%s'; defaulting to 0x%016llx"
+                                         : "cannot find entry symbol '%s'; defaulting to 0x%08llx",
+                                   entry, fallback));
     }
 }
 
-int layout_build(struct object *objects, uint nobjects, const char *name, const char *text, const char *entry_opt,
-                 struct layout *l) {
+int layout_build(struct object *objects, uint nobjects, int class, const char *name, const char *text,
+                 const char *entry_opt, struct layout *l) {
     memset(l, 0, sizeof *l);
     L = l;
+    l->class = class;
+    elf64 = class == FORMAT_ELF64;
     l->objects = objects;
     l->nobjects = nobjects;
     if (nobjects == 0) {
@@ -1270,7 +1300,9 @@ int layout_build(struct object *objects, uint nobjects, const char *name, const 
     script_name = have_script ? name : "<default layout>";
     uint line;
     char *msg;
-    if (!script_parse(have_script ? text : DEFAULT_SCRIPT, &S, &line, &msg, 0)) {
+    /* Read again for the class: main.c read it for ELF64, for ld.lld's
+     * errors; an ELF32 link reads it for its exact arithmetic and 4 GiB. */
+    if (!script_parse(have_script ? text : DEFAULT_SCRIPT, &S, &line, &msg, elf64)) {
         error(fmt("%s:%u: %s", script_name, line, msg));
         return 0;
     }
