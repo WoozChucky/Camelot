@@ -49,9 +49,11 @@ pub fn int(e: &Expr, x: Xlen) -> Option<i128> {
     int_of(eval(e, x)?).map(|(v, _)| v)
 }
 
-/// [`int`] before sema has typed the tree, for the parser: an operand `?:`
-/// does not choose must be constant too there, since its type, which the
-/// result's depends on, is known only from its leaves.
+/// [`int`] before sema has typed the tree, for the parser: types come from
+/// the leaves, so an operand `?:` does not choose must be constant here,
+/// for its type, which the result's depends on. The parser first turns one
+/// that is not into a 0 of the type sema would give it (`1 ? 2 : f()`:
+/// `Parser::resolve_sizeof`), so in its contexts too only its type counts.
 pub fn parsed_int(e: &Expr, x: Xlen) -> Option<i128> {
     int_of(value(e, x, true, false)?).map(|(v, _)| v)
 }
@@ -422,9 +424,10 @@ mod tests {
         assert_eq!(ev("y"), None);
         assert_eq!(ev("f()"), None);
         assert_eq!(ev("(1, 2)"), None, "C: comma is not a constant expression");
-        // Before sema, the operand `?:` does not choose has a type only if
-        // it is constant (codegen's tests fold `1 ? 2 : h()` once sema has
-        // typed it).
+        // Before sema, the operand `?:` does not choose has a type here only
+        // if it is constant (the parser gives `f()` its type first: its
+        // `the_operand_not_chosen_counts_by_its_type`; codegen's tests fold
+        // `1 ? 2 : h()` once sema has typed it).
         assert_eq!(ev("1 ? 2 : f()"), None);
         assert_eq!(ev("0 ? f() : 2"), None);
     }

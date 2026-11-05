@@ -488,7 +488,9 @@ impl Parser<'_> {
     /// array size, an enumerator's value or a `_Static_assert`. Each
     /// `sizeof expr` in it whose operand's type the parser can work out
     /// becomes `sizeof (type)` first, so `char buf[sizeof x]` and
-    /// `int b[sizeof a / sizeof a[0]]` work before sema has typed anything.
+    /// `int b[sizeof a / sizeof a[0]]` work before sema has typed anything;
+    /// and so does each operand a constant `?:` does not choose, whose type
+    /// alone counts (see [`Self::resolve_sizeof`]).
     fn const_int(&self, e: &mut Expr) -> Option<i128> {
         self.resolve_sizeof(e);
         consteval::parsed_int(e, self.xlen)
@@ -496,6 +498,10 @@ impl Parser<'_> {
 
     /// Rewrites `sizeof expr` into `sizeof (type)` throughout the operators
     /// [`consteval`] evaluates, where [`Self::operand_type`] knows the type.
+    /// The operand a constant `?:` does not choose is not evaluated (C99
+    /// 6.6p3): only its type counts, which the result's depends on, so one
+    /// that is not constant (`1 ? 2 : f()`) becomes a 0 of its type, as sema
+    /// types it, and clang takes it (in an array size as a GNU folding).
     fn resolve_sizeof(&self, e: &mut Expr) {
         match &mut e.kind {
             ExprKind::SizeofExpr(x) => {
@@ -537,16 +543,31 @@ impl Parser<'_> {
                 self.resolve_sizeof(c);
                 self.resolve_sizeof(a);
                 self.resolve_sizeof(b);
+                if let Some(v) = consteval::parsed_int(c, self.xlen) {
+                    let other = if v != 0 { b } else { a };
+                    if consteval::parsed_int(other, self.xlen).is_none() {
+                        if let Some(t) = self.value_type(other).filter(Type::is_integer) {
+                            let pos = other.pos;
+                            **other = Expr {
+                                kind: ExprKind::Num(0),
+                                ty: t.unqual().clone(),
+                                pos,
+                            };
+                        }
+                    }
+                }
             }
             _ => {}
         }
     }
 
-    /// The type of `sizeof`'s operand, as far as the parser can tell before
-    /// sema: variables by their declared types, literals, casts and compound
-    /// literals by theirs, and `*`, `&`, `[]`, `.`, `->`, `+` and `-` from
-    /// their operands'. `None` for anything else (calls, assignments, ...),
-    /// which leaves the `sizeof` for consteval to refuse.
+    /// The type of `sizeof`'s operand (or of an operand `?:` does not
+    /// choose), as far as the parser can tell before sema, as sema types it:
+    /// variables by their declared types, literals, casts and compound
+    /// literals by theirs, a call by what its function returns, and the
+    /// operators from their operands' (C's usual arithmetic conversions;
+    /// `int` for a comparison, `!`, `&&` and `||`). `None` for what it cannot
+    /// tell, which leaves the `sizeof` for consteval to refuse.
     fn operand_type(&self, e: &Expr) -> Option<Type> {
         match &e.kind {
             ExprKind::Num(_) | ExprKind::Enumerator { .. } | ExprKind::Str(_) | ExprKind::Cast { .. } => {
@@ -586,6 +607,35 @@ impl Parser<'_> {
                     _ => None,
                 }
             }
+            ExprKind::Binary(
+                BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor,
+                l,
+                r,
+            ) => {
+                let (lk, rk) = (self.value_type(l)?.int_kind()?, self.value_type(r)?.int_kind()?);
+                Some(Type::Int(common(lk, rk, self.xlen)))
+            }
+            // A shift is of its promoted left operand's type.
+            ExprKind::Binary(BinOp::Shl | BinOp::Shr, l, _) => {
+                Some(Type::Int(self.value_type(l)?.int_kind()?.promoted()))
+            }
+            ExprKind::Binary(_, _, _) | ExprKind::Unary(UnOp::Not, _) => Some(Type::INT),
+            ExprKind::Unary(_, x) => Some(Type::Int(self.value_type(x)?.int_kind()?.promoted())),
+            ExprKind::Cond(_, a, b) => {
+                let (at, bt) = (self.value_type(a)?, self.value_type(b)?);
+                match (at.int_kind(), bt.int_kind()) {
+                    (Some(ak), Some(bk)) => Some(Type::Int(common(ak, bk, self.xlen))),
+                    _ => (at == bt).then_some(at),
+                }
+            }
+            ExprKind::Comma(_, r) => self.value_type(r),
+            ExprKind::Assign { target, .. } | ExprKind::IncDec { target, .. } => {
+                Some(self.value_type(target)?.unqual().clone())
+            }
+            ExprKind::Call { callee, .. } => match self.value_type(callee)?.pointee()? {
+                Type::Func(f) => Some(f.ret.clone()),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -2855,6 +2905,34 @@ mod tests {
         );
     }
 
+    /// The operand a constant `?:` does not choose is not evaluated: in an
+    /// array size, an enumerator or a `_Static_assert` it need not be
+    /// constant, and only its type counts, as sema gives it (clang 23 takes
+    /// them all, the array size as a GNU folding).
+    #[test]
+    fn the_operand_not_chosen_counts_by_its_type() {
+        assert_eq!(
+            globals(
+                "unsigned u(void); long long l(void); int g;
+                 int a[1 ? 2 : u()]; char b[sizeof(1 ? 1 : l())];
+                 enum { A = (1 ? -1 : u()) < 0, B = 0 ? g : 3 } e; char c[B]; char d[A + 1];
+                 _Static_assert(1 ? 1 : u(), \"chosen\");"
+            ),
+            [
+                "int g",
+                "int a[2]",
+                "char b[8]",
+                "unsigned int e",
+                "char c[3]",
+                "char d[1]",
+            ]
+        );
+        // The operand chosen must still be constant.
+        let msg = "array size must be an integer constant expression \
+                   (literals, enum constants, operators, casts and sizeof)";
+        assert_eq!(err("int g; int a[0 ? 2 : g];"), format!("1:14: {msg}"));
+    }
+
     #[test]
     fn sizeof_an_expression_sizes_an_array() {
         // The parser works out the operand's type from declarations.
@@ -2911,10 +2989,19 @@ mod tests {
             ["char a[12]", "char b[6]", "char c[4]"]
         );
 
+        // A call is of what its function returns, an operator's result of
+        // the type sema gives it.
+        assert_eq!(
+            globals(
+                "int f(void); long long g(int); char a[sizeof f()];
+                 char b[sizeof g(1) + sizeof(1 ? 'c' : 2u) + sizeof(f() < 2) + sizeof(-(char)1)];"
+            ),
+            ["char a[4]", "char b[20]"]
+        );
+
         // What the parser can't type stays an error.
         let msg = "array size must be an integer constant expression \
                    (literals, enum constants, operators, casts and sizeof)";
-        assert_eq!(err("int f(void); char a[sizeof f()];"), format!("1:21: {msg}"));
         assert_eq!(err("char a[sizeof nothing];"), format!("1:8: {msg}"));
         assert_eq!(
             err("int t[] = {[3] = 1}; char a[sizeof t];"),
