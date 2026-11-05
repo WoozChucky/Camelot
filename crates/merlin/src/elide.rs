@@ -32,12 +32,12 @@ fn children(s: &Stmt) -> Vec<&Stmt> {
         StmtKind::For { init, body, .. } => init.as_deref().into_iter().chain([&**body]).collect(),
         StmtKind::Decl(_)
         | StmtKind::Expr(_)
-        | StmtKind::Empty
+        | StmtKind::Empty { .. }
         | StmtKind::Unevaluated(_)
         | StmtKind::Return(_)
         | StmtKind::Break
         | StmtKind::Continue
-        | StmtKind::Goto(_) => Vec::new(),
+        | StmtKind::Goto(..) => Vec::new(),
     }
 }
 

@@ -207,7 +207,8 @@ fn warnings_are_printed_as_clangs() {
     assert_eq!(
         stderr(&out),
         format!(
-            "{file}:2:15: error: too many arguments to 'f': expected 0, have 2 (declared at 1:5)\n\
+            "{file}:2:17: error: too many arguments to function call, expected 0, have 2\n\
+             {file}:1:5: note: 'f' declared here\n\
              {file}:3:5: {warning}\n"
         )
     );
@@ -270,7 +271,8 @@ fn every_semantic_error_is_reported() {
         stderr(&out),
         format!(
             "{file}:3:5: error: use of undeclared identifier 'y'\n\
-             {file}:4:12: error: too few arguments to 'two': expected 2, have 1 (declared at 1:5)\n"
+             {file}:4:17: error: too few arguments to function call, expected 2, have 1\n\
+             {file}:1:5: note: 'two' declared here\n"
         )
     );
     assert!(out.stdout.is_empty());
@@ -329,7 +331,7 @@ fn preprocessor_options() {
     let out = merlin(&[&t.file]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        stderr(&out).contains("1:10: error: 'defs.h' file not found"),
+        stderr(&out).contains("1:10: fatal error: 'defs.h' file not found"),
         "{}",
         stderr(&out)
     );
@@ -376,7 +378,7 @@ fn assembly_is_only_preprocessed() {
     let out = merlin(&[&flag("-E"), &flag("-xc"), &t.file]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        stderr(&out).contains("invalid preprocessing directive '#A'"),
+        stderr(&out).contains("1:3: error: invalid preprocessing directive\n"),
         "{}",
         stderr(&out)
     );

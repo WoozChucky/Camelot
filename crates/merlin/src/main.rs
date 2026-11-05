@@ -197,7 +197,7 @@ fn translate(input: &str, output: Option<&str>, mode: Mode, opts: &Options) -> R
             merlin::preprocess_asm(input, &src, opts, &merlin::read_file).map(|t| (t, Vec::new()))
         }
         Mode::Preprocess => merlin::preprocess(input, &src, opts, &merlin::read_file)
-            .map(|pp| (merlin::preprocess::spell(&pp.tokens), Vec::new())),
+            .map(|pp| (merlin::preprocess::spell(&pp.tokens), pp.diagnostics)),
         Mode::DumpAst => merlin::parse_with(input, &src, opts, &merlin::read_file)
             .map(|p| (merlin::ast::dump(&p), p.warnings)),
     };

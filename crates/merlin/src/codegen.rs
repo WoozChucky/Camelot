@@ -1787,10 +1787,10 @@ fn always_visited(s: &Stmt) -> bool {
         s.kind,
         StmtKind::Block(_)
             | StmtKind::Decl(_)
-            | StmtKind::Empty
+            | StmtKind::Empty { .. }
             | StmtKind::Unevaluated(_)
             | StmtKind::Label { .. }
-            | StmtKind::Goto(_)
+            | StmtKind::Goto(..)
             | StmtKind::Break
             | StmtKind::Continue
             | StmtKind::Case { .. }
@@ -2322,7 +2322,7 @@ impl<'a> FuncGen<'a, '_> {
         match &s.kind {
             StmtKind::Block(_)
             | StmtKind::Decl(_)
-            | StmtKind::Empty
+            | StmtKind::Empty { .. }
             | StmtKind::Unevaluated(_)
             | StmtKind::If { .. }
             | StmtKind::While { .. }
@@ -2348,6 +2348,11 @@ impl<'a> FuncGen<'a, '_> {
                 // a static local's data first, then its entry
                 // (`EmitStaticVarDecl`).
                 for d in decls {
+                    // A block's `extern` declaration, or a function's,
+                    // defines nothing.
+                    if d.storage == Storage::Extern || d.ty.is_func() {
+                        continue;
+                    }
                     // A local the code declares has a slot, used or not.
                     if let Some(VarRef::Local(id)) = d.var {
                         self.used[id.0].set(true);
@@ -2373,7 +2378,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             StmtKind::Expr(e) => self.expr(e),
             // Only checked: nothing is evaluated.
-            StmtKind::Empty | StmtKind::Unevaluated(_) => {}
+            StmtKind::Empty { .. } | StmtKind::Unevaluated(_) => {}
             StmtKind::If { cond, then, els } => {
                 // A constant condition runs one arm: only that one is
                 // generated, unless the other has a label (see [`elide`]).
@@ -2544,6 +2549,7 @@ impl<'a> FuncGen<'a, '_> {
                 body,
                 cases,
                 default,
+                ..
             } => {
                 // A chain of compares, one per `case`, in source order; then
                 // `default` (or the end, when there is none). The body is
@@ -2634,7 +2640,7 @@ impl<'a> FuncGen<'a, '_> {
                 }
                 self.stmt(body);
             }
-            StmtKind::Goto(name) => {
+            StmtKind::Goto(name, _) => {
                 let label = self.goto_label(name);
                 self.jump(&label);
             }
@@ -2989,7 +2995,15 @@ impl<'a> FuncGen<'a, '_> {
         if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_) | ExprKind::Enumerator { .. }) {
             return false;
         }
-        let Some(Const::Int(v, kind)) = consteval::eval(e) else {
+        // An item of a local aggregate clang emits as a constant has its
+        // evaluator's value, as a global's has; any other, what the
+        // instructions would compute.
+        let value = if self.constant_init {
+            consteval::eval(e)
+        } else {
+            consteval::eval_in_code(e)
+        };
+        let Some(Const::Int(v, kind)) = value else {
             return false;
         };
         // A disagreement would give the constant the wrong width (an `int`
@@ -3132,7 +3146,7 @@ impl<'a> FuncGen<'a, '_> {
             ExprKind::IncDec { inc, prefix, target } => {
                 let ty = &target.ty;
                 let step = match ty.unqual() {
-                    Type::Ptr(to) => to.size().expect("sema: pointer to a complete type") as i32,
+                    Type::Ptr(_) => ty.step().expect("sema: pointer to a complete type") as i32,
                     _ => 1,
                 };
                 let delta = if *inc { step } else { -step };
@@ -3229,7 +3243,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.expr(x);
                 self.convert(&x.ty, &e.ty);
             }
-            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => unreachable!("sema folds sizeof"),
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(..) => unreachable!("sema folds sizeof"),
             // A constant condition: only the operand it chooses, as clang has
             // it (an expression has no labels to keep).
             ExprKind::Cond(c, a, b) if self.constant_condition(c).is_some() => {
@@ -3270,6 +3284,7 @@ impl<'a> FuncGen<'a, '_> {
                 args,
                 result,
                 arg_copies,
+                ..
             } => self.call(callee, args, *result, arg_copies),
             ExprKind::CompoundLit { init, local } => {
                 self.compound_literal(&e.ty, init, *local);
@@ -3278,7 +3293,7 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             ExprKind::VaStart { ap, .. } => self.va_start(ap),
-            ExprKind::VaArg(ap) => self.va_arg(ap, &e.ty),
+            ExprKind::VaArg(ap, _) => self.va_arg(ap, &e.ty),
             ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => unreachable!("sema rewrites them"),
         }
     }
@@ -3348,6 +3363,11 @@ impl<'a> FuncGen<'a, '_> {
     /// Loads the value of type `ty` at the address in `a0`. Arrays, structs
     /// and functions are not loaded: their value is that address.
     fn load(&mut self, ty: &Type) {
+        // `*p` of a `void *` (GNU C's, which clang takes) is a value of no
+        // type: only `p` is evaluated, nothing loaded, as in clang.
+        if ty.is_void() {
+            return;
+        }
         if !ty.is_addressed() {
             self.ins(load_op(ty), "a0, 0(a0)");
         }
@@ -3570,12 +3590,8 @@ impl<'a> FuncGen<'a, '_> {
         // signedness; a pointer compares as an unsigned address.
         let unsigned = l.is_unsigned() || r.is_unsigned();
         let pick = |s: &'static str, u: &'static str| if unsigned { u } else { s };
-        let elem_size = |t: &Type| {
-            t.pointee()
-                .and_then(|t| t.size())
-                .expect("sema: complete pointee")
-        };
-        // The W form of an instruction for 32-bit arithmetic.
+        let elem_size = |t: &Type| t.step().expect("sema: complete pointee");
+        // The W form of an instruction for 32-bit arithmetic on RV64.
         let w32 = self.is_w(l);
         let w = |op: &'static str| -> String {
             if w32 {
@@ -4265,6 +4281,55 @@ mod tests {
         assert!(asm.contains("call  f\n"), "{asm}");
         assert!(asm.contains("la    a0, g\n"), "{asm}");
         assert_eq!(asm.matches(".globl").count(), 1);
+    }
+
+    /// A condition clang's evaluator notes undefined behaviour in is not
+    /// decided at compile time, as clang's code generator decides nothing
+    /// of it: both arms are generated. One without is.
+    #[test]
+    fn undefined_conditions_keep_both_arms() {
+        for cond in ["1 << 40", "2147483647 + 1 < 0", "(1 << 32) == 1"] {
+            let asm = compile(&format!(
+                "void a(void); void b(void); void f(void) {{ if ({cond}) a(); else b(); }}"
+            ));
+            assert!(
+                asm.contains(
+                    "call  a
+"
+                ) && asm.contains(
+                    "call  b
+"
+                ),
+                "{cond}: {asm}"
+            );
+        }
+        let asm = compile("void a(void); void b(void); void f(void) { if (1 << 30) a(); else b(); }");
+        assert!(
+            asm.contains(
+                "call  a
+"
+            ) && !asm.contains(
+                "call  b
+"
+            ),
+            "{asm}"
+        );
+    }
+
+    /// `extern` with an initializer after `static` defines the internal
+    /// variable (C99 6.2.2p4), as clang has it.
+    #[test]
+    fn extern_after_static_stays_internal() {
+        let asm = compile("static int s; extern int s = 3; int main() { return s; }");
+        assert!(!asm.contains(".globl s"), "{asm}");
+        assert!(
+            asm.contains(
+                "
+s:
+"
+            ),
+            "{asm}"
+        );
     }
 
     #[test]

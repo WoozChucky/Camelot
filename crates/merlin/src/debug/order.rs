@@ -127,7 +127,7 @@ impl Lines {
                 v
             }
             TypeNode::Record(_, members, ..) => members.iter().filter_map(|m| m.1).collect(),
-            TypeNode::Func(ret, params, _) => ret.iter().chain(params.iter().flatten()).copied().collect(),
+            TypeNode::Func(ret, params, ..) => ret.iter().chain(params.iter().flatten()).copied().collect(),
             TypeNode::Enum(_, of, ..) => vec![*of],
         }
     }

@@ -26,6 +26,7 @@
 
 use crate::ast::*;
 use crate::types::{common, IntKind, Type, PTR_SIZE};
+use crate::Pos;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Const {
@@ -56,13 +57,13 @@ pub fn int(e: &Expr) -> Option<i128> {
 /// that is not into a 0 of the type sema would give it (`1 ? 2 : f()`:
 /// `Parser::resolve_sizeof`), so in its contexts too only its type counts.
 pub fn parsed_int(e: &Expr) -> Option<i128> {
-    int_of(value(e, true, false)?).map(|(v, _)| v)
+    int_of(value(e, true, false, false)?).map(|(v, _)| v)
 }
 
 /// [`parsed_int`] of an operand that is not evaluated (the one a constant
 /// `?:` does not choose): dividing by zero in it is no error (C99 6.6p3).
 pub fn parsed_unevaluated_int(e: &Expr) -> Option<i128> {
-    int_of(value(e, false, false)?).map(|(v, _)| v)
+    int_of(value(e, false, false, false)?).map(|(v, _)| v)
 }
 
 /// Whether `e` is a null pointer constant: an integer constant expression
@@ -80,7 +81,17 @@ pub fn is_null_pointer(e: &Expr) -> bool {
 /// is not a constant expression merlin can evaluate (that includes dividing
 /// by zero, where the division is evaluated).
 pub fn eval(e: &Expr) -> Option<Const> {
-    value(e, true, true)
+    value(e, true, true, false)
+}
+
+/// [`eval`] of an expression in code, which code generation folds into
+/// one constant: what the instructions would compute, where C leaves the
+/// value undefined and clang's code has none (a shift by the width or
+/// more uses the low bits of its count, as `sll` does; spec section 10).
+/// A constant clang's front end gives a value of (an initializer, a case,
+/// an enumerator, an array's size) has clang's ([`eval`]).
+pub fn eval_in_code(e: &Expr) -> Option<Const> {
+    value(e, true, true, true)
 }
 
 /// [`eval`] of an operand that is `evaluated` or not, in a tree sema has
@@ -92,9 +103,9 @@ pub fn eval(e: &Expr) -> Option<Const> {
 /// tree the operand `?:` does not choose need not be constant at all, as
 /// the right operand of `0 && h()` need not: sema gave it its type, and
 /// `1 ? 2 : h()` is 2, which clang folds too.
-fn value(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
+fn value(e: &Expr, evaluated: bool, checked: bool, hw: bool) -> Option<Const> {
     use Const::*;
-    let eval = |e: &Expr| value(e, evaluated, checked);
+    let eval = |e: &Expr| value(e, evaluated, checked, hw);
     match &e.kind {
         ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => Some(Int(*v, e.ty.int_kind()?)),
         ExprKind::SizeofType(t) => Some(Int(t.size()?.into(), IntKind::size_t())),
@@ -121,7 +132,7 @@ fn value(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
         ExprKind::Binary(op, l, r) => {
             let (lc, rc) = (eval(l)?, eval(r)?);
             match (lc, rc) {
-                (Int(a, ak), Int(b, bk)) => binary(*op, (a, ak), (b, bk), evaluated),
+                (Int(a, ak), Int(b, bk)) => binary(*op, (a, ak), (b, bk), evaluated, hw),
                 // Address arithmetic: pointer plus or minus an integer, by
                 // whole elements, or an address converted to an integer
                 // plus or minus one, by bytes.
@@ -151,7 +162,7 @@ fn value(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
             let other = if checked {
                 other.ty.int_kind()
             } else {
-                int_of(value(other, false, false)?).map(|(_, k)| k)
+                int_of(value(other, false, false, hw)?).map(|(_, k)| k)
             };
             match (v, other) {
                 // The result has the operands' common type, whichever is chosen.
@@ -190,9 +201,9 @@ fn value(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
         ExprKind::Str(_) | ExprKind::Var { .. } | ExprKind::Deref(_) | ExprKind::Member { .. }
             if e.ty.is_array() || e.ty.is_func() =>
         {
-            addr_of(e, evaluated, checked)
+            addr_of(e, evaluated, checked, hw)
         }
-        ExprKind::Addr(x) => addr_of(x, evaluated, checked),
+        ExprKind::Addr(x) => addr_of(x, evaluated, checked, hw),
         _ => None,
     }
 }
@@ -200,7 +211,7 @@ fn value(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
 /// The address of an lvalue, if it is an address constant: a global object
 /// (or a member or element of one, at a constant offset), a string literal,
 /// or what a constant pointer points to.
-fn addr_of(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
+fn addr_of(e: &Expr, evaluated: bool, checked: bool, hw: bool) -> Option<Const> {
     match &e.kind {
         ExprKind::Var {
             var: Some(VarRef::Global(sym)),
@@ -213,7 +224,7 @@ fn addr_of(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
             base: Some(Base::Str(bytes.clone())),
             offset: 0,
         }),
-        ExprKind::Deref(p) => match value(p, evaluated, checked)? {
+        ExprKind::Deref(p) => match value(p, evaluated, checked, hw)? {
             a @ Const::Addr { .. } => Some(a),
             Const::Int(..) => None,
         },
@@ -224,9 +235,9 @@ fn addr_of(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
             ..
         } => {
             let at = if *arrow {
-                value(base, evaluated, checked)?
+                value(base, evaluated, checked, hw)?
             } else {
-                addr_of(base, evaluated, checked)?
+                addr_of(base, evaluated, checked, hw)?
             };
             match at {
                 Const::Addr { base, offset } => Some(Const::Addr {
@@ -246,7 +257,7 @@ fn step(t: &Type) -> Option<i128> {
     if t.is_integer() {
         return Some(1);
     }
-    Some(i128::from(t.pointee()?.size()?))
+    Some(i128::from(t.step()?))
 }
 
 /// Whether a constant is true, as a condition tests it: an object's
@@ -269,8 +280,15 @@ fn int_of(c: Const) -> Option<(i128, IntKind)> {
 
 /// An arithmetic, bitwise or comparison operator on two integer constants,
 /// each a value and its type. Dividing by zero is not constant where it is
-/// `evaluated` (see [`value`]).
-fn binary(op: BinOp, (a, ak): (i128, IntKind), (b, bk): (i128, IntKind), evaluated: bool) -> Option<Const> {
+/// `evaluated` (see [`value`]). A shift's count past the width is as the
+/// hardware takes it if `hw`, else as clang's evaluator does.
+fn binary(
+    op: BinOp,
+    (a, ak): (i128, IntKind),
+    (b, bk): (i128, IntKind),
+    evaluated: bool,
+    hw: bool,
+) -> Option<Const> {
     // Shifts take the promoted left operand's type; the others the common type.
     let k = match op {
         BinOp::Shl | BinOp::Shr => ak.promoted(),
@@ -284,9 +302,23 @@ fn binary(op: BinOp, (a, ak): (i128, IntKind), (b, bk): (i128, IntKind), evaluat
             k.wrap(b)
         },
     );
-    // The hardware uses the low 5 bits of a 32-bit shift's amount and the
-    // low 6 bits of a 64-bit one's (spec section 10).
-    let shift = (b & i128::from(k.size() * 8 - 1)) as u32;
+    // A shift as clang's evaluator does one (`handleIntIntBinOp`): a count
+    // of the width or more shifts by one less than the width, and a
+    // negative one shifts the other way by as much. C leaves both
+    // undefined; clang's constants have these values (`case 1 << 40:` is
+    // `case INT_MIN:`), and so do merlin's.
+    let width = i128::from(k.size() * 8);
+    let (left, shift) = if hw {
+        // The hardware uses the low 5 bits of a 32-bit shift's amount and
+        // the low 6 bits of a 64-bit one's (spec section 10).
+        (op == BinOp::Shl, (b & (width - 1)) as u32)
+    } else {
+        let (left, count) = match op {
+            BinOp::Shl => (b >= 0, b.abs()),
+            _ => (b < 0, b.abs()),
+        };
+        (left, count.min(width - 1) as u32)
+    };
     let v = match op {
         BinOp::Add => a + b,
         BinOp::Sub => a - b,
@@ -296,10 +328,10 @@ fn binary(op: BinOp, (a, ak): (i128, IntKind), (b, bk): (i128, IntKind), evaluat
         // i128 division truncates toward zero, like C; `INT_MIN / -1` wraps below.
         BinOp::Div => a / b,
         BinOp::Rem => a % b,
-        BinOp::Shl => a << shift,
         // `a` is sign-extended when k is signed (arithmetic shift) and
         // non-negative when it is unsigned (logical shift).
-        BinOp::Shr => a >> shift,
+        BinOp::Shl | BinOp::Shr if left => a << shift,
+        BinOp::Shl | BinOp::Shr => a >> shift,
         BinOp::BitAnd => a & b,
         BinOp::BitOr => a | b,
         BinOp::BitXor => a ^ b,
@@ -312,6 +344,147 @@ fn binary(op: BinOp, (a, ak): (i128, IntKind), (b, bk): (i128, IntKind), evaluat
         BinOp::LogAnd | BinOp::LogOr => unreachable!("handled by eval: they short-circuit"),
     };
     Some(Const::Int(k.wrap(v), k))
+}
+
+// ---- what clang's evaluator notes ----
+
+/// Where `e` (its operator, in a tree sema has `checked` or not) overflows
+/// its signed type, as clang's evaluator finds it and warns of it
+/// (`CheckedIntArithmetic`: -Winteger-overflow): a `+`, `-` or `*` of
+/// constant operands, or a unary `-` of one, whose exact result the type
+/// cannot hold. The value it wraps to, and the type. With `division`, a
+/// `/` or `%` of the type's least value by -1 too, which clang's evaluator
+/// notes as an overflow without the warning.
+pub fn overflow_at(e: &Expr, checked: bool, division: bool) -> Option<(i128, IntKind)> {
+    exact_overflow(e, checked, division).map(|(exact, k)| (k.wrap(exact), k))
+}
+
+/// [`overflow_at`], with the exact result rather than the wrapped one.
+fn exact_overflow(e: &Expr, checked: bool, division: bool) -> Option<(i128, IntKind)> {
+    let int = |e: &Expr| int_of(value(e, true, checked, false)?);
+    let (exact, k) = match &e.kind {
+        ExprKind::Binary(op, l, r) => {
+            let ((a, ak), (b, bk)) = (int(l)?, int(r)?);
+            let k = common(ak, bk);
+            let (a, b) = (k.wrap(a), k.wrap(b));
+            let exact = match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div | BinOp::Rem if division && b == -1 => -a,
+                _ => return None,
+            };
+            (exact, k)
+        }
+        ExprKind::Unary(UnOp::Neg, v) => {
+            let (a, k) = int(v)?;
+            let k = k.promoted();
+            (-k.wrap(a), k)
+        }
+        _ => return None,
+    };
+    let (min, max) = k.range();
+    (k.signed() && (exact < min || exact > max)).then_some((exact, k))
+}
+
+/// What clang's evaluator notes first of `e` (before sema) as making it no
+/// integer constant expression, though it has a value (C99 6.6p4: it must
+/// be in range for its type), and where: a signed overflow (`value
+/// 2147483648 is outside the range of representable values of type
+/// 'int'`), a shift by a negative count or by the width or more, and a
+/// `<<` of a negative value or that shifts set bits out of a signed type;
+/// as clang words them, at the operator. Only what is evaluated counts:
+/// not what a constant `?:`, `&&` or `||` passes by; operands before
+/// their operator. clang folds such an array size into a constant with
+/// its warning and this note; an enumerator or a case value, silently.
+pub fn parsed_note(e: &Expr) -> Option<(Pos, String)> {
+    note(e, false)
+}
+
+/// [`parsed_note`] of a tree sema has `checked` or not.
+fn note(e: &Expr, checked: bool) -> Option<(Pos, String)> {
+    let int = |e: &Expr| int_of(value(e, true, checked, false)?);
+    let go = |e: &Expr| note(e, checked);
+    let overflow = || {
+        let (exact, k) = exact_overflow(e, checked, true)?;
+        let msg = format!(
+            "value {exact} is outside the range of representable values of type '{}'",
+            Type::Int(k)
+        );
+        Some((e.pos, msg))
+    };
+    match &e.kind {
+        ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r) => go(l).or_else(|| {
+            int(l)
+                .filter(|&(v, _)| (v != 0) == (*op == BinOp::LogAnd))
+                .and_then(|_| go(r))
+        }),
+        ExprKind::Binary(op, l, r) => {
+            if let Some(n) = go(l).or_else(|| go(r)).or_else(overflow) {
+                return Some(n);
+            }
+            let ((a, ak), (b, _)) = (int(l)?, int(r)?);
+            let k = ak.promoted();
+            let width = i128::from(k.size() * 8);
+            let ty = Type::Int(k);
+            let msg = match op {
+                BinOp::Shl | BinOp::Shr if b < 0 => format!("negative shift count {b}"),
+                BinOp::Shl | BinOp::Shr if b >= width => {
+                    format!("shift count {b} >= width of type '{ty}' ({width} bits)")
+                }
+                BinOp::Shl if k.signed() => {
+                    // The bits above the value's that the shift keeps.
+                    let a = k.wrap(a);
+                    let used = 128 - i128::from(a.leading_zeros());
+                    if a < 0 {
+                        format!("left shift of negative value {a}")
+                    } else if width - used < b {
+                        "signed left shift discards bits".to_string()
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            };
+            Some((e.pos, msg))
+        }
+        ExprKind::Unary(_, v) => go(v).or_else(overflow),
+        ExprKind::Cond(c, a, b) => go(c).or_else(|| go(if int(c)?.0 != 0 { a } else { b })),
+        ExprKind::Cast { x: v, .. } => go(v),
+        _ => None,
+    }
+}
+
+/// Why `e`, a tree sema has checked, is no integer constant expression,
+/// as clang's evaluator notes it, where it says so: of a division by zero
+/// it reaches, `division by zero` at the operator. Operands are evaluated
+/// left to right, as far as they are constant (what is not stops it with
+/// nothing to say in C), and what a constant `&&`, `||` or `?:` passes by
+/// not at all.
+pub fn why_not(e: &Expr) -> Option<(Pos, &'static str)> {
+    let known = |e: &Expr| int(e).is_some();
+    match &e.kind {
+        ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r) => why_not(l).or_else(|| {
+            let v = int(l)?;
+            ((v != 0) == (*op == BinOp::LogAnd)).then(|| why_not(r)).flatten()
+        }),
+        ExprKind::Binary(op, l, r) => {
+            if let Some(n) = why_not(l) {
+                return Some(n);
+            }
+            if !known(l) {
+                return None;
+            }
+            if let Some(n) = why_not(r) {
+                return Some(n);
+            }
+            (matches!(op, BinOp::Div | BinOp::Rem) && int(r) == Some(0))
+                .then_some((e.pos, "division by zero"))
+        }
+        ExprKind::Cond(c, a, b) => why_not(c).or_else(|| why_not(if int(c)? != 0 { a } else { b })),
+        ExprKind::Unary(_, v) | ExprKind::Cast { x: v, .. } => why_not(v),
+        _ => None,
+    }
 }
 
 // ---- conditions ----
@@ -345,6 +518,18 @@ fn binary(op: BinOp, (a, ak): (i128, IntKind), (b, bk): (i128, IntKind), evaluat
 /// (`&g < &h`). A condition of pointer type is not folded at all
 /// (`if (&g)`): clang folds only integer ones.
 pub fn condition(e: &Expr) -> Option<i128> {
+    // What has undefined behaviour clang's code generator does not fold
+    // (its `ConstantFoldsToSimpleInteger` fails): it is computed, both
+    // ways kept (`if (1 << 40)`), what the instructions give deciding.
+    if note(e, true).is_some() {
+        return None;
+    }
+    cfg_condition(e)
+}
+
+/// [`condition`] as clang's CFG builder evaluates it, which folds what has
+/// undefined behaviour too, with its evaluator's value ([`crate::flow`]).
+pub fn cfg_condition(e: &Expr) -> Option<i128> {
     if !e.ty.is_integer() {
         return None;
     }
@@ -452,7 +637,7 @@ fn fold(e: &Expr) -> Option<Folded> {
             Some(Int(v.into(), IntKind::Int))
         }
         ExprKind::Binary(op, l, r) => match (fold(l)?, fold(r)?) {
-            (Int(a, ak), Int(b, bk)) => match binary(*op, (a, ak), (b, bk), true)? {
+            (Int(a, ak), Int(b, bk)) => match binary(*op, (a, ak), (b, bk), true, false)? {
                 Const::Int(v, k) => Some(Int(v, k)),
                 Const::Addr { .. } => None,
             },
@@ -686,7 +871,7 @@ mod tests {
             panic!()
         };
         let Init::Expr(e) = &items[0] else { panic!() };
-        value(e, true, false)
+        value(e, true, false, false)
     }
 
     fn int(src: &str) -> (i128, IntKind) {
@@ -724,9 +909,36 @@ mod tests {
         assert_eq!(int("1L + 1"), (2, Long));
         assert_eq!(
             int("1 << 33"),
+            (i32::MIN.into(), Int),
+            "clang's evaluator shifts by one less than the width"
+        );
+        assert_eq!(int("8 >> -2"), (32, Int), "and the other way by a negative count");
+        assert_eq!(int("-8 >> 40"), (-1, Int));
+    }
+
+    /// In code, a constant has what the instructions compute.
+    #[test]
+    fn shifts_in_code_are_the_hardwares() {
+        let in_code = |src: &str| {
+            let toks = crate::lexer::lex(&format!("int x[1] = {{ {src} }};")).unwrap();
+            let prog = crate::parser::parse(&toks).unwrap();
+            let Item::Decl(d) = &prog.items[0] else { panic!() };
+            let Some(Init::List(items, _)) = &d[0].init else {
+                panic!()
+            };
+            let Init::Expr(e) = &items[0] else { panic!() };
+            match value(e, true, false, true) {
+                Some(Const::Int(v, k)) => (v, k),
+                c => panic!("{src}: {c:?}"),
+            }
+        };
+        assert_eq!(
+            in_code("1 << 33"),
             (2, Int),
             "the low 5 bits of a 32-bit shift's amount"
         );
+        assert_eq!(in_code("1L << 65"), (2, Long), "the low 6 bits of a 64-bit one's");
+        assert_eq!(in_code("8 >> -2"), (0, Int), "-2 is 30 to `sraw`");
     }
 
     #[test]
@@ -746,12 +958,8 @@ mod tests {
         assert_eq!(int("(0ul - 1) >> 63"), (1, ULong), "logical shift");
         assert_eq!(int("-1L >> 63"), (-1, Long), "arithmetic shift");
         assert_eq!(int("1L << 63"), (i64::MIN.into(), Long));
-        assert_eq!(
-            int("1L << 65"),
-            (2, Long),
-            "the low 6 bits of a 64-bit shift's amount"
-        );
-        assert_eq!(int("1 << 33"), (2, Int), "the low 5 bits of a 32-bit one's");
+        assert_eq!(int("1L << 65"), (i64::MIN.into(), Long), "clang's evaluator");
+        assert_eq!(int("1 << 33"), (i32::MIN.into(), Int));
         assert_eq!(
             int("sizeof(long) + sizeof(char *)"),
             (16, ULong),
