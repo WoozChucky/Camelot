@@ -35,11 +35,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Largest image Lake creates by default, in sectors: what one Grail disk can address
-/// on an RV32 machine (version 1's `BLK_CAPACITY` register is 32 bits), just under
-/// 2 TiB. An image has no width: the same one may be attached to an RV32 VM or an
-/// RV64 one, whose 64-bit `BLK_CAPACITY` would address more (and of which the RV64
-/// kernel uses as much as this), so the default is what both can use whole.
+/// Largest image Lake creates by default, in sectors: 2^32 - 1, just under 2 TiB,
+/// which the Camelot kernel uses whole. (A Grail disk's 64-bit `BLK_CAPACITY`
+/// addresses more; until #159 this was what an RV32 machine's 32-bit one could.)
 pub const MAX_IMAGE_SECTORS: u64 = u32::MAX as u64;
 
 const SECTOR: u64 = SECTOR_SIZE as u64;

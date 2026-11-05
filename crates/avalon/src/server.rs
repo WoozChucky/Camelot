@@ -11,7 +11,7 @@
 //! ([`crate::switch`]), by name.
 
 use crate::outbox::Outbox;
-use crate::profile::{card_configs, profile_xlen, CardConfig};
+use crate::profile::{card_configs, CardConfig};
 use crate::switch::{Card, Switch, MAX_SWITCHES};
 use crate::vm::Vm;
 use crate::{lock, machine_config, Fail};
@@ -549,13 +549,9 @@ impl Shared {
     /// both take the last of the budget or the same name; the machine is built without
     /// it, so a slow build (a disk image on a slow path, gigabytes of RAM) holds up no
     /// other request.
-    fn create(&self, name: String, mut profile: HardwareProfile, program: &[u8]) -> Result<u32, Fail> {
+    fn create(&self, name: String, profile: HardwareProfile, program: &[u8]) -> Result<u32, Fail> {
         validate_name(&name).map_err(|e| Fail::new(ErrorCode::InvalidName, e))?;
-        let config =
-            machine_config(&profile, program).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
-        // The width the VM has, which its profile gives from now on: an ELF64 program
-        // has made an RV32 one RV64 (protocol doc, section 3, "The width").
-        profile.xlen = profile_xlen(config.xlen);
+        let config = machine_config(&profile).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
         let cards = card_configs(&name, &profile).map_err(|e| Fail::new(ErrorCode::InvalidProfile, e))?;
         // Checked again when the cards are plugged in, in case a switch is deleted
         // meanwhile; this saves building a machine that cannot be plugged in.
@@ -595,9 +591,8 @@ impl Shared {
         }
         if self.log {
             eprintln!(
-                "avalon: VM {id} ('{}') created: {}, {} RAM, {}",
+                "avalon: VM {id} ('{}') created: RV64, {} RAM, {}",
                 vm.name,
-                vm.profile.xlen,
                 show_size(vm.profile.ram_size),
                 match vm.profile.clock_hz {
                     Some(hz) => format!("{hz} Hz real-time clock"),

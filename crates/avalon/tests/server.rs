@@ -13,118 +13,115 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn two_vms_with_their_own_profiles() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut rt = connect(&server);
-        let small = create(&mut rt, "small", profile(64, None), example("sysinfo"));
-        let paced = create(&mut rt, "paced", profile(32, Some(5_000_000)), example("sysinfo"));
-        assert_eq!((small, paced), (1, 2));
-        assert_eq!(state(&mut rt, small), VmState::Created);
+    let server = server(None);
+    let mut rt = connect(&server);
+    let small = create(&mut rt, "small", profile(64, None), example("sysinfo"));
+    let paced = create(&mut rt, "paced", profile(32, Some(5_000_000)), example("sysinfo"));
+    assert_eq!((small, paced), (1, 2));
+    assert_eq!(state(&mut rt, small), VmState::Created);
 
-        // Attached before the start, so the whole output streams live.
-        let mut small_console = Console::attach(&server, VmRef::Name("small".into()));
-        let mut paced_console = Console::attach(&server, VmRef::Id(paced));
-        assert!(small_console.scrollback.is_empty());
-        assert_eq!((small_console.vm, paced_console.vm), (small, paced));
+    // Attached before the start, so the whole output streams live.
+    let mut small_console = Console::attach(&server, VmRef::Name("small".into()));
+    let mut paced_console = Console::attach(&server, VmRef::Id(paced));
+    assert!(small_console.scrollback.is_empty());
+    assert_eq!((small_console.vm, paced_console.vm), (small, paced));
 
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(small) }).unwrap();
-        rt.request_ok(&Message::StartVm {
-            vm: VmRef::Name("paced".into()),
-        })
-        .unwrap();
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(small) }).unwrap();
+    rt.request_ok(&Message::StartVm {
+        vm: VmRef::Name("paced".into()),
+    })
+    .unwrap();
 
-        let small_out = sysinfo_output(64, 10_000_000, false);
-        let paced_out = sysinfo_output(32, 5_000_000, true);
-        small_console.wait_for_event(Message::VmStateChanged {
-            vm: small,
-            state: VmState::Exited(0),
-        });
-        paced_console.wait_for_event(Message::VmStateChanged {
-            vm: paced,
-            state: VmState::Exited(0),
-        });
-        assert_eq!(String::from_utf8_lossy(&small_console.output), small_out);
-        assert_eq!(String::from_utf8_lossy(&paced_console.output), paced_out);
-        assert_eq!(
-            small_console.events,
-            [
-                Message::VmStateChanged {
-                    vm: small,
-                    state: VmState::Running
-                },
-                Message::VmStateChanged {
-                    vm: small,
-                    state: VmState::Exited(0)
-                }
-            ]
-        );
-
-        // The scrollback keeps it for anyone who attaches later.
-        let late = Console::attach(&server, VmRef::Id(paced));
-        assert_eq!(String::from_utf8_lossy(&late.scrollback), paced_out);
-        let late = Console::attach(&server, VmRef::Id(small));
-        assert_eq!(String::from_utf8_lossy(&late.scrollback), small_out);
-
-        // Each VM reports its own profile, the device table its guest read, and its steps.
-        let details = info(&mut rt, paced);
-        assert_eq!(details.vm.profile, profile(32, Some(5_000_000)));
-        assert_eq!(details.vm.state, VmState::Exited(0));
-        assert_eq!(details.vm.name, "paced");
-        let config = avalon::machine_config(&details.vm.profile, &[]).unwrap();
-        let expected: Vec<DeviceEntry> = grail::bus::device_table(&config, 0)
-            .iter()
-            .map(|d| DeviceEntry {
-                kind: d.kind as u32,
-                base: u32::try_from(d.base).expect("devices are below 4 GiB"),
-                size: u32::try_from(d.size).expect("devices are below 4 GiB"),
-                irq: d.irq,
-            })
-            .collect();
-        assert_eq!(details.devices, expected);
-        assert_eq!(details.devices.len(), 9);
-        assert!(details.steps > 1000, "{}", details.steps);
-        let small_steps = info(&mut rt, small).steps;
-        assert!(small_steps > 1000);
-
-        match rt.request(&Message::ListVms).unwrap() {
-            Message::VmList { vms } => assert_eq!(
-                vms,
-                [
-                    VmSummary {
-                        id: small,
-                        name: "small".into(),
-                        state: VmState::Exited(0),
-                        profile: profile(64, None),
-                    },
-                    VmSummary {
-                        id: paced,
-                        name: "paced".into(),
-                        state: VmState::Exited(0),
-                        profile: profile(32, Some(5_000_000)),
-                    },
-                ]
-            ),
-            other => panic!("{other:?}"),
-        }
-
-        // An exited VM cannot be restarted.
-        for msg in [
-            Message::StartVm { vm: VmRef::Id(small) },
-            Message::PauseVm { vm: VmRef::Id(small) },
-            Message::ResumeVm { vm: VmRef::Id(small) },
-            Message::StopVm { vm: VmRef::Id(small) },
-        ] {
-            assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState);
-        }
-        server.stop().unwrap();
+    let small_out = sysinfo_output(64, 10_000_000, false);
+    let paced_out = sysinfo_output(32, 5_000_000, true);
+    small_console.wait_for_event(Message::VmStateChanged {
+        vm: small,
+        state: VmState::Exited(0),
     });
+    paced_console.wait_for_event(Message::VmStateChanged {
+        vm: paced,
+        state: VmState::Exited(0),
+    });
+    assert_eq!(String::from_utf8_lossy(&small_console.output), small_out);
+    assert_eq!(String::from_utf8_lossy(&paced_console.output), paced_out);
+    assert_eq!(
+        small_console.events,
+        [
+            Message::VmStateChanged {
+                vm: small,
+                state: VmState::Running
+            },
+            Message::VmStateChanged {
+                vm: small,
+                state: VmState::Exited(0)
+            }
+        ]
+    );
+
+    // The scrollback keeps it for anyone who attaches later.
+    let late = Console::attach(&server, VmRef::Id(paced));
+    assert_eq!(String::from_utf8_lossy(&late.scrollback), paced_out);
+    let late = Console::attach(&server, VmRef::Id(small));
+    assert_eq!(String::from_utf8_lossy(&late.scrollback), small_out);
+
+    // Each VM reports its own profile, the device table its guest read, and its steps.
+    let details = info(&mut rt, paced);
+    assert_eq!(details.vm.profile, profile(32, Some(5_000_000)));
+    assert_eq!(details.vm.state, VmState::Exited(0));
+    assert_eq!(details.vm.name, "paced");
+    let config = avalon::machine_config(&details.vm.profile).unwrap();
+    let expected: Vec<DeviceEntry> = grail::bus::device_table(&config, 0)
+        .iter()
+        .map(|d| DeviceEntry {
+            kind: d.kind as u32,
+            base: u32::try_from(d.base).expect("devices are below 4 GiB"),
+            size: u32::try_from(d.size).expect("devices are below 4 GiB"),
+            irq: d.irq,
+        })
+        .collect();
+    assert_eq!(details.devices, expected);
+    assert_eq!(details.devices.len(), 9);
+    assert!(details.steps > 1000, "{}", details.steps);
+    let small_steps = info(&mut rt, small).steps;
+    assert!(small_steps > 1000);
+
+    match rt.request(&Message::ListVms).unwrap() {
+        Message::VmList { vms } => assert_eq!(
+            vms,
+            [
+                VmSummary {
+                    id: small,
+                    name: "small".into(),
+                    state: VmState::Exited(0),
+                    profile: profile(64, None),
+                },
+                VmSummary {
+                    id: paced,
+                    name: "paced".into(),
+                    state: VmState::Exited(0),
+                    profile: profile(32, Some(5_000_000)),
+                },
+            ]
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    // An exited VM cannot be restarted.
+    for msg in [
+        Message::StartVm { vm: VmRef::Id(small) },
+        Message::PauseVm { vm: VmRef::Id(small) },
+        Message::ResumeVm { vm: VmRef::Id(small) },
+        Message::StopVm { vm: VmRef::Id(small) },
+    ] {
+        assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState);
+    }
+    server.stop().unwrap();
 }
 
 #[test]
-fn an_rv64_vm_has_more_ram_than_the_host() {
+fn a_vm_has_more_ram_than_the_host() {
     // 512 GiB, more than any machine running these tests has: RAM is reserved, not
-    // allocated, so the VM is made and runs, its host paying for what it touches. An
-    // RV64 VM (its program is ELF64) takes it; an RV32 one is refused as a bad profile.
+    // allocated, so the VM is made and runs, its host paying for what it touches.
     let server = server(None);
     let mut conn = connect(&server);
     let vm = create(
@@ -141,79 +138,42 @@ fn an_rv64_vm_has_more_ram_than_the_host() {
     wait_until("the VM to run", Duration::from_secs(10), || {
         slices(&server, vm) > 0
     });
-    let refused = error_of(
-        &mut conn,
-        &Message::CreateVm {
-            name: "big32".into(),
-            profile: HardwareProfile::with_ram(512 << 30),
-            program: example("hello"),
-        },
-    );
-    assert_eq!(refused, avalon_proto::ErrorCode::InvalidProfile);
     server.stop().unwrap();
 }
 
-/// A VM's width is its profile's (protocol doc, section 3, "The width"), or RV64 for
-/// an ELF64 program, as Grail's `load_elf` makes the machine: what `VmInfo` and
-/// `VmList` say is the width the VM has.
+/// Every VM is RV64 (protocol doc, section 3, "The width"): its profile reads back
+/// as it was asked for, an ELF32 program does not run (as qemu-system-riscv64 does
+/// not load an ELF32 kernel), and it takes up to 1 TiB of RAM, booting from disk
+/// too.
 #[test]
-fn a_vm_is_as_wide_as_its_profile_or_its_program() {
-    use avalon_proto::{Paging, Xlen};
+fn every_vm_is_rv64() {
+    use avalon_proto::Paging;
     let server = server(None);
     let mut conn = connect(&server);
     let rv64 = HardwareProfile {
-        xlen: Xlen::Rv64,
         paging: Paging::Sv39,
         ..HardwareProfile::with_ram(16 * MIB)
     };
-    // An RV64 profile and an ELF64 program; an RV32 profile and an ELF64 program,
-    // which reads back as RV64 (its paging as it was asked for).
     let asked = create(&mut conn, "asked", rv64.clone(), rv64_spinner());
     assert_eq!(info(&mut conn, asked).vm.profile, rv64);
-    let widened = create(
-        &mut conn,
-        "widened",
-        HardwareProfile::with_ram(16 * MIB),
-        rv64_spinner(),
-    );
-    assert_eq!(
-        info(&mut conn, widened).vm.profile,
-        HardwareProfile {
-            xlen: Xlen::Rv64,
-            ..HardwareProfile::with_ram(16 * MIB)
-        }
-    );
-    // An RV32 VM stays RV32.
-    let narrow = create(
-        &mut conn,
-        "narrow",
-        HardwareProfile::with_ram(16 * MIB),
-        spinner(),
-    );
-    assert_eq!(info(&mut conn, narrow).vm.profile.xlen, Xlen::Rv32);
-    match conn.request(&Message::ListVms).unwrap() {
-        Message::VmList { vms } => {
-            let widths: Vec<Xlen> = vms.iter().map(|vm| vm.profile.xlen).collect();
-            assert_eq!(widths, [Xlen::Rv64, Xlen::Rv64, Xlen::Rv32]);
-        }
-        other => panic!("{other:?}"),
-    }
-    // An ELF32 program does not run on an RV64 VM, as qemu-system-riscv64 does not
-    // load an ELF32 kernel.
+    // clang's RV32 executable of crates/elf/tests/llvm.
+    let elf32 = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../elf/tests/llvm/rv32/prog.elf"
+    ))
+    .unwrap();
     match conn.request(&Message::CreateVm {
         name: "elf32".into(),
         profile: rv64.clone(),
-        program: spinner(),
+        program: elf32,
     }) {
         Err(avalon_proto::Error::Remote { code, message }) => {
             assert_eq!(code, ErrorCode::InvalidProgram);
-            assert_eq!(
-                message,
-                "program: an RV32 program (ELF32) cannot run on an RV64 machine"
-            );
+            assert!(message.contains("ELF32"), "{message}");
         }
         other => panic!("{other:?}"),
     }
+    // Up to 1 TiB of RAM, booting from disk too; more is refused.
     // An RV64 profile takes RV64's RAM, booting from disk too; more than 1 TiB is
     // refused for either width.
     let image = std::env::temp_dir().join(format!("avalon-rv64-{}.img", std::process::id()));
@@ -252,180 +212,174 @@ fn a_vm_is_as_wide_as_its_profile_or_its_program() {
 
 #[test]
 fn exit_codes_are_reported() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut rt = connect(&server);
-        let id = create(&mut rt, "seven", profile(1, None), exits_with(7));
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-        assert_eq!(
-            wait_for_state(&mut rt, id, |s| s != VmState::Running),
-            VmState::Exited(7)
-        );
-        let console = Console::attach(&server, VmRef::Id(id));
-        assert_eq!(console.scrollback, b"bye");
-        server.stop().unwrap();
-    });
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "seven", profile(1, None), exits_with(7));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    assert_eq!(
+        wait_for_state(&mut rt, id, |s| s != VmState::Running),
+        VmState::Exited(7)
+    );
+    let console = Console::attach(&server, VmRef::Id(id));
+    assert_eq!(console.scrollback, b"bye");
+    server.stop().unwrap();
 }
 
 #[test]
 fn pause_resume_stop_and_destroy_a_looping_guest() {
-    on_both_widths(|| {
-        let server = server(Some(64 * MIB));
-        let mut rt = connect(&server);
-        let id = create(&mut rt, "spin", profile(48, None), spinner());
-        let mut console = Console::attach(&server, VmRef::Name("spin".into()));
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-        console.wait_for("L");
+    let server = server(Some(64 * MIB));
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "spin", profile(48, None), spinner());
+    let mut console = Console::attach(&server, VmRef::Name("spin".into()));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    console.wait_for("L");
 
-        let steps = |rt: &mut _| info(rt, id).steps;
-        let wait_for_steps_above = |rt: &mut _, n: u64| {
-            let start = Instant::now();
-            while steps(rt) <= n {
-                assert!(start.elapsed() < SLOW, "the VM is not running");
-                std::thread::sleep(Duration::from_millis(5));
+    let steps = |rt: &mut _| info(rt, id).steps;
+    let wait_for_steps_above = |rt: &mut _, n: u64| {
+        let start = Instant::now();
+        while steps(rt) <= n {
+            assert!(start.elapsed() < SLOW, "the VM is not running");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    wait_for_steps_above(&mut rt, 1_000_000);
+
+    // Paused: not a single step more once PauseVm is answered.
+    rt.request_ok(&Message::PauseVm { vm: VmRef::Id(id) }).unwrap();
+    assert_eq!(state(&mut rt, id), VmState::Paused);
+    let paused_at = steps(&mut rt);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(steps(&mut rt), paused_at);
+    assert_eq!(
+        error_of(&mut rt, &Message::PauseVm { vm: VmRef::Id(id) }),
+        ErrorCode::InvalidState
+    );
+    assert_eq!(
+        error_of(&mut rt, &Message::StartVm { vm: VmRef::Id(id) }),
+        ErrorCode::InvalidState
+    );
+
+    rt.request_ok(&Message::ResumeVm { vm: VmRef::Id(id) }).unwrap();
+    assert_eq!(state(&mut rt, id), VmState::Running);
+    wait_for_steps_above(&mut rt, paused_at + 1_000_000);
+    assert_eq!(
+        error_of(&mut rt, &Message::ResumeVm { vm: VmRef::Id(id) }),
+        ErrorCode::InvalidState
+    );
+
+    rt.request_ok(&Message::StopVm { vm: VmRef::Id(id) }).unwrap();
+    assert_eq!(state(&mut rt, id), VmState::Stopped);
+    let stopped_at = steps(&mut rt);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(steps(&mut rt), stopped_at);
+    for msg in [
+        Message::StartVm { vm: VmRef::Id(id) },
+        Message::ResumeVm { vm: VmRef::Id(id) },
+        Message::PauseVm { vm: VmRef::Id(id) },
+        Message::StopVm { vm: VmRef::Id(id) },
+    ] {
+        assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState);
+    }
+
+    // The console saw every state change, in order.
+    let changes = [
+        VmState::Running,
+        VmState::Paused,
+        VmState::Running,
+        VmState::Stopped,
+    ];
+    console.wait_until(|c| c.events.len() == changes.len(), "four state changes");
+    let expected: Vec<Message> = changes
+        .iter()
+        .map(|&state| Message::VmStateChanged { vm: id, state })
+        .collect();
+    assert_eq!(console.events, expected);
+    assert_eq!(console.output, b"L");
+
+    // The VM still holds its RAM until it is destroyed.
+    assert_eq!(
+        error_of(
+            &mut rt,
+            &Message::CreateVm {
+                name: "other".into(),
+                profile: profile(32, None),
+                program: spinner(),
             }
-        };
-        wait_for_steps_above(&mut rt, 1_000_000);
+        ),
+        ErrorCode::OverBudget
+    );
 
-        // Paused: not a single step more once PauseVm is answered.
-        rt.request_ok(&Message::PauseVm { vm: VmRef::Id(id) }).unwrap();
-        assert_eq!(state(&mut rt, id), VmState::Paused);
-        let paused_at = steps(&mut rt);
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(steps(&mut rt), paused_at);
-        assert_eq!(
-            error_of(&mut rt, &Message::PauseVm { vm: VmRef::Id(id) }),
-            ErrorCode::InvalidState
-        );
-        assert_eq!(
-            error_of(&mut rt, &Message::StartVm { vm: VmRef::Id(id) }),
-            ErrorCode::InvalidState
-        );
-
-        rt.request_ok(&Message::ResumeVm { vm: VmRef::Id(id) }).unwrap();
-        assert_eq!(state(&mut rt, id), VmState::Running);
-        wait_for_steps_above(&mut rt, paused_at + 1_000_000);
-        assert_eq!(
-            error_of(&mut rt, &Message::ResumeVm { vm: VmRef::Id(id) }),
-            ErrorCode::InvalidState
-        );
-
-        rt.request_ok(&Message::StopVm { vm: VmRef::Id(id) }).unwrap();
-        assert_eq!(state(&mut rt, id), VmState::Stopped);
-        let stopped_at = steps(&mut rt);
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(steps(&mut rt), stopped_at);
-        for msg in [
-            Message::StartVm { vm: VmRef::Id(id) },
-            Message::ResumeVm { vm: VmRef::Id(id) },
-            Message::PauseVm { vm: VmRef::Id(id) },
-            Message::StopVm { vm: VmRef::Id(id) },
-        ] {
-            assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState);
-        }
-
-        // The console saw every state change, in order.
-        let changes = [
-            VmState::Running,
-            VmState::Paused,
-            VmState::Running,
-            VmState::Stopped,
-        ];
-        console.wait_until(|c| c.events.len() == changes.len(), "four state changes");
-        let expected: Vec<Message> = changes
-            .iter()
-            .map(|&state| Message::VmStateChanged { vm: id, state })
-            .collect();
-        assert_eq!(console.events, expected);
-        assert_eq!(console.output, b"L");
-
-        // The VM still holds its RAM until it is destroyed.
-        assert_eq!(
-            error_of(
-                &mut rt,
-                &Message::CreateVm {
-                    name: "other".into(),
-                    profile: profile(32, None),
-                    program: spinner(),
-                }
-            ),
-            ErrorCode::OverBudget
-        );
-
-        rt.request_ok(&Message::DestroyVm {
-            vm: VmRef::Name("spin".into()),
-        })
-        .unwrap();
-        console.wait_for_event(Message::Detached {
-            vm: id,
-            kind: AttachKind::Console,
-        });
-        for msg in [
-            Message::GetVmInfo { vm: VmRef::Id(id) },
-            Message::DestroyVm { vm: VmRef::Id(id) },
-            Message::StartVm {
-                vm: VmRef::Name("spin".into()),
-            },
-            Message::ConsoleAttach { vm: VmRef::Id(id) },
-        ] {
-            assert_eq!(error_of(&mut rt, &msg), ErrorCode::NoSuchVm);
-        }
-        assert_eq!(
-            rt.request(&Message::ListVms).unwrap(),
-            Message::VmList { vms: vec![] }
-        );
-
-        // Its RAM and its name are free again; ids are not reused.
-        let again = create(&mut rt, "spin", profile(48, None), spinner());
-        assert_eq!(again, id + 1);
-        // Destroying a running VM works too.
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(again) }).unwrap();
-        rt.request_ok(&Message::DestroyVm { vm: VmRef::Id(again) })
-            .unwrap();
-        create(&mut rt, "other", profile(32, None), spinner());
-        server.stop().unwrap();
+    rt.request_ok(&Message::DestroyVm {
+        vm: VmRef::Name("spin".into()),
+    })
+    .unwrap();
+    console.wait_for_event(Message::Detached {
+        vm: id,
+        kind: AttachKind::Console,
     });
+    for msg in [
+        Message::GetVmInfo { vm: VmRef::Id(id) },
+        Message::DestroyVm { vm: VmRef::Id(id) },
+        Message::StartVm {
+            vm: VmRef::Name("spin".into()),
+        },
+        Message::ConsoleAttach { vm: VmRef::Id(id) },
+    ] {
+        assert_eq!(error_of(&mut rt, &msg), ErrorCode::NoSuchVm);
+    }
+    assert_eq!(
+        rt.request(&Message::ListVms).unwrap(),
+        Message::VmList { vms: vec![] }
+    );
+
+    // Its RAM and its name are free again; ids are not reused.
+    let again = create(&mut rt, "spin", profile(48, None), spinner());
+    assert_eq!(again, id + 1);
+    // Destroying a running VM works too.
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(again) }).unwrap();
+    rt.request_ok(&Message::DestroyVm { vm: VmRef::Id(again) })
+        .unwrap();
+    create(&mut rt, "other", profile(32, None), spinner());
+    server.stop().unwrap();
 }
 
 #[test]
 fn stop_and_destroy_from_every_state() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut rt = connect(&server);
-        // Created → stopped.
-        let a = create(&mut rt, "a", profile(1, None), spinner());
-        rt.request_ok(&Message::StopVm { vm: VmRef::Id(a) }).unwrap();
-        assert_eq!(state(&mut rt, a), VmState::Stopped);
-        assert_eq!(info(&mut rt, a).steps, 0);
-        assert_eq!(
-            error_of(&mut rt, &Message::StartVm { vm: VmRef::Id(a) }),
-            ErrorCode::InvalidState
-        );
-        // Paused → stopped.
-        let b = create(&mut rt, "b", profile(1, None), spinner());
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(b) }).unwrap();
-        rt.request_ok(&Message::PauseVm { vm: VmRef::Id(b) }).unwrap();
-        rt.request_ok(&Message::StopVm { vm: VmRef::Id(b) }).unwrap();
-        assert_eq!(state(&mut rt, b), VmState::Stopped);
-        // Destroy: created, paused, running, stopped and exited VMs.
-        let c = create(&mut rt, "c", profile(1, None), spinner());
-        let d = create(&mut rt, "d", profile(1, None), spinner());
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(d) }).unwrap();
-        rt.request_ok(&Message::PauseVm { vm: VmRef::Id(d) }).unwrap();
-        let e = create(&mut rt, "e", profile(1, Some(1000)), spinner());
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(e) }).unwrap();
-        let f = create(&mut rt, "f", profile(1, None), exits_with(0));
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(f) }).unwrap();
-        wait_for_state(&mut rt, f, |s| s == VmState::Exited(0));
-        for id in [a, b, c, d, e, f] {
-            rt.request_ok(&Message::DestroyVm { vm: VmRef::Id(id) }).unwrap();
-        }
-        assert_eq!(
-            rt.request(&Message::ListVms).unwrap(),
-            Message::VmList { vms: vec![] }
-        );
-        server.stop().unwrap();
-    });
+    let server = server(None);
+    let mut rt = connect(&server);
+    // Created → stopped.
+    let a = create(&mut rt, "a", profile(1, None), spinner());
+    rt.request_ok(&Message::StopVm { vm: VmRef::Id(a) }).unwrap();
+    assert_eq!(state(&mut rt, a), VmState::Stopped);
+    assert_eq!(info(&mut rt, a).steps, 0);
+    assert_eq!(
+        error_of(&mut rt, &Message::StartVm { vm: VmRef::Id(a) }),
+        ErrorCode::InvalidState
+    );
+    // Paused → stopped.
+    let b = create(&mut rt, "b", profile(1, None), spinner());
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(b) }).unwrap();
+    rt.request_ok(&Message::PauseVm { vm: VmRef::Id(b) }).unwrap();
+    rt.request_ok(&Message::StopVm { vm: VmRef::Id(b) }).unwrap();
+    assert_eq!(state(&mut rt, b), VmState::Stopped);
+    // Destroy: created, paused, running, stopped and exited VMs.
+    let c = create(&mut rt, "c", profile(1, None), spinner());
+    let d = create(&mut rt, "d", profile(1, None), spinner());
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(d) }).unwrap();
+    rt.request_ok(&Message::PauseVm { vm: VmRef::Id(d) }).unwrap();
+    let e = create(&mut rt, "e", profile(1, Some(1000)), spinner());
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(e) }).unwrap();
+    let f = create(&mut rt, "f", profile(1, None), exits_with(0));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(f) }).unwrap();
+    wait_for_state(&mut rt, f, |s| s == VmState::Exited(0));
+    for id in [a, b, c, d, e, f] {
+        rt.request_ok(&Message::DestroyVm { vm: VmRef::Id(id) }).unwrap();
+    }
+    assert_eq!(
+        rt.request(&Message::ListVms).unwrap(),
+        Message::VmList { vms: vec![] }
+    );
+    server.stop().unwrap();
 }
 
 /// Input from attached clients reaches the UART; output goes to every attached
@@ -498,85 +452,76 @@ fn echo_session(clock_hz: Option<u32>) {
 
 #[test]
 fn console_at_full_speed() {
-    on_both_widths(|| {
-        echo_session(None);
-    });
+    echo_session(None);
 }
 
 #[test]
 fn console_in_real_time() {
-    on_both_widths(|| {
-        echo_session(Some(1_000_000));
-    });
+    echo_session(Some(1_000_000));
 }
 
 #[test]
 fn a_full_speed_vm_waiting_for_input_sleeps() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut rt = connect(&server);
-        let id = create(&mut rt, "echo", profile(1, None), example("uart-echo"));
-        let mut console = Console::attach(&server, VmRef::Id(id));
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-        console.send(b"a");
-        console.wait_for("a");
-        // Parked in wfi with only the UART interrupt enabled, it runs one slice every
-        // 50 ms rather than spinning (which is tens of millions of steps a second).
-        let before = info(&mut rt, id).steps;
-        let slices_before = slices(&server, id);
-        std::thread::sleep(Duration::from_millis(300));
-        let idle_steps = info(&mut rt, id).steps - before;
-        let idle_slices = slices(&server, id) - slices_before;
-        assert!(idle_steps < 5_000_000, "{idle_steps} steps while idle");
-        assert!(idle_slices < 100, "{idle_slices} slices while idle");
-        // And input still wakes it at once.
-        let start = Instant::now();
-        console.send(b"b");
-        console.wait_for("ab");
-        assert!(start.elapsed() < Duration::from_secs(2));
-        server.stop().unwrap();
-    });
+    let server = server(None);
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "echo", profile(1, None), example("uart-echo"));
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    console.send(b"a");
+    console.wait_for("a");
+    // Parked in wfi with only the UART interrupt enabled, it runs one slice every
+    // 50 ms rather than spinning (which is tens of millions of steps a second).
+    let before = info(&mut rt, id).steps;
+    let slices_before = slices(&server, id);
+    std::thread::sleep(Duration::from_millis(300));
+    let idle_steps = info(&mut rt, id).steps - before;
+    let idle_slices = slices(&server, id) - slices_before;
+    assert!(idle_steps < 5_000_000, "{idle_steps} steps while idle");
+    assert!(idle_slices < 100, "{idle_slices} slices while idle");
+    // And input still wakes it at once.
+    let start = Instant::now();
+    console.send(b"b");
+    console.wait_for("ab");
+    assert!(start.elapsed() < Duration::from_secs(2));
+    server.stop().unwrap();
 }
 
 #[test]
 fn a_real_time_vm_keeps_to_its_clock() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut rt = connect(&server);
-        // 1 MHz, waiting in wfi: idle ticks still count as steps, at the clock's rate.
-        let id = create(
-            &mut rt,
-            "clock",
-            profile(1, Some(1_000_000)),
-            example("uart-echo"),
-        );
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-        let start = Instant::now();
-        std::thread::sleep(Duration::from_millis(300));
-        let steps = info(&mut rt, id).steps;
-        let slices = slices(&server, id);
-        let elapsed = start.elapsed().as_secs_f64();
-        // Never ahead of the clock (give or take a 1 ms batch); behind only on a slow host.
-        assert!(
-            steps as f64 <= (elapsed + 0.002) * 1_000_000.0,
-            "{steps} steps in {elapsed} s"
-        );
-        assert!(steps > 50_000, "{steps} steps in {elapsed} s");
-        // And the thread sleeps between its ~1 ms batches instead of asking the machine
-        // for more steps over and over (millions of empty slices a second).
-        assert!(slices < 3_000, "{slices} slices in {elapsed} s");
-        server.stop().unwrap();
-    });
+    let server = server(None);
+    let mut rt = connect(&server);
+    // 1 MHz, waiting in wfi: idle ticks still count as steps, at the clock's rate.
+    let id = create(
+        &mut rt,
+        "clock",
+        profile(1, Some(1_000_000)),
+        example("uart-echo"),
+    );
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let start = Instant::now();
+    std::thread::sleep(Duration::from_millis(300));
+    let steps = info(&mut rt, id).steps;
+    let slices = slices(&server, id);
+    let elapsed = start.elapsed().as_secs_f64();
+    // Never ahead of the clock (give or take a 1 ms batch); behind only on a slow host.
+    assert!(
+        steps as f64 <= (elapsed + 0.002) * 1_000_000.0,
+        "{steps} steps in {elapsed} s"
+    );
+    assert!(steps > 50_000, "{steps} steps in {elapsed} s");
+    // And the thread sleeps between its ~1 ms batches instead of asking the machine
+    // for more steps over and over (millions of empty slices a second).
+    assert!(slices < 3_000, "{slices} slices in {elapsed} s");
+    server.stop().unwrap();
 }
 
 #[test]
 fn a_guest_that_presents_frames_runs_at_full_speed() {
-    on_both_widths(|| {
-        let server = server(None);
-        let mut rt = connect(&server);
-        // Presents a frame once, then prints `P` and counts forever.
-        let presenter = guest(
-            "
+    let server = server(None);
+    let mut rt = connect(&server);
+    // Presents a frame once, then prints `P` and counts forever.
+    let presenter = guest(
+        "
     .globl _start
 _start:
     li    t0, 0x30000014
@@ -587,105 +532,96 @@ _start:
 1:  addi  t2, t2, 1
     j     1b
 ",
-        );
-        let id = create(&mut rt, "presenter", profile(4, None), presenter);
-        let mut console = Console::attach(&server, VmRef::Id(id));
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-        console.wait_for("P");
-        let (steps_before, slices_before) = (info(&mut rt, id).steps, slices(&server, id));
-        std::thread::sleep(Duration::from_millis(300));
-        let steps = info(&mut rt, id).steps - steps_before;
-        let slices = slices(&server, id) - slices_before;
-        // The frame is taken, so slices are full ones again rather than a step each.
-        assert!(slices > 0);
-        assert!(steps / slices > 10_000, "{steps} steps in {slices} slices");
+    );
+    let id = create(&mut rt, "presenter", profile(4, None), presenter);
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    console.wait_for("P");
+    let (steps_before, slices_before) = (info(&mut rt, id).steps, slices(&server, id));
+    std::thread::sleep(Duration::from_millis(300));
+    let steps = info(&mut rt, id).steps - steps_before;
+    let slices = slices(&server, id) - slices_before;
+    // The frame is taken, so slices are full ones again rather than a step each.
+    assert!(slices > 0);
+    assert!(steps / slices > 10_000, "{steps} steps in {slices} slices");
 
-        // examples/colorbars draws, presents once and halts.
-        let bars = create(&mut rt, "colorbars", profile(4, None), example("colorbars"));
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(bars) }).unwrap();
-        assert_eq!(
-            wait_for_state(&mut rt, bars, |s| s != VmState::Running),
-            VmState::Exited(0)
-        );
-        server.stop().unwrap();
-    });
+    // examples/colorbars draws, presents once and halts.
+    let bars = create(&mut rt, "colorbars", profile(4, None), example("colorbars"));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(bars) }).unwrap();
+    assert_eq!(
+        wait_for_state(&mut rt, bars, |s| s != VmState::Running),
+        VmState::Exited(0)
+    );
+    server.stop().unwrap();
 }
 
 #[test]
 fn shutdown_stops_vms_and_closes_connections() {
-    on_both_widths(|| {
-        let server = server(None);
-        let addr = server.addr();
-        let mut rt = connect(&server);
-        let id = create(&mut rt, "spin", profile(1, None), spinner());
-        let idle = create(&mut rt, "idle", profile(1, None), spinner());
-        let mut console = Console::attach(&server, VmRef::Id(id));
-        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-        console.wait_for("L");
-        // A connection that never says Hello does not hold shutdown up.
-        let silent = std::net::TcpStream::connect(addr).unwrap();
+    let server = server(None);
+    let addr = server.addr();
+    let mut rt = connect(&server);
+    let id = create(&mut rt, "spin", profile(1, None), spinner());
+    let idle = create(&mut rt, "idle", profile(1, None), spinner());
+    let mut console = Console::attach(&server, VmRef::Id(id));
+    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    console.wait_for("L");
+    // A connection that never says Hello does not hold shutdown up.
+    let silent = std::net::TcpStream::connect(addr).unwrap();
 
-        let start = Instant::now();
-        server.stop().unwrap();
-        assert!(start.elapsed() < SLOW);
-        console.wait_closed();
-        assert_eq!(
-            console.events.last(),
-            Some(&Message::VmStateChanged {
-                vm: id,
-                state: VmState::Stopped
-            })
-        );
-        // The control connection is closed too.
-        assert!(rt.request(&Message::GetVmInfo { vm: VmRef::Id(idle) }).is_err());
-        drop(silent);
-        // Nothing listens any more.
-        assert!(avalon_proto::Connection::connect(addr, "late").is_err());
-    });
+    let start = Instant::now();
+    server.stop().unwrap();
+    assert!(start.elapsed() < SLOW);
+    console.wait_closed();
+    assert_eq!(
+        console.events.last(),
+        Some(&Message::VmStateChanged {
+            vm: id,
+            state: VmState::Stopped
+        })
+    );
+    // The control connection is closed too.
+    assert!(rt.request(&Message::GetVmInfo { vm: VmRef::Id(idle) }).is_err());
+    drop(silent);
+    // Nothing listens any more.
+    assert!(avalon_proto::Connection::connect(addr, "late").is_err());
 }
 
 #[test]
 fn many_clients_at_once() {
-    on_both_widths(|| {
-        let server = server(None);
-        let threads: Vec<_> = (0..8)
-            .map(|i| {
-                let mut conn = connect(&server);
-                // A thread of the test's width: its profile and program are of that width.
-                spawn(move || {
-                    let name = format!("vm-{i}");
-                    let id = create(&mut conn, &name, profile(1 + i as u64, None), exits_with(i));
-                    conn.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+    let server = server(None);
+    let threads: Vec<_> = (0..8)
+        .map(|i| {
+            let mut conn = connect(&server);
+            std::thread::spawn(move || {
+                let name = format!("vm-{i}");
+                let id = create(&mut conn, &name, profile(1 + i as u64, None), exits_with(i));
+                conn.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+                assert_eq!(
+                    wait_for_state(&mut conn, id, |s| matches!(s, VmState::Exited(_))),
+                    VmState::Exited(i)
+                );
+                for token in 0..100 {
                     assert_eq!(
-                        wait_for_state(&mut conn, id, |s| matches!(s, VmState::Exited(_))),
-                        VmState::Exited(i)
+                        conn.request(&Message::Ping { token }).unwrap(),
+                        Message::Pong { token }
                     );
-                    for token in 0..100 {
-                        assert_eq!(
-                            conn.request(&Message::Ping { token }).unwrap(),
-                            Message::Pong { token }
-                        );
-                    }
-                    id
-                })
-            })
-            .collect();
-        let mut ids: Vec<u32> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-        ids.sort();
-        assert_eq!(ids, (1..=8).collect::<Vec<_>>());
-        let mut rt = connect(&server);
-        match rt.request(&Message::ListVms).unwrap() {
-            Message::VmList { vms } => {
-                assert_eq!(vms.len(), 8);
-                assert!(vms.windows(2).all(|w| w[0].id < w[1].id), "in id order");
-                for vm in &vms {
-                    assert_eq!(vm.profile.xlen, xlen(), "VM {}'s width", vm.id);
                 }
-            }
-            other => panic!("{other:?}"),
+                id
+            })
+        })
+        .collect();
+    let mut ids: Vec<u32> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, (1..=8).collect::<Vec<_>>());
+    let mut rt = connect(&server);
+    match rt.request(&Message::ListVms).unwrap() {
+        Message::VmList { vms } => {
+            assert_eq!(vms.len(), 8);
+            assert!(vms.windows(2).all(|w| w[0].id < w[1].id), "in id order");
         }
-        server.stop().unwrap();
-    });
+        other => panic!("{other:?}"),
+    }
+    server.stop().unwrap();
 }
 
 /// The README's client example is the test below, but for the server's address, where
@@ -768,11 +704,11 @@ fn the_readme_client_example() -> Result<(), Box<dyn std::error::Error>> {
 /// disk"): here a boot block that says `bye` and halts with exit code 3. A VM whose
 /// disk has no boot block stops with the boot ROM's message and exit code.
 #[test]
-fn firmware_is_for_rv64_vms_and_must_load() {
-    // The profile's firmware is hardware, as its disks are: firmware on an RV32 VM, or
-    // a firmware file Grail cannot load, is InvalidProfile, as a disk image that cannot
-    // be opened is (protocol doc, section 3, `bios`).
-    use avalon_proto::{Bios, Xlen};
+fn firmware_must_load() {
+    // The profile's firmware is hardware, as its disks are: a firmware file Grail
+    // cannot load is InvalidProfile, as a disk image that cannot be opened is
+    // (protocol doc, section 3, `bios`).
+    use avalon_proto::Bios;
     let dir = std::env::temp_dir().join(format!("avalon-firmware-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let image = dir.join("disk.img");
@@ -780,8 +716,7 @@ fn firmware_is_for_rv64_vms_and_must_load() {
     let big = dir.join("big.bin");
     std::fs::write(&big, vec![0u8; (2 * MIB + 4) as usize]).unwrap();
     let path = |p: &std::path::Path| p.to_string_lossy().into_owned();
-    let with_disk = |xlen, bios| HardwareProfile {
-        xlen,
+    let with_disk = |bios| HardwareProfile {
         bios,
         devices: vec![DeviceSpec::Disk(DiskSpec {
             source: DiskSource::File(path(&image)),
@@ -799,96 +734,82 @@ fn firmware_is_for_rv64_vms_and_must_load() {
         Err(avalon_proto::Error::Remote { code, message }) => (code, message),
         other => panic!("{other:?}"),
     };
-    // An RV32 profile with firmware: booting from disk, or with an ELF32 program.
-    for program in [Vec::new(), spinner()] {
-        let (code, message) = refused(with_disk(Xlen::Rv32, Bios::Default), program);
-        assert_eq!(code, ErrorCode::InvalidProfile, "{message}");
-        assert!(message.contains("for RV64 VMs only"), "{message}");
-    }
     // A firmware file that is not there, and one too big for the firmware's 2 MiB.
     let missing = Bios::File(path(&dir.join("no-such-fw.bin")));
-    let (code, message) = refused(with_disk(Xlen::Rv64, missing), Vec::new());
+    let (code, message) = refused(with_disk(missing), Vec::new());
     assert_eq!(code, ErrorCode::InvalidProfile, "{message}");
     assert!(message.starts_with("cannot read the firmware"), "{message}");
-    let (code, message) = refused(with_disk(Xlen::Rv64, Bios::File(path(&big))), Vec::new());
+    let (code, message) = refused(with_disk(Bios::File(path(&big))), Vec::new());
     assert_eq!(code, ErrorCode::InvalidProfile, "{message}");
     assert!(message.contains("outside the firmware's RAM"), "{message}");
-    // Firmware that loads on an RV64 VM, or on an RV32 profile that an ELF64 program
-    // makes RV64, is a VM.
-    create(
-        &mut conn,
-        "rv64",
-        with_disk(Xlen::Rv64, Bios::Default),
-        Vec::new(),
-    );
+    // Firmware that loads is a VM, booting from disk or with a program.
+    create(&mut conn, "disk", with_disk(Bios::Default), Vec::new());
     let id = create(
         &mut conn,
-        "widened",
+        "program",
         HardwareProfile {
             bios: Bios::Default,
             ..HardwareProfile::with_ram(16 * MIB)
         },
         firmware_spinner(),
     );
-    assert_eq!(info(&mut conn, id).vm.profile.xlen, Xlen::Rv64);
+    assert_eq!(info(&mut conn, id).vm.profile.bios, Bios::Default);
     server.stop().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn a_vm_with_no_program_boots_from_its_disk() {
-    on_both_widths(|| {
-        let dir = std::env::temp_dir().join(format!("avalon-disk-boot-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = grail::elf::parse(&exits_with(3)).unwrap();
-        let mut block = [0u8; grail::boot::BOOT_BLOCK_SIZE];
-        block[..file.segments[0].data.len()].copy_from_slice(&file.segments[0].data);
-        grail::boot::seal(&mut block);
-        let bootable = dir.join("bootable.img");
-        std::fs::write(&bootable, [&block[..], &[0; 3072]].concat()).unwrap();
-        let empty = dir.join("empty.img");
-        std::fs::write(&empty, [0u8; 4096]).unwrap();
+    let dir = std::env::temp_dir().join(format!("avalon-disk-boot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = grail::elf::parse(&exits_with(3)).unwrap();
+    let mut block = [0u8; grail::boot::BOOT_BLOCK_SIZE];
+    block[..file.segments[0].data.len()].copy_from_slice(&file.segments[0].data);
+    grail::boot::seal(&mut block);
+    let bootable = dir.join("bootable.img");
+    std::fs::write(&bootable, [&block[..], &[0; 3072]].concat()).unwrap();
+    let empty = dir.join("empty.img");
+    std::fs::write(&empty, [0u8; 4096]).unwrap();
 
-        let server = server(None);
-        let mut rt = connect(&server);
-        let disk = |path: &std::path::Path| HardwareProfile {
-            devices: vec![DeviceSpec::Disk(DiskSpec {
-                source: DiskSource::File(path.to_string_lossy().into_owned()),
-                read_only: true,
-            })],
-            ..profile(4, None)
-        };
-        for (path, code, out) in [
-            (&bootable, 3, "bye".to_string()),
-            (
-                &empty,
-                grail::boot::EXIT_BOOT_FAILED,
-                "boot ROM: disk 0 is not bootable (no boot signature)\n".to_string(),
-            ),
-        ] {
-            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-            let vm = create(&mut rt, &name, disk(path), Vec::new());
-            let mut console = Console::attach(&server, VmRef::Id(vm));
-            rt.request_ok(&Message::StartVm { vm: VmRef::Id(vm) }).unwrap();
-            console.wait_for_event(Message::VmStateChanged {
-                vm,
-                state: VmState::Exited(code),
-            });
-            assert_eq!(String::from_utf8_lossy(&console.output), out);
-        }
-        // No program and no disk: nothing to run.
-        assert_eq!(
-            error_of(
-                &mut rt,
-                &Message::CreateVm {
-                    name: "nothing".into(),
-                    profile: profile(4, None),
-                    program: Vec::new(),
-                }
-            ),
-            ErrorCode::InvalidProgram
-        );
-        server.stop().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    });
+    let server = server(None);
+    let mut rt = connect(&server);
+    let disk = |path: &std::path::Path| HardwareProfile {
+        devices: vec![DeviceSpec::Disk(DiskSpec {
+            source: DiskSource::File(path.to_string_lossy().into_owned()),
+            read_only: true,
+        })],
+        ..profile(4, None)
+    };
+    for (path, code, out) in [
+        (&bootable, 3, "bye".to_string()),
+        (
+            &empty,
+            grail::boot::EXIT_BOOT_FAILED,
+            "boot ROM: disk 0 is not bootable (no boot signature)\n".to_string(),
+        ),
+    ] {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let vm = create(&mut rt, &name, disk(path), Vec::new());
+        let mut console = Console::attach(&server, VmRef::Id(vm));
+        rt.request_ok(&Message::StartVm { vm: VmRef::Id(vm) }).unwrap();
+        console.wait_for_event(Message::VmStateChanged {
+            vm,
+            state: VmState::Exited(code),
+        });
+        assert_eq!(String::from_utf8_lossy(&console.output), out);
+    }
+    // No program and no disk: nothing to run.
+    assert_eq!(
+        error_of(
+            &mut rt,
+            &Message::CreateVm {
+                name: "nothing".into(),
+                profile: profile(4, None),
+                program: Vec::new(),
+            }
+        ),
+        ErrorCode::InvalidProgram
+    );
+    server.stop().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

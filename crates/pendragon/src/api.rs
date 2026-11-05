@@ -13,13 +13,13 @@ use crate::json::Json;
 use crate::screen::{OpenError, Screens, Viewer, SUBPROTOCOL};
 use crate::websocket::{accept_response, Handshake};
 use avalon_client::{
-    arch_text, base_image, camelot_bios, create_camelot_vm, format_hz, format_size, holds_disks, lake_disks,
-    mac_text, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net,
-    parse_paging, parse_ram, parse_xlen, CamelotError, Client, Timeouts, VmAction,
+    arch_text, camelot_bios, create_camelot_vm, format_hz, format_size, holds_disks, lake_disks, mac_text,
+    parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_paging,
+    parse_ram, CamelotError, Client, Timeouts, VmAction,
 };
 use avalon_proto::{
     validate_name, Bios, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, NatConfig, PortOwner,
-    SwitchInfo, VmDetails, VmRef, VmState, VmSummary, Xlen, SECTOR_SIZE,
+    SwitchInfo, VmDetails, VmRef, VmState, VmSummary, SECTOR_SIZE,
 };
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -577,25 +577,15 @@ impl App {
             200,
             Json::object([
                 ("lake", self.lake.as_str().into()),
-                // The images a Camelot VM's disk is a copy of, RV32's and RV64's:
-                // the new-VM form offers Camelot first when Lake has the one of the
-                // width chosen.
-                ("camelot_image", base_image(Xlen::Rv32).into()),
-                ("camelot_image_rv64", base_image(Xlen::Rv64).into()),
-                // A Camelot VM's RAM of each width in MiB, for the new-VM form.
-                (
-                    "camelot_ram",
-                    (avalon_client::camelot_ram(Xlen::Rv32) >> 20).into(),
-                ),
-                (
-                    "camelot_ram_rv64",
-                    (avalon_client::camelot_ram(Xlen::Rv64) >> 20).into(),
-                ),
-                // And its firmware of each width, as `bios` takes it (none on RV32,
-                // Camelot's own on RV64): the form's until it is typed in, as the
-                // server's choice when `bios` is left empty.
-                ("camelot_bios", camelot_bios(Xlen::Rv32).to_string().into()),
-                ("camelot_bios_rv64", camelot_bios(Xlen::Rv64).to_string().into()),
+                // The image a Camelot VM's disk is a copy of: the new-VM form
+                // offers Camelot first when Lake has it.
+                ("camelot_image", avalon_client::BASE_IMAGE.into()),
+                // A Camelot VM's RAM in MiB, for the new-VM form.
+                ("camelot_ram", (avalon_client::CAMELOT_RAM >> 20).into()),
+                // And its firmware, as `bios` takes it (Camelot's own): the form's
+                // until it is typed in, as the server's choice when `bios` is left
+                // empty.
+                ("camelot_bios", camelot_bios().to_string().into()),
                 ("disks", Json::Array(disks)),
                 ("vms_error", vms.err().map(|f| f.message).into()),
             ]),
@@ -932,39 +922,34 @@ struct Create {
     profile: HardwareProfile,
     /// Empty: boot from disk 0.
     program: Vec<u8>,
-    /// Boot Camelot from a copy of Lake's image of the VM's width, `os-base` or
-    /// `os-base-rv64`, made first.
+    /// Boot Camelot from a copy of Lake's image, `os-base`, made first.
     camelot: bool,
     start: bool,
 }
 
-/// `{"name", "xlen", "paging", "ram", "clock", "harts", "disks": [{"source",
-/// "read_only"}], "nets": [{"switch", "mac"}], "camelot", "program", "start"}`: `xlen`,
-/// `paging`, `ram`, `clock` and `harts` as Round Table's `--xlen`, `--paging`, `--ram`,
-/// `--clock` and `--harts` take them (32 or 64, sv48 or sv39, MiB or with M/MiB, G/GiB
-/// or T/TiB, a frequency with Hz/kHz/MHz, a number of harts; empty is the default:
-/// RV32, Sv48, 4 MiB, full speed, one hart), each disk source a path on Avalon's host
+/// `{"name", "paging", "bios", "ram", "clock", "harts", "disks": [{"source",
+/// "read_only"}], "nets": [{"switch", "mac"}], "camelot", "program", "start"}`:
+/// `paging`, `bios`, `ram`, `clock` and `harts` as Round Table's `--paging`, `--bios`,
+/// `--ram`, `--clock` and `--harts` take them (sv48 or sv39, none, default or a file,
+/// MiB or with M/MiB, G/GiB or T/TiB, a frequency with Hz/kHz/MHz, a number of harts;
+/// empty is the default: Sv48, no firmware, 4 MiB, full speed, one hart), each disk
+/// source a path on Avalon's host
 /// or `lake://ADDR/NAME`, each network card the switch to plug it into (empty or null:
 /// none) and its MAC address (empty or null: Avalon makes one up), the program an ELF
 /// file in base64. `camelot` true boots Camelot from `<name>-disk0`, a copy of Lake's
-/// image of the VM's width (`os-base`, or `os-base-rv64` for an RV64 VM) that goes
-/// before the other disks, as Round Table's `create --camelot`; it takes no program.
+/// image `os-base` that goes before the other disks, as Round Table's `create --camelot`; it takes no program.
 /// Otherwise the program may be left out when there is a disk: the VM boots from the
 /// first.
 fn parse_create(body: &Json) -> Result<Create, Fail> {
     only_keys(
         body,
         &[
-            "name", "xlen", "paging", "bios", "ram", "clock", "harts", "disks", "nets", "camelot", "program",
-            "start",
+            "name", "paging", "bios", "ram", "clock", "harts", "disks", "nets", "camelot", "program", "start",
         ],
     )?;
     let name = string(body, "name")?.ok_or_else(|| Fail::bad("name: a VM needs a name"))?;
     validate_name(name).map_err(|e| Fail::bad(format!("name: {e}")))?;
     let mut profile = HardwareProfile::default();
-    if let Some(xlen) = string(body, "xlen")?.filter(|s| !s.trim().is_empty()) {
-        profile.xlen = parse_xlen(xlen.trim()).map_err(|e| Fail::bad(format!("xlen: {e}")))?;
-    }
     if let Some(paging) = string(body, "paging")?.filter(|s| !s.trim().is_empty()) {
         profile.paging = parse_paging(paging.trim()).map_err(|e| Fail::bad(format!("paging: {e}")))?;
     }
@@ -1025,16 +1010,16 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
         Some(_) => return Err(Fail::bad("nets: not a list")),
     }
     let camelot = flag(body, "camelot")?;
-    // A Camelot VM's RAM, left empty, is its width's (6 MiB on RV64: its firmware
-    // keeps 2 MiB), as Round Table's create --camelot without --ram.
+    // A Camelot VM's RAM, left empty, is 6 MiB (its firmware keeps 2), as Round
+    // Table's create --camelot without --ram.
     if camelot && string(body, "ram")?.is_none_or(|s| s.trim().is_empty()) {
-        profile.ram_size = avalon_client::camelot_ram(profile.xlen);
+        profile.ram_size = avalon_client::CAMELOT_RAM;
     }
     // The firmware as Round Table's --bios takes it; empty or left out, a Camelot VM
-    // has its width's (Camelot's own on RV64), any other VM none.
+    // has Camelot's own, any other VM none.
     profile.bios = match string(body, "bios")?.map(str::trim).filter(|s| !s.is_empty()) {
         Some(bios) => Bios::parse(bios).map_err(|e| Fail::bad(format!("bios: {e}")))?,
-        None if camelot => camelot_bios(profile.xlen),
+        None if camelot => camelot_bios(),
         None => Bios::None,
     };
     let program = match (string(body, "program")?, camelot) {
@@ -1144,12 +1129,10 @@ fn vm_json(vm: &VmSummary) -> Json {
             }
             .into(),
         ),
-        // The width in bits and the paging modes as `xlen` and `paging` take them, and
-        // the two as people read them.
-        ("xlen", profile.xlen.bits().into()),
+        // The paging modes as `paging` takes them, and the architecture as people
+        // read it.
         ("paging", profile.paging.to_string().into()),
-        ("arch", profile.xlen.to_string().into()),
-        ("arch_text", arch_text(profile.xlen, profile.paging).into()),
+        ("arch_text", arch_text(profile.paging).into()),
         // The firmware as `bios` takes it: none, default or the file's path.
         ("bios", profile.bios.to_string().into()),
         ("ram", profile.ram_size.into()),
@@ -1405,48 +1388,39 @@ mod tests {
         let c = create(r#"{"name": "os", "camelot": null, "program": null, "disks": [{"source": "d.img"}]}"#)
             .unwrap();
         assert!(!c.camelot && c.program.is_empty());
-        // An RV64 VM, Sv39 alone, with RV64's RAM.
-        let c = create(r#"{"name": "os", "camelot": true, "xlen": "64", "paging": "sv39", "ram": "16G"}"#)
-            .unwrap();
+        // Sv39 alone, with 16 GiB of RAM.
+        let c = create(r#"{"name": "os", "camelot": true, "paging": "sv39", "ram": "16G"}"#).unwrap();
         assert_eq!(
-            (c.profile.xlen, c.profile.paging, c.profile.ram_size),
-            (Xlen::Rv64, avalon_proto::Paging::Sv39, 16 << 30)
+            (c.profile.paging, c.profile.ram_size),
+            (avalon_proto::Paging::Sv39, 16 << 30)
         );
-        let c = create(r#"{"name": "os", "camelot": true, "xlen": " ", "paging": ""}"#).unwrap();
-        assert_eq!(
-            (c.profile.xlen, c.profile.paging),
-            (Xlen::Rv32, avalon_proto::Paging::Sv48)
-        );
-        // The firmware: none unless asked; a Camelot VM of RV64 has Camelot's,
-        // and its 2 MiB of RAM on top of 4, unless told.
+        let c = create(r#"{"name": "os", "camelot": true, "paging": ""}"#).unwrap();
+        assert_eq!(c.profile.paging, avalon_proto::Paging::Sv48);
+        // The firmware: none unless asked; a Camelot VM has Camelot's, and its
+        // 2 MiB of RAM on top of 4, unless told.
         let firmware = |text: &str| {
             let c = create(text).unwrap();
             (c.profile.bios, c.profile.ram_size >> 20)
         };
-        assert_eq!(c.profile.bios, Bios::None);
+        assert_eq!(c.profile.bios, Bios::Default);
+        assert_eq!(firmware(r#"{"name": "os", "program": "AA=="}"#), (Bios::None, 4));
+        assert_eq!(firmware(r#"{"name": "os", "camelot": true}"#), (Bios::Default, 6));
         assert_eq!(
-            firmware(r#"{"name": "os", "camelot": true, "xlen": "64"}"#),
-            (Bios::Default, 6)
-        );
-        assert_eq!(
-            firmware(r#"{"name": "os", "camelot": true, "xlen": "64", "bios": "none", "ram": "16"}"#),
+            firmware(r#"{"name": "os", "camelot": true, "bios": "none", "ram": "16"}"#),
             (Bios::None, 16)
         );
         assert_eq!(
-            firmware(r#"{"name": "os", "xlen": "64", "bios": "fw.bin", "program": "AA=="}"#),
+            firmware(r#"{"name": "os", "bios": "fw.bin", "program": "AA=="}"#),
             (Bios::File("fw.bin".into()), 4)
         );
         assert_eq!(
-            firmware(r#"{"name": "os", "xlen": "64", "bios": " default ", "program": "AA=="}"#),
+            firmware(r#"{"name": "os", "bios": " default ", "program": "AA=="}"#),
             (Bios::Default, 4)
         );
 
         for (text, why) in [
-            (
-                r#"{"name": "a", "camelot": true, "xlen": "128"}"#,
-                "xlen: '128' is not a register width (32 or 64)",
-            ),
-            (r#"{"name": "a", "camelot": true, "xlen": 64}"#, "xlen: not a string"),
+            // There is no width to choose.
+            (r#"{"name": "a", "camelot": true, "xlen": "64"}"#, "unknown field 'xlen'"),
             (
                 r#"{"name": "a", "camelot": true, "paging": "sv57"}"#,
                 "paging: 'sv57' is not a paging mode (sv39 or sv48)",
@@ -1629,7 +1603,6 @@ mod tests {
             state: VmState::Exited(2),
             profile: HardwareProfile {
                 clock_hz: Some(1_500_000),
-                xlen: Xlen::Rv64,
                 paging: avalon_proto::Paging::Sv39,
                 devices: vec![
                     DeviceSpec::Net(parse_net("-,mac=02:00:00:00:00:01").unwrap()),
@@ -1644,7 +1617,7 @@ mod tests {
         };
         assert_eq!(
             vm_json(&vm).encode(),
-            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"xlen":64,"paging":"sv39","arch":"RV64","arch_text":"RV64 (Sv39 paging)","bios":"none","ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","harts":1,"disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"nets":[{"card":0,"mac":"02:00:00:00:00:01","switch":null},{"card":1,"mac":"02:00:00:00:00:02","switch":"wan"}],"actions":["destroy"]}"#
+            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"paging":"sv39","arch_text":"RV64 (Sv39 paging)","bios":"none","ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","harts":1,"disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"nets":[{"card":0,"mac":"02:00:00:00:00:01","switch":null},{"card":1,"mac":"02:00:00:00:00:02","switch":"wan"}],"actions":["destroy"]}"#
         );
     }
 

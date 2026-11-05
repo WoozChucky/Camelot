@@ -11,9 +11,7 @@
 use avalon_proto::{
     DeviceEntry, DeviceSpec, DiskSpec, HardwareProfile, KeyEvent, Message, NetSpec, PIXEL_FORMAT_XRGB8888,
 };
-use grail::config::{
-    DiskSource, NetSource, DEFAULT_NOMINAL_HZ, MAX_HARTS, MAX_RAM_SIZE, MAX_RAM_SIZE_RV32, MIB,
-};
+use grail::config::{DiskSource, NetSource, DEFAULT_NOMINAL_HZ, MAX_HARTS, MAX_RAM_SIZE, MIB};
 use grail::net::{Hub, MacAddr};
 use grail::{DiskConfig, MachineConfig, NetConfig};
 
@@ -67,7 +65,6 @@ fn profile_from(config: &MachineConfig, switches: Switches) -> Result<HardwarePr
         harts,
         disks,
         nets,
-        xlen,
         paging,
         bios,
     } = config.clone();
@@ -80,19 +77,10 @@ fn profile_from(config: &MachineConfig, switches: Switches) -> Result<HardwarePr
         clock_hz,
         nominal_hz,
         harts: harts as u32,
-        xlen: xlen_from(xlen),
         paging: paging_from(paging),
         bios: bios_from(&bios)?,
         devices,
     })
-}
-
-/// Grail's width as the protocol's, every one of them (the match has no `_`).
-fn xlen_from(xlen: grail::Xlen) -> avalon_proto::Xlen {
-    match xlen {
-        grail::Xlen::Rv32 => avalon_proto::Xlen::Rv32,
-        grail::Xlen::Rv64 => avalon_proto::Xlen::Rv64,
-    }
 }
 
 /// Grail's paging modes as the protocol's, every one of them.
@@ -122,14 +110,6 @@ fn bios_to(bios: &avalon_proto::Bios) -> grail::Bios {
         avalon_proto::Bios::None => grail::Bios::None,
         avalon_proto::Bios::Default => grail::Bios::Default,
         avalon_proto::Bios::File(path) => grail::Bios::File(path.into()),
-    }
-}
-
-/// The protocol's width as Grail's.
-fn xlen_to(xlen: avalon_proto::Xlen) -> grail::Xlen {
-    match xlen {
-        avalon_proto::Xlen::Rv32 => grail::Xlen::Rv32,
-        avalon_proto::Xlen::Rv64 => grail::Xlen::Rv64,
     }
 }
 
@@ -179,7 +159,6 @@ fn config_from(profile: &HardwareProfile, switches: Switches) -> Result<MachineC
         harts: usize::try_from(profile.harts).map_err(|_| "too many harts".to_string())?,
         disks,
         nets,
-        xlen: xlen_to(profile.xlen),
         paging: paging_to(profile.paging),
         bios: bios_to(&profile.bios),
     };
@@ -218,15 +197,7 @@ fn defaults_match_grail() {
         HardwareProfile::with_ram(4096),
         profile_from(&MachineConfig::with_ram(4096), &[]).unwrap()
     );
-    // The wire's width is Grail's in bits.
-    for xlen in [grail::Xlen::Rv32, grail::Xlen::Rv64] {
-        assert_eq!(u32::from(xlen_from(xlen).bits()), xlen.bits());
-        assert_eq!(
-            avalon_proto::Xlen::from_bits(xlen_from(xlen).bits()),
-            Some(xlen_from(xlen))
-        );
-    }
-    // And its paging modes the widest one's `satp.MODE` (Sv48 9, Sv39 8).
+    // The wire's paging modes the widest one's `satp.MODE` (Sv48 9, Sv39 8).
     for (paging, mode) in [(grail::Paging::Sv48, 9), (grail::Paging::Sv39, 8)] {
         assert_eq!(paging_from(paging).satp_mode(), mode);
         assert_eq!(
@@ -243,30 +214,19 @@ fn configs_survive_the_wire() {
     let configs = [
         MachineConfig::default(),
         MachineConfig::with_ram(MIB),
-        MachineConfig::with_ram(MAX_RAM_SIZE_RV32),
-        // Each width with the most RAM it takes, and each paging mode.
+        // The most RAM it takes, and each paging mode.
+        MachineConfig::with_ram(MAX_RAM_SIZE),
         MachineConfig {
-            xlen: grail::Xlen::Rv64,
-            ..MachineConfig::with_ram(MAX_RAM_SIZE)
-        },
-        MachineConfig {
-            xlen: grail::Xlen::Rv64,
             paging: grail::Paging::Sv39,
             harts: 2,
-            disks: vec![DiskConfig::lake("127.0.0.1:7401", "os-base-rv64")],
+            disks: vec![DiskConfig::lake("127.0.0.1:7401", "os-base")],
             bios: grail::Bios::Default,
             ..MachineConfig::with_ram(64 * MIB)
         },
         // Each firmware.
         MachineConfig {
-            xlen: grail::Xlen::Rv64,
             bios: grail::Bios::File("firmware/fw_jump.bin".into()),
             ..MachineConfig::with_ram(16 * MIB)
-        },
-        // An RV32 machine keeps the paging it is given, though its harts have Sv32.
-        MachineConfig {
-            paging: grail::Paging::Sv39,
-            ..MachineConfig::with_ram(MIB)
         },
         MachineConfig {
             ram_size: 64 * MIB,
@@ -275,7 +235,6 @@ fn configs_survive_the_wire() {
             harts: 2,
             disks: Vec::new(),
             nets: Vec::new(),
-            xlen: grail::Xlen::Rv32,
             paging: grail::Paging::Sv48,
             bios: grail::Bios::None,
         },
@@ -286,7 +245,6 @@ fn configs_survive_the_wire() {
             harts: MAX_HARTS,
             disks: Vec::new(),
             nets: Vec::new(),
-            xlen: grail::Xlen::Rv32,
             paging: grail::Paging::Sv48,
             bios: grail::Bios::None,
         },
@@ -344,12 +302,7 @@ fn invalid_profiles_decode_and_are_left_to_the_server() {
     for bad in [
         HardwareProfile::with_ram(0),
         HardwareProfile::with_ram(4095),
-        HardwareProfile::with_ram(MAX_RAM_SIZE_RV32 as u64 + 4096),
         HardwareProfile::with_ram(MAX_RAM_SIZE as u64 + 4096),
-        HardwareProfile {
-            xlen: avalon_proto::Xlen::Rv64,
-            ..HardwareProfile::with_ram(MAX_RAM_SIZE as u64 + 4096)
-        },
         HardwareProfile::with_ram(u64::MAX),
         HardwareProfile {
             clock_hz: Some(0),
@@ -403,19 +356,27 @@ fn device_table_mirrors_sysinfo() {
         .collect();
     // What a running guest reads from its own sysinfo block.
     let mut machine = grail::Machine::new(config).unwrap();
-    let read = |m: &mut grail::Machine, off: u32| {
+    let read = |m: &mut grail::Machine, off: u32, len: u32| {
         m.cpu
             .bus
-            .read(grail::bus::SYSINFO_BASE + u64::from(off), 4)
+            .read(grail::bus::SYSINFO_BASE + u64::from(off), len)
             .unwrap()
     };
-    let count = read(&mut machine, grail::sysinfo::REG_DEV_COUNT);
+    let count = read(&mut machine, grail::sysinfo::REG_DEV_COUNT, 4);
     assert_eq!(count as usize, table.len());
+    // Each entry: its type and PLIC source (4 bytes each), then its base and
+    // size (8 bytes each).
+    use grail::sysinfo::{DEV_BASE, DEV_IRQ, DEV_SIZE, DEV_TYPE};
     for (i, entry) in table.iter().enumerate() {
         let at = grail::sysinfo::DEV_TABLE + i as u32 * grail::sysinfo::DEV_ENTRY_SIZE;
-        let words: Vec<u64> = (0..4).map(|w| read(&mut machine, at + 4 * w)).collect();
+        let fields = [
+            read(&mut machine, at + DEV_TYPE, 4),
+            read(&mut machine, at + DEV_BASE, 8),
+            read(&mut machine, at + DEV_SIZE, 8),
+            read(&mut machine, at + DEV_IRQ, 4),
+        ];
         assert_eq!(
-            words,
+            fields,
             [entry.kind, entry.base, entry.size, entry.irq].map(u64::from)
         );
     }

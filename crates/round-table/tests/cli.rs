@@ -56,62 +56,57 @@ fn usage() {
 
 #[test]
 fn against_avalon() {
-    on_both_widths(|| {
-        let arch = arch();
-        let server = avalon(256);
-        let addr = server.addr().to_string();
-        let echo = example_str("uart-echo");
+    let server = avalon(256);
+    let addr = server.addr().to_string();
+    let echo = example_str("uart-echo");
 
-        let out = round_table(&["--server", &addr, "create", "--name", "cli", "--ram", "16", &echo]);
-        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-        assert_eq!(stdout(&out), "created VM 1 (cli)\n");
-        assert!(out.stderr.is_empty());
+    let out = round_table(&["--server", &addr, "create", "--name", "cli", "--ram", "16", &echo]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "created VM 1 (cli)\n");
+    assert!(out.stderr.is_empty());
 
-        let out = round_table(&["list", "--server", &addr]);
-        assert_eq!(
-            stdout(&out),
-            format!(
-                "\
-ID  NAME  STATE    ARCH  RAM     CLOCK       DISKS  NETS
-1   cli   created  {arch}  16 MiB  full speed  0      0
+    let out = round_table(&["list", "--server", &addr]);
+    assert_eq!(
+        stdout(&out),
+        "\
+ID  NAME  STATE    RAM     CLOCK       DISKS  NETS
+1   cli   created  16 MiB  full speed  0      0
 "
-            )
-        );
-        let out = round_table(&["--server", &addr, "start", "cli"]);
-        assert_eq!(
-            (out.status.code(), stdout(&out)),
-            (Some(0), "started VM cli\n".into())
-        );
+    );
+    let out = round_table(&["--server", &addr, "start", "cli"]);
+    assert_eq!(
+        (out.status.code(), stdout(&out)),
+        (Some(0), "started VM cli\n".into())
+    );
 
-        // A refusal: exit status 1, the server's reason on stderr.
-        let out = round_table(&["--server", &addr, "start", "cli"]);
-        assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
-        let err = stderr(&out);
-        assert!(err.starts_with("round-table: invalid state: "), "{err}");
-        assert_eq!(err.lines().count(), 1, "{err}");
+    // A refusal: exit status 1, the server's reason on stderr.
+    let out = round_table(&["--server", &addr, "start", "cli"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let err = stderr(&out);
+    assert!(err.starts_with("round-table: invalid state: "), "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
 
-        let out = round_table(&["--server", &addr, "info", "nope"]);
-        assert_eq!(out.status.code(), Some(1));
-        assert_eq!(stderr(&out), "round-table: no such VM: no VM named 'nope'\n");
+    let out = round_table(&["--server", &addr, "info", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stderr(&out), "round-table: no such VM: no VM named 'nope'\n");
 
-        let out = round_table(&["--server", &addr, "destroy", "1"]);
-        assert_eq!(
-            (out.status.code(), stdout(&out)),
-            (Some(0), "destroyed VM 1\n".into())
-        );
-        server.stop().unwrap();
+    let out = round_table(&["--server", &addr, "destroy", "1"]);
+    assert_eq!(
+        (out.status.code(), stdout(&out)),
+        (Some(0), "destroyed VM 1\n".into())
+    );
+    server.stop().unwrap();
 
-        // No server: exit status 1.
-        let dead = dead_addr().to_string();
-        let out = round_table(&["--server", &dead, "list"]);
-        assert_eq!(out.status.code(), Some(1));
-        assert!(
-            stderr(&out).starts_with(&format!("round-table: cannot connect to Avalon at {dead}: ")),
-            "{}",
-            stderr(&out)
-        );
-    });
+    // No server: exit status 1.
+    let dead = dead_addr().to_string();
+    let out = round_table(&["--server", &dead, "list"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).starts_with(&format!("round-table: cannot connect to Avalon at {dead}: ")),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]

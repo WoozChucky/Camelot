@@ -92,7 +92,6 @@ fn field_layouts_match_the_protocol_doc() {
             clock_hz: Some(5),
             nominal_hz: 7,
             harts: 2,
-            xlen: Xlen::Rv64,
             paging: Paging::Sv39,
             bios: Bios::Default,
             devices: vec![DeviceSpec::Disk(DiskSpec {
