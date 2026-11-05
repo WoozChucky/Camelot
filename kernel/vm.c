@@ -26,11 +26,11 @@
 #include "vm.h"
 #include "kalloc.h"
 #include "kprintf.h"
-#include "machine.h"
 #include "memlayout.h"
 #include "mmio.h"
 #include "proc.h"
 #include "riscv.h"
+#include "sbi.h"
 #include "smp.h"
 #include "spinlock.h"
 #include "string.h"
@@ -681,7 +681,7 @@ static void early_panic(const char *msg) {
         uart_putc_phys(*msg);
     }
     uart_putc_phys('\n');
-    machine_halt(PANIC_EXIT_CODE);
+    machine_power_off(PANIC_EXIT_CODE);
 }
 
 static pagetable_t early_table(void) {

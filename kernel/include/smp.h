@@ -3,9 +3,9 @@
  * shootdown.
  *
  * Hart 0 boots the kernel alone; once its self-tests are done, smp_boot()
- * wakes every other hart Grail has (SYS_HARTS), each on a stack page of its
- * own, and they all run the scheduler, taking processes from the one shared
- * table (proc.c). Device interrupts stay with hart 0 (plic.c); each hart has
+ * starts every other hart Grail has (SYS_HARTS) through the SBI, each on a
+ * kernel stack of its own, and they all run the scheduler, taking processes
+ * from the one shared table (proc.c). Device interrupts stay with hart 0 (plic.c); each hart has
  * its own timer tick, which ends the time slice of the process it runs. */
 #ifndef CAMELOT_SMP_H
 #define CAMELOT_SMP_H
@@ -14,27 +14,22 @@
 #include "types.h"
 #include "vm.h"
 
-/* The stacks of every hart but hart 0 (which has the boot stack), set by
- * smp_boot() before it wakes the hart. hart_boot_sp[i]: the physical address
- * of the top of a page, which _start (entry.S) loads into sp for start() in
- * M-mode, which does not translate, and the jump to the high half. hart_sp[i]:
- * the top of the hart's kernel stack, which supervisor_entry loads once the
- * hart runs at its link addresses, and its scheduler runs on (on RV64 a
- * stack from kstack_alloc(), on RV32 the same page). On RV64 hart_main()
- * frees the boot page once the hart is on its kernel stack, and sets
- * hart_boot_sp[i] to 0. */
-extern uintptr hart_boot_sp[NCPU];
-extern uintptr hart_sp[NCPU];
-
-/* Hart 0, after the boot self-tests: wakes the other harts, waits until
- * every one of them runs the kernel, checks that each answers a TLB
- * shootdown, and prints `smp: N harts running`. Nothing at all on a
- * one-hart machine. Returns the number of failed checks. */
+/* Hart 0, after the boot self-tests: starts the other harts (the SBI's
+ * hart_start, at secondary_entry), waits up to a second for them to run the
+ * kernel, reports any that the SBI can't start (`smp: hart N failed to
+ * start (SBI_ERR_...)`) or that don't come up (`smp: hart N failed to come
+ * online`), checks that each one up answers a TLB shootdown, and prints
+ * `smp: N harts running`. Nothing at all on a one-hart machine. Returns the
+ * number of failed checks. */
 int smp_boot(void);
 
-/* Every other hart, from supervisor_entry (entry.s) in S-mode: sets up its
- * struct cpu, paging and interrupts, says it is up, and runs the scheduler
- * for good. */
+/* Where the SBI starts every other hart (entry.S), in S-mode with paging
+ * off: a0 = its id, a1 = the top of its kernel stack. Turns paging on and
+ * calls hart_main(). */
+void secondary_entry(void);
+
+/* Every other hart, from secondary_entry: sets up its struct cpu, paging,
+ * interrupts and tick, says it is up, and runs the scheduler for good. */
 void hart_main(void);
 
 /* The harts running the kernel, bit i for hart i: hart 0 from smp_boot()

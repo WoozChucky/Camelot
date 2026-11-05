@@ -1,19 +1,20 @@
 /* The kernel on several harts (spec section 10, "Kernel SMP"; smp.h).
  *
- * Booting. Grail starts hart 0 at the program's entry point and parks the
- * others in the boot ROM until an IPI (spec section 7, "Boot"). Hart 0 boots
- * the kernel alone, self-tests and all; then smp_boot() gives every other
- * hart its stacks (hart_boot_sp[] and hart_sp[], which entry.S reads) and wakes them all
- * with one MCALL_IPI. Each comes through _start and start() as hart 0 did
- * (its own M-mode trap vector, scratch block and timer), skips clearing
- * .bss, and in S-mode runs hart_main(): its struct cpu, the kernel page
- * table, its interrupts, then the scheduler, never to return.
+ * Booting. Hart 0 boots the kernel alone, self-tests and all, while the
+ * SBI holds every other hart STOPPED (machine.S, or OpenSBI on a board).
+ * Then smp_boot() starts each of them with the SBI's hart_start, as Linux's
+ * cpu_ops_sbi.c does: at secondary_entry (entry.S), in S-mode with paging
+ * off, with its id in a0 and the top of a kernel stack of its own in a1.
+ * There it turns paging on and runs hart_main(): its struct cpu, the kernel
+ * page table, its interrupts and its tick, then the scheduler, never to
+ * return. A hart the SBI can't start, or that doesn't come up within a
+ * second, is reported and left out; the kernel runs on the others.
  *
- * IPIs. S-mode can't write the CLINT, so a hart interrupts others with a
- * machine call, MCALL_IPI, which sets their msip; machine_vec on each of
- * them clears it and raises the supervisor software interrupt, the same
- * SSIP that a timer tick raises (machine.s). What the sender wants is in
- * memory, here: the only thing a hart asks of another is a TLB flush.
+ * IPIs. A hart interrupts others with the SBI's send_ipi, which raises the
+ * supervisor software interrupt on each of them (on Grail through their
+ * msip, machine.S). What the sender wants is in memory: a TLB flush here,
+ * or a look for a runnable thread (kick_idle(), proc.c). The SBI orders
+ * the sender's stores before the interrupt (#170).
  *
  * TLB shootdown. A hart may cache translations from the page table in its
  * satp. After a mapping is taken away (unmap_pages), the page may be reused
@@ -43,15 +44,13 @@
 #include "smp.h"
 #include "kalloc.h"
 #include "kprintf.h"
-#include "machine.h"
 #include "memlayout.h"
 #include "proc.h"
 #include "riscv.h"
+#include "sbi.h"
 #include "sysinfo.h"
+#include "timer.h"
 #include "trap.h"
-
-uintptr hart_boot_sp[NCPU];
-uintptr hart_sp[NCPU];
 
 /* The harts running the kernel, a bit each. Bits are only ever added
  * (atomic_or), so it is read without a lock. */
@@ -117,7 +116,7 @@ void tlb_shootdown(pagetable_t pt) {
     if (targets == 0) {
         return;
     }
-    machine_ipi(targets);
+    sbi_send_ipi(targets, 0);
     for (u32 i = 0; i < NCPU; i++) {
         if ((targets & (1u << i)) == 0) {
             continue;
@@ -178,39 +177,56 @@ int smp_boot(void) {
     if (n <= 1) {
         return 0;
     }
-    u32 wake = 0;
-    u32 count = 1;
+    /* Where they start, at its physical address: paging is off there. */
+    phys_addr_t entry = pa(secondary_entry);
+    u32 started = 0;
     for (u32 i = 1; i < n; i++) {
-        /* A page for start() in M-mode and for the jump to the high half,
-         * at its physical address (on RV64 hart_main() frees it); on RV64
-         * then the hart's own kernel stack (with its guard page, vm.h),
-         * which its scheduler runs on. */
-        u8 *boot = kalloc();
+        /* The hart's kernel stack, which its scheduler runs on: on RV64 one
+         * from the vmalloc area, with its guard page (vm.h); on RV32 a
+         * page. */
 #if __riscv_xlen == 64
-        u8 *stack = boot != NULL ? kstack_alloc() : NULL;
-        if (stack == NULL && boot != NULL) {
-            kfree(boot);
-            boot = NULL;
-        }
+        u8 *stack = kstack_alloc();
+        usize size = KSTACK_SIZE;
+#else
+        u8 *stack = kalloc();
+        usize size = PGSIZE;
 #endif
-        if (boot == NULL) {
+        if (stack == NULL) {
             kprintf("smp: no memory for hart %u's stack\n", i);
             break;
         }
-        hart_boot_sp[i] = pa(boot) + PGSIZE;
+        long err = sbi_hart_start(i, entry, (uintptr)stack + size);
+        if (err != SBI_SUCCESS) {
+            kprintf("smp: hart %u failed to start (%s)\n", i, sbi_strerror(err));
 #if __riscv_xlen == 64
-        hart_sp[i] = (uintptr)stack + KSTACK_SIZE;
+            kstack_free(stack);
 #else
-        hart_sp[i] = hart_boot_sp[i];
+            kfree(stack);
 #endif
-        wake |= 1u << i;
-        count++;
+            continue;
+        }
+        started |= 1u << i;
     }
-    /* They come out of the boot ROM's park loop into _start. */
-    machine_ipi(wake);
-    while ((harts_up & wake) != wake) {
+    /* Each says so in hart_main(). One that doesn't within a second may
+     * have crashed, or never got going: it is left out, as Linux leaves out
+     * a CPU that "failed to come online". Its stack stays where it is, as
+     * the hart may still be using it. */
+    u64 deadline = r_time() + timebase_hz();
+    while ((harts_up & started) != started && r_time() < deadline) {
     }
-    int failed = tlb_selftest(wake);
+    u32 up = harts_up & started;
+    for (u32 i = 1; i < n; i++) {
+        if ((started & (1u << i)) != 0 && (up & (1u << i)) == 0) {
+            kprintf("smp: hart %u failed to come online\n", i);
+        }
+    }
+    int failed = tlb_selftest(up);
+    u32 count = 1;
+    for (u32 i = 1; i < n; i++) {
+        if ((up & (1u << i)) != 0) {
+            count++;
+        }
+    }
     kprintf("smp: %u harts running\n", count);
     return failed;
 }
@@ -219,17 +235,10 @@ void hart_main(void) {
     /* This hart's struct cpu, which every lock uses: first of all. */
     cpu_init();
     kvminithart();
-#if __riscv_xlen == 64
-    /* The page start() and the jump to the high half ran on (smp_boot()):
-     * this hart runs on its own kernel stack now, and M-mode needs no stack
-     * (machine_vec), so it goes back to the allocator. (On RV32 it is the
-     * hart's stack for good.) */
-    kfree(va(hart_boot_sp[cpuid()] - PGSIZE));
-    hart_boot_sp[cpuid()] = 0;
-#endif
-    /* Timer ticks and IPIs, both a supervisor software interrupt. The
-     * devices' interrupts stay with hart 0 (plic.c), so not SEIE. */
-    w_sie(r_sie() | SIE_SSIE);
+    /* Its tick and IPIs. The devices' interrupts stay with hart 0 (plic.c),
+     * so not SEIE. */
+    w_sie(r_sie() | SIE_STIE | SIE_SSIE);
+    timer_start();
     atomic_or(&harts_up, 1u << cpuid());
     /* Interrupts come on in the scheduler loop. */
     scheduler();

@@ -19,6 +19,7 @@
 #include "mmio.h"
 #include "proc.h"
 #include "riscv.h"
+#include "sbi.h"
 #include "smp.h"
 #include "spinlock.h"
 #include "string.h"
@@ -352,6 +353,9 @@ int kmain(void) {
     for (u32 i = 0; i < sizeof banner / sizeof banner[0]; i++)
         kprintf("%s", banner[i]);
     kprintf("Camelot v%s booting...\n", CAMELOT_VERSION);
+    /* What the SBI under the kernel has, before anything needs it: the
+     * timer, IPIs, starting harts and stopping the machine. */
+    sbi_init();
 
     kprintf("kprintf: d=%d u=%u x=%x p=%p s=%s c=%c %%=%%\n", -42, 4294967295u, 0xcafef00du,
             (void *)0x80000000u, "excalibur", 'K');
