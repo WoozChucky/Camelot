@@ -1501,9 +1501,9 @@ fn fault_with_interrupts_off_panics() {
     assert_eq!((v["scause"], v["sepc"], v["stval"]), (2, kmain, 0));
     assert_eq!(v["sstatus"] & MSTATUS_SPIE as u32, 0);
     // ra is where kmain would have returned to: supervisor_entry's
-    // instruction after the call (after `mv tp, a0`, `la t0, kernel_vec`
-    // and `csrw stvec, t0`, and the call's two instructions).
-    assert_eq!(v["ra"], sym(&elf, "supervisor_entry") + 24);
+    // instruction after the call (after `mv tp, a0`, `li s0, 0`, `la t0,
+    // kernel_vec` and `csrw stvec, t0`, and the call's two instructions).
+    assert_eq!(v["ra"], sym(&elf, "supervisor_entry") + 28);
 }
 
 // ---- The console and the shell ----
