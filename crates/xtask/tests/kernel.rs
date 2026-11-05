@@ -3452,7 +3452,7 @@ fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     // sbrk maps the new pages one at a time: when memory runs out partway,
     // it must unmap and free the ones it had mapped and leave the heap as it
     // was. 3 MB fits in user space, and a 16 MiB machine has the pages (the
-    // default 4 MiB, with the kernel's 1.4 MB, has not)...
+    // default 4 MiB, with the kernel's 2.2 MB, has not)...
     const LINE: &str = "systest sbrk 3000000";
     let config = MachineConfig {
         ram_size: 16 << 20,
@@ -3461,8 +3461,8 @@ fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     let out = run_processes_on(config, format!("{LINE}\nexit\n").as_bytes());
     assert_eq!(command_output(&out, LINE), ["systest: sbrk 3000000: 0"]);
 
-    // ...but a 3 MiB one runs out of them after mapping some (2 MiB, most of it
-    // the kernel with its embedded programs, leaves systest too few to start in).
+    // ...but a 3 MiB one runs out of them after mapping some (the kernel with
+    // its embedded programs, a little over 2 MiB, leaves systest too few).
     let config = MachineConfig {
         ram_size: 3 << 20,
         ..MachineConfig::default()
