@@ -38,7 +38,6 @@ const INPUT: &[u8] = b"cat /README /README /README | cat\nexit\n";
 struct Setup {
     /// For the runs' caches.
     index: usize,
-    xlen: Xlen,
     paging: Paging,
     kernel: &'static str,
     /// The top of satp: Sv32's bit 31 (MODE 1), or MODE 9 (Sv48) or 8 (Sv39) in
@@ -47,24 +46,21 @@ struct Setup {
 }
 
 const SV32: Setup = Setup {
-    index: 0,
-    xlen: Xlen::Rv32,
+    index: 0::Rv32,
     paging: Paging::Sv48,
     kernel: "kernel/kernel-disk.elf",
     mode: 1 << 31,
 };
 
 const SV48: Setup = Setup {
-    index: 1,
-    xlen: Xlen::Rv64,
+    index: 1::Rv64,
     paging: Paging::Sv48,
     kernel: "kernel/kernel-disk-rv64.elf",
     mode: 9 << 60,
 };
 
 const SV39: Setup = Setup {
-    index: 2,
-    xlen: Xlen::Rv64,
+    index: 2::Rv64,
     paging: Paging::Sv39,
     kernel: "kernel/kernel-disk-rv64.elf",
     mode: 8 << 60,
@@ -81,7 +77,7 @@ fn image(s: Setup) -> &'static [u8] {
         Xlen::Rv64 => {
             let kernel = std::fs::read(path(s.kernel)).unwrap();
             let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
-            let mut image = xtask::fs::build_for(&root, &opts, Xlen::Rv64).unwrap();
+            let mut image = xtask::fs::build_for(&root, &opts).unwrap();
             let boot = xtask::boot::bootloader_rv64(&root).unwrap();
             camelot_fs::boot::install(&mut image, &boot, &kernel).unwrap();
             image
@@ -94,7 +90,7 @@ fn image(s: Setup) -> &'static [u8] {
 fn cat(s: Setup) -> &'static xtask::userprogs::Program {
     static CATS: [OnceLock<xtask::userprogs::Program>; 2] = [OnceLock::new(), OnceLock::new()];
     CATS[s.xlen as usize]
-        .get_or_init(|| xtask::userprogs::build_named_for(&path("kernel/user"), "cat", s.xlen).unwrap())
+        .get_or_init(|| xtask::userprogs::build_named_for(&path("kernel/user"), "cat").unwrap())
 }
 
 #[derive(Clone, Default)]
@@ -125,7 +121,6 @@ fn machine(s: Setup) -> (Machine, Console) {
         Xlen::Rv64 => (grail::Bios::Default, 6 << 20),
     };
     let config = MachineConfig {
-        xlen: s.xlen,
         paging: s.paging,
         bios,
         ram_size,
@@ -546,7 +541,7 @@ fn cat_pipeline(s: Setup) {
 fn a_location_in_two_programs_is_a_breakpoint_in_each() {
     let s = SV32;
     let cat_elf = cat_file(s);
-    let sh = xtask::userprogs::build_named_for(&path("kernel/user"), "sh", s.xlen).unwrap();
+    let sh = xtask::userprogs::build_named_for(&path("kernel/user"), "sh").unwrap();
     let sh_elf = elf_file("sh", &sh.debug);
     let commands = format!(
         "add-symbol-file {} program cat\n\

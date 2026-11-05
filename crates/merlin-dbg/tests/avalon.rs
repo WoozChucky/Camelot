@@ -137,7 +137,7 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
         ("kernel/kernel.elf", Xlen::Rv32),
         ("kernel/kernel-rv64.elf", Xlen::Rv64),
     ] {
-        let run = std::panic::catch_unwind(|| debug_a_vm(kernel, xlen));
+        let run = std::panic::catch_unwind(|| debug_a_vm(kernel));
         if let Err(payload) = run {
             let message = payload
                 .downcast_ref::<String>()
@@ -150,7 +150,7 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
 }
 
 /// The test on a VM of width `xlen` running `kernel`.
-fn debug_a_vm(kernel: &str, xlen: Xlen) {
+fn debug_a_vm(kernel: &str) {
     let server = server();
     let mut control = connect(&server);
     let id = match control.request(&Message::CreateVm {
@@ -159,11 +159,9 @@ fn debug_a_vm(kernel: &str, xlen: Xlen) {
         // and its 2.1 MiB image from 0x8020_0000 take 8 MiB.
         profile: match xlen {
             Xlen::Rv32 => HardwareProfile {
-                xlen,
                 ..HardwareProfile::with_ram(4 * 1024 * 1024)
             },
             _ => HardwareProfile {
-                xlen,
                 bios: avalon_proto::Bios::Default,
                 ..HardwareProfile::with_ram(8 * 1024 * 1024)
             },

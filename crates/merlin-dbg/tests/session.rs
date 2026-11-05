@@ -77,7 +77,6 @@ fn machine(elf: &str, harts: usize, input: &[u8]) -> (Machine, Console) {
 fn config_for(elf: &str) -> MachineConfig {
     if elf == "kernel/kernel-rv64.elf" {
         MachineConfig {
-            xlen: grail::Xlen::Rv64,
             bios: grail::Bios::Default,
             ram_size: 8 << 20,
             ..MachineConfig::default()
@@ -960,7 +959,6 @@ fn rv64_program(test: &str) -> TempFile {
 /// file named for `test`, removed with the guard.
 fn program(dir: &str, file: &str, xlen: excalibur::Xlen, test: &str) -> TempFile {
     let opts = merlin::Options {
-        xlen,
         debug: Some(merlin::DebugInfo { comp_dir: dir.into() }),
         ..merlin::Options::default()
     };
@@ -1398,7 +1396,7 @@ fn variables_and_types() {
         "down",
     ];
     for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
-        let elf = program(VARS_DIR, "vars.c", xlen, &format!("vars-{}", xlen.bits()));
+        let elf = program(VARS_DIR, "vars.c", &format!("vars-{}", xlen.bits()));
         let [nodes, counter, walk] = addresses(&elf, ["nodes", "counter", "walk"]);
         let ptr = u64::from(xlen.bits() / 8);
         let node = |i: u64| match i {
@@ -1849,8 +1847,8 @@ fn merlin_dbg_reads_clangs_variables_as_merlins() {
             .collect()
     };
     for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
-        let merlin = program(VARS_DIR, "vars.c", xlen, &format!("dbg-vars-{}", xlen.bits()));
-        let clang = clang_program(xlen, "dbg");
+        let merlin = program(VARS_DIR, "vars.c", &format!("dbg-vars-{}", xlen.bits()));
+        let clang = clang_program("dbg");
         let ours = shown(&merlin);
         assert!(
             ours.iter().any(|l| l == "$1 = {value = 30, next = ADDR}"),
@@ -1874,8 +1872,8 @@ fn merlin_dbg_reads_clangs_variables_as_merlins() {
 #[ignore]
 fn lldb_reads_merlins_variables_as_clangs() {
     for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
-        let merlin = program(VARS_DIR, "vars.c", xlen, &format!("lldb-vars-{}", xlen.bits()));
-        let clang = clang_program(xlen, "lldb");
+        let merlin = program(VARS_DIR, "vars.c", &format!("lldb-vars-{}", xlen.bits()));
+        let clang = clang_program("lldb");
         let ours = lldb_variables(&merlin);
         let theirs = lldb_variables(&clang);
         assert!(
