@@ -210,14 +210,14 @@ impl Vm {
     /// free ones (`nfree`, kernel/kalloc.c), a kernel stack being a page of
     /// free RAM; on RV64 those and the pages of every mapped kernel stack,
     /// and the stacks in use.
-    pub fn pages(&self) -> kstacks::Pages {
+    pub fn pages(&mut self) -> kstacks::Pages {
         if xlen() == Xlen::Rv32 {
             return kstacks::Pages {
                 total: self.read_var("nfree").into(),
                 stacks_in_use: 0,
             };
         }
-        kstacks::pages(&self.m, &kernel_elf())
+        kstacks::pages(&mut self.m, &kernel_elf())
     }
 }
 
