@@ -562,6 +562,19 @@ impl Type {
         }
     }
 
+    /// Whether `self` and `other` are the same type but for their
+    /// qualifiers, at any level of their pointers and arrays (`int **` and
+    /// `const int *const *`): C's similar types, as clang's
+    /// `hasCvrSimilarType` compares them. A cast between two such pointer
+    /// types changes nothing (clang's `CK_NoOp`).
+    pub fn similar(&self, other: &Type) -> bool {
+        match (self.unqual(), other.unqual()) {
+            (Type::Ptr(a), Type::Ptr(b)) => a.similar(b),
+            (Type::Array(a, n), Type::Array(b, m)) => n == m && a.similar(b),
+            (a, b) => a == b,
+        }
+    }
+
     /// The qualifiers of an object of this type: its own, or for an array
     /// its elements' (an array of `const int` is itself const).
     pub fn quals(&self) -> Quals {

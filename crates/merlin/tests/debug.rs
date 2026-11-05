@@ -838,6 +838,23 @@ fn initializer_casts_are_kept_as_clang_keeps_them() {
          }\n",
     );
     assert_eq!(named(&src, elf::dies::dw::TAG_TYPEDEF), ["R", "S", "T", "U", "V"]);
+    // A cast between pointers to similar types (the same but for
+    // qualifiers, at any level) changes nothing (`CK_NoOp`), so the emitter
+    // goes into it; one between other pointers (`CK_BitCast`) it does not.
+    let src = "int x[4];\ntypedef char *P1;\ntypedef int *P2;\ntypedef const char *P3;\n\
+               typedef int **P4;\ntypedef int **P5;\ntypedef int (*P6)[2];\ntypedef int *P7;\n\
+               const char *v1 = (const char *)(P1)&x;\n\
+               volatile int *v2 = (volatile int *)(P2)&x;\n\
+               char *v3 = (char *)(P3)&x;\n\
+               const int **v4 = (const int **)(P4)&x;\n\
+               int *const *v5 = (int *const *)(P5)&x;\n\
+               const int (*v6)[2] = (const int (*)[2])(P6)&x;\n\
+               const unsigned *v7 = (const unsigned *)(P7)&x;\n\
+               int main(void) { return 0; }\n";
+    assert_eq!(
+        named(src, elf::dies::dw::TAG_TYPEDEF),
+        ["P1", "P2", "P3", "P4", "P5", "P6"]
+    );
 }
 
 /// clang describes the enum of an enumeration constant its code uses, even

@@ -1204,7 +1204,8 @@ impl<'a> FileGen<'a> {
     /// it visits (`EmitExplicitCastExprType`), and evaluates what that
     /// emitter gives up on. The emitter visits casts, and goes on into a
     /// cast's operand when the cast changes nothing (the same type but for
-    /// its qualifiers: `CK_NoOp`) or converts an integer to another
+    /// its qualifiers, at any level of a pointer: `CK_NoOp`, as in
+    /// `(const char *)(char *)&x`) or converts an integer to another
     /// integer type (`CK_IntegralCast`, not to `_Bool`), and into the
     /// operand of a unary `-`; it gives up on anything else (`+`, `~`, a
     /// binary operator, `?:`, `&`, an address converted to an integer). So
@@ -1221,7 +1222,7 @@ impl<'a> FileGen<'a> {
                 }
                 let (from, to) = (x.ty.unqual(), e.ty.unqual());
                 let integral = from.is_integer() && to.is_integer() && *to != Type::Int(IntKind::Bool);
-                if from == to || integral {
+                if from.similar(to) || integral {
                     self.initializer_casts(x);
                 }
             }
