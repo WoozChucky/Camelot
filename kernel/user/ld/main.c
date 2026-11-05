@@ -254,8 +254,9 @@ int main(int argc, char **argv) {
      * ELF64 as ld.lld reads it (64-bit values whatever the class), so its
      * errors come first; then every file, in command-line order; and only
      * when all of that read, the classes, the script's OUTPUT_FORMAT's if it
-     * names one. layout_build reads the script again for an ELF32 link, for
- * its exact arithmetic and its 4 GiB limits. */
+     * names one. layout_build reads the script again for the class: the
+     * same script for ELF64, and for ELF32 with its exact arithmetic and
+     * its 4 GiB limits. */
     struct script read64;
     uint line;
     char *msg;
