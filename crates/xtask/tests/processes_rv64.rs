@@ -13,8 +13,9 @@
 //!   `sbrk`'s pointers above 4 GiB (`the_calls_take_and_return_64_bit_values`);
 //! - a 32-bit program is refused, with no compat mode
 //!   (`an_elf32_program_is_refused`);
-//! - a program starts as Linux starts one, with 8-byte words
-//!   (`a_program_starts_as_linux_starts_one`).
+//! - a program starts as Linux starts one, with 8-byte words, its
+//!   environment's among them (`a_program_starts_as_linux_starts_one`,
+//!   `the_shell_passes_its_environment_on`).
 
 mod common;
 
@@ -179,6 +180,15 @@ fn a_program_starts_as_linux_starts_one() {
         assert_eq!(m.cpu.pc, 0x1000, "{paging:?}");
         common::start::check(&m, 8, top, &sh.elf, "/bin/sh", &["sh"], common::start::INIT_ENV);
     }
+}
+
+#[test]
+fn the_shell_passes_its_environment_on() {
+    // The environment session of tests/common, as kernel.rs runs it on
+    // RV32: 64-bit programs get their environment from the shell, envp's
+    // pointers 8 bytes each, and the shell keeps its variables.
+    let out = run(Setup::default(), common::environment::INPUT);
+    common::environment::check(&out, command_output);
 }
 
 #[test]

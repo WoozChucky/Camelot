@@ -524,3 +524,68 @@ pub mod start {
         );
     }
 }
+
+/// The shell's environment (issue #216; kernel/user/sh.c, "Variables and
+/// the environment"): a session typed at either width, without a disk, and
+/// what each command must print. `env` (kernel/user/env.c) prints the
+/// environment the shell gave it, after its own changes.
+pub mod environment {
+    use super::PROMPT;
+
+    /// The session, one command a line. The last one replaces the shell,
+    /// the first process, so the machine stops when it ends.
+    pub const INPUT: &[u8] = b"env\n\
+        X=1 env -u TERM\n\
+        export Y=2\n\
+        Z=3\n\
+        env -u HOME\n\
+        HOME=/nope cd\n\
+        export Z\n\
+        export\n\
+        export 1A\n\
+        unset Y\n\
+        Y=4 env -u TERM -u HOME\n\
+        env -i A=1 B=two env\n\
+        env -i\n\
+        FOO=bar exec env -u TERM -u HOME -u Z\n";
+
+    /// Checks the session's output, `out` from the shell's banner on, with
+    /// `output`, the test file's command_output: the lines a command
+    /// printed.
+    pub fn check(out: &str, output: for<'a> fn(&'a str, &str) -> Vec<&'a str>) {
+        // The first process's environment, Linux's for init, which the
+        // shell passes on.
+        assert_eq!(output(out, "env"), ["HOME=/", "TERM=linux"], "{out}");
+        // An assignment before a program is in its environment alone.
+        assert_eq!(output(out, "X=1 env -u TERM"), ["HOME=/", "X=1"], "{out}");
+        // export: in every program's from then on; a plain assignment is
+        // the shell's own.
+        assert_eq!(output(out, "env -u HOME"), ["TERM=linux", "Y=2"], "{out}");
+        // A regular built-in sees the assignment, and leaves HOME as it
+        // was: cd goes to HOME (no disk here, so nowhere).
+        assert_eq!(
+            output(out, "HOME=/nope cd"),
+            ["sh: cd: /nope: no such file or directory"],
+            "{out}"
+        );
+        assert_eq!(
+            output(out, "export"),
+            ["export HOME=/", "export TERM=linux", "export Y=2", "export Z=3"],
+            "{out}"
+        );
+        assert_eq!(
+            output(out, "export 1A"),
+            ["sh: export: 1A: bad variable name"],
+            "{out}"
+        );
+        // unset takes Y out; an assignment of a name that is no variable
+        // comes after the others.
+        assert_eq!(output(out, "Y=4 env -u TERM -u HOME"), ["Z=3", "Y=4"], "{out}");
+        assert_eq!(output(out, "env -i A=1 B=two env"), ["A=1", "B=two"], "{out}");
+        assert!(output(out, "env -i").is_empty(), "{out}");
+        // Before exec, an assignment is exported to the program that
+        // replaces the shell.
+        let last = format!("{PROMPT}FOO=bar exec env -u TERM -u HOME -u Z\nFOO=bar\n");
+        assert!(out.ends_with(&last), "{out}");
+    }
+}

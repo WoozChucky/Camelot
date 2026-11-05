@@ -1473,9 +1473,9 @@ fn devices_may_share_a_page() {
 #[test]
 fn allocator_follows_the_ram_size() {
     // RAM comes from sysinfo: the smallest machine the kernel fits in (its
-    // image, with the user programs it embeds, takes most of a 1 MiB one),
+    // image, with the user programs it embeds, takes a little over 2 MiB),
     // and one whose RAM ends inside a 4 MiB region.
-    for mib in [2, 6] {
+    for mib in [3, 6] {
         check_kernel_memory(mib, &[]);
     }
 }
@@ -1535,8 +1535,11 @@ const HELP: &str = "\
 help            this list
 exit [N]        leave the shell, with status N or the last program's
 wait            wait for every background program
-cd [DIR]        change the working directory, to / without DIR
+cd [DIR]        change the working directory, to HOME (or /) without DIR
 exec [PROG ...] replace the shell with PROG; without one, keep its redirections
+export [NAME..] pass variables (NAME or NAME=VALUE) to programs; alone, list them
+unset NAME...   remove variables
+NAME=VALUE      set a variable; before a command, for that command alone
 PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /
 CMD < FILE      read the input from FILE
 CMD > FILE      write the output to FILE
@@ -2398,6 +2401,16 @@ fn booting_drops_into_the_user_shell() {
         format!("{BOOT_OUTPUT}{SHELL_BANNER}{PROMPT}hello\nhello from user mode\n{PROMPT}exit\n")
     );
     assert_eq!(r, RunResult::Exited(0));
+}
+
+#[test]
+fn the_shell_passes_its_environment_on() {
+    // Issue #216: the shell starts with the kernel's environment for init,
+    // keeps variables (assignments, export, unset) and gives every program
+    // the exported ones, through spawn and exec (tests/common's
+    // environment session; processes_rv64.rs runs it on RV64).
+    let out = run_processes(common::environment::INPUT);
+    common::environment::check(&out, command_output);
 }
 
 #[test]
@@ -3510,7 +3523,7 @@ fn the_elf_loader_refuses_bad_images() {
     let loads: Vec<u32> = (0..u32::from(parsed.header.phnum))
         .filter(|&i| parsed.segments[i as usize].ty == elf::PT_LOAD)
         .collect();
-    assert_eq!(loads.len(), 2, "hello: text and rodata");
+    assert_eq!(loads.len(), 3, "hello: text, rodata and data (environ)");
     let ph = |i: u32, field: u32| phoff + elf::PHDR_SIZE as u32 * loads[i as usize] + field;
     struct Load {
         offset: u32,
@@ -3527,25 +3540,32 @@ fn the_elf_loader_refuses_bad_images() {
             memsz: p.memsz as u32,
         }
     };
-    let (text, rodata) = (&load(0), &load(1));
+    let (text, rodata, data) = (&load(0), &load(1), &load(2));
     // The cases rely on this layout: the text from the first page on, then
-    // less than a page of rodata on a page of its own.
+    // less than a page of rodata on a page of its own, then the data, the
+    // C library's environ (crt0 sets it), all .bss, on a page of its own.
     assert_eq!(text.vaddr, USER_TEXT);
     assert!(rodata.vaddr >= text.vaddr + text.memsz && rodata.vaddr.is_multiple_of(PAGE));
     assert!(rodata.memsz < PAGE);
     assert_eq!(rodata.filesz, rodata.memsz);
-    // hello reaches its rodata pc-relatively (-mcmodel=medany), so it still
-    // runs with both segments moved by the same amount: here, so that its
-    // rodata, given a whole page, ends right at USER_LOAD_TOP.
-    let high_rodata = USER_LOAD_TOP - PAGE;
-    let high_text = high_rodata - (rodata.vaddr - text.vaddr);
+    assert!(data.vaddr >= rodata.vaddr + rodata.memsz && data.vaddr.is_multiple_of(PAGE));
+    assert!(data.memsz < PAGE);
+    assert_eq!(data.filesz, 0);
+    // hello reaches its rodata and its data pc-relatively
+    // (-mcmodel=medany), so it still runs with every segment moved by the
+    // same amount: here, so that its data, given a whole page, ends right
+    // at USER_LOAD_TOP.
+    let high_data = USER_LOAD_TOP - PAGE;
+    let high_text = high_data - (data.vaddr - text.vaddr);
+    let high_rodata = high_text + (rodata.vaddr - text.vaddr);
     let entry = parsed.header.entry as u32;
-    let moved_high = |rodata_memsz: u32| -> Vec<(u32, [u8; 4])> {
+    let moved_high = |data_memsz: u32| -> Vec<(u32, [u8; 4])> {
         vec![
             (E_ENTRY, (entry - text.vaddr + high_text).to_le_bytes()),
             (ph(0, P_VADDR), high_text.to_le_bytes()),
             (ph(1, P_VADDR), high_rodata.to_le_bytes()),
-            (ph(1, P_MEMSZ), rodata_memsz.to_le_bytes()),
+            (ph(2, P_VADDR), high_data.to_le_bytes()),
+            (ph(2, P_MEMSZ), data_memsz.to_le_bytes()),
         ]
     };
     let (at_top, past_top) = (moved_high(PAGE), moved_high(PAGE + 1));
