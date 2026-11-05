@@ -1,3 +1,4 @@
+    .file "strings.c"
     .text
 
     # int length(char *s): frame 16 bytes

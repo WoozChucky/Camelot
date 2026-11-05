@@ -1,3 +1,4 @@
+    .file "switch.c"
     .text
 
     # int classify(int x): frame 16 bytes

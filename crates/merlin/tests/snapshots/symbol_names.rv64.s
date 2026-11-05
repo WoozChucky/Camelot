@@ -1,3 +1,4 @@
+    .file "symbol_names.c"
     .data
 
     # const char *greeting: 8 bytes

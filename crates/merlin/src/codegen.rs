@@ -549,7 +549,7 @@
 use crate::abi::{self, Pass};
 use crate::ast::*;
 use crate::consteval::{self, Base, Const};
-use crate::debug::{DebugInfo, Lines, Location, Scope, Var};
+use crate::debug::{DebugInfo, Lines, Location, Scope, Sources, Var};
 use crate::elide;
 use crate::sema::{arith_type, symbol_base, LITERAL};
 use crate::types::{ptr_size, FuncType, IntKind, Member, RecordBody, Type, Xlen};
@@ -565,8 +565,8 @@ pub fn generate(prog: &Program) -> Result<String, Error> {
 }
 
 /// [`generate`], with debug information (`-g`) when `debug` gives it and
-/// the preprocessor's file names ([`crate::debug`]).
-pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> Result<String, Error> {
+/// the files the preprocessor read ([`crate::debug`]).
+pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, Sources)>) -> Result<String, Error> {
     // merlin-as reads a register name as a register, never as a symbol, so a
     // function or global called `sp` or `a0` could not be referenced or even
     // defined.
@@ -607,7 +607,7 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
         strings: Vec::new(),
         symbols: SymbolTable::default(),
         names: HashMap::new(),
-        debug: debug.map(|(info, names)| Lines::new(info, names, xlen)),
+        debug: debug.map(|(info, sources)| Lines::new(info, sources, xlen)),
         by_symbol: defs
             .iter()
             .enumerate()
@@ -4635,7 +4635,8 @@ mod tests {
         let asm = compile("int main() { return 42; }");
         assert_eq!(
             asm,
-            "    .text
+            "    .file \"<input>\"
+    .text
 
     # int main(void): frame 16 bytes
     .globl main
@@ -4995,7 +4996,8 @@ main:
         ] {
             assert!(data.contains(want), "missing {want:?} in\n{data}");
         }
-        assert!(data.starts_with("    .data\n"), "{data}");
+        // After the file's name, clang's first line.
+        assert!(data.starts_with("    .file \"<input>\"\n    .data\n"), "{data}");
         assert!(!data.contains(".globl u"), "static");
         assert!(!data.contains(".globl main.n"), "static local");
         assert!(asm.contains("la    a0, main.n\n"), "{asm}");

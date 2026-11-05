@@ -10,10 +10,13 @@ name = "merlin"
 
 [dependencies]
 excalibur = { path = "../excalibur" }
+# With -g, each `.file` names its file as LLVM's assembler files it
+# (merlin_as::dwarf::file_entry), the way clang's assembly printer writes it;
+# the tests also assemble merlin's output with it.
+merlin-as = { path = "../merlin-as" }
 
 [dev-dependencies]
 # The test harness runs compiled programs end to end: merlin -> merlin-as -> link -> Grail.
 grail = { path = "../grail" }
-merlin-as = { path = "../merlin-as" }
 merlin-ld = { path = "../merlin-ld" }
 elf = { path = "../elf" }

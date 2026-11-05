@@ -1,3 +1,4 @@
+    .file "array_init.c"
     .data
 
     # int g[5]: 20 bytes

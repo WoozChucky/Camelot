@@ -1,3 +1,4 @@
+    .file "fib.c"
     .text
 
     # int fib(int n): frame 16 bytes

@@ -1,3 +1,4 @@
+    .file "constant_conditions.c"
     .text
 
     # int bump(void): frame 16 bytes
