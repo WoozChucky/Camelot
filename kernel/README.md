@@ -106,15 +106,16 @@ the filesystem the rest; its size is in the spec, section 10, "Root image");
 builds the RV64 system's image too, `target/camelot-fs-rv64.img`: the
 programs built for RV64 in `/bin`, `boot/boot-rv64.elf` and
 `kernel-disk-rv64.elf` (about 380 blocks),
-in an image of the same size, which an RV64 machine of 4 MiB boots;
-`--xlen 32` or `--xlen 64` builds just one of them.
+in an image of the same size, which an RV64 machine of 6 MiB boots through
+Camelot's firmware (`--bios default`: the firmware's 2 MiB below the
+kernel's 4); `--xlen 32` or `--xlen 64` builds just one of them.
 
 ```
 cargo xtask fs
 cargo run --release -p grail -- --disk target/camelot-fs.img
 cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
-cargo run --release -p grail -- --xlen 64 --disk target/camelot-fs-rv64.img
-cargo run --release -p grail -- --xlen 64 --disk target/camelot-fs-rv64.img kernel/kernel-rv64.elf
+cargo run --release -p grail -- --xlen 64 --bios default --ram 6 --disk target/camelot-fs-rv64.img
+cargo run --release -p grail -- --bios default --ram 8 --disk target/camelot-fs-rv64.img kernel/kernel-rv64.elf
 ```
 
 ```

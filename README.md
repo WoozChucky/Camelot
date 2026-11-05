@@ -273,7 +273,7 @@ The Camelot kernel mounts disk 0 as its root filesystem when it holds one (forma
 cargo xtask fs
 cargo run --release -p grail -- --disk target/camelot-fs.img                   # boots from the disk (in 4 MiB)
 cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf # or runs the kernel given
-cargo run --release -p grail -- --bios default --ram 6 --disk target/camelot-fs-rv64.img   # the RV64 system, through its firmware
+cargo run --release -p grail -- --xlen 64 --bios default --ram 6 --disk target/camelot-fs-rv64.img   # the RV64 system, through its firmware
 cargo run --release -p camelot-fs -- mkfs disk.img some/dir --size 4M   # a new image holding a copy of some/dir
 cargo run --release -p camelot-fs -- mkfs root.img --boot kernel/boot/boot.elf --kernel kernel/kernel-disk.elf   # bootable
 cargo run --release -p camelot-fs -- fsck disk.img                      # every consistency rule (--recover replays the log)
