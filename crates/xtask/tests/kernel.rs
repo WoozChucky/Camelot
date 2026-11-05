@@ -1793,6 +1793,11 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     // The ten boot ticks, and maybe one more while the shell starts.
     let start = tick_count(&m);
     assert!((10..=11).contains(&start), "{start} ticks at the prompt");
+    // The shell still has its read to make after the prompt: the count starts once
+    // the hart first waits, so that a tick that comes on the way (the timing of boot
+    // and of the shell's start decides it) is not counted as one it waited for.
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == u64::from(wfi));
+    let start = tick_count(&m);
     let idle_end = start + 50;
 
     // Fifty idle ticks: the hart spends them in wfi (Grail skips the wait to
