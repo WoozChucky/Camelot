@@ -684,6 +684,64 @@ fn the_forms_are_clangs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The names of the base types `src`'s unit describes, compiled with `-g`.
+fn base_types(src: &str) -> Vec<String> {
+    use elf::dies::dw;
+    let asm = merlin::compile_with("c.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options::default()).unwrap();
+    let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+    units[0]
+        .dies
+        .iter()
+        .filter(|d| d.tag == dw::TAG_BASE_TYPE)
+        .filter_map(|d| d.name().map(str::to_string))
+        .collect()
+}
+
+/// The type of an explicit cast is kept only where the code evaluates it,
+/// as clang's code generator keeps it: not in the operand `?:` does not
+/// choose of a constant condition, which need not even be constant, nor in
+/// the operand a constant `&&` or `||` leaves out or decides by, nor in the
+/// arm an `if` on a constant does not take (whose variables are not
+/// described either), nor in a constant `if` condition, nor in the cases a
+/// `switch` on a constant does not run; but in a `while (1)`'s, which
+/// clang's code generator still evaluates.
+#[test]
+fn casts_not_evaluated_are_not_kept() {
+    let kept = |body: &str| {
+        base_types(&format!(
+            "int x; int h(void);\nint f(void) {{ return {body}; }}\n"
+        ))
+    };
+    assert_eq!(kept("1 ? 2 : (unsigned short)x"), ["int"]);
+    assert_eq!(kept("1 ? 2 : (unsigned short)h()"), ["int"]);
+    assert_eq!(kept("0 ? (unsigned short)h() : 2"), ["int"]);
+    assert_eq!(
+        kept("0 ? 2 : (unsigned short)x"),
+        ["unsigned short", "int"],
+        "the types of casts come first"
+    );
+    assert_eq!(
+        kept("((char)1 || (char)x) + (0 && (short)x) + ((short)1 && (unsigned short)x)"),
+        ["unsigned short", "int"]
+    );
+    let kept = |body: &str| base_types(&format!("int x;\nvoid f(void) {{ {body} }}\n"));
+    assert_eq!(kept("if (0) { long dead = (char)x; }"), ["int"]);
+    assert_eq!(kept("if ((char)1) x = 1;"), ["int"]);
+    assert_eq!(
+        kept("if (0) { l: x = (char)2; } goto l;"),
+        ["char", "int"],
+        "kept for its label"
+    );
+    assert_eq!(kept("while ((char)1) break;"), ["char", "int"]);
+    assert_eq!(kept("do x++; while ((char)0);"), ["char", "int"]);
+    assert_eq!(
+        kept("switch (1) { case 1: x = (char)1; break; case 2: x = (short)2; }"),
+        ["char", "int"],
+        "only the case that runs"
+    );
+}
+
 /// The types a function defines (a typedef, a struct, one in an inner block)
 /// are described in its entry, after its variables and blocks, as clang has
 /// them; a file-scope type of the same tag is the unit's.
@@ -782,22 +840,22 @@ fn entry_tree(tool: &str, obj: &Path) -> Vec<String> {
 /// - `enums.c`, `designated.c`: clang describes an enum whose constant its
 ///   generated code uses, even with no variable of it; merlin's parser makes
 ///   constants numbers;
-/// - `predefined_types.c`, `static_address_casts.c`: clang keeps the type of a
-///   cast its code generator visits, which leaves out operands it folds (`1 &&
-///   x`) and takes in some constant initializers; merlin keeps every explicit
-///   cast its code evaluates.
+/// - `static_address_casts.c`: clang keeps the type of a cast its code
+///   generator visits, which takes in some in constant initializers; merlin
+///   keeps the explicit casts its code evaluates (in a folded constant, those
+///   clang visits: not the operands `?:`, `&&` and `||` leave out; nor what a
+///   constant condition leaves out, where merlin generates what clang does).
 ///
 /// Ignored: it needs clang and llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP`
 /// name them if they are not on the PATH).
 #[test]
 #[ignore]
 fn the_entries_are_clangs_in_clangs_order() {
-    const DIFFERENT: [&str; 6] = [
+    const DIFFERENT: [&str; 5] = [
         "func_ptrs.c",
         "inline.c",
         "enums.c",
         "designated.c",
-        "predefined_types.c",
         "static_address_casts.c",
     ];
     let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
