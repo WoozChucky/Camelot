@@ -401,27 +401,45 @@ sbi_time:
     j     sbi_success
 
 # IPI send_ipi(hart_mask, hart_mask_base): msip = 1 for hart
-# hart_mask_base + i, for every bit i set in hart_mask; for every hart when
-# hart_mask_base is -1. SBI_ERR_INVALID_PARAM, and nothing sent, if a bit
-# names a hart the machine doesn't have. The receiving hart's
+# hart_mask_base + i, for every bit i set in hart_mask; for every hart that
+# can take it when hart_mask_base is -1. As OpenSBI's sbi_ipi_send_many(),
+# only a hart that can take an interrupt is sent one: STARTED or SUSPENDED
+# (sbi_hsm_hart_interruptible_mask()). A mask that names any other hart,
+# STOPPED, on its way, or one the machine doesn't have, is
+# SBI_ERR_INVALID_PARAM, and nothing is sent. The receiving hart's
 # machine_soft turns it into SSIP.
 sbi_ipi:
     bnez  a6, sbi_not_supported
     la    t0, sbi_hart_count
     lw    t1, 0(t0)             # t1 = harts
-    li    t2, -1
-    bne   a1, t2, 1f
-    li    t0, 1                 # every hart: the mask of t1 bits
-    sll   t0, t0, t1
-    addi  t0, t0, -1
-    j     2f
-1:  mv    t0, a0
-    beqz  t0, sbi_success       # no hart: nothing to do
+    # t0 = the harts that can take an interrupt, bit i for hart i. The
+    # states are read as hart_get_status reads them: a hart that changes
+    # its own meanwhile (hart_stop) is one an IPI may or may not reach.
+    li    t0, 0
+    la    t2, machine_scratch   # t2 = hart t3's scratch block
+    li    t3, 0
+1:  bgeu  t3, t1, 3f
+    lw    t4, SCRATCH_STATE(t2)
+    beqz  t4, 2f                # SBI_HSM_STATE_STARTED
+    li    t5, SBI_HSM_STATE_SUSPENDED
+    bne   t4, t5, 4f
+2:  li    t5, 1
+    sll   t5, t5, t3
+    or    t0, t0, t5
+4:  addi  t2, t2, SCRATCH_BYTES
+    addi  t3, t3, 1
+    j     1b
+3:  li    t2, -1
+    beq   a1, t2, 5f            # every hart: those
+    beqz  a0, sbi_success       # no hart: nothing to do
     bgeu  a1, t1, sbi_invalid_param
     sub   t2, t1, a1            # the harts from the base up, 1 or more
-    srl   t3, t0, t2
+    srl   t3, a0, t2
     bnez  t3, sbi_invalid_param # a bit past the last hart
-    sll   t0, t0, a1            # t0 = the harts, bit i for hart i
+    sll   t2, a0, a1            # t2 = the harts named, bit i for hart i
+    and   t3, t2, t0
+    bne   t3, t2, sbi_invalid_param # one that can't take it
+    mv    t0, t2
     # The caller's stores (a TLB shootdown's request counts, the threads
     # an idle hart is woken for) must be visible to the harts before the
     # interrupt that tells them to look. msip is an I/O store, which
@@ -435,16 +453,16 @@ sbi_ipi:
     # (W after) or follow other device writes (O before): here the send is
     # this one msip store, and no device store before it means anything to
     # the target.
-2:  fence rw, o
+5:  fence rw, o
     li    t1, CLINT_BASE
     li    t2, 1
-3:  beqz  t0, sbi_success
+6:  beqz  t0, sbi_success
     andi  t3, t0, 1
-    beqz  t3, 4f
+    beqz  t3, 7f
     sw    t2, 0(t1)
-4:  srli  t0, t0, 1
+7:  srli  t0, t0, 1
     addi  t1, t1, 4
-    j     3b
+    j     6b
 
 # HSM.
 sbi_hsm:

@@ -288,25 +288,70 @@ fn send_ipi_interrupts_the_harts_in_its_mask() {
         s.step_until(|m| m.cpu.hart(0).mode == Mode::S);
         assert!(!s.m.cpu.bus.clint.msip[0]);
         s.m.cpu.hart_mut(0).csr.mip &= !(1 << IRQ_S_SOFT);
-        // Hart 3 as base 3, bit 0; every hart with base -1. The others are
-        // STOPPED: the IPI wakes them for nothing, they stay STOPPED.
-        assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[1, 3]), (0, 0));
+        // Every hart with base -1: only those that can take an interrupt,
+        // as OpenSBI's sbi_ipi_send_many() sends it. The others are STOPPED,
+        // waiting in the SBI: the IPI doesn't wake them, they run nothing.
+        let retired = |s: &Sbi| (1..4).map(|h| s.m.cpu.hart(h).csr.minstret).collect::<Vec<_>>();
+        let before = retired(&s);
         assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[0, u64::MAX]), (0, 0));
         s.step_until(ssip);
         s.step_until(|m| m.cpu.hart(0).mode == Mode::S);
+        assert_eq!(retired(&s), before, "{xlen:?}");
         for h in 1..4 {
+            assert!(s.m.cpu.hart(h as usize).waiting, "{xlen:?} hart {h}");
             assert_eq!(s.status(h), STATE_STOPPED, "{xlen:?} hart {h}");
         }
+        s.m.cpu.hart_mut(0).csr.mip &= !(1 << IRQ_S_SOFT);
         // No hart: nothing to do, whatever the base.
         assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[0, 99]), (0, 0));
-        // A hart the machine doesn't have.
-        for (mask, base) in [(0b1_0000, 0), (2, 3), (1, 4), (1, u64::MAX - 1)] {
+        // A STOPPED hart named, alone or with hart 0 (base 0, base 3, every
+        // bit), and a hart the machine doesn't have: nothing is sent.
+        for (mask, base) in [
+            (0b10, 0),
+            (0b11, 0),
+            (1, 3),
+            (0b1111, 0),
+            (0b1_0000, 0),
+            (2, 3),
+            (1, 4),
+            (1, u64::MAX - 1),
+        ] {
             assert_eq!(
                 s.call(EXT_IPI, IPI_SEND_IPI, &[mask, base]),
                 (ERR_INVALID_PARAM, 0),
                 "{xlen:?} {mask:#b} from {base}"
             );
         }
+        assert!(s.m.cpu.bus.clint.msip.iter().all(|&p| !p), "{xlen:?}");
+        assert_eq!(s.m.cpu.hart(0).csr.mip & (1 << IRQ_S_SOFT), 0, "{xlen:?}");
+        assert_eq!(retired(&s), before, "{xlen:?}");
+
+        // Hart 1 started (at `j .`), hart 3 SUSPENDED (its state set in its
+        // scratch block, as its own hart_suspend would): both can take one.
+        s.m.cpu.bus.load(HART_CODE, &J_SELF.to_le_bytes()).unwrap();
+        assert_eq!(s.call(EXT_HSM, HSM_HART_START, &[1, HART_CODE, 0]), (0, 0));
+        s.step_until(|m| m.cpu.hart(1).pc == HART_CODE);
+        let word = u64::from(xlen.bits() / 8);
+        let state3 = s.pa(s.sym("machine_scratch")) + 3 * 16 * word + 6 * word;
+        s.m.cpu
+            .bus
+            .load(state3, &(STATE_SUSPENDED as u32).to_le_bytes())
+            .unwrap();
+        let ssip1 = |m: &Machine| m.cpu.hart(1).csr.mip & (1 << IRQ_S_SOFT) != 0;
+        assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[1, 1]), (0, 0));
+        s.step_until(ssip1);
+        s.m.cpu.hart_mut(1).csr.mip &= !(1 << IRQ_S_SOFT);
+        // Every hart: 0, 1 and 3, not hart 2.
+        let retired2 = s.m.cpu.hart(2).csr.minstret;
+        let retired3 = s.m.cpu.hart(3).csr.minstret;
+        assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[0, u64::MAX]), (0, 0));
+        s.step_until(|m| {
+            ssip(m) && m.cpu.hart(0).mode == Mode::S && ssip1(m) && m.cpu.hart(3).csr.minstret != retired3
+        });
+        assert_eq!(s.m.cpu.hart(2).csr.minstret, retired2, "{xlen:?}");
+        // Named: 1 and 3 from base 1, but not with hart 2.
+        assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[0b101, 1]), (0, 0));
+        assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[0b111, 1]), (ERR_INVALID_PARAM, 0));
     }
 }
 

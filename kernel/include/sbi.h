@@ -49,7 +49,8 @@
 
 /* IPI: send_ipi(hart_mask, hart_mask_base), a supervisor software interrupt
  * to hart hart_mask_base + i for every bit i set in hart_mask; a base of -1
- * means every hart. */
+ * means every hart that can take one (STARTED or SUSPENDED, as OpenSBI
+ * counts them), and a mask naming any other is SBI_ERR_INVALID_PARAM. */
 #define SBI_IPI_SEND_IPI 0
 
 /* HSM, hart state management. */
