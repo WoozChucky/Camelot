@@ -16,7 +16,8 @@
 #include "proc.h"
 #include "types.h"
 
-/* spawn(): starts the program at `path` with `args` as a child of the
+/* spawn(): starts the program at `path` with `args` (its arguments and
+ * environment, copied in from the caller's argv and envp) as a child of the
  * current process. Returns its pid, or -ENOENT/-ENOTDIR/-ENAMETOOLONG (the
  * path), -EACCES (not a regular file), or proc_create()'s errors. */
 int exec_spawn(const char *path, const struct proc_args *args);
@@ -26,9 +27,10 @@ int exec_spawn(const char *path, const struct proc_args *args);
  * -EAGAIN), the old program still running. */
 int exec_replace(const char *path, const struct proc_args *args);
 
-/* The first process's program: the one at `path`, with argv = { name }.
- * From the root filesystem if there is one, falling back to the embedded
- * programs if it has no such file. Returns 0 or an error. */
+/* The first process's program: the one at `path`, with argv = { name }
+ * and Linux's environment for init (init/main.c's envp_init: HOME=/ and
+ * TERM=linux). From the root filesystem if there is one, falling back to
+ * the embedded programs if it has no such file. Returns 0 or an error. */
 int exec_init(const char *path, const char *name);
 
 #endif

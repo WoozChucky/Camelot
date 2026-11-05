@@ -258,9 +258,9 @@ dong 4
 ```
 
 The programs live in `user/`, one `.c` or `.s` file each, all linked with the
-runtime (`user/crt0.S`, which calls `main(argc, argv, envp)` and then `exit`; `user/usys.s`, the
+runtime (`user/crt0.S`, which sets `environ` to `envp`, calls `main(argc, argv, envp)` and then `exit`; `user/usys.s`, the
 system call stubs), the C library of `user/lib/` (strings, numbers, `malloc`,
-`printf`, a line reader; declared in `user/user.h`, described in
+`printf`, a line reader, `getenv`; declared in `user/user.h`, described in
 `user/lib/README.md`, and linked like an archive, so a program gets only the
 parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
 
@@ -277,6 +277,8 @@ parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
 | `grep` | prints the lines that contain a string (`-v`, `-c`, `-n`) |
 | `ps` | lists the processes |
 | `kill` | kills processes by pid |
+| `env` | runs a program with the environment changed, or prints it |
+| `printenv` | prints variables' values, or the whole environment |
 | `sleep` | waits for some seconds (`0.5` for half a second) |
 | `ticks` | prints the timer ticks since boot |
 | `ifconfig`, `ping` | show and set the network interface; ICMP echo to a host (an address or a name) |

@@ -8,11 +8,13 @@
 # with atexit, 0 here (there is no dynamic linker), and every other register
 # is zero.
 #
-# So all that is left is to find argc, argv and envp and to call
-# main(argc, argv, envp), then exit with what it returns, as glibc's
-# __libc_start_main does in the end. Programs written in assembly define
-# main too. Preprocessed for each width: argc and the pointers are 4 bytes
-# on RV32 and 8 on RV64 (asm.h's REG_L and SZREG).
+# So all that is left is to find argc, argv and envp, to make envp the C
+# library's environ (lib/environ.c), which getenv looks in and programs pass
+# on to spawn and exec, and to call main(argc, argv, envp), then exit with
+# what it returns, as glibc's __libc_start_main does (its `__environ = ev`
+# first, the exit last). Programs written in assembly define main too.
+# Preprocessed for each width: argc and the pointers are 4 bytes on RV32
+# and 8 on RV64 (asm.h's REG_L, REG_S and SZREG).
 
 #include <asm.h>
 
@@ -24,6 +26,8 @@ _start:
     slli  a2, a0, RISCV_LGPTR   # envp: past argv's argc pointers and its NULL
     add   a2, a1, a2
     addi  a2, a2, SZREG
+    lla   t0, environ           # environ = envp
+    REG_S a2, 0(t0)
     call  main
     call  exit                  # main's return value is already in a0
 1:  j     1b                    # exit never returns

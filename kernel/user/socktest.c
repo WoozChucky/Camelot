@@ -445,7 +445,7 @@ static void test_inherited(void) {
     int out = dup(STDOUT);
     close(STDOUT);
     dup(c);
-    int pid = spawn("/bin/echo", (char *[]){"echo", "through", "a", "socket", NULL});
+    int pid = spawn("/bin/echo", (char *[]){"echo", "through", "a", "socket", NULL}, environ);
     close(STDOUT);
     dup(out);
     close(out);
@@ -596,12 +596,12 @@ static void test_udp(void) {
 
 /* Waits, killed while it does: the call ends at once. */
 static void test_killed_waits(void) {
-    int pid = spawn("/bin/socktest", (char *[]){"socktest", "udpwait", "7040", NULL});
+    int pid = spawn("/bin/socktest", (char *[]){"socktest", "udpwait", "7040", NULL}, environ);
     until_asleep(pid);
     check_eq(kill(pid), 0, "kill a process in recv");
     check(ends_soon(pid), "it ends at once");
     check_eq(status_of(pid), -1, "killed");
-    pid = spawn("/bin/socktest", (char *[]){"socktest", "acceptwait", "7041", NULL});
+    pid = spawn("/bin/socktest", (char *[]){"socktest", "acceptwait", "7041", NULL}, environ);
     until_asleep(pid);
     check_eq(kill(pid), 0, "kill a process in accept");
     check(ends_soon(pid), "it ends at once");
@@ -611,7 +611,7 @@ static void test_killed_waits(void) {
     check(l >= 0, "a killed process's port is free again");
     close(l);
     /* And one that gets what it waits for. */
-    pid = spawn("/bin/socktest", (char *[]){"socktest", "udpwait", "7040", NULL});
+    pid = spawn("/bin/socktest", (char *[]){"socktest", "udpwait", "7040", NULL}, environ);
     until_asleep(pid);
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in to = addr_of(INADDR_LOOPBACK, 7040);
@@ -635,7 +635,7 @@ static void test_running_out(void) {
         n++;
     }
     check_eq(n, NOFILE - 3, "TCP sockets on every free descriptor");
-    int pid = spawn("/bin/socktest", (char *[]){"socktest", "tcpfill", NULL});
+    int pid = spawn("/bin/socktest", (char *[]){"socktest", "tcpfill", NULL}, environ);
     check_eq(status_of(pid), TCP_SOCKETS - n, "the child gets the rest, then -ENOBUFS");
     for (int i = 0; i < n; i++) {
         close(fds[i]);
