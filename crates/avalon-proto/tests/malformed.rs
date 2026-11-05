@@ -263,12 +263,30 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
         (
             "disk source tag",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[32, 9, 0], &le(1), &[1, 7]]),
+            cat(&[
+                &le(0),
+                &[0; 8],
+                &[0],
+                &le(1),
+                &le(1),
+                &[32, 9, 0],
+                &le(1),
+                &[1, 7],
+            ]),
         ),
         (
             "card switch option tag",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[32, 9, 0], &le(1), &[2, 7]]),
+            cat(&[
+                &le(0),
+                &[0; 8],
+                &[0],
+                &le(1),
+                &le(1),
+                &[32, 9, 0],
+                &le(1),
+                &[2, 7],
+            ]),
         ),
         (
             "card MAC option tag",

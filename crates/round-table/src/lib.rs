@@ -366,6 +366,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 "--name",
                 "--xlen",
                 "--paging",
+                "--bios",
                 "--ram",
                 "--clock",
                 "--harts",
@@ -1266,7 +1267,10 @@ mod tests {
         assert_eq!(c.profile.ram_size, 4 << 20);
         assert_eq!(avalon_proto::DEFAULT_RAM_SIZE, 4 << 20);
         let mib = avalon_proto::DEFAULT_RAM_SIZE >> 20;
-        assert!(USAGE.contains(&format!("most 2 GiB (default {mib} MiB)\n")));
+        assert!(USAGE.contains(&format!(
+            "most 2 GiB (default {mib} MiB; {} MiB for an RV64 Camelot VM,\n",
+            camelot_ram(Xlen::Rv64) >> 20
+        )));
         assert!(!c.start);
         // No program: the VM boots from its disk.
         let Command::Create(c) = command("create --name os --disk root.img") else {
@@ -1306,6 +1310,27 @@ mod tests {
             panic!()
         };
         assert_eq!((c.profile.xlen, c.profile.paging), (Xlen::Rv32, Paging::Sv48));
+        // The firmware: none unless asked, as QEMU's -bios; a Camelot VM of RV64
+        // has Camelot's, and the firmware's 2 MiB of RAM on top of 4, unless told.
+        assert_eq!(c.profile.bios, Bios::None);
+        let bios = |line: &str| match command(line) {
+            Command::Create(c) => (c.profile.bios, c.profile.ram_size >> 20),
+            _ => panic!(),
+        };
+        assert_eq!(bios("create --name os --camelot --xlen 64"), (Bios::Default, 6));
+        assert_eq!(bios("create --name os --camelot"), (Bios::None, 4));
+        assert_eq!(
+            bios("create --name os --camelot --xlen 64 --bios none --ram 16"),
+            (Bios::None, 16)
+        );
+        assert_eq!(
+            bios("create --name os --xlen 64 --bios fw_jump.bin --disk a.img"),
+            (Bios::File("fw_jump.bin".into()), 4)
+        );
+        assert_eq!(
+            bios("create --name os --xlen 64 --bios default p.elf"),
+            (Bios::Default, 4)
+        );
     }
 
     #[test]
@@ -1561,6 +1586,7 @@ id       1
 name     web
 state    running
 arch     RV64 (Sv48 and Sv39 paging)
+firmware default
 RAM      64 MiB
 clock    1.5 MHz (real time)
 harts    2

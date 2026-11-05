@@ -1412,6 +1412,29 @@ mod tests {
             (c.profile.xlen, c.profile.paging),
             (Xlen::Rv32, avalon_proto::Paging::Sv48)
         );
+        // The firmware: none unless asked; a Camelot VM of RV64 has Camelot's,
+        // and its 2 MiB of RAM on top of 4, unless told.
+        let firmware = |text: &str| {
+            let c = create(text).unwrap();
+            (c.profile.bios, c.profile.ram_size >> 20)
+        };
+        assert_eq!(c.profile.bios, Bios::None);
+        assert_eq!(
+            firmware(r#"{"name": "os", "camelot": true, "xlen": "64"}"#),
+            (Bios::Default, 6)
+        );
+        assert_eq!(
+            firmware(r#"{"name": "os", "camelot": true, "xlen": "64", "bios": "none", "ram": "16"}"#),
+            (Bios::None, 16)
+        );
+        assert_eq!(
+            firmware(r#"{"name": "os", "xlen": "64", "bios": "fw.bin", "program": "AA=="}"#),
+            (Bios::File("fw.bin".into()), 4)
+        );
+        assert_eq!(
+            firmware(r#"{"name": "os", "xlen": "64", "bios": " default ", "program": "AA=="}"#),
+            (Bios::Default, 4)
+        );
 
         for (text, why) in [
             (
@@ -1616,7 +1639,7 @@ mod tests {
         };
         assert_eq!(
             vm_json(&vm).encode(),
-            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"xlen":64,"paging":"sv39","arch":"RV64","arch_text":"RV64 (Sv39 paging)","ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","harts":1,"disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"nets":[{"card":0,"mac":"02:00:00:00:00:01","switch":null},{"card":1,"mac":"02:00:00:00:00:02","switch":"wan"}],"actions":["destroy"]}"#
+            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"xlen":64,"paging":"sv39","arch":"RV64","arch_text":"RV64 (Sv39 paging)","bios":"none","ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","harts":1,"disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"nets":[{"card":0,"mac":"02:00:00:00:00:01","switch":null},{"card":1,"mac":"02:00:00:00:00:02","switch":"wan"}],"actions":["destroy"]}"#
         );
     }
 
