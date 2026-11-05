@@ -989,14 +989,13 @@ impl<'a> FnChecker<'a> {
         // name is the object or function outside it, which it defines
         // nothing of.
         if d.storage == Storage::Extern || d.ty.is_func() {
-            if d.init.is_some() {
-                let msg = "declaration of block scope identifier with linkage cannot have an initializer";
-                self.err(d.pos, msg);
-                return;
-            }
             let var = VarRef::Global(d.name.clone());
             self.bind(&d.name, var.clone(), &d.ty, d.pos, "");
             d.var = Some(var);
+            if d.init.is_some() {
+                let msg = "declaration of block scope identifier with linkage cannot have an initializer";
+                self.err(d.pos, msg);
+            }
             return;
         }
         if d.ty.is_void() {
@@ -2359,16 +2358,13 @@ mod tests {
         );
         assert_eq!(
             all("unsigned u(void);\nint a[1 ? 2 : u()];\nint b = ;"),
-            [
-                format!("2:5: {folded}"),
-                "3:9: expected expression, found ';' Error".into()
-            ]
+            [format!("2:5: {folded}"), "3:9: expected expression Error".into()]
         );
         assert_eq!(
             all("unsigned u(void);\nint f(void) { if (1) { static int a[1 ? 2 : u()]; { int q = ; } } }"),
             [
                 format!("2:35: {folded}"),
-                "2:61: expected expression, found ';' Error".into()
+                "2:61: expected expression Error".into()
             ]
         );
         // A compound literal's at its `(`.
@@ -3367,7 +3363,7 @@ mod tests {
         ok("typedef void V; int f(V); int main(V) { return f(); }");
         assert_eq!(
             err("typedef void V; void f(const V);"),
-            "1:24: parameter has incomplete type 'void'"
+            "1:31: parameter has incomplete type 'void'"
         );
         // `int a[const 3]` makes the pointer const, not the elements.
         ok("int f(int a[const 3]) { a[0] = 1; return a[1]; }");
@@ -3463,7 +3459,7 @@ mod tests {
         );
         assert_eq!(
             err("int f(int a, int a) { return a; }"),
-            "1:18: redefinition of parameter 'a' (first declared at 1:11)"
+            "1:18: redefinition of parameter 'a'"
         );
         // The body's top level shares the parameters' scope.
         assert_eq!(

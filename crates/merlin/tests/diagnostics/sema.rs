@@ -202,7 +202,7 @@ pub fn cases() -> Vec<Case> {
         case("int z(void);\nint f() { return z(0); }", &["2:20: error: too many arguments to function call, expected 0, have 1"]),
         // redefinitions
         case("int f() { int a; int a; return 0; }", &["1:22: error: redefinition of 'a'"]),
-        case("int f(int a, int a) { return a; }", &["1:18: error: redefinition of parameter 'a'", "1:18: warning: omitting the parameter name in a function definition is a C23 extension [-Wc23-extensions]"]),
+        case("int f(int a, int a) { return a; }", &["1:18: error: redefinition of parameter 'a'", "1:11: note: previous declaration is here"]).then(&["1:18: warning: omitting the parameter name in a function definition is a C23 extension [-Wc23-extensions]"]),
         case("int f(int a) { int a = 1; return a; }", &["1:20: error: redefinition of 'a'"]),
         case("int f() { return 0; }\nint f() { return 1; }", &["2:5: error: redefinition of 'f'"]),
         case("int f();\nint f() { return 0; }\nint f() { return 1; }", &["3:5: error: redefinition of 'f'"]),

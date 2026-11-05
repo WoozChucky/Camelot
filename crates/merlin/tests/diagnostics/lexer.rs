@@ -21,14 +21,14 @@ pub fn cases() -> Vec<Case> {
         case("int c = '';", &["1:9: warning: empty character constant [-Winvalid-pp-token]", "1:9: error: expected expression"]),
         case("int c = 'ab';", &["1:9: warning: multi-character character constant [-Wmultichar]"]),
         case("int c = 'abcde';", &["1:9: warning: multi-character character constant [-Wmultichar]", "1:9: warning: character constant too long for its type"]),
-        case("int c = 'a;", &["1:9: warning: missing terminating ' character [-Winvalid-pp-token]", "1:9: error: expected expression", "1:12: error: expected ';' after top level declarator"]),
+        case("int c = 'a;", &["1:9: warning: missing terminating ' character [-Winvalid-pp-token]", "1:9: error: expected expression"]).then(&["1:12: error: expected ';' after top level declarator"]),
         case("int c = '\\q';", &["1:10: warning: unknown escape sequence '\\q' [-Wunknown-escape-sequence]"]),
         case("int c = '\\x100';", &["1:10: error: hex escape sequence out of range"]),
         case("int c = '\\400';", &["1:10: error: octal escape sequence out of range"]),
         case("int c = '\\x';", &["1:10: error: \\x used with no following hex digits"]),
         // String literals.
-        case("char *s = \"abc\nd\";", &["1:11: warning: missing terminating '\"' character [-Winvalid-pp-token]", "1:11: error: expected expression", "2:2: warning: missing terminating '\"' character [-Winvalid-pp-token]", "2:4: error: expected ';' after top level declarator"]),
-        case("char *s = \"abc", &["1:11: warning: missing terminating '\"' character [-Winvalid-pp-token]", "1:11: error: expected expression", "1:15: error: expected ';' after top level declarator"]),
+        case("char *s = \"abc\nd\";", &["1:11: warning: missing terminating '\"' character [-Winvalid-pp-token]", "1:11: error: expected expression", "2:2: warning: missing terminating '\"' character [-Winvalid-pp-token]"]).then(&["2:4: error: expected ';' after top level declarator"]),
+        case("char *s = \"abc", &["1:11: warning: missing terminating '\"' character [-Winvalid-pp-token]", "1:11: error: expected expression"]).then(&["1:15: error: expected ';' after top level declarator"]),
         case("char *s = \"\\q\";", &["1:12: warning: unknown escape sequence '\\q' [-Wunknown-escape-sequence]"]),
         // What makes no token, or no token outside a directive.
         case("int x;\n  /* oops", &["2:3: error: unterminated /* comment"]),
