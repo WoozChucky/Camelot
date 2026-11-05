@@ -356,12 +356,12 @@ fn the_rv64_kernel() {
     // The RV64 kernel (#154) runs at its link addresses, high in the address space,
     // with Sv48 on: a breakpoint by symbol is a link address, which the hart's pc is
     // once the kernel has jumped there, and the stub reads the stack through the
-    // page table.
+    // page table. Its shell (#155) runs hello and exits, which ends the run.
     let file = std::fs::read(path("kernel/kernel-rv64.elf")).unwrap();
     let out = connected(
         "kernel/kernel-rv64.elf",
         1,
-        b"",
+        b"hello\nexit\n",
         "break kmain\n\
          continue\n\
          regs\n\
