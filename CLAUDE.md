@@ -44,6 +44,7 @@ include/                asm.h, what assembly writes differently on RV32 and RV64
 docs/                   ISA spec, Avalon protocol, Pendragon API, Camelot system calls, Camelot filesystem format (camelot-fs.md), Camelot network stack (camelot-net.md), merlin-dbg and Grail's GDB stub (merlin-dbg.md)
 examples/               bare-metal programs, each built for RV32 and RV64 (`<name>-rv64.elf`, until #159) from one .S source, preprocessed per width (`#if __riscv_xlen == 64`, include/asm.h); their .elf files are committed, rebuild them with `cargo xtask examples` after changes (`cargo test` checks)
 tests/riscv-tests       prebuilt riscv-tests ELFs, and obj/ with their objects (merlin-ld relinks them); rv64/ the same for the RV64 suites
+tests/opensbi           OpenSBI v1.9's fw_jump.bin for the generic platform, built for Excalibur's ISA by scripts/build-opensbi.sh (clang, no make; its commit, licence and checksum in its README.md): a reference firmware, the ignored crates/xtask/tests/opensbi.rs boots the RV64 kernel on it (`--bios FILE`)
 ```
 
 Reuse `excalibur` (register names, CSR names, decoder, `Inst::format`) and `elf` (reading ELF files, relocation names) instead of duplicating tables.
