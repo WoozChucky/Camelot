@@ -997,3 +997,27 @@ int copyinstr(pagetable_t pt, char *dst, uintptr va, u32 max) {
     dst[max - 1] = 0;
     return -2;
 }
+
+u32 strnlen_user(pagetable_t pt, uintptr va, u32 max) {
+    /* Page by page, as copyinstr() reads. */
+    u32 len = 0;
+    acquire(&uvm_lock);
+    while (len < max) {
+        usize n = page_chunk(va, max - len);
+        if (!uvm_range_ok(pt, va, n, PTE_R)) {
+            release(&uvm_lock);
+            return 0;
+        }
+        const u8 *src = user_ptr(pt, va);
+        for (usize i = 0; i < n; i++) {
+            len++;
+            if (src[i] == 0) {
+                release(&uvm_lock);
+                return len;
+            }
+        }
+        va += n;
+    }
+    release(&uvm_lock);
+    return max + 1;
+}

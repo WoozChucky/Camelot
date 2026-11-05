@@ -98,7 +98,7 @@ sleep:
     ecall
     ret
 
-# int spawn(const char *path, char *const argv[])
+# int spawn(const char *path, char *const argv[], char *const envp[])
     .globl spawn
 spawn:
     li    a7, SYS_spawn
@@ -196,7 +196,7 @@ pipe:
     ecall
     ret
 
-# int exec(const char *path, char *const argv[]): returns only on an error
+# int exec(const char *path, char *const argv[], char *const envp[]): returns only on an error
     .globl exec
 exec:
     li    a7, SYS_exec

@@ -425,15 +425,28 @@ pub mod start {
         String::from_utf8(s).unwrap()
     }
 
-    /// Checks the start of program `elf`, run as `path` with `argv`, on the
-    /// stack under `user_top` that ends at the current hart's sp, with
-    /// `word_size`-byte pointers: every register zero but sp (a0, the
-    /// psABI's atexit function, is 0 too); at sp, 16-byte aligned, argc,
-    /// then argv, a NULL, an empty envp, and the auxiliary vector in the
-    /// kernel's order; the strings, argv's in order, then the path and a
-    /// zero word at the very top; the 16 random bytes between the two,
-    /// aligned.
-    pub fn check(m: &Machine, word_size: u64, user_top: u64, elf: &[u8], path: &str, argv: &[&str]) {
+    /// The environment the kernel starts the first process with: Linux's
+    /// for init (init/main.c's envp_init), kernel/exec.c's exec_init.
+    pub const INIT_ENV: &[&str] = &["HOME=/", "TERM=linux"];
+
+    /// Checks the start of program `elf`, run as `path` with `argv` and
+    /// the environment `envp`, on the stack under `user_top` that ends at
+    /// the current hart's sp, with `word_size`-byte pointers: every
+    /// register zero but sp (a0, the psABI's atexit function, is 0 too); at
+    /// sp, 16-byte aligned, argc, then argv, a NULL, envp, a NULL, and the
+    /// auxiliary vector in the kernel's order; the strings, argv's in
+    /// order, then envp's, then the path and a zero word at the very top,
+    /// as Linux's create_elf_tables lays them out; the 16 random bytes
+    /// between the strings and the vector, aligned.
+    pub fn check(
+        m: &Machine,
+        word_size: u64,
+        user_top: u64,
+        elf: &[u8],
+        path: &str,
+        argv: &[&str],
+        envp: &[&str],
+    ) {
         let w = |va: u64| word(m, va, word_size);
         let regs = m.cpu.x;
         let sp = regs[2];
@@ -447,16 +460,19 @@ pub mod start {
         let mut at = sp;
         assert_eq!(w(at), argv.len() as u64, "argc");
         at += word_size;
+        // argv's pointers and a NULL, then envp's and a NULL: the strings
+        // they point at, in order.
         let mut ptrs = Vec::new();
-        for want in argv {
-            let p = w(at);
-            assert_eq!(&string(m, p), want);
-            ptrs.push(p);
+        for (strings, what) in [(argv, "argv"), (envp, "envp")] {
+            for want in strings {
+                let p = w(at);
+                assert_eq!(&string(m, p), want, "{what}");
+                ptrs.push(p);
+                at += word_size;
+            }
+            assert_eq!(w(at), 0, "{what}'s NULL");
             at += word_size;
         }
-        assert_eq!(w(at), 0, "argv's NULL");
-        assert_eq!(w(at + word_size), 0, "envp's NULL: no environment");
-        at += 2 * word_size;
         let mut auxv = Vec::new();
         loop {
             let (ty, val) = (w(at), w(at + word_size));
@@ -466,9 +482,10 @@ pub mod start {
                 break;
             }
         }
-        // The strings: contiguous, argv's then the path, then the marker.
+        // The strings: contiguous, argv's then envp's, then the path, then
+        // the marker.
         let mut s = ptrs[0];
-        for (p, want) in ptrs.iter().zip(argv) {
+        for (p, want) in ptrs.iter().zip(argv.iter().chain(envp)) {
             assert_eq!(*p, s);
             s += want.len() as u64 + 1;
         }
@@ -515,5 +532,76 @@ pub mod start {
                 (AT_NULL, 0),
             ]
         );
+    }
+}
+
+/// The shell's environment (issue #216; kernel/user/sh.c, "Variables and
+/// the environment"): a session typed at either width, without a disk, and
+/// what each command must print. `env` (kernel/user/env.c) prints the
+/// environment the shell gave it, after its own changes, and
+/// `printenv` (kernel/user/printenv.c) the values getenv finds in it.
+pub mod environment {
+    use super::PROMPT;
+
+    /// The session, one command a line. The last one replaces the shell,
+    /// the first process, so the machine stops when it ends.
+    pub const INPUT: &[u8] = b"env\n\
+        X=1 env -u TERM\n\
+        X=1 printenv X HOME\n\
+        printenv X\n\
+        export Y=2\n\
+        Z=3\n\
+        env -u HOME\n\
+        HOME=/nope cd\n\
+        export Z\n\
+        export\n\
+        export 1A\n\
+        unset Y\n\
+        Y=4 env -u TERM -u HOME\n\
+        env -i A=1 B=two env\n\
+        env -i\n\
+        FOO=bar exec env -u TERM -u HOME -u Z\n";
+
+    /// Checks the session's output, `out` from the shell's banner on, with
+    /// `output`, the test file's command_output: the lines a command
+    /// printed.
+    pub fn check(out: &str, output: for<'a> fn(&'a str, &str) -> Vec<&'a str>) {
+        // The first process's environment, Linux's for init, which the
+        // shell passes on.
+        assert_eq!(output(out, "env"), ["HOME=/", "TERM=linux"], "{out}");
+        // An assignment before a program is in its environment alone.
+        assert_eq!(output(out, "X=1 env -u TERM"), ["HOME=/", "X=1"], "{out}");
+        // printenv: getenv of each name.
+        assert_eq!(output(out, "X=1 printenv X HOME"), ["1", "/"], "{out}");
+        assert_eq!(output(out, "printenv X"), ["printenv: exit 1"], "{out}");
+        // export: in every program's from then on; a plain assignment is
+        // the shell's own.
+        assert_eq!(output(out, "env -u HOME"), ["TERM=linux", "Y=2"], "{out}");
+        // A regular built-in sees the assignment, and leaves HOME as it
+        // was: cd goes to HOME (no disk here, so nowhere).
+        assert_eq!(
+            output(out, "HOME=/nope cd"),
+            ["sh: cd: /nope: no such file or directory"],
+            "{out}"
+        );
+        assert_eq!(
+            output(out, "export"),
+            ["export HOME=/", "export TERM=linux", "export Y=2", "export Z=3"],
+            "{out}"
+        );
+        assert_eq!(
+            output(out, "export 1A"),
+            ["sh: export: 1A: bad variable name"],
+            "{out}"
+        );
+        // unset takes Y out; an assignment of a name that is no variable
+        // comes after the others.
+        assert_eq!(output(out, "Y=4 env -u TERM -u HOME"), ["Z=3", "Y=4"], "{out}");
+        assert_eq!(output(out, "env -i A=1 B=two env"), ["A=1", "B=two"], "{out}");
+        assert!(output(out, "env -i").is_empty(), "{out}");
+        // Before exec, an assignment is exported to the program that
+        // replaces the shell.
+        let last = format!("{PROMPT}FOO=bar exec env -u TERM -u HOME -u Z\nFOO=bar\n");
+        assert!(out.ends_with(&last), "{out}");
     }
 }

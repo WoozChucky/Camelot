@@ -176,10 +176,13 @@ fn shell_accepts_windows_line_ends() {
     let want = format!(
         "{SHELL_BANNER}{PROMPT}help\n\
          help            this list\n\
-         exit [N]        leave the shell, with status N or the last program's\n\
+         exit [N]        leave the shell, with status N or the last command's\n\
          wait            wait for every background program\n\
-         cd [DIR]        change the working directory, to / without DIR\n\
+         cd [DIR]        change the working directory, to HOME (or /) without DIR\n\
          exec [PROG ...] replace the shell with PROG; without one, keep its redirections\n\
+         export [NAME..] pass variables (NAME or NAME=VALUE) to programs; alone, list them\n\
+         unset NAME...   remove variables\n\
+         NAME=VALUE      set a variable; before a command, for that command alone\n\
          PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /\n\
          CMD < FILE      read the input from FILE\n\
          CMD > FILE      write the output to FILE\n\
@@ -254,10 +257,10 @@ fn exec_replaces_the_shell() {
 fn kernel_boots_with_paging_on_any_ram_size() {
     // The page allocator takes the RAM size from sysinfo, so --ram changes
     // what the kernel manages; the self-tests and the ticks run with paging
-    // on either way, and so does the shell. 2 MiB is the smallest machine
+    // on either way, and so does the shell. 3 MiB is the smallest machine
     // the kernel fits in: its image, with the user programs it embeds,
-    // takes most of a 1 MiB one.
-    for mib in ["2", "16", "300"] {
+    // takes a little over 2 MiB.
+    for mib in ["3", "16", "300"] {
         let (code, out) = grail_with(&["--ram", mib], &kernel_elf(), b"exit\n");
         assert_eq!(code, Some(0), "--ram {mib}, output:\n{out}");
         let want = format!(

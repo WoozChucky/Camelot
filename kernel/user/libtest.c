@@ -7,7 +7,9 @@
  * `libtest feed N` is a child it runs: writes N numbered lines to its
  * output, in writes that cut lines in two. `libtest nap` sleeps for long,
  * and `libtest family` starts a `libtest nap` and sleeps too: the
- * processes kill_descendants ends. */
+ * processes kill_descendants ends. `libtest getenv NAME VALUE` exits 0 if
+ * getenv gives it NAME's value VALUE (none for "-"): the environment a
+ * child gets. */
 #include "user.h"
 
 static int checks;
@@ -394,7 +396,7 @@ static void test_reader(void) {
     int out = dup(STDOUT);
     close(STDOUT);
     dup(p[1]);
-    int pid = spawn("/bin/libtest", (char *[]){"libtest", "feed", "100", NULL});
+    int pid = spawn("/bin/libtest", (char *[]){"libtest", "feed", "100", NULL}, environ);
     close(STDOUT);
     dup(out);
     close(out);
@@ -485,7 +487,7 @@ static int nap(void) {
 }
 
 static int family(void) {
-    if (spawn("/bin/libtest", (char *[]){"libtest", "nap", NULL}) < 0) {
+    if (spawn("/bin/libtest", (char *[]){"libtest", "nap", NULL}, environ) < 0) {
         return 1;
     }
     return nap();
@@ -518,8 +520,8 @@ static int exists(int pid) {
 static void test_kill_descendants(void) {
     check_eq(kill_descendants(getpid()), 0, "kill_descendants with no children");
     /* Two children, one with a child of its own. */
-    int fam = spawn("/bin/libtest", (char *[]){"libtest", "family", NULL});
-    int napper = spawn("/bin/libtest", (char *[]){"libtest", "nap", NULL});
+    int fam = spawn("/bin/libtest", (char *[]){"libtest", "family", NULL}, environ);
+    int napper = spawn("/bin/libtest", (char *[]){"libtest", "nap", NULL}, environ);
     check(fam > 0 && napper > 0, "spawn a family and a napper");
     int grandchild = 0;
     for (int tries = 0; tries < 1000 && grandchild == 0; tries++) {
@@ -546,7 +548,110 @@ static void test_kill_descendants(void) {
     check_eq(kill_descendants(getpid()), 0, "nothing left to kill");
 }
 
+/* `libtest getenv NAME VALUE`: exits 0 if its environment gives NAME the
+ * value VALUE, or none for VALUE "-", else 1. */
+static int getenv_child(const char *name, const char *want) {
+    const char *got = getenv(name);
+    if (strcmp(want, "-") == 0) {
+        return got == NULL ? 0 : 1;
+    }
+    return got != NULL && strcmp(got, want) == 0 ? 0 : 1;
+}
+
+/* Runs `libtest getenv NAME VALUE` with the environment `envp` and returns
+ * its exit status, or the error. */
+static int run_getenv(const char *name, const char *want, char **envp) {
+    char *argv[] = {"libtest", "getenv", (char *)name, (char *)want, NULL};
+    int pid = spawn("/bin/libtest", argv, envp);
+    if (pid < 0) {
+        return pid;
+    }
+    int status = -1000;
+    return wait(pid, &status) == pid ? status : -1000;
+}
+
+/* How many entries environ has. */
+static int entries(void) {
+    int n = 0;
+    while (environ[n] != NULL) {
+        n++;
+    }
+    return n;
+}
+
+static void test_env(void) {
+    /* The environment the shell passed, as crt0 left it in environ. */
+    char **start = environ;
+    check(start != NULL, "crt0 sets environ");
+    int n = entries();
+    check(getenv("") == NULL, "getenv of an empty name");
+    check(getenv("LIBTEST_A") == NULL, "getenv of a variable that isn't there");
+    check_eq(setenv("LIBTEST_A", "one", 0), 0, "setenv adds a variable");
+    check_str(getenv("LIBTEST_A"), "one", "getenv finds it");
+    check(environ != start, "setenv makes an array of its own");
+    check_eq(entries(), n + 1, "one more entry");
+    check_str(environ[n], "LIBTEST_A=one", "at the end");
+    check(environ[0] == start[0], "the others stay");
+    char *kept = getenv("LIBTEST_A");
+    check_eq(setenv("LIBTEST_A", "two", 0), 0, "setenv without overwrite");
+    check_str(getenv("LIBTEST_A"), "one", "leaves the value");
+    check_eq(setenv("LIBTEST_A", "two", 1), 0, "setenv with overwrite");
+    check_str(getenv("LIBTEST_A"), "two", "replaces it");
+    check_str(kept, "one", "and what getenv returned before stays good");
+    check_eq(entries(), n + 1, "in its place");
+    check_eq(setenv("LIBTEST_B", "", 1), 0, "setenv to an empty value");
+    check(getenv("LIBTEST_B") != NULL && getenv("LIBTEST_B")[0] == 0, "an empty value is a value");
+    check_eq(setenv("", "x", 1), -EINVAL, "setenv of an empty name");
+    check_eq(setenv("A=B", "x", 1), -EINVAL, "setenv of a name with a =");
+    check(getenv("A=B") == NULL, "getenv of a name with a =");
+    check_eq(unsetenv(""), -EINVAL, "unsetenv of an empty name");
+    check_eq(unsetenv("A=B"), -EINVAL, "unsetenv of a name with a =");
+    /* A child started with environ has what setenv put there, and not what
+     * unsetenv took out. */
+    check_eq(run_getenv("LIBTEST_A", "two", environ), 0, "a child gets the variable");
+    check_eq(unsetenv("LIBTEST_A"), 0, "unsetenv");
+    check(getenv("LIBTEST_A") == NULL, "removes it");
+    check_eq(entries(), n + 1, "and its entry");
+    check_eq(unsetenv("LIBTEST_A"), 0, "unsetenv of a variable that isn't there");
+    check_eq(run_getenv("LIBTEST_A", "-", environ), 0, "a child doesn't get it");
+    check_eq(run_getenv("LIBTEST_B", "", environ), 0, "a child gets an empty value");
+    check_eq(run_getenv("HOME", "-", NULL), 0, "a NULL environment is an empty one");
+
+    /* An array of the program's own: getenv takes the first entry of a
+     * name, unsetenv removes them all, setenv makes a new array. */
+    char *own[] = {"D=1", "LIBTEST_D=first", "X", "LIBTEST_D=second", "LIBTEST_DD=3", NULL};
+    environ = own;
+    check_str(getenv("LIBTEST_D"), "first", "getenv takes the first");
+    check_str(getenv("D"), "1", "a name is all of it, not a part");
+    check(getenv("X") == NULL, "an entry without a = has no value");
+    check_eq(unsetenv("LIBTEST_D"), 0, "unsetenv of a name with two entries");
+    check(environ == own && own[1] != NULL && strcmp(own[1], "X") == 0 && strcmp(own[2], "LIBTEST_DD=3") == 0 &&
+              own[3] == NULL,
+          "removes both, in place, the others in order");
+    check_eq(setenv("E", "5", 1), 0, "setenv on the program's array");
+    check(environ != own && strcmp(environ[3], "E=5") == 0 && environ[4] == NULL, "copies it, one longer");
+    check_eq(run_getenv("E", "5", environ), 0, "a child gets that one");
+    environ = NULL;
+    check(getenv("E") == NULL, "getenv with no environment");
+    check_eq(setenv("F", "6", 1), 0, "setenv with no environment");
+    check(environ != NULL && strcmp(environ[0], "F=6") == 0 && environ[1] == NULL, "makes one");
+    /* The array setenv made last is the one it grows, even when environ
+     * has become another since: it copies that one's pointers in rather
+     * than leave its own unused (glibc's __add_to_environ). realloc keeps
+     * a block that is big enough, and this one is: it had room for E's five. */
+    char **made = environ;
+    char *other[] = {"G=7", NULL};
+    environ = other;
+    check_eq(setenv("H", "8", 1), 0, "setenv on another array again");
+    check(environ == made && strcmp(environ[0], "G=7") == 0 && strcmp(environ[1], "H=8") == 0 && environ[2] == NULL,
+          "grows the array it made before, which it has not lost");
+    environ = start;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 4 && strcmp(argv[1], "getenv") == 0) {
+        return getenv_child(argv[2], argv[3]);
+    }
     if (argc == 3 && strcmp(argv[1], "feed") == 0) {
         return feed(atoi(argv[2]));
     }
@@ -568,6 +673,7 @@ int main(int argc, char **argv) {
     test_odd_break();
     test_reader();
     test_kill_descendants();
+    test_env();
     printf("libtest: %d checks, %d failed\n", checks, failures);
     return failures;
 }

@@ -396,7 +396,7 @@ fn threadtest_passes_on_one_and_four_harts() {
 }
 
 /// The checks `threadtest` and `threadtest fs` make: each must run every one.
-const THREADTEST_CHECKS: u32 = 96;
+const THREADTEST_CHECKS: u32 = 100;
 const THREADTEST_FS_CHECKS: u32 = 16;
 
 #[test]

@@ -324,7 +324,7 @@ static void test_working_directory(void) {
     check(fd >= 0, "create a file there");
     close(fd);
     check_eq(stat("/ft/d/c", &st), 0, "it is in that directory");
-    int pid = spawn("/bin/filetest", (char *[]){"filetest", "incwd", NULL});
+    int pid = spawn("/bin/filetest", (char *[]){"filetest", "incwd", NULL}, environ);
     check_eq(status_of(pid), 0, "a child starts in its parent's working directory");
     check_eq(chdir(".."), 0, "chdir ..");
     check_eq(stat("d/c", &st), 0, "back in /ft");
@@ -400,7 +400,7 @@ static int run_captured(const char *path, char **argv, char *out, int size, int 
     close(STDOUT);
     dup(p[1]);
     close(p[1]);
-    int pid = spawn(path, argv);
+    int pid = spawn(path, argv, environ);
     close(STDOUT);
     dup(console);
     close(console);
@@ -430,17 +430,17 @@ static void test_programs(void) {
     write(fd, "#!/bin/sh\n", 10);
     close(fd);
     /* The kernel prints why: "spawn: /ft/notelf: not an ELF file". */
-    check_eq(spawn("/ft/notelf", NULL), -ENOEXEC, "a file that isn't a program");
+    check_eq(spawn("/ft/notelf", NULL, environ), -ENOEXEC, "a file that isn't a program");
     /* exec fails as late as it can, reading the file: this program carries
      * on, the same process, its memory as it was. */
     int pid = getpid();
     char mark[] = "still here";
-    check_eq(exec("/ft/notelf", (char *[]){"notelf", NULL}), -ENOEXEC, "exec a file that isn't a program");
+    check_eq(exec("/ft/notelf", (char *[]){"notelf", NULL}, environ), -ENOEXEC, "exec a file that isn't a program");
     check(getpid() == pid && strcmp(mark, "still here") == 0, "and the old program carries on");
-    check_eq(spawn("/ft", NULL), -EACCES, "a directory isn't a program");
-    check_eq(spawn("/dev/console", NULL), -EACCES, "nor is a device");
-    check_eq(exec("/ft", NULL), -EACCES, "exec a directory");
-    check_eq(spawn("/ft/notelf/x", NULL), -ENOTDIR, "a path through a file");
+    check_eq(spawn("/ft", NULL, environ), -EACCES, "a directory isn't a program");
+    check_eq(spawn("/dev/console", NULL, environ), -EACCES, "nor is a device");
+    check_eq(exec("/ft", NULL, environ), -EACCES, "exec a directory");
+    check_eq(spawn("/ft/notelf/x", NULL, environ), -ENOTDIR, "a path through a file");
     check_eq(unlink("myecho"), 0, "remove the copy");
     check_eq(unlink("notelf"), 0, "remove the script");
 }
@@ -509,7 +509,7 @@ static void test_open_file_table(void) {
     char tag[2] = "a";
     while (c == 'M' && children < 6) {
         tag[0] = (char)('a' + children);
-        int pid = spawn("/bin/filetest", (char *[]){"filetest", "hold", tag, NULL});
+        int pid = spawn("/bin/filetest", (char *[]){"filetest", "hold", tag, NULL}, environ);
         if (pid < 0) {
             break;
         }

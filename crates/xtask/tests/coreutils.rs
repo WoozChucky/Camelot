@@ -468,7 +468,10 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool, xlen: Xlen) {
     // The shell sleeps in wait() for ps, unless a tick preempted it between
     // starting ps and waiting: then it is still ready to run.
     let sh_state = if rows[0][2] == "ready" { "ready" } else { "sleep" };
-    assert_eq!(rows[0], [sh, "0", sh_state, &size("sh"), "sh"], "{ps}");
+    // The shell's size is its program's and a page of heap: malloc's
+    // first sbrk, for the variables it copied from its environment.
+    let sh_size = (size_of(&host, "sh") + 4096).to_string();
+    assert_eq!(rows[0], [sh, "0", sh_state, &sh_size, "sh"], "{ps}");
     assert_eq!(rows[1], [&pid_s, sh, "sleep", &size("sleep"), "sleep"], "{ps}");
     assert_eq!(rows[2], [&ps_pid, sh, "run", &size("ps"), "ps"], "{ps}");
     assert!(shell_pid < pid);
@@ -549,6 +552,33 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool, xlen: Xlen) {
             && waited.contains(&format!("[{}] cat: exit -1\n", pids[1])),
         "{waited}"
     );
+
+    // env (#216): the environment the shell passes on (the kernel's for
+    // init), emptied, changed, and a program run with it; and cd's HOME.
+    assert_eq!(s.run("env"), "HOME=/\nTERM=linux\n");
+    assert_eq!(s.run("env -i A=1 B=2 env"), "A=1\nB=2\n");
+    assert_eq!(s.run("env -u HOME TERM=vt100"), "TERM=vt100\n");
+    assert_eq!(
+        s.run("env =x"),
+        format!("env: cannot set =x: invalid argument\n{}", exit_line("env", 125))
+    );
+    let usage = "usage: env [-i] [-u NAME]... [NAME=VALUE]... [PROG [ARG...]]\n";
+    assert_eq!(s.run("env -x"), format!("{usage}{}", exit_line("env", 125)));
+    assert_eq!(
+        s.run("env nope"),
+        format!("env: nope: {enoent}\n{}", exit_line("env", 127))
+    );
+    assert_eq!(
+        s.run("env /bin"),
+        format!("env: /bin: not a regular file\n{}", exit_line("env", 126))
+    );
+    assert_eq!(s.run("printenv TERM HOME"), "linux\n/\n");
+    assert_eq!(s.run("printenv"), "HOME=/\nTERM=linux\n");
+    assert_eq!(s.run("printenv HOME=/"), exit_line("printenv", 1));
+    assert_eq!(s.run("HOME=/t cd"), "");
+    assert_eq!(s.run("ls u"), listing);
+    assert_eq!(s.run("cd"), "");
+    assert_eq!(s.run("ls t/u"), listing);
 
     let (r, disk) = s.exit();
     // The shell's status is the last program's (0); a failed self-test

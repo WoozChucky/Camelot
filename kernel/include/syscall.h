@@ -24,7 +24,7 @@
 #define SYS_getpid 4  /* getpid(): the caller's pid */
 #define SYS_yield 5   /* yield(): 0, after the other runnable processes had a turn */
 #define SYS_sleep 6   /* sleep(ticks): 0, at least `ticks` timer ticks later */
-#define SYS_spawn 7   /* spawn(path, argv): the new process's pid */
+#define SYS_spawn 7   /* spawn(path, argv, envp): the new process's pid */
 #define SYS_wait 8    /* wait(pid, status): the pid of the child that ended */
 #define SYS_sbrk 9    /* sbrk(increment): the old end of the heap */
 #define SYS_uptime 10 /* uptime(): timer ticks since boot */
@@ -38,7 +38,7 @@
 #define SYS_chdir 18  /* chdir(path): 0 */
 #define SYS_dup 19    /* dup(fd): a new descriptor for the same open file */
 #define SYS_pipe 20   /* pipe(fds): 0, with fds[0] the read end and fds[1] the write end */
-#define SYS_exec 21   /* exec(path, argv): does not return */
+#define SYS_exec 21   /* exec(path, argv, envp): does not return */
 #define SYS_kill 22   /* kill(pid): 0, the process ends before it runs U-mode code again */
 #define SYS_procs 23  /* procs(buf, max): the number of processes, up to max described in buf */
 #define SYS_netinfo 24 /* netinfo(info): 0, with *info filled in */
@@ -273,11 +273,14 @@ struct sockaddr_in {
     u8 sin_zero[8];
 };
 
-/* spawn's and exec's limits: at most MAXARG arguments (argv[0] included), whose strings
- * take at most ARG_MAX bytes with their NULs. They go on the new process's
- * stack, above its first stack frame. */
+/* spawn's and exec's limits, as execve's: at most MAXARG strings in argv
+ * (argv[0] included) and as many in envp (Linux's MAX_ARG_STRINGS bounds
+ * each array alike), and the strings of both, with their NULs, at most
+ * ARG_MAX bytes together (POSIX's ARG_MAX counts the environment's data in;
+ * Linux's limit is the two arrays' strings and pointers together). They go
+ * on the new process's stack, above its first stack frame. */
 #define MAXARG 16
-#define ARG_MAX 512
+#define ARG_MAX 1024
 
 /* The auxiliary vector's entry types (docs/camelot-syscalls.md, "Starting
  * a program"): what the kernel tells a program it starts, after its
