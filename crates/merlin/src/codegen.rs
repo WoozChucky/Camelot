@@ -443,6 +443,16 @@
 //! those of one name ([`crate::sema::symbol_key`]); [`FileGen::name`] is the
 //! symbol a key was given.
 //!
+//! Some globals of clang's take numbers though merlin has no object for
+//! them, so merlin counts them all the same: the constants clang copies a
+//! local's initializer from (`__const.f.a`, an array's `constinit`:
+//! [`FileGen::take_name`]), and a global clang makes a second time, of its
+//! definition's LLVM type, when a reference made it with another (an
+//! `extern int a[]` used before `int a[3] = {1, 2, 3};`), which takes a
+//! number for a moment before the name moves over to it
+//! ([`FileGen::defined`]). Code control cannot reach takes no names
+//! ("Unreachable code" below).
+//!
 //! ## Control flow
 //!
 //! Conditions are evaluated into `a0` and tested with `beqz`/`bnez`. Jumps go
@@ -536,11 +546,12 @@ use crate::consteval::{self, Base, Const};
 use crate::debug::{DebugInfo, Lines, Location, Scope, Var};
 use crate::elide;
 use crate::sema::{arith_type, symbol_base, LITERAL};
-use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
+use crate::types::{ptr_size, FuncType, IntKind, Member, RecordBody, Type, Xlen};
 use crate::{Error, Pos};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::sync::Arc;
 
 /// Generates assembly for a whole translation unit.
 pub fn generate(prog: &Program) -> Result<String, Error> {
@@ -602,6 +613,7 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
         queue: Vec::new(),
         created: Vec::new(),
         created_set: HashSet::new(),
+        referred_as: HashMap::new(),
         chunks: HashMap::new(),
         dry: false,
     };
@@ -905,6 +917,19 @@ impl SymbolTable {
             }
         }
     }
+
+    /// A second global made under the name `base` of one that has it, which
+    /// then takes the name over (`takeName`): the second is named
+    /// `base.N` for a moment, so the counter moves on, and no name is left
+    /// taken.
+    fn rename(&mut self, base: &str) {
+        loop {
+            self.last_unique += 1;
+            if !self.taken.contains(&format!("{base}.{}", self.last_unique)) {
+                return;
+            }
+        }
+    }
 }
 
 /// What clang's `emitStoresForConstant` looks at in the constant
@@ -1003,6 +1028,9 @@ struct FileGen<'a> {
     /// output has them.
     created: Vec<String>,
     created_set: HashSet<String>,
+    /// The type a variable was declared with where a reference made its
+    /// symbol, before its definition was emitted ([`Self::defined`]).
+    referred_as: HashMap<String, Type>,
     /// The output of each symbol emitted, in pieces by section.
     chunks: HashMap<String, Vec<(&'static str, String)>>,
     /// A function's first pass is being generated, which makes nothing
@@ -1063,10 +1091,10 @@ impl<'a> FileGen<'a> {
         self.names.get(sym).map_or(sym, String::as_str)
     }
 
-    /// A reference to symbol `sym` in the code or the data generated. A
-    /// compound literal it names is emitted first, as clang emits one where
-    /// an initializer names it.
-    fn reference(&mut self, sym: &str) {
+    /// A reference to symbol `sym` in the code or the data generated, of a
+    /// variable declared there with type `ty`. A compound literal it names
+    /// is emitted first, as clang emits one where an initializer names it.
+    fn reference(&mut self, sym: &str, ty: Option<&Type>) {
         if self.dry {
             return;
         }
@@ -1075,7 +1103,140 @@ impl<'a> FileGen<'a> {
                 self.emit(k).expect("a variable is emitted without errors");
             }
         }
+        if let Some(ty) = ty.filter(|_| !self.created_set.contains(sym)) {
+            self.referred_as.insert(sym.to_string(), ty.clone());
+        }
         self.create(sym);
+    }
+
+    /// The definition of global `d` (key `sym`), its initializer's data
+    /// made: if a reference made its symbol before, as clang makes a
+    /// global of the type the variable was declared with there, and the
+    /// constant clang makes of the initializer is of another type, clang
+    /// makes a new global of that type, under the name, and moves the name
+    /// over to it (`GetOrCreateLLVMGlobal`): the name counter moves on.
+    ///
+    /// ```text
+    ///   extern int a[];          (a [0 x i32] global, where p refers to it)
+    ///   int *p = a;
+    ///   int a[3] = {1, 2, 3};    ([3 x i32]: a new global, a.1, renamed a)
+    /// ```
+    fn defined(&mut self, d: &Declarator, sym: &str) {
+        let Some(referred) = self.referred_as.remove(sym) else {
+            return;
+        };
+        let same = same_llvm_type(&referred, &d.ty, self.xlen)
+            && d.init
+                .as_ref()
+                .is_none_or(|init| self.constant_has_type(&d.ty, init));
+        if !same {
+            let name = self.name(sym).to_string();
+            self.symbols.rename(&name);
+        }
+    }
+
+    /// Whether the constant clang makes of `init`, the initializer of an
+    /// object of type `ty`, has the LLVM type clang gives such an object
+    /// in memory (`ConvertTypeForMem`), as clang's `ConstExprEmitter`
+    /// builds it:
+    ///
+    /// - a scalar's, and a `char` array's string (the array's size), have
+    ///   it; so does a subobject the list leaves out (an empty list here),
+    ///   clang's `EmitNullConstant`;
+    /// - an array's (`EmitArrayConstant`) is an array of its elements'
+    ///   type, which is the array's if every element's is, unless 8 zeros
+    ///   or more end it (a struct then, the zeros an array of their own);
+    ///   all zeros is the array's own `zeroinitializer`;
+    /// - a struct's is the struct's if every member's constant has its type
+    ///   and the struct has no padding: C has clang spell the padding out as
+    ///   arrays of zeros (`DoZeroInitPadding`), which the struct's own type
+    ///   leaves to the layout;
+    /// - a union's has the member it initializes and padding to the
+    ///   union's size, the union's own type if that member's constant has
+    ///   the LLVM type of the member the union's type holds (the most
+    ///   aligned, then the largest, the first of those: `lowerUnion`).
+    fn constant_has_type(&self, ty: &Type, init: &Init) -> bool {
+        let x = self.xlen;
+        match (ty.unqual(), init) {
+            (_, Init::List(items, _)) if items.is_empty() => true,
+            (Type::Array(elem, Some(n)), Init::List(items, _)) => {
+                let nonzero = items
+                    .iter()
+                    .rposition(|i| !self.constant_is_null(elem, i))
+                    .map_or(0, |i| i + 1);
+                nonzero == 0
+                    || (*n as usize - nonzero < 8 && items.iter().all(|i| self.constant_has_type(elem, i)))
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().expect("sema: initialized objects are complete");
+                if r.union {
+                    let held = &body.members[items.len() - 1];
+                    let storage = union_storage(body, x);
+                    return same_llvm_type(&held.ty, &storage.ty, x)
+                        && self.constant_has_type(&held.ty, &items[items.len() - 1]);
+                }
+                !padded(body, x)
+                    && body
+                        .members
+                        .iter()
+                        .zip(items)
+                        .all(|(m, i)| self.constant_has_type(&m.ty, i))
+            }
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_has_type(lit, init),
+            _ => true,
+        }
+    }
+
+    /// Whether the constant clang makes of `init` (of an object of type
+    /// `ty`) is all zeros (LLVM's `isNullValue`): what ends an array's
+    /// elements before [`Self::constant_has_type`] counts its zeros.
+    fn constant_is_null(&self, ty: &Type, init: &Init) -> bool {
+        match (ty.unqual(), init) {
+            (Type::Array(elem, _), Init::List(items, _)) => {
+                items.iter().all(|i| self.constant_is_null(elem, i))
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                // (A union's: the member it initializes, its last item.)
+                let body = r.body().expect("sema: initialized objects are complete");
+                let first = if r.union { items.len().saturating_sub(1) } else { 0 };
+                body.members[first..]
+                    .iter()
+                    .zip(&items[first..])
+                    .all(|(m, i)| self.constant_is_null(&m.ty, i))
+            }
+            (_, Init::List(items, _)) => items.is_empty(),
+            (
+                Type::Array(_, Some(n)),
+                Init::Expr(Expr {
+                    kind: ExprKind::Str(bytes),
+                    ..
+                }),
+            ) => bytes.iter().take(*n as usize).all(|&b| b == 0),
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_is_null(lit, init),
+            (_, Init::Expr(e)) => matches!(
+                consteval::eval(e, self.xlen),
+                Some(Const::Int(0, _))
+                    | Some(Const::Addr {
+                        base: None,
+                        offset: 0
+                    })
+            ),
+            (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
+        }
     }
 
     /// Emits definition `k`: its code or its data, and with `-g` its entry.
@@ -1284,6 +1445,7 @@ impl<'a> FileGen<'a> {
         if let Some(init) = &d.init {
             self.data(&d.ty, init, &mut data);
         }
+        self.defined(d, sym);
         self.create(sym);
         let name = self.name(sym).to_string();
         self.begin();
@@ -1414,7 +1576,7 @@ impl<'a> FileGen<'a> {
                     } => {
                         let sym = match base {
                             Base::Sym(s) => {
-                                self.reference(&s);
+                                self.reference(&s, referred_type(e, &s));
                                 self.name(&s).to_string()
                             }
                             Base::Str(bytes) => self.string(&bytes, e.pos),
@@ -1550,6 +1712,69 @@ enum Place {
     Pushed,
 }
 
+/// Whether clang gives objects of types `a` and `b` one LLVM type in memory
+/// (`ConvertTypeForMem`): integers of one size (`iN`, whatever their
+/// signedness, `_Bool` an `i8`), any two pointers (`ptr`), arrays of as many
+/// such elements (`[0 x T]` for an unknown size), the same struct or union
+/// (a named type of its own).
+fn same_llvm_type(a: &Type, b: &Type, x: Xlen) -> bool {
+    match (a.unqual(), b.unqual()) {
+        (Type::Int(k), Type::Int(l)) => k.size(x) == l.size(x),
+        (Type::Ptr(_), Type::Ptr(_)) => true,
+        (Type::Array(e, n), Type::Array(f, m)) => n.unwrap_or(0) == m.unwrap_or(0) && same_llvm_type(e, f, x),
+        (Type::Record(r), Type::Record(s)) => Arc::ptr_eq(r, s),
+        _ => false,
+    }
+}
+
+/// The member whose type a union's LLVM type holds (then padding to the
+/// union's size): the most aligned, of those the largest, of those the
+/// first (`CGRecordLowering::lowerUnion`).
+fn union_storage(body: &RecordBody, x: Xlen) -> &Member {
+    let key = |m: &Member| (m.ty.align(x), m.ty.size(x).unwrap_or(0));
+    let mut best = &body.members[0];
+    for m in &body.members[1..] {
+        if key(m) > key(best) {
+            best = m;
+        }
+    }
+    best
+}
+
+/// Whether a struct has padding: a member that does not start where the
+/// one before ends, or bytes after the last.
+fn padded(body: &RecordBody, x: Xlen) -> bool {
+    let mut end = 0;
+    for m in &body.members {
+        if m.offset != end {
+            return true;
+        }
+        end = m.offset + m.ty.size(x).unwrap_or(0);
+    }
+    end != body.size
+}
+
+/// The type of the first reference to global `sym` in `e`, the variable as
+/// it was declared there (an expression the symbol of a static initializer
+/// came from, [`consteval::eval`]'s `Base::Sym`).
+fn referred_type<'e>(e: &'e Expr, sym: &str) -> Option<&'e Type> {
+    let sub = |x: &'e Expr| referred_type(x, sym);
+    match &e.kind {
+        ExprKind::Var {
+            var: Some(VarRef::Global(s)),
+            ..
+        } if s == sym => Some(&e.ty),
+        ExprKind::Addr(x)
+        | ExprKind::Deref(x)
+        | ExprKind::Unary(_, x)
+        | ExprKind::Cast { x, .. }
+        | ExprKind::Member { base: x, .. } => sub(x),
+        ExprKind::Binary(_, l, r) | ExprKind::Comma(l, r) => sub(l).or_else(|| sub(r)),
+        ExprKind::Cond(c, t, f) => sub(c).or_else(|| sub(t)).or_else(|| sub(f)),
+        _ => None,
+    }
+}
+
 /// Whether `s` is visited even where control cannot reach it: clang's
 /// `EmitSimpleStmt` statements, which `EmitStmt` handles before it asks
 /// whether there is an insertion point. A block's statements are each
@@ -1654,9 +1879,9 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     /// `la reg, symbol`: `auipc` + `addi`, for the symbol of key `symbol`
-    /// (a function or variable).
-    fn la(&mut self, reg: &str, symbol: &str) {
-        self.file.reference(symbol);
+    /// (a function or variable, declared there with type `ty`).
+    fn la(&mut self, reg: &str, symbol: &str, ty: &Type) {
+        self.file.reference(symbol, Some(ty));
         let name = self.file.name(symbol).to_string();
         self.la_label(reg, &name);
     }
@@ -2958,7 +3183,7 @@ impl<'a> FuncGen<'a, '_> {
                     }
                 }
                 Some(VarRef::Global(sym)) => {
-                    self.la("a0", sym);
+                    self.la("a0", sym, &e.ty);
                     self.load(&e.ty);
                 }
                 None => unreachable!("sema resolves every variable"),
@@ -3299,7 +3524,7 @@ impl<'a> FuncGen<'a, '_> {
                     let off = self.offset(*id);
                     self.add_imm("a0", "s0", off);
                 }
-                Some(VarRef::Global(sym)) => self.la("a0", sym),
+                Some(VarRef::Global(sym)) => self.la("a0", sym, &e.ty),
                 None => unreachable!("sema resolves every variable"),
             },
             // The address of *p is p.
@@ -3811,7 +4036,7 @@ impl<'a> FuncGen<'a, '_> {
         // (`EmitCallee`, then `EmitCallArgs`): in `f(g())`, `f`'s symbol is
         // made first ("Order" above).
         if let Some(name) = direct {
-            self.file.reference(name);
+            self.file.reference(name, None);
         }
         if used > abi::ARG_REGS {
             let hidden = if abi::returns_in_memory(&ft.ret, self.xlen) {
@@ -3895,7 +4120,7 @@ impl<'a> FuncGen<'a, '_> {
         match direct {
             // `call` is `auipc ra` + `jalr ra`: two words.
             Some(name) => {
-                self.file.reference(name);
+                self.file.reference(name, None);
                 self.ins_sized(8, "call", name)
             }
             None => self.ins("jalr", "t1"),

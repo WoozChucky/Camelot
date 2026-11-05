@@ -6,8 +6,9 @@
 // already, in the order they are emitted, the names of the constants clang
 // copies a local's initializer from included, which merlin does not make
 // (docs/excalibur-spec.md, "Symbol names"), and not those of code control
-// cannot reach, which clang does not generate; the names are in the
-// comments.
+// cannot reach, which clang does not generate, and a number for a global
+// clang makes again, of another type, for its definition; the names are in
+// the comments.
 
 struct pair {
     int a, b;
@@ -20,10 +21,11 @@ struct named {
 
 const char *greeting = "hi";                     // .L.str
 int *ones = (int[]){1, 1};                       // .compoundliteral
-static struct pair *late = &(struct pair){3, 4}; // .compoundliteral.13, at the end
+static struct pair *late = &(struct pair){3, 4}; // .compoundliteral.14, at the end
 const char *farewell = "bye";                    // .L.str.1
 int *twos = (int[]){2};                          // .compoundliteral.2
 const char *again = "hi";                        // .L.str again: the same bytes
+extern int table[];                              // defined after main, which uses it
 
 int count(void) {
     static int n = 5;                 // count.n
@@ -97,5 +99,11 @@ int main(void) {
     sum += other();                                                     // 14
     sum += copies(1);                                                   // 25
     sum += dead(1) + dead(5);                                           // 31
+    sum += table[1] - 2;                                                // 31
     return sum + late->b + (*"x" == 'x');                               // 36, .L.str.12
 }
+
+// main made table's symbol, an int[] there: an LLVM [0 x i32], which the
+// definition's [3 x i32] is not, so clang makes a new global, table.13 for
+// a moment, and moves the name over to it.
+int table[3] = {1, 2, 3};

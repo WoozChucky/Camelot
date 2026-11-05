@@ -192,7 +192,7 @@ other.n.5:
     .type late, @object
     .size late, 8
 late:
-    .quad .compoundliteral.13
+    .quad .compoundliteral.14
 
     .text
 
@@ -707,6 +707,28 @@ main:
     lw    a0, -20(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
+    la    a0, table
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    li    a0, 1
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    slli  a0, a0, 2
+    add   a0, a1, a0
+    lw    a0, 0(a0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    li    a0, 2
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    subw  a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     la    a0, late
     ld    a0, 0(a0)
     addi  a0, a0, 4
@@ -738,11 +760,21 @@ main:
 
     .data
 
-    # static struct pair .compoundliteral.13: 8 bytes
+    # int table[3]: 12 bytes
+    .globl table
     .balign 4
-    .type .compoundliteral.13, @object
-    .size .compoundliteral.13, 8
-.compoundliteral.13:
+    .type table, @object
+    .size table, 12
+table:
+    .word 1
+    .word 2
+    .word 3
+
+    # static struct pair .compoundliteral.14: 8 bytes
+    .balign 4
+    .type .compoundliteral.14, @object
+    .size .compoundliteral.14, 8
+.compoundliteral.14:
     .word 3
     .word 4
 
