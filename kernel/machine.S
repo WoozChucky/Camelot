@@ -269,6 +269,15 @@ machine_soft:
     li    t1, CLINT_BASE
     add   t0, t0, t1
     sw    zero, 0(t0)
+    # The clear before every access that follows, S-mode's loads of what
+    # the senders asked (tlb_serve()'s of tlb_asked[]) above all. msip is
+    # I/O, so nothing else orders the store before them (RVWMO): a load
+    # performed first could read a request from before a second IPI, whose
+    # msip = 1 the clear, landing later, would then erase, and the request
+    # would wait for the next tick. OpenSBI has a wmb() (fence ow, ow) after
+    # the clear (sbi_ipi_raw_clear()), for the writes after it; the loads
+    # need O before R too, so O before RW, as sbi_hart_wait's fence o, r.
+    fence o, rw
     csrsi mip, MIP_SSIP
     j     machine_return
 
@@ -417,8 +426,15 @@ sbi_ipi:
     # an idle hart is woken for) must be visible to the harts before the
     # interrupt that tells them to look. msip is an I/O store, which
     # neither the ecall nor an AMO's aq/rl bits order after ordinary
-    # memory (RVWMO; #170): Linux's writel() puts a fence before its store
-    # too.
+    # memory (RVWMO; #170). Linux's writel() puts a fence w, o before its
+    # store, and OpenSBI's sbi_ipi_raw_send() a wmb(), fence ow, ow, before
+    # the device's ipi_send(). What both are for is W before O: the stores
+    # to memory before the msip store. fence rw, o orders that, and the
+    # caller's loads before it as well. wmb()'s other bits are for what
+    # OpenSBI can't know of its drivers, whose ipi_send() may write memory
+    # (W after) or follow other device writes (O before): here the send is
+    # this one msip store, and no device store before it means anything to
+    # the target.
 2:  fence rw, o
     li    t1, CLINT_BASE
     li    t2, 1

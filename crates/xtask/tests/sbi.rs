@@ -6,8 +6,9 @@
 //! the kernel's own side: the exit codes machine_power_off() gives, a hart
 //! that hart_start can't start and one that never comes online, both
 //! reported and left out, and, over whole boots, that every IPI store comes
-//! after a fence that orders the stores before it (#170) and that S-mode
-//! never touches the CLINT or the SBI's scratch blocks.
+//! after a fence that orders the stores before it (#170), that every msip
+//! clear comes before a fence that orders it before the loads after it, and
+//! that S-mode never touches the CLINT or the SBI's scratch blocks.
 
 mod common;
 
@@ -584,15 +585,22 @@ fn a_hart_that_never_comes_online_is_reported_after_a_second() {
 
 /// What the boots below watch on every hart's turn: each store to an msip
 /// (an IPI) must come after a `fence` whose predecessor set has W and whose
-/// successor set has O, with no store to memory in between (#170), and S-mode
-/// must never touch the CLINT or the SBI's scratch blocks.
+/// successor set has O, with no store to memory in between (#170); each
+/// store clearing an msip must be followed by a `fence` whose predecessor
+/// set has O before the hart's next load from memory, or a second IPI could
+/// be erased after the load missed what it asked; and S-mode must never
+/// touch the CLINT or the SBI's scratch blocks.
 struct Ordering {
     xlen: Xlen,
     /// Per hart: a fence ordering the stores so far before device stores
     /// has run since the hart's last store to memory.
     fenced: Vec<bool>,
+    /// Per hart: it has cleared its msip, and no fence ordering device
+    /// stores before loads has run since.
+    cleared: Vec<bool>,
     scratch: std::ops::Range<u64>,
     ipis: usize,
+    clears: usize,
 }
 
 impl Ordering {
@@ -612,17 +620,23 @@ impl Ordering {
                 Xlen::Rv64 => a,
             }
         };
-        let (target, value) = match excalibur::decode(word, self.xlen) {
+        // The address, the value stored, and whether the access reads (an
+        // AMO does both).
+        let (target, value, reads) = match excalibur::decode(word, self.xlen) {
             Inst::Fence { pred, succ } => {
                 if pred & 1 != 0 && succ & 4 != 0 {
                     self.fenced[h] = true;
                 }
+                if pred & 4 != 0 && succ & 2 != 0 {
+                    self.cleared[h] = false;
+                }
                 return;
             }
-            Inst::Load { rs1, imm, .. } => (addr(rs1, imm), None),
-            Inst::Store { rs1, rs2, imm, .. } => (addr(rs1, imm), Some(reg(rs2))),
-            Inst::Amo { rs1, rs2, .. } | Inst::Sc { rs1, rs2, .. } => (addr(rs1, 0), Some(reg(rs2))),
-            Inst::Lr { rs1, .. } => (addr(rs1, 0), None),
+            Inst::Load { rs1, imm, .. } => (addr(rs1, imm), None, true),
+            Inst::Store { rs1, rs2, imm, .. } => (addr(rs1, imm), Some(reg(rs2)), false),
+            Inst::Amo { rs1, rs2, .. } => (addr(rs1, 0), Some(reg(rs2)), true),
+            Inst::Sc { rs1, rs2, .. } => (addr(rs1, 0), Some(reg(rs2)), false),
+            Inst::Lr { rs1, .. } => (addr(rs1, 0), None, true),
             _ => return,
         };
         let clint = (0x0200_0000..0x0201_0000).contains(&target);
@@ -634,8 +648,15 @@ impl Ordering {
                 cpu.pc
             );
         }
+        let memory = !clint && target >= RAM_BASE;
+        assert!(
+            !(reads && memory && self.cleared[h]),
+            "a load at {:#x} after an msip clear without a fence between them",
+            cpu.pc
+        );
+        let msip = (CLINT_MSIP..CLINT_MSIP + 32).contains(&target);
         match value {
-            Some(v) if (CLINT_MSIP..CLINT_MSIP + 32).contains(&target) && v & 0xffff_ffff != 0 => {
+            Some(v) if msip && v & 0xffff_ffff != 0 => {
                 assert!(
                     self.fenced[h],
                     "an IPI at {:#x} without a fence before it",
@@ -643,7 +664,11 @@ impl Ordering {
                 );
                 self.ipis += 1;
             }
-            Some(_) if !clint && target >= RAM_BASE => self.fenced[h] = false,
+            Some(_) if msip => {
+                self.cleared[h] = true;
+                self.clears += 1;
+            }
+            Some(_) if memory => self.fenced[h] = false,
             _ => {}
         }
     }
@@ -669,13 +694,18 @@ fn every_ipi_comes_after_a_fence_and_s_mode_never_touches_the_sbi() {
         let mut watch = Ordering {
             xlen,
             fenced: vec![false; 4],
+            cleared: vec![false; 4],
             scratch: scratch..scratch + size,
             ipis: 0,
+            clears: 0,
         };
         let r = m.run(Some(common::RUN_MAX_STEPS), |cpu| watch.step(cpu));
         assert_eq!(r, RunResult::Exited(0), "{xlen:?}");
         // At least the three harts woken, the three started, and the boot's
         // TLB self-test.
         assert!(watch.ipis >= 9, "{xlen:?}: {} IPIs", watch.ipis);
+        // As many cleared: the ROM's and sbi_hart_wait's for the wake-up,
+        // sbi_hart_wait's for each start, machine_soft's for the rest.
+        assert!(watch.clears >= 9, "{xlen:?}: {} msip clears", watch.clears);
     }
 }
