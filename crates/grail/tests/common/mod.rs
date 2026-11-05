@@ -39,13 +39,29 @@ thread_local! {
 }
 
 /// Runs `test` on the RV32 kernel, then on the RV64 one: every machine a
-/// [`Vm`] makes meanwhile is of that width and runs that kernel.
+/// [`Vm`] makes meanwhile is of that width and runs that kernel. A failure
+/// says which width failed: the panic is raised again with the width
+/// before its message.
 pub fn on_both_widths(test: impl Fn()) {
     for xlen in [Xlen::Rv32, Xlen::Rv64] {
         XLEN.with(|x| x.set(xlen));
-        test();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
+        XLEN.with(|x| x.set(Xlen::Rv32));
+        if let Err(payload) = result {
+            panic!("on RV{}: {}", xlen.bits(), panic_message(&*payload));
+        }
     }
-    XLEN.with(|x| x.set(Xlen::Rv32));
+}
+
+/// What a panic said: its message, if it had one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s
+    } else {
+        "(a panic without a message)"
+    }
 }
 
 /// The width of the kernel under test.

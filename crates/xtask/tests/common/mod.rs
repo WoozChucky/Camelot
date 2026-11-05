@@ -256,13 +256,33 @@ pub mod width {
         static XLEN: Cell<Xlen> = const { Cell::new(Xlen::Rv32) };
     }
 
-    /// Runs `test` for RV32, then for RV64: [`get`] says which.
+    /// Runs `test` for RV32, then for RV64: [`get`] says which. A failure
+    /// says which width failed: the panic is raised again with the width
+    /// before its message.
     pub fn on_both(test: impl Fn()) {
         for xlen in xtask::kernel::XLENS {
             XLEN.with(|x| x.set(xlen));
-            test();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
+            XLEN.with(|x| x.set(Xlen::Rv32));
+            if let Err(payload) = result {
+                let name = match xlen {
+                    Xlen::Rv32 => "RV32",
+                    Xlen::Rv64 => "RV64",
+                };
+                panic!("on {name}: {}", panic_message(&*payload));
+            }
         }
-        XLEN.with(|x| x.set(Xlen::Rv32));
+    }
+
+    /// What a panic said: its message, if it had one.
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            s
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s
+        } else {
+            "(a panic without a message)"
+        }
     }
 
     /// The width under test.
