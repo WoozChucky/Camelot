@@ -9,7 +9,7 @@ pub fn cases() -> Vec<Case> {
         case("#define s(x) #x\nconst char *p = s(\\);", &["2:19: warning: invalid string literal, ignoring final '\\'"]),
         case("#define s(x) #x\ns(a \\)", &["2:5: warning: invalid string literal, ignoring final '\\'", "2:1: error: expected identifier or '('"]),
         // pasting
-        case("#define cat(a, b) a ## b\ncat(+, -)", &["2:1: error: pasting formed '+-', an invalid preprocessing token", "2:1: error: expected external declaration", "2:8: error: expected external declaration"]),
+        case("#define cat(a, b) a ## b\ncat(+, -)", &["2:1: error: pasting formed '+-', an invalid preprocessing token", "2:1: error: expected external declaration"]).then(&["2:8: error: expected external declaration"]),
         case("#define cat(a, b) a ## b\ncat(/, /)", &["2:1: error: pasting formed '//', an invalid preprocessing token", "2:1: error: expected identifier or '('"]),
         // file_and_line
         case("#line 0", &[]),
@@ -21,7 +21,7 @@ pub fn cases() -> Vec<Case> {
         case("#include \"nope.h\"", &["1:10: fatal error: 'nope.h' file not found"]).files(&[("a.h", "int a;\n#include \"sub/b.h\""), ("sub/b.h", "int b;\n#include \"c.h\""), ("sub/c.h", "int c;"), ("inc/d.h", "int d;"), ("inc/c.h", "int wrong;")]),
         case("#include", &["1:9: error: expected \"FILENAME\" or <FILENAME>"]),
         case("#include \"a.h\" x", &["1:16: warning: extra tokens at end of #include directive [-Wextra-tokens]", "1:10: fatal error: 'a.h' file not found"]),
-        case("#include <a.h", &["1:14: error: expected '>'"]),
+        case("#include <a.h", &["1:14: error: expected '>'", "1:10: note: to match this '<'"]),
         // include_guards_and_once
         case("#include \"self.h\"", &["self.h:1:10: error: #include nested too deeply"]).files(&[("guard.h", "#ifndef GUARD_H\n#define GUARD_H\nint g;\n#endif\n"), ("once.h", "#pragma once\nint o;\n"), ("twice.h", "int t;\n"), ("self.h", "#include \"self.h\"\n")]),
         // errors_in_headers_name_the_header
@@ -32,7 +32,7 @@ pub fn cases() -> Vec<Case> {
         case("#if 1 / 0\n#endif", &["1:7: error: division by zero in preprocessor expression"]),
         case("#if\n#endif", &["1:4: error: expected value in expression"]),
         case("#if 1 +\n#endif", &["1:8: error: expected value in expression"]),
-        case("#if (1\n#endif", &["1:7: error: expected ')' in preprocessor expression"]),
+        case("#if (1\n#endif", &["1:7: error: expected ')' in preprocessor expression", "1:5: note: to match this '('"]),
         case("#if 1 2\n#endif", &["1:7: error: token is not a valid binary operator in a preprocessor subexpression"]),
         case("#if 1 = 2\n#endif", &["1:7: error: token is not a valid binary operator in a preprocessor subexpression"]),
         case("#if 18446744073709551616 == 0\n#endif", &["1:5: error: integer literal is too large to be represented in any integer type"]),
@@ -40,10 +40,10 @@ pub fn cases() -> Vec<Case> {
         case("#if 99999999999999999999999 == 0\n#endif", &["1:5: error: integer literal is too large to be represented in any integer type"]),
         case("#if 1.0\n#endif", &["1:5: error: floating point literal in preprocessor expression"]),
         case("#if defined\n#endif", &["1:12: error: macro name missing"]),
-        case("#if defined(X\n#endif", &["1:14: error: missing ')' after 'defined'"]),
+        case("#if defined(X\n#endif", &["1:14: error: missing ')' after 'defined'", "1:12: note: to match this '('"]),
         case("#define D defined(X)\n#if D\n#endif", &["2:5: warning: macro expansion producing 'defined' has undefined behavior [-Wexpansion-to-defined]"]),
         // conditional_errors
-        case("#if 1\nx", &["1:2: error: unterminated conditional directive", "2:1: error: unknown type name 'x'", "2:2: error: expected identifier or '('"]),
+        case("#if 1\nx", &["1:2: error: unterminated conditional directive", "2:1: error: unknown type name 'x'"]).then(&["2:2: error: expected identifier or '('"]),
         case("#if 0\nx", &["1:2: error: unterminated conditional directive"]),
         case("#else", &["1:2: error: #else without #if"]),
         case("#elif 1", &["1:2: error: #elif without #if"]),
@@ -63,9 +63,9 @@ pub fn cases() -> Vec<Case> {
         case("#define", &["1:8: error: macro name missing"]),
         case("#define 1 2", &["1:9: error: macro name must be an identifier"]),
         case("#define defined", &["1:9: error: 'defined' cannot be used as a macro name"]),
-        case("#define N 1\n#define N 2", &["2:9: warning: 'N' macro redefined [-Wmacro-redefined]"]),
-        case("#define F(a) a\n#define F(b) b", &["2:9: warning: 'F' macro redefined [-Wmacro-redefined]"]),
-        case("#define N 1+1\n#define N 1 + 1", &["2:9: warning: 'N' macro redefined [-Wmacro-redefined]"]),
+        case("#define N 1\n#define N 2", &["2:9: warning: 'N' macro redefined [-Wmacro-redefined]", "1:9: note: previous definition is here"]),
+        case("#define F(a) a\n#define F(b) b", &["2:9: warning: 'F' macro redefined [-Wmacro-redefined]", "1:9: note: previous definition is here"]),
+        case("#define N 1+1\n#define N 1 + 1", &["2:9: warning: 'N' macro redefined [-Wmacro-redefined]", "1:9: note: previous definition is here"]),
         case("#define F(a", &["1:12: error: expected comma in macro parameter list"]),
         case("#define F(a,)", &["1:13: error: expected identifier in macro parameter list"]),
         case("#define F(a b)", &["1:13: error: expected comma in macro parameter list"]),
@@ -76,10 +76,10 @@ pub fn cases() -> Vec<Case> {
         case("#define F x ##", &["1:13: error: '##' cannot appear at end of macro expansion"]),
         case("#define F(x) __VA_ARGS__", &[]),
         // call_errors
-        case("#define F(a, b) a\nF(1)", &["2:4: error: too few arguments provided to function-like macro invocation", "2:1: error: unknown type name 'F'", "2:5: error: expected identifier or '('"]),
-        case("#define F(a) a\nF(1, 2)", &["2:6: error: too many arguments provided to function-like macro invocation", "2:1: error: unknown type name 'F'", "2:8: error: expected identifier or '('"]),
-        case("#define F() 1\nF(x)", &["2:3: error: too many arguments provided to function-like macro invocation", "2:1: error: unknown type name 'F'", "2:5: error: expected identifier or '('"]),
-        case("#define F(a) a\nF(1", &["2:1: error: unterminated function-like macro invocation"]),
+        case("#define F(a, b) a\nF(1)", &["2:4: error: too few arguments provided to function-like macro invocation", "1:9: note: macro 'F' defined here", "2:1: error: unknown type name 'F'"]).then(&["2:5: error: expected identifier or '('"]),
+        case("#define F(a) a\nF(1, 2)", &["2:6: error: too many arguments provided to function-like macro invocation", "1:9: note: macro 'F' defined here", "2:1: error: unknown type name 'F'"]).then(&["2:8: error: expected identifier or '('"]),
+        case("#define F() 1\nF(x)", &["2:3: error: too many arguments provided to function-like macro invocation", "1:9: note: macro 'F' defined here", "2:1: error: unknown type name 'F'"]).then(&["2:5: error: expected identifier or '('"]),
+        case("#define F(a) a\nF(1", &["2:1: error: unterminated function-like macro invocation", "1:9: note: macro 'F' defined here"]),
         case("#define F(a) a\nF(1\n#define X\n)", &["2:3: error: expected identifier or '('"]),
         case("#include \"open.h\"\n)", &["open.h:2:3: error: expected identifier or '('"]).files(&[("open.h", "#define F(a) a\nF(1")]),
         // command_line_macros

@@ -277,10 +277,11 @@ pub fn preprocess_asm(name: &str, src: &str, opts: &Options, load: Loader) -> Re
 }
 
 /// Preprocesses, lexes, parses and checks one translation unit. The
-/// preprocessor and the parser stop at the first error; the checker reports
-/// every error it finds. Errors in headers have their [`Error::file`] set.
+/// preprocessor goes on after an error where clang does, the parser stops
+/// at the first; the checker reports every error it finds. Errors in
+/// headers have their [`Error::file`] set.
 pub fn parse_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result<ast::Program, Vec<Error>> {
-    let pp = preprocess(name, src, opts, load)?;
+    let pp = preprocess::preprocess_recovering(name, src, opts, load)?;
     let mut prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
     prog.warnings = pp.name_files(prog.warnings);
     Ok(prog)
@@ -299,7 +300,7 @@ pub fn compile_warned(
     opts: &Options,
     load: Loader,
 ) -> Result<(String, Vec<Error>), Vec<Error>> {
-    let pp = preprocess(name, src, opts, load)?;
+    let pp = preprocess::preprocess_recovering(name, src, opts, load)?;
     let debug = opts.debug.as_ref().map(|d| (d, pp.files.as_slice()));
     let prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
     let warnings = pp.name_files(prog.warnings.clone());
@@ -310,16 +311,12 @@ pub fn compile_warned(
 }
 
 /// The front end after the preprocessor: tokens, syntax tree, checks. The
-/// errors come with the warnings, in the order clang gives them.
+/// errors come with the warnings, the preprocessor's among them, in
+/// clang's order ([`in_clangs_order`], [`preprocess::Output::merge`]).
 fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec<Error>> {
-    // The preprocessor's and the lexer's diagnostics: clang goes on after
-    // an error in a literal, or a token that is none, and so does merlin.
-    let mut lexed = pp.warnings.clone();
-    let (toks, more) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|mut e| {
-        lexed.append(&mut e);
-        lexed.clone()
-    })?;
-    lexed.extend(more);
+    // The lexer's diagnostics: clang goes on after an error in a literal,
+    // or a token that is none, and so does merlin.
+    let (toks, lexed) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| pp.merge(e))?;
     let (prog, checked) = match parser::parse_salvaging(&toks, xlen) {
         Ok(mut prog) => {
             let checked = match sema::check(&mut prog) {
@@ -341,7 +338,7 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
             (None, checked)
         }
     };
-    let diagnostics = in_clangs_order(lexed, checked);
+    let diagnostics = pp.merge(in_clangs_order(lexed, checked));
     match prog {
         Some(mut prog) if diagnostics.iter().all(Error::is_warning) => {
             prog.warnings = diagnostics;
@@ -351,12 +348,12 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
     }
 }
 
-/// The diagnostics of the lexer (with the preprocessor's) and those of the
-/// parser and sema, in the order clang gives them: clang lexes as it
-/// parses, so a token's diagnostic comes among those of the code around it,
-/// by its position, while the parser's and sema's keep the order they were
-/// found in (which is not always that of their positions: clang reports a
-/// loop's empty body at the end of its block, say).
+/// The diagnostics of the lexer and those of the parser and sema, in the
+/// order clang gives them: clang lexes as it parses, so a token's
+/// diagnostic comes among those of the code around it, by its position,
+/// while the parser's and sema's keep the order they were found in (which
+/// is not always that of their positions: clang reports a loop's empty
+/// body at the end of its block, say).
 fn in_clangs_order(lexed: Vec<Error>, checked: Vec<Error>) -> Vec<Error> {
     let mut out = Vec::with_capacity(lexed.len() + checked.len());
     let mut lexed = lexed.into_iter().peekable();

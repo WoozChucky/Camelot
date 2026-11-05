@@ -344,7 +344,7 @@ fn preprocessor_options() {
     let out = merlin(&[&t.file]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        stderr(&out).contains("1:10: error: 'defs.h' file not found"),
+        stderr(&out).contains("1:10: fatal error: 'defs.h' file not found"),
         "{}",
         stderr(&out)
     );
@@ -391,7 +391,7 @@ fn assembly_is_only_preprocessed() {
     let out = merlin(&[&flag("-E"), &flag("-xc"), &t.file]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
-        stderr(&out).contains("invalid preprocessing directive '#A'"),
+        stderr(&out).contains("1:3: error: invalid preprocessing directive\n"),
         "{}",
         stderr(&out)
     );
