@@ -118,7 +118,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .state { font-weight: 600; }
 .state-running { color: var(--good); }
-.state-paused, .state-created { color: var(--warn); }
+.state-paused, .state-created, .state-debug { color: var(--warn); }
 .state-stopped, .state-exited { color: var(--muted); }
 .ok { color: var(--good); font-weight: 600; }
 .down { color: var(--bad); font-weight: 600; }

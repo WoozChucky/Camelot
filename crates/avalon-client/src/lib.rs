@@ -171,7 +171,7 @@ impl VmAction {
             VmAction::Start => state == Created,
             VmAction::Pause => state == Running,
             VmAction::Resume => state == Paused,
-            VmAction::Stop => matches!(state, Created | Running | Paused),
+            VmAction::Stop => matches!(state, Created | Running | Paused | Debug),
             VmAction::Destroy => true,
         }
     }
@@ -190,9 +190,13 @@ impl VmAction {
 
 /// Whether a VM in `state` still has its machine, and so holds its disks: a VM's disks
 /// are attached when it is created and released when its machine ends, when it is
-/// stopped or its program exits (protocol doc, section 6.6).
+/// stopped or its program exits (protocol doc, section 6.6). A VM its debugger holds
+/// (state debug) has its machine.
 pub fn holds_disks(state: VmState) -> bool {
-    matches!(state, VmState::Created | VmState::Running | VmState::Paused)
+    matches!(
+        state,
+        VmState::Created | VmState::Running | VmState::Paused | VmState::Debug
+    )
 }
 
 /// The Lake images in a hardware profile, as (server address, image name, read-only),
@@ -661,9 +665,11 @@ mod tests {
         assert_eq!(allowed(Created), ["start", "stop", "destroy"]);
         assert_eq!(allowed(Running), ["pause", "stop", "destroy"]);
         assert_eq!(allowed(Paused), ["resume", "stop", "destroy"]);
+        // Its debugger resumes it, not ResumeVm.
+        assert_eq!(allowed(Debug), ["stop", "destroy"]);
         assert_eq!(allowed(Stopped), ["destroy"]);
         assert_eq!(allowed(Exited(3)), ["destroy"]);
-        assert!(holds_disks(Created) && holds_disks(Running) && holds_disks(Paused));
+        assert!(holds_disks(Created) && holds_disks(Running) && holds_disks(Paused) && holds_disks(Debug));
         assert!(!holds_disks(Stopped) && !holds_disks(Exited(0)));
     }
 

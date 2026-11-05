@@ -217,9 +217,15 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
     vec![
         ("bool 2", ty::BLOCK_OPEN, cat(&[&le(1), b"a", &[2]])),
         ("VM ref tag", ty::START_VM, cat(&[&[2], &le(1)])),
-        ("VM state tag", ty::VM_STATE_CHANGED, cat(&[&le(1), &[5]])),
+        ("VM state tag", ty::VM_STATE_CHANGED, cat(&[&le(1), &[6]])),
         ("attach kind 0", ty::DETACHED, cat(&[&le(1), &[0]])),
-        ("attach kind 3", ty::DETACHED, cat(&[&le(1), &[3]])),
+        ("attach kind 4", ty::DETACHED, cat(&[&le(1), &[4]])),
+        ("debug attach VM ref tag", ty::DEBUG_ATTACH, cat(&[&[2], &le(1)])),
+        (
+            "debug attach invalid UTF-8",
+            ty::DEBUG_ATTACH,
+            cat(&[&[1], &le(2), &[0xc3, 0x28]]),
+        ),
         ("invalid UTF-8", ty::DISK_DELETE, cat(&[&le(2), &[0xc3, 0x28]])),
         ("option tag", ty::CREATE_VM, cat(&[&le(0), &[0; 8], &[2]])),
         (

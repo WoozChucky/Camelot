@@ -347,7 +347,8 @@ A VM is created from a name, a hardware profile and a program (an Excalibur ELF,
 
 ```
 created --start--> running --pause--> paused --resume--> running
-created, running, paused --stop--> stopped        running --program halts--> exited(code)
+created, running, paused --debug attach--> debug --debugger continues--> running --breakpoint--> debug
+created, running, paused, debug --stop--> stopped        running --program halts--> exited(code)
 any state --destroy--> gone (its name and RAM are free again; ids are never reused)
 ```
 
@@ -559,7 +560,7 @@ pendragon: Avalon at 127.0.0.1:7400, Lake at 127.0.0.1:7401
 
 Open the URL it prints (the token in it changes at every launch). Options: `--listen ADDR` (default `127.0.0.1:7402`), `--avalon ADDR` and `--lake ADDR` (the servers, defaults `127.0.0.1:7400` and `127.0.0.1:7401`), `--avalon-max-ram SIZE` (Avalon's budget, shown on the overview; default 4096, Avalon's own default), `--allow-host NAME` (see below). The pages:
 
-- **Overview** (`#/`): Avalon and Lake, each up or down with its version or the error that says why; the RAM all VMs hold against Avalon's budget, as a bar; how many VMs are running, paused, created and ended; how many disks there are, how many are attached, and their total size. It refreshes every few seconds, as the other pages do.
+- **Overview** (`#/`): Avalon and Lake, each up or down with its version or the error that says why; the RAM all VMs hold against Avalon's budget, as a bar; how many VMs are running, paused, held by a debugger, created and ended; how many disks there are, how many are attached, and their total size. It refreshes every few seconds, as the other pages do.
 - **VMs** (`#/vms`): a table of every VM with its id, name, state, RAM, clock and disks, and a button for each action its state allows (start for a created VM; pause, stop, destroy for a running one; resume for a paused one; destroy for a stopped or exited one). Stop and destroy ask first.
 - **New VM** (`#/vms/new`): name, RAM (MiB, or with `M`/`G`; 4 MiB by default), clock (`10MHz`, `500kHz`, `5Hz`, or empty for full speed: the syntax of `--ram` and `--clock`), harts (1 to 8), what it boots: *Camelot (boot from disk)*, the choice when Lake has the image `os-base`, gives the VM its own copy of that image, `NAME-disk0`, as its first disk and boots it, as `round-table create --camelot` does; *Program (ELF)* uploads an ELF file chosen in the browser, which may be left out when the VM has a disk to boot from instead; any number of disks (each a `lake://ADDR/NAME` source, offered from Lake's list, or the path of an image file on Avalon's host, read-write or read-only), network cards (each on a switch, offered from Avalon's list, or unplugged, with an address or one Avalon makes up), and whether to start it at once. Mistakes come back as Round Table would say them (`ram: 0 is out of range (1 MiB to 1 TiB)`).
 - **One VM** (`#/vms/ID`): its facts (state, RAM, clock, steps run, disks, the device table its guest sees), its action buttons, and its console: the scrollback, then the output live as the guest writes it, and an input line whose text goes to the VM's UART when you press Enter, followed by LF, CR or nothing as you choose (a Ctrl-D button sends EOT). Several pages, and Herald, can watch one console at once.
