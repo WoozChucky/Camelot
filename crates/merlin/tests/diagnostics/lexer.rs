@@ -39,19 +39,28 @@ pub fn cases() -> Vec<Case> {
         case("int f(void) { return 1 ` 2; }", &["1:23: error: expected ';' after return statement"]),
         case("#include <x.h>", &["1:10: fatal error: 'x.h' file not found"]),
         // What merlin's language has not, which clang takes.
-        case("int f(void) { float s; return 0; }", &[]).merlin("no floating point"),
-        case("int x = 1.5;", &[]).merlin("no floating point"),
-        case("int x = .5;", &[]).merlin("no floating point"),
-        case("int x = 1e5;", &[]).merlin("no floating point"),
-        case("int x = 0x1p3;", &[]).merlin("no floating point"),
-        // Trigraphs, which C99 replaces before anything else: merlin has
-        // none, and errs where one would change the meaning.
-        case("char *s = \"a??=\";", &[]).merlin("trigraphs"),
-        case("int c = '??'';", &[]).merlin("trigraphs"),
-        case("char *s = \"\\??/\";", &[]).merlin("trigraphs"),
-        case("int x = 1 ??- 2;", &[]).merlin("trigraphs"),
-        case("int x; // note ??/  \r\nint y = 2;", &[]).merlin("trigraphs"),
-        case("??=define N 1", &[]).merlin("trigraphs"),
+        case("int f(void) { float s; return 0; }", &["1:15: error: 'float' is not supported yet"]).merlin("no floating point"),
+        case("int x = 1.5;", &["1:9: error: floating-point literals are not supported"]).merlin("no floating point"),
+        case("int x = .5;", &["1:9: error: floating-point literals are not supported"]).merlin("no floating point"),
+        case("int x = 1e5;", &["1:9: error: floating-point literals are not supported"]).merlin("no floating point"),
+        case("int x = 0x1p3;", &["1:9: error: floating-point literals are not supported"]).merlin("no floating point"),
+        // Trigraphs, which C99 replaces before anything else, in literals,
+        // in code, in a directive, and in a comment, where `??/` before
+        // the newline splices the next line on.
+        case("char *s = \"a??=\";", &["1:13: warning: trigraph converted to '#' character [-Wtrigraphs]"]),
+        case("int c = '??'';", &["1:10: warning: trigraph converted to '^' character [-Wtrigraphs]"]),
+        case("char *s = \"\\??/\";", &["1:13: warning: trigraph converted to '\\' character [-Wtrigraphs]"]),
+        case("int x = 1 ??- 2;", &["1:11: warning: trigraph converted to '~' character [-Wtrigraphs]", "1:10: error: expected ';' after top level declarator"]),
+        case("int x; // note ??/  \r\nint y = 2;", &["1:18: warning: backslash and newline separated by space [-Wbackslash-newline-escape]"]),
+        case("??=define N 1", &["1:1: warning: trigraph converted to '#' character [-Wtrigraphs]"]),
+        case("int x; /* ??= ??/  \n */ int y ??( 2 ??) = ??< 1 ??>;", &["2:11: warning: trigraph converted to '[' character [-Wtrigraphs]", "2:17: warning: trigraph converted to ']' character [-Wtrigraphs]", "2:23: warning: trigraph converted to '{' character [-Wtrigraphs]", "2:29: warning: trigraph converted to '}' character [-Wtrigraphs]"]),
+        case("int a = 1 ??/  \n+ 2;", &["1:11: warning: trigraph converted to '\\' character [-Wtrigraphs]", "1:14: warning: backslash and newline separated by space [-Wbackslash-newline-escape]"]),
+        // A line splice with blanks before its newline: at the backslash
+        // in a `//` comment, after it elsewhere, nothing in a `/* */` one.
+        case("int a = 1 \\  \n+ 2;", &["1:12: warning: backslash and newline separated by space [-Wbackslash-newline-escape]"]),
+        case("int x; // note \\  \nint y = 2;", &["1:16: warning: backslash and newline separated by space [-Wbackslash-newline-escape]"]),
+        case("char *s = \"a\\ \r\nb\";", &["1:14: warning: backslash and newline separated by space [-Wbackslash-newline-escape]"]),
+        case("int x; /* a \\ \n */", &[]),
         // `register` is a storage class of objects in a block (or of
         // parameters), whose address cannot be taken.
         case("register int x;", &["1:14: error: illegal storage class on file-scoped variable"]),

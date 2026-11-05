@@ -776,6 +776,7 @@ pub fn preprocess_recovering(
         last_out: Pos::default(),
         marks: Vec::new(),
         carry: (false, false, false),
+        skipping: false,
         diagnostics: Vec::new(),
         after: Vec::new(),
     };
@@ -1063,6 +1064,8 @@ struct Pp<'a> {
     after: Vec<Pos>,
     /// Where files start and end, after how many tokens.
     marks: Vec<(usize, Mark)>,
+    /// In a group `#if` skips ([`Pp::skip_group`]).
+    skipping: bool,
     /// A macro that expanded to nothing started a line, or had a space
     /// before it: the next token takes that over (as in clang, so that
     /// `EMPTY li a0, 1` is indented like `li a0, 1`). Its `bol`, `space`
@@ -1165,14 +1168,25 @@ impl Pp<'_> {
     }
 
     /// Takes the next token of the innermost file (there must be one), with
-    /// its position as `#line` has it.
+    /// its position as `#line` has it, and gives the lexer's warnings of
+    /// what came before it ([`PpToken::lexed`]), but in a group `#if`
+    /// skips, which clang reads raw.
     fn take_file(&mut self) -> PpToken {
         let cur = self.stack.last_mut().expect("a file");
         let mut t = cur.toks[cur.i].clone();
         cur.i += 1;
-        for p in [&mut t.pos, &mut t.end] {
+        let mut lexed = std::mem::take(&mut t.lexed);
+        let positions = [&mut t.pos, &mut t.end]
+            .into_iter()
+            .chain(lexed.iter_mut().map(|w| &mut w.pos));
+        for p in positions {
             p.file = cur.file;
             p.line = (i64::from(p.line) + cur.line_delta) as u32;
+        }
+        if !self.skipping {
+            for w in lexed {
+                self.report(w);
+            }
         }
         t
     }
@@ -1408,6 +1422,7 @@ impl Pp<'_> {
                 end: at.t.end,
                 bol: at.t.bol,
                 space: at.t.space,
+                lexed: Vec::new(),
             },
             hide: at.hide.clone(),
             site: Some(at.site.unwrap_or(at.t.pos)),
@@ -1538,6 +1553,7 @@ impl Pp<'_> {
                 pos: at.pos,
                 end,
                 bol: false,
+                lexed: Vec::new(),
                 ..t.clone()
             },
             hide: HideSet::default(),
@@ -1554,6 +1570,7 @@ impl Pp<'_> {
                 end,
                 bol: false,
                 space: false,
+                lexed: Vec::new(),
             },
             hide: HideSet::default(),
             site,
@@ -1827,6 +1844,7 @@ impl Pp<'_> {
                 end: hash.end,
                 bol: true,
                 space: false,
+                lexed: Vec::new(),
             },
             hide: HideSet::default(),
             site: None,
@@ -2256,6 +2274,13 @@ impl Pp<'_> {
     /// none was taken before) or its `#endif` closes it. Only directives
     /// are looked at, to follow the nesting of conditionals.
     fn skip_group(&mut self) {
+        self.skipping = true;
+        self.skip_lines();
+        self.skipping = false;
+    }
+
+    /// [`Pp::skip_group`]'s lines.
+    fn skip_lines(&mut self) {
         // Where the conditionals that open in the skipped lines are.
         let mut nested: Vec<Pos> = Vec::new();
         loop {

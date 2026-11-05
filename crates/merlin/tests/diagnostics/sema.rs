@@ -84,7 +84,7 @@ pub fn cases() -> Vec<Case> {
         case("int a[];", &["1:5: warning: tentative array definition assumed to have one element [-Wtentative-definition-array]"]),
         case("int a; static int a;", &["1:19: error: static declaration of 'a' follows non-static declaration", "1:5: note: previous definition is here"]),
         case("static int a; int a;", &["1:19: error: non-static declaration of 'a' follows static declaration", "1:12: note: previous definition is here"]),
-        case("int f(); int f;", &["1:14: error: redefinition of 'f' as different kind of symbol"]),
+        case("int f(); int f;", &["1:14: error: redefinition of 'f' as different kind of symbol", "1:5: note: previous definition is here"]),
         case("int f; int f();", &["1:12: error: redefinition of 'f' as different kind of symbol", "1:5: note: previous definition is here"]),
         case("void v;", &["1:6: error: variable has incomplete type 'void'"]),
         case("extern int e = 1;", &["1:12: warning: 'extern' variable has an initializer [-Wextern-initializer]"]),
@@ -185,7 +185,7 @@ pub fn cases() -> Vec<Case> {
         case("int f(int a[const 3]) { a = 0; return 0; }", &["1:27: error: cannot assign to variable 'a' with const-qualified type 'int *const'", "1:11: note: variable 'a' declared const here"]),
         // conditions_must_be_scalar
         case("void v(); int f() { if (v()) return 1; return 0; }", &["1:21: error: statement requires expression of scalar type ('void' invalid)"]),
-        case("void v(); int f() { while (v()) ; return 0; }", &["1:21: error: statement requires expression of scalar type ('void' invalid)", "1:33: warning: while loop has empty body [-Wempty-body]"]),
+        case("void v(); int f() { while (v()) ; return 0; }", &["1:21: error: statement requires expression of scalar type ('void' invalid)", "1:33: warning: while loop has empty body [-Wempty-body]", "1:33: note: put the semicolon on a separate line to silence this warning"]),
         // undeclared_identifiers
         case("int f() { return y; }", &["1:18: error: use of undeclared identifier 'y'"]),
         case("int f() { y = 1; return 0; }", &["1:11: error: use of undeclared identifier 'y'"]),

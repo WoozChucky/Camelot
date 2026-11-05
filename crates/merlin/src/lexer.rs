@@ -11,14 +11,20 @@
 //!    keywords, integer constants with their C type, the bytes of literals.
 //!
 //! Comments (`//` to end of line and `/* ... */`) count as spaces.
-//! Trigraphs (`??=`...), which C99 rewrites before anything else, are
-//! errors wherever they would change what merlin reads.
+//! Trigraphs (`??=` for `#`, `??/` for `\`...), which C99 replaces before
+//! anything else (phase 1), are replaced as clang replaces them in its C99
+//! mode, with its warning where they are no comment.
 //!
 //! Assembly preprocessed as C (`.S` files, [`lex_pp_asm`]) is split into the
 //! same tokens, as clang's `-x assembler-with-cpp` splits it: what is no C
 //! token (`$`, `@`, `\`, an apostrophe with no closing one on its line)
 //! passes through as it is, and trigraphs are only characters (clang leaves
 //! them alone in its default GNU mode, and only warns).
+//!
+//! The lexer's warnings (a trigraph, a line splice with blanks between the
+//! backslash and the newline) go with the token after them
+//! ([`PpToken::lexed`]): the preprocessor gives them as it reads it, which
+//! is when clang's lexer gives them, and not in a group `#if 0` skips.
 //!
 //! Integer literals get their C type in [`finish`] (C99 6.4.4.1): the first
 //! of the candidate types that holds the value. A decimal literal is `int`,
@@ -207,6 +213,9 @@ pub struct PpToken {
     /// Whitespace or a comment comes right before it. Stringizing (`#x`)
     /// turns that into one space, and `-E` output keeps it.
     pub space: bool,
+    /// The lexer's warnings of what comes before it, from the end of the
+    /// token before (the module's notes).
+    pub lexed: Vec<Error>,
 }
 
 impl PpToken {
@@ -270,52 +279,112 @@ impl Token {
     }
 }
 
-/// The source after C99's translation phase 2: line splices (a backslash
-/// right before a newline) deleted, every remaining character with its
-/// position in the original text, so that tokens joined by a splice still
-/// say where they were written.
+/// The source after C99's translation phases 1 and 2: trigraphs replaced,
+/// line splices (a backslash right before a newline) deleted, every
+/// remaining character with its position in the original text, so that
+/// tokens joined by a splice still say where they were written.
 struct Spliced {
     chars: Vec<char>,
     at: Vec<Pos>,
+    /// What the lexer may warn of, at the index of the character it comes
+    /// before, in order.
+    marks: Vec<(usize, Mark)>,
     /// Just past the last character.
     end: Pos,
 }
 
-/// Deletes line splices. Blanks between the backslash and the newline are
-/// allowed, as clang allows them.
-fn splice(src: &str, file: u32) -> Spliced {
+/// Something phases 1 and 2 did that clang warns of, but in a comment.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// A trigraph at `pos` replaced by `to`.
+    Trigraph { pos: Pos, to: char },
+    /// A line splice with blanks between the backslash, at `backslash`,
+    /// and the newline: clang warns at the backslash in a `//` comment
+    /// (and not in a `/* */` one), elsewhere at the first blank.
+    Blanks { backslash: Pos, first: Pos },
+}
+
+/// What C99 replaces the trigraph `??c` by.
+fn trigraph(c: char) -> Option<char> {
+    let to = match c {
+        '=' => '#',
+        '(' => '[',
+        '/' => '\\',
+        ')' => ']',
+        '\'' => '^',
+        '<' => '{',
+        '!' => '|',
+        '>' => '}',
+        '-' => '~',
+        _ => return None,
+    };
+    Some(to)
+}
+
+/// Replaces trigraphs (unless `asm`: clang's assembler-with-cpp has none)
+/// and deletes line splices. Blanks between the backslash and the newline
+/// are allowed, as clang allows them, with a warning ([`Mark`]); a `\r`
+/// before the newline is a line's end, no blank.
+fn splice(src: &str, file: u32, asm: bool) -> Spliced {
     let src: Vec<char> = src.chars().collect();
     let (mut chars, mut at) = (Vec::with_capacity(src.len()), Vec::with_capacity(src.len()));
+    let mut marks = Vec::new();
     let (mut line, mut col) = (1, 1);
     let mut k = 0;
     while k < src.len() {
-        if src[k] == '\\' {
-            let mut j = k + 1;
+        // The character here after phase 1, and how many it was written as.
+        let (c, n) = match (src[k], src.get(k + 1), src.get(k + 2).and_then(|&c| trigraph(c))) {
+            ('?', Some('?'), Some(to)) if !asm => (to, 3),
+            (c, ..) => (c, 1),
+        };
+        let pos = Pos::in_file(file, line, col);
+        if c == '\\' {
+            let mut j = k + n;
             while matches!(src.get(j), Some(' ' | '\t' | '\r')) {
                 j += 1;
             }
             if src.get(j) == Some(&'\n') {
+                if n == 3 {
+                    marks.push((chars.len(), Mark::Trigraph { pos, to: c }));
+                }
+                if src[k + n..j].iter().any(|&b| b != '\r') {
+                    let backslash = Pos::in_file(file, line, col + n as u32 - 1);
+                    let first = Pos::in_file(file, line, col + n as u32);
+                    marks.push((chars.len(), Mark::Blanks { backslash, first }));
+                }
                 line += 1;
                 col = 1;
                 k = j + 1;
                 continue;
             }
         }
-        chars.push(src[k]);
-        at.push(Pos::in_file(file, line, col));
-        if src[k] == '\n' {
+        if n == 3 {
+            marks.push((chars.len(), Mark::Trigraph { pos, to: c }));
+        }
+        chars.push(c);
+        at.push(pos);
+        if c == '\n' {
             line += 1;
             col = 1;
         } else {
-            col += 1;
+            col += n as u32;
         }
-        k += 1;
+        k += n;
     }
     Spliced {
         chars,
         at,
+        marks,
         end: Pos::in_file(file, line, col),
     }
+}
+
+/// Where the lexer is, for the warnings of [`Mark`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Context {
+    Code,
+    LineComment,
+    BlockComment,
 }
 
 struct Lexer {
@@ -325,8 +394,11 @@ struct Lexer {
     newline: bool,
     /// Whitespace or a comment was skipped since the last token.
     space: bool,
-    /// Assembler-with-cpp: trigraphs are characters like any other.
-    asm: bool,
+    /// The next of [`Spliced::marks`] to look at, and where the lexer is.
+    mark: usize,
+    context: Context,
+    /// The warnings for the next token.
+    lexed: Vec<Error>,
 }
 
 impl Lexer {
@@ -345,27 +417,36 @@ impl Lexer {
 
     fn bump(&mut self) -> Option<char> {
         let c = self.peek(0)?;
+        self.marks_before(self.i + 1);
         self.i += 1;
         Some(c)
     }
 
-    /// Whether a trigraph (`??=` for `#`, `??/` for `\`, ...) starts here.
-    /// C99 replaces them before anything else, so merlin rejects them rather
-    /// than read `"??="` as three characters.
-    fn at_trigraph(&self) -> bool {
-        self.at("??") && self.peek(2).is_some_and(|c| "=(/)'<!>-".contains(c))
-    }
-
-    /// The error for a trigraph here, if one starts here.
-    fn trigraph(&self) -> Result<(), Error> {
-        if self.asm || !self.at_trigraph() {
-            return Ok(());
+    /// clang's warnings of the [`Mark`]s before index `end`, as where the
+    /// lexer is has them: none for a trigraph in a comment, none for a
+    /// splice's blanks in a `/* */` one.
+    fn marks_before(&mut self, end: usize) {
+        while let Some(&(at, mark)) = self.src.marks.get(self.mark) {
+            if at >= end {
+                return;
+            }
+            self.mark += 1;
+            let warning = match (mark, self.context) {
+                (Mark::Trigraph { pos, to }, Context::Code) => Error::warning(
+                    pos,
+                    format!("trigraph converted to '{to}' character"),
+                    "trigraphs",
+                ),
+                (Mark::Blanks { backslash, .. }, Context::LineComment) => {
+                    Error::warning(backslash, BLANKS, "backslash-newline-escape")
+                }
+                (Mark::Blanks { first, .. }, Context::Code) => {
+                    Error::warning(first, BLANKS, "backslash-newline-escape")
+                }
+                _ => continue,
+            };
+            self.lexed.push(warning);
         }
-        let msg = format!(
-            "trigraphs are not supported ('{}'; write '\\?' for a '?' that starts one)",
-            self.src.chars[self.i..self.i + 3].iter().collect::<String>()
-        );
-        Err(Error::new(self.pos(), msg))
     }
 
     /// Skips whitespace and comments, noting newlines and spaces.
@@ -379,24 +460,16 @@ impl Lexer {
                 }
                 (Some('/'), Some('/')) => {
                     self.space = true;
+                    self.context = Context::LineComment;
                     while self.peek(0).is_some_and(|c| c != '\n') {
-                        // `??/` and a newline would be a line splice, which
-                        // continues the comment on the next line.
-                        if self.at("??/") {
-                            let mut k = 3;
-                            while matches!(self.peek(k), Some(' ' | '\t' | '\r')) {
-                                k += 1;
-                            }
-                            if self.peek(k) == Some('\n') {
-                                self.trigraph()?;
-                            }
-                        }
                         self.bump();
                     }
+                    self.context = Context::Code;
                 }
                 (Some('/'), Some('*')) => {
                     self.space = true;
                     let start = self.pos();
+                    self.context = Context::BlockComment;
                     self.bump();
                     self.bump();
                     loop {
@@ -412,6 +485,7 @@ impl Lexer {
                             (None, _) => return Err(Error::new(start, "unterminated /* comment")),
                         }
                     }
+                    self.context = Context::Code;
                 }
                 _ => return Ok(()),
             }
@@ -453,14 +527,11 @@ impl Lexer {
                     ))));
                 }
                 Some(c) => {
-                    self.trigraph()?;
                     self.bump();
                     if c == quote {
                         return Ok(if quote == '"' { PpKind::Str } else { PpKind::Char });
                     }
                     if c == '\\' && self.peek(0).is_some_and(|c| c != '\n') {
-                        // `\??/` is `\\` to C, not `\?` and `?/`.
-                        self.trigraph()?;
                         self.bump();
                     }
                 }
@@ -469,17 +540,20 @@ impl Lexer {
     }
 }
 
+/// clang's warning of a line splice with blanks before its newline.
+const BLANKS: &str = "backslash and newline separated by space";
+
 /// Splits one file (`file` is its number, see [`Pos`]) into preprocessing
 /// tokens, and gives the position of its end. Only an unterminated `/*`
-/// comment and trigraphs are errors here; anything else that is no token
-/// becomes a [`PpKind::Invalid`] one.
+/// comment is an error here; anything else that is no token becomes a
+/// [`PpKind::Invalid`] one.
 pub fn lex_pp(src: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
     lex_pp_in(src, file, false)
 }
 
 /// [`lex_pp`] for assembly preprocessed as C (`clang -x assembler-with-cpp`):
-/// the same tokens, but trigraphs are never errors. An unterminated `/*`
-/// comment still is, as in clang.
+/// the same tokens, but trigraphs are only characters. An unterminated `/*`
+/// comment is an error, as in clang.
 pub fn lex_pp_asm(src: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
     lex_pp_in(src, file, true)
 }
@@ -487,20 +561,26 @@ pub fn lex_pp_asm(src: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
 /// [`lex_pp`] (`asm` false) or [`lex_pp_asm`].
 pub fn lex_pp_in(src: &str, file: u32, asm: bool) -> Result<(Vec<PpToken>, Pos), Error> {
     let mut lx = Lexer {
-        src: splice(src, file),
+        src: splice(src, file, asm),
         i: 0,
         newline: true,
         space: false,
-        asm,
+        mark: 0,
+        context: Context::Code,
+        lexed: Vec::new(),
     };
-    let mut out = Vec::new();
+    let mut out: Vec<PpToken> = Vec::new();
     loop {
         lx.skip_trivia()?;
         let pos = lx.pos();
         let Some(c) = lx.peek(0) else {
+            // What comes after the last token goes with it.
+            lx.marks_before(usize::MAX);
+            if let Some(last) = out.last_mut() {
+                last.lexed.append(&mut lx.lexed);
+            }
             return Ok((out, lx.src.end));
         };
-        lx.trigraph()?;
         let start = lx.i;
         let kind = if c.is_ascii_digit() || (c == '.' && lx.peek(1).is_some_and(|d| d.is_ascii_digit())) {
             lx.number();
@@ -532,6 +612,7 @@ pub fn lex_pp_in(src: &str, file: u32, asm: bool) -> Result<(Vec<PpToken>, Pos),
             end,
             bol: std::mem::take(&mut lx.newline),
             space: std::mem::take(&mut lx.space),
+            lexed: std::mem::take(&mut lx.lexed),
         });
     }
 }
@@ -1144,17 +1225,29 @@ mod tests {
         assert_eq!(toks("x = 'a;")[2], Tok::Unknown);
     }
 
-    /// Trigraphs are errors (tests/diagnostics has them), never three
-    /// characters.
+    /// Trigraphs are replaced before anything else, with clang's warnings
+    /// (tests/diagnostics has them) going with the token after them.
     #[test]
-    fn trigraphs_are_errors() {
+    fn trigraphs_are_replaced() {
         // A '?' that doesn't start a trigraph is fine, and so is '\?'.
         assert_eq!(
-            toks(r#""???" "?\?=""#)[..2],
-            [Tok::Str(b"???".to_vec()), Tok::Str(b"??=".to_vec())]
+            toks(r#""???" "?\?=" "a??=""#)[..3],
+            [
+                Tok::Str(b"???".to_vec()),
+                Tok::Str(b"??=".to_vec()),
+                Tok::Str(b"a#".to_vec())
+            ]
         );
+        // `??/` and a newline are a line splice, in a comment too.
+        assert_eq!(toks("x ??/\n= 1 // c ??/\ny = 2;").len(), 4);
         // Elsewhere in comments, trigraphs mean nothing.
         assert_eq!(toks("// a \\ b ??= ??/ c\n/* ??/\n **/ x").len(), 2);
+        let (t, _) = lex_pp("// ??=\nx ??( 1", 0).unwrap();
+        assert!(t[0].lexed.is_empty());
+        assert_eq!(
+            t[1].lexed[0].to_string(),
+            "2:3: trigraph converted to '[' character"
+        );
     }
 
     #[test]
@@ -1236,7 +1329,7 @@ mod tests {
             ["la", "a0", ",", "$", "x", "@", "\\", "rs1", "?", "?", "=", "'c'", "#", "it", "'s"]
         );
         assert!(matches!(t[3].kind, PpKind::Invalid(_)));
-        assert!(lex_pp("??=", 0).is_err());
+        assert_eq!(lex_pp("??=", 0).unwrap().0[0].text, "#");
         assert!(lex_pp_asm("/* x", 0).is_err());
     }
 
