@@ -166,6 +166,8 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         salvaged: RefCell::new(Vec::new()),
         partial: RefCell::new(None),
         parens: RefCell::new(None),
+        parens_written: RefCell::new(Default::default()),
+        trailing_else: Cell::new(None),
         warnings: RefCell::new(Vec::new()),
     };
     let mut items = Vec::new();
@@ -190,6 +192,10 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
                 xlen,
                 unevaluated,
                 warnings: p.warnings.take(),
+                written: Written {
+                    parens: p.parens_written.take(),
+                    ..Written::default()
+                },
             };
             return Err(Box::new((e, partial)));
         }
@@ -199,6 +205,10 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         xlen,
         unevaluated,
         warnings: p.warnings.take(),
+        written: Written {
+            parens: p.parens_written.take(),
+            ..Written::default()
+        },
     })
 }
 
@@ -587,6 +597,12 @@ struct Parser<'a> {
     /// The warnings so far: what clang warns of as it parses, and goes on
     /// (`declaration does not declare anything`).
     warnings: RefCell<Vec<Error>>,
+    /// Where the operators in parentheses are ([`Written::parens`]).
+    parens_written: RefCell<std::collections::HashSet<Pos>>,
+    /// The `else` of the `if` the statement just parsed ends with, through
+    /// loops and labels, not braces: an `if` without one of its own around
+    /// it is clang's dangling `else` (its `TrailingElseLoc`).
+    trailing_else: Cell<Option<Pos>>,
 }
 
 impl Parser<'_> {
@@ -2813,12 +2829,28 @@ impl Parser<'_> {
                 self.advance();
                 let cond = self.paren_expr("if")?;
                 let then = Box::new(self.stmt()?);
-                let els = if self.eat_kw(Kw::Else) {
-                    Some(Box::new(self.stmt()?))
+                let inner = self.trailing_else.take();
+                let els = if *self.peek() == Tok::Kw(Kw::Else) {
+                    let at = self.advance().pos;
+                    let els = Box::new(self.stmt()?);
+                    self.trailing_else.set(Some(at));
+                    Some(els)
                 } else {
+                    // `if (a) if (b) x; else y;`: the `else` is the inner
+                    // `if`'s, which clang warns may not be what was meant.
+                    if let Some(at) = inner {
+                        self.warn(Error::warning(
+                            at,
+                            "add explicit braces to avoid dangling else",
+                            "dangling-else",
+                        ));
+                    }
                     None
                 };
-                StmtKind::If { cond, then, els }
+                return Ok(Stmt {
+                    kind: StmtKind::If { cond, then, els },
+                    pos,
+                });
             }
             Tok::Kw(Kw::Switch) => {
                 self.advance();
@@ -2911,6 +2943,19 @@ impl Parser<'_> {
                 StmtKind::Expr(e)
             }
         };
+        // Only an `if`, and a statement that ends with one (a loop, a
+        // `switch`, a label), ends with its `else`.
+        if !matches!(
+            kind,
+            StmtKind::While { .. }
+                | StmtKind::For { .. }
+                | StmtKind::Switch { .. }
+                | StmtKind::Label { .. }
+                | StmtKind::Case { .. }
+                | StmtKind::Default { .. }
+        ) {
+            self.trailing_else.set(None);
+        }
         Ok(Stmt { kind, pos })
     }
 
@@ -3280,6 +3325,7 @@ impl Parser<'_> {
                 if let Some(parens) = self.parens.borrow_mut().as_mut() {
                     parens.push((paren_key(&e), pos));
                 }
+                self.parens_written.borrow_mut().insert(e.pos);
                 return Ok(e);
             }
             _ => return Err(self.expected("expression")),

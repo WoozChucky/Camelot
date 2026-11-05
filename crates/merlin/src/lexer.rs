@@ -735,6 +735,7 @@ pub fn char_constant(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Tok
 pub fn number(text: &str, pos: Pos, x: Xlen, diags: &mut Vec<Error>) -> Result<Tok, Error> {
     let IntLit {
         value,
+        low,
         decimal,
         unsigned,
         long,
@@ -753,11 +754,14 @@ pub fn number(text: &str, pos: Pos, x: Xlen, diags: &mut Vec<Error>) -> Result<T
         1 => !matches!(k, Int | UInt),
         _ => matches!(k, LongLong | ULongLong),
     });
+    // Too large for any type: clang's error, and it goes on with the low
+    // 64 bits, an `unsigned long long`.
     let Some(value) = value else {
-        return Err(Error::new(
+        diags.push(Error::new(
             pos,
             "integer literal is too large to be represented in any integer type",
         ));
+        return Ok(Tok::Num(low.into(), ULongLong));
     };
     match candidates.into_iter().find(|k| i128::from(value) <= k.range(x).1) {
         Some(&k) => Ok(Tok::Num(value.into(), k)),
@@ -778,6 +782,8 @@ pub struct IntLit {
     /// The value; `None` when it does not fit in 64 bits (in C, too large
     /// for any integer type).
     pub value: Option<u64>,
+    /// Its low 64 bits, which clang goes on with when it does not fit.
+    pub low: u64,
     /// Written in decimal (not hex or octal).
     pub decimal: bool,
     /// The suffix has a `u`.
@@ -852,8 +858,13 @@ pub fn integer(text: &str, pos: Pos) -> Result<IntLit, Error> {
         ));
     }
     // The digits are valid, so the only way to fail is to overflow.
+    let low = digits.chars().fold(0u64, |v, c| {
+        v.wrapping_mul(u64::from(radix))
+            .wrapping_add(u64::from(c.to_digit(radix).expect("a digit")))
+    });
     Ok(IntLit {
         value: u64::from_str_radix(&digits, radix).ok(),
+        low,
         decimal: radix == 10,
         unsigned,
         long,

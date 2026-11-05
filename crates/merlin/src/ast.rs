@@ -39,6 +39,23 @@ pub struct Program {
     /// The warnings so far (`Error`s of [`crate::Severity::Warning`]):
     /// what is not an error but clang warns of.
     pub warnings: Vec<crate::Error>,
+    /// What the tree does not keep of how the source was written, which
+    /// clang's warnings look at.
+    pub written: Written,
+}
+
+/// How a program was written, past its tree: where an operator had
+/// parentheses around its expression (`(a + b) << c`), and where a macro's
+/// expansion is, by the positions of the expressions: clang gives some
+/// warnings only of what is written out (`a & b == c`), and not in a
+/// macro's expansion.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Written {
+    /// The positions of the expressions in parentheses (an operator's
+    /// is where its operator is).
+    pub parens: std::collections::HashSet<Pos>,
+    /// The positions where a macro was expanded (where its tokens are).
+    pub macros: std::collections::HashSet<Pos>,
 }
 
 /// An expression the parser needed no value of, for sema to check without

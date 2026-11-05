@@ -49,6 +49,8 @@ mod parser;
 mod preprocessor;
 #[path = "diagnostics/sema.rs"]
 mod sema;
+#[path = "diagnostics/warnings.rs"]
+mod warnings;
 
 use merlin::types::Xlen;
 use std::path::{Component, Path};
@@ -145,6 +147,7 @@ fn table() -> Vec<Case> {
         preprocessor::cases(),
         parser::cases(),
         sema::cases(),
+        warnings::cases(),
         codegen::cases(),
     ]
     .into_iter()
@@ -216,7 +219,6 @@ fn merlin_lines(c: &Case, x: Xlen) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "work in progress: merlin's messages are being made clang's"]
 fn merlin_gives_the_tables_diagnostics() {
     let mut failures = Vec::new();
     let mut count = 0;

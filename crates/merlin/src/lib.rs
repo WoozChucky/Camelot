@@ -32,6 +32,7 @@ pub mod codegen;
 pub mod consteval;
 pub mod debug;
 pub mod elide;
+pub mod flow;
 pub mod lexer;
 pub mod parser;
 pub mod preprocess;
@@ -47,7 +48,7 @@ use std::path::Path;
 /// are the headers it includes, numbered by the preprocessor in the order
 /// it first reads them), then the 1-based line and column (columns count
 /// characters). Positions order by file first.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Pos {
     pub file: u32,
     pub line: u32,
@@ -317,28 +318,36 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
     // The lexer's diagnostics: clang goes on after an error in a literal,
     // or a token that is none, and so does merlin.
     let (toks, lexed) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| pp.merge(e))?;
-    let (prog, checked) = match parser::parse_salvaging(&toks, xlen) {
+    // The parser's warnings (it stops at its first error) come as it reads,
+    // as the lexer's do; sema's after them.
+    let (prog, parsed, checked) = match parser::parse_salvaging(&toks, xlen) {
         Ok(mut prog) => {
-            let checked = match sema::check(&mut prog) {
+            prog.written.macros = pp.macros.clone();
+            let parsed = std::mem::take(&mut prog.warnings);
+            let erred = lexed.iter().any(|e| !e.is_warning());
+            let checked = match sema::check_after(&mut prog, erred) {
                 Ok(()) => std::mem::take(&mut prog.warnings),
                 Err(all) => all,
             };
-            (Some(prog), checked)
+            (Some(prog), parsed, checked)
         }
         Err(salvaged) => {
             let (e, mut partial) = *salvaged;
+            partial.written.macros = pp.macros.clone();
+            let parsed = std::mem::take(&mut partial.warnings);
             // The warnings of what came before a syntax error come with it,
             // as clang gives them; not the errors of what it cut short.
-            let all = match sema::check(&mut partial) {
+            let all = match sema::check_after(&mut partial, true) {
                 Ok(()) => partial.warnings,
                 Err(all) => all,
             };
             let mut checked: Vec<Error> = all.into_iter().filter(Error::is_warning).collect();
             checked.push(e);
-            (None, checked)
+            (None, parsed, checked)
         }
     };
-    let diagnostics = pp.merge(in_clangs_order(lexed, checked));
+    let read = in_clangs_order(lexed, parsed);
+    let diagnostics = pp.merge(in_clangs_order(read, checked));
     match prog {
         Some(mut prog) if diagnostics.iter().all(Error::is_warning) => {
             prog.warnings = diagnostics;

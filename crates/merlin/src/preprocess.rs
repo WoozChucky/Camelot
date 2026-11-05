@@ -358,6 +358,10 @@ const DIRECTIVES: &[&str] = &[
 pub struct Output {
     /// Every token, macros replaced, directives gone.
     pub tokens: Vec<PpToken>,
+    /// Where a macro's expansion is: the positions of the tokens it made
+    /// (where it was used), which clang's warnings of what is written
+    /// leave out ([`crate::ast::Written`]).
+    pub macros: std::collections::HashSet<Pos>,
     /// The end of the file being compiled (where end of file is reported).
     pub end: Pos,
     /// The name of each file, indexed by [`Pos::file`]: 0 is the file being
@@ -795,7 +799,13 @@ pub fn preprocess_recovering(
                     lead: t.lead,
                 })
                 .collect();
+            let macros = toks
+                .iter()
+                .filter(|t| t.site.is_some())
+                .map(|t| t.t.pos)
+                .collect();
             Ok(Output {
+                macros,
                 tokens: toks.into_iter().map(|t| t.t).collect(),
                 end,
                 files,
