@@ -452,9 +452,9 @@ header; a broken disk may make it panic.
 ## Booting
 
 The filesystem leaves the boot block (block 0) and the blocks past `size`
-alone, and a bootable disk uses both, so it is still a valid filesystem. Grail's boot ROM, started with no program, reads the boot block
+alone, and a bootable disk uses both, so it is still a valid filesystem. Grail's boot ROM (or, on an RV64 machine, its firmware), started with no program, reads the boot block
 into RAM, checks it and jumps to it (`docs/excalibur-spec.md` section 7,
-"Boot from disk"); Camelot's boot block loads the kernel from the blocks
+"Boot from disk" and "Firmware"); Camelot's boot block loads the kernel from the blocks
 after the filesystem:
 
 ```
@@ -520,13 +520,25 @@ is not a little-endian RISC-V `ET_EXEC` of its width (ELF32, ELF64) with its
 program headers in its first 1 KiB, a segment with file bytes whose file offset is not a
 multiple of 512 (merlin-ld and ld.lld place segments at page offsets) or
 that runs past `kernel_sectors` (a `.bss`-only segment, `p_filesz` 0, reads
-nothing, so its offset is not checked), and a segment outside RAM or
-reaching into the 64 KiB the bootloader runs in. Then it writes the kernel's
-entry point to the boot ROM's entry word (a doubleword on RV64), so harts
-the kernel wakes go there too, and jumps to it with a0 = 0 and a1 = the
-sysinfo block: the load address of `e_entry`, `p_paddr + (e_entry -
-p_vaddr)` of the segment that holds it, since the kernel starts with paging
-off (mkfs checks that a segment holds it). mkfs stores only what the
+nothing, so its offset is not checked), and a segment outside free RAM or
+reaching into the 64 KiB the bootloader runs in. Then it starts the kernel
+at the load address of `e_entry`, `p_paddr + (e_entry - p_vaddr)` of the
+segment that holds it, since the kernel starts with paging off (mkfs checks
+that a segment holds it), with a0 = 0, in the mode the bootloader runs in:
+
+- **RV32**, on the boot ROM, in M-mode: free RAM starts at 0x8000_0000, the
+  bootloader runs in the last 64 KiB of RAM, where the ROM put it, and it
+  writes the kernel's entry point to the boot ROM's entry word first, so
+  harts the kernel wakes go there too; a1 = the sysinfo block.
+- **RV64**, the firmware's next stage (`docs/excalibur-spec.md` section 7,
+  "Firmware"), in S-mode: the firmware loads the block at 0x8020_0000, where
+  the kernel loads too, and starts it with a1 = the device tree and a2 = the
+  disk's registers, so the bootloader first copies itself to the 64 KiB below
+  the device tree (which Grail puts at the last 2 MiB boundary of RAM that
+  leaves it room) and goes on there, as a PC's boot sector moves out of
+  0x7C00; free RAM is from 0x8020_0000, after the firmware's 2 MiB, to its
+  copy. It writes nothing to the ROM, as the kernel starts its other harts
+  through the SBI's `hart_start`, and passes a1, the device tree, on. mkfs stores only what the
 bootloader loads of the kernel, with the section header fields of the ELF
 header cleared at the offsets of its class (`e_shoff` at 32 in ELF32, at 40
 in ELF64). On success it prints one line,

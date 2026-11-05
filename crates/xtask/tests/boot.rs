@@ -589,6 +589,115 @@ const V2_REGISTERS: &[(&str, u32)] = {
     ]
 };
 
+/// A `#define NAME VALUE` of a C header, the value a number.
+fn define(header: &str, name: &str) -> u64 {
+    let line = header
+        .lines()
+        .find(|l| l.split_whitespace().take(2).eq(["#define", name]))
+        .unwrap_or_else(|| panic!("no #define {name}"));
+    let value = line
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_matches(|c| c == '(' || c == ')');
+    match value.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).unwrap(),
+        None => value.parse().unwrap(),
+    }
+}
+
+#[test]
+fn the_firmware_grail_the_kernel_and_the_documents_agree() {
+    // The firmware's layout and hand-off (spec section 7, "Firmware"), as
+    // Grail lays the machine out, the firmware's sources and the RV64
+    // bootloader and kernel assume it.
+    let root = repo_root();
+    let read = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
+    let fw = read("firmware/fw.h");
+    use grail::firmware as gf;
+    assert_eq!(define(&fw, "FW_BASE"), gf::FW_BASE);
+    assert_eq!(define(&fw, "FW_SIZE"), gf::FW_SIZE);
+    assert_eq!(define(&fw, "FW_JUMP_ADDR"), gf::FW_JUMP_ADDR);
+    assert_eq!(define(&fw, "FW_DYNAMIC_INFO_MAGIC"), gf::FW_DYNAMIC_INFO_MAGIC);
+    assert_eq!(
+        define(&fw, "FW_DYNAMIC_INFO_NEXT_MODE_S"),
+        gf::FW_DYNAMIC_INFO_NEXT_MODE_S
+    );
+    assert!(define(&fw, "FW_DYNAMIC_INFO_VERSION_MIN") <= gf::FW_DYNAMIC_INFO_VERSION);
+    assert_eq!(define(&fw, "FW_MAX_HARTS") as usize, grail::MAX_HARTS);
+    assert_eq!(
+        define(&fw, "EXIT_BOOT_FAILED"),
+        u64::from(grail::boot::EXIT_BOOT_FAILED)
+    );
+    assert_eq!(define(&fw, "CLINT_BASE"), grail::bus::CLINT_BASE);
+    assert_eq!(define(&fw, "UART_BASE"), grail::bus::UART_BASE);
+    assert_eq!(define(&fw, "SYSINFO_BASE"), grail::bus::SYSINFO_BASE);
+    assert_eq!(define(&fw, "DISK0"), grail::bus::BLK_BASE);
+    // fw.h's RV64 definitions come after its `#if __riscv_xlen == 64`.
+    let fw64 = &fw[fw.find("#if __riscv_xlen == 64\n#define SYS_RAM_BASE").unwrap()..];
+    use grail::sysinfo::v2;
+    assert_eq!(
+        define(fw64, "SYS_RESERVED_BASE"),
+        u64::from(v2::REG_RESERVED_BASE)
+    );
+    assert_eq!(
+        define(fw64, "SYS_RESERVED_SIZE"),
+        u64::from(v2::REG_RESERVED_SIZE)
+    );
+    assert_eq!(define(fw64, "SYS_HARTS"), u64::from(v2::REG_HARTS));
+    for (name, reg) in [
+        ("BLK_CAPACITY", grail::block::v2::REG_CAPACITY),
+        ("BLK_SECTOR", grail::block::v2::REG_SECTOR),
+        ("BLK_DMA", grail::block::v2::REG_DMA),
+        ("BLK_COUNT", grail::block::v2::REG_COUNT),
+        ("BLK_CMD", grail::block::v2::REG_CMD),
+        ("BLK_STATUS", grail::block::v2::REG_STATUS),
+        ("BLK_ERROR", grail::block::v2::REG_ERROR),
+    ] {
+        assert_eq!(define(&fw, name), u64::from(reg), "{name}");
+    }
+    // The kernel reads the reserved range where sysinfo has it.
+    let sysinfo_h = read("kernel/include/sysinfo.h");
+    assert_eq!(
+        define(&sysinfo_h, "SYS_RESERVED_BASE"),
+        u64::from(v2::REG_RESERVED_BASE)
+    );
+    assert_eq!(
+        define(&sysinfo_h, "SYS_RESERVED_SIZE"),
+        u64::from(v2::REG_RESERVED_SIZE)
+    );
+    // The firmware checks a boot block as the ROM does.
+    let assembly = |path: &str, xlen| {
+        xtask::examples::assembly_of(&root, path, &[xtask::examples::INCLUDE_DIR], xlen).unwrap()
+    };
+    let disk = assembly("firmware/disk.S", Xlen::Rv64);
+    assert_eq!(equ(&disk, "BOOT_MAGIC"), grail::boot::BOOT_MAGIC);
+    assert_eq!(equ(&disk, "BOOT_SIZE") as usize, grail::boot::BOOT_BLOCK_SIZE);
+    assert_eq!(equ(&disk, "BOOT_SIG") as usize, boot::MAGIC_AT);
+    // The RV64 bootloader runs where the firmware starts its next stage, and
+    // the RV64 kernel loads there.
+    let loader64 = assembly("kernel/boot/boot.S", Xlen::Rv64);
+    assert_eq!(u64::from(equ(&loader64, "FW_JUMP_ADDR")), gf::FW_JUMP_ADDR);
+    assert_eq!(equ(&loader64, "BOOT_AREA"), grail::boot::BOOT_AREA_SIZE);
+    assert_eq!(equ(&loader64, "BOOT_SIZE") as usize, grail::boot::BOOT_BLOCK_SIZE);
+    assert!(read("kernel/kernel.lds.S").contains("AT(0x80200000)"));
+    // And the spec says so.
+    let spec = read("docs/excalibur-spec.md");
+    for s in [
+        "0x8000_0000 to 0x801F_FFFF",
+        "starts at 0x8020_0000 (OpenSBI's `FW_JUMP_ADDR`)",
+        "`SYS_RESERVED_BASE`",
+        "the magic 0x4942_534F (\"OSBI\"), version 2",
+        "`csrr a0, mhartid; lui t0, 1; ld a1, 0x18(t0); addi a2, t0, 0x128; ld t0, 0x120(t0); jr t0`",
+    ] {
+        assert!(spec.contains(s), "the spec does not say {s}");
+    }
+    assert_eq!(grail::boot::FDT_ADDR_ADDR, 0x1018);
+    assert_eq!(grail::boot::FW_ENTRY_ADDR, 0x1120);
+    assert_eq!(grail::boot::FW_DYNAMIC_INFO_ADDR, 0x1128);
+    assert_eq!(grail::boot::FW_HANDOFF_PC, 0x1100);
+}
+
 #[test]
 fn the_rom_the_bootloader_mkfs_and_the_documents_agree() {
     let root = repo_root();

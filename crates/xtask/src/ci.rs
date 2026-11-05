@@ -220,6 +220,7 @@ const STEPS: &[Step] = &[
             "up",
             "--",
             "the_rom_the_bootloader_mkfs_and_the_documents_agree",
+            "the_firmware_grail_the_kernel_and_the_documents_agree",
             "the_spec_gives_the_root_images_size",
             "the_format_document_matches",
             "the_system_call_document_matches",
