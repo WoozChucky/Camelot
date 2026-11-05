@@ -352,8 +352,9 @@ cargo test -p merlin-as
 ```
 
 The tests cover both widths; the RV64 references live in `rv64/`
-subdirectories, out of the corpus that Camelot's `/bin/as`, which is RV32,
-assembles in `crates/xtask/tests/selfhost.rs`.
+subdirectories. Camelot's `/bin/as` assembles each width's in
+`crates/xtask/tests/selfhost.rs`, on a machine of that width, the values
+of `li.golden` and `rv64/li.golden` too.
 
 - `encode_golden`: lines assembled by LLVM, words and relocations identical.
   RV32: 168 lines (`tests/golden/encode.s` → `encode.golden`: RV32I, M, A
