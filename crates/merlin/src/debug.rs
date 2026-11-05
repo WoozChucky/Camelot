@@ -48,10 +48,14 @@
 //!   anonymous struct, union or enum a member is of inside the record, and
 //!   a type a function defines inside the function's entry),
 //!   enums with their constants, typedefs, `const` and `volatile`, and
-//!   function types (for function pointers).
+//!   function types (for function pointers); and, as clang keeps them,
+//!   the types of the explicit casts its code generator visits and the
+//!   enums whose constants the code uses.
 //!
 //! The entries are in clang's order, which [`order`] works out from what the
-//! code generator saw ([`Event`]s): the order LLVM makes them in.
+//! code generator saw ([`Event`]s), in the order it generated the functions
+//! and globals (clang's front end's) and the order of their code: the order
+//! LLVM makes them in.
 //!
 //! The forms are clang's for DWARF 5 (see [`Val`]): a string is an index in
 //! `.debug_str_offsets`, whose entries point into `.debug_str`
