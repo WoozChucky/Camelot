@@ -397,6 +397,12 @@
 //! way each time the expression is evaluated; its value is the local's
 //! address (loaded for a scalar `T`).
 //!
+//! clang emits a local array, struct or union whose initializer is constant
+//! (what a static initializer could be) as a constant it copies, not as
+//! code; merlin stores it element by element all the same, but with `-g`
+//! describes what clang's would: the casts a static initializer keeps, and
+//! no enum of its constants ([`FuncGen::constant_initializer`]).
+//!
 //! Globals and `static` locals are data: the initializer, a constant
 //! expression, is written out with `.byte`, `.half`, `.word`, `.quad` (8
 //! bytes, as clang writes them: a `long` or a pointer on RV64; `.word
@@ -972,6 +978,7 @@ impl<'a> FileGen<'a> {
                 ret_label: format!(".L.return.{}", f.name),
                 elided_cases: Vec::new(),
                 after_prologue: false,
+                constant_init: false,
                 scopes: Vec::new(),
                 used: (0..n).map(|i| Cell::new(i < f.params.len())).collect(),
                 slots,
@@ -1342,6 +1349,10 @@ struct FuncGen<'a, 'f> {
     /// With `-g`: the scopes being generated, the function's body first and
     /// the innermost block last, with the variables declared in each.
     scopes: Vec<Scope>,
+    /// With `-g`: a local's constant initializer is being generated, which
+    /// clang emits as a constant ([`FuncGen::constant_initializer`]): its
+    /// code keeps no casts' types and describes no enums.
+    constant_init: bool,
     /// The locals the code generated so far declares or uses (the
     /// parameters from the start).
     used: Vec<Cell<bool>>,
@@ -2210,7 +2221,55 @@ impl<'a> FuncGen<'a, '_> {
             self.comment(format!("{} = ...", d.ty.declare(&d.name)));
             self.clear_local(off, d.ty.size(self.xlen).unwrap() as i32);
         }
+        // `-g`: clang emits an array, struct or union with a constant
+        // initializer as a static's (`EmitAutoVarInit`, its
+        // `IsConstantAggregate`: `ConstantEmitter`), not as code: what
+        // its debug information keeps of it is a static initializer's.
+        let constant = self.file.debug.is_some()
+            && (d.ty.is_array() || d.ty.is_record())
+            && self.constant_initializer(&d.ty, init);
+        self.constant_init = constant;
         self.init_local(&d.ty, init, off);
+        self.constant_init = false;
+    }
+
+    /// Whether `init` is a constant initializer of an object of type `ty`,
+    /// as clang's `Expr::isConstantInitializer` has it: what a static
+    /// initializer could be (numbers, addresses of globals and string
+    /// literals, strings for a `char` array), every element of a list.
+    fn constant_initializer(&self, ty: &Type, init: &Init) -> bool {
+        match (ty.unqual(), init) {
+            (Type::Array(elem, _), Init::List(items, _)) => {
+                items.iter().all(|i| self.constant_initializer(elem, i))
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().expect("sema: locals have complete types");
+                body.members
+                    .iter()
+                    .zip(items)
+                    .all(|(m, i)| self.constant_initializer(&m.ty, i))
+            }
+            (_, Init::List(items, _)) => items.iter().all(|i| self.constant_initializer(ty, i)),
+            (
+                Type::Array(..),
+                Init::Expr(Expr {
+                    kind: ExprKind::Str(_),
+                    ..
+                }),
+            ) => true,
+            // A struct initialized by a compound literal, as GCC allows
+            // even at file scope: constant if its list is.
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_initializer(lit, init),
+            (_, Init::Expr(e)) => consteval::eval(e, self.xlen).is_some(),
+            (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
+        }
     }
 
     /// Stores an initializer into the local object at `off(s0)`; arrays and
@@ -2255,6 +2314,11 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             (_, Init::Expr(e)) => {
+                // A constant initializer's element keeps what a static
+                // initializer's does.
+                if self.constant_init {
+                    self.file.initializer_casts(e);
+                }
                 self.expr(e);
                 self.store_local(ty, off);
             }
@@ -2316,7 +2380,7 @@ impl<'a> FuncGen<'a, '_> {
     /// (`1 && r`, `0 || r`) and nothing otherwise (clang's
     /// `VisitAbstractConditionalOperator`, `VisitBinLAnd`, `VisitBinLOr`).
     fn kept_casts(&mut self, e: &'a Expr) {
-        if self.file.debug.is_none() {
+        if self.file.debug.is_none() || self.constant_init {
             return;
         }
         self.kept_cast(e);
@@ -2350,6 +2414,9 @@ impl<'a> FuncGen<'a, '_> {
     /// `-g`: clang keeps the type of an explicit cast in the unit (and
     /// describes it as it is evaluated).
     fn kept_cast(&mut self, e: &Expr) {
+        if self.constant_init {
+            return;
+        }
         if let (
             Some(d),
             ExprKind::Cast {

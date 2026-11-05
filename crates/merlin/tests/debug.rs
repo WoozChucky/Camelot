@@ -819,6 +819,25 @@ fn initializer_casts_are_kept_as_clang_keeps_them() {
         named(&src, elf::dies::dw::TAG_TYPEDEF),
         ["A", "C", "D", "F", "G", "I", "J"]
     );
+    // A local array, struct or union with a constant initializer is
+    // emitted as a static's (`EmitAutoVarInit`, `IsConstantAggregate`), so
+    // its casts are kept by the same rules; one that is not constant is
+    // code, all its casts kept.
+    let names = ["M", "N", "O", "P", "Q", "R", "S", "T", "U", "V"];
+    let mut src: String = names.iter().map(|n| format!("typedef long {n};\n")).collect();
+    src.push_str(
+        "int x[4];\nint f(long y) {\n\
+             long a[1] = {(M)1 + (N)2};\n\
+             long b[2] = {1 ? (O)1 : 2};\n\
+             long c[1] = {(P)&x + 4};\n\
+             int *d[1] = {(int *)(Q)&x};\n\
+             long e[1] = {(R)&x};\n\
+             long h[2] = {(S)(T)3, 0};\n\
+             long k[1] = {(U)y + (V)1};\n\
+             return a[0] + b[0] + c[0] + *d[0] + e[0] + h[0] + k[0];\n\
+         }\n",
+    );
+    assert_eq!(named(&src, elf::dies::dw::TAG_TYPEDEF), ["R", "S", "T", "U", "V"]);
 }
 
 /// clang describes the enum of an enumeration constant its code uses, even
@@ -853,6 +872,26 @@ fn enums_are_described_for_the_constants_the_code_uses() {
         named(&src, elf::dies::dw::TAG_ENUMERATOR),
         ["E", "H", "I", "J", "L", "N", "O", "Q"]
     );
+    // Nor in a local array, struct or union with a constant initializer
+    // (addresses of globals and compound literals among them), which clang
+    // emits as a static's; but in one that is not constant, and in a
+    // scalar's.
+    let names = ["P", "R", "S", "T", "U", "V", "W"];
+    let mut src: String = names.iter().map(|n| format!("enum {{ {n} = 1 }};\n")).collect();
+    src.push_str(
+        "int arr[4];\nunion un { int i; long l; };\nstruct st { int p; int *q; };\n\
+         int g(int x) {\n\
+             int a[2] = {P, 1};\n\
+             int m[2][2] = {{R}, {1}};\n\
+             union un u = {S};\n\
+             struct st s = {T, &arr[0]};\n\
+             struct st t = {U, &x};\n\
+             struct st c = (struct st){V, 0};\n\
+             int sc = W;\n\
+             return a[0] + m[0][0] + u.i + s.p + t.p + c.p + sc;\n\
+         }\n",
+    );
+    assert_eq!(named(&src, elf::dies::dw::TAG_ENUMERATOR), ["U", "W"]);
 }
 
 /// The types a function defines (a typedef, a struct, one in an inner block)
