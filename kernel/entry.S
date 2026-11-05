@@ -113,37 +113,40 @@ supervisor_entry:
 # runs the scheduler until hart 0 stops the machine.
     .globl secondary_entry
 secondary_entry:
-    # tp and sp first, as Linux's secondary_start_sbi loads them before
-    # anything else, so that nothing runs here without them: on RV32 the
-    # stack is a page at its physical address, which paging maps where it
-    # is, so kernel_vec can use it from the start. On RV64 it is at its link
-    # address in the vmalloc area, usable once kernel_satp is in satp: until
-    # then the trap vector is early_s_trap, which uses no stack (as Linux's
-    # .Lsecondary_park doesn't).
-    mv    tp, a0
-    mv    sp, a1
-    # Nothing enabled or pending from whatever ran before (Linux does the
-    # same).
+    # As Linux's secondary_start_sbi: nothing enabled or pending from
+    # whatever ran before, a trap vector that needs nothing (Linux's
+    # .Lsecondary_park; on RV64 early_s_trap, which uses no stack), then tp
+    # and sp, all with paging still off. On RV32 the stack is a page at its
+    # physical address, which paging maps where it is, so kernel_vec can use
+    # it from the start; sstatus.SIE is 0, and nothing before it can trap.
+    # On RV64 it is at its link address in the vmalloc area, usable only
+    # once kernel_satp is in satp.
     csrw  sie, zero
     csrw  sip, zero
 #if __riscv_xlen == 64
     la    t0, early_s_trap
     csrw  stvec, t0
+#endif
+    mv    tp, a0
+    mv    sp, a1
+#if __riscv_xlen == 64
     call  relocate_enable_mmu
-    # High. The stack is in the vmalloc area, which only the kernel page
-    # table maps, and hart 0 has built that table by now (kvminit()): switch
-    # to it first, which also drops the identity mapping, so the trap
-    # vector goes high before it does.
-    la    t0, kernel_vec
+    # High. The trap vector goes high first: early_s_trap at its link
+    # address, which the early page table and the kernel's both map, as
+    # Linux's relocate_enable_mmu points stvec at .Lsecondary_park's
+    # virtual address before it switches tables. Then the kernel page table
+    # (hart 0 has built it by now, kvminit()), which maps the stack and
+    # drops the identity mapping, and only then kernel_vec, which uses the
+    # stack (Linux's .Lsetup_trap_vector, after relocate_enable_mmu).
+    la    t0, early_s_trap
     csrw  stvec, t0
     la    t0, kernel_satp
     REG_L t0, 0(t0)
     csrw  satp, t0
     sfence.vma
-#else
+#endif
     la    t0, kernel_vec
     csrw  stvec, t0
-#endif
     call  hart_main
 1:  j     1b
 

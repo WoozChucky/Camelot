@@ -7,9 +7,9 @@
 //! warning and fallback when a reason is refused; a hart that hart_start
 //! can't start and one that never comes online, both reported and left
 //! out, one that comes online too late, which stops itself, and a trap on a
-//! hart that is starting, which stops the machine; and, over whole boots,
-//! that every IPI store comes
-//! after a fence that orders the stores before it (#170), that every msip
+//! hart that is starting, which stops the machine (on RV64 through a trap
+//! vector that needs no stack until the hart's stack is mapped); and, over
+//! whole boots, that every IPI store comes after a fence that orders the stores before it (#170), that every msip
 //! clear comes before a fence that orders it before the loads after it, and
 //! that S-mode never touches the CLINT or the SBI's scratch blocks.
 
@@ -769,6 +769,44 @@ fn a_trap_on_a_starting_hart_stops_the_machine() {
         if xlen == Xlen::Rv32 {
             assert!(out.contains("panic: "), "{xlen:?}:\n{out}");
         }
+    }
+}
+
+#[test]
+fn a_starting_rv64_hart_takes_kernel_vec_only_once_its_stack_is_mapped() {
+    // Linux's order (relocate_enable_mmu, then .Lsetup_trap_vector): once
+    // hart 2 runs high, its trap vector is early_s_trap's link address,
+    // which uses no stack, while the early page table, which doesn't map
+    // the hart's stack, is in satp; it is still early_s_trap once
+    // kernel_satp is, and only then kernel_vec. A trap at either point
+    // stops the machine with 0xff from early_s_trap.
+    for at_kernel_satp in [false, true] {
+        let mut s = four_harts_at_kmain(Xlen::Rv64);
+        let (early_s_trap, kernel_vec) = (s.sym("early_s_trap"), s.sym("kernel_vec"));
+        let entry = s.pa(s.sym("secondary_entry"));
+        s.step_until(|m| m.cpu.hart(2).pc == entry);
+        s.step_until(|m| m.cpu.hart(2).csr.stvec >= RV64_LINK);
+        let early_satp = s.m.cpu.hart(2).csr.satp;
+        assert_ne!(early_satp, 0);
+        assert_eq!(
+            s.m.cpu.hart(2).csr.stvec,
+            early_s_trap,
+            "with the early page table"
+        );
+        if at_kernel_satp {
+            s.step_until(|m| m.cpu.hart(2).csr.satp != early_satp);
+            assert_eq!(s.m.cpu.hart(2).csr.stvec, early_s_trap, "with kernel_satp");
+        } else {
+            // Where it goes on to: kernel_vec, with kernel_satp in satp.
+            let mut later = four_harts_at_kmain(Xlen::Rv64);
+            later.step_until(|m| m.cpu.hart(2).pc == entry);
+            later.step_until(|m| m.cpu.hart(2).csr.stvec == kernel_vec);
+            let satp = later.m.cpu.hart(2).csr.satp;
+            assert!(satp != 0 && satp != early_satp, "kernel_vec with satp {satp:#x}");
+        }
+        s.m.cpu.hart_mut(2).pc = 0;
+        let r = s.m.run(Some(BOOT_MAX_STEPS), |_| {});
+        assert_eq!(r, RunResult::Exited(0xff), "{}", s.printed());
     }
 }
 
