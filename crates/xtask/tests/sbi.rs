@@ -3,9 +3,12 @@
 //! `ecall` from S-mode as the kernel makes them, on both committed kernels
 //! (kernel/kernel.elf, RV32, and kernel/kernel-rv64.elf, RV64), with each
 //! call's results and errors, and every register but a0 and a1 kept. Then
-//! the kernel's own side: the exit codes machine_power_off() gives, a hart
-//! that hart_start can't start and one that never comes online, both
-//! reported and left out, and, over whole boots, that every IPI store comes
+//! the kernel's own side: the exit codes machine_power_off() gives, and its
+//! warning and fallback when a reason is refused; a hart that hart_start
+//! can't start and one that never comes online, both reported and left
+//! out, one that comes online too late, which stops itself, and a trap on a
+//! hart that is starting, which stops the machine; and, over whole boots,
+//! that every IPI store comes
 //! after a fence that orders the stores before it (#170), that every msip
 //! clear comes before a fence that orders it before the loads after it, and
 //! that S-mode never touches the CLINT or the SBI's scratch blocks.
