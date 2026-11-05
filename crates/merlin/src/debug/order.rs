@@ -16,6 +16,10 @@
 //! 6. then the types of each function's parameters and locals, in the order
 //!    they are declared.
 //!
+//! Phases 4 to 6 go through the functions as 2 does, in the order of their
+//! code (LLVM's list of the subprograms it made), not the order they were
+//! emitted in: a `static` function emitted last may have its code first.
+//!
 //! Making an entry makes the types it refers to that are not made yet, depth
 //! first, each one added before those it refers to (a pointer before what it
 //! points to, a struct before its members' types, an array before its element
@@ -251,9 +255,10 @@ impl Lines {
                 _ => None,
             });
         }
-        // 4. Each function's types and static locals.
-        for l in &locals {
-            for x in l {
+        // 4. Each function's types and static locals, the functions in the
+        // order of their code (LLVM's list of subprograms), as 5 and 6.
+        for &i in &self.code {
+            for x in &locals[i] {
                 match x {
                     Local::Type(t) => m.ty(Some(*t)),
                     Local::Static(sym) => {
@@ -269,11 +274,12 @@ impl Lines {
             }
         }
         // 5. Each function's return type.
-        for f in &self.functions {
-            m.ty(f.ret);
+        for &i in &self.code {
+            m.ty(self.functions[i].ret);
         }
         // 6. Each function's parameters' and locals' types.
-        for f in &self.functions {
+        for &i in &self.code {
+            let f = &self.functions[i];
             for p in &f.params {
                 m.ty(p.ty);
             }

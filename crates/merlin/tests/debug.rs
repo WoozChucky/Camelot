@@ -884,6 +884,40 @@ fn a_functions_types_are_its_own() {
     assert_eq!(u.dies[u.dies[outer[0]].children[0]].name(), Some("l"));
 }
 
+/// The types LLVM makes after the globals (each function's static locals
+/// and own types, then its return type, then its parameters' and locals'
+/// types) come in the order of the functions' code, not the order they were
+/// emitted in: a `static` function emitted last whose code is first has its
+/// types first (clang 23).
+#[test]
+fn a_functions_late_types_follow_its_code() {
+    use elf::dies::dw;
+    // `sh` is emitted after `g`, as it is first used, but its code is
+    // written where `f` refers to it, before `g`'s.
+    let src = "struct X { int a; };
+struct Y { int b; };
+static int sh(void);
+               int f(void) { return sh(); }
+               int g(void) { struct Y y; y.b = 2; return y.b; }
+               static int sh(void) { struct X x; x.a = 3; return x.a; }
+";
+    assert_eq!(named(src, dw::TAG_STRUCTURE_TYPE), ["X", "Y"]);
+    let src = "typedef long RX;
+typedef short RY;
+static RX sh(void);
+               int f(void) { return sh(); }
+RY g(void) { return 2; }
+               static RX sh(void) { return 3; }
+";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["RX", "RY"]);
+    let src = "static int sh(void);
+int f(void) { return sh(); }
+               int g(void) { static short s; return s; }
+               static int sh(void) { static long l; return l; }
+";
+    assert_eq!(named(src, dw::TAG_BASE_TYPE), ["long", "short", "int"]);
+}
+
 /// The entries of a unit as llvm-dwarfdump shows them: each one's depth, tag
 /// and name (or, without one, the name of its type), the unit's own left out.
 fn entry_tree(tool: &str, obj: &Path) -> Vec<String> {
