@@ -427,7 +427,9 @@ fn grail_boots_a_machine_from_disk_without_firmware() {
     let block = boot_block(&[LD_T1_RAM_SIZE, SRLI_T1_20, HALT_T1]);
     std::fs::write(&img, disk(&block, 2)).unwrap();
     let img = img.to_str().unwrap();
-    for (args, ram) in [(vec![], 4), (vec!["--ram", "64"], 64)] {
+    // The command's default RAM, and 64 MiB.
+    let default = (grail::cli::COMMAND_RAM_SIZE >> 20) as i32;
+    for (args, ram) in [(vec![], default), (vec!["--ram", "64"], 64)] {
         let (code, out, err) = grail(&[&args[..], &["--bios", "none", "--disk", img]].concat(), b"");
         assert_eq!(code, Some(ram), "{args:?}:\n{out}{err}");
         assert_eq!(out, "");

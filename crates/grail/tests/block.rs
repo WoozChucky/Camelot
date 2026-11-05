@@ -171,7 +171,10 @@ fn example_on_a_read_only_disk() {
 fn example_without_a_disk() {
     let (result, out, _) = run_example(Machine::new(MachineConfig::default()).unwrap());
     assert_eq!(result, RunResult::Exited(1));
-    assert_eq!(out, "no disk (try grail --disk examples/disk/disk.img)\n");
+    assert_eq!(
+        out,
+        "no disk (try grail --bios none --disk examples/disk/disk.img)\n"
+    );
 }
 
 #[test]

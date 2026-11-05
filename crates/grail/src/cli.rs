@@ -165,7 +165,6 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
             "--ram" => config.ram_size = parsed("--ram", value("--ram")?, parse_ram_size)?,
             "--clock" => config.clock_hz = Some(parsed("--clock", value("--clock")?, parse_clock)?),
             "--harts" => config.harts = parsed("--harts", value("--harts")?, parse_harts)?,
-
             "--paging" => config.paging = parsed("--paging", value("--paging")?, parse_paging)?,
             "--bios" => config.bios = parsed("--bios", value("--bios")?, parse_bios)?,
             "--disk" | "--disk-ro" => {

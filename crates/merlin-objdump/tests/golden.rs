@@ -130,14 +130,26 @@ const CASES: &[(&str, &str, &[&str])] = &[
         "crates/merlin-objdump/tests/fixtures/linked.elf",
         &["-x"],
     ),
-    ("rv32ui-p-add.d", "tests/riscv-tests/rv32ui-p-add", &["-d"]),
-    ("rv32mi-p-csr.d", "tests/riscv-tests/rv32mi-p-csr", &["-d"]),
+    (
+        "rv32ui-p-add.d",
+        "crates/merlin-objdump/tests/fixtures/rv32/rv32ui-p-add",
+        &["-d"],
+    ),
+    (
+        "rv32mi-p-csr.d",
+        "crates/merlin-objdump/tests/fixtures/rv32/rv32mi-p-csr",
+        &["-d"],
+    ),
     (
         "rv32si-p-dirty.dx",
-        "tests/riscv-tests/rv32si-p-dirty",
+        "crates/merlin-objdump/tests/fixtures/rv32/rv32si-p-dirty",
         &["-d", "-x"],
     ),
-    ("rv32ua-p-lrsc.d", "tests/riscv-tests/rv32ua-p-lrsc", &["-d"]),
+    (
+        "rv32ua-p-lrsc.d",
+        "crates/merlin-objdump/tests/fixtures/rv32/rv32ua-p-lrsc",
+        &["-d"],
+    ),
     // RV64: ELF64 files, in golden/rv64/.
     ("rv64/hello-elf.d", RV64_HELLO_ELF, &["-d"]),
     (
@@ -205,26 +217,14 @@ const CASES: &[(&str, &str, &[&str])] = &[
     ("rv64/linked-elf.d", RV64_LINKED, &["-d"]),
     ("rv64/linked-elf.x", RV64_LINKED, &["-x"]),
     ("rv64/linked-elf.s", RV64_LINKED, &["-s"]),
-    (
-        "rv64/rv64ui-p-add.d",
-        "tests/riscv-tests/rv64/rv64ui-p-add",
-        &["-d"],
-    ),
-    (
-        "rv64/rv64mi-p-csr.d",
-        "tests/riscv-tests/rv64/rv64mi-p-csr",
-        &["-d"],
-    ),
+    ("rv64/rv64ui-p-add.d", "tests/riscv-tests/rv64ui-p-add", &["-d"]),
+    ("rv64/rv64mi-p-csr.d", "tests/riscv-tests/rv64mi-p-csr", &["-d"]),
     (
         "rv64/rv64si-p-dirty.dx",
-        "tests/riscv-tests/rv64/rv64si-p-dirty",
+        "tests/riscv-tests/rv64si-p-dirty",
         &["-d", "-x"],
     ),
-    (
-        "rv64/rv64ua-p-lrsc.d",
-        "tests/riscv-tests/rv64/rv64ua-p-lrsc",
-        &["-d"],
-    ),
+    ("rv64/rv64ua-p-lrsc.d", "tests/riscv-tests/rv64ua-p-lrsc", &["-d"]),
 ];
 
 const RV64_HELLO_ELF: &str = "crates/merlin-objdump/tests/fixtures/rv64/hello.elf";
@@ -373,9 +373,13 @@ fn generator_script_builds_every_fixture() {
             continue; // the riscv-tests ELFs come from scripts/build-riscv-tests.sh
         };
         let output = format!("-o \"$FIX/{file}\"");
-        if !script
-            .lines()
-            .any(|l| !l.trim_start().starts_with('#') && l.contains(&output))
+        // The RV32 riscv-tests ELFs kept in fixtures/rv32 are prebuilt too, by
+        // the script before RV32 went (#159).
+        let prebuilt = file.starts_with("rv32/");
+        if !prebuilt
+            && !script
+                .lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains(&output))
         {
             missing.push(format!("{name}: nothing writes {file}"));
         }

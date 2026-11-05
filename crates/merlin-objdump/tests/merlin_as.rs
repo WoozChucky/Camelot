@@ -44,14 +44,14 @@ fn disassembly() {
     // 0x13` is no `nop`); an instruction that does not decode is a `.word`
     // too (llvm-objdump: `<unknown>`), its word as one.
     let expected = "
-t.o:\tfile format elf32-littleriscv
+t.o:\tfile format elf64-littleriscv
 
 Disassembly of section .text:
 
-00000000 <.text>:
+0000000000000000 <.text>:
        0: 13 00 00 00  \t.word\t0x00000013
 
-00000004 <start>:
+0000000000000004 <start>:
        4: 00c58533     \tadd\ta0, a1, a2
        8: 0005000b     \txcal.dbg\ta0
        c: 0000005b     \t.word\t0x0000005b
@@ -71,17 +71,31 @@ fn data_relocations_and_symbols() {
         ..Options::default()
     };
     let out = dump("t.o", &object(), &opts).unwrap();
-    assert!(out.contains("\nRELOCATION RECORDS FOR [.data]:\nOFFSET   TYPE                     VALUE\n"));
-    assert!(out.contains("00000000 R_RISCV_32               start\n"), "{out}");
     assert!(
-        out.contains("00000004 R_RISCV_32               ext+0x4\n"),
+        out.contains("\nRELOCATION RECORDS FOR [.data]:\nOFFSET           TYPE                     VALUE\n")
+    );
+    assert!(
+        out.contains("0000000000000000 R_RISCV_32               start\n"),
         "{out}"
     );
-    assert!(out.contains("00000004 l       .text\t00000000 start\n"), "{out}");
-    assert!(out.contains("00000000 g       .data\t00000000 table\n"), "{out}");
-    assert!(out.contains("00000000         *UND*\t00000000 ext\n"), "{out}");
+    assert!(
+        out.contains("0000000000000004 R_RISCV_32               ext+0x4\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("0000000000000004 l       .text\t0000000000000000 start\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("0000000000000000 g       .data\t0000000000000000 table\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("0000000000000000         *UND*\t0000000000000000 ext\n"),
+        "{out}"
+    );
     let bss = out.lines().find(|l| l.contains(".bss ")).unwrap();
-    assert!(bss.ends_with("00000010 00000000 BSS"), "{bss}");
+    assert!(bss.ends_with("00000010 0000000000000000 BSS"), "{bss}");
 }
 
 /// Like llvm-objdump, a run of at least 8 zero bytes is printed as `...`,
@@ -113,11 +127,11 @@ fn zero_runs() {
     };
     let out = dump("z.o", &merlin_as::assemble_to_elf(src).unwrap(), &opts).unwrap();
     let expected = "
-z.o:\tfile format elf32-littleriscv
+z.o:\tfile format elf64-littleriscv
 
 Disassembly of section .text:
 
-00000000 <.text>:
+0000000000000000 <.text>:
        0: 13 00 00 00  \t.word\t0x00000013
 \t\t...
       10: 13 00 00 00  \t.word\t0x00000013
@@ -125,7 +139,7 @@ Disassembly of section .text:
       18: 13 00 00 00  \t.word\t0x00000013
 \t\t...
       24: 00 00 00 00  \t.word\t0x00000000
-\t\t\t00000024:  R_RISCV_32\text
+\t\t0000000000000024:  R_RISCV_32\text
       28: 13 00 00 00  \t.word\t0x00000013
 \t\t...
       34: 00 13 00 00  \t.word\t0x00001300

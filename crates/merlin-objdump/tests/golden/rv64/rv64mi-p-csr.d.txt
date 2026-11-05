@@ -1,5 +1,5 @@
 
-tests/riscv-tests/rv64/rv64mi-p-csr:	file format elf64-littleriscv
+tests/riscv-tests/rv64mi-p-csr:	file format elf64-littleriscv
 
 Disassembly of section .text.init:
 

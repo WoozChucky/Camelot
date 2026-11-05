@@ -403,7 +403,7 @@ fn rv32_only_csrs_are_illegal_on_rv64() {
 }
 
 #[test]
-fn counters_read_64_bits_on_rv64() {
+fn counters_read_64_bits() {
     let mut m = machine();
     m.cpu.csr.mcycle = 0x1_2345_6789;
     run(&mut m, "csrrs a0, mcycle, zero", csrr(A0, MCYCLE));

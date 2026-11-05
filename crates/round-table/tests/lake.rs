@@ -24,6 +24,10 @@ impl Drop for TempDir {
     }
 }
 
+/// The largest disk a client takes is Lake's largest image: avalon-client cannot
+/// depend on Lake, so this ties the two.
+const _: () = assert!(avalon_client::parse::MAX_DISK_SECTORS == lake::MAX_IMAGE_SECTORS);
+
 #[test]
 fn disk_commands_against_lake() {
     let dir = TempDir::new("disks");

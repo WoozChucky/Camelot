@@ -174,8 +174,6 @@ fn every_vm_is_rv64() {
         other => panic!("{other:?}"),
     }
     // Up to 1 TiB of RAM, booting from disk too; more is refused.
-    // An RV64 profile takes RV64's RAM, booting from disk too; more than 1 TiB is
-    // refused for either width.
     let image = std::env::temp_dir().join(format!("avalon-rv64-{}.img", std::process::id()));
     std::fs::write(&image, [0u8; 4096]).unwrap();
     let disk = DeviceSpec::Disk(DiskSpec {

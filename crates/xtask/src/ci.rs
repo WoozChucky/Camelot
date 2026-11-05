@@ -9,15 +9,15 @@
 //! - the toolchain against its references: excalibur's decoder and
 //!   disassembler against llvm-objdump's text, the elf crate against
 //!   llvm-readelf's and llvm-dwarfdump's, merlin-as's encodings, round
-//!   trips and mapping symbols, merlin-ld's links on both widths (riscv-tests relinked, the
-//!   fixtures current),
-//!   merlin-objdump's goldens, the compiler's end-to-end harness, riscv-tests
-//!   on Grail;
+//!   trips and mapping symbols, merlin-ld's links (riscv-tests relinked, the
+//!   fixtures current), merlin-objdump's goldens, the compiler's end-to-end
+//!   harness, riscv-tests on Grail;
 //! - Grail's display controller, and its keyboard in both of its modes, through
 //!   `examples/kbd-echo`;
 //! - the committed binaries are what the tools build now: the kernel, the
-//!   examples, the boot programs, hello, the disk image; and the kernel boots;
-//! - RV64 processes' system call ABI: results sign-extended, pointers into the
+//!   examples, the boot programs, hello, the disk image; and the kernel boots,
+//!   on 1 to 8 harts, under Sv48 and Sv39, from disk, and panics as it should;
+//! - processes' system call ABI: results sign-extended, pointers into the
 //!   kernel's half refused, 64-bit values through the calls;
 //! - how Avalon and Lake end connections: bad handshakes, and a server's last
 //!   frame arriving whole though the client sent more (Linux's TCP stack is not
@@ -45,7 +45,7 @@ const STEPS: &[Step] = &[
         args: &["--workspace", "--lib", "--bins"],
     },
     Step {
-        what: "decoder and disassembler against llvm-objdump, both widths",
+        what: "decoder and disassembler against llvm-objdump, RV64's and RV32's",
         args: &["-p", "excalibur", "--test", "disasm"],
     },
     Step {
@@ -57,15 +57,15 @@ const STEPS: &[Step] = &[
         args: &["-p", "merlin-as", "--tests"],
     },
     Step {
-        what: "merlin-ld: links, riscv-tests relinked, fixtures current, both widths",
+        what: "merlin-ld: links, riscv-tests relinked, fixtures current",
         args: &["-p", "merlin-ld", "--tests"],
     },
     Step {
-        what: "merlin-objdump against llvm-objdump, both widths",
+        what: "merlin-objdump against llvm-objdump, RV64's and RV32's",
         args: &["-p", "merlin-objdump", "--tests"],
     },
     Step {
-        what: "merlin: the compiler end to end, both widths",
+        what: "merlin: the compiler end to end",
         args: &["-p", "merlin", "--tests"],
     },
     Step {
@@ -95,15 +95,15 @@ const STEPS: &[Step] = &[
         args: &["-p", "avalon", "--test", "debug"],
     },
     Step {
-        what: "Avalon: a VM's width, its profile's or its program's, and RV64's RAM",
+        what: "Avalon: every VM is RV64 (an ELF32 program refused), and its RAM",
         args: &[
             "-p",
             "avalon",
             "--test",
             "server",
             "--",
-            "a_vm_is_as_wide_as_its_profile_or_its_program",
-            "an_rv64_vm_has_more_ram_than_the_host",
+            "every_vm_is_rv64",
+            "a_vm_has_more_ram_than_the_host",
         ],
     },
     Step {
@@ -150,7 +150,8 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
-        what: "the committed kernel is current and boots",
+        what: "the committed kernel is current, linked high, boots on 1-8 harts, under Sv39 and from \
+               disk, panics as it should, and the shell's built-in statuses are dash's",
         args: &[
             "-p",
             "xtask",
@@ -159,29 +160,35 @@ const STEPS: &[Step] = &[
             "--",
             "committed_kernel_is_what_our_toolchain_builds",
             "committed_kernel_boots",
-            "committed_kernel_layout",
+            "the_kernel_is_linked_high_and_loaded_low",
+            "the_kernels_have_no_m_mode_code",
+            "kmain_runs_in_s_mode_with_traps_delegated",
+            "the_kernel_boots_through_its_self_tests",
+            "the_kernel_runs_on_up_to_eight_harts",
+            "illegal_instruction_panics_with_a_64_bit_register_dump",
+            "a_kernel_stack_overflow_hits_the_guard_page_and_is_reported",
+            "the_kernel_page_table_maps_the_kernel_half_only",
+            "the_kernel_falls_back_to_sv39",
+            "the_kernel_boots_from_disk",
+            "a_failed_builtin_gives_dashs_status",
         ],
     },
     Step {
-        what: "the committed RV64 kernel is current, boots on 1-8 harts and panics as it should",
-        args: &["-p", "xtask", "--test", "kernel_rv64"],
-    },
-    Step {
-        what: "the kernels' SBI: every call and error on both widths, a fence before every IPI (#170)",
+        what: "the kernel's SBI: every call and error, a fence before every IPI (#170)",
         args: &["-p", "xtask", "--test", "sbi"],
     },
     Step {
-        what: "the RV64 kernel on OpenSBI v1.9's fw_jump, the reference firmware, on 1, 4 and 8 harts",
+        what: "the kernel on OpenSBI v1.9's fw_jump, the reference firmware, on 1, 4 and 8 harts",
         args: &["-p", "xtask", "--test", "opensbi"],
     },
     Step {
-        what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
-               Linux's start, the environment (#216)",
+        what: "processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
+               Linux's start as pid 1, the environment (#216)",
         args: &[
             "-p",
             "xtask",
             "--test",
-            "processes_rv64",
+            "processes",
             "--",
             "negative_results_arrive_sign_extended",
             "pointers_into_the_kernel_half_are_refused",
@@ -191,22 +198,8 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
-        what: "RV32 processes: Linux's start with the environment, and the shell's environment and \
-               built-in statuses (#216)",
-        args: &[
-            "-p",
-            "xtask",
-            "--test",
-            "kernel",
-            "--",
-            "the_shell_is_the_first_process",
-            "the_shell_passes_its_environment_on",
-            "a_failed_builtin_gives_dashs_status",
-        ],
-    },
-    Step {
-        what: "the committed examples, boot programs and hello are current; an RV64 boot block and the \
-               RV64 root image boot",
+        what: "the committed examples, boot programs and hello are current; a boot block and the root \
+               image boot",
         args: &[
             "-p",
             "xtask",
@@ -219,8 +212,8 @@ const STEPS: &[Step] = &[
             "--",
             "committed_examples_are_current",
             "committed_boot_programs_are_up_to_date",
-            "an_rv64_boot_block_boots_through_the_rv64_rom",
-            "the_rv64_root_image_boots_from_disk_and_runs_programs_from_bin",
+            "a_boot_block_boots_through_the_rom",
+            "the_root_image_boots_from_disk_and_runs_programs_from_bin",
             "hello",
         ],
     },

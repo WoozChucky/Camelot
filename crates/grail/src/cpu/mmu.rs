@@ -69,9 +69,8 @@ impl Scheme {
 /// The leaf of a successful page-table walk.
 struct Leaf {
     pte: u64,
-    /// Where the PTE is, and its size, for the A/D update.
+    /// Where the PTE is (PTE_SIZE bytes), for the A/D update.
     addr: u64,
-    size: u32,
     /// The physical address the walk translated to.
     paddr: u64,
 }
@@ -132,12 +131,7 @@ fn walk(bus: &Bus, scheme: Scheme, root: u64, vaddr: u64) -> Result<Leaf, WalkEr
                 return Err(WalkError::PageFault);
             }
             let paddr = ppn << PAGE_SHIFT | (vaddr & offset);
-            return Ok(Leaf {
-                pte,
-                addr,
-                size: PTE_SIZE,
-                paddr,
-            });
+            return Ok(Leaf { pte, addr, paddr });
         }
         // A pointer to the next level's table; at level 0 there is none. A pointer's
         // A, D and U bits are reserved: one with any of them set is a page fault.
@@ -217,7 +211,7 @@ impl Hart {
             new_pte |= PTE_D;
         }
         if new_pte != pte {
-            self.write_phys(bus, leaf.addr, leaf.size, new_pte)
+            self.write_phys(bus, leaf.addr, PTE_SIZE, new_pte)
                 .map_err(|_| access_fault)?;
         }
         Ok(leaf.paddr)

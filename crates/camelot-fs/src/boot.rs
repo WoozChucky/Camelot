@@ -2,10 +2,11 @@
 //! bootloader in the boot block and a kernel right after the filesystem, so
 //! that Grail started with the image as its disk 0 and no program boots it.
 //!
-//! Grail's boot ROM reads the boot block (block 0, 1 KiB) into RAM, checks
-//! that its last word is [`BOOT_MAGIC`] and that its 256 words add up to 0,
-//! and jumps to its first byte (spec section 7, "Boot from disk"). The
-//! bootloader, `kernel/boot/boot.S`, then reads the kernel ELF from the
+//! Camelot's firmware reads the boot block (block 0, 1 KiB) to where it starts
+//! its next stage, 0x8020_0000, checks that its last word is [`BOOT_MAGIC`]
+//! and that its 256 words add up to 0, and starts its first byte in S-mode
+//! (spec section 7, "Firmware" and "Boot from disk"). The bootloader,
+//! `kernel/boot/boot.S`, then reads the kernel ELF from the
 //! sectors the boot block names and loads its segments. The kernel is not a
 //! file of the filesystem: a region of its own is far simpler to read for a
 //! bootloader of under 1 KiB than a directory, an inode and an extent tree.
@@ -18,10 +19,10 @@
 //! section headers, the symbols and their names stay in the kernel's file on the
 //! host, for the disassembler and the tests.
 //!
-//! Both widths: an RV32 bootloader (`boot.elf`, ELF32) loads an RV32 kernel
-//! (ELF32), an RV64 one (`boot-rv64.elf`, ELF64) an RV64 kernel (ELF64), whose
-//! segments run at their link addresses (`p_vaddr`, high) but load at their
-//! physical ones (`p_paddr`).
+//! The bootloader (`boot.elf`) and the kernel are ELF64 files, RV64's: the
+//! kernel's segments run at their link addresses (`p_vaddr`, high) but load at
+//! their physical ones (`p_paddr`). An ELF32 file, RV32 code, which no
+//! Excalibur hart runs, is refused.
 
 use crate::{Superblock, BSIZE, SECTOR_SIZE, SUPER_BLOCK};
 
@@ -42,8 +43,8 @@ pub const MAX_BOOT_CODE: usize = KERNEL_SECTOR_AT;
 pub const KERNEL_HEADERS: usize = 1024;
 /// Where RAM starts (spec section 7): the kernel's segments go there or above.
 pub const RAM_BASE: u32 = 0x8000_0000;
-/// Where RAM can end on an RV64 machine: 1 TiB of it (spec section 7).
-pub const RAM_END_RV64: u64 = 0x100_8000_0000;
+/// Where RAM can end: 1 TiB of it (spec section 7).
+pub const RAM_END: u64 = 0x100_8000_0000;
 
 /// Where a bootable image keeps its kernel, as its boot block says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,17 +56,16 @@ pub struct BootInfo {
 }
 
 /// Parses `elf`, the bootloader's or the kernel's (`what` names it in errors):
-/// ELF32 (RV32) or ELF64 (RV64).
+/// an ELF64 file. An ELF32 one is refused, as merlin-ld refuses an ELF32
+/// object.
 fn parse<'a>(what: &str, elf: &'a [u8]) -> Result<elf::Elf<'a>, String> {
-    elf::Elf::parse(elf).map_err(|e| format!("{what}: {e}"))
-}
-
-/// The size of a program header of `class`.
-fn phdr_size(class: elf::Class) -> usize {
-    match class {
-        elf::Class::Elf32 => elf::PHDR_SIZE,
-        elf::Class::Elf64 => elf::PHDR64_SIZE,
+    let e = elf::Elf::parse(elf).map_err(|e| format!("{what}: {e}"))?;
+    if e.class == elf::Class::Elf32 {
+        return Err(format!(
+            "{what}: an ELF32 (RV32) file: Excalibur is RV64, and boots ELF64 files only"
+        ));
     }
+    Ok(e)
 }
 
 /// The code of a bootloader linked as an ELF executable (`kernel/boot/boot.elf`):
@@ -105,7 +105,7 @@ pub fn boot_code(elf: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Checks that the bootloader can load the kernel ELF `elf`: an Excalibur
-/// executable (ELF32 or ELF64, little-endian, RISC-V, `ET_EXEC`) whose ELF
+/// executable (ELF64, little-endian, RISC-V, `ET_EXEC`) whose ELF
 /// header and program headers are in its first [`KERNEL_HEADERS`] bytes, and
 /// whose loadable segments load in RAM (at `p_paddr`) and, when they have
 /// bytes in the file, start at a sector boundary of it (a `.bss`-only segment
@@ -119,7 +119,7 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
     if h.ty != elf::ET_EXEC || h.machine != elf::EM_RISCV {
         return Err("kernel: not a RISC-V executable".into());
     }
-    let phdr = phdr_size(e.class);
+    let phdr = elf::PHDR64_SIZE;
     if h.phentsize as usize != phdr || h.phoff as usize + h.phnum as usize * phdr > KERNEL_HEADERS {
         return Err(format!(
             "kernel: the program headers must be in the first {KERNEL_HEADERS} bytes"
@@ -132,13 +132,8 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
                 p.paddr, p.offset
             ));
         }
-        // ELF32 values: the end must not pass 2^32 - 1; ELF64 ones RAM's
-        // largest end.
-        let end = match e.class {
-            elf::Class::Elf32 => u64::from(u32::MAX),
-            elf::Class::Elf64 => RAM_END_RV64,
-        };
-        let fits = p.paddr.checked_add(p.memsz).is_some_and(|last| last <= end);
+        // The end must not pass RAM's largest end.
+        let fits = p.paddr.checked_add(p.memsz).is_some_and(|last| last <= RAM_END);
         if p.memsz < p.filesz || p.paddr < u64::from(RAM_BASE) || !fits {
             return Err(format!("kernel: the segment at {:#x} is not in RAM", p.paddr));
         }
@@ -163,13 +158,9 @@ pub fn check_kernel(elf: &[u8]) -> Result<(), String> {
 pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
     let e = parse("kernel", elf)?;
     let h = &e.header;
-    let headers = h.phoff as usize + h.phnum as usize * phdr_size(e.class);
-    let ehdr = match e.class {
-        elf::Class::Elf32 => elf::EHDR_SIZE,
-        elf::Class::Elf64 => elf::EHDR64_SIZE,
-    };
+    let headers = h.phoff as usize + h.phnum as usize * elf::PHDR64_SIZE;
     let mut out = elf
-        .get(..headers.max(ehdr))
+        .get(..headers.max(elf::EHDR64_SIZE))
         .ok_or("kernel: the program headers run past the file")?
         .to_vec();
     for p in e
@@ -182,18 +173,9 @@ pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
         out.resize(out.len().max(at + data.len()), 0);
         out[at..at + data.len()].copy_from_slice(data);
     }
-    // No section headers: e_shoff, then e_shentsize, e_shnum and e_shstrndx,
-    // at each class's offsets.
-    match e.class {
-        elf::Class::Elf32 => {
-            out[32..36].fill(0);
-            out[46..52].fill(0);
-        }
-        elf::Class::Elf64 => {
-            out[40..48].fill(0);
-            out[58..64].fill(0);
-        }
-    }
+    // No section headers: e_shoff, then e_shentsize, e_shnum and e_shstrndx.
+    out[40..48].fill(0);
+    out[58..64].fill(0);
     Ok(out)
 }
 
@@ -206,12 +188,6 @@ pub fn loadable(elf: &[u8]) -> Result<Vec<u8>, String> {
 pub fn install(image: &mut Vec<u8>, boot_elf: &[u8], kernel_elf: &[u8]) -> Result<BootInfo, String> {
     let code = boot_code(boot_elf)?;
     check_kernel(kernel_elf)?;
-    // A bootloader loads kernels of its own width: the boot ROM of an RV32
-    // machine runs an RV32 boot block, which reads ELF32.
-    let class = |elf: &[u8]| parse("", elf).map(|e| e.class);
-    if class(boot_elf)? != class(kernel_elf)? {
-        return Err("the bootloader and the kernel are not of the same width (ELF32 and ELF64)".into());
-    }
     let kernel_elf = &loadable(kernel_elf)?;
     let sb = Superblock::decode(crate::block(image, SUPER_BLOCK));
     sb.validate((image.len() / BSIZE) as u64)?;
@@ -242,7 +218,8 @@ pub fn install(image: &mut Vec<u8>, boot_elf: &[u8], kernel_elf: &[u8]) -> Resul
     Ok(info)
 }
 
-/// What the boot block of `image` says, if Grail's boot ROM would boot it:
+/// What the boot block of `image` says, if the firmware (or Grail's boot
+/// ROM) would boot it:
 /// `None` when it has no signature, an error when it has one but a bad
 /// checksum or names sectors past the image. `kernel_sectors` 0 means no
 /// kernel (Camelot's bootloader refuses it).
@@ -310,36 +287,35 @@ mod tests {
         }
     }
 
-    /// A minimal ELF32 RISC-V executable: the header, `phdrs` program headers
+    /// A minimal ELF64 RISC-V executable: the header, `phdrs` program headers
     /// (type, offset, paddr, filesz, memsz) right after it, and `size` bytes
     /// in all.
-    fn elf(entry: u32, phdrs: &[(u32, u32, u32, u32, u32)], size: usize) -> Vec<u8> {
+    fn elf(entry: u64, phdrs: &[(u32, u64, u64, u64, u64)], size: usize) -> Vec<u8> {
         let mut f = vec![0u8; size];
         f[..4].copy_from_slice(b"\x7fELF");
-        f[4] = 1; // ELFCLASS32
+        f[4] = 2; // ELFCLASS64
         f[5] = 1; // little-endian
         f[6] = 1; // EV_CURRENT
         f[16..18].copy_from_slice(&elf::ET_EXEC.to_le_bytes());
         f[18..20].copy_from_slice(&elf::EM_RISCV.to_le_bytes());
         f[20..24].copy_from_slice(&1u32.to_le_bytes());
-        f[24..28].copy_from_slice(&entry.to_le_bytes());
-        f[28..32].copy_from_slice(&52u32.to_le_bytes());
-        f[40..42].copy_from_slice(&52u16.to_le_bytes());
-        f[42..44].copy_from_slice(&32u16.to_le_bytes());
-        f[44..46].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+        f[24..32].copy_from_slice(&entry.to_le_bytes());
+        f[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        f[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        f[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        f[56..58].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
         for (i, &(ty, off, paddr, filesz, memsz)) in phdrs.iter().enumerate() {
-            let at = 52 + 32 * i;
-            for (j, v) in [ty, off, paddr, paddr, filesz, memsz, 5, 0x1000]
-                .iter()
-                .enumerate()
-            {
-                f[at + 4 * j..at + 4 * j + 4].copy_from_slice(&v.to_le_bytes());
+            let at = 64 + 56 * i;
+            f[at..at + 4].copy_from_slice(&ty.to_le_bytes());
+            f[at + 4..at + 8].copy_from_slice(&5u32.to_le_bytes()); // R+X
+            for (j, v) in [off, paddr, paddr, filesz, memsz, 0x1000].iter().enumerate() {
+                f[at + 8 + 8 * j..at + 16 + 8 * j].copy_from_slice(&v.to_le_bytes());
             }
         }
         f
     }
 
-    fn bootloader(len: u32) -> Vec<u8> {
+    fn bootloader(len: u64) -> Vec<u8> {
         let mut f = elf(0, &[(elf::PT_LOAD, 0x200, 0, len, len)], 0x200 + len as usize);
         for (i, b) in f[0x200..].iter_mut().enumerate() {
             *b = i as u8 | 1;
@@ -348,7 +324,8 @@ mod tests {
     }
 
     fn kernel_elf() -> Vec<u8> {
-        let mut f = elf(RAM_BASE, &[(elf::PT_LOAD, 0x400, RAM_BASE, 0x300, 0x2000)], 0x700);
+        let base = u64::from(RAM_BASE);
+        let mut f = elf(base, &[(elf::PT_LOAD, 0x400, base, 0x300, 0x2000)], 0x700);
         f[0x400..].fill(0xab);
         f
     }
@@ -357,12 +334,13 @@ mod tests {
     /// linker puts there: section headers (which the ELF header points to) and
     /// symbols.
     fn kernel_with_sections() -> Vec<u8> {
+        let base = u64::from(RAM_BASE);
         let mut f = elf(
-            RAM_BASE,
+            base,
             &[
-                (elf::PT_LOAD, 0x200, RAM_BASE, 0x100, 0x100),
+                (elf::PT_LOAD, 0x200, base, 0x100, 0x100),
                 (elf::PT_NULL, 0, 0, 0, 0),
-                (elf::PT_LOAD, 0x600, RAM_BASE + 0x1000, 0x80, 0x400),
+                (elf::PT_LOAD, 0x600, base + 0x1000, 0x80, 0x400),
             ],
             0x900,
         );
@@ -370,10 +348,10 @@ mod tests {
         f[0x300..0x600].fill(0xee); // not part of any segment
         f[0x600..0x680].fill(0x22);
         f[0x680..].fill(0x33); // symbols, names, ...
-        f[32..36].copy_from_slice(&0x800u32.to_le_bytes()); // e_shoff
-        f[46..48].copy_from_slice(&40u16.to_le_bytes()); // e_shentsize
-        f[48..50].copy_from_slice(&0u16.to_le_bytes()); // e_shnum: none to parse
-        f[50..52].copy_from_slice(&7u16.to_le_bytes()); // e_shstrndx
+        f[40..48].copy_from_slice(&0x800u64.to_le_bytes()); // e_shoff
+        f[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        f[60..62].copy_from_slice(&0u16.to_le_bytes()); // e_shnum: none to parse
+        f[62..64].copy_from_slice(&7u16.to_le_bytes()); // e_shstrndx
         f
     }
 
@@ -381,13 +359,13 @@ mod tests {
         std::fs::read(format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
-    /// RV64: the RV64 kernel (ELF64, linked high, loaded at 0x8020_0000) is
-    /// checked and stripped at ELF64's offsets, and goes with the RV64
-    /// bootloader only; the RV32 bootloader takes only ELF32 kernels.
+    /// The committed kernel (ELF64, linked high, loaded at 0x8020_0000) is
+    /// checked and stripped, and installed with the committed bootloader; an
+    /// ELF32 file, as the bootloader or the kernel, is refused.
     #[test]
-    fn elf64_kernels_go_with_the_rv64_bootloader() {
-        let kernel = repo_file("kernel/kernel-disk-rv64.elf");
-        let boot = repo_file("kernel/boot/boot-rv64.elf");
+    fn the_committed_kernel_and_bootloader_install() {
+        let kernel = repo_file("kernel/kernel-disk.elf");
+        let boot = repo_file("kernel/boot/boot.elf");
         assert_eq!(check_kernel(&kernel), Ok(()));
         let stored = loadable(&kernel).unwrap();
         let (full, kept) = (
@@ -401,15 +379,19 @@ mod tests {
         assert_eq!(kept.segments, full.segments);
         assert!(kept.segments.iter().all(|p| p.vaddr != p.paddr));
         let mut image = mkfs::mkfs(&small(), None).unwrap();
-        let want = "the bootloader and the kernel are not of the same width (ELF32 and ELF64)";
+        // clang's RV32 executable (crates/elf/tests/llvm).
+        let rv32 = repo_file("crates/elf/tests/llvm/rv32/prog.elf");
+        assert_eq!(rv32[4], 1, "ELFCLASS32");
+        let refused = "an ELF32 (RV32) file: Excalibur is RV64, and boots ELF64 files only";
         assert_eq!(
-            install(&mut image.clone(), &bootloader(64), &kernel),
-            Err(want.into())
+            install(&mut image.clone(), &rv32, &kernel),
+            Err(format!("bootloader: {refused}"))
         );
         assert_eq!(
-            install(&mut image.clone(), &boot, &kernel_elf()),
-            Err(want.into())
+            install(&mut image.clone(), &boot, &rv32),
+            Err(format!("kernel: {refused}"))
         );
+        assert_eq!(check_kernel(&rv32), Err(format!("kernel: {refused}")));
         let info = install(&mut image, &boot, &kernel).unwrap();
         assert!(kernel_image(&image).unwrap().starts_with(&stored));
         assert_eq!(boot_info(&image), Ok(Some(info)));
@@ -429,10 +411,10 @@ mod tests {
         // Up to the end of the last segment's bytes.
         assert_eq!(kept.len(), 0x680);
         // The headers, but no section headers.
-        assert_eq!(&kept[..32], &full[..32]);
-        assert_eq!(&kept[36..46], &full[36..46]);
-        assert!(kept[32..36].iter().chain(&kept[46..52]).all(|&b| b == 0));
-        assert_eq!(&kept[52..52 + 3 * 32], &full[52..52 + 3 * 32]);
+        assert_eq!(&kept[..40], &full[..40]);
+        assert_eq!(&kept[48..58], &full[48..58]);
+        assert!(kept[40..48].iter().chain(&kept[58..64]).all(|&b| b == 0));
+        assert_eq!(&kept[64..64 + 3 * 56], &full[64..64 + 3 * 56]);
         // The segments where they were; nothing else.
         assert!(kept[0x200..0x300].iter().all(|&b| b == 0x11));
         assert!(kept[0x300..0x600].iter().all(|&b| b == 0));
@@ -532,25 +514,30 @@ mod tests {
         let mut rel = kernel.clone();
         rel[16] = elf::ET_REL as u8;
         assert!(err(&boot, &rel).contains("not a RISC-V executable"));
-        let odd = elf(RAM_BASE, &[(elf::PT_LOAD, 0x204, RAM_BASE, 4, 4)], 0x300);
+        let base = u64::from(RAM_BASE);
+        let odd = elf(base, &[(elf::PT_LOAD, 0x204, base, 4, 4)], 0x300);
         assert!(err(&boot, &odd).contains("not a multiple of 512"));
         // A .bss-only segment reads nothing from the file: its offset is not checked
         // (merlin-ld gives it one congruent to its address modulo 4 KiB).
         let bss_only = elf(
-            RAM_BASE,
+            base,
             &[
-                (elf::PT_LOAD, 0x200, RAM_BASE, 4, 4),
-                (elf::PT_LOAD, 0x210, RAM_BASE + 0x1010, 0, 0x100),
+                (elf::PT_LOAD, 0x200, base, 4, 4),
+                (elf::PT_LOAD, 0x210, base + 0x1010, 0, 0x100),
             ],
             0x300,
         );
         assert!(install(&mut fresh(), &boot, &bss_only).is_ok());
         let low = elf(0, &[(elf::PT_LOAD, 0x200, 0x1000, 4, 4)], 0x300);
         assert!(err(&boot, &low).contains("not in RAM"));
-        let wraps = elf(RAM_BASE, &[(elf::PT_LOAD, 0x200, 0xffff_f000, 4, 0x2000)], 0x300);
+        // Past RAM's largest end, and past 2^64.
+        let past = elf(base, &[(elf::PT_LOAD, 0x200, RAM_END - 0x1000, 4, 0x2000)], 0x300);
+        assert!(err(&boot, &past).contains("not in RAM"));
+        let wraps = elf(base, &[(elf::PT_LOAD, 0x200, u64::MAX - 0xfff, 4, 0x2000)], 0x300);
         assert!(err(&boot, &wraps).contains("not in RAM"));
-        let many: Vec<_> = (0..31).map(|_| (elf::PT_NULL, 0, 0, 0, 0)).collect();
-        assert!(err(&boot, &elf(RAM_BASE, &many, 0x800)).contains("first 1024 bytes"));
+        // 18 program headers end past the first 1024 bytes: 64 + 18 * 56.
+        let many: Vec<_> = (0..18).map(|_| (elf::PT_NULL, 0, 0, 0, 0)).collect();
+        assert!(err(&boot, &elf(base, &many, 0x800)).contains("first 1024 bytes"));
 
         let mut used = fresh();
         used[5] = 1;

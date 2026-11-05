@@ -41,9 +41,10 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Script {
     pub entry: Option<String>,
-    /// `OUTPUT_FORMAT(...)`'s first argument, which ld.lld goes by: ELF64,
-    /// the only class merlin-ld writes (any other name is refused).
-    pub format: Option<Class>,
+    /// Whether the script has an `OUTPUT_FORMAT(...)`: its names can only be
+    /// ELF64's, the only class merlin-ld writes (any other name is refused),
+    /// so it decides nothing.
+    pub format: bool,
     pub memory: Option<Region>,
     /// The contents of `SECTIONS`, in order.
     pub commands: Vec<Command>,
@@ -114,7 +115,7 @@ pub enum Item {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
-    /// A number, as [`parse_number`] reads it for the script's class.
+    /// A number, as [`parse_number`] reads it: 64 bits.
     Num(u64),
     Dot,
     Symbol(String),
@@ -461,7 +462,7 @@ impl Parser {
     fn script(&mut self) -> Result<Script, ScriptError> {
         let mut script = Script {
             entry: None,
-            format: None,
+            format: false,
             memory: None,
             commands: Vec::new(),
         };
@@ -490,14 +491,14 @@ impl Parser {
                     // little)`, one argument or three, as ld.lld takes them:
                     // it goes by the first; merlin-ld also wants the others
                     // to be names it knows.
-                    let first = self.format_arg(line)?;
+                    self.format_arg(line)?;
                     if self.eat(",") {
                         self.format_arg(line)?;
                         self.expect(",")?;
                         self.format_arg(line)?;
                     }
                     self.expect(")")?;
-                    script.format.get_or_insert(first);
+                    script.format = true;
                 }
                 "MEMORY" => {
                     if seen_memory {
@@ -1170,28 +1171,25 @@ mod tests {
     #[test]
     fn quoted_arch_and_format() {
         let s = parse("OUTPUT_ARCH( \"riscv\" ) OUTPUT_FORMAT(\"elf64-littleriscv\")").unwrap();
-        assert_eq!(s.format, Some(Class::Elf64));
+        assert!(s.format);
         assert!(err("OUTPUT_ARCH(i386)").contains("only riscv"));
         // Three arguments, as ld.lld takes them: every one must be ELF64,
         // the first is the one that counts.
         let s = parse("OUTPUT_FORMAT(\"elf64-littleriscv\", \"elf64-littleriscv\", \"elf64-littleriscv\")")
             .unwrap();
-        assert_eq!(s.format, Some(Class::Elf64));
-        assert_eq!(parse("ENTRY(_start)").unwrap().format, None);
+        assert!(s.format);
+        assert!(!parse("ENTRY(_start)").unwrap().format);
         for (src, want) in [
-            (r#"OUTPUT_FORMAT("elf64-littleriscv")"#, Some(Class::Elf64)),
+            (r#"OUTPUT_FORMAT("elf64-littleriscv")"#, true),
             // ld.lld takes the -freebsd names too.
-            (
-                r#"OUTPUT_FORMAT("elf64-littleriscv-freebsd")"#,
-                Some(Class::Elf64),
-            ),
+            (r#"OUTPUT_FORMAT("elf64-littleriscv-freebsd")"#, true),
             (
                 "MEMORY { RAM (rwx) : ORIGIN = 0, LENGTH = 4 }\nOUTPUT_FORMAT(\"elf64-littleriscv\")",
-                Some(Class::Elf64),
+                true,
             ),
-            ("ENTRY(_start)", None),
+            ("ENTRY(_start)", false),
             // A word among a command's arguments, or in SECTIONS, is no command.
-            ("ENTRY(OUTPUT_FORMAT) SECTIONS { OUTPUT_FORMAT = 1; }", None),
+            ("ENTRY(OUTPUT_FORMAT) SECTIONS { OUTPUT_FORMAT = 1; }", false),
         ] {
             assert_eq!(parse(src).unwrap().format, want, "{src}");
         }
@@ -1224,10 +1222,7 @@ mod tests {
     fn names_take_dashes_and_expressions_do_not() {
         // Outside expressions ld.lld's tokens take `-` as they take letters,
         // so an unquoted format name is one token.
-        assert_eq!(
-            parse("OUTPUT_FORMAT(elf64-littleriscv)").unwrap().format,
-            Some(Class::Elf64)
-        );
+        assert!(parse("OUTPUT_FORMAT(elf64-littleriscv)").unwrap().format);
         assert_eq!(
             err("OUTPUT_FORMAT(elf32-littleriscv)"),
             "1: OUTPUT_FORMAT(elf32-littleriscv): only elf64-littleriscv is supported"

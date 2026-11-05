@@ -650,21 +650,21 @@ fn alu64(op: AluOp, a: u64, b: u64) -> u64 {
     }
 }
 
-/// The 32-bit ALU of the W instructions: the operation on the low 32
-/// bits of `a` and `b` (shift amounts from the low 5 bits of `b`), sign-extended.
+/// The 32-bit ALU of the W instructions (`addw`, `subw`, `sllw`, `srlw`,
+/// `sraw` and their immediate forms): the operation on the low 32 bits of `a`
+/// and `b` (shift amounts from the low 5 bits of `b`), sign-extended. No W
+/// instruction compares or does a logical operation.
 fn alu32(op: AluOp, a: u64, b: u64) -> u64 {
     let (a, b) = (a as u32, b as u32);
     let v = match op {
         AluOp::Add => a.wrapping_add(b),
         AluOp::Sub => a.wrapping_sub(b),
         AluOp::Sll => a << (b & 31),
-        AluOp::Slt => ((a as i32) < (b as i32)) as u32,
-        AluOp::Sltu => (a < b) as u32,
-        AluOp::Xor => a ^ b,
         AluOp::Srl => a >> (b & 31),
         AluOp::Sra => ((a as i32) >> (b & 31)) as u32,
-        AluOp::Or => a | b,
-        AluOp::And => a & b,
+        AluOp::Slt | AluOp::Sltu | AluOp::Xor | AluOp::Or | AluOp::And => {
+            unreachable!("no W form of {op:?}")
+        }
     };
     sext32(v.into())
 }
@@ -703,9 +703,7 @@ fn muldiv32(op: MulOp, a: u64, b: u64) -> u64 {
     let (sa, sb) = (a as i32, b as i32);
     let v = match op {
         MulOp::Mul => a.wrapping_mul(b),
-        MulOp::Mulh => ((sa as i64 * sb as i64) >> 32) as u32,
-        MulOp::Mulhsu => ((sa as i64 * b as i64) >> 32) as u32,
-        MulOp::Mulhu => ((a as u64 * b as u64) >> 32) as u32,
+        MulOp::Mulh | MulOp::Mulhsu | MulOp::Mulhu => unreachable!("no W form of {op:?}"),
         MulOp::Div => match sb {
             0 => u32::MAX,
             -1 => sa.wrapping_neg() as u32,

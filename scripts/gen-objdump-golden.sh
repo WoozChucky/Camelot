@@ -13,8 +13,9 @@
 #    fixtures/rv64/ holds the RV64 twins (from rv64/*.S, rv64/lines.s,
 #    rv64/linked.ld, and debug.c and hello.S again), built the same way for
 #    riscv64 and the lp64 ABI.
-# 2. Runs llvm-objdump over those files and a few riscv-tests ELFs (RV32 and
-#    RV64), writing tests/golden/<name>.txt (tests/golden/rv64/ for RV64).
+# 2. Runs llvm-objdump over those files and a few riscv-tests ELFs (RV64's,
+#    from tests/riscv-tests, and RV32's, kept in fixtures/rv32 for the
+#    disassembler, which still reads RV32), writing tests/golden/<name>.txt (tests/golden/rv64/ for RV64).
 #
 # hello.S writes the Xcal instructions as mnemonics, which clang learns from
 # examples/xcal.inc (-include).
@@ -128,10 +129,10 @@ gen linked-elf.d               "$FIX/linked.elf" -d
 gen linked-elf.x               "$FIX/linked.elf" -x
 # The riscv-tests ELFs' mapping symbols ($x.0) make llvm-objdump warn on
 # stderr that they name no ISA.
-gen rv32ui-p-add.d             tests/riscv-tests/rv32ui-p-add -d
-gen rv32mi-p-csr.d             tests/riscv-tests/rv32mi-p-csr -d
-gen rv32si-p-dirty.dx          tests/riscv-tests/rv32si-p-dirty -d -x
-gen rv32ua-p-lrsc.d            tests/riscv-tests/rv32ua-p-lrsc -d
+gen rv32ui-p-add.d             "$FIX/rv32/rv32ui-p-add" -d
+gen rv32mi-p-csr.d             "$FIX/rv32/rv32mi-p-csr" -d
+gen rv32si-p-dirty.dx          "$FIX/rv32/rv32si-p-dirty" -d -x
+gen rv32ua-p-lrsc.d            "$FIX/rv32/rv32ua-p-lrsc" -d
 
 gen rv64/hello-elf.d           "$FIX/rv64/hello.elf" -d
 gen rv64/hello-elf.d-no-raw    "$FIX/rv64/hello.elf" -d --no-show-raw-insn
@@ -164,9 +165,9 @@ gen_lines rv64/units-elf.dl    "$FIX/rv64/units.elf" -d -l
 gen rv64/linked-elf.d          "$FIX/rv64/linked.elf" -d
 gen rv64/linked-elf.x          "$FIX/rv64/linked.elf" -x
 gen rv64/linked-elf.s          "$FIX/rv64/linked.elf" -s
-gen rv64/rv64ui-p-add.d        tests/riscv-tests/rv64/rv64ui-p-add -d
-gen rv64/rv64mi-p-csr.d        tests/riscv-tests/rv64/rv64mi-p-csr -d
-gen rv64/rv64si-p-dirty.dx     tests/riscv-tests/rv64/rv64si-p-dirty -d -x
-gen rv64/rv64ua-p-lrsc.d       tests/riscv-tests/rv64/rv64ua-p-lrsc -d
+gen rv64/rv64ui-p-add.d        tests/riscv-tests/rv64ui-p-add -d
+gen rv64/rv64mi-p-csr.d        tests/riscv-tests/rv64mi-p-csr -d
+gen rv64/rv64si-p-dirty.dx     tests/riscv-tests/rv64si-p-dirty -d -x
+gen rv64/rv64ua-p-lrsc.d       tests/riscv-tests/rv64ua-p-lrsc -d
 
 echo "wrote $(ls "$OUT"/*.txt "$OUT"/rv64/*.txt | wc -l) golden files"

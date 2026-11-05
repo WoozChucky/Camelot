@@ -2009,17 +2009,15 @@ impl<'a> FuncGen<'a, '_> {
 
     /// Pushes `a0`: a whole register.
     fn push(&mut self) {
-        let w = WORD;
-        self.ins("addi", format!("sp, sp, {}", -w));
+        self.ins("addi", format!("sp, sp, {}", -WORD));
         self.ins("sd", "a0, 0(sp)");
         self.depth += 1;
     }
 
     /// Pops the top temporary into `reg`.
     fn pop(&mut self, reg: &str) {
-        let w = WORD;
         self.ins("ld", format!("{reg}, 0(sp)"));
-        self.ins("addi", format!("sp, sp, {w}"));
+        self.ins("addi", format!("sp, sp, {WORD}"));
         self.depth -= 1;
     }
 
@@ -2965,22 +2963,21 @@ impl<'a> FuncGen<'a, '_> {
     /// [`layout`]): register-sized stores (`sd`), or a loop
     /// for more than 16 of them, then the last bytes.
     fn clear_local(&mut self, off: i32, size: i32) {
-        let (w, store) = (WORD, "sd");
-        let words = size / w;
+        let words = size / WORD;
         if words > 16 {
             self.add_imm("t1", "s0", off); //  t1 = start
-            self.li("t0", (words * w).into()); //   t0 = end
+            self.li("t0", (words * WORD).into()); //   t0 = end
             self.ins("add", "t0, t1, t0");
             self.label("2");
-            self.ins(store, "zero, 0(t1)");
-            self.ins("addi", format!("t1, t1, {w}"));
+            self.ins("sd", "zero, 0(t1)");
+            self.ins("addi", format!("t1, t1, {WORD}"));
             self.ins("bltu", "t1, t0, 2b");
         } else {
             for i in 0..words {
-                self.access_local(store, "zero", off + w * i);
+                self.access_local("sd", "zero", off + WORD * i);
             }
         }
-        for b in words * w..size {
+        for b in words * WORD..size {
             self.access_local("sb", "zero", off + b);
         }
     }
@@ -3778,9 +3775,8 @@ impl<'a> FuncGen<'a, '_> {
         if let Some(result) = result {
             let off = self.offset(result);
             if let Pass::Words(n) = abi::classify(&ft.ret) {
-                let (w, store) = (WORD, "sd");
                 for i in 0..n {
-                    self.access_local(store, &format!("a{i}"), off + w * i as i32);
+                    self.access_local("sd", &format!("a{i}"), off + WORD * i as i32);
                 }
             }
             self.add_imm("a0", "s0", off);
@@ -3795,13 +3791,13 @@ impl<'a> FuncGen<'a, '_> {
     ///
     /// ```text
     ///     <arg 0>  push ... <arg n-1>  push
-    ///     addi sp, sp, -area           # the outgoing words: 0(sp), 4(sp), ...
-    ///     lw   t1, <arg 8>(sp)         # a stack word
-    ///     sw   t1, 0(sp)
-    ///     lw   a0, <arg 0>(sp)         # a register
+    ///     addi sp, sp, -area           # the outgoing words: 0(sp), 8(sp), ...
+    ///     ld   t1, <arg 8>(sp)         # a stack word
+    ///     sd   t1, 0(sp)
+    ///     ld   a0, <arg 0>(sp)         # a register
     ///     ...
     ///     call f
-    ///     addi sp, sp, area + 4n       # the words and the pushed arguments
+    ///     addi sp, sp, area + 8n       # the words and the pushed arguments
     /// ```
     fn call_with_stack(
         &mut self,
@@ -3824,9 +3820,8 @@ impl<'a> FuncGen<'a, '_> {
             self.push();
         }
         let n = args.len() as i32;
-        let (w, load, store) = (WORD, "ld", "sd");
-        let pushed = w * self.depth as i32;
-        let stack = w * abi::stack_words(used) as i32;
+        let pushed = WORD * self.depth as i32;
+        let stack = WORD * abi::stack_words(used) as i32;
         let area = (pushed + stack + 15) / 16 * 16 - pushed;
         self.comment(match abi::stack_words(used) {
             1 => "1 argument word goes on the stack".to_string(),
@@ -3834,22 +3829,22 @@ impl<'a> FuncGen<'a, '_> {
         });
         self.add_imm("sp", "sp", -area);
         // Where argument i was pushed: the last one is right above the area.
-        let temp = |i: usize| area + w * (args.len() - 1 - i) as i32;
+        let temp = |i: usize| area + WORD * (args.len() - 1 - i) as i32;
         // The stack words first (with t1, t2 and t0), then the registers.
         for (i, &(word, pass)) in words.iter().enumerate() {
             match pass {
                 Pass::Scalar | Pass::Ref => {
                     if let ArgWord::Stack(at) = arg_word(word) {
-                        self.ins(load, format!("t1, {}(sp)", temp(i)));
-                        self.ins(store, format!("t1, {at}(sp)"));
+                        self.ins("ld", format!("t1, {}(sp)", temp(i)));
+                        self.ins("sd", format!("t1, {at}(sp)"));
                     }
                 }
                 Pass::Words(nw) => {
                     for k in 0..nw {
                         if let ArgWord::Stack(at) = arg_word(word + k as usize) {
-                            self.ins(load, format!("t1, {}(sp)", temp(i)));
+                            self.ins("ld", format!("t1, {}(sp)", temp(i)));
                             self.load_word("t2", "t1", k, &types[i]);
-                            self.ins(store, format!("t2, {at}(sp)"));
+                            self.ins("sd", format!("t2, {at}(sp)"));
                         }
                     }
                 }
@@ -3859,12 +3854,12 @@ impl<'a> FuncGen<'a, '_> {
             match pass {
                 Pass::Scalar | Pass::Ref => {
                     if let ArgWord::Reg(r) = arg_word(word) {
-                        self.ins(load, format!("{r}, {}(sp)", temp(i)));
+                        self.ins("ld", format!("{r}, {}(sp)", temp(i)));
                     }
                 }
                 Pass::Words(nw) => {
                     if word < abi::ARG_REGS {
-                        self.ins(load, format!("t1, {}(sp)", temp(i)));
+                        self.ins("ld", format!("t1, {}(sp)", temp(i)));
                     }
                     for k in 0..nw {
                         if let ArgWord::Reg(r) = arg_word(word + k as usize) {
@@ -3880,11 +3875,11 @@ impl<'a> FuncGen<'a, '_> {
             self.add_imm("a0", "s0", off);
         }
         if direct.is_none() {
-            self.ins(load, format!("t1, {}(sp)", area + w * n));
+            self.ins("ld", format!("t1, {}(sp)", area + WORD * n));
         }
         self.jump_to(direct);
         let popped = n + i32::from(direct.is_none());
-        self.add_imm("sp", "sp", area + w * popped);
+        self.add_imm("sp", "sp", area + WORD * popped);
         self.depth -= popped as u32;
     }
 

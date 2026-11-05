@@ -492,10 +492,10 @@ fn csr_addr(op: &Operand, ctx: &Ctx) -> Result<u32, String> {
     }
     match (e, ctx.constant(e)) {
         (_, Some(v)) => Err(format!("CSR number {v} out of range (0..=0xfff)")),
-        // Not a name on this width but one on RV32: so this is RV64, and the
-        // name is the high half of a 64-bit CSR (`cycleh`, `mstatush`) or an
-        // odd `pmpcfg`, which RV64 does not have (LLVM: "system register
-        // 'cycleh' is RV32 only"). Its number is still accepted, as in LLVM.
+        // A name only RV32 has: the high half of a 64-bit CSR (`cycleh`,
+        // `mstatush`) or an odd `pmpcfg`, which RV64 does not have (LLVM:
+        // "system register 'cycleh' is RV32 only"). Its number is still
+        // accepted, as in LLVM.
         (Expr::Sym(name), None) if csr::parse(name, Xlen::Rv32).is_some() => {
             Err(format!("CSR '{name}' exists only on RV32"))
         }
@@ -1781,7 +1781,7 @@ mod tests {
     ];
 
     #[test]
-    fn li_steps_are_llvms_on_rv64() {
+    fn li_steps_are_llvms() {
         for &(value, words) in LI64 {
             let words = hex_words(words);
             let steps = li_steps(value as i64);
@@ -1811,7 +1811,7 @@ mod tests {
     /// -mattr=+m,+a,+zicsr,+zifencei -show-encoding`), with what
     /// `excalibur::decode` reads back from each word on RV64.
     #[test]
-    fn rv64_instructions_are_llvms_and_decode_back() {
+    fn the_64_bit_instructions_are_llvms_and_decode_back() {
         use excalibur::{AmoOp, AmoWidth, CsrOp, CsrSrc, LoadOp, MulOp, Ordering};
         // The instructions below use rd = a0 (10), rs1 = a1 (11), rs2 = a2 (12)
         // unless said otherwise; the atomics take their address in a2.
@@ -2016,7 +2016,7 @@ mod tests {
     }
 
     #[test]
-    fn hi_lo_of_a_constant_takes_64_bits_on_rv64() {
+    fn hi_lo_of_a_constant_takes_64_bits() {
         // LLVM's words: any 64-bit constant.
         assert_eq!(words64("lui a0, %hi(0x123456789)"), [0x2345_6537]);
         assert_eq!(words64("addi a0, a0, %lo(0x123456789)"), [0x7895_0513]);

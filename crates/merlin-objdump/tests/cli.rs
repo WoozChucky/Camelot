@@ -26,8 +26,8 @@ fn objdump(args: &[&str]) -> (i32, String, String) {
 fn disassembles_hello() {
     let (code, out, err) = objdump(&["-d", "examples/hello/hello.elf"]);
     assert_eq!((code, err.as_str()), (0, ""));
-    assert!(out.starts_with("\nexamples/hello/hello.elf:\tfile format elf32-littleriscv\n"));
-    assert!(out.contains("\n80000000 <_start>:\n"));
+    assert!(out.starts_with("\nexamples/hello/hello.elf:\tfile format elf64-littleriscv\n"));
+    assert!(out.contains("\n0000000080000000 <_start>:\n"));
     // Built by merlin-ld, which keeps `call` as auipc + jalr (no relaxation).
     assert!(out.contains("80000010: 00000097     \tauipc\tra, 0x0\n"));
     assert!(out.contains("80000014: 010080e7     \tjalr\t0x10(ra) <puts>\n"));
@@ -75,7 +75,7 @@ fn errors_and_exit_codes() {
         err.contains("error: 'examples/hello/hello.S': bad ELF: missing magic"),
         "{err}"
     );
-    assert!(out.contains("start address: 0x80000000"));
+    assert!(out.contains("start address: 0x0000000080000000"));
 }
 
 #[test]
@@ -101,20 +101,23 @@ fn both_widths() {
 }
 
 /// A mapping symbol whose ISA LLVM cannot parse gets llvm-objdump's warning
-/// on stderr, once per name; the listing is the same. The riscv-tests ELFs,
-/// built by GNU's assembler, have `$x.0`.
+/// on stderr, once per name; the listing is the same. The RV32 riscv-tests
+/// ELFs, built by GNU's assembler, have `$x.0`.
 #[test]
 fn unparsable_isa_mapping_symbols_warn() {
-    let (code, out, err) = objdump(&["-d", "tests/riscv-tests/rv32ui-p-add", "-t"]);
+    let file = "crates/merlin-objdump/tests/fixtures/rv32/rv32ui-p-add";
+    let (code, out, err) = objdump(&["-d", file, "-t"]);
     assert_eq!(code, 0);
     assert_eq!(
         err,
-        "merlin-objdump: warning: 'tests/riscv-tests/rv32ui-p-add': could not parse ISA mapping \
-         symbol '$x.0': string may only contain [a-z0-9_]; falling back to default disassembler\n"
+        format!(
+            "merlin-objdump: warning: '{file}': could not parse ISA mapping symbol '$x.0': string may \
+             only contain [a-z0-9_]; falling back to default disassembler\n"
+        )
     );
     assert!(out.contains("<test_2>:"), "{out}");
     // Only the disassembly reads them.
-    let (code, _, err) = objdump(&["-t", "tests/riscv-tests/rv32ui-p-add"]);
+    let (code, _, err) = objdump(&["-t", file]);
     assert_eq!((code, err.as_str()), (0, ""));
 }
 
