@@ -13,7 +13,7 @@ together.
 | `stdlib.c` | `atoi`, `strtol` (bases 2 to 36, or 0 for C's prefixes; out of range gives `LONG_MAX` or `LONG_MIN`) |
 | `environ.c` | `environ`, the program's environment: `crt0.S` sets it to `main`'s `envp` before calling `main`, as glibc's `__libc_start_main` does, so every program has this member, and only this one of the environment's (as glibc's `posix/environ.c` is a file of its own) |
 | `getenv.c` | `getenv`, `setenv`, `unsetenv` over `environ`, as POSIX has them, but for returning a negative error number (`-EINVAL` for an empty name or one with a `=`, `-ENOMEM`): `setenv` adds a variable by growing the array it made last with `realloc` (none the first time), copying `environ`'s pointers into it when `environ` is another array, as glibc's `__add_to_environ` does, `unsetenv` takes entries out of whichever array it is in place; neither frees a string, as glibc's keep them, so a value `getenv` returned stays good; the two hold a mutex of their own, glibc's `envlock`, so they may run in several threads at once, but not alongside a `getenv` or anything else reading `environ` |
-| `libgcc.c` | `__divdi3`, `__udivdi3`, `__moddi3`, `__umoddi3`, `__muldi3`: the routines merlin and clang call for `long long` division on RV32 (libgcc's names), with RISC-V's results for division by zero and `LLONG_MIN / -1`; the kernel has the same ones (`kernel/libgcc.c`) |
+
 | `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk`, under a mutex |
 | `printf.c` | `printf`, `fprintf` (to a descriptor), `snprintf`, `puts` |
 | `getline.c` | `getline` (a console line from stdin), `reader_init` and `reader_getline` (lines from any descriptor) |
@@ -25,7 +25,7 @@ together.
 | `resolve.c` | `resolve`: a host's address, from its text or by a DNS query (RFC 1035) to the server the network gave; `resolve_error` |
 | `atomic.s` | `atomic_swap`, `atomic_add`, `atomic_cas`, `atomic_load`, `atomic_store`; `spin_lock`, `spin_unlock` |
 | `mutex.c` | `mutex_lock`, `mutex_trylock`, `mutex_unlock`: a mutex that sleeps on a futex |
-| `thread.S` | `thread_start`: a C function in a new thread (preprocessed for each width: its two stack slots are pointers) |
+| `thread.S` | `thread_start`: a C function in a new thread (preprocessed for `<asm.h>`: its two stack slots are pointers) |
 
 ## How programs get it
 
@@ -84,17 +84,14 @@ needs. The conversions are `%d %u %x %p %s %c %%`, with the flags `-` (pad
 on the right) and `0` (pad with zeros, after a minus sign) and a width.
 `d`, `u` and `x` take an `int` (or `unsigned int`), or with a length before
 them a wider integer, as C's `printf` does: `l` a `long`, as wide as a
-register (64 bits on RV64, 32 on RV32), `ll` a `long long` (`int64_t`, 64
-bits on both), `z` a `size_t` (`ssize_t` with `d`). `%p` prints every
-digit of a pointer, 8 on RV32 and 16 on RV64. An unknown conversion is
-printed as written. The digits are divided off a 64-bit value with
-`do_div`, as Linux's `vsprintf.c` does: on RV32 three 32-bit divisions, so
-a program that prints numbers needs no `__udivdi3`. It is the kernel's
-`kprintf` (`kernel/kprintf.c`) with what programs need added: `kprintf`
-has no `-` flag and no `z` length, takes `0` only right after the `%`,
-and divides a value past 32 bits with C's `/`, which on RV32 is a call to
-`__udivdi3` (`kernel/libgcc.c`); and a conversion cut off by the end of
-the format it prints as written, where `printf` prints a lone `%`.
+register (64 bits), `ll` a `long long` (`int64_t`, 64 bits too), `z` a
+`size_t` (`ssize_t` with `d`). `%p` prints every digit of a pointer, 16.
+An unknown conversion is printed as written. The digits are divided off a
+64-bit value with `do_div`, as Linux's `vsprintf.c` does. It is the
+kernel's `kprintf` (`kernel/kprintf.c`) with what programs need added:
+`kprintf` has no `-` flag and no `z` length, and takes `0` only right
+after the `%`; and a conversion cut off by the end of the format it prints
+as written, where `printf` prints a lone `%`.
 
 ## Line input
 
@@ -117,10 +114,9 @@ Two ways, for two kinds of input:
 
 `malloc.c` is the allocator of K&R's *The C Programming Language*, section
 8.7. Each block starts with a header of two words, a pointer's size each
-(8 bytes on RV32, 16 on RV64): its size in header-sized units, a `size_t`,
-and, while it is free, the next free block. So every block is aligned to
-the header's size, which on RV64 is the ABI's largest alignment, 16 bytes,
-as glibc's `malloc` gives. When a program has moved the end of the heap
+(16 bytes): its size in header-sized units, a `size_t`, and, while it is
+free, the next free block. So every block is aligned to the header's size,
+which is the ABI's largest alignment, 16 bytes, as glibc's `malloc` gives. When a program has moved the end of the heap
 with `sbrk` itself, by a number of bytes that is not a multiple of the
 header's size, `malloc` skips to the next multiple before it puts a block
 there, and takes the bytes it skipped from `sbrk` too, as glibc corrects a

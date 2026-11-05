@@ -217,7 +217,7 @@ static void set_name(struct proc *p, const char *name) {
 
 /* The ISA the kernel runs programs on, as AT_HWCAP gives it, Linux's way: a
  * bit for each single-letter extension, 'X' - 'A' (Zicsr and Zifencei have
- * no letter). RV32IMA and RV64IMA: the base, M and A. */
+ * no letter). RV64IMA: the base, M and A. */
 #define HWCAP_ISA(letter) (1ul << ((letter) - 'A'))
 #define HWCAP (HWCAP_ISA('I') | HWCAP_ISA('M') | HWCAP_ISA('A'))
 

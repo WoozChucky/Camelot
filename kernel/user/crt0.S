@@ -13,8 +13,7 @@
 # on to spawn and exec, and to call main(argc, argv, envp), then exit with
 # what it returns, as glibc's __libc_start_main does (its `__environ = ev`
 # first, the exit last). Programs written in assembly define main too.
-# Preprocessed for each width: argc and the pointers are 4 bytes on RV32
-# and 8 on RV64 (asm.h's REG_L, REG_S and SZREG).
+# argc and the pointers are 8 bytes (asm.h's REG_L, REG_S and SZREG).
 
 #include <asm.h>
 

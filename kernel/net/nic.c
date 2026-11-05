@@ -69,11 +69,7 @@ static void set_reg(u32 off, u32 val) {
 /* Writes a ring's base, a physical address: one 64-bit register in version
  * 2 of the interface, a 32-bit one in version 1. */
 static void set_base(u32 off, phys_addr_t base) {
-#if __riscv_xlen == 64
     mmio_write64(nic.base + off, base);
-#else
-    mmio_write32(nic.base + off, base);
-#endif
 }
 
 /* The MAC address of the card at `base`, bytes in wire order. */

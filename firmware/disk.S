@@ -9,13 +9,13 @@
 #      registers, waiting for BLK_STATUS.DONE and acknowledging it;
 #   2. check it as the ROM does: the disk has at least 2 sectors, the read
 #      worked, the block's last word is the signature "BOOT" (0x544f4f42)
-#      and its 256 words add up to 0 (mod 2^32: addw, as the RV64 ROM);
+#      and its 256 words add up to 0 (mod 2^32: addw, as the boot ROM);
 #   3. return with a2 = the disk's registers, which the coldboot leaves for
 #      the boot block (sbi.S), with a0 = 0 and a1 = the device tree.
 #
 # A failure prints "firmware: <why>" on the UART and stops the machine with
 # exit code 0xfd (fw_fail, entry.S), the ROM's messages with the firmware's
-# prefix. RV64 only, as the firmware is: version 2 of the disk's registers.
+# prefix. Version 2 of the disk's registers.
 
 #include <asm.h>
 #include "fw.h"

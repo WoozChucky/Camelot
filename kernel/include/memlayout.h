@@ -15,11 +15,10 @@
 
 /* Linker symbols (kernel.lds.S), all page aligned. Only their
  * addresses mean anything: text from __text_start (= _start, loaded at
- * 0x8000_0000: on RV32 also its address, on RV64 linked at
- * 0xffff_ffff_8000_0000), read-only data from __rodata_start, writable data,
- * .bss and the boot stack from __data_start, and free RAM from
- * __kernel_end. Hart 0's boot stack is [__stack_bottom, __stack_top), and
- * on RV64 the page below it its guard page, unmapped (vm.c). */
+ * 0x8020_0000 and linked at 0xffff_ffff_8000_0000), read-only data from
+ * __rodata_start, writable data, .bss and the boot stack from __data_start,
+ * and free RAM from __kernel_end. Hart 0's boot stack is [__stack_bottom,
+ * __stack_top), and the page below it its guard page, unmapped (vm.c). */
 #ifndef __ASSEMBLER__
 extern char __text_start[];
 extern char __rodata_start[];

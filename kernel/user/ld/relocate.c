@@ -11,7 +11,6 @@ static struct reloc_context ctx;
 static struct uintmap failed_hi20;
 
 static void context(struct layout *l) {
-    ctx.elf64 = l->class == FORMAT_ELF64;
     for (uint k = 0; k < l->nsections; k++) {
         struct output_section *os = &l->sections[k];
         for (uint j = 0; j < os->ninputs; j++) {
@@ -204,11 +203,9 @@ static uchar **loaded(struct layout *l) {
  * tombstone: 0, or 1 in .debug_loc and .debug_ranges, where a pair of zeros
  * ends a DWARF 4 list. */
 static uchar **debug(struct layout *l) {
-    /* No PCREL_HI20 sites; R_RISCV_64 as in a section not loaded. */
+    /* No PCREL_HI20 sites. */
     struct reloc_context none;
     memset(&none, 0, sizeof none);
-    none.elf64 = l->class == FORMAT_ELF64;
-    none.debug = 1;
     uchar **images = xcalloc((l->ndebug + 1) * sizeof(uchar *));
     for (uint k = 0; k < l->ndebug; k++) {
         struct debug_section *ds = &l->debug[k];

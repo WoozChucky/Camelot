@@ -125,7 +125,7 @@ const T1: Reg = 6;
 // ===================================================================
 // Field packers
 //
-// Every RV32 instruction is one of six formats. They all keep opcode, rd,
+// Every base instruction is one of six formats. They all keep opcode, rd,
 // rs1, rs2 and funct3 in the same bit positions, so decoding can read
 // registers before knowing the format; the price is that immediates are
 // split up ("scrambled") differently in each format. Each `x_imm` function
@@ -254,7 +254,7 @@ pub fn hi_lo(value: i32) -> (u32, i32) {
 }
 
 /// [`hi_lo`] for a 64-bit value, as LLVM computes `%hi(c)` and `%lo(c)` of a
-/// constant on both widths (`RISCVAsmBackend`'s `fixup_riscv_hi20` and
+/// constant (`RISCVAsmBackend`'s `fixup_riscv_hi20` and
 /// `fixup_riscv_lo12_i`): `hi = ((c + 0x800) >> 12) & 0xfffff`, `lo` the low
 /// 12 bits sign-extended. Bits above 31 are simply dropped, never an error:
 /// `%hi(0x123456789)` is `0x23456`, `%lo` of it `0x789`.
@@ -1955,7 +1955,7 @@ mod tests {
                 0xe2b6_352f,
                 amo(AmoOp::Maxu, AmoWidth::D, rl),
             ),
-            // The .w forms are the same on both widths.
+            // The .w forms: the word's AMOs.
             (
                 "amoadd.w a0, a1, (a2)",
                 0x00b6_252f,

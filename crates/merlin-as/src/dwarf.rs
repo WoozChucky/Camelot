@@ -116,7 +116,7 @@ pub struct Sequence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     /// This offset in `.debug_line_str`: a 4-byte field (DWARF32's
-    /// `DW_FORM_line_strp`) on both widths.
+    /// `DW_FORM_line_strp`).
     LineStr(u32),
     /// This offset in a code section: an address, as wide as the target's
     /// (the table's `address_size`).

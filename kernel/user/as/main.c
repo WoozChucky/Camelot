@@ -4,26 +4,21 @@
 
 static const char USAGE[] = "usage: as [-march=ISA] [-o output.o] input.s\n"
                             "\n"
-                            "  -march=ISA  rv32ima_zicsr_zifencei (default) or rv64ima_zicsr_zifencei\n"
+                            "  -march=ISA  rv64ima_zicsr_zifencei, the one ISA (the default)\n"
                             "  -o FILE     output object (default: input with .o extension)";
 
-uint xlen = 32;
+/* The `-march=` string, merlin-as's MARCH: the ISA it implements, spelled as
+ * clang spells it. Nothing else is taken: there is no other extension to
+ * turn on or off, and no other width. */
+static const char MARCH[] = "rv64ima_zicsr_zifencei";
 
-/* The `-march=` strings, merlin-as's MARCH: the ISA it implements at either
- * width, spelled as clang spells it. Nothing else is taken: there is no
- * other extension to turn on or off. */
-static const char *const MARCH[2] = {"rv32ima_zicsr_zifencei", "rv64ima_zicsr_zifencei"};
-static const uint MARCH_XLEN[2] = {32, 64};
-
-/* The width `-march=` names (merlin_as::parse_march), or 0 after printing
+/* Whether `-march=` names the ISA (merlin_as::parse_march); if not, prints
  * merlin-as's error. */
-static uint parse_march(const char *s) {
-    for (int i = 0; i < 2; i++) {
-        if (strcmp(s, MARCH[i]) == 0) {
-            return MARCH_XLEN[i];
-        }
+static int parse_march(const char *s) {
+    if (strcmp(s, MARCH) == 0) {
+        return 1;
     }
-    fprintf(2, "as: unsupported -march '%s' (merlin-as takes %s or %s)\n", s, MARCH[0], MARCH[1]);
+    fprintf(2, "as: unsupported -march '%s' (merlin-as takes %s)\n", s, MARCH);
     return 0;
 }
 
@@ -130,8 +125,7 @@ int main(int argc, char **argv) {
             return 0;
         } else if (strncmp(a, "-march=", 7) == 0) {
             /* Only the `=` form, as in clang; the last one wins. */
-            xlen = parse_march(a + 7);
-            if (xlen == 0) {
+            if (!parse_march(a + 7)) {
                 return 2;
             }
         } else if (a[0] == '-') {

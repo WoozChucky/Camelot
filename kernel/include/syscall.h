@@ -3,10 +3,10 @@
  * a0-a5; the result comes back in a0, a negative value being an error, minus
  * one of the E* numbers below. Every other register is preserved.
  *
- * The widths are Linux's (LP64 on RV64, ILP32 on RV32): every argument and
- * the result are a register wide, a call returns a `long`, sign-extended in
- * a0 (so -EFAULT is negative to a 64-bit program too), a user address is a
- * pointer, a size a size_t and a file offset an off_t (types.h).
+ * The widths are Linux's, LP64: every argument and the result are a
+ * register wide, a call returns a `long` (so -EFAULT is negative in all 64
+ * bits of a0), a user address is a pointer, a size a size_t and a file
+ * offset an off_t (types.h).
  *
  * kernel/user/usys.s (the stubs) and kernel/user/user.h (the error numbers)
  * have their own copies of these numbers, and the document a table of them;
@@ -144,8 +144,8 @@
 /* The longest path a call takes, without its NUL. */
 #define MAXPATH 127
 
-/* What fstat stores: 16 bytes on RV32, 24 on RV64, where the size is a
- * 64-bit off_t (padded to 8 bytes on both sides). `type` is the inode's
+/* What fstat stores: 24 bytes, where the size is a 64-bit off_t (8-byte
+ * aligned). `type` is the inode's
  * (T_DIR, T_FILE or T_DEVICE, fs.h), T_PIPE or T_SOCKET; `ino` and `nlink`
  * are 0 for a pipe and for the console the first process got without
  * opening a path, and a pipe's size is the bytes waiting in it. A socket's
@@ -163,8 +163,8 @@ struct stat {
 #define T_PIPE 4
 #define T_SOCKET 5
 
-/* What procs stores for each process: 32 bytes on RV32, 40 on RV64, where
- * `size`, an address, is 64-bit (and 8-byte aligned). `state` is one of the
+/* What procs stores for each process: 40 bytes, where `size`, an address,
+ * is 64-bit (and 8-byte aligned). `state` is one of the
  * PROC_ values (proc.h), `ppid` 0 for a process without a parent, `size`
  * the end of its heap (its program, data and heap, from address 0), 0 for
  * a kernel process. */
@@ -253,8 +253,7 @@ struct ping_reply {
 #define SOL_SOCKET 1  /* setsockopt: the socket's own options */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait: a struct timeval */
 
-/* A time: seconds and microseconds, two longs, as Linux's (8 bytes on
- * RV32, 16 on RV64). */
+/* A time: seconds and microseconds, two longs, as Linux's (16 bytes). */
 struct timeval {
     time_t tv_sec;
     long tv_usec;

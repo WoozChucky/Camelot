@@ -150,8 +150,7 @@ static void test_read_write_seek(void) {
     check_eq(lseek(fd, 0x7fffffff, SEEK_CUR), -EINVAL, "an offset that would overflow");
     check_eq(lseek(fd, -10, SEEK_END), 4990, "seek from the end");
     check_eq(read(fd, buf, 20), 10, "read the last 10 bytes");
-#ifdef _LP64
-    /* RV64: an off_t is 64 bits, all of them the offset. Past the end is
+    /* An off_t is 64 bits, all of them the offset. Past the end is
      * past the largest file too (2^32 blocks of 1 KiB, 2^42 bytes), and
      * fails the same way, never as the offset's low 32 bits would: 2^32 +
      * 100 is not 100. */
@@ -163,7 +162,6 @@ static void test_read_write_seek(void) {
     check_eq(lseek(fd, LONG_MIN, SEEK_END), -EINVAL, "LONG_MIN from the end");
     check_eq(lseek(fd, -0x100000000l + 4990, SEEK_END), -EINVAL, "2^32 - 10 bytes before the start");
     check_eq(lseek(fd, 0, SEEK_CUR), 5000, "and the offset is where it was");
-#endif
     check_eq(lseek(fd, 100, SEEK_SET), 100, "seek into the middle");
     check_eq(write(fd, "XYZ", 3), 3, "write in the middle");
     check_eq(lseek(fd, -3, SEEK_CUR), 100, "seek back over it");

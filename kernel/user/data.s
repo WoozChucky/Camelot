@@ -7,15 +7,15 @@
 # it fills its stack and .bss with non-zero bytes, so that the pages it gives
 # back are dirty for whoever gets them next.
 #
-# The same code for RV32 and RV64: the stack page is the one sp is in (its
-# address depends on USER_TOP, which on RV64 depends on the paging mode),
-# and the words are 32-bit, compared as lw reads them, sign-extended.
+# The stack page is the one sp is in (its address depends on USER_TOP,
+# which depends on the paging mode), and the words are 32-bit, compared as
+# lw reads them, sign-extended.
 
     .equ STACK_SIZE, 0x1000
     .equ BSS_SIZE, 0x1800
     .equ INITIAL, 0x600df00d
     # 0xa5a5a5a5 as a 32-bit word: negative, so that li makes the value lw
-    # reads back on RV64 too.
+    # reads back, sign-extended.
     .equ DIRT, -0x5a5a5a5b
 
     .text

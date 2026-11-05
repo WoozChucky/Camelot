@@ -1,7 +1,8 @@
 /* The kernel on several harts (spec section 10, "Kernel SMP"; smp.h).
  *
  * Booting. Hart 0 boots the kernel alone, self-tests and all, while the
- * SBI holds every other hart STOPPED (machine.S, or OpenSBI on a board).
+ * SBI holds every other hart STOPPED (Camelot's firmware/sbi.S, or OpenSBI
+ * on a board).
  * Then smp_boot() starts each of them with the SBI's hart_start, as Linux's
  * cpu_ops_sbi.c does: at secondary_entry (entry.S), in S-mode with paging
  * off, with its id in a0 and the top of a kernel stack of its own in a1.
@@ -15,7 +16,7 @@
  *
  * IPIs. A hart interrupts others with the SBI's send_ipi, which raises the
  * supervisor software interrupt on each of them (on Grail through their
- * msip, machine.S). What the sender wants is in memory: a TLB flush here,
+ * msip, firmware/sbi.S). What the sender wants is in memory: a TLB flush here,
  * or a look for a runnable thread (kick_idle(), proc.c). The SBI orders
  * the sender's stores before the interrupt (#170).
  *
@@ -76,11 +77,7 @@ static volatile u32 tlb_done[NCPU];
 /* Where the boot self-test maps its page: vmtest.c's alias address, whose
  * second-level table the kernel page table keeps, so the test adds no root
  * entry (which processes' page tables would miss, vm.h). */
-#if __riscv_xlen == 64
 #define SMP_TEST_VA (VM_TEST_AREA + 32 * LEVEL_SIZE(1))
-#else
-#define SMP_TEST_VA 0x40000000u
-#endif
 
 u32 harts_running(void) {
     return harts_up;
@@ -194,16 +191,10 @@ int smp_boot(void) {
     phys_addr_t entry = pa(secondary_entry);
     u32 started = 0;
     for (u32 i = 1; i < n; i++) {
-        /* The hart's kernel stack, which its scheduler runs on: on RV64 one
-         * from the vmalloc area, with its guard page (vm.h); on RV32 a
-         * page. */
-#if __riscv_xlen == 64
+        /* The hart's kernel stack, which its scheduler runs on: one from the
+         * vmalloc area, with its guard page (vm.h). */
         u8 *stack = kstack_alloc();
         usize size = KSTACK_SIZE;
-#else
-        u8 *stack = kalloc();
-        usize size = PGSIZE;
-#endif
         if (stack == NULL) {
             kprintf("smp: no memory for hart %u's stack\n", i);
             break;
@@ -211,11 +202,7 @@ int smp_boot(void) {
         long err = sbi_hart_start(i, entry, (uintptr)stack + size);
         if (err != SBI_SUCCESS) {
             kprintf("smp: hart %u failed to start (%s)\n", i, sbi_strerror(err));
-#if __riscv_xlen == 64
             kstack_free(stack);
-#else
-            kfree(stack);
-#endif
             continue;
         }
         started |= 1u << i;

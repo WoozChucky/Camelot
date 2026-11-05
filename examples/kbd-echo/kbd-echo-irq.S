@@ -12,9 +12,8 @@
 #
 # Run it with the framebuffer window (Windows) and type into the window:
 #
-#   cargo run --release -p grail -- --fb examples/kbd-echo/kbd-echo-irq.elf
+#   cargo run --release -p grail -- --bios none --fb examples/kbd-echo/kbd-echo-irq.elf
 #
-# (kbd-echo-irq-rv64.elf on an RV64 machine).
 #
 # Built with our own tools by `cargo xtask examples kbd-echo-irq`, which does the same as
 #
@@ -22,25 +21,12 @@
 #   merlin-as kbd-echo-irq.s -o kbd-echo-irq.o
 #   merlin-ld -T examples/kbd-echo/link.ld kbd-echo-irq.o -o examples/kbd-echo/kbd-echo-irq.elf
 #
-# and, for RV64 (the same code: mcause's interrupt bit, CAUSE_MEI, is bit 63, and
-# putkey saves ra and its argument with REG_S, sd there), the same as
-#
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/kbd-echo/kbd-echo-irq.S -o kbd-echo-irq.s
-#   merlin-as -march=rv64ima_zicsr_zifencei kbd-echo-irq.s -o kbd-echo-irq.o
-#   merlin-ld -T examples/kbd-echo/link.ld kbd-echo-irq.o -o examples/kbd-echo/kbd-echo-irq-rv64.elf
-#
 # Reference build with LLVM, only for comparison:
-#
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
-#         -T examples/kbd-echo/link.ld examples/kbd-echo/kbd-echo-irq.S -o kbd-echo-irq.elf
-#
-# and for RV64:
 #
 #   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
 #         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
 #         -I include -T examples/kbd-echo/link.ld examples/kbd-echo/kbd-echo-irq.S \
-#         -o kbd-echo-irq-rv64.elf
+#         -o kbd-echo-irq.elf
 
 #include <asm.h>
 
@@ -63,11 +49,7 @@
 
     .equ MIE_MEIE,      0x800           # mie bit 11
     .equ MSTATUS_MIE,   0x8
-#if __riscv_xlen == 64
     .equ CAUSE_MEI,     0x800000000000000b # interrupt bit 63, cause 11
-#else
-    .equ CAUSE_MEI,     0x8000000b
-#endif
 
     .section .text.start
     .globl _start

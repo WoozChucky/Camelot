@@ -10,22 +10,16 @@
 
 /* User space (kernel/include/vm.h): the stack grows down from USER_TOP to
  * at most USER_STACK_LIMIT, 8 MiB below, with an unmapped guard page under
- * that. USER_TOP is 0x0c000000 on RV32; on RV64 it depends on the paging
- * mode (2^47 in Sv48, 2^38 in Sv39), so main() finds it: the arguments are
- * in the stack's last page. */
+ * that. USER_TOP depends on the paging mode (2^47 in Sv48, 2^38 in Sv39),
+ * so main() finds it: the arguments are in the stack's last page. */
 static uintptr_t user_top;
 #define USER_TOP user_top
 #define PAGE 0x1000ul
 #define USER_STACK_LIMIT (USER_TOP - (8ul << 20))
 #define GUARD (USER_STACK_LIMIT - PAGE)
-/* Kernel memory, mapped in every process but without U: on RV32 the
- * kernel's first page, on RV64 the kernel image at its link address, in
- * the upper half of the address space (vm.h). */
-#ifdef _LP64
+/* Kernel memory, mapped in every process but without U: the kernel image
+ * at its link address, in the upper half of the address space (vm.h). */
 #define KERNEL 0xffffffff80000000ul
-#else
-#define KERNEL 0x80000000ul
-#endif
 
 static const char msg[] = "badptr: every bad pointer refused\n";
 
@@ -147,8 +141,7 @@ int main(int argc, char **args) {
     expect(spawn("", NULL, bad_argv), -EFAULT);              /* 63 */
     expect(exec("", NULL, bad_argv), -EFAULT);               /* 64 */
     expect(wait(-1, &status), -ECHILD);                      /* 65 */
-#ifdef _LP64
-    /* RV64: every address from USER_TOP up is the kernel's, or not an
+    /* Every address from USER_TOP up is the kernel's, or not an
      * address at all (between the two halves): the first one past user
      * space, the lowest of the upper half, the direct map's start in Sv48
      * and in Sv39, the vmalloc area's, the very top; and a range from the
@@ -171,11 +164,10 @@ int main(int argc, char **args) {
     expect(open((char *)KERNEL, O_RDONLY), -EFAULT);         /* 85 */
     expect(wait(-1, (int *)0xffffffd600000000ul), -EFAULT);  /* 86 */
     expect(write(STDOUT, (char *)0x100000000ul + 0x1000, 1), -EFAULT); /* 87 */
-#endif
     /* And a good buffer. */
     if (failed_case == 0) {
         size_t len = strlen(msg);
-        expect(write(STDOUT, msg, len), (long)len);          /* 66, or 88 on RV64 */
+        expect(write(STDOUT, msg, len), (long)len);          /* 88 */
     } else {
         printf("badptr: case %d failed\n", failed_case);
     }

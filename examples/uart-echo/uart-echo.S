@@ -13,27 +13,14 @@
 #   merlin-as uart-echo.s -o uart-echo.o
 #   merlin-ld -T examples/uart-echo/link.ld uart-echo.o -o examples/uart-echo/uart-echo.elf
 #
-# and, for RV64 (the same code: only mcause's interrupt bit, CAUSE_MEI, is another,
-# bit 63), the same as
-#
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/uart-echo/uart-echo.S -o uart-echo.s
-#   merlin-as -march=rv64ima_zicsr_zifencei uart-echo.s -o uart-echo.o
-#   merlin-ld -T examples/uart-echo/link.ld uart-echo.o -o examples/uart-echo/uart-echo-rv64.elf
-#
 # Reference build with LLVM, only for comparison:
-#
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
-#         -T examples/uart-echo/link.ld examples/uart-echo/uart-echo.S -o uart-echo.elf
-#
-# and for RV64:
 #
 #   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
 #         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
-#         -T examples/uart-echo/link.ld examples/uart-echo/uart-echo.S -o uart-echo-rv64.elf
+#         -T examples/uart-echo/link.ld examples/uart-echo/uart-echo.S -o uart-echo.elf
 #
-# Try it: printf 'hello\n\004' | grail examples/uart-echo/uart-echo.elf
-# (and examples/uart-echo/uart-echo-rv64.elf on an RV64 machine).
+# Try it: printf 'hello\n\004' | grail --bios none examples/uart-echo/uart-echo.elf
+#.
 
     .equ UART_BASE,     0x10000000
     .equ UART_RBR,      0               # receive buffer (read)
@@ -51,11 +38,7 @@
 
     .equ MIE_MEIE,      0x800           # mie bit 11
     .equ MSTATUS_MIE,   0x8
-#if __riscv_xlen == 64
     .equ CAUSE_MEI,     0x800000000000000b # interrupt bit 63, cause 11
-#else
-    .equ CAUSE_MEI,     0x8000000b
-#endif
 
     .section .text.start
     .globl _start

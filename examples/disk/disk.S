@@ -9,8 +9,8 @@
 # up when MEIP rises and no trap handler is needed. The handler-less "interrupt" is
 # then claimed, acknowledged at the disk (BLK_STATUS.DONE) and completed at the PLIC.
 #
-#   grail --disk examples/disk/disk.img examples/disk/disk.elf
-#   grail --disk-ro examples/disk/disk.img examples/disk/disk.elf
+#   grail --bios none --disk examples/disk/disk.img examples/disk/disk.elf
+#   grail --bios none --disk-ro examples/disk/disk.img examples/disk/disk.elf
 #
 # Exit code 0 on success, 1 without a disk, 2 on a disk error, 3 if the data read back
 # differs or the out-of-range read did not fail, 4 on an unexpected PLIC source.
@@ -19,10 +19,10 @@
 # and of sector 7. crates/grail/tests/block.rs builds the same bytes and checks the
 # committed file against them (set GRAIL_WRITE_DISK_IMG=1 to rewrite it from there).
 #
-# On RV64 machines (disk-rv64.elf) the device table and the disk have the registers
-# of version 2 of their interfaces (spec sections 9.5 and 9.6): 24-byte table entries
-# with a 64-bit base, and a disk whose BLK_CAPACITY, BLK_SECTOR and BLK_DMA are 64-bit
-# (REG_L and REG_S: ld and sd there). Its address prints as 16 hex digits.
+# The device table and the disk have the registers of version 2 of their interfaces
+# (spec sections 9.5 and 9.6): 24-byte table entries with a 64-bit base, and a disk
+# whose BLK_CAPACITY, BLK_SECTOR and BLK_DMA are 64-bit (REG_L and REG_S: ld and sd).
+# Its address prints as 16 hex digits.
 #
 # Built with our own tools by `cargo xtask examples disk`, which does the same as
 #
@@ -30,38 +30,21 @@
 #   merlin-as disk.s -o disk.o
 #   merlin-ld -T examples/disk/link.ld disk.o -o examples/disk/disk.elf
 #
-# and, for RV64, the same as
-#
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/disk/disk.S -o disk.s
-#   merlin-as -march=rv64ima_zicsr_zifencei disk.s -o disk.o
-#   merlin-ld -T examples/disk/link.ld disk.o -o examples/disk/disk-rv64.elf
-#
 # Reference build with LLVM, only for comparison:
-#
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
-#         -T examples/disk/link.ld examples/disk/disk.S -o disk.elf
-#
-# and for RV64:
 #
 #   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
 #         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
-#         -I include -T examples/disk/link.ld examples/disk/disk.S -o disk-rv64.elf
+#         -I include -T examples/disk/link.ld examples/disk/disk.S -o disk.elf
 
 #include <asm.h>
 
-#if __riscv_xlen == 64
 #define DEC_END 20      /* put_dec's digits: sp+0 .. sp+19, the 20 of 2^64 - 1 */
-#else
-#define DEC_END 12      /* sp+2 .. sp+11, the 10 of 2^32 - 1 */
-#endif
 
     .equ UART_BASE,       0x10000000
     .equ UART_LSR,        5
     .equ LSR_THRE,        0x20
 
     .equ SYSINFO_BASE,    0x30002000
-#if __riscv_xlen == 64
     .equ SYS_DEV_COUNT,   0x24
     .equ SYS_DEV_TABLE,   0x40
     .equ DEV_ENTRY_SIZE,  24            # type, irq, base (64-bit), size (64-bit)
@@ -79,22 +62,6 @@
     .equ BLK_STATUS,      0x24          # bit 1: done (write 1 to clear)
     .equ BLK_ERROR,       0x28
     .equ BLK_CTRL,        0x2c          # bit 0: completion interrupt enable
-#else
-    .equ SYS_DEV_COUNT,   0x1c
-    .equ SYS_DEV_TABLE,   0x40
-    .equ DEV_ENTRY_SIZE,  16            # type, base, size, irq
-    .equ DEV_BLOCK,       9             # device type code of a disk
-
-    .equ BLK_CAPACITY,    0x00          # size in sectors
-    .equ BLK_FLAGS,       0x04          # bit 0: read-only
-    .equ BLK_SECTOR,      0x08
-    .equ BLK_DMA,         0x0c          # buffer address in RAM
-    .equ BLK_COUNT,       0x10          # sectors
-    .equ BLK_CMD,         0x14
-    .equ BLK_STATUS,      0x18          # bit 1: done (write 1 to clear)
-    .equ BLK_ERROR,       0x1c
-    .equ BLK_CTRL,        0x20          # bit 0: completion interrupt enable
-#endif
     .equ CMD_READ,        1
     .equ CMD_WRITE,       2
     .equ CMD_FLUSH,       3
@@ -116,26 +83,17 @@ _start:
 
     # Find the first disk: s1 = its registers, s2 = its PLIC source, s3 = its size.
     li    t0, SYSINFO_BASE
-    LWU   t1, SYS_DEV_COUNT(t0)
+    lwu   t1, SYS_DEV_COUNT(t0)
     addi  t0, t0, SYS_DEV_TABLE
     li    t2, DEV_BLOCK
 1:  beqz  t1, no_disk
-#if __riscv_xlen == 64
     lwu   t3, DEV_TYPE(t0)
-#else
-    lw    t3, 0(t0)
-#endif
     beq   t3, t2, 2f
     addi  t0, t0, DEV_ENTRY_SIZE
     addi  t1, t1, -1
     j     1b
-#if __riscv_xlen == 64
 2:  ld    s1, DEV_BASE(t0)
     lwu   s2, DEV_IRQ(t0)
-#else
-2:  lw    s1, 4(t0)
-    lw    s2, 12(t0)
-#endif
     REG_L s3, BLK_CAPACITY(s1)
 
     la    a0, s_disk                # "disk 0x10001000, irq 3: 8 sectors[ (read-only)]"
@@ -370,8 +328,8 @@ put_text:
     addi  sp, sp, 16
     ret
 
-# put_dec(a0 = unsigned value): decimal, no padding, up to the 10 digits of
-# 2^32 - 1, or the 20 of 2^64 - 1 on RV64.
+# put_dec(a0 = unsigned value): decimal, no padding, up to the 20 digits of
+# 2^64 - 1.
 put_dec:
     addi  sp, sp, -32
     REG_S ra, 32-SZREG(sp)
@@ -392,7 +350,7 @@ put_dec:
     addi  sp, sp, 32
     ret
 
-# put_hex(a0 = value): "0x" and XLEN/4 lowercase hex digits (8, or 16 on RV64).
+# put_hex(a0 = value): "0x" and XLEN/4 lowercase hex digits, 16.
 put_hex:
     addi  sp, sp, -16
     REG_S ra, 16-SZREG(sp)
@@ -428,7 +386,7 @@ s_ok:           .asciz ": ok\n"
 s_mismatch:     .asciz ": FAILED, read back different data\n"
 s_skipped:      .asciz "read-only disk: write test skipped\n"
 s_error:        .asciz "disk error "
-s_no_disk:      .asciz "no disk (try grail --disk examples/disk/disk.img)\n"
+s_no_disk:      .asciz "no disk (try grail --bios none --disk examples/disk/disk.img)\n"
 s_wrong_irq:    .asciz "unexpected PLIC source\n"
 
     .section .bss

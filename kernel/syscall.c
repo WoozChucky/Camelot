@@ -206,8 +206,8 @@ static bool is_net_call(uintptr num) {
 void syscall(struct trap_frame *f) {
     struct proc *p = myproc();
     long ret;
-    /* The number is all of a7, as Linux takes it (a long): on RV64 2^32 + 2
-     * is no call, not write. */
+    /* The number is all of a7, as Linux takes it (a long): 2^32 + 2 is no
+     * call, not write. */
     uintptr num = f->regs[REG_A7];
     /* Whatever the program has on its stack is at or above sp: map the stack
      * down to it, so that a buffer there the program hasn't touched yet (a
@@ -385,7 +385,7 @@ void syscall(struct trap_frame *f) {
         }
     }
     /* A long is the register's width: a negative error stays negative to
-     * the program (on RV64 bits 63-32 copy bit 31 of -EFAULT, say), and a
+     * the program (bits 63-32 copy bit 31 of -EFAULT, say), and a
      * pointer (sbrk's) comes back whole. */
     f->regs[REG_A0] = (uintptr)ret;
 }

@@ -277,8 +277,8 @@ off_t filelseek(struct file *f, off_t offset, u32 whence) {
         return -EINVAL;
     }
     /* The new offset, base + offset, must be in [0, size]. Files are at
-     * most MAXFILE_BYTES, which an off_t holds (open refuses a bigger one
-     * on RV32), and so is an offset, so base and size are both in
+     * most MAXFILE_BYTES, which an off_t holds (open refuses a bigger
+     * one), and so is an offset, so base and size are both in
      * [0, MAXFILE_BYTES]; base may be past size, though (SEEK_CUR after
      * another descriptor truncated the file). Neither -base nor size - base
      * overflows, then, and the sum is only made once it is known to be in

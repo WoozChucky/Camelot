@@ -14,10 +14,10 @@
 
 struct spinlock uart_tx_lock;
 
-/* Where the registers are reached (uart.h): UART_BASE, which is the UART's
- * mapping on RV32; on RV64 the fixmap's page from setup_vm() on, before
- * paging is on (vm.h); the kernel's ioremap() of it from uart_map() on. So
- * a panic at kmain's first instruction still gets out. */
+/* Where the registers are reached (uart.h): UART_BASE with paging off; the
+ * fixmap's page from setup_vm() on, before paging is on (vm.h); the
+ * kernel's ioremap() of it from uart_map() on. So a panic at kmain's first
+ * instruction still gets out. */
 uintptr uart_regs = UART_BASE;
 
 /* The receive ring buffer, filled by uart_intr (in the trap handler) and

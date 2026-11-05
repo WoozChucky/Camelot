@@ -45,7 +45,7 @@ static void add_needs(struct strmap *names, struct object *o) {
     }
 }
 
-struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, int format, uint *count, int *class) {
+struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, uint *count) {
     struct object *objects = xcalloc((n ? n : 1) * sizeof(struct object));
     for (uint i = 0; i < n; i++) {
         char *err;
@@ -53,38 +53,10 @@ struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, int fo
             error(fmt("%s: %s", inputs[i].name, err));
         }
     }
-    /* The script's errors, then the files', all of them, and the link stops. */
+    /* The script's errors, then the files', all of them (an ELF32 one
+     * among them, a member too, needed or not, as ld.lld reads its lazy
+     * objects), and the link stops. */
     if (errors.n != 0) {
-        return NULL;
-    }
-    /* The executable's class: the script's OUTPUT_FORMAT's if it names
-     * one, else the first file's, a member's too (ld.lld's). Every file, a
-     * member too, needed or not, must have it, as ld.lld checks its lazy
-     * objects too, in command-line order: merlin-ld's check_classes, which
-     * reports every one that has not, and the link stops (an RV32 object's
-     * code cannot run on an RV64 hart, or the other way round). The message
-     * says where the class came from, in ld.lld's words: the OUTPUT_FORMAT,
-     * else the first file that is no member and has it, else nothing. */
-    *class = format != FORMAT_NONE ? format : objects[0].class;
-    const char *first = NULL;
-    int wrong = 0;
-    for (uint i = 0; i < n; i++) {
-        if (objects[i].class == *class) {
-            if (!lazy[i] && first == NULL) {
-                first = objects[i].name;
-            }
-            continue;
-        }
-        wrong = 1;
-        if (format != FORMAT_NONE) {
-            error(fmt("%s is incompatible with %s", objects[i].name, format_name(format)));
-        } else if (first != NULL) {
-            error(fmt("%s is incompatible with %s", objects[i].name, first));
-        } else {
-            error(fmt("%s is incompatible", objects[i].name));
-        }
-    }
-    if (wrong) {
         return NULL;
     }
     struct strmap names;

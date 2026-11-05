@@ -142,8 +142,8 @@ pub struct Symbol {
     /// Set for `.equ`/`.set` constants.
     pub constant: Option<i64>,
     pub ty: SymType,
-    /// `st_size`, as `.size` gave it: 64 bits, which an ELF32 object cuts
-    /// to 32.
+    /// `st_size`, as `.size` gave it: 64 bits, all of which the ELF64
+    /// symbol keeps.
     pub size: u64,
     /// Named by `.local`: local even if nothing defines it (clang writes
     /// such a symbol as a local undefined one), where any other undefined
@@ -758,9 +758,8 @@ impl Assembler {
 
     /// Whether `n` more bytes fit in the current section, which reports an
     /// error if they do not. A section's size and offsets are 32-bit here
-    /// (all ELF32 has room for; on RV64 merlin-as's own limit), so a section
-    /// stops short of 4 GiB: whatever would take it there is an error, never
-    /// a size that wraps around.
+    /// (merlin-as's own limit), so a section stops short of 4 GiB: whatever
+    /// would take it there is an error, never a size that wraps around.
     fn has_room(&mut self, n: u64) -> bool {
         let sec = &self.sections[self.current];
         if u64::from(sec.size) + n <= u64::from(u32::MAX) {
@@ -969,9 +968,8 @@ impl Assembler {
     /// A label's address is only known at link time, so `.word sym` and
     /// `.dword sym` leave zeros and a relocation (`R_RISCV_32`, `R_RISCV_64`)
     /// for the linker to fill. The width of the data, not of the machine,
-    /// picks it: LLVM writes `R_RISCV_32` for a `.word` on RV64, and
-    /// `R_RISCV_64` for a `.dword` on RV32. The psABI has no 1- or 2-byte
-    /// absolute relocation.
+    /// picks it: LLVM writes `R_RISCV_32` for a `.word` on RV64. The psABI
+    /// has no 1- or 2-byte absolute relocation.
     fn data(&mut self, args: &[DirArg], size: u32) {
         if !args.is_empty() {
             self.take_loc();
@@ -1106,9 +1104,8 @@ impl Assembler {
                 if n <= 0 {
                     return self.error(".section: the entry size must be positive");
                 }
-                // sh_entsize is 32 bits in ELF32, and LLVM keeps an entry
-                // size in 32 bits on either width (a larger one is cut, then
-                // fails its own check), so it is an error on both.
+                // LLVM keeps an entry size in 32 bits (a larger one is cut,
+                // then fails its own check), so a larger one is an error.
                 if n > u32::MAX as i64 {
                     return self.error(format!(".section: entry size {n} does not fit in 32 bits"));
                 }
@@ -1424,9 +1421,7 @@ impl Assembler {
             ".size" => {
                 // `.size f, . - f` (merlin's), `.size f, .Lfunc_end0 - f`
                 // (clang's) or a constant. Any value is taken, as LLVM
-                // takes it: its bits are the symbol's st_size, cut to the
-                // 32 bits of an ELF32 field by the writer (clang riscv32
-                // writes 0 for 0x100000000 and 0xfffffffc for -4).
+                // takes it: its 64 bits are the symbol's st_size.
                 if let Some(n) = self.arg_name(args, 0, ".size") {
                     let v = match args.get(1) {
                         Some(DirArg::Expr(e)) => self.eval_relative(e),
@@ -2209,7 +2204,7 @@ w:      .word 0, 0, 0
             assert!(errs[0].msg.contains(".size: expected"), "{bad:?}: {errs:?}");
         }
         // Any constant is a size, as in LLVM, a negative or a 64-bit one
-        // too: the ELF writer cuts it to 32 bits in an ELF32 object.
+        // too.
         let obj = crate::assemble("f: nop\n.size f, -4\ng: nop\n.size g, 0x100000000\n").unwrap();
         assert_eq!(
             (sym(&obj, "f").size, sym(&obj, "g").size),
@@ -2546,10 +2541,9 @@ f:      nop
 
     #[test]
     fn data_of_every_size() {
-        // The bytes and relocations llvm-mc 23 writes for this source, the
-        // same for riscv32 and riscv64 (llvm-objdump -s, llvm-readelf -r):
-        // `.dword sym` is R_RISCV_64 on RV32 too, `.word sym` R_RISCV_32 on
-        // RV64 too, and `>>` is a logical shift.
+        // The bytes and relocations llvm-mc 23 writes for this source
+        // (llvm-objdump -s, llvm-readelf -r): `.word sym` is R_RISCV_32,
+        // `.dword sym` R_RISCV_64, and `>>` is a logical shift.
         let src = "
         .data
         .byte 255, -128
@@ -2639,9 +2633,8 @@ x:      .dword x + 8, .
 
     #[test]
     fn right_shifts_are_logical() {
-        // llvm-mc 23 -show-encoding: `li a0, -1 >> 32` is `li a0, -1` on
-        // riscv32 (0xffffffff is -1 in 32 bits) and `li a0, -1; srli a0, a0,
-        // 32` on riscv64; `-16 >> 60` is 15 on both.
+        // llvm-mc 23 -show-encoding: `li a0, -1 >> 32` is `li a0, -1; srli
+        // a0, a0, 32` (0xffffffff, in 64 bits); `-16 >> 60` is 15.
         let words = |src: &str| {
             let obj = crate::assemble(src).unwrap();
             let data = &obj.sections[0].data;

@@ -24,10 +24,9 @@
 # Run it with the framebuffer window (Windows), at a real-time clock so that the frames
 # go by at the speed the program draws them:
 #
-#   cargo run --release -p grail -- --fb --clock 50MHz examples/flip/flip.elf
+#   cargo run --release -p grail -- --bios none --fb --clock 50MHz examples/flip/flip.elf
 #
-# or headless, dumping each frame it shows:  grail --fb-dump out examples/flip/flip.elf
-# (flip-rv64.elf on an RV64 machine).
+# or headless, dumping each frame it shows:  grail --bios none --fb-dump out examples/flip/flip.elf
 #
 # Built with our own tools by `cargo xtask examples flip`, which does the same as
 #
@@ -35,25 +34,11 @@
 #   merlin-as flip.s -o flip.o
 #   merlin-ld -T examples/flip/link.ld flip.o -o examples/flip/flip.elf
 #
-# and, for RV64 (the same code: mcause's interrupt bit, CAUSE_MEI, is bit 63, and
-# FB_SCANOUT, a 64-bit register, is written whole with sd instead of by its halves),
-# the same as
-#
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/flip/flip.S -o flip.s
-#   merlin-as -march=rv64ima_zicsr_zifencei flip.s -o flip.o
-#   merlin-ld -T examples/flip/link.ld flip.o -o examples/flip/flip-rv64.elf
-#
 # Reference build with LLVM, only for comparison:
-#
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
-#         -T examples/flip/link.ld examples/flip/flip.S -o flip.elf
-#
-# and for RV64:
 #
 #   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
 #         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
-#         -I include -T examples/flip/link.ld examples/flip/flip.S -o flip-rv64.elf
+#         -I include -T examples/flip/link.ld examples/flip/flip.S -o flip.elf
 
 #include <asm.h>
 
@@ -80,11 +65,7 @@
 
     .equ MIE_MEIE,      0x800           # mie bit 11
     .equ MSTATUS_MIE,   0x8
-#if __riscv_xlen == 64
     .equ CAUSE_MEI,     0x800000000000000b # interrupt bit 63, cause 11
-#else
-    .equ CAUSE_MEI,     0x8000000b
-#endif
 
     .equ WIDTH,         800
     .equ HEIGHT,        600
@@ -223,12 +204,7 @@ fail:
 
 # set_scanout(a0 = buffer): FB_SCANOUT = a0, a physical address below 4 GiB.
 set_scanout:
-#if __riscv_xlen == 64
     sd    a0, FB_SCANOUT(s0)
-#else
-    sw    a0, FB_SCANOUT(s0)            # the low half
-    sw    zero, FB_SCANOUT+4(s0)        # and the high half
-#endif
     ret
 
 # draw(a0 = buffer): frame s4, bands of BAND rows, the colours of `bands` from the top

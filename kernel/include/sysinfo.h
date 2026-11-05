@@ -1,13 +1,10 @@
 /* Grail's sysinfo block (spec section 9.5): read-only registers that describe
  * the machine, so the kernel discovers RAM and its devices instead of
- * hard-coding them. An RV32 machine has version 1 of its layout, all 32-bit
- * registers; an RV64 one version 2, whose addresses and sizes are 64-bit
- * (RAM's base and size, the device table's base and size). */
+ * hard-coding them. Version 2 of its layout, whose addresses and sizes are
+ * 64-bit (RAM's base and size, the device table's base and size). */
 #ifndef CAMELOT_SYSINFO_H
 #define CAMELOT_SYSINFO_H
 
-/* Assembly includes this file too (machine.S, for the registers): the C is
- * under #ifndef __ASSEMBLER__ (const.h). */
 #ifndef __ASSEMBLER__
 #include "types.h"
 #endif
@@ -22,7 +19,6 @@
 #define SYS_MAGIC 0x00
 #define SYS_VERSION 0x04
 #define SYS_RAM_BASE 0x08
-#if __riscv_xlen == 64
 #define SYS_RAM_SIZE 0x10
 #define SYS_TIMEBASE_HZ 0x18
 #define SYS_CPU_HZ 0x1c
@@ -31,22 +27,12 @@
 #define SYS_HARTS 0x28 /* number of harts, 1 to 8 (spec section 7, "Harts") */
 /* The RAM the firmware keeps for itself (spec section 7, "Firmware"; the
  * device tree's /reserved-memory): 0x8000_0000 and 2 MiB under Grail's
- * --bios, a size of 0 without firmware. Version 2 only: RV32 machines have
- * no firmware. */
+ * --bios, a size of 0 without firmware. */
 #define SYS_RESERVED_BASE 0x30
 #define SYS_RESERVED_SIZE 0x38
-#else
-#define SYS_RAM_SIZE 0x0c
-#define SYS_TIMEBASE_HZ 0x10
-#define SYS_CPU_HZ 0x14
-#define SYS_FLAGS 0x18
-#define SYS_DEV_COUNT 0x1c
-#define SYS_HARTS 0x20
-#endif
 #define SYS_DEV_TABLE 0x40
 
 #define SYSINFO_MAGIC 0x53595349 /* "SYSI" */
-#if __riscv_xlen == 64
 /* The layout this kernel knows (SYS_VERSION). */
 #define SYSINFO_VERSION 2
 /* Device table entry i, at SYS_DEV_TABLE + 24 * i: the type and the PLIC
@@ -56,15 +42,6 @@
 #define DEV_IRQ 0x4
 #define DEV_BASE 0x8
 #define DEV_SIZE 0x10
-#else
-#define SYSINFO_VERSION 1
-/* Device table entry i: four words at SYS_DEV_TABLE + 16 * i. */
-#define SYS_DEV_ENTRY_SIZE 16
-#define DEV_TYPE 0x0
-#define DEV_BASE 0x4
-#define DEV_SIZE 0x8
-#define DEV_IRQ 0xc
-#endif
 
 /* Device type codes. */
 #define DEV_CLINT 1
@@ -88,13 +65,12 @@ struct sysinfo_device {
 };
 
 /* Where the block's registers are reached: SYSINFO_BASE, its physical
- * address (as setup_vm() reads it, with paging off; M-mode reads it there
- * too, machine.S); on RV64 the fixmap's page from setup_vm()
- * on (vm.h); then its ioremap() mapping (sysinfo_map()). */
+ * address (as setup_vm() reads it, with paging off); the fixmap's page from
+ * setup_vm() on (vm.h); then its ioremap() mapping (sysinfo_map()). */
 extern uintptr sysinfo_regs;
 
 /* Points sysinfo_regs at the block's ioremap() mapping, once kvminit() has
- * made ioremap() work (on RV32 it changes nothing). */
+ * made ioremap() work. */
 void sysinfo_map(void);
 
 /* Reads 32-bit register `off`. */

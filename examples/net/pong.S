@@ -23,26 +23,12 @@
 #   merlin-as netlib.s -o netlib.o
 #   merlin-ld -T examples/net/link.ld pong.o netlib.o -o examples/net/net-pong.elf
 #
-# and, for RV64 (the same code here; the driver has what differs), the same as
-#
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/net/pong.S -o pong.s
-#   merlin-as -march=rv64ima_zicsr_zifencei pong.s -o pong.o
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include examples/net/netlib.S -o netlib.s
-#   merlin-as -march=rv64ima_zicsr_zifencei netlib.s -o netlib.o
-#   merlin-ld -T examples/net/link.ld pong.o netlib.o -o examples/net/net-pong-rv64.elf
-#
 # Reference build with LLVM, only for comparison:
-#
-#   clang --target=riscv32 -march=rv32im_zicsr -mabi=ilp32 -mno-relax -nostdlib -static \
-#         -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc -I include \
-#         -T examples/net/link.ld examples/net/pong.S examples/net/netlib.S -o net-pong.elf
-#
-# and for RV64:
 #
 #   clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax \
 #         -nostdlib -static -fuse-ld=lld -Wl,--no-relax,--discard-none -include examples/xcal.inc \
 #         -I include -T examples/net/link.ld examples/net/pong.S examples/net/netlib.S \
-#         -o net-pong-rv64.elf
+#         -o net-pong.elf
 
     .equ FRAME_SIZE,      1536
 
@@ -100,7 +86,7 @@ halt:
 
     .section .rodata
 s_hello_back:   .asciz "Hello back from pong!"
-s_no_card:      .asciz "no network card (try grail --net hub)\n"
+s_no_card:      .asciz "no network card (try grail --bios none --net hub)\n"
 s_wrong_irq:    .asciz "unexpected PLIC source\n"
 s_failed:       .asciz "network error\n"
 

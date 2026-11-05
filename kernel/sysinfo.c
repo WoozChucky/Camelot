@@ -1,7 +1,6 @@
 /* Reading Grail's sysinfo block (spec section 9.5) through sysinfo_regs: its
- * physical address, which is its mapping on RV32 (and RV64's with paging
- * off); on RV64 the fixmap's page from setup_vm() on, then the kernel's
- * ioremap() of it (sysinfo_map()). */
+ * physical address with paging off, the fixmap's page from setup_vm() on,
+ * then the kernel's ioremap() of it (sysinfo_map()). */
 #include "sysinfo.h"
 #include "mmio.h"
 #include "trap.h"
@@ -18,11 +17,7 @@ u32 sysinfo_read(u32 off) {
 }
 
 usize sysinfo_read_reg(u32 off) {
-#if __riscv_xlen == 64
     return mmio_read64(sysinfo_regs + off);
-#else
-    return mmio_read32(sysinfo_regs + off);
-#endif
 }
 
 void sysinfo_check(void) {

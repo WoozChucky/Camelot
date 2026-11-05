@@ -1,9 +1,7 @@
 # Grail's boot ROM, disk part: boots a machine started with no program from its
 # disk 0, like a PC's BIOS loading the master boot record (spec section 7,
-# "Boot from disk"). One source for both widths: Grail puts the build of the
-# machine's width in its ROM (src/boot.rs), diskboot.elf in an RV32 machine's
-# and diskboot-rv64.elf in an RV64 one's. On RV64 what it does is the same,
-# with RV64's registers and devices:
+# "Boot from disk"), with --bios none. Grail puts it in its ROM (src/boot.rs).
+# The machine's registers and devices are RV64's:
 #
 #   * sysinfo's SYS_RAM_SIZE (0x10) and the disk's BLK_CAPACITY, BLK_SECTOR
 #     and BLK_DMA are 64-bit registers (version 2 of the interfaces, spec
@@ -37,26 +35,20 @@
 # Harts other than hart 0 never get here on their own: they wait in the park
 # loop (0x1020) for an IPI and then jump to the entry word. The boot block's
 # program writes its kernel's entry point there before starting it (the word
-# at 0x1010 is the ROM's one writable word, with an 8-byte store on RV64), so
+# at 0x1010 is the ROM's one writable word, a doubleword), so
 # harts woken later go to the kernel. One woken before that comes here, and goes
 # back to the park loop.
 #
-# Grail includes the committed diskboot.elf and diskboot-rv64.elf (src/boot.rs).
-# Rebuild them with our own tools after changing this file, `cargo xtask boot`,
-# which does the same as
+# Grail includes the committed diskboot.elf (src/boot.rs). Rebuild it with
+# our own tools after changing this file, `cargo xtask boot`, which does the
+# same as
 #
 #   merlin -E -I include crates/grail/rom/diskboot.S -o diskboot.s
 #   merlin-as diskboot.s -o diskboot.o
 #   merlin-ld -T crates/grail/rom/link.ld diskboot.o -o crates/grail/rom/diskboot.elf
 #
-# and, for RV64, the same as
-#
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include crates/grail/rom/diskboot.S -o diskboot.s
-#   merlin-as -march=rv64ima_zicsr_zifencei diskboot.s -o diskboot.o
-#   merlin-ld -T crates/grail/rom/link.ld diskboot.o -o crates/grail/rom/diskboot-rv64.elf
-#
-# (`cargo test` checks the committed files are up to date). asm.h is the
-# repository's (include/asm.h), the examples' too: REG_L, REG_S, SZREG, ADDW.
+# (`cargo test` checks the committed file is up to date). asm.h is the
+# repository's (include/asm.h), the examples' too: REG_L, REG_S, SZREG.
 
 #include <asm.h>
 
@@ -71,7 +63,6 @@
 
     .equ UART_BASE,        0x10000000   # THR at +0; THRE is always set
     .equ SYSINFO_BASE,     0x30002000
-#if __riscv_xlen == 64
     .equ SYS_RAM_SIZE,     0x10         # 64-bit
     .equ DISK0,            0x10001000   # disk 0's registers (spec section 9.6)
     .equ BLK_CAPACITY,     0x00         # 64-bit
@@ -81,17 +72,6 @@
     .equ BLK_CMD,          0x20
     .equ BLK_STATUS,       0x24
     .equ BLK_ERROR,        0x28
-#else
-    .equ SYS_RAM_SIZE,     0x0c
-    .equ DISK0,            0x10001000   # disk 0's registers (spec section 9.6)
-    .equ BLK_CAPACITY,     0x00
-    .equ BLK_SECTOR,       0x08
-    .equ BLK_DMA,          0x0c
-    .equ BLK_COUNT,        0x10
-    .equ BLK_CMD,          0x14
-    .equ BLK_STATUS,       0x18
-    .equ BLK_ERROR,        0x1c
-#endif
     .equ CMD_READ,         1
     .equ STATUS_DONE,      2
 
@@ -138,12 +118,12 @@ disk_boot:
     la    a0, s_magic
     bne   t0, t1, fail
 
-    # The checksum: every word of the block, added up, is 0 (mod 2^32: addw on RV64).
+    # The checksum: every word of the block, added up, is 0 (mod 2^32: addw).
     mv    t0, s1
     addi  t2, s1, BOOT_SIZE
     li    t1, 0
 3:  lw    t3, 0(t0)
-    ADDW  t1, t1, t3
+    addw  t1, t1, t3
     addi  t0, t0, 4
     bne   t0, t2, 3b
     la    a0, s_sum
@@ -196,8 +176,8 @@ puts:
     j     1b
 2:  jr    t6
 
-# put_hex(a0): "0x" and XLEN/4 hex digits (8, or 16 on RV64), returns through
-# t6. Clobbers t0-t3.
+# put_hex(a0): "0x" and XLEN/4 hex digits, 16, returns through t6. Clobbers
+# t0-t3.
 put_hex:
     li    t1, UART_BASE
     li    t0, '0'

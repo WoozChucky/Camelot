@@ -40,12 +40,12 @@ struct proc;
 struct thread;
 
 /* What the kernel keeps per hart. `tp` holds the hart's id (its mhartid,
- * set by _start in M-mode and never changed by the kernel; user_vec puts it
- * back after a trap from U-mode, where programs may use tp as they like), so
- * mycpu() is &cpus[tp]. spinlock.S reaches the fields at fixed offsets
- * (CPU_NOFF, CPU_INTENA) and the entries at CPU_SIZE apart, as defined for
- * each width below, which the _Static_asserts check against the
- * structure. */
+ * which the firmware passes in a0, set by _start and secondary_entry and
+ * never changed by the kernel; user_vec puts it back after a trap from
+ * U-mode, where programs may use tp as they like), so mycpu() is &cpus[tp].
+ * spinlock.S reaches the fields at fixed offsets (CPU_NOFF, CPU_INTENA) and
+ * the entries at CPU_SIZE apart, as defined below, which the
+ * _Static_asserts check against the structure. */
 struct cpu {
     /* The process of the thread running on this hart (thread->proc), or
      * NULL while the hart runs the scheduler loop or kmain. */
@@ -81,23 +81,14 @@ struct cpu {
 #endif
 
 /* The layout spinlock.S and the kernel tests (crates/xtask/tests/common)
- * use. RV64's pointers and saved registers are 8 bytes, and the pointers
- * after a u32 start on the next 8-byte boundary. */
-#if __riscv_xlen == 64
+ * use. Pointers and saved registers are 8 bytes, and the pointers after a
+ * u32 start on the next 8-byte boundary. */
 #define CPU_NOFF 8
 #define CPU_INTENA 12
 #define CPU_CONTEXT 24
 #define CPU_PAGETABLE 136
 #define CPU_THREAD 160
 #define CPU_SIZE 168
-#else
-#define CPU_NOFF 4
-#define CPU_INTENA 8
-#define CPU_CONTEXT 16
-#define CPU_PAGETABLE 72
-#define CPU_THREAD 88
-#define CPU_SIZE 92
-#endif
 
 #ifndef __ASSEMBLER__
 _Static_assert(sizeof(struct cpu) == CPU_SIZE, "spinlock.S indexes cpus[] by CPU_SIZE");
@@ -122,7 +113,7 @@ u32 cpuid(void);
 void cpu_init(void);
 
 /* The fields are at fixed offsets (locked at LOCK_LOCKED, 0, cpu at
- * LOCK_CPU: 4 on RV32, 8 on RV64): spinlock.S uses them. */
+ * LOCK_CPU, 8): spinlock.S uses them. */
 struct spinlock {
     /* 0 when free, 1 when held: acquire() swaps a 1 in with amoswap.w. */
     u32 locked;
@@ -134,11 +125,7 @@ struct spinlock {
 #endif
 
 #define LOCK_LOCKED 0
-#if __riscv_xlen == 64
 #define LOCK_CPU 8
-#else
-#define LOCK_CPU 4
-#endif
 
 #ifndef __ASSEMBLER__
 _Static_assert(offsetof(struct spinlock, locked) == LOCK_LOCKED, "spinlock.S swaps locked at LOCK_LOCKED");

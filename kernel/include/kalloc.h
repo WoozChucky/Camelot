@@ -1,35 +1,30 @@
 /* Physical page allocator (spec section 10, "Kernel memory"). Every free 4 KiB
  * page of RAM, all of it but the kernel image's, the firmware's and the
  * device tree's, is on one free list. RAM's base and size come from sysinfo, so the allocator
- * follows Grail's --ram, and so does the firmware's region on RV64.
- * The pages are handed out as kernel pointers: on RV64 their direct-map
- * addresses (va(), vm.h), on RV32 their physical addresses, which the
- * kernel's identity map makes the same. */
+ * follows Grail's --ram, and so does the firmware's region.
+ * The pages are handed out as kernel pointers: their direct-map addresses
+ * (va(), vm.h). */
 #ifndef CAMELOT_KALLOC_H
 #define CAMELOT_KALLOC_H
 
 #include "types.h"
 
-/* RAM as sysinfo reports it (set by kinit), physical. On RV32 ram_base +
- * ram_size is 2^32 with 2 GiB of RAM, which wraps to 0: test
- * `pa - ram_base < ram_size` instead. On RV64 ram_size is what the direct
- * map holds of it. */
+/* RAM as sysinfo reports it (set by kinit), physical: ram_size is what the
+ * direct map holds of it. */
 extern phys_addr_t ram_base;
 extern usize ram_size;
-/* The RAM the firmware keeps (sysinfo's SYS_RESERVED_BASE and _SIZE, RV64
- * only), physical: never handed out. A size of 0 without firmware. */
+/* The RAM the firmware keeps (sysinfo's SYS_RESERVED_BASE and _SIZE),
+ * physical: never handed out. A size of 0 without firmware. */
 extern phys_addr_t reserved_base;
 extern usize reserved_size;
-/* The pages of the device tree the firmware passed (RV64: dtb_early_pa,
- * set by kinit from its header's totalsize), physical: never handed out,
+/* The pages of the device tree the firmware passed (dtb_early_pa, set by
+ * kinit from its header's totalsize), physical: never handed out,
  * as Linux memblock_reserve()s the tree. A size of 0 without one. */
 extern phys_addr_t dtb_base;
 extern usize dtb_size;
-#if __riscv_xlen == 64
 /* The device tree's physical address, the firmware's a1, which _start
  * keeps (entry.S), as Linux's setup_vm() keeps dtb_early_pa. */
 extern phys_addr_t dtb_early_pa;
-#endif
 
 /* A flattened device tree's first word (the Devicetree Specification,
  * chapter 5), big-endian in the tree. */

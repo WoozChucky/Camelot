@@ -30,11 +30,7 @@
 #define UDP_MAX_DATA 1472
 #define TCP_EPHEMERAL_FIRST 49152
 /* The kernel's first page: mapped in every process, but without U. */
-#ifdef _LP64
 #define KERNEL 0xffffffff80000000ul
-#else
-#define KERNEL 0x80000000ul
-#endif
 
 static int checks;
 static int failures;

@@ -423,8 +423,8 @@ int ctx_undefined(const char *name) {
     return i < 0 || !symbols[i].defined;
 }
 
-/* A CSR operand: a name of the width being assembled (csr_parse), or any
- * 12-bit number, on either width, as LLVM takes it. */
+/* A CSR operand: a name (csr_parse), or any 12-bit number, as LLVM takes
+ * it. */
 int ctx_csr(struct expr *e, uint *addr) {
     if (e->kind == E_SYM && csr_parse(e->sym, addr)) {
         return 1;
@@ -1464,8 +1464,9 @@ static int isa_parse(const char *s, uint *bits, struct isa *x) {
     return 1;
 }
 
+/* The base width of merlin-as's ISA: RV64 (isa.rs's BITS). */
 static uint isa_bits(void) {
-    return xlen;
+    return 64;
 }
 
 static void isa_other(const char *directive) {
@@ -1709,8 +1710,7 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
     } else if (strcmp(name, ".size") == 0) {
         /* `.size f, . - f` (merlin's), `.size f, .Lfunc_end0 - f` (clang's)
          * or a constant. Any value is taken, as LLVM takes it, in 64 bits:
-         * an ELF32 st_size keeps its low 32 (clang riscv32 writes 0 for
-         * 0x100000000 and 0xfffffffc for -4), an ELF64 one all of them. */
+         * the ELF64 st_size keeps all of them. */
         char *n = arg_name(args, nargs, 0, ".size");
         if (n != NULL) {
             int ok = nargs > 1 && args[1].kind == DA_EXPR && eval_relative(args[1].e, &v);
@@ -2019,12 +2019,11 @@ static void line_table(void) {
     uint base = section_size(".debug_line");
     uint str_base = section_size(".debug_line_str");
     struct line_table t;
-    /* A code address is as wide as a register: 4 bytes on RV32, 8 on RV64
-     * (DWARF's address_size), relocated by R_RISCV_32 or R_RISCV_64. A
-     * string's offset is a 4-byte DWARF32 field on both (R_RISCV_32, as
-     * clang writes it). */
+    /* A code address is as wide as a register, 8 bytes (DWARF's
+     * address_size), relocated by R_RISCV_64. A string's offset is a 4-byte
+     * DWARF32 field (R_RISCV_32, as clang writes it). */
     dwarf_encode(&file0, files + 1, nfiles > 0 ? nfiles - 1 : 0, rows, nrows, sections, nsections, base, str_base,
-                 xlen / 8, &t);
+                 8, &t);
     int line_sec = append(".debug_line", &t.line);
     int str_sec = append(".debug_line_str", &t.line_str);
     for (uint k = 0; k < t.nfixups; k++) {
@@ -2035,7 +2034,7 @@ static void line_table(void) {
         struct reloc *r = &s->relocs[s->nrelocs++];
         memset(r, 0, sizeof *r);
         r->offset = f->at;
-        r->kind = f->section < 0 || xlen == 32 ? R_RISCV_32 : R_RISCV_64;
+        r->kind = f->section < 0 ? R_RISCV_32 : R_RISCV_64;
         r->symbol = symbol;
         r->addend = f->off;
         r->line = at;

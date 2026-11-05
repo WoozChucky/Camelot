@@ -12,17 +12,10 @@ static void put_number(struct buf *b, uint64_t v, uint base, uint width, int zer
     const char *names = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     char digits[24];
     int n = 0;
-    /* In 64 bits while the value needs them (on RV32 a 64-bit division is a
-     * call to libgcc's routine), in 32 for the rest. */
-    while (v > UINT32_MAX) {
+    do {
         digits[n++] = names[v % base];
         v /= base;
-    }
-    uint w = (uint)v;
-    do {
-        digits[n++] = names[w % base];
-        w /= base;
-    } while (w != 0);
+    } while (v != 0);
     while ((uint)n < width) {
         buf_byte(b, zero ? '0' : ' ');
         width--;
@@ -107,7 +100,7 @@ void die(const char *msg) {
 
 /* An allocator's blocks: each starts with a header, the block before and
  * its own size (struct block), HEADER bytes, which keeps what follows it
- * 8-aligned on both widths. */
+ * 8-aligned. */
 struct pool {
     char *block;
     uint used;

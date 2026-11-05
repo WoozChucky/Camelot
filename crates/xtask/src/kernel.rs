@@ -2,8 +2,8 @@
 //!
 //! Every `*.c`, `*.S` and `*.s` file directly in `kernel/` or in one of its
 //! source subdirectories ([`SUBDIRS`], e.g. `net/arp.c`) is one object (a
-//! `.S` file is assembly that goes through the C preprocessor first, so one
-//! source serves both widths, #193), and so is
+//! `.S` file is assembly that goes through the C preprocessor first, #193),
+//! and so is
 //! [`USERPROGS`], `userprogs.s`: the user programs of `kernel/user/` as data,
 //! which is not a file in `kernel/` but generated at build time
 //! ([`crate::userprogs`]). The objects are linked in name order with
@@ -15,12 +15,9 @@
 //! That is how the committed `kernel/kernel.elf` is made, and `cargo test`
 //! checks it is what the current sources and tools give.
 //!
-//! The same sources, the linker script too, build for both widths while RV32
-//! and RV64 exist side by side (#141): the RV32 kernel (`kernel.elf`:
-//! everything at 0x8000_0000, identity mapped) and the RV64 one
-//! (`kernel-rv64.elf`: a higher-half kernel linked at 0xffff_ffff_8000_0000
-//! and loaded at 0x8020_0000 after the firmware, #154 and #174), which embeds the user programs built for
-//! RV64 (#155, [`crate::userprogs::generated_for`]).
+//! The kernel is a higher-half kernel linked at 0xffff_ffff_8000_0000 and
+//! loaded at 0x8020_0000 after the firmware (#154 and #174), which embeds the
+//! user programs (#155, [`crate::userprogs::generated`]).
 //!
 //! The reference build ([`Toolchain::Clang`], `cargo xtask kernel --cc
 //! clang`) compiles the C with clang `-O2`, assembles with clang (or
@@ -29,49 +26,29 @@
 //! output doesn't depend on where the repository is checked out.
 
 use crate::toolchain;
-pub use crate::toolchain::Xlen;
-use grail::{Machine, RunResult};
+use grail::{Bios, Machine, MachineConfig, RunResult};
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 
-/// Flags shared by every clang invocation: the Excalibur target. No linker
-/// relaxation, since merlin-as and merlin-ld won't do it either.
+/// Flags shared by every clang invocation: the Excalibur target, with the
+/// LP64 ABI. No linker relaxation, since merlin-as and merlin-ld won't do it
+/// either.
 pub const TARGET_FLAGS: &[&str] = &[
-    "--target=riscv32-unknown-elf",
-    "-march=rv32ima_zicsr",
-    "-mabi=ilp32",
-    "-mno-relax",
-];
-
-/// [`TARGET_FLAGS`] for RV64: the LP64 ABI, and `-mcmodel=medany` for the
-/// assembly too, since the kernel runs at its physical address before paging
-/// is on and only pc-relative addressing reaches its symbols there (#154).
-pub const TARGET_FLAGS_RV64: &[&str] = &[
     "--target=riscv64-unknown-elf",
     "-march=rv64ima_zicsr",
     "-mabi=lp64",
     "-mno-relax",
 ];
 
-/// The clang target flags for `xlen`.
-pub fn target_flags(xlen: Xlen) -> &'static [&'static str] {
-    match xlen {
-        Xlen::Rv32 => TARGET_FLAGS,
-        Xlen::Rv64 => TARGET_FLAGS_RV64,
-    }
-}
-
-/// The kernel's widths, in the order `cargo xtask kernel` builds them.
-pub const XLENS: [Xlen; 2] = [Xlen::Rv32, Xlen::Rv64];
-
 /// Extra flags for C files in the reference build: freestanding, no libc
 /// headers, no hidden runtime (stack protector, unwind tables), and no
 /// `.comment` with the clang version. `medany` addresses globals
-/// pc-relatively (`auipc`), which works for a kernel linked at 0x8000_0000
-/// (merlin always does).
+/// pc-relatively (`auipc`): the kernel runs at its physical address before
+/// paging is on, where only pc-relative addressing reaches its symbols (#154),
+/// and merlin always addresses them so.
 pub const C_FLAGS: &[&str] = &[
     "-mcmodel=medany",
     "-std=c11",
@@ -92,17 +69,30 @@ pub const C_FLAGS: &[&str] = &[
     "-Iinclude",
 ];
 
-/// Generous step budget for running the kernel non-interactively. Booting
-/// the kernel to its shell with the default 4 MiB of RAM takes about 16
-/// million steps (36 million with 128 MiB, where nearly all of them go to
-/// putting every page on the free list, mapping RAM page by page, and the
-/// allocator self-test that takes every page and gives it back; merlin does
-/// not optimize, and the clang `-O2` reference build needs far fewer);
-/// mounting the root filesystem and checking that `/bin` holds the kernel's
-/// own programs takes about 30 million more (the disk kernel, which has no
-/// copies to compare, boots from its image in about 18 million all told),
-/// and a few shell commands a few hundred thousand.
+/// Generous step budget for running the kernel non-interactively: booting
+/// it to its shell, mounting the root filesystem and checking that `/bin`
+/// holds the kernel's own programs, and a few shell commands. Nearly all of
+/// the boot goes to putting every page on the free list, mapping RAM and the
+/// allocator self-test that takes every page and gives it back, so it grows
+/// with the RAM; merlin does not optimize, and the clang `-O2` reference
+/// build needs far fewer.
 pub const BOOT_MAX_STEPS: u64 = 200_000_000;
+
+/// The RAM of the machines `cargo xtask kernel --run` and the tests boot the
+/// kernel on: the firmware's 2 MiB at the start of RAM, the image's from
+/// 0x8020_0000, and room for the pages of a few processes.
+pub const RAM_SIZE: usize = 8 << 20;
+
+/// The machine the kernel runs on here: Camelot's firmware (`grail --bios
+/// default`), which starts it in S-mode at 0x8020_0000, and [`RAM_SIZE`] of
+/// RAM.
+pub fn machine_config() -> MachineConfig {
+    MachineConfig {
+        ram_size: RAM_SIZE,
+        bios: Bios::Default,
+        ..MachineConfig::default()
+    }
+}
 
 /// The banner the kernel prints first at boot, before `Camelot vX booting...`
 /// (`banner` in kernel/main.c), as a string literal so tests can `concat!` it
@@ -141,30 +131,24 @@ pub const ASM_INCLUDE_DIRS: &[&str] = &["../include", INCLUDE_DIR];
 /// directory of `-g`): `kernel`, relative to the repository root, so a
 /// debugger run there finds `kernel/main.c`.
 pub const DEBUG_DIR: &str = "kernel";
-/// The kernel's linker script, in the kernel directory: one for both widths,
-/// preprocessed for each ([`linker_script`]), as Linux's `vmlinux.lds.S`.
-/// RV32 links everything at 0x8000_0000; RV64 links high and loads at
-/// 0x8020_0000, after the firmware (`AT`).
+/// The kernel's linker script, in the kernel directory, preprocessed
+/// ([`linker_script`]), as Linux's `vmlinux.lds.S`: it links high and loads
+/// at 0x8020_0000, after the firmware (`AT`).
 pub const SCRIPT: &str = "kernel.lds.S";
 /// The preprocessed script, in the object directory, for ld.lld (and for
 /// reading: merlin-ld links with it in memory).
 pub const SCRIPT_OUT: &str = "kernel.lds";
 
-/// The text of [`SCRIPT`] for `xlen`: `merlin -E -P` (no line markers, which
-/// a linker script can't have) with the assembly's include directories, so
-/// it may include the headers that assembly does.
-pub fn linker_script(kernel_dir: &Path, xlen: Xlen) -> Result<String, String> {
-    toolchain::preprocess_lds(kernel_dir, SCRIPT, ASM_INCLUDE_DIRS, xlen)
+/// The text of [`SCRIPT`]: `merlin -E -P` (no line markers, which a linker
+/// script can't have) with the assembly's include directories, so it may
+/// include the headers that assembly does.
+pub fn linker_script(kernel_dir: &Path) -> Result<String, String> {
+    toolchain::preprocess_lds(kernel_dir, SCRIPT, ASM_INCLUDE_DIRS)
 }
 
-/// Links `inputs` for `xlen` with [`linker_script`] (`what` in errors).
-fn link_kernel(
-    kernel_dir: &Path,
-    xlen: Xlen,
-    inputs: &[merlin_ld::Input],
-    what: &str,
-) -> Result<Vec<u8>, String> {
-    let text = linker_script(kernel_dir, xlen)?;
+/// Links `inputs` with [`linker_script`] (`what` in errors).
+fn link_kernel(kernel_dir: &Path, inputs: &[merlin_ld::Input], what: &str) -> Result<Vec<u8>, String> {
+    let text = linker_script(kernel_dir)?;
     toolchain::link_script(SCRIPT, text, inputs, what, false)
 }
 /// The generated source that holds the user programs
@@ -183,27 +167,6 @@ pub const KERNEL_ELF: &str = "kernel.elf";
 /// The kernel without them ([`disk_kernel`]), in the kernel directory: what a
 /// bootable root image holds (`cargo xtask fs`).
 pub const DISK_KERNEL: &str = "kernel-disk.elf";
-/// The RV64 kernel, in the kernel directory, as the examples name their RV64
-/// executables.
-pub const KERNEL_ELF_RV64: &str = "kernel-rv64.elf";
-/// The RV64 disk kernel.
-pub const DISK_KERNEL_RV64: &str = "kernel-disk-rv64.elf";
-
-/// The kernel's file name for `xlen`.
-pub fn kernel_elf(xlen: Xlen) -> &'static str {
-    match xlen {
-        Xlen::Rv32 => KERNEL_ELF,
-        Xlen::Rv64 => KERNEL_ELF_RV64,
-    }
-}
-
-/// The disk kernel's file name for `xlen`.
-pub fn disk_kernel_elf(xlen: Xlen) -> &'static str {
-    match xlen {
-        Xlen::Rv32 => DISK_KERNEL,
-        Xlen::Rv64 => DISK_KERNEL_RV64,
-    }
-}
 
 /// What assembles the `.s` files in the reference build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,8 +315,6 @@ pub struct Built {
     /// In link order: the sources' name order.
     pub objects: Vec<Object>,
     pub elf: Vec<u8>,
-    /// The width it was built for.
-    pub xlen: Xlen,
 }
 
 /// The text of [`USERPROGS`] for the kernel in `kernel_dir`: every program in
@@ -363,66 +324,46 @@ pub fn userprogs(kernel_dir: &Path) -> Result<String, String> {
     crate::userprogs::generated(&kernel_dir.join(USER_DIR))
 }
 
-/// [`userprogs`] for the `xlen` kernel: on RV64 the programs built for RV64
-/// ([`crate::userprogs::generated_for`]).
-pub fn userprogs_for(kernel_dir: &Path, xlen: Xlen) -> Result<String, String> {
-    match xlen {
-        Xlen::Rv32 => userprogs(kernel_dir),
-        Xlen::Rv64 => crate::userprogs::generated_for(&kernel_dir.join(USER_DIR), xlen),
-    }
-}
-
 /// The assembly merlin-as assembles for the assembly source `source` of the
-/// `xlen` kernel: a `.S` file preprocessed by merlin ([`ASM_INCLUDE_DIRS`]),
-/// a `.s` one as it is.
-pub fn assembly_of(kernel_dir: &Path, source: &Source, xlen: Xlen) -> Result<String, String> {
+/// kernel: a `.S` file preprocessed by merlin ([`ASM_INCLUDE_DIRS`]), a `.s`
+/// one as it is.
+pub fn assembly_of(kernel_dir: &Path, source: &Source) -> Result<String, String> {
     if source.is_preprocessed() {
-        return toolchain::preprocess_asm(kernel_dir, &source.name, ASM_INCLUDE_DIRS, xlen);
+        return toolchain::preprocess_asm(kernel_dir, &source.name, ASM_INCLUDE_DIRS);
     }
     let path = kernel_dir.join(&source.name);
     std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))
 }
 
-/// Builds the RV32 kernel in `kernel_dir` with merlin, merlin-as and
-/// merlin-ld, in memory ([`build_merlin_for`]).
+/// Builds the kernel in `kernel_dir` with merlin, merlin-as and merlin-ld,
+/// in memory: merlin compiles each C file (`-I include`), merlin-as
+/// assembles that and each assembly file (a `.S` one preprocessed by merlin
+/// first), and merlin-ld links the objects in name order with
+/// [`linker_script`]. [`USERPROGS`] is `userprogs` if given (the text of
+/// another build of the programs), or else [`userprogs()`]. No LLVM; nothing
+/// is written.
 pub fn build_merlin(kernel_dir: &Path, userprogs: Option<&str>) -> Result<Built, String> {
-    build_merlin_for(kernel_dir, userprogs, Xlen::Rv32)
-}
-
-/// Builds the `xlen` kernel in `kernel_dir` with merlin, merlin-as and
-/// merlin-ld, in memory: merlin compiles each C file (`-I include`) for
-/// `xlen`, merlin-as assembles that and each assembly file (a `.S` one
-/// preprocessed by merlin first), and merlin-ld links the objects in name
-/// order with [`linker_script`]`(xlen)`. [`USERPROGS`] is `userprogs` if given (the
-/// text of another build of the programs), or else [`userprogs_for`]. No
-/// LLVM; nothing is written.
-pub fn build_merlin_for(kernel_dir: &Path, userprogs: Option<&str>, xlen: Xlen) -> Result<Built, String> {
     let mut objects = Vec::new();
     for source in sources(kernel_dir)? {
         let (asm, obj) = match source.lang {
             Lang::C => {
-                let asm =
-                    toolchain::compile_c_for(kernel_dir, &source.name, &[INCLUDE_DIR], DEBUG_DIR, xlen)?;
-                let obj = toolchain::assemble_for(
-                    &format!("{} (merlin's assembly)", source.asm_name()),
-                    &asm,
-                    xlen,
-                )?;
+                let asm = toolchain::compile_c(kernel_dir, &source.name, &[INCLUDE_DIR], DEBUG_DIR)?;
+                let obj = toolchain::assemble(&format!("{} (merlin's assembly)", source.asm_name()), &asm)?;
                 (Some(asm), obj)
             }
             Lang::Asm if source.is_generated() => {
                 let text = match userprogs {
                     Some(text) => text.to_string(),
-                    None => userprogs_for(kernel_dir, xlen)?,
+                    None => self::userprogs(kernel_dir)?,
                 };
-                (None, toolchain::assemble_for(&source.name, &text, xlen)?)
+                (None, toolchain::assemble(&source.name, &text)?)
             }
             Lang::Asm => {
-                let text = assembly_of(kernel_dir, &source, xlen)?;
+                let text = assembly_of(kernel_dir, &source)?;
                 // A preprocessed source keeps its text, as merlin's assembly
                 // of a C file is kept: what merlin-as saw.
                 let asm = source.is_preprocessed().then(|| text.clone());
-                (asm, toolchain::assemble_for(&source.name, &text, xlen)?)
+                (asm, toolchain::assemble(&source.name, &text)?)
             }
         };
         objects.push(Object { source, asm, obj });
@@ -434,8 +375,8 @@ pub fn build_merlin_for(kernel_dir: &Path, userprogs: Option<&str>, xlen: Xlen) 
             data: o.obj.clone(),
         })
         .collect();
-    let elf = link_kernel(kernel_dir, xlen, &inputs, "the kernel")?;
-    Ok(Built { objects, elf, xlen })
+    let elf = link_kernel(kernel_dir, &inputs, "the kernel")?;
+    Ok(Built { objects, elf })
 }
 
 /// The disk kernel (`kernel/kernel-disk.elf`, [`DISK_KERNEL`]): the objects of
@@ -443,10 +384,10 @@ pub fn build_merlin_for(kernel_dir: &Path, userprogs: Option<&str>, xlen: Xlen) 
 /// that has no programs ([`crate::userprogs::empty`]), so the kernel runs every
 /// program from `/bin` on its root filesystem.
 ///
-/// This is the Linux split: `kernel/kernel.elf` carries its programs, about 1.1 MB
-/// of its 1.4 MB, the way an initramfs carries the programs of a machine with no
-/// root disk; the kernel a bootable image holds (`cargo xtask fs`) does not need
-/// them, since the same programs are in the image's `/bin`, and is a quarter the
+/// This is the Linux split: `kernel/kernel.elf` carries its programs, most of its
+/// size, the way an initramfs carries the programs of a machine with no root
+/// disk; the kernel a bootable image holds (`cargo xtask fs`) does not need them,
+/// since the same programs are in the image's `/bin`, and is a fraction of the
 /// size. Booted with no shell in `/bin` (or with no root filesystem at all) it
 /// panics: there is nothing else to run.
 pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> {
@@ -455,7 +396,7 @@ pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> 
     }
     // The same link, in the same order, with the empty table's object in place
     // of the programs'.
-    let empty = toolchain::assemble_for(USERPROGS, &crate::userprogs::empty(), built.xlen)?;
+    let empty = toolchain::assemble(USERPROGS, &crate::userprogs::empty())?;
     let inputs: Vec<merlin_ld::Input> = built
         .objects
         .iter()
@@ -468,17 +409,14 @@ pub fn disk_kernel(kernel_dir: &Path, built: &Built) -> Result<Vec<u8>, String> 
             },
         })
         .collect();
-    link_kernel(kernel_dir, built.xlen, &inputs, "the disk kernel")
+    link_kernel(kernel_dir, &inputs, "the disk kernel")
 }
 
 /// The disk kernel's path for a kernel written to `out`: `kernel.elf` gives
-/// `kernel-disk.elf` next to it, and `kernel-rv64.elf` `kernel-disk-rv64.elf`.
+/// `kernel-disk.elf` next to it.
 pub fn disk_kernel_path(out: &Path) -> PathBuf {
     let stem = out.file_stem().unwrap_or_default().to_string_lossy();
-    let stem = match stem.strip_suffix("-rv64") {
-        Some(base) => format!("{base}-disk-rv64"),
-        None => format!("{stem}-disk"),
-    };
+    let stem = format!("{stem}-disk");
     let name = match out.extension() {
         Some(ext) => format!("{stem}.{}", ext.to_string_lossy()),
         None => stem,
@@ -505,8 +443,6 @@ pub struct Build {
     pub userprogs: Option<PathBuf>,
     /// Print each command (or its command-line equivalent) before running it.
     pub verbose: bool,
-    /// The width to build for.
-    pub xlen: Xlen,
 }
 
 impl Build {
@@ -531,7 +467,7 @@ impl Build {
 
     /// clang arguments for one source (run with the kernel directory as cwd).
     pub fn compile_args(&self, src: &Source) -> Vec<OsString> {
-        let mut args: Vec<OsString> = target_flags(self.xlen).iter().map(OsString::from).collect();
+        let mut args: Vec<OsString> = TARGET_FLAGS.iter().map(OsString::from).collect();
         if src.lang == Lang::C {
             args.extend(C_FLAGS.iter().map(OsString::from));
         } else if src.is_preprocessed() {
@@ -600,19 +536,15 @@ impl Build {
     /// for ld.lld.
     fn write_script(&self) -> Result<(), String> {
         if self.verbose {
-            let march = match self.xlen {
-                Xlen::Rv32 => "",
-                Xlen::Rv64 => "-march=rv64ima_zicsr_zifencei ",
-            };
             let incs: Vec<String> = ASM_INCLUDE_DIRS.iter().map(|d| format!("-I {d}")).collect();
             eprintln!(
-                "merlin {march}-E -P {} {SCRIPT} -o {}",
+                "merlin -E -P {} {SCRIPT} -o {}",
                 incs.join(" "),
                 self.obj_dir.join(SCRIPT_OUT).display()
             );
         }
         let path = self.kernel_dir.join(&self.obj_dir).join(SCRIPT_OUT);
-        std::fs::write(&path, linker_script(&self.kernel_dir, self.xlen)?)
+        std::fs::write(&path, linker_script(&self.kernel_dir)?)
             .map_err(|e| format!("cannot write {}: {e}", path.display()))
     }
 
@@ -637,12 +569,10 @@ impl Build {
             );
         }
         let user = self.kernel_dir.join(USER_DIR);
-        let programs =
-            crate::userprogs::build_all_for(&user, crate::userprogs::CCompiler::Merlin, self.xlen)?;
-        let text = crate::userprogs::generate_for(
+        let programs = crate::userprogs::build_all_with(&user, crate::userprogs::CCompiler::Merlin)?;
+        let text = crate::userprogs::generate(
             &crate::userprogs::embedded(&programs),
             crate::userprogs::CCompiler::Merlin,
-            self.xlen,
         );
         std::fs::write(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         // The programs with their debug information, for merlin-dbg's
@@ -664,36 +594,20 @@ impl Build {
         if self.verbose {
             // What the same build is from the command line, inside kernel/.
             let obj = |name: String| self.obj_dir.join(name).display().to_string();
-            let march = match self.xlen {
-                Xlen::Rv32 => "",
-                Xlen::Rv64 => "-march=rv64ima_zicsr_zifencei ",
-            };
             for src in sources {
                 let input = self.input(src).to_string_lossy().into_owned();
                 if src.lang == Lang::C {
                     eprintln!(
-                        "merlin {march}-g -fdebug-compilation-dir={DEBUG_DIR} -I {INCLUDE_DIR} {input} -o {}",
+                        "merlin -g -fdebug-compilation-dir={DEBUG_DIR} -I {INCLUDE_DIR} {input} -o {}",
                         obj(src.asm_name())
                     );
-                    eprintln!(
-                        "merlin-as {march}{} -o {}",
-                        obj(src.asm_name()),
-                        obj(src.object_name())
-                    );
+                    eprintln!("merlin-as {} -o {}", obj(src.asm_name()), obj(src.object_name()));
                 } else if src.is_preprocessed() {
                     let incs: Vec<String> = ASM_INCLUDE_DIRS.iter().map(|d| format!("-I {d}")).collect();
-                    eprintln!(
-                        "merlin {march}-E {} {input} -o {}",
-                        incs.join(" "),
-                        obj(src.asm_name())
-                    );
-                    eprintln!(
-                        "merlin-as {march}{} -o {}",
-                        obj(src.asm_name()),
-                        obj(src.object_name())
-                    );
+                    eprintln!("merlin -E {} {input} -o {}", incs.join(" "), obj(src.asm_name()));
+                    eprintln!("merlin-as {} -o {}", obj(src.asm_name()), obj(src.object_name()));
                 } else {
-                    eprintln!("merlin-as {march}{input} -o {}", obj(src.object_name()));
+                    eprintln!("merlin-as {input} -o {}", obj(src.object_name()));
                 }
             }
         }
@@ -708,7 +622,7 @@ impl Build {
                 .collect();
             eprintln!("merlin-ld {}", args.join(" "));
         }
-        let built = build_merlin_for(&self.kernel_dir, userprogs, self.xlen)?;
+        let built = build_merlin(&self.kernel_dir, userprogs)?;
         let write = |path: PathBuf, bytes: &[u8]| {
             std::fs::write(&path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
         };
@@ -737,9 +651,9 @@ impl Build {
         let text = if src.is_generated() {
             std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?
         } else {
-            assembly_of(&self.kernel_dir, src, self.xlen)?
+            assembly_of(&self.kernel_dir, src)?
         };
-        let elf = toolchain::assemble_for(&src.name, &text, self.xlen)?;
+        let elf = toolchain::assemble(&src.name, &text)?;
         let obj = self.kernel_dir.join(&self.obj_dir).join(src.object_name());
         std::fs::write(&obj, elf).map_err(|e| format!("cannot write {}: {e}", obj.display()))
     }
@@ -773,24 +687,13 @@ impl Build {
 /// programs' assembly from clang (`user/`), their `userprogs.s`, the
 /// objects (`obj/`) and `kernel.elf`.
 pub const REFERENCE_DIR: &str = "target/kernel/clang";
-/// Where the RV64 reference build goes.
-pub const REFERENCE_DIR_RV64: &str = "target/kernel/clang/rv64";
-
-/// The reference build's directory for `xlen`.
-pub fn reference_dir(xlen: Xlen) -> &'static str {
-    match xlen {
-        Xlen::Rv32 => REFERENCE_DIR,
-        Xlen::Rv64 => REFERENCE_DIR_RV64,
-    }
-}
 
 /// The reference build (`cargo xtask kernel --cc clang`) of the kernel under
 /// `root`, into `work` (absolute): clang compiles the user programs' C to
 /// assembly, merlin-as and merlin-ld build the programs from it as usual
 /// (into `work/userprogs.s`), then clang compiles
 /// the kernel's C, `assembler` assembles its assembly files and ld.lld links
-/// `out`. Returns `out`. The RV32 kernel; [`build_reference_for`] builds
-/// either.
+/// `out`. Returns `out`.
 pub fn build_reference(
     root: &Path,
     clang: &Path,
@@ -800,31 +703,14 @@ pub fn build_reference(
     out: &Path,
     verbose: bool,
 ) -> Result<PathBuf, String> {
-    build_reference_for(root, clang, lld, assembler, work, out, verbose, Xlen::Rv32)
-}
-
-/// [`build_reference`] for `xlen`: the RV64 kernel is built with
-/// [`TARGET_FLAGS_RV64`], its user programs' C compiled by clang for RV64
-/// too.
-#[allow(clippy::too_many_arguments)]
-pub fn build_reference_for(
-    root: &Path,
-    clang: &Path,
-    lld: &Path,
-    assembler: Assembler,
-    work: &Path,
-    out: &Path,
-    verbose: bool,
-    xlen: Xlen,
-) -> Result<PathBuf, String> {
     use crate::userprogs::{self, CCompiler};
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
     let progs = work.join(USERPROGS);
     let user = userprogs::user_dir(root);
     let asm = work.join("user");
-    userprogs::compile_clang_for(clang, &user, &asm, verbose, xlen)?;
-    let programs = userprogs::build_all_for(&user, CCompiler::Clang(&asm), xlen)?;
-    let text = userprogs::generate_for(&userprogs::embedded(&programs), CCompiler::Clang(&asm), xlen);
+    userprogs::compile_clang(clang, &user, &asm, verbose)?;
+    let programs = userprogs::build_all_with(&user, CCompiler::Clang(&asm))?;
+    let text = userprogs::generate(&userprogs::embedded(&programs), CCompiler::Clang(&asm));
     std::fs::write(&progs, text).map_err(|e| format!("cannot write {}: {e}", progs.display()))?;
     Build {
         kernel_dir: root.join("kernel"),
@@ -837,7 +723,6 @@ pub fn build_reference_for(
         },
         userprogs: Some(progs),
         verbose,
-        xlen,
     }
     .run()
 }
@@ -867,12 +752,12 @@ pub fn typed(bytes: &[u8]) -> Receiver<u8> {
     rx
 }
 
-/// Runs a kernel image on Grail with `input` waiting on the UART (commands
-/// for the shell, which runs until it reads `exit`) and the UART
-/// captured. Returns how it ended and everything it printed (UART and
-/// `xcal.dbg`).
+/// Runs a kernel image on Grail ([`machine_config`]) with `input` waiting on
+/// the UART (commands for the shell, which runs until it reads `exit`) and
+/// the UART captured. Returns how it ended and everything it printed (UART
+/// and `xcal.dbg`).
 pub fn run_on_grail(elf: &[u8], input: &[u8], max_steps: u64) -> Result<(RunResult, String), String> {
-    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::new(machine_config())?;
     m.cpu.bus.uart.capture = true;
     m.load_elf(elf)?;
     m.set_uart_input(typed(input));
@@ -882,7 +767,7 @@ pub fn run_on_grail(elf: &[u8], input: &[u8], max_steps: u64) -> Result<(RunResu
 }
 
 /// What `cargo xtask kernel --run` does once the image is built: boots `elf` on a
-/// default Grail machine for at most `max_steps` steps (`None`: until it halts), with
+/// [`machine_config`] machine for at most `max_steps` steps (`None`: until it halts), with
 /// the UART reading `input` and writing to `uart`, and `xcal.dbg` output going to
 /// `debug`. Returns the result and the machine in its final state.
 pub fn run_with_output(
@@ -892,7 +777,7 @@ pub fn run_with_output(
     uart: impl Write + Send + 'static,
     debug: impl Write + Send + 'static,
 ) -> Result<(RunResult, Machine), String> {
-    let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+    let mut m = Machine::new(machine_config())?;
     m.load_elf(elf)?;
     m.set_uart_input(input);
     m.set_uart_output(uart);
@@ -930,7 +815,6 @@ mod tests {
             },
             userprogs: None,
             verbose: false,
-            xlen: Xlen::Rv32,
         }
     }
 
@@ -1033,7 +917,6 @@ mod tests {
             toolchain: Toolchain::Merlin,
             userprogs: None,
             verbose: false,
-            xlen: Xlen::Rv32,
         };
         assert_eq!(b.run().unwrap(), b.out);
         let elf = std::fs::read(&b.out).unwrap();
@@ -1043,13 +926,14 @@ mod tests {
         // (`user_program_count` 0 where the full kernel has them all).
         let disk = std::fs::read(dir.join("out").join("kernel-disk.elf")).unwrap();
         let programs = |elf: &[u8]| {
-            let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+            let mut m = Machine::new(machine_config()).unwrap();
             m.load_elf(elf).unwrap();
+            // A link address in the upper half, loaded 0x8020_0000 on.
             let at = grail::elf::parse(elf)
                 .unwrap()
                 .symbol("user_program_count")
                 .unwrap();
-            m.cpu.bus.peek(at).unwrap()
+            m.cpu.bus.peek(at - 0xffff_ffff_8000_0000 + 0x8020_0000).unwrap()
         };
         assert!(programs(&elf) > 0);
         assert_eq!(programs(&disk), 0);
@@ -1125,9 +1009,9 @@ mod tests {
             lang: Lang::C,
         }));
         for flag in [
-            "--target=riscv32-unknown-elf",
-            "-march=rv32ima_zicsr",
-            "-mabi=ilp32",
+            "--target=riscv64-unknown-elf",
+            "-march=rv64ima_zicsr",
+            "-mabi=lp64",
             "-mno-relax",
             "-ffreestanding",
             "-nostdinc",
@@ -1191,7 +1075,6 @@ mod tests {
         let built = Built {
             objects: Vec::new(),
             elf: Vec::new(),
-            xlen: Xlen::Rv32,
         };
         let err = disk_kernel(Path::new("kernel"), &built).unwrap_err();
         assert!(err.contains("no userprogs.s"), "{err}");

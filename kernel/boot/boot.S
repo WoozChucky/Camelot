@@ -3,24 +3,16 @@
 # --boot --kernel` stored on the disk right after the filesystem, and starts it
 # as Grail's boot ROM would have started it from an ELF file.
 #
-# RV32: Grail's boot ROM reads this block (sectors 0 and 1 of disk 0) into the
-# last 64 KiB of RAM, checks its signature and checksum, and jumps to its first
-# byte in M-mode with (spec section 7, "Boot from disk"):
-#
-#   a0 = 0, the hart id
-#   a1 = the sysinfo block (0x3000_2000)
-#   a2 = the registers of the disk it was read from
-#   mtvec = the ROM's trap handler, which reports any trap and stops
-#
-# RV64: the firmware does that (spec section 7, "Firmware"), and this block is
-# its next stage: it runs at 0x8020_0000 in S-mode with paging off, which
-# reaches the disk and the UART at their physical addresses, with
+# The firmware reads this block (sectors 0 and 1 of disk 0), checks its
+# signature and checksum (spec section 7, "Firmware"), and starts it as its
+# next stage: it runs at 0x8020_0000 in S-mode with paging off, which reaches
+# the disk and the UART at their physical addresses, with
 #
 #   a0 = 0, the hart id
 #   a1 = the device tree's physical address
 #   a2 = the registers of the disk it was read from
 #
-# 0x8020_0000 is where the RV64 kernel loads, so the block first moves itself
+# 0x8020_0000 is where the kernel loads, so the block first moves itself
 # out of the way, as a PC's boot sector moves itself out of 0x7c00: to the 64
 # KiB below the device tree, which Grail puts near the end of RAM, at the last
 # 2 MiB boundary that leaves it room (QEMU's place), and goes on there. The
@@ -43,13 +35,11 @@
 # The steps:
 #
 #   1. read the kernel's first 1 KiB, which must hold its ELF header and its
-#      program headers, and check it is an Excalibur executable of this
-#      bootloader's width (ELF32 on RV32, ELF64 on RV64; little-endian,
-#      RISC-V, ET_EXEC);
-#   2. for each PT_LOAD segment: check it lies in free RAM (from the start of
-#      RAM on RV32, from 0x8020_0000, after the firmware's 2 MiB, on RV64) below
-#      this block and in the
-#      kernel's sectors, read its whole sectors straight to p_paddr with the
+#      program headers, and check it is an Excalibur executable (ELF64,
+#      little-endian, RISC-V, ET_EXEC);
+#   2. for each PT_LOAD segment: check it lies in free RAM (from 0x8020_0000,
+#      after the firmware's 2 MiB) below this block and in the kernel's
+#      sectors, read its whole sectors straight to p_paddr with the
 #      disk's DMA, its last partial sector through a buffer (so nothing past
 #      p_filesz is written), and zero the rest up to p_memsz (.bss). A segment
 #      with file bytes must start at a multiple of 512 in the file, as merlin-ld
@@ -57,28 +47,22 @@
 #      (p_filesz 0) reads nothing, so its offset does not matter;
 #   3. find the entry point's load address: e_entry is a link address, in one
 #      of the segments, so its load address is that segment's p_paddr plus
-#      its distance from p_vaddr (the RV64 kernel is linked at
+#      its distance from p_vaddr (the kernel is linked at
 #      0xffff_ffff_8000_0000 and loaded at 0x8020_0000, and starts with
-#      paging off; on RV32 the two are the same);
-#   4. RV32: write it to the ROM's entry word (0x1010), so that harts the
-#      kernel wakes later with an IPI jump to it from the park loop, as after
-#      an ELF boot. RV64 has nothing to write: the kernel starts the other
+#      paging off). Nothing needs it written: the kernel starts the other
 #      harts through the firmware's SBI (HSM hart_start);
-#   5. jump to it with a0 = 0 and a1 = the sysinfo block (RV32) or the device
-#      tree (RV64, a1 as the firmware gave it), in the mode this block runs in.
+#   4. jump to it with a0 = 0 and a1 = the device tree, a1 as the firmware
+#      gave it, in S-mode.
 #
 # A failure prints "boot: <why>" on the UART and stops the machine with exit
-# code 0xfc. No stack: the calls are leaf calls, and the steps keep their state
-# in s0-s11, the disk's registers in a2.
+# code 0xfc, through the SBI's system_reset (this block runs in S-mode, where
+# xcal.halt is illegal). No stack: the calls are leaf calls, and the steps
+# keep their state in s0-s11, the disk's registers in a2.
 #
-# One source for both widths (#193): <asm.h> names what differs (REG_L,
-# REG_S, LWU), and #if __riscv_xlen marks the layouts that do (ELF32 and
-# ELF64 headers; version 1 and 2 of the disk's registers, spec section 9.6)
-# and the RV64 block's place as the firmware's next stage. The firmware runs
-# the RV64 boot block, so a disk's bootloader is of its machine's width, and
-# so is the kernel it loads. RAM_BASE and FW_JUMP_ADDR are loaded with li,
-# which gives 0x8000_0000 itself on RV64 (lui alone would sign-extend it to
-# 0xffff_ffff_8000_0000).
+# <asm.h> names the register-wide loads and stores (REG_L, REG_S), as
+# Linux's assembly does. FW_JUMP_ADDR is loaded with li, which gives
+# 0x8020_0000 itself (lui alone would sign-extend it to
+# 0xffff_ffff_8020_0000).
 #
 # Built with our own tools by `cargo xtask boot`, which does the same as
 #
@@ -86,24 +70,21 @@
 #   merlin-as boot.s -o boot.o
 #   merlin-ld -T kernel/boot/link.ld boot.o -o kernel/boot/boot.elf
 #
-# and for RV64
-#
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include kernel/boot/boot.S -o boot.s
-#   merlin-as -march=rv64ima_zicsr_zifencei boot.s -o boot.o
-#   merlin-ld -T kernel/boot/link.ld boot.o -o kernel/boot/boot-rv64.elf
-#
-# (`cargo test` checks both are up to date).
+# (`cargo test` checks it is up to date).
 
 #include <asm.h>
 
-    .equ RAM_BASE,         0x80000000
-    .equ SYSINFO_BASE,     0x30002000
     .equ UART_BASE,        0x10000000
-    .equ BOOT_ENTRY,       0x1010       # the boot ROM's entry word
-    .equ FW_JUMP_ADDR,     0x80200000   # RV64: the firmware's next stage, here
+    .equ FW_JUMP_ADDR,     0x80200000   # the firmware's next stage, here
     .equ BOOT_AREA,        0x10000      # the 64 KiB this block may use
     .equ BOOT_SIZE,        1024         # the block
     .equ EXIT_BOOT_FAILED, 0xfc
+    # The SBI's system_reset (SRST): a shutdown whose reason Camelot's SBI
+    # makes the exit code, 0xE000_0000 | code (kernel/include/sbi.h). The
+    # reason is a uint32_t, of which the SBI takes a1's low 32 bits: written
+    # sign-extended here, -0x2000_0000, li makes it in two instructions.
+    .equ SBI_EXT_SRST,     0x53525354
+    .equ SBI_SRST_REASON,  -0x20000000
 
     # This block, as mkfs fills it in.
     .equ KERNEL_SECTOR,    1008
@@ -114,34 +95,24 @@
     .equ HEADERS_SIZE,     0x400
     .equ SECTOR_SIZE,      512
 
-    # The disk's registers (spec section 9.6): version 2 on RV64, with the
-    # 64-bit BLK_SECTOR and BLK_DMA; version 1 on RV32.
-#if __riscv_xlen == 64
+    # The disk's registers (spec section 9.6), with the 64-bit BLK_SECTOR
+    # and BLK_DMA.
     .equ BLK_SECTOR,       0x08         # 64-bit
     .equ BLK_DMA,          0x10         # 64-bit
     .equ BLK_COUNT,        0x18
     .equ BLK_CMD,          0x20
     .equ BLK_STATUS,       0x24
     .equ BLK_ERROR,        0x28
-#else
-    .equ BLK_SECTOR,       0x08
-    .equ BLK_DMA,          0x0c
-    .equ BLK_COUNT,        0x10
-    .equ BLK_CMD,          0x14
-    .equ BLK_STATUS,       0x18
-    .equ BLK_ERROR,        0x1c
-#endif
     .equ CMD_READ,         1
     .equ STATUS_DONE,      2
 
-    # The ELF header's fields and a program header's: ELF64's on RV64, where
-    # the addresses and sizes are 8 bytes (REG_L), ELF32's on RV32.
+    # The ELF header's fields and a program header's: ELF64's, where the
+    # addresses and sizes are 8 bytes (REG_L).
     .equ ELF_MAGIC,        0x464c457f   # "\x7fELF"
     .equ EI_CLASS,         4            # with EI_DATA: class, 1 (little-endian)
     .equ E_TYPE,           16           # with e_machine: ET_EXEC (2), EM_RISCV (243)
     .equ ELF_EXEC_RISCV,   0x00f30002
     .equ E_ENTRY,          24
-#if __riscv_xlen == 64
     .equ ELF_CLASS_DATA,   0x0102       # ELFCLASS64
     .equ E_PHOFF,          32
     .equ E_PHENTSIZE,      54
@@ -153,26 +124,12 @@
     .equ P_PADDR,          24
     .equ P_FILESZ,         32
     .equ P_MEMSZ,          40
-#else
-    .equ ELF_CLASS_DATA,   0x0101       # ELFCLASS32
-    .equ E_PHOFF,          28
-    .equ E_PHENTSIZE,      42
-    .equ E_PHNUM,          44
-    .equ PHDR_SIZE,        32
-    .equ P_TYPE,           0
-    .equ P_OFFSET,         4
-    .equ P_VADDR,          8
-    .equ P_PADDR,          12
-    .equ P_FILESZ,         16
-    .equ P_MEMSZ,          20
-#endif
     .equ PT_LOAD,          1
 
     .text
     .globl _start
 _start:
     auipc s0, 0                         # s0 = this block
-#if __riscv_xlen == 64
     # Out of the kernel's way, to the 64 KiB below the device tree: copy the
     # whole block there a doubleword at a time, mkfs's words included, and go
     # on in the copy, at its `moved` (a label's offset in the block is its
@@ -189,9 +146,8 @@ _start:
     fence.i                             # the copy is code now
     jalr  zero, %lo(moved)(s0)
 moved:
-#endif
-    LWU   s2, KERNEL_SECTOR(s0)         # s2 = the kernel's first sector
-    LWU   s3, KERNEL_SECTORS(s0)
+    lwu   s2, KERNEL_SECTOR(s0)         # s2 = the kernel's first sector
+    lwu   s3, KERNEL_SECTORS(s0)
     addi  a0, s0, %lo(s_none)
     beqz  s3, fail
     slli  s3, s3, 9                     # s3 = the kernel's length in bytes
@@ -200,8 +156,6 @@ moved:
     jal   puts
     mv    a0, s2
     jal   put_hex
-    addi  a0, s0, %lo(s_newline)
-    jal   puts
 
     # 1. The headers.
     mv    a3, s2
@@ -254,11 +208,7 @@ segment:
     REG_S t1, E_ENTRY(s4)
 5:  addi  a0, s0, %lo(s_place)         # free RAM <= paddr <= paddr + memsz <= s0
     bltu  s10, s9, fail
-#if __riscv_xlen == 64
     li    t1, FW_JUMP_ADDR              # the firmware's RAM is below it
-#else
-    li    t1, RAM_BASE
-#endif
     bltu  s8, t1, fail
     add   t0, s8, s10
     bltu  t0, s8, fail
@@ -310,15 +260,10 @@ next_segment:
     addi  s6, s6, -1
     j     segment
 
-    # 4 and 5.
+    # 4.
 start_kernel:
     REG_L t0, E_ENTRY(s4)
-#if __riscv_xlen == 32
-    li    t1, BOOT_ENTRY
-    REG_S t0, 0(t1)
-    li    a1, SYSINFO_BASE
-#endif
-    li    a0, 0                         # RV64: a1 is still the device tree
+    li    a0, 0                         # a1 is still the device tree
     fence.i                             # the segments are code now
     jr    t0
 
@@ -333,8 +278,7 @@ read:
 1:  lw    t0, BLK_STATUS(a2)
     andi  t0, t0, STATUS_DONE
     beqz  t0, 1b
-    li    t0, STATUS_DONE
-    sw    t0, BLK_STATUS(a2)
+    sw    t0, BLK_STATUS(a2)            # t0 = STATUS_DONE: clears it
     lw    t0, BLK_ERROR(a2)
     bnez  t0, 2f
     ret
@@ -345,11 +289,10 @@ read:
     jal   puts
     mv    a0, s11
     jal   put_hex
-    addi  a0, s0, %lo(s_newline)
-    jal   puts
     j     halt
 
-# Prints "boot: " and the message at a0, then stops the machine.
+# Prints "boot: " and the message at a0, then stops the machine: the SBI's
+# system_reset(SHUTDOWN, reason 0xE000_0000 | EXIT_BOOT_FAILED).
 fail:
     mv    s11, a0
     addi  a0, s0, %lo(s_prefix)
@@ -357,8 +300,11 @@ fail:
     mv    a0, s11
     jal   puts
 halt:
-    li    a0, EXIT_BOOT_FAILED
-    xcal.halt a0
+    li    a7, SBI_EXT_SRST
+    li    a6, 0                         # system_reset
+    li    a0, 0                         # SHUTDOWN
+    li    a1, SBI_SRST_REASON | EXIT_BOOT_FAILED
+    ecall
     j     halt
 
 # puts(a0 = NUL-terminated string). Clobbers a0, t0, t1.
@@ -371,13 +317,10 @@ puts:
     j     1b
 2:  ret
 
-# put_hex(a0): "0x" and eight hex digits. Clobbers t0-t3.
+# put_hex(a0): eight hex digits and a newline (the "0x" before them is the
+# message's). Clobbers t0-t3.
 put_hex:
     li    t1, UART_BASE
-    li    t0, '0'
-    sb    t0, 0(t1)
-    li    t0, 'x'
-    sb    t0, 0(t1)
     li    t2, 28                        # shift of the next digit
 1:  srl   t0, a0, t2
     andi  t0, t0, 15
@@ -388,15 +331,16 @@ put_hex:
     sb    t0, 0(t1)
     addi  t2, t2, -4
     bgez  t2, 1b
+    li    t0, '\n'
+    sb    t0, 0(t1)
     ret
 
-s_loading: .asciz "boot: kernel at sector "
+s_loading: .asciz "boot: kernel at sector 0x"
 s_prefix:  .asciz "boot: "
 s_none:    .asciz "no kernel on this disk\n"
-s_read:    .asciz "disk read error "
+s_read:    .asciz "disk read error 0x"
 s_elf:     .asciz "the kernel is not an Excalibur ELF executable\n"
 s_phdrs:   .asciz "the kernel's program headers are past its first 1 KiB\n"
 s_align:   .asciz "a kernel segment is not at a sector boundary\n"
 s_short:   .asciz "a kernel segment runs past the end of the kernel\n"
 s_place:   .asciz "a kernel segment is not in free RAM\n"
-s_newline: .asciz "\n"

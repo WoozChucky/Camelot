@@ -2,14 +2,11 @@
 //!
 //! 1. **Build** ([`build`]): the platform's binaries in release mode
 //!    (`cargo build --release -p lake -p avalon -p pendragon -p round-table -p herald`),
-//!    and the bootable Camelot root images, RV32's and RV64's, as `cargo xtask fs`
-//!    builds them (`target/camelot-fs.img`, `target/camelot-fs-rv64.img`).
-//!    `--no-build` skips both and uses what is there.
+//!    and the bootable Camelot root image, as `cargo xtask fs` builds it
+//!    (`target/camelot-fs.img`). `--no-build` skips both and uses what is there.
 //! 2. **Seed** ([`seed`]): Lake's images directory (`target/platform/images` by
-//!    default) gets the root images as the disks `os-base` and `os-base-rv64`, the
-//!    images an RV32 and an RV64 Camelot VM's disk is a copy of
-//!    (`avalon_client::base_image`): one per width while both exist (#159), since a
-//!    boot block runs on the boot ROM of one width. Each is written when it is
+//!    default) gets the root image as the disk `os-base`, the image a Camelot VM's
+//!    disk is a copy of (`avalon_client::BASE_IMAGE`). It is written when it is
 //!    missing and replaced when it differs from the one just built; nothing else in
 //!    the directory is touched.
 //! 3. **Start** ([`Platform::start`]): Lake, Avalon and Pendragon, as child processes
@@ -21,7 +18,8 @@
 //!    ([`reachable`]): that is the address Pendragon, the demo and the summary use,
 //!    since Windows refuses to connect to an unspecified address.
 //! 4. **Demo** (`--demo`, [`Platform::demo`]): a switch `nat` with a NAT gateway, and a
-//!    VM `vm001` with the default hardware (4 MiB of RAM) that boots from `vm001-disk0`,
+//!    VM `vm001` with a Camelot VM's hardware (Camelot's firmware and 6 MiB of RAM,
+//!    `avalon_client::CAMELOT_RAM`) that boots from `vm001-disk0`,
 //!    its own copy of the image, plugged into it and started. The gateway forwards
 //!    127.0.0.1:2323 (`--shd`) to the VM's port 23, and once the VM is at its prompt,
 //!    `up` types `shd &` on its console: the shell server, which gives each connection
@@ -40,10 +38,12 @@
 //! already, and a VM keeps nothing that is not on its disks, so stopping a server
 //! loses nothing.
 
-use avalon_client::{base_image, create_camelot_vm, vm_disk, CamelotError, Client, BASE_IMAGE};
+use avalon_client::{
+    camelot_bios, create_camelot_vm, vm_disk, CamelotError, Client, BASE_IMAGE, CAMELOT_RAM,
+};
 use avalon_proto::{
     DeviceSpec, DiskSource, DiskSpec, ErrorCode, FwdProto, HardwareProfile, Message, NatConfig, NetSpec,
-    PortForward, VmRef, Xlen,
+    PortForward, VmRef,
 };
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpStream};
@@ -62,11 +62,6 @@ pub const SERVERS: [&str; 3] = ["lake", "avalon", "pendragon"];
 /// The binaries `up` builds: the servers, and the clients its summary tells you to
 /// use.
 pub const BINARIES: [&str; 5] = ["lake", "avalon", "pendragon", "round-table", "herald"];
-
-/// The widths `up` has a root image of, each seeded as its base image
-/// (`avalon_client::base_image`): RV32's `os-base` and RV64's `os-base-rv64`, until
-/// #159 leaves RV64 alone.
-pub const WIDTHS: [Xlen; 2] = [Xlen::Rv32, Xlen::Rv64];
 
 /// Where each server listens by default: the platform's default addresses.
 pub const DEFAULT_LAKE: &str = avalon_proto::DEFAULT_LAKE_ADDR;
@@ -100,21 +95,19 @@ pub const INTERRUPTED: &str = "interrupted";
 
 pub const USAGE: &str = "usage: cargo xtask up [options]
 
-Brings the Avalon platform up: builds it, puts the Camelot root images in Lake's
-images directory as the images os-base (RV32) and os-base-rv64 (RV64), and runs
-Lake, Avalon and Pendragon until Ctrl-C (or until one of them ends), their output
-prefixed by server.
+Brings the Avalon platform up: builds it, puts the Camelot root image in Lake's
+images directory as the image os-base, and runs Lake, Avalon and Pendragon until
+Ctrl-C (or until one of them ends), their output prefixed by server.
 
   --images DIR       Lake's images directory (default target/platform/images).
-                     Only the images os-base and os-base-rv64 are written there:
-                     created when missing, replaced when the build has changed
-                     them
+                     Only the image os-base is written there: created when
+                     missing, replaced when the build has changed it
   --lake ADDR        where Lake listens (default 127.0.0.1:7401)
   --avalon ADDR      where Avalon listens (default 127.0.0.1:7400)
   --pendragon ADDR   where Pendragon serves its page (default 127.0.0.1:7402)
                      ADDR is host:port, or a host alone for the default port
-  --no-build         use the binaries and the images already built
-                     (target/camelot-fs.img, target/camelot-fs-rv64.img)
+  --no-build         use the binaries and the image already built
+                     (target/camelot-fs.img)
   --demo             also create a switch nat with a NAT gateway and a VM vm001
                      that boots from its own copy of the image, vm001-disk0,
                      plugged into it, and start it, with shd, its shell server,
@@ -131,10 +124,8 @@ pub struct Options {
     pub root: PathBuf,
     /// Where the built binaries are (`target/release`).
     pub bin_dir: PathBuf,
-    /// The bootable RV32 root image, as `cargo xtask fs` writes it.
+    /// The bootable root image, as `cargo xtask fs` writes it.
     pub image: PathBuf,
-    /// The bootable RV64 root image, as `cargo xtask fs --xlen 64` writes it.
-    pub image_rv64: PathBuf,
     /// Lake's images directory.
     pub images: PathBuf,
     pub lake: SocketAddr,
@@ -157,8 +148,7 @@ impl Options {
         Options {
             root: root.to_path_buf(),
             bin_dir: target.join("release"),
-            image: crate::fs::default_out_for(root, crate::toolchain::Xlen::Rv32),
-            image_rv64: crate::fs::default_out_for(root, crate::toolchain::Xlen::Rv64),
+            image: crate::fs::default_out(root),
             images: DEFAULT_IMAGES
                 .split('/')
                 .fold(root.to_path_buf(), |path, part| path.join(part)),
@@ -175,15 +165,6 @@ impl Options {
     pub fn binary(&self, name: &str) -> PathBuf {
         self.bin_dir
             .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
-    }
-
-    /// Where the root image of width `xlen` is: [`Options::image`] or
-    /// [`Options::image_rv64`].
-    pub fn image_for(&self, xlen: Xlen) -> &Path {
-        match xlen {
-            Xlen::Rv32 => &self.image,
-            Xlen::Rv64 => &self.image_rv64,
-        }
     }
 }
 
@@ -223,18 +204,10 @@ pub type Log<'a> = &'a mut dyn FnMut(&str);
 
 // ---- Build and seed ----
 
-/// The bootable root images [`build`] makes, one per width ([`WIDTHS`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RootImages {
-    pub rv32: Vec<u8>,
-    pub rv64: Vec<u8>,
-}
-
 /// Builds the binaries (`cargo build --release -p ...`, its output on this process's
-/// stderr) and the bootable root images, RV32's written to `options.image` and RV64's
-/// to `options.image_rv64`, as `cargo xtask fs` and `cargo xtask fs --xlen 64` build
-/// them. Returns the images.
-pub fn build(options: &Options, log: Log) -> Result<RootImages, String> {
+/// stderr) and the bootable root image, written to `options.image` as `cargo xtask
+/// fs` builds it. Returns the image.
+pub fn build(options: &Options, log: Log) -> Result<Vec<u8>, String> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(&options.root).args(["build", "--release"]);
@@ -252,24 +225,14 @@ pub fn build(options: &Options, log: Log) -> Result<RootImages, String> {
     if !status.success() {
         return Err(format!("cargo build failed ({status})"));
     }
-    let mut built = Vec::new();
-    for xlen in WIDTHS {
-        let path = options.image_for(xlen);
-        log(&format!("up: building the {xlen} root image {}", path.display()));
-        let width = match xlen {
-            Xlen::Rv32 => crate::toolchain::Xlen::Rv32,
-            Xlen::Rv64 => crate::toolchain::Xlen::Rv64,
-        };
-        let image = crate::fs::build_bootable_for(&options.root, crate::fs::IMAGE_SIZE, width)?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        }
-        std::fs::write(path, &image).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-        built.push(image);
+    let path = &options.image;
+    log(&format!("up: building the root image {}", path.display()));
+    let image = crate::fs::build_bootable(&options.root, crate::fs::IMAGE_SIZE)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    let rv64 = built.pop().expect("both widths were built");
-    let rv32 = built.pop().expect("both widths were built");
-    Ok(RootImages { rv32, rv64 })
+    std::fs::write(path, &image).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(image)
 }
 
 /// What [`seed`] did with a base image.
@@ -282,7 +245,7 @@ pub enum Seeded {
 }
 
 /// Puts `image` in the images directory `dir` (created if needed) as the disk
-/// `name` (a base image: [`BASE_IMAGE`], or RV64's), unless it is there already. The
+/// `name` (the base image, [`BASE_IMAGE`]), unless it is there already. The
 /// new contents go to a file whose name is not a disk name and are renamed into
 /// place, so Lake never sees half an image. Nothing else in the directory is touched.
 pub fn seed(dir: &Path, name: &str, image: &[u8]) -> io::Result<Seeded> {
@@ -302,31 +265,29 @@ pub fn seed(dir: &Path, name: &str, image: &[u8]) -> io::Result<Seeded> {
     Ok(seeded)
 }
 
-/// The root images to seed, by width ([`WIDTHS`]): the ones just built, or with
-/// `--no-build` the ones at `options.image` and `options.image_rv64`, each if it is
-/// there (`None`: leave that base image in the images directory as it is).
-fn images_to_seed(options: &Options, log: Log) -> Result<[Option<Vec<u8>>; 2], String> {
+/// The root image to seed: the one just built, or with `--no-build` the one at
+/// `options.image` if it is there (`None`: leave the base image in the images
+/// directory as it is).
+fn image_to_seed(options: &Options, log: Log) -> Result<Option<Vec<u8>>, String> {
     if options.build {
-        let built = build(options, log)?;
-        return Ok([Some(built.rv32), Some(built.rv64)]);
+        return build(options, log).map(Some);
     }
-    let read = |path: &Path| match std::fs::read(path) {
+    match std::fs::read(&options.image) {
         Ok(image) => Ok(Some(image)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-    };
-    Ok([read(&options.image)?, read(&options.image_rv64)?])
+        Err(e) => Err(format!("cannot read {}: {e}", options.image.display())),
+    }
 }
 
-/// Builds (unless `--no-build`) and seeds the images directory with the base image
-/// of each width; with `--no-build`, checks that the binaries are there and that Lake
-/// will have an image of each width to copy.
+/// Builds (unless `--no-build`) and seeds the images directory with the base
+/// image; with `--no-build`, checks that the binaries are there and that Lake will
+/// have the image to copy.
 ///
-/// With `--demo`, when the RV32 image has just been replaced and the demo VM's disk
-/// is there from an earlier run, says that the disk is a copy of the old image: the
+/// With `--demo`, when the image has just been replaced and the demo VM's disk is
+/// there from an earlier run, says that the disk is a copy of the old image: the
 /// demo boots from it as it is (with what the VM wrote to it), not from the new build.
 pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
-    let images = images_to_seed(options, log)?;
+    let image = image_to_seed(options, log)?;
     for name in SERVERS {
         let path = options.binary(name);
         if !path.is_file() {
@@ -336,16 +297,7 @@ pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
             ));
         }
     }
-    for (xlen, image) in WIDTHS.into_iter().zip(images) {
-        seed_width(options, xlen, image, log)?;
-    }
-    Ok(())
-}
-
-/// Seeds the base image of width `xlen` with `image` (`None`: the one already in the
-/// images directory, which must be there), and says what it did.
-fn seed_width(options: &Options, xlen: Xlen, image: Option<Vec<u8>>, log: Log) -> Result<(), String> {
-    let name = base_image(xlen);
+    let name = BASE_IMAGE;
     let base = options.images.join(name);
     match image {
         Some(image) => {
@@ -360,9 +312,8 @@ fn seed_width(options: &Options, xlen: Xlen, image: Option<Vec<u8>>, log: Log) -
                 "up: image {name} in {}: {what}",
                 options.images.display()
             ));
-            // The demo VM is RV32: a copy of BASE_IMAGE.
             let demo_disk = options.images.join(vm_disk(DEMO_VM));
-            if xlen == Xlen::Rv32 && seeded == Seeded::Replaced && options.demo && demo_disk.is_file() {
+            if seeded == Seeded::Replaced && options.demo && demo_disk.is_file() {
                 log(&format!(
                     "up: note: the demo VM's disk {} is a copy of the image {BASE_IMAGE} from \
                      before this build, and the demo boots it as it is; to boot the new build, \
@@ -377,7 +328,7 @@ fn seed_width(options: &Options, xlen: Xlen, image: Option<Vec<u8>>, log: Log) -
             return Err(format!(
                 "there is no {} to put in {} as the image {name}: run cargo xtask up without \
                  --no-build",
-                options.image_for(xlen).display(),
+                options.image.display(),
                 options.images.display()
             ))
         }
@@ -707,7 +658,11 @@ impl Platform {
             .flat_map(|nat| &nat.hostfwd)
             .find(|f| f.proto == FwdProto::Tcp && f.guest == DEMO_GUEST)
             .map(|f| reachable(SocketAddr::V4(f.host)));
+        // A Camelot VM's hardware, as round-table's --camelot makes it: the firmware
+        // the boot block runs on, and RAM for it and the kernel.
         let profile = HardwareProfile {
+            ram_size: CAMELOT_RAM,
+            bios: camelot_bios(),
             devices: vec![DeviceSpec::Net(NetSpec {
                 switch: Some(DEMO_SWITCH.into()),
                 mac: None,
@@ -787,11 +742,8 @@ impl Platform {
             "\nThe Avalon platform is up.\n\
              \n  Pendragon  {}\n             open it in a browser (the token changes at every launch)\
              \n  Avalon     {}\n  Lake       {}, images in {}\n\
-             \nFrom another terminal: a Camelot VM of your own (RV32, or RV64), the list of VMs, a VM's \
-             console\n\
+             \nFrom another terminal: a Camelot VM of your own, the list of VMs, a VM's console\n\
              \x20 cargo run --release -p round-table -- {server}{lake}create --name web --camelot --start\n\
-             \x20 cargo run --release -p round-table -- {server}{lake}create --name web64 --camelot --xlen 64 \
-             --start\n\
              \x20 cargo run --release -p round-table -- {server}list\n\
              \x20 cargo run --release -p herald -- {server}{vm}      (Ctrl-] detaches)\n\
              {shell}\
@@ -1255,8 +1207,6 @@ mod tests {
         assert!(o.build && !o.demo);
         assert_eq!(o.shd.to_string(), "127.0.0.1:2323");
         assert_eq!(o.image, root.join("target/camelot-fs.img"));
-        assert_eq!(o.image_rv64, root.join("target/camelot-fs-rv64.img"));
-        assert_eq!(o.image_for(Xlen::Rv64), o.image_rv64);
         let o = parse_args(
             &args("--images imgs --lake 127.0.0.1:0 --avalon 0.0.0.0 --pendragon localhost:9000 --no-build --demo"),
             root,
@@ -1349,16 +1299,9 @@ mod tests {
         assert_eq!(seed(&images, "os-base", &[1; 1024]).unwrap(), Seeded::UpToDate);
         assert_eq!(seed(&images, "os-base", &[2; 2048]).unwrap(), Seeded::Replaced);
         assert_eq!(std::fs::read(images.join("os-base")).unwrap(), [2; 2048]);
-        // Each width's image under its own name.
-        assert_eq!(
-            seed(&images, base_image(Xlen::Rv64), &[3; 1024]).unwrap(),
-            Seeded::Created
-        );
-        assert_eq!(std::fs::read(images.join("os-base-rv64")).unwrap(), [3; 1024]);
-        assert_eq!(std::fs::read(images.join("os-base")).unwrap(), [2; 2048]);
         // Nothing else was touched, and nothing was left behind.
         assert_eq!(std::fs::read(images.join("mine")).unwrap(), [7; 512]);
-        assert_eq!(std::fs::read_dir(&images).unwrap().count(), 3);
+        assert_eq!(std::fs::read_dir(&images).unwrap().count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

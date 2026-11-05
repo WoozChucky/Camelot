@@ -55,7 +55,7 @@ struct as_op2 {
 #define F_AMO_D 3
 
 /* The encodings of the real instructions, by format (merlin-as's encode.rs); the
- * _32_ and _RV64_ ones are RV64's own, looked up only when assembling for RV64. */
+ * _32_ and _RV64_ ones are RV64's own, beyond the base set. */
 extern const struct as_op3 OP_FUNCT[];
 extern const struct as_op3 SHIFT_FUNCT[];
 extern const struct as_op3 OP_32_FUNCT[];
@@ -74,8 +74,9 @@ extern const struct as_op2 STORE_RV64_FUNCT3[];
 /* Register ABI names, by number (and x0-x31, and fp for s0). */
 extern const char *const REG_NAMES[32];
 
-/* CSR names and numbers (excalibur's csr.rs): every one RV32 has, and those of them
- * only RV32 has, which are no name on RV64; and the counters' numbers. */
+/* CSR names and numbers (excalibur's csr.rs): every one excalibur knows, and those
+ * of them only RV32 has, which are no name here (an error says they are RV32's, as
+ * LLVM's does); and the counters' numbers. */
 extern const struct as_op2 CSR_NAMES[];
 extern const struct as_op2 CSR_RV32_ONLY[];
 #define CSR_CYCLE 0xc00
@@ -127,8 +128,7 @@ extern const struct as_section PREDEFINED_SECTIONS[];
 #define R_RISCV_LO12_I 27
 #define R_RISCV_LO12_S 28
 
-/* Tag_RISCV_arch in every object's .riscv.attributes (merlin-as's elf.rs), by width. */
-#define RISCV_ARCH "rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0"
-#define RISCV_ARCH_RV64 "rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0"
+/* Tag_RISCV_arch in every object's .riscv.attributes (merlin-as's elf.rs). */
+#define RISCV_ARCH "rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0"
 
 #endif

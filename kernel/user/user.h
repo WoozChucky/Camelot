@@ -8,9 +8,9 @@ typedef unsigned char uchar;
 typedef unsigned short ushort;
 typedef unsigned int uint;
 
-/* The system call ABI's types, Linux's: a `long` wide, so 64 bits on RV64
- * (LP64) and 32 on RV32 (ILP32). A size, a count of bytes or an error, a
- * file offset, a time in seconds, an integer that holds a pointer. */
+/* The system call ABI's types, Linux's: a `long` wide, 64 bits (LP64). A
+ * size, a count of bytes or an error, a file offset, a time in seconds, an
+ * integer that holds a pointer. */
 typedef unsigned long size_t;
 typedef long ssize_t;
 typedef long off_t;
@@ -18,10 +18,8 @@ typedef long time_t;
 typedef long intptr_t;
 typedef unsigned long uintptr_t;
 
-/* Integers of a given width, as <stdint.h> has them: the same on both
- * widths. The 64-bit ones are long long, which merlin and clang make a
- * register on RV64 and a pair of them on RV32 (lib/libgcc.c has the
- * routines RV32 calls to divide them). */
+/* Integers of a given width, as <stdint.h> has them. The 64-bit ones are
+ * long long, as Linux's are. */
 typedef signed char int8_t;
 typedef unsigned char uint8_t;
 typedef short int16_t;
@@ -32,17 +30,12 @@ typedef long long int64_t;
 typedef unsigned long long uint64_t;
 
 /* The limits of the integer types, as <limits.h> and <stdint.h> give
- * them. A long is a register: 64 bits on RV64 (_LP64), 32 on RV32. */
+ * them. A long is a register: 64 bits. */
 #define INT_MAX 2147483647
 #define INT_MIN (-INT_MAX - 1)
 #define UINT_MAX 4294967295u
-#ifdef _LP64
 #define LONG_MAX 0x7fffffffffffffffL
 #define ULONG_MAX 0xffffffffffffffffUL
-#else
-#define LONG_MAX 2147483647L
-#define ULONG_MAX 4294967295UL
-#endif
 #define LONG_MIN (-LONG_MAX - 1)
 #define LLONG_MAX 0x7fffffffffffffffLL
 #define LLONG_MIN (-LLONG_MAX - 1)
@@ -175,7 +168,7 @@ typedef unsigned long long uint64_t;
 #define T_PIPE 4
 #define T_SOCKET 5
 
-/* 16 bytes on RV32, 24 on RV64 (the size a 64-bit off_t). */
+/* 24 bytes (the size a 64-bit off_t). */
 struct stat {
     uint ino;     /* the inode; 0 for a pipe or the shell's console */
     ushort type;  /* T_DIR, T_FILE, T_DEVICE, T_PIPE or T_SOCKET */
@@ -192,7 +185,7 @@ struct dirent {
     char name[DIRSIZ];
 };
 
-/* What procs stores for each process: 32 bytes on RV32, 40 on RV64. */
+/* What procs stores for each process: 40 bytes. */
 struct procinfo {
     uint pid;
     uint ppid;   /* its parent's pid, 0 if it has none */
@@ -404,8 +397,8 @@ int setenv(const char *name, const char *value, int overwrite);
 int unsetenv(const char *name);
 
 /* The heap (lib/malloc.c), on top of sbrk: blocks aligned to the size of
- * malloc's header, two pointers' worth (8 bytes on RV32, 16 on RV64: the
- * ABI's largest alignment, as glibc's malloc gives), a free list with
+ * malloc's header, two pointers' worth (16 bytes: the ABI's largest
+ * alignment, as glibc's malloc gives), a free list with
  * neighbours merged. malloc(0) and a failure return NULL.
  * calloc zeroes; realloc keeps the old bytes (up to the smaller size), and
  * realloc(NULL, n) is malloc(n). */
@@ -457,7 +450,7 @@ int thread_start(int (*fn)(void *), void *arg, void *stack, uint size);
  * '-' (left align), '0' (zero padding) and width. d, u and x take an int
  * (or unsigned int), or with a length before them a wider one: 'l' a long,
  * 'll' a long long (int64_t), 'z' a size_t (or ssize_t, with d). %p prints
- * every digit of a pointer, 8 on RV32 and 16 on RV64. printf and fprintf return the
+ * every digit of a pointer, 16. printf and fprintf return the
  * bytes written, or a negative error number; snprintf writes at most
  * `size` bytes into `buf`, the last one a NUL, and returns the length the
  * whole text has (longer than `size` - 1 if it was cut). */
