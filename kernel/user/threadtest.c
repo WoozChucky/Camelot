@@ -4,7 +4,7 @@
  * futexes (a value that differs returns at once, a bad pointer is an
  * error, a wake wakes no more than it is asked to), running out of thread
  * slots, the library's mutex and malloc from several threads, sbrk from
- * three threads at once, a pipe write whose buffer another thread unmaps
+ * three threads at once, setenv and unsetenv from three threads, a pipe write whose buffer another thread unmaps
  * meanwhile, and processes with threads that end (exit from one thread
  * while others run, kill, the last thread's thread_exit, exec, a fault).
  * Prints a line for each check that fails and, at the end,
@@ -403,6 +403,57 @@ static int sbrks(void *arg) {
     return 0;
 }
 
+/* Sets ENV_NAMES variables of its own (T0a, T0b, ... for thread 0), then
+ * unsets the first half of them again, while other threads do the same
+ * with theirs: setenv and unsetenv hold a lock (lib/getenv.c), without
+ * which two of them would grow the same array, or one would compact the
+ * array another is copying, and variables would go missing. 0 if every
+ * call succeeded. Nothing reads the environment meanwhile: that is the
+ * program's to keep apart. */
+#define ENV_NAMES 20
+
+static int setenvs(void *arg) {
+    char name[4] = {'T', (char)('0' + (int)(uintptr_t)arg), 0, 0};
+    for (int i = 0; i < ENV_NAMES; i++) {
+        name[2] = (char)('a' + i);
+        if (setenv(name, "x", 1) != 0) {
+            return 1;
+        }
+    }
+    for (int i = 0; i < ENV_NAMES / 2; i++) {
+        name[2] = (char)('a' + i);
+        if (unsetenv(name) != 0) {
+            return 2;
+        }
+    }
+    return 0;
+}
+
+/* Whether the environment holds what three setenvs threads left: the
+ * second half of each one's variables, none of the first, and nothing
+ * else new, the `before` entries it had first in their place. */
+static int env_left(char **start, int before) {
+    for (int t = 0; t < 3; t++) {
+        char name[4] = {'T', (char)('0' + t), 0, 0};
+        for (int i = 0; i < ENV_NAMES; i++) {
+            name[2] = (char)('a' + i);
+            if ((getenv(name) != NULL) != (i >= ENV_NAMES / 2)) {
+                return 0;
+            }
+        }
+    }
+    int n = 0;
+    while (environ[n] != NULL) {
+        n++;
+    }
+    for (int i = 0; i < before; i++) {
+        if (environ[i] != start[i]) {
+            return 0;
+        }
+    }
+    return n == before + 3 * (ENV_NAMES - ENV_NAMES / 2);
+}
+
 static void test_locks(void) {
     struct mutex m = {0};
     check_eq(mutex_trylock(&m), 1, "trylock a free mutex");
@@ -437,6 +488,20 @@ static void test_locks(void) {
         check_eq(joined(tids[i]), 0, "sbrk from three threads");
     }
     check((char *)sbrk(0) == end, "the heap is back where it was");
+
+    char **env = environ;
+    int before = 0;
+    while (env[before] != NULL) {
+        before++;
+    }
+    for (int i = 0; i < 3; i++) {
+        tids[i] = start(setenvs, (void *)(uintptr_t)i, i);
+    }
+    for (int i = 0; i < 3; i++) {
+        check_eq(joined(tids[i]), 0, "setenv and unsetenv from three threads at once");
+    }
+    check(env_left(env, before), "keep every variable");
+    environ = env;
 
     /* Every free slot, until thread_start says there are none. */
     int all[NTHREAD];

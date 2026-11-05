@@ -40,69 +40,75 @@ char *getenv(const char *name) {
     return NULL;
 }
 
-/* The array setenv last made, from malloc: while environ is still it,
- * setenv can grow it with realloc; once a program has set environ to an
- * array of its own (or before setenv made one: crt0's, on the stack), it
- * makes a new one, as glibc's setenv does with its last_environ. */
-static char **owned;
+/* setenv and unsetenv change environ, and threads share it: as glibc's
+ * setenv.c holds its envlock, they hold this mutex across the whole of
+ * what they do, so that two of them at once can't both grow the same
+ * array, or compact one another is copying. getenv takes no lock, as
+ * glibc's doesn't: a program that reads the environment in one thread
+ * while another changes it keeps them apart itself (setenv may move the
+ * array getenv is reading), as POSIX leaves it, where neither getenv nor
+ * setenv need be thread-safe. */
+static struct mutex envlock;
 
-/* How many entries environ has. */
-static int count(void) {
-    int n = 0;
-    while (environ != NULL && environ[n] != NULL) {
-        n++;
-    }
-    return n;
-}
+/* The array setenv last made, from malloc: glibc's last_environ. setenv
+ * grows it with realloc whether or not environ is still it. When a
+ * program has set environ to an array of its own since (or setenv hasn't
+ * made one yet: environ is crt0's, on the stack), setenv copies environ's
+ * pointers into the grown array, and the array it had made before is
+ * reused rather than lost, as glibc's __add_to_environ does. */
+static char **last_environ;
 
 int setenv(const char *name, const char *value, int overwrite) {
     int len = name_length(name);
     if (len < 0) {
         return -EINVAL;
     }
-    int n = count();
-    int at = 0;
-    while (at < n && !is_named(environ[at], name, len)) {
-        at++;
-    }
-    if (at < n && !overwrite) {
-        return 0;
-    }
-    /* The new entry, NAME=value. The one it replaces is not freed: a
-     * pointer getenv returned into it stays good (glibc keeps them too). */
-    size_t vlen = strlen(value);
-    char *entry = malloc((size_t)len + 1 + vlen + 1);
-    if (entry == NULL) {
-        return -ENOMEM;
-    }
-    memcpy(entry, name, (size_t)len);
-    entry[len] = '=';
-    memcpy(entry + len + 1, value, vlen + 1);
-    if (at < n) {
-        environ[at] = entry;
-        return 0;
-    }
-    /* A new variable goes at the end: an array one longer, which is ours
-     * to grow if environ is the one we made last time. */
-    char **grown;
-    if (environ != NULL && environ == owned) {
-        grown = realloc(owned, sizeof(char *) * (size_t)(n + 2));
-    } else {
-        grown = malloc(sizeof(char *) * (size_t)(n + 2));
-        if (grown != NULL) {
-            for (int i = 0; i < n; i++) {
-                grown[i] = environ[i];
-            }
+    mutex_lock(&envlock);
+    /* environ is read once the lock is held: another thread's setenv may
+     * have just made a new one. */
+    int size = 0;
+    char **ep = environ;
+    if (ep != NULL) {
+        while (*ep != NULL && !is_named(*ep, name, len)) {
+            ep++;
+            size++;
         }
     }
-    if (grown == NULL) {
-        free(entry);
-        return -ENOMEM;
+    if (ep == NULL || *ep == NULL) {
+        /* A new variable, at the end: an array one longer (with room for
+         * its NULL), grown from the one setenv made last. realloc keeps
+         * that one if it fails, and so does environ. */
+        char **grown = realloc(last_environ, sizeof(char *) * (size_t)(size + 2));
+        if (grown == NULL) {
+            mutex_unlock(&envlock);
+            return -ENOMEM;
+        }
+        if (environ != last_environ) {
+            memcpy(grown, environ, sizeof(char *) * (size_t)size);
+        }
+        grown[size] = NULL;
+        grown[size + 1] = NULL;
+        ep = grown + size;
+        last_environ = grown;
+        environ = grown;
     }
-    grown[n] = entry;
-    grown[n + 1] = NULL;
-    owned = grown;
-    environ = grown;
+    if (*ep == NULL || overwrite) {
+        /* The entry, NAME=value. The one it replaces is not freed: a
+         * pointer getenv returned into it stays good (glibc keeps them
+         * too). If there is no memory for it, the array grown above stays,
+         * still ending where it did. */
+        size_t vlen = strlen(value);
+        char *entry = malloc((size_t)len + 1 + vlen + 1);
+        if (entry == NULL) {
+            mutex_unlock(&envlock);
+            return -ENOMEM;
+        }
+        memcpy(entry, name, (size_t)len);
+        entry[len] = '=';
+        memcpy(entry + len + 1, value, vlen + 1);
+        *ep = entry;
+    }
+    mutex_unlock(&envlock);
     return 0;
 }
 
@@ -111,18 +117,19 @@ int unsetenv(const char *name) {
     if (len < 0) {
         return -EINVAL;
     }
-    if (environ == NULL) {
-        return 0;
-    }
+    mutex_lock(&envlock);
     /* Every entry called `name` goes, the others move down in their order:
      * in place, whoever's array it is, as glibc's unsetenv does. */
-    char **to = environ;
-    for (char **from = environ; *from != NULL; from++) {
-        if (!is_named(*from, name, len)) {
-            *to = *from;
-            to++;
+    if (environ != NULL) {
+        char **to = environ;
+        for (char **from = environ; *from != NULL; from++) {
+            if (!is_named(*from, name, len)) {
+                *to = *from;
+                to++;
+            }
         }
+        *to = NULL;
     }
-    *to = NULL;
+    mutex_unlock(&envlock);
     return 0;
 }

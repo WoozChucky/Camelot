@@ -1036,7 +1036,12 @@ spinlock` with `spin_lock` and `spin_unlock`; `struct mutex` with
 `malloc` and its kin may be called from several threads at once; so may
 the rest, but `resolve` (which keeps its DNS messages in static buffers)
 and `inet_ntoa` (which returns one), and a `struct reader` must not be
-shared without a lock.
+shared without a lock. `setenv` and `unsetenv` hold a lock of their own,
+as glibc's do (its `envlock`), so they may run in several threads at
+once, but not alongside `getenv` or anything else that reads `environ`
+(a `setenv` may move the array): as in glibc, and as POSIX allows, where
+none of the three need be thread-safe, a program that changes its
+environment while another thread reads it keeps the two apart itself.
 `syscall(number, a0, a1, a2)` makes any call by number, for tests, and
 returns its `long` result.
 

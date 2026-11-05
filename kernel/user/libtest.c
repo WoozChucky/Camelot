@@ -635,6 +635,16 @@ static void test_env(void) {
     check(getenv("E") == NULL, "getenv with no environment");
     check_eq(setenv("F", "6", 1), 0, "setenv with no environment");
     check(environ != NULL && strcmp(environ[0], "F=6") == 0 && environ[1] == NULL, "makes one");
+    /* The array setenv made last is the one it grows, even when environ
+     * has become another since: it copies that one's pointers in rather
+     * than leave its own unused (glibc's __add_to_environ). realloc keeps
+     * a block that is big enough, and this one is: it had room for E's five. */
+    char **made = environ;
+    char *other[] = {"G=7", NULL};
+    environ = other;
+    check_eq(setenv("H", "8", 1), 0, "setenv on another array again");
+    check(environ == made && strcmp(environ[0], "G=7") == 0 && strcmp(environ[1], "H=8") == 0 && environ[2] == NULL,
+          "grows the array it made before, which it has not lost");
     environ = start;
 }
 
