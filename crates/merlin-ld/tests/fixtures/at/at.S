@@ -49,7 +49,7 @@ check:
     lw    t1, 0(t0)
     li    t2, 0x12345678
     bne   t1, t2, bad
-    lw    t1, 4(t0)
+    lwu   t1, 4(t0)          # zero-extended, as li makes 0x9abcdef0
     li    t2, 0x9abcdef0
     bne   t1, t2, bad
     la    t0, scratch

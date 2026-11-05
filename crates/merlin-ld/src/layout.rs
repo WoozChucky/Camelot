@@ -4,7 +4,7 @@
 //! Steps, in order:
 //!
 //! 1. Read the script and every object ([`crate::object`]), in ld.lld's
-//!    order, and pick the executable's class ([`read`]).
+//!    order ([`read`]).
 //! 2. Build the global symbol table. Locals stay per object. Two strong
 //!    definitions of a global are an error; a strong one beats a weak one.
 //! 3. Assign input sections to output sections: script order, first matching
@@ -26,22 +26,13 @@
 //! for them. Those sections have no address; a symbol in one is its offset
 //! there (see [`Layout::debug`]).
 //!
-//! ## Two widths
+//! ## The address space
 //!
-//! The executable has the class of its objects ([`Layout::class`]): ELF32
-//! for RV32, ELF64 for RV64. Addresses and sizes are `u64` for both. What
-//! differs is how far they go and how the script computes:
-//!
-//! - ELF64 has the whole 64-bit address space, and script arithmetic is
-//!   `u64` modulo 2^64, as ld.lld's (`0 - 1` is `0xffff_ffff_ffff_ffff`). A
-//!   section may not run past 2^64 (ld.lld's `checkSections`: "exceeds
-//!   available address space").
-//! - ELF32 (RV32, until #159) has 4 GiB: the location counter, script
-//!   symbols, section ends, the MEMORY region and the entry point must stay
-//!   within it, and script arithmetic is exact (`i64`, an error on overflow).
-//!   A section past 4 GiB is an error in ld.lld too, with the same words as
-//!   on ELF64; the other values ld.lld truncates to 32 bits, and merlin-ld
-//!   says what is wrong.
+//! The executable is ELF64, as its objects are. Addresses and sizes are
+//! `u64`: the whole 64-bit address space, and script arithmetic is `u64`
+//! modulo 2^64, as ld.lld's (`0 - 1` is `0xffff_ffff_ffff_ffff`). A section
+//! may not run past 2^64 (ld.lld's `checkSections`: "exceeds available address
+//! space"). (Until #159 an ELF32 link had 4 GiB and exact `i64` arithmetic.)
 //!
 //! At the top level of `SECTIONS` the location counter moves anywhere, as
 //! in ld.lld: backward, and round 2^64 on ELF64 (`. += n`, `ALIGN`). Only
@@ -80,7 +71,7 @@
 //! `ADDR` names is kept even if it is empty, as in ld.lld.
 
 use crate::object::{
-    self, Class, Object, SHF_ALLOC, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
+    self, Object, SHF_ALLOC, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
     SHN_UNDEF, STT_SECTION,
 };
 use crate::script::{self, Assign, Command, Expr, Item, Script};
@@ -172,8 +163,6 @@ pub fn is_debug(sec: &object::Section) -> bool {
 
 #[derive(Debug)]
 pub struct Layout {
-    /// The class of the executable: its objects' (the first one's).
-    pub class: Class,
     pub objects: Vec<Object>,
     pub sections: Vec<OutputSection>,
     /// The debug sections, by name in the order the inputs first have them.
@@ -218,16 +207,15 @@ fn align_up(v: u64, a: u64) -> Option<u64> {
 }
 
 /// `v` rounded up to a multiple of `a`, a power of two, modulo 2^64: ld.lld's
-/// alignToPowerOf2, which the location counter goes through, so an ELF64
-/// address near the top aligns to 0. (ELF32's stay far below 2^64.)
+/// alignToPowerOf2, which the location counter goes through, so an address
+/// near the top aligns to 0.
 fn align_wrapping(v: u64, a: u64) -> u64 {
     v.wrapping_add(a - 1) & !(a - 1)
 }
 
 /// The alignment an `ALIGN(n)` asks for, as ld.lld's checkAlignment reads
 /// it, in expressions and on sections alike: 0 is 1, and the rest must be
-/// powers of two. (On ELF32 a negative `i64` reads as a `u64`, which only
-/// -2^63 leaves a power of two.)
+/// powers of two.
 fn check_alignment(n: u64) -> Result<u64, &'static str> {
     let a = n.max(1);
     if a.is_power_of_two() {
@@ -237,14 +225,10 @@ fn check_alignment(n: u64) -> Result<u64, &'static str> {
     }
 }
 
-/// The address of a symbol `value` bytes into a section at `base`. ELF32
-/// (RV32, until #159): addresses are 32 bits and wrap at 4 GiB, as they
-/// always have in merlin-ld (a symbol defined far past its section's end).
-fn symbol_address(class: Class, base: u64, value: u64) -> u64 {
-    match class {
-        Class::Elf32 => u64::from((base as u32).wrapping_add(value as u32)),
-        Class::Elf64 => base.wrapping_add(value),
-    }
+/// The address of a symbol `value` bytes into a section at `base`, modulo
+/// 2^64.
+fn symbol_address(base: u64, value: u64) -> u64 {
+    base.wrapping_add(value)
 }
 
 impl Layout {
@@ -274,7 +258,7 @@ impl Layout {
             SHN_ABS => Some(s.value),
             sec => self
                 .section_base(obj, sec as usize)
-                .map(|a| symbol_address(self.class, a, s.value)),
+                .map(|a| symbol_address(a, s.value)),
         }
     }
 
@@ -378,7 +362,6 @@ impl Layout {
 
 /// Mutable state while walking `SECTIONS`.
 struct Walker<'a> {
-    class: Class,
     script_name: &'a str,
     script: &'a Script,
     objects: &'a [Object],
@@ -402,58 +385,39 @@ impl Walker<'_> {
             .push(err(format!("{}:{line}: {}", self.script_name, msg.into())));
     }
 
-    /// `a + b` in script arithmetic. ELF64: modulo 2^64, as ld.lld computes
-    /// (`. = 0xffffffff80000000 + 0x80000000` is 0). ELF32 (RV32, until #159):
-    /// the values are `i64`s (see [`Walker::eval`]) and the sum is exact, an
-    /// overflow an error.
-    fn add(&self, a: u64, b: u64) -> Result<u64, String> {
-        match self.class {
-            Class::Elf32 => (a as i64)
-                .checked_add(b as i64)
-                .map(|v| v as u64)
-                .ok_or("arithmetic overflow".into()),
-            Class::Elf64 => Ok(a.wrapping_add(b)),
-        }
+    /// `a + b` in script arithmetic: modulo 2^64, as ld.lld computes (`. =
+    /// 0xffffffff80000000 + 0x80000000` is 0).
+    fn add(&self, a: u64, b: u64) -> u64 {
+        a.wrapping_add(b)
     }
 
     /// `a - b`, as [`Walker::add`].
-    fn sub(&self, a: u64, b: u64) -> Result<u64, String> {
-        match self.class {
-            Class::Elf32 => (a as i64)
-                .checked_sub(b as i64)
-                .map(|v| v as u64)
-                .ok_or("arithmetic overflow".into()),
-            Class::Elf64 => Ok(a.wrapping_sub(b)),
-        }
+    fn sub(&self, a: u64, b: u64) -> u64 {
+        a.wrapping_sub(b)
     }
 
-    /// The value of a script expression with the location counter at `dot`.
-    ///
-    /// The result is a `u64` on both classes. ELF64 reads it as one: a 64-bit
-    /// address, any of them. ELF32 (RV32, until #159) reads its bits as an
-    /// `i64` (`v as i64`), the type merlin-ld's RV32 scripts have always been
-    /// evaluated in: numbers up to `i64::MAX`, exact `+` and `-`, so `0 - 1`
-    /// is -1, which the uses then refuse (a backward location counter, a
-    /// symbol that does not fit in 32 bits) rather than wrap.
+    /// The value of a script expression with the location counter at `dot`:
+    /// a 64-bit address, any of them. An error for a name the script cannot
+    /// use.
     fn eval(&self, e: &Expr, dot: u64) -> Result<u64, String> {
         Ok(match e {
             Expr::Num(n) => *n,
             Expr::Dot => dot,
             Expr::Symbol(name) => {
-                let value = self
-                    .global_index
-                    .get(name)
-                    .and_then(|&i| match self.globals[i].1 {
-                        Def::Script(v) => Some(v),
-                        Def::Object { obj, sym } => {
-                            let s = &self.objects[obj].symbols[sym];
-                            match s.shndx {
-                                SHN_ABS => Some(s.value),
-                                sec => self.placement[obj][sec as usize]
-                                    .map(|p| symbol_address(self.class, p.addr, s.value)),
+                let value =
+                    self.global_index
+                        .get(name)
+                        .and_then(|&i| match self.globals[i].1 {
+                            Def::Script(v) => Some(v),
+                            Def::Object { obj, sym } => {
+                                let s = &self.objects[obj].symbols[sym];
+                                match s.shndx {
+                                    SHN_ABS => Some(s.value),
+                                    sec => self.placement[obj][sec as usize]
+                                        .map(|p| symbol_address(p.addr, s.value)),
+                                }
                             }
-                        }
-                    });
+                        });
                 match value {
                     Some(v) => v,
                     None if self.global_index.contains_key(name) => {
@@ -506,18 +470,14 @@ impl Walker<'_> {
                     None => return Err(format!("undefined section {name}")),
                 },
             },
-            Expr::Add(a, b) => self.add(self.eval(a, dot)?, self.eval(b, dot)?)?,
-            Expr::Sub(a, b) => self.sub(self.eval(a, dot)?, self.eval(b, dot)?)?,
+            Expr::Add(a, b) => self.add(self.eval(a, dot)?, self.eval(b, dot)?),
+            Expr::Sub(a, b) => self.sub(self.eval(a, dot)?, self.eval(b, dot)?),
         })
     }
 
-    /// A script value as a message shows it in decimal: signed on ELF32 (RV32,
-    /// until #159), where values are `i64`s, unsigned on ELF64.
+    /// A script value as a message shows it, in decimal.
     fn show(&self, v: u64) -> String {
-        match self.class {
-            Class::Elf32 => (v as i64).to_string(),
-            Class::Elf64 => v.to_string(),
-        }
+        v.to_string()
     }
 
     /// Runs one assignment, at the top level of `SECTIONS` or inside an
@@ -532,58 +492,26 @@ impl Walker<'_> {
         };
         match &a.symbol {
             None => {
-                let new = if a.add { self.add(dot, v) } else { Ok(v) };
-                let new = match new {
-                    Ok(new) => new,
-                    Err(e) => {
-                        self.script_err(a.line, e);
-                        return dot;
-                    }
-                };
+                let new = if a.add { self.add(dot, v) } else { v };
                 // Inside an output section `.` only moves forward (ld.lld's
-                // setDot: "unable to move location counter ... backward").
-                // ELF32 (RV32, until #159): compared as i64s, so a negative
-                // value (`. = 0 - 1`) is a move backward. On ELF64 a `. += n`
-                // or an ALIGN that wraps past 2^64 comes out below `dot`,
+                // setDot: "unable to move location counter ... backward"). A
+                // `. += n` or an ALIGN that wraps past 2^64 comes out below `dot`,
                 // backward too. As in ld.lld, `.` still takes the new value,
                 // and the section's end then reports what follows from it.
                 // At the top level ld.lld moves `.` anywhere, backward and
                 // round 2^64 too, and so does merlin-ld: sections that end up
                 // over each other are an error once all are placed
                 // ([`address_overlaps`]).
-                let backward = match self.class {
-                    Class::Elf32 => (new as i64) < dot as i64,
-                    Class::Elf64 => new < dot,
-                };
-                if in_section && backward {
+                if in_section && new < dot {
                     self.script_err(
                         a.line,
                         format!("cannot move the location counter backward (from {dot:#x} to {new:#x})"),
                     );
                     return new;
                 }
-                // ELF32 (RV32, until #159): 4 GiB of address space. `.` may be
-                // exactly 2^32, the end of a section that fills it. A negative
-                // value reads as a u64 past it too.
-                if self.class == Class::Elf32 && new > 1 << 32 {
-                    self.script_err(
-                        a.line,
-                        format!("location counter {new:#x} is past the 4 GiB address space"),
-                    );
-                    return dot;
-                }
                 new
             }
             Some(name) => {
-                // ELF32 (RV32, until #159): a symbol's value is 32 bits (ld.lld
-                // would truncate it). Read as an i64, so -1 does not fit either.
-                if self.class == Class::Elf32 && u32::try_from(v as i64).is_err() {
-                    self.script_err(
-                        a.line,
-                        format!("value {v:#x} of '{name}' does not fit in 32 bits"),
-                    );
-                    return dot;
-                }
                 // A script assignment overrides an object's definition (as in ld.lld).
                 match self.global_index.get(name) {
                     Some(&i) => self.globals[i].1 = Def::Script(v),
@@ -656,18 +584,12 @@ pub fn is_merge_warning(warning: &str) -> bool {
     warning.contains(MERGE_WARNING)
 }
 
-/// Whether a section loaded at `lma` with `size` bytes fits the class's
-/// address space, as its address range must. ELF32 (RV32, until #159):
-/// within 4 GiB, which ld.lld does not check (it truncates `p_paddr` to 32
-/// bits). ELF64: below 2^64, which ld.lld does not check either (`p_paddr +
-/// p_memsz` would wrap); merlin-ld says so rather than write a segment that
-/// ends before it starts.
-fn load_range_fits(class: Class, lma: u64, size: u64) -> bool {
-    let end = lma.checked_add(size);
-    match class {
-        Class::Elf32 => end.is_some_and(|end| end <= 1 << 32),
-        Class::Elf64 => end.is_some(),
-    }
+/// Whether a section loaded at `lma` with `size` bytes fits the address space,
+/// as its address range must: below 2^64, which ld.lld does not check (`p_paddr +
+/// p_memsz` would wrap); merlin-ld says so rather than write a segment that ends
+/// before it starts.
+fn load_range_fits(lma: u64, size: u64) -> bool {
+    lma.checked_add(size).is_some()
 }
 
 /// Sections loaded over each other, as ld.lld's checkSections finds them
@@ -678,11 +600,11 @@ fn load_range_fits(class: Class, lma: u64, size: u64) -> bool {
 /// Like ld.lld, sort them by load address and compare each with the next
 /// one, naming the lower one first (its range is the one the other starts
 /// in).
-fn load_overlaps(class: Class, sections: &[OutputSection]) -> Vec<Error> {
+fn load_overlaps(sections: &[OutputSection]) -> Vec<Error> {
     // (One whose load range does not fit has been reported already.)
     let loaded = sections
         .iter()
-        .filter(|s| !s.nobits && s.size > 0 && load_range_fits(class, s.lma, s.size))
+        .filter(|s| !s.nobits && s.size > 0 && load_range_fits(s.lma, s.size))
         .map(|s| (s, s.lma))
         .collect();
     overlaps("load address", loaded)
@@ -1008,31 +930,18 @@ fn script_source(opts: &Options) -> (&str, &str) {
     }
 }
 
-/// Step 1: reads a link's files and its script, as ld.lld reads them, and
-/// picks the executable's class. `files` are the command line's, in its
-/// order, each with whether it is a library member (between `--start-lib`
-/// and `--end-lib`, [`crate::library`]); the objects come back in the same
-/// order.
+/// Step 1: reads a link's files and its script, as ld.lld reads them. `files`
+/// are the command line's, in its order, each with whether it is a library
+/// member (between `--start-lib` and `--end-lib`, [`crate::library`]); the
+/// objects come back in the same order.
 ///
 /// ld.lld reads the script when it meets `-T`, before it reads any object,
-/// so a script's errors come first, then every object's, and only when all
-/// of them read does it compare their classes. Its script values are
-/// 64-bit whatever the class, so the script is read for ELF64 first, where
-/// no value is refused for being past 4 GiB: its errors are the ones ld.lld
-/// gives. Once the class is known an ELF32 link (RV32, until #159) reads it
-/// again, for its exact arithmetic and its 4 GiB limits.
-///
-/// The class is ld.lld's (it needs no option either): the script's
-/// `OUTPUT_FORMAT` if it names one, else the first file's, a library
-/// member's too. Every file must have it, or the link stops
-/// ([`object::check_classes`]).
-pub(crate) fn read(
-    files: &[(&Input, bool)],
-    opts: &Options,
-) -> Result<(Vec<Object>, Script, Class), Vec<Error>> {
+/// so a script's errors come first, then every object's (an ELF32 one among
+/// them, [`object::parse`]).
+pub(crate) fn read(files: &[(&Input, bool)], opts: &Options) -> Result<(Vec<Object>, Script), Vec<Error>> {
     let (script_name, src) = script_source(opts);
     let mut errors = Vec::new();
-    let script64 = match script::parse(src, Class::Elf64) {
+    let script = match script::parse(src) {
         Ok(s) => Some(s),
         Err(e) => {
             errors.push(err(format!("{script_name}:{e}")));
@@ -1046,42 +955,25 @@ pub(crate) fn read(
             Err(e) => errors.push(err(format!("{}: {e}", i.name))),
         }
     }
-    let Some(script64) = script64.filter(|_| errors.is_empty()) else {
+    let Some(script) = script.filter(|_| errors.is_empty()) else {
         return Err(errors);
     };
     if files.iter().all(|&(_, lazy)| lazy) {
         return Err(vec![err("no input files")]);
     }
-    let class = script64.format.unwrap_or(objects[0].class);
-    let lazy = files.iter().map(|&(_, lazy)| lazy);
-    let wrong = object::check_classes(class, script64.format, objects.iter().zip(lazy));
-    if !wrong.is_empty() {
-        return Err(wrong);
-    }
-    let script = match class {
-        Class::Elf64 => script64,
-        Class::Elf32 => {
-            script::parse(src, Class::Elf32).map_err(|e| vec![err(format!("{script_name}:{e}"))])?
-        }
-    };
-    Ok((objects, script, class))
+    Ok((objects, script))
 }
 
 /// The layout of a link of `inputs`, every one linked.
 pub fn build(inputs: &[Input], opts: &Options) -> Result<Layout, Vec<Error>> {
     let files: Vec<(&Input, bool)> = inputs.iter().map(|i| (i, false)).collect();
-    let (objects, script, class) = read(&files, opts)?;
-    build_from(objects, script, class, opts)
+    let (objects, script) = read(&files, opts)?;
+    build_from(objects, script, opts)
 }
 
 /// Steps 2 to 6, for the objects [`read`] read (only those linked: a
 /// library's members that are needed, after the others) and its script.
-pub(crate) fn build_from(
-    objects: Vec<Object>,
-    script: Script,
-    class: Class,
-    opts: &Options,
-) -> Result<Layout, Vec<Error>> {
+pub(crate) fn build_from(objects: Vec<Object>, script: Script, opts: &Options) -> Result<Layout, Vec<Error>> {
     let (script_name, _) = script_source(opts);
     let mut errors = Vec::new();
 
@@ -1190,7 +1082,6 @@ pub(crate) fn build_from(
 
     // 4. Addresses.
     let mut w = Walker {
-        class,
         script_name,
         script: &script,
         objects: &objects,
@@ -1278,8 +1169,8 @@ pub(crate) fn build_from(
                     .unwrap_or(1);
                 // `.name : ALIGN(n) { ... }`: at least n, like an input that
                 // aligned (ld.lld's sh_addralign is the larger of the two).
-                // [`check_alignment`], then at most 2^31 on both classes:
-                // ld.lld keeps a section's alignment in 32 bits on RV64 too,
+                // [`check_alignment`], then at most 2^31: ld.lld keeps a
+                // section's alignment in 32 bits on RV64 too,
                 // and ignores a larger power of two (its 32 bits are 0).
                 if let Some(e) = &o.align {
                     match w.eval(e, dot) {
@@ -1343,10 +1234,9 @@ pub(crate) fn build_from(
                                     section: si,
                                     addr: d,
                                 });
-                                // Wrapping, as ld.lld's location counter: an
-                                // ELF64 section that runs past 2^64 is
-                                // reported once its size is known, below.
-                                // ELF32's `d` stays far below 2^64.
+                                // Wrapping, as ld.lld's location counter: a
+                                // section that runs past 2^64 is reported
+                                // once its size is known, below.
                                 d = d.wrapping_add(sec.size);
                                 flags |= sec.flags & (SHF_WRITE | SHF_EXECINSTR);
                                 nobits &= sec.is_nobits();
@@ -1356,17 +1246,9 @@ pub(crate) fn build_from(
                     }
                 }
                 let size = d.wrapping_sub(start);
-                // The address space, as ld.lld's checkSections sees it, with
-                // its words on both classes. ELF32 (RV32, until #159): `d`
-                // may be exactly 4 GiB (a section ending at the top of the
-                // address space), but the size must still fit in 32 bits
-                // (ld.lld would cut a 4 GiB size to 0). ELF64: the section
-                // must end below 2^64, even exactly at it is too far.
-                let past = match class {
-                    Class::Elf32 => size > u64::from(u32::MAX) || d > 1 << 32,
-                    Class::Elf64 => start.checked_add(size).is_none(),
-                };
-                if past {
+                // The address space, as ld.lld's checkSections sees it: the
+                // section must end below 2^64, even exactly at it is too far.
+                if start.checked_add(size).is_none() {
                     w.script_err(
                         o.line,
                         format!(
@@ -1375,7 +1257,7 @@ pub(crate) fn build_from(
                         ),
                     );
                     // The link fails, but as in ld.lld the location counter
-                    // goes on from the section's end (wrapped on ELF64), so
+                    // goes on from the section's end (wrapped), so
                     // the sections after it are placed, and reported, where
                     // ld.lld places them.
                     dot = d;
@@ -1387,15 +1269,11 @@ pub(crate) fn build_from(
                 // The load address range must fit as the address range does.
                 // The section is still placed: its addresses are right, and
                 // the sections after it go where they should.
-                if !load_range_fits(class, lma, size) {
-                    let space = match class {
-                        Class::Elf32 => "the 4 GiB",
-                        Class::Elf64 => "the 64-bit",
-                    };
+                if !load_range_fits(lma, size) {
                     w.script_err(
                         o.line,
                         format!(
-                            "section {} load address range extends past {space} address space",
+                            "section {} load address range extends past the 64-bit address space",
                             o.name
                         ),
                     );
@@ -1466,7 +1344,7 @@ pub(crate) fn build_from(
     errors.append(&mut w.errors);
     // ld.lld's order: addresses, then load addresses.
     errors.extend(address_overlaps(&w.sections));
-    errors.extend(load_overlaps(class, &w.sections));
+    errors.extend(load_overlaps(&w.sections));
 
     // Debug information, after everything else.
     let mut debug: Vec<DebugSection> = Vec::new();
@@ -1508,7 +1386,6 @@ pub(crate) fn build_from(
     }
 
     let mut layout = Layout {
-        class,
         objects: Vec::new(),
         sections: w.sections,
         debug,
@@ -1548,14 +1425,9 @@ pub(crate) fn build_from(
         (None, Some(e)) => (e.clone(), false),
         (None, None) => ("_start".to_string(), false),
     };
-    if let Some(n) = script::parse_number(&entry, class) {
-        // ELF32 (RV32, until #159): e_entry is 32 bits (ld.lld would truncate
-        // it). ELF64 takes any address, `-e 0xffffffff80000000` too.
-        if class == Class::Elf32 && u32::try_from(n).is_err() {
-            errors.push(err(format!("entry address {entry} does not fit in 32 bits")));
-        } else {
-            layout.entry = n;
-        }
+    if let Some(n) = script::parse_number(&entry) {
+        // Any address, `-e 0xffffffff80000000` too.
+        layout.entry = n;
     } else if let Some(v) = layout.symbol(&entry) {
         layout.entry = v;
         layout.entry_symbol = Some(entry);
@@ -1569,13 +1441,9 @@ pub(crate) fn build_from(
             .or(layout.sections.first())
             .map_or(0, |s| s.addr);
         layout.entry = fallback;
-        // An address as wide as the class's: 8 or 16 hex digits.
-        let shown = match class {
-            Class::Elf32 => format!("{fallback:#010x}"),
-            Class::Elf64 => format!("{fallback:#018x}"),
-        };
+        // A 64-bit address: 16 hex digits.
         layout.warnings.push(format!(
-            "cannot find entry symbol '{entry}'; defaulting to {shown}"
+            "cannot find entry symbol '{entry}'; defaulting to {fallback:#018x}"
         ));
     }
 

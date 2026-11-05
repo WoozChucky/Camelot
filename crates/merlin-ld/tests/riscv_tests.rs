@@ -1,60 +1,31 @@
 //! Stress test: every riscv-tests program, relinked by merlin-ld from the
 //! object it was built from (`scripts/build-riscv-tests.sh`, with
 //! `-mno-relax`), must give the same loaded bytes as the committed ld.lld
-//! executable and pass in Grail. Two suites: RV32 (`tests/riscv-tests`,
-//! objects in `obj/`) and RV64 (`tests/riscv-tests/rv64`, objects in
-//! `rv64/obj/`), each with its env's `link.ld`.
+//! executable and pass in Grail. The suites are RV64's, in
+//! `tests/riscv-tests`, with their objects and the env's `link.ld` in
+//! `obj/`.
 //!
-//! The RV64 executables were linked by the LLD merlin-ld follows (23.1.4),
-//! and relinking their objects with it gives the same files, so their
-//! program headers are compared whole too: offsets, load addresses, sizes,
-//! flags and alignment. The RV32 ones come from older LLDs (18 and 21), whose
-//! `.comment` moves what follows it, so only their addresses and contents are.
-//! The RV64 objects carry only PC-relative relocations (PCREL_HI20 and its
-//! LO12_I and LO12_S): R_RISCV_64 and the range edges are the fixtures'
-//! (`tests/rv64.rs`).
+//! The executables were linked by the LLD merlin-ld follows (23.1.4), and
+//! relinking their objects with it gives the same files, so their program
+//! headers are compared whole too: offsets, load addresses, sizes, flags
+//! and alignment. The objects carry only PC-relative relocations
+//! (PCREL_HI20 and its LO12_I and LO12_S): R_RISCV_64 and the range edges
+//! are the fixtures' (`tests/link.rs`).
 
 use grail::{Machine, RunResult};
 use merlin_ld::{Input, Options, ScriptSource};
 use std::path::{Path, PathBuf};
 
-/// One suite: a directory of executables, with their objects and the
-/// script in its `obj/`.
-struct Suite {
-    /// Relative to `tests/riscv-tests`.
-    dir: &'static str,
-    /// The name every executable of the suite starts with.
-    prefix: &'static str,
-    /// Not run, as in Grail's own riscv-tests runner: it expects misaligned
-    /// accesses to work in hardware, which Excalibur traps instead (spec
-    /// §4). Its bytes are still compared.
-    not_run: &'static str,
-    /// The references are from the same LLD: compare every program header
-    /// field, not only the addresses and the bytes.
-    same_lld: bool,
+/// Not run, as in Grail's own riscv-tests runner: it expects misaligned
+/// accesses to work in hardware, which Excalibur traps instead (spec §4).
+/// Its bytes are still compared.
+const NOT_RUN: &str = "rv64ui-p-ma_data";
+
+fn dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/riscv-tests")
 }
 
-const RV32: Suite = Suite {
-    dir: "",
-    prefix: "rv32",
-    not_run: "rv32ui-p-ma_data",
-    same_lld: false,
-};
-
-const RV64: Suite = Suite {
-    dir: "rv64",
-    prefix: "rv64",
-    not_run: "rv64ui-p-ma_data",
-    same_lld: true,
-};
-
-fn dir(suite: &Suite) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/riscv-tests")
-        .join(suite.dir)
-}
-
-/// The PT_LOADs of an executable (either class), with their file bytes.
+/// The PT_LOADs of an executable, with their file bytes.
 fn loads(file: &[u8]) -> Result<Vec<(elf::ProgramHeader, Vec<u8>)>, String> {
     let e = elf::Elf::parse(file).map_err(|e| e.to_string())?;
     e.segments
@@ -65,14 +36,14 @@ fn loads(file: &[u8]) -> Result<Vec<(elf::ProgramHeader, Vec<u8>)>, String> {
 }
 
 /// Links `name.o` and checks it; the error says what went wrong.
-fn check(suite: &Suite, name: &str, opts: &Options) -> Result<(), String> {
-    let obj = dir(suite).join("obj").join(format!("{name}.o"));
+fn check(name: &str, opts: &Options) -> Result<(), String> {
+    let obj = dir().join("obj").join(format!("{name}.o"));
     let inputs = [Input {
         name: format!("{name}.o"),
         data: std::fs::read(&obj).map_err(|e| format!("{}: {e}", obj.display()))?,
     }];
     let linked = merlin_ld::link(&inputs, opts).map_err(|e| format!("link: {e:?}"))?;
-    let lld = std::fs::read(dir(suite).join(name)).map_err(|e| format!("ld.lld executable: {e}"))?;
+    let lld = std::fs::read(dir().join(name)).map_err(|e| format!("ld.lld executable: {e}"))?;
     let (ours, theirs) = (loads(&linked.elf)?, loads(&lld)?);
     if ours.len() != theirs.len() {
         return Err(format!("{} PT_LOADs, ld.lld has {}", ours.len(), theirs.len()));
@@ -85,17 +56,16 @@ fn check(suite: &Suite, name: &str, opts: &Options) -> Result<(), String> {
                 a.memsz, a.filesz, b.memsz, b.filesz
             ));
         }
-        if suite.same_lld && a != b {
+        if a != b {
             return Err(format!("segment {va:#x}: {a:x?}, ld.lld: {b:x?}"));
         }
         if let Some(i) = (0..a_bytes.len()).find(|&i| a_bytes[i] != b_bytes[i]) {
             return Err(format!("first differing byte at {:#x}", va + i as u64));
         }
     }
-    if name == suite.not_run {
+    if name == NOT_RUN {
         return Ok(());
     }
-    // An ELF64 file makes the machine RV64.
     let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
     m.cpu.bus.uart.capture = true;
     m.load_elf(&linked.elf).map_err(|e| format!("load: {e}"))?;
@@ -106,9 +76,9 @@ fn check(suite: &Suite, name: &str, opts: &Options) -> Result<(), String> {
     }
 }
 
-/// Relinks every program of `suite`; returns how many there were.
-fn relink(suite: &Suite) -> usize {
-    let script = dir(suite).join("obj/link.ld");
+#[test]
+fn riscv_tests_relinked_by_merlin_ld() {
+    let script = dir().join("obj/link.ld");
     let opts = Options {
         script: Some(ScriptSource {
             name: "link.ld".into(),
@@ -116,7 +86,7 @@ fn relink(suite: &Suite) -> usize {
         }),
         entry: None,
     };
-    let mut names: Vec<String> = std::fs::read_dir(dir(suite).join("obj"))
+    let mut names: Vec<String> = std::fs::read_dir(dir().join("obj"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.extension().is_some_and(|e| e == "o"))
@@ -124,18 +94,18 @@ fn relink(suite: &Suite) -> usize {
         .collect();
     names.sort();
     // One object per prebuilt executable.
-    let mut elfs: Vec<String> = std::fs::read_dir(dir(suite))
+    let mut elfs: Vec<String> = std::fs::read_dir(dir())
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .filter(|n| n.starts_with(suite.prefix))
+        .filter(|n| n.starts_with("rv64"))
         .collect();
     elfs.sort();
     assert_eq!(names, elfs);
-    assert!(names.iter().any(|n| n == suite.not_run));
+    assert!(names.iter().any(|n| n == NOT_RUN));
 
     let failures: Vec<String> = names
         .iter()
-        .filter_map(|n| check(suite, n, &opts).err().map(|e| format!("{n}: {e}")))
+        .filter_map(|n| check(n, &opts).err().map(|e| format!("{n}: {e}")))
         .collect();
     assert!(
         failures.is_empty(),
@@ -144,17 +114,5 @@ fn relink(suite: &Suite) -> usize {
         names.len(),
         failures.join("\n")
     );
-    names.len()
-}
-
-#[test]
-fn riscv_tests_relinked_by_merlin_ld() {
-    let n = relink(&RV32);
-    assert!(n > 60, "{n} objects");
-}
-
-#[test]
-fn rv64_riscv_tests_relinked_by_merlin_ld() {
-    let n = relink(&RV64);
-    assert!(n > 100, "{n} objects");
+    assert!(names.len() > 100, "{} objects", names.len());
 }

@@ -1,9 +1,9 @@
 
-unaligned.lld.elf:	file format elf32-littleriscv
+unaligned.lld.elf:	file format elf64-littleriscv
 
 Disassembly of section .text:
 
-80000100 <_start>:
+0000000080000100 <_start>:
 80000100: 100002b7     	lui	t0, 0x10000
 80000104: 04f00313     	li	t1, 0x4f
 80000108: 00628023     	sb	t1, 0x0(t0)
@@ -13,6 +13,6 @@ Disassembly of section .text:
 80000118: 00628023     	sb	t1, 0x0(t0)
 8000011c: 0000100b     	<unknown>
 
-80000120 <helper>:
+0000000080000120 <helper>:
 80000120: 00150513     	addi	a0, a0, 0x1
 80000124: 00008067     	ret

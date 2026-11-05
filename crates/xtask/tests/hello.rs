@@ -86,7 +86,7 @@ fn objdump(objdump: &Path, obj: &Path) -> String {
 /// Every example source, at each width: merlin-as assembles what merlin's
 /// preprocessor makes of it, and clang assembles it too, preprocessing it
 /// itself, with the Xcal mnemonics from `examples/xcal.inc` (RV64 with the
-/// flags of the RV64 reference builds, `xtask::ld_fixtures::RV64`).
+/// flags of the RV64 reference builds, `xtask::ld_fixtures::FLAGS`).
 #[test]
 fn objdump_of_merlin_as_objects_matches_clang() {
     let tools = tools::find("clang").and_then(|clang| {
@@ -133,7 +133,7 @@ fn objdump_of_merlin_as_objects_matches_clang() {
         let mut clang_cmd = Command::new(&clang);
         if rv64 {
             clang_cmd
-                .args(xtask::ld_fixtures::RV64.flags)
+                .args(xtask::ld_fixtures::FLAGS)
                 .arg(xtask::ld_fixtures::NO_RELAX);
         } else {
             clang_cmd

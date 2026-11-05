@@ -1,7 +1,6 @@
 //! merlin-ld: links RISC-V relocatable objects into an Excalibur executable
-//! (`ET_EXEC`) that Grail loads directly. The objects are ELF32 (RV32) or
-//! ELF64 (RV64), all of one class, and the executable has their class: there
-//! is no option for it, as ld.lld needs none ([`Layout::class`]).
+//! (`ET_EXEC`) that Grail loads directly: ELF64 (RV64) objects into an ELF64
+//! executable. (Until #159 it linked ELF32 (RV32) objects too.)
 //!
 //! Pipeline: [`object`] (read `.o` files) → [`layout`] (symbols, section
 //! merging, addresses; driven by a [`script`]) → [`relocate`] (copies section
@@ -110,10 +109,10 @@ pub fn link_with_library(inputs: &[Input], library: &[Input], opts: &Options) ->
 /// is a library member (between `--start-lib` and `--end-lib`): what
 /// merlin-ld's command line does. The members are linked only when needed
 /// ([`library`]), after the other files, in library order, but the script
-/// and every file are read, and their classes compared, in command-line
+/// and every file are read in command-line
 /// order, as ld.lld does ([`layout::read`]): so are their errors.
 pub fn link_files(files: &[(&Input, bool)], opts: &Options) -> Result<Linked, Vec<Error>> {
-    let (objects, script, class) = layout::read(files, opts)?;
+    let (objects, script) = layout::read(files, opts)?;
     let lazy: Vec<bool> = files.iter().map(|&(_, lazy)| lazy).collect();
     let pulled = library::pulled(&objects.iter().collect::<Vec<_>>(), &lazy);
     let (program, members): (Vec<_>, Vec<_>) = objects
@@ -123,5 +122,5 @@ pub fn link_files(files: &[(&Input, bool)], opts: &Options) -> Result<Linked, Ve
         .filter(|&((_, lazy), pulled)| !lazy || pulled)
         .partition(|&((_, lazy), _)| !lazy);
     let objects = program.into_iter().chain(members).map(|((o, _), _)| o).collect();
-    finish(layout::build_from(objects, script, class, opts)?)
+    finish(layout::build_from(objects, script, opts)?)
 }

@@ -1,17 +1,16 @@
-//! Reads little-endian RISC-V relocatable objects (`ET_REL`), ELF32 (RV32)
-//! and ELF64 (RV64): the subset that clang (`-c`) and merlin-as produce.
-//! Anything outside that subset is rejected with a message saying what was
-//! found, never skipped silently.
+//! Reads little-endian RISC-V relocatable objects (`ET_REL`), ELF64 (RV64):
+//! the subset that clang (`-c`) and merlin-as produce. Anything outside that
+//! subset is rejected with a message saying what was found, never skipped
+//! silently: an ELF32 (RV32) object among them.
 //!
 //! The records themselves are read by the `elf` crate (shared with Grail,
-//! merlin-objdump and merlin-dbg), which knows both classes' layouts. This
-//! module is merlin-ld's side of it: it checks what merlin-ld accepts, in a
-//! fixed order, before and after the crate reads each part:
+//! merlin-objdump and merlin-dbg), which reads ELF32 too. This module is
+//! merlin-ld's side of it: it checks what merlin-ld accepts, in a fixed
+//! order, before and after the crate reads each part:
 //!
-//! 1. `e_ident` and the file header, read here: an ELF file, ELF32 or
-//!    ELF64, little-endian, version 1, `ET_REL`, RISC-V, `e_flags` 0 (the
-//!    soft-float ABI, no compressed instructions), section headers of the
-//!    class's size;
+//! 1. `e_ident` and the file header, read here: an ELF64 file, little-endian,
+//!    version 1, `ET_REL`, RISC-V, `e_flags` 0 (the soft-float ABI, no
+//!    compressed instructions), section headers of ELF64's size;
 //! 2. the section headers and their names ([`elf::Elf::parse_sections_only`]);
 //! 3. the sections, the symbol table and the relocation sections, each
 //!    checked (types, links, entry sizes, contents inside the file) before
@@ -21,13 +20,7 @@
 //! and a symbol's `st_shndx` can be used directly.
 //!
 //! Sizes, flags, symbol values, relocation offsets and addends are held at
-//! ELF64's widths (`u64`, `i64`), whatever the class of the file, so the rest
-//! of the linker has one set of types for RV32 and RV64; an ELF32 file's
-//! fields are zero-extended (sign-extended for the addend). The class itself
-//! is kept in [`Object::class`], and [`check_classes`] makes sure every
-//! object of a link has the same one.
-
-use crate::Error;
+//! ELF64's widths (`u64`, `i64`).
 
 // The ELF constants, the elf crate's (shared with merlin-objdump, and generated into
 // the C linker's tables by crates/xtask/src/c_tables.rs). Its section flags are 8
@@ -39,7 +32,7 @@ pub use elf::{
     STT_NOTYPE, STT_SECTION, STT_TLS,
 };
 
-/// One `Elf32_Rela` or `Elf64_Rela` entry, the elf crate's: `offset` is the
+/// One `Elf64_Rela` entry, the elf crate's: `offset` is the
 /// offset of the patched bytes from the start of the section, `ty` an
 /// `R_RISCV_*` number, `sym` an index into [`Object::symbols`].
 pub use elf::Rela;
@@ -53,9 +46,9 @@ pub struct Section {
     pub data: Vec<u8>,
     /// Size in memory (`sh_size`), also for `SHT_NOBITS`.
     pub size: u64,
-    /// Alignment in bytes, a power of two (`sh_addralign` 0 is 1). 32 bits
-    /// on both classes: ld.lld keeps an input section's alignment in 32 bits
-    /// too, and refuses an ELF64 `sh_addralign` above 2^32 - 1 ("section
+    /// Alignment in bytes, a power of two (`sh_addralign` 0 is 1). 32 bits:
+    /// ld.lld keeps an input section's alignment in 32 bits too, and refuses
+    /// an `sh_addralign` above 2^32 - 1 ("section
     /// sh_addralign is too large") and one that is not a power of two, as
     /// [`parse`] does. 1 for the symbol and string tables and relocations,
     /// whose alignment neither linker looks at.
@@ -102,9 +95,6 @@ impl Symbol {
 pub struct Object {
     /// File name, used as the prefix of every diagnostic about this object.
     pub name: String,
-    /// ELF32 (RV32) or ELF64 (RV64), from `e_ident[EI_CLASS]`: the class of
-    /// the executable, whose layout takes it from the first object.
-    pub class: Class,
     /// Indexed by ELF section index; entry 0 is the null section.
     pub sections: Vec<Section>,
     /// Indexed by symbol table index; entry 0 is the null symbol.
@@ -125,46 +115,6 @@ impl Object {
             None => "",
         }
     }
-}
-
-/// Every file of a link that is not of class `class`, the executable's,
-/// as ld.lld's isCompatible finds them: `files` in command-line order, each
-/// with whether it is a library member (`--start-lib`), which ld.lld checks
-/// too, needed or not. Like ld.lld, this reports all of them, and then the
-/// link stops: an RV32 object's code cannot run on an RV64 hart, or the
-/// other way round.
-///
-/// The message says where the class came from, in ld.lld's words: the
-/// script's `OUTPUT_FORMAT` if it names one (`a.o is incompatible with
-/// elf32-littleriscv`), else the first file that is not a library member
-/// and has the class (`b.o is incompatible with a.o`). Before there is one
-/// the class came from a library member, and ld.lld names nothing: `a.o is
-/// incompatible`.
-pub fn check_classes<'a>(
-    class: Class,
-    format: Option<Class>,
-    files: impl IntoIterator<Item = (&'a Object, bool)>,
-) -> Vec<Error> {
-    let mut first: Option<&str> = None;
-    let mut errors = Vec::new();
-    for (o, lazy) in files {
-        if o.class == class {
-            if !lazy && first.is_none() {
-                first = Some(&o.name);
-            }
-            continue;
-        }
-        errors.push(Error(match (format, first) {
-            (Some(f), _) => format!(
-                "{} is incompatible with {}",
-                o.name,
-                crate::script::format_name(f)
-            ),
-            (None, Some(a)) => format!("{} is incompatible with {a}", o.name),
-            (None, None) => format!("{} is incompatible", o.name),
-        }));
-    }
-    errors
 }
 
 /// Bounds-checked reads of the file, for the header fields this module
@@ -222,10 +172,14 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
     if file.len() < 4 || &file[..4] != b"\x7fELF" {
         return Err("not an ELF file".into());
     }
+    // ELF64 only: RV64's objects. An ELF32 one is RV32 code, which no
+    // Excalibur hart runs (merlin-ld linked RV32 until #159).
     let class = match r.u8(4)? {
-        elf::ELFCLASS32 => Class::Elf32,
         elf::ELFCLASS64 => Class::Elf64,
-        c => return Err(format!("not a 32- or 64-bit ELF file (EI_CLASS is {c})")),
+        elf::ELFCLASS32 => {
+            return Err("an ELF32 (RV32) object: merlin-ld links RV64 (ELF64) objects only".into())
+        }
+        c => return Err(format!("not a 64-bit ELF file (EI_CLASS is {c})")),
     };
     if r.u8(5)? != 1 {
         return Err("not a little-endian ELF file".into());
@@ -257,14 +211,10 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
         return Err("built with compressed instructions (EF_RISCV_RVC); Excalibur has no C extension".into());
     }
     if flags != 0 {
-        // clang's ilp32 and lp64 (and merlin-as's objects) have e_flags 0:
+        // clang's lp64 (and merlin-as's objects) have e_flags 0:
         // no float ABI bits, no RVC, no TSO.
-        let abi = match class {
-            Class::Elf32 => "ilp32",
-            Class::Elf64 => "lp64",
-        };
         return Err(format!(
-            "e_flags {flags:#x} not supported: Excalibur objects use the {abi} soft-float ABI (e_flags 0)"
+            "e_flags {flags:#x} not supported: Excalibur objects use the lp64 soft-float ABI (e_flags 0)"
         ));
     }
     let shentsize = r.u16(rest + 10)? as usize;
@@ -273,7 +223,6 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
     if shnum == 0 {
         return Ok(Object {
             name: name.to_string(),
-            class,
             sections: Vec::new(),
             symbols: Vec::new(),
         });
@@ -460,8 +409,7 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
             ));
         }
         r.contents(h)?;
-        // r_info is `sym << 8 | type` in ELF32 and `sym << 32 | type` in
-        // ELF64; the crate splits it either way.
+        // r_info is `sym << 32 | type`; the crate splits it.
         let relocs = elf.relocations(h).map_err(|e| e.0)?;
         if let Some(bad) = relocs.iter().find(|rela| rela.sym as usize >= symbols.len()) {
             return Err(format!(
@@ -474,7 +422,6 @@ pub fn parse(name: &str, file: &[u8]) -> Result<Object, String> {
 
     Ok(Object {
         name: name.to_string(),
-        class,
         sections,
         symbols,
     })
