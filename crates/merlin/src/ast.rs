@@ -521,10 +521,17 @@ impl Expr {
 #[derive(Clone, Copy, Debug)]
 pub struct ExprId(pub u64);
 
+static NEXT_EXPR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl ExprId {
     pub fn new() -> ExprId {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        ExprId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        ExprId(NEXT_EXPR.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The number the next expression gets: expressions made after this
+    /// call (by this thread) have it or a greater one.
+    pub fn next() -> u64 {
+        NEXT_EXPR.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

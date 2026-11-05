@@ -40,17 +40,45 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
-    check_after(prog, false)
+    check_after(prog, &[])
 }
 
-/// [`check`] of a program in which an error was found before (`erred`:
-/// a syntax error cut it short, or the lexer found one), which clang's
-/// analysis of the function bodies then leaves out ([`crate::flow`]).
-pub fn check_after(prog: &mut Program, erred: bool) -> Result<(), Vec<Error>> {
+/// [`check`] of a program in which the preprocessor or the lexer found
+/// errors, which clang reports as it reads the code: `earlier` has where
+/// each one is reported (see [`Checker::earlier`]).
+pub fn check_after(prog: &mut Program, earlier: &[Pos]) -> Result<(), Vec<Error>> {
+    let (diagnostics, _) = checked(prog, earlier, None);
+    // The diagnostics are in the order clang gives them, which is the order
+    // they were found in: the warnings go with the program, unless there is
+    // an error, which stops it, and then they come with the errors.
+    if diagnostics.iter().all(Error::is_warning) {
+        prog.warnings.extend(diagnostics);
+        Ok(())
+    } else {
+        Err(diagnostics)
+    }
+}
+
+/// [`check_after`] of what the parser read before a syntax error at
+/// `cut` ([`crate::parser::parse_salvaging`]): the diagnostics clang gives
+/// before that error, and those it gives after it, which are the ones of
+/// the end of the function it cut short (clang goes on to its `}`) and of
+/// the end of the file.
+pub fn check_cut(prog: &mut Program, earlier: &[Pos], cut: Pos) -> (Vec<Error>, Vec<Error>) {
+    let (mut diagnostics, late) = checked(prog, earlier, Some(cut));
+    let after = diagnostics.split_off(late.unwrap_or(diagnostics.len()));
+    (diagnostics, after)
+}
+
+/// Checks the program: every diagnostic, in order; with a syntax error at
+/// `cut`, where those clang gives after it begin.
+fn checked(prog: &mut Program, earlier: &[Pos], cut: Option<Pos>) -> (Vec<Error>, Option<usize>) {
     let mut c = Checker {
         globals: HashMap::new(),
         errors: Vec::new(),
-        erred,
+        earlier: earlier.to_vec(),
+        cut,
+        late: None,
         literals: Vec::new(),
         written: std::mem::take(&mut prog.written),
         xlen: prog.xlen,
@@ -79,6 +107,10 @@ pub fn check_after(prog: &mut Program, erred: bool) -> Result<(), Vec<Error>> {
     }
     c.unevaluated(&mut unevaluated, next, usize::MAX);
     prog.unevaluated = unevaluated;
+    // What clang finds at the end of the file it finds after a syntax error.
+    if c.cut.is_some() && c.late.is_none() {
+        c.late = Some(c.errors.len());
+    }
     c.mark_definitions(prog);
     // File-scope compound literals: the objects their expressions name.
     let literals = std::mem::take(&mut c.literals);
@@ -95,15 +127,7 @@ pub fn check_after(prog: &mut Program, erred: bool) -> Result<(), Vec<Error>> {
             }
         }
     }
-    // The diagnostics are in the order clang gives them, which is the order
-    // they were found in: the warnings go with the program, unless there is
-    // an error, which stops it, and then they come with the errors.
-    if c.errors.iter().all(Error::is_warning) {
-        prog.warnings.extend(c.errors);
-        Ok(())
-    } else {
-        Err(c.errors)
-    }
+    (c.errors, c.late)
 }
 
 /// The type of `l op r` for the arithmetic, bitwise and shift operators, with
@@ -566,8 +590,18 @@ impl Global {
 struct Checker {
     globals: HashMap<String, Global>,
     errors: Vec<Error>,
-    /// An error was found before sema ([`check_after`]).
-    erred: bool,
+    /// Where clang reports each error the preprocessor and the lexer
+    /// found: for the preprocessor's, where the last token before it is,
+    /// as clang reads the next token after a function's `}` before it is
+    /// done with the function. A function is done after the errors at or
+    /// before its `}`: clang's analysis of its body is left out.
+    earlier: Vec<Pos>,
+    /// Where a syntax error cut the program short, if one did: the end of
+    /// the function it is in ([`check_cut`]).
+    cut: Option<Pos>,
+    /// Where in `errors` the diagnostics clang gives after the syntax
+    /// error begin.
+    late: Option<usize>,
     /// The objects of file-scope compound literals so far, defined.
     literals: Vec<Declarator>,
     /// How the source was written, for clang's warnings of it.
@@ -710,16 +744,28 @@ impl Checker {
             .then(|| c.temp(&Type::ptr(f.ret.clone()), "result address", f.pos));
         // The body's outermost block shares the parameters' scope, as in C.
         c.block(body);
-        for (name, pos) in std::mem::take(&mut c.gotos) {
-            if !c.labels.contains_key(&name) {
-                c.err(pos, format!("use of undeclared label '{name}'"));
+        // A function a syntax error cut short: clang reads on to its `}`,
+        // which merlin does not, and what it finds at the end comes after
+        // that error. A label after it is not known, so neither is a goto
+        // to a label that is nowhere.
+        let cut = self.cut == Some(f.end);
+        if cut {
+            self.late = Some(c.errors.len());
+        } else {
+            for (name, pos) in std::mem::take(&mut c.gotos) {
+                if !c.labels.contains_key(&name) {
+                    c.err(pos, format!("use of undeclared label '{name}'"));
+                }
             }
         }
         // clang's analysis of the body, unless the program has an error so
-        // far: then the warnings of what runs are all given, unanalysed.
+        // far (in sema's, or before the function's end in the
+        // preprocessor's and the lexer's): then the warnings of what runs
+        // are all given, unanalysed.
         let linked = std::mem::take(&mut c.linked);
         let pending = std::mem::take(&mut c.pending);
-        if self.erred || c.errors.iter().any(|e| !e.is_warning()) {
+        let erred = cut || self.earlier.iter().any(|&at| at <= f.end);
+        if erred || c.errors.iter().any(|e| !e.is_warning()) {
             c.errors.extend(pending.into_iter().map(|(e, _)| e));
         } else {
             let flow = crate::flow::analyze(body, self.xlen);

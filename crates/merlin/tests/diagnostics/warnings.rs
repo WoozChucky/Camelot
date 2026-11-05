@@ -118,5 +118,31 @@ pub fn cases() -> Vec<Case> {
         case("enum e {A,B,C}; int f(enum e x) { switch (x) { case A: case B: case A: ; } switch (x) { case 9: ; default: ; } switch (x) { case A: case B: case C: return 1; default: return 2; } }", &["1:69: error: duplicate case value 'A'", "1:53: note: previous case defined here", "1:94: warning: case value not in enumerated type 'enum e' [-Wswitch]"]),
         case("enum e {A,B,C=0}; int f(enum e x) { switch (x) { case A: case C: case 0: case (B): case 1: case (int)B: ; } return 0; }", &["1:63: error: duplicate case value: 'A' and 'C' both equal '0'", "1:55: note: previous case defined here", "1:71: error: duplicate case value: 'C' and '0' both equal '0'", "1:63: note: previous case defined here", "1:89: error: duplicate case value: 'B' and '1' both equal '1'", "1:79: note: previous case defined here", "1:97: error: duplicate case value: '1' and 'B' both equal '1'", "1:89: note: previous case defined here"]),
         case("enum e {A,B}; int f(enum e x, int y) { switch (x) { case A: case y: ; } return 0; }", &["1:66: error: expression is not an integer constant expression"]),
+        // Before a syntax error: sema's errors, and the analysis of the
+        // functions done before it; after it, what the end of the function
+        // it cut short gives.
+        case("int f(void) { return a; }\nint g(void) { return 1 }", &["1:22: error: use of undeclared identifier 'a'", "2:23: error: expected ';' after return statement"]),
+        case("int f(void) { return a; return 1 }", &["1:22: error: use of undeclared identifier 'a'", "1:33: error: expected ';' after return statement"]),
+        case("int f(void) { return a[1; }", &["1:22: error: use of undeclared identifier 'a'", "1:25: error: expected ']'", "1:23: note: to match this '['"]),
+        case("int f(int x) { if (x) return 1; }\nint g(void) { return 1 }", &["1:33: warning: non-void function does not return a value in all control paths [-Wreturn-type]", "2:23: error: expected ';' after return statement"]),
+        case("int f(void) { } }", &["1:15: warning: non-void function does not return a value [-Wreturn-type]", "1:17: error: extraneous closing brace ('}')"]),
+        case("int f(int x) { if (0) return x / 0; return 1; }\nint g(void) { return 1 }", &["2:23: error: expected ';' after return statement"]),
+        case("int f(int x) { if (x) return 1/0; return 1 }", &["1:43: error: expected ';' after return statement", "1:31: warning: division by zero is undefined [-Wdivision-by-zero]"]),
+        case("int f(int x) { if (x) return 1; }\nint g(void) { int a = 1/0; return 1 }", &["1:33: warning: non-void function does not return a value in all control paths [-Wreturn-type]", "2:36: error: expected ';' after return statement", "2:24: warning: division by zero is undefined [-Wdivision-by-zero]"]),
+        case("int f(int x) { if (x) return 1; }\nstatic int s(void); int g(void) { return s() }", &["1:33: warning: non-void function does not return a value in all control paths [-Wreturn-type]", "2:45: error: expected ';' after return statement"]),
+        // An error before a function's end leaves out its analysis.
+        case("#error x\nint f(int x) { if (x) return 1; }", &["1:2: error: x"]),
+        case("int f(int x) { if (x) return 1; }\n#error x", &["2:2: error: x"]),
+        case("int f(int x) { if (x) return 1; }\n#error x\nint g(int x) { if (x) return 1; }", &["2:2: error: x"]),
+        case("int h(void) { return b; }\nint f(int x) { if (x) return 1; }", &["1:22: error: use of undeclared identifier 'b'"]),
+        case("int f(int x) { if (x) return 1; }\nchar c = '\\u12';", &["1:33: warning: non-void function does not return a value in all control paths [-Wreturn-type]", "2:11: error: incomplete universal character name"]),
+        case("int x = a[1;", &["1:9: error: use of undeclared identifier 'a'", "1:12: error: expected ']'", "1:10: note: to match this '['"]),
+        case("int f(void) { if (a) { b; c[1 } }", &["1:19: error: use of undeclared identifier 'a'", "1:24: error: use of undeclared identifier 'b'", "1:27: error: use of undeclared identifier 'c'", "1:31: error: expected ']'", "1:28: note: to match this '['"]),
+        case("int f(void) { x; x; y[1 }", &["1:15: error: use of undeclared identifier 'x'", "1:18: error: use of undeclared identifier 'x'", "1:21: error: use of undeclared identifier 'y'", "1:25: error: expected ']'", "1:22: note: to match this '['"]),
+        case("int f(void) { return foo(1 }", &["1:22: error: call to undeclared function 'foo'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]", "1:28: error: expected ')'", "1:25: note: to match this '('"]),
+        case("int f(void) { int k = (z + 1) * w; return k }", &["1:24: error: use of undeclared identifier 'z'", "1:33: error: use of undeclared identifier 'w'", "1:44: error: expected ';' after return statement"]),
+        case("int f(int a) { return sizeof(q) + a[1; }", &["1:30: error: use of undeclared identifier 'q'", "1:38: error: expected ']'", "1:36: note: to match this '['"]),
+        case("int f(int a) { if (a) { return 1/0; } return a[1; }", &["1:49: error: expected ']'", "1:47: note: to match this '['", "1:33: warning: division by zero is undefined [-Wdivision-by-zero]"]),
+        case("int f(int x) { goto L; if (x) return 1 }", &["1:39: error: expected ';' after return statement"]).then(&["1:21: error: use of undeclared label 'L'"]),
     ]
 }

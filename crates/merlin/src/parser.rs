@@ -164,6 +164,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         prototype: RefCell::new(Vec::new()),
         folding: Cell::new(false),
         salvaged: RefCell::new(Vec::new()),
+        undeclared: RefCell::new(Vec::new()),
         partial: RefCell::new(None),
         parens: RefCell::new(None),
         parens_written: RefCell::new(Default::default()),
@@ -175,6 +176,8 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
     let mut items = Vec::new();
     let mut unevaluated = Vec::new();
     while *p.peek() != Tok::Eof {
+        let mark = p.undeclared.borrow().len();
+        let start = ExprId::next();
         let item = p.item();
         let error = match item {
             Ok(item) => {
@@ -188,6 +191,17 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         };
         let n = items.len();
         unevaluated.extend(p.unevaluated.take().into_iter().map(|u| (n, u)));
+        // A declaration cut short: its undeclared names (a function's are
+        // its blocks').
+        if error.is_some() {
+            if let Some(Stmt {
+                kind: StmtKind::Unevaluated(us),
+                ..
+            }) = p.cut_names(mark, start)
+            {
+                unevaluated.extend(us.into_iter().map(|u| (n, u)));
+            }
+        }
         if let Some(e) = error {
             let partial = Program {
                 items,
@@ -596,6 +610,13 @@ struct Parser<'a> {
     /// The statements of the blocks a syntax error cut short, the innermost
     /// first, and the function they make up so far ([`parse_salvaging`]).
     salvaged: RefCell<Vec<Vec<Stmt>>>,
+    /// The names read as expressions that nothing declares (not called:
+    /// that is an implicit declaration), in order, kept for a syntax error
+    /// in the statement or declaration they are in: clang checks them as
+    /// it reads them, so `return a[1;` is the error of the undeclared `a`
+    /// before the syntax error. A block cut short checks those of its
+    /// statement that was cut short ([`Parser::cut_names`]).
+    undeclared: RefCell<Vec<Expr>>,
     partial: RefCell<Option<Item>>,
     /// While a `_Static_assert`'s condition is parsed, the parenthesized
     /// expressions in it, and where their `(` is ([`Printer`]).
@@ -1084,6 +1105,33 @@ impl Parser<'_> {
 
     /// What the declaration or statement just parsed left for sema to
     /// check, as a statement after it, at `pos`.
+    /// The undeclared names read since `mark` that are in the item a syntax
+    /// error cut short (read after `item`, its [`ExprId::next`]), as a
+    /// statement for sema to check, unevaluated; those of the items before
+    /// it are in them. The names since `mark` are taken.
+    fn cut_names(&self, mark: usize, item: u64) -> Option<Stmt> {
+        let names = self.undeclared.borrow_mut().split_off(mark);
+        let us: Vec<Unevaluated> = names
+            .into_iter()
+            .filter(|e| e.id.0 >= item)
+            .map(|expr| Unevaluated {
+                expr,
+                untyped: None,
+                non_integer: None,
+                folded: false,
+                diagnostic: None,
+                with: 0,
+                vla: None,
+                params: Vec::new(),
+            })
+            .collect();
+        let pos = us.first()?.expr.pos;
+        Some(Stmt {
+            kind: StmtKind::Unevaluated(us),
+            pos,
+        })
+    }
+
     fn unevaluated_stmt(&self, pos: Pos) -> Option<Stmt> {
         let us = self.unevaluated.take();
         (!us.is_empty()).then_some(Stmt {
@@ -2636,9 +2684,13 @@ impl Parser<'_> {
         // checked with that statement, out of the block's scope.
         let outer = self.unevaluated.take();
         let mut items = Vec::new();
-        if let Err(e) = self.block_items_into(&mut items, open) {
-            // What the error leaves of the block ([`parse_salvaging`]).
+        let mark = self.undeclared.borrow().len();
+        let mut item = ExprId::next();
+        if let Err(e) = self.block_items_into(&mut items, open, &mut item) {
+            // What the error leaves of the block ([`parse_salvaging`]),
+            // and the undeclared names of the item it cut short.
             items.extend(self.unevaluated_stmt(self.here()));
+            items.extend(self.cut_names(mark, item));
             self.salvaged.borrow_mut().push(items);
             *self.unevaluated.borrow_mut() = outer;
             return Err(e);
@@ -2648,9 +2700,11 @@ impl Parser<'_> {
     }
 
     /// The items of a block after its `{` (at `open`), up to and including
-    /// its `}`.
-    fn block_items_into(&mut self, items: &mut Vec<Stmt>, open: Pos) -> Result<(), Error> {
+    /// its `}`; `item` is the [`ExprId::next`] of where the item being read
+    /// began.
+    fn block_items_into(&mut self, items: &mut Vec<Stmt>, open: Pos, item: &mut u64) -> Result<(), Error> {
         loop {
+            *item = ExprId::next();
             if self.eat_punct("}") {
                 return Ok(());
             }
@@ -3345,7 +3399,27 @@ impl Parser<'_> {
                             format!("unexpected type name '{name}': expected expression"),
                         ));
                     }
-                    _ => {}
+                    Some(_) => {}
+                    None => {
+                        let var = Expr::new(
+                            ExprKind::Var {
+                                name: name.clone(),
+                                var: None,
+                            },
+                            pos,
+                        );
+                        // Called, it is declared implicitly: clang's error
+                        // of that as it reads the name, which a call of no
+                        // arguments gives too.
+                        let e = match self.peek_at(1) {
+                            Tok::Punct("(") => {
+                                let open = self.toks[self.pos + 1].pos;
+                                Expr::new(ExprKind::call(var, Vec::new(), (open, open)), pos)
+                            }
+                            _ => var,
+                        };
+                        self.undeclared.borrow_mut().push(e);
+                    }
                 }
                 self.advance();
                 ExprKind::Var { name, var: None }

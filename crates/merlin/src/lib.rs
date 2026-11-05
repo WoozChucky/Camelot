@@ -332,12 +332,17 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
     let (toks, lexed) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| pp.merge(e))?;
     // The parser's warnings (it stops at its first error) come as it reads,
     // as the lexer's do; sema's after them.
+    // Where the errors before sema's are, which leave out clang's analysis
+    // of the functions done after them.
+    let earlier: Vec<Pos> = pp
+        .error_points()
+        .chain(lexed.iter().filter(|e| !e.is_warning()).map(|e| e.pos))
+        .collect();
     let (prog, parsed, checked) = match parser::parse_salvaging(&toks, xlen) {
         Ok(mut prog) => {
             prog.written.macros = pp.macros.clone();
             let parsed = std::mem::take(&mut prog.warnings);
-            let erred = lexed.iter().any(|e| !e.is_warning());
-            let checked = match sema::check_after(&mut prog, erred) {
+            let checked = match sema::check_after(&mut prog, &earlier) {
                 Ok(()) => std::mem::take(&mut prog.warnings),
                 Err(all) => all,
             };
@@ -347,14 +352,12 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
             let (e, mut partial) = *salvaged;
             partial.written.macros = pp.macros.clone();
             let parsed = std::mem::take(&mut partial.warnings);
-            // The warnings of what came before a syntax error come with it,
-            // as clang gives them; not the errors of what it cut short.
-            let all = match sema::check_after(&mut partial, true) {
-                Ok(()) => partial.warnings,
-                Err(all) => all,
-            };
-            let mut checked: Vec<Error> = all.into_iter().filter(Error::is_warning).collect();
+            // What came before a syntax error is checked as clang checks it
+            // as it parses, errors too; the end of the function it is in,
+            // and of the file, come after it.
+            let (mut checked, after) = sema::check_cut(&mut partial, &earlier, e.pos);
             checked.push(e);
+            checked.extend(after);
             (None, parsed, checked)
         }
     };

@@ -408,6 +408,17 @@ enum Mark {
 }
 
 impl Output {
+    /// Of each error of preprocessing, where the last token that came out
+    /// before it is (see [`Output::merge`]): clang finds it when its parser
+    /// reads the token after that one.
+    pub fn error_points(&self) -> impl Iterator<Item = Pos> + '_ {
+        self.diagnostics
+            .iter()
+            .zip(&self.after)
+            .filter(|(d, _)| !d.is_warning())
+            .map(|(_, &after)| after)
+    }
+
     /// Names the file of every error not in the file being compiled.
     pub fn name_files(&self, mut errors: Vec<Error>) -> Vec<Error> {
         name_files(&self.files, &mut errors);
