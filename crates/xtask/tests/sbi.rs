@@ -308,17 +308,32 @@ fn send_ipi_interrupts_the_harts_in_its_mask() {
         // No hart: nothing to do, whatever the base.
         assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[0, 99]), (0, 0));
         // A STOPPED hart named, alone or with hart 0 (base 0, base 3, every
-        // bit), and a hart the machine doesn't have: nothing is sent.
-        for (mask, base) in [
-            (0b10, 0),
-            (0b11, 0),
-            (1, 3),
-            (0b1111, 0),
-            (0b1_0000, 0),
-            (2, 3),
-            (1, 4),
-            (1, u64::MAX - 1),
-        ] {
+        // bit): as OpenSBI's sbi_ipi_send_many() since 110f28518a, the harts
+        // named are checked against the machine's only, and a STOPPED one is
+        // skipped without an error. Hart 0, when named, is still sent one.
+        let msip = |s: &Sbi| s.m.cpu.bus.clint.msip.to_vec();
+        for (mask, base) in [(0b10, 0), (0b11, 0), (1, 3), (0b1111, 0)] {
+            assert_eq!(
+                s.call(EXT_IPI, IPI_SEND_IPI, &[mask, base]),
+                (0, 0),
+                "{xlen:?} {mask:#b} from {base}"
+            );
+            let to_hart0 = base == 0 && mask & 1 != 0;
+            assert_eq!(
+                msip(&s),
+                [to_hart0, false, false, false],
+                "{xlen:?} {mask:#b} from {base}"
+            );
+            assert_eq!(retired(&s), before, "{xlen:?} {mask:#b} from {base}");
+            if to_hart0 {
+                s.step_until(ssip);
+                s.step_until(|m| m.cpu.hart(0).mode == Mode::S);
+                s.m.cpu.hart_mut(0).csr.mip &= !(1 << IRQ_S_SOFT);
+            }
+        }
+        // A hart the machine doesn't have (hart 4, alone or with hart 0; from
+        // base 3, bit 1; base 4 and past): nothing is sent.
+        for (mask, base) in [(0b1_0000, 0), (0b1_0001, 0), (2, 3), (1, 4), (1, u64::MAX - 1)] {
             assert_eq!(
                 s.call(EXT_IPI, IPI_SEND_IPI, &[mask, base]),
                 (ERR_INVALID_PARAM, 0),
@@ -352,9 +367,23 @@ fn send_ipi_interrupts_the_harts_in_its_mask() {
             ssip(m) && m.cpu.hart(0).mode == Mode::S && ssip1(m) && m.cpu.hart(3).csr.minstret != retired3
         });
         assert_eq!(s.m.cpu.hart(2).csr.minstret, retired2, "{xlen:?}");
-        // Named: 1 and 3 from base 1, but not with hart 2.
-        assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[0b101, 1]), (0, 0));
-        assert_eq!(s.call(EXT_IPI, IPI_SEND_IPI, &[0b111, 1]), (ERR_INVALID_PARAM, 0));
+        // Named: 1 and 3 from base 1, alone and with hart 2, which is
+        // skipped. Each time, from hart 3 back in its wfi and hart 1's SSIP
+        // clear: hart 1 gets SSIP, hart 3 wakes, and hart 2 runs nothing.
+        for mask in [0b101, 0b111] {
+            s.step_until(|m| m.cpu.hart(3).waiting);
+            s.m.cpu.hart_mut(1).csr.mip &= !(1 << IRQ_S_SOFT);
+            let retired2 = s.m.cpu.hart(2).csr.minstret;
+            let retired3 = s.m.cpu.hart(3).csr.minstret;
+            assert_eq!(
+                s.call(EXT_IPI, IPI_SEND_IPI, &[mask, 1]),
+                (0, 0),
+                "{xlen:?} {mask:#b}"
+            );
+            s.step_until(|m| ssip1(m) && m.cpu.hart(3).csr.minstret != retired3);
+            assert_eq!(s.m.cpu.hart(2).csr.minstret, retired2, "{xlen:?} {mask:#b}");
+            assert_eq!(s.status(2), STATE_STOPPED, "{xlen:?} {mask:#b}");
+        }
     }
 }
 

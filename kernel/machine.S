@@ -401,13 +401,19 @@ sbi_time:
     j     sbi_success
 
 # IPI send_ipi(hart_mask, hart_mask_base): msip = 1 for hart
-# hart_mask_base + i, for every bit i set in hart_mask; for every hart that
-# can take it when hart_mask_base is -1. As OpenSBI's sbi_ipi_send_many(),
-# only a hart that can take an interrupt is sent one: STARTED or SUSPENDED
-# (sbi_hsm_hart_interruptible_mask()). A mask that names any other hart,
-# STOPPED, on its way, or one the machine doesn't have, is
-# SBI_ERR_INVALID_PARAM, and nothing is sent. The receiving hart's
-# machine_soft turns it into SSIP.
+# hart_mask_base + i, for every bit i set in hart_mask; for every hart when
+# hart_mask_base is -1. As OpenSBI's sbi_ipi_send_many() since 110f28518a
+# ("lib: sbi_ipi: Validate hartids against domain, not HSM state"), the
+# harts named are checked against the machine's only: a mask naming a hart
+# it doesn't have (a base at or past the last hart, or a bit past it) is
+# SBI_ERR_INVALID_PARAM, and nothing is sent. Of the harts named, only one
+# that can take an interrupt, STARTED or SUSPENDED
+# (sbi_hsm_hart_interruptible_mask()), is sent one; a STOPPED or
+# START_PENDING hart is skipped and the call still succeeds, which is safe
+# for a TLB shootdown: a hart flushes its TLB when it starts
+# (secondary_entry's sfence.vma). 110f28518a fixed 37eaca4ab3, which had
+# made a mask naming such a hart SBI_ERR_INVALID_PARAM. The receiving
+# hart's machine_soft turns the IPI into SSIP.
 sbi_ipi:
     bnez  a6, sbi_not_supported
     la    t0, sbi_hart_count
@@ -430,16 +436,14 @@ sbi_ipi:
     addi  t3, t3, 1
     j     1b
 3:  li    t2, -1
-    beq   a1, t2, 5f            # every hart: those
+    beq   a1, t2, 5f            # every hart: those that can take it
     beqz  a0, sbi_success       # no hart: nothing to do
     bgeu  a1, t1, sbi_invalid_param
     sub   t2, t1, a1            # the harts from the base up, 1 or more
     srl   t3, a0, t2
     bnez  t3, sbi_invalid_param # a bit past the last hart
     sll   t2, a0, a1            # t2 = the harts named, bit i for hart i
-    and   t3, t2, t0
-    bne   t3, t2, sbi_invalid_param # one that can't take it
-    mv    t0, t2
+    and   t0, t0, t2            # those of them that can take it
     # The caller's stores (a TLB shootdown's request counts, the threads
     # an idle hart is woken for) must be visible to the harts before the
     # interrupt that tells them to look. msip is an I/O store, which

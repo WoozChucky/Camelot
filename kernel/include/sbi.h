@@ -48,9 +48,12 @@
 #define SBI_TIME_SET_TIMER 0
 
 /* IPI: send_ipi(hart_mask, hart_mask_base), a supervisor software interrupt
- * to hart hart_mask_base + i for every bit i set in hart_mask; a base of -1
- * means every hart that can take one (STARTED or SUSPENDED, as OpenSBI
- * counts them), and a mask naming any other is SBI_ERR_INVALID_PARAM. */
+ * to hart hart_mask_base + i for every bit i set in hart_mask, a base of -1
+ * meaning every hart. A mask naming a hart the machine doesn't have is
+ * SBI_ERR_INVALID_PARAM; of those named, only the harts that can take an
+ * interrupt (STARTED or SUSPENDED, as OpenSBI counts them) are sent one,
+ * a STOPPED or START_PENDING hart skipped without an error, as OpenSBI's
+ * 110f28518a does (37eaca4ab3 had made it SBI_ERR_INVALID_PARAM). */
 #define SBI_IPI_SEND_IPI 0
 
 /* HSM, hart state management. */

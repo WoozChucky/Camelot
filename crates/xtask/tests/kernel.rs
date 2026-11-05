@@ -1783,9 +1783,14 @@ fn shell_takes_more_input_than_the_ring_buffer_holds() {
 
 #[test]
 fn plic_routes_the_uart_to_the_kernel() {
-    // No input: the kernel waits at the prompt.
-    let (mut m, _) = load_committed_on(MachineConfig::default(), None);
+    // No input: the kernel waits at the prompt. It is looked at once the
+    // hart first reaches wfi: before, a tick may be on its way (the timing
+    // of boot and of the shell's start decides it), STIP pending with
+    // M-mode's timer off until the handler's set_timer turns it on again.
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), None);
+    let wfi = sym(&elf, "wfi");
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == u64::from(wfi));
     let mut reg = |addr| m.cpu.bus.read(addr, 4).unwrap();
     // Source 1 (the UART) at priority 1, enabled for context 1 (S-mode) only,
     // whose threshold of 0 lets it through.
