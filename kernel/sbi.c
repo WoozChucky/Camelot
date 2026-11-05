@@ -183,32 +183,3 @@ const char *sbi_strerror(long error) {
     }
     return "an unknown SBI error";
 }
-
-/* Linux's sbi_err_map_linux_errno() (arch/riscv/include/asm/sbi.h), case
- * for case. */
-int sbi_err_map_linux_errno(long err) {
-    switch (err) {
-    case SBI_SUCCESS:
-        return 0;
-    case SBI_ERR_DENIED:
-    case SBI_ERR_DENIED_LOCKED:
-        return -EPERM;
-    case SBI_ERR_INVALID_PARAM:
-    case SBI_ERR_INVALID_STATE:
-        return -EINVAL;
-    case SBI_ERR_BAD_RANGE:
-        return -ERANGE;
-    case SBI_ERR_INVALID_ADDRESS:
-        return -EFAULT;
-    case SBI_ERR_NO_SHMEM:
-        return -ENOMEM;
-    case SBI_ERR_TIMEOUT:
-        return -ETIMEDOUT;
-    case SBI_ERR_IO:
-        return -EIO;
-    case SBI_ERR_NOT_SUPPORTED:
-    case SBI_ERR_FAILED:
-    default:
-        return -ENOTSUPP;
-    }
-}
