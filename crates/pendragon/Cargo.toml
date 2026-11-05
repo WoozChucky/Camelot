@@ -9,10 +9,12 @@ license.workspace = true
 # Every VM and disk operation goes through the client layer Round Table uses too.
 avalon-client = { path = "../avalon-client" }
 avalon-proto = { path = "../avalon-proto" }
+# The screen's keys: KeyboardEvent.code to the HID usage (keyboard::usage), and
+# ASCII mode's codes.
+grail = { path = "../grail" }
 
 [dev-dependencies]
 # The integration tests run Avalon and Lake in process and drive them through
 # Pendragon over HTTP.
 avalon = { path = "../avalon" }
-grail = { path = "../grail" }
 lake = { path = "../lake" }

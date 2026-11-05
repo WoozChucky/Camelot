@@ -82,6 +82,24 @@ impl Json {
         }
     }
 
+    /// A number that is a whole number from `i64::MIN` to `i64::MAX`, written without
+    /// a fraction or exponent.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Json::Number(text) if !text.contains(['.', 'e', 'E']) => text.parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// Any number, as the nearest `f64` (a browser's numbers are all `f64`). A number
+    /// too large for one is `None`, not infinity.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Number(text) => text.parse::<f64>().ok().filter(|n| n.is_finite()),
+            _ => None,
+        }
+    }
+
     pub fn as_array(&self) -> Option<&[Json]> {
         match self {
             Json::Array(items) => Some(items),
@@ -438,6 +456,15 @@ mod tests {
         assert_eq!(n("1e3").as_u64(), None);
         assert_eq!(Json::from(u64::MAX).encode(), "18446744073709551615");
         assert_eq!(Json::from(-5i64).encode(), "-5");
+        assert_eq!(n("-9223372036854775808").as_i64(), Some(i64::MIN));
+        assert_eq!(n("9223372036854775808").as_i64(), None);
+        assert_eq!(n("-3").as_i64(), Some(-3));
+        assert_eq!(n("-3.0").as_i64(), None);
+        assert_eq!(n("2E1").as_i64(), None);
+        assert_eq!(n("-33.25").as_f64(), Some(-33.25));
+        assert_eq!(n("1e2").as_f64(), Some(100.0));
+        assert_eq!(n("1e999").as_f64(), None, "not infinity");
+        assert_eq!(Json::from("1").as_f64(), None);
         for bad in [
             "01", "-", "1.", ".5", "1e", "1e+", "+1", "-01", "0x10", "NaN", "Infinity", "1_000",
         ] {

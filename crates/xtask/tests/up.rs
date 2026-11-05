@@ -441,6 +441,142 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     platform.stop(log);
 }
 
+/// Whether the summary tells how to reach shd: the `herald --tcp` line.
+fn tells_of_shd(summary: &str) -> bool {
+    summary.contains("herald -- --tcp")
+}
+
+/// The demo when its gateway cannot bind `--shd`'s address (something else listens
+/// there): `up` says so, the switch and the VM come up without the forward, there is
+/// no shd to reach ([`Platform::shd`] is None) and the summary says nothing of one.
+/// And `start_shd` giving up when no shell answers within its time.
+#[test]
+fn a_taken_shd_address_leaves_the_demo_without_shd() {
+    let dir = TempDir::new("shd-taken");
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken_addr = taken.local_addr().unwrap();
+    let out = Output::default();
+    let log = &mut |line: &str| out.push(line);
+    let mut options = options(&dir);
+    options.demo = true;
+    options.shd = match taken_addr {
+        SocketAddr::V4(v4) => v4,
+        SocketAddr::V6(_) => unreachable!(),
+    };
+    up::prepare(&options, log).unwrap();
+    let mut platform = Platform::start(&options, &RUNNING, log).unwrap();
+    let id = platform.demo(log).unwrap();
+    let lines = out.lines();
+    let cannot = format!("up: demo: cannot forward {taken_addr} to the VM's shell server (");
+    let said = lines
+        .iter()
+        .find(|l| l.starts_with(&cannot))
+        .unwrap_or_else(|| panic!("{lines:#?}"));
+    assert!(
+        said.ends_with("); no shd (--shd picks another address)"),
+        "{said}"
+    );
+    assert!(
+        lines.contains(&"up: demo: created switch nat with a NAT gateway".to_string()),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("shd, the shell server") || l.contains("start shd")),
+        "{lines:#?}"
+    );
+    assert_eq!(platform.shd, None);
+    let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
+    let switches = avalon.list_switches().unwrap();
+    assert_eq!(switches.len(), 1);
+    assert_eq!(switches[0].nat.as_ref().map(|n| n.hostfwd.len()), Some(0));
+    // The platform carries on: the VM boots to its shell, the servers answer.
+    let mut console = Console::attach(platform.avalon, id);
+    console.wait_for_end(PROMPT);
+    console.type_line("echo no shd");
+    console.wait_for_end("no shd\n$ ");
+    all_answer(&platform);
+    let summary = platform.summary(true);
+    assert!(!tells_of_shd(&summary), "{summary}");
+    check_summary(&summary, 3);
+
+    // start_shd with nobody's shell at the address it is given (the listener, which
+    // accepts and says nothing): it types `shd &`, which starts, and gives up when its
+    // time is out.
+    let start = Instant::now();
+    let e = up::start_shd(platform.avalon, id, taken_addr, Duration::from_secs(3)).unwrap_err();
+    assert_eq!(e, format!("no shell answered at {taken_addr}"));
+    assert!(start.elapsed() < SLOW, "{:?}", start.elapsed());
+    console.wait_for_end("]\n$ ");
+    assert!(console.output.contains("shd &\n["), "{}", console.output);
+    drop((console, taken));
+    platform.stop(log);
+}
+
+/// The demo on an older disk, one without `/bin/shd`: the console says so at once
+/// (`sh: shd: no such program`), and `up` says shd could not start and how to start
+/// it, leaves `herald --tcp` out of its summary, and carries on.
+#[test]
+fn a_disk_without_shd_leaves_the_demo_without_shd() {
+    let dir = TempDir::new("no-shd");
+    let out = Output::default();
+    let log = &mut |line: &str| out.push(line);
+    let mut options = options(&dir);
+    options.demo = true;
+    up::prepare(&options, log).unwrap();
+    let mut platform = Platform::start(&options, &RUNNING, log).unwrap();
+    // The demo VM's disk from an earlier run, where /bin/shd was removed: made by a
+    // VM of that name, which is then destroyed (the VMs end with Avalon; the disk
+    // stays).
+    let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
+    let mut lake = Client::connect(&platform.lake.to_string(), "test").unwrap();
+    let (old, disk) = avalon_client::create_camelot_vm(
+        &mut avalon,
+        &mut lake,
+        &platform.lake.to_string(),
+        "vm001",
+        avalon_proto::HardwareProfile::default(),
+    )
+    .unwrap();
+    assert_eq!(disk, "vm001-disk0");
+    avalon.start_vm(&VmRef::Id(old)).unwrap();
+    let mut console = Console::attach(platform.avalon, old);
+    console.wait_for_end(PROMPT);
+    console.type_line("rm /bin/shd");
+    console.wait_for_end("rm /bin/shd\n$ ");
+    drop(console);
+    avalon.stop_vm(&VmRef::Id(old)).unwrap();
+    avalon.destroy_vm(&VmRef::Id(old)).unwrap();
+
+    let start = Instant::now();
+    let id = platform.demo(log).unwrap();
+    // The console told at once: no waiting for SHD_TIMEOUT.
+    assert!(start.elapsed() < up::SHD_TIMEOUT, "{:?}", start.elapsed());
+    let lines = out.lines();
+    for line in [
+        "up: demo: using disk vm001-disk0 from an earlier run".to_string(),
+        format!(
+            "up: demo: could not start shd in VM {id} (sh: shd: no such program); type shd & on its \
+             console"
+        ),
+    ] {
+        assert!(lines.contains(&line), "no {line:?} in {lines:#?}");
+    }
+    // The forward is there, for a shd started by hand.
+    assert!(platform.shd.is_some());
+    let summary = platform.summary(true);
+    assert!(!tells_of_shd(&summary), "{summary}");
+    check_summary(&summary, 3);
+    // The platform carries on.
+    let mut console = Console::attach(platform.avalon, id);
+    console.type_line("echo still up");
+    console.wait_for_end("still up\n$ ");
+    all_answer(&platform);
+    drop((console, avalon, lake));
+    platform.stop(log);
+}
+
 /// `up::run`, the command itself: it comes up, prints its summary, and stops when the
 /// flag is set (here by the log, once it has seen the summary and every server
 /// answered).

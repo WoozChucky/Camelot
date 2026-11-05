@@ -108,6 +108,7 @@ there is a filesystem to look it up in.
 | 44 | `gettid` | | the caller's thread id |
 | 45 | `futex_wait` | `int *addr, int val` | 0; `-EAGAIN`, `-EINVAL`, `-EINTR`, `-EFAULT` |
 | 46 | `futex_wake` | `int *addr, int n` | the number of threads woken; `-EINVAL`, `-EFAULT` |
+| 47 | `fcntl` | `int fd, int cmd, int arg` | the descriptor's flags, a new descriptor, or 0; `-EBADF`, `-EINVAL`, `-EMFILE` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -176,8 +177,9 @@ returns at once.
 below) as a new process, a child of the caller, and returns its pid. From
 then on both take turns on the CPU with the other runnable processes. The
 child gets copies of the caller's descriptors 0, 1 and 2 (sharing their
-open files, offsets included; a closed one stays closed) and no other, and
-the caller's working directory. Its name, in the kernel's messages, is the
+open files, offsets included; a closed one stays closed, and so does one
+that closes on exec, since `spawn` stands for a fork and an exec, as
+`posix_spawn` does) and no other, and the caller's working directory. Its name, in the kernel's messages, is the
 last name of `path`. `argv` is the child's argument list, an array of string
 pointers ending with a null pointer, `argv[0]` conventionally the program's
 name; a null `argv` stands for `{ path, NULL }`. The kernel copies the
@@ -221,9 +223,10 @@ clock), as an unsigned number.
 **open(path, flags)** opens the file at `path` and returns a new descriptor
 for it, the lowest one free. `flags` is one access mode, `O_RDONLY` (0),
 `O_WRONLY` (1) or `O_RDWR` (2), plus any of `O_CREAT` (0x40: make the file,
-empty, if `path` names nothing; open it as it is if it exists) and
+empty, if `path` names nothing; open it as it is if it exists),
 `O_TRUNC` (0x200: empty a file opened for writing; ignored for reading and
-for devices); anything else is `-EINVAL`. The offset starts at 0. What it
+for devices) and `O_CLOEXEC` (0x80000: the new descriptor closes on
+`exec`, its `FD_CLOEXEC` set; see `fcntl`); anything else is `-EINVAL`. The offset starts at 0. What it
 opens:
 
 - a file, in the access mode asked for; on a read-only filesystem, writing
@@ -308,7 +311,30 @@ if it is not a directory; the path's errors; `-EFAULT`.
 
 **dup(fd)** returns a new descriptor, the lowest one free, for the open file
 behind `fd`: both share it, offset included, and it stays open until both
-are closed. `-EBADF`, or `-EMFILE` if every descriptor is taken.
+are closed. The new descriptor stays open across `exec`, whatever `fd`'s
+flag: a descriptor's `FD_CLOEXEC` is its own, not the open file's. `-EBADF`,
+or `-EMFILE` if every descriptor is taken.
+
+**fcntl(fd, cmd, arg)** is Linux's for a descriptor's flags and for copies
+of it, with Linux's numbers. Each descriptor has one flag, `FD_CLOEXEC`
+(1): it closes when the process `exec`s a new program (and `spawn` passes
+it on to no child). `open` sets it with `O_CLOEXEC`; every other descriptor
+starts without it, and `close` clears it with the descriptor. `cmd` is:
+
+- `F_DUPFD` (0): a new descriptor for the open file behind `fd`, as `dup`
+  makes, but the lowest free one from `arg` up, without `FD_CLOEXEC`;
+- `F_DUPFD_CLOEXEC` (1030): the same, with `FD_CLOEXEC` set (a shell keeps
+  its own descriptors this way while it puts others at 0 and 1 for a
+  program it `exec`s);
+- `F_GETFD` (1): `fd`'s flags, `FD_CLOEXEC` or 0;
+- `F_SETFD` (2): sets them to `arg`, of which only `FD_CLOEXEC` counts;
+  returns 0.
+
+Errors: `-EBADF` if `fd` is not open, checked before `cmd` (so an unknown
+`cmd` on a closed descriptor is `-EBADF`, as on Linux); `-EINVAL` for
+another `cmd`, or for an `arg` of `F_DUPFD` or `F_DUPFD_CLOEXEC` that is
+not a descriptor, 0 to 15 (Linux's answer for one at or past
+`RLIMIT_NOFILE`); `-EMFILE` when no descriptor from `arg` up is free.
 
 **pipe(fds)** makes a pipe and stores two new descriptors in `fds[0]` (the
 read end) and `fds[1]` (the write end), the lowest two free ("Pipes").
@@ -318,12 +344,14 @@ Errors: `-EMFILE`, `-ENFILE`, `-ENOMEM` (no page for its buffer), or
 **exec(path, argv)** replaces the caller's program with the one at `path`:
 its address space goes, and the new program starts as one started by
 `spawn` does ("Starting a program"), with `argv`, in the same process. Its
-pid, parent, descriptors (all of them) and working directory stay; its name
-becomes the last name of `path`. Its other threads, if it has any, end
+pid, parent, descriptors and working directory stay, but for the
+descriptors with `FD_CLOEXEC` set (`fcntl`), which are closed once the new
+program has replaced the old one; its name becomes the last name of `path`. Its other threads, if it has any, end
 first ("Threads" below): the new program runs in the caller's thread
 alone. On success it doesn't return; on an error,
-nothing changed and the old program carries on with the error, `spawn`'s
-but `-EAGAIN` (the kernel prints `exec: PATH: REASON` for `-ENOEXEC`).
+nothing changed (the descriptors that close on exec are still open) and
+the old program carries on with the error, `spawn`'s but `-EAGAIN` (the
+kernel prints `exec: PATH: REASON` for `-ENOEXEC`).
 
 **kill(pid)** ends the process `pid`, every one of its threads: it exits with status -1, as a
 process killed for a fault does (its parent's `wait` gets -1), but
@@ -684,10 +712,13 @@ A descriptor is a small number, 0 to 15, that stands for an open file: a
 file or directory of the filesystem, a device (the console), one end of a
 pipe, or a socket. Each process has its own 16, which all its threads share; they point into the kernel's table of 64
 open files, which is where the access mode (reading, writing or both) and,
-for a file on the disk, the offset live. `dup`, and `spawn` for descriptors
-0 to 2, make a second descriptor for the same open file, which then shares
-its offset; `open` makes a new open file every time, with its own. The open
-file goes once the last descriptor for it is closed.
+for a file on the disk, the offset live. `dup`, `fcntl`'s `F_DUPFD`, and
+`spawn` for descriptors 0 to 2, make a second descriptor for the same open
+file, which then shares its offset; `open` makes a new open file every
+time, with its own. The open file goes once the last descriptor for it is
+closed. A descriptor's one flag, `FD_CLOEXEC` (`fcntl`, `O_CLOEXEC`), is
+its own: `exec` closes the descriptors that have it, and `spawn` passes
+none of them on.
 
 The first process, the shell, starts with the console as 0 (stdin, for
 reading), 1 (stdout) and 2 (stderr), both for writing. Every other process
@@ -695,7 +726,10 @@ gets 0, 1 and 2 from its parent at `spawn`, whatever they are by then: the
 shell redirects a program's input or output by putting a file or a pipe at
 0 or 1 (`close`, then `dup` or `open`, which take the lowest free number),
 spawning it, and putting its own back from copies it keeps above 2, which
-no child inherits. So does `exec`, which keeps every descriptor.
+no child inherits. For `exec PROG > FILE`, where PROG keeps every
+descriptor but those that close on exec, the shell makes its copies with
+`fcntl`'s `F_DUPFD_CLOEXEC`: the kernel closes them as PROG starts, and if
+PROG can't be started the shell puts its own back from them.
 
 ## Paths
 
@@ -822,7 +856,8 @@ line and its NUL.
 
 Programs are compiled freestanding with only `user.h`, which declares the
 calls above (the stubs in `usys.s`, which return the raw result, a negative
-error number included), their constants and structures (`O_*`, `SEEK_*`,
+error number included), their constants and structures (`O_*`, `F_*`,
+`FD_CLOEXEC`, `SEEK_*`,
 `struct stat`, `struct dirent`, `T_*`, `struct procinfo`, `PROC_*`,
 `struct hartinfo`,
 `struct netinfo`, `struct net_stats`, `NETINFO_*`, `struct ping_reply`,

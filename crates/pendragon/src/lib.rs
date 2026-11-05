@@ -1,7 +1,8 @@
 //! Pendragon: the web console of the Avalon platform. One browser page for the VMs on
 //! an Avalon server and the disk images on a Lake server: list, create, start, pause,
-//! resume, stop and destroy VMs, watch and type into their consoles, create, delete,
-//! attach and detach disks, and see how both servers are doing.
+//! resume, stop and destroy VMs, watch and type into their consoles, see their
+//! screens and use their keyboards and mice, create, delete, attach and detach disks,
+//! and see how both servers are doing.
 //!
 //! Pendragon is a client of both servers, like Round Table, and goes through the same
 //! client layer ([`avalon_client`]) for every operation; Avalon and Lake stay headless.
@@ -12,7 +13,9 @@
 //! - [`json`]: the API's JSON, and [`base64`] for bytes inside it.
 //! - [`guard`]: the checks that keep other web pages out (`Host`, a per-launch token
 //!   from the OS random source in [`random`], `Origin`), and the security headers.
-//! - `api.rs`: the routes, pages and API; `console.rs`: live consoles for the page.
+//! - [`websocket`]: WebSockets (RFC 6455), with [`sha1`] for their handshake.
+//! - `api.rs`: the routes, pages and API; `console.rs`: live consoles for the page;
+//!   [`screen`]: VM screens, keyboards and mice for the page, over a WebSocket.
 //! - [`Server`] (`server.rs`): the listener, a thread per connection.
 //! - `ui/`: the page, its script and its style, plain HTML, JavaScript and CSS built
 //!   into the binary (`include_str!`), with no build step.
@@ -25,14 +28,18 @@ pub mod guard;
 pub mod http;
 pub mod json;
 pub mod random;
+pub mod sha1;
+pub mod websocket;
 
 mod api;
 mod console;
+pub mod screen;
 mod server;
 
 pub use api::{MAX_BODY, MAX_UPLOAD, MAX_WAIT};
 pub use console::{ConsoleLimits, IDLE as CONSOLE_IDLE, KEEP as CONSOLE_KEEP, MAX_TAPS};
-pub use guard::TOKEN_HEADER;
+pub use guard::{TOKEN_HEADER, TOKEN_PROTOCOL};
+pub use screen::{ScreenLimits, MAX_SCREENS};
 pub use server::{
     Config, Server, ServerThread, ShutdownHandle, DEFAULT_AVALON_MAX_RAM, DEFAULT_LISTEN, MAX_CONNECTIONS,
 };
