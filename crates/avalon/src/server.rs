@@ -1115,13 +1115,14 @@ impl Session<'_> {
     }
 
     /// The connection is ending: detach it from every console and screen, and from the
-    /// VMs it debugs (which run on without its breakpoints).
+    /// VMs it debugs (which stay as they are, as QEMU leaves a VM whose GDB connection
+    /// closes).
     fn detach_everywhere(&self) {
         let vms: Vec<Arc<Vm>> = lock(&self.server.table).vms.values().cloned().collect();
         for vm in vms {
             vm.detach_console(self.outbox.id);
             vm.detach_screen(self.outbox.id);
-            vm.detach_debugger(self.outbox.id);
+            vm.debugger_gone(self.outbox.id);
         }
     }
 }

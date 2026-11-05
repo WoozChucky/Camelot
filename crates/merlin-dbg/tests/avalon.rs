@@ -3,7 +3,7 @@
 //! kernel to its shell, and Herald is attached to its console the whole time. The
 //! debugger breaks in the kernel's `write` system call, shows where, continues to the
 //! next one and leaves; the console goes on working, and Herald sees nothing but the
-//! VM's state changes.
+//! VM's state changes, few of them (a VM with a debugger has its notices rate-limited).
 
 use avalon::{Config, Server, ServerThread};
 use avalon_proto::{Connection, HardwareProfile, Message, VmRef, VmState};
@@ -162,7 +162,8 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
         .spawn()
         .unwrap();
     let start = Instant::now();
-    while state(&mut control, id) != VmState::Debug {
+    // Paused for it, as QEMU's stub pauses a VM for a GDB connection.
+    while !(server.debug_vm(id).unwrap().debugged && state(&mut control, id) == VmState::Paused) {
         assert!(start.elapsed() < SLOW, "the debugger never attached");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -215,11 +216,15 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
         console.contains("$ echo camelot\ncamelot\n$ echo again\nagain\n$ "),
         "{console:?}"
     );
+    // Paused for the debugger as it attached (QEMU's run states); the run states its
+    // continues and breakpoints went through after that come at most once a second
+    // (avalon::vm::NOTICE_RATE), so Herald hears of few of them.
     let notices = herald.notices.text();
     assert!(
-        notices.contains(&format!("herald: VM {id} is debug\n")),
+        notices.starts_with(&format!("herald: VM {id} is paused\n")),
         "{notices}"
     );
+    assert!(notices.lines().count() <= 6, "{notices}");
     assert!(
         notices.ends_with(&format!("herald: VM {id} is running\n")),
         "{notices}"

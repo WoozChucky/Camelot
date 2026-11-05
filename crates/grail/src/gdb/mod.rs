@@ -10,8 +10,12 @@
 //! Avalon carries a [`Session`] over its own connection instead
 //! (`docs/avalon-protocol.md`, section 6.8).
 //!
-//! One client at a time. A client that detaches (`D`) or disconnects leaves the machine
-//! running without breakpoints, and the next one to connect stops it. `k` stops Grail.
+//! One client at a time, and the machine is stopped while one connects, as QEMU's stub
+//! stops a VM for a new GDB connection. A client that detaches (`D`) leaves the machine
+//! running without its breakpoints and watchpoints. One whose connection ends without
+//! `D` leaves the machine as it was, as QEMU does: stopped, it stays stopped until the
+//! next client resumes it; running, it runs on, and the breakpoints still stop it (the
+//! next client's `?` removes them). `k` stops Grail.
 
 pub mod commands;
 pub mod packet;
@@ -59,19 +63,39 @@ pub fn serve(
         None
     };
     listener.set_nonblocking(true)?;
+    // Whether the machine is stopped with no client: one whose connection ended left it
+    // stopped, or a breakpoint it left has stopped it since.
+    let mut stopped = false;
     loop {
         match client.take() {
             Some(stream) => match TcpSession::new(m, stream)?.run(m, trace) {
                 Ended::Exited(code) => return Ok(Outcome::Exited(code)),
                 Ended::Killed => return Ok(Outcome::Killed),
                 // Free to run on its own again.
-                Ended::Detached => m.clear_debug_points(),
+                Ended::Detached => {
+                    m.clear_debug_points();
+                    stopped = false;
+                }
+                // Left as it was, its breakpoints too.
+                Ended::Dropped { running } => stopped = !running,
             },
+            None if stopped => {
+                // Nothing runs until a client comes.
+                listener.set_nonblocking(false)?;
+                let (stream, _) = listener.accept()?;
+                listener.set_nonblocking(true)?;
+                client = Some(stream);
+            }
             None => {
                 if let Some(code) = m.exit_code() {
                     return Ok(Outcome::Exited(code));
                 }
-                m.debug_continue(SLICE, trace);
+                if let Some(stop) = m.debug_continue(SLICE, trace) {
+                    // A breakpoint or watchpoint the last client left: the machine stops,
+                    // as a QEMU VM stops in its run state debug with no debugger to tell.
+                    stopped = !matches!(stop, crate::debug::Stop::Exited(_));
+                    continue;
+                }
                 if let Some(d) = m.pace_delay() {
                     std::thread::sleep(d.min(MAX_WAIT));
                 }
@@ -90,7 +114,8 @@ pub fn serve(
 /// [`serve`] runs one over TCP; Avalon runs one for each VM's debugger.
 ///
 /// The host owns the machine and runs it. While it is stopped, the host passes every
-/// event to [`Session::event`]. On [`Next::Continue`] it runs the machine with
+/// event to [`Session::event`]. On [`Next::Step`] it runs one step with
+/// [`Session::step`], which writes the stop reply. On [`Next::Continue`] it runs the machine with
 /// [`Machine::debug_continue`] until that stops it or the client sends a Ctrl-C
 /// ([`Session::interrupts`]; anything else the client sends meanwhile is dropped, as in
 /// GDB's all-stop mode), and gives the reason to [`Session::stopped`], which writes the
@@ -109,6 +134,10 @@ pub enum Next {
     /// Run the machine until it stops or the client interrupts it, then call
     /// [`Session::stopped`].
     Continue,
+    /// Run one instruction of the selected hart with [`Session::step`] (`s`, `vCont;s`).
+    /// A host with run states has the machine running for it, as QEMU's is for a step,
+    /// and stopped again after it (debug).
+    Step,
     /// The client killed the machine (`k`, `vKill`); `X09` was written.
     Kill,
     /// The client detached (`D`); `OK` was written. Its breakpoints and watchpoints are
@@ -132,16 +161,8 @@ impl Session {
     }
 
     /// An event from the client while the machine is stopped: appends what to send to
-    /// `out` (an ack, a reply, a packet sent again) and says what to do next. A step
-    /// runs here, and its stop reply is written; `trace` is called before each hart's
-    /// turn.
-    pub fn event(
-        &mut self,
-        m: &mut Machine,
-        event: Event,
-        trace: &mut impl FnMut(&Cpu),
-        out: &mut Vec<u8>,
-    ) -> Next {
+    /// `out` (an ack, a reply, a packet sent again) and says what to do next.
+    pub fn event(&mut self, m: &mut Machine, event: Event, out: &mut Vec<u8>) -> Next {
         let payload = match event {
             Event::Packet(p) => p,
             Event::Bad => {
@@ -175,15 +196,17 @@ impl Session {
                 self.send(b"OK", out);
                 Next::Detach
             }
-            Action::Step => {
-                let stop = m.debug_step(trace);
-                match self.stopped(m, StopReason::Machine(stop), out) {
-                    Some(code) => Next::Exited(code),
-                    None => Next::Wait,
-                }
-            }
+            Action::Step => Next::Step,
             Action::Continue => Next::Continue,
         }
+    }
+
+    /// Runs the step [`Next::Step`] asked for and appends its stop reply to `out`. The
+    /// program's exit code if the step reached the exit (the reply is `W`), which ends
+    /// the session. `trace` is called before each hart's turn.
+    pub fn step(&mut self, m: &mut Machine, trace: &mut impl FnMut(&Cpu), out: &mut Vec<u8>) -> Option<u32> {
+        let stop = m.debug_step(trace);
+        self.stopped(m, StopReason::Machine(stop), out)
     }
 
     /// Whether `event`, from a client whose machine is running, stops it: a Ctrl-C.
@@ -218,8 +241,13 @@ impl Session {
 enum Ended {
     Exited(u32),
     Killed,
-    /// `D`, or the client went away.
+    /// `D`.
     Detached,
+    /// The connection ended without `D` (or writing to it failed), the machine running
+    /// for the client or stopped.
+    Dropped {
+        running: bool,
+    },
 }
 
 /// One client over TCP: its [`Session`], the socket to write to, and the events from the
@@ -246,45 +274,49 @@ impl TcpSession {
     }
 
     fn run(&mut self, m: &mut Machine, trace: &mut impl FnMut(&Cpu)) -> Ended {
-        let ended = self.serve(m, trace).unwrap_or(Ended::Detached);
+        let ended = self.serve(m, trace);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         ended
     }
 
-    /// The session's loop. An error writing to the client ends it, as a detach.
-    fn serve(&mut self, m: &mut Machine, trace: &mut impl FnMut(&Cpu)) -> io::Result<Ended> {
+    /// The session's loop. An error writing to the client ends it as its connection
+    /// ending does.
+    fn serve(&mut self, m: &mut Machine, trace: &mut impl FnMut(&Cpu)) -> Ended {
+        const STOPPED: Ended = Ended::Dropped { running: false };
         // Stopped: wait for a packet.
         loop {
             let Ok(event) = self.events.recv() else {
-                return Ok(Ended::Detached);
+                return STOPPED;
             };
             let mut out = Vec::new();
-            let next = self.session.event(m, event, trace, &mut out);
+            let next = self.session.event(m, event, &mut out);
             let written = self.stream.write_all(&out);
-            match next {
+            let exited = match next {
                 // GDB never reads the reply to `k`, and may be gone already.
-                Next::Kill => return Ok(Ended::Killed),
-                Next::Wait => written?,
-                Next::Detach => {
-                    written?;
-                    return Ok(Ended::Detached);
-                }
-                Next::Exited(code) => {
-                    written?;
-                    return Ok(Ended::Exited(code));
+                Next::Kill => return Ended::Killed,
+                _ if written.is_err() => return STOPPED,
+                Next::Wait => continue,
+                Next::Detach => return Ended::Detached,
+                Next::Exited(code) => return Ended::Exited(code),
+                Next::Step => {
+                    let mut out = Vec::new();
+                    let exited = self.session.step(m, trace, &mut out);
+                    (exited, self.stream.write_all(&out))
                 }
                 Next::Continue => {
-                    written?;
                     let Some(reason) = self.run_until_stopped(m, trace) else {
-                        return Ok(Ended::Detached);
+                        // Gone while the machine ran for it: it runs on.
+                        return Ended::Dropped { running: true };
                     };
                     let mut out = Vec::new();
                     let exited = self.session.stopped(m, reason, &mut out);
-                    self.stream.write_all(&out)?;
-                    if let Some(code) = exited {
-                        return Ok(Ended::Exited(code));
-                    }
+                    (exited, self.stream.write_all(&out))
                 }
+            };
+            match exited {
+                (Some(code), _) => return Ended::Exited(code),
+                (None, Err(_)) => return STOPPED,
+                (None, Ok(())) => {}
             }
         }
     }

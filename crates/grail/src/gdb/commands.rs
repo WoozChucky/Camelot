@@ -138,7 +138,13 @@ impl Stub {
             return reply("");
         };
         let result = match cmd {
-            b'?' => Ok(Action::Reply(self.stop_reply(m))),
+            b'?' => {
+                // A client asks this as it connects, so the breakpoints and watchpoints
+                // an earlier one left (its connection ended without `D`) go, as QEMU's
+                // stub removes them here (`handle_target_halt`).
+                m.clear_debug_points();
+                Ok(Action::Reply(self.stop_reply(m)))
+            }
             b'g' => Ok(read_general(m)),
             b'G' => write_general(m, args),
             b'p' => read_register(m, args),
@@ -1039,5 +1045,20 @@ mod tests {
         assert_eq!(r, b"T05thread:2;20:20100000;");
         assert_eq!(stub.stopped(&mut m, StopReason::Machine(Stop::Exited(3))), b"W03");
         assert_eq!(ask(&mut m, &mut stub, "?"), "W03");
+    }
+
+    /// `?` is what a client asks as it connects: the breakpoints and watchpoints a
+    /// client before it left go, as QEMU's stub has it.
+    #[test]
+    fn a_new_clients_question_clears_what_the_last_one_left() {
+        let (mut m, mut stub) = setup(1);
+        assert_eq!(ask(&mut m, &mut stub, "Z0,80000000,4"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "Z2,80001000,4"), "OK");
+        assert!(m.has_debug_points());
+        let mut next = Stub::new();
+        assert!(ask(&mut m, &mut next, "?").starts_with("T02"));
+        assert!(!m.has_debug_points());
+        assert_eq!(m.breakpoints().count(), 0);
+        assert!(m.watchpoints().is_empty());
     }
 }

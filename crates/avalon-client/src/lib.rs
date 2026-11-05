@@ -168,13 +168,14 @@ impl VmAction {
     }
 
     /// Whether the server accepts this action on a VM in `state` (protocol doc,
-    /// section 6.2): front ends offer only these.
+    /// section 6.2): front ends offer only these. A VM its debugger holds (paused or
+    /// debug) is the debugger's to resume, and refuses `Resume` all the same.
     pub fn allowed_in(self, state: VmState) -> bool {
         use VmState::*;
         match self {
             VmAction::Start => state == Created,
             VmAction::Pause => state == Running,
-            VmAction::Resume => state == Paused,
+            VmAction::Resume => matches!(state, Paused | Debug),
             VmAction::Stop => matches!(state, Created | Running | Paused | Debug),
             VmAction::Destroy => true,
         }
@@ -606,8 +607,9 @@ fn unexpected(reply: &Message) -> Error {
 /// what it has read.
 ///
 /// The stream ends when the server ends the attachment (`Detached`: the VM's machine
-/// ended) or the session breaks. Dropping the tunnel closes the session, which the
-/// server takes as a detach.
+/// ended) or the session breaks. Dropping the tunnel closes the session: the server
+/// leaves the VM as it is, stopped or running, breakpoints and all, as QEMU leaves a VM
+/// whose GDB connection closes. A debugger detaches with GDB's `D` first.
 pub struct DebugTunnel {
     conn: Connection<TcpStream>,
     vm: u32,
@@ -815,8 +817,8 @@ mod tests {
         assert_eq!(allowed(Created), ["start", "stop", "destroy"]);
         assert_eq!(allowed(Running), ["pause", "stop", "destroy"]);
         assert_eq!(allowed(Paused), ["resume", "stop", "destroy"]);
-        // Its debugger resumes it, not ResumeVm.
-        assert_eq!(allowed(Debug), ["stop", "destroy"]);
+        // Stopped at a breakpoint, once its debugger has gone (QEMU's `cont`).
+        assert_eq!(allowed(Debug), ["resume", "stop", "destroy"]);
         assert_eq!(allowed(Stopped), ["destroy"]);
         assert_eq!(allowed(Exited(3)), ["destroy"]);
         assert!(holds_disks(Created) && holds_disks(Running) && holds_disks(Paused) && holds_disks(Debug));

@@ -354,6 +354,7 @@ Debugging: a machine can be debugged through Grail's debug interface (`grail::de
 - **Single steps** run one turn of the selected hart, after the turns of the harts before it in that step.
 - **Debugger access** has no side effects. It reads registers and CSRs whatever the hart's privilege, and reads and writes memory physically (the stub's `Qqemu.PhyMemMode:1`, QEMU's) or through the selected hart's current translation (no permission checks, no A/D updates). It never touches device registers. A debugger that wants another address space than the hart's walks its page table itself, over physical memory, as merlin-dbg does for a Camelot process.
 - **Determinism:** a debugged run executes exactly the instructions of an undebugged one.
+- **Sessions** follow QEMU's stub: a client's connection stops the machine (as an interrupt, SIGINT); `D` removes the breakpoints and watchpoints and resumes it; a connection that ends without `D` leaves the machine as it was, breakpoints and watchpoints included, and the next client's `?` removes them. An Avalon VM goes through QEMU's run states for its debugger: paused (an attach, an interrupt, a pause), debug (a breakpoint, a watchpoint, a step's end), running (a continue, a step).
 
 Inter-processor interrupts: writing 1 to hart `i`'s `msip` sets its `mip.MSIP`; it stays pending until software writes 0 there (the hart that takes it, typically). Any hart may write any `msip`, its own included.
 

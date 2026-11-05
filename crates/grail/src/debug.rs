@@ -212,7 +212,15 @@ impl Machine {
         self.debug.steps
     }
 
-    /// Removes every breakpoint and watchpoint (a debugger detaching).
+    /// Whether the machine has a breakpoint or a watchpoint: a host runs it with
+    /// [`Machine::debug_continue`] then, debugger or not, so that they stop it (QEMU
+    /// keeps a debugger's breakpoints when its connection ends without `D`).
+    pub fn has_debug_points(&self) -> bool {
+        !self.debug.breakpoints.is_empty() || !self.cpu.bus.watches.list.is_empty()
+    }
+
+    /// Removes every breakpoint and watchpoint (a debugger detaching, or a new one
+    /// asking why the machine stopped, `?`).
     pub fn clear_debug_points(&mut self) {
         self.debug.breakpoints.clear();
         self.cpu.bus.watches.list.clear();

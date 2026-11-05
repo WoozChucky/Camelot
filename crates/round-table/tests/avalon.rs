@@ -4,7 +4,7 @@
 
 mod common;
 
-use avalon_client::{Client, VmAction};
+use avalon_client::{Client, DebugTunnel, VmAction};
 use avalon_proto::{ErrorCode, VmRef, VmState};
 use common::*;
 use round_table::Failure;
@@ -383,8 +383,31 @@ fn refusals() {
     }
 }
 
-/// A VM its debugger holds (protocol doc, section 6.8) is in state debug, as `list`
-/// and `info` show; it can be stopped, not paused or resumed.
+/// Sends the stub one packet over `tunnel` and returns its reply's packet (`$...#xx`).
+fn ask_stub(tunnel: &mut DebugTunnel, packet: &[u8]) -> String {
+    tunnel.write_all(packet).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = tunnel
+            .read_timeout(&mut buf, Some(Duration::from_secs(30)))
+            .unwrap();
+        got.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&got).into_owned();
+        if let Some(start) = text.find('$') {
+            if text[start..]
+                .find('#')
+                .is_some_and(|end| start + end + 3 <= text.len())
+            {
+                return text[start..].to_string();
+            }
+        }
+    }
+}
+
+/// A VM its debugger holds (protocol doc, section 6.8): stopped for it as QEMU's run
+/// states have it, paused when it attaches and debug once a step (or a breakpoint) has
+/// stopped it, as `list` and `info` show. It can be stopped; the debugger resumes it.
 #[test]
 fn a_debugged_vm() {
     let server = avalon(256);
@@ -394,8 +417,17 @@ fn a_debugged_vm() {
         addr,
         &["create", "--name", "echo", "--ram", "64", "--start", &echo],
     );
-    let mut debugger = Client::connect(&addr.to_string(), "test").unwrap();
-    let id = debugger.attach_debugger(&VmRef::Name("echo".into())).unwrap();
+    let client = Client::connect(&addr.to_string(), "test").unwrap();
+    let mut tunnel = DebugTunnel::open(client, &VmRef::Name("echo".into())).unwrap();
+    let id = tunnel.vm();
+    assert_eq!(state(addr, "echo"), VmState::Paused);
+    let why = refused(addr, &["resume", "echo"]);
+    assert_eq!(
+        why,
+        "invalid state: VM 1 ('echo') is paused, held by its debugger: the debugger resumes it"
+    );
+    // A step: running, then debug.
+    assert!(ask_stub(&mut tunnel, b"$s#73").starts_with("$T05"));
     assert_eq!(state(addr, "echo"), VmState::Debug);
     assert_eq!(
         ok(addr, &["list"]),
@@ -406,17 +438,25 @@ ID  NAME  STATE  RAM     CLOCK       DISKS  NETS
     );
     assert!(ok(addr, &["info", "echo"]).contains("\nstate    debug\n"));
     let why = refused(addr, &["resume", "echo"]);
-    assert_eq!(why, "invalid state: VM 1 ('echo') is debug, not paused");
+    assert_eq!(
+        why,
+        "invalid state: VM 1 ('echo') is debug, held by its debugger: the debugger resumes it"
+    );
     let why = refused(addr, &["pause", "echo"]);
     assert_eq!(why, "invalid state: VM 1 ('echo') is debug, not running");
-    // A second debugger is refused; detaching runs the VM on.
+    // A second debugger is refused; detaching (`D`) runs the VM on.
     let mut other = Client::connect(&addr.to_string(), "test").unwrap();
     let busy = other.attach_debugger(&VmRef::Id(id)).unwrap_err();
     assert_eq!(busy.code(), Some(ErrorCode::Busy));
-    debugger.detach_debugger(id).unwrap();
-    assert_eq!(state(addr, "echo"), VmState::Running);
+    assert_eq!(ask_stub(&mut tunnel, b"$D#44"), "$OK#9a");
+    let start = std::time::Instant::now();
+    while state(addr, "echo") != VmState::Running {
+        assert!(start.elapsed() < Duration::from_secs(30), "not running again");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     // Held again, and stopped.
     other.attach_debugger(&VmRef::Id(id)).unwrap();
+    assert_eq!(state(addr, "echo"), VmState::Paused);
     assert_eq!(ok(addr, &["stop", "echo"]), "stopped VM echo\n");
     assert_eq!(state(addr, "echo"), VmState::Stopped);
     server.stop().unwrap();

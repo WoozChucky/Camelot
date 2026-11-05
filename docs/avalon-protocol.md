@@ -110,7 +110,7 @@ Round Table and Herald take a VM argument that is all digits as an id, anything 
 | 2 | paused | |
 | 3 | stopped (by a client) | |
 | 4 | exited (the program stopped the machine) | `code: u32` |
-| 5 | debug (held by its debugger, section 6.8) | |
+| 5 | debug (stopped by a breakpoint, a watchpoint or a debugger's step, section 6.8) | |
 
 **HardwareProfile**, the hardware of one VM. It mirrors Grail's `MachineConfig` field for field (`crates/avalon-proto/tests/machine_config.rs` stops compiling if `MachineConfig` gains a field the profile lacks):
 
@@ -357,8 +357,8 @@ length 14    Hello  "AVLN"       v11    agent "rt"
 | `GetVmInfo` | `vm: VmRef` | |
 | `VmInfo` | `vm: VmSummary`, `devices: list<DeviceEntry>`, `steps: u64` | `devices` is the guest's sysinfo device table; `steps` the instructions executed so far |
 | `StartVm` | `vm: VmRef` | created → running |
-| `PauseVm` | `vm: VmRef` | running → paused (also one its debugger resumed, section 6.8) |
-| `ResumeVm` | `vm: VmRef` | paused → running. A VM in state debug is resumed by its debugger, not by `ResumeVm` (`InvalidState`) |
+| `PauseVm` | `vm: VmRef` | running → paused (also one its debugger resumed, which gets its stop reply, section 6.8) |
+| `ResumeVm` | `vm: VmRef` | paused or debug → running. A VM with a debugger is resumed by its debugger, not by `ResumeVm` (`InvalidState`, section 6.8) |
 | `StopVm` | `vm: VmRef` | created, running, paused or debug → stopped. A stopped or exited VM cannot be restarted; destroy it and create a new one |
 | `DestroyVm` | `vm: VmRef` | any state; frees the VM, unplugs its network cards, detaches its clients (`Detached`), and its name can be reused |
 | `VmStateChanged` | `vm: u32`, `state: VmState` | sent to every client attached to the VM (console, screen or debugger; once to a client attached more than one way) when its state changes, including when its program exits |
@@ -494,16 +494,26 @@ A VM has a GDB stub: Grail's (`grail --gdb`, [`merlin-dbg.md`](merlin-dbg.md), "
 
 | Message | Payload | Notes |
 |---|---|---|
-| `DebugAttach` | `vm: VmRef` | the client becomes the VM's debugger, and the VM stops for it: its state becomes debug, stopped between two steps as a new GDB client stops `grail --gdb`. A created VM starts in state debug, before its first instruction, as `grail --gdb-wait` waits; a running or paused one stops. Answered once the VM has stopped. Errors: `NoSuchVm`, `Busy` (it has a debugger already: one at a time, as Grail's stub serves one client), `InvalidState` (stopped or exited: there is no machine to debug) |
+| `DebugAttach` | `vm: VmRef` | the client becomes the VM's debugger, and the VM stops for it between two steps, as a new GDB client stops `grail --gdb`: a running VM is paused. A created VM starts paused, before its first instruction, as `grail --gdb-wait` waits; a paused one, or one in state debug, stays as it is. Answered once the VM has stopped. Errors: `NoSuchVm`, `Busy` (it has a debugger already: one at a time, as Grail's stub serves one client), `InvalidState` (stopped or exited: there is no machine to debug) |
 | `DebugAttached` | `vm: u32` | the VM's id. The stub waits for the debugger's first packet |
 | `DebugInput` | `vm: u32`, `data: bytes` | the debugger's bytes for the stub. Dropped unless this client is the VM's debugger |
 | `DebugOutput` | `vm: u32`, `data: bytes` | the stub's bytes for the debugger |
-| `DebugDetach` | `vm: u32` | the client stops being the debugger, as if it had sent GDB's `D`: the breakpoints and watchpoints go, and a VM in state debug runs again (running). Errors: `NoSuchVm`, `InvalidState` (this connection is not its debugger) |
+| `DebugDetach` | `vm: u32` | the client stops being the debugger, as if it had sent GDB's `D`: the breakpoints and watchpoints go, and a stopped VM (paused or debug) runs again (running). Errors: `NoSuchVm`, `InvalidState` (this connection is not its debugger) |
 
-**State.** While the debugger holds the VM stopped, its state is debug (QEMU's run state `debug`, which `info status` shows as "paused (debug)"); Round Table and Pendragon show it as `debug`. When the debugger resumes it (`c`, `vCont;c`), the VM is running, and when it stops again (a breakpoint, a watchpoint, an interrupt the debugger sends) it is in state debug again; each change is a `VmStateChanged`, to the debugger too. A single step (`s`, `vCont;s`) runs one instruction while the VM stays in state debug: it changes no state. The console, screen and input of a VM being debugged are as they always are, for every client attached to them: the machine runs the same instructions with or without a debugger (merlin-dbg.md, "Determinism"), and its output goes out while it runs. Input waits while it is stopped, as it does while it is paused.
+**State.** The run states are QEMU's, as its stub moves a VM through them (`gdbstub/system.c`), and every change is a `VmStateChanged`, to the debugger too:
 
-- `PauseVm` pauses a VM its debugger resumed; the debugger goes on waiting for its stop reply, and `ResumeVm` lets it run on. A Ctrl-C from the debugger stops a paused VM for it (debug). A VM in state debug cannot be paused or resumed by `PauseVm` and `ResumeVm` (`InvalidState`): it is the debugger's.
-- **Detaching**: GDB's `D`, `DebugDetach`, or the debugger's connection ending: the breakpoints and watchpoints are removed, and a VM in state debug runs on (running), as a machine does after its debugger detaches from `grail --gdb`. A VM running or paused stays so. The VM can have a new debugger at once.
+- **paused** (SIGINT): the debugger's arrival stops the VM as QEMU stops one for a GDB connection (`vm_stop(RUN_STATE_PAUSED)`), and so do the debugger's Ctrl-C and a `PauseVm` while the VM runs for it. A debugger waiting for a stop reply gets one, `T02`: QEMU sends one for any stop of the VM.
+- **debug** (SIGTRAP): a breakpoint, a watchpoint or the end of a step stops the VM in QEMU's run state `debug` (which its `info status` shows as "paused (debug)"); Round Table and Pendragon show it as `debug`. The debugger gets `T05`.
+- **running**: the debugger's continue (`c`, `vCont;c`, QEMU's `vm_start`) and its step (`s`, `vCont;s`, `vm_prepare_start`) run the VM. A step is a running, then a debug: one instruction runs between them.
+
+A stopped VM with a debugger is the debugger's to resume: `ResumeVm` is `InvalidState` (paused or debug), where QEMU's `cont` would run it under a debugger that waits for no stop reply and would not hear when it stops again. `PauseVm` applies to a VM running for its debugger, as above. A VM in state debug without a debugger (its debugger's connection ended at a stop, below) is resumed by `ResumeVm`, as QEMU's `cont` resumes one.
+
+**Rate limit.** While a VM has a debugger, its `VmStateChanged` notices are rate-limited as QEMU's monitor rate-limits its noisy events (`monitor_qapi_event_queue`, once a second): the first change goes out at once, the ones in the second after it are held, only the last of them kept, and that one goes out when the second is over, unless the VM is back in the state the last notice gave. merlin-dbg's `next` may step a million times, each step two changes; without the limit every client attached to the VM would hear of each. The end of the machine (stopped, exited) is never held, and `GetVmInfo` always gives the state as it is.
+
+The console, screen and input of a VM being debugged are as they always are, for every client attached to them: the machine runs the same instructions with or without a debugger (merlin-dbg.md, "Determinism"), and its output goes out while it runs. Input waits while it is stopped, as it does while it is paused.
+
+- **Detaching**: GDB's `D` or `DebugDetach`: the breakpoints and watchpoints are removed, and a stopped VM (paused or debug) runs on (running), as QEMU's `D` does (`gdb_continue`) and as a machine does after its debugger detaches from `grail --gdb`. The VM can have a new debugger at once.
+- **A connection that ends** without `D` leaves the VM as it was, as QEMU does when a GDB connection closes: stopped, it stays stopped (`ResumeVm` resumes it, or the next debugger); running, it runs on, and the breakpoints and watchpoints the debugger set still stop it, in state debug, with no debugger to tell. The next debugger's `?`, which a GDB client asks as it connects, removes them, as QEMU's stub does. The VM can have a new debugger at once.
 - **The end of the machine**: when the program exits, the debugger gets the stub's stop reply (`W` and the exit code) if it was waiting for one; when the VM is stopped (`StopVm`, or GDB's `k`, which stops it as `StopVm` does and is answered `X09`) a debugger that was waiting for a stop reply gets `X09`, ended by SIGKILL. Then, as for a destroyed VM, the server ends the attachment with `Detached` (kind 3): there is nothing left to debug.
 
 The stub sees the machine and nothing else of the VM: the guest's memory, its registers and CSRs, through the selected hart's translation or (QEMU's `Qqemu.PhyMemMode:1`) physical.
@@ -530,7 +540,7 @@ History:
 | 8 | `ScreenResized` (0x0307): a VM's screen changes size when its guest changes the framebuffer's mode (section 6.4, **Modes**), followed by a full frame; screens up to 1920 × 1080, with Avalon's viewer backlog following the screen's size (`screen_backlog`, a little over one full frame: 2 MiB at 640 × 480, as before, up to 8.4 MiB at 1920 × 1080) and its limit on a client's queued output 32 MiB (section 8), which was 8 MiB for 640 × 480 screens |
 | 9 | `KeyEvent` carries the physical key for the keyboard's raw mode (Excalibur spec section 9.4): the `usage` field (`u16`, after `flags`) and the repeat flag (bit 3); `code` may be 0 when `usage` is not; the repeat flag only on a press; a viewer that goes (`ScreenDetach`, or its connection ends) has the keys and buttons it held released (section 6.4, **Input**) |
 | 10 | `CursorShape` (0x0308) and `CursorPosition` (0x0309): the framebuffer's cursor plane (Excalibur spec section 9.3) goes to the viewers apart from the frames, its image when it changes and its place when it moves (section 6.4, **Cursor**), up to `MAX_CURSOR_SIZE` (256) pixels each way |
-| 11 | the debugging group 0x07xx (section 6.8: `DebugAttach`, `DebugAttached`, `DebugInput`, `DebugOutput`, `DebugDetach`), a VM's GDB stub over the connection; `VmState` tag 5, debug (held by its debugger); `Detached` kind 3, a debugger; `StopVm` of a VM in state debug |
+| 11 | the debugging group 0x07xx (section 6.8: `DebugAttach`, `DebugAttached`, `DebugInput`, `DebugOutput`, `DebugDetach`), a VM's GDB stub over the connection; `VmState` tag 5, debug (stopped by a breakpoint, a watchpoint or a step); `Detached` kind 3, a debugger; `StopVm` of a VM in state debug |
 
 ## 8. Limits
 
