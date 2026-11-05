@@ -21,11 +21,11 @@ static void check(int ok, const char *what) {
     }
 }
 
-static void check_eq(int got, int want, const char *what) {
+static void check_eq(long got, long want, const char *what) {
     checks++;
     if (got != want) {
         failures++;
-        printf("libtest: FAILED: %s: got %d, want %d\n", what, got, want);
+        printf("libtest: FAILED: %s: got %ld, want %ld\n", what, got, want);
     }
 }
 
@@ -84,14 +84,26 @@ static void test_numbers(void) {
     check(end == bad, "no digits: end is the start");
     check_eq((int)strtol("0xg", &end, 16), 0, "strtol 0x without a hex digit");
     check(*end == 'x', "it stops at the x");
-    /* Out of range: the limit, as in C, not a wrapped-around value. */
-    check_eq((int)strtol("2147483647", NULL, 10), LONG_MAX, "strtol of LONG_MAX");
-    check_eq((int)strtol("-2147483648", NULL, 10), LONG_MIN, "strtol of LONG_MIN");
-    check_eq((int)strtol("2147483648", &end, 10), LONG_MAX, "strtol just past LONG_MAX");
-    check_eq((int)strtol("-2147483649", NULL, 10), LONG_MIN, "strtol just past LONG_MIN");
-    check_eq((int)strtol("4294967302x", &end, 10), LONG_MAX, "strtol of 2^32 + 6 does not wrap to 6");
+    /* Out of range: the limit, as in C, not a wrapped-around value. A long
+     * is 32 bits on RV32 and 64 on RV64, and so are its limits. */
+#ifdef _LP64
+    check_eq(strtol("9223372036854775807", NULL, 10), LONG_MAX, "strtol of LONG_MAX");
+    check_eq(strtol("-9223372036854775808", NULL, 10), LONG_MIN, "strtol of LONG_MIN");
+    check_eq(strtol("9223372036854775808", &end, 10), LONG_MAX, "strtol just past LONG_MAX");
+    check_eq(strtol("-9223372036854775809", NULL, 10), LONG_MIN, "strtol just past LONG_MIN");
+    check_eq(strtol("18446744073709551622x", &end, 10), LONG_MAX, "strtol of 2^64 + 6 does not wrap to 6");
     check(*end == 'x', "and it ends after all the digits");
-    check_eq((int)strtol("0x100000000", NULL, 0), LONG_MAX, "strtol of a hex number out of range");
+    check_eq(strtol("0x10000000000000000", NULL, 0), LONG_MAX, "strtol of a hex number out of range");
+    check_eq(strtol("4294967302", NULL, 10), 4294967302l, "strtol of 2^32 + 6, a long");
+#else
+    check_eq(strtol("2147483647", NULL, 10), LONG_MAX, "strtol of LONG_MAX");
+    check_eq(strtol("-2147483648", NULL, 10), LONG_MIN, "strtol of LONG_MIN");
+    check_eq(strtol("2147483648", &end, 10), LONG_MAX, "strtol just past LONG_MAX");
+    check_eq(strtol("-2147483649", NULL, 10), LONG_MIN, "strtol just past LONG_MIN");
+    check_eq(strtol("4294967302x", &end, 10), LONG_MAX, "strtol of 2^32 + 6 does not wrap to 6");
+    check(*end == 'x', "and it ends after all the digits");
+    check_eq(strtol("0x100000000", NULL, 0), LONG_MAX, "strtol of a hex number out of range");
+#endif
 }
 
 /* lib/i64.c: 64-bit integers as two words. */
@@ -130,7 +142,14 @@ static void test_snprintf(void) {
     snprintf(buf, sizeof buf, "%d %ld %lu", (int)0x80000000u, 7, 8u);
     check_str(buf, "-2147483648 7 8", "INT_MIN and l");
     snprintf(buf, sizeof buf, "%p %s", (void *)0x1000, (char *)NULL);
+#ifdef _LP64
+    check_str(buf, "0x0000000000001000 (null)", "%p and a null string");
+    /* A long's digits: all 64 bits of it. */
+    snprintf(buf, sizeof buf, "%ld %lu %lx", LONG_MIN, ~0ul, 0x123456789abcdefl);
+    check_str(buf, "-9223372036854775808 18446744073709551615 123456789abcdef", "64-bit longs");
+#else
     check_str(buf, "0x00001000 (null)", "%p and a null string");
+#endif
     snprintf(buf, sizeof buf, "%q %");
     check_str(buf, "%q %", "unknown conversions are printed as written");
     check_eq(snprintf(buf, 6, "%s", "camelot"), 7, "snprintf returns the whole length");
@@ -142,21 +161,25 @@ static void test_snprintf(void) {
     check_eq(buf[0], 0, "writes the NUL");
 }
 
-/* A block of this many bytes is two pages with its 8-byte header: more
+/* malloc's header (lib/malloc.c): a pointer and a size, 8 bytes on RV32,
+ * 16 on RV64, which is also every block's alignment. */
+#define HDR (2 * (int)sizeof(void *))
+
+/* A block of this many bytes is two pages with its header: more
  * than any free block before test_merge (it runs before anything else
  * uses the heap) and at least the page malloc grows the heap by, so each
  * comes from the top of the heap, sbrk asked for exactly it. */
-#define MERGE_BYTES (2 * 4096 - 8)
+#define MERGE_BYTES (2 * 4096 - HDR)
 
 /* Three neighbouring blocks of MERGE_BYTES, lowest first, from fresh heap
  * at its top; 0 if they aren't that. */
 static int three_neighbours(char **blk) {
-    int top = sbrk(0);
+    char *top = sbrk(0);
     for (int i = 0; i < 3; i++) {
         blk[i] = malloc(MERGE_BYTES);
     }
-    return blk[0] == (char *)top + 8 && blk[1] == blk[0] + MERGE_BYTES + 8 &&
-           blk[2] == blk[1] + MERGE_BYTES + 8 && sbrk(0) == top + 3 * (MERGE_BYTES + 8);
+    return blk[0] == top + HDR && blk[1] == blk[0] + MERGE_BYTES + HDR &&
+           blk[2] == blk[1] + MERGE_BYTES + HDR && (char *)sbrk(0) == top + 3 * (MERGE_BYTES + HDR);
 }
 
 /* Frees three neighbours in the order `a`, `b`, `c` (0 the lowest), then
@@ -169,8 +192,8 @@ static char *merge_case(int a, int b, int c, const char *what) {
     free(blk[a]);
     free(blk[b]);
     free(blk[c]);
-    int top = sbrk(0);
-    char *p = malloc(3 * MERGE_BYTES + 16);
+    char *top = sbrk(0);
+    char *p = malloc(3 * MERGE_BYTES + 2 * HDR);
     check(p == blk[0] && sbrk(0) == top, what);
     return p;
 }
@@ -195,7 +218,9 @@ static void test_malloc(void) {
     char *b = malloc(100);
     char *c = malloc(3000);
     check(a != NULL && b != NULL && c != NULL, "malloc");
-    check(((uint)a & 7) == 0 && ((uint)b & 7) == 0 && ((uint)c & 7) == 0, "8-byte aligned");
+    uintptr_t align = (uintptr_t)HDR - 1;
+    check(((uintptr_t)a & align) == 0 && ((uintptr_t)b & align) == 0 && ((uintptr_t)c & align) == 0,
+          "aligned to the header's size");
     check(b >= a + 10 || a >= b + 100, "blocks don't overlap");
     memset(a, 'a', 10);
     memset(b, 'b', 100);
@@ -210,13 +235,13 @@ static void test_malloc(void) {
     free(d);
     /* What was freed is used again, without growing the heap (test_merge
      * checks that neighbours merge). */
-    int top = sbrk(0);
+    char *top = sbrk(0);
     char *e = malloc(3000);
     check(e != NULL && sbrk(0) == top, "freed blocks are used again");
     free(e);
     /* Grow past a page: sbrk is asked for more. */
     char *big = malloc(100000);
-    check(big != NULL && sbrk(0) > top, "a big block grows the heap");
+    check(big != NULL && (char *)sbrk(0) > top, "a big block grows the heap");
     big[99999] = 1;
     free(big);
     free(NULL);
@@ -263,7 +288,7 @@ static int feed(int n) {
     }
     for (int at = 0; at < len; at += 7) {
         int m = len - at < 7 ? len - at : 7;
-        if (write(STDOUT, text + at, (uint)m) != m) {
+        if (write(STDOUT, text + at, (size_t)m) != m) {
             return 1;
         }
     }

@@ -45,9 +45,8 @@
 //!   `// expect: N`.
 //! * `kernel_sources_compile`: merlin compiles every C file of the Camelot
 //!   kernel and its user programs (`kernel/*.c`, `kernel/user/*.c`), and
-//!   merlin-as assembles the result, every file on both widths (on RV64 the
-//!   kernel's headers leave out their two checks of RV32 structure sizes,
-//!   `THREAD_SIZE` and `PROC_SIZE`, until #155). Nothing
+//!   merlin-as assembles the result, every file on both widths, every
+//!   `_Static_assert` of the kernel's headers holding on each. Nothing
 //!   runs here: `cargo xtask kernel` builds the kernel this way, and xtask's
 //!   tests boot it.
 //!
@@ -896,12 +895,10 @@ fn multi_file_clang(x: Xlen) {
 /// user programs compiles with merlin, with the include directories `cargo xtask
 /// kernel` gives clang, and the result assembles, for RV32 and for RV64.
 ///
-/// Every file must compile and assemble cleanly on both widths. Two of the
-/// kernel's `_Static_assert`s check RV32 layouts its tests index structures
-/// by (`THREAD_SIZE` and `PROC_SIZE` in `proc.h`): the headers make them for
-/// `__riscv_xlen == 32` only, until the processes move to RV64 (#155). Every
-/// other check, such as `spinlock.h`'s and `trap.h`'s layouts of each width
-/// (#154) and `fs.h`'s on-disk layouts, holds on both.
+/// Every file must compile and assemble cleanly on both widths, and every
+/// `_Static_assert` of the kernel's headers holds on both: the layouts of
+/// each width (`spinlock.h`'s and `trap.h`'s, #154; `proc.h`'s, #155) and
+/// `fs.h`'s on-disk layouts.
 #[test]
 fn kernel_sources_compile() {
     for x in WIDTHS {

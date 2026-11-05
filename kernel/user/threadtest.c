@@ -68,11 +68,11 @@ static void check(int ok, const char *what) {
     }
 }
 
-static void check_eq(int got, int want, const char *what) {
+static void check_eq(long got, long want, const char *what) {
     checks++;
     if (got != want) {
         failures++;
-        printf("threadtest: FAILED: %s: got %d, want %d\n", what, got, want);
+        printf("threadtest: FAILED: %s: got %ld, want %ld\n", what, got, want);
     }
 }
 
@@ -92,7 +92,7 @@ static int joined(int tid) {
 /* ---- Creating, ending and joining ---- */
 
 static int returns_arg(void *arg) {
-    return (int)(uint)arg;
+    return (int)(uintptr_t)arg;
 }
 
 /* thread_exit from a few calls down: the innermost call ends the thread. */
@@ -132,10 +132,10 @@ static int raw_sp_ok;
 
 static void raw_entry(void *arg) {
     char here;
-    raw_arg = (int)(uint)arg;
+    raw_arg = (int)(uintptr_t)arg;
     /* Its frame is just below the stack it was given. */
-    uint sp = (uint)&here;
-    raw_sp_ok = sp < (uint)(stacks[1] + STACK_SIZE) && sp > (uint)stacks[1];
+    uintptr_t sp = (uintptr_t)&here;
+    raw_sp_ok = sp < (uintptr_t)(stacks[1] + STACK_SIZE) && sp > (uintptr_t)stacks[1];
     thread_exit(3);
 }
 
@@ -206,13 +206,13 @@ static void test_threads(void) {
     char *top = stacks[1] + STACK_SIZE;
     check_eq(thread_create((void (*)(void *))0, NULL, top), -EFAULT, "entry NULL");
     check_eq(thread_create((void (*)(void *))0x80000000, NULL, top), -EFAULT, "entry in the kernel");
-    check_eq(thread_create((void (*)(void *))(uint)&checks, NULL, top), -EFAULT, "entry in data");
+    check_eq(thread_create((void (*)(void *))(uintptr_t)&checks, NULL, top), -EFAULT, "entry in data");
     check_eq(thread_create(raw_entry, NULL, NULL), -EFAULT, "stack NULL");
     check_eq(thread_create(raw_entry, NULL, (void *)0x80001000), -EFAULT, "stack in the kernel");
     check_eq(thread_create(raw_entry, NULL, (void *)USER_LOAD_TOP), -EFAULT, "stack over the guard page");
     check_eq(thread_create(raw_entry, NULL, (void *)0x2000), -EFAULT, "stack in the program's code");
     check_eq(thread_create(raw_entry, NULL, top - 8), -EINVAL, "stack not 16-byte aligned");
-    check_eq(thread_create((void (*)(void *))((uint)raw_entry + 2), NULL, top), -EINVAL, "entry not aligned");
+    check_eq(thread_create((void (*)(void *))((uintptr_t)raw_entry + 2), NULL, top), -EINVAL, "entry not aligned");
 }
 
 /* ---- Futexes ---- */
@@ -327,7 +327,7 @@ static int counter;
 static int spun;
 
 static int adds(void *arg) {
-    int n = (int)(uint)arg;
+    int n = (int)(uintptr_t)arg;
     for (int i = 0; i < n; i++) {
         mutex_lock(&lock);
         counter = counter + 1;
@@ -354,7 +354,7 @@ static int waits_at_gate(void *arg) {
  * keeps the threads out of each other's way. 0 if every block held its
  * bytes. */
 static int mallocs(void *arg) {
-    int me = (int)(uint)arg;
+    int me = (int)(uintptr_t)arg;
     for (int round = 0; round < 20; round++) {
         uchar *blocks[4];
         for (int i = 0; i < 4; i++) {
@@ -386,7 +386,7 @@ static int mallocs(void *arg) {
 static int sbrks(void *arg) {
     (void)arg;
     for (int i = 0; i < 20; i++) {
-        if (sbrk(PAGE) < 0) {
+        if ((long)sbrk(PAGE) < 0) {
             return 1;
         }
         /* Some time in U-mode, for the others' shootdowns to find this
@@ -396,7 +396,7 @@ static int sbrks(void *arg) {
         for (int j = 0; j < 5000; j++) {
             x = x + j;
         }
-        if (sbrk(-PAGE) < 0) {
+        if ((long)sbrk(-PAGE) < 0) {
             return 2;
         }
     }
@@ -423,20 +423,20 @@ static void test_locks(void) {
     check_eq(spun, 600, "the spinlock keeps every addition");
 
     for (int i = 0; i < 3; i++) {
-        tids[i] = start(mallocs, (void *)(uint)i, i);
+        tids[i] = start(mallocs, (void *)(uintptr_t)i, i);
     }
     for (int i = 0; i < 3; i++) {
         check_eq(joined(tids[i]), 0, "malloc from three threads at once");
     }
 
-    int end = sbrk(0);
+    char *end = sbrk(0);
     for (int i = 0; i < 3; i++) {
         tids[i] = start(sbrks, NULL, i);
     }
     for (int i = 0; i < 3; i++) {
         check_eq(joined(tids[i]), 0, "sbrk from three threads");
     }
-    check_eq(sbrk(0), end, "the heap is back where it was");
+    check((char *)sbrk(0) == end, "the heap is back where it was");
 
     /* Every free slot, until thread_start says there are none. */
     int all[NTHREAD];
@@ -483,7 +483,7 @@ static int waits_forever(void *arg) {
 }
 
 static int joins(void *arg) {
-    return joined((int)(uint)arg);
+    return joined((int)(uintptr_t)arg);
 }
 
 static int spins(void *arg) {
@@ -502,7 +502,7 @@ static int faults(void *arg) {
 }
 
 static int ends_last(void *arg) {
-    int main_tid = (int)(uint)arg;
+    int main_tid = (int)(uintptr_t)arg;
     /* The main thread has ended (or will): joining it gets its status. */
     int status = joined(main_tid);
     return status == 0 ? 9 : 100;
@@ -524,7 +524,7 @@ static int status_of(int pid) {
 /* ---- A buffer unmapped while a call uses it ---- */
 
 static int pipe_fds[2];
-static uint pipe_src;
+static uintptr_t pipe_src;
 static int pipe_started;
 
 /* Writes 1024 bytes from pipe_src: the first half in a page that stays,
@@ -540,15 +540,15 @@ static void test_unmapped(void) {
     /* The heap's end on a page boundary, then one more page, B. The 512
      * bytes before B are 'A's, B's first 512 'B's: a write of 1024 fills the
      * pipe (512 bytes) with the 'A's and waits. */
-    int end = sbrk(0);
-    int pad = (PAGE - end % PAGE) % PAGE;
+    char *end = sbrk(0);
+    int pad = (int)((PAGE - (uintptr_t)end % PAGE) % PAGE);
     if (pad > 0) {
         sbrk(pad);
     }
     char *b = (char *)sbrk(PAGE);
-    check(b == (char *)(end + pad), "a page for the pipe's buffer");
+    check(b == end + pad, "a page for the pipe's buffer");
     /* The page before B, the heap's or the program's data, stays. */
-    pipe_src = (uint)b - 512;
+    pipe_src = (uintptr_t)b - 512;
     memset(b - 512, 'A', 512);
     memset(b, 'B', 512);
     check_eq(pipe(pipe_fds), 0, "pipe");
@@ -558,7 +558,7 @@ static void test_unmapped(void) {
     }
     /* Two ticks: the writer has filled the pipe and sleeps in write. */
     sleep(2);
-    check_eq(sbrk(-PAGE), (int)((uint)b + PAGE), "unmap the buffer's second half");
+    check_eq((long)sbrk(-PAGE), (long)(b + PAGE), "unmap the buffer's second half");
     char got[1024];
     int n = 0;
     int r = read(pipe_fds[0], got, sizeof got);
@@ -569,7 +569,7 @@ static void test_unmapped(void) {
      * that was there, and nothing it couldn't copy reaches the pipe. */
     check_eq(joined(t), 512, "a write whose buffer is unmapped stops short");
     close(pipe_fds[1]);
-    while ((r = read(pipe_fds[0], got + n, sizeof got - (uint)n)) > 0) {
+    while ((r = read(pipe_fds[0], got + n, sizeof got - (size_t)n)) > 0) {
         n += r;
     }
     close(pipe_fds[0]);
@@ -591,7 +591,7 @@ static void test_unmapped(void) {
     close(pipe_fds[1]);
     check_eq(fstat(0, (struct stat *)b), -EFAULT, "fstat to an unmapped buffer");
     sbrk(-pad);
-    check_eq(sbrk(0), end, "the heap is back where it was");
+    check((char *)sbrk(0) == end, "the heap is back where it was");
 }
 
 /* ---- Threads on the filesystem (threadtest fs) ---- */
@@ -795,7 +795,7 @@ static int child(int argc, char **argv) {
     if (strcmp(mode, "live") == 0) {
         int a = start(waits_forever, NULL, 0);
         start(sleeps, NULL, 1);
-        start(joins, (void *)(uint)a, 2);
+        start(joins, (void *)(uintptr_t)a, 2);
         start(spins, NULL, 3);
         sleep(2);
         exit(7);
@@ -804,13 +804,13 @@ static int child(int argc, char **argv) {
         /* No thread in sleep(), which wakes on every tick and would see the
          * kill by itself: kill must wake the futex and join waiters. */
         int a = start(waits_forever, NULL, 0);
-        start(joins, (void *)(uint)a, 1);
+        start(joins, (void *)(uintptr_t)a, 1);
         for (;;) {
             futex_wait(&forever, 0);
         }
     }
     if (strcmp(mode, "last") == 0) {
-        start(ends_last, (void *)(uint)gettid(), 0);
+        start(ends_last, (void *)(uintptr_t)gettid(), 0);
         thread_exit(0);
     }
     if (strcmp(mode, "exec") == 0) {

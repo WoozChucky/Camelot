@@ -29,14 +29,14 @@ void file_init(void) {
 
 /* Major 0 has no driver: device_has_driver() says so before anything is
  * opened, and these fail just in case. */
-static int nodev_read(pagetable_t pt, u32 dst, u32 n) {
+static isize nodev_read(pagetable_t pt, uintptr dst, usize n) {
     (void)pt;
     (void)dst;
     (void)n;
     return -ENODEV;
 }
 
-static int nodev_write(pagetable_t pt, u32 src, u32 n) {
+static isize nodev_write(pagetable_t pt, uintptr src, usize n) {
     (void)pt;
     (void)src;
     (void)n;
@@ -132,15 +132,15 @@ struct file *file_console(bool readable, bool writable) {
 }
 
 /* Reads from `f`'s inode at its offset, a page at a time. */
-static int inode_read(struct file *f, pagetable_t pt, u32 dst, u32 n) {
+static isize inode_read(struct file *f, pagetable_t pt, uintptr dst, usize n) {
     u8 *buf = kalloc();
     if (buf == NULL) {
         return -ENOMEM;
     }
-    u32 done = 0;
+    usize done = 0;
     ilock(f->ip);
     while (done < n) {
-        u32 m = MIN(n - done, PGSIZE);
+        u32 m = (u32)MIN(n - done, PGSIZE);
         int r = readi(f->ip, buf, f->off, m);
         if (r <= 0) {
             break; /* the end of the file */
@@ -151,7 +151,7 @@ static int inode_read(struct file *f, pagetable_t pt, u32 dst, u32 n) {
         if (copyout(pt, dst + done, buf, (u32)r) != 0) {
             iunlock(f->ip);
             kfree(buf);
-            return done > 0 ? (int)done : -EFAULT;
+            return done > 0 ? (isize)done : -EFAULT;
         }
         f->off += (u32)r;
         done += (u32)r;
@@ -161,22 +161,22 @@ static int inode_read(struct file *f, pagetable_t pt, u32 dst, u32 n) {
     }
     iunlock(f->ip);
     kfree(buf);
-    return (int)done;
+    return (isize)done;
 }
 
 /* Writes to `f`'s inode at its offset, MAXWRITE bytes per transaction. */
-static int inode_write(struct file *f, pagetable_t pt, u32 src, u32 n) {
+static isize inode_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
     u8 *buf = kalloc();
     if (buf == NULL) {
         return -ENOMEM;
     }
-    u32 done = 0;
+    usize done = 0;
     int err = 0;
     /* The whole write, against a truncation (and another write) coming in
      * between its transactions. */
     acquiresleep(&f->ip->wlock);
     while (done < n) {
-        u32 m = MIN(n - done, MAXWRITE);
+        u32 m = (u32)MIN(n - done, MAXWRITE);
         /* As in inode_read: never write a chunk that wasn't copied in (the
          * page holds whatever it held last). */
         if (copyin(pt, buf, src + done, m) != 0) {
@@ -202,15 +202,18 @@ static int inode_write(struct file *f, pagetable_t pt, u32 src, u32 n) {
     }
     releasesleep(&f->ip->wlock);
     kfree(buf);
-    return done > 0 || err == 0 ? (int)done : err;
+    return done > 0 || err == 0 ? (isize)done : err;
 }
 
-int fileread(struct file *f, pagetable_t pt, u32 dst, u32 n) {
+isize fileread(struct file *f, pagetable_t pt, uintptr dst, usize n) {
     if (!f->readable) {
         return -EBADF;
     }
     if (!uvm_range_ok(pt, dst, n, PTE_W)) {
         return -EFAULT;
+    }
+    if (n > MAX_RW_COUNT) {
+        n = MAX_RW_COUNT;
     }
     /* A socket's read is its recv, which for 0 bytes on UDP still takes
      * the next datagram. */
@@ -229,12 +232,15 @@ int fileread(struct file *f, pagetable_t pt, u32 dst, u32 n) {
     return inode_read(f, pt, dst, n);
 }
 
-int filewrite(struct file *f, pagetable_t pt, u32 src, u32 n) {
+isize filewrite(struct file *f, pagetable_t pt, uintptr src, usize n) {
     if (!f->writable) {
         return -EBADF;
     }
     if (!uvm_range_ok(pt, src, n, PTE_R)) {
         return -EFAULT;
+    }
+    if (n > MAX_RW_COUNT) {
+        n = MAX_RW_COUNT;
     }
     /* A socket's write is its send, which for 0 bytes on UDP is still a
      * datagram (an empty one). */
@@ -253,31 +259,35 @@ int filewrite(struct file *f, pagetable_t pt, u32 src, u32 n) {
     return inode_write(f, pt, src, n);
 }
 
-int filelseek(struct file *f, i32 offset, u32 whence) {
+off_t filelseek(struct file *f, off_t offset, u32 whence) {
     if (f->type != FD_INODE) {
         return -ESPIPE;
     }
     ilock(f->ip);
-    u32 size = f->ip->size;
+    off_t size = (off_t)f->ip->size;
     iunlock(f->ip);
-    i32 base;
+    off_t base;
     if (whence == SEEK_SET) {
         base = 0;
     } else if (whence == SEEK_CUR) {
-        base = (i32)f->off;
+        base = (off_t)f->off;
     } else if (whence == SEEK_END) {
-        base = (i32)size;
+        base = size;
     } else {
         return -EINVAL;
     }
-    /* Files are at most 2^31 - 1 bytes (MAXFILE_BYTES; open refuses
-     * bigger ones), so none of this overflows unless `offset` is huge,
-     * which the checks below refuse. */
-    if ((offset > 0 && base > 0x7fffffff - offset) || base + offset < 0 || (u32)(base + offset) > size) {
+    /* The new offset, base + offset, must be in [0, size]. Files are at
+     * most MAXFILE_BYTES, which an off_t holds (open refuses a bigger one
+     * on RV32), and so is an offset, so base and size are both in
+     * [0, MAXFILE_BYTES]; base may be past size, though (SEEK_CUR after
+     * another descriptor truncated the file). Neither -base nor size - base
+     * overflows, then, and the sum is only made once it is known to be in
+     * range. */
+    if (offset < -base || offset > size - base) {
         return -EINVAL;
     }
-    f->off = (u32)(base + offset);
-    return (int)f->off;
+    f->off = (u64)(base + offset);
+    return base + offset;
 }
 
 void filestat(struct file *f, struct stat *st) {

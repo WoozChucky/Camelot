@@ -1284,12 +1284,31 @@ fn the_format_document_matches_the_kernel_and_the_host() {
     let doc = std::fs::read_to_string(repo_root().join("docs/camelot-fs.md")).unwrap();
     let fs_h = std::fs::read_to_string(repo_root().join("kernel/include/fs.h")).unwrap();
     let log_h = std::fs::read_to_string(repo_root().join("kernel/include/log.h")).unwrap();
+    // A macro's value: what follows its name, up to a comment.
     let define = |text: &str, name: &str| -> String {
+        let def = format!("#define {name} ");
         let line = text
             .lines()
-            .find(|l| l.starts_with(&format!("#define {name} ")))
+            .find(|l| l.starts_with(&def))
             .unwrap_or_else(|| panic!("no #define {name}"));
-        line.split_whitespace().nth(2).unwrap().to_string()
+        line[def.len()..].split("/*").next().unwrap().trim().to_string()
+    };
+    // A macro defined per width: its value in the `#if __riscv_xlen == 64`
+    // branch, then in the `#else` one.
+    let per_width = |text: &str, name: &str| -> (String, String) {
+        let at = text
+            .find(&format!("#define {name} "))
+            .unwrap_or_else(|| panic!("no #define {name}"));
+        let start = text[..at]
+            .rfind("#if __riscv_xlen == 64\n")
+            .unwrap_or_else(|| panic!("{name} is not in an #if __riscv_xlen == 64"));
+        let (rv64, rest) = text[start..].split_once("\n#else\n").unwrap();
+        let rv32 = rest.split_once("\n#endif").unwrap().0;
+        (define(rv64, name), define(rv32, name))
+    };
+    let number = |value: &str| -> u64 {
+        let digits = value.strip_prefix("0x").unwrap().trim_end_matches(['u', 'l']);
+        u64::from_str_radix(digits, 16).unwrap()
     };
     assert_eq!(define(&fs_h, "FS_MAGIC"), format!("{:#x}", camelot_fs::MAGIC));
     assert!(doc.contains(&format!("`{:#010x}`", camelot_fs::MAGIC)));
@@ -1325,11 +1344,21 @@ fn the_format_document_matches_the_kernel_and_the_host() {
     assert!(doc.contains("`MAXOPBLOCKS` = 22"));
     assert_eq!(define(&log_h, "MAXOPBLOCKS"), "22");
     assert!(doc.contains("(`nlog` < 23)"));
-    // The largest file: the format's, and the kernel's for now.
+    // The largest file: the format's, 2^32 blocks; the RV64 kernel's, one
+    // block less (ext4's EXT_MAX_BLOCKS); the RV32 kernel's, its off_t's
+    // reach.
+    assert_eq!(camelot_fs::MAX_FILE_BLOCKS, 1 << 32);
     assert_eq!(camelot_fs::MAX_FILE_SIZE, 4 << 40);
     assert!(doc.contains("2^32 blocks (its logical block numbers are\n  u32), 4 TiB"));
-    assert_eq!(define(&fs_h, "MAXFILE_BYTES"), "0x7fffffffu");
-    assert!(doc.contains("writes files of at most 2^31 - 1\n  bytes"));
+    assert_eq!(
+        number(&define(&fs_h, "EXT_MAX_BLOCKS")),
+        camelot_fs::MAX_FILE_BLOCKS - 1
+    );
+    let (rv64, rv32) = per_width(&fs_h, "MAXFILE_BYTES");
+    assert_eq!(rv64, "((u64)EXT_MAX_BLOCKS * BSIZE)");
+    assert_eq!(number(&rv32), i32::MAX as u64);
+    assert!(doc.contains("reads and writes files of up to 2^32 - 1\n  blocks"));
+    assert!(doc.contains("writes files of at most 2^31 - 1 bytes"));
 }
 
 // ---- The file system calls (issue #67) ----

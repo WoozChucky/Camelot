@@ -50,7 +50,7 @@ static int work(int x, int round) {
 }
 
 static int worker(void *arg) {
-    int me = (int)(uint)arg;
+    int me = (int)(uintptr_t)arg;
     for (int r = 0; r < rounds; r++) {
         mutex_lock(&lock);
         int c = counter;
@@ -76,7 +76,7 @@ int main(int argc, char **argv) {
     }
     int tids[MAX_THREADS];
     for (int i = 0; i < n; i++) {
-        tids[i] = thread_start(worker, (void *)(uint)i, stacks[i], STACK_SIZE);
+        tids[i] = thread_start(worker, (void *)(uintptr_t)i, stacks[i], STACK_SIZE);
         if (tids[i] < 0) {
             fprintf(STDERR, "threads: thread_start: %s\n", strerror(-tids[i]));
             return 1;

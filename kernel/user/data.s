@@ -6,18 +6,24 @@
 # that holds, else with the number of the check that failed. On the way out
 # it fills its stack and .bss with non-zero bytes, so that the pages it gives
 # back are dirty for whoever gets them next.
+#
+# The same code for RV32 and RV64: the stack page is the one sp is in (its
+# address depends on USER_TOP, which on RV64 depends on the paging mode),
+# and the words are 32-bit, compared as lw reads them, sign-extended.
 
-    .equ USER_TOP, 0x0c000000
     .equ STACK_SIZE, 0x1000
     .equ BSS_SIZE, 0x1800
     .equ INITIAL, 0x600df00d
-    .equ DIRT, 0xa5a5a5a5
+    # 0xa5a5a5a5 as a 32-bit word: negative, so that li makes the value lw
+    # reads back on RV64 too.
+    .equ DIRT, -0x5a5a5a5b
 
     .text
     .globl main
 main:
     li    s0, 1                 # the stack page reads zero below sp
-    li    a0, USER_TOP - STACK_SIZE
+    srli  a0, sp, 12            # its start: sp with the low 12 bits clear
+    slli  a0, a0, 12
     sub   a1, sp, a0
     call  all_zero
     bnez  a0, fail
@@ -51,7 +57,8 @@ main:
     li    t2, DIRT
     bne   t1, t2, fail
 
-    li    a0, USER_TOP - STACK_SIZE # dirty the stack too, then exit
+    srli  a0, sp, 12            # dirty the stack too, then exit
+    slli  a0, a0, 12
     li    a1, STACK_SIZE
     call  fill
     li    a0, 0

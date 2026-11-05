@@ -33,11 +33,11 @@ void console_intr(void);
  *
  * Returns -EFAULT, having taken nothing, if [dst, dst + n) is not writable
  * user memory. */
-int console_read(pagetable_t pt, u32 dst, u32 n);
+isize console_read(pagetable_t pt, uintptr dst, usize n);
 
 /* write(1 or 2, src, n): prints the `n` bytes at user address `src` and
  * returns n, or returns -EFAULT, printing nothing, if any of them is not
  * readable user memory. */
-int console_write(pagetable_t pt, u32 src, u32 n);
+isize console_write(pagetable_t pt, uintptr src, usize n);
 
 #endif

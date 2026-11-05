@@ -1234,9 +1234,10 @@ const PTE_D: u32 = 1 << 7;
 /// What the kernel's own leaves have besides their permissions (vm.h's
 /// PTE_KERNEL, Linux's _PAGE_KERNEL): A and D set up front, and G.
 const PTE_KERNEL: u32 = PTE_G | PTE_A | PTE_D;
-/// The bits of a user PTE the kernel chooses; A and D are Grail's there, and
-/// RSW (9:8) is for software, which the kernel doesn't use yet.
-const PTE_KERNEL_BITS: u32 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G;
+/// The bits of a user PTE the kernel chooses, A and D up front with the
+/// others (vm.h's PTE_USER_AD); RSW (9:8) is for software, which the kernel
+/// doesn't use yet.
+const PTE_KERNEL_BITS: u32 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G | PTE_A | PTE_D;
 const PTE_RSW: u32 = 0x300;
 
 /// Boots the committed kernel on a machine with `ram_mib` MiB of RAM and
@@ -1364,7 +1365,7 @@ fn check_kernel_memory(ram_mib: usize, extra_devices: &[DeviceEntry]) {
     for &(va, pte) in &leaves {
         assert_eq!((pte >> 10) * PAGE, va, "{va:#x} not identity mapped");
         assert_eq!(pte & PTE_RSW, 0, "{va:#x}: {pte:#x}");
-        got.insert(va, pte & (PTE_KERNEL_BITS | PTE_A | PTE_D));
+        got.insert(va, pte & PTE_KERNEL_BITS);
     }
     // Compared as a whole only after spotting the first difference, since the
     // maps have tens of thousands of entries.
@@ -2218,9 +2219,10 @@ fn user_sym(elf: &[u8], name: &str) -> u32 {
         .value as u32
 }
 
-/// The user pages a program's ELF image asks for, as (va, PTE permissions),
-/// then its stack page: what the process's page table must map below
-/// USER_TOP.
+/// The user pages a program's ELF image asks for, as (va, PTE bits), then its
+/// stack page: what the process's page table must map below USER_TOP. Each
+/// has A, and D if it is writable, as map_pages() makes a user leaf (vm.h's
+/// PTE_USER_AD, Linux's user protections).
 fn expected_user_pages(elf: &[u8]) -> Vec<(u32, u32)> {
     let parsed = elf::Elf::parse(elf).unwrap();
     let mut pages = Vec::new();
@@ -2229,9 +2231,9 @@ fn expected_user_pages(elf: &[u8]) -> Vec<(u32, u32)> {
         .iter()
         .filter(|s| s.ty == elf::PT_LOAD && s.memsz > 0)
     {
-        let mut perm = PTE_V | PTE_U | PTE_R;
+        let mut perm = PTE_V | PTE_U | PTE_R | PTE_A;
         if seg.flags & elf::PF_W != 0 {
-            perm |= PTE_W;
+            perm |= PTE_W | PTE_D;
         }
         if seg.flags & elf::PF_X != 0 {
             perm |= PTE_X;
@@ -2244,7 +2246,7 @@ fn expected_user_pages(elf: &[u8]) -> Vec<(u32, u32)> {
             va += PAGE;
         }
     }
-    pages.push((USER_STACK, PTE_V | PTE_U | PTE_R | PTE_W));
+    pages.push((USER_STACK, PTE_V | PTE_U | PTE_R | PTE_W | PTE_A | PTE_D));
     pages
 }
 
@@ -2456,7 +2458,7 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
     // kernel's, none of it with U.
     let ding = user_program("ding");
     let want = expected_user_pages(&ding.elf);
-    assert_eq!(want[0], (USER_TEXT, PTE_V | PTE_U | PTE_R | PTE_X));
+    assert_eq!(want[0], (USER_TEXT, PTE_V | PTE_U | PTE_R | PTE_X | PTE_A));
     assert!(want.iter().all(|&(va, _)| va >= USER_TEXT && va != USER_LOAD_TOP));
     assert_eq!(user_pages(&m, satp), want);
     let (leaves, tables, megapages) = page_table(&m, satp);
@@ -2650,7 +2652,7 @@ fn a_store_to_read_only_data_is_killed() {
             main + 8
         )
     );
-    assert!(lines[2].ends_with(" ---U--RV"), "{out}");
+    assert!(lines[2].ends_with(" -A-U--RV"), "{out}");
     assert_eq!(lines[3], "badstore: exit -1");
 }
 
@@ -3802,6 +3804,11 @@ fn the_system_call_document_matches_the_code() {
     };
     assert_eq!(defines(&header, "SYS_"), sys(&calls), "syscall.h");
     assert_eq!(defines(&usys, "SYS_"), sys(&calls), "usys.s");
+    // A call's declaration in user.h: `type name(...);`, or `type *name(...);`
+    // for one that returns a pointer (sbrk).
+    let declares = |l: &str, name: &str| {
+        (l.contains(&format!(" {name}(")) || l.contains(&format!(" *{name}("))) && l.ends_with(");")
+    };
     for (_, name) in &calls {
         // A stub in usys.s that uses the number, and a declaration in user.h.
         assert!(
@@ -3811,9 +3818,7 @@ fn the_system_call_document_matches_the_code() {
             "usys.s: no stub for {name}"
         );
         assert!(
-            user_h
-                .lines()
-                .any(|l| l.contains(&format!(" {name}(")) && l.ends_with(");")),
+            user_h.lines().any(|l| declares(l, name)),
             "user.h: no declaration of {name}"
         );
     }
@@ -3829,10 +3834,7 @@ fn the_system_call_document_matches_the_code() {
         let [args, returns] = cells[..] else {
             panic!("{name}: {cells:?}");
         };
-        let decl = user_h
-            .lines()
-            .find(|l| l.contains(&format!(" {name}(")) && l.ends_with(");"))
-            .unwrap();
+        let decl = user_h.lines().find(|l| declares(l, &name)).unwrap();
         let params = &decl[decl.find('(').unwrap() + 1..decl.len() - 2];
         let params = if params == "void" { "" } else { params };
         assert_eq!(
@@ -3869,6 +3871,54 @@ fn the_system_call_document_matches_the_code() {
             "{name}: {returns}"
         );
     }
+    // The structures' sizes on each width (## Structures): what user.h and
+    // the kernel's headers make of them, compiled by merlin for RV32 (ILP32)
+    // and RV64 (LP64), each size a _Static_assert.
+    let at = doc.find("\n## Structures\n").expect("no ## Structures");
+    let section = &doc[at + 1..];
+    let section = &section[..section[3..].find("\n## ").unwrap() + 3];
+    let sizes: Vec<(&str, u32, u32)> = section
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let name = cells.get(1)?.strip_prefix('`')?.strip_suffix('`')?;
+            Some((name, cells.get(2)?.parse().ok()?, cells.get(3)?.parse().ok()?))
+        })
+        .collect();
+    assert_eq!(sizes.len(), 9, "{sizes:?}");
+    for (xlen, wide) in [
+        (merlin::types::Xlen::Rv32, false),
+        (merlin::types::Xlen::Rv64, true),
+    ] {
+        for (dir, include, headers) in [
+            ("kernel/user", None, "#include \"user.h\"\n"),
+            (
+                "kernel",
+                Some("include"),
+                "#include \"syscall.h\"\n#include \"fs.h\"\n",
+            ),
+        ] {
+            let mut src = headers.to_string();
+            for (name, rv32, rv64) in &sizes {
+                let size = if wide { rv64 } else { rv32 };
+                src.push_str(&format!(
+                    "_Static_assert(sizeof({name}) == {size}, \"{name} is {size} bytes\");\n"
+                ));
+            }
+            let opts = merlin::Options {
+                include_dirs: include.into_iter().map(PathBuf::from).collect(),
+                xlen,
+                ..merlin::Options::default()
+            };
+            let base = repo_root().join(dir);
+            let load = |p: &std::path::Path| std::fs::read_to_string(base.join(p)).ok();
+            if let Err(errors) = merlin::compile_with("sizes.c", &src, &opts, &load) {
+                let errors: Vec<String> = errors.iter().map(|e| e.render("sizes.c")).collect();
+                panic!("{dir} on {xlen:?}: {}", errors.join("\n"));
+            }
+        }
+    }
+
     // And the limits.
     for limit in ["MAXARG", "ARG_MAX", "MAXPATH"] {
         let want = defines(&header, limit);

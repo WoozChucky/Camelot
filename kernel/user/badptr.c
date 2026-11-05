@@ -9,13 +9,23 @@
 #include "user.h"
 
 /* User space (kernel/include/vm.h): the stack grows down from USER_TOP to
- * at most USER_STACK_LIMIT, with an unmapped guard page under that. */
-#define USER_TOP 0x0c000000u
-#define USER_STACK_LIMIT 0x0b800000u
-#define PAGE 0x1000u
+ * at most USER_STACK_LIMIT, 8 MiB below, with an unmapped guard page under
+ * that. USER_TOP is 0x0c000000 on RV32; on RV64 it depends on the paging
+ * mode (2^47 in Sv48, 2^38 in Sv39), so main() finds it: the arguments are
+ * in the stack's last page. */
+static uintptr_t user_top;
+#define USER_TOP user_top
+#define PAGE 0x1000ul
+#define USER_STACK_LIMIT (USER_TOP - (8ul << 20))
 #define GUARD (USER_STACK_LIMIT - PAGE)
-/* The kernel's first page: mapped in every process, but without U. */
-#define KERNEL 0x80000000u
+/* Kernel memory, mapped in every process but without U: on RV32 the
+ * kernel's first page, on RV64 the kernel image at its link address, in
+ * the upper half of the address space (vm.h). */
+#ifdef _LP64
+#define KERNEL 0xffffffff80000000ul
+#else
+#define KERNEL 0x80000000ul
+#endif
 
 static const char msg[] = "badptr: every bad pointer refused\n";
 
@@ -23,14 +33,16 @@ static const char msg[] = "badptr: every bad pointer refused\n";
 static int failed_case;
 static int number;
 
-static void expect(int got, int want) {
+static void expect(long got, long want) {
     number++;
     if (got != want && failed_case == 0) {
         failed_case = number;
     }
 }
 
-int main(void) {
+int main(int argc, char **args) {
+    (void)argc;
+    user_top = ((uintptr_t)args[0] + PAGE - 1) & ~(PAGE - 1);
     char *bad[] = {
         (char *)KERNEL,           /* kernel memory */
         (char *)0,                /* page 0: never mapped */
@@ -42,17 +54,17 @@ int main(void) {
         expect(read(STDIN, bad[i], 4), -EFAULT);             /* cases 2, 4, 6, 8 */
     }
     /* A length that wraps around the address space. */
-    expect(write(STDOUT, msg, 0xffffffffu), -EFAULT);        /* 9 */
+    expect(write(STDOUT, msg, (size_t)-1), -EFAULT);         /* 9 */
     char buf[8];
-    expect(read(STDIN, buf, 0xffffffffu), -EFAULT);          /* 10 */
+    expect(read(STDIN, buf, (size_t)-1), -EFAULT);           /* 10 */
     /* Read-only memory is no place to read into: the program's rodata and
      * its code. */
     expect(read(STDIN, (char *)msg, 4), -EFAULT);            /* 11 */
     expect(read(STDIN, (char *)main, 4), -EFAULT);           /* 12 */
     /* Past the end of the heap. */
-    int brk = sbrk(0);
-    expect(write(STDOUT, (char *)brk, 1), -EFAULT);          /* 13 */
-    expect(read(STDIN, (char *)brk, 1), -EFAULT);            /* 14 */
+    char *brk = sbrk(0);
+    expect(write(STDOUT, brk, 1), -EFAULT);                  /* 13 */
+    expect(read(STDIN, brk, 1), -EFAULT);                    /* 14 */
     /* The other calls that take pointers. */
     int status;
     expect(wait(-1, (int *)KERNEL), -EFAULT);                /* 15 */
@@ -120,10 +132,35 @@ int main(void) {
     expect(buf[0] == 'o' && buf[1] == 'k', 1);               /* 57 */
     close(p[0]);
     close(p[1]);
+#ifdef _LP64
+    /* RV64: every address from USER_TOP up is the kernel's, or not an
+     * address at all (between the two halves): the first one past user
+     * space, the lowest of the upper half, the direct map's start in Sv48
+     * and in Sv39, the vmalloc area's, the very top; and a range from the
+     * last user page into them. Never truncated to a user address: 2^32 +
+     * 0x1000 is not 0x1000. */
+    char *kernel_half[] = {
+        (char *)USER_TOP,
+        (char *)0xffff800000000000ul,
+        (char *)0xffffaf8000000000ul,
+        (char *)0xffffffd600000000ul,
+        (char *)0xffff8f8000000000ul,
+        (char *)0xfffffffffffff000ul,
+    };
+    for (int i = 0; i < 6; i++) {
+        expect(write(STDOUT, kernel_half[i], 1), -EFAULT);   /* 58, 61, ... */
+        expect(read(STDIN, kernel_half[i], 1), -EFAULT);     /* 59, 62, ... */
+        expect(fstat(STDOUT, (struct stat *)kernel_half[i]), -EFAULT); /* 60, 63, ... */
+    }
+    expect(write(STDOUT, (char *)(USER_TOP - 1), 2), -EFAULT); /* 76 */
+    expect(open((char *)KERNEL, O_RDONLY), -EFAULT);         /* 77 */
+    expect(wait(-1, (int *)0xffffffd600000000ul), -EFAULT);  /* 78 */
+    expect(write(STDOUT, (char *)0x100000000ul + 0x1000, 1), -EFAULT); /* 79 */
+#endif
     /* And a good buffer. */
     if (failed_case == 0) {
-        uint len = strlen(msg);
-        expect(write(STDOUT, msg, len), (int)len);           /* 58 */
+        size_t len = strlen(msg);
+        expect(write(STDOUT, msg, len), (long)len);          /* 58, or 80 on RV64 */
     } else {
         printf("badptr: case %d failed\n", failed_case);
     }

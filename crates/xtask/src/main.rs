@@ -26,7 +26,7 @@ tasks:
                and kernel/kernel-disk.elf, the same kernel without the user programs built in
                (it runs them from /bin: the kernel of a bootable root image); then the same
                for RV64, kernel/kernel-rv64.elf and kernel/kernel-disk-rv64.elf, a
-               higher-half kernel (no RV64 user programs yet)
+               higher-half kernel, with the user programs built for RV64
                --cc clang: the reference build instead (clang -O2 + ld.lld from the official
                LLVM install, the user programs' C compiled by clang too), in target/kernel/clang
                (RV64: target/kernel/clang/rv64)

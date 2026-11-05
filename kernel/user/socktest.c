@@ -30,7 +30,11 @@
 #define UDP_MAX_DATA 1472
 #define TCP_EPHEMERAL_FIRST 49152
 /* The kernel's first page: mapped in every process, but without U. */
-#define KERNEL 0x80000000u
+#ifdef _LP64
+#define KERNEL 0xffffffff80000000ul
+#else
+#define KERNEL 0x80000000ul
+#endif
 
 static int checks;
 static int failures;
@@ -47,11 +51,11 @@ static void check(int ok, const char *what) {
     }
 }
 
-static void check_eq(int got, int want, const char *what) {
+static void check_eq(long got, long want, const char *what) {
     checks++;
     if (got != want) {
         failures++;
-        printf("socktest: FAILED: %s: got %d, want %d\n", what, got, want);
+        printf("socktest: FAILED: %s: got %ld, want %ld\n", what, got, want);
     }
 }
 
@@ -218,7 +222,7 @@ static void test_bad_pointers(void) {
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in *kernel = (struct sockaddr_in *)KERNEL;
     struct sockaddr_in *ro = (struct sockaddr_in *)rodata;
-    int brk = sbrk(0);
+    char *brk = sbrk(0);
     struct sockaddr_in *past = (struct sockaddr_in *)(brk - 8); /* runs past the heap */
     check_eq(bind(t, NULL), -EFAULT, "bind to address NULL");
     check_eq(bind(t, kernel), -EFAULT, "bind to kernel memory");
@@ -450,7 +454,7 @@ static void test_inherited(void) {
     char buf[32];
     int n = 0;
     for (;;) {
-        int r = recv(s, buf + n, (uint)(sizeof buf - 1 - n));
+        int r = (int)recv(s, buf + n, sizeof buf - 1 - (size_t)n);
         if (r <= 0) {
             check_eq(r, 0, "the end, once echo exited and closed the last descriptor");
             break;

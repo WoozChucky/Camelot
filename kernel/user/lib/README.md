@@ -24,7 +24,7 @@ together.
 | `resolve.c` | `resolve`: a host's address, from its text or by a DNS query (RFC 1035) to the server the network gave; `resolve_error` |
 | `atomic.s` | `atomic_swap`, `atomic_add`, `atomic_cas`, `atomic_load`, `atomic_store`; `spin_lock`, `spin_unlock` |
 | `mutex.c` | `mutex_lock`, `mutex_trylock`, `mutex_unlock`: a mutex that sleeps on a futex |
-| `thread.s` | `thread_start`: a C function in a new thread |
+| `thread.S` | `thread_start`: a C function in a new thread (preprocessed for each width: its two stack slots are pointers) |
 
 ## How programs get it
 
@@ -121,7 +121,7 @@ kernel: the heap goes when the program exits.
 ## Threads
 
 A program starts more threads with `thread_start(fn, arg, stack, size)`
-(`thread.s`): `fn(arg)` runs in a new thread on the `size` bytes at
+(`thread.S`): `fn(arg)` runs in a new thread on the `size` bytes at
 `stack`, which the caller provides (static, or from `malloc`) and must keep
 until the thread has ended, and what `fn` returns is the status
 `thread_join` collects. The `thread_create` system call itself starts a

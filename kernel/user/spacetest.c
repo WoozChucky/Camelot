@@ -13,12 +13,23 @@
  *                        sooner if RAM runs out first */
 #include "user.h"
 
-/* User space (USER_TOP, USER_STACK_LIMIT, USER_LOAD_TOP in vm.h). */
-#define USER_TOP 0x0c000000u
-#define USER_STACK_LIMIT 0x0b800000u
-#define USER_LOAD_TOP 0x0b7ff000u
 #define PAGE 4096u
 #define MIB (1024u * 1024u)
+
+/* User space (USER_TOP, USER_STACK_LIMIT, USER_LOAD_TOP in vm.h): the
+ * stack's 8 MiB under USER_TOP, a guard page under that, the heap below.
+ * USER_TOP is 0x0c000000 on RV32; on RV64 it depends on the paging mode
+ * (2^47 in Sv48, 2^38 in Sv39), so main() finds it: the arguments are at
+ * the top of the stack, in its last page. */
+#ifdef _LP64
+static uintptr_t USER_TOP;
+static uintptr_t USER_STACK_LIMIT;
+static uintptr_t USER_LOAD_TOP;
+#else
+#define USER_TOP 0x0c000000ul
+#define USER_STACK_LIMIT 0x0b800000ul
+#define USER_LOAD_TOP 0x0b7ff000ul
+#endif
 
 static int checks;
 static int failed;
@@ -31,11 +42,11 @@ static void check(int ok, const char *what) {
     }
 }
 
-static void check_eq(int got, int want, const char *what) {
+static void check_eq(long got, long want, const char *what) {
     checks++;
     if (got != want) {
         failed++;
-        printf("spacetest: FAILED: %s: got %d, want %d\n", what, got, want);
+        printf("spacetest: FAILED: %s: got %ld, want %ld\n", what, got, want);
     }
 }
 
@@ -44,11 +55,11 @@ static int fds[2];
 
 /* What write() of `len` bytes at `addr` into the pipe returns; whatever it
  * wrote is read back out, so the pipe never fills. */
-static int write_at(uint addr, uint len) {
-    int r = write(fds[1], (const void *)addr, len);
+static long write_at(uintptr_t addr, size_t len) {
+    long r = write(fds[1], (const void *)addr, len);
     char sink[16];
     if (r > 0) {
-        read(fds[0], sink, (uint)r);
+        read(fds[0], sink, (size_t)r);
     }
     return r;
 }
@@ -78,7 +89,7 @@ static void stack_checks(void) {
     check_eq(deep(200), 200, "200 frames of 1000 bytes: about 200 KiB of stack");
     check(untouched(), "a system call writes into a stack frame not touched yet");
     char here;
-    uint sp = (uint)&here;
+    uintptr_t sp = (uintptr_t)&here;
     check(sp >= USER_STACK_LIMIT && sp < USER_TOP, "the stack is in its range");
     /* The stack's top page holds the arguments: mapped. Past it is not user
      * space; under the stack's limit is the guard page. */
@@ -92,40 +103,43 @@ static void stack_checks(void) {
     check_eq(write_at(sp - MIB, 1), -EFAULT, "a megabyte below sp");
 }
 
+/* sbrk's result as a number: an address, or minus an error number. */
+#define brk_by(increment) ((long)sbrk(increment))
+
 static void heap_checks(void) {
-    int end = sbrk(0);
-    check_eq(sbrk((int)(USER_LOAD_TOP - (uint)end + 1)), -ENOMEM, "grow one byte into the guard page");
-    check_eq(sbrk(64 * (int)MIB), -ENOMEM, "grow by more than the RAM");
-    check_eq(sbrk(0), end, "failed calls change nothing");
-    check_eq(write_at((uint)end, 1), -EFAULT, "the byte past the heap");
+    long end = brk_by(0);
+    check_eq(brk_by((long)(USER_LOAD_TOP - (uintptr_t)end + 1)), -ENOMEM, "grow one byte into the guard page");
+    check_eq(brk_by(64 * (long)MIB), -ENOMEM, "grow by more than the RAM");
+    check_eq(brk_by(0), end, "failed calls change nothing");
+    check_eq(write_at((uintptr_t)end, 1), -EFAULT, "the byte past the heap");
 }
 
 /* `spacetest heap MIB`. */
 static void big_heap(int mib) {
-    uint size = (uint)mib * MIB;
-    int start = sbrk((int)size);
+    size_t size = (size_t)mib * MIB;
+    long start = brk_by((long)size);
     check(start > 0, "grow the heap");
     if (start <= 0) {
         return;
     }
-    uint base = (uint)start;
+    uintptr_t base = (uintptr_t)start;
     if (size > 4 * MIB) {
         check(base + size > 4 * MIB, "the heap ends past the first 4 MiB");
     }
-    for (uint a = base; a < base + size; a += PAGE) {
-        *(uint *)(a & ~3u) = a;
+    for (uintptr_t a = base; a < base + size; a += PAGE) {
+        *(uint *)(a & ~(uintptr_t)3) = (uint)a;
     }
     int bad = 0;
-    for (uint a = base; a < base + size; a += PAGE) {
-        if (*(uint *)(a & ~3u) != a) {
+    for (uintptr_t a = base; a < base + size; a += PAGE) {
+        if (*(uint *)(a & ~(uintptr_t)3) != (uint)a) {
             bad++;
         }
     }
     check_eq(bad, 0, "every page of the heap keeps what was written");
     check_eq(write_at(base + size - 1, 1), 1, "the heap's last byte");
     check_eq(write_at(base + size, 1), -EFAULT, "the byte past it");
-    check_eq(sbrk(-(int)size), start + (int)size, "shrink it back");
-    check_eq(sbrk(0), start, "back where it was");
+    check_eq(brk_by(-(long)size), start + (long)size, "shrink it back");
+    check_eq(brk_by(0), start, "back where it was");
 }
 
 /* Always 1, but volatile: a compiler cannot tell that forever() never
@@ -145,6 +159,11 @@ static int forever(int n) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _LP64
+    USER_TOP = ((uintptr_t)argv[0] + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
+    USER_STACK_LIMIT = USER_TOP - 8 * MIB;
+    USER_LOAD_TOP = USER_STACK_LIMIT - PAGE;
+#endif
     if (argc == 2 && strcmp(argv[1], "overflow") == 0) {
         return forever(0);
     }

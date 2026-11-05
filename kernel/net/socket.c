@@ -103,7 +103,7 @@ static void sock_file(struct file *f, struct socket *s) {
 /* Reads the struct sockaddr_in at user address `uaddr` into a host-order
  * address and port. -EFAULT, or -EAFNOSUPPORT for a family other than
  * AF_INET. */
-static int get_addr(u32 uaddr, u32 *addr, u32 *port) {
+static int get_addr(uintptr uaddr, u32 *addr, u32 *port) {
     struct sockaddr_in a;
     if (copyin(user_pt(), &a, uaddr, sizeof a) < 0) {
         return -EFAULT;
@@ -121,7 +121,7 @@ static int get_addr(u32 uaddr, u32 *addr, u32 *port) {
  * process has unmapped it since (sbrk). accept and recvfrom, which have
  * taken a connection or a datagram by then, still return it: the address
  * is lost, as it would be on a bad pointer the check missed. */
-static int put_addr(u32 uaddr, u32 addr, u32 port) {
+static int put_addr(uintptr uaddr, u32 addr, u32 port) {
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
@@ -132,7 +132,7 @@ static int put_addr(u32 uaddr, u32 addr, u32 port) {
 
 /* Whether `uaddr` can take a struct sockaddr_in (0, for the calls where it
  * is optional, can). */
-static bool addr_writable(u32 uaddr, bool optional) {
+static bool addr_writable(uintptr uaddr, bool optional) {
     if (optional && uaddr == 0) {
         return true;
     }
@@ -159,10 +159,19 @@ static int udp_autobind(struct socket *s) {
 
 /* ---- sending and receiving ---- */
 
+/* The most one call sends or receives: INT_MAX bytes, as Linux's sendto
+ * and recvfrom clamp `len` (and read and write their count, file.c), so
+ * that the result fits an int and the stack's lengths stay 32-bit. */
+#define MAX_LEN 0x7fffffffu
+
+static u32 clamp_len(usize n) {
+    return n > MAX_LEN ? MAX_LEN : (u32)n;
+}
+
 /* Sends `n` bytes at user address `src`: on a stream, into the
  * connection; as a datagram, to `addr`:`port` if `to`, else to the peer
  * the socket is connected to. */
-static int sock_send(struct socket *s, u32 src, u32 n, bool to, u32 addr, u32 port) {
+static int sock_send(struct socket *s, uintptr src, u32 n, bool to, u32 addr, u32 port) {
     if (s->type == SOCK_STREAM) {
         /* An address is ignored: the connection says where (as on Linux). */
         return tcp_send(s->tcp, user_pt(), src, n);
@@ -188,7 +197,7 @@ static int sock_send(struct socket *s, u32 src, u32 n, bool to, u32 addr, u32 po
 
 /* Receives up to `n` bytes into user address `dst`; where they came from
  * in *addr and *port. */
-static int sock_recv(struct socket *s, u32 dst, u32 n, u32 *addr, u32 *port) {
+static int sock_recv(struct socket *s, uintptr dst, u32 n, u32 *addr, u32 *port) {
     if (s->rd_shut) {
         return 0;
     }
@@ -217,20 +226,20 @@ static int sock_recv(struct socket *s, u32 dst, u32 n, u32 *addr, u32 *port) {
  * stack, so each takes net_lock (net.h); the system calls below have it
  * already (syscall.c). */
 
-int socket_read(struct socket *s, pagetable_t pt, u32 dst, u32 n) {
+isize socket_read(struct socket *s, pagetable_t pt, uintptr dst, usize n) {
     (void)pt; /* the current process's, as for every system call */
     u32 addr;
     u32 port;
     acquire(&net_lock);
-    int r = sock_recv(s, dst, n, &addr, &port);
+    int r = sock_recv(s, dst, clamp_len(n), &addr, &port);
     release(&net_lock);
     return r;
 }
 
-int socket_write(struct socket *s, pagetable_t pt, u32 src, u32 n) {
+isize socket_write(struct socket *s, pagetable_t pt, uintptr src, usize n) {
     (void)pt;
     acquire(&net_lock);
-    int r = sock_send(s, src, n, false, 0, 0);
+    int r = sock_send(s, src, clamp_len(n), false, 0, 0);
     release(&net_lock);
     return r;
 }
@@ -304,7 +313,7 @@ int sock_sys_socket(u32 domain, u32 type, u32 protocol) {
     return sock_install(f, s);
 }
 
-int sock_sys_bind(u32 fd, u32 uaddr) {
+int sock_sys_bind(u32 fd, uintptr uaddr) {
     int err;
     struct socket *s = fd_sock(fd, &err);
     if (s == NULL) {
@@ -350,7 +359,7 @@ int sock_sys_listen(u32 fd, u32 backlog) {
     return tcp_listen(s->tcp, backlog);
 }
 
-int sock_sys_accept(u32 fd, u32 uaddr) {
+int sock_sys_accept(u32 fd, uintptr uaddr) {
     int err;
     struct socket *s = fd_sock(fd, &err);
     if (s == NULL) {
@@ -397,7 +406,7 @@ int sock_sys_accept(u32 fd, u32 uaddr) {
     return nfd;
 }
 
-int sock_sys_connect(u32 fd, u32 uaddr) {
+int sock_sys_connect(u32 fd, uintptr uaddr) {
     int err;
     struct socket *s = fd_sock(fd, &err);
     if (s == NULL) {
@@ -424,15 +433,15 @@ int sock_sys_connect(u32 fd, u32 uaddr) {
     return 0;
 }
 
-int sock_sys_send(u32 fd, u32 ubuf, u32 len) {
+isize sock_sys_send(u32 fd, uintptr ubuf, usize len) {
     return sock_sys_sendto(fd, ubuf, len, 0);
 }
 
-int sock_sys_recv(u32 fd, u32 ubuf, u32 len) {
+isize sock_sys_recv(u32 fd, uintptr ubuf, usize len) {
     return sock_sys_recvfrom(fd, ubuf, len, 0);
 }
 
-int sock_sys_sendto(u32 fd, u32 ubuf, u32 len, u32 uaddr) {
+isize sock_sys_sendto(u32 fd, uintptr ubuf, usize len, uintptr uaddr) {
     int err;
     struct socket *s = fd_sock(fd, &err);
     if (s == NULL) {
@@ -455,10 +464,10 @@ int sock_sys_sendto(u32 fd, u32 ubuf, u32 len, u32 uaddr) {
             return err;
         }
     }
-    return sock_send(s, ubuf, len, uaddr != 0, addr, port);
+    return sock_send(s, ubuf, clamp_len(len), uaddr != 0, addr, port);
 }
 
-int sock_sys_recvfrom(u32 fd, u32 ubuf, u32 len, u32 uaddr) {
+isize sock_sys_recvfrom(u32 fd, uintptr ubuf, usize len, uintptr uaddr) {
     int err;
     struct socket *s = fd_sock(fd, &err);
     if (s == NULL) {
@@ -469,7 +478,7 @@ int sock_sys_recvfrom(u32 fd, u32 ubuf, u32 len, u32 uaddr) {
     }
     u32 addr = 0;
     u32 port = 0;
-    int n = sock_recv(s, ubuf, len, &addr, &port);
+    int n = sock_recv(s, ubuf, clamp_len(len), &addr, &port);
     if (n >= 0 && uaddr != 0) {
         (void)put_addr(uaddr, addr, port);
     }
@@ -514,7 +523,7 @@ int sock_sys_shutdown(u32 fd, u32 how) {
     return 0;
 }
 
-int sock_sys_name(u32 fd, u32 uaddr, bool peer) {
+int sock_sys_name(u32 fd, uintptr uaddr, bool peer) {
     int err;
     struct socket *s = fd_sock(fd, &err);
     if (s == NULL) {
@@ -545,7 +554,7 @@ int sock_sys_name(u32 fd, u32 uaddr, bool peer) {
     return put_addr(uaddr, laddr, lport);
 }
 
-int sock_sys_setsockopt(u32 fd, u32 level, u32 option, u32 uvalue, u32 len) {
+int sock_sys_setsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, u32 len) {
     int err;
     struct socket *s = fd_sock(fd, &err);
     if (s == NULL) {
@@ -568,7 +577,8 @@ int sock_sys_setsockopt(u32 fd, u32 level, u32 option, u32 uvalue, u32 len) {
     u32 hz = TICK_HZ;
     u32 usec_per_tick = 1000000 / hz;
     u32 max_sec = 0xffffffffu / hz - 1;
-    u32 sec = (u32)tv.tv_sec > max_sec ? max_sec : (u32)tv.tv_sec;
+    /* Compared as a time_t: a 64-bit tv_sec past 2^32 is long, not short. */
+    u32 sec = tv.tv_sec > (time_t)max_sec ? max_sec : (u32)tv.tv_sec;
     s->rcvtimeo = sec * hz + ((u32)tv.tv_usec + usec_per_tick - 1) / usec_per_tick;
     return 0;
 }

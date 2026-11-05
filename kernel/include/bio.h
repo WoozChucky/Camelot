@@ -23,6 +23,10 @@
 #include "types.h"
 
 #define BSIZE 1024
+/* log2(BSIZE): a file offset's block number is off >> BSHIFT, which costs
+ * no 64-bit division on RV32. */
+#define BSHIFT 10
+_Static_assert(BSIZE == 1 << BSHIFT, "BSHIFT is BSIZE's log2");
 #define BLOCK_SECTORS (BSIZE / BLK_SECTOR_SIZE)
 
 /* Buffers in the cache. bread() panics if every one is in use. The log

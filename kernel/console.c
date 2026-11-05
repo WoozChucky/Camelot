@@ -93,7 +93,7 @@ static bool edit_line(void) {
     return line_done;
 }
 
-int console_read(pagetable_t pt, u32 dst, u32 n) {
+isize console_read(pagetable_t pt, uintptr dst, usize n) {
     if (!uvm_range_ok(pt, dst, n, PTE_W)) {
         return -EFAULT;
     }
@@ -110,7 +110,7 @@ int console_read(pagetable_t pt, u32 dst, u32 n) {
     }
     u32 count = line_len - line_taken;
     if (count > n) {
-        count = n;
+        count = (u32)n;
     }
     /* Checked above, and nothing unmaps it while the process sleeps.
      * copyout() never sleeps, so it may run under the lock. */
@@ -125,20 +125,20 @@ int console_read(pagetable_t pt, u32 dst, u32 n) {
         line_done = false;
     }
     release(&cons_lock);
-    return (int)count;
+    return (isize)count;
 }
 
-int console_write(pagetable_t pt, u32 src, u32 n) {
+isize console_write(pagetable_t pt, uintptr src, usize n) {
     if (!uvm_range_ok(pt, src, n, PTE_R)) {
         return -EFAULT;
     }
     char chunk[WRITE_CHUNK];
-    for (u32 done = 0; done < n;) {
-        u32 count = n - done < WRITE_CHUNK ? n - done : WRITE_CHUNK;
+    for (usize done = 0; done < n;) {
+        u32 count = n - done < WRITE_CHUNK ? (u32)(n - done) : WRITE_CHUNK;
         /* Checked above, but another thread of the process may have
          * unmapped part of the buffer since (sbrk). */
         if (copyin(pt, chunk, src + done, count) != 0) {
-            return done > 0 ? (int)done : -EFAULT;
+            return done > 0 ? (isize)done : -EFAULT;
         }
         acquire(&uart_tx_lock);
         for (u32 i = 0; i < count; i++) {
@@ -147,5 +147,5 @@ int console_write(pagetable_t pt, u32 src, u32 n) {
         release(&uart_tx_lock);
         done += count;
     }
-    return (int)n;
+    return (isize)n;
 }
