@@ -1744,6 +1744,7 @@ impl Parser<'_> {
             };
             let at = tag.as_ref().map_or(kw_pos, |(_, pos)| *pos);
             self.record_body(&record, at)?;
+            self.after_definition(kw)?;
             // `struct { int x; };` declares nothing anyone can name.
             return Ok((Type::Record(record), tag.is_some(), tag.is_none()));
         }
@@ -1995,7 +1996,55 @@ impl Parser<'_> {
         if let Some((name, pos)) = tag {
             self.bind_tag(&name, Tag::Enum(ty.clone(), spelled.clone(), pos));
         }
+        self.after_definition("enum")?;
         Ok((ty, true, spelled))
+    }
+
+    /// After a struct, union or enum's `}` (the `kw` it is), what can
+    /// follow a type specifier, as clang's `isValidAfterTypeSpecifier` has
+    /// it, else clang's error that the `;` is missing after it: a type
+    /// specifier (`struct s { ... } struct t;`) or a keyword that begins
+    /// none of a declarator. A qualifier or storage class followed by a
+    /// type specifier is taken for the next declaration's, too.
+    fn after_definition(&self, kw: &str) -> Result<(), Error> {
+        let type_specifier = |t: &Tok| match t {
+            Tok::Kw(k) => matches!(
+                k,
+                Kw::Void
+                    | Kw::Char
+                    | Kw::Short
+                    | Kw::Int
+                    | Kw::Long
+                    | Kw::Signed
+                    | Kw::Unsigned
+                    | Kw::Bool
+                    | Kw::Struct
+                    | Kw::Union
+                    | Kw::Enum
+            ),
+            Tok::Ident(name) => matches!(self.lookup_name(name), Some(Name::Typedef(..))),
+            _ => false,
+        };
+        let valid = match self.peek() {
+            Tok::Punct(";" | "*" | ")" | "(" | "," | "[" | "..." | ":" | "}") | Tok::Ident(_) => true,
+            Tok::Kw(
+                Kw::Const
+                | Kw::Volatile
+                | Kw::Restrict
+                | Kw::Inline
+                | Kw::Static
+                | Kw::Extern
+                | Kw::Typedef
+                | Kw::Register
+                | Kw::Auto,
+            ) => !type_specifier(self.peek_at(1)),
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::new(self.after_prev(), format!("expected ';' after {kw}")))
+        }
     }
     /// `const`, `volatile` and `restrict` after a `*`.
     fn qualifiers(&mut self) -> Quals {

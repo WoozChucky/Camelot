@@ -87,5 +87,9 @@ pub fn cases() -> Vec<Case> {
         case("int x[sizeof \"\\u00e9\\U0001F600\" == 7 ? 1 : -1];", &[]),
         // Four characters are no -Wmultichar (-Wfour-char-constants is off).
         case("int c = 'abcd'; int d = 'abc';", &["1:25: warning: multi-character character constant [-Wmultichar]"]),
+        // Columns count bytes; a byte-order mark is skipped, its bytes counted.
+        case("/* \u{e9}\u{e9} */ int f(void) { return y; }", &["1:33: error: use of undeclared identifier 'y'"]),
+        case("int f(void) { char *s = \"\u{20ac}\\q\"; return y; }", &["1:29: warning: unknown escape sequence '\\q' [-Wunknown-escape-sequence]", "1:41: error: use of undeclared identifier 'y'"]),
+        case("\u{feff}int x = y;\nint z = w;", &["1:12: error: use of undeclared identifier 'y'", "2:9: error: use of undeclared identifier 'w'"]),
     ]
 }

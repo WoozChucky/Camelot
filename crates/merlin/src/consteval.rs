@@ -456,6 +456,40 @@ pub fn parsed_note(e: &Expr, x: Xlen) -> Option<(Pos, String)> {
     }
 }
 
+/// Why `e`, a tree sema has checked, is no integer constant expression,
+/// as clang's evaluator notes it, where it says so: of a division by zero
+/// it reaches, `division by zero` at the operator. Operands are evaluated
+/// left to right, as far as they are constant (what is not stops it with
+/// nothing to say in C), and what a constant `&&`, `||` or `?:` passes by
+/// not at all.
+pub fn why_not(e: &Expr, x: Xlen) -> Option<(Pos, &'static str)> {
+    let known = |e: &Expr| int(e, x).is_some();
+    match &e.kind {
+        ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r) => why_not(l, x).or_else(|| {
+            let v = int(l, x)?;
+            ((v != 0) == (*op == BinOp::LogAnd))
+                .then(|| why_not(r, x))
+                .flatten()
+        }),
+        ExprKind::Binary(op, l, r) => {
+            if let Some(n) = why_not(l, x) {
+                return Some(n);
+            }
+            if !known(l) {
+                return None;
+            }
+            if let Some(n) = why_not(r, x) {
+                return Some(n);
+            }
+            (matches!(op, BinOp::Div | BinOp::Rem) && int(r, x) == Some(0))
+                .then_some((e.pos, "division by zero"))
+        }
+        ExprKind::Cond(c, a, b) => why_not(c, x).or_else(|| why_not(if int(c, x)? != 0 { a } else { b }, x)),
+        ExprKind::Unary(_, v) | ExprKind::Cast { x: v, .. } => why_not(v, x),
+        _ => None,
+    }
+}
+
 // ---- conditions ----
 
 /// The value clang's code generator folds a condition to at `-O0`

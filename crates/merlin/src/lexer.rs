@@ -337,6 +337,12 @@ fn splice(src: &str, file: u32, asm: bool) -> Spliced {
     let mut marks = Vec::new();
     let (mut line, mut col) = (1, 1);
     let mut k = 0;
+    // A UTF-8 byte-order mark is no character of the source: clang skips
+    // it, its three bytes still in the first line's columns.
+    if src.first() == Some(&'\u{feff}') {
+        k = 1;
+        col = 4;
+    }
     while k < src.len() {
         // The character here after phase 1, and how many it was written as.
         let (c, n) = match (src[k], src.get(k + 1), src.get(k + 2).and_then(|&c| trigraph(c))) {
@@ -373,15 +379,22 @@ fn splice(src: &str, file: u32, asm: bool) -> Spliced {
             line += 1;
             col = 1;
         } else {
-            col += n as u32;
+            // Columns count bytes, as clang's do: `é` is two.
+            col += src[k..k + n].iter().map(|c| c.len_utf8() as u32).sum::<u32>();
         }
         k += n;
     }
+    // The end of a file that ends with a newline is that newline, as
+    // clang has it (its `LexEndOfFile`): no line follows it.
+    let end = match (chars.last(), at.last()) {
+        (Some('\n'), Some(&newline)) => newline,
+        _ => Pos::in_file(file, line, col),
+    };
     Spliced {
         chars,
         at,
         marks,
-        end: Pos::in_file(file, line, col),
+        end,
     }
 }
 
@@ -897,8 +910,15 @@ fn decode_in(text: &str, pos: Pos, diags: &mut Vec<Error>, char_const: bool) -> 
     let chars: Vec<char> = text.chars().collect();
     let body = &chars[1..chars.len() - 1];
     // Where character `k` of the body is (the literal is on one line, unless
-    // a line splice ran through it).
-    let at = |k: usize| Pos::in_file(pos.file, pos.line, pos.col + 1 + k as u32);
+    // a line splice ran through it), columns counting bytes.
+    let mut bytes = Vec::with_capacity(body.len() + 1);
+    let mut n = 0;
+    for c in body {
+        bytes.push(n);
+        n += c.len_utf8() as u32;
+    }
+    bytes.push(n);
+    let at = |k: usize| Pos::in_file(pos.file, pos.line, pos.col + 1 + bytes[k.min(body.len())]);
     let mut out = Vec::new();
     let mut k = 0;
     while k < body.len() {

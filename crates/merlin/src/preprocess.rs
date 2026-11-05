@@ -1265,10 +1265,8 @@ impl Pp<'_> {
         let line = (i64::from(name.end.line) - cur.line_delta) as usize;
         let mut lines = cur.text.split('\n').skip(line - 1);
         let first = lines.next().unwrap_or("");
-        let start = first
-            .char_indices()
-            .nth(name.end.col as usize - 1)
-            .map_or(first.len(), |(i, _)| i);
+        // Columns count bytes.
+        let start = (name.end.col as usize - 1).min(first.len());
         let mut text = String::new();
         let mut part = &first[start..];
         loop {

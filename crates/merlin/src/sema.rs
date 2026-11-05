@@ -771,6 +771,7 @@ impl Checker {
             spellings: f.params.iter().map(|p| (p.pos, p.spelled.clone())).collect(),
             ret_spelled: f.ret_spelled.clone(),
             init_spelled: Spelled::default(),
+            item_spelled: Spelled::default(),
             written: &self.written,
             func: &f.name,
             ret: &f.ret,
@@ -793,6 +794,7 @@ impl Checker {
             address_taken: false,
             errors: &mut self.errors,
             pending: Vec::new(),
+            conversions: None,
             unevaluated: 0,
             registers: HashSet::new(),
             linked: Vec::new(),
@@ -1280,6 +1282,9 @@ struct FnChecker<'a> {
     spellings: HashMap<Pos, Spelled>,
     ret_spelled: Spelled,
     init_spelled: Spelled,
+    /// How the object an item of a list being checked initializes was
+    /// spelled ([`Self::fill`]).
+    item_spelled: Spelled,
     /// How the source was written ([`Written`]).
     written: &'a Written,
     /// The function being checked (empty at file scope).
@@ -1322,6 +1327,10 @@ struct FnChecker<'a> {
     /// at the end of the function ([`FnChecker::runtime`]), each with the
     /// expression it is of.
     pending: Vec<(Error, ExprId)>,
+    /// While a declaration's list is checked, the warnings of its items'
+    /// conversions, to give once it is (each with what it is of, if it is
+    /// of what runs).
+    conversions: Option<Vec<(Error, Option<ExprId>)>>,
     /// How many operands deep in what is never evaluated (`sizeof`'s,
     /// what the parser evaluated away) the checker is.
     unevaluated: usize,
@@ -1355,6 +1364,7 @@ impl<'a> FnChecker<'a> {
             spellings: HashMap::new(),
             ret_spelled: Spelled::default(),
             init_spelled: Spelled::default(),
+            item_spelled: Spelled::default(),
             written,
             func: "",
             ret: &VOID,
@@ -1374,6 +1384,7 @@ impl<'a> FnChecker<'a> {
             address_taken: false,
             errors,
             pending: Vec::new(),
+            conversions: None,
             unevaluated: 0,
             registers: HashSet::new(),
             linked: Vec::new(),
@@ -1440,7 +1451,14 @@ impl<'a> FnChecker<'a> {
                 let t = u.expr.ty.decay();
                 match u.non_integer {
                     Some((at, what)) if !t.is_integer() => self.err(at, format!("{what} '{t}'")),
-                    _ => self.err(*pos, msg.clone()),
+                    _ => {
+                        let mut e = Error::new(*pos, msg.clone());
+                        if let Some((at, note)) = consteval::why_not(&u.expr, self.xlen) {
+                            e = e.note(at, note);
+                        }
+                        self.errors.push(e);
+                        Reported
+                    }
                 };
             }
             clean.push(ok);
@@ -1708,7 +1726,14 @@ impl<'a> FnChecker<'a> {
                 } else {
                     match consteval::int(expr, self.xlen).filter(|_| expr.ty.is_integer()) {
                         None => {
-                            self.err(expr.pos, "expression is not an integer constant expression");
+                            let mut e = Error::new(
+                                self.begin_written(expr),
+                                "expression is not an integer constant expression",
+                            );
+                            if let Some((at, note)) = consteval::why_not(expr, self.xlen) {
+                                e = e.note(at, note);
+                            }
+                            self.errors.push(e);
                             self.switches.last_mut().expect("checked above").incomplete = true;
                         }
                         Some(v) => {
@@ -2467,6 +2492,30 @@ impl<'a> FnChecker<'a> {
     /// initialized is declared (a compound literal, where its type is), for
     /// clang's errors of its whole initializer; a list in a list has none.
     fn init(&mut self, ty: &mut Type, init: &mut Init, constant: bool, decl: Option<Pos>) -> Checked {
+        // A declaration's list: the warnings of its items' conversions
+        // come once it is checked, last item first, as clang's analysis of
+        // the full expression walks them (`{ 300, -200 }` of a `char[2]`
+        // warns of -200 first).
+        if matches!(init, Init::List(..)) && decl.is_some() {
+            self.item_spelled = std::mem::take(&mut self.init_spelled);
+        }
+        if matches!(init, Init::List(..)) && decl.is_some() && self.conversions.is_none() {
+            self.conversions = Some(Vec::new());
+            let checked = self.init_list(ty, init, constant, decl);
+            let deferred = self.conversions.take().unwrap_or_default();
+            for (e, of) in deferred.into_iter().rev() {
+                match of {
+                    Some(of) => self.pending.push((e, of)),
+                    None => self.errors.push(e),
+                }
+            }
+            return checked;
+        }
+        self.init_list(ty, init, constant, decl)
+    }
+
+    /// [`Self::init`] itself.
+    fn init_list(&mut self, ty: &mut Type, init: &mut Init, constant: bool, decl: Option<Pos>) -> Checked {
         let Init::List(items, pos) = init else {
             let Init::Expr(e) = init else { unreachable!() };
             return self.init_expr(ty, e, constant, false, None);
@@ -2714,6 +2763,12 @@ impl<'a> FnChecker<'a> {
                 (_, Some(r)) => r.body().expect("checked above").members[next].ty.clone(),
                 _ => unreachable!("an aggregate"),
             };
+            // A member is as its declaration spelled it; an element as the
+            // array is.
+            let outer_spelled = self.item_spelled.clone();
+            if let Some(r) = &record {
+                self.item_spelled = r.body().expect("checked above").members[next].spelled.clone();
+            }
             if slots.len() <= next {
                 slots.resize(next + 1, None);
             }
@@ -2747,6 +2802,7 @@ impl<'a> FnChecker<'a> {
                 let old = slots[next].take();
                 self.fill(&mut sub, queue, constant, at, Fill::Designated(rest, old))?
             };
+            self.item_spelled = outer_spelled;
             // A union holds one member: the last one initialized.
             if record.as_ref().is_some_and(|r| r.union) {
                 slots.iter_mut().for_each(|s| *s = None);
@@ -2961,10 +3017,12 @@ impl<'a> FnChecker<'a> {
                 if !checked {
                     self.value(e, constant)?;
                 }
+                // How the object initialized was spelled: the declaration's,
+                // or of an item of a list, what it is an element or member of.
                 let spelled = if decl.is_some() {
                     std::mem::take(&mut self.init_spelled)
                 } else {
-                    Spelled::default()
+                    self.item_spelled.clone()
                 };
                 self.convert(e, ty, &spelled, Conv::Init, at)?;
                 coerce(e, ty);
@@ -2992,10 +3050,20 @@ impl<'a> FnChecker<'a> {
         let from_spelled = self.spelled_of(e);
         let named = from.named(&from_spelled);
         self.convert_value(e, &from, &named, &from_spelled, null, to, to_spelled, how, at)?;
+        let (errors, pending) = (self.errors.len(), self.pending.len());
         self.constant_conversion(e, to);
         // An argument's, after the note on its parameter.
         if how != Conv::Arg {
             self.enum_to_enum(e, to, to_spelled);
+        }
+        // Of an item of a list, kept to come with the list's ([`Self::init`]).
+        if let Some(kept) = &mut self.conversions {
+            for e in self.errors.drain(errors..).rev() {
+                kept.push((e, None));
+            }
+            for (e, of) in self.pending.drain(pending..).rev() {
+                kept.push((e, Some(of)));
+            }
         }
         // Converted to `_Bool`, it is taken as true or false (an
         // argument's, after the note on its parameter).
@@ -3843,7 +3911,9 @@ impl<'a> FnChecker<'a> {
                             ""
                         };
                         let msg = format!("member reference type '{t}' is not a pointer{hint}");
-                        return Err(self.err(pos, msg));
+                        // At the `->` with the hint, else at the member's name.
+                        let here = if t.is_record() { pos } else { *at };
+                        return Err(self.err(here, msg));
                     }
                     (false, t @ Type::Ptr(_)) if t.pointee().is_some_and(Type::is_record) => {
                         let msg =
