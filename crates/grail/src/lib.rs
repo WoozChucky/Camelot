@@ -16,6 +16,7 @@ pub mod debug;
 pub mod devices;
 pub mod display;
 pub mod elf;
+pub mod fdt;
 pub mod framebuffer;
 pub mod gdb;
 pub mod keyboard;
