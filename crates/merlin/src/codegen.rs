@@ -867,6 +867,65 @@ impl SymbolTable {
     }
 }
 
+/// What clang's `emitStoresForConstant` looks at in the constant
+/// initializer of a local array, struct or union, to choose how to store it
+/// ([`FuncGen::local_decl`]): its bytes and its scalars.
+struct ConstantImage {
+    /// Each byte of the object, `None` for those of an address (which no
+    /// byte value stands for). Padding and what the list leaves out are
+    /// zero, as C has them and clang's constant spells them out.
+    bytes: Vec<Option<u8>>,
+    /// How many scalars are not zero: a store each, after clearing.
+    nonzero: usize,
+    /// One is the address of a symbol itself (no offset, not converted to
+    /// an integer), a global in LLVM's constant, which
+    /// `canEmitInitWithFewStoresAfterBZero` gives up on.
+    symbol: bool,
+}
+
+impl ConstantImage {
+    fn new(size: u32) -> ConstantImage {
+        ConstantImage {
+            bytes: vec![Some(0); size as usize],
+            nonzero: 0,
+            symbol: false,
+        }
+    }
+
+    /// A scalar of bytes `bytes` at byte `at`.
+    fn scalar(&mut self, at: usize, bytes: &[u8], nonzero: bool) {
+        for (i, &b) in bytes.iter().enumerate() {
+            self.bytes[at + i] = Some(b);
+        }
+        self.nonzero += usize::from(nonzero);
+    }
+
+    /// An address of `size` bytes at byte `at`; `symbol`: a symbol's own.
+    fn address(&mut self, at: usize, size: usize, symbol: bool) {
+        self.bytes[at..at + size].fill(None);
+        self.nonzero += 1;
+        self.symbol |= symbol;
+    }
+
+    /// Whether clang copies the object from a constant global, at `-O0`:
+    /// not when every byte is zero (a `memset` of zeros), and for more than
+    /// 32 bytes not when at most 6 scalars are not zero and no one is a
+    /// symbol's address (zeros, then a store each:
+    /// `shouldUseBZeroPlusStoresToInitialize`), nor when every byte is the
+    /// same (a `memset`: `shouldUseMemSetToInitialize`).
+    fn copied(&self) -> bool {
+        if self.bytes.iter().all(|&b| b == Some(0)) {
+            return false;
+        }
+        if self.bytes.len() <= 32 {
+            return true;
+        }
+        let few_stores = !self.symbol && self.nonzero <= 6;
+        let one_byte = self.bytes[0].is_some() && self.bytes.iter().all(|&b| b == self.bytes[0]);
+        !few_stores && !one_byte
+    }
+}
+
 /// What is shared by the whole file: the output, the label counter and the
 /// string literals seen so far.
 struct FileGen<'a> {
@@ -881,7 +940,8 @@ struct FileGen<'a> {
     pieces: Vec<(&'static str, String)>,
     /// Label counter shared by every function in the file, so labels are unique.
     labels: usize,
-    /// String literals, emitted at the end: each one's bytes and label.
+    /// String literals, emitted at the end: each one's bytes (its whole
+    /// array, the NUL included) and label.
     strings: Vec<(Vec<u8>, String)>,
     /// The names of the module's symbols, and the symbol each key sema
     /// gave a variable is written as ("Symbol names" above).
@@ -1124,7 +1184,18 @@ impl<'a> FileGen<'a> {
     /// (`GetAddrOfConstantStringFromLiteral`), `.L.str` in the assembly
     /// (`.L`: a private symbol, which the object leaves out).
     fn string(&mut self, bytes: &[u8], pos: Pos) -> String {
-        if let Some((_, label)) = self.strings.iter().find(|(s, _)| s == bytes) {
+        let mut array = bytes.to_vec();
+        array.push(0);
+        self.string_array(&array, pos)
+    }
+
+    /// The label of a string literal whose array is `array` (its bytes,
+    /// the NUL included if it has one): [`Self::string`]'s, or that of one
+    /// that initializes a longer or shorter `char` array, whose type sema
+    /// makes that array's (C99 6.7.8p14). Literals are the same when their
+    /// arrays are, as clang's are the same constant.
+    fn string_array(&mut self, array: &[u8], pos: Pos) -> String {
+        if let Some((_, label)) = self.strings.iter().find(|(s, _)| s == array) {
             return label.clone();
         }
         // A first pass's literals are taken back ([`Self::function`]): they
@@ -1134,11 +1205,21 @@ impl<'a> FileGen<'a> {
         } else {
             format!(".L{}", self.symbols.insert(".str"))
         };
-        self.strings.push((bytes.to_vec(), label.clone()));
+        self.strings.push((array.to_vec(), label.clone()));
         if let Some(d) = self.debug.as_mut() {
-            d.literal(&label, bytes.len(), pos);
+            d.literal(&label, array.len(), pos);
         }
         label
+    }
+
+    /// Takes the name `base` for a global clang makes that merlin has no
+    /// object for (a constant clang copies a local's initializer from,
+    /// [`FuncGen::local_decl`]): the counter goes on as clang's ("Symbol
+    /// names" above). A function's first pass takes none.
+    fn take_name(&mut self, base: &str) {
+        if !self.dry {
+            self.symbols.insert(base);
+        }
     }
 
     /// Emits a global variable or, when `local`, a `static` local: its
@@ -1352,9 +1433,7 @@ impl<'a> FileGen<'a> {
         self.switch(".rodata");
         for (bytes, label) in std::mem::take(&mut self.strings) {
             let _ = writeln!(self.out, "\n{label}:");
-            let mut with_nul = bytes.clone();
-            with_nul.push(0);
-            for line in byte_directives(&with_nul) {
+            for line in byte_directives(&bytes) {
                 let _ = writeln!(self.out, "    {line}");
             }
         }
@@ -2350,16 +2429,90 @@ impl<'a> FuncGen<'a, '_> {
             self.comment(format!("{} = ...", d.ty.declare(&d.name)));
             self.clear_local(off, d.ty.size(self.xlen).unwrap() as i32);
         }
-        // `-g`: clang emits an array, struct or union with a constant
-        // initializer as a static's (`EmitAutoVarInit`, its
-        // `IsConstantAggregate`: `ConstantEmitter`), not as code: what
-        // its debug information keeps of it is a static initializer's.
-        let constant = self.file.debug.is_some()
-            && (d.ty.is_array() || d.ty.is_record())
-            && self.constant_initializer(&d.ty, init);
+        // clang emits an array, struct or union with a constant initializer
+        // as a static's (`EmitAutoVarInit`, its `IsConstantAggregate`:
+        // `ConstantEmitter`), not as code: with `-g`, what its debug
+        // information keeps of it is a static initializer's.
+        let constant = (d.ty.is_array() || d.ty.is_record()) && self.constant_initializer(&d.ty, init);
         self.constant_init = constant;
         self.init_local(&d.ty, init, off);
         self.constant_init = false;
+        // It copies the object from a constant of its own, which takes a
+        // name after the string literals in it, unless it clears the object
+        // and stores the few scalars that are not zero, or fills it with
+        // one byte ([`ConstantImage::copied`]).
+        if constant {
+            let size = d.ty.size(self.xlen).expect("sema: locals have complete types");
+            let mut image = ConstantImage::new(size);
+            self.constant_image(&d.ty, init, 0, &mut image);
+            if image.copied() {
+                self.file
+                    .take_name(&format!("__const.{}.{}", self.func.name, d.name));
+            }
+        }
+    }
+
+    /// The bytes and scalars of `init`, a constant initializer of an object
+    /// of type `ty` at byte `at` of `image`, as clang's constant has them.
+    fn constant_image(&self, ty: &Type, init: &Init, at: usize, image: &mut ConstantImage) {
+        match (ty.unqual(), init) {
+            (Type::Array(elem, _), Init::List(items, _)) => {
+                let size = elem.size(self.xlen).expect("sema: locals have complete types") as usize;
+                for (i, item) in items.iter().enumerate() {
+                    self.constant_image(elem, item, at + i * size, image);
+                }
+            }
+            // A union's list has empty items before the member it holds.
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().expect("sema: locals have complete types");
+                for (m, item) in body.members.iter().zip(items) {
+                    self.constant_image(&m.ty, item, at + m.offset as usize, image);
+                }
+            }
+            (_, Init::List(items, _)) => {
+                for item in items {
+                    self.constant_image(ty, item, at, image);
+                }
+            }
+            (
+                Type::Array(_, Some(n)),
+                Init::Expr(Expr {
+                    kind: ExprKind::Str(bytes),
+                    ..
+                }),
+            ) => {
+                // Each `char` a scalar of its own (LLVM's
+                // `ConstantDataArray`).
+                for (i, &b) in bytes.iter().take(*n as usize).enumerate() {
+                    image.scalar(at + i, &b.to_le_bytes(), b != 0);
+                }
+            }
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_image(lit, init, at, image),
+            (_, Init::Expr(e)) => {
+                let size = ty.size(self.xlen).expect("a scalar's size") as usize;
+                match consteval::eval(e, self.xlen).expect("a constant initializer") {
+                    Const::Int(v, _) => image.scalar(at, &v.to_le_bytes()[..size], v != 0),
+                    Const::Addr { base: None, offset } => {
+                        image.scalar(at, &offset.to_le_bytes()[..size], offset != 0)
+                    }
+                    // An address: no bytes are known. A pointer to a
+                    // symbol itself is LLVM's global; with an offset, or
+                    // converted to an integer, a constant expression.
+                    Const::Addr {
+                        base: Some(_),
+                        offset,
+                    } => image.address(at, size, ty.is_ptr() && offset == 0),
+                }
+            }
+            (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
+        }
     }
 
     /// Whether `init` is a constant initializer of an object of type `ty`,
@@ -2451,18 +2604,24 @@ impl<'a> FuncGen<'a, '_> {
             (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 let size = elem.size(self.xlen).unwrap() as i32;
-                // `-g`: clang emits an array whose initializers hold more
-                // than 16 bytes as a constant if it can (`EmitArrayInit`'s
-                // `ConstantEmitter`), visiting them as a static
-                // initializer's first; else element by element.
+                // clang emits an array whose initializers hold more than 16
+                // bytes as a constant if it can (`EmitArrayInit`'s
+                // `ConstantEmitter`, which with `-g` visits them as a static
+                // initializer's), copied from a global it names
+                // `constinit` after the string literals in it; else element
+                // by element.
                 let was = self.constant_init;
-                if !was && self.file.debug.is_some() && items.len() as i64 * i64::from(size) > 16 {
-                    self.constant_init = items.iter().all(|i| self.constant_visit(elem, i));
-                }
+                let whole = !was
+                    && items.len() as i64 * i64::from(size) > 16
+                    && items.iter().all(|i| self.constant_visit(elem, i));
+                self.constant_init = was || whole;
                 for (i, item) in items.iter().enumerate() {
                     self.init_local(elem, item, off + i as i32 * size);
                 }
                 self.constant_init = was;
+                if whole {
+                    self.file.take_name("constinit");
+                }
             }
             (Type::Record(r), Init::List(items, _)) => {
                 // Sema's list is fully braced: one item per member, in order.
@@ -2481,14 +2640,29 @@ impl<'a> FuncGen<'a, '_> {
                 Type::Array(_, Some(n)),
                 Init::Expr(Expr {
                     kind: ExprKind::Str(bytes),
+                    pos,
                     ..
                 }),
             ) => {
-                for (i, &b) in bytes.iter().take(*n as usize).enumerate() {
-                    if b != 0 {
-                        self.li("a0", b.into());
-                        self.access_local("sb", "a0", off + i as i32);
+                if self.constant_init {
+                    // Bytes of a constant clang emits whole.
+                    for (i, &b) in bytes.iter().take(*n as usize).enumerate() {
+                        if b != 0 {
+                            self.li("a0", b.into());
+                            self.access_local("sb", "a0", off + i as i32);
+                        }
                     }
+                } else {
+                    // Otherwise clang copies the array from the literal,
+                    // whose array is this one, cut or padded with zeros
+                    // (`EmitAggExpr` of the string literal).
+                    let mut array = bytes.clone();
+                    array.push(0);
+                    array.resize(*n as usize, 0);
+                    let label = self.file.string_array(&array, *pos);
+                    self.la_label("a0", &label);
+                    self.add_imm("a1", "s0", off);
+                    self.copy("a1", "a0", ty);
                 }
             }
             (_, Init::Expr(e)) => {

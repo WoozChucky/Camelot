@@ -1234,8 +1234,9 @@ fn data_size(d: &str) -> Option<u64> {
 /// globals. The numbers come from one counter, in the order the symbols are
 /// emitted, so a difference in that order, or a name clang takes that merlin
 /// does not count, changes them. Left out of clang's are the constants it
-/// copies a local's constant initializer from (`__const.f.a`), which merlin
-/// does not make: it counts their names all the same. Needs clang.
+/// copies a local's initializer from, `__const.f.a` or an array's
+/// `constinit`, which merlin does not make: it counts their names all the
+/// same. Needs clang.
 ///
 ///     cargo test -p merlin --test harness -- --ignored symbol_names
 #[test]
@@ -1275,7 +1276,10 @@ fn symbol_names_are_clangs() {
             }
             let theirs: Vec<(String, u64)> = objects(&std::fs::read_to_string(&s).unwrap())
                 .into_iter()
-                .filter(|(sym, _)| !sym.starts_with(".L__const."))
+                .filter(|(sym, _)| {
+                    let constinit = sym == ".Lconstinit" || sym.starts_with(".Lconstinit.");
+                    !sym.starts_with(".L__const.") && !constinit
+                })
                 .collect();
             if ours != theirs {
                 let only = |a: &[(String, u64)], b: &[(String, u64)]| -> Vec<String> {
