@@ -18,7 +18,7 @@
 //! it: the walk is repeated until the labels it found reached stop growing.
 
 use crate::ast::*;
-use crate::consteval;
+use crate::consteval::{self, Const};
 use crate::types::Xlen;
 
 use std::collections::HashSet;
@@ -62,7 +62,9 @@ pub fn analyze(body: &[Stmt], x: Xlen) -> Flow {
 
 /// The value clang's CFG builder gives a condition, if it can: its
 /// `tryEvaluateBool`. Of `&&` and `||`, one operand may decide it (`x || 1`
-/// is true); otherwise, whatever constant folding gives (an object's
+/// is true), or, when neither is known, the two comparisons of one
+/// variable with constants together ([`incorrect_logic`]: `x > 5 || x <=
+/// 5` is true); otherwise, whatever constant folding gives (an object's
 /// address is not null).
 fn truth(e: &Expr, x: Xlen) -> Option<bool> {
     if let ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r) = &e.kind {
@@ -70,8 +72,10 @@ fn truth(e: &Expr, x: Xlen) -> Option<bool> {
         return match (truth(l, x), truth(r, x)) {
             (Some(a), _) if a == or => Some(a),
             (Some(_), Some(b)) => Some(b),
+            (Some(_), None) => None,
             (None, Some(b)) if b == or => Some(b),
-            _ => None,
+            (None, Some(_)) => None,
+            (None, None) => incorrect_logic(*op, l, r, x),
         };
     }
     if e.ty.is_integer() {
@@ -82,6 +86,119 @@ fn truth(e: &Expr, x: Xlen) -> Option<bool> {
         consteval::Const::Addr { base: Some(_), .. } => Some(true),
         consteval::Const::Addr { base: None, offset } => Some(offset != 0),
     }
+}
+
+/// clang's `checkIncorrectLogicOperator`: `l && r` or `l || r` of two
+/// comparisons of the same variable with integer literals (or constants
+/// of one enum), `x op1 c1` and `x op2 c2`, that are true or false for
+/// every value of `x`. It tries what decides them: a value below both
+/// constants, each of them, one just above the smaller, one above both
+/// (in the constants' type).
+fn incorrect_logic(op: BinOp, l: &Expr, r: &Expr, x: Xlen) -> Option<bool> {
+    let (v1, op1, c1) = normalized(l)?;
+    let (v2, op2, c2) = normalized(r)?;
+    if !crate::sema::same_operand(v1, v2) || !same_kind(c1, c2) {
+        return None;
+    }
+    // In the constants' own types, not the comparisons'.
+    let own = |e: &Expr| match &e.kind {
+        ExprKind::Cast {
+            x: inner,
+            implicit: true,
+            ..
+        } => consteval::eval(inner, x),
+        _ => consteval::eval(e, x),
+    };
+    let (Some(Const::Int(a, ka)), Some(Const::Int(b, kb))) = (own(c1), own(c2)) else {
+        return None;
+    };
+    if ka.signed() != kb.signed() || ka.size(x) != kb.size(x) {
+        return None;
+    }
+    let (min, max) = ka.range(x);
+    let values = [min, a, ka.wrap(a.min(b) + 1, x), b, max];
+    let test = |op: BinOp, v: i128, c: i128| match op {
+        BinOp::Lt => v < c,
+        BinOp::Le => v <= c,
+        BinOp::Gt => v > c,
+        BinOp::Ge => v >= c,
+        BinOp::Eq => v == c,
+        _ => v != c,
+    };
+    let (mut always_true, mut always_false) = (true, true);
+    for v in values {
+        let (r1, r2) = (test(op1, v, a), test(op2, v, b));
+        let both = if op == BinOp::LogAnd { r1 && r2 } else { r1 || r2 };
+        always_true &= both;
+        always_false &= !both;
+    }
+    if always_true || always_false {
+        Some(always_true)
+    } else {
+        None
+    }
+}
+
+/// A comparison as `x op c`, with `c` an integer literal (through a
+/// conversion and a unary minus) or an enumeration constant: clang's
+/// `tryNormalizeBinaryOperator`, which turns `c op x` round.
+fn normalized(e: &Expr) -> Option<(&Expr, BinOp, &Expr)> {
+    let ExprKind::Binary(op, a, b) = &e.kind else {
+        return None;
+    };
+    if !op.is_comparison() {
+        return None;
+    }
+    if constant_operand(b) {
+        return Some((a, *op, b));
+    }
+    if !constant_operand(a) {
+        return None;
+    }
+    let flipped = match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Ge => BinOp::Le,
+        op => *op,
+    };
+    Some((b, flipped, a))
+}
+
+/// clang's `tryTransformToIntOrEnumConstant`: an integer literal, maybe
+/// converted and negated, or an enumeration constant.
+fn constant_operand(e: &Expr) -> bool {
+    let mut e = e;
+    if let ExprKind::Cast {
+        x, implicit: true, ..
+    } = &e.kind
+    {
+        e = x;
+    }
+    if let ExprKind::Unary(UnOp::Neg, x) = &e.kind {
+        e = x;
+    }
+    matches!(e.kind, ExprKind::Num(_) | ExprKind::Enumerator { .. })
+}
+
+/// Whether two constants are of a kind (`areExprTypesCompatible`): both
+/// integer literals, or constants of one enum.
+fn same_kind(a: &Expr, b: &Expr) -> bool {
+    let inner = |e: &Expr| {
+        let mut e = e;
+        while let ExprKind::Cast {
+            x, implicit: true, ..
+        }
+        | ExprKind::Unary(UnOp::Neg, x) = &e.kind
+        {
+            e = x;
+        }
+        match &e.kind {
+            ExprKind::Enumerator { of, .. } => Some(format!("{of:?}")),
+            _ => None,
+        }
+    };
+    inner(a) == inner(b)
 }
 
 /// One walk of a body, with the labels found reached so far.

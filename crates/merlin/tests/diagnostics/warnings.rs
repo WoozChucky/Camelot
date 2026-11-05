@@ -253,5 +253,15 @@ pub fn cases() -> Vec<Case> {
         case("int f(int a) { return a; } int f(); int g(void) { return f(1); }", &["1:32: warning: a function declaration without a prototype is deprecated in all versions of C and is treated as a zero-parameter prototype in C23, conflicting with a previous declaration [-Wdeprecated-non-prototype]", "1:5: note: conflicting prototype is here"]),
         case("int g(int); int (*pg)() = g; int h(char); int (*ph)() = h;", &["1:49: error: incompatible function pointer types initializing 'int (*)()' with an expression of type 'int (char)' [-Wincompatible-function-pointer-types]"]),
         case("int f(); int g(void) { struct s { int a; } v = {1}; return f(v) + f(2 > 0); }", &["1:61: warning: passing arguments to 'f' without a prototype is deprecated in all versions of C and is not supported in C23 [-Wdeprecated-non-prototype]", "1:68: warning: passing arguments to 'f' without a prototype is deprecated in all versions of C and is not supported in C23 [-Wdeprecated-non-prototype]"]),
+        // clang's CFG decides `&&` and `||` of comparisons of one variable
+        // with constants.
+        case("int f(int x) { if (x > 5 || x <= 5) return 1; }", &[]),
+        case("int f(int x) { return (x > 5 || x <= 5) || x / 0; }", &[]),
+        case("int f(int x) { if (x == 1 && x == 2) return x / 0; return 0; }", &[]),
+        case("int f(unsigned char c) { if (c > 255 || c <= 255 || 256 > c || c != -1) return 1; return 0; }", &[]),
+        case("int f(int x) { if (x < 3 && x > 7) return x / 0; if (5 < x || x < 6) return 1; }", &[]),
+        case("enum e { A, B }; int f(enum e x) { if (x == A || x != A) return 1; }", &[]),
+        case("int f(int x, int y) { if (x > 5 || y <= 5) return 1; }", &["1:54: warning: non-void function does not return a value in all control paths [-Wreturn-type]"]),
+        case("int f(int x) { if (x > -5 || x <= -5) return 1; }", &[]),
     ]
 }

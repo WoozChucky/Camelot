@@ -5309,7 +5309,7 @@ fn promoted(t: &Type) -> Type {
 /// always true or false, as clang's `isSameComparisonOperand` sees it: the
 /// same variable, the same member of the same variable (through `.` and
 /// `->`), the same element (by the same index) of the same array.
-fn same_operand(a: &Expr, b: &Expr) -> bool {
+pub(crate) fn same_operand(a: &Expr, b: &Expr) -> bool {
     match (&a.kind, &b.kind) {
         (ExprKind::Var { var: Some(x), .. }, ExprKind::Var { var: Some(y), .. }) => x == y,
         (
