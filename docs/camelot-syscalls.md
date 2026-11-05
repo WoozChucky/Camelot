@@ -85,23 +85,22 @@ there is a filesystem to look it up in.
 ## Structures
 
 What the calls store and read, as `user.h` and `kernel/include/syscall.h`
-declare them, in bytes. The ones made of fixed-width fields are the same on
-both widths, as their Linux counterparts are; the three with a `long`, a
-`size_t` or an `off_t` grow on RV64, each such field 8-byte aligned. The
-test that checks the tables compiles both headers for both widths and
-checks each size.
+declare them, in bytes, LP64's: a `long`, a `size_t` or an `off_t` is 8
+bytes, 8-byte aligned, and the fixed-width fields are as their Linux
+counterparts have them. The test that checks the table compiles both
+headers and checks each size.
 
-| Structure | RV32 | RV64 | What |
-|-----------|------|------|------|
-| `struct stat` | 16 | 24 | `fstat`'s: `size` is an `off_t` |
-| `struct dirent` | 16 | 16 | a directory's entries, as `read` gives them |
-| `struct procinfo` | 32 | 40 | `procs`': `size` is a `size_t` |
-| `struct hartinfo` | 16 | 16 | `harts`' |
-| `struct net_stats` | 108 | 108 | the network's counters |
-| `struct netinfo` | 132 | 132 | `netinfo`'s |
-| `struct ping_reply` | 16 | 16 | `ping`'s |
-| `struct timeval` | 8 | 16 | `SO_RCVTIMEO`'s: two `long`s, `tv_sec` a `time_t` |
-| `struct sockaddr_in` | 16 | 16 | an IPv4 address and port |
+| Structure | Bytes | What |
+|-----------|-------|------|
+| `struct stat` | 24 | `fstat`'s: `size` is an `off_t` |
+| `struct dirent` | 16 | a directory's entries, as `read` gives them |
+| `struct procinfo` | 40 | `procs`': `size` is a `size_t` |
+| `struct hartinfo` | 16 | `harts`' |
+| `struct net_stats` | 108 | the network's counters |
+| `struct netinfo` | 132 | `netinfo`'s |
+| `struct ping_reply` | 16 | `ping`'s |
+| `struct timeval` | 16 | `SO_RCVTIMEO`'s: two `long`s, `tv_sec` a `time_t` |
+| `struct sockaddr_in` | 16 | an IPv4 address and port |
 
 ## Calls
 

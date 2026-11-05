@@ -111,12 +111,10 @@ the table's last block past inode `ninodes` - 1 are unused.
   version puts what this one leaves out (timestamps, say), as ext4's inode
   grew beyond ext2's.
 - **Size.** A file is at most 2^32 blocks (its logical block numbers are
-  u32), 4 TiB, and in practice no bigger than the filesystem. The RV64
-  kernel, whose `off_t` is 64-bit, reads and writes files of up to 2^32 - 1
+  u32), 4 TiB, and in practice no bigger than the filesystem. The kernel,
+  whose `off_t` is 64-bit, reads and writes files of up to 2^32 - 1
   blocks, as ext4 does (`EXT_MAX_BLOCKS`, its `s_maxbytes`), which no file
-  reaches. The RV32 kernel, whose `off_t` is 32-bit until RV32 goes (#159),
-  writes files of at most 2^31 - 1 bytes and refuses to open bigger ones
-  (docs/camelot-syscalls.md); the format does not have that limit.
+  reaches, and refuses to open a bigger one (docs/camelot-syscalls.md).
 - A **directory** or **regular file** maps its contents with the extent tree
   rooted in `i_block`: a header with up to 4 entries. An empty one has a
   header with no entries. A **device** has `size` 0, no blocks, and an

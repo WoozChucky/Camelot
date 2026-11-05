@@ -11,15 +11,13 @@
 //! The programs are compiled by merlin; the same session runs, in a test
 //! that needs clang and is ignored otherwise, with every program compiled
 //! by clang instead, so that a program that builds with only one of the
-//! compilers, or behaves differently with each, is caught. Both run on
-//! RV64 too (#156): the RV64 kernel, `kernel/kernel-rv64.elf`, on the RV64
-//! root image, whose programs give the same output.
+//! compilers, or behaves differently with each, is caught.
 
 use camelot_fs::read::Fs;
 use camelot_fs::{fsck, SECTOR_SIZE};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::sync::mpsc::{self, Sender};
-use xtask::kernel::{Xlen, BOOT_MAX_STEPS};
+use xtask::kernel::BOOT_MAX_STEPS;
 use xtask::repo_root;
 use xtask::userprogs::CCompiler;
 
@@ -33,11 +31,10 @@ const SLICE: u64 = 500_000;
 /// slower than clang's; the slowest command here takes about 20 million.
 const COMMAND_MAX_STEPS: u64 = 200_000_000;
 /// The ticks that `ticks`, the shell and `sleep` itself may take besides
-/// the ones `sleep` waits for, on both widths. RV64's 4-level page tables
-/// are seven pages a process where RV32's are three: zeroed four bytes at a
-/// time, the 36 pages of `ticks`, `sleep` and `ticks` (24 on RV32) took
-/// RV64 a million steps, a tick, more; kzalloc() zeroes with memset's
-/// register-wide stores now, as Linux's clear_page() does.
+/// the ones `sleep` waits for. Sv48's 4-level page tables are seven pages a
+/// process: zeroed four bytes at a time, the 36 pages of `ticks`, `sleep`
+/// and `ticks` took a million steps, a tick, more; kzalloc() zeroes with
+/// memset's register-wide stores, as Linux's clear_page() does.
 const SLEEP_SLACK: u32 = 3;
 
 /// Camelot running on Grail, with its shell waiting for a command.
@@ -47,28 +44,19 @@ struct Session {
 }
 
 impl Session {
-    /// Boots the committed `xlen` kernel with `image` as disk 0 and waits
-    /// for the shell's first prompt.
-    fn boot(image: Vec<u8>, xlen: Xlen) -> Session {
-        // The RV64 kernel runs in S-mode, on Camelot's firmware.
-        let (machine_xlen, bios, kernel) = match xlen {
-            Xlen::Rv32 => (grail::Xlen::Rv32, grail::Bios::None, "kernel.elf"),
-            Xlen::Rv64 => (
-                grail::Xlen::Rv64,
-                grail::Bios::Default,
-                xtask::kernel::KERNEL_ELF_RV64,
-            ),
-        };
+    /// Boots the committed kernel with `image` as disk 0 and waits for the
+    /// shell's first prompt. The kernel runs in S-mode, on Camelot's
+    /// firmware.
+    fn boot(image: Vec<u8>) -> Session {
         let config = MachineConfig {
             ram_size: RAM,
-            xlen: machine_xlen,
-            bios,
+            bios: grail::Bios::Default,
             disks: vec![DiskConfig::memory(image)],
             ..MachineConfig::default()
         };
         let mut m = Machine::new(config).unwrap();
         m.cpu.bus.uart.capture = true;
-        let elf = std::fs::read(repo_root().join("kernel").join(kernel)).unwrap();
+        let elf = std::fs::read(repo_root().join("kernel").join(xtask::kernel::KERNEL_ELF)).unwrap();
         m.load_elf(&elf).unwrap();
         let (input, rx) = mpsc::channel();
         m.set_uart_input(rx);
@@ -152,14 +140,14 @@ impl Session {
     }
 }
 
-/// The `xlen` root image, its programs compiled by `cc`, laid out as the
-/// real one is (`cargo xtask fs`: [`xtask::fs::IMAGE_SIZE`] blocks with the
-/// kernel's left out), so the programs have the room they have on Camelot.
-fn root_image(cc: CCompiler, xlen: Xlen) -> Vec<u8> {
+/// The root image, its programs compiled by `cc`, laid out as the real one
+/// is (`cargo xtask fs`: [`xtask::fs::IMAGE_SIZE`] blocks with the kernel's
+/// left out), so the programs have the room they have on Camelot.
+fn root_image(cc: CCompiler) -> Vec<u8> {
     let root = repo_root();
-    let kernel = std::fs::read(root.join(xtask::fs::kernel_for(xlen))).unwrap();
+    let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
     let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
-    xtask::fs::build_for_with(&root, &opts, xlen, cc).unwrap()
+    xtask::fs::build_with(&root, &opts, cc).unwrap()
 }
 
 /// What `wc` counts in `text`: lines, words, bytes.
@@ -204,18 +192,18 @@ fn exit_line(prog: &str, status: i32) -> String {
 }
 
 /// Runs every basic program, its errors included, on `image`, with the
-/// `xlen` kernel, and checks what it printed and what it left on the disk.
+/// committed kernel, and checks what it printed and what it left on the disk.
 /// `same_programs` says whether `/bin` holds the programs the committed
 /// kernel embeds: the kernel's boot self-test checks that they are the
 /// same, and otherwise reports one failure, which becomes the machine's
 /// exit status.
-fn coreutils_session(image: Vec<u8>, same_programs: bool, xlen: Xlen) {
+fn coreutils_session(image: Vec<u8>, same_programs: bool) {
     let host = Fs::open(&image).unwrap();
     let readme_bytes = host.read_file("/README").unwrap();
     let readme = String::from_utf8(readme_bytes.clone()).unwrap();
     let (lines, words, bytes) = counts(&readme_bytes);
     let enoent = "no such file or directory";
-    let mut s = Session::boot(image.clone(), xlen);
+    let mut s = Session::boot(image.clone());
     let boot = s.out();
     let failures: Vec<&str> = boot.lines().filter(|l| l.contains("FAILED")).collect();
     let expected_failures: &[&str] = if same_programs {
@@ -606,36 +594,21 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool, xlen: Xlen) {
 
 #[test]
 fn each_basic_program_does_its_job_and_reports_its_errors() {
-    coreutils_session(root_image(CCompiler::Merlin, Xlen::Rv32), true, Xlen::Rv32);
-}
-
-#[test]
-fn each_basic_program_does_the_same_on_rv64() {
-    coreutils_session(root_image(CCompiler::Merlin, Xlen::Rv64), true, Xlen::Rv64);
+    coreutils_session(root_image(CCompiler::Merlin), true);
 }
 
 /// The same session with every program compiled by clang (the issue's
-/// "with each available compiler"), for `xlen`: the kernel is the committed
-/// one, and `/bin` holds clang's programs, linked by merlin-ld (not the
-/// ones the kernel embeds, which its boot self-test reports).
-fn clang_session(xlen: Xlen) {
-    let clang = xtask::tools::find("clang").expect("clang (the official LLVM install, or on PATH)");
-    let dir = std::env::temp_dir().join(format!("xtask-coreutils-clang-{xlen:?}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let user = xtask::userprogs::user_dir(&repo_root());
-    xtask::userprogs::compile_clang_for(&clang, &user, &dir, false, xlen).unwrap();
-    coreutils_session(root_image(CCompiler::Clang(&dir), xlen), false, xlen);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
+/// "with each available compiler"): the kernel is the committed one, and
+/// `/bin` holds clang's programs, linked by merlin-ld (not the ones the
+/// kernel embeds, which its boot self-test reports).
 #[test]
 #[ignore = "needs clang"]
 fn each_basic_program_does_the_same_compiled_by_clang() {
-    clang_session(Xlen::Rv32);
-}
-
-#[test]
-#[ignore = "needs clang"]
-fn each_basic_program_does_the_same_compiled_by_clang_on_rv64() {
-    clang_session(Xlen::Rv64);
+    let clang = xtask::tools::find("clang").expect("clang (the official LLVM install, or on PATH)");
+    let dir = std::env::temp_dir().join(format!("xtask-coreutils-clang-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let user = xtask::userprogs::user_dir(&repo_root());
+    xtask::userprogs::compile_clang(&clang, &user, &dir, false).unwrap();
+    coreutils_session(root_image(CCompiler::Clang(&dir)), false);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,33 +1,36 @@
-//! `examples/hello/hello.S` built with merlin-as (acceptance criteria of #4),
-//! for RV32 and for RV64 (#151).
+//! `examples/hello/hello.S` built with merlin-as (acceptance criteria of #4).
 //!
-//! The committed images (`crates/merlin-as/tests/golden/hello.elf` and
-//! `golden/rv64/hello.elf`: merlin-as and ld.lld, rebuilt by `cargo xtask
-//! hello`) always run on Grail, so this passes without LLVM. With ld.lld
-//! installed the images are rebuilt from the current merlin-as and must load
-//! the same; with clang and llvm-objdump too, `llvm-objdump -dr` of our object
-//! must equal that of clang's (`-mno-relax`), for every example source.
+//! The committed image (`crates/merlin-as/tests/golden/hello.elf`: merlin-as
+//! and ld.lld, rebuilt by `cargo xtask hello`) always runs on Grail, so this
+//! passes without LLVM. With ld.lld installed the image is rebuilt from the
+//! current merlin-as and must load the same; with clang and llvm-objdump too,
+//! `llvm-objdump -dr` of our object must equal that of clang's
+//! (`-mno-relax`), for every example source.
 //! `crates/merlin-as/tests/encode_hello.rs` checks the object against
 //! committed clang output without LLVM.
 
-use grail::RunResult;
+use grail::{Machine, MachineConfig, RunResult};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use xtask::examples::Xlen;
-use xtask::hello::{self, golden, output};
-use xtask::{examples, kernel, repo_root, tools};
+use xtask::hello::{self, GOLDEN, OUTPUT};
+use xtask::{examples, repo_root, tools};
 
 const MAX_STEPS: u64 = 100_000;
 
-fn assert_prints_hello(elf: &[u8], xlen: Xlen) {
-    // hello reads nothing from the UART. An ELF64 file makes the machine RV64.
-    let (r, out) = kernel::run_on_grail(elf, b"", MAX_STEPS).unwrap();
-    assert_eq!(out, output(xlen));
+/// Runs `elf` on a machine without firmware (`--bios none`: hello is a
+/// bare-metal M-mode program) and checks what it prints.
+fn assert_prints_hello(elf: &[u8]) {
+    // hello reads nothing from the UART.
+    let mut m = Machine::new(MachineConfig::default()).unwrap();
+    m.cpu.bus.uart.capture = true;
+    m.load_elf(elf).unwrap();
+    let r = m.run(Some(MAX_STEPS), |_| {});
+    assert_eq!(String::from_utf8_lossy(&m.cpu.bus.uart.captured), OUTPUT);
     assert_eq!(r, RunResult::Exited(0));
 }
 
-fn committed(xlen: Xlen) -> Vec<u8> {
-    let path = repo_root().join(golden(xlen));
+fn committed() -> Vec<u8> {
+    let path = repo_root().join(GOLDEN);
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
@@ -41,16 +44,13 @@ fn scratch(name: &str) -> PathBuf {
 
 #[test]
 fn committed_hello_prints_hello() {
-    for xlen in examples::XLENS {
-        let elf = committed(xlen);
-        let class = elf::Elf::parse(&elf).unwrap().class;
-        let want = match xlen {
-            Xlen::Rv32 => elf::Class::Elf32,
-            Xlen::Rv64 => elf::Class::Elf64,
-        };
-        assert_eq!(class, want, "{}", golden(xlen));
-        assert_prints_hello(&elf, xlen);
-    }
+    let elf = committed();
+    assert_eq!(
+        elf::Elf::parse(&elf).unwrap().class,
+        elf::Class::Elf64,
+        "{GOLDEN}"
+    );
+    assert_prints_hello(&elf);
 }
 
 #[test]
@@ -59,15 +59,12 @@ fn rebuilt_hello_prints_hello_and_matches_committed() {
         eprintln!("skipped: ld.lld not found");
         return;
     };
-    for xlen in examples::XLENS {
-        let elf = hello::build(&repo_root(), &lld, &scratch(&format!("lld-{xlen:?}")), xlen, true).unwrap();
-        assert_prints_hello(&elf, xlen);
-        assert!(
-            hello::loaded_image(&elf).unwrap() == hello::loaded_image(&committed(xlen)).unwrap(),
-            "{} is out of date: run `cargo xtask hello` and commit it",
-            golden(xlen)
-        );
-    }
+    let elf = hello::build(&repo_root(), &lld, &scratch("lld"), true).unwrap();
+    assert_prints_hello(&elf);
+    assert!(
+        hello::loaded_image(&elf).unwrap() == hello::loaded_image(&committed()).unwrap(),
+        "{GOLDEN} is out of date: run `cargo xtask hello` and commit it"
+    );
 }
 
 /// `llvm-objdump -d -r` of `obj`, run inside its directory so the header
@@ -83,10 +80,10 @@ fn objdump(objdump: &Path, obj: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().replace('\r', "")
 }
 
-/// Every example source, at each width: merlin-as assembles what merlin's
-/// preprocessor makes of it, and clang assembles it too, preprocessing it
-/// itself, with the Xcal mnemonics from `examples/xcal.inc` (RV64 with the
-/// flags of the RV64 reference builds, `xtask::ld_fixtures::FLAGS`).
+/// Every example source: merlin-as assembles what merlin's preprocessor makes
+/// of it, and clang assembles it too, preprocessing it itself, with the Xcal
+/// mnemonics from `examples/xcal.inc` and the flags of the reference builds
+/// (`xtask::ld_fixtures::FLAGS`).
 #[test]
 fn objdump_of_merlin_as_objects_matches_clang() {
     let tools = tools::find("clang").and_then(|clang| {
@@ -99,20 +96,13 @@ fn objdump_of_merlin_as_objects_matches_clang() {
     };
     let mut sources = std::collections::BTreeSet::new();
     for e in examples::EXAMPLES {
-        for xlen in examples::XLENS {
-            for s in e.sources {
-                sources.insert((xlen == examples::Xlen::Rv64, format!("{}/{s}", e.dir)));
-            }
+        for s in e.sources {
+            sources.insert(format!("{}/{s}", e.dir));
         }
     }
-    for (rv64, example) in sources {
+    for example in sources {
         let src = repo_root().join("examples").join(&example);
-        let xlen = if rv64 {
-            examples::Xlen::Rv64
-        } else {
-            examples::Xlen::Rv32
-        };
-        let name = format!("{}-{xlen:?}", example.replace(['/', '.'], "-"));
+        let name = example.replace(['/', '.'], "-");
         let obj = format!("{name}.o");
 
         let ours = scratch(&format!("objdump-merlin-{name}"));
@@ -121,27 +111,16 @@ fn objdump_of_merlin_as_objects_matches_clang() {
             &repo_root(),
             &format!("examples/{example}"),
             &[examples::INCLUDE_DIR],
-            xlen,
         )
         .unwrap();
-        let opts = merlin_as::Options { xlen };
-        let data = merlin_as::assemble_to_elf_with(&text, &opts).unwrap();
+        let data = merlin_as::assemble_to_elf(&text).unwrap();
         std::fs::write(ours.join(&obj), data).unwrap();
 
         let theirs = scratch(&format!("objdump-clang-{name}"));
         std::fs::create_dir_all(&theirs).unwrap();
-        let mut clang_cmd = Command::new(&clang);
-        if rv64 {
-            clang_cmd
-                .args(xtask::ld_fixtures::FLAGS)
-                .arg(xtask::ld_fixtures::NO_RELAX);
-        } else {
-            clang_cmd
-                .args(kernel::TARGET_FLAGS)
-                .arg("-march=rv32ima_zicsr_zifencei")
-                .arg("-c");
-        }
-        let status = clang_cmd
+        let status = Command::new(&clang)
+            .args(xtask::ld_fixtures::FLAGS)
+            .arg(xtask::ld_fixtures::NO_RELAX)
             .arg("-include")
             .arg(repo_root().join(examples::XCAL_INCLUDE))
             .arg("-I")
@@ -157,6 +136,6 @@ fn objdump_of_merlin_as_objects_matches_clang() {
             objdump(&llvm_objdump, &ours.join(&obj)),
             objdump(&llvm_objdump, &theirs.join(&obj)),
         );
-        assert_eq!(ours, theirs, "{example} ({xlen:?})");
+        assert_eq!(ours, theirs, "{example}");
     }
 }

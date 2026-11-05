@@ -786,13 +786,13 @@ pub fn run_with_output(
     Ok((r, m))
 }
 
-/// Replaces the program counter in `[dbg] pc=XXXXXXXX` lines with dots, so
+/// Replaces the program counter in `[dbg] pc=XXXXXXXXXXXXXXXX` lines with dots, so
 /// output can be compared across builds whose code layout differs.
 pub fn mask_dbg_pc(out: &str) -> String {
     out.split_inclusive('\n')
         .map(|line| match line.strip_prefix("[dbg] pc=") {
-            Some(rest) if rest.len() >= 8 && rest.is_char_boundary(8) => {
-                format!("[dbg] pc=........{}", &rest[8..])
+            Some(rest) if rest.len() >= 16 && rest.is_char_boundary(16) => {
+                format!("[dbg] pc=................{}", &rest[16..])
             }
             _ => line.to_string(),
         })
@@ -1082,10 +1082,10 @@ mod tests {
 
     #[test]
     fn masks_dbg_pc() {
-        let out = "hi\n[dbg] pc=80000123 a0 = 0x00000000 (0)\n[dbg] pc=8\n";
+        let out = "hi\n[dbg] pc=ffffffff80000123 a0 = 0x0000000000000000 (0)\n[dbg] pc=8\n";
         assert_eq!(
             mask_dbg_pc(out),
-            "hi\n[dbg] pc=........ a0 = 0x00000000 (0)\n[dbg] pc=8\n"
+            "hi\n[dbg] pc=................ a0 = 0x0000000000000000 (0)\n[dbg] pc=8\n"
         );
         assert_eq!(mask_dbg_pc(""), "");
     }

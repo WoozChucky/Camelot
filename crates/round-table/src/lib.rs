@@ -37,11 +37,9 @@ VM commands, sent to Avalon:
                   grail --disk IMG does
   create --name NAME --camelot [--lake ADDR] [options]
                   create a VM that boots Camelot from a disk of its own:
-                  Lake's image os-base, or os-base-rv64 for an RV64 VM
-                  (cargo xtask up puts both there), is copied to
-                  NAME-disk0, which becomes the VM's first disk
-  list            every VM: id, name, state, width, RAM, clock, disks and
-                  cards
+                  Lake's image os-base (cargo xtask up puts it there) is
+                  copied to NAME-disk0, which becomes the VM's first disk
+  list            every VM: id, name, state, RAM, clock, disks and cards
   info VM         one VM in detail: hardware, disks, network cards, steps
                   run, devices
   start VM        start a created VM

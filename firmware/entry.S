@@ -32,12 +32,12 @@
 # (src/firmware.rs). Rebuild it with our own tools after changing a file of
 # firmware/, `cargo xtask boot`, which does the same as
 #
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include firmware/entry.S -o entry.s
-#   merlin-as -march=rv64ima_zicsr_zifencei entry.s -o entry.o
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include firmware/sbi.S -o sbi.s
-#   merlin-as -march=rv64ima_zicsr_zifencei sbi.s -o sbi.o
-#   merlin -E -march=rv64ima_zicsr_zifencei -I include firmware/disk.S -o disk.s
-#   merlin-as -march=rv64ima_zicsr_zifencei disk.s -o disk.o
+#   merlin -E -I include firmware/entry.S -o entry.s
+#   merlin-as entry.s -o entry.o
+#   merlin -E -I include firmware/sbi.S -o sbi.s
+#   merlin-as sbi.s -o sbi.o
+#   merlin -E -I include firmware/disk.S -o disk.s
+#   merlin-as disk.s -o disk.o
 #   merlin-ld -T firmware/firmware.ld entry.o sbi.o disk.o -o crates/grail/rom/firmware.elf
 #
 # (`cargo test` checks the committed file is up to date). asm.h is the

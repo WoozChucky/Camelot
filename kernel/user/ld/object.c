@@ -150,7 +150,7 @@ const char *symbol_display_name(struct object *o, uint index) {
 }
 
 /* The checks of the ELF header; 0 with *err set. */
-static int header(struct object *o, uint64_t *shoff, uint *shentsize, uint *shnum, uint *shstrndx, char **err) {
+static int header(uint64_t *shoff, uint *shentsize, uint *shnum, uint *shstrndx, char **err) {
     uint v;
     if (flen < 4 || file[0] != 0x7f || file[1] != 'E' || file[2] != 'L' || file[3] != 'F') {
         *err = "not an ELF file";
@@ -236,7 +236,7 @@ static int parse(const char *name, struct object *o, char **err) {
     uint shentsize, shnum, shstrndx;
     memset(o, 0, sizeof *o);
     o->name = (char *)name;
-    if (!header(o, &shoff, &shentsize, &shnum, &shstrndx, err)) {
+    if (!header(&shoff, &shentsize, &shnum, &shstrndx, err)) {
         return 0;
     }
     if (shnum == 0) {
