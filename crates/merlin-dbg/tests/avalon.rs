@@ -162,6 +162,7 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
         .spawn()
         .unwrap();
     let start = Instant::now();
+    let attaching = start;
     // Paused for it, as QEMU's stub pauses a VM for a GDB connection.
     while !(server.debug_vm(id).unwrap().debugged && state(&mut control, id) == VmState::Paused) {
         assert!(start.elapsed() < SLOW, "the debugger never attached");
@@ -224,7 +225,10 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
         notices.starts_with(&format!("herald: VM {id} is paused\n")),
         "{notices}"
     );
-    assert!(notices.lines().count() <= 6, "{notices}");
+    // Paused, at most one a second while the debugger held the VM, the last held one,
+    // and the running after it went.
+    let most = 3 + attaching.elapsed().as_secs() as usize + 1;
+    assert!(notices.lines().count() <= most, "{notices}");
     assert!(
         notices.ends_with(&format!("herald: VM {id} is running\n")),
         "{notices}"
