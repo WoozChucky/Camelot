@@ -185,7 +185,8 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
-        what: "RV32 processes: Linux's start with the environment, and the shell's environment (#216)",
+        what: "RV32 processes: Linux's start with the environment, and the shell's environment and \
+               built-in statuses (#216)",
         args: &[
             "-p",
             "xtask",
@@ -194,6 +195,7 @@ const STEPS: &[Step] = &[
             "--",
             "the_shell_is_the_first_process",
             "the_shell_passes_its_environment_on",
+            "a_failed_builtin_gives_dashs_status",
         ],
     },
     Step {

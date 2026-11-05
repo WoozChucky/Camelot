@@ -176,7 +176,7 @@ fn shell_accepts_windows_line_ends() {
     let want = format!(
         "{SHELL_BANNER}{PROMPT}help\n\
          help            this list\n\
-         exit [N]        leave the shell, with status N or the last program's\n\
+         exit [N]        leave the shell, with status N or the last command's\n\
          wait            wait for every background program\n\
          cd [DIR]        change the working directory, to HOME (or /) without DIR\n\
          exec [PROG ...] replace the shell with PROG; without one, keep its redirections\n\

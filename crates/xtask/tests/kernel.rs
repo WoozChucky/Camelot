@@ -1533,7 +1533,7 @@ const UART_RX_SIZE: usize = 128;
 /// What the shell's `help` prints (kernel/user/sh.c).
 const HELP: &str = "\
 help            this list
-exit [N]        leave the shell, with status N or the last program's
+exit [N]        leave the shell, with status N or the last command's
 wait            wait for every background program
 cd [DIR]        change the working directory, to HOME (or /) without DIR
 exec [PROG ...] replace the shell with PROG; without one, keep its redirections
@@ -2411,6 +2411,60 @@ fn the_shell_passes_its_environment_on() {
     // environment session; processes_rv64.rs runs it on RV64).
     let out = run_processes(common::environment::INPUT);
     common::environment::check(&out, command_output);
+}
+
+#[test]
+fn a_failed_builtin_gives_dashs_status() {
+    // A built-in's status is the last one, which `exit` gives: 0, or 2 when
+    // it fails, as dash's (kernel/user/sh.c, at the top). The console's
+    // shell is interactive, so it carries on (fs.rs runs the same errors in
+    // shells that are not, which end). export and unset stop at a word that
+    // is no name; a successful built-in's status is 0 again.
+    for (input, line, printed) in [
+        (
+            &b"hello\nexport 1A\nexit\n"[..],
+            "export 1A",
+            "sh: export: 1A: bad variable name",
+        ),
+        (
+            b"hello\nunset 1A\nexit\n",
+            "unset 1A",
+            "sh: unset: 1A: bad variable name",
+        ),
+        (
+            b"cd /nope\nexit\n",
+            "cd /nope",
+            "sh: cd: /nope: no such file or directory",
+        ),
+    ] {
+        let (r, out) = run_shell(input);
+        assert_eq!(command_output(&out, line), [printed], "{out}");
+        assert_eq!(r, RunResult::Exited(2), "{out}");
+    }
+    let (r, out) = run_shell(b"export A=1 1B C=3\nenv\nexport 1A\nexport A\nexit\n");
+    assert_eq!(
+        command_output(&out, "export A=1 1B C=3"),
+        ["sh: export: 1B: bad variable name"],
+        "{out}"
+    );
+    assert_eq!(
+        command_output(&out, "env"),
+        ["HOME=/", "TERM=linux", "A=1"],
+        "{out}"
+    );
+    assert_eq!(r, RunResult::Exited(0), "{out}");
+    // An assignment that can't be made: the shell has room for 32
+    // variables, two of them HOME and TERM, so the 15th of the second line
+    // is one too many, and the line's status is 2.
+    let names = |c: char| (0..16).map(|i| format!("{c}{i}=1")).collect::<Vec<_>>().join(" ");
+    let (a, b) = (names('A'), names('B'));
+    let (r, out) = run_shell(format!("{a}\n{b}\nexit\n").as_bytes());
+    assert_eq!(
+        command_output(&out, &b),
+        ["sh: B14=1: too many variables"],
+        "{out}"
+    );
+    assert_eq!(r, RunResult::Exited(2), "{out}");
 }
 
 #[test]

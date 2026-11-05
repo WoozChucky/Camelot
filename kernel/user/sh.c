@@ -32,8 +32,15 @@
  * [ARG...]] (see below). All but exec run in the shell itself, with its
  * redirections, but can't be part of a pipeline. The shell ends with
  * `exit`, or at the end of the input (Ctrl-D on an empty line), with the
- * status N or else the last foreground program's; when it is the first
- * process, the kernel then stops the machine with it.
+ * status N or else the last status; when it is the first process, the
+ * kernel then stops the machine with it. The last status is the last
+ * foreground program's, or the last built-in's: 0, or 2 when it fails, as
+ * dash gives (`cd` to a directory it can't go to; `export` or `unset` with
+ * a word that is no name, where they stop; an assignment that can't be
+ * made, with too many variables or no memory, where the command doesn't
+ * run). A special built-in that fails (`exec`, `exit`, `export`, `unset`,
+ * and assignments alone) also ends a shell that is not interactive, as
+ * POSIX has it ("Consequences of Shell Errors"), with that status.
  *
  * `exec PROG [ARG...]` is POSIX's: the program replaces the shell in its
  * process (the kernel's exec), with the same pid, parent, descriptors and
@@ -64,7 +71,8 @@
  *   NAME=value ...        alone, they set shell variables, which stay
  *                         exported if they were (else they are the
  *                         shell's own, until `export NAME`), and the
- *                         status is 0, as POSIX has it;
+ *                         status is 0, as POSIX has it (2 if one can't
+ *                         be made);
  *   NAME=value PROG ...   before a program, they are in its environment
  *                         only (and the shell's stays as it was);
  *   NAME=value exec PROG  before `exec`, `exit`, `export` or `unset` (POSIX's
@@ -118,7 +126,8 @@ struct job {
 
 static struct job jobs[MAX_JOBS];
 
-/* The exit status of the last foreground program. */
+/* The last status: the last foreground program's, or the last built-in's
+ * (see the top), which `exit` without N gives. */
 static int last_status;
 
 /* Whether the input is the console (a device) or a network connection: see
@@ -232,12 +241,31 @@ static int set_var(const char *entry, int len, int export) {
     return 0;
 }
 
-/* Sets the shell's variables to command `c`'s assignments, exporting them
- * if `export`. */
-static void assign_all(const struct cmd *c, int export) {
-    for (int i = 0; i < c->nassigns; i++) {
-        set_var(c->assigns[i], name_length(c->assigns[i], 0), export);
+/* A special built-in (`exec`, `exit`, `export`, `unset`) or an assignment
+ * failed with `status`: as POSIX's "Consequences of Shell Errors" has it,
+ * and dash does, that is the last status, and, unless the shell is
+ * interactive, its end (see the top). Returns 1 if the shell should exit,
+ * with the status in *exit_status. */
+static int special_failed(int status, int *exit_status) {
+    last_status = status;
+    if (interactive) {
+        return 0;
     }
+    *exit_status = status;
+    return 1;
+}
+
+/* Sets the shell's variables to command `c`'s assignments, exporting them
+ * if `export`. Returns 0, or 2 (dash's status for an error the shell finds
+ * itself) at the first one that can't be made, having said why: the ones
+ * after it are not made, as dash stops at its error. */
+static int assign_all(const struct cmd *c, int export) {
+    for (int i = 0; i < c->nassigns; i++) {
+        if (set_var(c->assigns[i], name_length(c->assigns[i], 0), export) < 0) {
+            return 2;
+        }
+    }
+    return 0;
 }
 
 /* The value of `name` for command `c`: its own assignment, or the shell's
@@ -293,15 +321,17 @@ static void import_env(void) {
     }
 }
 
-/* `export [-p] [NAME[=value]...]` (see the top). */
-static void export_builtin(struct cmd *c) {
+/* `export [-p] [NAME[=value]...]` (see the top). Returns its status: 0,
+ * or 2 at the first word that is no name or a variable that can't be set,
+ * having said why; as in dash, the words after it are left alone. */
+static int export_builtin(struct cmd *c) {
     if (c->argc == 1 || (c->argc == 2 && strcmp(c->argv[1], "-p") == 0)) {
         for (int i = 0; i < MAX_VARS; i++) {
             if (vars[i].entry != NULL && vars[i].exported) {
                 printf("export %s\n", vars[i].entry);
             }
         }
-        return;
+        return 0;
     }
     for (int i = 1; i < c->argc; i++) {
         const char *a = c->argv[i];
@@ -311,20 +341,24 @@ static void export_builtin(struct cmd *c) {
         }
         if (len == 0) {
             fprintf(STDERR, "sh: export: %s: bad variable name\n", a);
-            continue;
+            return 2;
         }
-        set_var(a, len, 1);
+        if (set_var(a, len, 1) < 0) {
+            return 2;
+        }
     }
+    return 0;
 }
 
-/* `unset NAME...`: the variables go, exported or not. */
-static void unset_builtin(struct cmd *c) {
+/* `unset NAME...`: the variables go, exported or not. Returns its status:
+ * 0, or 2 at the first word that is no name, having said so, as `export`. */
+static int unset_builtin(struct cmd *c) {
     for (int i = 1; i < c->argc; i++) {
         const char *name = c->argv[i];
         int len = name_length(name, 1);
         if (len == 0) {
             fprintf(STDERR, "sh: unset: %s: bad variable name\n", name);
-            continue;
+            return 2;
         }
         struct var *v = find_var(name, len);
         if (v != NULL) {
@@ -333,6 +367,7 @@ static void unset_builtin(struct cmd *c) {
             v->exported = 0;
         }
     }
+    return 0;
 }
 
 static int is_blank(char c) {
@@ -420,7 +455,7 @@ static void wait_all(void) {
 
 static void help(void) {
     printf("help            this list\n");
-    printf("exit [N]        leave the shell, with status N or the last program's\n");
+    printf("exit [N]        leave the shell, with status N or the last command's\n");
     printf("wait            wait for every background program\n");
     printf("cd [DIR]        change the working directory, to HOME (or /) without DIR\n");
     printf("exec [PROG ...] replace the shell with PROG; without one, keep its redirections\n");
@@ -445,27 +480,34 @@ static int is_builtin(const struct cmd *c) {
            strcmp(name, "cd") == 0 || strcmp(name, "export") == 0 || strcmp(name, "unset") == 0;
 }
 
-/* Runs built-in `c`. Returns 1 if the shell should exit, with the status in
- * *exit_status. */
+/* Runs built-in `c`, and makes its status the last one: 0, or 2 for an
+ * error, as dash gives (`cd` to a directory that isn't there, a bad name
+ * for `export` or `unset`, an assignment that can't be made). An error in
+ * a special built-in also ends a shell that is not interactive
+ * (special_failed()). Returns 1 if the shell should exit, with the status
+ * in *exit_status. */
 static int builtin(struct cmd *c, int *exit_status) {
     const char *name = c->argv[0];
-    /* POSIX's special built-ins keep the assignments before them; the
-     * others see them (lookup()) but leave the shell's variables be. */
-    if (strcmp(name, "exit") == 0 || strcmp(name, "export") == 0 || strcmp(name, "unset") == 0) {
-        assign_all(c, 0);
+    /* POSIX's special built-ins keep the assignments before them, and do
+     * not run if one can't be made; the others see them (lookup()) but
+     * leave the shell's variables be. */
+    int special = strcmp(name, "exit") == 0 || strcmp(name, "export") == 0 || strcmp(name, "unset") == 0;
+    if (special && assign_all(c, 0) != 0) {
+        return special_failed(2, exit_status);
     }
     if (strcmp(name, "exit") == 0) {
         *exit_status = c->argv[1] != NULL ? atoi(c->argv[1]) : last_status;
         return 1;
     }
+    int status = 0;
     if (strcmp(name, "help") == 0) {
         help();
     } else if (strcmp(name, "wait") == 0) {
         wait_all();
     } else if (strcmp(name, "export") == 0) {
-        export_builtin(c);
+        status = export_builtin(c);
     } else if (strcmp(name, "unset") == 0) {
-        unset_builtin(c);
+        status = unset_builtin(c);
     } else if (strcmp(name, "cd") == 0) {
         /* Without a directory, HOME (POSIX's), or the root if it has none. */
         const char *home = lookup(c, "HOME");
@@ -473,8 +515,13 @@ static int builtin(struct cmd *c, int *exit_status) {
         int r = chdir(dir);
         if (r < 0) {
             fprintf(STDERR, "sh: cd: %s: %s\n", dir, strerror(-r));
+            status = 2;
         }
     }
+    if (special && status != 0) {
+        return special_failed(status, exit_status);
+    }
+    last_status = status;
     return 0;
 }
 
@@ -615,18 +662,6 @@ static void look_at_input(void) {
     connection_input = got_stat && st.type == T_SOCKET;
 }
 
-/* `exec` failed with `status`: the last status, and, unless the shell is
- * interactive, its end (see the top). Returns 1 if the shell should exit,
- * with the status in *exit_status. */
-static int exec_failed(int status, int *exit_status) {
-    last_status = status;
-    if (interactive) {
-        return 0;
-    }
-    *exit_status = status;
-    return 1;
-}
-
 /* A copy of descriptor `fd` from SAVED_FD up that closes on exec, or -1
  * having said why there is none. */
 static int save_fd(int fd) {
@@ -652,12 +687,15 @@ static void restore_fd(int fd, int copy) {
  * could not be made. */
 static int exec_builtin(struct cmd *c, int *exit_status) {
     /* A special built-in: the assignments are the shell's from now on, and
-     * exported for the program, as dash and bash have them. */
-    assign_all(c, c->argc > 1);
+     * exported for the program, as dash and bash have them. If one can't
+     * be made, nothing runs. */
+    if (assign_all(c, c->argc > 1) != 0) {
+        return special_failed(2, exit_status);
+    }
     int in = -1;
     int out = -1;
     if (open_files(c, &in, &out) < 0) {
-        return exec_failed(1, exit_status);
+        return special_failed(1, exit_status);
     }
     if (c->argc == 1) {
         /* No program: the redirections become the shell's own. */
@@ -680,7 +718,7 @@ static int exec_builtin(struct cmd *c, int *exit_status) {
         close_if(out);
         close_if(saved_in);
         close_if(saved_out);
-        return exec_failed(1, exit_status);
+        return special_failed(1, exit_status);
     }
     if (in >= 0) {
         put_at(STDIN, in);
@@ -699,7 +737,7 @@ static int exec_builtin(struct cmd *c, int *exit_status) {
     restore_fd(STDIN, saved_in);
     restore_fd(STDOUT, saved_out);
     cannot_start(c->argv[1], err);
-    return exec_failed(not_found(c->argv[1], err) ? 127 : 126, exit_status);
+    return special_failed(not_found(c->argv[1], err) ? 127 : 126, exit_status);
 }
 
 /* Runs the pipeline cmds[0..n), in the background or not. Returns 1 if the
@@ -708,10 +746,14 @@ static int exec_builtin(struct cmd *c, int *exit_status) {
 static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
     if (n == 1 && !background && cmds[0].argc == 0) {
         /* Assignments alone: the shell's variables (see the top), and the
-         * status 0, as POSIX has it. Their redirections are made below, as
-         * for `exec` alone (in a pipeline or in the background, a subshell
+         * status 0, as POSIX has it; or 2 if one can't be made, an error
+         * that ends a shell that is not interactive, as in dash
+         * (special_failed()). Their redirections are made below, as for
+         * `exec` alone (in a pipeline or in the background, a subshell
          * would make the assignments, and they go with it). */
-        assign_all(&cmds[0], 0);
+        if (assign_all(&cmds[0], 0) != 0) {
+            return special_failed(2, exit_status);
+        }
         if (cmds[0].in == NULL && cmds[0].out == NULL) {
             last_status = 0;
             return 0;
