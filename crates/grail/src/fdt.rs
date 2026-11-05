@@ -218,7 +218,10 @@ pub struct Node {
 impl Node {
     /// The property `name`'s value.
     pub fn prop(&self, name: &str) -> Option<&[u8]> {
-        self.props.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice())
+        self.props
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_slice())
     }
 
     /// The property `name` as 32-bit cells.
@@ -439,7 +442,10 @@ mod tests {
         let blob = w.finish();
 
         assert_eq!(&blob[..4], &MAGIC.to_be_bytes());
-        assert_eq!(u32::from_be_bytes(blob[4..8].try_into().unwrap()) as usize, blob.len());
+        assert_eq!(
+            u32::from_be_bytes(blob[4..8].try_into().unwrap()) as usize,
+            blob.len()
+        );
         let tree = parse(&blob).unwrap();
         assert_eq!(tree.reservations, [(0x8000_0000, 0x20_0000)]);
         let root = &tree.root;

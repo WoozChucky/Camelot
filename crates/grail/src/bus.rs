@@ -5,6 +5,7 @@ use crate::boot;
 use crate::config::MachineConfig;
 use crate::cpu::Reservation;
 use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, FB_IRQ, KBD_IRQ, NET_IRQ, PTR_IRQ, UART_IRQ};
+use crate::firmware;
 use crate::framebuffer::{Frame, Framebuffer, VRAM_SIZE};
 use crate::keyboard::Keyboard;
 use crate::net::NetDevice;
@@ -272,6 +273,54 @@ impl Bus {
         self.set_boot_entry(boot::DISK_BOOT_PC);
         self.rom.resize((boot::DISK_BOOT_PC - BOOT_ROM_BASE) as usize, 0);
         self.rom.extend(boot::disk_loader(self.xlen));
+    }
+
+    /// Fills the boot ROM to start firmware (spec section 7, "Firmware"): the stub and
+    /// the park loop of [`Bus::set_boot_entry`], with the entry point at the ROM's
+    /// hand-off ([`boot::FW_HANDOFF_PC`], where the disk loader is without firmware),
+    /// which every hart runs, hart 0 from the stub and the others from the park loop,
+    /// as every hart runs QEMU's reset vector:
+    ///
+    /// ```text
+    /// 0x1100: csrr  a0, mhartid
+    ///         lui   t0, 1           BOOT_ROM_BASE
+    ///         ld    a1, 0x18(t0)    the device tree, the doubleword at 0x1018
+    ///         addi  a2, t0, 0x128   the fw_dynamic_info at 0x1128
+    ///         ld    t0, 0x120(t0)   the firmware's entry, the doubleword at 0x1120
+    ///         jr    t0
+    /// ```
+    ///
+    /// The `fw_dynamic_info` is QEMU's, six doublewords ([`firmware::Handoff`]). RV64
+    /// only, as firmware is.
+    pub fn set_firmware_boot(&mut self, handoff: &firmware::Handoff) {
+        assert_eq!(self.xlen, Xlen::Rv64, "firmware runs on RV64 machines");
+        self.set_boot_entry(boot::FW_HANDOFF_PC);
+        let at = |addr: u64| (addr - BOOT_ROM_BASE) as usize;
+        let put = |rom: &mut Vec<u8>, addr: u64, bytes: &[u8]| {
+            let i = at(addr);
+            if rom.len() < i + bytes.len() {
+                rom.resize(i + bytes.len(), 0);
+            }
+            rom[i..i + bytes.len()].copy_from_slice(bytes);
+        };
+        put(&mut self.rom, boot::FDT_ADDR_ADDR, &handoff.fdt.to_le_bytes());
+        let code: [u32; 6] = [
+            0xf140_2573, // csrr  a0, mhartid
+            0x0000_12b7, // lui   t0, 1
+            0x0182_b583, // ld    a1, 0x18(t0)
+            0x1282_8613, // addi  a2, t0, 0x128
+            0x1202_b283, // ld    t0, 0x120(t0)
+            0x0002_8067, // jr    t0
+        ];
+        let code: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        put(&mut self.rom, boot::FW_HANDOFF_PC, &code);
+        put(&mut self.rom, boot::FW_ENTRY_ADDR, &handoff.entry.to_le_bytes());
+        let info: Vec<u8> = handoff
+            .dynamic_info()
+            .iter()
+            .flat_map(|d| d.to_le_bytes())
+            .collect();
+        put(&mut self.rom, boot::FW_DYNAMIC_INFO_ADDR, &info);
     }
 
     /// Hart `hart`'s LR/SC reservation.
