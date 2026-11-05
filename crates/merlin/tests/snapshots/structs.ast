@@ -280,13 +280,13 @@ Function int main(void) <27:5>
     Assign += : int <63:8>
       Var ok #0 : int <63:5>
       Binary == : int <63:31>
-        Num 20 : unsigned int <63:11>
+        Num 20 : unsigned long <63:11>
         Num 20 : int <63:34>
   ExprStmt <64:5>
     Assign += : int <64:8>
       Var ok #0 : int <64:5>
       Binary == : int <64:22>
-        Num 24 : unsigned int <64:11>
+        Num 24 : unsigned long <64:11>
         Num 24 : int <64:25>
   ExprStmt <66:5>
     Assign += : int <66:8>

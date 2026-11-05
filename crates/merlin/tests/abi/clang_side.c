@@ -5,22 +5,20 @@
  * which calls every c_ function here, and c_calls_merlin calls every m_
  * function there, so structs of every size class travel both ways:
  *
- *   up to 4 bytes   in one register         s1, s3, s4
- *   5 to 8 bytes    in a register pair      s5, s6, s8, mixed, u8
- *   more            by reference to a copy  s12, big (results through a
+ *   up to 8 bytes    in one register         s1, s3, s4, s5, s6, s8, mixed,
+ *                                            u8, l1, q1
+ *   9 to 16 bytes    in a register pair      s12, l2, li, cl, s9, s10, cq, iq
+ *   more             by reference to a copy  l3, big (results through a
  *                                            hidden pointer in a0)
- *
- * on RV32, and on RV64 up to 16 bytes in one or two registers (l2, li, cl,
- * s9, s10, cq), more by reference (l3, big);
  *
  * and so do the narrow scalars (_Bool, signed char, short, unsigned short),
  * which the caller extends to 32 bits as an argument and the callee as a
- * result: clang -O1 relies on both, and on RV64 on 32-bit values, unsigned
- * ones too, being sign-extended. So do arguments past a7, on the stack (a
- * pair may straddle a7 and the stack, a struct start at an odd word), the
- * variadic arguments of functions with `...`, every kind of them (a long
- * long, or a struct holding one, from an even register on RV32), and
- * pointers to functions.
+ * result, and 32-bit values, unsigned ones too, sign-extended: clang -O1
+ * relies on all of it. So do arguments past a7, on the stack (a pair may
+ * straddle a7 and the stack), the variadic arguments of functions with
+ * `...`, every kind of them, and pointers to functions. (The size classes
+ * were 4 and 8 bytes on RV32, which Excalibur had until #159; the struct
+ * names come from then.)
  *
  * Each side numbers its checks from 1 and reports the first that fails (0
  * when all pass); tests/abi.rs prints which one it was.
@@ -75,10 +73,9 @@ struct big {
     int v[10];
 };
 
-/* Register-wide members: a long and a pointer are 8 bytes on RV64 (LP64),
- * so l1 takes one register, l2, li and cl (the int and the char padded) a
- * pair, and l3 goes by reference; on RV32 (ILP32), where they are 4 bytes,
- * the same classes come out. */
+/* Register-wide members: a long and a pointer are 8 bytes, so l1 takes one
+ * register, l2, li and cl (the int and the char padded) a pair, and l3 goes
+ * by reference. */
 struct l1 {
     long a;
 };
@@ -101,9 +98,7 @@ struct l3 {
     long a, b, c;
 };
 
-/* A long long is 64 bits on both widths: on RV32 a pair of registers, as is
- * a struct holding one (aligned to 8, so it starts at an even register when
- * variadic and at an even word on the stack). */
+/* A long long is 64 bits, a register, as is a struct holding one. */
 struct q1 {
     long long v;
 };
@@ -113,9 +108,8 @@ struct iq {
     long long v;
 };
 
-/* Bigger than two registers on RV32 (by reference there), two registers on
- * RV64: 9 and 10 bytes aligned to 1 and 2, and a char before a long long
- * (16 bytes aligned to 8). */
+/* Two registers: 9 and 10 bytes aligned to 1 and 2, and a char before a
+ * long long (16 bytes aligned to 8). */
 struct s9 {
     char b[9];
 };
@@ -420,7 +414,7 @@ struct s12 c_stack_ret(int a, int b, int c, int d, int e, int f, int g, int h, i
     return r;
 }
 
-/* Mixed widths. On RV64 an int and an unsigned int travel sign-extended to
+/* Mixed widths. An int and an unsigned int travel sign-extended to
  * 64 bits, as the psABI says and clang -O1 relies on (an unsigned
  * 0xffffffff is -1 in its register), a long and a pointer as they are; a
  * 32-bit result comes back sign-extended too. */
@@ -481,7 +475,7 @@ struct l3 c_addl3(struct l3 x, struct l3 y) {
 }
 
 /* Letters of fmt: i an int, u an unsigned and L an unsigned long (both
- * shifted right by 4, so that the sums stay in range on RV32 too), l a long,
+ * shifted right by 4, so that the sums stay in range), l a long,
  * p a char pointer (its first char), q a struct l2, t a struct li and T a
  * struct l3 (by reference). */
 long c_vmixw(const char *fmt, ...) {
@@ -528,8 +522,7 @@ unsigned long long c_qhigh(unsigned long long x) {
     return x >> 32;
 }
 
-/* h starts in a7 on RV32, its high word at 0(sp); i, j and k are on the
- * stack, i and k from an even word. */
+/* h in a7; i, j and k on the stack, each in an 8-byte slot. */
 long long c_qlate(int a, int b, int c, int d, int e, int f, int g, long long h, long long i, int j, long long k) {
     return a + b + c + d + e + f + g + h * 2 + i * 3 + j + k * 5;
 }
@@ -562,7 +555,7 @@ long long c_vq(const char *fmt, ...) {
     return s;
 }
 
-/* Seven named ints: on RV32 the variadic pair skips a7. */
+/* Seven named ints: the first variadic long long in a7. */
 long long c_vqlate(int a, int b, int c, int d, int e, int f, int g, ...) {
     va_list ap;
     long long x;
@@ -572,23 +565,22 @@ long long c_vqlate(int a, int b, int c, int d, int e, int f, int g, ...) {
     return x + a + b + c + d + e + f + g;
 }
 
-/* g in a6:a7 on RV32. */
+/* g in a6. */
 long long c_q67(int a, int b, int c, int d, int e, int f, long long g) {
     return a + b + c + d + e + f + g * 3;
 }
 
-/* Past a7 on RV32: i at 0(sp), j (a struct s8, aligned to 4) from the odd
- * word 4(sp), k at 12(sp), l (aligned to 8) at 16(sp), m at 24(sp) and n (a
- * struct s6) from the odd word 28(sp); on RV64 each from an 8-byte slot. */
+/* Past a7: i at 0(sp), j (a struct s8) at 8(sp), k at 16(sp), l at 24(sp),
+ * m at 32(sp) and n (a struct s6) at 40(sp), each in an 8-byte slot. */
 long long c_oddstack(int a, int b, int c, int d, int e, int f, int g, int h, int i, struct s8 j, int k,
                      struct q1 l, short m, struct s6 n) {
     return a + b + c + d + e + f + g + h + i * 10 + j.x * 100 + j.y + k * 1000 + l.v + m + n.a + n.b + n.c;
 }
 
-/* Three named arguments, an odd number: on RV32 a variadic long long or
- * struct q1 after them starts at an even register, a4 (a3 left out), and
- * one that would start in a7 goes to the stack instead. Letters of fmt: i
- * an int, q a long long, s a struct q1. */
+/* Three named arguments, an odd number: a variadic long long or struct q1
+ * after them takes the next word, a3, as any argument does (an aligned
+ * pair skipped one on RV32). Letters of fmt: i an int, q a long long, s a
+ * struct q1. */
 long long c_vq3(int a, int b, const char *fmt, ...) {
     va_list ap;
     long long s = a + b;
@@ -622,9 +614,8 @@ struct s10 c_neg10(struct s10 s) {
     return s;
 }
 
-/* h after seven ints: on RV64 its first 8 bytes in a7 and the last at
- * 0(sp), i at 8(sp) and 16(sp); on RV32 their copies' addresses in a7 and
- * at 0(sp). */
+/* h after seven ints: its first 8 bytes in a7 and the last at 0(sp), i at
+ * 8(sp) and 16(sp). */
 int c_late910(int a, int b, int c, int d, int e, int f, int g, struct s9 h, struct s10 i) {
     return a + b + c + d + e + f + g + h.b[0] + h.b[8] * 10 + i.h[0] + i.h[4] * 100;
 }
@@ -662,7 +653,7 @@ long long c_cqsum(int a, struct cq s, struct cq t) {
     return a + s.c + s.v + t.c * 10 + t.v;
 }
 
-/* On RV64 an unsigned int travels sign-extended, an argument and a result
+/* An unsigned int travels sign-extended, an argument and a result
  * alike, and clang -O1 compares and passes on such registers as they are:
  * 0x80000000 is 0xffffffff80000000 in one. */
 int c_ucmp(unsigned a, unsigned b) {
@@ -802,7 +793,7 @@ int c_calls_merlin(void) {
     check(m_vqlate(1, 2, 3, 4, 5, 6, 7, qbig) == qbig + 28);
     /* More pairs: in a6:a7, at odd stack words, after an odd number of
      * named arguments; 9- and 10-byte structs, a char before a long long,
-     * unsigned ints sign-extended on RV64, a pointer to a function
+     * unsigned ints sign-extended, a pointer to a function
      * returning a long long. */
     cqv.c = 'a';
     cqv.v = -qbig;

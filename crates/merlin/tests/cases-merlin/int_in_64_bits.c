@@ -1,9 +1,9 @@
 // expect: 15
-// int arithmetic is 32-bit arithmetic on RV64 too, where registers are 64
+// int arithmetic is 32-bit arithmetic, though registers are 64
 // bits: the W instructions (addw, mulw, sllw, divw, negw...) wrap at 32 bits
 // and leave the result sign-extended, so a wrapped int converts to long as
 // the int it is, and an unsigned int stays below 2^32. (Signed overflow is
-// undefined in C; merlin wraps, on both widths.)
+// undefined in C; merlin wraps.)
 long widen(long v) {
     return v;
 }

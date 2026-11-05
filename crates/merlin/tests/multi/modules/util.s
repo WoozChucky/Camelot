@@ -1,6 +1,7 @@
-# util.rv32.s for RV64: the same functions and data, with `ra` saved as a
-# doubleword and the int arithmetic in W instructions, which keep a 32-bit
-# result sign-extended as the calling convention wants it.
+# Hand-written assembly linked with the C files: functions C calls, one
+# that calls back into C, and data C reads. `ra` is saved as a doubleword
+# and the int arithmetic is in W instructions, which keep a 32-bit result
+# sign-extended as the calling convention wants it.
 
     .text
     .globl triple

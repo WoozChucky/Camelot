@@ -5,8 +5,7 @@
 //! generation but the checked tree: memory is a flat byte array, globals and
 //! string literals are laid out from a low address, each call's locals get a
 //! fresh area further up, and every value is the number it is (an `i128`, in
-//! the range of its C type; a pointer is an address). The program's target
-//! gives the sizes: ILP32 on RV32, LP64 on RV64.
+//! the range of its C type; a pointer is an address). The sizes are LP64's.
 //! A struct's value is its address (as an array's), and assigning, passing or
 //! returning it copies its bytes. Functions get made-up addresses below the
 //! data, so pointers to them compare and convert like any pointer but cannot
@@ -14,7 +13,7 @@
 //!
 //! Semantics match what the generated code must do on Excalibur (spec section
 //! 10, "Merlin C subset"): arithmetic wrapping at the width of its type (32
-//! bits for `int`, as the W instructions do on RV64), `div`/`rem` rounding
+//! bits for `int`, as the W instructions do), `div`/`rem` rounding
 //! toward zero with RISC-V's results for `INT_MIN / -1` and division by zero,
 //! shifts by the low 5 bits of the amount (6 for a 64-bit type), comparisons
 //! and `! && ||` give 0 or 1, and falling off the end of a function returns 0.
@@ -32,7 +31,7 @@
 use merlin::abi::{self, Pass};
 use merlin::ast::*;
 use merlin::consteval::{self, Base, Const};
-use merlin::types::{ptr_size, IntKind, Type, Xlen};
+use merlin::types::{IntKind, Type, PTR_SIZE};
 use std::collections::HashMap;
 
 /// A value: an integer in the range of its type, or an address.
@@ -68,7 +67,6 @@ const MEMORY: usize = 16 << 20;
 
 fn run_here(prog: &Program, entry: &str) -> Result<i32, String> {
     let mut it = Interp {
-        x: prog.xlen,
         funcs: HashMap::new(),
         mem: vec![0; MEMORY],
         symbols: HashMap::new(),
@@ -152,8 +150,8 @@ fn symbol(d: &Declarator) -> String {
     }
 }
 
-fn size_of(ty: &Type, x: Xlen) -> u32 {
-    ty.size(x).expect("sema: objects have complete types")
+fn size_of(ty: &Type) -> u32 {
+    ty.size().expect("sema: objects have complete types")
 }
 
 /// The address a pointer value holds, if memory has it (else one past it,
@@ -164,7 +162,6 @@ fn address(v: Val) -> u32 {
 
 struct Interp<'a> {
     /// The target: sizes, and the width of arithmetic.
-    x: Xlen,
     /// Each function's name and definition, by its made-up address.
     funcs: HashMap<u32, (&'a str, Option<&'a Function>)>,
     mem: Vec<u8>,
@@ -202,10 +199,10 @@ pub const POISON: u8 = 0xa5;
 
 impl<'a> Interp<'a> {
     /// Reserves memory for an object of type `ty` at `*top`, zeroed.
-    fn alloc_at(mem: &mut [u8], top: &mut u32, limit: u32, ty: &Type, x: Xlen) -> u32 {
-        let align = ty.align(x).max(1);
+    fn alloc_at(mem: &mut [u8], top: &mut u32, limit: u32, ty: &Type) -> u32 {
+        let align = ty.align().max(1);
         let addr = top.div_ceil(align) * align;
-        let size = size_of(ty, x);
+        let size = size_of(ty);
         *top = addr + size;
         assert!(*top < limit, "interpreter out of memory");
         mem[addr as usize..(addr + size) as usize].fill(0);
@@ -214,7 +211,7 @@ impl<'a> Interp<'a> {
 
     /// Memory for a global or a string literal, for the whole run.
     fn alloc_data(&mut self, ty: &Type) -> u32 {
-        Self::alloc_at(&mut self.mem, &mut self.data_top, FRAMES_START, ty, self.x)
+        Self::alloc_at(&mut self.mem, &mut self.data_top, FRAMES_START, ty)
     }
 
     /// Memory for a local, until its call returns. A local declared without
@@ -223,14 +220,14 @@ impl<'a> Interp<'a> {
     /// than zeros: a case that reads one gets a value no expectation is
     /// likely to match, rather than a 0 that passes here and not in Grail.
     fn alloc_frame(&mut self, ty: &Type) -> u32 {
-        let addr = Self::alloc_at(&mut self.mem, &mut self.top, MEMORY as u32, ty, self.x);
+        let addr = Self::alloc_at(&mut self.mem, &mut self.top, MEMORY as u32, ty);
         let size = self.size(ty);
         self.mem[addr as usize..(addr + size) as usize].fill(POISON);
         addr
     }
 
     fn size(&self, ty: &Type) -> u32 {
-        size_of(ty, self.x)
+        size_of(ty)
     }
 
     fn check(&self, addr: u32, size: u32) -> Result<usize, String> {
@@ -251,7 +248,7 @@ impl<'a> Interp<'a> {
         let a = self.check(addr, size)?;
         let mut bytes = [0u8; 16];
         bytes[..size as usize].copy_from_slice(&self.mem[a..a + size as usize]);
-        Ok(convert(i128::from_le_bytes(bytes), ty, self.x))
+        Ok(convert(i128::from_le_bytes(bytes), ty))
     }
 
     /// Stores the value `v` of type `ty`: its low bytes, two's complement.
@@ -318,7 +315,7 @@ impl<'a> Interp<'a> {
                 self.mem[addr as usize..addr as usize + n].copy_from_slice(&b[..n]);
             }
             (_, Init::Expr(e)) => {
-                let v = match consteval::eval(e, self.x).ok_or("initializer is not constant")? {
+                let v = match consteval::eval(e).ok_or("initializer is not constant")? {
                     Const::Int(v, _) => v,
                     Const::Addr { base: None, offset } => offset,
                     Const::Addr {
@@ -369,16 +366,14 @@ impl<'a> Interp<'a> {
         }
         if f.variadic {
             // The words of all the arguments, as the calling convention
-            // numbers them (an aligned pair at an even word), from an area
-            // aligned to two words; va_start points at the first word the
-            // named ones leave.
-            let x = self.x;
+            // numbers them, from an area aligned to two words; va_start
+            // points at the first word the named ones leave.
             let types: Vec<Type> = args.iter().map(|(_, t)| t.clone()).collect();
-            let (places, total) = abi::call_arguments(&f.ret, &types, named, x);
-            let (_, first) = abi::call_arguments(&f.ret, &types[..named], named, x);
-            // A word is a register: a `long` on either width.
+            let (places, total) = abi::call_arguments(&f.ret, &types);
+            let (_, first) = abi::call_arguments(&f.ret, &types[..named]);
+            // A word is a register: a `long`.
             let word = Type::Int(IntKind::Long);
-            let w = ptr_size(x);
+            let w = PTR_SIZE;
             // Two words more, so that the area is aligned and has an address
             // of its own.
             let area_ty = Type::array(word.clone(), Some(total as u32 + 2));
@@ -388,7 +383,6 @@ impl<'a> Interp<'a> {
                 let at = base + w * n as u32;
                 match pass {
                     Pass::Scalar => self.store(at, &word, *v)?,
-                    Pass::Pair => self.store(at, t, *v)?,
                     Pass::Words(_) => self.copy(at, address(*v), t)?,
                     Pass::Ref => {
                         let copy = self.alloc_frame(t);
@@ -664,7 +658,6 @@ impl<'a> Interp<'a> {
 
     fn expr(&mut self, e: &'a Expr, frame: &[u32]) -> Result<Val, String> {
         self.tick()?;
-        let x = self.x;
         Ok(match &e.kind {
             ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => *v,
             ExprKind::Var { .. }
@@ -684,7 +677,7 @@ impl<'a> Interp<'a> {
                         let old = self.load(a, &target.ty)?;
                         let v = self.expr(value, frame)?;
                         let (t, vt) = (target.ty.decay(), value.ty.decay());
-                        convert(binary(*op, old, &t, v, &vt, x)?, &target.ty, x)
+                        convert(binary(*op, old, &t, v, &vt)?, &target.ty)
                     }
                 };
                 self.put(a, &target.ty, v)?;
@@ -702,7 +695,7 @@ impl<'a> Interp<'a> {
                     Type::Ptr(t) => self.size(t).into(),
                     _ => 1,
                 };
-                let new = convert(if *inc { old + step } else { old - step }, &target.ty, x);
+                let new = convert(if *inc { old + step } else { old - step }, &target.ty);
                 self.store(a, &target.ty, new)?;
                 if *prefix {
                     new
@@ -719,21 +712,21 @@ impl<'a> Interp<'a> {
             ExprKind::Binary(op, l, r) => {
                 let a = self.expr(l, frame)?;
                 let b = self.expr(r, frame)?;
-                binary(*op, a, &l.ty.decay(), b, &r.ty.decay(), x)?
+                binary(*op, a, &l.ty.decay(), b, &r.ty.decay())?
             }
             ExprKind::Unary(op, operand) => {
                 let v = self.expr(operand, frame)?;
                 // The result has the promoted type, `e.ty`.
                 match op {
-                    UnOp::Neg => convert(-v, &e.ty, x),
+                    UnOp::Neg => convert(-v, &e.ty),
                     UnOp::Plus => v,
                     UnOp::Not => (v == 0).into(),
-                    UnOp::BitNot => convert(!v, &e.ty, x),
+                    UnOp::BitNot => convert(!v, &e.ty),
                 }
             }
             ExprKind::Cast { x: from, .. } => {
                 let v = self.expr(from, frame)?;
-                convert(v, &e.ty, x)
+                convert(v, &e.ty)
             }
             ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => return Err("sizeof survived sema".into()),
             ExprKind::Cond(c, a, b) => {
@@ -767,18 +760,13 @@ impl<'a> Interp<'a> {
             }
             ExprKind::VaArg(ap) => {
                 let a = self.addr(ap, frame)?;
-                let mut at = self.load(a, &ap.ty)?;
-                let pass = abi::classify(&e.ty, x);
-                // An aligned pair is at the next even word.
-                if abi::aligned_pair(&e.ty, pass, x) {
-                    let align = Val::from(2 * ptr_size(x));
-                    at = (at + align - 1) / align * align;
-                }
-                let words = ptr_size(x) * pass.registers() as u32;
+                let at = self.load(a, &ap.ty)?;
+                let pass = abi::classify(&e.ty);
+                let words = PTR_SIZE * pass.registers() as u32;
                 self.store(a, &ap.ty, at + Val::from(words))?;
                 match pass {
                     // A narrower scalar is in the low bytes of its word.
-                    Pass::Scalar | Pass::Pair => self.load(address(at), &e.ty)?,
+                    Pass::Scalar => self.load(address(at), &e.ty)?,
                     // The struct's bytes are right there.
                     Pass::Words(_) => at,
                     Pass::Ref => self.load(address(at), &Type::ptr(Type::Void))?,
@@ -793,34 +781,34 @@ impl<'a> Interp<'a> {
 /// conversions, the out-of-range signed case the two's complement way, as
 /// clang does; `_Bool` gives 0 or 1), a pointer to a pointer-sized unsigned
 /// address. Anything else is as it is.
-fn convert(v: Val, ty: &Type, x: Xlen) -> Val {
+fn convert(v: Val, ty: &Type) -> Val {
     match ty.unqual() {
-        Type::Int(k) => k.wrap(v, x),
-        Type::Ptr(_) => IntKind::ULong.wrap(v, x),
+        Type::Int(k) => k.wrap(v),
+        Type::Ptr(_) => IntKind::ULong.wrap(v),
         Type::Void => 0,
         _ => v,
     }
 }
 
 /// `a op b` with `a` of (decayed) type `lt` and `b` of type `rt`.
-fn binary(op: BinOp, a: Val, lt: &Type, b: Val, rt: &Type, x: Xlen) -> Result<Val, String> {
-    let elem = |t: &Type| -> Val { t.pointee().map_or(1, |t| size_of(t, x)).into() };
+fn binary(op: BinOp, a: Val, lt: &Type, b: Val, rt: &Type) -> Result<Val, String> {
+    let elem = |t: &Type| -> Val { t.pointee().map_or(1, size_of).into() };
     if let (Some(lk), Some(rk)) = (lt.int_kind(), rt.int_kind()) {
         // Integers: both operands converted to the type the operation is
         // done in (a shift's is its left operand's promoted type), the
         // result wrapped to it.
         let k = match op {
             BinOp::Shl | BinOp::Shr => lk.promoted(),
-            _ => merlin::types::common(lk, rk, x),
+            _ => merlin::types::common(lk, rk),
         };
-        let a = k.wrap(a, x);
-        let bits = k.size(x) * 8;
+        let a = k.wrap(a);
+        let bits = k.size() * 8;
         let b = if matches!(op, BinOp::Shl | BinOp::Shr) {
             // The hardware uses the low 5 bits of a 32-bit shift's amount,
             // the low 6 of a 64-bit one's.
-            rk.wrap(b, x) & Val::from(bits - 1)
+            rk.wrap(b) & Val::from(bits - 1)
         } else {
-            k.wrap(b, x)
+            k.wrap(b)
         };
         let v = match op {
             BinOp::Add => a + b,
@@ -848,15 +836,15 @@ fn binary(op: BinOp, a: Val, lt: &Type, b: Val, rt: &Type, x: Xlen) -> Result<Va
                 return Err("short-circuit operators are evaluated by expr".into())
             }
         };
-        return Ok(k.wrap(v, x));
+        return Ok(k.wrap(v));
     }
     // Pointers (addresses, unsigned), with an integer or each other.
-    let addr = |v: Val| IntKind::ULong.wrap(v, x);
+    let addr = |v: Val| IntKind::ULong.wrap(v);
     Ok(match op {
         BinOp::Add if lt.is_ptr() => addr(a + b * elem(lt)),
         BinOp::Add => addr(a * elem(rt) + b),
         // The difference of two pointers counts elements: a `ptrdiff_t`.
-        BinOp::Sub if rt.is_ptr() => IntKind::ptrdiff_t(x).wrap(a - b, x) / elem(lt),
+        BinOp::Sub if rt.is_ptr() => IntKind::ptrdiff_t().wrap(a - b) / elem(lt),
         BinOp::Sub => addr(a - b * elem(lt)),
         BinOp::Eq => (a == b).into(),
         BinOp::Ne => (a != b).into(),

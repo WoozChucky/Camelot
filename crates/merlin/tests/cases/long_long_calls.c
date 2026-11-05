@@ -1,9 +1,7 @@
 // expect: 21
-// long long arguments, results and variadic arguments. On RV32 each is a
-// pair of words: in two registers (from any one, the last a7 with its high
-// word on the stack), on the stack from an even word, and when variadic in
-// an even register too; a result comes back in a0 and a1. Structs holding
-// one travel the same way. On RV64 each is a register.
+// long long arguments, results and variadic arguments: each is a register,
+// and so is a struct holding one. (On RV32, until #159, each was a pair of
+// words, which these calls placed at every odd and even word.)
 typedef __builtin_va_list va_list;
 #define va_start(ap, last) __builtin_va_start(ap, last)
 #define va_arg(ap, type) __builtin_va_arg(ap, type)
@@ -26,7 +24,7 @@ unsigned long long high(unsigned long long x) {
     return x >> 32;
 }
 
-/* The fourth pair starts in a7 on RV32. */
+/* The eighth argument: a7. */
 long long last(int a, int b, int c, int d, int e, int f, int g, long long h) {
     return h - (a + b + c + d + e + f + g);
 }

@@ -1,6 +1,6 @@
 // expect: 20
 // The predefined macros that <stddef.h> and <stdint.h> are built from name the
-// types clang's do, and their sizes and limits agree on both widths:
+// types clang's do, and their sizes and limits agree:
 // size_t, ptrdiff_t and intptr_t are as wide as a pointer, int64_t is 64 bits.
 typedef __SIZE_TYPE__ size_t;
 typedef __PTRDIFF_TYPE__ ptrdiff_t;

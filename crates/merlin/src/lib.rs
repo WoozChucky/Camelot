@@ -5,15 +5,14 @@
 //! → [`codegen`]. [`parse_with`] runs the front end and returns a checked,
 //! typed AST; [`compile_with`] goes all the way to assembly text, one
 //! translation unit at a time ([`parse`] and [`compile`] for a source with no
-//! headers). The target is [`Options::xlen`] (`-march`): RV32 with the
-//! ILP32 ABI, the default until #159, or RV64 with LP64. [`types`] has the C
-//! types and their layout on each, [`consteval`] evaluates constant
+//! headers). The target is Excalibur, RV64 with the LP64 ABI ([`MARCH`],
+//! [`ABI`]; until #159 merlin compiled for RV32 and ILP32 too). [`types`]
+//! has the C types and their layout, [`consteval`] evaluates constant
 //! expressions, and [`abi`] says how arguments and results travel (the
 //! RISC-V integer calling convention).
 //!
 //! The preprocessor also serves assembly: [`preprocess_asm`] runs a `.S`
-//! file through it as `clang -E -x assembler-with-cpp` does, for merlin-as
-//! (how one source serves RV32 and RV64, with `__riscv_xlen`).
+//! file through it as `clang -E -x assembler-with-cpp` does, for merlin-as.
 //!
 //! The language (spec section 10) is a subset of C99 without floating point:
 //! the C99 preprocessor, the integer types (`_Bool`, `char`, `short`, `int`,
@@ -147,33 +146,23 @@ impl fmt::Display for Error {
     }
 }
 
-/// The `-march=` values merlin takes, and the width each one means: the two
-/// ISAs merlin-as assembles, as clang spells them.
-pub const MARCH: &[(&str, types::Xlen)] = &[
-    ("rv32ima_zicsr_zifencei", types::Xlen::Rv32),
-    ("rv64ima_zicsr_zifencei", types::Xlen::Rv64),
-];
+/// The ISA merlin compiles for, as clang spells it for `-march=`: the one
+/// merlin-as assembles.
+pub const MARCH: &str = "rv64ima_zicsr_zifencei";
 
-/// Reads the value of `-march=`: one of [`MARCH`].
-pub fn parse_march(s: &str) -> Result<types::Xlen, String> {
-    MARCH
-        .iter()
-        .find(|(name, _)| *name == s)
-        .map(|&(_, x)| x)
-        .ok_or_else(|| {
-            let takes: Vec<&str> = MARCH.iter().map(|&(name, _)| name).collect();
-            format!("unsupported -march '{s}' (merlin takes {})", takes.join(" or "))
-        })
-}
-
-/// The ABI of each width, as `-mabi=` names it: `ilp32` for RV32, `lp64`
-/// for RV64 (soft-float: merlin has no floating point).
-pub fn abi_name(x: types::Xlen) -> &'static str {
-    match x {
-        types::Xlen::Rv32 => "ilp32",
-        types::Xlen::Rv64 => "lp64",
+/// Reads the value of `-march=`: [`MARCH`], the only ISA merlin takes. Any
+/// other is refused, an RV32 one as any unknown one.
+pub fn parse_march(s: &str) -> Result<(), String> {
+    if s == MARCH {
+        Ok(())
+    } else {
+        Err(format!("unsupported -march '{s}' (merlin takes {MARCH})"))
     }
 }
+
+/// The ABI, as `-mabi=` names it: `lp64` (soft-float: merlin has no
+/// floating point).
+pub const ABI: &str = "lp64";
 
 /// The name [`parse`] and [`compile`] give their source (for `__FILE__`).
 pub const INPUT_NAME: &str = "<input>";
@@ -201,7 +190,7 @@ pub fn preprocess(
 }
 
 /// Preprocesses an assembly source (a `.S` file, `-x assembler-with-cpp`)
-/// for [`Options::xlen`] into the text merlin-as assembles, as `clang -E`
+/// into the text merlin-as assembles, as `clang -E`
 /// writes it (see [`preprocess::Output::print_asm`]); [`Options::lang`] is
 /// taken to be [`Lang::AssemblerWithCpp`]. Errors in headers have their
 /// [`Error::file`] set.
@@ -218,7 +207,7 @@ pub fn preprocess_asm(name: &str, src: &str, opts: &Options, load: Loader) -> Re
 /// every error it finds. Errors in headers have their [`Error::file`] set.
 pub fn parse_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result<ast::Program, Vec<Error>> {
     let pp = preprocess(name, src, opts, load)?;
-    let mut prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
+    let mut prog = check(&pp).map_err(|errors| pp.name_files(errors))?;
     prog.warnings = pp.name_files(prog.warnings);
     Ok(prog)
 }
@@ -238,7 +227,7 @@ pub fn compile_warned(
 ) -> Result<(String, Vec<Error>), Vec<Error>> {
     let pp = preprocess(name, src, opts, load)?;
     let debug = opts.debug.as_ref().map(|d| (d, pp.files.as_slice()));
-    let prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
+    let prog = check(&pp).map_err(|errors| pp.name_files(errors))?;
     let warnings = pp.name_files(prog.warnings.clone());
     match codegen::generate_with(&prog, debug) {
         Ok(asm) => Ok((asm, warnings)),
@@ -248,9 +237,9 @@ pub fn compile_warned(
 
 /// The front end after the preprocessor: tokens, syntax tree, checks. The
 /// errors come with the warnings, in the order of their positions.
-fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec<Error>> {
-    let toks = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| vec![e])?;
-    let mut prog = match parser::parse_salvaging(&toks, xlen) {
+fn check(pp: &preprocess::Output) -> Result<ast::Program, Vec<Error>> {
+    let toks = lexer::finish(pp.tokens.clone(), pp.end).map_err(|e| vec![e])?;
+    let mut prog = match parser::parse_salvaging(&toks) {
         Ok(prog) => prog,
         Err(salvaged) => {
             let (e, mut partial) = *salvaged;

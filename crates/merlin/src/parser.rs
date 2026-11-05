@@ -88,8 +88,8 @@ use crate::ast::*;
 use crate::consteval;
 use crate::lexer::{Kw, Tok, Token};
 use crate::types::{
-    align_up, common, ptr_size, EnumType, IntKind, Quals, Record, Spelled, Spelling, Spellings, Type,
-    TypedefName, Xlen, MAX_OBJECT_SIZE,
+    align_up, common, EnumType, IntKind, Quals, Record, Spelled, Spelling, Spellings, Type, TypedefName,
+    MAX_OBJECT_SIZE, PTR_SIZE,
 };
 use crate::{Error, Pos};
 use std::cell::{Cell, RefCell};
@@ -121,17 +121,17 @@ pub const MAX_PARAMS: usize = 127;
 /// runs on a 64 MiB thread). clang's bracket limit is also 256.
 pub const MAX_DEPTH: usize = 256;
 
-/// Parses a translation unit for the target `xlen`, whose sizes the parser
+/// Parses a translation unit, whose sizes the parser
 /// needs for array bounds, `sizeof` and struct layouts.
-pub fn parse(toks: &[Token], xlen: Xlen) -> Result<Program, Error> {
-    parse_salvaging(toks, xlen).map_err(|b| b.0)
+pub fn parse(toks: &[Token]) -> Result<Program, Error> {
+    parse_salvaging(toks).map_err(|b| b.0)
 }
 
 /// [`parse`], which with a syntax error also gives what came before it:
 /// the items parsed, and as much of the function whose body has the error
 /// as its blocks hold before it. Sema finds in them the warnings clang
 /// gives before such an error (it checks as it parses).
-pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error, Program)>> {
+pub fn parse_salvaging(toks: &[Token]) -> Result<Program, Box<(Error, Program)>> {
     // The type clang's `<stdarg.h>` builds `va_list` from: on RISC-V a plain
     // pointer into the argument words (see `crate::codegen`). A typedef of
     // no position, as clang describes it under `-g`.
@@ -154,7 +154,6 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         pos: 0,
         depth: 0,
         scopes: vec![file],
-        xlen,
         unevaluated: RefCell::new(Vec::new()),
         prototype: RefCell::new(Vec::new()),
         folding: Cell::new(false),
@@ -180,7 +179,6 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         if let Some(e) = error {
             let partial = Program {
                 items,
-                xlen,
                 unevaluated,
                 warnings: Vec::new(),
             };
@@ -189,7 +187,6 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
     }
     Ok(Program {
         items,
-        xlen,
         unevaluated,
         warnings: Vec::new(),
     })
@@ -245,7 +242,7 @@ fn assign_op(t: &Tok) -> Option<Option<BinOp>> {
 /// `None` for the rest (brace elision, designators), which sema works out.
 fn init_len(elem: &Type, init: &Init) -> Option<u32> {
     // A character type: 1 byte, on every target.
-    let is_char = elem.int_kind().is_some_and(|k| k.size(Xlen::Rv32) == 1);
+    let is_char = elem.int_kind().is_some_and(|k| k.size() == 1);
     let string = |i: &Init| match i {
         Init::Expr(Expr {
             kind: ExprKind::Str(b),
@@ -441,8 +438,6 @@ struct Parser<'a> {
     depth: usize,
     /// Block scopes, innermost last; the first is the file scope.
     scopes: Vec<Scope>,
-    /// The target, for sizes.
-    xlen: Xlen,
     /// The expressions the constants evaluated so far have that sema must
     /// still check ([`Unevaluated`]), until the declaration or statement
     /// they are in is done.
@@ -586,7 +581,7 @@ impl Parser<'_> {
             // to judge.
             Some((Name::Object(prev), prev_pos)) => {
                 if let Name::Object(new) = what {
-                    if new.size(self.xlen).is_some() || prev.size(self.xlen).is_none() {
+                    if new.size().is_some() || prev.size().is_none() {
                         *prev = new;
                     }
                     return Ok(());
@@ -639,7 +634,7 @@ impl Parser<'_> {
         let mark = self.unevaluated.borrow().len();
         let original = e.clone();
         self.resolve_sizeof(e);
-        let Some(v) = consteval::parsed_int(e, self.xlen) else {
+        let Some(v) = consteval::parsed_int(e) else {
             // No constant the parser can work out: sema checks the whole
             // expression, and reports its error if it has one, as clang
             // does (`sizeof n.y` of an `int n` is no member), else `msg`.
@@ -717,7 +712,7 @@ impl Parser<'_> {
             }
             ExprKind::Cond(c, a, b) => {
                 self.resolve_sizeof(c);
-                match consteval::parsed_int(c, self.xlen) {
+                match consteval::parsed_int(c) {
                     Some(v) => {
                         let (chosen, other) = if v != 0 { (a, b) } else { (b, a) };
                         self.resolve_sizeof(chosen);
@@ -747,7 +742,7 @@ impl Parser<'_> {
         self.resolve_sizeof(&mut resolved);
         // A constant, as it is not evaluated: `1 / 0` is one there (C99
         // 6.6p3), and nothing is folded.
-        if consteval::parsed_unevaluated_int(&resolved, self.xlen).is_some() {
+        if consteval::parsed_unevaluated_int(&resolved).is_some() {
             *e = resolved;
             return;
         }
@@ -897,7 +892,7 @@ impl Parser<'_> {
                 Type::Array(elem, None) => Some(Type::array((**elem).clone(), Some(init_len(elem, init)?))),
                 t => Some(t.clone()),
             },
-            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => Some(Type::Int(IntKind::size_t(self.xlen))),
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => Some(Type::Int(IntKind::size_t())),
             ExprKind::Var { name, .. } => match self.lookup_name(name)? {
                 Name::Object(t) => Some(t.clone()),
                 _ => None,
@@ -919,10 +914,10 @@ impl Parser<'_> {
                 let (lt, rt) = (self.value_type(l)?, self.value_type(r)?);
                 match (lt.is_ptr(), rt.is_ptr()) {
                     // The difference of two pointers is a `ptrdiff_t`.
-                    (true, true) if *op == BinOp::Sub => Some(Type::Int(IntKind::ptrdiff_t(self.xlen))),
+                    (true, true) if *op == BinOp::Sub => Some(Type::Int(IntKind::ptrdiff_t())),
                     (true, false) => Some(lt),
                     (false, true) if *op == BinOp::Add => Some(rt),
-                    (false, false) => Some(Type::Int(common(lt.int_kind()?, rt.int_kind()?, self.xlen))),
+                    (false, false) => Some(Type::Int(common(lt.int_kind()?, rt.int_kind()?))),
                     _ => None,
                 }
             }
@@ -932,7 +927,7 @@ impl Parser<'_> {
                 r,
             ) => {
                 let (lk, rk) = (self.value_type(l)?.int_kind()?, self.value_type(r)?.int_kind()?);
-                Some(Type::Int(common(lk, rk, self.xlen)))
+                Some(Type::Int(common(lk, rk)))
             }
             // A shift is of its promoted left operand's type.
             ExprKind::Binary(BinOp::Shl | BinOp::Shr, l, _) => {
@@ -943,7 +938,7 @@ impl Parser<'_> {
             ExprKind::Cond(_, a, b) => {
                 let (at, bt) = (self.value_type(a)?, self.value_type(b)?);
                 match (at.int_kind(), bt.int_kind()) {
-                    (Some(ak), Some(bk)) => Some(Type::Int(common(ak, bk, self.xlen))),
+                    (Some(ak), Some(bk)) => Some(Type::Int(common(ak, bk))),
                     _ => (at == bt).then_some(at),
                 }
             }
@@ -1298,7 +1293,7 @@ impl Parser<'_> {
                         format!("field '{}' declared as a function", d.name),
                     ));
                 }
-                let Some(size) = d.ty.size(self.xlen) else {
+                let Some(size) = d.ty.size() else {
                     let msg = match &d.ty {
                         Type::Array(_, None) => "flexible array members are not supported yet".to_string(),
                         t => format!("field '{}' has incomplete type '{t}'", d.name),
@@ -1314,7 +1309,7 @@ impl Parser<'_> {
                 end = if record.union {
                     end.max(u64::from(size))
                 } else {
-                    align_up(end, d.ty.align(self.xlen)) + u64::from(size)
+                    align_up(end, d.ty.align()) + u64::from(size)
                 };
                 if end > MAX_OBJECT_SIZE {
                     return Err(Error::new(d.pos, format!("{} is too large", record.keyword())));
@@ -1331,16 +1326,12 @@ impl Parser<'_> {
         }
         if align_up(
             end,
-            members
-                .iter()
-                .map(|(_, t, _, _)| t.align(self.xlen))
-                .max()
-                .unwrap_or(1),
+            members.iter().map(|(_, t, _, _)| t.align()).max().unwrap_or(1),
         ) > MAX_OBJECT_SIZE
         {
             return Err(Error::new(open, format!("{} is too large", record.keyword())));
         }
-        record.complete_spelled(members, at, self.xlen);
+        record.complete_spelled(members, at);
         Ok(())
     }
 
@@ -1376,7 +1367,7 @@ impl Parser<'_> {
                 return Err(Error::new(*pos, format!("redefinition of 'enum {name}'")));
             }
         }
-        let (int_min, int_max) = IntKind::Int.range(self.xlen);
+        let (int_min, int_max) = IntKind::Int.range();
         let mut next = 0i128;
         let mut negative = false;
         let mut constants = Vec::new();
@@ -1579,13 +1570,13 @@ impl Parser<'_> {
         let mut folded = None;
         // The size of `ty`, kept as it grows: `Type::size` recurses, so asking
         // it at every dimension would be quadratic in the number of dimensions.
-        let mut size = ty.size(self.xlen).map(u64::from);
+        let mut size = ty.size().map(u64::from);
         let steps = ops.len();
         for (i, op) in ops.into_iter().enumerate() {
             match op {
                 Derive::Ptr(q) => {
                     ty = Type::ptr(ty).qualified(q);
-                    size = Some(u64::from(ptr_size(self.xlen)));
+                    size = Some(u64::from(PTR_SIZE));
                 }
                 Derive::Array(n, open, quals, at) => {
                     folded = folded.or(at);
@@ -1622,7 +1613,7 @@ impl Parser<'_> {
                         // qualifiers land on the pointer: `int a[const 3]`
                         // declares `int *const a`.
                         ty = ty.decay().qualified(q);
-                        size = Some(u64::from(ptr_size(self.xlen)));
+                        size = Some(u64::from(PTR_SIZE));
                     }
                 }
                 Derive::Func(params, variadic, with_prototype, scope) => {
@@ -1878,7 +1869,7 @@ impl Parser<'_> {
             // incomplete type: sema completes it, the same way.) Unless an
             // earlier declaration gave the size: `int a[3]; int a[] = {1};`.
             let bound = self.scopes.last().and_then(|s| s.names.get(&d.name));
-            let incomplete = matches!(bound, Some((Name::Object(t), _)) if t.size(self.xlen).is_none());
+            let incomplete = matches!(bound, Some((Name::Object(t), _)) if t.size().is_none());
             if let (Type::Array(elem, None), Some(init), true) = (&d.ty, &init, incomplete) {
                 if let Some(n) = init_len(elem, init) {
                     let full = Type::array((**elem).clone(), Some(n));
@@ -2730,7 +2721,7 @@ mod tests {
     use crate::lexer::lex;
 
     fn prog(src: &str) -> Program {
-        parse(&lex(src, Xlen::Rv32).unwrap(), Xlen::Rv32).unwrap_or_else(|e| panic!("{src}: {e}"))
+        parse(&lex(src).unwrap()).unwrap_or_else(|e| panic!("{src}: {e}"))
     }
 
     /// The first error of `src`: the parser's, or sema's, which checks what
@@ -3166,7 +3157,7 @@ mod tests {
         // One tag, one type.
         assert_eq!(t[1].pointee(), Some(&t[0]));
         assert_eq!(t[2], t[0]);
-        assert_eq!(t[0].size(Xlen::Rv32), Some(8));
+        assert_eq!(t[0].size(), Some(8));
         // A struct may point to itself.
         let t = global_types("struct node { int v; struct node *next; } n;");
         let body = t[0].record().unwrap().body().unwrap();
@@ -3174,16 +3165,16 @@ mod tests {
         // A forward declaration, completed later.
         let t = global_types("struct s; struct s *p; struct s { char c; } x;");
         assert_eq!(t[0].pointee(), Some(&t[1]));
-        assert_eq!(t[0].pointee().unwrap().size(Xlen::Rv32), Some(1));
+        assert_eq!(t[0].pointee().unwrap().size(), Some(1));
         // An inner scope's struct is a different type.
         let p = prog("struct s { int a; } g; int f() { struct s { char c[3]; } l; return sizeof l; }");
         let StmtKind::Decl(ds) = &funcs(&p)[0].body.as_ref().unwrap()[0].kind else {
             panic!()
         };
-        assert_eq!(ds[0].ty.size(Xlen::Rv32), Some(3));
+        assert_eq!(ds[0].ty.size(), Some(3));
         // Anonymous structs and nested definitions (whose tags are in scope outside).
         let t = global_types("struct { struct in { short a; } i; char c; } a; struct in b;");
-        assert_eq!((t[0].size(Xlen::Rv32), t[1].size(Xlen::Rv32)), (Some(4), Some(2)));
+        assert_eq!((t[0].size(), t[1].size()), (Some(4), Some(2)));
         assert_eq!(t[0].to_string(), "struct (anonymous at 1:1)");
         for (src, msg) in [
             (
@@ -3561,12 +3552,12 @@ mod tests {
                 "struct s s, struct s *p",
                 "char e[3]",
                 "char f[4]",
-                "char g[4]",
+                "char g[8]",
                 "char h[4]",
-                "char i[4]",
-                "char j[6]",
-                "char k[4]",
-                "char l[4]",
+                "char i[8]",
+                "char j[10]",
+                "char k[8]",
+                "char l[8]",
                 "char m[8]",
             ]
         );
@@ -3575,7 +3566,7 @@ mod tests {
         let p = prog("int x; int f(char x, int v[10]) { char a[sizeof x]; char b[sizeof v]; return 0; }");
         let body = format!("{:?}", funcs(&p)[0].body);
         assert!(body.contains("Array(Int(Char), Some(1))"), "{body}");
-        assert!(body.contains("Array(Int(Char), Some(4))"), "{body}");
+        assert!(body.contains("Array(Int(Char), Some(8))"), "{body}");
         let g: Vec<String> = globals(
             "int t[] = {1, 2, 3}; char u[sizeof t]; char s[] = \"hello\"; char v[sizeof s];
              char w[] = {\"hi\"}; char y[sizeof w]; int z[4]; int z[] = {1}; char q[sizeof z];
@@ -3959,7 +3950,7 @@ mod tests {
     fn nesting_limit_checks() {
         let deep = |n: usize| format!("int f() {{ {} }}", nest(n, "{", "", "}"));
         // `int f() { ` is 10 characters, so the 257th `{` is at column 267.
-        assert!(parse(&lex(&deep(MAX_DEPTH), Xlen::Rv32).unwrap(), Xlen::Rv32).is_ok());
+        assert!(parse(&lex(&deep(MAX_DEPTH)).unwrap()).is_ok());
         assert_eq!(
             err(&deep(MAX_DEPTH + 1)),
             "1:267: nesting too deep: merlin allows at most 256 levels"
@@ -3974,15 +3965,15 @@ mod tests {
         // A return statement and its expression take two levels.
         let ret = |e: &str| format!("int f(int x) {{ return {e}; }}");
         let src = ret(&nest(MAX_DEPTH - 2, "(", "1", ")"));
-        assert!(parse(&lex(&src, Xlen::Rv32).unwrap(), Xlen::Rv32).is_ok());
+        assert!(parse(&lex(&src).unwrap()).is_ok());
         limit(&ret(&nest(MAX_DEPTH - 1, "(", "1", ")")));
         limit(&ret(&nest(100_000, "(", "1", ")")));
         limit(&ret(&nest(100_000, "- ", "1", "")));
         // Declarators: as many `*`s, or `[]`s, as the limit allows, and no more.
         let stars = |n: usize| format!("int {}p;", "*".repeat(n));
         let dims = |n: usize| format!("char a{};", "[1]".repeat(n));
-        assert!(parse(&lex(&stars(MAX_DEPTH), Xlen::Rv32).unwrap(), Xlen::Rv32).is_ok());
-        assert!(parse(&lex(&dims(MAX_DEPTH), Xlen::Rv32).unwrap(), Xlen::Rv32).is_ok());
+        assert!(parse(&lex(&stars(MAX_DEPTH)).unwrap()).is_ok());
+        assert!(parse(&lex(&dims(MAX_DEPTH)).unwrap()).is_ok());
         assert_eq!(
             err(&stars(MAX_DEPTH + 1)),
             "1:261: type nesting too deep: merlin allows at most 256 '*'s"
@@ -4024,10 +4015,10 @@ mod tests {
         assert_eq!(body(&"x = 1; ".repeat(100_000)).len(), 100_000);
         let args = vec!["1"; MAX_PARAMS].join(", ");
         let src = ret(&format!("f({args})"));
-        assert!(parse(&lex(&src, Xlen::Rv32).unwrap(), Xlen::Rv32).is_ok());
+        assert!(parse(&lex(&src).unwrap()).is_ok());
         let args = vec!["1"; MAX_PARAMS + 1].join(", ");
         let src = ret(&format!("f({args})"));
-        let e = parse(&lex(&src, Xlen::Rv32).unwrap(), Xlen::Rv32).unwrap_err();
+        let e = parse(&lex(&src).unwrap()).unwrap_err();
         assert!(
             e.msg.contains("too many arguments: merlin supports at most 127"),
             "{}",

@@ -7,9 +7,8 @@
 //! registers across statements and every variable lives in memory, so the
 //! output is long but easy to follow, and easy to check by hand.
 //!
-//! The program's target ([`Program::xlen`]) is RV32, with the ILP32 ABI, or
-//! RV64, with LP64. The examples below are RV32's; where RV64 differs, the
-//! text says how. In short: a register (a *word* here) is 8 bytes on RV64,
+//! The target is Excalibur, RV64 with the LP64 ABI (until #159 merlin
+//! compiled for RV32 and ILP32 too). A register (a *word* here) is 8 bytes,
 //! so pushes, saved registers, argument words and register-wide loads and
 //! stores are `sd`/`ld` of 8 bytes, and `int` arithmetic uses the W
 //! instructions ("The 32-bit invariant" below).
@@ -35,7 +34,7 @@
 //!   inline definition) that nothing emitted uses is not emitted, as clang
 //!   leaves it out ("Order" below).
 //! * Semantics: arithmetic wraps at the width of its type (32 bits for `int`,
-//!   and for `long` on RV32; 64 for `long` on RV64), `/` and `%` truncate
+//!   64 for `long` and `long long`), `/` and `%` truncate
 //!   toward zero (`div`/`rem`, or `divu`/`remu` when unsigned), shifts use the
 //!   low 5 bits of the amount (6 for a 64-bit type), comparisons and `! &&
 //!   ||` produce 0 or 1, `&&`/`||` short-circuit, an assignment evaluates to
@@ -87,15 +86,14 @@
 //! (`lbu`/`lb`, `lhu`/`lh`, by its signedness; plain `char` is unsigned) and
 //! narrowed when it is stored (`sb`, `sh`), so integer promotion costs
 //! nothing. A conversion *to* a narrow type in a register (a cast, or the
-//! value of `c = 300` for a `char c`) is done in place (on RV64 the shifts
-//! are by 56 and 48):
+//! value of `c = 300` for a `char c`) is done in place:
 //!
 //! ```text
 //!   andi  a0, a0, 255         # to unsigned char (and plain char)
-//!   slli  a0, a0, 24          # to signed char: keep the low byte...
-//!   srai  a0, a0, 24          # ...and copy its top bit up
-//!   slli  a0, a0, 16          # to unsigned short (srai for short)
-//!   srli  a0, a0, 16
+//!   slli  a0, a0, 56          # to signed char: keep the low byte...
+//!   srai  a0, a0, 56          # ...and copy its top bit up
+//!   slli  a0, a0, 48          # to unsigned short (srai for short)
+//!   srli  a0, a0, 48
 //! ```
 //!
 //! A binary operator's operands are converted to the type the operation is
@@ -104,9 +102,9 @@
 //! `sltu` and `srl` when it is unsigned (`unsigned int`, `unsigned long`, or
 //! a pointer), `div`, `rem`, `slt` and `sra` otherwise.
 //!
-//! ### The 32-bit invariant (RV64)
+//! ### The 32-bit invariant
 //!
-//! On RV64 an `int` or `unsigned int` lives in a 64-bit register *sign-
+//! An `int` or `unsigned int` lives in a 64-bit register *sign-
 //! extended* from bit 31, whatever its signedness, as the psABI requires of
 //! arguments and results and as the hand-written assembly expects (so an
 //! `unsigned` 0xffffffff is -1 in its register). `lw` loads it so, and every
@@ -126,41 +124,8 @@
 //! An `int` needs nothing to become a `long` or an index: it is its own
 //! sign extension already.
 //!
-//! ### Register pairs (RV32)
-//!
-//! A `long long` is 64 bits on both widths. On RV64 it is a register like a
-//! `long`. On RV32 it is a *pair*: an expression leaves its low word in `a0`
-//! and its high word in `a1`, a push takes 8 bytes (the low word at the lower
-//! address, as in memory), and a binary operator finds its left operand in
-//! `a2:a3` and its right one in `a0:a1` (a narrower operand is extended into
-//! the other word by its signedness: `srai a1, a0, 31`, or `li a1, 0`). The
-//! operations are inline, as LLVM expands them on RV32 with M:
-//!
-//! ```text
-//!   add  a0, a2, a0           # +: the low words,
-//!   sltu t0, a0, a2           #    their carry,
-//!   add  a1, a3, a1           #    the high words
-//!   add  a1, a1, t0
-//!   mul  t0, a3, a0           # *: the cross products' low words, and the
-//!   mul  t1, a2, a1           #    high word of lo * lo (mulhu)
-//!   add  t0, t0, t1
-//!   mulhu t1, a2, a0
-//!   add  a1, t0, t1
-//!   mul  a0, a2, a0
-//! ```
-//!
-//! `-` borrows the same way; `& | ^ ~` work word by word; a comparison
-//! compares the high words (signed or not) and, when they are equal, the low
-//! ones unsigned; a shift by `n` (its low 6 bits) moves a word across when
-//! `n` reaches 32 and shifts the bits crossing between the words otherwise
-//! ([`FuncGen::pair_shift`]); a condition is `or a0, a0, a1`. Division and
-//! remainder call libgcc's routines (`__divdi3`, `__udivdi3`, `__moddi3`,
-//! `__umoddi3`, with the operands in `a0:a1` and `a2:a3`), which the C
-//! library and the kernel provide (`kernel/user/lib/libgcc.c`), as clang's
-//! code calls them too. A conversion to a narrower type takes the low word;
-//! one to `_Bool` both. Pairs travel as the psABI says ([`crate::abi`]): in
-//! two argument words, from an even one on the stack and, when variadic, in
-//! an even register; a result in `a0` and `a1`.
+//! A `long long` is 64 bits, a register like a `long`. (On RV32, until #159,
+//! it was a register pair, with libgcc's routines for division.)
 //!
 //! A `_Bool` holds 0 or 1: converting to it is `snez a0, a0` (from a pointer
 //! too), and it is loaded with `lbu`.
@@ -184,20 +149,19 @@
 //!   `f().m` is a member access like any other.
 //!
 //! Copies go in units of the struct's alignment, at most a register
-//! (`ld`/`sd` on RV64, `lw`/`sw`, `lhu`/`sh`, `lbu`/`sb`), so no access is
+//! (`ld`/`sd`, `lw`/`sw`, `lhu`/`sh`, `lbu`/`sb`), so no access is
 //! misaligned: unrolled for up to 16 units, a loop for more. Struct locals
 //! get slots aligned to a register that are a whole number of registers
-//! long, so that a struct arriving in registers can be stored with `sw`
-//! (`sd`).
+//! long, so that a struct arriving in registers can be stored with `sd`.
 //!
-//! ## Calling convention (RISC-V ILP32 and LP64)
+//! ## Calling convention (RISC-V LP64)
 //!
 //! * Arguments go in `a0-a7`, left to right, and the words past `a7` on the
 //!   stack, from `0(sp)` up at the call; the result comes back in `a0`.
 //!   Arguments and results narrower than 32 bits travel widened by their type
-//!   (sema's casts do that), and on RV64 32-bit ones sign-extended (the
+//!   (sema's casts do that), and 32-bit ones sign-extended (the
 //!   32-bit invariant). The arguments `...` takes travel the same way.
-//! * A struct of up to two words (8 bytes on RV32, 16 on RV64) travels in one
+//! * A struct of up to two words (16 bytes) travels in one
 //!   or two registers, its bytes as they lie in memory: it is loaded from its
 //!   address word by word (put together from smaller aligned pieces, each
 //!   zero-extended, if it is not aligned to a register). A
@@ -221,8 +185,8 @@
 //! ```text
 //!            caller's frame
 //!   s0 ->  +------------------+  (16-byte aligned: sp before the call)
-//!          | saved ra         |  -4(s0)
-//!          | caller's s0      |  -8(s0)
+//!          | saved ra         |  -8(s0)
+//!          | caller's s0      |  -16(s0)
 //!          | local #0         |           parameters first: a0 is stored here,
 //!          | local #1         |           a1 next, and so on
 //!          | ...              |
@@ -232,16 +196,14 @@
 //! ```
 //!
 //! The caller's stack arguments, if any, are right above: word 8 of the
-//! arguments at `0(s0)`, word 9 at `4(s0)`, and so on.
+//! arguments at `0(s0)`, word 9 at `8(s0)`, and so on, as clang lays out its
+//! frames.
 //!
-//! On RV64 each of these is a doubleword: `ra` at `-8(s0)`, the caller's
-//! `s0` at `-16(s0)` (`sd`/`ld`), the locals from `-16(s0)` down, and the
-//! stack arguments at `0(s0)`, `8(s0)`, ..., as clang lays out its frames.
-//!
-//! Locals are placed downwards from `-8(s0)` in order, each at the next
-//! offset aligned for its type (arrays at least to 4 bytes): an `int` takes the
-//! 4 bytes below the previous local, a `char` 1 byte, an `int a[3]` 12 bytes.
-//! With only `int`s, local `#i` is at `-(12 + 4*i)(s0)`. Sema gives every
+//! Locals are placed downwards from `-16(s0)` in order, each at the next
+//! offset aligned for its type (arrays and structs at least to 8 bytes): an
+//! `int` takes the 4 bytes below the previous local, a `char` 1 byte, an
+//! `int a[3]` 12 bytes. With only `int`s, local `#i` is at
+//! `-(20 + 4*i)(s0)`. Sema gives every
 //! declaration in the function its own local (shadowed names included), so a
 //! slot never has to be reused and scopes cost nothing here.
 //!
@@ -260,11 +222,11 @@
 //!
 //! ```text
 //!   f:  addi  sp, sp, -16          .L.return.f:              # result in a0
-//!       sw    ra, 12(sp)               addi  sp, s0, -16
-//!       sw    s0, 8(sp)                lw    ra, 12(sp)
-//!       addi  s0, sp, 16               lw    s0, 8(sp)
+//!       sd    ra, 8(sp)                addi  sp, s0, -16
+//!       sd    s0, 0(sp)                ld    ra, 8(sp)
+//!       addi  s0, sp, 16               ld    s0, 0(sp)
 //!       addi  sp, sp, -(frame - 16)    addi  sp, sp, 16
-//!       sw    a0, -12(s0)  # params    ret
+//!       sw    a0, -20(s0)  # params    ret
 //! ```
 //!
 //! A struct parameter that came in registers is stored word by word; one
@@ -282,21 +244,19 @@
 //! argument then lies in one run of words from there up, as if all had been
 //! passed on the stack, and a `va_list` is a plain pointer that walks it (as
 //! clang does). `ra` and `s0` go below the saved registers, and the fixed
-//! part of the frame grows to a multiple of 16 that holds them all (on RV64
-//! each saved register takes 8 bytes, `-8(s0)` .. `-56(s0)` for `a7` ..
-//! `a1`):
+//! part of the frame grows to a multiple of 16 that holds them all:
 //!
 //! ```text
 //!   int f(int n, ...)                    s0 ->  +-----------+
-//!     addi  sp, sp, -48                         | a7 .. a1  |  -4(s0) .. -28(s0)
-//!     sw    ra, 16(sp)    # -32(s0)             | saved ra  |  -32(s0)
-//!     sw    s0, 12(sp)    # -36(s0)             | caller s0 |  -36(s0)
-//!     addi  s0, sp, 48                          | n         |  -40(s0), locals...
-//!     sw    a1, -28(s0)   ... sw a7, -4(s0)
+//!     addi  sp, sp, -80                         | a7 .. a1  |  -8(s0) .. -56(s0)
+//!     sd    ra, 16(sp)    # -64(s0)             | saved ra  |  -64(s0)
+//!     sd    s0, 8(sp)     # -72(s0)             | caller s0 |  -72(s0)
+//!     addi  s0, sp, 80                          | n         |  -76(s0), locals...
+//!     sd    a1, -56(s0)   ... sd a7, -8(s0)
 //! ```
 //!
-//! `va_start(ap, n)` points `ap` at the first variadic word (`-28(s0)` here;
-//! `4*k(s0)` when the named parameters take `8 + k` words, all registers and
+//! `va_start(ap, n)` points `ap` at the first variadic word (`-56(s0)` here;
+//! `8*k(s0)` when the named parameters take `8 + k` words, all registers and
 //! some stack). `va_arg(ap, T)` takes the words of a `T` at `ap` and moves
 //! `ap` past them: a scalar is loaded, a small struct's value is its address
 //! right there, and a big struct's is the word there (the address of the
@@ -308,12 +268,12 @@
 //!
 //! ```text
 //!   <l>                    # a0 = l
-//!   addi  sp, sp, -4       # push a0: <r> may need a0 (and any register);
-//!   sw    a0, 0(sp)        #   on RV64 -8 and `sd`
+//!   addi  sp, sp, -8       # push a0: <r> may need a0 (and any register)
+//!   sd    a0, 0(sp)
 //!   <r>                    # a0 = r
-//!   lw    a1, 0(sp)        # pop: a1 = l
-//!   addi  sp, sp, 4
-//!   sub   a0, a1, a0       # a0 = l - r
+//!   ld    a1, 0(sp)        # pop: a1 = l
+//!   addi  sp, sp, 8
+//!   subw  a0, a1, a0       # a0 = l - r, an int
 //! ```
 //!
 //! Comparisons give 0 or 1 with `slt` (`l < r`), `slt` with the operands
@@ -329,8 +289,8 @@
 //! difference by it.
 //!
 //! An integer constant expression (C99 6.6) is one constant, of any integer
-//! type, at both widths: `8 * (1024ul * 1024ul)` is `li a0, 8388608`, and
-//! `3LL << 40` on RV32 is `li a0, 0` and `li a1, 768` (a pair). clang does
+//! type: `8 * (1024ul * 1024ul)` is `li a0, 8388608`, and `3LL << 40` is
+//! `li a0, 3298534883328`. clang does
 //! the same at `-O0`, since its front end folds them whatever the type.
 //! [`crate::consteval`] works the value out with the semantics above (the
 //! usual arithmetic conversions, wrapping at the type's width, shift amounts
@@ -352,11 +312,11 @@
 //! ```text
 //!   x = 5;   (local)          a[i] = 5;
 //!     li    a0, 5               <address of a[i]>
-//!     sw    a0, -12(s0)         addi sp, sp, -4    # push it
-//!                               sw   a0, 0(sp)
+//!     sw    a0, -24(s0)         addi sp, sp, -8    # push it
+//!                               sd   a0, 0(sp)
 //!                               li   a0, 5
-//!                               lw   a1, 0(sp)     # pop it
-//!                               addi sp, sp, 4
+//!                               ld   a1, 0(sp)     # pop it
+//!                               addi sp, sp, 8
 //!                               sw   a0, 0(a1)
 //! ```
 //!
@@ -380,7 +340,7 @@
 //! When the arguments take more than `a0-a7`, every one of them is pushed;
 //! then `sp` goes down far enough for the stack words (keeping it aligned),
 //! each stack word is copied from its pushed argument to its place at
-//! `0(sp)`, `4(sp)`, ..., and the register words are loaded from theirs. One
+//! `0(sp)`, `8(sp)`, ..., and the register words are loaded from theirs. One
 //! `addi` after the call frees the words and the pushed arguments together.
 //!
 //! ## Initializers
@@ -405,8 +365,8 @@
 //!
 //! Globals and `static` locals are data: the initializer, a constant
 //! expression, is written out with `.byte`, `.half`, `.word`, `.quad` (8
-//! bytes, as clang writes them: a `long` or a pointer on RV64; `.word
-//! sym+off` or `.quad sym+off` for an address, which the linker fills in),
+//! bytes, as clang writes them: a `long` or a pointer; `.quad sym+off` for
+//! an address, which the linker fills in),
 //! `.ascii` and `.zero` (struct padding too), after a `.balign` for the
 //! type. A `static` local's symbol is
 //! `function.name`, a local symbol (no `.globl`). Each string literal gets a
@@ -466,7 +426,7 @@ use crate::consteval::{self, Base, Const};
 use crate::debug::{DebugInfo, Lines, Location, Scope, Var};
 use crate::elide;
 use crate::sema::arith_type;
-use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
+use crate::types::{FuncType, IntKind, Type, PTR_SIZE};
 use crate::{Error, Pos};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -499,7 +459,6 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
         }
     }
 
-    let xlen = prog.xlen;
     // The definitions, in the order they come; a compound literal of the
     // file's scope is emitted by the initializer that names it.
     let mut defs = Vec::new();
@@ -512,13 +471,12 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
     }
     let n = defs.len();
     let mut file = FileGen {
-        xlen,
         out: String::new(),
         section: "",
         pieces: Vec::new(),
         labels: 0,
         strings: Vec::new(),
-        debug: debug.map(|(info, names)| Lines::new(info, names, xlen)),
+        debug: debug.map(|(info, names)| Lines::new(info, names)),
         by_symbol: defs
             .iter()
             .enumerate()
@@ -655,33 +613,19 @@ impl<'a> Def<'a> {
 /// explicitly, `(void *)0` is converted as any pointer is (a bit cast), and
 /// visited. (In a static initializer clang's `ConstExprEmitter` does visit
 /// the operand of such a cast: [`FileGen::initializer_casts`].)
-fn null_to_pointer(e: &Expr, xlen: Xlen) -> bool {
+fn null_to_pointer(e: &Expr) -> bool {
     let ExprKind::Cast { x, implicit, .. } = &e.kind else {
         return false;
     };
-    e.ty.is_ptr() && consteval::is_null_pointer(x, xlen) && (x.ty.is_integer() || *implicit)
+    e.ty.is_ptr() && consteval::is_null_pointer(x) && (x.ty.is_integer() || *implicit)
 }
 
-/// The bytes of a register, and of an argument word: 4 on RV32, 8 on RV64.
-fn word(x: Xlen) -> i32 {
-    ptr_size(x) as i32
-}
+/// The bytes of a register, and of an argument word: 8.
+const WORD: i32 = abi::WORD as i32;
 
 /// `ra` and the caller's `s0` take the top two words of every frame (below
-/// the saved argument registers of a variadic function): 8 bytes on RV32,
-/// 16 on RV64.
-fn saved_regs(x: Xlen) -> i32 {
-    2 * word(x)
-}
-
-/// The load and the store of a whole register: `lw`/`sw` on RV32, `ld`/`sd`
-/// on RV64.
-fn word_ops(x: Xlen) -> (&'static str, &'static str) {
-    match x {
-        Xlen::Rv32 => ("lw", "sw"),
-        Xlen::Rv64 => ("ld", "sd"),
-    }
-}
+/// the saved argument registers of a variadic function): 16 bytes.
+const SAVED_REGS: i32 = 2 * WORD;
 
 /// The largest frame: offsets from `s0` and the frame size must stay `i32`s.
 const MAX_FRAME: i64 = i32::MAX as i64 & !15;
@@ -691,7 +635,7 @@ const MAX_FRAME: i64 = i32::MAX as i64 & !15;
 /// registers): its offset from `s0` (0 for one not used, which has no
 /// slot), and the frame size (a multiple of 16, the convention's stack
 /// alignment). `None` if the frame would be larger than [`MAX_FRAME`].
-fn layout(locals: &[Local], used: &[bool], header: i32, x: Xlen) -> Option<(Vec<i32>, i32)> {
+fn layout(locals: &[Local], used: &[bool], header: i32) -> Option<(Vec<i32>, i32)> {
     // In i64: each local is at most `i32::MAX` bytes, but their sum need not be.
     let mut off = -i64::from(header);
     let mut offsets = Vec::with_capacity(locals.len());
@@ -700,16 +644,16 @@ fn layout(locals: &[Local], used: &[bool], header: i32, x: Xlen) -> Option<(Vec<
             offsets.push(0);
             continue;
         }
-        let mut size = l.ty.size(x).expect("sema: locals have complete types");
+        let mut size = l.ty.size().expect("sema: locals have complete types");
         // Arrays and structs are aligned to a register so that clearing them
-        // can use `sw` (`sd` on RV64), and a struct's slot is a whole number
+        // can use `sd`, and a struct's slot is a whole number
         // of registers, so that one arriving in registers can be stored with
         // the same (see [`abi`]).
-        let w = word(x) as u32;
+        let w = WORD as u32;
         let align = if l.ty.is_array() || l.ty.is_record() {
-            l.ty.align(x).max(w)
+            l.ty.align().max(w)
         } else {
-            l.ty.align(x)
+            l.ty.align()
         };
         if l.ty.is_record() {
             size = size.next_multiple_of(w);
@@ -736,10 +680,10 @@ struct ArgLayout {
 }
 
 impl ArgLayout {
-    fn new(ft: &FuncType, args: &[Expr], x: Xlen) -> ArgLayout {
+    fn new(ft: &FuncType, args: &[Expr]) -> ArgLayout {
         let mut types = ft.params.clone();
         types.extend(args[ft.params.len()..].iter().map(|a| a.ty.clone()));
-        let (words, used) = abi::call_arguments(&ft.ret, &types, ft.params.len(), x);
+        let (words, used) = abi::call_arguments(&ft.ret, &types);
         ArgLayout { types, words, used }
     }
 }
@@ -751,11 +695,11 @@ enum ArgWord {
     Stack(i32),
 }
 
-fn arg_word(n: usize, x: Xlen) -> ArgWord {
+fn arg_word(n: usize) -> ArgWord {
     if n < abi::ARG_REGS {
         ArgWord::Reg(format!("a{n}"))
     } else {
-        ArgWord::Stack(word(x) * (n - abi::ARG_REGS) as i32)
+        ArgWord::Stack(WORD * (n - abi::ARG_REGS) as i32)
     }
 }
 
@@ -765,12 +709,12 @@ fn fits_imm12(v: impl Into<i64>) -> bool {
 }
 
 /// The load that brings a value of type `ty` into a register, widened.
-fn load_op(ty: &Type, x: Xlen) -> &'static str {
+fn load_op(ty: &Type) -> &'static str {
     match ty.unqual() {
         // `_Bool` holds 0 or 1: `lbu`.
-        // An `int` or `unsigned int` is loaded sign-extended on RV64 too:
+        // An `int` or `unsigned int` is loaded sign-extended:
         // see "The 32-bit invariant" above.
-        Type::Int(k) => match (k.size(x), k.signed()) {
+        Type::Int(k) => match (k.size(), k.signed()) {
             (1, true) => "lb",
             (1, false) => "lbu",
             (2, true) => "lh",
@@ -778,26 +722,20 @@ fn load_op(ty: &Type, x: Xlen) -> &'static str {
             (4, _) => "lw",
             _ => "ld",
         },
-        Type::Ptr(_) => word_ops(x).0,
+        Type::Ptr(_) => "ld",
         _ => unreachable!("no value of type '{ty}' is loaded"),
     }
 }
 
 /// The store that writes a value of type `ty` (its low bytes) to memory.
-fn store_op(ty: &Type, x: Xlen) -> &'static str {
-    match ty.size(x) {
+fn store_op(ty: &Type) -> &'static str {
+    match ty.size() {
         Some(1) => "sb",
         Some(2) => "sh",
         Some(4) => "sw",
         Some(8) => "sd",
         _ => unreachable!("no value of type '{ty}' is stored"),
     }
-}
-
-/// The low and high words of a 64-bit value, as `li` takes them.
-fn pair_image(v: i128) -> (i32, i32) {
-    let v = v as i64;
-    (v as i32, (v >> 32) as i32)
 }
 
 /// `log2(n)` if `n` is a power of two.
@@ -808,8 +746,6 @@ fn log2(n: u32) -> Option<u32> {
 /// What is shared by the whole file: the output, the label counter and the
 /// string literals seen so far.
 struct FileGen<'a> {
-    /// The target.
-    xlen: Xlen,
     /// The text being written: the piece of a symbol's output in
     /// `section` (or the whole file, at the end).
     out: String,
@@ -962,7 +898,6 @@ impl<'a> FileGen<'a> {
 
     /// Generates function `f`.
     fn function(&mut self, f: &'a Function) -> Result<(), Error> {
-        let xlen = self.xlen;
         let body = f.body.as_ref().expect("a definition has a body");
         self.create(&f.name);
         // A variadic function keeps the argument registers its named
@@ -970,17 +905,16 @@ impl<'a> FileGen<'a> {
         let Type::Func(ft) = f.ty() else {
             unreachable!("a function's type")
         };
-        let (_, named_words) = abi::arguments(&ft, xlen);
+        let (_, named_words) = abi::arguments(&ft);
         let va_save = if f.variadic {
-            word(xlen) * (abi::ARG_REGS - named_words.min(abi::ARG_REGS)) as i32
+            WORD * (abi::ARG_REGS - named_words.min(abi::ARG_REGS)) as i32
         } else {
             0
         };
-        let header = saved_regs(xlen) + va_save;
+        let header = SAVED_REGS + va_save;
         let n = f.locals.len();
         let gen = |file: &mut FileGen<'a>, slots: Vec<bool>, (offsets, frame): (Vec<i32>, i32)| {
             let mut g = FuncGen {
-                xlen,
                 func: f,
                 offsets,
                 frame,
@@ -1012,13 +946,13 @@ impl<'a> FileGen<'a> {
         let debug = self.debug.take();
         let (labels, strings) = (self.labels, self.strings.len());
         self.dry = true;
-        let all = layout(&f.locals, &vec![true; n], header, xlen).unwrap_or((vec![0; n], 0));
+        let all = layout(&f.locals, &vec![true; n], header).unwrap_or((vec![0; n], 0));
         let (_, used) = gen(self, vec![true; n], all);
         self.dry = false;
         self.debug = debug;
         self.labels = labels;
         self.strings.truncate(strings);
-        let Some(frame) = layout(&f.locals, &used, header, xlen) else {
+        let Some(frame) = layout(&f.locals, &used, header) else {
             let msg = format!("the locals of '{}' need a stack frame larger than 2 GiB", f.name);
             return Err(Error::new(f.pos, msg));
         };
@@ -1082,9 +1016,7 @@ impl<'a> FileGen<'a> {
         } else {
             self.piece(".bss");
         }
-        let size =
-            d.ty.size(self.xlen)
-                .expect("sema: definitions have complete types");
+        let size = d.ty.size().expect("sema: definitions have complete types");
         let storage = if d.storage == Storage::Static {
             "static "
         } else {
@@ -1099,8 +1031,8 @@ impl<'a> FileGen<'a> {
         if d.storage != Storage::Static && !sym.contains('.') {
             let _ = writeln!(self.out, "    .globl {sym}");
         }
-        if d.ty.align(self.xlen) > 1 {
-            let _ = writeln!(self.out, "    .balign {}", d.ty.align(self.xlen));
+        if d.ty.align() > 1 {
+            let _ = writeln!(self.out, "    .balign {}", d.ty.align());
         }
         // An object symbol with its size, as for functions: debuggers and
         // tests find what an address belongs to from the symbol table.
@@ -1121,7 +1053,7 @@ impl<'a> FileGen<'a> {
         match (ty.unqual(), init) {
             // A subobject a designator skipped: zero.
             (_, Init::List(items, _)) if items.is_empty() => {
-                out.push(format!(".zero {}", ty.size(self.xlen).expect("a complete type")));
+                out.push(format!(".zero {}", ty.size().expect("a complete type")));
             }
             (Type::Record(r), Init::List(items, _)) if r.union => {
                 // The member the union is initialized with is the last item.
@@ -1129,7 +1061,7 @@ impl<'a> FileGen<'a> {
                 let k = items.len() - 1;
                 let m = &body.members[k];
                 self.data(&m.ty, &items[k], out);
-                let size = m.ty.size(self.xlen).expect("complete member");
+                let size = m.ty.size().expect("complete member");
                 if body.size > size {
                     out.push(format!(".zero {}", body.size - size));
                 }
@@ -1145,7 +1077,7 @@ impl<'a> FileGen<'a> {
                         out.push(format!(".zero {}", m.offset - at));
                     }
                     self.data(&m.ty, item, out);
-                    at = m.offset + m.ty.size(self.xlen).expect("complete member");
+                    at = m.offset + m.ty.size().expect("complete member");
                 }
                 if body.size > at {
                     out.push(format!(".zero {}", body.size - at));
@@ -1155,7 +1087,7 @@ impl<'a> FileGen<'a> {
                 for item in items {
                     self.data(elem, item, out);
                 }
-                let rest = (*n as usize - items.len()) as u32 * elem.size(self.xlen).unwrap();
+                let rest = (*n as usize - items.len()) as u32 * elem.size().unwrap();
                 if rest > 0 {
                     out.push(format!(".zero {rest}"));
                 }
@@ -1176,10 +1108,10 @@ impl<'a> FileGen<'a> {
             }
             (_, Init::Expr(e)) => {
                 self.initializer_casts(e);
-                let value = consteval::eval(e, self.xlen).expect("sema: static initializers are constant");
+                let value = consteval::eval(e).expect("sema: static initializers are constant");
                 // `.quad` for 8 bytes, as clang writes it (merlin-as also
                 // reads `.dword` and `.8byte`).
-                let directive = match ty.size(self.xlen) {
+                let directive = match ty.size() {
                     Some(1) => ".byte",
                     Some(2) => ".half",
                     Some(4) => ".word",
@@ -1189,7 +1121,7 @@ impl<'a> FileGen<'a> {
                 // 0xffffffff is 4294967295, a negative address offset wraps.
                 let operand = match value {
                     Const::Int(v, _) => v.to_string(),
-                    Const::Addr { base: None, offset } => IntKind::ULong.wrap(offset, self.xlen).to_string(),
+                    Const::Addr { base: None, offset } => IntKind::ULong.wrap(offset).to_string(),
                     Const::Addr {
                         base: Some(base),
                         offset,
@@ -1240,7 +1172,7 @@ impl<'a> FileGen<'a> {
                 }
                 let (from, to) = (x.ty.unqual(), e.ty.unqual());
                 let integral = from.is_integer() && to.is_integer() && *to != Type::Int(IntKind::Bool);
-                if from.similar(to) || integral || null_to_pointer(e, self.xlen) {
+                if from.similar(to) || integral || null_to_pointer(e) {
                     self.initializer_casts(x);
                 }
             }
@@ -1337,8 +1269,6 @@ enum Place {
 /// Per-function code generator state. `'a` is the tree's lifetime, `'f` the
 /// (shorter) borrow of the file's state.
 struct FuncGen<'a, 'f> {
-    /// The target.
-    xlen: Xlen,
     func: &'a Function,
     /// Offset from `s0` of each local.
     offsets: Vec<i32>,
@@ -1393,7 +1323,7 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     /// `li reg, value`: one instruction for small values, two (`lui` and
-    /// `addi`, `addiw` on RV64) for others that fit 32 bits. A 64-bit value
+    /// `addiw`) for others that fit 32 bits. A 64-bit value
     /// takes up to 8 instructions (LLVM's RISCVMatInt, which merlin-as
     /// follows), and [`relax_branches`] counts that many.
     fn li(&mut self, reg: &str, value: i64) {
@@ -1471,123 +1401,43 @@ impl<'a> FuncGen<'a, '_> {
 
     /// How a register holds the value `v` of type `k`: its bits, widened to
     /// the register as [`Self::convert`] keeps values. A 32-bit type is
-    /// sign-extended, `unsigned int` too on RV64 (the 32-bit invariant), so
+    /// sign-extended, `unsigned int` too (the 32-bit invariant), so
     /// an `unsigned` 0xffffffff is -1; a narrower one holds its value.
     fn image(&self, v: i128, k: IntKind) -> i64 {
-        let v = k.wrap(v, self.xlen);
-        match k.size(self.xlen) {
+        let v = k.wrap(v);
+        match k.size() {
             4 => v as i32 as i64,
             _ => v as i64,
         }
     }
 
-    /// Whether a value of type `ty` is a register pair: a `long long` on
-    /// RV32, its low word in `a0` and its high word in `a1` (see "Register
-    /// pairs").
-    fn is_pair(&self, ty: &Type) -> bool {
-        self.xlen == Xlen::Rv32 && ty.int_kind().is_some_and(|k| k.size(self.xlen) == 8)
-    }
-
-    /// `a0` (and `a1`) = the constant `v` of type `k`.
+    /// `a0` = the constant `v` of type `k`.
     fn constant(&mut self, v: i128, k: IntKind) {
-        if self.is_pair(&Type::Int(k)) {
-            let (lo, hi) = pair_image(k.wrap(v, self.xlen));
-            self.li("a0", lo.into());
-            self.li("a1", hi.into());
-        } else {
-            self.li("a0", self.image(v, k));
-        }
-    }
-
-    /// Evaluates a condition into `a0`, nonzero when it holds: a pair is
-    /// nonzero when either word is (`or a0, a0, a1`).
-    fn test(&mut self, e: &'a Expr) {
-        self.expr(e);
-        if self.is_pair(&e.ty) {
-            self.ins("or", "a0, a0, a1");
-        }
-    }
-
-    /// Pushes the value of type `ty`: `a0`, or a pair's two words (the low
-    /// one at the lower address, as in memory).
-    fn push_value(&mut self, ty: &Type) {
-        if self.is_pair(ty) {
-            self.ins("addi", "sp, sp, -8");
-            self.ins("sw", "a0, 0(sp)");
-            self.ins("sw", "a1, 4(sp)");
-            self.depth += 2;
-        } else {
-            self.push();
-        }
-    }
-
-    /// Pops a pushed pair into `lo` and `hi`.
-    fn pop_pair(&mut self, lo: &str, hi: &str) {
-        self.ins("lw", format!("{lo}, 0(sp)"));
-        self.ins("lw", format!("{hi}, 4(sp)"));
-        self.ins("addi", "sp, sp, 8");
-        self.depth -= 2;
-    }
-
-    /// Pops the left operand of `l op r`, of type `l`: into `a1`, or a pair
-    /// into `a2` and `a3` (the right one is in `a0`, or `a0:a1`). An operand
-    /// the operation widens to a pair goes to `a2`, so as not to clobber the
-    /// right one's high word ([`Self::binary`] extends it into `a3`); a
-    /// shift uses only its amount's low word.
-    fn pop_left(&mut self, op: BinOp, l: &Type, r: &Type) {
-        if self.is_pair(l) {
-            self.pop_pair("a2", "a3");
-        } else if self.is_pair(r) && l.is_integer() && !matches!(op, BinOp::Shl | BinOp::Shr) {
-            self.pop("a2");
-        } else {
-            self.pop("a1");
-        }
-    }
-
-    /// `a0:a1 += delta` (a `++` or `--` of a long long on RV32).
-    fn pair_step(&mut self, delta: i32) {
-        self.li("a2", delta.into());
-        self.li("a3", if delta < 0 { -1 } else { 0 });
-        self.pair_arith(BinOp::Add, false);
+        self.li("a0", self.image(v, k));
     }
 
     /// Whether arithmetic in the (promoted) type `ty` is 32-bit arithmetic
-    /// on 64-bit registers: an `int` or `unsigned int` on RV64, which the W
+    /// on 64-bit registers: an `int` or `unsigned int`, which the W
     /// instructions do (`addw`, `sllw`, `divuw`...), each leaving its result
     /// sign-extended.
     fn is_w(&self, ty: &Type) -> bool {
-        self.xlen == Xlen::Rv64 && ty.int_kind().is_some_and(|k| k.size(self.xlen) == 4)
+        ty.int_kind().is_some_and(|k| k.size() == 4)
     }
 
     // ---- the stack of temporaries ----
 
-    /// The bytes of a register: 4 on RV32, 8 on RV64.
-    fn word(&self) -> i32 {
-        word(self.xlen)
-    }
-
-    /// The load of a whole register, `lw` or `ld`.
-    fn load_reg(&self) -> &'static str {
-        word_ops(self.xlen).0
-    }
-
-    /// The store of a whole register, `sw` or `sd`.
-    fn store_reg(&self) -> &'static str {
-        word_ops(self.xlen).1
-    }
-
     /// Pushes `a0`: a whole register.
     fn push(&mut self) {
-        let w = self.word();
+        let w = WORD;
         self.ins("addi", format!("sp, sp, {}", -w));
-        self.ins(self.store_reg(), "a0, 0(sp)");
+        self.ins("sd", "a0, 0(sp)");
         self.depth += 1;
     }
 
     /// Pops the top temporary into `reg`.
     fn pop(&mut self, reg: &str) {
-        let w = self.word();
-        self.ins(self.load_reg(), format!("{reg}, 0(sp)"));
+        let w = WORD;
+        self.ins("ld", format!("{reg}, 0(sp)"));
         self.ins("addi", format!("sp, sp, {w}"));
         self.depth -= 1;
     }
@@ -1655,7 +1505,7 @@ impl<'a> FuncGen<'a, '_> {
         }
 
         // Prologue: save ra and the caller's s0, set up s0, make room for locals.
-        let (top, va_save, w, store) = (self.top(), self.va_save, self.word(), self.store_reg());
+        let (top, va_save, w, store) = (self.top(), self.va_save, WORD, "sd");
         self.add_imm("sp", "sp", -top);
         self.ins(store, format!("ra, {}(sp)", top - va_save - w));
         self.ins(store, format!("s0, {}(sp)", top - va_save - 2 * w));
@@ -1684,18 +1534,17 @@ impl<'a> FuncGen<'a, '_> {
             let off = self.offset(ret_ptr);
             self.access_local(store, "a0", off);
         }
-        let (words, _) = abi::arguments(&ft, self.xlen);
+        let (words, _) = abi::arguments(&ft);
         for (i, (p, (word, pass))) in f.params.iter().zip(words).enumerate() {
             let off = self.offsets[i];
             match pass {
                 Pass::Scalar => {
                     let reg = self.incoming(word);
-                    self.access_local(store_op(&p.ty, self.xlen), &reg, off);
+                    self.access_local(store_op(&p.ty), &reg, off);
                 }
                 // A small struct: its words, as they lie in memory (the slot is
-                // a whole number of words); a long long on RV32: its low word,
-                // then its high word.
-                Pass::Words(_) | Pass::Pair => {
+                // a whole number of words).
+                Pass::Words(_) => {
                     for i in 0..pass.registers() {
                         let reg = self.incoming(word + i);
                         self.access_local(store, &reg, off + w * i as i32);
@@ -1706,12 +1555,12 @@ impl<'a> FuncGen<'a, '_> {
                 // copy in place would do too; a copy keeps every parameter
                 // in the frame.)
                 Pass::Ref => {
-                    let src = match arg_word(word, self.xlen) {
+                    let src = match arg_word(word) {
                         ArgWord::Reg(r) => r,
                         // Every register argument is in its slot by now, so
                         // a0 is free.
                         ArgWord::Stack(at) => {
-                            self.ins(self.load_reg(), format!("a0, {at}(s0)"));
+                            self.ins("ld", format!("a0, {at}(s0)"));
                             "a0".to_string()
                         }
                     };
@@ -1741,16 +1590,13 @@ impl<'a> FuncGen<'a, '_> {
         self.loc(f.end);
         if !returned {
             self.li("a0", 0);
-            if self.is_pair(&f.ret) {
-                self.li("a1", 0);
-            }
         }
 
         // Epilogue: the result is in a0. Free the frame from s0 (whatever its
         // size), restore ra and s0, return.
         let ret = self.ret_label.clone();
         self.label(&ret);
-        let load = self.load_reg();
+        let load = "ld";
         self.ins("addi", format!("sp, s0, {}", -top));
         self.ins(load, format!("ra, {}(sp)", top - va_save - w));
         self.ins(load, format!("s0, {}(sp)", top - va_save - 2 * w));
@@ -1798,16 +1644,16 @@ impl<'a> FuncGen<'a, '_> {
     /// and a variadic function's saved registers, rounded up to 16 bytes so
     /// that `sp` stays aligned at every step. 16 for most functions.
     fn top(&self) -> i32 {
-        (saved_regs(self.xlen) + self.va_save + 15) & !15
+        (SAVED_REGS + self.va_save + 15) & !15
     }
 
     /// In the prologue: the register holding argument word `word`. A word
     /// on the stack is loaded into `t1` first.
     fn incoming(&mut self, word: usize) -> String {
-        match arg_word(word, self.xlen) {
+        match arg_word(word) {
             ArgWord::Reg(r) => r,
             ArgWord::Stack(at) => {
-                self.ins(self.load_reg(), format!("t1, {at}(s0)"));
+                self.ins("ld", format!("t1, {at}(s0)"));
                 "t1".to_string()
             }
         }
@@ -1945,7 +1791,7 @@ impl<'a> FuncGen<'a, '_> {
                 //                               <els>
                 //                             .L.end.N:
                 self.loc(s.pos);
-                self.test(cond);
+                self.expr(cond);
                 match els {
                     None => {
                         let end = self.new_label("end");
@@ -1981,7 +1827,7 @@ impl<'a> FuncGen<'a, '_> {
                     self.kept_casts(cond);
                 } else {
                     self.loc(cond.pos);
-                    self.test(cond);
+                    self.expr(cond);
                     self.branch_if_zero(&brk);
                 }
                 self.loop_body(body, &cont, &brk);
@@ -2006,7 +1852,7 @@ impl<'a> FuncGen<'a, '_> {
                     self.kept_casts(cond);
                 } else {
                     self.loc(cond.pos);
-                    self.test(cond);
+                    self.expr(cond);
                     self.branch_if_nonzero(&top);
                 }
                 self.label(&brk);
@@ -2036,7 +1882,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.label(&top);
                 if let Some(cond) = cond {
                     self.loc(cond.pos);
-                    self.test(cond);
+                    self.expr(cond);
                     self.branch_if_zero(&brk);
                 }
                 self.loop_body(body, &cont, &brk);
@@ -2094,7 +1940,7 @@ impl<'a> FuncGen<'a, '_> {
                 // On a constant condition, only the statements that run, as
                 // clang has them, when they can be picked out (see [`elide`]):
                 // no compares, no labels, no `break`.
-                if let Some(v) = consteval::condition(cond, self.xlen) {
+                if let Some(v) = consteval::condition(cond) {
                     if let Some(run) = elide::case_statements(body, v, cases, *default) {
                         self.elided_cases
                             .extend(cases.iter().map(|&(_, id)| id).chain(*default));
@@ -2108,20 +1954,8 @@ impl<'a> FuncGen<'a, '_> {
                 let brk = self.new_label("break");
                 self.expr(cond);
                 let kind = cond.ty.int_kind().expect("sema: an integer condition");
-                let pair = self.is_pair(&cond.ty);
                 for &(value, id) in cases {
                     let target = self.case_label(id);
-                    if pair {
-                        // A long long on RV32: equal when both words are.
-                        let (lo, hi) = pair_image(value);
-                        self.li("t0", lo.into());
-                        self.li("t1", hi.into());
-                        self.ins("xor", "t0, a0, t0");
-                        self.ins("xor", "t1, a1, t1");
-                        self.ins("or", "t0, t0, t1");
-                        self.branch("beqz", "t0", &target);
-                        continue;
-                    }
                     // The value as the register holds it: an `unsigned`
                     // 0xffffffff is `li t0, -1`.
                     self.li("t0", self.image(value, kind));
@@ -2185,7 +2019,7 @@ impl<'a> FuncGen<'a, '_> {
     /// one of addresses known not to be null or one another (`&g != 0`,
     /// [`consteval::condition`]).
     fn constant_condition(&self, e: &Expr) -> Option<bool> {
-        consteval::condition(e, self.xlen).map(|v| v != 0)
+        consteval::condition(e).map(|v| v != 0)
     }
 
     fn loop_body(&mut self, body: &'a Stmt, cont: &str, brk: &str) {
@@ -2214,11 +2048,11 @@ impl<'a> FuncGen<'a, '_> {
         match self.func.ret_ptr {
             Some(ret_ptr) => {
                 let off = self.offset(ret_ptr);
-                self.access_local(self.load_reg(), "a1", off);
+                self.access_local("ld", "a1", off);
                 self.copy("a1", "a0", ty);
             }
             None => {
-                let Pass::Words(n) = abi::classify(ty, self.xlen) else {
+                let Pass::Words(n) = abi::classify(ty) else {
                     unreachable!("a big result has a result address")
                 };
                 self.ins("mv", "t1, a0");
@@ -2242,7 +2076,7 @@ impl<'a> FuncGen<'a, '_> {
         // object, then store what the initializer gives.
         if d.ty.is_array() || (d.ty.is_record() && matches!(init, Init::List(..))) {
             self.comment(format!("{} = ...", d.ty.declare(&d.name)));
-            self.clear_local(off, d.ty.size(self.xlen).unwrap() as i32);
+            self.clear_local(off, d.ty.size().unwrap() as i32);
         }
         // `-g`: clang emits an array, struct or union with a constant
         // initializer as a static's (`EmitAutoVarInit`, its
@@ -2290,7 +2124,7 @@ impl<'a> FuncGen<'a, '_> {
                     ..
                 }),
             ) => self.constant_initializer(lit, init),
-            (_, Init::Expr(e)) => consteval::eval(e, self.xlen).is_some(),
+            (_, Init::Expr(e)) => consteval::eval(e).is_some(),
             (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
         }
     }
@@ -2329,7 +2163,7 @@ impl<'a> FuncGen<'a, '_> {
             ) => self.constant_visit(lit, init),
             (_, Init::Expr(e)) => {
                 self.file.initializer_casts(e);
-                consteval::eval(e, self.xlen).is_some()
+                consteval::eval(e).is_some()
             }
             (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
         }
@@ -2344,7 +2178,7 @@ impl<'a> FuncGen<'a, '_> {
             // is one of these.)
             (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
-                let size = elem.size(self.xlen).unwrap() as i32;
+                let size = elem.size().unwrap() as i32;
                 // `-g`: clang emits an array whose initializers hold more
                 // than 16 bytes as a constant if it can (`EmitArrayInit`'s
                 // `ConstantEmitter`), visiting them as a static
@@ -2399,10 +2233,10 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     /// Clears `size` bytes at `off(s0)` (aligned to a register, see
-    /// [`layout`]): register-sized stores (`sw`, `sd` on RV64), or a loop
+    /// [`layout`]): register-sized stores (`sd`), or a loop
     /// for more than 16 of them, then the last bytes.
     fn clear_local(&mut self, off: i32, size: i32) {
-        let (w, store) = (self.word(), self.store_reg());
+        let (w, store) = (WORD, "sd");
         let words = size / w;
         if words > 16 {
             self.add_imm("t1", "s0", off); //  t1 = start
@@ -2432,11 +2266,11 @@ impl<'a> FuncGen<'a, '_> {
         if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_) | ExprKind::Enumerator { .. }) {
             return false;
         }
-        let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
+        let Some(Const::Int(v, kind)) = consteval::eval(e) else {
             return false;
         };
-        // A disagreement would load the wrong registers (on RV32, a `long`
-        // where sema has a `long long` pair): checked in every build.
+        // A disagreement would give the constant the wrong width (an `int`
+        // where sema has a `long`): checked in every build.
         assert_eq!(e.ty.int_kind(), Some(kind), "consteval types it as sema does");
         self.kept_casts(e);
         self.constant(v, kind);
@@ -2456,9 +2290,9 @@ impl<'a> FuncGen<'a, '_> {
             return;
         }
         self.kept_cast(e);
-        let decided = |c: &Expr| consteval::condition(c, self.xlen).map(|v| v != 0);
+        let decided = |c: &Expr| consteval::condition(c).map(|v| v != 0);
         match &e.kind {
-            ExprKind::Cast { .. } if null_to_pointer(e, self.xlen) => {}
+            ExprKind::Cast { .. } if null_to_pointer(e) => {}
             ExprKind::Unary(_, x)
             | ExprKind::Cast { x, .. }
             | ExprKind::Addr(x)
@@ -2563,19 +2397,19 @@ impl<'a> FuncGen<'a, '_> {
             } => {
                 let place = self.place(target);
                 self.load_place(&place, &target.ty);
-                self.push_value(&target.ty);
+                self.push();
                 self.expr(value);
-                self.pop_left(*op, &target.ty, &value.ty); // the target's value, then value
+                self.pop("a1"); // the target's value, then value
                 let (t, v) = (target.ty.decay(), value.ty.decay());
                 self.binary(*op, &t, &v);
-                let result = arith_type(*op, &t, &v, self.xlen).expect("sema checked the operands");
+                let result = arith_type(*op, &t, &v).expect("sema checked the operands");
                 self.convert(&result, &target.ty);
                 self.store_place(place, &target.ty);
             }
             ExprKind::IncDec { inc, prefix, target } => {
                 let ty = &target.ty;
                 let step = match ty.unqual() {
-                    Type::Ptr(to) => to.size(self.xlen).expect("sema: pointer to a complete type") as i32,
+                    Type::Ptr(to) => to.size().expect("sema: pointer to a complete type") as i32,
                     _ => 1,
                 };
                 let delta = if *inc { step } else { -step };
@@ -2590,15 +2424,6 @@ impl<'a> FuncGen<'a, '_> {
                     self.store_place(place, ty);
                     if !prefix {
                         self.ins("mv", "a0, t1");
-                    }
-                    return;
-                }
-                if self.is_pair(ty) {
-                    // A long long on RV32: the step as a pair, added with carry.
-                    self.pair_step(delta);
-                    self.store_place(place, ty);
-                    if !prefix {
-                        self.pair_step(-delta);
                     }
                     return;
                 }
@@ -2621,7 +2446,7 @@ impl<'a> FuncGen<'a, '_> {
             ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r)
                 if self.constant_condition(l) == Some(*op == BinOp::LogAnd) =>
             {
-                self.test(r);
+                self.expr(r);
                 self.ins("snez", "a0, a0");
             }
             ExprKind::Binary(BinOp::LogAnd, l, r) => {
@@ -2631,54 +2456,33 @@ impl<'a> FuncGen<'a, '_> {
                 //   .L.and.N:
                 //     snez a0, a0         # 0 or 1
                 let end = self.new_label("and");
-                self.test(l);
+                self.expr(l);
                 self.branch_if_zero(&end);
-                self.test(r);
+                self.expr(r);
                 self.label(&end);
                 self.ins("snez", "a0, a0");
             }
             ExprKind::Binary(BinOp::LogOr, l, r) => {
                 // The mirror image: a nonzero l skips r and becomes 1.
                 let end = self.new_label("or");
-                self.test(l);
+                self.expr(l);
                 self.branch_if_nonzero(&end);
-                self.test(r);
+                self.expr(r);
                 self.label(&end);
                 self.ins("snez", "a0, a0");
             }
             ExprKind::Binary(op, l, r) => {
                 self.expr(l);
-                self.push_value(&l.ty);
+                self.push();
                 self.expr(r);
-                self.pop_left(*op, &l.ty, &r.ty);
-                // Now a1 = l, a0 = r (a2:a3 and a0:a1 for pairs).
+                self.pop("a1");
+                // Now a1 = l, a0 = r.
                 self.binary(*op, &l.ty.decay(), &r.ty.decay());
-            }
-            ExprKind::Unary(op, x) if self.is_pair(&e.ty) || (*op == UnOp::Not && self.is_pair(&x.ty)) => {
-                self.expr(x);
-                match op {
-                    // 0 - x: the high word borrows when the low one is not 0.
-                    UnOp::Neg => {
-                        self.ins("snez", "t0, a0");
-                        self.ins("neg", "a0, a0");
-                        self.ins("neg", "a1, a1");
-                        self.ins("sub", "a1, a1, t0");
-                    }
-                    UnOp::Plus => {}
-                    UnOp::Not => {
-                        self.ins("or", "a0, a0, a1");
-                        self.ins("seqz", "a0, a0");
-                    }
-                    UnOp::BitNot => {
-                        self.ins("not", "a0, a0");
-                        self.ins("not", "a1, a1");
-                    }
-                }
             }
             ExprKind::Unary(op, x) => {
                 self.expr(x);
                 match op {
-                    // sub a0, zero, a0 (`negw` for an `int` on RV64)
+                    // sub a0, zero, a0 (`negw` for an `int`)
                     UnOp::Neg if self.is_w(&e.ty) => self.ins("negw", "a0, a0"),
                     UnOp::Neg => self.ins("neg", "a0, a0"),
                     UnOp::Plus => {}                           // promotion only: nothing to do
@@ -2693,7 +2497,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             // A null pointer constant made a pointer: null, its operand
             // neither generated nor described, as clang has it.
-            ExprKind::Cast { .. } if null_to_pointer(e, self.xlen) => {
+            ExprKind::Cast { .. } if null_to_pointer(e) => {
                 self.kept_cast(e);
                 self.li("a0", 0);
             }
@@ -2722,7 +2526,7 @@ impl<'a> FuncGen<'a, '_> {
                 //   .L.end.N:
                 let else_ = self.new_label("else");
                 let end = self.new_label("end");
-                self.test(c);
+                self.expr(c);
                 self.branch_if_zero(&else_);
                 self.expr(a);
                 self.ins("j", &end);
@@ -2779,7 +2583,7 @@ impl<'a> FuncGen<'a, '_> {
         let off = self.offset(local.expect("sema gives compound literals a local"));
         self.comment(format!("compound literal ({ty})"));
         if ty.is_array() || ty.is_record() {
-            self.clear_local(off, ty.size(self.xlen).expect("complete") as i32);
+            self.clear_local(off, ty.size().expect("complete") as i32);
         }
         self.init_local(ty, init, off);
         self.add_imm("a0", "s0", off);
@@ -2790,7 +2594,7 @@ impl<'a> FuncGen<'a, '_> {
     /// among the caller's stack words, past the named ones.
     fn va_start(&mut self, ap: &'a Expr) {
         let place = self.place(ap);
-        let first = match arg_word(self.named_words, self.xlen) {
+        let first = match arg_word(self.named_words) {
             ArgWord::Reg(_) => -self.va_save,
             ArgWord::Stack(at) => at,
         };
@@ -2800,66 +2604,40 @@ impl<'a> FuncGen<'a, '_> {
 
     /// `va_arg(ap, ty)`: the argument is where ap points, and ap moves past
     /// its words. A scalar is loaded from there; a small struct's value is
-    /// its address, there; a big one's address is the word there.
-    ///
-    /// A pair aligned to two words (a long long on RV32) is at the next even
-    /// word, as the caller placed it ([`abi`]): `ap` is rounded up to 8 bytes
-    /// first, as clang's `va_arg` does.
+    /// its address, there; a big one's address is the word there. (merlin
+    /// has no type the psABI aligns to two words, which would start at an
+    /// even word: [`abi`].)
     fn va_arg(&mut self, ap: &'a Expr, ty: &Type) {
-        let pass = abi::classify(ty, self.xlen);
+        let pass = abi::classify(ty);
         let place = self.place(ap);
         self.load_place(&place, &ap.ty);
-        if abi::aligned_pair(ty, pass, self.xlen) {
-            let align = 2 * self.word();
-            self.ins("addi", format!("a0, a0, {}", align - 1));
-            self.ins("andi", format!("a0, a0, {}", -align));
-        }
         self.ins("mv", "t1, a0");
-        self.add_imm("a0", "a0", self.word() * pass.registers() as i32);
+        self.add_imm("a0", "a0", WORD * pass.registers() as i32);
         self.store_place(place, &ap.ty);
         match pass {
             // A narrower scalar is in the low bytes of its word.
-            Pass::Scalar => self.ins(load_op(ty, self.xlen), "a0, 0(t1)"),
-            Pass::Pair => {
-                self.ins("lw", "a0, 0(t1)");
-                self.ins("lw", "a1, 4(t1)");
-            }
+            Pass::Scalar => self.ins(load_op(ty), "a0, 0(t1)"),
             Pass::Words(_) => self.ins("mv", "a0, t1"),
-            Pass::Ref => self.ins(self.load_reg(), "a0, 0(t1)"),
+            Pass::Ref => self.ins("ld", "a0, 0(t1)"),
         }
     }
 
     /// Loads the value of type `ty` at the address in `a0`. Arrays, structs
     /// and functions are not loaded: their value is that address.
     fn load(&mut self, ty: &Type) {
-        if self.is_pair(ty) {
-            // The high word first: a0 holds the address.
-            self.ins("lw", "a1, 4(a0)");
-            self.ins("lw", "a0, 0(a0)");
-        } else if !ty.is_addressed() {
-            self.ins(load_op(ty, self.xlen), "a0, 0(a0)");
+        if !ty.is_addressed() {
+            self.ins(load_op(ty), "a0, 0(a0)");
         }
     }
 
-    /// Loads the local of type `ty` at `off(s0)`: into `a0`, or for a pair
-    /// into `a0` (low word) and `a1` (high).
+    /// Loads the local of type `ty` at `off(s0)` into `a0`.
     fn load_local(&mut self, ty: &Type, off: i32) {
-        if self.is_pair(ty) {
-            self.access_local("lw", "a0", off);
-            self.access_local("lw", "a1", off + 4);
-        } else {
-            self.access_local(load_op(ty, self.xlen), "a0", off);
-        }
+        self.access_local(load_op(ty), "a0", off);
     }
 
-    /// Stores `a0` (and for a pair `a1`) to the local of type `ty` at `off(s0)`.
+    /// Stores `a0` to the local of type `ty` at `off(s0)`.
     fn store_local(&mut self, ty: &Type, off: i32) {
-        if self.is_pair(ty) {
-            self.access_local("sw", "a0", off);
-            self.access_local("sw", "a1", off + 4);
-        } else {
-            self.access_local(store_op(ty, self.xlen), "a0", off);
-        }
+        self.access_local(store_op(ty), "a0", off);
     }
 
     /// Leaves the address of the lvalue `e` in `a0`.
@@ -2910,7 +2688,7 @@ impl<'a> FuncGen<'a, '_> {
         match place {
             Place::Frame(off) => self.load_local(ty, *off),
             Place::Pushed => {
-                self.ins(self.load_reg(), "a0, 0(sp)"); // the address, left on the stack
+                self.ins("ld", "a0, 0(sp)"); // the address, left on the stack
                 self.load(ty);
             }
         }
@@ -2920,69 +2698,35 @@ impl<'a> FuncGen<'a, '_> {
     fn store_place(&mut self, place: Place, ty: &Type) {
         match place {
             Place::Frame(off) => self.store_local(ty, off),
-            // A pair's value is in a0 and a1: the address goes to t2.
-            Place::Pushed if self.is_pair(ty) => {
-                self.pop("t2");
-                self.ins("sw", "a0, 0(t2)");
-                self.ins("sw", "a1, 4(t2)");
-            }
             Place::Pushed => {
                 self.pop("a1");
-                self.ins(store_op(ty, self.xlen), "a0, 0(a1)");
+                self.ins(store_op(ty), "a0, 0(a1)");
             }
         }
     }
 
     /// Converts the value in `a0` from type `from` to type `to`.
-    ///
-    /// On RV32 a `long long` is a pair: one comes from a 32-bit value with
-    /// its high word the sign (`srai a1, a0, 31`) or 0, by the value's
-    /// signedness; one goes to a narrower type from its low word, and to
-    /// `_Bool` from both (`or` then `snez`).
     fn convert(&mut self, from: &Type, to: &Type) {
-        match (self.is_pair(from), self.is_pair(to)) {
-            (false, true) => self.widen_to_pair("a0", "a1", from),
-            (true, true) => {}
-            (true, false) if to.int_kind() == Some(IntKind::Bool) => {
-                self.ins("or", "a0, a0, a1");
-                self.ins("snez", "a0, a0");
-            }
-            // The low word, as the unsigned int it is.
-            (true, false) => self.convert_reg("a0", &Type::UINT, to),
-            (false, false) => self.convert_reg("a0", from, to),
-        }
-    }
-
-    /// `lo:hi` = the 32-bit value of type `from` in `lo`, as a long long:
-    /// its high word copies the sign of a signed value, and is 0 for an
-    /// unsigned one (narrow types are extended already).
-    fn widen_to_pair(&mut self, lo: &str, hi: &str, from: &Type) {
-        if from.is_integer() && !from.is_unsigned() {
-            self.ins("srai", format!("{hi}, {lo}, 31"));
-        } else {
-            self.ins("li", format!("{hi}, 0"));
-        }
+        self.convert_reg("a0", from, to)
     }
 
     /// Converts the value in `reg` from type `from` to type `to`, keeping
     /// every value as a register holds it (see "Values and types"): a type
     /// narrower than the register sign- or zero-extended by its signedness,
-    /// and on RV64 a 32-bit one sign-extended whatever its signedness. So
+    /// and a 32-bit one sign-extended whatever its signedness. So
     ///
     /// * to `_Bool`, anything but 0 (a pointer too) becomes 1: `snez`;
     /// * to a register-wide type (`long`, a pointer), only an `unsigned int`
-    ///   on RV64 changes, zero-extended (`slli` and `srli` by 32); every
-    ///   other value is its own extension already;
-    /// * to a 32-bit type on RV64, a register-wide value is cut to 32 bits
-    ///   and sign-extended: `sext.w` (`addiw reg, reg, 0`);
+    ///   changes, zero-extended (`slli` and `srli` by 32); every other value
+    ///   is its own extension already;
+    /// * to a 32-bit type, a register-wide value is cut to 32 bits and
+    ///   sign-extended: `sext.w` (`addiw reg, reg, 0`);
     /// * to `char` or `short`, a value that may not fit is cut to the type
     ///   and widened back ([`Self::wrap_reg`]).
     ///
-    /// On RV32 only the last two narrowings change bits. An array's value
-    /// is its address, already a pointer.
+    /// An array's value is its address, already a pointer.
     fn convert_reg(&mut self, reg: &str, from: &Type, to: &Type) {
         let (from, to) = (from.unqual(), to.unqual());
-        let x = self.xlen;
         if to.int_kind() == Some(IntKind::Bool) {
             if from != to {
                 self.ins("snez", format!("{reg}, {reg}"));
@@ -2991,16 +2735,16 @@ impl<'a> FuncGen<'a, '_> {
         }
         // (size, signed) of each side; pointers are unsigned addresses.
         let shape = |t: &Type| match t {
-            Type::Int(k) => Some((k.size(x), k.signed())),
-            Type::Ptr(_) | Type::Array(..) | Type::Func(_) => Some((ptr_size(x), false)),
+            Type::Int(k) => Some((k.size(), k.signed())),
+            Type::Ptr(_) | Type::Array(..) | Type::Func(_) => Some((PTR_SIZE, false)),
             _ => None,
         };
         let (Some((fsize, fsigned)), Some((tsize, tsigned))) = (shape(from), shape(to)) else {
             return; // to `void`, or a struct as it is
         };
-        let w = ptr_size(x);
+        let w = PTR_SIZE;
         if tsize == w {
-            if x == Xlen::Rv64 && fsize == 4 && !fsigned {
+            if fsize == 4 && !fsigned {
                 self.ins("slli", format!("{reg}, {reg}, 32"));
                 self.ins("srli", format!("{reg}, {reg}, 32"));
             }
@@ -3030,11 +2774,11 @@ impl<'a> FuncGen<'a, '_> {
     /// RV64 is sign-extended (`sext.w`), and a register-wide one is as it is.
     fn wrap_reg(&mut self, reg: &str, ty: &Type) {
         let Some(k) = ty.int_kind() else { return };
-        let size = k.size(self.xlen);
-        let shift = 8 * (ptr_size(self.xlen) - size);
+        let size = k.size();
+        let shift = 8 * (PTR_SIZE - size);
         match (size, k.signed()) {
             _ if k == IntKind::Bool => self.ins("snez", format!("{reg}, {reg}")),
-            _ if size == ptr_size(self.xlen) => {}
+            _ if size == PTR_SIZE => {}
             (4, _) => self.ins("sext.w", format!("{reg}, {reg}")),
             (1, false) => self.ins("andi", format!("{reg}, {reg}, 255")),
             (_, signed) => {
@@ -3062,28 +2806,15 @@ impl<'a> FuncGen<'a, '_> {
     /// first converted to the type the operation is done in (the usual
     /// arithmetic conversions; for a shift, the left operand's promoted
     /// type), which changes bits only where widths differ: an `int` meeting
-    /// a `long` on RV64. An integer added to a pointer is first widened to
-    /// the pointer's width by its signedness. On RV64, arithmetic in a
-    /// 32-bit type uses the W instructions.
+    /// a `long`. An integer added to a pointer is first widened to the
+    /// pointer's width by its signedness. Arithmetic in a 32-bit type uses
+    /// the W instructions.
     fn binary(&mut self, op: BinOp, l: &Type, r: &Type) {
-        let x = self.xlen;
         if let (Some(lk), Some(rk)) = (l.int_kind(), r.int_kind()) {
             let k = Type::Int(match op {
                 BinOp::Shl | BinOp::Shr => lk.promoted(),
-                _ => crate::types::common(lk, rk, x),
+                _ => crate::types::common(lk, rk),
             });
-            if self.is_pair(&k) {
-                // In a long long on RV32: the left operand in a2:a3, the
-                // right in a0:a1 (a shift's amount is its low word, a0).
-                // A narrower left operand is in a2 already (see `pop_left`).
-                if !self.is_pair(l) {
-                    self.widen_to_pair("a2", "a3", l);
-                }
-                if !matches!(op, BinOp::Shl | BinOp::Shr) && !self.is_pair(r) {
-                    self.widen_to_pair("a0", "a1", r);
-                }
-                return self.pair_arith(op, k.is_unsigned());
-            }
             self.convert_reg("a1", l, &k);
             if !matches!(op, BinOp::Shl | BinOp::Shr) {
                 self.convert_reg("a0", r, &k);
@@ -3095,182 +2826,17 @@ impl<'a> FuncGen<'a, '_> {
         let index = |t: &Type| {
             let signed = !t.is_unsigned();
             Type::Int(if signed {
-                IntKind::ptrdiff_t(x)
+                IntKind::ptrdiff_t()
             } else {
-                IntKind::size_t(x)
+                IntKind::size_t()
             })
         };
         if l.is_ptr() && r.is_integer() {
-            // A pair index on RV32: its low word, in a0 already.
-            if !self.is_pair(r) {
-                self.convert_reg("a0", r, &index(r));
-            }
+            self.convert_reg("a0", r, &index(r));
         } else if r.is_ptr() && l.is_integer() {
-            if self.is_pair(l) {
-                self.ins("mv", "a1, a2");
-            } else {
-                self.convert_reg("a1", l, &index(l));
-            }
+            self.convert_reg("a1", l, &index(l));
         }
         self.arith(op, l, r);
-    }
-
-    /// `a0:a1 = a2:a3 op a0:a1` for a long long on RV32 (`unsigned` for an
-    /// `unsigned long long`), as LLVM expands 64-bit operations on RV32
-    /// with M: a carry or a borrow from the low words (`sltu`), `mul` and
-    /// `mulhu` for the product, each shift in two halves by whether the
-    /// amount reaches 32, comparisons on the high words and then the low
-    /// ones, unsigned (their result, 0 or 1, in `a0`). Division and
-    /// remainder call the libgcc routines (`__divdi3`, `__udivdi3`,
-    /// `__moddi3`, `__umoddi3`), which the C library and the kernel
-    /// provide. Clobbers `t0`-`t2`.
-    fn pair_arith(&mut self, op: BinOp, unsigned: bool) {
-        let less = if unsigned { "sltu" } else { "slt" };
-        match op {
-            BinOp::Add => {
-                self.ins("add", "a0, a2, a0");
-                self.ins("sltu", "t0, a0, a2"); // the carry
-                self.ins("add", "a1, a3, a1");
-                self.ins("add", "a1, a1, t0");
-            }
-            BinOp::Sub => {
-                self.ins("sltu", "t0, a2, a0"); // the borrow
-                self.ins("sub", "a0, a2, a0");
-                self.ins("sub", "a1, a3, a1");
-                self.ins("sub", "a1, a1, t0");
-            }
-            BinOp::Mul => {
-                self.ins("mul", "t0, a3, a0"); // hi(l) * lo(r)
-                self.ins("mul", "t1, a2, a1"); // lo(l) * hi(r)
-                self.ins("add", "t0, t0, t1");
-                self.ins("mulhu", "t1, a2, a0"); // the carry out of lo(l) * lo(r)
-                self.ins("add", "a1, t0, t1");
-                self.ins("mul", "a0, a2, a0");
-            }
-            BinOp::Div | BinOp::Rem => {
-                let helper = match (op, unsigned) {
-                    (BinOp::Div, false) => "__divdi3",
-                    (BinOp::Div, true) => "__udivdi3",
-                    (_, false) => "__moddi3",
-                    (_, true) => "__umoddi3",
-                };
-                // The dividend in a0:a1, the divisor in a2:a3.
-                self.ins("mv", "t0, a0");
-                self.ins("mv", "t1, a1");
-                self.ins("mv", "a0, a2");
-                self.ins("mv", "a1, a3");
-                self.ins("mv", "a2, t0");
-                self.ins("mv", "a3, t1");
-                let pad = (16 - (self.depth as i32 * self.word()) % 16) % 16;
-                if pad != 0 {
-                    self.ins("addi", format!("sp, sp, {}", -pad));
-                }
-                self.ins_sized(8, "call", helper);
-                if pad != 0 {
-                    self.ins("addi", format!("sp, sp, {pad}"));
-                }
-            }
-            BinOp::Shl | BinOp::Shr => self.pair_shift(op == BinOp::Shl, unsigned),
-            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                let w = match op {
-                    BinOp::BitAnd => "and",
-                    BinOp::BitOr => "or",
-                    _ => "xor",
-                };
-                self.ins(w, "a0, a2, a0");
-                self.ins(w, "a1, a3, a1");
-            }
-            BinOp::Eq | BinOp::Ne => {
-                self.ins("xor", "t0, a2, a0");
-                self.ins("xor", "t1, a3, a1");
-                self.ins("or", "a0, t0, t1");
-                self.ins(if op == BinOp::Eq { "seqz" } else { "snez" }, "a0, a0");
-            }
-            // l < r: the high words decide, or when they are equal the low
-            // ones (unsigned). `>` swaps the sides; `<=` and `>=` negate.
-            BinOp::Lt | BinOp::Ge => {
-                self.pair_less(less, ("a2", "a3"), ("a0", "a1"));
-                if op == BinOp::Ge {
-                    self.ins("xori", "a0, a0, 1");
-                }
-            }
-            BinOp::Gt | BinOp::Le => {
-                self.pair_less(less, ("a0", "a1"), ("a2", "a3"));
-                if op == BinOp::Le {
-                    self.ins("xori", "a0, a0, 1");
-                }
-            }
-            BinOp::LogAnd | BinOp::LogOr => unreachable!("handled in expr: they short-circuit"),
-        }
-    }
-
-    /// `a0 = x < y` for the pairs `x` and `y` (`slt` or `sltu` on the high
-    /// words): `(x.hi < y.hi) | (x.hi == y.hi & x.lo <u y.lo)`.
-    fn pair_less(&mut self, less: &str, x: (&str, &str), y: (&str, &str)) {
-        self.ins(less, format!("t0, {}, {}", x.1, y.1));
-        self.ins("xor", format!("t1, {}, {}", x.1, y.1));
-        self.ins("seqz", "t1, t1");
-        self.ins("sltu", format!("t2, {}, {}", x.0, y.0));
-        self.ins("and", "t1, t1, t2");
-        self.ins("or", "a0, t0, t1");
-    }
-
-    /// `a0:a1 = a2:a3 << a0` (or `>>`, arithmetic unless `unsigned`), by the
-    /// low 6 bits of the amount, as RV64's `sll` takes them. From 32 up one
-    /// word moves to the other, shifted by the rest (`sll` takes its low 5
-    /// bits); below 32 the bits crossing between the words are shifted by
-    /// `31 - n` after a shift by 1, which is right for `n = 0` too:
-    ///
-    /// ```text
-    ///     andi  a0, a0, 63       # n
-    ///     andi  t0, a0, 32
-    ///     beqz  t0, .L.shl.N
-    ///     sll   a1, a2, a0       # n >= 32: hi = lo << (n - 32), lo = 0
-    ///     li    a0, 0
-    ///     j     .L.shift.M
-    ///   .L.shl.N:                # n < 32
-    ///     not   t2, a0           # 31 - n, in its low 5 bits
-    ///     sll   a1, a3, a0       # hi << n
-    ///     srli  t1, a2, 1        # | lo >> (32 - n)
-    ///     srl   t1, t1, t2
-    ///     or    a1, a1, t1
-    ///     sll   a0, a2, a0       # lo << n
-    ///   .L.shift.M:
-    /// ```
-    fn pair_shift(&mut self, left: bool, unsigned: bool) {
-        let small = self.new_label(if left { "shl" } else { "shr" });
-        let end = self.new_label("shift");
-        self.ins("andi", "a0, a0, 63");
-        self.ins("andi", "t0, a0, 32");
-        self.branch("beqz", "t0", &small);
-        if left {
-            self.ins("sll", "a1, a2, a0");
-            self.ins("li", "a0, 0");
-        } else if unsigned {
-            self.ins("srl", "a0, a3, a0");
-            self.ins("li", "a1, 0");
-        } else {
-            self.ins("sra", "a0, a3, a0");
-            self.ins("srai", "a1, a3, 31");
-        }
-        self.ins("j", &end);
-        self.label(&small);
-        self.ins("not", "t2, a0");
-        if left {
-            self.ins("sll", "a1, a3, a0");
-            self.ins("srli", "t1, a2, 1");
-            self.ins("srl", "t1, t1, t2");
-            self.ins("or", "a1, a1, t1");
-            self.ins("sll", "a0, a2, a0");
-        } else {
-            self.ins("srl", "t0, a2, a0"); // lo >> n
-            self.ins("slli", "t1, a3, 1"); // | hi << (32 - n)
-            self.ins("sll", "t1, t1, t2");
-            self.ins("or", "t0, t0, t1");
-            self.ins(if unsigned { "srl" } else { "sra" }, "a1, a3, a0");
-            self.ins("mv", "a0, t0");
-        }
-        self.label(&end);
     }
 
     /// [`Self::binary`] once the operands are converted: both of the
@@ -3281,13 +2847,12 @@ impl<'a> FuncGen<'a, '_> {
         // signedness; a pointer compares as an unsigned address.
         let unsigned = l.is_unsigned() || r.is_unsigned();
         let pick = |s: &'static str, u: &'static str| if unsigned { u } else { s };
-        let x = self.xlen;
         let elem_size = |t: &Type| {
             t.pointee()
-                .and_then(|t| t.size(x))
+                .and_then(|t| t.size())
                 .expect("sema: complete pointee")
         };
-        // The W form of an instruction for 32-bit arithmetic on RV64.
+        // The W form of an instruction for 32-bit arithmetic.
         let w32 = self.is_w(l);
         let w = |op: &'static str| -> String {
             if w32 {
@@ -3375,7 +2940,7 @@ impl<'a> FuncGen<'a, '_> {
             .and_then(Type::func_type)
             .expect("sema: the callee is a function")
             .clone();
-        let layout = ArgLayout::new(&ft, args, self.xlen);
+        let layout = ArgLayout::new(&ft, args);
         let (types, regs, used) = (&layout.types, &layout.words, layout.used);
         let direct = callee.direct_callee();
         // clang refers to the function it calls before the arguments
@@ -3385,7 +2950,7 @@ impl<'a> FuncGen<'a, '_> {
             self.file.reference(name);
         }
         if used > abi::ARG_REGS {
-            let hidden = if abi::returns_in_memory(&ft.ret, self.xlen) {
+            let hidden = if abi::returns_in_memory(&ft.ret) {
                 result
             } else {
                 None
@@ -3412,17 +2977,12 @@ impl<'a> FuncGen<'a, '_> {
         if let Some(last) = args.len().checked_sub(1) {
             for i in 0..last {
                 self.argument(&args[i], copies[i]);
-                self.push_value(&args[i].ty);
+                self.push();
             }
             self.argument(&args[last], copies[last]);
             match regs[last] {
-                (0, Pass::Scalar | Pass::Ref | Pass::Pair) => {}
+                (0, Pass::Scalar | Pass::Ref) => {}
                 (r, Pass::Scalar | Pass::Ref) => self.ins("mv", format!("a{r}, a0")),
-                // The high word first: a1 may be where the low word goes.
-                (r, Pass::Pair) => {
-                    self.ins("mv", format!("a{}, a1", r + 1));
-                    self.ins("mv", format!("a{r}, a0"));
-                }
                 (r, Pass::Words(n)) => {
                     self.ins("mv", "t1, a0");
                     self.load_words("t1", r, n, &types[last]);
@@ -3431,7 +2991,6 @@ impl<'a> FuncGen<'a, '_> {
             for i in (0..last).rev() {
                 match regs[i] {
                     (r, Pass::Scalar | Pass::Ref) => self.pop(&format!("a{r}")),
-                    (r, Pass::Pair) => self.pop_pair(&format!("a{r}"), &format!("a{}", r + 1)),
                     (r, Pass::Words(n)) => {
                         self.pop("t1");
                         self.load_words("t1", r, n, &types[i]);
@@ -3443,14 +3002,14 @@ impl<'a> FuncGen<'a, '_> {
             }
         }
         // A big struct result goes to the hidden local: its address in a0.
-        if abi::returns_in_memory(&ft.ret, self.xlen) {
+        if abi::returns_in_memory(&ft.ret) {
             let off = self.offset(result.expect("sema: a struct result has a local"));
             self.add_imm("a0", "s0", off);
         }
         // Temporaries of an enclosing expression may still be pushed (in
         // `x + f(y)`, x is). The convention wants sp 16-byte aligned at the
         // call, so pad the stack to the next multiple of 16 around it.
-        let pad = (16 - (self.depth as i32 * self.word()) % 16) % 16;
+        let pad = (16 - (self.depth as i32 * WORD) % 16) % 16;
         if pad != 0 {
             self.ins("addi", format!("sp, sp, {}", -pad));
         }
@@ -3479,8 +3038,8 @@ impl<'a> FuncGen<'a, '_> {
     fn call_result(&mut self, ft: &FuncType, result: Option<LocalId>) {
         if let Some(result) = result {
             let off = self.offset(result);
-            if let Pass::Words(n) = abi::classify(&ft.ret, self.xlen) {
-                let (w, store) = (self.word(), self.store_reg());
+            if let Pass::Words(n) = abi::classify(&ft.ret) {
+                let (w, store) = (WORD, "sd");
                 for i in 0..n {
                     self.access_local(store, &format!("a{i}"), off + w * i as i32);
                 }
@@ -3520,15 +3079,13 @@ impl<'a> FuncGen<'a, '_> {
             self.expr(callee);
             self.push();
         }
-        // How many words each argument takes pushed: a pair two, others one.
-        let mut sizes = Vec::with_capacity(args.len());
+        // Each argument takes one word pushed.
         for (i, a) in args.iter().enumerate() {
             self.argument(a, copies[i]);
-            self.push_value(&a.ty);
-            sizes.push(if self.is_pair(&a.ty) { 2 } else { 1 });
+            self.push();
         }
-        let n: i32 = sizes.iter().sum();
-        let (w, load, store) = (self.word(), self.load_reg(), self.store_reg());
+        let n = args.len() as i32;
+        let (w, load, store) = (WORD, "ld", "sd");
         let pushed = w * self.depth as i32;
         let stack = w * abi::stack_words(used) as i32;
         let area = (pushed + stack + 15) / 16 * 16 - pushed;
@@ -3538,28 +3095,19 @@ impl<'a> FuncGen<'a, '_> {
         });
         self.add_imm("sp", "sp", -area);
         // Where argument i was pushed: the last one is right above the area.
-        let temp = |i: usize| area + w * sizes[i + 1..].iter().sum::<i32>();
+        let temp = |i: usize| area + w * (args.len() - 1 - i) as i32;
         // The stack words first (with t1, t2 and t0), then the registers.
         for (i, &(word, pass)) in words.iter().enumerate() {
             match pass {
                 Pass::Scalar | Pass::Ref => {
-                    if let ArgWord::Stack(at) = arg_word(word, self.xlen) {
+                    if let ArgWord::Stack(at) = arg_word(word) {
                         self.ins(load, format!("t1, {}(sp)", temp(i)));
                         self.ins(store, format!("t1, {at}(sp)"));
                     }
                 }
-                // A pair's words were pushed as they go: low, then high.
-                Pass::Pair => {
-                    for k in 0..2 {
-                        if let ArgWord::Stack(at) = arg_word(word + k, self.xlen) {
-                            self.ins(load, format!("t1, {}(sp)", temp(i) + w * k as i32));
-                            self.ins(store, format!("t1, {at}(sp)"));
-                        }
-                    }
-                }
                 Pass::Words(nw) => {
                     for k in 0..nw {
-                        if let ArgWord::Stack(at) = arg_word(word + k as usize, self.xlen) {
+                        if let ArgWord::Stack(at) = arg_word(word + k as usize) {
                             self.ins(load, format!("t1, {}(sp)", temp(i)));
                             self.load_word("t2", "t1", k, &types[i]);
                             self.ins(store, format!("t2, {at}(sp)"));
@@ -3571,15 +3119,8 @@ impl<'a> FuncGen<'a, '_> {
         for (i, &(word, pass)) in words.iter().enumerate() {
             match pass {
                 Pass::Scalar | Pass::Ref => {
-                    if let ArgWord::Reg(r) = arg_word(word, self.xlen) {
+                    if let ArgWord::Reg(r) = arg_word(word) {
                         self.ins(load, format!("{r}, {}(sp)", temp(i)));
-                    }
-                }
-                Pass::Pair => {
-                    for k in 0..2 {
-                        if let ArgWord::Reg(r) = arg_word(word + k, self.xlen) {
-                            self.ins(load, format!("{r}, {}(sp)", temp(i) + w * k as i32));
-                        }
                     }
                 }
                 Pass::Words(nw) => {
@@ -3587,7 +3128,7 @@ impl<'a> FuncGen<'a, '_> {
                         self.ins(load, format!("t1, {}(sp)", temp(i)));
                     }
                     for k in 0..nw {
-                        if let ArgWord::Reg(r) = arg_word(word + k as usize, self.xlen) {
+                        if let ArgWord::Reg(r) = arg_word(word + k as usize) {
                             self.load_word(&r, "t1", k, &types[i]);
                         }
                     }
@@ -3630,17 +3171,17 @@ impl<'a> FuncGen<'a, '_> {
         }
     }
 
-    /// Loads word `w` (a register's worth: 4 bytes, 8 on RV64) of the struct
+    /// Loads word `w` (a register's worth: 8 bytes) of the struct
     /// of type `ty` at the address in `src` into `reg`. A struct aligned to
     /// less than a register may not be at a register boundary, so its word is
-    /// put together from aligned bytes, halves or (on RV64) words, each
+    /// put together from aligned bytes, halves or words, each
     /// zero-extended (in `t0`); bytes past the struct's end read as zero.
     fn load_word(&mut self, reg: &str, src: &str, w: u32, ty: &Type) {
-        let size = ty.size(self.xlen).expect("a complete struct");
-        let reg_size = self.word() as u32;
-        let unit = ty.align(self.xlen).min(reg_size);
+        let size = ty.size().expect("a complete struct");
+        let reg_size = WORD as u32;
+        let unit = ty.align().min(reg_size);
         if unit == reg_size {
-            self.ins(self.load_reg(), format!("{reg}, {}({src})", reg_size * w));
+            self.ins("ld", format!("{reg}, {}({src})", reg_size * w));
             return;
         }
         let load = match unit {
@@ -3669,8 +3210,8 @@ impl<'a> FuncGen<'a, '_> {
     /// misaligned: unrolled up to 16 units, a loop beyond. Clobbers `t0`, and
     /// `t1-t3` for the loop.
     fn copy(&mut self, dst: &str, src: &str, ty: &Type) {
-        let size = ty.size(self.xlen).expect("sema: a complete struct");
-        let unit = ty.align(self.xlen).min(self.word() as u32);
+        let size = ty.size().expect("sema: a complete struct");
+        let unit = ty.align().min(WORD as u32);
         let (load, store) = match unit {
             1 => ("lbu", "sb"),
             2 => ("lhu", "sh"),
@@ -3851,36 +3392,35 @@ mod tests {
     fn locals(decls: &str) -> (Vec<i32>, i32) {
         let p = crate::parse(&format!("int f() {{ {decls} }}")).unwrap();
         let f = p.funcs().next().unwrap();
-        layout(
-            &f.locals,
-            &vec![true; f.locals.len()],
-            saved_regs(Xlen::Rv32),
-            Xlen::Rv32,
-        )
-        .unwrap()
+        layout(&f.locals, &vec![true; f.locals.len()], SAVED_REGS).unwrap()
     }
 
     #[test]
     fn frame_layout() {
-        // Only ints: local #i at -(12 + 4*i), as in v0.
-        assert_eq!(locals("int a, b, c;"), (vec![-12, -16, -20], 32));
-        assert_eq!(locals("int a, b;"), (vec![-12, -16], 16));
+        // Locals start below the 16 bytes of ra and s0. Only ints: local #i
+        // at -(20 + 4*i).
+        assert_eq!(locals("int a, b, c;"), (vec![-20, -24, -28], 32));
+        assert_eq!(locals("int a;"), (vec![-20], 32));
         assert_eq!(locals(""), (vec![], 16));
         // Each type at its own alignment, packed downwards.
         assert_eq!(
             locals("char c; short s; char d; int i;"),
-            (vec![-9, -12, -13, -20], 32)
+            (vec![-17, -20, -21, -28], 32)
         );
-        // Arrays are word-aligned.
-        assert_eq!(locals("char c; char buf[5]; char d;"), (vec![-9, -16, -17], 32));
-        assert_eq!(locals("int a[10];"), (vec![-48], 48));
+        assert_eq!(locals("int a, b; long c;"), (vec![-20, -24, -32], 32));
+        assert_eq!(locals("char *p; char c;"), (vec![-24, -25], 32));
+        // Arrays and structs are aligned to 8, structs a whole number of
+        // doublewords.
+        assert_eq!(locals("char c; char buf[5]; char d;"), (vec![-17, -24, -25], 32));
+        assert_eq!(locals("int a[10];"), (vec![-56], 64));
+        assert_eq!(locals("struct { int a, b, c; } s;"), (vec![-32], 32));
         // A local the code does not use has no slot.
         let p = crate::parse("int f() { int a, b, c; }").unwrap();
         let f = p.funcs().next().unwrap();
         let used = [true, false, true];
         assert_eq!(
-            layout(&f.locals, &used, saved_regs(Xlen::Rv32), Xlen::Rv32),
-            Some((vec![-12, 0, -16], 16))
+            layout(&f.locals, &used, SAVED_REGS),
+            Some((vec![-20, 0, -24], 32))
         );
     }
 
@@ -3894,53 +3434,11 @@ mod tests {
         );
         let p = crate::parse("int f() { char a[2147483600]; }").unwrap();
         assert_eq!(
-            layout(
-                &p.funcs().next().unwrap().locals,
-                &[true],
-                saved_regs(Xlen::Rv32),
-                Xlen::Rv32
-            )
-            .unwrap()
-            .1,
+            layout(&p.funcs().next().unwrap().locals, &[true], SAVED_REGS)
+                .unwrap()
+                .1,
             2147483616
         );
-    }
-
-    #[test]
-    fn smallest_function() {
-        let asm = compile("int main() { return 42; }");
-        assert_eq!(
-            asm,
-            "    .text
-
-    # int main(void): frame 16 bytes
-    .globl main
-    .type main, @function
-main:
-    addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
-    addi  s0, sp, 16
-    li    a0, 42
-.L.return.main:
-    addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
-    addi  sp, sp, 16
-    ret
-    .size main, . - main
-"
-        );
-        // Each function symbol carries its type and size, as clang's do: ten
-        // instructions here, and the static one's too.
-        let obj = merlin_as::assemble(&compile(
-            "int main(void) { return 42; } static int f(void) { return 1; } int (*use)(void) = f;",
-        ))
-        .unwrap();
-        for name in ["main", "f"] {
-            let s = obj.symbols.iter().find(|s| s.name == name).unwrap();
-            assert_eq!((s.size, s.ty), (40, merlin_as::asm::SymType::Func), "{name}");
-        }
     }
 
     /// Functions and globals come in clang's order (checked against clang
@@ -4004,18 +3502,18 @@ main:
             (line[line.find("frame").unwrap()..].to_string(), slots)
         };
         let (f, slots) = frame("int f(int c) { if (0) { int big[100]; big[0] = c; } return c; }");
-        assert_eq!(f, "frame 16 bytes");
-        assert_eq!(slots, ["-12(s0)  param int c"]);
+        assert_eq!(f, "frame 32 bytes");
+        assert_eq!(slots, ["-20(s0)  param int c"]);
         let (f, slots) = frame(
             "struct big { int a[10]; }; struct big h(void);\n\
              int g(void) { return 1 ? 2 : h().a[0]; }",
         );
         assert_eq!((f.as_str(), slots.len()), ("frame 16 bytes", 0));
         let (f, slots) = frame("int f(void) { int unused; return 0; }");
-        assert_eq!(f, "frame 16 bytes");
-        assert_eq!(slots, ["-12(s0)  local int unused"]);
+        assert_eq!(f, "frame 32 bytes");
+        assert_eq!(slots, ["-20(s0)  local int unused"]);
         let (f, _) = frame("int f(int c) { if (0) { int k[8]; l: k[0] = c; return k[0]; } goto l; }");
-        assert_eq!(f, "frame 48 bytes", "kept for its label");
+        assert_eq!(f, "frame 64 bytes", "kept for its label");
     }
 
     #[test]
@@ -4073,21 +3571,22 @@ main:
             body,
             [
                 "addi sp, sp, -16",
-                "sw ra, 12(sp)",
-                "sw s0, 8(sp)",
+                "sd ra, 8(sp)",
+                "sd s0, 0(sp)",
                 "addi s0, sp, 16",
-                // 8 + 4 + 1 (+1 to align) + 2 = 16 bytes: the save area is the frame.
-                "sw a0, -12(s0)",
-                "sb a1, -13(s0)",
-                "sh a2, -16(s0)",
-                "lh a0, -16(s0)",
+                // 16 + 4 + 1 (+1 to align) + 2 = 24 bytes, a frame of 32.
+                "addi sp, sp, -16",
+                "sw a0, -20(s0)",
+                "sb a1, -21(s0)",
+                "sh a2, -24(s0)",
+                "lh a0, -24(s0)",
             ]
         );
         assert!(
-            asm.contains("# int f(int a, char b, short c): frame 16 bytes\n"),
+            asm.contains("# int f(int a, char b, short c): frame 32 bytes\n"),
             "{asm}"
         );
-        assert!(asm.contains("#     -13(s0)  param char b\n"), "{asm}");
+        assert!(asm.contains("#     -21(s0)  param char b\n"), "{asm}");
     }
 
     #[test]
@@ -4097,19 +3596,21 @@ main:
                 &compile(&format!("int main({ty} x, {ty} y) {{ return {src}; }}")),
                 "main",
             );
-            // Skip the prologue (4 lines), the parameter stores (2), `lw` x, the
+            // Skip the prologue (5 lines), the parameter stores (2), `lw` x, the
             // push (2) and `lw` y: what is left is the pop and the operator.
-            body[10..]
+            body[11..]
                 .join("; ")
-                .replace("lw a1, 0(sp); addi sp, sp, 4; ", "")
+                .replace("ld a1, 0(sp); addi sp, sp, 8; ", "")
         };
-        assert_eq!(op("int", "x + y"), "add a0, a1, a0");
-        assert_eq!(op("int", "x - y"), "sub a0, a1, a0");
-        assert_eq!(op("int", "x * y"), "mul a0, a1, a0");
-        assert_eq!(op("int", "x / y"), "div a0, a1, a0");
-        assert_eq!(op("int", "x % y"), "rem a0, a1, a0");
-        assert_eq!(op("int", "x << y"), "sll a0, a1, a0");
-        assert_eq!(op("int", "x >> y"), "sra a0, a1, a0");
+        // In `int` the W instructions (`and`, `or`, `xor` and the
+        // comparisons keep the 32-bit invariant as they are).
+        assert_eq!(op("int", "x + y"), "addw a0, a1, a0");
+        assert_eq!(op("int", "x - y"), "subw a0, a1, a0");
+        assert_eq!(op("int", "x * y"), "mulw a0, a1, a0");
+        assert_eq!(op("int", "x / y"), "divw a0, a1, a0");
+        assert_eq!(op("int", "x % y"), "remw a0, a1, a0");
+        assert_eq!(op("int", "x << y"), "sllw a0, a1, a0");
+        assert_eq!(op("int", "x >> y"), "sraw a0, a1, a0");
         assert_eq!(op("int", "x & y"), "and a0, a1, a0");
         assert_eq!(op("int", "x | y"), "or a0, a1, a0");
         assert_eq!(op("int", "x ^ y"), "xor a0, a1, a0");
@@ -4120,18 +3621,24 @@ main:
         assert_eq!(op("int", "x == y"), "xor a0, a1, a0; seqz a0, a0");
         assert_eq!(op("int", "x != y"), "xor a0, a1, a0; snez a0, a0");
         // Unsigned operations.
-        assert_eq!(op("unsigned", "x / y"), "divu a0, a1, a0");
-        assert_eq!(op("unsigned", "x % y"), "remu a0, a1, a0");
-        assert_eq!(op("unsigned", "x >> y"), "srl a0, a1, a0");
+        assert_eq!(op("unsigned", "x / y"), "divuw a0, a1, a0");
+        assert_eq!(op("unsigned", "x % y"), "remuw a0, a1, a0");
+        assert_eq!(op("unsigned", "x >> y"), "srlw a0, a1, a0");
         assert_eq!(op("unsigned", "x < y"), "sltu a0, a1, a0");
         assert_eq!(op("unsigned long", "x >= y"), "sltu a0, a1, a0; xori a0, a0, 1");
+        assert_eq!(
+            op("long", "x / y"),
+            "div a0, a1, a0; sext.w a0, a0",
+            "cut to the int main returns"
+        );
+        assert_eq!(op("long", "x >> y"), "sra a0, a1, a0; sext.w a0, a0");
         // unsigned char promotes to int: signed.
         let body = body_of(
             &compile("int main(unsigned char x, unsigned char y) { return x / y; }"),
             "main",
         );
-        assert_eq!(body.last().unwrap(), "div a0, a1, a0");
-        assert!(body.contains(&"lbu a0, -9(s0)".to_string()), "{body:?}");
+        assert_eq!(body.last().unwrap(), "divw a0, a1, a0");
+        assert!(body.contains(&"lbu a0, -17(s0)".to_string()), "{body:?}");
     }
 
     #[test]
@@ -4141,7 +3648,8 @@ main:
         assert!(p("int *p; int i;", "*(p + i)").ends_with("slli a0, a0, 2; add a0, a1, a0; lw a0, 0(a0)"));
         assert!(p("int *p; int i;", "*(i + p)").ends_with("slli a1, a1, 2; add a0, a1, a0; lw a0, 0(a0)"));
         assert!(p("char *p; int i;", "*(p - i)").ends_with("sub a0, a1, a0; lbu a0, 0(a0)"));
-        assert!(p("short *p, *q;", "p - q").ends_with("sub a0, a1, a0; srai a0, a0, 1"));
+        // A difference is a long, cut to the int main returns.
+        assert!(p("short *p, *q;", "p - q").ends_with("sub a0, a1, a0; srai a0, a0, 1; sext.w a0, a0"));
         // 12-byte elements: multiply and divide.
         assert!(p("int m[4][3]; int i;", "m[i][0]").contains("li t0, 12; mul a0, a0, t0"));
     }
@@ -4150,37 +3658,12 @@ main:
     fn narrow_types_load_and_store_by_size() {
         assert_eq!(
             main_body("", "signed char c = 1; unsigned short s = 2; c = s; return c;"),
-            "li a0, 1; sb a0, -9(s0); li a0, 2; sh a0, -12(s0); lhu a0, -12(s0); \
-             slli a0, a0, 24; srai a0, a0, 24; sb a0, -9(s0); lb a0, -9(s0)"
+            "addi sp, sp, -16; li a0, 1; sb a0, -17(s0); li a0, 2; sh a0, -20(s0); lhu a0, -20(s0); \
+             slli a0, a0, 56; srai a0, a0, 56; sb a0, -17(s0); lb a0, -17(s0)"
         );
         // Widening is free.
         assert!(main_body("", "unsigned char c = 1; int i = c; return i;")
-            .contains("lbu a0, -9(s0); sw a0, -16(s0)"));
-    }
-
-    #[test]
-    fn conversions() {
-        let cast = |from: &str, to: &str| {
-            let body = body_of(
-                &compile(&format!("int main({from} x) {{ return ({to})x; }}")),
-                "main",
-            );
-            body[6..].join("; ")
-        };
-        assert_eq!(cast("int", "char"), "andi a0, a0, 255");
-        assert_eq!(cast("int", "unsigned char"), "andi a0, a0, 255");
-        assert_eq!(cast("int", "signed char"), "slli a0, a0, 24; srai a0, a0, 24");
-        assert_eq!(cast("int", "short"), "slli a0, a0, 16; srai a0, a0, 16");
-        assert_eq!(cast("int", "unsigned short"), "slli a0, a0, 16; srli a0, a0, 16");
-        assert_eq!(cast("int", "unsigned"), "");
-        assert_eq!(cast("char", "short"), "");
-        assert_eq!(cast("char", "unsigned char"), "");
-        assert_eq!(cast("char", "signed char"), "slli a0, a0, 24; srai a0, a0, 24");
-        assert_eq!(cast("signed char", "char"), "andi a0, a0, 255");
-        assert_eq!(
-            cast("short", "unsigned short"),
-            "slli a0, a0, 16; srli a0, a0, 16"
-        );
+            .contains("lbu a0, -17(s0); sw a0, -24(s0)"));
     }
 
     #[test]
@@ -4188,30 +3671,33 @@ main:
         // A local: straight to its slot.
         assert_eq!(
             main_body("", "int x; x = 5;"),
-            "li a0, 5; sw a0, -12(s0); li a0, 0"
+            "addi sp, sp, -16; li a0, 5; sw a0, -20(s0); li a0, 0"
         );
         // A global: through its address.
         assert_eq!(
             main_body("int g;", "g = 5;"),
-            "la a0, g; addi sp, sp, -4; sw a0, 0(sp); li a0, 5; lw a1, 0(sp); addi sp, sp, 4; sw a0, 0(a1); \
+            "la a0, g; addi sp, sp, -8; sd a0, 0(sp); li a0, 5; ld a1, 0(sp); addi sp, sp, 8; sw a0, 0(a1); \
              li a0, 0"
         );
         // Compound assignment evaluates the target once and keeps its address.
         assert_eq!(
             main_body("char *p;", "*p += 300;"),
-            "la a0, p; lw a0, 0(a0); addi sp, sp, -4; sw a0, 0(sp); lw a0, 0(sp); lbu a0, 0(a0); \
-             addi sp, sp, -4; sw a0, 0(sp); li a0, 300; lw a1, 0(sp); addi sp, sp, 4; add a0, a1, a0; \
-             andi a0, a0, 255; lw a1, 0(sp); addi sp, sp, 4; sb a0, 0(a1); li a0, 0"
+            "la a0, p; ld a0, 0(a0); addi sp, sp, -8; sd a0, 0(sp); ld a0, 0(sp); lbu a0, 0(a0); \
+             addi sp, sp, -8; sd a0, 0(sp); li a0, 300; ld a1, 0(sp); addi sp, sp, 8; addw a0, a1, a0; \
+             andi a0, a0, 255; ld a1, 0(sp); addi sp, sp, 8; sb a0, 0(a1); li a0, 0"
         );
         // Increments step by the pointed-to size; postfix gives the old value back.
         assert_eq!(
-            main_body("", "int *p; return p++ == 0;").split("; xor").next().unwrap(),
-            "lw a0, -12(s0); addi a0, a0, 4; sw a0, -12(s0); addi a0, a0, -4; addi sp, sp, -4; sw a0, 0(sp); \
-             li a0, 0; lw a1, 0(sp); addi sp, sp, 4"
+            main_body("", "int *p; return p++ == 0;")
+                .split("; xor")
+                .next()
+                .unwrap(),
+            "addi sp, sp, -16; ld a0, -24(s0); addi a0, a0, 4; sd a0, -24(s0); addi a0, a0, -4; \
+             addi sp, sp, -8; sd a0, 0(sp); li a0, 0; ld a1, 0(sp); addi sp, sp, 8"
         );
         assert_eq!(
             main_body("", "unsigned char c; return --c;"),
-            "lbu a0, -9(s0); addi a0, a0, -1; andi a0, a0, 255; sb a0, -9(s0)"
+            "addi sp, sp, -16; lbu a0, -17(s0); addi a0, a0, -1; andi a0, a0, 255; sb a0, -17(s0)"
         );
     }
 
@@ -4219,8 +3705,8 @@ main:
     fn arrays_are_addresses() {
         assert_eq!(
             main_body("", "int a[2]; return a[1];"),
-            "addi a0, s0, -16; addi sp, sp, -4; sw a0, 0(sp); li a0, 1; lw a1, 0(sp); \
-             addi sp, sp, 4; slli a0, a0, 2; add a0, a1, a0; lw a0, 0(a0)"
+            "addi sp, sp, -16; addi a0, s0, -24; addi sp, sp, -8; sd a0, 0(sp); li a0, 1; ld a1, 0(sp); \
+             addi sp, sp, 8; slli a0, a0, 2; add a0, a1, a0; lw a0, 0(a0)"
         );
         // &a and a are the same address; a global array is `la`.
         assert!(main_body("int g[3];", "return &g == 0;").starts_with("la a0, g; addi sp"));
@@ -4229,66 +3715,27 @@ main:
     #[test]
     fn local_array_initializers() {
         assert_eq!(
-            main_body("", "int a[3] = {7}; return a[0];").split("; addi a0, s0").next().unwrap(),
-            "addi sp, sp, -16; sw zero, -20(s0); sw zero, -16(s0); sw zero, -12(s0); li a0, 7; sw a0, -20(s0)"
+            main_body("", "int a[3] = {7}; return a[0];")
+                .split("; addi a0, s0")
+                .next()
+                .unwrap(),
+            "addi sp, sp, -16; sd zero, -32(s0); sb zero, -24(s0); sb zero, -23(s0); sb zero, -22(s0); \
+             sb zero, -21(s0); li a0, 7; sw a0, -32(s0)"
         );
         assert_eq!(
             main_body("", "char s[] = \"a\\0b\"; return s[2];")
                 .split("; addi a0, s0")
                 .next()
                 .unwrap(),
-            "sw zero, -12(s0); li a0, 97; sb a0, -12(s0); li a0, 98; sb a0, -10(s0)"
+            "addi sp, sp, -16; sb zero, -24(s0); sb zero, -23(s0); sb zero, -22(s0); sb zero, -21(s0); \
+             li a0, 97; sb a0, -24(s0); li a0, 98; sb a0, -22(s0)"
         );
         // Big arrays are cleared with a loop.
         let body = main_body("", "int a[100] = {1}; return a[99];");
         assert!(
-            body.contains("addi t1, s0, -408; li t0, 400; add t0, t1, t0; sw zero, 0(t1); addi t1, t1, 4; bltu t1, t0, 2b"),
+            body.contains("addi t1, s0, -416; li t0, 400; add t0, t1, t0; sd zero, 0(t1); addi t1, t1, 8; bltu t1, t0, 2b"),
             "{body}"
         );
-    }
-
-    #[test]
-    fn global_data() {
-        let asm = compile(
-            "int g = 5; char c = 'x'; short h[3] = {1, -1}; int *p = &g + 1; char s[] = \"hi\\n\";
-             static unsigned u; char *str = \"a\\\"b\\\\\"; char raw[3] = {1, 2, 255}; int zeros[2] = {0};
-             int main() { static int n = 3; return n + u; }",
-        );
-        let data = &asm;
-        for want in [
-            // No empty `.text` first: sections are switched as needed.
-            "    .data\n\n    # int g: 4 bytes\n    .globl g\n    .balign 4\n    .type g, @object\n    .size g, 4\ng:\n    .word 5\n",
-            "\n    # char c: 1 byte\n    .globl c\n    .type c, @object\n    .size c, 1\nc:\n    .byte 120\n",
-            "\n    .balign 2\n    .type h, @object\n    .size h, 6\nh:\n    .half 1\n    .half -1\n    .zero 2\n",
-            "p:\n    .word g+4\n",
-            "s:\n    .ascii \"hi\\n\"\n    .zero 1\n",
-            "    .bss\n\n    # static unsigned int u: 4 bytes\n    .balign 4\n    .type u, @object\n    .size u, 4\nu:\n    .zero 4\n",
-            "str:\n    .word .L.str.0\n",
-            "raw:\n    .byte 1\n    .byte 2\n    .byte 255\n",
-            "zeros:\n    .word 0\n    .zero 4\n",
-            "\n    # static int n: 4 bytes\n    .balign 4\n    .type main.n, @object\n    .size main.n, 4\nmain.n:\n    .word 3\n",
-            "    .section .rodata\n\n.L.str.0:\n    .asciz \"a\\\"b\\\\\"\n",
-        ] {
-            assert!(data.contains(want), "missing {want:?} in\n{data}");
-        }
-        assert!(data.starts_with("    .data\n"), "{data}");
-        assert!(!data.contains(".globl u"), "static");
-        assert!(!data.contains(".globl main.n"), "static local");
-        assert!(asm.contains("la    a0, main.n\n"), "{asm}");
-        // An address converted to a 32-bit integer is a `.word`, as clang
-        // writes it, moved by bytes.
-        let asm = compile(
-            "int i[2]; long a = (long)&i; unsigned b = (unsigned)&i[1] - 2; int c = 8 + (int)i;\n\
-             char *d = (char *)((long)\"xy\" + 1);",
-        );
-        for want in [
-            "a:\n    .word i\n",
-            "b:\n    .word i+2\n",
-            "c:\n    .word i+8\n",
-            "d:\n    .word .L.str.0+1\n",
-        ] {
-            assert!(asm.contains(want), "missing {want:?} in\n{asm}");
-        }
     }
 
     #[test]
@@ -4314,28 +3761,13 @@ main:
     }
 
     #[test]
-    fn calls_pad_the_stack_to_16_bytes() {
-        // No temporaries pushed: no padding.
-        let asm = compile("int f(int a) { return a; } int main() { return f(1); }");
-        let body = body_of(&asm, "main");
-        assert_eq!(&body[4..], ["li a0, 1", "call f"]);
-        // `1 + f(2)`: 1 is pushed (4 bytes), so 12 more bytes keep sp aligned.
-        let asm = compile("int f(int a) { return a; } int main() { return 1 + f(2); }");
-        let body = body_of(&asm, "main").join("; ");
-        assert!(
-            body.contains("li a0, 2; addi sp, sp, -12; call f; addi sp, sp, 12; lw a1, 0(sp)"),
-            "{body}"
-        );
-    }
-
-    #[test]
     fn arguments_are_evaluated_before_loading_registers() {
         let asm = compile("int f(int a, int b) { return a - b; } int main() { return f(f(5, 1), f(2, 3)); }");
         let body = body_of(&asm, "main").join("; ");
         // Both inner calls happen before a0/a1 are loaded for the outer one.
         let outer = body.rfind("call f").unwrap();
         assert!(
-            body[..outer].ends_with("call f; addi sp, sp, 12; mv a1, a0; lw a0, 0(sp); addi sp, sp, 4; "),
+            body[..outer].ends_with("call f; addi sp, sp, 8; mv a1, a0; ld a0, 0(sp); addi sp, sp, 8; "),
             "{body}"
         );
     }
@@ -4347,7 +3779,7 @@ main:
         assert_eq!(body_of(&asm, "main")[4..].join("; "), "li a0, 44; call f");
         assert!(body_of(&asm, "f")
             .join("; ")
-            .ends_with("add a0, a1, a0; andi a0, a0, 255"));
+            .ends_with("addw a0, a1, a0; andi a0, a0, 255"));
     }
 
     #[test]
@@ -4371,13 +3803,13 @@ main:
         let asm = compile("int main(int a, int b) { return a && b; }");
         let body = body_of(&asm, "main").join("; ");
         assert!(
-            body.ends_with("lw a0, -12(s0); beqz a0, .L.and.1; lw a0, -16(s0); snez a0, a0"),
+            body.ends_with("lw a0, -20(s0); beqz a0, .L.and.1; lw a0, -24(s0); snez a0, a0"),
             "{body}"
         );
         let asm = compile("int main(int a, int b) { return a || b; }");
         let body = body_of(&asm, "main").join("; ");
         assert!(
-            body.ends_with("lw a0, -12(s0); bnez a0, .L.or.1; lw a0, -16(s0); snez a0, a0"),
+            body.ends_with("lw a0, -20(s0); bnez a0, .L.or.1; lw a0, -24(s0); snez a0, a0"),
             "{body}"
         );
     }
@@ -4386,17 +3818,18 @@ main:
     fn big_frames_use_t0() {
         let decls: String = (0..600).map(|i| format!("int v{i} = {i};")).collect();
         let asm = compile(&format!("int main() {{ {decls} return v599; }}"));
-        // 8 + 600 * 4 = 2408 bytes, rounded up to 2416; 16 come from the save area.
+        // 16 + 600 * 4 = 2416 bytes, a multiple of 16; 16 come from the save
+        // area.
         let body = body_of(&asm, "main").join("; ");
         assert!(body.contains("li t0, -2400; add sp, sp, t0"), "{body}");
-        // v509 is at -12 - 4 * 509 = -2048, the last slot a 12-bit offset reaches.
-        assert!(body.contains("li a0, 509; sw a0, -2048(s0)"), "{body}");
+        // v507 is at -20 - 4 * 507 = -2048, the last slot a 12-bit offset reaches.
+        assert!(body.contains("li a0, 507; sw a0, -2048(s0)"), "{body}");
         assert!(
-            body.contains("li a0, 510; li t0, -2052; add t0, s0, t0; sw a0, 0(t0)"),
+            body.contains("li a0, 508; li t0, -2052; add t0, s0, t0; sw a0, 0(t0)"),
             "{body}"
         );
         assert!(
-            body.ends_with("li t0, -2408; add t0, s0, t0; lw a0, 0(t0)"),
+            body.ends_with("li t0, -2416; add t0, s0, t0; lw a0, 0(t0)"),
             "{body}"
         );
     }
@@ -4510,18 +3943,18 @@ main:
         let s = "struct s { char c; int i; };";
         assert_eq!(
             main_body(s, "struct s v; v.i = 5;"),
-            "addi a0, s0, -16; addi a0, a0, 4; addi sp, sp, -4; sw a0, 0(sp); li a0, 5; lw a1, 0(sp); \
-             addi sp, sp, 4; sw a0, 0(a1); li a0, 0"
+            "addi sp, sp, -16; addi a0, s0, -24; addi a0, a0, 4; addi sp, sp, -8; sd a0, 0(sp); li a0, 5; \
+             ld a1, 0(sp); addi sp, sp, 8; sw a0, 0(a1); li a0, 0"
         );
         // `p->i` adds the offset to the pointer's value.
         assert_eq!(
             main_body(s, "struct s *p; return p->i;"),
-            "lw a0, -12(s0); addi a0, a0, 4; lw a0, 0(a0)"
+            "addi sp, sp, -16; ld a0, -24(s0); addi a0, a0, 4; lw a0, 0(a0)"
         );
         // A struct's value is its address: `.c` at offset 0 adds nothing.
         assert_eq!(
             main_body(s, "struct s v; return v.c;"),
-            "addi a0, s0, -16; lbu a0, 0(a0)"
+            "addi sp, sp, -16; addi a0, s0, -24; lbu a0, 0(a0)"
         );
     }
 
@@ -4530,7 +3963,7 @@ main:
         // Word-aligned: one word at a time, unrolled.
         assert_eq!(
             main_body("struct s { int a, b; } x, y;", "x = y;"),
-            "la a0, x; addi sp, sp, -4; sw a0, 0(sp); la a0, y; lw a1, 0(sp); addi sp, sp, 4; \
+            "la a0, x; addi sp, sp, -8; sd a0, 0(sp); la a0, y; ld a1, 0(sp); addi sp, sp, 8; \
              lw t0, 0(a0); sw t0, 0(a1); lw t0, 4(a0); sw t0, 4(a1); mv a0, a1; li a0, 0"
         );
         // Aligned to 2: halves, so no access is misaligned.
@@ -4551,29 +3984,30 @@ main:
     #[test]
     fn small_structs_travel_in_registers() {
         let asm = compile(
-            "struct s { int a, b; }; struct s f(struct s x) { return x; }
+            "struct s { long a, b; }; struct s f(struct s x) { return x; }
              int main() { struct s v; return f(v).b; }",
         );
         // The callee stores both words, and returns them from the struct's address.
         assert_eq!(
             body_of(&asm, "f")[4..],
             [
-                "sw a0, -16(s0)",
-                "sw a1, -12(s0)",
-                "addi a0, s0, -16",
+                "addi sp, sp, -16",
+                "sd a0, -32(s0)",
+                "sd a1, -24(s0)",
+                "addi a0, s0, -32",
                 "mv t1, a0",
-                "lw a0, 0(t1)",
-                "lw a1, 4(t1)",
+                "ld a0, 0(t1)",
+                "ld a1, 8(t1)",
             ]
         );
         // The caller loads them, and keeps the result in a hidden local.
         assert_eq!(
             body_of(&asm, "main")[5..].join("; "),
-            "addi a0, s0, -16; mv t1, a0; lw a0, 0(t1); lw a1, 4(t1); call f; sw a0, -24(s0); \
-             sw a1, -20(s0); addi a0, s0, -24; addi a0, a0, 4; lw a0, 0(a0)"
+            "addi a0, s0, -32; mv t1, a0; ld a0, 0(t1); ld a1, 8(t1); call f; sd a0, -48(s0); \
+             sd a1, -40(s0); addi a0, s0, -48; addi a0, a0, 8; ld a0, 0(a0); sext.w a0, a0"
         );
         assert!(
-            asm.contains("#     -24(s0)  temp struct s (call result)\n"),
+            asm.contains("#     -48(s0)  temp struct s (call result)\n"),
             "{asm}"
         );
         // Aligned to less than a word: each word is put together from aligned pieces.
@@ -4591,7 +4025,7 @@ main:
     #[test]
     fn big_structs_travel_by_reference() {
         let asm = compile(
-            "struct b { int v[3]; }; struct b f(int k, struct b x) { return x; }
+            "struct b { int v[5]; }; struct b f(int k, struct b x) { return x; }
              int main() { struct b v; return f(1, v).v[2]; }",
         );
         // The callee keeps the result's address (a0) and copies its argument
@@ -4599,16 +4033,17 @@ main:
         let f = body_of(&asm, "f").join("; ");
         assert!(
             f.starts_with(
-                "addi sp, sp, -16; sw ra, 12(sp); sw s0, 8(sp); addi s0, sp, 16; addi sp, sp, -16; \
-                 sw a0, -28(s0); sw a1, -12(s0); addi t4, s0, -24; lw t0, 0(a2); sw t0, 0(t4)"
+                "addi sp, sp, -16; sd ra, 8(sp); sd s0, 0(sp); addi s0, sp, 16; addi sp, sp, -48; \
+                 sd a0, -56(s0); sw a1, -20(s0); addi t4, s0, -48; lw t0, 0(a2); sw t0, 0(t4)"
             ),
             "{f}"
         );
         // `return x` copies x to where the caller asked.
         assert!(
             f.ends_with(
-                "addi a0, s0, -24; lw a1, -28(s0); lw t0, 0(a0); sw t0, 0(a1); lw t0, 4(a0); \
-                 sw t0, 4(a1); lw t0, 8(a0); sw t0, 8(a1)"
+                "addi a0, s0, -48; ld a1, -56(s0); lw t0, 0(a0); sw t0, 0(a1); lw t0, 4(a0); \
+                 sw t0, 4(a1); lw t0, 8(a0); sw t0, 8(a1); lw t0, 12(a0); sw t0, 12(a1); \
+                 lw t0, 16(a0); sw t0, 16(a1)"
             ),
             "{f}"
         );
@@ -4616,9 +4051,10 @@ main:
         let main = body_of(&asm, "main").join("; ");
         assert!(
             main.contains(
-                "addi a0, s0, -20; addi a1, s0, -32; lw t0, 0(a0); sw t0, 0(a1); lw t0, 4(a0); \
-                 sw t0, 4(a1); lw t0, 8(a0); sw t0, 8(a1); mv a0, a1; mv a2, a0; lw a1, 0(sp); \
-                 addi sp, sp, 4; addi a0, s0, -44; call f; addi a0, s0, -44"
+                "addi a0, s0, -40; addi a1, s0, -64; lw t0, 0(a0); sw t0, 0(a1); lw t0, 4(a0); \
+                 sw t0, 4(a1); lw t0, 8(a0); sw t0, 8(a1); lw t0, 12(a0); sw t0, 12(a1); \
+                 lw t0, 16(a0); sw t0, 16(a1); mv a0, a1; mv a2, a0; ld a1, 0(sp); \
+                 addi sp, sp, 8; addi a0, s0, -88; call f; addi a0, s0, -88"
             ),
             "{main}"
         );
@@ -4629,17 +4065,17 @@ main:
         let asm = compile("int f(int a, int b); int main() { int (*p)(int, int) = f; return p(1, 2); }");
         assert_eq!(
             body_of(&asm, "main")[4..].join("; "),
-            "la a0, f; sw a0, -12(s0); lw a0, -12(s0); addi sp, sp, -4; sw a0, 0(sp); li a0, 1; \
-             addi sp, sp, -4; sw a0, 0(sp); li a0, 2; mv a1, a0; lw a0, 0(sp); addi sp, sp, 4; \
-             lw t1, 0(sp); addi sp, sp, 4; jalr t1"
+            "addi sp, sp, -16; la a0, f; sd a0, -24(s0); ld a0, -24(s0); addi sp, sp, -8; sd a0, 0(sp); \
+             li a0, 1; addi sp, sp, -8; sd a0, 0(sp); li a0, 2; mv a1, a0; ld a0, 0(sp); addi sp, sp, 8; \
+             ld t1, 0(sp); addi sp, sp, 8; jalr t1"
         );
         let asm = compile("int main() { int (*p)(void) = 0; return p(); }");
         assert!(body_of(&asm, "main")
             .join("; ")
-            .ends_with("lw a0, -12(s0); mv t1, a0; jalr t1"));
+            .ends_with("ld a0, -24(s0); mv t1, a0; jalr t1"));
         // A function table is data with relocations.
         let asm = compile("int f(void); int g(void); int (*t[2])(void) = {f, g}; int main() { return 0; }");
-        assert!(asm.contains("t:\n    .word f\n    .word g\n"), "{asm}");
+        assert!(asm.contains("t:\n    .quad f\n    .quad g\n"), "{asm}");
     }
 
     #[test]
@@ -4648,8 +4084,8 @@ main:
             "int main(int x) { switch (x) { case 1: return 5; case -2: default: break; } return 0; }",
         );
         assert_eq!(
-            body_of(&asm, "main")[5..].join("; "),
-            "lw a0, -12(s0); li t0, 1; beq a0, t0, .L.case.main.0; li t0, -2; beq a0, t0, .L.case.main.1; \
+            body_of(&asm, "main")[6..].join("; "),
+            "lw a0, -20(s0); li t0, 1; beq a0, t0, .L.case.main.0; li t0, -2; beq a0, t0, .L.case.main.1; \
              j .L.case.main.2; li a0, 5; j .L.return.main; j .L.break.1; li a0, 0"
         );
         assert!(asm.contains("\n.L.case.main.1:\n.L.case.main.2:\n"), "{asm}");
@@ -4676,7 +4112,7 @@ main:
             body_of(
                 &compile(&format!("int main({from} x) {{ return (_Bool)x; }}")),
                 "main",
-            )[6..]
+            )[7..]
                 .join("; ")
         };
         assert_eq!(cast("int"), "snez a0, a0");
@@ -4684,12 +4120,13 @@ main:
         assert_eq!(cast("_Bool"), "");
         assert_eq!(
             main_body("", "_Bool b = 5; return b;"),
-            "li a0, 1; sb a0, -9(s0); lbu a0, -9(s0)"
+            "addi sp, sp, -16; li a0, 1; sb a0, -17(s0); lbu a0, -17(s0)"
         );
         // `b--` cannot be undone from the new value: the old one is kept in t1.
         assert_eq!(
             main_body("", "_Bool b; return b--;"),
-            "lbu a0, -9(s0); mv t1, a0; addi a0, a0, -1; snez a0, a0; sb a0, -9(s0); mv a0, t1"
+            "addi sp, sp, -16; lbu a0, -17(s0); mv t1, a0; addi a0, a0, -1; snez a0, a0; sb a0, -17(s0); \
+             mv a0, t1"
         );
     }
 
@@ -4817,598 +4254,347 @@ main:
         compile("int main() { int a0 = 1; return a0; }");
     }
 
+    // LP64 sizes, the W instructions and the 32-bit invariant, doubleword
+    // registers.
+
+    #[test]
+    fn smallest_function() {
+        // ra and s0 take the top 16 bytes: -8(s0) and -16(s0).
+        assert_eq!(
+            body_of(&compile("int main() { return 42; }"), "main"),
+            [
+                "addi sp, sp, -16",
+                "sd ra, 8(sp)",
+                "sd s0, 0(sp)",
+                "addi s0, sp, 16",
+                "li a0, 42"
+            ]
+        );
+        let asm = compile("int main() { return 42; }");
+        assert!(
+            asm.ends_with(
+                ".L.return.main:\n    addi  sp, s0, -16\n    ld    ra, 8(sp)\n    ld    s0, 0(sp)\n    \
+                 addi  sp, sp, 16\n    ret\n    .size main, . - main\n"
+            ),
+            "{asm}"
+        );
+        let obj = merlin_as::assemble(&asm).unwrap();
+        let main = obj.symbols.iter().find(|s| s.name == "main").unwrap();
+        assert_eq!(main.size, 40);
+    }
+
+    #[test]
+    fn int_arithmetic_uses_the_w_instructions() {
+        let op = |ty: &str, src: &str| {
+            let body = body_of(
+                &compile(&format!("{ty} f({ty} x, {ty} y) {{ return {src}; }}")),
+                "f",
+            );
+            // Skip the prologue (5 lines: the frame is 32 bytes), the
+            // stores (2), the load of x, its push (2) and the load of y;
+            // then the pop.
+            body[11..]
+                .join("; ")
+                .replace("ld a1, 0(sp); addi sp, sp, 8; ", "")
+        };
+        assert_eq!(op("int", "x + y"), "addw a0, a1, a0");
+        assert_eq!(op("int", "x - y"), "subw a0, a1, a0");
+        assert_eq!(op("int", "x * y"), "mulw a0, a1, a0");
+        assert_eq!(op("int", "x / y"), "divw a0, a1, a0");
+        assert_eq!(op("int", "x % y"), "remw a0, a1, a0");
+        assert_eq!(op("int", "x << y"), "sllw a0, a1, a0");
+        assert_eq!(op("int", "x >> y"), "sraw a0, a1, a0");
+        assert_eq!(op("unsigned", "x / y"), "divuw a0, a1, a0");
+        assert_eq!(op("unsigned", "x % y"), "remuw a0, a1, a0");
+        assert_eq!(op("unsigned", "x >> y"), "srlw a0, a1, a0");
+        // Bitwise operators and comparisons keep sign-extended values right.
+        assert_eq!(op("int", "x & y"), "and a0, a1, a0");
+        assert_eq!(op("unsigned", "x < y"), "sltu a0, a1, a0");
+        assert_eq!(op("int", "x < y"), "slt a0, a1, a0");
+        // long arithmetic is 64-bit.
+        assert_eq!(op("long", "x + y"), "add a0, a1, a0");
+        assert_eq!(op("long", "x * y"), "mul a0, a1, a0");
+        assert_eq!(op("unsigned long", "x / y"), "divu a0, a1, a0");
+        assert_eq!(op("long", "x >> y"), "sra a0, a1, a0");
+        assert_eq!(op("unsigned long", "x << y"), "sll a0, a1, a0");
+        // Negation, and ++.
+        assert!(main_body("", "int x = 1; return -x;").ends_with("lw a0, -20(s0); negw a0, a0"));
+        assert!(main_body("", "long x = 1; return -x;").contains("ld a0, -24(s0); neg a0, a0"));
+        assert!(main_body("", "int x = 1; x++; return x;")
+            .contains("lw a0, -20(s0); addiw a0, a0, 1; sw a0, -20(s0)"));
+    }
+
+    #[test]
+    fn conversions() {
+        let cast = |from: &str, to: &str| {
+            let body = body_of(&compile(&format!("{to} f({from} x) {{ return ({to})x; }}")), "f");
+            // The prologue (5 lines), the parameter's store and load.
+            body[7..].join("; ")
+        };
+        // int and unsigned int are sign-extended in registers: to long
+        // only an unsigned int changes, zero-extended.
+        assert_eq!(cast("int", "long"), "");
+        assert_eq!(cast("unsigned", "long"), "slli a0, a0, 32; srli a0, a0, 32");
+        assert_eq!(
+            cast("unsigned", "unsigned long"),
+            "slli a0, a0, 32; srli a0, a0, 32"
+        );
+        assert_eq!(cast("int", "unsigned long"), "");
+        assert_eq!(cast("unsigned short", "long"), "");
+        // Down to 32 bits: sext.w, whichever the signedness.
+        assert_eq!(cast("long", "int"), "sext.w a0, a0");
+        assert_eq!(cast("unsigned long", "unsigned"), "sext.w a0, a0");
+        assert_eq!(cast("char *", "int"), "sext.w a0, a0");
+        assert_eq!(cast("int", "unsigned"), "");
+        assert_eq!(cast("unsigned", "int"), "");
+        // Narrow types: shifts by 64 - width.
+        assert_eq!(cast("long", "short"), "slli a0, a0, 48; srai a0, a0, 48");
+        assert_eq!(cast("int", "unsigned short"), "slli a0, a0, 48; srli a0, a0, 48");
+        assert_eq!(cast("long", "char"), "andi a0, a0, 255");
+        assert_eq!(cast("long", "_Bool"), "snez a0, a0");
+        // Pointers are 64-bit: an int index is already sign-extended.
+        assert_eq!(cast("int", "char *"), "");
+        assert_eq!(cast("unsigned", "char *"), "slli a0, a0, 32; srli a0, a0, 32");
+    }
+
+    #[test]
+    fn mixed_widths_meet_at_the_common_type() {
+        // long + int: the int is sign-extended already; long + unsigned:
+        // the unsigned is zero-extended first (they meet at long).
+        let body = main_body("long l; int i; unsigned u;", "return l + i + u;");
+        assert!(
+            body.contains("ld a1, 0(sp); addi sp, sp, 8; add a0, a1, a0"),
+            "{body}"
+        );
+        assert!(
+            body.contains("ld a1, 0(sp); addi sp, sp, 8; slli a0, a0, 32; srli a0, a0, 32; add a0, a1, a0"),
+            "{body}"
+        );
+        // int < long compares in 64 bits; the result is an int.
+        assert!(main_body("long l; int i;", "return i < l;").ends_with("slt a0, a1, a0"));
+    }
+
+    #[test]
+    fn loads_and_stores_by_size() {
+        assert_eq!(
+            main_body("", "long l = 1; char *p = 0; int i = 2; l = i; return p == 0;")
+                .split("; xor")
+                .next()
+                .unwrap(),
+            "addi sp, sp, -32; li a0, 1; sd a0, -24(s0); li a0, 0; sd a0, -32(s0); li a0, 2; sw a0, -36(s0); \
+             lw a0, -36(s0); sd a0, -24(s0); ld a0, -32(s0); addi sp, sp, -8; sd a0, 0(sp); li a0, 0; \
+             ld a1, 0(sp); addi sp, sp, 8"
+        );
+    }
+
+    #[test]
+    fn pointer_arithmetic_widens_the_index() {
+        let p = |decls: &str, e: &str| {
+            let asm = compile(&format!("{decls}\nlong f(void) {{ return {e}; }}"));
+            body_of(&asm, "f")[4..].join("; ")
+        };
+        // An int index is sign-extended already; an unsigned one is
+        // zero-extended before it scales.
+        assert!(p("long *q; int i;", "*(q + i)").ends_with("slli a0, a0, 3; add a0, a1, a0; ld a0, 0(a0)"));
+        assert!(p("long *q; unsigned i;", "*(q + i)")
+            .ends_with("slli a0, a0, 32; srli a0, a0, 32; slli a0, a0, 3; add a0, a1, a0; ld a0, 0(a0)"));
+        // The difference of two pointers is a long.
+        assert!(p("int *a, *b;", "a - b").ends_with("sub a0, a1, a0; srai a0, a0, 2"));
+    }
+
+    #[test]
+    fn big_constants() {
+        // li takes 64-bit values; an unsigned int is held sign-extended.
+        let body = main_body("", "unsigned u; u = 0xffffffffu; return 0;");
+        assert!(body.contains("; li a0, -1; sw a0"), "{body}");
+        let body = main_body("", "long l; l = 0x123456789abcdef0L; return 0;");
+        assert!(body.contains("li a0, 1311768467463790320; sd a0"), "{body}");
+        let body = main_body("", "unsigned long u; u = 0xffffffffffffffffUL; return 0;");
+        assert!(body.contains("; li a0, -1; sd a0"), "{body}");
+        // A constant converted is the converted constant.
+        let body = main_body("", "unsigned long u; u = 4294967295u; return 0;");
+        assert!(body.contains("; li a0, 4294967295; sd a0"), "{body}");
+    }
+
     #[test]
     fn constant_expressions_are_folded() {
-        // Every integer type, as clang's front end folds them at -O0: a
-        // long long is a pair, its low word in a0.
+        // Every integer type, as clang's front end folds them at -O0.
         let f = |ty: &str, e: &str| {
             let asm = compile(&format!("{ty} f(void) {{ return {e}; }}"));
             body_of(&asm, "f")[4..].join("; ")
         };
         assert_eq!(f("long", "8 * (1024ul * 1024ul)"), "li a0, 8388608");
         assert_eq!(f("int", "8 * (1024 * 1024)"), "li a0, 8388608");
-        assert_eq!(f("unsigned long", "0ul - 1"), "li a0, -1");
-        assert_eq!(
-            f("long", "2147483647L + 1"),
-            "li a0, -2147483648",
-            "wraps at 32 bits"
-        );
-        assert_eq!(f("long long", "3LL << 40"), "li a0, 0; li a1, 768");
+        assert_eq!(f("long long", "3LL << 40"), "li a0, 3298534883328");
         assert_eq!(
             f("unsigned long long", "(0ull - 1) / 3 + 1"),
-            "li a0, 1431655766; li a1, 1431655765"
+            "li a0, 6148914691236517206"
         );
-        assert_eq!(f("long long", "-1LL >> 63"), "li a0, -1; li a1, -1");
+        assert_eq!(f("unsigned long", "0ul - 1"), "li a0, -1");
         assert_eq!(
-            f("long long", "1LL << 65"),
-            "li a0, 2; li a1, 0",
-            "the low 6 bits of the amount"
+            f("long", "-9223372036854775807L - 1"),
+            "li a0, -9223372036854775808"
         );
-        assert_eq!(f("long long", "(long long)-1"), "li a0, -1; li a1, -1");
-        assert_eq!(f("int", "(int)(1LL << 32 | 7)"), "li a0, 7");
-        assert_eq!(f("int", "(0LL - 1) < 0ull"), "li a0, 0", "an unsigned comparison");
-        assert_eq!(f("char", "(char)300 + 1"), "li a0, 45");
-        assert_eq!(f("unsigned", "sizeof(long long) * 3"), "li a0, 24");
-        assert_eq!(f("int", "1 && 2LL || 0"), "li a0, 1");
-        // The operand `?:` does not choose is not evaluated: it need not be
-        // constant (C99 6.6p3), only its type counts, as clang folds it.
-        let g = |src: &str| body_of(&compile(src), "f")[4..].join("; ");
-        assert_eq!(g("int h(void); int f(void) { return 1 ? 2 : h(); }"), "li a0, 2");
+        // The 32-bit invariant: an unsigned int is held sign-extended.
+        assert_eq!(f("unsigned", "0x80000000u | 1"), "li a0, -2147483647");
         assert_eq!(
-            g("unsigned h(void); unsigned long long f(void) { return 0 ? h() : -1; }"),
-            "li a0, -1; li a1, 0",
-            "-1 converted to the operands' common type, unsigned int"
+            f("long", "(long)(0xffffffffu + 1)"),
+            "li a0, 0",
+            "unsigned int wraps at 32 bits"
+        );
+        assert_eq!(f("long", "1L << 65"), "li a0, 2", "the low 6 bits of the amount");
+        assert_eq!(
+            f("int", "1 << 33"),
+            "li a0, 2",
+            "the low 5 bits of a 32-bit one's"
         );
         assert_eq!(
-            g("long long h(void); long long f(void) { return 1 ? -1 : h(); }"),
-            "li a0, -1; li a1, -1"
+            f("long", "(-9223372036854775807L - 1) / -1"),
+            "li a0, -9223372036854775808"
         );
-        let asm = compile("int h(void); int x = 1 ? 2 : h(); int y = 0 && h();");
-        assert!(
-            asm.contains(
-                "x:
-    .word 2
-"
-            ),
-            "{asm}"
-        );
-        assert!(
-            asm.contains(
-                "y:
-    .word 0
-"
-            ),
-            "{asm}"
+        assert_eq!(f("unsigned long", "sizeof(long) * 3"), "li a0, 24");
+        assert_eq!(
+            f("int", "0 ? 1 / 0 : 2L > 1"),
+            "li a0, 1",
+            "the operand not chosen is not divided"
         );
         // Division by zero is left to run time; the rest is folded.
         assert_eq!(
-            f("int", "(2 * 3) / 0"),
-            "li a0, 6; addi sp, sp, -4; sw a0, 0(sp); li a0, 0; lw a1, 0(sp); addi sp, sp, 4; div a0, a1, a0"
+            f("long", "(2L * 3) / 0"),
+            "li a0, 6; addi sp, sp, -8; sd a0, 0(sp); li a0, 0; ld a1, 0(sp); addi sp, sp, 8; div a0, a1, a0"
         );
-        // Only the constant parts of an expression, and nothing reassociated.
-        let asm = compile("int x; int f(void) { return x * (2 * 3) + x * 2 * 3; }");
-        let body = body_of(&asm, "f").join("; ");
-        assert_eq!(body.matches("mul ").count(), 3, "{body}");
-        assert!(body.contains("li a0, 6"), "{body}");
     }
 
-    /// `long long` on RV32: register pairs.
-    mod pairs {
-        use super::{body_of, compile};
-
-        /// The instructions of `f` after the prologue and the parameters'
-        /// stores and loads, up to the epilogue.
-        fn tail(src: &str, f: &str, skip: usize) -> String {
-            body_of(&compile(src), f)[skip..].join("; ")
+    #[test]
+    fn global_data() {
+        let asm = compile("long g = -2; int i = 5; int *p = &i + 1; char *s = \"x\"; unsigned long u = 1;");
+        for want in [
+            "    # long g: 8 bytes\n    .globl g\n    .balign 8\n    .type g, @object\n    .size g, 8\ng:\n    .quad -2\n",
+            "i:\n    .word 5\n",
+            "    .balign 8\n    .type p, @object\n    .size p, 8\np:\n    .quad i+4\n",
+            "s:\n    .quad .L.str.0\n",
+            "u:\n    .quad 1\n",
+        ] {
+            assert!(asm.contains(want), "missing {want:?} in\n{asm}");
         }
-
-        #[test]
-        fn arithmetic_across_the_words() {
-            let op = |e: &str| {
-                tail(
-                    &format!("long long f(long long a, long long b) {{ return {e}; }}"),
-                    "f",
-                    19,
-                )
-            };
-            assert_eq!(
-                op("a + b"),
-                "add a0, a2, a0; sltu t0, a0, a2; add a1, a3, a1; add a1, a1, t0"
-            );
-            assert_eq!(
-                op("a - b"),
-                "sltu t0, a2, a0; sub a0, a2, a0; sub a1, a3, a1; sub a1, a1, t0"
-            );
-            assert_eq!(
-                op("a * b"),
-                "mul t0, a3, a0; mul t1, a2, a1; add t0, t0, t1; mulhu t1, a2, a0; add a1, t0, t1; mul a0, a2, a0"
-            );
-            assert_eq!(op("a & b"), "and a0, a2, a0; and a1, a3, a1");
-            // Division calls libgcc's routines, with the operands in a0:a1 and a2:a3.
-            assert_eq!(
-                op("a / b"),
-                "mv t0, a0; mv t1, a1; mv a0, a2; mv a1, a3; mv a2, t0; mv a3, t1; call __divdi3"
-            );
-            assert!(tail(
-                "unsigned long long f(unsigned long long a, unsigned long long b) { return a % b; }",
-                "f",
-                19
-            )
-            .ends_with("call __umoddi3"));
-            // Comparisons: the high words, then the low ones unsigned.
-            let cmp = tail("int f(long long a, long long b) { return a < b; }", "f", 19);
-            assert_eq!(
-                cmp,
-                "slt t0, a3, a1; xor t1, a3, a1; seqz t1, t1; sltu t2, a2, a0; and t1, t1, t2; or a0, t0, t1"
-            );
-            let eq = tail("int f(long long a, long long b) { return a == b; }", "f", 19);
-            assert_eq!(eq, "xor t0, a2, a0; xor t1, a3, a1; or a0, t0, t1; seqz a0, a0");
-        }
-
-        #[test]
-        fn shifts_by_whether_the_amount_reaches_32() {
-            let body = tail("long long f(long long a, int n) { return a << n; }", "f", 17);
-            assert!(
-                body.starts_with(
-                    "andi a0, a0, 63; andi t0, a0, 32; beqz t0, .L.shl.1; sll a1, a2, a0; li a0, 0; j .L.shift.2; \
-                     not t2, a0; sll a1, a3, a0; srli t1, a2, 1; srl t1, t1, t2; or a1, a1, t1; sll a0, a2, a0"
-                ),
-                "{body}"
-            );
-            let body = tail("long long f(long long a, int n) { return a >> n; }", "f", 17);
-            assert!(body.contains("sra a0, a3, a0; srai a1, a3, 31"), "{body}");
-            let body = tail(
-                "unsigned long long f(unsigned long long a, int n) { return a >> n; }",
-                "f",
-                17,
-            );
-            assert!(body.contains("srl a0, a3, a0; li a1, 0"), "{body}");
-        }
-
-        #[test]
-        fn conversions() {
-            // To a pair: the sign, or 0; from one, the low word.
-            let cast =
-                |from: &str, to: &str| tail(&format!("{to} f({from} x) {{ return ({to})x; }}"), "f", 6);
-            assert_eq!(cast("int", "long long"), "srai a1, a0, 31");
-            assert_eq!(cast("unsigned", "long long"), "li a1, 0");
-            assert_eq!(cast("unsigned char", "long long"), "srai a1, a0, 31");
-            assert_eq!(cast("char *", "unsigned long long"), "li a1, 0");
-            let cast =
-                |from: &str, to: &str| tail(&format!("{to} f({from} x) {{ return ({to})x; }}"), "f", 8);
-            assert_eq!(cast("long long", "int"), "");
-            assert_eq!(cast("long long", "short"), "slli a0, a0, 16; srai a0, a0, 16");
-            assert_eq!(cast("long long", "_Bool"), "or a0, a0, a1; snez a0, a0");
-            // A constant is two li.
-            assert_eq!(
-                tail("long long f(void) { return 0x123456789LL; }", "f", 4),
-                "li a0, 591751049; li a1, 1"
-            );
-        }
-
-        #[test]
-        fn arguments_take_pairs_of_words() {
-            // A named pair may start in a7, its high word at 0(s0).
-            let body = body_of(
-                &compile(
-                    "long long f(int a, int b, int c, int d, int e, int f, int g, long long h) { return h; }",
-                ),
-                "f",
-            );
-            assert!(
-                body.join("; ")
-                    .contains("sw a7, -48(s0); lw t1, 0(s0); sw t1, -44(s0)"),
-                "{body:?}"
-            );
-            // A variadic one starts in an even register: 5LL skips a1.
-            let body = tail(
-                "long long v(int n, ...); int f(void) { return v(1, 5LL); }",
-                "f",
-                4,
-            );
-            assert_eq!(
-                body,
-                "li a0, 1; addi sp, sp, -4; sw a0, 0(sp); li a0, 5; li a1, 0; mv a3, a1; mv a2, a0; \
-                 lw a0, 0(sp); addi sp, sp, 4; call v"
-            );
-            // va_arg rounds the pointer up to 8 bytes first.
-            let body = tail(
-                "long long f(int n, ...) { __builtin_va_list ap; __builtin_va_start(ap, n); \
-                 return __builtin_va_arg(ap, long long); }",
-                "f",
-                14,
-            );
-            assert!(
-                body.contains("addi a0, a0, 7; andi a0, a0, -8; mv t1, a0; addi a0, a0, 8"),
-                "{body}"
-            );
-            assert!(body.ends_with("lw a0, 0(t1); lw a1, 4(t1)"), "{body}");
+        // An address converted to a 64-bit integer is a `.quad`, as
+        // clang writes it.
+        let asm = compile(
+            "int i[2]; long a = (long)&i; unsigned long long b = (unsigned long long)&i[1] - 2;\n\
+             long c = 8 + (long)i;",
+        );
+        for want in ["a:\n    .quad i\n", "b:\n    .quad i+2\n", "c:\n    .quad i+8\n"] {
+            assert!(asm.contains(want), "missing {want:?} in\n{asm}");
         }
     }
 
-    /// The RV64 counterparts of the tests above: LP64 sizes, the W
-    /// instructions and the 32-bit invariant, doubleword registers.
-    mod rv64 {
-        use super::body_of;
-        use crate::types::Xlen;
+    #[test]
+    fn small_structs_travel_in_doublewords() {
+        // 12 bytes: two registers, each a doubleword of the struct (the
+        // second one's top half past its end).
+        let asm = compile(
+            "struct s { int a, b, c; }; struct s f(struct s x) { return x; }
+             int main() { struct s v; return f(v).c; }",
+        );
+        assert_eq!(
+            body_of(&asm, "f")[4..],
+            [
+                "addi sp, sp, -16",
+                "sd a0, -32(s0)",
+                "sd a1, -24(s0)",
+                "addi a0, s0, -32",
+                "mv t1, a0",
+                "lwu a0, 0(t1)",
+                "lwu t0, 4(t1)",
+                "slli t0, t0, 32",
+                "or a0, a0, t0",
+                "lwu a1, 8(t1)",
+            ]
+        );
+        // Aligned to 8: whole doublewords.
+        let asm = compile("struct s { long a, b; }; long f(struct s x) { return x.b; }");
+        assert!(body_of(&asm, "f").starts_with(&[
+            "addi sp, sp, -16".to_string(),
+            "sd ra, 8(sp)".into(),
+            "sd s0, 0(sp)".into(),
+            "addi s0, sp, 16".into(),
+            "addi sp, sp, -16".into(),
+            "sd a0, -32(s0)".into(),
+            "sd a1, -24(s0)".into(),
+        ]));
+        // Bigger than 16 bytes: by reference.
+        let asm = compile("struct s { long a, b, c; }; long f(struct s x) { return x.c; }");
+        assert!(
+            asm.contains("addi  t4, s0, -40\n    ld    t0, 0(a0)\n    sd    t0, 0(t4)\n"),
+            "{asm}"
+        );
+    }
 
-        fn compile(src: &str) -> String {
-            let opts = crate::Options {
-                xlen: Xlen::Rv64,
-                ..crate::Options::default()
-            };
-            crate::compile_with(crate::INPUT_NAME, src, &opts, &crate::no_files)
-                .unwrap_or_else(|e| panic!("{e:?}"))
-        }
+    #[test]
+    fn variadic_functions_save_doublewords() {
+        let asm = compile(
+            "long f(int n, ...) { __builtin_va_list ap; __builtin_va_start(ap, n); return __builtin_va_arg(ap, long); }",
+        );
+        let body = body_of(&asm, "f");
+        // a1-a7 at the top of the frame, 8 bytes each; ra and s0 below them.
+        assert_eq!(
+            body[..5],
+            [
+                "addi sp, sp, -80",
+                "sd ra, 16(sp)",
+                "sd s0, 8(sp)",
+                "addi s0, sp, 80",
+                "addi sp, sp, -16",
+            ]
+        );
+        assert_eq!(body[5], "sd a1, -56(s0)");
+        assert_eq!(body[11], "sd a7, -8(s0)");
+        let body = body.join("; ");
+        assert!(body.contains("addi a0, s0, -56"), "va_start: {body}");
+        assert!(
+            body.contains("mv t1, a0; addi a0, a0, 8;"),
+            "va_arg steps a doubleword: {body}"
+        );
+        assert!(body.ends_with("ld a0, 0(t1)"), "{body}");
+    }
 
-        /// The instructions `main` runs for `body`, after the prologue.
-        fn main_body(globals: &str, body: &str) -> String {
-            let asm = compile(&format!("{globals}\nint main() {{ {body} }}"));
-            body_of(&asm, "main")[4..].join("; ")
-        }
+    #[test]
+    fn calls_pad_the_stack_to_16_bytes() {
+        // One doubleword pushed: 8 bytes of padding around the call.
+        let body = main_body("int f(int);", "return 1 + f(2);");
+        assert!(
+            body.contains("li a0, 2; addi sp, sp, -8; call f; addi sp, sp, 8"),
+            "{body}"
+        );
+        // Two pushed: none.
+        let body = main_body("int f(int);", "return 1 + (2 + f(3));");
+        assert!(body.contains("li a0, 3; call f"), "{body}");
+    }
 
-        #[test]
-        fn smallest_function() {
-            // ra and s0 take the top 16 bytes: -8(s0) and -16(s0).
-            assert_eq!(
-                body_of(&compile("int main() { return 42; }"), "main"),
-                [
-                    "addi sp, sp, -16",
-                    "sd ra, 8(sp)",
-                    "sd s0, 0(sp)",
-                    "addi s0, sp, 16",
-                    "li a0, 42"
-                ]
-            );
-            let asm = compile("int main() { return 42; }");
-            assert!(
-                asm.ends_with(
-                    ".L.return.main:\n    addi  sp, s0, -16\n    ld    ra, 8(sp)\n    ld    s0, 0(sp)\n    \
-                     addi  sp, sp, 16\n    ret\n    .size main, . - main\n"
-                ),
-                "{asm}"
-            );
-            let obj = merlin_as::assemble_with(&asm, &merlin_as::Options { xlen: Xlen::Rv64 }).unwrap();
-            let main = obj.symbols.iter().find(|s| s.name == "main").unwrap();
-            assert_eq!(main.size, 40);
-        }
+    #[test]
+    fn stack_arguments_are_doublewords() {
+        let body = main_body(
+            "int f(int a, int b, int c, int d, int e, int f, int g, int h, long i, int j);",
+            "return f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);",
+        );
+        // Ten pushed doublewords (80 bytes) and two outgoing ones: 96 in all.
+        assert!(
+            body.contains(
+                "addi sp, sp, -16; ld t1, 24(sp); sd t1, 0(sp); ld t1, 16(sp); sd t1, 8(sp); ld a0, 88(sp)"
+            ),
+            "{body}"
+        );
+        assert!(body.ends_with("call f; addi sp, sp, 96"), "{body}");
+    }
 
-        #[test]
-        fn frame_layout() {
-            let locals = |decls: &str| {
-                let opts = crate::Options {
-                    xlen: Xlen::Rv64,
-                    ..crate::Options::default()
-                };
-                let src = format!("int f() {{ {decls} }}");
-                let p = crate::parse_with(crate::INPUT_NAME, &src, &opts, &crate::no_files).unwrap();
-                let f = p.funcs().next().unwrap();
-                super::super::layout(&f.locals, &vec![true; f.locals.len()], 16, Xlen::Rv64).unwrap()
-            };
-            // Locals start below the 16 bytes of ra and s0.
-            assert_eq!(locals("int a, b; long c;"), (vec![-20, -24, -32], 32));
-            assert_eq!(locals("char *p; char c;"), (vec![-24, -25], 32));
-            // Arrays and structs are aligned to 8, structs a whole number of doublewords.
-            assert_eq!(locals("char c; char buf[5];"), (vec![-17, -24], 32));
-            assert_eq!(locals("struct { int a, b, c; } s;"), (vec![-32], 32));
-        }
-
-        #[test]
-        fn int_arithmetic_uses_the_w_instructions() {
-            let op = |ty: &str, src: &str| {
-                let body = body_of(
-                    &compile(&format!("{ty} f({ty} x, {ty} y) {{ return {src}; }}")),
-                    "f",
-                );
-                // Skip the prologue (5 lines: the frame is 32 bytes), the
-                // stores (2), the load of x, its push (2) and the load of y;
-                // then the pop.
-                body[11..]
-                    .join("; ")
-                    .replace("ld a1, 0(sp); addi sp, sp, 8; ", "")
-            };
-            assert_eq!(op("int", "x + y"), "addw a0, a1, a0");
-            assert_eq!(op("int", "x - y"), "subw a0, a1, a0");
-            assert_eq!(op("int", "x * y"), "mulw a0, a1, a0");
-            assert_eq!(op("int", "x / y"), "divw a0, a1, a0");
-            assert_eq!(op("int", "x % y"), "remw a0, a1, a0");
-            assert_eq!(op("int", "x << y"), "sllw a0, a1, a0");
-            assert_eq!(op("int", "x >> y"), "sraw a0, a1, a0");
-            assert_eq!(op("unsigned", "x / y"), "divuw a0, a1, a0");
-            assert_eq!(op("unsigned", "x % y"), "remuw a0, a1, a0");
-            assert_eq!(op("unsigned", "x >> y"), "srlw a0, a1, a0");
-            // Bitwise operators and comparisons keep sign-extended values right.
-            assert_eq!(op("int", "x & y"), "and a0, a1, a0");
-            assert_eq!(op("unsigned", "x < y"), "sltu a0, a1, a0");
-            assert_eq!(op("int", "x < y"), "slt a0, a1, a0");
-            // long arithmetic is 64-bit.
-            assert_eq!(op("long", "x + y"), "add a0, a1, a0");
-            assert_eq!(op("long", "x * y"), "mul a0, a1, a0");
-            assert_eq!(op("unsigned long", "x / y"), "divu a0, a1, a0");
-            assert_eq!(op("long", "x >> y"), "sra a0, a1, a0");
-            assert_eq!(op("unsigned long", "x << y"), "sll a0, a1, a0");
-            // Negation, and ++.
-            assert!(main_body("", "int x = 1; return -x;").ends_with("lw a0, -20(s0); negw a0, a0"));
-            assert!(main_body("", "long x = 1; return -x;").contains("ld a0, -24(s0); neg a0, a0"));
-            assert!(main_body("", "int x = 1; x++; return x;")
-                .contains("lw a0, -20(s0); addiw a0, a0, 1; sw a0, -20(s0)"));
-        }
-
-        #[test]
-        fn conversions() {
-            let cast = |from: &str, to: &str| {
-                let body = body_of(&compile(&format!("{to} f({from} x) {{ return ({to})x; }}")), "f");
-                // The prologue (5 lines), the parameter's store and load.
-                body[7..].join("; ")
-            };
-            // int and unsigned int are sign-extended in registers: to long
-            // only an unsigned int changes, zero-extended.
-            assert_eq!(cast("int", "long"), "");
-            assert_eq!(cast("unsigned", "long"), "slli a0, a0, 32; srli a0, a0, 32");
-            assert_eq!(
-                cast("unsigned", "unsigned long"),
-                "slli a0, a0, 32; srli a0, a0, 32"
-            );
-            assert_eq!(cast("int", "unsigned long"), "");
-            assert_eq!(cast("unsigned short", "long"), "");
-            // Down to 32 bits: sext.w, whichever the signedness.
-            assert_eq!(cast("long", "int"), "sext.w a0, a0");
-            assert_eq!(cast("unsigned long", "unsigned"), "sext.w a0, a0");
-            assert_eq!(cast("char *", "int"), "sext.w a0, a0");
-            assert_eq!(cast("int", "unsigned"), "");
-            assert_eq!(cast("unsigned", "int"), "");
-            // Narrow types: shifts by 64 - width.
-            assert_eq!(cast("long", "short"), "slli a0, a0, 48; srai a0, a0, 48");
-            assert_eq!(cast("int", "unsigned short"), "slli a0, a0, 48; srli a0, a0, 48");
-            assert_eq!(cast("long", "char"), "andi a0, a0, 255");
-            assert_eq!(cast("long", "_Bool"), "snez a0, a0");
-            // Pointers are 64-bit: an int index is already sign-extended.
-            assert_eq!(cast("int", "char *"), "");
-            assert_eq!(cast("unsigned", "char *"), "slli a0, a0, 32; srli a0, a0, 32");
-        }
-
-        #[test]
-        fn mixed_widths_meet_at_the_common_type() {
-            // long + int: the int is sign-extended already; long + unsigned:
-            // the unsigned is zero-extended first (they meet at long).
-            let body = main_body("long l; int i; unsigned u;", "return l + i + u;");
-            assert!(
-                body.contains("ld a1, 0(sp); addi sp, sp, 8; add a0, a1, a0"),
-                "{body}"
-            );
-            assert!(
-                body.contains(
-                    "ld a1, 0(sp); addi sp, sp, 8; slli a0, a0, 32; srli a0, a0, 32; add a0, a1, a0"
-                ),
-                "{body}"
-            );
-            // int < long compares in 64 bits; the result is an int.
-            assert!(main_body("long l; int i;", "return i < l;").ends_with("slt a0, a1, a0"));
-        }
-
-        #[test]
-        fn loads_and_stores_by_size() {
-            assert_eq!(
-                main_body("", "long l = 1; char *p = 0; int i = 2; l = i; return p == 0;")
-                    .split("; xor")
-                    .next()
-                    .unwrap(),
-                "addi sp, sp, -32; li a0, 1; sd a0, -24(s0); li a0, 0; sd a0, -32(s0); li a0, 2; sw a0, -36(s0); \
-                 lw a0, -36(s0); sd a0, -24(s0); ld a0, -32(s0); addi sp, sp, -8; sd a0, 0(sp); li a0, 0; \
-                 ld a1, 0(sp); addi sp, sp, 8"
-            );
-        }
-
-        #[test]
-        fn pointer_arithmetic_widens_the_index() {
-            let p = |decls: &str, e: &str| {
-                let asm = compile(&format!("{decls}\nlong f(void) {{ return {e}; }}"));
-                body_of(&asm, "f")[4..].join("; ")
-            };
-            // An int index is sign-extended already; an unsigned one is
-            // zero-extended before it scales.
-            assert!(
-                p("long *q; int i;", "*(q + i)").ends_with("slli a0, a0, 3; add a0, a1, a0; ld a0, 0(a0)")
-            );
-            assert!(p("long *q; unsigned i;", "*(q + i)")
-                .ends_with("slli a0, a0, 32; srli a0, a0, 32; slli a0, a0, 3; add a0, a1, a0; ld a0, 0(a0)"));
-            // The difference of two pointers is a long.
-            assert!(p("int *a, *b;", "a - b").ends_with("sub a0, a1, a0; srai a0, a0, 2"));
-        }
-
-        #[test]
-        fn big_constants() {
-            // li takes 64-bit values; an unsigned int is held sign-extended.
-            let body = main_body("", "unsigned u; u = 0xffffffffu; return 0;");
-            assert!(body.contains("; li a0, -1; sw a0"), "{body}");
-            let body = main_body("", "long l; l = 0x123456789abcdef0L; return 0;");
-            assert!(body.contains("li a0, 1311768467463790320; sd a0"), "{body}");
-            let body = main_body("", "unsigned long u; u = 0xffffffffffffffffUL; return 0;");
-            assert!(body.contains("; li a0, -1; sd a0"), "{body}");
-            // A constant converted is the converted constant.
-            let body = main_body("", "unsigned long u; u = 4294967295u; return 0;");
-            assert!(body.contains("; li a0, 4294967295; sd a0"), "{body}");
-        }
-
-        #[test]
-        fn constant_expressions_are_folded() {
-            // Every integer type, as clang's front end folds them at -O0.
-            let f = |ty: &str, e: &str| {
-                let asm = compile(&format!("{ty} f(void) {{ return {e}; }}"));
-                body_of(&asm, "f")[4..].join("; ")
-            };
-            assert_eq!(f("long", "8 * (1024ul * 1024ul)"), "li a0, 8388608");
-            assert_eq!(f("int", "8 * (1024 * 1024)"), "li a0, 8388608");
-            assert_eq!(f("long long", "3LL << 40"), "li a0, 3298534883328");
-            assert_eq!(
-                f("unsigned long long", "(0ull - 1) / 3 + 1"),
-                "li a0, 6148914691236517206"
-            );
-            assert_eq!(f("unsigned long", "0ul - 1"), "li a0, -1");
-            assert_eq!(
-                f("long", "-9223372036854775807L - 1"),
-                "li a0, -9223372036854775808"
-            );
-            // The 32-bit invariant: an unsigned int is held sign-extended.
-            assert_eq!(f("unsigned", "0x80000000u | 1"), "li a0, -2147483647");
-            assert_eq!(
-                f("long", "(long)(0xffffffffu + 1)"),
-                "li a0, 0",
-                "unsigned int wraps at 32 bits"
-            );
-            assert_eq!(f("long", "1L << 65"), "li a0, 2", "the low 6 bits of the amount");
-            assert_eq!(
-                f("int", "1 << 33"),
-                "li a0, 2",
-                "the low 5 bits of a 32-bit one's"
-            );
-            assert_eq!(
-                f("long", "(-9223372036854775807L - 1) / -1"),
-                "li a0, -9223372036854775808"
-            );
-            assert_eq!(f("unsigned long", "sizeof(long) * 3"), "li a0, 24");
-            assert_eq!(
-                f("int", "0 ? 1 / 0 : 2L > 1"),
-                "li a0, 1",
-                "the operand not chosen is not divided"
-            );
-            // Division by zero is left to run time; the rest is folded.
-            assert_eq!(
-                f("long", "(2L * 3) / 0"),
-                "li a0, 6; addi sp, sp, -8; sd a0, 0(sp); li a0, 0; ld a1, 0(sp); addi sp, sp, 8; div a0, a1, a0"
-            );
-        }
-
-        #[test]
-        fn global_data() {
-            let asm =
-                compile("long g = -2; int i = 5; int *p = &i + 1; char *s = \"x\"; unsigned long u = 1;");
-            for want in [
-                "    # long g: 8 bytes\n    .globl g\n    .balign 8\n    .type g, @object\n    .size g, 8\ng:\n    .quad -2\n",
-                "i:\n    .word 5\n",
-                "    .balign 8\n    .type p, @object\n    .size p, 8\np:\n    .quad i+4\n",
-                "s:\n    .quad .L.str.0\n",
-                "u:\n    .quad 1\n",
-            ] {
-                assert!(asm.contains(want), "missing {want:?} in\n{asm}");
-            }
-            // An address converted to a 64-bit integer is a `.quad`, as
-            // clang writes it.
-            let asm = compile(
-                "int i[2]; long a = (long)&i; unsigned long long b = (unsigned long long)&i[1] - 2;\n\
-                 long c = 8 + (long)i;",
-            );
-            for want in ["a:\n    .quad i\n", "b:\n    .quad i+2\n", "c:\n    .quad i+8\n"] {
-                assert!(asm.contains(want), "missing {want:?} in\n{asm}");
-            }
-        }
-
-        #[test]
-        fn small_structs_travel_in_doublewords() {
-            // 12 bytes: two registers, each a doubleword of the struct (the
-            // second one's top half past its end).
-            let asm = compile(
-                "struct s { int a, b, c; }; struct s f(struct s x) { return x; }
-                 int main() { struct s v; return f(v).c; }",
-            );
-            assert_eq!(
-                body_of(&asm, "f")[4..],
-                [
-                    "addi sp, sp, -16",
-                    "sd a0, -32(s0)",
-                    "sd a1, -24(s0)",
-                    "addi a0, s0, -32",
-                    "mv t1, a0",
-                    "lwu a0, 0(t1)",
-                    "lwu t0, 4(t1)",
-                    "slli t0, t0, 32",
-                    "or a0, a0, t0",
-                    "lwu a1, 8(t1)",
-                ]
-            );
-            // Aligned to 8: whole doublewords.
-            let asm = compile("struct s { long a, b; }; long f(struct s x) { return x.b; }");
-            assert!(body_of(&asm, "f").starts_with(&[
-                "addi sp, sp, -16".to_string(),
-                "sd ra, 8(sp)".into(),
-                "sd s0, 0(sp)".into(),
-                "addi s0, sp, 16".into(),
-                "addi sp, sp, -16".into(),
-                "sd a0, -32(s0)".into(),
-                "sd a1, -24(s0)".into(),
-            ]));
-            // Bigger than 16 bytes: by reference.
-            let asm = compile("struct s { long a, b, c; }; long f(struct s x) { return x.c; }");
-            assert!(
-                asm.contains("addi  t4, s0, -40\n    ld    t0, 0(a0)\n    sd    t0, 0(t4)\n"),
-                "{asm}"
-            );
-        }
-
-        #[test]
-        fn variadic_functions_save_doublewords() {
-            let asm = compile(
-                "long f(int n, ...) { __builtin_va_list ap; __builtin_va_start(ap, n); return __builtin_va_arg(ap, long); }",
-            );
-            let body = body_of(&asm, "f");
-            // a1-a7 at the top of the frame, 8 bytes each; ra and s0 below them.
-            assert_eq!(
-                body[..5],
-                [
-                    "addi sp, sp, -80",
-                    "sd ra, 16(sp)",
-                    "sd s0, 8(sp)",
-                    "addi s0, sp, 80",
-                    "addi sp, sp, -16",
-                ]
-            );
-            assert_eq!(body[5], "sd a1, -56(s0)");
-            assert_eq!(body[11], "sd a7, -8(s0)");
-            let body = body.join("; ");
-            assert!(body.contains("addi a0, s0, -56"), "va_start: {body}");
-            assert!(
-                body.contains("mv t1, a0; addi a0, a0, 8;"),
-                "va_arg steps a doubleword: {body}"
-            );
-            assert!(body.ends_with("ld a0, 0(t1)"), "{body}");
-        }
-
-        #[test]
-        fn calls_pad_the_stack_to_16_bytes() {
-            // One doubleword pushed: 8 bytes of padding around the call.
-            let body = main_body("int f(int);", "return 1 + f(2);");
-            assert!(
-                body.contains("li a0, 2; addi sp, sp, -8; call f; addi sp, sp, 8"),
-                "{body}"
-            );
-            // Two pushed: none.
-            let body = main_body("int f(int);", "return 1 + (2 + f(3));");
-            assert!(body.contains("li a0, 3; call f"), "{body}");
-        }
-
-        #[test]
-        fn stack_arguments_are_doublewords() {
-            let body = main_body(
-                "int f(int a, int b, int c, int d, int e, int f, int g, int h, long i, int j);",
-                "return f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);",
-            );
-            // Ten pushed doublewords (80 bytes) and two outgoing ones: 96 in all.
-            assert!(
-                body.contains("addi sp, sp, -16; ld t1, 24(sp); sd t1, 0(sp); ld t1, 16(sp); sd t1, 8(sp); ld a0, 88(sp)"),
-                "{body}"
-            );
-            assert!(body.ends_with("call f; addi sp, sp, 96"), "{body}");
-        }
-
-        #[test]
-        fn switch_on_unsigned_compares_sign_extended() {
-            let body = main_body(
-                "unsigned u;",
-                "switch (u) { case 0xffffffffu: return 1; } return 0;",
-            );
-            assert!(body.contains("li t0, -1; beq a0, t0"), "{body}");
-            let body = main_body("long l;", "switch (l) { case 0x100000000L: return 1; } return 0;");
-            assert!(body.contains("li t0, 4294967296; beq a0, t0"), "{body}");
-        }
+    #[test]
+    fn switch_on_unsigned_compares_sign_extended() {
+        let body = main_body(
+            "unsigned u;",
+            "switch (u) { case 0xffffffffu: return 1; } return 0;",
+        );
+        assert!(body.contains("li t0, -1; beq a0, t0"), "{body}");
+        let body = main_body("long l;", "switch (l) { case 0x100000000L: return 1; } return 0;");
+        assert!(body.contains("li t0, 4294967296; beq a0, t0"), "{body}");
     }
 }

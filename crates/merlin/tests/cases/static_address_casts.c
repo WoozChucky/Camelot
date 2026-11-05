@@ -2,8 +2,8 @@
 // An address converted to an integer type as wide as a pointer is an address
 // constant, as clang has it: a global may be initialized with one, moved by
 // adding or subtracting an integer (by bytes), or converted back to a
-// pointer. long and the intptr types are that wide on both widths; int and
-// unsigned only on RV32, long long only on RV64.
+// pointer. long, long long and the intptr types are that wide; int and
+// unsigned are not.
 typedef __INTPTR_TYPE__ intptr_t;
 typedef __UINTPTR_TYPE__ uintptr_t;
 

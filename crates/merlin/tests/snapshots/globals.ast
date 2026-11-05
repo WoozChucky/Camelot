@@ -57,10 +57,10 @@ Function int main(void) <21:5>
   ExprStmt <26:5>
     Assign += : int <26:7>
       Var r #0 : int <26:5>
-      Binary + : int <26:17>
+      Binary + : long <26:17>
         Deref : int <26:10>
           Var third @third : int * <26:11>
-        Binary - : int <26:25>
+        Binary - : long <26:25>
           Var past @past : int * <26:20>
           Var third @third : int * <26:27>
   ExprStmt <27:5>

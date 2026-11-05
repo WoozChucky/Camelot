@@ -961,14 +961,13 @@ mod tests {
         );
     }
 
-    /// kernel/kernel.lds.S for `xlen`, preprocessed as `cargo xtask kernel`
+    /// kernel/kernel.lds.S, preprocessed as `cargo xtask kernel`
     /// does (`merlin -E -P`, with the assembly's include directories).
-    fn kernel_script(xlen: merlin::types::Xlen) -> String {
+    fn kernel_script() -> String {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let kernel = root.join("kernel");
         let src = std::fs::read_to_string(kernel.join("kernel.lds.S")).unwrap();
         let opts = merlin::Options {
-            xlen,
             include_dirs: vec!["../include".into(), "include".into()],
             line_markers: false,
             ..merlin::Options::default()
@@ -982,7 +981,7 @@ mod tests {
         // kernel/kernel.lds.S: ALIGN(n) after the colon, NOLOAD, /DISCARD/;
         // linked high, loaded at 0x8020_0000, where the firmware starts its
         // next stage (OpenSBI's FW_JUMP_ADDR), no region.
-        let s = parse(&kernel_script(merlin::types::Xlen::Rv64)).unwrap();
+        let s = parse(&kernel_script()).unwrap();
         let outs: Vec<&OutputDesc> = s
             .commands
             .iter()

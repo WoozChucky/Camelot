@@ -6,9 +6,8 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: merlin [options] input.c...
 
-  -march=ISA        rv32ima_zicsr_zifencei (default) or rv64ima_zicsr_zifencei
-  -mabi=ABI         ilp32 for rv32 (the default), lp64 for rv64: the one
-                    the ISA has (merlin has no floating point)
+  -march=ISA        rv64ima_zicsr_zifencei, the only one (and the default)
+  -mabi=ABI         lp64, the only one (merlin has no floating point)
   -o FILE           output file (default: each input with a .s extension;
                     with -E, standard output); needs a single input
   -I DIR            look for #include files in DIR (after the including
@@ -101,7 +100,7 @@ fn run() -> ExitCode {
             "--dump-ast" => mode = Mode::DumpAst,
             // `-march=ISA` and `-mabi=ABI` only, as clang takes them.
             _ if a.starts_with("-march=") => match merlin::parse_march(&a["-march=".len()..]) {
-                Ok(x) => opts.xlen = x,
+                Ok(()) => {}
                 Err(e) => return usage_error(&e),
             },
             _ if a.starts_with("-mabi=") => abi = Some(a["-mabi=".len()..].to_string()),
@@ -140,9 +139,9 @@ fn run() -> ExitCode {
             }
         }
     }
-    // The ABI must be the ISA's, whichever of the two came first; clang calls
-    // any other an unknown one (`-mabi=lp64` with an RV32 `-march` too).
-    if let Some(abi) = abi.filter(|a| a != merlin::abi_name(opts.xlen)) {
+    // The ABI must be the ISA's; clang calls any other an unknown one
+    // (`-mabi=ilp32` too).
+    if let Some(abi) = abi.filter(|a| a != merlin::ABI) {
         return usage_error(&format!("unknown target ABI '{abi}'"));
     }
     if debug {

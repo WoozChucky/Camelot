@@ -8,9 +8,9 @@
 //! which also knows that an object's address is not null).
 //!
 //! Integer constants carry their C type and wrap the way the generated code
-//! would at run time on the target (each function takes it: an `int` is 32
-//! bits on both widths, a `long` 64 on RV64). Values are `i128`s, so every
-//! value of every type, `unsigned long` on LP64 included, is the number it
+//! would at run time (an `int` is 32 bits, a `long` 64). Values are
+//! `i128`s, so every value of every type, `unsigned long` included, is the
+//! number it
 //! is. The parser calls [`parsed_int`] before sema has typed the
 //! tree, so integer types are worked out here from the leaves (literals,
 //! casts, `sizeof`) rather than read from [`Expr::ty`]. Address constants
@@ -18,15 +18,14 @@
 //! found in a checked tree.
 //!
 //! An address converted to an integer type as wide as a pointer stays an
-//! address constant, as clang has it: `(long)&g` (or `(unsigned)&g` on
-//! RV32, `(unsigned long long)&g` on RV64) initializes a global with `.word
-//! g` or `.quad g`, and adding or subtracting an integer moves it by that
-//! many bytes (`(long)&g + 4` is `g+4`). Any other arithmetic on it is not
-//! constant, nor is a narrower or wider conversion (`(int)&g` on RV64,
-//! `(long long)&g` on RV32): clang rejects those in an initializer too.
+//! address constant, as clang has it: `(long)&g` (or `(unsigned long
+//! long)&g`) initializes a global with `.quad g`, and adding or subtracting
+//! an integer moves it by that many bytes (`(long)&g + 4` is `g+4`). Any
+//! other arithmetic on it is not constant, nor is a narrower conversion
+//! (`(int)&g`): clang rejects those in an initializer too.
 
 use crate::ast::*;
-use crate::types::{common, ptr_size, IntKind, Type, Xlen};
+use crate::types::{common, IntKind, Type, PTR_SIZE};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Const {
@@ -47,8 +46,8 @@ pub enum Base {
 }
 
 /// The value of an integer constant expression, in a checked tree.
-pub fn int(e: &Expr, x: Xlen) -> Option<i128> {
-    int_of(eval(e, x)?).map(|(v, _)| v)
+pub fn int(e: &Expr) -> Option<i128> {
+    int_of(eval(e)?).map(|(v, _)| v)
 }
 
 /// [`int`] before sema has typed the tree, for the parser: types come from
@@ -56,32 +55,32 @@ pub fn int(e: &Expr, x: Xlen) -> Option<i128> {
 /// for its type, which the result's depends on. The parser first turns one
 /// that is not into a 0 of the type sema would give it (`1 ? 2 : f()`:
 /// `Parser::resolve_sizeof`), so in its contexts too only its type counts.
-pub fn parsed_int(e: &Expr, x: Xlen) -> Option<i128> {
-    int_of(value(e, x, true, false)?).map(|(v, _)| v)
+pub fn parsed_int(e: &Expr) -> Option<i128> {
+    int_of(value(e, true, false)?).map(|(v, _)| v)
 }
 
 /// [`parsed_int`] of an operand that is not evaluated (the one a constant
 /// `?:` does not choose): dividing by zero in it is no error (C99 6.6p3).
-pub fn parsed_unevaluated_int(e: &Expr, x: Xlen) -> Option<i128> {
-    int_of(value(e, x, false, false)?).map(|(v, _)| v)
+pub fn parsed_unevaluated_int(e: &Expr) -> Option<i128> {
+    int_of(value(e, false, false)?).map(|(v, _)| v)
 }
 
 /// Whether `e` is a null pointer constant: an integer constant expression
 /// equal to 0, or one cast to `void *` (C99 6.3.2.3).
-pub fn is_null_pointer(e: &Expr, xlen: Xlen) -> bool {
+pub fn is_null_pointer(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Cast {
             x, implicit: false, ..
-        } if e.ty == Type::ptr(Type::Void) => is_null_pointer(x, xlen),
-        _ => e.ty.is_integer() && int(e, xlen) == Some(0),
+        } if e.ty == Type::ptr(Type::Void) => is_null_pointer(x),
+        _ => e.ty.is_integer() && int(e) == Some(0),
     }
 }
 
 /// The constant value of `e`, in a tree sema has checked, or `None` if it
 /// is not a constant expression merlin can evaluate (that includes dividing
 /// by zero, where the division is evaluated).
-pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
-    value(e, xlen, true, true)
+pub fn eval(e: &Expr) -> Option<Const> {
+    value(e, true, true)
 }
 
 /// [`eval`] of an operand that is `evaluated` or not, in a tree sema has
@@ -93,41 +92,41 @@ pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
 /// tree the operand `?:` does not choose need not be constant at all, as
 /// the right operand of `0 && h()` need not: sema gave it its type, and
 /// `1 ? 2 : h()` is 2, which clang folds too.
-fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> {
+fn value(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
     use Const::*;
-    let eval = |e: &Expr, xlen: Xlen| value(e, xlen, evaluated, checked);
+    let eval = |e: &Expr| value(e, evaluated, checked);
     match &e.kind {
         ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => Some(Int(*v, e.ty.int_kind()?)),
-        ExprKind::SizeofType(t) => Some(Int(t.size(xlen)?.into(), IntKind::size_t(xlen))),
+        ExprKind::SizeofType(t) => Some(Int(t.size()?.into(), IntKind::size_t())),
         // An address is true: an object's is never null.
-        ExprKind::Unary(UnOp::Not, x) => Some(Int((!const_truth(&eval(x, xlen)?)).into(), IntKind::Int)),
+        ExprKind::Unary(UnOp::Not, x) => Some(Int((!const_truth(&eval(x)?)).into(), IntKind::Int)),
         ExprKind::Unary(op, x) => {
-            let (v, k) = int_of(eval(x, xlen)?)?;
+            let (v, k) = int_of(eval(x)?)?;
             let k = k.promoted();
             Some(match op {
-                UnOp::Neg => Int(k.wrap(-v, xlen), k),
+                UnOp::Neg => Int(k.wrap(-v), k),
                 UnOp::Plus => Int(v, k),
-                UnOp::BitNot => Int(k.wrap(!v, xlen), k),
+                UnOp::BitNot => Int(k.wrap(!v), k),
                 UnOp::Not => Int((v == 0).into(), IntKind::Int),
             })
         }
         ExprKind::Binary(BinOp::LogAnd, l, r) => {
-            let l = const_truth(&eval(l, xlen)?);
-            Some(Int((l && const_truth(&eval(r, xlen)?)).into(), IntKind::Int))
+            let l = const_truth(&eval(l)?);
+            Some(Int((l && const_truth(&eval(r)?)).into(), IntKind::Int))
         }
         ExprKind::Binary(BinOp::LogOr, l, r) => {
-            let l = const_truth(&eval(l, xlen)?);
-            Some(Int((l || const_truth(&eval(r, xlen)?)).into(), IntKind::Int))
+            let l = const_truth(&eval(l)?);
+            Some(Int((l || const_truth(&eval(r)?)).into(), IntKind::Int))
         }
         ExprKind::Binary(op, l, r) => {
-            let (lc, rc) = (eval(l, xlen)?, eval(r, xlen)?);
+            let (lc, rc) = (eval(l)?, eval(r)?);
             match (lc, rc) {
-                (Int(a, ak), Int(b, bk)) => binary(*op, (a, ak), (b, bk), xlen, evaluated),
+                (Int(a, ak), Int(b, bk)) => binary(*op, (a, ak), (b, bk), evaluated),
                 // Address arithmetic: pointer plus or minus an integer, by
                 // whole elements, or an address converted to an integer
                 // plus or minus one, by bytes.
                 (Addr { base, offset }, Int(n, _)) if matches!(op, BinOp::Add | BinOp::Sub) => {
-                    let size = step(&l.ty, xlen)?;
+                    let size = step(&l.ty)?;
                     let n = if *op == BinOp::Sub { -n } else { n };
                     Some(Addr {
                         base,
@@ -135,7 +134,7 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> 
                     })
                 }
                 (Int(n, _), Addr { base, offset }) if *op == BinOp::Add => {
-                    let size = step(&r.ty, xlen)?;
+                    let size = step(&r.ty)?;
                     Some(Addr {
                         base,
                         offset: offset + n * size,
@@ -147,44 +146,40 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> 
         ExprKind::Cond(c, a, b) => {
             // Only the chosen operand is evaluated; of the other only the
             // type counts: sema's, or before sema what its value has.
-            let (chosen, other) = if const_truth(&eval(c, xlen)?) {
-                (a, b)
-            } else {
-                (b, a)
-            };
-            let v = eval(chosen, xlen)?;
+            let (chosen, other) = if const_truth(&eval(c)?) { (a, b) } else { (b, a) };
+            let v = eval(chosen)?;
             let other = if checked {
                 other.ty.int_kind()
             } else {
-                int_of(value(other, xlen, false, false)?).map(|(_, k)| k)
+                int_of(value(other, false, false)?).map(|(_, k)| k)
             };
             match (v, other) {
                 // The result has the operands' common type, whichever is chosen.
                 (Int(x, xk), Some(yk)) => {
-                    let k = common(xk, yk, xlen);
-                    Some(Int(k.wrap(x, xlen), k))
+                    let k = common(xk, yk);
+                    Some(Int(k.wrap(x), k))
                 }
                 (v, _) => Some(v),
             }
         }
         ExprKind::Cast { x, .. } => {
-            let v = eval(x, xlen)?;
+            let v = eval(x)?;
             match (e.ty.unqual(), v) {
-                (Type::Int(k), Int(v, _)) => Some(Int(k.wrap(v, xlen), *k)),
+                (Type::Int(k), Int(v, _)) => Some(Int(k.wrap(v), *k)),
                 // A non-null address is true.
                 (Type::Int(IntKind::Bool), Addr { base: Some(_), .. }) => Some(Int(1, IntKind::Bool)),
                 // A plain number used as an address converts back: that
                 // makes `(unsigned)&((struct s *)0)->field` (offsetof) a
                 // constant.
-                (Type::Int(k), Addr { base: None, offset }) => Some(Int(k.wrap(offset, xlen), *k)),
+                (Type::Int(k), Addr { base: None, offset }) => Some(Int(k.wrap(offset), *k)),
                 // An address converted to an integer as wide as a pointer
                 // stays one, what the linker will fill in; to any other
                 // width it is not a constant.
-                (Type::Int(k), a @ Addr { .. }) if k.size(xlen) == ptr_size(xlen) => Some(a),
+                (Type::Int(k), a @ Addr { .. }) if k.size() == PTR_SIZE => Some(a),
                 // An address is a pointer-sized unsigned number.
                 (Type::Ptr(_), Int(v, _)) => Some(Addr {
                     base: None,
-                    offset: IntKind::ULong.wrap(v, xlen),
+                    offset: IntKind::ULong.wrap(v),
                 }),
                 (Type::Ptr(_), a @ Addr { .. }) => Some(a),
                 _ => None,
@@ -195,9 +190,9 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> 
         ExprKind::Str(_) | ExprKind::Var { .. } | ExprKind::Deref(_) | ExprKind::Member { .. }
             if e.ty.is_array() || e.ty.is_func() =>
         {
-            addr_of(e, xlen, evaluated, checked)
+            addr_of(e, evaluated, checked)
         }
-        ExprKind::Addr(x) => addr_of(x, xlen, evaluated, checked),
+        ExprKind::Addr(x) => addr_of(x, evaluated, checked),
         _ => None,
     }
 }
@@ -205,7 +200,7 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> 
 /// The address of an lvalue, if it is an address constant: a global object
 /// (or a member or element of one, at a constant offset), a string literal,
 /// or what a constant pointer points to.
-fn addr_of(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> {
+fn addr_of(e: &Expr, evaluated: bool, checked: bool) -> Option<Const> {
     match &e.kind {
         ExprKind::Var {
             var: Some(VarRef::Global(sym)),
@@ -218,7 +213,7 @@ fn addr_of(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const
             base: Some(Base::Str(bytes.clone())),
             offset: 0,
         }),
-        ExprKind::Deref(p) => match value(p, xlen, evaluated, checked)? {
+        ExprKind::Deref(p) => match value(p, evaluated, checked)? {
             a @ Const::Addr { .. } => Some(a),
             Const::Int(..) => None,
         },
@@ -229,9 +224,9 @@ fn addr_of(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const
             ..
         } => {
             let at = if *arrow {
-                value(base, xlen, evaluated, checked)?
+                value(base, evaluated, checked)?
             } else {
-                addr_of(base, xlen, evaluated, checked)?
+                addr_of(base, evaluated, checked)?
             };
             match at {
                 Const::Addr { base, offset } => Some(Const::Addr {
@@ -247,11 +242,11 @@ fn addr_of(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const
 
 /// How many bytes adding 1 to a constant of type `t` moves an address: a
 /// pointer's element size, or 1 for an address converted to an integer.
-fn step(t: &Type, xlen: Xlen) -> Option<i128> {
+fn step(t: &Type) -> Option<i128> {
     if t.is_integer() {
         return Some(1);
     }
-    Some(i128::from(t.pointee()?.size(xlen)?))
+    Some(i128::from(t.pointee()?.size()?))
 }
 
 /// Whether a constant is true, as a condition tests it: an object's
@@ -275,29 +270,23 @@ fn int_of(c: Const) -> Option<(i128, IntKind)> {
 /// An arithmetic, bitwise or comparison operator on two integer constants,
 /// each a value and its type. Dividing by zero is not constant where it is
 /// `evaluated` (see [`value`]).
-fn binary(
-    op: BinOp,
-    (a, ak): (i128, IntKind),
-    (b, bk): (i128, IntKind),
-    x: Xlen,
-    evaluated: bool,
-) -> Option<Const> {
+fn binary(op: BinOp, (a, ak): (i128, IntKind), (b, bk): (i128, IntKind), evaluated: bool) -> Option<Const> {
     // Shifts take the promoted left operand's type; the others the common type.
     let k = match op {
         BinOp::Shl | BinOp::Shr => ak.promoted(),
-        _ => common(ak, bk, x),
+        _ => common(ak, bk),
     };
     let (a, b) = (
-        k.wrap(a, x),
+        k.wrap(a),
         if matches!(op, BinOp::Shl | BinOp::Shr) {
             b
         } else {
-            k.wrap(b, x)
+            k.wrap(b)
         },
     );
     // The hardware uses the low 5 bits of a 32-bit shift's amount and the
     // low 6 bits of a 64-bit one's (spec section 10).
-    let shift = (b & i128::from(k.size(x) * 8 - 1)) as u32;
+    let shift = (b & i128::from(k.size() * 8 - 1)) as u32;
     let v = match op {
         BinOp::Add => a + b,
         BinOp::Sub => a - b,
@@ -322,7 +311,7 @@ fn binary(
         BinOp::Ge => return Some(Const::Int((a >= b).into(), IntKind::Int)),
         BinOp::LogAnd | BinOp::LogOr => unreachable!("handled by eval: they short-circuit"),
     };
-    Some(Const::Int(k.wrap(v, x), k))
+    Some(Const::Int(k.wrap(v), k))
 }
 
 // ---- conditions ----
@@ -355,11 +344,11 @@ fn binary(
 /// address converted to an integer (`(long)&g`), two objects' order
 /// (`&g < &h`). A condition of pointer type is not folded at all
 /// (`if (&g)`): clang folds only integer ones.
-pub fn condition(e: &Expr, x: Xlen) -> Option<i128> {
+pub fn condition(e: &Expr) -> Option<i128> {
     if !e.ty.is_integer() {
         return None;
     }
-    match fold(e, x)? {
+    match fold(e)? {
         Folded::Int(v, _) => Some(v),
         Folded::Addr(..) => None,
     }
@@ -422,10 +411,10 @@ fn truth(v: &Folded) -> bool {
     }
 }
 
-fn fold(e: &Expr, x: Xlen) -> Option<Folded> {
+fn fold(e: &Expr) -> Option<Folded> {
     use Folded::*;
     // An integer constant expression, as everywhere.
-    if let Some(Const::Int(v, k)) = eval(e, x) {
+    if let Some(Const::Int(v, k)) = eval(e) {
         return Some(Int(v, k));
     }
     let as_int = |v: Folded| match v {
@@ -439,14 +428,14 @@ fn fold(e: &Expr, x: Xlen) -> Option<Folded> {
         Addr(o, to, d.filter(|&(lo, hi)| (lo..=hi).contains(&to)))
     };
     match &e.kind {
-        ExprKind::Unary(UnOp::Not, a) => Some(Int((!truth(&fold(a, x)?)).into(), IntKind::Int)),
+        ExprKind::Unary(UnOp::Not, a) => Some(Int((!truth(&fold(a)?)).into(), IntKind::Int)),
         ExprKind::Unary(op, a) => {
-            let (v, k) = as_int(fold(a, x)?)?;
+            let (v, k) = as_int(fold(a)?)?;
             let k = k.promoted();
             Some(Int(
                 match op {
-                    UnOp::Neg => k.wrap(-v, x),
-                    UnOp::BitNot => k.wrap(!v, x),
+                    UnOp::Neg => k.wrap(-v),
+                    UnOp::BitNot => k.wrap(!v),
                     _ => v,
                 },
                 k,
@@ -454,44 +443,44 @@ fn fold(e: &Expr, x: Xlen) -> Option<Folded> {
         }
         // Short-circuits: what the left operand decides is enough.
         ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r) => {
-            let l = truth(&fold(l, x)?);
+            let l = truth(&fold(l)?);
             let v = if l == (*op == BinOp::LogOr) {
                 l
             } else {
-                truth(&fold(r, x)?)
+                truth(&fold(r)?)
             };
             Some(Int(v.into(), IntKind::Int))
         }
-        ExprKind::Binary(op, l, r) => match (fold(l, x)?, fold(r, x)?) {
-            (Int(a, ak), Int(b, bk)) => match binary(*op, (a, ak), (b, bk), x, true)? {
+        ExprKind::Binary(op, l, r) => match (fold(l)?, fold(r)?) {
+            (Int(a, ak), Int(b, bk)) => match binary(*op, (a, ak), (b, bk), true)? {
                 Const::Int(v, k) => Some(Int(v, k)),
                 Const::Addr { .. } => None,
             },
             // A pointer moved by whole elements.
             (Addr(o, at, d), Int(n, _)) if matches!(op, BinOp::Add | BinOp::Sub) => {
                 let n = if *op == BinOp::Sub { -n } else { n };
-                Some(moved(o, at, d, n * step(&l.ty, x)?))
+                Some(moved(o, at, d, n * step(&l.ty)?))
             }
-            (Int(n, _), Addr(o, at, d)) if *op == BinOp::Add => Some(moved(o, at, d, n * step(&r.ty, x)?)),
-            (Addr(a, at, ad), Addr(b, bt, bd)) => compare(*op, (a, at, ad), (b, bt, bd), &l.ty, x),
+            (Int(n, _), Addr(o, at, d)) if *op == BinOp::Add => Some(moved(o, at, d, n * step(&r.ty)?)),
+            (Addr(a, at, ad), Addr(b, bt, bd)) => compare(*op, (a, at, ad), (b, bt, bd), &l.ty),
             // An address compared with a null pointer constant, `&g != 0`.
-            (Addr(a, at, ad), Int(n, _)) => compare(*op, (a, at, ad), (None, n, None), &l.ty, x),
-            (Int(n, _), Addr(b, bt, bd)) => compare(*op, (None, n, None), (b, bt, bd), &r.ty, x),
+            (Addr(a, at, ad), Int(n, _)) => compare(*op, (a, at, ad), (None, n, None), &l.ty),
+            (Int(n, _), Addr(b, bt, bd)) => compare(*op, (None, n, None), (b, bt, bd), &r.ty),
         },
         ExprKind::Cond(c, a, b) => {
-            let v = fold(if truth(&fold(c, x)?) { a } else { b }, x)?;
+            let v = fold(if truth(&fold(c)?) { a } else { b })?;
             match (v, e.ty.int_kind()) {
-                (Int(v, _), Some(k)) => Some(Int(k.wrap(v, x), k)),
+                (Int(v, _), Some(k)) => Some(Int(k.wrap(v), k)),
                 (v, _) => Some(v),
             }
         }
-        ExprKind::Cast { x: a, .. } => match (e.ty.unqual(), fold(a, x)?) {
+        ExprKind::Cast { x: a, .. } => match (e.ty.unqual(), fold(a)?) {
             (Type::Int(IntKind::Bool), v) => Some(Int(truth(&v).into(), IntKind::Bool)),
-            (Type::Int(k), Int(v, _)) => Some(Int(k.wrap(v, x), *k)),
+            (Type::Int(k), Int(v, _)) => Some(Int(k.wrap(v), *k)),
             // A plain number used as an address is that number again; an
             // object's address as a number is not known.
-            (Type::Int(k), Addr(None, at, _)) => Some(Int(k.wrap(at, x), *k)),
-            (Type::Ptr(_), Int(v, _)) => Some(Addr(None, IntKind::ULong.wrap(v, x), None)),
+            (Type::Int(k), Addr(None, at, _)) => Some(Int(k.wrap(at), *k)),
+            (Type::Ptr(_), Int(v, _)) => Some(Addr(None, IntKind::ULong.wrap(v), None)),
             // A pointer cast to another pointer type designates nothing any
             // more (clang's `CK_BitCast`), but to `void *` or to a pointer
             // to a similar type (`CK_NoOp`: qualifiers added); an array or
@@ -516,16 +505,16 @@ fn fold(e: &Expr, x: Xlen) -> Option<Folded> {
         | ExprKind::CompoundLit { .. }
             if e.ty.is_array() || e.ty.is_func() =>
         {
-            place(e, x)
+            place(e)
         }
-        ExprKind::Addr(a) => place(a, x),
+        ExprKind::Addr(a) => place(a),
         _ => None,
     }
 }
 
 /// The address of an lvalue, if [`condition`] knows it.
-fn place(e: &Expr, x: Xlen) -> Option<Folded> {
-    let size = e.ty.size(x).map(i128::from);
+fn place(e: &Expr) -> Option<Folded> {
+    let size = e.ty.size().map(i128::from);
     let object = |what: Place| {
         // An incomplete type has no size; a function has none either.
         let incomplete = size.is_none() && !e.ty.is_func();
@@ -554,7 +543,7 @@ fn place(e: &Expr, x: Xlen) -> Option<Folded> {
         // a function a local).
         ExprKind::CompoundLit { local: Some(id), .. } => object(Place::Local(*id)),
         ExprKind::CompoundLit { local: None, .. } => object(Place::Literal(e as *const Expr as usize)),
-        ExprKind::Deref(p) => match fold(p, x)? {
+        ExprKind::Deref(p) => match fold(p)? {
             // An array element that is an array itself (`m[1]` of an
             // `int m[2][4]`) is the subobject designated.
             Folded::Addr(o, at, d) if e.ty.is_array() => {
@@ -569,7 +558,7 @@ fn place(e: &Expr, x: Xlen) -> Option<Folded> {
             arrow,
             offset: member,
             ..
-        } => match if *arrow { fold(base, x)? } else { place(base, x)? } {
+        } => match if *arrow { fold(base)? } else { place(base)? } {
             Folded::Addr(o, at, d) => {
                 let at = at + i128::from(*member);
                 Some(Folded::Addr(o, at, d.and(size.map(|s| (at, at + s)))))
@@ -588,7 +577,6 @@ fn compare(
     (a, at, ad): (Option<Object>, i128, Designator),
     (b, bt, bd): (Option<Object>, i128, Designator),
     l: &Type,
-    x: Xlen,
 ) -> Option<Folded> {
     let int = |v: bool| Some(Folded::Int(v.into(), IntKind::Int));
     // Two string literals may share their bytes, or not: they are at one
@@ -642,7 +630,7 @@ fn compare(
             BinOp::Le if ordered => int(at <= bt),
             BinOp::Gt if ordered => int(at > bt),
             BinOp::Ge if ordered => int(at >= bt),
-            BinOp::Sub => Some(Folded::Int((at - bt) / step(l, x)?, IntKind::ptrdiff_t(x))),
+            BinOp::Sub => Some(Folded::Int((at - bt) / step(l)?, IntKind::ptrdiff_t())),
             _ => None,
         };
     }
@@ -691,26 +679,18 @@ mod tests {
 
     /// Evaluates `src` as an untyped expression, the way the parser does.
     fn ev(src: &str) -> Option<Const> {
-        ev_for(src, Xlen::Rv32)
-    }
-
-    fn ev_for(src: &str, x: Xlen) -> Option<Const> {
-        let toks = crate::lexer::lex(&format!("int x[1] = {{ {src} }};"), x).unwrap();
-        let prog = crate::parser::parse(&toks, x).unwrap();
+        let toks = crate::lexer::lex(&format!("int x[1] = {{ {src} }};")).unwrap();
+        let prog = crate::parser::parse(&toks).unwrap();
         let Item::Decl(d) = &prog.items[0] else { panic!() };
         let Some(Init::List(items, _)) = &d[0].init else {
             panic!()
         };
         let Init::Expr(e) = &items[0] else { panic!() };
-        value(e, x, true, false)
+        value(e, true, false)
     }
 
     fn int(src: &str) -> (i128, IntKind) {
-        int_for(src, Xlen::Rv32)
-    }
-
-    fn int_for(src: &str, x: Xlen) -> (i128, IntKind) {
-        match ev_for(src, x) {
+        match ev(src) {
             Some(Const::Int(v, k)) => (v, k),
             c => panic!("{src}: {c:?}"),
         }
@@ -735,14 +715,13 @@ mod tests {
         assert_eq!(int("(char)300"), (44, Char));
         assert_eq!(int("(signed char)200"), (-56, SChar));
         assert_eq!(int("(char)300 + 1"), (45, Int), "promoted");
-        assert_eq!(int("sizeof(int) * 4"), (16, UInt));
-        assert_eq!(int("sizeof(char[3][5])"), (15, UInt));
+        assert_eq!(int("sizeof(int) * 4"), (16, ULong));
+        assert_eq!(int("sizeof(char[3][5])"), (15, ULong));
         assert_eq!(int("~0"), (-1, Int));
         assert_eq!(int("!5 || 3 && 4"), (1, Int));
         assert_eq!(int("1 ? 2 : 3u"), (2, UInt));
         assert_eq!(int("'a' + 1"), (98, Int));
         assert_eq!(int("1L + 1"), (2, Long));
-        assert_eq!(int("1u + 1L"), (2, ULong));
         assert_eq!(
             int("1 << 33"),
             (2, Int),
@@ -752,7 +731,6 @@ mod tests {
 
     #[test]
     fn lp64_arithmetic() {
-        let int = |src: &str| int_for(src, Xlen::Rv64);
         assert_eq!(int("1u + 1L"), (2, Long), "long holds every unsigned int");
         assert_eq!(int("-1 < 0L"), (1, Int));
         assert_eq!(int("0xffffffffu + 1L"), (1 << 32, Long));
@@ -790,7 +768,7 @@ mod tests {
         assert_eq!(int("1 ? 2 : 1 / 0"), (2, Int));
         assert_eq!(int("0 ? 1 / 0 : 2"), (2, Int));
         assert_eq!(int("0 ? 1 % 0 : 2u"), (2, UInt), "its type still counts");
-        assert_eq!(int_for("1 ? 2 : 1L / 0", Xlen::Rv64), (2, Long));
+        assert_eq!(int("1 ? 2 : 1L / 0"), (2, Long));
         assert_eq!(int("1 ? 2 : (0 ? 3 : 4 / 0)"), (2, Int));
         assert_eq!(int("0 && 1 / 0"), (0, Int));
         assert_eq!(int("1 || 1 / 0"), (1, Int));
@@ -828,7 +806,7 @@ mod tests {
         let StmtKind::If { cond, .. } = &body[2].kind else {
             panic!("{body:?}")
         };
-        condition(cond, Xlen::Rv32)
+        condition(cond)
     }
 
     /// clang 23 folds a condition of addresses it knows: an object's is not

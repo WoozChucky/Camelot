@@ -19,7 +19,6 @@ fn examples_dir() -> std::path::PathBuf {
 /// makes it, with `-I include`: what merlin-as assembles.
 fn preprocessed(name: &str, src: &str) -> String {
     let opts = merlin::Options {
-        xlen: merlin::types::Xlen::Rv64,
         include_dirs: vec![examples_dir().join("../include")],
         ..merlin::Options::default()
     };

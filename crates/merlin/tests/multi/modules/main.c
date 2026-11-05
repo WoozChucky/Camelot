@@ -1,6 +1,6 @@
 // expect: 211
 // Several translation units: main.c and counter.c share counter.h (from
-// -I include), util.rv32.s (or util.rv64.s) is hand-written assembly. Calls
+// -I include), util.s is hand-written assembly. Calls
 // go across files both ways, `total` is an extern global, and each file's
 // statics are its own.
 #include "counter.h"

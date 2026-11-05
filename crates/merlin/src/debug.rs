@@ -65,10 +65,9 @@
 //! a constant the smallest `data` form that holds it. [`Die::pool`] gives them
 //! their indices before the abbreviations are made.
 //!
-//! Addresses in `.debug_addr` are the target's: 4 bytes written `.word` on
-//! RV32, 8 bytes written `.quad` on RV64, as clang writes them, and the
-//! unit's header and the table's say which (the address size). merlin-as
-//! turns each into a relocation (`R_RISCV_32` or `R_RISCV_64`), and merlin-ld
+//! Addresses in `.debug_addr` are 8 bytes, written `.quad` as clang writes
+//! them, and the unit's header and the table's say so (the address size).
+//! merlin-as turns each into a relocation (`R_RISCV_64`), and merlin-ld
 //! applies it.
 //!
 //! None of it changes the code: labels and directives assemble to no bytes
@@ -76,7 +75,7 @@
 
 mod order;
 
-use crate::types::{ptr_size, IntKind, Quals, Record, Spelled, Spelling, Type, Xlen};
+use crate::types::{IntKind, Quals, Record, Spelled, Spelling, Type, PTR_SIZE};
 use crate::Pos;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -435,8 +434,6 @@ pub(crate) struct Lines {
     /// The records, typedefs and enums in the table, kept alive so that
     /// their addresses stay theirs.
     keep: Vec<Arc<dyn std::any::Any>>,
-    /// The target, whose addresses are 4 or 8 bytes.
-    xlen: Xlen,
 }
 
 /// The anonymous types records describe: each one's record and member
@@ -468,7 +465,7 @@ fn quoted(s: &str) -> String {
 }
 
 impl Lines {
-    pub fn new(info: &DebugInfo, names: &[String], xlen: Xlen) -> Self {
+    pub fn new(info: &DebugInfo, names: &[String]) -> Self {
         Lines {
             info: info.clone(),
             names: names.to_vec(),
@@ -488,7 +485,6 @@ impl Lines {
             types: Vec::new(),
             type_ids: HashMap::new(),
             keep: Vec::new(),
-            xlen,
         }
     }
 
@@ -1177,7 +1173,7 @@ impl Lines {
                 };
                 d.attr(AT_NAME, Val::Str(k.name().to_string()));
                 d.attr(AT_ENCODING, Val::Data1(encoding));
-                d.attr(AT_BYTE_SIZE, Val::Const(k.size(self.xlen).into()));
+                d.attr(AT_BYTE_SIZE, Val::Const(k.size().into()));
                 d
             }
             TypeNode::ArraySize => {
@@ -1361,7 +1357,7 @@ impl Lines {
 
         // Where each entry starts, from the unit's start: its header is 12
         // bytes (length, version, unit type, address size, abbreviations).
-        let addr = ptr_size(self.xlen);
+        let addr = PTR_SIZE;
         let mut type_offsets = vec![0u32; self.types.len()];
         let end = cu.layout(12, &mut type_offsets);
 
@@ -1389,10 +1385,7 @@ impl Lines {
         let _ = writeln!(s, "    .byte {UT_COMPILE}    # a compile unit");
         let _ = writeln!(s, "    .byte {addr}    # address size");
         let _ = writeln!(s, "    .word .Ldebug_abbrev0");
-        let addr_directive = match self.xlen {
-            Xlen::Rv32 => ".word",
-            Xlen::Rv64 => ".quad",
-        };
+        let addr_directive = ".quad";
         cu.emit(&mut s, &type_offsets, 0);
 
         // The strings: their offsets in `.debug_str` (a header of 8 bytes,

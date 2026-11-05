@@ -1,5 +1,5 @@
 // expect: 16
-// Struct and union layout, as clang lays them out for ILP32: each member at
+// Struct and union layout, as clang lays them out for LP64: each member at
 // the next offset aligned for it, the size rounded up to the alignment.
 
 struct a {

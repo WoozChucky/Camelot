@@ -5,7 +5,7 @@
 //!   [`Function::locals`] gets every parameter and local, and every variable
 //!   reference and declarator its [`VarRef`]. A function's name is a global
 //!   of function type, which decays to a pointer to the function.
-//! * Every expression gets its C type, by C99's rules with ILP32 sizes (see
+//! * Every expression gets its C type, by C99's rules with LP64 sizes (see
 //!   [`crate::types`]). Operands must make sense for their operator (no
 //!   arithmetic on `void *`, no pointer plus pointer, `*` only on pointers,
 //!   `.` only on structs), assignments, arguments and returns must convert as
@@ -34,7 +34,7 @@
 use crate::abi;
 use crate::ast::*;
 use crate::consteval;
-use crate::types::{common, FuncType, IntKind, Spelled, Type, Xlen};
+use crate::types::{common, FuncType, IntKind, Spelled, Type};
 use crate::{Error, Pos};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -43,7 +43,6 @@ pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
         globals: HashMap::new(),
         errors: Vec::new(),
         literals: Vec::new(),
-        xlen: prog.xlen,
     };
     // What the parser evaluated away at file scope is checked where it was,
     // after the items before it.
@@ -100,21 +99,20 @@ pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
 /// both operands already decayed; `None` if C doesn't allow the operands.
 /// Comparisons and `&&`/`||` always give `int`. Code generation uses this too,
 /// to know the type a compound assignment computes in.
-pub fn arith_type(op: BinOp, l: &Type, r: &Type, x: Xlen) -> Option<Type> {
+pub fn arith_type(op: BinOp, l: &Type, r: &Type) -> Option<Type> {
     // Pointer arithmetic needs to know the size of what is pointed to.
-    let sized = |t: &Type| t.pointee().and_then(|t| t.size(x)).is_some();
+    let sized = |t: &Type| t.pointee().and_then(|t| t.size()).is_some();
     match (op, l.unqual(), r.unqual()) {
         (_, Type::Int(a), Type::Int(b)) => Some(Type::Int(match op {
             BinOp::Shl | BinOp::Shr => a.promoted(),
-            _ => common(*a, *b, x),
+            _ => common(*a, *b),
         })),
         (BinOp::Add | BinOp::Sub, Type::Ptr(_), Type::Int(_)) if sized(l) => Some(l.clone()),
         (BinOp::Add, Type::Int(_), Type::Ptr(_)) if sized(r) => Some(r.clone()),
-        // The difference of two pointers counts elements: `ptrdiff_t`, `int`
-        // on ILP32 and `long` on LP64. What they point to may differ in
-        // qualifiers only.
+        // The difference of two pointers counts elements: `ptrdiff_t`, a
+        // `long`. What they point to may differ in qualifiers only.
         (BinOp::Sub, Type::Ptr(a), Type::Ptr(b)) if a.unqual() == b.unqual() && sized(l) => {
-            Some(Type::Int(IntKind::ptrdiff_t(x)))
+            Some(Type::Int(IntKind::ptrdiff_t()))
         }
         _ => None,
     }
@@ -275,8 +273,6 @@ struct Checker {
     errors: Vec<Error>,
     /// The objects of file-scope compound literals so far, defined.
     literals: Vec<Declarator>,
-    /// The target, for sizes and conversions.
-    xlen: Xlen,
 }
 
 impl Checker {
@@ -357,11 +353,11 @@ impl Checker {
         }
         // A definition needs complete parameter and result types.
         for p in &f.params {
-            if p.ty.is_record() && p.ty.size(self.xlen).is_none() {
+            if p.ty.is_record() && p.ty.size().is_none() {
                 self.err(p.pos, format!("variable has incomplete type '{}'", p.ty));
             }
         }
-        let ret_complete = !f.ret.is_record() || f.ret.size(self.xlen).is_some();
+        let ret_complete = !f.ret.is_record() || f.ret.size().is_some();
         if !ret_complete {
             self.err(
                 f.pos,
@@ -391,13 +387,12 @@ impl Checker {
             constant: false,
             address_taken: false,
             errors: &mut self.errors,
-            xlen: self.xlen,
         };
         for p in &f.params {
             c.declare(&p.name, &p.ty, p.pos, "parameter ");
         }
         // A big struct result goes where the caller says: keep that address.
-        f.ret_ptr = (ret_complete && abi::returns_in_memory(&f.ret, self.xlen))
+        f.ret_ptr = (ret_complete && abi::returns_in_memory(&f.ret))
             .then(|| c.temp(&Type::ptr(f.ret.clone()), "result address", f.pos));
         // The body's outermost block shares the parameters' scope, as in C.
         for s in body.iter_mut() {
@@ -443,7 +438,7 @@ impl Checker {
                     return self.err(d.pos, msg);
                 }
                 // `int a[3]; int a[] = {1};` declares an `int [3]`.
-                if d.ty.is_array() && d.ty.size(self.xlen).is_none() {
+                if d.ty.is_array() && d.ty.size().is_none() {
                     d.ty = prev.ty.clone();
                 }
                 if prev.init.is_some() && init.is_some() {
@@ -467,7 +462,7 @@ impl Checker {
                         ),
                     );
                 }
-                if !d.ty.is_array() || d.ty.size(self.xlen).is_some() {
+                if !d.ty.is_array() || d.ty.size().is_some() {
                     prev.ty = d.ty.clone();
                 }
                 prev.init = prev.init.or(init);
@@ -487,7 +482,7 @@ impl Checker {
             }
         }
         let Some(d_init) = &mut d.init else { return };
-        let mut fc = FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len(), self.xlen);
+        let mut fc = FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len());
         let checked = fc.init_object(&mut d.ty, d_init, true, d.pos);
         self.literals.extend(fc.literals);
         let Some(Global::Var(g)) = self.globals.get_mut(&d.name) else {
@@ -498,7 +493,7 @@ impl Checker {
             // not defined here: there is nothing to emit.
             g.init = g.init.filter(|&i| i != at);
             g.tentative = g.tentative.filter(|&i| i != at);
-        } else if g.ty.size(self.xlen).is_none() {
+        } else if g.ty.size().is_none() {
             // The initializer completed an array's size.
             g.ty = d.ty.clone();
         }
@@ -510,8 +505,7 @@ impl Checker {
     fn unevaluated(&mut self, us: &mut [(usize, Unevaluated)], from: usize, before: usize) -> usize {
         let to = from + us[from..].iter().take_while(|(n, _)| *n <= before).count();
         if to > from {
-            let mut fc =
-                FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len(), self.xlen);
+            let mut fc = FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len());
             fc.unevaluated(us[from..to].iter_mut().map(|(_, u)| u));
         }
         to
@@ -521,8 +515,7 @@ impl Checker {
     /// at file scope ([`Unevaluated`]).
     fn file_unevaluated(&mut self, us: &mut [Unevaluated]) {
         if !us.is_empty() {
-            FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len(), self.xlen)
-                .unevaluated(us);
+            FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len()).unevaluated(us);
         }
     }
 
@@ -545,7 +538,7 @@ impl Checker {
                 unreachable!("recorded from a declaration")
             };
             let d = &mut decls[j];
-            if ty.size(self.xlen).is_none() {
+            if ty.size().is_none() {
                 let msg = if ty.is_array() {
                     format!("definition of '{}' needs the array size ('{}')", d.name, ty)
                 } else {
@@ -652,8 +645,6 @@ struct FnChecker<'a> {
     /// member that is): it is an object, not a value.
     address_taken: bool,
     errors: &'a mut Vec<Error>,
-    /// The target, for sizes and conversions.
-    xlen: Xlen,
 }
 
 impl<'a> FnChecker<'a> {
@@ -662,7 +653,6 @@ impl<'a> FnChecker<'a> {
         globals: &'a HashMap<String, Global>,
         errors: &'a mut Vec<Error>,
         literal_base: usize,
-        xlen: Xlen,
     ) -> Self {
         FnChecker {
             globals,
@@ -683,7 +673,6 @@ impl<'a> FnChecker<'a> {
             constant: false,
             address_taken: false,
             errors,
-            xlen,
         }
     }
 
@@ -886,7 +875,7 @@ impl<'a> FnChecker<'a> {
                 if self.switches.is_empty() {
                     self.err(pos, "'case' statement not in switch statement");
                 } else if checked.is_ok() {
-                    match consteval::int(expr, self.xlen).filter(|_| expr.ty.is_integer()) {
+                    match consteval::int(expr).filter(|_| expr.ty.is_integer()) {
                         None => {
                             self.err(expr.pos, "case value is not an integer constant expression");
                         }
@@ -894,7 +883,7 @@ impl<'a> FnChecker<'a> {
                             *id = self.next_case;
                             self.next_case += 1;
                             let sw = self.switches.last_mut().expect("checked above");
-                            *value = sw.kind.wrap(v, self.xlen);
+                            *value = sw.kind.wrap(v);
                             if let Some(prev) = sw.seen.insert(*value, expr.pos) {
                                 let msg =
                                     format!("duplicate case value '{}' (previous case at {prev})", *value);
@@ -1024,7 +1013,7 @@ impl<'a> FnChecker<'a> {
                 self.scopes.last_mut().unwrap().insert(d.name.clone(), binding);
             }
         }
-        if d.ty.size(self.xlen).is_none() {
+        if d.ty.size().is_none() {
             let msg = format!("variable '{}' has incomplete type '{}'", d.name, d.ty);
             self.err(d.pos, msg);
         }
@@ -1374,7 +1363,7 @@ impl<'a> FnChecker<'a> {
                     ));
                 };
                 self.expr(e)?;
-                let Some(i) = consteval::int(e, self.xlen).filter(|_| e.ty.is_integer()) else {
+                let Some(i) = consteval::int(e).filter(|_| e.ty.is_integer()) else {
                     return Err(self.err(e.pos, "expression is not an integer constant expression"));
                 };
                 if i < 0 {
@@ -1388,7 +1377,7 @@ impl<'a> FnChecker<'a> {
                 }
                 // Each element up to the designated one gets an item, so the
                 // index must be reasonable even when the array is big.
-                let size = i128::from(elem.size(self.xlen).unwrap_or(1).max(1));
+                let size = i128::from(elem.size().unwrap_or(1).max(1));
                 if i >= MAX_DESIGNATED || (i + 1) * size > i128::from(i32::MAX) {
                     let msg = format!(
                         "array designator index ({i}) is too large: merlin supports up to {}",
@@ -1499,7 +1488,7 @@ impl<'a> FnChecker<'a> {
                 }
                 self.convert(e, ty, Conv::Init)?;
                 coerce(e, ty);
-                if constant && consteval::eval(e, self.xlen).is_none() {
+                if constant && consteval::eval(e).is_none() {
                     return Err(self.err(begin(e), "initializer element is not a compile-time constant"));
                 }
                 Ok(())
@@ -1521,7 +1510,7 @@ impl<'a> FnChecker<'a> {
             (Type::Int(_), Type::Int(_)) => return Ok(()),
             (Type::Int(IntKind::Bool), Type::Ptr(_)) => return Ok(()),
             (Type::Record(a), Type::Record(b)) if a == b => {
-                if to.size(self.xlen).is_none() {
+                if to.size().is_none() {
                     let msg = format!("incomplete type '{to}' cannot be copied");
                     return Err(self.err(e.pos, msg));
                 }
@@ -1530,7 +1519,7 @@ impl<'a> FnChecker<'a> {
             // `(void *)0`, and so `NULL`, is a null pointer constant, which
             // converts to any pointer, a function's too (C11 6.5.16.1p1),
             // where any other `void *` converts only to an object's.
-            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(e, self.xlen) => return Ok(()),
+            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(e) => return Ok(()),
             (Type::Ptr(a), Type::Ptr(b)) => {
                 let (au, bu) = (a.unqual(), b.unqual());
                 let compatible =
@@ -1544,7 +1533,7 @@ impl<'a> FnChecker<'a> {
                     return Ok(());
                 }
             }
-            (Type::Ptr(_), Type::Int(_)) if consteval::is_null_pointer(e, self.xlen) => return Ok(()),
+            (Type::Ptr(_), Type::Int(_)) if consteval::is_null_pointer(e) => return Ok(()),
             (Type::Ptr(_), Type::Int(_)) => "incompatible integer to pointer conversion",
             (Type::Int(_), Type::Ptr(_)) => "incompatible pointer to integer conversion",
             _ => "incompatible types",
@@ -1645,7 +1634,7 @@ impl<'a> FnChecker<'a> {
                     Some(op) => {
                         // `t op= v` computes `t op v`, then stores it as `t = ...` would.
                         let (t, v) = (target.ty.decay(), value.ty.decay());
-                        let ok = match arith_type(*op, &t, &v, self.xlen) {
+                        let ok = match arith_type(*op, &t, &v) {
                             Some(r) => (t.is_integer() && r.is_integer()) || r == t,
                             None => false,
                         };
@@ -1662,7 +1651,7 @@ impl<'a> FnChecker<'a> {
                 self.assignable(target)?;
                 let ok = match target.ty.unqual() {
                     Type::Int(_) => true,
-                    Type::Ptr(t) => t.size(self.xlen).is_some(),
+                    Type::Ptr(t) => t.size().is_some(),
                     _ => false,
                 };
                 if !ok {
@@ -1862,7 +1851,7 @@ impl<'a> FnChecker<'a> {
                     }
                     coerce(a, p);
                     // A struct too big for registers is passed as the address of a copy.
-                    if p.is_record() && abi::classify(p, self.xlen) == abi::Pass::Ref {
+                    if p.is_record() && abi::classify(p) == abi::Pass::Ref {
                         arg_copies[i] = Some(self.temp(p, "argument copy", a.pos));
                     }
                 }
@@ -1871,7 +1860,7 @@ impl<'a> FnChecker<'a> {
                     return Err(Reported);
                 }
                 if ft.ret.is_record() {
-                    if ft.ret.size(self.xlen).is_none() {
+                    if ft.ret.size().is_none() {
                         let msg = format!("calling a function with incomplete result type '{}'", ft.ret);
                         return Err(self.err(pos, msg));
                     }
@@ -1910,10 +1899,7 @@ impl<'a> FnChecker<'a> {
     /// Checks a compound literal's type: any complete object type, or an
     /// array of unknown size (which the list completes).
     fn literal_type(&mut self, ty: &Type, pos: Pos) -> Checked {
-        if ty.is_func()
-            || ty.is_void()
-            || (ty.size(self.xlen).is_none() && !matches!(ty, Type::Array(_, None)))
-        {
+        if ty.is_func() || ty.is_void() || (ty.size().is_none() && !matches!(ty, Type::Array(_, None))) {
             return Err(self.err(pos, format!("compound literal has incomplete type '{ty}'")));
         }
         Ok(())
@@ -1961,7 +1947,7 @@ impl<'a> FnChecker<'a> {
         let mut ok = true;
         for (a, copy) in args.iter_mut().zip(copies) {
             let t = a.ty.decay();
-            if t.is_void() || (t.is_record() && t.size(self.xlen).is_none()) {
+            if t.is_void() || (t.is_record() && t.size().is_none()) {
                 self.err(a.pos, format!("argument type '{t}' is incomplete"));
                 ok = false;
                 continue;
@@ -1971,7 +1957,7 @@ impl<'a> FnChecker<'a> {
                 t => t,
             };
             coerce(a, &promoted);
-            if promoted.is_record() && abi::classify(&promoted, self.xlen) == abi::Pass::Ref {
+            if promoted.is_record() && abi::classify(&promoted) == abi::Pass::Ref {
                 *copy = Some(self.temp(&promoted, "argument copy", a.pos));
             }
         }
@@ -1999,7 +1985,7 @@ impl<'a> FnChecker<'a> {
     /// argument promotions leave alone.
     fn va_arg(&mut self, ap: &mut Expr, t: &Type, pos: Pos) -> Checked {
         self.va_list(ap, "__builtin_va_arg", true)?;
-        let problem = if t.is_void() || t.is_func() || t.size(self.xlen).is_none() {
+        let problem = if t.is_void() || t.is_func() || t.size().is_none() {
             Some(format!("second argument to 'va_arg' is of incomplete type '{t}'"))
         } else if t.is_array() {
             Some(format!("second argument to 'va_arg' is of array type '{t}'"))
@@ -2070,10 +2056,9 @@ impl<'a> FnChecker<'a> {
         Ok(())
     }
 
-    /// Replaces a `sizeof` with its value, a `size_t`: `unsigned int` on ILP32,
-    /// `unsigned long` on LP64.
+    /// Replaces a `sizeof` with its value, a `size_t`: `unsigned long`.
     fn sizeof(&mut self, e: &mut Expr, t: &Type) -> Checked {
-        let Some(size) = t.size(self.xlen) else {
+        let Some(size) = t.size() else {
             let what = if t.is_func() {
                 "a function type"
             } else {
@@ -2083,7 +2068,7 @@ impl<'a> FnChecker<'a> {
             return Err(self.err(e.pos, msg));
         };
         e.kind = ExprKind::Num(size.into());
-        e.ty = Type::Int(IntKind::size_t(self.xlen));
+        e.ty = Type::Int(IntKind::size_t());
         Ok(())
     }
 
@@ -2110,13 +2095,11 @@ impl<'a> FnChecker<'a> {
                     (Type::Ptr(a), Type::Ptr(b)) => {
                         a.unqual() == b.unqual()
                             || (equality && ((a.is_void() && !b.is_func()) || (b.is_void() && !a.is_func())))
-                            || (equality
-                                && (consteval::is_null_pointer(l, self.xlen)
-                                    || consteval::is_null_pointer(r, self.xlen)))
+                            || (equality && (consteval::is_null_pointer(l) || consteval::is_null_pointer(r)))
                     }
                     // A pointer may be compared for equality with the null pointer constant.
-                    (Type::Ptr(_), Type::Int(_)) => equality && consteval::is_null_pointer(r, self.xlen),
-                    (Type::Int(_), Type::Ptr(_)) => equality && consteval::is_null_pointer(l, self.xlen),
+                    (Type::Ptr(_), Type::Int(_)) => equality && consteval::is_null_pointer(r),
+                    (Type::Int(_), Type::Ptr(_)) => equality && consteval::is_null_pointer(l),
                     _ => false,
                 };
                 if !ok {
@@ -2126,7 +2109,7 @@ impl<'a> FnChecker<'a> {
                 Ok(Type::INT)
             }
             // Named as written, before arrays decay, as clang names them.
-            _ => arith_type(op, &lt, &rt, self.xlen).ok_or_else(|| self.invalid_operands(pos, &l.ty, &r.ty)),
+            _ => arith_type(op, &lt, &rt).ok_or_else(|| self.invalid_operands(pos, &l.ty, &r.ty)),
         }
     }
 
@@ -2134,13 +2117,13 @@ impl<'a> FnChecker<'a> {
     fn cond_type(&mut self, a: &mut Expr, b: &mut Expr, pos: Pos) -> Result<Type, Reported> {
         let (at, bt) = (a.ty.decay(), b.ty.decay());
         let ty = match (&at, &bt) {
-            (Type::Int(x), Type::Int(y)) => Type::Int(common(*x, *y, self.xlen)),
+            (Type::Int(x), Type::Int(y)) => Type::Int(common(*x, *y)),
             (Type::Void, Type::Void) => Type::Void,
             (Type::Record(x), Type::Record(y)) if x == y => at.clone(),
             // A null pointer constant takes the other pointer's type, even
             // when it is `(void *)0` (C99 6.5.15p6).
-            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(a, self.xlen) => bt.clone(),
-            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(b, self.xlen) => at.clone(),
+            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(a) => bt.clone(),
+            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(b) => at.clone(),
             // Otherwise both point to the same type (or one to void), and
             // the result points to it with every qualifier of either side.
             (Type::Ptr(x), Type::Ptr(y))
@@ -2156,8 +2139,8 @@ impl<'a> FnChecker<'a> {
                 };
                 Type::ptr(to.qualified(q))
             }
-            (Type::Ptr(_), Type::Int(_)) if consteval::is_null_pointer(b, self.xlen) => at.clone(),
-            (Type::Int(_), Type::Ptr(_)) if consteval::is_null_pointer(a, self.xlen) => bt.clone(),
+            (Type::Ptr(_), Type::Int(_)) if consteval::is_null_pointer(b) => at.clone(),
+            (Type::Int(_), Type::Ptr(_)) if consteval::is_null_pointer(a) => bt.clone(),
             _ => {
                 let msg = format!("incompatible operand types ('{at}' and '{bt}')");
                 return Err(self.err(pos, msg));
@@ -2185,7 +2168,6 @@ fn is_char_array(t: &Type) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::ast::*;
-    use crate::types::Xlen;
 
     fn ok(src: &str) -> Program {
         crate::parse(src).unwrap_or_else(|e| panic!("{src}: {e:?}"))
@@ -2379,15 +2361,15 @@ mod tests {
                 .collect()
         };
         for (sym, want) in [
-            ("v", vec![".word 0"]),
+            ("v", vec![".quad 0"]),
             ("m", vec![".word 5"]),
-            ("p", vec![".word g"]),
-            ("l", vec![".word 3"]),
+            ("p", vec![".quad g"]),
+            ("l", vec![".quad 3"]),
             ("m2", vec![".word 6"]),
-            ("ps", vec![".word 0", ".word g"]),
-            ("pp", vec![".word g+4"]),
+            ("ps", vec![".quad 0", ".quad g"]),
+            ("pp", vec![".quad g+4"]),
             ("z", vec![".word 1"]),
-            ("pz", vec![".word 0"]),
+            ("pz", vec![".quad 0"]),
             ("st", vec![".word 8", ".word 9"]),
             ("ia", vec![".word 1", ".word 2"]),
             ("ia3", vec![".word 4", ".word 5", ".word 6"]),
@@ -2398,8 +2380,8 @@ mod tests {
             ("ib", vec![".zero 4", ".word 4"]),
             ("wi", vec![".word 5"]),
             ("w", vec![".word 6"]),
-            ("pm", vec![".word .compoundliteral.0+4"]),
-            ("f.sp", vec![".word g"]),
+            ("pm", vec![".quad .compoundliteral.0+4"]),
+            ("f.sp", vec![".quad g"]),
             ("f.ss", vec![".word 3", ".word 4"]),
             ("f.s6", vec![".word 5"]),
         ] {
@@ -2708,7 +2690,7 @@ mod tests {
         let Some(Init::Expr(e)) = &ds[0].init else {
             panic!()
         };
-        assert_eq!(crate::consteval::int(e, Xlen::Rv32), Some(4));
+        assert_eq!(crate::consteval::int(e), Some(4));
         // An array the initializer completes is incomplete inside it, as in C,
         // and complete after it.
         assert_eq!(
@@ -2719,7 +2701,7 @@ mod tests {
         let StmtKind::Return(Some(e)) = &func(&p, "f").body.as_ref().unwrap()[1].kind else {
             panic!()
         };
-        assert_eq!(crate::consteval::int(e, Xlen::Rv32), Some(12));
+        assert_eq!(crate::consteval::int(e), Some(12));
         // And a global's.
         ok("void *self = &self; int f() { return self == &self; }");
         ok("int *ring[2] = {(int *)&ring[1], (int *)&ring[0]};");
@@ -2863,49 +2845,38 @@ mod tests {
         // An address converted to an integer as wide as a pointer is one,
         // moved by adding or subtracting an integer; any other width or
         // arithmetic is not constant, as clang has it.
-        let err_on = |x: Xlen, src: &str| -> Option<String> {
-            let opts = crate::Options {
-                xlen: x,
-                ..crate::Options::default()
-            };
-            crate::parse_with("t.c", src, &opts, &crate::no_files)
+        let err_on = |src: &str| -> Option<String> {
+            crate::parse_with("t.c", src, &crate::Options::default(), &crate::no_files)
                 .err()
                 .map(|e| e.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "))
         };
         const NOT_CONSTANT: &str = "initializer element is not a compile-time constant";
-        for (src, rv32, rv64) in [
-            ("int a; long b = (long)&a;", true, true),
-            ("int a; unsigned long b = (unsigned long)&a + 4;", true, true),
-            ("int a; long b = 4 + (long)&a - 8;", true, true),
-            ("int a; int *b = (int *)((long)&a + 4);", true, true),
+        for (src, ok) in [
+            ("int a; long b = (long)&a;", true),
+            ("int a; unsigned long b = (unsigned long)&a + 4;", true),
+            ("int a; long b = 4 + (long)&a - 8;", true),
+            ("int a; int *b = (int *)((long)&a + 4);", true),
             (
                 "int a[2]; long b = (long)a, c = (long)\"s\", d = (long)&a[1];",
                 true,
-                true,
             ),
-            ("void f(void); long b = (long)f;", true, true),
-            ("int a; int b = (int)&a;", true, false),
-            ("int a; unsigned b = (unsigned)&a;", true, false),
-            ("int a; int b = (int)(long)&a;", true, false),
-            ("int a; long long b = (long long)&a;", false, true),
-            (
-                "int a; unsigned long long b = (unsigned long long)&a;",
-                false,
-                true,
-            ),
-            ("int a; short b = (short)&a;", false, false),
-            ("int a; char b = (char)&a;", false, false),
-            ("int a; long b = (long)&a * 2;", false, false),
-            ("int a; long b = (long)&a | 1;", false, false),
-            ("int a; long b = -(long)&a;", false, false),
-            ("int a; long b = 4 - (long)&a;", false, false),
-            ("int a; long b = (long)&a - (long)&a;", false, false),
+            ("void f(void); long b = (long)f;", true),
+            ("int a; long long b = (long long)&a;", true),
+            ("int a; unsigned long long b = (unsigned long long)&a;", true),
+            ("int a; int b = (int)&a;", false),
+            ("int a; unsigned b = (unsigned)&a;", false),
+            ("int a; int b = (int)(long)&a;", false),
+            ("int a; short b = (short)&a;", false),
+            ("int a; char b = (char)&a;", false),
+            ("int a; long b = (long)&a * 2;", false),
+            ("int a; long b = (long)&a | 1;", false),
+            ("int a; long b = -(long)&a;", false),
+            ("int a; long b = 4 - (long)&a;", false),
+            ("int a; long b = (long)&a - (long)&a;", false),
         ] {
-            for (x, ok) in [(Xlen::Rv32, rv32), (Xlen::Rv64, rv64)] {
-                match err_on(x, src) {
-                    None => assert!(ok, "{src} ({x:?}) compiles"),
-                    Some(e) => assert!(!ok && e.ends_with(NOT_CONSTANT), "{src} ({x:?}): {e}"),
-                }
+            match err_on(src) {
+                None => assert!(ok, "{src} compiles"),
+                Some(e) => assert!(!ok && e.ends_with(NOT_CONSTANT), "{src}: {e}"),
             }
         }
         // Locals may be initialized with anything.
@@ -2944,7 +2915,7 @@ mod tests {
                     Init::List(items, _) => {
                         format!("{{{}}}", items.iter().map(show).collect::<Vec<_>>().join(", "))
                     }
-                    Init::Expr(e) => match crate::consteval::int(e, Xlen::Rv32) {
+                    Init::Expr(e) => match crate::consteval::int(e) {
                         Some(v) => v.to_string(),
                         None => "s".into(),
                     },
@@ -3060,7 +3031,7 @@ mod tests {
         assert_eq!(ty("char c", "-c"), "int");
         assert_eq!(ty("char c", "~c"), "int");
         assert_eq!(ty("unsigned u, int i", "u + i"), "unsigned int");
-        assert_eq!(ty("unsigned u, long l", "u * l"), "unsigned long");
+        assert_eq!(ty("unsigned u, long l", "u * l"), "long");
         assert_eq!(ty("unsigned short u, int i", "u + i"), "int");
         assert_eq!(ty("unsigned u, int i", "u < i"), "int");
         assert_eq!(
@@ -3071,7 +3042,7 @@ mod tests {
         assert_eq!(ty("unsigned u", "u >> 1"), "unsigned int");
         assert_eq!(ty("int *p", "p + 1"), "int *");
         assert_eq!(ty("int *p", "1 + p"), "int *");
-        assert_eq!(ty("int *p, int *q", "p - q"), "int");
+        assert_eq!(ty("int *p, int *q", "p - q"), "long");
         assert_eq!(ty("int *p", "*p"), "int");
         assert_eq!(ty("int *p", "&p"), "int **");
         assert_eq!(ty("int *p", "p[2]"), "int");
@@ -3079,7 +3050,7 @@ mod tests {
         assert_eq!(ty("int x", "buf + 1"), "char *");
         assert_eq!(ty("int x", "&buf"), "char (*)[8]");
         assert_eq!(ty("int x", "*buf"), "char");
-        assert_eq!(ty("int x", "sizeof buf"), "unsigned int");
+        assert_eq!(ty("int x", "sizeof buf"), "unsigned long");
         // A null pointer constant takes the other side's type, even as `(void *)0`.
         assert_eq!(ty("int *p, int c", "c ? (void *)0 : p"), "int *");
         assert_eq!(ty("int *p, int c", "c ? p : (void *)0"), "int *");
@@ -3114,8 +3085,8 @@ mod tests {
         let StmtKind::Return(Some(e)) = &func(&p, "f").body.as_ref().unwrap()[1].kind else {
             panic!()
         };
-        // 15 + 5 + 4 + 2 + 4 + 4; `p++` is not evaluated.
-        assert_eq!(crate::consteval::int(e, Xlen::Rv32), Some(34));
+        // 15 + 5 + 8 + 2 + 4 + 8; `p++` is not evaluated.
+        assert_eq!(crate::consteval::int(e), Some(42));
         assert_eq!(
             err("int f() { return sizeof(void); }"),
             "1:18: invalid application of 'sizeof' to an incomplete type 'void'"
@@ -3645,7 +3616,7 @@ mod tests {
     #[test]
     fn struct_calls_get_hidden_locals() {
         let p = ok(
-            "struct big { int v[3]; }; struct big g(struct big a, struct big b);
+            "struct big { int v[5]; }; struct big g(struct big a, struct big b);
                     int f(struct big x) { return g(x, x).v[0]; }",
         );
         let f = func(&p, "f");
@@ -3664,7 +3635,7 @@ mod tests {
             ]
         );
         // A definition returning a big struct keeps the result's address.
-        let p = ok("struct big { int v[3]; }; struct big g(int a) { struct big b; b.v[0] = a; return b; }");
+        let p = ok("struct big { int v[5]; }; struct big g(int a) { struct big b; b.v[0] = a; return b; }");
         let g = func(&p, "g");
         assert_eq!(g.locals[g.ret_ptr.unwrap().0].ty.to_string(), "struct big *");
         // Small structs travel in registers: no copies.
@@ -3730,7 +3701,7 @@ mod tests {
                 .unwrap();
             let Some(Init::Expr(e)) = &d.init else { panic!() };
             assert_eq!(
-                crate::consteval::eval(e, Xlen::Rv32),
+                crate::consteval::eval(e),
                 Some(crate::consteval::Const::Addr {
                     base: Some(crate::consteval::Base::Sym(format!(".compoundliteral.{i}"))),
                     offset: 0
@@ -3763,7 +3734,7 @@ mod tests {
 
     #[test]
     fn variadic_calls() {
-        let p = ok("int f(int n, ...); struct s { int v[4]; } x; \
+        let p = ok("int f(int n, ...); struct s { int v[5]; } x; \
                     int g(char c) { return f(1, c, \"s\", x, (short)2); }");
         let Some(StmtKind::Return(Some(e))) = func(&p, "g").body.as_ref().unwrap().first().map(|s| &s.kind)
         else {
@@ -3842,7 +3813,7 @@ mod tests {
             "1:50: passing 'volatile int *' to parameter of type 'int *' discards qualifiers"
         );
         // Comparisons and differences ignore what the pointers' targets add.
-        assert_eq!(ty("const int *p, int *q", "p - q"), "int");
+        assert_eq!(ty("const int *p, int *q", "p - q"), "long");
         assert_eq!(ty("const int *p, int *q", "p == q"), "int");
         assert_eq!(
             ty("const int *p, volatile int *q, int c", "c ? p : q"),

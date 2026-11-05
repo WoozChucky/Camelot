@@ -1,105 +1,107 @@
     .text
 
-    # int bump(int v): frame 16 bytes
-    #     -12(s0)  param int v
+    # int bump(int v): frame 32 bytes
+    #     -20(s0)  param int v
     .globl bump
     .type bump, @function
 bump:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
-    sw    a0, -12(s0)
-    lw    a0, -12(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    addi  sp, sp, -16
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
 .L.return.bump:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size bump, . - bump
 
-    # int main(void): frame 16 bytes
-    #     -12(s0)  local int hits
-    #     -16(s0)  local int r
+    # int main(void): frame 32 bytes
+    #     -20(s0)  local int hits
+    #     -24(s0)  local int r
     .globl main
     .type main, @function
 main:
     addi  sp, sp, -16
-    sw    ra, 12(sp)
-    sw    s0, 8(sp)
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
     addi  s0, sp, 16
+    addi  sp, sp, -16
     li    a0, 0
-    sw    a0, -12(s0)
+    sw    a0, -20(s0)
     li    a0, 1
-    sw    a0, -16(s0)
-    lw    a0, -16(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    sw    a0, -24(s0)
+    lw    a0, -24(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -16(s0)
-    lw    a0, -16(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -24(s0)
+    lw    a0, -24(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -16(s0)
-    lw    a0, -16(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -24(s0)
+    lw    a0, -24(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
     li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -16(s0)
-    lw    a0, -16(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, -12(s0)
-    addi  sp, sp, -12
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -24(s0)
+    lw    a0, -24(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
     call  bump
-    addi  sp, sp, 12
-    sw    a0, -12(s0)
+    addi  sp, sp, 8
+    sw    a0, -20(s0)
     snez  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -16(s0)
-    lw    a0, -16(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, -12(s0)
-    addi  sp, sp, -12
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -24(s0)
+    lw    a0, -24(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
     call  bump
-    addi  sp, sp, 12
-    sw    a0, -12(s0)
+    addi  sp, sp, 8
+    sw    a0, -20(s0)
     snez  a0, a0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    sw    a0, -16(s0)
-    lw    a0, -16(s0)
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    lw    a0, -12(s0)
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -24(s0)
+    lw    a0, -24(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    lw    a0, -20(s0)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
 .L.return.main:
     addi  sp, s0, -16
-    lw    ra, 12(sp)
-    lw    s0, 8(sp)
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
     addi  sp, sp, 16
     ret
     .size main, . - main
