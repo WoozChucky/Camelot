@@ -1,3 +1,4 @@
+    .file "char_types.c"
     .text
 
     # int main(void): frame 48 bytes

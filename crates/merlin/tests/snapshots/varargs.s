@@ -1,3 +1,4 @@
+    .file "varargs.c"
     .text
 
     # int sum(int n, ...): frame 48 bytes

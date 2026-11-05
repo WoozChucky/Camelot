@@ -216,23 +216,25 @@ mod tests {
         let dir = scratch("compile");
         std::fs::write(dir.join("include").join("k.h"), "#define K 42\n").unwrap();
         std::fs::write(dir.join("near.h"), "int near(void);\n").unwrap();
-        std::fs::write(
-            dir.join("a.c"),
-            "#include \"k.h\"\n#include \"near.h\"\nint f(void) { return K + near(); }\n",
-        )
-        .unwrap();
+        let src = "#include \"k.h\"\n#include \"near.h\"\nint f(void) { return K + near(); }\n";
+        std::fs::write(dir.join("a.c"), src).unwrap();
         let asm = compile_c(&dir, "a.c", &["include"], "x").unwrap();
         assert!(asm.contains("f:"), "{asm}");
         assert!(asm.contains("42"), "{asm}");
         // With debug information, which can be turned off. A unit with no
         // globals, strings, enums or casts has its `.file 0` just before the
-        // first `.loc`, where clang puts it.
+        // first `.loc`, where clang puts it, with the file's MD5 as clang's.
+        let md5 = merlin::md5::hex(&merlin::md5::md5(src.as_bytes()));
         assert!(
-            asm.contains("    .file 0 \"x\" \"a.c\"\n    .loc 0 3 0\n"),
+            asm.contains(&format!(
+                "    .file 0 \"x\" \"a.c\" md5 0x{md5}\n    .loc 0 3 0\n"
+            )),
             "{asm}"
         );
         let plain = without_debug_info(|| compile_c(&dir, "a.c", &["include"], "x").unwrap());
-        assert!(!plain.contains(".file") && !plain.contains(".loc"), "{plain}");
+        // Without, only clang's `.file "a.c"` (the object's file symbol).
+        assert!(plain.starts_with("    .file \"a.c\"\n"), "{plain}");
+        assert!(!plain.contains(".file 0") && !plain.contains(".loc"), "{plain}");
         assert!(compile_c(&dir, "a.c", &["include"], "x")
             .unwrap()
             .contains(".loc"));
