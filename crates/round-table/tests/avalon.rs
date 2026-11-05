@@ -383,6 +383,45 @@ fn refusals() {
     }
 }
 
+/// A VM its debugger holds (protocol doc, section 6.8) is in state debug, as `list`
+/// and `info` show; it can be stopped, not paused or resumed.
+#[test]
+fn a_debugged_vm() {
+    let server = avalon(256);
+    let addr = server.addr();
+    let echo = example_str("uart-echo");
+    ok(
+        addr,
+        &["create", "--name", "echo", "--ram", "64", "--start", &echo],
+    );
+    let mut debugger = Client::connect(&addr.to_string(), "test").unwrap();
+    let id = debugger.attach_debugger(&VmRef::Name("echo".into())).unwrap();
+    assert_eq!(state(addr, "echo"), VmState::Debug);
+    assert_eq!(
+        ok(addr, &["list"]),
+        "\
+ID  NAME  STATE  RAM     CLOCK       DISKS  NETS
+1   echo  debug  64 MiB  full speed  0      0
+"
+    );
+    assert!(ok(addr, &["info", "echo"]).contains("\nstate    debug\n"));
+    let why = refused(addr, &["resume", "echo"]);
+    assert_eq!(why, "invalid state: VM 1 ('echo') is debug, not paused");
+    let why = refused(addr, &["pause", "echo"]);
+    assert_eq!(why, "invalid state: VM 1 ('echo') is debug, not running");
+    // A second debugger is refused; detaching runs the VM on.
+    let mut other = Client::connect(&addr.to_string(), "test").unwrap();
+    let busy = other.attach_debugger(&VmRef::Id(id)).unwrap_err();
+    assert_eq!(busy.code(), Some(ErrorCode::Busy));
+    debugger.detach_debugger(id).unwrap();
+    assert_eq!(state(addr, "echo"), VmState::Running);
+    // Held again, and stopped.
+    other.attach_debugger(&VmRef::Id(id)).unwrap();
+    assert_eq!(ok(addr, &["stop", "echo"]), "stopped VM echo\n");
+    assert_eq!(state(addr, "echo"), VmState::Stopped);
+    server.stop().unwrap();
+}
+
 /// The library layer on its own, as Pendragon uses it.
 #[test]
 fn client_library() {

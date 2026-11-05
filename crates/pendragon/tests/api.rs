@@ -433,6 +433,23 @@ fn vms_and_disks_end_to_end() {
     assert_eq!(s(&api.expect(200, api.get("vms/echo")), "state"), "running");
     assert_eq!(api.action(&format!("vms/{echo}/reboot")).status, 404);
 
+    // ---- A debugger holds it (protocol doc, section 6.8): state debug ----
+    let mut debugger = avalon_client::Client::connect(&platform.avalon.addr().to_string(), "test").unwrap();
+    let id = debugger
+        .attach_debugger(&avalon_proto::VmRef::Name("echo".into()))
+        .unwrap();
+    assert_eq!(id as u64, echo);
+    let vm = api.expect(200, api.get(&format!("vms/{echo}")));
+    assert_eq!(s(&vm, "state"), "debug");
+    // The debugger resumes it, not the page.
+    assert_eq!(actions(&vm), ["stop", "destroy"]);
+    assert_eq!(list(&vm, "disks")[0].get("held"), Some(&Json::Bool(true)));
+    let o = api.expect(200, api.get("overview"));
+    assert_eq!(n(o.get("vms").unwrap(), "debug"), 1);
+    assert_eq!(n(o.get("vms").unwrap(), "running"), 0);
+    debugger.detach_debugger(id).unwrap();
+    assert_eq!(s(&api.expect(200, api.get("vms/echo")), "state"), "running");
+
     // ---- Detach: the VM holding the disk stops and lets go of it ----
     let r = api.expect(200, api.action("disks/data/detach"));
     assert_eq!(n(&list(&r, "stopped")[0], "id"), echo);

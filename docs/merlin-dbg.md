@@ -1,15 +1,16 @@
 # merlin-dbg and Grail's GDB stub
 
-merlin-dbg is the Camelot debugger. This document covers its first three layers:
+merlin-dbg is the Camelot debugger. This document covers its four layers:
 
 - **machine-level debugging** of any program running in Grail, RV32 or RV64, with no help from the compiler: breakpoints, watchpoints, single steps, registers, CSRs, memory, disassembly and backtraces by frame pointer, on one hart or several;
 - **source-level debugging** of programs built with `merlin -g` (the kernel and its user programs are): breakpoints on a source line, stepping by line, the source shown at every stop, from the programs' DWARF line tables (see "Source lines" below);
-- **variables and types**, from the rest of the programs' DWARF debug information: `print` of C expressions, `info locals` and `info args`, `ptype` and `whatis`, and a backtrace with each frame's arguments, in the frame `frame`, `up` and `down` select (see "Variables and types" below).
+- **variables and types**, from the rest of the programs' DWARF debug information: `print` of C expressions, `info locals` and `info args`, `ptype` and `whatis`, and a backtrace with each frame's arguments, in the frame `frame`, `up` and `down` select (see "Variables and types" below);
+- **the platform**: a VM on an Avalon server (`--vm`, its stub carried over the Avalon connection), and Camelot's processes: `info processes`, breakpoints that stop in one process only, symbol files keyed by the program a process runs, and memory read through a process's page table (see "Processes" below).
 
 It has three parts:
 
 - **Grail's debug interface** (`grail::debug`): what a debugger needs from the emulator, as methods on `Machine`.
-- **Grail's GDB stub** (`grail::gdb`, `grail --gdb ADDR`): that interface over TCP, in the GDB remote serial protocol. merlin-dbg, GDB and LLDB can all connect to it.
+- **Grail's GDB stub** (`grail::gdb`, `grail --gdb ADDR`): that interface over TCP, in the GDB remote serial protocol. merlin-dbg, GDB and LLDB can all connect to it. Avalon serves the same stub for each of its VMs, over its own connection ([`avalon-protocol.md`](avalon-protocol.md), section 6.8): `grail::gdb::Session` is a client's conversation with the stub whatever carries it, which `grail --gdb` runs over TCP and Avalon's VM threads over the Avalon protocol.
 - **merlin-dbg** (`crates/merlin-dbg`): a GDB remote protocol client with a command line. It either connects to a running `grail --gdb` or starts a machine in its own process.
 
 The spec's section 7, "Debugging", says what the machine guarantees under a debugger.
@@ -153,6 +154,9 @@ Packets are `$payload#checksum`, with `+`/`-` acks until `QStartNoAckMode`. A 0x
 | `qfThreadInfo`, `qsThreadInfo`, `qC` | `m1,2,...`, `l`, `QC` and the selected thread |
 | `qThreadExtraInfo,thread` | e.g. `hart 1, S-mode, in wfi`, hex encoded |
 | `qAttached` | `1` |
+| `qqemu.Supported` | `PhyMemMode`: of QEMU's own packets, the one Grail has |
+| `Qqemu.PhyMemMode:1`, `Qqemu.PhyMemMode:0` | `OK`: from now on `m`, `M` and `X` use physical addresses, or again the selected hart's translation (QEMU's, which GDB sends for `maintenance packet Qqemu.PhyMemMode:1`); another value is `E01` |
+| `qqemu.PhyMemMode` | `1` or `0`: which they use |
 | `qXfer:features:read:target.xml:off,len` | the target description: `riscv:rv32` or `riscv:rv64` with every register 32 or 64 bits wide (`bitsize`), the `org.gnu.gdb.riscv.cpu` registers, every CSR Grail implements that has a name for the machine's width (RV64 has no `cycleh`), and `priv` |
 | `qRegisterInfoN` | LLDB's register description, for `x0`-`x31` and `pc`, as wide as `g`'s and at their offsets in it (LLDB builds without XML support, such as LLVM 21's Windows build, ask for these instead of `target.xml`) |
 | `qHostInfo`, `qProcessInfo` | LLDB's: triple `riscv32-unknown-unknown-elf` and 4-byte pointers, or `riscv64-unknown-unknown-elf` and 8-byte pointers; little endian |
@@ -249,7 +253,9 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 | `print EXPR`, `info locals`, `info args`, `ptype`, `whatis` | variables and types: see "Variables and types" |
 | `list [FILE:]LINE`, `list FUNC`, `l` | ten source lines around LINE (of the file listed last) or a function's first line; `list` alone goes on after the lines listed last, or shows those around the stop |
 | `directory DIR` | looks for source files under DIR first |
-| `add-symbol-file FILE` | adds the symbols and line tables of another program: a user program next to the kernel |
+| `add-symbol-file FILE [program NAME]` | adds the symbols and line tables of another program: a user program next to the kernel, everywhere, or only where program NAME runs (see "Processes") |
+| `break LOC process PID`, `break LOC satp VALUE` | a breakpoint that stops in one process, or one address space, only (see "Processes") |
+| `info processes`, `process [PID]` | the kernel's processes; `print` and `x` read through process PID's page table (see "Processes") |
 | `hart`, `info harts` | every hart, its mode and pc. `*` marks the selected one |
 | `hart N` | selects hart N |
 | `quit`, `q` | leaves |
@@ -351,7 +357,7 @@ The line tables (`.debug_line`, the spec's section 10, "Debug information") map 
 - **`break FILE:LINE`**: FILE is the path the line table has (`kernel/main.c`) or its end after a `/` (`main.c`). The breakpoint goes at the lowest address of a statement on that line in each function that has one (a `for` line has several statements: its initialization first). A line with no code, such as a comment or a declaration without an initializer, means the next line that has some, as in gdb, and merlin-dbg says so. A function's first line is its prologue, so a breakpoint there goes past the prologue, as `break FUNC` does (and as GDB's `skip_prologue_sal` does with a line in a function's prologue); a line further in stays where it is.
 - **`step` and `next`** run instructions until the pc is at the start of a statement on another line. A call on the way runs to its return under `next`, a temporary breakpoint as `nexti` uses. `step` follows it into the function, and stops past its prologue, at its `prologue_end` row (or its second row). A function with no line information, an assembly one, is run to its return instead, as gdb does. A return stops in the caller, on the line of the call, wherever in it the pc is. Any other stop on the way (a breakpoint, a watchpoint, another hart's) ends the command, and Ctrl-C does too. A line that never ends (`for (;;);`) is given up after a million instructions.
 - **Sources** are found by their paths in the line tables, under a `directory` first, then relative to the current directory. The kernel's are relative to the repository root (`kernel/main.c`, `kernel/user/sh.c`), so run merlin-dbg there.
-- **User programs**: the kernel embeds its programs without their line tables, and `/bin` holds them the same way; `cargo xtask kernel` writes them with their line tables to `target/kernel/obj/user/<name>.elf`. Every program runs at the same virtual addresses, so a breakpoint in one stops whichever process runs that address; telling processes apart is #121.
+- **User programs**: the kernel embeds its programs without their line tables, and `/bin` holds them the same way; `cargo xtask kernel` writes them with their line tables to `target/kernel/obj/user/<name>.elf`. Every program runs at the same virtual addresses, so a breakpoint in one stops whichever process runs that address, unless its symbols are keyed to the program (`add-symbol-file FILE program NAME`) or the breakpoint to a process: see "Processes".
 
 ```
 $ cargo run -p merlin-dbg -- -- kernel/kernel.elf
@@ -444,6 +450,67 @@ type = struct proc {
 
 LLDB reads the same entries: `frame variable` and `target variable` show the same variables, types and values for a program built by merlin as for the same one built by clang (`cargo test -p merlin-dbg --test session -- --ignored`).
 
+### Processes
+
+On the Camelot kernel, merlin-dbg knows the processes: it reads the kernel's process table, as GDB's Linux scripts (`lx-ps`) read the task list, with the kernel's own debugging information as the guide (`crates/merlin-dbg/src/camelot.rs`). Nothing of the layout is written down in merlin-dbg; only the names are:
+
+- `procs`, the table (`kernel/proc.c`), and its `struct proc`'s `state`, `pid`, `name` and `pagetable`;
+- `cpus`, each hart's `struct cpu` at its hart id (`kernel/spinlock.c`), whose `proc` is the process running on the hart, or NULL while the hart runs the scheduler or `kmain`.
+
+The state numbers are `kernel/include/proc.h`'s `PROC_` constants, which are `#define`s and so not in the debugging information; a unit test checks merlin-dbg's names against the header. Where a unit only declares a struct (`spinlock.c` has `struct proc;`, a pointer's target), the type is the one another unit defines, as GDB resolves an opaque type (`check_typedef`).
+
+| Command | What it does |
+|---|---|
+| `info processes` | the processes in the table, in slot order: pid, state (`new`, `live` or `zombie`), the program they run (the process's name, the last name of the path it was run from) and their `satp`, which is the value the hart's `satp` holds while it runs on their page table (in the hart's paging mode; a kernel process has none of its own). `*` marks the process whose memory `print` and `x` read, and `hart N` each hart that runs one |
+| `break LOC process PID` | a breakpoint that stops only when the hart that reaches LOC runs process PID (`cpus[hart].proc`). PID must exist (GDB's `thread N` must) |
+| `break LOC satp VALUE` | one that stops only when the hart's `satp` is VALUE: in that address space, whichever process or thread runs it |
+| `add-symbol-file FILE program NAME` | FILE's symbols, line tables and variables apply only where program NAME runs (keyed by address space): see below |
+| `process PID` | `print` and `x` read memory through process PID's page table until the next stop; `process` alone says whose memory they read |
+
+**Breakpoints in one process.** A breakpoint hit by another process is not a stop: merlin-dbg sees the stop, finds that the breakpoint does not apply there, and runs the machine on, as GDB does with a breakpoint whose condition is false (`bpstat_check_breakpoint_conditions`). Nothing is reported, and nothing about the run changes, since every stop of Grail's debug interface resumes exactly where it stopped ("Determinism"). If the process table cannot be read, the breakpoint stops and says why, as GDB stops on a condition it cannot evaluate. Every program runs at the same virtual addresses (`USER_LOAD` and up), so without a limit a breakpoint in one program stops in every process at that address: in another copy of the same program, and in another program whose code is there. `info breakpoints` lists the limits after the address (`0x00001128 <copy+276>, process 8, program cat`).
+
+**Symbols keyed by address space.** The kernel's symbols, and those of `add-symbol-file FILE`, apply everywhere. Those of `add-symbol-file FILE program NAME` apply only in the address spaces of the processes that run program NAME: at each stop, merlin-dbg uses the symbols of every address space and those of the program the stopping hart's process runs. A breakpoint's location is looked for in the global symbols first, then in each program's: a location found only in program NAME's (`break main`, `break kernel/user/cat.c:19`) gets a breakpoint that stops only where NAME runs (`program cat`), so it never stops in the shell running other code at that address. Keyed by the program rather than by a pid, the symbols follow the program across processes and `exec`s.
+
+**Another process's memory.** `process PID` makes `print` and `x` read through that process's page table, whichever process the hart runs; registers, frames and the backtrace stay the hart's. The stub translates only through the selected hart's own `satp`, so merlin-dbg walks the other table itself (`crates/merlin-dbg/src/paging.rs`), as OpenOCD's RISC-V target does for `virt2phys`: the process's `pagetable` pointer is a kernel address, translated through the hart's table (every process's table maps the kernel), and from that root the privileged spec's walk (Sv32 on RV32, Sv39 or Sv48 on RV64, in the hart's mode), reading page-table entries and then the data over physical memory, with QEMU's packet for it (`Qqemu.PhyMemMode:1`, which Grail's stub has: "Protocol subset"). No permission is checked, as for the stub's own reads. Every stop selects the hart's own process again.
+
+The shell's pipeline `cat /README /README /README | cat` runs two processes of `/bin/cat`, the writer and, reading the pipe, the reader:
+
+```
+(merlin-dbg) add-symbol-file target/kernel/obj/user/cat.elf program cat
+added the symbols of target/kernel/obj/user/cat.elf, for program cat
+(merlin-dbg) break main
+breakpoint 1 at 0x1244 <main+28>: kernel/user/cat.c:28, program cat
+(merlin-dbg) continue
+breakpoint 1
+=> 0x00001244 <main+28>:  lw a0, -0xc(s0)
+kernel/user/cat.c:28:     if (argc < 2) {
+(merlin-dbg) print argv[1]
+$1 = 0xbffffe8 "/README"
+(merlin-dbg) info processes
+  PID  State     Name             satp
+  6    live      sh               0x800803fa
+* 7    live      cat              0x800803e7  hart 0
+  8    live      cat              0x800803dd
+(merlin-dbg) delete
+(merlin-dbg) break kernel/user/cat.c:19 process 8
+breakpoint 2 at 0x1128 <copy+276>: kernel/user/cat.c:19, process 8, program cat
+(merlin-dbg) continue
+breakpoint 2
+=> 0x00001128 <copy+276>:  li a0, 0x1
+kernel/user/cat.c:19:         int w = write(STDOUT, buf, (uint)n);
+(merlin-dbg) info args
+fd = 0
+name = 0x4016 "input"
+(merlin-dbg) process 7
+process 7 (cat), satp 0x800803e7
+(merlin-dbg) print (char *) 0xbffffe8
+$2 = 0xbffffe8 "/README"
+```
+
+The writer passed line 19 first, twice, without stopping: the breakpoint is the reader's.
+
+The process table is the RV32 kernel's for now. The RV64 kernel gets processes with #155; the walk and the table's reading do not depend on the width, but nothing tests them on RV64 until then.
+
 ### Tests
 
 `crates/merlin-dbg/tests/session.rs` drives the merlin-dbg binary against the stub, on `examples/hello`, `examples/smp` with 2 harts, and the kernel booted to its shell. The stub is `grail::gdb::serve`, what `grail --gdb` runs, in the test's process, so the test can capture the machine's console. The test checks:
@@ -467,10 +534,16 @@ The same on RV64 machines, against the stub's `riscv:rv64` description:
 
 - `kernel/kernel-rv64.elf` (#154), the higher-half kernel: `break kmain` and `break kvminit` at their link addresses (0xffff_ffff_8...), stopped in S-mode with Sv48 on, `regs`, and a backtrace of three frames read through the page table, down to `supervisor_entry`.
 
+The platform:
+
+- `crates/merlin-dbg/tests/avalon.rs` runs an Avalon server in the test's process, a VM on it running the kernel to its shell, and Herald attached to its console all along. `merlin-dbg --vm vm001 --server ADDR` attaches (the VM in state debug), breaks in `sys_write` as the shell answers a command typed in Herald, shows the backtrace and the system call's number, continues to the next `write` and quits. The VM runs on, the shell answers the next command, Herald's console is the one an undebugged run gives, and Herald saw nothing but the state changes.
+- `crates/merlin-dbg/tests/processes.rs` boots the root image (built as `cargo xtask fs` builds it) with `cat /README /README /README | cat`, and cat's symbols keyed to the program. A breakpoint on cat's `write` line for every process stops in both cats, the writer first. Limited to the reader by its pid, then by its `satp`, it stops only in the reader, as often as the reader writes; the stops show the reader's arguments (`copy`'s `fd` and `name`, `main`'s `argc` and `argv`) and the writer's argument and buffer, read through the writer's page table (`process`). Each debugged run's console is the undebugged one's.
+- `crates/avalon/tests/debug.rs` drives a VM's stub over the Avalon protocol with raw GDB packets: the debug state and its changes, breakpoints, steps, a Ctrl-C, `PauseVm` and `ResumeVm` around a debugger's run, `D`, `DebugDetach` and a connection that ends, a created VM debugged from its first instruction to its exit, `k`, `StopVm` and `DestroyVm` with a debugger attached, and the errors (`Busy`, `InvalidState`, `NoSuchVm`, input from a client that is not the debugger).
+- `src/paging.rs`'s tests walk random Sv32, Sv39 and Sv48 tables and agree with Grail's own walk on every address; `src/camelot.rs`'s check the state names against `proc.h`; `grail::gdb::commands`'s check `Qqemu.PhyMemMode`.
+
 `src/remote.rs`'s unit tests give it a stub with no target description, whose width comes from the `g` reply.
 
 ## What's next
 
-The next layer of merlin-dbg builds on these:
-
-- debugging Avalon VMs and individual Camelot processes (#121).
+- Processes on the RV64 kernel come with its user space (#155): the process table and the page walk are read the same way at both widths, and only the tests are RV32 for now.
+- A GDB or LLDB client can reach a VM's stub only through a client of the Avalon protocol: merlin-dbg is one. A bridge from a TCP port (QEMU's `-gdb tcp::PORT`) would let them attach too.
