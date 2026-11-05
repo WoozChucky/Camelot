@@ -394,6 +394,8 @@ struct FuncSig {
     /// it leaves unnamed) and where they are, which clang's messages and
     /// notes on a call name.
     params: Vec<(String, Pos)>,
+    /// Declared at file scope (not only in a block, [`Global::hidden`]).
+    visible: bool,
 }
 
 struct GlobalVar {
@@ -407,6 +409,8 @@ struct GlobalVar {
     /// and where it is.
     init: Option<(usize, usize)>,
     init_pos: Option<Pos>,
+    /// Declared at file scope (not only in a block, [`Global::hidden`]).
+    visible: bool,
     /// The first declarator that is not `extern` (a tentative definition).
     tentative: Option<(usize, usize)>,
 }
@@ -414,6 +418,53 @@ struct GlobalVar {
 enum Global {
     Func(FuncSig),
     Var(GlobalVar),
+}
+
+impl Global {
+    /// A declaration with linkage in a block (`extern int x;`, `int
+    /// g(void);`) declares what file scope's of the name declare (C99
+    /// 6.2.2), which must agree with it, but the name is in scope only in
+    /// the block: until file scope declares it, it is kept hidden.
+    fn hidden(pos: Pos, ty: &Type) -> Global {
+        match ty.func_type() {
+            Some(f) => Global::Func(FuncSig {
+                ty: f.clone(),
+                is_static: false,
+                defined: false,
+                inline_only: false,
+                pos,
+                def: None,
+                params: Vec::new(),
+                visible: false,
+            }),
+            None => Global::Var(GlobalVar {
+                ty: ty.clone(),
+                is_static: false,
+                pos,
+                defines: false,
+                init: None,
+                init_pos: None,
+                tentative: None,
+                visible: false,
+            }),
+        }
+    }
+
+    fn visible(&self) -> bool {
+        match self {
+            Global::Func(f) => f.visible,
+            Global::Var(v) => v.visible,
+        }
+    }
+
+    /// Its type and where its latest declaration is, and whether that is a
+    /// definition.
+    fn declaration(&self) -> (Type, Pos, bool) {
+        match self {
+            Global::Func(f) => (Type::Func(Box::new(f.ty.clone())), f.pos, f.def == Some(f.pos)),
+            Global::Var(v) => (v.ty.clone(), v.pos, v.defines),
+        }
+    }
 }
 
 struct Checker {
@@ -447,6 +498,7 @@ impl Checker {
             pos: f.pos,
             def: f.body.is_some().then_some(f.pos),
             params: f.params.iter().map(|p| (p.name.clone(), p.pos)).collect(),
+            visible: true,
         };
         // Functions are visible from their declaration onwards, so a function can
         // call itself and anything declared above it (use a prototype for mutual
@@ -480,9 +532,11 @@ impl Checker {
                     None => {
                         prev.defined |= sig.defined;
                         prev.def = prev.def.or(sig.def);
-                        prev.inline_only &= sig.inline_only;
+                        // Of declarations in blocks only, none said inline.
+                        prev.inline_only = (prev.inline_only || !prev.visible) && sig.inline_only;
                         prev.pos = sig.pos;
                         prev.params = sig.params;
+                        prev.visible = true;
                     }
                 }
             }
@@ -537,6 +591,7 @@ impl Checker {
             pending: Vec::new(),
             unevaluated: 0,
             registers: HashSet::new(),
+            linked: Vec::new(),
             xlen: self.xlen,
         };
         for p in &f.params {
@@ -557,6 +612,7 @@ impl Checker {
         }
         // clang's analysis of the body, unless the program has an error so
         // far: then the warnings of what runs are all given, unanalysed.
+        let linked = std::mem::take(&mut c.linked);
         let pending = std::mem::take(&mut c.pending);
         if self.erred || c.errors.iter().any(|e| !e.is_warning()) {
             c.errors.extend(pending.into_iter().map(|(e, _)| e));
@@ -581,6 +637,11 @@ impl Checker {
             }
         }
         f.locals = c.locals;
+        for (name, ty, pos) in linked {
+            self.globals
+                .entry(name)
+                .or_insert_with(|| Global::hidden(pos, &ty));
+        }
     }
 
     fn global_var(&mut self, d: &mut Declarator, at: (usize, usize)) {
@@ -649,6 +710,7 @@ impl Checker {
                 prev.tentative = prev.tentative.or(tentative);
                 prev.pos = d.pos;
                 prev.defines = d.storage != Storage::Extern;
+                prev.visible = true;
             }
             None => {
                 self.globals.insert(
@@ -661,6 +723,7 @@ impl Checker {
                         init,
                         init_pos: init.map(|_| d.pos),
                         tentative,
+                        visible: true,
                     }),
                 );
             }
@@ -947,6 +1010,9 @@ struct FnChecker<'a> {
     unevaluated: usize,
     /// The locals declared `register` (by [`LocalId`]).
     registers: HashSet<usize>,
+    /// What its blocks declared with linkage (`extern int x;`), in order:
+    /// [`Global::hidden`].
+    linked: Vec<(String, Type, Pos)>,
     /// The target, for sizes and conversions.
     xlen: Xlen,
 }
@@ -983,6 +1049,7 @@ impl<'a> FnChecker<'a> {
             pending: Vec::new(),
             unevaluated: 0,
             registers: HashSet::new(),
+            linked: Vec::new(),
             xlen,
         }
     }
@@ -1168,6 +1235,7 @@ impl<'a> FnChecker<'a> {
             StmtKind::Expr(e) => {
                 if self.expr(e).is_ok() {
                     self.full(e);
+                    self.unused(e);
                 }
             }
             StmtKind::Return(e) => self.ret(e.as_mut(), s.pos),
@@ -1207,7 +1275,10 @@ impl<'a> FnChecker<'a> {
                     let _ = c.condition(e, s.pos);
                 }
                 if let Some(e) = step {
-                    let _ = c.expr(e);
+                    if c.expr(e).is_ok() {
+                        c.full(e);
+                        c.unused(e);
+                    }
                 }
                 c.in_loop(|c| c.scoped(|c| c.stmt(body)));
             }),
@@ -1374,6 +1445,96 @@ impl<'a> FnChecker<'a> {
         Ok(())
     }
 
+    /// clang's warnings of an expression statement `e` whose value is all
+    /// it gives (its `DiagnoseUnusedExprResult`): a comparison's at once
+    /// (`-Wunused-comparison`, `x == 2;` was likely meant as `x = 2;`), any
+    /// other's when the function ends, if it can run (`-Wunused-value`;
+    /// `-Wunused-volatile-lvalue` for a `volatile` object, which is read).
+    fn unused(&mut self, e: &Expr) {
+        if let ExprKind::Binary(op, ..) = &e.kind {
+            if op.is_comparison() {
+                let (what, note) = match op {
+                    BinOp::Eq => (
+                        "equality",
+                        Some("use '=' to turn this equality comparison into an assignment"),
+                    ),
+                    BinOp::Ne => (
+                        "inequality",
+                        Some("use '|=' to turn this inequality comparison into an or-assignment"),
+                    ),
+                    _ => ("relational", None),
+                };
+                let mut w = Error::warning(
+                    e.pos,
+                    format!("{what} comparison result unused"),
+                    "unused-comparison",
+                );
+                if let Some(n) = note {
+                    w = w.note(e.pos, n);
+                }
+                self.errors.push(w);
+                return;
+            }
+        }
+        match self.unused_result(e) {
+            // At once, where clang finds it.
+            Some((at, _, true)) => self.errors.push(Error::warning(
+                at,
+                "expression result unused; assign into a variable to force a volatile load",
+                "unused-volatile-lvalue",
+            )),
+            Some((at, anchor, false)) => self.runtime_of(
+                Error::warning(at, "expression result unused", "unused-value"),
+                anchor,
+            ),
+            None => {}
+        }
+    }
+
+    /// Whether the value of `e` is all it gives, as clang's
+    /// `isUnusedResultAWarning` decides: then where clang reports it, the
+    /// expression that is (for [`crate::flow`]), and whether it reads a
+    /// `volatile` object. An assignment, an increment, a call, a cast to
+    /// `void` give more; `a, b` and `c ? a : b` are as their operands are
+    /// (`(f(), 0)` is an idiom), `a && b` as `b` is.
+    fn unused_result(&self, e: &Expr) -> Option<(Pos, Pos, bool)> {
+        match &e.kind {
+            ExprKind::Assign { .. }
+            | ExprKind::IncDec { .. }
+            | ExprKind::Call { .. }
+            | ExprKind::VaStart { .. }
+            | ExprKind::VaArg(..)
+            | ExprKind::VaEnd(_)
+            | ExprKind::VaCopy(..) => None,
+            ExprKind::Cast { implicit: false, .. } if e.ty.is_void() => None,
+            ExprKind::Cast {
+                x, implicit: true, ..
+            } => self.unused_result(x),
+            ExprKind::Comma(_, b) if matches!(b.kind, ExprKind::Num(0)) => None,
+            ExprKind::Comma(_, b) => self.unused_result(b),
+            // Both operands, or it may be control flow; reported at the
+            // second's.
+            ExprKind::Cond(_, a, b) => {
+                self.unused_result(a)?;
+                self.unused_result(b)
+            }
+            ExprKind::Binary(BinOp::LogAnd | BinOp::LogOr, _, b) => {
+                self.unused_result(b)?;
+                Some((e.pos, e.pos, false))
+            }
+            // Reading a `volatile` object is what it does; of `volatile
+            // void` there is nothing read.
+            _ if is_lvalue(e) && e.ty.quals().volatile && !e.ty.is_void() => None,
+            _ if is_lvalue(e) && e.ty.quals().volatile => Some((expr_loc(e), e.pos, true)),
+            // `a[i]`, at its `]`.
+            ExprKind::Deref(x) if x.pos == e.pos => {
+                let at = self.written.brackets.get(&e.pos).copied().unwrap_or(e.pos);
+                Some((at, e.pos, false))
+            }
+            _ => Some((expr_loc(e), e.pos, false)),
+        }
+    }
+
     /// clang's `-Wpointer-bool-conversion` of `e` taken as true or false:
     /// an address that is never null ([`never_null`]).
     fn bool_like(&mut self, e: &Expr) {
@@ -1461,13 +1622,38 @@ impl<'a> FnChecker<'a> {
         // name is the object or function outside it, which it defines
         // nothing of.
         if d.storage == Storage::Extern || d.ty.is_func() {
+            // clang declares it all the same.
+            self.linkage_redeclared(d);
             let var = VarRef::Global(d.name.clone());
-            self.bind(&d.name, var.clone(), &d.ty, d.pos, "");
+            let binding = (var.clone(), d.ty.clone(), d.pos);
+            self.scopes
+                .last_mut()
+                .expect("a scope")
+                .insert(d.name.clone(), binding);
+            self.linked.push((d.name.clone(), d.ty.clone(), d.pos));
             d.var = Some(var);
             if d.init.is_some() {
                 let msg = "declaration of block scope identifier with linkage cannot have an initializer";
                 self.err(d.pos, msg);
             }
+            return;
+        }
+        // An object of no linkage where the block declared one with it.
+        if let Some((_, _, prev)) = self
+            .scopes
+            .last()
+            .and_then(|s| s.get(&d.name))
+            .filter(|(v, ..)| matches!(v, VarRef::Global(sym) if *sym == d.name))
+        {
+            let e = Error::new(
+                d.pos,
+                format!(
+                    "non-extern declaration of '{}' follows extern declaration",
+                    d.name
+                ),
+            )
+            .note(*prev, "previous declaration is here");
+            self.errors.push(e);
             return;
         }
         if d.ty.is_void() {
@@ -2299,12 +2485,72 @@ impl<'a> FnChecker<'a> {
         }
     }
 
+    /// A file-scope declaration of `name` this checker sees: not one only a
+    /// block declared ([`Global::hidden`]).
+    fn global(&self, name: &str) -> Option<&'a Global> {
+        self.globals.get(name).filter(|g| g.visible())
+    }
+
+    /// clang's error for a block's declaration with linkage `d` that does
+    /// not agree with an earlier one of its name: one of no linkage in the
+    /// same block, or one with linkage, in a block of this function or of
+    /// an earlier one, or at file scope (shown or not). Whether it had one.
+    fn linkage_redeclared(&mut self, d: &Declarator) -> bool {
+        let name = &d.name;
+        // A static local's symbol is its own (`f.x`), a declaration's with
+        // linkage the name.
+        let no_linkage = |v: &VarRef| !matches!(v, VarRef::Global(sym) if sym == name);
+        if let Some((v, _, prev)) = self
+            .scopes
+            .last()
+            .and_then(|s| s.get(name))
+            .filter(|(v, ..)| no_linkage(v))
+        {
+            let msg = match v {
+                VarRef::Global(_) => format!("non-static declaration of '{name}' follows static declaration"),
+                _ => format!("extern declaration of '{name}' follows non-extern declaration"),
+            };
+            let e = Error::new(d.pos, msg).note(*prev, "previous definition is here");
+            self.errors.push(e);
+            return true;
+        }
+        let earlier = match self.linked.iter().rev().find(|(n, ..)| n == name) {
+            Some((_, ty, pos)) => Some((ty.clone(), *pos, false)),
+            None => self.globals.get(name).map(Global::declaration),
+        };
+        let Some((ty, pos, definition)) = earlier else {
+            return false;
+        };
+        let msg = match (ty.is_func(), d.ty.is_func()) {
+            (true, true) if ty != d.ty => format!("conflicting types for '{name}'"),
+            (false, false) if !compatible(&ty, &d.ty) => {
+                format!(
+                    "redeclaration of '{name}' with a different type: '{}' vs '{ty}'",
+                    d.ty
+                )
+            }
+            (true, false) | (false, true) => {
+                let e = Error::new(
+                    d.pos,
+                    format!("redefinition of '{name}' as different kind of symbol"),
+                )
+                .note(pos, "previous definition is here");
+                self.errors.push(e);
+                return true;
+            }
+            _ => return false,
+        };
+        let (at, what) = previous(pos, definition);
+        self.errors.push(Error::new(d.pos, msg).note(at, what));
+        true
+    }
+
     /// The type and the position of the declaration a name in scope refers
     /// to: a local's, or a global's latest.
     fn declared(&self, name: &str) -> Option<(Type, Pos)> {
         match self.lookup(name) {
             Some((_, ty, pos)) => Some((ty.clone(), *pos)),
-            None => match self.globals.get(name)? {
+            None => match self.global(name)? {
                 Global::Var(g) => Some((g.ty.clone(), g.pos)),
                 Global::Func(f) => Some((Type::Func(Box::new(f.ty.clone())), f.pos)),
             },
@@ -2412,7 +2658,7 @@ impl<'a> FnChecker<'a> {
                     *var = Some(v.clone());
                     ty.clone()
                 }
-                None => match globals.get(name.as_str()) {
+                None => match self.global(name) {
                     Some(Global::Var(g)) => {
                         *var = Some(VarRef::Global(name.clone()));
                         g.ty.clone()
@@ -2515,7 +2761,7 @@ impl<'a> FnChecker<'a> {
                     // `*p` of a `void *` is an expression of type `void`, which
                     // clang takes with a warning (it then can only be
                     // discarded).
-                    Type::Ptr(t) if t.is_void() && !subscript => {
+                    Type::Ptr(t) if t.is_void() && !subscript && self.unevaluated == 0 => {
                         let msg = format!("ISO C does not allow indirection on operand of type '{}'", x.ty);
                         self.errors.push(Error::warning(pos, msg, "void-ptr-dereference"));
                         *t
@@ -2599,6 +2845,13 @@ impl<'a> FnChecker<'a> {
                 let (r1, r2) = (self.expr(a), self.expr(b));
                 r1?;
                 r2?;
+                // clang's DiagnoseCommaOperator: a left operand whose value
+                // is all it does.
+                if let Some((at, anchor, _)) = self.unused_result(a) {
+                    let w =
+                        Error::warning(at, "left operand of comma operator has no effect", "unused-value");
+                    self.runtime_of(w, anchor);
+                }
                 let t = b.ty.decay();
                 coerce(b, &t);
                 t
@@ -2663,7 +2916,7 @@ impl<'a> FnChecker<'a> {
                 parens: (open, close),
             } => {
                 if let ExprKind::Var { name, .. } = &callee.kind {
-                    if self.lookup(name).is_none() && !globals.contains_key(name.as_str()) {
+                    if self.lookup(name).is_none() && self.global(name).is_none() {
                         let msg = format!(
                             "call to undeclared function '{name}'; ISO C99 and later do not support \
                              implicit function declarations"

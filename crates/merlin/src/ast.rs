@@ -56,6 +56,9 @@ pub struct Written {
     pub parens: std::collections::HashSet<Pos>,
     /// The positions where a macro was expanded (where its tokens are).
     pub macros: std::collections::HashSet<Pos>,
+    /// Of each subscript `a[i]`, where its `]` is, by where its `[` is:
+    /// clang reports a subscript there.
+    pub brackets: std::collections::HashMap<Pos, Pos>,
 }
 
 /// An expression the parser needed no value of, for sema to check without

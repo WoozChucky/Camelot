@@ -2838,6 +2838,11 @@ impl<'a> FuncGen<'a, '_> {
     /// Loads the value of type `ty` at the address in `a0`. Arrays, structs
     /// and functions are not loaded: their value is that address.
     fn load(&mut self, ty: &Type) {
+        // `*p` of a `void *` (GNU C's, which clang takes) is a value of no
+        // type: only `p` is evaluated, nothing loaded, as in clang.
+        if ty.is_void() {
+            return;
+        }
         if self.is_pair(ty) {
             // The high word first: a0 holds the address.
             self.ins("lw", "a1, 4(a0)");

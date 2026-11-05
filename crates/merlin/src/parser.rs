@@ -167,6 +167,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         partial: RefCell::new(None),
         parens: RefCell::new(None),
         parens_written: RefCell::new(Default::default()),
+        brackets_written: RefCell::new(Default::default()),
         trailing_else: Cell::new(None),
         warnings: RefCell::new(Vec::new()),
     };
@@ -194,6 +195,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
                 warnings: p.warnings.take(),
                 written: Written {
                     parens: p.parens_written.take(),
+                    brackets: p.brackets_written.take(),
                     ..Written::default()
                 },
             };
@@ -207,6 +209,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         warnings: p.warnings.take(),
         written: Written {
             parens: p.parens_written.take(),
+            brackets: p.brackets_written.take(),
             ..Written::default()
         },
     })
@@ -597,8 +600,10 @@ struct Parser<'a> {
     /// The warnings so far: what clang warns of as it parses, and goes on
     /// (`declaration does not declare anything`).
     warnings: RefCell<Vec<Error>>,
-    /// Where the operators in parentheses are ([`Written::parens`]).
+    /// Where the operators in parentheses are ([`Written::parens`]), and
+    /// the subscripts' `]` ([`Written::brackets`]).
     parens_written: RefCell<std::collections::HashSet<Pos>>,
+    brackets_written: RefCell<std::collections::HashMap<Pos, Pos>>,
     /// The `else` of the `if` the statement just parsed ends with, through
     /// loops and labels, not braces: an `if` without one of its own around
     /// it is clang's dangling `else` (its `TrailingElseLoc`).
@@ -3194,7 +3199,9 @@ impl Parser<'_> {
                     self.enter()?;
                     let pos = self.advance().pos;
                     let index = self.expr()?;
+                    let close = self.here();
                     self.expect_close("]", pos)?;
+                    self.brackets_written.borrow_mut().insert(pos, close);
                     // a[i] is *(a + i).
                     let sum = Expr::new(ExprKind::Binary(BinOp::Add, Box::new(e), Box::new(index)), pos);
                     e = Expr::new(ExprKind::Deref(Box::new(sum)), pos);

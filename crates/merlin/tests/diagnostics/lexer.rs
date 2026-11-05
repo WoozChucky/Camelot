@@ -77,5 +77,15 @@ pub fn cases() -> Vec<Case> {
         case("struct s { register int x; };", &["1:12: error: type name does not allow storage class to be specified"]),
         case("int f(void) { static register int x; return 0; }", &["1:22: error: cannot combine with previous 'static' declaration specifier"]),
         case("typedef register int R;", &["1:9: error: cannot combine with previous 'typedef' declaration specifier"]),
+        // Escapes clang takes as it does: GNU's `\e`, its nonstandard ones,
+        // universal character names and what C99 refuses of them.
+        case("int a = '\\e' + '\\E' + '\\(' + '\\{' + '\\[' + '\\%' + '\\q';", &["1:52: warning: unknown escape sequence '\\q' [-Wunknown-escape-sequence]"]),
+        case("char *s = \"\\u00e9\\U0001F600\\u0041\\u0024\\uD800\\u12\";", &["1:28: error: character 'A' cannot be specified by a universal character name", "1:40: error: invalid universal character", "1:46: error: incomplete universal character name"]),
+        case("char *s = \"\\u0001\\u0085\\u0060\\u0040\\u00a0\\u007f\";", &["1:12: error: universal character name refers to a control character", "1:18: error: universal character name refers to a control character", "1:42: error: universal character name refers to a control character"]),
+        case("char *t = \"\\U00110000\";", &["1:12: error: invalid universal character"]),
+        case("int c = '\\u00e9'; int d = '\\u0041'; int e = '\\u0024';", &["1:9: error: character too large for enclosing character literal type", "1:28: error: character 'A' cannot be specified by a universal character name"]),
+        case("int x[sizeof \"\\u00e9\\U0001F600\" == 7 ? 1 : -1];", &[]),
+        // Four characters are no -Wmultichar (-Wfour-char-constants is off).
+        case("int c = 'abcd'; int d = 'abc';", &["1:25: warning: multi-character character constant [-Wmultichar]"]),
     ]
 }

@@ -655,7 +655,10 @@ impl<'a> Interp<'a> {
     /// The value of an lvalue: loaded, or the address itself for an array, a
     /// struct or a function.
     fn value_at(&self, addr: u32, ty: &Type) -> Result<Val, String> {
-        if ty.is_addressed() {
+        // `*p` of a `void *` reads nothing.
+        if ty.is_void() {
+            Ok(0)
+        } else if ty.is_addressed() {
             Ok(addr.into())
         } else {
             self.load(addr, ty)
@@ -804,7 +807,8 @@ fn convert(v: Val, ty: &Type, x: Xlen) -> Val {
 
 /// `a op b` with `a` of (decayed) type `lt` and `b` of type `rt`.
 fn binary(op: BinOp, a: Val, lt: &Type, b: Val, rt: &Type, x: Xlen) -> Result<Val, String> {
-    let elem = |t: &Type| -> Val { t.pointee().map_or(1, |t| size_of(t, x)).into() };
+    // `void *` steps by bytes, as GNU C has it.
+    let elem = |t: &Type| -> Val { t.step(x).map_or(1, Val::from) };
     if let (Some(lk), Some(rk)) = (lt.int_kind(), rt.int_kind()) {
         // Integers: both operands converted to the type the operation is
         // done in (a shift's is its left operand's promoted type), the

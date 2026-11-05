@@ -708,8 +708,10 @@ pub fn finish(toks: Vec<PpToken>, end: Pos, x: Xlen) -> Result<(Vec<Token>, Vec<
 /// each (and one more past four bytes, which do not all fit). `''` is no
 /// token at all to clang ([`lex_pp`] leaves it to the parser).
 pub fn char_constant(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Tok, Error> {
-    let bytes = decode(text, pos, diags)?;
-    if bytes.len() > 1 {
+    let bytes = decode_in(text, pos, diags, true)?;
+    // Four characters are clang's `-Wfour-char-constants` (`'abcd'`, as
+    // Mac OS's type codes were written), which is off by default.
+    if bytes.len() > 1 && bytes.len() != 4 {
         diags.push(Error::warning(
             pos,
             "multi-character character constant",
@@ -877,6 +879,13 @@ pub fn integer(text: &str, pos: Pos) -> Result<IntLit, Error> {
 /// ASCII come out as their UTF-8 bytes. `pos` is where the literal starts;
 /// an error or a warning points at the escape sequence.
 pub fn decode(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Vec<u8>, Error> {
+    decode_in(text, pos, diags, false)
+}
+
+/// [`decode`] of a character constant (`char_const`) or a string literal,
+/// which differ in what a universal character name may be: a constant
+/// holds one byte.
+fn decode_in(text: &str, pos: Pos, diags: &mut Vec<Error>, char_const: bool) -> Result<Vec<u8>, Error> {
     let chars: Vec<char> = text.chars().collect();
     let body = &chars[1..chars.len() - 1];
     // Where character `k` of the body is (the literal is on one line, unless
@@ -940,6 +949,57 @@ pub fn decode(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Vec<u8>, E
                 let hex: String = body[digits_start..k].iter().collect();
                 let v = u64::from_str_radix(&hex, 16).unwrap_or(u64::MAX);
                 u8::try_from(v).map_err(|_| Error::new(at(start), "hex escape sequence out of range"))?
+            }
+            // GNU's escape for ESC, which clang takes without a word.
+            'e' | 'E' => 27,
+            // clang's other escapes (its `ProcessCharEscape`): the character,
+            // which its pedantic warning only says C has not.
+            '(' | '{' | '[' | '%' => e as u8,
+            // A universal character name (C99 6.4.3): `\u` and four hex
+            // digits, `\U` and eight, the character in UTF-8.
+            'u' | 'U' => {
+                let n = if e == 'u' { 4 } else { 8 };
+                let digits: String = body[k..]
+                    .iter()
+                    .take(n)
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect();
+                k += digits.len();
+                if digits.len() < n {
+                    diags.push(Error::new(at(start), "incomplete universal character name"));
+                    continue;
+                }
+                let v = u32::from_str_radix(&digits, 16).expect("hex digits");
+                // What C99 lets no universal character name be: a control
+                // character, the basic character set but `$`, `@` and `` ` ``,
+                // a surrogate, or what is past Unicode.
+                let problem = match char::from_u32(v) {
+                    None => Some("invalid universal character".to_string()),
+                    Some(c) if c.is_control() => {
+                        Some("universal character name refers to a control character".to_string())
+                    }
+                    Some(c) if v < 0xa0 && !"$@`".contains(c) => Some(format!(
+                        "character '{c}' cannot be specified by a universal character name"
+                    )),
+                    Some(_) if char_const && v > 0x7f => {
+                        // clang's error is the constant's.
+                        diags.push(Error::new(
+                            pos,
+                            "character too large for enclosing character literal type",
+                        ));
+                        continue;
+                    }
+                    Some(_) => None,
+                };
+                match (problem, char::from_u32(v)) {
+                    (Some(msg), _) => diags.push(Error::new(at(start), msg)),
+                    (None, Some(c)) => {
+                        let mut buf = [0; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                    (None, None) => unreachable!("an invalid one has a problem"),
+                }
+                continue;
             }
             // clang: the character itself, and a warning.
             _ => {

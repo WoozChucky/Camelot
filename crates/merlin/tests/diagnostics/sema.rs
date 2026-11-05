@@ -293,5 +293,24 @@ pub fn cases() -> Vec<Case> {
         case("union u { int a; char b; }; union u g = {1, 2};", &["1:45: warning: excess elements in union initializer [-Wexcess-initializers]"]),
         case("struct s { int a; }; struct s g = {{1, 2}};", &["1:40: warning: excess elements in scalar initializer [-Wexcess-initializers]"]),
         case("struct p { int x; }; static struct p g = {1}; struct p h = g;", &["1:60: error: initializer element is not a compile-time constant"]),
+        // A block's declarations with linkage, checked against every other
+        // declaration of the name (C99 6.2.2).
+        case("int g = 1; long long f(void) { extern long long g; return g; }", &["1:49: error: redeclaration of 'g' with a different type: 'long long' vs 'int'", "1:5: note: previous definition is here"]),
+        case("void a(void) { extern int z; z = 1; } long long b(void) { extern long long z; return z; }", &["1:76: error: redeclaration of 'z' with a different type: 'long long' vs 'int'", "1:27: note: previous declaration is here"]),
+        case("int f(void) { extern int g(int, int); return g(1, 2); } int g(int a) { return a; }", &["1:61: error: conflicting types for 'g'", "1:26: note: previous declaration is here"]),
+        case("int f(void) { long g(void); return g(); } int g(void) { return 1; }", &["1:47: error: conflicting types for 'g'", "1:20: note: previous declaration is here"]),
+        case("int f(void) { extern int arr[2]; return arr[1]; } int arr[5];", &["1:55: error: redefinition of 'arr' with a different type: 'int[5]' vs 'int[2]'", "1:26: note: previous declaration is here"]),
+        case("int f(void){ extern int y; return y; } static int y = 3;", &["1:51: error: static declaration of 'y' follows non-static declaration", "1:25: note: previous declaration is here"]),
+        case("int f(void) { int y; extern int y; return y; }", &["1:33: error: extern declaration of 'y' follows non-extern declaration", "1:19: note: previous definition is here"]),
+        case("int f(void) { extern int y; int y; return y; }", &["1:33: error: non-extern declaration of 'y' follows extern declaration", "1:26: note: previous declaration is here"]),
+        case("int f(void) { extern int y; extern long y; return 0; }", &["1:41: error: redeclaration of 'y' with a different type: 'long' vs 'int'", "1:26: note: previous declaration is here"]),
+        case("static int s; int f(void) { extern int s; return s; }", &[]),
+        case("int f(void) { extern int q; return q; } int q; long q2; int h(void) { extern long q; return 0; }", &["1:83: error: redeclaration of 'q' with a different type: 'long' vs 'int'", "1:45: note: previous definition is here"]),
+        case("int g(void); int f(void) { int g; { extern int g(void); } return g; }", &[]),
+        case("int f(void) { extern int x; return x; } int x[3];", &["1:45: error: redefinition of 'x' with a different type: 'int[3]' vs 'int'", "1:26: note: previous declaration is here"]),
+        case("int f(void) { int g(int); return g(1); } int g(int a) { return a; } int k(void) { extern int g(int); return 0; }", &[]),
+        case("void a(void) { extern int w; } int b(void) { return w; }", &["1:53: error: use of undeclared identifier 'w'"]),
+        case("int f(void) { static int y; extern int y; return y; }", &["1:40: error: non-static declaration of 'y' follows static declaration", "1:26: note: previous definition is here"]),
+        case("int g; int f(void) { extern int g(void); return 0; }", &["1:33: error: redefinition of 'g' as different kind of symbol", "1:5: note: previous definition is here"]),
     ]
 }
