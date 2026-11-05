@@ -17,7 +17,7 @@ The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the mess
 
 - TCP, through `std::net`. One connection is one session; either side ends it by closing the socket.
 - Servers listen on loopback by default: Avalon on `127.0.0.1:7400`, Lake on `127.0.0.1:7401`. Listening on any other interface takes an explicit command-line flag.
-- **No authentication and no encryption** (versions 1 to 11). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
+- **No authentication and no encryption** (versions 1 to 12). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
 - A client and a server are both just byte streams to the protocol; tests run it over in-memory buffers as well as sockets.
 
 ## 2. Framing
@@ -116,13 +116,17 @@ Round Table and Herald take a VM argument that is all digits as an id, anything 
 
 | Field | Type | Meaning |
 |---|---|---|
-| `ram_size` | `u64` | RAM in bytes: a non-zero multiple of 4 KiB, at most 1 TiB, or 2 GiB for an RV32 VM (Excalibur spec section 7, "RAM"). Until the protocol carries a width (#158), a VM is RV64 if its program is ELF64 and RV32 otherwise, booting from disk included. Avalon's RAM budget counts the whole size, lazily backed or not. The protocol has no default; `HardwareProfile::default()` and the clients have Grail's, 4 MiB (`DEFAULT_RAM_SIZE`) |
+| `ram_size` | `u64` | RAM in bytes: a non-zero multiple of 4 KiB, at most 1 TiB, or 2 GiB for an RV32 VM (Excalibur spec section 7, "RAM"), the width being `xlen`'s (or the program's, below). Avalon's RAM budget counts the whole size, lazily backed or not: what the VM may use, which the budget guarantees, while the host commits only what the guest touches. The protocol has no default; `HardwareProfile::default()` and the clients have Grail's, 4 MiB (`DEFAULT_RAM_SIZE`) |
 | `clock_hz` | `option<u32>` | real-time clock in instructions per second; none = run at full speed |
 | `nominal_hz` | `u32` | clock reported to the guest when `clock_hz` is none (Grail's default: 10 000 000) |
 | `harts` | `u32` | number of harts, 1 to 8 (Excalibur spec section 7, "Harts"; Grail's default: 1). The clock is per hart |
+| `xlen` | `u8` | the harts' register width in bits: 32 (RV32) or 64 (RV64); other values are invalid. `HardwareProfile::default()` and the clients have 32 while both widths exist (#159). See **The width**, below |
+| `paging` | `u8` | the paging modes an RV64 VM's harts implement, as the widest one's `satp.MODE`: 9 for Sv48 and Sv39 (the default), 8 for Sv39 alone (Excalibur spec section 5; Grail's `--paging`); other values are invalid. An RV32 VM has Sv32 whatever this says |
 | `devices` | `list<DeviceSpec>` | optional hardware beyond the fixed machine, in the order the guest should see it |
 
-The guest reads these values from its sysinfo block (Excalibur spec section 9.5). The wire accepts any values; the server validates them as Grail does and answers `InvalidProfile`.
+The guest reads these values from its sysinfo block (Excalibur spec section 9.5) and its `misa` and `satp` CSRs. The wire accepts any values of the numeric fields but `xlen` and `paging`; the server validates them as Grail does and answers `InvalidProfile`.
+
+**The width.** A VM's width is part of its hardware, chosen when it is created, as QEMU chooses it with its binary (`qemu-system-riscv32` or `qemu-system-riscv64`) and Grail with `--xlen`: the profile says it, rather than the server guessing it from what the VM runs, since a VM that boots from disk has nothing to guess from until its boot ROM, which is already of one width, has run the disk's boot block. A program decides it as it does for Grail (`Machine::load_elf`): an ELF64 program on a profile that says 32 makes the VM RV64 (its RAM checked against RV64's limit), and an ELF32 program on a profile that says 64 is `InvalidProgram`, as `qemu-system-riscv64` refuses an ELF32 kernel. The VM's profile in `VmList` and `VmInfo` gives the width it has, so an RV32 profile with an ELF64 program reads back as RV64. A VM that boots from disk is as wide as `xlen` says: its boot ROM is of that width, and so must be the code in the disk's boot block (an RV64 Camelot image boots on an RV64 VM; Lake's images have no width of their own). The device table (`DeviceEntry`) keeps 32-bit addresses on both widths: every device is below 4 GiB.
 
 **DeviceSpec**:
 
@@ -339,18 +343,18 @@ Any request can also be answered by `Error`. A server answers requests from a gr
 | `Ping` | `token: u32` |
 | `Pong` | `token: u32` (the `Ping`'s) |
 
-Example, `Hello` version 11 from agent `"rt"`:
+Example, `Hello` version 12 from agent `"rt"`:
 
 ```
-0e 00 00 00  01 00  41 56 4c 4e  0b 00  02 00 00 00  72 74
-length 14    Hello  "AVLN"       v11    agent "rt"
+0e 00 00 00  01 00  41 56 4c 4e  0c 00  02 00 00 00  72 74
+length 14    Hello  "AVLN"       v12    agent "rt"
 ```
 
 ### 6.2 VM control
 
 | Message | Payload | Notes |
 |---|---|---|
-| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable, or empty: the VM then boots from its disk 0, as `grail --disk IMG` does (spec section 7, "Boot from disk"), and a profile without a disk is `InvalidProgram`. The VM is loaded and left in state created, its network cards plugged into the switches the profile names. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below, and a bad network card), `NoSuchSwitch` (a card names a switch that does not exist), `AlreadyExists` (a card's address is on its switch already), `InvalidProgram`, `OverBudget`. A create that fails plugs in nothing |
+| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable, ELF32 or ELF64 (an ELF64 one makes the VM RV64, an ELF32 one cannot run on an RV64 VM: section 3, **The width**), or empty: the VM then boots from its disk 0, as `grail --disk IMG` does (spec section 7, "Boot from disk"), through the boot ROM of the profile's width, and a profile without a disk is `InvalidProgram`. The VM is loaded and left in state created, its network cards plugged into the switches the profile names. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below, and a bad network card), `NoSuchSwitch` (a card names a switch that does not exist), `AlreadyExists` (a card's address is on its switch already), `InvalidProgram`, `OverBudget`. A create that fails plugs in nothing |
 | `VmCreated` | `id: u32` | ids are never reused while the server runs |
 | `ListVms` | empty | |
 | `VmList` | `vms: list<VmSummary>` | in id order |
@@ -520,11 +524,11 @@ The stub sees the machine and nothing else of the VM: the guest's memory, its re
 
 ## 7. Versioning
 
-- The protocol version is a `u16`, currently **11** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
+- The protocol version is a `u16`, currently **12** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
 - Any change to the catalogue bumps the version: a new message type, a new field, a new enum variant or tag, a changed layout or a changed rule. (Unknown codes and tags are errors in the decoder, so an old peer could not read them anyway.)
 - Three things never change, in any version, so that peers of different versions can always tell each other so: the frame header (`u32` length, `u16` type), the `Hello` and `Welcome` messages (codes 0x0001 and 0x0002 and their layouts) and the `Error` message (code 0x0003 and its layout). Error codes are never reused or renumbered; new ones may be added with a version bump.
 - Things that are deliberately open-ended and need no new version: `DeviceEntry.kind` (sysinfo device type codes come from the Excalibur spec), `ScreenAttached.format` values a server chooses to send, free-text fields.
-- This document describes version 11. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+- This document describes version 12. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
 
 History:
 
@@ -541,6 +545,7 @@ History:
 | 9 | `KeyEvent` carries the physical key for the keyboard's raw mode (Excalibur spec section 9.4): the `usage` field (`u16`, after `flags`) and the repeat flag (bit 3); `code` may be 0 when `usage` is not; the repeat flag only on a press; a viewer that goes (`ScreenDetach`, or its connection ends) has the keys and buttons it held released (section 6.4, **Input**) |
 | 10 | `CursorShape` (0x0308) and `CursorPosition` (0x0309): the framebuffer's cursor plane (Excalibur spec section 9.3) goes to the viewers apart from the frames, its image when it changes and its place when it moves (section 6.4, **Cursor**), up to `MAX_CURSOR_SIZE` (256) pixels each way |
 | 11 | the debugging group 0x07xx (section 6.8: `DebugAttach`, `DebugAttached`, `DebugInput`, `DebugOutput`, `DebugDetach`), a VM's GDB stub over the connection; `VmState` tag 5, debug (stopped by a breakpoint, a watchpoint or a step); `Detached` kind 3, a debugger; `StopVm` of a VM in state debug |
+| 12 | `HardwareProfile.xlen` and `HardwareProfile.paging` (a `u8` each, after `harts`): a VM's register width, RV32 or RV64, and an RV64 VM's paging modes, Sv48 and Sv39 or Sv39 alone (section 3, **The width**). Version 11 servers made a VM RV64 only for an ELF64 program, and RV32 otherwise, booting from disk included |
 
 ## 8. Limits
 

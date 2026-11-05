@@ -186,6 +186,15 @@ fn the_new_vm_form_offers_camelot() {
         "list.camelot_image",
         "cargo xtask up",
         "or a disk to boot from",
+        // The width and the paging, as Round Table's --xlen and --paging take them,
+        // and the Camelot image of the width chosen.
+        "xlen: xlen.value,",
+        "paging: paging.value,",
+        "option(\"32\", \"RV32\", true), option(\"64\", \"RV64\")",
+        "option(\"sv48\", \"Sv48 and Sv39\", true), option(\"sv39\", \"Sv39 alone\")",
+        "xlen.value === \"64\" ? images.camelot_image_rv64 : images.camelot_image",
+        "xlen.addEventListener(\"change\", showBoot);",
+        "[\"Arch\", vm.arch_text]",
     ] {
         assert!(js.contains(needed), "app.js lacks {needed:?}");
     }

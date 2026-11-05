@@ -1,7 +1,8 @@
-//! Protocol values as text for people: sizes, frequencies, device names, disk sources.
+//! Protocol values as text for people: sizes, frequencies, widths, device names, disk
+//! sources.
 //! [`format_hz`] and [`disk_source_text`] give back what [`crate::parse`] accepts.
 
-use avalon_proto::DiskSource;
+use avalon_proto::{DiskSource, Paging, Xlen};
 use grail::net::MacAddr;
 use grail::sysinfo::DeviceType;
 
@@ -83,6 +84,18 @@ pub fn disk_source_text(source: &DiskSource) -> String {
     source.to_string()
 }
 
+/// A VM's width and the paging its harts have: `RV64 (Sv48 and Sv39 paging)`,
+/// `RV64 (Sv39 paging)`, or `RV32 (Sv32 paging)` (an RV32 VM's harts have Sv32
+/// whatever its profile's `paging` says).
+pub fn arch_text(xlen: Xlen, paging: Paging) -> String {
+    let modes = match (xlen, paging) {
+        (Xlen::Rv32, _) => "Sv32",
+        (Xlen::Rv64, Paging::Sv48) => "Sv48 and Sv39",
+        (Xlen::Rv64, Paging::Sv39) => "Sv39",
+    };
+    format!("{xlen} ({modes} paging)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +161,15 @@ mod tests {
         assert_eq!(mac_text(mac), "02:ca:00:0f:a0:ff");
         let back = crate::parse_net(&format!("-,mac={}", mac_text(mac))).unwrap();
         assert_eq!(back.mac, Some(mac));
+    }
+
+    #[test]
+    fn widths() {
+        assert_eq!(arch_text(Xlen::Rv64, Paging::Sv48), "RV64 (Sv48 and Sv39 paging)");
+        assert_eq!(arch_text(Xlen::Rv64, Paging::Sv39), "RV64 (Sv39 paging)");
+        for paging in [Paging::Sv48, Paging::Sv39] {
+            assert_eq!(arch_text(Xlen::Rv32, paging), "RV32 (Sv32 paging)");
+        }
     }
 
     #[test]

@@ -51,9 +51,9 @@ fn life_cycle() {
     assert_eq!(
         ok(addr, &["list"]),
         "\
-ID  NAME  STATE      RAM     CLOCK       DISKS  NETS
-1   echo  created    64 MiB  1 MHz       0      0
-2   sys   exited(0)  32 MiB  full speed  0      0
+ID  NAME  STATE      ARCH  RAM     CLOCK       DISKS  NETS
+1   echo  created    RV32  64 MiB  1 MHz       0      0
+2   sys   exited(0)  RV32  32 MiB  full speed  0      0
 "
     );
     assert_eq!(
@@ -63,6 +63,7 @@ ID  NAME  STATE      RAM     CLOCK       DISKS  NETS
 id       1
 name     echo
 state    created
+arch     RV32 (Sv32 paging)
 RAM      64 MiB
 clock    1 MHz (real time)
 harts    2
@@ -74,7 +75,9 @@ nets     none
     );
     let sys = ok(addr, &["info", "2"]);
     assert!(
-        sys.starts_with("id       2\nname     sys\nstate    exited(0)\nRAM      32 MiB\n"),
+        sys.starts_with(
+            "id       2\nname     sys\nstate    exited(0)\narch     RV32 (Sv32 paging)\nRAM      32 MiB\n"
+        ),
         "{sys}"
     );
     assert!(
@@ -108,15 +111,15 @@ nets     none
     assert_eq!(
         ok(addr, &["list"]),
         "\
-ID  NAME  STATE      RAM     CLOCK       DISKS  NETS
-2   sys   exited(0)  32 MiB  full speed  0      0
+ID  NAME  STATE      ARCH  RAM     CLOCK       DISKS  NETS
+2   sys   exited(0)  RV32  32 MiB  full speed  0      0
 "
     );
     assert_eq!(
         ok(addr, &["create", "--name", "echo", &echo]),
         "created VM 3 (echo)\n"
     );
-    assert!(ok(addr, &["list"]).contains("\n3   echo  created    4 MiB   full speed  0      0\n"));
+    assert!(ok(addr, &["list"]).contains("\n3   echo  created    RV32  4 MiB   full speed  0      0\n"));
     assert_eq!(ok(addr, &["destroy", "2"]), "destroyed VM 2\n");
     assert_eq!(ok(addr, &["destroy", "3"]), "destroyed VM 3\n");
     assert_eq!(ok(addr, &["list"]), "no VMs\n");
@@ -163,7 +166,7 @@ fn disks_are_attached_at_create() {
         "{info}"
     );
     assert!(info.contains("\n  block     0x"), "{info}");
-    assert!(ok(addr, &["list"]).contains("\n1   disky  exited(0)  4 MiB  full speed  1      0\n"));
+    assert!(ok(addr, &["list"]).contains("\n1   disky  exited(0)  RV32  4 MiB  full speed  1      0\n"));
 
     // Two disks, in order, the second read-only.
     ok(
@@ -257,7 +260,7 @@ fn disks_are_released_when_the_machine_ends() {
     wait_for_open(run, true);
     ok(addr, &["stop", "run"]);
     wait_for_open(run, false);
-    assert!(ok(addr, &["list"]).contains("\n1   run   stopped  4 MiB  full speed  1      0\n"));
+    assert!(ok(addr, &["list"]).contains("\n1   run   stopped  RV32  4 MiB  full speed  1      0\n"));
     let info = ok(addr, &["info", "run"]);
     assert!(
         info.contains(&format!("\ndisks    {} (read-write)\n", arg(run))),
@@ -432,8 +435,8 @@ fn a_debugged_vm() {
     assert_eq!(
         ok(addr, &["list"]),
         "\
-ID  NAME  STATE  RAM     CLOCK       DISKS  NETS
-1   echo  debug  64 MiB  full speed  0      0
+ID  NAME  STATE  ARCH  RAM     CLOCK       DISKS  NETS
+1   echo  debug  RV32  64 MiB  full speed  0      0
 "
     );
     assert!(ok(addr, &["info", "echo"]).contains("\nstate    debug\n"));

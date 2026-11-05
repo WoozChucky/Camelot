@@ -431,9 +431,9 @@ created VM 1 (demo)
 started VM 1 (demo)
 created VM 2 (echo)
 started VM echo
-ID  NAME  STATE      RAM     CLOCK       DISKS  NETS
-1   demo  exited(0)  64 MiB  2 MHz       0      0
-2   echo  running    16 MiB  full speed  0      0
+ID  NAME  STATE      ARCH  RAM     CLOCK       DISKS  NETS
+1   demo  exited(0)  RV32  64 MiB  2 MHz       0      0
+2   echo  running    RV32  16 MiB  full speed  0      0
 ```
 
 `round-table info demo` shows one VM in detail, with the device table its guest sees:
@@ -442,6 +442,7 @@ ID  NAME  STATE      RAM     CLOCK       DISKS  NETS
 id       1
 name     demo
 state    exited(0)
+arch     RV32 (Sv32 paging)
 RAM      64 MiB
 clock    2 MHz (real time)
 steps    6461
@@ -459,7 +460,7 @@ devices  9
   fb-vram   0x31000000 + 0x0012c000
 ```
 
-The life cycle is `start`, `pause`, `resume`, `stop` and `destroy`, each taking a VM's id or its name (`round-table pause echo`, `round-table destroy 2`). `create` takes `--name` (required), `--ram SIZE`, `--clock FREQ` and `--harts N` with exactly the syntax of `grail --ram`, `--clock` and `--harts` (the same parsers), `--disk SRC` and `--disk-ro SRC` (an image file on Avalon's host, or `lake://ADDR/NAME` for an image on a Lake server; repeat for more disks), `--start`, and `--camelot` instead of a program (below). `--server ADDR` picks the Avalon for the VM commands (default `127.0.0.1:7400`; a host alone means port 7400). `round-table --help` lists everything.
+The life cycle is `start`, `pause`, `resume`, `stop` and `destroy`, each taking a VM's id or its name (`round-table pause echo`, `round-table destroy 2`). `create` takes `--name` (required), `--xlen 32|64`, `--paging sv48|sv39`, `--ram SIZE`, `--clock FREQ` and `--harts N` with exactly the syntax of `grail --xlen`, `--paging`, `--ram`, `--clock` and `--harts` (the same parsers; the width is the VM's, RV32 by default, as QEMU's binary picks it, and an ELF64 program makes it RV64 anyway: protocol doc, section 3, "The width"), `--disk SRC` and `--disk-ro SRC` (an image file on Avalon's host, or `lake://ADDR/NAME` for an image on a Lake server; repeat for more disks), `--start`, and `--camelot` instead of a program (below). `--server ADDR` picks the Avalon for the VM commands (default `127.0.0.1:7400`; a host alone means port 7400). `round-table --help` lists everything.
 
 The disk commands talk to Lake (`--lake ADDR`, default `127.0.0.1:7401`; the VM commands do not take it, but for `create --camelot` below, nor do the disk commands take `--server`):
 
@@ -565,7 +566,7 @@ Open the URL it prints (the token in it changes at every launch). Options: `--li
 
 - **Overview** (`#/`): Avalon and Lake, each up or down with its version or the error that says why; the RAM all VMs hold against Avalon's budget, as a bar; how many VMs are running, paused, held by a debugger, created and ended; how many disks there are, how many are attached, and their total size. It refreshes every few seconds, as the other pages do.
 - **VMs** (`#/vms`): a table of every VM with its id, name, state, RAM, clock and disks, and a button for each action its state allows (start for a created VM; pause, stop, destroy for a running one; resume for a paused one; stop and destroy for one its debugger holds, state *debug*; destroy for a stopped or exited one). Stop and destroy ask first.
-- **New VM** (`#/vms/new`): name, RAM (MiB, or with `M`/`G`; 4 MiB by default), clock (`10MHz`, `500kHz`, `5Hz`, or empty for full speed: the syntax of `--ram` and `--clock`), harts (1 to 8), what it boots: *Camelot (boot from disk)*, the choice when Lake has the image `os-base`, gives the VM its own copy of that image, `NAME-disk0`, as its first disk and boots it, as `round-table create --camelot` does; *Program (ELF)* uploads an ELF file chosen in the browser, which may be left out when the VM has a disk to boot from instead; any number of disks (each a `lake://ADDR/NAME` source, offered from Lake's list, or the path of an image file on Avalon's host, read-write or read-only), network cards (each on a switch, offered from Avalon's list, or unplugged, with an address or one Avalon makes up), and whether to start it at once. Mistakes come back as Round Table would say them (`ram: 0 is out of range (1 MiB to 1 TiB)`).
+- **New VM** (`#/vms/new`): name, width (RV32, the default, or RV64, and an RV64 VM's paging: Sv48 and Sv39, or Sv39 alone), RAM (MiB, or with `M`/`G`/`T`; 4 MiB by default; up to 1 TiB, an RV32 VM 2 GiB), clock (`10MHz`, `500kHz`, `5Hz`, or empty for full speed: the syntax of `--ram` and `--clock`), harts (1 to 8), what it boots: *Camelot (boot from disk)*, the choice when Lake has the image `os-base`, gives the VM its own copy of the image of its width (`os-base`, or `os-base-rv64` for an RV64 VM), `NAME-disk0`, as its first disk and boots it, as `round-table create --camelot` does; *Program (ELF)* uploads an ELF file chosen in the browser, which may be left out when the VM has a disk to boot from instead; any number of disks (each a `lake://ADDR/NAME` source, offered from Lake's list, or the path of an image file on Avalon's host, read-write or read-only), network cards (each on a switch, offered from Avalon's list, or unplugged, with an address or one Avalon makes up), and whether to start it at once. Mistakes come back as Round Table would say them (`ram: 0 is out of range (1 MiB to 1 TiB)`).
 - **One VM** (`#/vms/ID`): its facts (state, RAM, clock, steps run, disks, the device table its guest sees), its action buttons, and its console: the scrollback, then the output live as the guest writes it, and an input line whose text goes to the VM's UART when you press Enter, followed by LF, CR or nothing as you choose (a Ctrl-D button sends EOT). Several pages, and Herald, can watch one console at once.
 - **Disks** (`#/disks`): a form to create an image (name and size: `64MiB`, `512K`, `1G`, `2048s`), and a table of Lake's images with their size, how they are attached (read-write, or how many readers) and which VMs hold them, with three buttons: *attach* opens the new-VM form with the image filled in (a VM's disks are part of its hardware, attached when it is created), *detach* stops the VMs that hold it (a VM lets go of its disks when it stops, and cannot be started again: the page says so first), and *delete*, for an image nobody holds.
 - **Switches** (`#/switches`): a form to create a switch (its name, whether it has a NAT gateway, and the ports it forwards, one rule per line as `--hostfwd` takes them), a form to plug a VM's card into a switch, and a panel per switch: its gateway (network, forwarded ports as bound, and each lease with the VM it belongs to) with a button to add or remove it, a delete button, and its ports with frames and bytes in and out, frames dropped, and an *unplug* button per card.

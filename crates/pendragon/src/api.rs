@@ -13,13 +13,13 @@ use crate::json::Json;
 use crate::screen::{OpenError, Screens, Viewer, SUBPROTOCOL};
 use crate::websocket::{accept_response, Handshake};
 use avalon_client::{
-    create_camelot_vm, format_hz, format_size, holds_disks, lake_disks, mac_text, parse_clock,
-    parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_ram, CamelotError,
-    Client, Timeouts, VmAction, BASE_IMAGE,
+    arch_text, base_image, create_camelot_vm, format_hz, format_size, holds_disks, lake_disks, mac_text,
+    parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_paging,
+    parse_ram, parse_xlen, CamelotError, Client, Timeouts, VmAction,
 };
 use avalon_proto::{
     validate_name, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, NatConfig, PortOwner,
-    SwitchInfo, VmDetails, VmRef, VmState, VmSummary, SECTOR_SIZE,
+    SwitchInfo, VmDetails, VmRef, VmState, VmSummary, Xlen, SECTOR_SIZE,
 };
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -577,9 +577,11 @@ impl App {
             200,
             Json::object([
                 ("lake", self.lake.as_str().into()),
-                // The image a Camelot VM's disk is a copy of: the new-VM form offers
-                // Camelot first when Lake has it.
-                ("camelot_image", BASE_IMAGE.into()),
+                // The images a Camelot VM's disk is a copy of, RV32's and RV64's:
+                // the new-VM form offers Camelot first when Lake has the one of the
+                // width chosen.
+                ("camelot_image", base_image(Xlen::Rv32).into()),
+                ("camelot_image_rv64", base_image(Xlen::Rv64).into()),
                 ("disks", Json::Array(disks)),
                 ("vms_error", vms.err().map(|f| f.message).into()),
             ]),
@@ -916,19 +918,22 @@ struct Create {
     profile: HardwareProfile,
     /// Empty: boot from disk 0.
     program: Vec<u8>,
-    /// Boot Camelot from a copy of Lake's image `os-base`, made first.
+    /// Boot Camelot from a copy of Lake's image of the VM's width, `os-base` or
+    /// `os-base-rv64`, made first.
     camelot: bool,
     start: bool,
 }
 
-/// `{"name", "ram", "clock", "harts", "disks": [{"source", "read_only"}], "nets":
-/// [{"switch", "mac"}], "camelot", "program", "start"}`: `ram`, `clock` and `harts` as
-/// Round Table's `--ram`, `--clock` and `--harts` take them (MiB, or with M/MiB or G/GiB, a frequency
-/// with Hz/kHz/MHz, a number of harts; an empty clock is full speed, an empty hart count
-/// one hart), each disk source a path on Avalon's host or `lake://ADDR/NAME`, each
-/// network card the switch to plug it into (empty or null: none) and its MAC address
-/// (empty or null: Avalon makes one up), the program an ELF file in base64. `camelot`
-/// true boots Camelot from `<name>-disk0`, a copy of Lake's image `os-base` that goes
+/// `{"name", "xlen", "paging", "ram", "clock", "harts", "disks": [{"source",
+/// "read_only"}], "nets": [{"switch", "mac"}], "camelot", "program", "start"}`: `xlen`,
+/// `paging`, `ram`, `clock` and `harts` as Round Table's `--xlen`, `--paging`, `--ram`,
+/// `--clock` and `--harts` take them (32 or 64, sv48 or sv39, MiB or with M/MiB, G/GiB
+/// or T/TiB, a frequency with Hz/kHz/MHz, a number of harts; empty is the default:
+/// RV32, Sv48, 4 MiB, full speed, one hart), each disk source a path on Avalon's host
+/// or `lake://ADDR/NAME`, each network card the switch to plug it into (empty or null:
+/// none) and its MAC address (empty or null: Avalon makes one up), the program an ELF
+/// file in base64. `camelot` true boots Camelot from `<name>-disk0`, a copy of Lake's
+/// image of the VM's width (`os-base`, or `os-base-rv64` for an RV64 VM) that goes
 /// before the other disks, as Round Table's `create --camelot`; it takes no program.
 /// Otherwise the program may be left out when there is a disk: the VM boots from the
 /// first.
@@ -936,12 +941,18 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
     only_keys(
         body,
         &[
-            "name", "ram", "clock", "harts", "disks", "nets", "camelot", "program", "start",
+            "name", "xlen", "paging", "ram", "clock", "harts", "disks", "nets", "camelot", "program", "start",
         ],
     )?;
     let name = string(body, "name")?.ok_or_else(|| Fail::bad("name: a VM needs a name"))?;
     validate_name(name).map_err(|e| Fail::bad(format!("name: {e}")))?;
     let mut profile = HardwareProfile::default();
+    if let Some(xlen) = string(body, "xlen")?.filter(|s| !s.trim().is_empty()) {
+        profile.xlen = parse_xlen(xlen.trim()).map_err(|e| Fail::bad(format!("xlen: {e}")))?;
+    }
+    if let Some(paging) = string(body, "paging")?.filter(|s| !s.trim().is_empty()) {
+        profile.paging = parse_paging(paging.trim()).map_err(|e| Fail::bad(format!("paging: {e}")))?;
+    }
     if let Some(ram) = string(body, "ram")?.filter(|s| !s.trim().is_empty()) {
         profile.ram_size = parse_ram(ram.trim()).map_err(|e| Fail::bad(format!("ram: {e}")))?;
     }
@@ -1106,6 +1117,12 @@ fn vm_json(vm: &VmSummary) -> Json {
             }
             .into(),
         ),
+        // The width in bits and the paging modes as `xlen` and `paging` take them, and
+        // the two as people read them.
+        ("xlen", profile.xlen.bits().into()),
+        ("paging", profile.paging.to_string().into()),
+        ("arch", profile.xlen.to_string().into()),
+        ("arch_text", arch_text(profile.xlen, profile.paging).into()),
         ("ram", profile.ram_size.into()),
         ("ram_text", format_size(profile.ram_size).into()),
         ("clock_hz", profile.clock_hz.into()),
@@ -1359,8 +1376,29 @@ mod tests {
         let c = create(r#"{"name": "os", "camelot": null, "program": null, "disks": [{"source": "d.img"}]}"#)
             .unwrap();
         assert!(!c.camelot && c.program.is_empty());
+        // An RV64 VM, Sv39 alone, with RV64's RAM.
+        let c = create(r#"{"name": "os", "camelot": true, "xlen": "64", "paging": "sv39", "ram": "16G"}"#)
+            .unwrap();
+        assert_eq!(
+            (c.profile.xlen, c.profile.paging, c.profile.ram_size),
+            (Xlen::Rv64, avalon_proto::Paging::Sv39, 16 << 30)
+        );
+        let c = create(r#"{"name": "os", "camelot": true, "xlen": " ", "paging": ""}"#).unwrap();
+        assert_eq!(
+            (c.profile.xlen, c.profile.paging),
+            (Xlen::Rv32, avalon_proto::Paging::Sv48)
+        );
 
         for (text, why) in [
+            (
+                r#"{"name": "a", "camelot": true, "xlen": "128"}"#,
+                "xlen: '128' is not a register width (32 or 64)",
+            ),
+            (r#"{"name": "a", "camelot": true, "xlen": 64}"#, "xlen: not a string"),
+            (
+                r#"{"name": "a", "camelot": true, "paging": "sv57"}"#,
+                "paging: 'sv57' is not a paging mode (sv39 or sv48)",
+            ),
             (
                 r#"{"name": "a", "camelot": true, "program": "AA=="}"#,
                 "program: a Camelot VM boots from its disk, and takes no program",
@@ -1539,6 +1577,8 @@ mod tests {
             state: VmState::Exited(2),
             profile: HardwareProfile {
                 clock_hz: Some(1_500_000),
+                xlen: Xlen::Rv64,
+                paging: avalon_proto::Paging::Sv39,
                 devices: vec![
                     DeviceSpec::Net(parse_net("-,mac=02:00:00:00:00:01").unwrap()),
                     DeviceSpec::Disk(DiskSpec {
@@ -1552,7 +1592,7 @@ mod tests {
         };
         assert_eq!(
             vm_json(&vm).encode(),
-            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","harts":1,"disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"nets":[{"card":0,"mac":"02:00:00:00:00:01","switch":null},{"card":1,"mac":"02:00:00:00:00:02","switch":"wan"}],"actions":["destroy"]}"#
+            r#"{"id":3,"name":"web","state":"exited","state_text":"exited(2)","exit_code":2,"xlen":64,"paging":"sv39","arch":"RV64","arch_text":"RV64 (Sv39 paging)","ram":67108864,"ram_text":"64 MiB","clock_hz":1500000,"clock_text":"1.5 MHz","nominal_hz":10000000,"nominal_text":"10 MHz","harts":1,"disks":[{"source":"lake://127.0.0.1:7401/data","read_only":true,"lake":{"addr":"127.0.0.1:7401","name":"data"},"held":false}],"nets":[{"card":0,"mac":"02:00:00:00:00:01","switch":null},{"card":1,"mac":"02:00:00:00:00:02","switch":"wan"}],"actions":["destroy"]}"#
         );
     }
 

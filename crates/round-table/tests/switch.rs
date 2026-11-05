@@ -116,7 +116,7 @@ VM  CARD  MAC                IN  IN-BYTES  OUT  OUT-BYTES  DROPPED
     assert!(ok(addr, &["info", "ping"]).contains("\nnets     02:ca:00:00:00:01 unplugged\n"));
     let list = ok(addr, &["list"]);
     assert!(
-        list.contains("\n2   ping  exited(0)  16 MiB  1 MHz       0      1\n"),
+        list.contains("\n2   ping  exited(0)  RV32  16 MiB  1 MHz       0      1\n"),
         "{list}"
     );
     server.stop().unwrap();

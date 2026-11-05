@@ -145,9 +145,9 @@ fn camelot_vms_boot_from_copies_of_their_own() {
     assert_eq!(
         ok(addr, &["list"]),
         "\
-ID  NAME  STATE    RAM     CLOCK       DISKS  NETS
-1   one   running  16 MiB  full speed  1      0
-2   two   running  16 MiB  full speed  1      0
+ID  NAME  STATE    ARCH  RAM     CLOCK       DISKS  NETS
+1   one   running  RV32  16 MiB  full speed  1      0
+2   two   running  RV32  16 MiB  full speed  1      0
 "
     );
     let info = ok(addr, &["info", "one"]);
