@@ -684,6 +684,42 @@ fn the_forms_are_clangs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The names of the base types `src`'s unit describes, compiled with `-g`.
+fn base_types(src: &str) -> Vec<String> {
+    use elf::dies::dw;
+    let asm = merlin::compile_with("c.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options::default()).unwrap();
+    let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+    units[0]
+        .dies
+        .iter()
+        .filter(|d| d.tag == dw::TAG_BASE_TYPE)
+        .filter_map(|d| d.name().map(str::to_string))
+        .collect()
+}
+
+/// The type of an explicit cast is kept only where the code evaluates it,
+/// as clang's code generator keeps it: not in the operand `?:` does not
+/// choose of a constant condition, which need not even be constant.
+#[test]
+fn casts_not_evaluated_are_not_kept() {
+    let kept = |body: &str| {
+        base_types(&format!(
+            "int x; int h(void);
+int f(void) {{ return {body}; }}
+"
+        ))
+    };
+    assert_eq!(kept("1 ? 2 : (unsigned short)x"), ["int"]);
+    assert_eq!(kept("1 ? 2 : (unsigned short)h()"), ["int"]);
+    assert_eq!(kept("0 ? (unsigned short)h() : 2"), ["int"]);
+    assert_eq!(
+        kept("0 ? 2 : (unsigned short)x"),
+        ["unsigned short", "int"],
+        "the types of casts come first"
+    );
+}
+
 /// The types a function defines (a typedef, a struct, one in an inner block)
 /// are described in its entry, after its variables and blocks, as clang has
 /// them; a file-scope type of the same tag is the unit's.

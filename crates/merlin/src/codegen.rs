@@ -4131,6 +4131,36 @@ main:
         assert_eq!(f("char", "(char)300 + 1"), "li a0, 45");
         assert_eq!(f("unsigned", "sizeof(long long) * 3"), "li a0, 24");
         assert_eq!(f("int", "1 && 2LL || 0"), "li a0, 1");
+        // The operand `?:` does not choose is not evaluated: it need not be
+        // constant (C99 6.6p3), only its type counts, as clang folds it.
+        let g = |src: &str| body_of(&compile(src), "f")[4..].join("; ");
+        assert_eq!(g("int h(void); int f(void) { return 1 ? 2 : h(); }"), "li a0, 2");
+        assert_eq!(
+            g("unsigned h(void); unsigned long long f(void) { return 0 ? h() : -1; }"),
+            "li a0, -1; li a1, 0",
+            "-1 converted to the operands' common type, unsigned int"
+        );
+        assert_eq!(
+            g("long long h(void); long long f(void) { return 1 ? -1 : h(); }"),
+            "li a0, -1; li a1, -1"
+        );
+        let asm = compile("int h(void); int x = 1 ? 2 : h(); int y = 0 && h();");
+        assert!(
+            asm.contains(
+                "x:
+    .word 2
+"
+            ),
+            "{asm}"
+        );
+        assert!(
+            asm.contains(
+                "y:
+    .word 0
+"
+            ),
+            "{asm}"
+        );
         // Division by zero is left to run time; the rest is folded.
         assert_eq!(
             f("int", "(2 * 3) / 0"),

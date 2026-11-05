@@ -9,7 +9,7 @@
 //! would at run time on the target (each function takes it: an `int` is 32
 //! bits on both widths, a `long` 64 on RV64). Values are `i128`s, so every
 //! value of every type, `unsigned long` on LP64 included, is the number it
-//! is. The parser calls [`eval`] before sema has typed the
+//! is. The parser calls [`parsed_int`] before sema has typed the
 //! tree, so integer types are worked out here from the leaves (literals,
 //! casts, `sizeof`) rather than read from [`Expr::ty`]. Address constants
 //! (`&g`, `arr + 2`, `"text"`) need the types sema assigns, so they are only
@@ -44,12 +44,16 @@ pub enum Base {
     Str(Vec<u8>),
 }
 
-/// The value of an integer constant expression.
+/// The value of an integer constant expression, in a checked tree.
 pub fn int(e: &Expr, x: Xlen) -> Option<i128> {
-    match eval(e, x)? {
-        Const::Int(v, _) => Some(v),
-        Const::Addr { .. } => None,
-    }
+    int_of(eval(e, x)?).map(|(v, _)| v)
+}
+
+/// [`int`] before sema has typed the tree, for the parser: an operand `?:`
+/// does not choose must be constant too there, since its type, which the
+/// result's depends on, is known only from its leaves.
+pub fn parsed_int(e: &Expr, x: Xlen) -> Option<i128> {
+    int_of(value(e, x, true, false)?).map(|(v, _)| v)
 }
 
 /// Whether `e` is a null pointer constant: an integer constant expression
@@ -63,22 +67,25 @@ pub fn is_null_pointer(e: &Expr, xlen: Xlen) -> bool {
     }
 }
 
-/// The constant value of `e`, or `None` if it is not a constant expression
-/// merlin can evaluate (that includes dividing by zero, where the division
-/// is evaluated).
+/// The constant value of `e`, in a tree sema has checked, or `None` if it
+/// is not a constant expression merlin can evaluate (that includes dividing
+/// by zero, where the division is evaluated).
 pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
-    value(e, xlen, true)
+    value(e, xlen, true, true)
 }
 
-/// [`eval`] of an operand that is `evaluated` or not. C99 6.6p3 and p11
-/// hold a constant expression to what it evaluates: in `1 ? 2 : 1 / 0` the
-/// third operand is never divided, only its type counts (the result's is
-/// the operands' common type), so there dividing by zero is no error and
-/// gives 0, a value nothing reads. clang has it so: `int a[1 ? 2 : 1 / 0];`
-/// has two elements.
-fn value(e: &Expr, xlen: Xlen, evaluated: bool) -> Option<Const> {
+/// [`eval`] of an operand that is `evaluated` or not, in a tree sema has
+/// `checked` or not. C99 6.6p3 and p11 hold a constant expression to what
+/// it evaluates: in `1 ? 2 : 1 / 0` the third operand is never divided,
+/// only its type counts (the result's is the operands' common type), so
+/// there dividing by zero is no error and gives 0, a value nothing reads.
+/// clang has it so: `int a[1 ? 2 : 1 / 0];` has two elements. In a checked
+/// tree the operand `?:` does not choose need not be constant at all, as
+/// the right operand of `0 && h()` need not: sema gave it its type, and
+/// `1 ? 2 : h()` is 2, which clang folds too.
+fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> {
     use Const::*;
-    let eval = |e: &Expr, xlen: Xlen| value(e, xlen, evaluated);
+    let eval = |e: &Expr, xlen: Xlen| value(e, xlen, evaluated, checked);
     match &e.kind {
         ExprKind::Num(v) => Some(Int(*v, e.ty.int_kind()?)),
         ExprKind::SizeofType(t) => Some(Int(t.size(xlen)?.into(), IntKind::size_t(xlen))),
@@ -126,17 +133,26 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool) -> Option<Const> {
             }
         }
         ExprKind::Cond(c, a, b) => {
-            // Only the chosen operand is evaluated.
-            let c = int_of(eval(c, xlen)?)?.0 != 0;
-            let a = value(a, xlen, evaluated && c)?;
-            let b = value(b, xlen, evaluated && !c)?;
-            match (a, b) {
+            // Only the chosen operand is evaluated; of the other only the
+            // type counts: sema's, or before sema what its value has.
+            let (chosen, other) = if int_of(eval(c, xlen)?)?.0 != 0 {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let v = eval(chosen, xlen)?;
+            let other = if checked {
+                other.ty.int_kind()
+            } else {
+                int_of(value(other, xlen, false, false)?).map(|(_, k)| k)
+            };
+            match (v, other) {
                 // The result has the operands' common type, whichever is chosen.
-                (Int(x, xk), Int(y, yk)) => {
+                (Int(x, xk), Some(yk)) => {
                     let k = common(xk, yk, xlen);
-                    Some(Int(k.wrap(if c { x } else { y }, xlen), k))
+                    Some(Int(k.wrap(x, xlen), k))
                 }
-                (x, y) => Some(if c { x } else { y }),
+                (v, _) => Some(v),
             }
         }
         ExprKind::Cast { x, .. } => {
@@ -167,9 +183,9 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool) -> Option<Const> {
         ExprKind::Str(_) | ExprKind::Var { .. } | ExprKind::Deref(_) | ExprKind::Member { .. }
             if e.ty.is_array() || e.ty.is_func() =>
         {
-            addr_of(e, xlen, evaluated)
+            addr_of(e, xlen, evaluated, checked)
         }
-        ExprKind::Addr(x) => addr_of(x, xlen, evaluated),
+        ExprKind::Addr(x) => addr_of(x, xlen, evaluated, checked),
         _ => None,
     }
 }
@@ -177,7 +193,7 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool) -> Option<Const> {
 /// The address of an lvalue, if it is an address constant: a global object
 /// (or a member or element of one, at a constant offset), a string literal,
 /// or what a constant pointer points to.
-fn addr_of(e: &Expr, xlen: Xlen, evaluated: bool) -> Option<Const> {
+fn addr_of(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> {
     match &e.kind {
         ExprKind::Var {
             var: Some(VarRef::Global(sym)),
@@ -190,7 +206,7 @@ fn addr_of(e: &Expr, xlen: Xlen, evaluated: bool) -> Option<Const> {
             base: Some(Base::Str(bytes.clone())),
             offset: 0,
         }),
-        ExprKind::Deref(p) => match value(p, xlen, evaluated)? {
+        ExprKind::Deref(p) => match value(p, xlen, evaluated, checked)? {
             a @ Const::Addr { .. } => Some(a),
             Const::Int(..) => None,
         },
@@ -201,9 +217,9 @@ fn addr_of(e: &Expr, xlen: Xlen, evaluated: bool) -> Option<Const> {
             ..
         } => {
             let at = if *arrow {
-                value(base, xlen, evaluated)?
+                value(base, xlen, evaluated, checked)?
             } else {
-                addr_of(base, xlen, evaluated)?
+                addr_of(base, xlen, evaluated, checked)?
             };
             match at {
                 Const::Addr { base, offset } => Some(Const::Addr {
@@ -303,7 +319,7 @@ mod tests {
             panic!()
         };
         let Init::Expr(e) = &items[0] else { panic!() };
-        eval(e, x)
+        value(e, x, true, false)
     }
 
     fn int(src: &str) -> (i128, IntKind) {
@@ -406,5 +422,10 @@ mod tests {
         assert_eq!(ev("y"), None);
         assert_eq!(ev("f()"), None);
         assert_eq!(ev("(1, 2)"), None, "C: comma is not a constant expression");
+        // Before sema, the operand `?:` does not choose has a type only if
+        // it is constant (codegen's tests fold `1 ? 2 : h()` once sema has
+        // typed it).
+        assert_eq!(ev("1 ? 2 : f()"), None);
+        assert_eq!(ev("0 ? f() : 2"), None);
     }
 }

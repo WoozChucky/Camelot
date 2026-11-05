@@ -1,8 +1,15 @@
-// expect: 24
+// expect: 26
 // Integer constant expressions of every integer type are folded: each is one
 // constant in the code, as clang's front end has it at -O0. Each must be
 // what the same operations give at run time, on variables, and what C says
 // it is. Each check that holds counts one.
+int calls;
+
+unsigned bump(void) {
+    calls++;
+    return 1;
+}
+
 int main() {
     int r = 0;
     int one = 1, three = 3, forty = 40, sixty = 60;
@@ -41,5 +48,9 @@ int main() {
     r += (0 ? 1 / 0 : 2L) == 2;                                       // 22
     r += (1LL && 0ull) == 0 && (0LL || 4294967296LL) == 1;            // 23
     r += sizeof(long long) * 3 == 24;                                 // 24
+    // The operand ?: does not choose need not be constant: only its type
+    // counts (unsigned int here), and it is not called.
+    r += (1 ? -1 : bump()) == 0xffffffffu && (1 ? -1 : bump()) > 0;   // 25
+    r += (0 ? bump() : 2) == 2 && calls == 0;                         // 26
     return r;
 }
