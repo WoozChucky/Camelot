@@ -84,6 +84,19 @@ static struct header *more(size_t units) {
     if ((long)got < 0) {
         return NULL;
     }
+    /* A program that calls sbrk itself may have left the end of the heap
+     * anywhere. Then the block starts at the next multiple of UNIT, so it
+     * stays aligned, and sbrk is asked for the bytes that skips, which
+     * also leaves the end aligned for the next time, as glibc's malloc
+     * corrects a misaligned break (sysmalloc's `correction`). If even
+     * those few bytes can't be had, the block is a unit smaller. */
+    uintptr_t skip = -(uintptr_t)got & (UNIT - 1);
+    if (skip != 0) {
+        got += skip;
+        if ((long)sbrk((long)skip) < 0) {
+            units--;
+        }
+    }
     struct header *b = (struct header *)got;
     b->units = units;
     free_locked(b + 1);

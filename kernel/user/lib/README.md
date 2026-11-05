@@ -118,7 +118,11 @@ Two ways, for two kinds of input:
 (8 bytes on RV32, 16 on RV64): its size in header-sized units, a `size_t`,
 and, while it is free, the next free block. So every block is aligned to
 the header's size, which on RV64 is the ABI's largest alignment, 16 bytes,
-as glibc's `malloc` gives. A request of more than `LONG_MAX` bytes (what
+as glibc's `malloc` gives. When a program has moved the end of the heap
+with `sbrk` itself, by a number of bytes that is not a multiple of the
+header's size, `malloc` skips to the next multiple before it puts a block
+there, and takes the bytes it skipped from `sbrk` too, as glibc corrects a
+misaligned break. A request of more than `LONG_MAX` bytes (what
 `sbrk` takes) fails with `NULL` at once. The
 free blocks form a ring in address order, through a dummy block of size 0;
 `malloc` walks it from where the last search stopped and takes the first

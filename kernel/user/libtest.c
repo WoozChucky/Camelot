@@ -335,6 +335,22 @@ static void test_malloc(void) {
     free(all);
 }
 
+/* A program that moves the end of the heap itself, by an odd number of
+ * bytes: the blocks malloc then takes from fresh heap are still aligned to
+ * its header's size, and so is the end of the heap after them. Runs after
+ * test_malloc, whose biggest free block is smaller than the request. */
+static void test_odd_break(void) {
+    uintptr_t align = (uintptr_t)HDR - 1;
+    char *top = sbrk(3);
+    check((long)top >= 0 && ((uintptr_t)sbrk(0) & align) != 0, "sbrk by 3 bytes leaves the end unaligned");
+    char *p = malloc(200000);
+    check(p != NULL && p > top, "a block from above the odd end");
+    check(((uintptr_t)p & align) == 0 && ((uintptr_t)sbrk(0) & align) == 0,
+          "is aligned to the header's size, and so is the new end");
+    p[199999] = 1;
+    free(p);
+}
+
 /* libtest feed N: N lines "line K", written in pieces of 7 bytes. */
 static int feed(int n) {
     static char text[1024];
@@ -530,6 +546,7 @@ int main(int argc, char **argv) {
     /* First, while the heap is still empty. */
     test_merge();
     test_malloc();
+    test_odd_break();
     test_reader();
     test_kill_descendants();
     printf("libtest: %d checks, %d failed\n", checks, failures);
