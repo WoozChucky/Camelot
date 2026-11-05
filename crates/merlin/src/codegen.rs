@@ -274,7 +274,9 @@
 //! swapped (`l > r`), those two followed by `xori 1` (`>=`, `<=`), and `xor`
 //! followed by `seqz`/`snez` (`==`, `!=`). `&&` and `||` branch around their
 //! right side and turn the result into 0 or 1 with `snez`; `?:` branches like
-//! an `if`.
+//! an `if`. A constant condition is decided here, as clang's code generator
+//! decides it at `-O0` (see "Control flow"): `c ? a : b` is the operand `c`
+//! chooses, and `1 && x` and `0 || x` are `x`, as 0 or 1.
 //!
 //! Pointer arithmetic counts elements: `p + i` scales `i` by the size of what
 //! `p` points to (a shift for powers of two), and `p - q` divides the byte
@@ -374,6 +376,18 @@
 //! chain is simpler to read and works for any values. A C label `name` is
 //! `.L.label.<function>.<name>`, and `goto` is a `j` to it.
 //!
+//! A condition that is an integer constant expression is decided at compile
+//! time, as clang's code generator decides it at `-O0` ([`crate::elide`]):
+//! `if (1) a; else b;` is `a` alone, with no test, and a `switch` on a
+//! constant is the statements its case runs, up to the `break`, without
+//! compares or labels. Code a jump can still reach is kept: an arm with a
+//! `goto` label in it, or a `case` of a `switch` around it, and the `if` is
+//! generated as usual. `while (1)` tests nothing, nor does `do ... while
+//! (0)`; `while (0)`, `do ... while (1)` and `for` loops test their
+//! condition, as in clang. `-g` describes only what is generated: the
+//! variables of an arm left out are not described, and the types of its
+//! casts are not kept.
+//!
 //! A conditional branch reaches only ±4 KiB, and merlin-as reports a branch
 //! that cannot reach its label as an error rather than rewriting it. So once a
 //! function is generated, [`relax_branches`] estimates every instruction's
@@ -398,6 +412,7 @@ use crate::abi::{self, Pass};
 use crate::ast::*;
 use crate::consteval::{self, Base, Const};
 use crate::debug::{DebugInfo, Lines, Location, Scope, Var};
+use crate::elide;
 use crate::sema::arith_type;
 use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
 use crate::{Error, Pos};
@@ -478,6 +493,7 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
                     file: &mut file,
                     ret_label: format!(".L.return.{}", f.name),
                     statics: Vec::new(),
+                    elided_cases: Vec::new(),
                     after_prologue: false,
                     scopes: Vec::new(),
                 };
@@ -978,6 +994,9 @@ struct FuncGen<'a, 'f> {
     ret_label: String,
     /// The function's `static` locals, emitted as data after it.
     statics: Vec<&'a Declarator>,
+    /// The ids of the `case`s and `default`s of each `switch` on a constant
+    /// generated so far, whose labels nothing jumps to.
+    elided_cases: Vec<usize>,
     /// With `-g`: a `.loc` has been written since the function's first, so
     /// the next is not the one that ends the prologue.
     after_prologue: bool,
@@ -1480,14 +1499,17 @@ impl<'a> FuncGen<'a, '_> {
     fn unscoped_stmt(&mut self, s: &'a Stmt) {
         debug_assert_eq!(self.depth, 0, "temporaries left on the stack between statements");
         // `-g`: a statement with code of its own starts a line. A loop's parts
-        // and a declaration's initializers get theirs where they are made.
+        // and a declaration's initializers get theirs where they are made, an
+        // `if`'s and a `switch`'s where their condition is tested.
         match &s.kind {
             StmtKind::Block(_)
             | StmtKind::Decl(_)
             | StmtKind::Empty
+            | StmtKind::If { .. }
             | StmtKind::While { .. }
             | StmtKind::DoWhile { .. }
             | StmtKind::For { .. }
+            | StmtKind::Switch { .. }
             | StmtKind::Case { .. }
             | StmtKind::Default { .. }
             | StmtKind::Label { .. } => {}
@@ -1512,6 +1534,21 @@ impl<'a> FuncGen<'a, '_> {
             StmtKind::Expr(e) => self.expr(e),
             StmtKind::Empty => {}
             StmtKind::If { cond, then, els } => {
+                // A constant condition runs one arm: only that one is
+                // generated, unless the other has a label (see [`elide`]).
+                if let Some(c) = self.constant_condition(cond) {
+                    let (run, skipped) = if c {
+                        (Some(&**then), els.as_deref())
+                    } else {
+                        (els.as_deref(), Some(&**then))
+                    };
+                    if !skipped.is_some_and(|s| elide::contains_label(s, false)) {
+                        if let Some(run) = run {
+                            self.stmt(run);
+                        }
+                        return;
+                    }
+                }
                 //     <cond>                    <cond>
                 //     beqz a0, .L.end.N         beqz a0, .L.else.N
                 //     <then>                    <then>
@@ -1519,6 +1556,7 @@ impl<'a> FuncGen<'a, '_> {
                 //                             .L.else.N:
                 //                               <els>
                 //                             .L.end.N:
+                self.loc(s.pos);
                 self.test(cond);
                 match els {
                     None => {
@@ -1549,9 +1587,15 @@ impl<'a> FuncGen<'a, '_> {
                 let cont = self.new_label("continue");
                 let brk = self.new_label("break");
                 self.label(&cont);
-                self.loc(cond.pos);
-                self.test(cond);
-                self.branch_if_zero(&brk);
+                if self.constant_condition(cond) == Some(true) {
+                    // `while (1)`: nothing to test, as clang has it. Its
+                    // code generator still visits the condition (`-g`).
+                    self.kept_casts(cond);
+                } else {
+                    self.loc(cond.pos);
+                    self.test(cond);
+                    self.branch_if_zero(&brk);
+                }
                 self.loop_body(body, &cont, &brk);
                 self.ins("j", &cont);
                 self.label(&brk);
@@ -1569,9 +1613,14 @@ impl<'a> FuncGen<'a, '_> {
                 self.label(&top);
                 self.loop_body(body, &cont, &brk);
                 self.label(&cont);
-                self.loc(cond.pos);
-                self.test(cond);
-                self.branch_if_nonzero(&top);
+                if self.constant_condition(cond) == Some(false) {
+                    // `do ... while (0)`: nothing to test, as clang has it.
+                    self.kept_casts(cond);
+                } else {
+                    self.loc(cond.pos);
+                    self.test(cond);
+                    self.branch_if_nonzero(&top);
+                }
                 self.label(&brk);
             }
             StmtKind::For {
@@ -1652,6 +1701,21 @@ impl<'a> FuncGen<'a, '_> {
                 //     j    .L.case.f.2         (default; or .L.break.N)
                 //     <body>                   (with .L.case.f.<id>: labels)
                 //   .L.break.N:
+                //
+                // On a constant condition, only the statements that run, as
+                // clang has them, when they can be picked out (see [`elide`]):
+                // no compares, no labels, no `break`.
+                if let Some(v) = consteval::int(cond, self.xlen).filter(|_| cond.ty.is_integer()) {
+                    if let Some(run) = elide::case_statements(body, v, cases, *default) {
+                        self.elided_cases
+                            .extend(cases.iter().map(|&(_, id)| id).chain(*default));
+                        for s in run {
+                            self.stmt(s);
+                        }
+                        return;
+                    }
+                }
+                self.loc(s.pos);
                 let brk = self.new_label("break");
                 self.expr(cond);
                 let kind = cond.ty.int_kind().expect("sema: an integer condition");
@@ -1685,8 +1749,11 @@ impl<'a> FuncGen<'a, '_> {
                 self.label(&brk);
             }
             StmtKind::Case { id, body, .. } | StmtKind::Default { id, body } => {
-                let label = self.case_label(*id);
-                self.label(&label);
+                // (Nothing jumps to the label of a switch on a constant.)
+                if !self.elided_cases.contains(id) {
+                    let label = self.case_label(*id);
+                    self.label(&label);
+                }
                 self.stmt(body);
             }
             StmtKind::Label { name, body } => {
@@ -1704,6 +1771,16 @@ impl<'a> FuncGen<'a, '_> {
                 self.ins("j", label);
             }
         }
+    }
+
+    /// The value of a condition clang's code generator decides at compile
+    /// time: an integer constant expression (`ConstantFoldsToSimpleInteger`;
+    /// for loops, the `ConstantInt` the condition's code folds to).
+    fn constant_condition(&self, e: &Expr) -> Option<bool> {
+        if !e.ty.is_integer() {
+            return None;
+        }
+        consteval::int(e, self.xlen).map(|v| v != 0)
     }
 
     fn loop_body(&mut self, body: &'a Stmt, cont: &str, brk: &str) {
@@ -2016,6 +2093,14 @@ impl<'a> FuncGen<'a, '_> {
                     self.step(ty, -delta);
                 }
             }
+            // `1 && r` and `0 || r` are `r` as 0 or 1, as clang has them
+            // (`0 && r` and `1 || r` are constants, folded above).
+            ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r)
+                if self.constant_condition(l) == Some(*op == BinOp::LogAnd) =>
+            {
+                self.test(r);
+                self.ins("snez", "a0, a0");
+            }
             ExprKind::Binary(BinOp::LogAnd, l, r) => {
                 //     <l>
                 //     beqz a0, .L.and.N   # l is 0: so is the result, skip r
@@ -2089,6 +2174,15 @@ impl<'a> FuncGen<'a, '_> {
                 self.convert(&x.ty, &e.ty);
             }
             ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => unreachable!("sema folds sizeof"),
+            // A constant condition: only the operand it chooses, as clang has
+            // it (an expression has no labels to keep).
+            ExprKind::Cond(c, a, b) if self.constant_condition(c).is_some() => {
+                self.expr(if self.constant_condition(c) == Some(true) {
+                    a
+                } else {
+                    b
+                });
+            }
             ExprKind::Cond(c, a, b) => {
                 //     <c>
                 //     beqz a0, .L.else.N

@@ -68,14 +68,11 @@ main:
     lw    a0, -24(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 1
-    beqz  a0, .L.and.1
     lw    a0, -20(s0)
     addi  sp, sp, -8
     call  bump
     addi  sp, sp, 8
     sw    a0, -20(s0)
-.L.and.1:
     snez  a0, a0
     ld    a1, 0(sp)
     addi  sp, sp, 8
@@ -84,14 +81,11 @@ main:
     lw    a0, -24(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 0
-    bnez  a0, .L.or.2
     lw    a0, -20(s0)
     addi  sp, sp, -8
     call  bump
     addi  sp, sp, 8
     sw    a0, -20(s0)
-.L.or.2:
     snez  a0, a0
     ld    a1, 0(sp)
     addi  sp, sp, 8
