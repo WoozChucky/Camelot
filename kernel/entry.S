@@ -121,6 +121,9 @@ _start:
     .globl supervisor_entry
 supervisor_entry:
     mv    tp, a0
+    # The outermost frame: a backtrace by frame pointer stops here, whatever
+    # the SBI left in s0 (it defines a0 and a1 only).
+    li    s0, 0
 #if __riscv_xlen == 64
     # Paging off, at the physical address. A trap here is a bug: stop.
     la    t0, early_s_trap
@@ -160,6 +163,7 @@ secondary_entry:
 #endif
     mv    tp, a0
     mv    sp, a1
+    li    s0, 0                 # the outermost frame, as on hart 0
 #if __riscv_xlen == 64
     call  relocate_enable_mmu
     # High. The trap vector goes high first: early_s_trap at its link
