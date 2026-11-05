@@ -275,6 +275,9 @@ pub struct RecordBody {
     pub members: Vec<Member>,
     pub size: u32,
     pub align: u32,
+    /// Where the definition is (its tag, or `struct` without one), which
+    /// may be after where the type was first declared (for `-g`).
+    pub pos: Pos,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -322,12 +325,12 @@ impl Record {
             .into_iter()
             .map(|(n, t)| (n, t, Spelled::default(), pos))
             .collect();
-        self.complete_spelled(members, x)
+        self.complete_spelled(members, pos, x)
     }
 
-    /// [`Record::complete`], with each member's spelling and position, which
-    /// only `-g` reads.
-    pub fn complete_spelled(&self, members: Vec<(String, Type, Spelled, Pos)>, x: Xlen) -> bool {
+    /// [`Record::complete`], with each member's spelling and position, and
+    /// the definition's, which only `-g` reads.
+    pub fn complete_spelled(&self, members: Vec<(String, Type, Spelled, Pos)>, pos: Pos, x: Xlen) -> bool {
         let mut offset = 0u64;
         let mut size = 0u64;
         let mut align = 1;
@@ -353,6 +356,7 @@ impl Record {
                 members: laid_out,
                 size: size as u32,
                 align,
+                pos,
             })
             .is_ok()
     }

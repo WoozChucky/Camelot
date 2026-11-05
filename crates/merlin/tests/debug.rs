@@ -244,7 +244,14 @@ fn headers_get_their_own_file_numbers() {
         (p == Path::new("inc/h.h")).then(|| "static int twice(int x) {\n    return 2 * x;\n}\n".to_string())
     };
     let asm = merlin::compile_with("m.c", src, &debug_opts("src"), &load).unwrap();
-    assert!(asm.starts_with("    .file 0 \"src\" \"m.c\"\n"), "{asm}");
+    // No globals, enums or casts: LLVM makes the unit for the first
+    // function's code, and `.file 0` comes with its first `.loc`, as clang
+    // writes it.
+    assert!(
+        asm.contains("main:\n    .file 0 \"src\" \"m.c\"\n    .loc 0 2 0\n"),
+        "{asm}"
+    );
+    assert_eq!(asm.matches(".file 0 ").count(), 1, "{asm}");
     assert!(
         asm.contains("    .file 1 \"src\" \"./inc/h.h\"\n    .loc 1 1 0\n"),
         "{asm}"
@@ -293,7 +300,8 @@ fn file_numbers_follow_the_output() {
 fn the_command_line_takes_g() {
     let dir = std::env::temp_dir().join(format!("merlin-debug-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.c"), "int f(void) { return 1; }\n").unwrap();
+    // With a global, `.file 0` is the first line.
+    std::fs::write(dir.join("a.c"), "int g;\nint f(void) { return g; }\n").unwrap();
     let run = |args: &[&str]| {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_merlin"))
             .args(args)
@@ -1037,6 +1045,185 @@ fn the_entries_are_clangs_in_clangs_order() {
             let (ours, theirs) = (entry_tree(&tool, &ours), entry_tree(&tool, &theirs));
             assert!(ours.len() > 2, "{name}: {ours:#?}");
             assert_eq!(ours, theirs, "{name}: merlin's (left) and clang's (right), {x:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Each `.debug_line` file's name without its directory, in the table's
+/// order, and each entry's tag and name with the number of the file it is
+/// declared in, in the unit's order: what `.file` numbering decides.
+fn file_numbers(obj: &[u8]) -> (Vec<String>, Vec<String>) {
+    use elf::dies::dw;
+    let elf = elf::Elf::parse(obj).unwrap();
+    let base = |p: &str| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string();
+    let files = elf.line_tables().unwrap()[0]
+        .files
+        .iter()
+        .map(|f| base(f))
+        .collect();
+    let units = elf.debug_entries().unwrap();
+    let entries = units[0]
+        .dies
+        .iter()
+        .skip(1)
+        .map(|d| {
+            let file = d.unsigned(dw::AT_DECL_FILE).map_or("-".into(), |n| n.to_string());
+            format!("{:#x} {} {file}", d.tag, d.name().unwrap_or(""))
+        })
+        .collect();
+    (files, entries)
+}
+
+/// The files are numbered as clang 23 numbers them, which is the order LLVM
+/// needs them in (`Lines::renumber`): first the files of the enums and the
+/// types of casts, a type's after those of the types it refers to; then the
+/// files the code comes from, in the output's order; then the files of the
+/// other entries, in the order they are made. So the line table lists the
+/// same files in the same order, and every `DW_AT_decl_file` is the same,
+/// for small programs of several headers and for kernel files that include
+/// many (a struct declared in one header and defined in another, or in the
+/// file, is declared where it is defined; one never defined has no file).
+///
+/// Ignored: it needs clang (`CLANG` names it if it is not on the PATH).
+#[test]
+#[ignore]
+fn the_files_are_numbered_as_clangs() {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let dir = std::env::temp_dir().join(format!("merlin-files-{}", std::process::id()));
+    // Each case: its files, the first the one compiled.
+    let cases: &[&[(&str, &str)]] = &[
+        // An enum's and a cast type's headers first, a local's at the end.
+        &[
+            (
+                "s1.c",
+                "#include \"e1.h\"\n#include \"e2.h\"\n#include \"t1.h\"\n\
+                 int ea(void);\nint f(void) { struct s1 x = {1}; return GREEN + (int)(ul)ea(); }\n",
+            ),
+            ("e1.h", "enum col { RED, GREEN };\n"),
+            ("e2.h", "typedef unsigned long ul;\n"),
+            ("t1.h", "struct s1 { int a; };\n"),
+        ],
+        // A global's type, then each function's locals', in the code's order.
+        &[
+            (
+                "q1.c",
+                "#include \"t1.h\"\n#include \"t2.h\"\n#include \"t3.h\"\n\
+                 static int k(void);\nint f(void) { struct B x; x.b = k(); return x.b; }\n\
+                 struct C gl;\nint g(void) { struct D y; y.d = 2; return y.d; }\n\
+                 static int k(void) { struct A z; z.a = 2; return z.a; }\n",
+            ),
+            ("t1.h", "struct A { int a; };\n"),
+            ("t2.h", "struct B { int b; };\nstruct D { int d; };\n"),
+            ("t3.h", "struct C { int c; };\n"),
+        ],
+        // A cast's type's header before the code's, a global's after.
+        &[
+            (
+                "r.c",
+                "#include \"hC.h\"\n#include \"hB.h\"\n#include \"hA.h\"\nstruct C gc;\n\
+                 int main(void) { void *p = &gc; return hb(((struct A *)p)->x); }\n",
+            ),
+            ("hC.h", "struct C { int c; };\n"),
+            ("hB.h", "static inline int hb(int x) { return x + 1; }\n"),
+            ("hA.h", "struct A { int x; };\n"),
+        ],
+        // An enum the code uses, from a header after the code's.
+        &[
+            (
+                "e.c",
+                "#include \"hB.h\"\n#include \"hE.h\"\nint main(void) { return hb(E1); }\n",
+            ),
+            ("hB.h", "static inline int hb(int x) { return x + 1; }\n"),
+            ("hE.h", "enum E { E0, E1 };\n"),
+        ],
+        // A cast to a pointer to a struct whose member's typedef is in
+        // another header: that header first.
+        &[
+            (
+                "po.c",
+                "#include \"ps.h\"\nint g;\nint f(void) { return ((struct ps *)&g)->v; }\n",
+            ),
+            ("pt.h", "typedef unsigned short w16;\n"),
+            ("ps.h", "#include \"pt.h\"\nstruct ps { w16 v; };\n"),
+        ],
+        // Declared in a header, defined in the file; and one never defined.
+        &[
+            (
+                "d.c",
+                "#include \"d.h\"\nstruct p { int n; };\nstruct p vp;\nQ *vq;\n\
+                 int f(void) { return vp.n + (vq != 0); }\n",
+            ),
+            ("d.h", "struct p;\nstruct q;\ntypedef struct q Q;\n"),
+        ],
+    ];
+    let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel");
+    // Each unit: its directory, where both compilers run (so that the
+    // names are as short as the kernel's build has them), its file and
+    // whether it includes the kernel's headers.
+    let mut units: Vec<(PathBuf, &str, bool)> = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let d = dir.join(i.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        for (name, text) in case.iter() {
+            std::fs::write(d.join(name), text).unwrap();
+        }
+        units.push((d, case[0].0, false));
+    }
+    for f in ["fs.c", "pipe.c", "proc.c"] {
+        units.push((kernel.clone(), f, true));
+    }
+    for x in [Xlen::Rv32, Xlen::Rv64] {
+        let bits = x.bits();
+        let abi = if bits == 64 { "lp64" } else { "ilp32" };
+        for (k, (at, name, kernel)) in units.iter().enumerate() {
+            let includes: Vec<&str> = if *kernel { vec!["include"] } else { Vec::new() };
+            let opts = Options {
+                xlen: x,
+                include_dirs: includes.iter().map(PathBuf::from).collect(),
+                ..debug_opts("dir")
+            };
+            let load = |p: &Path| std::fs::read_to_string(at.join(p)).ok();
+            let src = load(Path::new(name)).unwrap();
+            let asm = merlin::compile_with(name, &src, &opts, &load).unwrap();
+            let ours = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
+            let theirs = dir.join(format!("{k}-clang-{bits}.o"));
+            let out = std::process::Command::new(&clang)
+                .args([
+                    &format!("--target=riscv{bits}"),
+                    &format!("-march=rv{bits}ima_zicsr_zifencei"),
+                    &format!("-mabi={abi}"),
+                    "-mno-relax",
+                    "-O0",
+                    "-g",
+                    "-ffreestanding",
+                    "-fno-builtin",
+                    "-w",
+                    "-c",
+                ])
+                .args(includes.iter().map(|i| format!("-I{i}")))
+                .arg(name)
+                .arg("-o")
+                .arg(&theirs)
+                .current_dir(at)
+                .output()
+                .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let theirs = std::fs::read(&theirs).unwrap();
+            let (ours, theirs) = (file_numbers(&ours), file_numbers(&theirs));
+            assert!(ours.0.len() > 1, "{name}: {ours:#?}");
+            assert_eq!(
+                ours.0, theirs.0,
+                "{name}: merlin's files (left) and clang's (right), {x:?}"
+            );
+            assert_eq!(
+                ours.1, theirs.1,
+                "{name}: merlin's entries (left) and clang's (right), {x:?}"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

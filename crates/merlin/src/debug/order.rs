@@ -49,6 +49,16 @@
 //! Phase 2 follows the code, which is in the order clang's module has the
 //! functions: the order each was first defined or referred to, so a `static`
 //! function emitted later than the others may come before some of them.
+//!
+//! The order LLVM makes the entries in is also the order it numbers the
+//! files they are declared in (`DW_AT_decl_file`), each the first time an
+//! entry needs it ([`Lines::renumber`] has the numbering): an entry's file
+//! is given once the types it refers to are made, as LLVM adds
+//! `DW_AT_decl_file` after `DW_AT_type` (a typedef's file after the type it
+//! stands for's, a struct's after its members'), but a variable's before
+//! its type's, and a function's before its return type's. A struct only
+//! declared, never completed, has no file (`isForwardDecl`), and neither
+//! has `__builtin_va_list`.
 
 use super::{Event, Lines, TypeKey, TypeNode};
 use std::collections::HashMap;
@@ -70,12 +80,23 @@ pub(super) enum Local {
     Static(String),
 }
 
-/// Where each entry goes.
+/// Where each entry goes, and the files they name in the order LLVM
+/// numbers them.
 pub(super) struct Order {
     /// The unit's children.
     pub unit: Vec<Child>,
     /// Each function's types and static locals, after its blocks.
     pub locals: Vec<Vec<Local>>,
+    /// Whether the module begins by describing something (phase 1 has
+    /// entries): LLVM makes the unit then.
+    pub begins: bool,
+    /// The files the entries of phase 1 are declared in, in the order LLVM
+    /// needs them (numbers given as the code was generated; some more than
+    /// once, file 0 among them).
+    pub begin_files: Vec<u32>,
+    /// The same, for the entries LLVM makes as the module ends (phases 3 to
+    /// 6).
+    pub end_files: Vec<u32>,
 }
 
 impl Lines {
@@ -150,7 +171,7 @@ impl Lines {
                 }
                 for e in &f.events {
                     match e {
-                        Event::Local(t) => make(*t, &mut locals),
+                        Event::Local(t, _) => make(*t, &mut locals),
                         Event::Static(sym, t) => {
                             make(*t, &mut locals);
                             locals[i].push(Local::Static(sym.clone()));
@@ -208,8 +229,12 @@ impl Lines {
             unit: Vec<Child>,
             record_of: HashMap<usize, usize>,
             local_of: HashMap<usize, usize>,
+            /// The files the entries made so far name, in order.
+            files: Vec<u32>,
         }
         impl Maker<'_> {
+            /// Makes type `t`'s entry if it is not made yet: the types it
+            /// refers to, and the file it is declared in after theirs.
             fn ty(&mut self, t: Option<usize>) {
                 let Some(t) = t else { return };
                 if self.made[t] {
@@ -228,8 +253,31 @@ impl Lines {
                 if !self.record_of.contains_key(&t) && !self.local_of.contains_key(&t) {
                     self.unit.push(Child::Type(t));
                 }
-                for r in self.lines.referred(t) {
-                    self.ty(Some(r));
+                match &self.lines.types[t] {
+                    // Each member's type, then its file; the record's own
+                    // last, if it is defined.
+                    TypeNode::Record(r, members, file, _) => {
+                        for &(_, ty, _, file, _) in members {
+                            self.ty(ty);
+                            self.files.push(file);
+                        }
+                        if r.body().is_some() {
+                            self.files.push(*file);
+                        }
+                    }
+                    node => {
+                        for r in self.lines.referred(t) {
+                            self.ty(Some(r));
+                        }
+                        match node {
+                            TypeNode::Typedef(_, _, file, pos) | TypeNode::Enum(_, _, _, file, pos)
+                                if pos.line != 0 =>
+                            {
+                                self.files.push(*file)
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -239,21 +287,26 @@ impl Lines {
             unit: Vec::new(),
             record_of,
             local_of,
+            files: Vec::new(),
         };
         // 1. The enums, then the kept types.
         for &t in enums.iter().chain(&retained) {
             m.ty(Some(t));
         }
+        let begins = !enums.is_empty() || !retained.is_empty();
+        let begin_files = std::mem::take(&mut m.files);
         // 2. The functions, in the order of their code.
         m.unit.extend(self.code.iter().copied().map(Child::Function));
-        // 3. The globals.
+        // 3. The globals: each one's type, then its file.
         for g in globals {
             m.unit.push(g);
-            m.ty(match g {
-                Child::Global(i) => self.globals[i].var.ty,
-                Child::Literal(l) => self.literals[l].ty,
-                _ => None,
-            });
+            let (ty, file) = match g {
+                Child::Global(i) => (self.globals[i].var.ty, self.globals[i].var.file),
+                Child::Literal(l) => (self.literals[l].ty, self.literals[l].file),
+                _ => unreachable!("a global or a string literal"),
+            };
+            m.ty(ty);
+            m.files.push(file);
         }
         // 4. Each function's types and static locals, the functions in the
         // order of their code (LLVM's list of subprograms), as 5 and 6.
@@ -262,37 +315,50 @@ impl Lines {
                 match x {
                     Local::Type(t) => m.ty(Some(*t)),
                     Local::Static(sym) => {
-                        let ty = self
+                        let v = self
                             .functions
                             .iter()
                             .flat_map(|f| &f.body.statics)
-                            .find(|v| matches!(&v.location, super::Location::Symbol(s) if s == sym))
-                            .and_then(|v| v.ty);
-                        m.ty(ty);
+                            .find(|v| matches!(&v.location, super::Location::Symbol(s) if s == sym));
+                        if let Some(v) = v {
+                            m.ty(v.ty);
+                            m.files.push(v.file);
+                        }
                     }
                 }
             }
         }
-        // 5. Each function's return type.
+        // 5. Each function's return type, after its own file.
         for &i in &self.code {
+            m.files.push(self.functions[i].file);
             m.ty(self.functions[i].ret);
         }
-        // 6. Each function's parameters' and locals' types.
+        // 6. Each function's parameters' and locals' types, each after the
+        // variable's file, and its labels' files.
         for &i in &self.code {
             let f = &self.functions[i];
             for p in &f.params {
+                m.files.push(p.file);
                 m.ty(p.ty);
             }
             for e in &f.events {
-                if let Event::Local(t) = e {
+                if let Event::Local(t, file) = e {
+                    m.files.push(*file);
                     m.ty(*t);
                 }
             }
+            f.body.label_files(&mut m.files);
         }
         // Anything else merlin describes (none should be left).
         for t in 0..self.types.len() {
             m.ty(Some(t));
         }
-        Order { unit: m.unit, locals }
+        Order {
+            unit: m.unit,
+            locals,
+            begins,
+            begin_files,
+            end_files: m.files,
+        }
     }
 }

@@ -916,7 +916,8 @@ impl Parser<'_> {
                 },
                 None => Record::new(union, None, kw_pos),
             };
-            self.record_body(&record)?;
+            let at = tag.as_ref().map_or(kw_pos, |(_, pos)| *pos);
+            self.record_body(&record, at)?;
             // `struct { int x; };` declares nothing anyone can name.
             return Ok((Type::Record(record), tag.is_some()));
         }
@@ -944,8 +945,9 @@ impl Parser<'_> {
         }
     }
 
-    /// `{ member-decl+ }`: the members, laid out into `record`.
-    fn record_body(&mut self, record: &Record) -> Result<(), Error> {
+    /// `{ member-decl+ }`: the members, laid out into `record`, whose
+    /// definition is at `at`.
+    fn record_body(&mut self, record: &Record, at: Pos) -> Result<(), Error> {
         let open = self.expect_punct("{")?;
         let mut members: Vec<(String, Type, Spelled, Pos)> = Vec::new();
         let mut seen: HashMap<String, Pos> = HashMap::new();
@@ -1018,7 +1020,7 @@ impl Parser<'_> {
         {
             return Err(Error::new(open, format!("{} is too large", record.keyword())));
         }
-        record.complete_spelled(members, self.xlen);
+        record.complete_spelled(members, at, self.xlen);
         Ok(())
     }
 

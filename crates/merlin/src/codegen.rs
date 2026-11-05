@@ -74,9 +74,11 @@
 //!   declaration is generated; a compound literal of the file's scope is
 //!   generated as the initializer that names it is.
 //!
-//! With `-g` the `.file` numbers go by the order of the output too
-//! ([`Lines::renumber`]), and the debug information by both orders, as
-//! LLVM's does ([`crate::debug`]).
+//! With `-g` the `.file` numbers of the code's files go by the order of
+//! the output too ([`Lines::renumber`]), and the debug information by both
+//! orders, as LLVM's does ([`crate::debug`]). A function call refers to the
+//! function before its arguments are generated, as clang's `EmitCallee`
+//! comes before `EmitCallArgs`: in `f(g())` `f` is made first.
 //!
 //! ## Values and types
 //!
@@ -573,10 +575,8 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
             file.out.push_str(&text);
         }
     }
-    if let Some(d) = &mut file.debug {
-        file.out = d.renumber(&file.out);
-    }
-    file.strings();
+    // `-g`: the functions in the order of their code, which the files are
+    // numbered by, and the entries made in.
     if let Some(d) = &mut file.debug {
         let functions: Vec<&str> = created
             .iter()
@@ -588,6 +588,10 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
             .map(String::as_str)
             .collect();
         d.code_order(&functions);
+        file.out = d.renumber(&file.out);
+    }
+    file.strings();
+    if let Some(d) = &mut file.debug {
         file.out.push_str(&d.sections());
     }
     Ok(file.out)
@@ -1616,8 +1620,7 @@ impl<'a> FuncGen<'a, '_> {
         // `-g`: the prologue comes from the function's first line (column 0, as
         // clang has it).
         if let Some(d) = self.file.debug.as_mut() {
-            let lines = d.loc(f.pos, Some(0), false);
-            self.lines.extend(lines.into_iter().map(Line::Text));
+            self.lines.push(Line::Text(d.loc(f.pos, Some(0), false)));
             self.scopes.push(Scope::default());
         }
 
@@ -1758,8 +1761,7 @@ impl<'a> FuncGen<'a, '_> {
         }
         let first = !self.after_prologue;
         self.after_prologue = true;
-        let lines = d.loc(pos, None, first);
-        self.lines.extend(lines.into_iter().map(Line::Text));
+        self.lines.push(Line::Text(d.loc(pos, None, first)));
     }
 
     /// The top of the frame, which the prologue sets up first: `ra`, `s0`
@@ -3223,6 +3225,12 @@ impl<'a> FuncGen<'a, '_> {
         let layout = ArgLayout::new(&ft, args, self.xlen);
         let (types, regs, used) = (&layout.types, &layout.words, layout.used);
         let direct = callee.direct_callee();
+        // clang refers to the function it calls before the arguments
+        // (`EmitCallee`, then `EmitCallArgs`): in `f(g())`, `f`'s symbol is
+        // made first ("Order" above).
+        if let Some(name) = direct {
+            self.file.reference(name);
+        }
         if used > abi::ARG_REGS {
             let hidden = if abi::returns_in_memory(&ft.ret, self.xlen) {
                 result
@@ -3810,6 +3818,19 @@ main:
             ["f", "g", "sh", "vb", "sv", "h", "sd", "ta", "vc", "main", "main.n"],
             "{asm}"
         );
+        // A call refers to the function it calls before its arguments are
+        // generated (clang's `EmitCallee`, then `EmitCallArgs`).
+        let asm = compile(
+            "static int sa(int); static int sb(void); int (*pf)(int);\n\
+             int f(void) { return sa(sb()) + pf(sb()); }\n\
+             static int sa(int x) { return x; }\nstatic int sb(void) { return 2; }\n",
+        );
+        let symbols: Vec<&str> = asm
+            .lines()
+            .filter_map(|l| l.strip_suffix(':'))
+            .filter(|l| !l.starts_with('.'))
+            .collect();
+        assert_eq!(symbols, ["f", "sa", "sb", "pf"], "{asm}");
     }
 
     /// The frame has slots only for the locals of the code generated, as

@@ -9,7 +9,8 @@
 //! * `.file N "dir" "name"` numbers the source files: 0 is the file being
 //!   compiled, with the *compilation directory* (`-fdebug-compilation-dir`, the
 //!   directory the names are relative to); then each header that has code or
-//!   declares a described type, in the order they come.
+//!   declares a described entry, numbered as LLVM numbers them (see
+//!   [`Lines::renumber`]).
 //! * `.loc FILE LINE COLUMN` goes before the code of every statement (see
 //!   [`crate::codegen`]): a function's first line (column 0) before its
 //!   prologue, each statement's start, a loop's condition and step each time
@@ -242,6 +243,14 @@ impl Scope {
         }
     }
 
+    /// The files of the scope's `goto` labels and its blocks', in order.
+    fn label_files(&self, out: &mut Vec<u32>) {
+        out.extend(self.labels.iter().map(|l| l.file));
+        for b in &self.blocks {
+            b.label_files(out);
+        }
+    }
+
     /// Adds a `goto` label of the scope.
     pub fn push_label(&mut self, l: Label) {
         self.labels.push(l);
@@ -370,8 +379,9 @@ struct Literal {
 /// [`order`] to work out the order of the unit's entries as clang's.
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
-    /// A local variable is described: its type.
-    Local(Option<usize>),
+    /// A local variable is described: its type, and the `.file` number
+    /// of its declaration.
+    Local(Option<usize>, u32),
     /// A `static` local, at its symbol, of its type.
     Static(String, Option<usize>),
     /// An explicit cast to this type, which clang keeps in the unit
@@ -393,13 +403,18 @@ pub(crate) struct Lines {
     numbers: HashMap<u32, u32>,
     /// A name already numbered (a header read twice is one file).
     by_name: HashMap<String, u32>,
-    /// `.file` directives for files numbered outside the code (a header
-    /// that only declares a type), by number: written before the file's
-    /// first `.loc` if it gets one, else with the debug sections.
-    pending_files: Vec<(u32, String)>,
+    /// The names of the files numbered so far, file `n` at `n - 1`.
+    file_names: Vec<String>,
     /// The final `.file` numbers of the numbers given as the code was
     /// generated ([`Lines::renumber`]).
     renumbered: HashMap<u32, u32>,
+    /// The `.file` directives of the files only the entries LLVM makes as
+    /// the module ends name, written with the debug sections.
+    late_files: Vec<String>,
+    /// The order of the entries ([`order`]), worked out by
+    /// [`Lines::renumber`], which needs it to number the files: with the
+    /// anonymous types records describe and the types functions define.
+    order: Option<(order::Order, Nested)>,
     /// How many blocks have labels.
     blocks: u32,
     functions: Vec<Function>,
@@ -423,6 +438,10 @@ pub(crate) struct Lines {
     /// The target, whose addresses are 4 or 8 bytes.
     xlen: Xlen,
 }
+
+/// The anonymous types records describe: each one's record and member
+/// ([`Lines::nested_types`]).
+type Nested = Vec<(usize, (usize, usize))>;
 
 /// A `.file` or `.loc` directive `line` of file `from`, of file `to`.
 fn renumbered_line(line: &str, from: u32, to: u32) -> String {
@@ -455,8 +474,10 @@ impl Lines {
             names: names.to_vec(),
             numbers: HashMap::new(),
             by_name: HashMap::new(),
-            pending_files: Vec::new(),
+            file_names: Vec::new(),
             renumbered: HashMap::new(),
+            late_files: Vec::new(),
+            order: None,
             blocks: 0,
             functions: Vec::new(),
             globals: Vec::new(),
@@ -478,7 +499,8 @@ impl Lines {
             .map_or_else(|| "<unknown>".to_string(), |n| n.replace('\\', "/"))
     }
 
-    /// `.file 0`, the first line of the output.
+    /// `.file 0`, the first line of the output until [`Lines::renumber`]
+    /// puts it where clang has it.
     pub fn file0(&self) -> String {
         format!(
             ".file 0 {} {}",
@@ -487,77 +509,140 @@ impl Lines {
         )
     }
 
-    /// The `.file` number of `file`, and the `.file` directive to write first
-    /// if it has none yet.
-    pub fn number(&mut self, file: u32) -> (u32, Option<String>) {
+    /// The `.file` number of `file` as the code is generated, given the
+    /// first time it is asked for: [`Lines::renumber`] gives the final ones.
+    fn number(&mut self, file: u32) -> u32 {
         if file == 0 {
-            return (0, None);
+            return 0;
         }
         if let Some(&n) = self.numbers.get(&file) {
-            return (n, None);
+            return n;
         }
         let name = self.name(file);
         if let Some(&n) = self.by_name.get(&name) {
             self.numbers.insert(file, n);
-            return (n, None);
+            return n;
         }
         let n = self.by_name.len() as u32 + 1;
         self.by_name.insert(name.clone(), n);
+        self.file_names.push(name);
         self.numbers.insert(file, n);
-        let directive = format!(".file {n} {} {}", quoted(&self.info.comp_dir), quoted(&name));
-        (n, Some(directive))
-    }
-
-    /// The `.file` number of a declaration's file, outside the code: a new
-    /// number's directive goes with the debug sections.
-    fn decl_file(&mut self, pos: Pos) -> u32 {
-        let (n, directive) = self.number(pos.file);
-        self.pending_files.extend(directive.map(|d| (n, d)));
         n
     }
 
-    /// Numbers the files again in the order the output `text` needs them,
-    /// and returns it with its `.file` and `.loc` directives renumbered.
-    /// Code is generated in the order clang's front end emits it, and
-    /// written in the order of its symbols (see "Order" in
-    /// [`crate::codegen`]), so a `.loc` may come before the `.file` given
-    /// as its file was first seen: the numbers go by the output instead,
-    /// then the files only declarations name.
+    /// The `.file` number of a declaration's file.
+    fn decl_file(&mut self, pos: Pos) -> u32 {
+        self.number(pos.file)
+    }
+
+    /// The `.file` directive of file `n` (as the code was generated) under
+    /// its final number `to`.
+    fn file_directive(&self, n: u32, to: u32) -> String {
+        let name = &self.file_names[n as usize - 1];
+        format!(".file {to} {} {}", quoted(&self.info.comp_dir), quoted(name))
+    }
+
+    /// Numbers the files as LLVM does, and returns the output `text` with
+    /// its `.loc` directives renumbered and the `.file` directives where
+    /// clang writes them. Call it once the code is generated and its order
+    /// known ([`Lines::code_order`]).
+    ///
+    /// LLVM gives a file its number the first time it needs one
+    /// (`DwarfUnit::getOrCreateSourceID`, for a `.loc` or an entry's
+    /// `DW_AT_decl_file`), and so in three steps:
+    ///
+    /// 1. as the module begins, the files of the enums and the types of
+    ///    casts it describes then (phase 1 of [`order`]), a type's after
+    ///    those of the types it refers to, as LLVM gives a type's entry its
+    ///    file once it has made what it refers to: their `.file`s come right
+    ///    after `.file 0`;
+    /// 2. then each file the code comes from, at its first `.loc` in the
+    ///    output, which is in the order of the module's symbols, not the
+    ///    order the code was generated in (see "Order" in
+    ///    [`crate::codegen`]): its `.file` right before that `.loc`;
+    /// 3. as the module ends, the files of the other entries, in the order
+    ///    LLVM makes them (phases 3 to 6 of [`order`]): their `.file`s go
+    ///    with the debug sections.
+    ///
+    /// LLVM makes the unit as the module begins if it describes something
+    /// then or has globals (string literals among them): `.file 0` is then
+    /// the first line of the output. Otherwise it makes the unit for the
+    /// first function's code, and `.file 0` comes right before the first
+    /// `.loc`.
     pub fn renumber(&mut self, text: &str) -> String {
+        // Arrays count their elements in the type clang names
+        // __ARRAY_SIZE_TYPE__.
+        if self.types.iter().any(|t| matches!(t, TypeNode::Array(..))) {
+            self.intern(TypeKey::ArraySize, || TypeNode::ArraySize);
+        }
+        let nested = self.nested_types();
+        let local: Vec<(usize, usize)> = self
+            .local_types()
+            .into_iter()
+            .filter(|(t, _)| !nested.iter().any(|(n, _)| n == t))
+            .collect();
+        let order = self.order(&nested, &local);
+
+        // The final numbers, from 1 as LLVM needs them.
+        let mut map: HashMap<u32, u32> = HashMap::from([(0, 0)]);
+        let give = |map: &mut HashMap<u32, u32>, n: u32| -> Option<u32> {
+            if map.contains_key(&n) {
+                return None;
+            }
+            let next = map.len() as u32;
+            map.insert(n, next);
+            Some(next)
+        };
+        // 1. The files of the entries made as the module begins.
+        let mut first = String::new();
+        for &n in &order.begin_files {
+            if let Some(to) = give(&mut map, n) {
+                let _ = writeln!(first, "    {}", self.file_directive(n, to));
+            }
+        }
+        let unit_first = order.begins || !self.globals.is_empty() || !self.literals.is_empty();
+        // 2. The files of the code, as the output needs them. The only
+        // `.file` in `text` is `.file 0`.
         let directive = |l: &str, name: &str| -> Option<u32> {
             let rest = l.trim_start().strip_prefix(name)?;
             rest.split_whitespace().next()?.parse().ok()
         };
-        // Each file's `.file`, wherever it was written: it moves to before
-        // the first `.loc` of the file in the output.
-        let mut files: HashMap<u32, &str> = HashMap::new();
-        for l in text.split_inclusive('\n') {
-            if let Some(n) = directive(l, ".file ").filter(|&n| n != 0) {
-                files.insert(n, l);
-            }
-        }
-        let mut map: HashMap<u32, u32> = HashMap::from([(0, 0)]);
+        let mut file0 = None;
         let mut out = String::with_capacity(text.len());
         for l in text.split_inclusive('\n') {
-            if directive(l, ".file ").is_some_and(|n| n != 0) {
+            if directive(l, ".file ").is_some() {
+                if unit_first {
+                    out.push_str(l);
+                    out.push_str(&first);
+                } else {
+                    file0 = Some(l);
+                }
                 continue;
             }
             let Some(n) = directive(l, ".loc ") else {
                 out.push_str(l);
                 continue;
             };
-            if !map.contains_key(&n) {
-                let next = map.len() as u32;
-                map.insert(n, next);
-                out.push_str(&renumbered_line(files[&n], n, next));
+            if let Some(f) = file0.take() {
+                out.push_str(f);
+            }
+            if let Some(to) = give(&mut map, n) {
+                let _ = writeln!(out, "    {}", self.file_directive(n, to));
             }
             out.push_str(&renumbered_line(l, n, map[&n]));
         }
-        for (n, _) in &self.pending_files {
-            let next = map.len() as u32;
-            map.entry(*n).or_insert(next);
+        if let Some(f) = file0 {
+            out.insert_str(0, f);
+        }
+        // 3. The files of the entries made as the module ends.
+        for &n in &order.end_files {
+            if let Some(to) = give(&mut map, n) {
+                let d = self.file_directive(n, to);
+                self.late_files.push(d);
+            }
         }
         self.renumbered = map;
+        self.order = Some((order, nested));
         out
     }
 
@@ -578,19 +663,14 @@ impl Lines {
         (format!(".Ldbg.block.{n}"), format!(".Ldbg.block_end.{n}"))
     }
 
-    /// The directives that say the next instruction comes from `pos`: a
-    /// `.file` if its file has no number yet, then the `.loc`. `column`
-    /// overrides the position's (0 for a function's first line).
-    pub fn loc(&mut self, pos: Pos, column: Option<u32>, prologue_end: bool) -> Vec<String> {
-        let (n, mut file) = self.number(pos.file);
-        if let Some(i) = self.pending_files.iter().position(|(m, _)| *m == n) {
-            file = Some(self.pending_files.remove(i).1);
-        }
+    /// The `.loc` that says the next instruction comes from `pos` (its
+    /// file's `.file` comes with [`Lines::renumber`]). `column` overrides
+    /// the position's (0 for a function's first line).
+    pub fn loc(&mut self, pos: Pos, column: Option<u32>, prologue_end: bool) -> String {
+        let n = self.number(pos.file);
         let flags = if prologue_end { " prologue_end" } else { "" };
         let col = column.unwrap_or(pos.col);
-        file.into_iter()
-            .chain([format!(".loc {n} {} {col}{flags}", pos.line)])
-            .collect()
+        format!(".loc {n} {} {col}{flags}", pos.line)
     }
 
     // ---- types ----
@@ -670,8 +750,11 @@ impl Lines {
         if let Some(&id) = self.type_ids.get(&key) {
             return id;
         }
-        let file = self.decl_file(r.pos);
-        let id = self.intern(key, || TypeNode::Record(r.clone(), Vec::new(), file, r.pos.line));
+        // Where it is defined, as clang has it, which may come after where
+        // it was first declared (`struct s;` in a header).
+        let pos = r.body().map_or(r.pos, |b| b.pos);
+        let file = self.decl_file(pos);
+        let id = self.intern(key, || TypeNode::Record(r.clone(), Vec::new(), file, pos.line));
         self.keep.push(r.clone());
         let mut members = Vec::new();
         if let Some(body) = r.body() {
@@ -748,7 +831,7 @@ impl Lines {
     /// end describes it there ([`Event::Local`], [`Event::Static`]).
     pub fn declared(&mut self, v: &Var) {
         let e = match &v.location {
-            Location::Frame(_) => Event::Local(v.ty),
+            Location::Frame(_) => Event::Local(v.ty, v.file),
             Location::Symbol(sym) => Event::Static(sym.clone(), v.ty),
         };
         self.events.push(e);
@@ -822,7 +905,7 @@ impl Lines {
         variadic: bool,
         body: Scope,
     ) {
-        let (file, _) = self.number(pos.file);
+        let file = self.number(pos.file);
         let ret = self.type_of(ret.0, ret.1);
         let events = std::mem::take(&mut self.events);
         self.items.push((true, self.functions.len()));
@@ -976,7 +1059,7 @@ impl Lines {
         let mut local = Vec::new();
         for (id, t) in self.types.iter().enumerate() {
             let pos = match t {
-                TypeNode::Record(r, ..) => r.pos,
+                TypeNode::Record(r, ..) => r.body().map_or(r.pos, |b| b.pos),
                 TypeNode::Typedef(_, _, _, pos) | TypeNode::Enum(_, _, _, _, pos) => *pos,
                 _ => continue,
             };
@@ -1010,7 +1093,7 @@ impl Lines {
     /// or points to or is an array of: each one's record and member (the
     /// first that reaches it), which clang describes it in, after the member.
     /// A C type with no name can only be used where it is defined.
-    fn nested_types(&self) -> Vec<(usize, (usize, usize))> {
+    fn nested_types(&self) -> Nested {
         let mut nested: Vec<(usize, (usize, usize))> = Vec::new();
         for (id, t) in self.types.iter().enumerate() {
             let TypeNode::Record(_, members, ..) = t else {
@@ -1099,12 +1182,16 @@ impl Lines {
                 if let Some(t) = &r.tag {
                     d.attr(AT_NAME, Val::Str(t.clone()));
                 }
+                // One only declared has no file and line (clang's
+                // `isForwardDecl`).
                 match r.body() {
-                    Some(body) => d.attr(AT_BYTE_SIZE, Val::Const(body.size.into())),
+                    Some(body) => {
+                        d.attr(AT_BYTE_SIZE, Val::Const(body.size.into()));
+                        d.attr(AT_DECL_FILE, self.file_val(*file));
+                        d.attr(AT_DECL_LINE, Val::Const((*line).into()));
+                    }
                     None => d.attr(AT_DECLARATION, Val::Flag),
                 }
-                d.attr(AT_DECL_FILE, self.file_val(*file));
-                d.attr(AT_DECL_LINE, Val::Const((*line).into()));
                 for (i, (name, ty, offset, file, line)) in members.iter().enumerate() {
                     let mut m = Die::new(TAG_MEMBER, name);
                     m.attr(AT_NAME, Val::Str(name.clone()));
@@ -1199,11 +1286,7 @@ impl Lines {
         if self.functions.is_empty() {
             return String::new();
         }
-        // Arrays count their elements in the type clang names
-        // __ARRAY_SIZE_TYPE__.
-        if self.types.iter().any(|t| matches!(t, TypeNode::Array(..))) {
-            self.intern(TypeKey::ArraySize, || TypeNode::ArraySize);
-        }
+        let (order, nested) = self.order.take().expect("the files are numbered first");
         let first = &self.functions[self.code[0]].name;
         let last_end = &self.functions[self.code[self.code.len() - 1]].end;
 
@@ -1218,14 +1301,7 @@ impl Lines {
         cu.attr(AT_LOW_PC, Val::Addr(first.clone()));
         cu.attr(AT_HIGH_PC, Val::Len(last_end.clone(), first.clone()));
         cu.attr(AT_ADDR_BASE, Val::SecOffset(".Laddr_table_base0".into()));
-        let nested = self.nested_types();
-        let local: Vec<(usize, usize)> = self
-            .local_types()
-            .into_iter()
-            .filter(|(t, _)| !nested.iter().any(|(n, _)| n == t))
-            .collect();
         // The entries in clang's order (see [`order`]).
-        let order = self.order(&nested, &local);
         for child in &order.unit {
             let die = match *child {
                 order::Child::Function(i) => self.function_die(i, &order.locals[i], &nested),
@@ -1253,8 +1329,8 @@ impl Lines {
         let end = cu.layout(12, &mut type_offsets);
 
         let mut s = String::new();
-        for (n, f) in &self.pending_files {
-            let _ = writeln!(s, "    {}", renumbered_line(f, *n, self.final_file(*n)));
+        for f in &self.late_files {
+            let _ = writeln!(s, "    {f}");
         }
         let _ = writeln!(s, "\n    .section .debug_abbrev,\"\",@progbits");
         let _ = writeln!(s, ".Ldebug_abbrev0:");
