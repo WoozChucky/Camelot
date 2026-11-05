@@ -196,6 +196,55 @@ fn expr_loc(e: &Expr) -> Pos {
     }
 }
 
+/// Whether evaluating the constant `e` overflows a signed type somewhere.
+fn overflows(e: &Expr, x: Xlen) -> bool {
+    let int = |e: &Expr| consteval::int(e, x);
+    let out = |v: i128, t: &Type| {
+        t.int_kind()
+            .is_some_and(|k| k.signed() && (v < k.range(x).0 || v > k.range(x).1))
+    };
+    let here = match &e.kind {
+        ExprKind::Binary(op, l, r) => match (int(l), int(r)) {
+            (Some(a), Some(b)) => match op {
+                BinOp::Add => out(a + b, &e.ty),
+                BinOp::Sub => out(a - b, &e.ty),
+                BinOp::Mul => out(a * b, &e.ty),
+                _ => false,
+            },
+            _ => false,
+        },
+        ExprKind::Unary(UnOp::Neg, v) => int(v).is_some_and(|a| out(-a, &e.ty)),
+        _ => false,
+    };
+    here || children(e).into_iter().any(|c| overflows(c, x))
+}
+
+/// Of pointers to `a` and to `b`, whether they are the signed and the
+/// unsigned type of one integer rank (clang's `-Wpointer-sign`), and
+/// whether one of them is plain `char`.
+fn sign_pair(a: &Type, b: &Type) -> Option<bool> {
+    use IntKind::*;
+    let rank = |k: IntKind| match k {
+        Char | SChar | UChar => Some(0),
+        Short | UShort => Some(1),
+        Int | UInt => Some(2),
+        Long | ULong => Some(3),
+        LongLong | ULongLong => Some(4),
+        Bool => None,
+    };
+    let (x, y) = (a.int_kind()?, b.int_kind()?);
+    (x != y && rank(x)? == rank(y)?).then_some(x == Char || y == Char)
+}
+
+/// Whether two types are the same but for qualifiers, at any depth of
+/// pointers.
+fn alike(a: &Type, b: &Type) -> bool {
+    match (a.unqual(), b.unqual()) {
+        (Type::Ptr(x), Type::Ptr(y)) => alike(x, y),
+        (x, y) => x == y,
+    }
+}
+
 /// The operands of `e`, in order.
 fn children(e: &Expr) -> Vec<&Expr> {
     match &e.kind {
@@ -268,6 +317,7 @@ fn empty_body(pos: Pos, what: &str) -> Error {
 fn zero(ty: &Type, pos: Pos) -> Init {
     if ty.is_scalar() {
         Init::Expr(Expr {
+            id: ExprId::new(),
             kind: ExprKind::Num(0),
             ty: ty.unqual().clone(),
             pos,
@@ -298,6 +348,7 @@ fn coerce(e: &mut Expr, to: &Type) {
     let pos = e.pos;
     let inner = std::mem::replace(e, Expr::new(ExprKind::Num(0), pos));
     *e = Expr {
+        id: ExprId::new(),
         kind: ExprKind::Cast {
             x: Box::new(inner),
             implicit: true,
@@ -621,7 +672,7 @@ impl Checker {
             c.errors.extend(
                 pending
                     .into_iter()
-                    .filter(|(_, at)| flow.live.contains(at))
+                    .filter(|(_, of)| flow.live.contains(&of.0))
                     .map(|(e, _)| e),
             );
             // Falling off the end of a function that returns a value: C99
@@ -737,6 +788,10 @@ impl Checker {
             self.xlen,
         );
         let checked = fc.init_object(&mut d.ty, d_init, true, d.pos);
+        // The warnings of what an initializer does when it runs come after
+        // its other diagnostics.
+        let pending = std::mem::take(&mut fc.pending);
+        fc.errors.extend(pending.into_iter().map(|(e, _)| e));
         self.literals.extend(fc.literals);
         let Some(Global::Var(g)) = self.globals.get_mut(&d.name) else {
             unreachable!("declared above")
@@ -1004,7 +1059,7 @@ struct FnChecker<'a> {
     /// The warnings of what the code does when it runs, which clang gives
     /// at the end of the function ([`FnChecker::runtime`]), each with the
     /// expression it is of.
-    pending: Vec<(Error, Pos)>,
+    pending: Vec<(Error, ExprId)>,
     /// How many operands deep in what is never evaluated (`sizeof`'s,
     /// what the parser evaluated away) the checker is.
     unevaluated: usize,
@@ -1062,20 +1117,11 @@ impl<'a> FnChecker<'a> {
     /// A warning of what the code does when it runs (dividing by zero,
     /// say), which clang's `DiagRuntimeBehavior` gives: never for what is
     /// not evaluated (`sizeof`'s operand), and in a function at its end,
-    /// after its other diagnostics, if the expression it is of (at its
-    /// position) can run ([`crate::flow`]).
-    fn runtime(&mut self, e: Error) {
-        let at = e.pos;
-        self.runtime_of(e, at);
-    }
-
-    /// [`Self::runtime`] of the expression at `at`.
-    fn runtime_of(&mut self, e: Error, at: Pos) {
-        if self.unevaluated > 0 {
-        } else if self.func.is_empty() {
-            self.errors.push(e);
-        } else {
-            self.pending.push((e, at));
+    /// after its other diagnostics, if the expression it is of (`of`) can
+    /// run ([`crate::flow`]).
+    fn runtime(&mut self, e: Error, of: ExprId) {
+        if self.unevaluated == 0 {
+            self.pending.push((e, of));
         }
     }
 
@@ -1207,6 +1253,13 @@ impl<'a> FnChecker<'a> {
         }
     }
 
+    /// Whether `s` is a `;` on the line of the `)` before it, not of a
+    /// macro's expansion: an empty body clang warns of (its
+    /// `ShouldDiagnoseEmptyStmtBody`).
+    fn empty_body(&self, s: &Stmt) -> bool {
+        matches!(s.kind, StmtKind::Empty { glued: true }) && !self.written.macros.contains(&s.pos)
+    }
+
     /// clang's `-Wempty-body` for a `while` or `for` loop `s` whose body
     /// is a `;` on the line of its `)`, followed by `next`, which looks
     /// like the body meant: a block, or a statement further right than
@@ -1219,7 +1272,7 @@ impl<'a> FnChecker<'a> {
             _ => return,
         };
         let typo = matches!(next.kind, StmtKind::Block(_)) || next.pos.col > s.pos.col;
-        if typo && matches!(body.kind, StmtKind::Empty { glued: true }) {
+        if typo && self.empty_body(body) {
             self.errors.push(empty_body(body.pos, what));
         }
     }
@@ -1234,7 +1287,7 @@ impl<'a> FnChecker<'a> {
             }
             StmtKind::Expr(e) => {
                 if self.expr(e).is_ok() {
-                    self.full(e);
+                    self.full_expression(e);
                     self.unused(e);
                 }
             }
@@ -1248,7 +1301,7 @@ impl<'a> FnChecker<'a> {
                 self.scoped(|c| c.stmt(then));
                 if let Some(e) = els {
                     self.scoped(|c| c.stmt(e));
-                } else if matches!(then.kind, StmtKind::Empty { glued: true }) {
+                } else if self.empty_body(then) {
                     self.errors.push(empty_body(then.pos, "if statement"));
                 }
             }
@@ -1276,7 +1329,7 @@ impl<'a> FnChecker<'a> {
                 }
                 if let Some(e) = step {
                     if c.expr(e).is_ok() {
-                        c.full(e);
+                        c.full_expression(e);
                         c.unused(e);
                     }
                 }
@@ -1320,7 +1373,7 @@ impl<'a> FnChecker<'a> {
                 self.break_depth += 1;
                 self.scoped(|c| c.stmt(body));
                 self.break_depth -= 1;
-                if matches!(body.kind, StmtKind::Empty { glued: true }) {
+                if self.empty_body(body) {
                     self.errors.push(empty_body(body.pos, "switch statement"));
                 }
                 let ctx = self.switches.pop().expect("pushed above");
@@ -1418,7 +1471,7 @@ impl<'a> FnChecker<'a> {
                 } else if self.convert(e, ret, Conv::Return, begin(e)).is_ok() {
                     coerce(e, ret);
                 }
-                self.full(e);
+                self.full_expression(e);
             }
             None if *ret != Type::Void => {
                 let msg = format!("non-void function '{}' should return a value", self.func);
@@ -1440,8 +1493,9 @@ impl<'a> FnChecker<'a> {
             return Err(self.err(at, msg));
         }
         // clang's CheckBooleanCondition, then the full expression's.
+        self.assignment_condition(e);
         self.bool_like(e);
-        self.full(e);
+        self.full_expression(e);
         Ok(())
     }
 
@@ -1483,7 +1537,7 @@ impl<'a> FnChecker<'a> {
                 "expression result unused; assign into a variable to force a volatile load",
                 "unused-volatile-lvalue",
             )),
-            Some((at, anchor, false)) => self.runtime_of(
+            Some((at, anchor, false)) => self.runtime(
                 Error::warning(at, "expression result unused", "unused-value"),
                 anchor,
             ),
@@ -1497,7 +1551,7 @@ impl<'a> FnChecker<'a> {
     /// `volatile` object. An assignment, an increment, a call, a cast to
     /// `void` give more; `a, b` and `c ? a : b` are as their operands are
     /// (`(f(), 0)` is an idiom), `a && b` as `b` is.
-    fn unused_result(&self, e: &Expr) -> Option<(Pos, Pos, bool)> {
+    fn unused_result(&self, e: &Expr) -> Option<(Pos, ExprId, bool)> {
         match &e.kind {
             ExprKind::Assign { .. }
             | ExprKind::IncDec { .. }
@@ -1520,18 +1574,41 @@ impl<'a> FnChecker<'a> {
             }
             ExprKind::Binary(BinOp::LogAnd | BinOp::LogOr, _, b) => {
                 self.unused_result(b)?;
-                Some((e.pos, e.pos, false))
+                Some((e.pos, e.id, false))
             }
             // Reading a `volatile` object is what it does; of `volatile
             // void` there is nothing read.
             _ if is_lvalue(e) && e.ty.quals().volatile && !e.ty.is_void() => None,
-            _ if is_lvalue(e) && e.ty.quals().volatile => Some((expr_loc(e), e.pos, true)),
+            _ if is_lvalue(e) && e.ty.quals().volatile => Some((expr_loc(e), e.id, true)),
             // `a[i]`, at its `]`.
             ExprKind::Deref(x) if x.pos == e.pos => {
                 let at = self.written.brackets.get(&e.pos).copied().unwrap_or(e.pos);
-                Some((at, e.pos, false))
+                Some((at, e.id, false))
             }
-            _ => Some((expr_loc(e), e.pos, false)),
+            _ => Some((expr_loc(e), e.id, false)),
+        }
+    }
+
+    /// clang's `-Wparentheses` of a condition that is an assignment written
+    /// without parentheses (`if (a = b)`), likely meant as `==`.
+    fn assignment_condition(&mut self, e: &Expr) {
+        if let ExprKind::Assign { op: None, .. } = e.kind {
+            if !self.written.parens.contains_key(&e.pos) {
+                let w = Error::warning(
+                    e.pos,
+                    "using the result of an assignment as a condition without parentheses",
+                    "parentheses",
+                )
+                .note(
+                    e.pos,
+                    "place parentheses around the assignment to silence this warning",
+                )
+                .note(
+                    e.pos,
+                    "use '==' to turn this assignment into an equality comparison",
+                );
+                self.errors.push(w);
+            }
         }
     }
 
@@ -1562,7 +1639,7 @@ impl<'a> FnChecker<'a> {
         while let Some(e) = work.pop() {
             match &e.kind {
                 ExprKind::Binary(op, l, r) if op.is_comparison() => {
-                    self.out_of_range(*op, e.pos, l, r);
+                    self.out_of_range(*op, e.pos, e.id, l, r);
                     self.full(l);
                     self.full(r);
                 }
@@ -1854,6 +1931,7 @@ impl<'a> FnChecker<'a> {
         // `{}` for a scalar (C23's, which clang takes in C99 too) means 0.
         if items.is_empty() && !ty.is_array() && !ty.is_record() {
             *init = Init::Expr(Expr {
+                id: ExprId::new(),
                 kind: ExprKind::Num(0),
                 ty: Type::INT,
                 pos,
@@ -2256,6 +2334,7 @@ impl<'a> FnChecker<'a> {
                 }
                 self.convert(e, ty, Conv::Init, at)?;
                 coerce(e, ty);
+                self.full_expression(e);
                 if constant && consteval::eval(e, self.xlen).is_none() {
                     return Err(self.err(expr_loc(e), "initializer element is not a compile-time constant"));
                 }
@@ -2344,6 +2423,30 @@ impl<'a> FnChecker<'a> {
                         let flag = "incompatible-pointer-types-discards-qualifiers";
                         self.errors.push(Error::warning(at, msg, flag));
                     }
+                    return Ok(());
+                } else if let Some(plain) = sign_pair(au, bu) {
+                    // Pointers to the signed and unsigned of one integer
+                    // type: clang's warning, and the conversion.
+                    let why = if plain {
+                        "where one is of the unique plain 'char' type and the other is not"
+                    } else {
+                        "with different sign"
+                    };
+                    let msg = format!(
+                        "{} converts between pointers to integer types {why}",
+                        how.phrase(to, named)
+                    );
+                    self.errors.push(Error::warning(at, msg, "pointer-sign"));
+                    return Ok(());
+                } else if alike(au, bu) {
+                    // `const char **` from `char **`: the same but for
+                    // qualifiers further in, which clang only warns of.
+                    let msg = format!(
+                        "{} discards qualifiers in nested pointer types",
+                        how.phrase(to, named)
+                    );
+                    let flag = "incompatible-pointer-types-discards-qualifiers";
+                    self.errors.push(Error::warning(at, msg, flag));
                     return Ok(());
                 } else {
                     ("incompatible pointer types", Some("incompatible-pointer-types"))
@@ -2631,7 +2734,7 @@ impl<'a> FnChecker<'a> {
 
     /// Types `e` and everything in it.
     fn expr(&mut self, e: &mut Expr) -> Checked {
-        let pos = e.pos;
+        let (pos, id) = (e.pos, e.id);
         // Only `e` itself is the operand of `&`, not what is inside it.
         let addressed = std::mem::take(&mut self.address_taken);
         if !addressed && self.folded_literal(e)? {
@@ -2698,6 +2801,7 @@ impl<'a> FnChecker<'a> {
                             format!("'{r}'")
                         };
                         self.convert_value(value, &r, &named, false, &target.ty, Conv::Assign, pos)?;
+                        self.bad_shift_or_divisor(*op, pos, id, &t, value);
                     }
                 }
                 // The value of an assignment is what was stored: no qualifiers.
@@ -2725,9 +2829,7 @@ impl<'a> FnChecker<'a> {
                 a?;
                 b?;
                 self.precedence(*op, pos, l, r);
-                let ty = self.binary(*op, l, r, pos)?;
-                self.overflow(*op, pos, l, r, &ty);
-                ty
+                self.binary(*op, l, r, pos, id)?
             }
             ExprKind::Unary(op, x) => {
                 self.expr(x)?;
@@ -2800,7 +2902,12 @@ impl<'a> FnChecker<'a> {
                 if let (Type::Int(k), Type::Ptr(_)) = (to.unqual(), &from) {
                     if *k != IntKind::Bool && k.size(self.xlen) < from.size(self.xlen).unwrap_or(0) {
                         let msg = format!("cast to smaller integer type '{to}' from '{from}'");
-                        self.errors.push(Error::warning(pos, msg, "pointer-to-int-cast"));
+                        let flag = if from.pointee().is_some_and(Type::is_void) {
+                            "void-pointer-to-int-cast"
+                        } else {
+                            "pointer-to-int-cast"
+                        };
+                        self.errors.push(Error::warning(pos, msg, flag));
                     }
                 }
                 return Ok(());
@@ -2820,7 +2927,7 @@ impl<'a> FnChecker<'a> {
                 self.literals.truncate(mark);
                 r?;
                 if side_effects(x) {
-                    let here = if self.written.parens.contains(&x.pos) {
+                    let here = if self.written.parens.contains_key(&x.pos) {
                         at
                     } else {
                         expr_loc(x)
@@ -2850,7 +2957,7 @@ impl<'a> FnChecker<'a> {
                 if let Some((at, anchor, _)) = self.unused_result(a) {
                     let w =
                         Error::warning(at, "left operand of comma operator has no effect", "unused-value");
-                    self.runtime_of(w, anchor);
+                    self.runtime(w, anchor);
                 }
                 let t = b.ty.decay();
                 coerce(b, &t);
@@ -3003,7 +3110,7 @@ impl<'a> FnChecker<'a> {
             }
             ExprKind::VaArg(ap, at) => {
                 let t = e.ty.clone();
-                self.va_arg(ap, &t, *at, pos)?;
+                self.va_arg(ap, &t, *at, id)?;
                 t
             }
             ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => unreachable!("rewritten above"),
@@ -3110,6 +3217,18 @@ impl<'a> FnChecker<'a> {
                 "second argument to 'va_start' is not the last non-variadic parameter",
                 "varargs",
             ));
+        } else if let Some((_, ty, at)) = self.lookup(&param).cloned() {
+            // A parameter the default argument promotions change is not
+            // where the caller put it.
+            if ty.int_kind().is_some_and(|k| k.promoted() != k) {
+                let e = Error::warning(
+                    begin(last),
+                    "passing an object that undergoes default argument promotion to 'va_start' has undefined behavior",
+                    "varargs",
+                )
+                .note(at, format!("parameter of type '{ty}' is declared here"));
+                self.errors.push(e);
+            }
         }
         Ok(())
     }
@@ -3118,7 +3237,7 @@ impl<'a> FnChecker<'a> {
     /// object type. One the default argument promotions change, or an
     /// array, makes it undefined, which clang warns of (when it runs:
     /// [`Self::runtime`]), and then reads as the type says.
-    fn va_arg(&mut self, ap: &mut Expr, t: &Type, at: Pos, pos: Pos) -> Checked {
+    fn va_arg(&mut self, ap: &mut Expr, t: &Type, at: Pos, of: ExprId) -> Checked {
         self.expr(ap)?;
         if ap.ty.decay() != Type::ptr(Type::Void) {
             let msg = format!(
@@ -3152,7 +3271,7 @@ impl<'a> FnChecker<'a> {
             None
         };
         if let Some(msg) = undefined {
-            self.runtime_of(Error::warning(at, msg, "varargs"), pos);
+            self.runtime(Error::warning(at, msg, "varargs"), of);
         }
         self.assignable(ap, ap.pos)
     }
@@ -3192,6 +3311,7 @@ impl<'a> FnChecker<'a> {
                 coerce(&mut src, &dst.ty);
                 let ty = dst.ty.unqual().clone();
                 Box::new(Expr {
+                    id: ExprId::new(),
                     kind: ExprKind::Assign {
                         op: None,
                         target: dst,
@@ -3241,7 +3361,14 @@ impl<'a> FnChecker<'a> {
         Ok(())
     }
 
-    fn binary(&mut self, op: BinOp, l: &mut Expr, r: &mut Expr, pos: Pos) -> Result<Type, Reported> {
+    fn binary(
+        &mut self,
+        op: BinOp,
+        l: &mut Expr,
+        r: &mut Expr,
+        pos: Pos,
+        id: ExprId,
+    ) -> Result<Type, Reported> {
         let (lt, rt) = (l.ty.decay(), r.ty.decay());
         match op {
             BinOp::LogAnd | BinOp::LogOr => {
@@ -3254,7 +3381,8 @@ impl<'a> FnChecker<'a> {
             _ if op.is_comparison() => {
                 // clang's warnings come first, of what the operands are,
                 // then whether they can be compared at all.
-                if same_operand(l, r) {
+                // Not of a macro's (`#define SAME(x) (x == x)`).
+                if same_operand(l, r) && !self.written.macros.contains(&pos) {
                     let always = matches!(op, BinOp::Eq | BinOp::Le | BinOp::Ge);
                     let msg = format!("self-comparison always evaluates to {always}");
                     self.errors.push(Error::warning(pos, msg, "tautological-compare"));
@@ -3318,7 +3446,7 @@ impl<'a> FnChecker<'a> {
             _ => {
                 let ty = arith_type(op, &lt, &rt, self.xlen)
                     .ok_or_else(|| self.invalid_operands(op, pos, &l.ty, &r.ty))?;
-                self.bad_shift_or_divisor(op, pos, &lt, r);
+                self.bad_shift_or_divisor(op, pos, id, &lt, r);
                 Ok(ty)
             }
         }
@@ -3332,7 +3460,7 @@ impl<'a> FnChecker<'a> {
     fn precedence(&mut self, op: BinOp, pos: Pos, l: &Expr, r: &Expr) {
         let written = self.written;
         let bare = |e: &Expr| match &e.kind {
-            ExprKind::Binary(o, ..) if !written.parens.contains(&e.pos) => Some(*o),
+            ExprKind::Binary(o, ..) if !written.parens.contains_key(&e.pos) => Some(*o),
             _ => None,
         };
         let (lo, ro) = (bare(l), bare(r));
@@ -3357,6 +3485,16 @@ impl<'a> FnChecker<'a> {
                 );
                 self.errors.push(e);
             }
+        }
+        // `a < b < c` is `(a < b) < c`, which clang 23 makes an error.
+        let relational = |o: BinOp| matches!(o, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge);
+        if let (true, Some(inner)) = (relational(op), lo.filter(|o| relational(*o))) {
+            let msg = format!(
+                "chained comparison 'X {} Y {} Z' does not behave the same as a mathematical expression",
+                inner.symbol(),
+                op.symbol()
+            );
+            self.errors.push(Error::new(pos, msg).flagged("parentheses"));
         }
         if matches!(op, BinOp::Shl | BinOp::Shr) {
             for (side, o) in [(l, lo), (r, ro)] {
@@ -3384,6 +3522,18 @@ impl<'a> FnChecker<'a> {
         if !consteval::int(r, self.xlen).is_some_and(|v| v != 0 && v != 1) {
             return;
         }
+        // Not of an enumerator (clang's `EnumConstantInBoolContext`), nor of
+        // a value its evaluator does not give (it overflows).
+        let mut inner = r;
+        while let ExprKind::Cast {
+            x, implicit: true, ..
+        } = &inner.kind
+        {
+            inner = x;
+        }
+        if matches!(inner.kind, ExprKind::Enumerator { .. }) || overflows(inner, self.xlen) {
+            return;
+        }
         let (logical, bitwise) = if op == BinOp::LogAnd {
             ("&&", "&")
         } else {
@@ -3405,7 +3555,7 @@ impl<'a> FnChecker<'a> {
     /// not less than the width of the left operand's (promoted) type `lt`,
     /// and of dividing by a constant zero: what the code does when it runs
     /// ([`Self::runtime`]).
-    fn bad_shift_or_divisor(&mut self, op: BinOp, pos: Pos, lt: &Type, r: &Expr) {
+    fn bad_shift_or_divisor(&mut self, op: BinOp, pos: Pos, of: ExprId, lt: &Type, r: &Expr) {
         let Some(v) = r.ty.is_integer().then(|| consteval::int(r, self.xlen)).flatten() else {
             return;
         };
@@ -3427,35 +3577,90 @@ impl<'a> FnChecker<'a> {
             _ => None,
         };
         if let Some((msg, flag)) = warning {
-            self.runtime(Error::warning(pos, msg, flag));
+            self.runtime(Error::warning(pos, msg, flag), of);
         }
     }
 
-    /// clang's `-Winteger-overflow` of an operator `op` at `pos` (of type
-    /// `ty`) on constants whose exact result its signed type cannot hold:
-    /// what it evaluates as the full expression ends, `+`, `-` and `*`.
-    fn overflow(&mut self, op: BinOp, pos: Pos, l: &Expr, r: &Expr, ty: &Type) {
-        let Some(k) = ty.int_kind().filter(|k| k.signed()) else {
-            return;
-        };
+    /// clang's `-Winteger-overflow` in the full expression `e`, which it
+    /// evaluates once it is built (its `EvaluateForOverflow`), as it runs:
+    /// the operands a constant `?:`, `&&` or `||` passes by are not. Of
+    /// `+`, `-`, `*` and `-x` on constants whose exact result the signed
+    /// type cannot hold, at the operator.
+    fn overflow(&mut self, e: &Expr) {
         if self.unevaluated > 0 {
             return;
         }
-        let (Some(a), Some(b)) = (consteval::int(l, self.xlen), consteval::int(r, self.xlen)) else {
+        let x = self.xlen;
+        let int = |e: &Expr| consteval::int(e, x);
+        match &e.kind {
+            ExprKind::Cond(c, a, b) => {
+                self.overflow(c);
+                match int(c) {
+                    Some(0) => self.overflow(b),
+                    Some(_) => self.overflow(a),
+                    None => {
+                        self.overflow(a);
+                        self.overflow(b);
+                    }
+                }
+            }
+            ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), a, b) => {
+                self.overflow(a);
+                let passed = match int(a) {
+                    Some(v) => (v != 0) == (*op == BinOp::LogOr),
+                    None => false,
+                };
+                if !passed {
+                    self.overflow(b);
+                }
+            }
+            ExprKind::Binary(op, l, r) => {
+                self.overflow(l);
+                self.overflow(r);
+                let (Some(a), Some(b)) = (int(l), int(r)) else {
+                    return;
+                };
+                let exact = match op {
+                    BinOp::Add => a + b,
+                    BinOp::Sub => a - b,
+                    BinOp::Mul => a * b,
+                    _ => return,
+                };
+                self.overflowed(exact, &e.ty, e.pos);
+            }
+            ExprKind::Unary(UnOp::Neg, v) => {
+                self.overflow(v);
+                if let Some(a) = int(v) {
+                    self.overflowed(-a, &e.ty, e.pos);
+                }
+            }
+            ExprKind::SizeofExpr(..) | ExprKind::SizeofType(_) => {}
+            _ => {
+                for c in children(e) {
+                    self.overflow(c);
+                }
+            }
+        }
+    }
+
+    /// [`Self::overflow`] of a value `exact` of the type `ty`, at `at`.
+    fn overflowed(&mut self, exact: i128, ty: &Type, at: Pos) {
+        let Some(k) = ty.int_kind().filter(|k| k.signed()) else {
             return;
-        };
-        let exact = match op {
-            BinOp::Add => a + b,
-            BinOp::Sub => a - b,
-            BinOp::Mul => a * b,
-            _ => return,
         };
         let (min, max) = k.range(self.xlen);
         if exact < min || exact > max {
             let value = digit_groups(k.wrap(exact, self.xlen));
             let msg = format!("overflow in expression; result is {value} with type '{ty}'");
-            self.errors.push(Error::warning(pos, msg, "integer-overflow"));
+            self.errors.push(Error::warning(at, msg, "integer-overflow"));
         }
+    }
+
+    /// What clang checks of a full expression once it is built: its
+    /// conversions and comparisons ([`Self::full`]), then its overflows.
+    fn full_expression(&mut self, e: &Expr) {
+        self.full(e);
+        self.overflow(e);
     }
 
     /// clang's `-Wtautological-constant-out-of-range-compare`: a constant
@@ -3463,7 +3668,7 @@ impl<'a> FnChecker<'a> {
     /// side of it (`-1 < us` of an `unsigned short us`), so the result is
     /// always the same, as the other operand's type before it is converted
     /// for the comparison says.
-    fn out_of_range(&mut self, op: BinOp, pos: Pos, l: &Expr, r: &Expr) {
+    fn out_of_range(&mut self, op: BinOp, pos: Pos, of: ExprId, l: &Expr, r: &Expr) {
         let x = self.xlen;
         let (Some(lk), Some(rk)) = (l.ty.decay().int_kind(), r.ty.decay().int_kind()) else {
             return;
@@ -3506,11 +3711,10 @@ impl<'a> FnChecker<'a> {
                 "result of comparison of constant {v} with expression of type '{}' is always {always}",
                 inner.ty.unqual()
             );
-            self.runtime(Error::warning(
-                pos,
-                msg,
-                "tautological-constant-out-of-range-compare",
-            ));
+            self.runtime(
+                Error::warning(pos, msg, "tautological-constant-out-of-range-compare"),
+                of,
+            );
         }
     }
 
@@ -3524,6 +3728,20 @@ impl<'a> FnChecker<'a> {
             return;
         };
         let Some(v) = consteval::int(e, x).filter(|_| k != IntKind::Bool) else {
+            // Each operand a `?:` may give, the right one of a comma.
+            match &e.kind {
+                ExprKind::Cond(_, a, b) => {
+                    self.constant_conversion(a, to);
+                    self.constant_conversion(b, to);
+                }
+                ExprKind::Comma(_, b) => self.constant_conversion(b, to),
+                ExprKind::Cast {
+                    x: inner,
+                    implicit: true,
+                    ..
+                } => self.constant_conversion(inner, to),
+                _ => {}
+            }
             return;
         };
         // The bits the value needs (a sign bit with them for a negative
@@ -3542,8 +3760,16 @@ impl<'a> FnChecker<'a> {
         );
         let warning = Error::warning(expr_loc(e), msg, "constant-conversion");
         if width > bits {
-            self.runtime(warning);
-        } else if width == bits && k.signed() && v >= 0 && from.signed() {
+            self.runtime(warning, e.id);
+        } else if width == bits
+            && k.signed()
+            && v >= 0
+            && from.signed()
+            && !self.written.bit_patterns.contains(&begin(e))
+        {
+            // Not of a literal written in hex or octal, a bit pattern
+            // (`signed char c = 0xff;`), as clang's
+            // `isSameWidthConstantConversion` has it.
             self.errors.push(warning);
         }
     }

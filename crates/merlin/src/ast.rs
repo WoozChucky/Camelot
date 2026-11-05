@@ -51,14 +51,17 @@ pub struct Program {
 /// macro's expansion.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Written {
-    /// The positions of the expressions in parentheses (an operator's
-    /// is where its operator is).
-    pub parens: std::collections::HashSet<Pos>,
+    /// The expressions in parentheses, by their positions (an operator's
+    /// is where its operator is), each with where its outermost `(` is.
+    pub parens: std::collections::HashMap<Pos, Pos>,
     /// The positions where a macro was expanded (where its tokens are).
     pub macros: std::collections::HashSet<Pos>,
     /// Of each subscript `a[i]`, where its `]` is, by where its `[` is:
     /// clang reports a subscript there.
     pub brackets: std::collections::HashMap<Pos, Pos>,
+    /// Where an integer literal written in hex or octal is (`0xff`), which
+    /// clang takes for a bit pattern.
+    pub bit_patterns: std::collections::HashSet<Pos>,
 }
 
 /// An expression the parser needed no value of, for sema to check without
@@ -490,6 +493,8 @@ pub struct Expr {
     /// sema for everything else (before sema it is `int` elsewhere).
     pub ty: Type,
     pub pos: Pos,
+    /// Which expression it is ([`ExprId`]).
+    pub id: ExprId,
 }
 
 impl Expr {
@@ -498,9 +503,39 @@ impl Expr {
             kind,
             ty: Type::INT,
             pos,
+            id: ExprId::new(),
         }
     }
 }
+
+/// An expression's own number, which no other one made has: what tells
+/// apart two expressions at one position (all of a macro's expansion is
+/// where the macro was used), for what [`crate::flow`] finds can run. A
+/// copy has its original's. Never part of comparing trees: any two compare
+/// equal.
+#[derive(Clone, Copy, Debug)]
+pub struct ExprId(pub u64);
+
+impl ExprId {
+    pub fn new() -> ExprId {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        ExprId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Default for ExprId {
+    fn default() -> ExprId {
+        ExprId::new()
+    }
+}
+
+impl PartialEq for ExprId {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ExprId {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExprKind {

@@ -20,13 +20,14 @@
 use crate::ast::*;
 use crate::consteval;
 use crate::types::Xlen;
-use crate::Pos;
+
 use std::collections::HashSet;
 
 /// What [`analyze`] finds of a function body.
 pub struct Flow {
-    /// The positions of the expressions that may be evaluated.
-    pub live: HashSet<Pos>,
+    /// The expressions that may be evaluated, by [`ExprId`]: not by
+    /// position, which all of a macro's expansion shares.
+    pub live: HashSet<u64>,
     /// Whether control can fall off the end of the body.
     pub falls_off: bool,
     /// Whether a `return` can be reached.
@@ -89,7 +90,7 @@ struct Walk<'a> {
     labels: &'a HashSet<String>,
     /// The labels a reachable `goto` names.
     gotos: HashSet<String>,
-    live: HashSet<Pos>,
+    live: HashSet<u64>,
     returns: bool,
     /// For each loop or `switch` around, whether a reachable `break` leaves
     /// it; for each loop, whether a reachable `continue` goes on with it.
@@ -274,7 +275,7 @@ impl Walk<'_> {
     /// An expression evaluated if `live`, and what in it is.
     fn expr(&mut self, e: &Expr, live: bool) {
         if live {
-            self.live.insert(e.pos);
+            self.live.insert(e.id.0);
         }
         match &e.kind {
             ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), a, b) => {

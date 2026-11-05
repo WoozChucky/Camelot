@@ -168,6 +168,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         parens: RefCell::new(None),
         parens_written: RefCell::new(Default::default()),
         brackets_written: RefCell::new(Default::default()),
+        bit_patterns: RefCell::new(Default::default()),
         trailing_else: Cell::new(None),
         warnings: RefCell::new(Vec::new()),
     };
@@ -196,6 +197,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
                 written: Written {
                     parens: p.parens_written.take(),
                     brackets: p.brackets_written.take(),
+                    bit_patterns: p.bit_patterns.take(),
                     ..Written::default()
                 },
             };
@@ -210,6 +212,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         written: Written {
             parens: p.parens_written.take(),
             brackets: p.brackets_written.take(),
+            bit_patterns: p.bit_patterns.take(),
             ..Written::default()
         },
     })
@@ -602,8 +605,10 @@ struct Parser<'a> {
     warnings: RefCell<Vec<Error>>,
     /// Where the operators in parentheses are ([`Written::parens`]), and
     /// the subscripts' `]` ([`Written::brackets`]).
-    parens_written: RefCell<std::collections::HashSet<Pos>>,
+    parens_written: RefCell<std::collections::HashMap<Pos, Pos>>,
     brackets_written: RefCell<std::collections::HashMap<Pos, Pos>>,
+    /// Where the literals written in hex or octal are ([`Written::bit_patterns`]).
+    bit_patterns: RefCell<std::collections::HashSet<Pos>>,
     /// The `else` of the `if` the statement just parsed ends with, through
     /// loops and labels, not braces: an `if` without one of its own around
     /// it is clang's dangling `else` (its `TrailingElseLoc`).
@@ -947,6 +952,7 @@ impl Parser<'_> {
         let original = std::mem::replace(
             e,
             Expr {
+                id: ExprId::new(),
                 kind: ExprKind::Num(0),
                 ty,
                 pos,
@@ -3133,6 +3139,7 @@ impl Parser<'_> {
                 }
                 let x = self.nested(Self::unary)?;
                 return Ok(Expr {
+                    id: ExprId::new(),
                     kind: ExprKind::Cast {
                         x: Box::new(x),
                         implicit: false,
@@ -3176,6 +3183,7 @@ impl Parser<'_> {
     fn compound_literal(&mut self, ty: Type, pos: Pos) -> Result<Expr, Error> {
         let init = self.initializer()?;
         Ok(Expr {
+            id: ExprId::new(),
             kind: ExprKind::CompoundLit {
                 init: Box::new(init),
                 local: None,
@@ -3270,8 +3278,13 @@ impl Parser<'_> {
         let pos = self.here();
         let kind = match self.peek().clone() {
             Tok::Num(v, k) => {
-                self.advance();
+                let t = self.advance();
+                if t.text.len() > 1 && t.text.starts_with('0') && t.text.as_bytes()[1].is_ascii_alphanumeric()
+                {
+                    self.bit_patterns.borrow_mut().insert(pos);
+                }
                 return Ok(Expr {
+                    id: ExprId::new(),
                     kind: ExprKind::Num(v),
                     ty: Type::Int(k),
                     pos,
@@ -3286,6 +3299,7 @@ impl Parser<'_> {
                 }
                 let len = bytes.len() as u32 + 1;
                 return Ok(Expr {
+                    id: ExprId::new(),
                     kind: ExprKind::Str(bytes),
                     ty: Type::array(Type::CHAR, Some(len)),
                     pos,
@@ -3332,7 +3346,7 @@ impl Parser<'_> {
                 if let Some(parens) = self.parens.borrow_mut().as_mut() {
                     parens.push((paren_key(&e), pos));
                 }
-                self.parens_written.borrow_mut().insert(e.pos);
+                self.parens_written.borrow_mut().insert(e.pos, pos);
                 return Ok(e);
             }
             _ => return Err(self.expected("expression")),
@@ -3374,6 +3388,7 @@ impl Parser<'_> {
                 let ty = self.type_name()?;
                 self.expect_close(")", open)?;
                 return Ok(Expr {
+                    id: ExprId::new(),
                     kind: ExprKind::VaArg(first, at),
                     // The value is a copy: qualifiers mean nothing on it.
                     ty: ty.unqual().clone(),
