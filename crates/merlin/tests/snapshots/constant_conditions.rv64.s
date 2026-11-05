@@ -42,8 +42,7 @@ calls:
     # int main(void): frame 32 bytes
     #     -20(s0)  local int r
     #     -24(s0)  local int x
-    #     -28(s0)  local int dead
-    #     -32(s0)  local int y
+    #     -28(s0)  local int y
     .globl main
     .type main, @function
 main:
@@ -225,8 +224,8 @@ main:
 .L.end.9:
 .L.break.8:
     li    a0, 2
-    sw    a0, -32(s0)
-    lw    a0, -32(s0)
+    sw    a0, -28(s0)
+    lw    a0, -28(s0)
     sw    a0, -24(s0)
     lw    a0, -20(s0)
     addi  sp, sp, -8

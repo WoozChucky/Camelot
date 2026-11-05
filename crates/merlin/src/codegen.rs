@@ -243,6 +243,15 @@
 //! declaration in the function its own local (shadowed names included), so a
 //! slot never has to be reused and scopes cost nothing here.
 //!
+//! Only the locals of the code generated get a slot, as clang's frame at
+//! `-O0` has room only for the code it emits: a local declared in an arm a
+//! constant condition leaves out, or a temporary of an operand left out (the
+//! result of a call in `1 ? 2 : h().a[0]`), has none. A local declared in
+//! code that is generated has one, used or not. Since what is generated is
+//! known only once it is, a function is generated twice: a first pass, with
+//! a slot for every local, notes the ones the code declares or uses and is
+//! thrown away; the second lays out those alone.
+//!
 //! The prologue saves `ra` and `s0` in a fixed 16 bytes, points `s0` at the top
 //! of the frame and then makes room for the rest; the epilogue undoes it from
 //! `s0`, so it never needs to know the frame size:
@@ -451,6 +460,7 @@ use crate::elide;
 use crate::sema::arith_type;
 use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
 use crate::{Error, Pos};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -513,6 +523,7 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
         created: Vec::new(),
         created_set: HashSet::new(),
         chunks: HashMap::new(),
+        dry: false,
     };
 
     // clang's front end (CodeGenModule): the file, as it comes, emits what
@@ -649,15 +660,20 @@ fn word_ops(x: Xlen) -> (&'static str, &'static str) {
 /// The largest frame: offsets from `s0` and the frame size must stay `i32`s.
 const MAX_FRAME: i64 = i32::MAX as i64 & !15;
 
-/// Places every local in the frame, below the `header` bytes at its top
-/// (`ra`, `s0` and a variadic function's saved registers): its offset from
-/// `s0`, and the frame size (a multiple of 16, the convention's stack
+/// Places every local the code uses (`used`) in the frame, below the
+/// `header` bytes at its top (`ra`, `s0` and a variadic function's saved
+/// registers): its offset from `s0` (0 for one not used, which has no
+/// slot), and the frame size (a multiple of 16, the convention's stack
 /// alignment). `None` if the frame would be larger than [`MAX_FRAME`].
-fn layout(locals: &[Local], header: i32, x: Xlen) -> Option<(Vec<i32>, i32)> {
+fn layout(locals: &[Local], used: &[bool], header: i32, x: Xlen) -> Option<(Vec<i32>, i32)> {
     // In i64: each local is at most `i32::MAX` bytes, but their sum need not be.
     let mut off = -i64::from(header);
     let mut offsets = Vec::with_capacity(locals.len());
-    for l in locals {
+    for (l, &used) in locals.iter().zip(used) {
+        if !used {
+            offsets.push(0);
+            continue;
+        }
         let mut size = l.ty.size(x).expect("sema: locals have complete types");
         // Arrays and structs are aligned to a register so that clearing them
         // can use `sw` (`sd` on RV64), and a struct's slot is a whole number
@@ -797,6 +813,9 @@ struct FileGen<'a> {
     created_set: HashSet<String>,
     /// The output of each symbol emitted, in pieces by section.
     chunks: HashMap<String, Vec<(&'static str, String)>>,
+    /// A function's first pass is being generated, which makes nothing
+    /// ([`FileGen::function`]).
+    dry: bool,
 }
 
 impl<'a> FileGen<'a> {
@@ -823,6 +842,9 @@ impl<'a> FileGen<'a> {
     /// `GetOrCreateLLVMGlobal`): the output has the symbols in this order. A
     /// deferred definition waiting for its first use is to be emitted now.
     fn create(&mut self, sym: &str) {
+        if self.dry {
+            return;
+        }
         if self.created_set.insert(sym.to_string()) {
             self.created.push(sym.to_string());
             if let Some(&k) = self.by_symbol.get(sym) {
@@ -838,6 +860,9 @@ impl<'a> FileGen<'a> {
     /// compound literal it names is emitted first, as clang emits one where
     /// an initializer names it.
     fn reference(&mut self, sym: &str) {
+        if self.dry {
+            return;
+        }
         if let Some(&k) = self.by_symbol.get(sym) {
             if self.defs[k].hidden() && !self.emitted[k] {
                 self.emit(k).expect("a variable is emitted without errors");
@@ -925,29 +950,53 @@ impl<'a> FileGen<'a> {
         } else {
             0
         };
-        let Some((offsets, frame)) = layout(&f.locals, saved_regs(xlen) + va_save, xlen) else {
+        let header = saved_regs(xlen) + va_save;
+        let n = f.locals.len();
+        let gen = |file: &mut FileGen<'a>, slots: Vec<bool>, (offsets, frame): (Vec<i32>, i32)| {
+            let mut g = FuncGen {
+                xlen,
+                func: f,
+                offsets,
+                frame,
+                named_words,
+                va_save,
+                lines: Vec::new(),
+                depth: 0,
+                breaks: Vec::new(),
+                continues: Vec::new(),
+                file,
+                ret_label: format!(".L.return.{}", f.name),
+                elided_cases: Vec::new(),
+                after_prologue: false,
+                scopes: Vec::new(),
+                used: (0..n).map(|i| Cell::new(i < f.params.len())).collect(),
+                slots,
+            };
+            g.function(body);
+            let used: Vec<bool> = g.used.iter().map(Cell::get).collect();
+            (g.lines, used)
+        };
+        // The frame holds only the locals the code generated uses, as clang's
+        // at `-O0` allocates only for the code it emits: not those of an arm
+        // a constant condition leaves out, nor the temporaries of an operand
+        // left out. A first pass finds them, generating into nothing (no
+        // `-g`, no symbols made, no data, its labels and string literals
+        // taken back); the second is the function.
+        let debug = self.debug.take();
+        let (labels, strings) = (self.labels, self.strings.len());
+        self.dry = true;
+        let all = layout(&f.locals, &vec![true; n], header, xlen).unwrap_or((vec![0; n], 0));
+        let (_, used) = gen(self, vec![true; n], all);
+        self.dry = false;
+        self.debug = debug;
+        self.labels = labels;
+        self.strings.truncate(strings);
+        let Some(frame) = layout(&f.locals, &used, header, xlen) else {
             let msg = format!("the locals of '{}' need a stack frame larger than 2 GiB", f.name);
             return Err(Error::new(f.pos, msg));
         };
-        let mut g = FuncGen {
-            xlen,
-            func: f,
-            offsets,
-            frame,
-            named_words,
-            va_save,
-            lines: Vec::new(),
-            depth: 0,
-            breaks: Vec::new(),
-            continues: Vec::new(),
-            file: self,
-            ret_label: format!(".L.return.{}", f.name),
-            elided_cases: Vec::new(),
-            after_prologue: false,
-            scopes: Vec::new(),
-        };
-        g.function(body);
-        let lines = g.lines;
+        let (lines, again) = gen(self, used.clone(), frame);
+        debug_assert_eq!(used, again, "both passes generate the same code");
         self.begin();
         self.piece(".text");
         self.out.push('\n');
@@ -965,6 +1014,7 @@ impl<'a> FileGen<'a> {
             return format!(".L.str.{i}");
         }
         self.strings.push(bytes.to_vec());
+        // (A first pass's literals are taken back: see [`Self::function`].)
         let label = format!(".L.str.{}", self.strings.len() - 1);
         if let Some(d) = self.debug.as_mut() {
             d.literal(&label, bytes.len(), pos);
@@ -983,6 +1033,9 @@ impl<'a> FileGen<'a> {
             unreachable!("sema gives globals and statics a symbol")
         };
         if local {
+            if self.dry {
+                return;
+            }
             self.create(sym);
         }
         let mut data = Vec::new();
@@ -1285,6 +1338,11 @@ struct FuncGen<'a, 'f> {
     /// With `-g`: the scopes being generated, the function's body first and
     /// the innermost block last, with the variables declared in each.
     scopes: Vec<Scope>,
+    /// The locals the code generated so far declares or uses (the
+    /// parameters from the start).
+    used: Vec<Cell<bool>>,
+    /// The locals the frame has slots for: those the code uses.
+    slots: Vec<bool>,
 }
 
 impl<'a> FuncGen<'a, '_> {
@@ -1373,6 +1431,7 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     fn offset(&self, id: LocalId) -> i32 {
+        self.used[id.0].set(true);
         self.offsets[id.0]
     }
 
@@ -1527,6 +1586,10 @@ impl<'a> FuncGen<'a, '_> {
             self.comment(format!("    {}(s0)  {regs}, saved for va_arg", -self.va_save));
         }
         for (i, l) in f.locals.iter().enumerate() {
+            // (The frame has no slot for a local the code does not use.)
+            if !self.slots[i] {
+                continue;
+            }
             let off = self.offsets[i];
             let what = if i < f.params.len() {
                 format!("param {}", l.ty.declare(&l.name))
@@ -1806,6 +1869,10 @@ impl<'a> FuncGen<'a, '_> {
                 // a static local's data first, then its entry
                 // (`EmitStaticVarDecl`).
                 for d in decls {
+                    // A local the code declares has a slot, used or not.
+                    if let Some(VarRef::Local(id)) = d.var {
+                        self.used[id.0].set(true);
+                    }
                     if matches!(d.var, Some(VarRef::Global(_))) {
                         self.local_decl(d);
                         self.debug_decl(d);
@@ -3623,7 +3690,13 @@ mod tests {
     fn locals(decls: &str) -> (Vec<i32>, i32) {
         let p = crate::parse(&format!("int f() {{ {decls} }}")).unwrap();
         let f = p.funcs().next().unwrap();
-        layout(&f.locals, saved_regs(Xlen::Rv32), Xlen::Rv32).unwrap()
+        layout(
+            &f.locals,
+            &vec![true; f.locals.len()],
+            saved_regs(Xlen::Rv32),
+            Xlen::Rv32,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3640,6 +3713,14 @@ mod tests {
         // Arrays are word-aligned.
         assert_eq!(locals("char c; char buf[5]; char d;"), (vec![-9, -16, -17], 32));
         assert_eq!(locals("int a[10];"), (vec![-48], 48));
+        // A local the code does not use has no slot.
+        let p = crate::parse("int f() { int a, b, c; }").unwrap();
+        let f = p.funcs().next().unwrap();
+        let used = [true, false, true];
+        assert_eq!(
+            layout(&f.locals, &used, saved_regs(Xlen::Rv32), Xlen::Rv32),
+            Some((vec![-12, 0, -16], 16))
+        );
     }
 
     #[test]
@@ -3654,6 +3735,7 @@ mod tests {
         assert_eq!(
             layout(
                 &p.funcs().next().unwrap().locals,
+                &[true],
                 saved_regs(Xlen::Rv32),
                 Xlen::Rv32
             )
@@ -3728,6 +3810,38 @@ main:
             ["f", "g", "sh", "vb", "sv", "h", "sd", "ta", "vc", "main", "main.n"],
             "{asm}"
         );
+    }
+
+    /// The frame has slots only for the locals of the code generated, as
+    /// clang's at `-O0` allocates only for the code it emits: none for an
+    /// arm a constant condition leaves out, nor for the temporaries of an
+    /// operand left out; a local declared in code that runs has one, used
+    /// or not, and so do those of an arm kept for its label.
+    #[test]
+    fn frames_hold_only_what_is_emitted() {
+        let frame = |src: &str| {
+            let asm = compile(src);
+            let line = asm.lines().find(|l| l.contains(": frame ")).unwrap().to_string();
+            let slots: Vec<String> = asm
+                .lines()
+                .filter(|l| l.contains("(s0)  "))
+                .map(|l| l.trim_start_matches([' ', '#']).to_string())
+                .collect();
+            (line[line.find("frame").unwrap()..].to_string(), slots)
+        };
+        let (f, slots) = frame("int f(int c) { if (0) { int big[100]; big[0] = c; } return c; }");
+        assert_eq!(f, "frame 16 bytes");
+        assert_eq!(slots, ["-12(s0)  param int c"]);
+        let (f, slots) = frame(
+            "struct big { int a[10]; }; struct big h(void);\n\
+             int g(void) { return 1 ? 2 : h().a[0]; }",
+        );
+        assert_eq!((f.as_str(), slots.len()), ("frame 16 bytes", 0));
+        let (f, slots) = frame("int f(void) { int unused; return 0; }");
+        assert_eq!(f, "frame 16 bytes");
+        assert_eq!(slots, ["-12(s0)  local int unused"]);
+        let (f, _) = frame("int f(int c) { if (0) { int k[8]; l: k[0] = c; return k[0]; } goto l; }");
+        assert_eq!(f, "frame 48 bytes", "kept for its label");
     }
 
     #[test]
@@ -4795,7 +4909,7 @@ main:
                 let src = format!("int f() {{ {decls} }}");
                 let p = crate::parse_with(crate::INPUT_NAME, &src, &opts, &crate::no_files).unwrap();
                 let f = p.funcs().next().unwrap();
-                super::super::layout(&f.locals, 16, Xlen::Rv64).unwrap()
+                super::super::layout(&f.locals, &vec![true; f.locals.len()], 16, Xlen::Rv64).unwrap()
             };
             // Locals start below the 16 bytes of ra and s0.
             assert_eq!(locals("int a, b; long c;"), (vec![-20, -24, -32], 32));
