@@ -82,6 +82,10 @@ fn merlin_as_object(src: &str, xlen: Xlen) -> Result<Vec<u8>, Vec<merlin_as::Err
 /// (`tests/golden/rv64/encode.s`, which merlin-as assembles after
 /// `golden/encode.s` for its RV64 golden) and the RV64 line tables
 /// (`tests/debug_line/rv64`), and merlin's assembly is its RV64 code.
+/// Every value of the width's `li` golden (`tests/golden/li.golden`, or
+/// `tests/golden/rv64/li.golden`) is one more `li a0, VALUE` line, in
+/// files of [`LI_LINES`]: the values merlin-as's encode_golden.rs holds
+/// RISCVMatInt to, so that /bin/as's port of it is held to them too.
 fn corpus(big: bool, xlen: Xlen) -> Vec<(String, String)> {
     let root = repo_root();
     // Assembly sources, not the preprocessed linker script (kernel.lds.S).
@@ -171,7 +175,38 @@ fn corpus(big: bool, xlen: Xlen) -> Vec<(String, String)> {
     }
     out.push(("data.s".into(), DATA.into()));
     out.push(("sections.s".into(), SECTIONS.into()));
+    out.extend(li_corpus(xlen));
     out
+}
+
+/// How many `li` lines a file of the li golden's values has.
+const LI_LINES: usize = 250;
+
+/// The values of merlin-as's `li` golden for `xlen` (each line `VALUE |
+/// WORDS`, `#` a comment), as `li a0, VALUE` lines in files of
+/// [`LI_LINES`].
+fn li_corpus(xlen: Xlen) -> Vec<(String, String)> {
+    let golden = match xlen {
+        Xlen::Rv32 => "crates/merlin-as/tests/golden/li.golden",
+        Xlen::Rv64 => "crates/merlin-as/tests/golden/rv64/li.golden",
+    };
+    let text = std::fs::read_to_string(repo_root().join(golden)).unwrap();
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| format!("    li a0, {}\n", l.split('|').next().unwrap().trim()))
+        .collect();
+    let want = match xlen {
+        Xlen::Rv32 => 425,
+        Xlen::Rv64 => 2246,
+    };
+    assert_eq!(lines.len(), want, "{golden}");
+    let name = golden.replace('/', "_");
+    lines
+        .chunks(LI_LINES)
+        .enumerate()
+        .map(|(k, chunk)| (format!("{name}.{k}.s"), chunk.concat()))
+        .collect()
 }
 
 /// `.section` with flags, every way of writing the type, mergeable sections
