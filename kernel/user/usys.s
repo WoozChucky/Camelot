@@ -63,14 +63,14 @@ exit:
     ecall
 1:  j     1b
 
-# int write(int fd, const void *buf, uint len)
+# ssize_t write(int fd, const void *buf, size_t len)
     .globl write
 write:
     li    a7, SYS_write
     ecall
     ret
 
-# int read(int fd, void *buf, uint len)
+# ssize_t read(int fd, void *buf, size_t len)
     .globl read
 read:
     li    a7, SYS_read
@@ -112,7 +112,7 @@ wait:
     ecall
     ret
 
-# int sbrk(int increment)
+# void *sbrk(long increment)
     .globl sbrk
 sbrk:
     li    a7, SYS_sbrk
@@ -140,7 +140,7 @@ close:
     ecall
     ret
 
-# int lseek(int fd, int offset, int whence)
+# off_t lseek(int fd, off_t offset, int whence)
     .globl lseek
 lseek:
     li    a7, SYS_lseek
@@ -273,28 +273,28 @@ connect:
     ecall
     ret
 
-# int send(int fd, const void *buf, uint len)
+# ssize_t send(int fd, const void *buf, size_t len)
     .globl send
 send:
     li    a7, SYS_send
     ecall
     ret
 
-# int recv(int fd, void *buf, uint len)
+# ssize_t recv(int fd, void *buf, size_t len)
     .globl recv
 recv:
     li    a7, SYS_recv
     ecall
     ret
 
-# int sendto(int fd, const void *buf, uint len, const struct sockaddr_in *to)
+# ssize_t sendto(int fd, const void *buf, size_t len, const struct sockaddr_in *to)
     .globl sendto
 sendto:
     li    a7, SYS_sendto
     ecall
     ret
 
-# int recvfrom(int fd, void *buf, uint len, struct sockaddr_in *from)
+# ssize_t recvfrom(int fd, void *buf, size_t len, struct sockaddr_in *from)
     .globl recvfrom
 recvfrom:
     li    a7, SYS_recvfrom
@@ -339,7 +339,7 @@ harts:
 # int thread_create(void (*entry)(void *), void *arg, void *stack): the raw
 # call; the new thread starts at entry with a0 = arg, sp = stack and every
 # other register zero, ra included, so entry must end with thread_exit.
-# The library's thread_start (lib/thread.s) wraps it for C functions.
+# The library's thread_start (lib/thread.S) wraps it for C functions.
     .globl thread_create
 thread_create:
     li    a7, SYS_thread_create
@@ -388,7 +388,7 @@ fcntl:
     ecall
     ret
 
-# int syscall(int number, uint a0, uint a1, uint a2): any call by number, for
+# long syscall(long number, long a0, long a1, long a2): any call by number, for
 # the tests that make calls the stubs above can't (an unknown number).
     .globl syscall
 syscall:
