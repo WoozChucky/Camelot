@@ -57,7 +57,7 @@ impl Console {
 fn machine(elf: &str, harts: usize, input: &[u8]) -> (Machine, Console) {
     let config = MachineConfig {
         harts,
-        ..MachineConfig::default()
+        ..config_for(elf)
     };
     let mut m = Machine::new(config).unwrap();
     m.load_elf(&std::fs::read(path(elf)).unwrap()).unwrap();
@@ -69,6 +69,22 @@ fn machine(elf: &str, harts: usize, input: &[u8]) -> (Machine, Console) {
     }
     m.set_uart_input(rx);
     (m, console)
+}
+
+/// The machine `elf` runs on: the default one, but for the RV64 kernel, which
+/// runs in S-mode on Camelot's firmware (`--bios default`), with the
+/// firmware's 2 MiB and its 2.1 MiB image from 0x8020_0000 in 8 MiB.
+fn config_for(elf: &str) -> MachineConfig {
+    if elf == "kernel/kernel-rv64.elf" {
+        MachineConfig {
+            xlen: grail::Xlen::Rv64,
+            bios: grail::Bios::Default,
+            ram_size: 8 << 20,
+            ..MachineConfig::default()
+        }
+    } else {
+        MachineConfig::default()
+    }
 }
 
 /// The program's console output and exit code without a debugger.

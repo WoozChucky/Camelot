@@ -1,6 +1,7 @@
 /* Physical page allocator (spec section 10, "Kernel memory"). Every free 4 KiB
- * page of RAM from __kernel_end to the end of RAM is on one free list. RAM's
- * base and size come from sysinfo, so the allocator follows Grail's --ram.
+ * page of RAM, all of it but the kernel image's, the firmware's and the
+ * device tree's, is on one free list. RAM's base and size come from sysinfo, so the allocator
+ * follows Grail's --ram, and so does the firmware's region on RV64.
  * The pages are handed out as kernel pointers: on RV64 their direct-map
  * addresses (va(), vm.h), on RV32 their physical addresses, which the
  * kernel's identity map makes the same. */
@@ -15,8 +16,28 @@
  * map holds of it. */
 extern phys_addr_t ram_base;
 extern usize ram_size;
+/* The RAM the firmware keeps (sysinfo's SYS_RESERVED_BASE and _SIZE, RV64
+ * only), physical: never handed out. A size of 0 without firmware. */
+extern phys_addr_t reserved_base;
+extern usize reserved_size;
+/* The pages of the device tree the firmware passed (RV64: dtb_early_pa,
+ * set by kinit from its header's totalsize), physical: never handed out,
+ * as Linux memblock_reserve()s the tree. A size of 0 without one. */
+extern phys_addr_t dtb_base;
+extern usize dtb_size;
+#if __riscv_xlen == 64
+/* The device tree's physical address, the firmware's a1, which _start
+ * keeps (entry.S), as Linux's setup_vm() keeps dtb_early_pa. */
+extern phys_addr_t dtb_early_pa;
+#endif
 
-/* Reads the RAM range from sysinfo and frees every page after the kernel. */
+/* A flattened device tree's first word (the Devicetree Specification,
+ * chapter 5), big-endian in the tree. */
+#define FDT_MAGIC 0xd00dfeedu
+
+/* Reads RAM's range and the firmware's from sysinfo, finds the device
+ * tree's pages, and frees every page of RAM but the kernel image's, the
+ * firmware's and the device tree's. */
 void kinit(void);
 
 /* Takes a page off the free list. Its contents are whatever was there last.

@@ -29,6 +29,12 @@
 #define SYS_FLAGS 0x20
 #define SYS_DEV_COUNT 0x24
 #define SYS_HARTS 0x28 /* number of harts, 1 to 8 (spec section 7, "Harts") */
+/* The RAM the firmware keeps for itself (spec section 7, "Firmware"; the
+ * device tree's /reserved-memory): 0x8000_0000 and 2 MiB under Grail's
+ * --bios, a size of 0 without firmware. Version 2 only: RV32 machines have
+ * no firmware. */
+#define SYS_RESERVED_BASE 0x30
+#define SYS_RESERVED_SIZE 0x38
 #else
 #define SYS_RAM_SIZE 0x0c
 #define SYS_TIMEBASE_HZ 0x10

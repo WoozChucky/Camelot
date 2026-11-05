@@ -66,6 +66,10 @@ pub struct MachineConfig {
     /// write of MODE 9 (WARL, spec section 5), which is how software finds out. An
     /// RV32 hart has Sv32 whatever this says.
     pub paging: Paging,
+    /// The firmware the machine boots, QEMU's `-bios` (`--bios`, #174): none by
+    /// default, so the program runs in M-mode; Camelot's built-in firmware or one
+    /// from a file, which starts the program in S-mode. RV64 machines only.
+    pub bios: Bios,
 }
 
 /// What [`MachineConfig::paging`] lets an RV64 hart translate with.
@@ -76,6 +80,31 @@ pub enum Paging {
     Sv48,
     /// Sv39 (and Bare) only: no Sv48.
     Sv39,
+}
+
+/// What [`MachineConfig::bios`] loads before the program: QEMU's `-bios` (spec
+/// section 7, "Firmware").
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Bios {
+    /// No firmware (`--bios none`): the boot ROM starts the program, or its disk
+    /// loader the disk's boot block, in M-mode. The default: riscv-tests, the
+    /// bare-metal examples and the RV32 kernel run in M-mode.
+    #[default]
+    None,
+    /// Camelot's firmware, built into Grail (`--bios default`,
+    /// [`crate::firmware::FIRMWARE_ELF`]): it runs in M-mode, implements the SBI,
+    /// and starts the program, or the disk's boot block, in S-mode.
+    Default,
+    /// The firmware in this file (`--bios FILE`): an ELF executable, or a raw
+    /// binary loaded at the start of RAM, as OpenSBI's `fw_jump.bin`.
+    File(PathBuf),
+}
+
+impl Bios {
+    /// Whether the machine has firmware.
+    pub fn is_some(&self) -> bool {
+        *self != Bios::None
+    }
 }
 
 /// One network card of a [`MachineConfig`]: what it is plugged into, its address, and
@@ -300,6 +329,7 @@ impl Default for MachineConfig {
             nets: Vec::new(),
             xlen: Xlen::Rv32,
             paging: Paging::Sv48,
+            bios: Bios::None,
         }
     }
 }
@@ -438,6 +468,17 @@ pub fn parse_paging(s: &str) -> Result<Paging, String> {
         "sv48" => Ok(Paging::Sv48),
         "sv39" => Ok(Paging::Sv39),
         s => Err(format!("'{s}' is not a paging mode (sv39 or sv48)")),
+    }
+}
+
+/// Parses a `--bios` value, as QEMU's `-bios`: `none`, `default` (the built-in
+/// firmware) or a file's path.
+pub fn parse_bios(s: &str) -> Result<Bios, String> {
+    match s {
+        "" => Err("give none, default or a firmware file".into()),
+        "none" => Ok(Bios::None),
+        "default" => Ok(Bios::Default),
+        path => Ok(Bios::File(PathBuf::from(path))),
     }
 }
 

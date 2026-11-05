@@ -11,11 +11,14 @@
  * RV64 (#154): a higher-half kernel, as Linux's riscv64 vmlinux.lds lays one
  * out. The image is linked at KERNEL_LINK_ADDR, 0xffff_ffff_8000_0000, the
  * top 2 GiB of the address space, where paging maps it (include/vm.h), and
- * loaded at the start of RAM, 0x8000_0000, where the boot ROM jumps: the AT
- * on the first section gives every segment's p_paddr, which Grail and the
- * bootloader load at, while p_vaddr and every symbol are the high addresses.
- * entry.S starts at the physical address, with paging off, and reaches the
- * high ones once it has turned Sv48 (or Sv39) on.
+ * loaded at 0x8020_0000, where the firmware starts its next stage (OpenSBI's
+ * FW_JUMP_ADDR on QEMU virt, and Camelot's firmware's: spec section 7,
+ * "Firmware"), right after the 2 MiB the firmware keeps at the start of
+ * RAM. Linux's riscv64 Image loads there too. The AT on the first section
+ * gives every segment's p_paddr, which Grail and the bootloader load at,
+ * while p_vaddr and every symbol are the high addresses. entry.S starts at
+ * the physical address, in S-mode with paging off, and reaches the high
+ * ones once it has turned Sv48 (or Sv39) on.
  *
  * Text, read-only data and the rest each start on a page boundary, so the
  * kernel page table (vm.c) maps them with different permissions: text R+X,
@@ -36,7 +39,7 @@ SECTIONS
 #if __riscv_xlen == 64
     . = 0xffffffff80000000;
 
-    .text : AT(0x80000000) {
+    .text : AT(0x80200000) {
 #else
     .text : {
 #endif

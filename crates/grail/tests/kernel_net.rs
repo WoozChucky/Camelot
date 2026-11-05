@@ -163,8 +163,22 @@ fn grail_net_user_boots_camelot_onto_the_network() {
         let kernel = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(kernel_path());
+        // The RV64 kernel on Camelot's firmware.
+        let bios = match xlen() {
+            grail::Xlen::Rv32 => "none",
+            grail::Xlen::Rv64 => "default",
+        };
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_grail"))
-            .args(["--max-steps", "400000000", "--ram", "16", "--net", "user"])
+            .args([
+                "--max-steps",
+                "400000000",
+                "--ram",
+                "16",
+                "--net",
+                "user",
+                "--bios",
+                bios,
+            ])
             .arg(kernel)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

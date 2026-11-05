@@ -69,6 +69,7 @@ fn profile_from(config: &MachineConfig, switches: Switches) -> Result<HardwarePr
         nets,
         xlen,
         paging,
+        bios,
     } = config.clone();
     let mut devices: Vec<DeviceSpec> = disks.iter().map(disk_spec_from).collect::<Result<_, _>>()?;
     for net in &nets {
@@ -81,6 +82,7 @@ fn profile_from(config: &MachineConfig, switches: Switches) -> Result<HardwarePr
         harts: harts as u32,
         xlen: xlen_from(xlen),
         paging: paging_from(paging),
+        bios: bios_from(&bios)?,
         devices,
     })
 }
@@ -98,6 +100,28 @@ fn paging_from(paging: grail::Paging) -> avalon_proto::Paging {
     match paging {
         grail::Paging::Sv48 => avalon_proto::Paging::Sv48,
         grail::Paging::Sv39 => avalon_proto::Paging::Sv39,
+    }
+}
+
+/// Grail's firmware as the protocol's, every one of them: a file by its path, which
+/// must be UTF-8 on the wire.
+fn bios_from(bios: &grail::Bios) -> Result<avalon_proto::Bios, String> {
+    Ok(match bios {
+        grail::Bios::None => avalon_proto::Bios::None,
+        grail::Bios::Default => avalon_proto::Bios::Default,
+        grail::Bios::File(path) => match path.to_str() {
+            Some(path) => avalon_proto::Bios::File(path.to_string()),
+            None => return Err(format!("{} is not UTF-8", path.display())),
+        },
+    })
+}
+
+/// The protocol's firmware as Grail's.
+fn bios_to(bios: &avalon_proto::Bios) -> grail::Bios {
+    match bios {
+        avalon_proto::Bios::None => grail::Bios::None,
+        avalon_proto::Bios::Default => grail::Bios::Default,
+        avalon_proto::Bios::File(path) => grail::Bios::File(path.into()),
     }
 }
 
@@ -157,6 +181,7 @@ fn config_from(profile: &HardwareProfile, switches: Switches) -> Result<MachineC
         nets,
         xlen: xlen_to(profile.xlen),
         paging: paging_to(profile.paging),
+        bios: bios_to(&profile.bios),
     };
     config.validate()?;
     Ok(config)
@@ -229,7 +254,14 @@ fn configs_survive_the_wire() {
             paging: grail::Paging::Sv39,
             harts: 2,
             disks: vec![DiskConfig::lake("127.0.0.1:7401", "os-base-rv64")],
+            bios: grail::Bios::Default,
             ..MachineConfig::with_ram(64 * MIB)
+        },
+        // Each firmware.
+        MachineConfig {
+            xlen: grail::Xlen::Rv64,
+            bios: grail::Bios::File("firmware/fw_jump.bin".into()),
+            ..MachineConfig::with_ram(16 * MIB)
         },
         // An RV32 machine keeps the paging it is given, though its harts have Sv32.
         MachineConfig {
@@ -245,6 +277,7 @@ fn configs_survive_the_wire() {
             nets: Vec::new(),
             xlen: grail::Xlen::Rv32,
             paging: grail::Paging::Sv48,
+            bios: grail::Bios::None,
         },
         MachineConfig {
             ram_size: 4096,
@@ -255,6 +288,7 @@ fn configs_survive_the_wire() {
             nets: Vec::new(),
             xlen: grail::Xlen::Rv32,
             paging: grail::Paging::Sv48,
+            bios: grail::Bios::None,
         },
         MachineConfig {
             disks: vec![

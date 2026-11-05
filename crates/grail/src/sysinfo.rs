@@ -52,6 +52,11 @@ pub mod v2 {
     pub const REG_FLAGS: u32 = 0x20;
     pub const REG_DEV_COUNT: u32 = 0x24;
     pub const REG_HARTS: u32 = 0x28;
+    /// 64-bit: where the RAM the firmware keeps for itself starts (spec section 7,
+    /// "Firmware"), 0 without firmware.
+    pub const REG_RESERVED_BASE: u32 = 0x30;
+    /// 64-bit: its size, 0 without firmware.
+    pub const REG_RESERVED_SIZE: u32 = 0x38;
     /// Bytes per device table entry: type (+0), irq (+4), base (+8, 64-bit), size
     /// (+0x10, 64-bit).
     pub const DEV_ENTRY_SIZE: u32 = 24;
@@ -111,6 +116,8 @@ pub struct Sysinfo {
     flags: u32,
     harts: u32,
     devices: Vec<DeviceEntry>,
+    /// The RAM the firmware keeps, as (base, size): (0, 0) without firmware.
+    reserved: (u64, u64),
     /// Which layout the block presents: version 2 on RV64, 1 on RV32.
     xlen: Xlen,
 }
@@ -133,8 +140,21 @@ impl Sysinfo {
             },
             harts: u32::try_from(config.harts).expect("a valid hart count fits in 32 bits"),
             devices,
+            reserved: (0, 0),
             xlen: config.xlen,
         }
+    }
+
+    /// The RAM the machine's firmware keeps for itself, `size` bytes from `base`
+    /// (`SYS_RESERVED_BASE`, `SYS_RESERVED_SIZE`, version 2 only): set when the
+    /// firmware is loaded ([`crate::Machine::load_elf`] with `--bios`).
+    pub fn set_reserved(&mut self, base: u64, size: u64) {
+        self.reserved = (base, size);
+    }
+
+    /// The RAM the firmware keeps, as (base, size).
+    pub fn reserved(&self) -> (u64, u64) {
+        self.reserved
     }
 
     /// Presents the layout of an `xlen` machine (an ELF64 program made the machine
@@ -205,6 +225,10 @@ impl Sysinfo {
             v2::REG_FLAGS => self.flags,
             v2::REG_DEV_COUNT => self.devices.len() as u32,
             v2::REG_HARTS => self.harts,
+            v2::REG_RESERVED_BASE => return Field::Low(self.reserved.0),
+            o if o == v2::REG_RESERVED_BASE + 4 => return Field::High(self.reserved.0),
+            v2::REG_RESERVED_SIZE => return Field::Low(self.reserved.1),
+            o if o == v2::REG_RESERVED_SIZE + 4 => return Field::High(self.reserved.1),
             o if o >= DEV_TABLE => {
                 let index = ((o - DEV_TABLE) / v2::DEV_ENTRY_SIZE) as usize;
                 let Some(d) = self.devices.get(index) else {
