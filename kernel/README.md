@@ -99,12 +99,19 @@ filesystem's `/bin`, and with no `/bin/sh` (or no filesystem) it panics
 MB), which play the part of an initramfs: they are what it runs without a
 disk. So the whole system fits in one image (the kernel about 300 blocks,
 the filesystem the rest; its size is in the spec, section 10, "Root image");
-`cargo xtask fs --size N` makes an image of N blocks.
+`cargo xtask fs --size N` makes an image of N blocks. The same command
+builds the RV64 system's image too, `target/camelot-fs-rv64.img`: the
+programs built for RV64 in `/bin` (but `as` and `ld`, RV32 tools until
+#157), `boot/boot-rv64.elf` and `kernel-disk-rv64.elf` (about 400 blocks),
+in an image of the same size, which an RV64 machine of 4 MiB boots;
+`--xlen 32` or `--xlen 64` builds just one of them.
 
 ```
 cargo xtask fs
 cargo run --release -p grail -- --disk target/camelot-fs.img
 cargo run --release -p grail -- --disk target/camelot-fs.img kernel/kernel.elf
+cargo run --release -p grail -- --xlen 64 --disk target/camelot-fs-rv64.img
+cargo run --release -p grail -- --xlen 64 --disk target/camelot-fs-rv64.img kernel/kernel-rv64.elf
 ```
 
 ```
@@ -251,7 +258,7 @@ dong 4
 ```
 
 The programs live in `user/`, one `.c` or `.s` file each, all linked with the
-runtime (`user/crt0.s`, which calls `main` and then `exit`; `user/usys.s`, the
+runtime (`user/crt0.S`, which calls `main(argc, argv, envp)` and then `exit`; `user/usys.s`, the
 system call stubs), the C library of `user/lib/` (strings, numbers, `malloc`,
 `printf`, a line reader; declared in `user/user.h`, described in
 `user/lib/README.md`, and linked like an archive, so a program gets only the
@@ -504,7 +511,7 @@ one process.
 | `sysfile.c` | the file system calls: `read`, `write`, `open`, `close`, `lseek`, `fstat`, `dup`, `fcntl`, `pipe`, `mkdir`, `unlink`, `link`, `chdir`, each change to the disk in one transaction |
 | `file.c` | open files (xv6's): the table of 64, `filealloc()`/`filedup()`/`fileclose()`, reading and writing an inode (writes 3 KiB per transaction), a device (`devsw`: the console) or a pipe, `filelseek()`, `filestat()` |
 | `pipe.c` | pipes (xv6's): a 512-byte buffer in a page, readers and writers sleeping on each other, end of input when the writers are gone, `-EPIPE` when the readers are |
-| `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.s`, `usys.s`, `user.h`), the C library (`lib/`) and linker script `user.ld`, built with merlin, merlin-as and merlin-ld and embedded in `kernel.elf` through `userprogs.s`, which the build generates (not a file here: see "Building") |
+| `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.S`, `usys.s`, `user.h`), the C library (`lib/`) and linker script `user.ld`, built with merlin, merlin-as and merlin-ld and embedded in `kernel.elf` through `userprogs.s`, which the build generates (not a file here: see "Building") |
 | `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo and frees every page from `__kernel_end` to the end of RAM; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()` |
 | `vm.c` | page tables (Sv32; on RV64 Sv48 or Sv39, with the levels the boot chose): `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on; user address spaces: `uvm_create()`/`uvm_free()`, `uvm_range_ok()`, `copyin()`, `copyout()`, `copyinstr()`; `ioremap()`; the kernel stacks (`kstack_alloc()`: on RV64 16 KiB in the vmalloc area with a guard page); on RV64 `setup_vm()`, the early page table and the `satp` probe |
 | `vmtest.c` | the memory self-tests: allocate and free every page, `kzalloc()` and `pagetable_create()` clear a reused dirty page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |
@@ -527,7 +534,7 @@ one process.
 | `console.c` | the console device (`read` and `write` on it): `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `libgcc.c` | `__divdi3`, `__udivdi3`, `__moddi3`, `__umoddi3`, `__muldi3`: the C library's (`user/lib/libgcc.c`), for `long long` division on RV32 |
-| `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself) |
+| `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself); `memset` stores whole registers, as Linux's riscv one, the rest a byte at a time |
 | `kernel.lds.S` | the layout, one linker script for both widths, preprocessed first (`merlin -E -P`, as Linux's `vmlinux.lds.S`): `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end`; on RV64 linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000 (`AT`), the boot stack 32 KiB aligned |
 | `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct thread`, `struct user_program`, sleep and wakeup, the thread and futex calls), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
 | `kernel.elf` | the prebuilt image, with the user programs built in, committed so `cargo test` and Grail need no build |

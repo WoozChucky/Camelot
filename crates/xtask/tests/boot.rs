@@ -7,7 +7,8 @@
 //! disk in tests/kernel_rv64.rs, #154). The image
 //! (`xtask::fs::IMAGE_SIZE` blocks, the size the spec gives) holds the disk kernel, which has no programs of its own (issue #108):
 //! it boots in a machine of the default 4 MiB, and panics when there is no shell
-//! to run.
+//! to run. The RV64 root image (`cargo xtask fs --xlen 64`, #156) does the
+//! same on an RV64 machine of the default 4 MiB, in an image of the same size.
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::{boot, fsck, read::Fs, BSIZE};
@@ -20,7 +21,16 @@ use xtask::repo_root;
 /// Boots `image` on a machine of the default hardware with no program, `input`
 /// typed for the shell. Returns how it ended, what it printed, and the disk.
 fn boot_image(image: Vec<u8>, input: &[u8]) -> (RunResult, String, Vec<u8>, Machine) {
+    boot_image_on(Xlen::Rv32, image, input)
+}
+
+/// [`boot_image`] on an `xlen` machine.
+fn boot_image_on(xlen: Xlen, image: Vec<u8>, input: &[u8]) -> (RunResult, String, Vec<u8>, Machine) {
     let config = MachineConfig {
+        xlen: match xlen {
+            Xlen::Rv32 => grail::Xlen::Rv32,
+            Xlen::Rv64 => grail::Xlen::Rv64,
+        },
         disks: vec![DiskConfig::memory(image)],
         ..MachineConfig::default()
     };
@@ -242,11 +252,23 @@ fn an_rv64_boot_block_boots_through_the_rv64_rom() {
 
 #[test]
 fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
+    root_image_boots(Xlen::Rv32);
+}
+
+#[test]
+fn the_rv64_root_image_boots_from_disk_and_runs_programs_from_bin() {
+    root_image_boots(Xlen::Rv64);
+}
+
+/// The `xlen` root image, `cargo xtask fs`'s: its layout, the room left in
+/// its filesystem, and a boot on an `xlen` machine of the default 4 MiB,
+/// whose shell runs programs from `/bin` and writes to the disk.
+fn root_image_boots(xlen: Xlen) {
     let root = repo_root();
-    let image = xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap();
-    let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
+    let image = xtask::fs::build_bootable_for(&root, xtask::fs::IMAGE_SIZE, xlen).unwrap();
+    let kernel = std::fs::read(root.join(xtask::fs::kernel_for(xlen))).unwrap();
     let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
-    let plain = xtask::fs::build(&root, &opts).unwrap();
+    let plain = xtask::fs::build_for(&root, &opts, xlen).unwrap();
 
     // IMAGE_SIZE blocks in all: the filesystem, the same as without booting, and
     // the disk kernel after it, as much of it as the bootloader loads (no symbols).
@@ -270,7 +292,7 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     // programs in /bin grow with every one added to kernel/user: when they take
     // too much, this says so, and xtask::fs::IMAGE_SIZE must grow.
     eprintln!(
-        "the {} KiB root image: a filesystem of {} blocks, {} free; a kernel of {} blocks",
+        "the {} KiB {xlen:?} root image: a filesystem of {} blocks, {} free; a kernel of {} blocks",
         image.len() / 1024,
         report.sb.size,
         report.free_blocks,
@@ -285,7 +307,8 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
 
     // The default machine: 4 MiB of RAM.
     assert_eq!(MachineConfig::default().ram_size, 4 << 20);
-    let (result, out, disk, m) = boot_image(
+    let (result, out, disk, m) = boot_image_on(
+        xlen,
         image,
         b"echo from the disk\nls /bin | wc > /count\ncat /count\nexit\n",
     );
@@ -299,7 +322,12 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
         "{out}"
     );
     assert!(out.contains("\nram: 4 MiB at 0x80000000\n"), "{out}");
-    let programs = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root)).unwrap();
+    // On RV64 all but as and ld, which write RV32 code until #157.
+    let programs: Vec<String> = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root))
+        .unwrap()
+        .into_iter()
+        .filter(|p| xlen == Xlen::Rv32 || !xtask::userprogs::RV32_ONLY.contains(&p.as_str()))
+        .collect();
     assert!(
         out.contains(&format!(
             "fs: /bin holds {} programs, the kernel none\n",
@@ -322,10 +350,27 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
         )),
         "{out}"
     );
-    // The bootloader pointed the ROM's entry word at the kernel, so harts the kernel
-    // wakes with an IPI go there from the park loop, as after an ELF boot.
-    let entry = elf::Elf::parse(&kernel).unwrap().header.entry;
-    assert_eq!(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR), Some(entry as u32));
+    // The bootloader pointed the ROM's entry word (a doubleword on RV64) at the
+    // kernel's physical entry point, so harts the kernel wakes with an IPI go
+    // there from the park loop, as after an ELF boot. The RV64 kernel is
+    // linked high and loaded low: its entry's load address.
+    let k = elf::Elf::parse(&kernel).unwrap();
+    let entry = k.header.entry;
+    let entry = k
+        .segments
+        .iter()
+        .find(|s| s.ty == 1 && (s.vaddr..s.vaddr + s.memsz).contains(&entry))
+        .map(|s| s.paddr + (entry - s.vaddr))
+        .unwrap();
+    let lo = u64::from(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR).unwrap());
+    match xlen {
+        Xlen::Rv32 => assert_eq!(lo, entry),
+        Xlen::Rv64 => {
+            let hi = u64::from(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR + 4).unwrap());
+            assert_eq!(lo | hi << 32, entry);
+            assert_eq!(entry, 0x8000_0000);
+        }
+    }
 }
 
 #[test]

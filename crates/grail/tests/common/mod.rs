@@ -2,10 +2,19 @@
 //! kernel_tcp.rs, kernel_sockets.rs): machines run in turns by step counts with the shell driven through
 //! the UART, frames crafted and read back, a host played by the test on a hub port,
 //! and a gateway on a clock that follows the machine's steps.
+//!
+//! Every test runs twice ([`on_both_widths`]): on the RV32 kernel,
+//! `kernel/kernel.elf`, and on the RV64 one, `kernel/kernel-rv64.elf` (#156),
+//! whose programs are the same, built for RV64. The kernel's variables are
+//! read and set through their load addresses ([`image_pa`]): the RV64 image
+//! is linked in the upper half and loaded at 0x8000_0000.
 #![allow(dead_code)]
 
+pub mod kstacks;
+
 use grail::net::{Hub, HubPort, MacAddr, NetBackend, POLL_STEPS};
-use grail::{Machine, MachineConfig, NetConfig, RunResult};
+use grail::{Machine, MachineConfig, NetConfig, RunResult, Xlen};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
@@ -24,8 +33,73 @@ pub const MAX_STEPS: u64 = 400_000_000;
 pub const SHELL_BANNER: &str = "Type help for the list of commands.\n";
 pub const PROMPT: &str = "$ ";
 
+thread_local! {
+    /// The width of the kernel this thread's test runs ([`on_both_widths`]).
+    static XLEN: Cell<Xlen> = const { Cell::new(Xlen::Rv32) };
+}
+
+/// Runs `test` on the RV32 kernel, then on the RV64 one: every machine a
+/// [`Vm`] makes meanwhile is of that width and runs that kernel. A failure
+/// says which width failed: the panic is raised again with the width
+/// before its message.
+pub fn on_both_widths(test: impl Fn()) {
+    for xlen in [Xlen::Rv32, Xlen::Rv64] {
+        XLEN.with(|x| x.set(xlen));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
+        XLEN.with(|x| x.set(Xlen::Rv32));
+        if let Err(payload) = result {
+            panic!("on RV{}: {}", xlen.bits(), panic_message(&*payload));
+        }
+    }
+}
+
+/// What a panic said: its message, if it had one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s
+    } else {
+        "(a panic without a message)"
+    }
+}
+
+/// The width of the kernel under test.
+pub fn xlen() -> Xlen {
+    XLEN.with(|x| x.get())
+}
+
+/// The committed kernel of the width under test, as a path from the
+/// repository root.
+pub fn kernel_path() -> &'static str {
+    match xlen() {
+        Xlen::Rv32 => "kernel/kernel.elf",
+        Xlen::Rv64 => "kernel/kernel-rv64.elf",
+    }
+}
+
 pub fn kernel_elf() -> Vec<u8> {
-    std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/kernel.elf")).unwrap()
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(kernel_path()),
+    )
+    .unwrap()
+}
+
+/// Where the RV64 kernel image is linked, and where it is loaded.
+const KERNEL_LINK_ADDR_RV64: u64 = 0xffff_ffff_8000_0000;
+const LOAD_ADDR: u64 = 0x8000_0000;
+
+/// The physical address of `va`, an address in the kernel image: the same
+/// on RV32, where the kernel runs where it is loaded; on RV64 its load
+/// address.
+pub fn image_pa(va: u64) -> u64 {
+    if va >= KERNEL_LINK_ADDR_RV64 {
+        va - KERNEL_LINK_ADDR_RV64 + LOAD_ADDR
+    } else {
+        va
+    }
 }
 
 /// Addresses as the kernel's variables hold them: in host order.
@@ -70,12 +144,16 @@ impl Vm {
     }
 
     /// The kernel on a machine built from `config` (its disks, say), with `cards`
-    /// and `patches` as for [`Vm::new`].
+    /// and `patches` as for [`Vm::new`]; the machine of the width under test.
     pub fn with_config(
         config: MachineConfig,
         cards: Vec<(MacAddr, Box<dyn NetBackend>)>,
         patches: &[(&str, u32)],
     ) -> Vm {
+        let config = MachineConfig {
+            xlen: xlen(),
+            ..config
+        };
         let mut m = Machine::with_devices(config, Vec::new(), cards).unwrap();
         m.cpu.bus.uart.capture = true;
         let file = kernel_elf();
@@ -83,9 +161,9 @@ impl Vm {
         let elf = grail::elf::parse(&file).unwrap();
         for (name, value) in patches {
             let addr = elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
-            m.cpu.bus.load(addr, &value.to_le_bytes()).unwrap();
+            m.cpu.bus.load(image_pa(addr), &value.to_le_bytes()).unwrap();
         }
-        let free_count = elf.symbol("free_count").expect("no symbol free_count");
+        let free_count = image_pa(elf.symbol("free_count").expect("no symbol free_count"));
         let (input, rx) = channel();
         m.set_uart_input(rx);
         Vm { m, input, free_count }
@@ -116,17 +194,34 @@ impl Vm {
     pub fn write_var(&mut self, name: &str, value: u32) {
         self.m.cpu.bus.load(var_addr(name), &value.to_le_bytes()).unwrap();
     }
+
+    /// The pages the kernel has not lost ([`kstacks::pages`]): on RV32 the
+    /// free ones (`nfree`, kernel/kalloc.c), a kernel stack being a page of
+    /// free RAM; on RV64 those and the pages of every mapped kernel stack,
+    /// and the stacks in use.
+    pub fn pages(&self) -> kstacks::Pages {
+        if xlen() == Xlen::Rv32 {
+            return kstacks::Pages {
+                total: self.read_var("nfree").into(),
+                stacks_in_use: 0,
+            };
+        }
+        kstacks::pages(&self.m, &kernel_elf())
+    }
 }
 
-/// The address of the kernel variable `name`, looked up in kernel.elf once.
+/// The physical address of the kernel variable `name`, looked up once for
+/// each width's kernel.
 pub fn var_addr(name: &str) -> u64 {
-    static ADDRS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    static ADDRS: OnceLock<Mutex<HashMap<(bool, String), u64>>> = OnceLock::new();
     let mut addrs = ADDRS.get_or_init(Default::default).lock().unwrap();
-    *addrs.entry(name.to_string()).or_insert_with(|| {
-        let file = kernel_elf();
-        let elf = grail::elf::parse(&file).unwrap();
-        elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
-    })
+    *addrs
+        .entry((xlen() == Xlen::Rv64, name.to_string()))
+        .or_insert_with(|| {
+            let file = kernel_elf();
+            let elf = grail::elf::parse(&file).unwrap();
+            image_pa(elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}")))
+        })
 }
 
 /// Runs the machines in turns, letting `host` (if any) see what they send between

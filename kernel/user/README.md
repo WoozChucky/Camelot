@@ -8,6 +8,17 @@ and merlin-ld (`cargo xtask kernel`, which embeds them in the kernel for
 when there is no disk; `cargo xtask fs`, which installs them in `/bin` of
 the root image). The shell runs `NAME` as `/bin/NAME`.
 
+Every program builds for both widths from the same source, and runs the
+same on each: for the RV32 kernel as ELF32 (ILP32: `int`, `long` and
+pointers 4 bytes), for the RV64 kernel as ELF64 (LP64: `long`, `size_t`
+and pointers 8 bytes), and the RV64 kernel's `/bin` (`cargo xtask fs`'s
+`target/camelot-fs-rv64.img`) holds them all but `as` and `ld`, which
+write RV32 code until #157. Assembly that differs between the widths is a
+`.S` file, preprocessed for each with `include/asm.h` (`REG_L`, `SZREG`).
+A program starts as Linux starts one: `main(argc, argv, envp)`, with the
+auxiliary vector after `envp` (docs/camelot-syscalls.md, "Starting a
+program").
+
 ## The basic programs
 
 Each one reports a problem as `NAME: WHAT: REASON` on stderr (the shell

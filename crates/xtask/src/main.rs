@@ -32,8 +32,12 @@ tasks:
                (RV64: target/kernel/clang/rv64)
   fs           build the root filesystem image (target/camelot-fs.img): kernel/fs/ at /,
                the user programs in /bin (merlin, merlin-as, merlin-ld; no LLVM), /dev/console,
-               made bootable with kernel/boot/boot.s and kernel/kernel-disk.elf
-               (grail --disk target/camelot-fs.img boots it, in the default 4 MiB of RAM)
+               made bootable with kernel/boot/boot.elf and kernel/kernel-disk.elf
+               (grail --disk target/camelot-fs.img boots it, in the default 4 MiB of RAM);
+               then the same for RV64, target/camelot-fs-rv64.img, with the programs built
+               for RV64 (but as and ld), kernel/boot/boot-rv64.elf and
+               kernel/kernel-disk-rv64.elf (grail --xlen 64 --disk target/camelot-fs-rv64.img)
+               --xlen 32|64: build only the RV32 or the RV64 image (with -o, RV32 by default)
                -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default
                {image_size}), the filesystem filling what the kernel leaves;
                --no-boot: the filesystem alone, N blocks (the same default)
@@ -190,6 +194,8 @@ struct FsArgs {
     out: Option<PathBuf>,
     size: Option<u32>,
     no_boot: bool,
+    /// The one width to build; both when `None` (RV32 alone with `-o`).
+    xlen: Option<Xlen>,
 }
 
 fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
@@ -204,6 +210,13 @@ fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
                 f.size = Some(v.parse().map_err(|_| format!("bad size {v} (blocks)"))?);
             }
             "--no-boot" => f.no_boot = true,
+            "--xlen" => {
+                f.xlen = Some(match value("--xlen")?.as_str() {
+                    "32" => Xlen::Rv32,
+                    "64" => Xlen::Rv64,
+                    other => return Err(format!("unknown width {other} (32 or 64)")),
+                })
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -459,11 +472,31 @@ fn build_boot(args: ExamplesArgs) -> ExitCode {
     }
 }
 
-/// `cargo xtask fs`: the root filesystem image, bootable unless `--no-boot`,
-/// checked with fsck after it is built.
+/// `cargo xtask fs`: the root filesystem images, bootable unless
+/// `--no-boot`, each checked with fsck after it is built: the RV32 one and
+/// the RV64 one, or the one `--xlen` (or `-o`, RV32) asks for.
 fn build_fs(f: FsArgs) -> ExitCode {
+    let xlens = match (f.xlen, &f.out) {
+        (Some(x), _) => vec![x],
+        (None, Some(_)) => vec![Xlen::Rv32],
+        (None, None) => xtask::kernel::XLENS.to_vec(),
+    };
+    for xlen in xlens {
+        let code = build_fs_for(&f, xlen);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// [`build_fs`]'s `xlen` image.
+fn build_fs_for(f: &FsArgs, xlen: Xlen) -> ExitCode {
     let root = repo_root();
-    let out = f.out.unwrap_or_else(|| xtask::fs::default_out(&root));
+    let out = f
+        .out
+        .clone()
+        .unwrap_or_else(|| xtask::fs::default_out_for(&root, xlen));
     let built = if f.no_boot {
         // As big as the root image by default, so that every program fits
         // with the room it has there.
@@ -471,9 +504,9 @@ fn build_fs(f: FsArgs) -> ExitCode {
             size: f.size.unwrap_or(xtask::fs::IMAGE_SIZE),
             ..camelot_fs::mkfs::Options::default()
         };
-        xtask::fs::build(&root, &opts)
+        xtask::fs::build_for(&root, &opts, xlen)
     } else {
-        xtask::fs::build_bootable(&root, f.size.unwrap_or(xtask::fs::IMAGE_SIZE))
+        xtask::fs::build_bootable_for(&root, f.size.unwrap_or(xtask::fs::IMAGE_SIZE), xlen)
     };
     let image = match built {
         Ok(image) => image,
@@ -860,9 +893,13 @@ mod tests {
                 out: Some("d.img".into()),
                 size: Some(512),
                 no_boot: false,
+                xlen: None,
             }
         );
         assert!(parse(&["--no-boot"]).unwrap().no_boot);
+        assert_eq!(parse(&["--xlen", "64"]).unwrap().xlen, Some(Xlen::Rv64));
+        assert_eq!(parse(&["--xlen", "32"]).unwrap().xlen, Some(Xlen::Rv32));
+        assert!(parse(&["--xlen", "128"]).unwrap_err().contains("unknown width"));
         assert!(parse(&["--size", "1M"]).unwrap_err().contains("bad size"));
         assert!(parse(&["-v"]).unwrap_err().contains("unknown option"));
     }
