@@ -1374,7 +1374,8 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
     if xlen == Xlen::Rv64 {
         // RV64's own: an R_RISCV_32 whose value does not fit in 32 bits, and
         // a script that reads a 64-bit address past 2^63 for the location
-        // counter, then for a section's load address.
+        // counter, then for a section's load address: a link that succeeds,
+        // with the warning of no entry symbol, so that its file is compared.
         cases.push((
             vec![obj(
                 ".text\n.globl _start\n_start: nop\n.data\n.word _start\n.word far\n",
@@ -1383,9 +1384,7 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
             "",
         ));
         cases.push((
-            vec![obj(
-                ".text\n.globl _start\n_start: nop\n.data\n.dword _start\n.word -1\n",
-            )],
+            vec![obj(".text\nmain: nop\n.data\n.dword main\n.word -1\n")],
             "SECTIONS { . = 0x8000000000000000; .text : { *(.text) } .data : AT(0xfffffffffffffff0) \
              { *(.data) } }"
                 .into(),
