@@ -1099,6 +1099,15 @@ long proc_sbrk(long increment) {
             releasesleep(&p->heap_lock);
             return -ENOMEM;
         }
+        /* More than the whole of RAM can never be had: that fails at once,
+         * as Linux's default overcommit check fails it (mm/util.c,
+         * __vm_enough_memory with OVERCOMMIT_GUESS: more pages than RAM and
+         * swap hold), rather than after taking and zeroing every free
+         * page. */
+        if (grow / PGSIZE > ram_size / PGSIZE) {
+            releasesleep(&p->heap_lock);
+            return -ENOMEM;
+        }
         uintptr end = old + grow;
         /* Map the pages from the first one not yet mapped up to the new
          * end; on failure, unmap them again. */

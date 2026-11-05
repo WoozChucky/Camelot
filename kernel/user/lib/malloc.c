@@ -15,16 +15,15 @@
  * instruction each way when there is only one thread. */
 #include "../user.h"
 
-/* A pointer and a size: 8 bytes on RV32, 16 on RV64 (the pointer's 8 and
- * the size's 4, padded to the pointer's alignment), which is also the
+/* A pointer and a size: 8 bytes on RV32, 16 on RV64, which is also the
  * alignment every block gets: on RV64 the ABI's largest, 16, as glibc's
  * malloc gives. */
 struct header {
     struct header *next; /* the next free block, while this one is free */
-    uint units;          /* the block's size, in headers, its own included */
+    size_t units;        /* the block's size, in headers, its own included */
 };
 
-#define UNIT ((uint)sizeof(struct header))
+#define UNIT sizeof(struct header)
 /* The least sbrk is asked for: a page. */
 #define GROW_UNITS (4096 / UNIT)
 
@@ -73,11 +72,12 @@ void free(void *p) {
 
 /* Grows the heap by at least `units` and puts the new block on the free
  * list. Returns the list, or NULL when sbrk fails. */
-static struct header *more(uint units) {
+static struct header *more(size_t units) {
     if (units < GROW_UNITS) {
         units = GROW_UNITS;
     }
-    if (units > 0x7fffffffu / UNIT) {
+    /* sbrk takes a long: more than LONG_MAX bytes is more than there is. */
+    if (units > (size_t)LONG_MAX / UNIT) {
         return NULL;
     }
     char *got = sbrk((long)(units * UNIT));
@@ -91,11 +91,13 @@ static struct header *more(uint units) {
 }
 
 void *malloc(size_t n) {
-    if (n == 0 || n > 0x7fffffffu - UNIT) {
+    /* Nothing for 0 bytes; nor for more than a long holds (sbrk's
+     * argument), which also keeps the rounding below from wrapping. */
+    if (n == 0 || n > (size_t)LONG_MAX - UNIT) {
         return NULL;
     }
     /* The header, and n bytes rounded up to whole units. */
-    uint units = (uint)((n + UNIT - 1) / UNIT) + 1;
+    size_t units = (n + UNIT - 1) / UNIT + 1;
     mutex_lock(&heap_lock);
     if (freep == NULL) {
         base.next = &base;

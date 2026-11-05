@@ -37,6 +37,31 @@ static void check_str(const char *got, const char *want, const char *what) {
     }
 }
 
+/* user.h's types: the fixed-width ones are as wide as their names say on
+ * both widths, and the ABI's (size_t, ssize_t, off_t, time_t, intptr_t) a
+ * long's width, a register's. */
+static void test_types(void) {
+    check(sizeof(int8_t) == 1 && sizeof(uint8_t) == 1, "int8_t and uint8_t are a byte");
+    check(sizeof(int16_t) == 2 && sizeof(uint16_t) == 2, "int16_t and uint16_t are 2 bytes");
+    check(sizeof(int32_t) == 4 && sizeof(uint32_t) == 4, "int32_t and uint32_t are 4 bytes");
+    check(sizeof(int64_t) == 8 && sizeof(uint64_t) == 8, "int64_t and uint64_t are 8 bytes");
+    check((int8_t)0xff < 0 && (uint8_t)0xff > 0 && (int16_t)0xffff < 0, "int8_t and int16_t are signed");
+    check(sizeof(size_t) == sizeof(long) && sizeof(ssize_t) == sizeof(long), "size_t is a long's width");
+    check(sizeof(off_t) == sizeof(long) && sizeof(time_t) == sizeof(long), "off_t and time_t too");
+    check(sizeof(intptr_t) == sizeof(void *) && sizeof(uintptr_t) == sizeof(void *), "intptr_t holds a pointer");
+    check(sizeof(long) == sizeof(void *), "a long is a pointer's width");
+#ifdef _LP64
+    check(sizeof(long) == 8, "LP64: a long is 8 bytes");
+#else
+    check(sizeof(long) == 4, "ILP32: a long is 4 bytes");
+#endif
+    check(LONG_MAX == (long)(ULONG_MAX >> 1) && LONG_MIN == -LONG_MAX - 1, "LONG_MAX and LONG_MIN");
+    check(INT64_MAX == 0x7fffffffffffffffll && INT64_MIN + INT64_MAX == -1 && UINT64_MAX + 1 == 0,
+          "the 64-bit limits");
+    check(SIZE_MAX == (size_t)-1 && UINT_MAX == (uint)-1 && UINT32_MAX == 0xffffffffu, "the unsigned limits");
+    check(INT_MAX == 2147483647 && INT_MIN == (int)0x80000000u, "INT_MAX and INT_MIN");
+}
+
 static void test_strings(void) {
     char buf[32];
     check_eq((int)strlen(""), 0, "strlen of nothing");
@@ -149,6 +174,32 @@ static void test_snprintf(void) {
     check_str(buf, "-9223372036854775808 18446744073709551615 123456789abcdef", "64-bit longs");
 #else
     check_str(buf, "0x00001000 (null)", "%p and a null string");
+    /* A long is 32 bits: %ld and %lu of its limits. */
+    snprintf(buf, sizeof buf, "%ld %lu %lx", LONG_MIN, ~0ul, 0x89abcdeful);
+    check_str(buf, "-2147483648 4294967295 89abcdef", "32-bit longs");
+#endif
+    /* A long long is 64 bits on both widths (on RV32 a register pair,
+     * which a variadic call passes in an even register and the next). */
+    snprintf(buf, sizeof buf, "%lld %llu %llx", LLONG_MIN, ULLONG_MAX, 0x123456789abcdefll);
+    check_str(buf, "-9223372036854775808 18446744073709551615 123456789abcdef", "%ll: 64-bit long longs");
+    snprintf(buf, sizeof buf, "%d|%lld|%d", 1, -2ll, 3);
+    check_str(buf, "1|-2|3", "%lld between ints");
+    snprintf(buf, sizeof buf, "[%20llu|%-5lld|%05llx]", 4294967296ull, -1ll, 0xabcull);
+    check_str(buf, "[          4294967296|-1   |00abc]", "%ll with widths and flags");
+    int64_t i64max = INT64_MAX;
+    uint64_t u64 = (uint64_t)1 << 40;
+    snprintf(buf, sizeof buf, "%lld %llx", i64max, u64);
+    check_str(buf, "9223372036854775807 10000000000", "int64_t and uint64_t");
+    /* z: a size_t (or ssize_t), a long's width. */
+    snprintf(buf, sizeof buf, "%zu %zd %zx", sizeof(struct stat), (ssize_t)-5, (size_t)0xff);
+#ifdef _LP64
+    check_str(buf, "24 -5 ff", "%z: size_t and ssize_t");
+    snprintf(buf, sizeof buf, "%zu", SIZE_MAX);
+    check_str(buf, "18446744073709551615", "%zu of SIZE_MAX");
+#else
+    check_str(buf, "16 -5 ff", "%z: size_t and ssize_t");
+    snprintf(buf, sizeof buf, "%zu", SIZE_MAX);
+    check_str(buf, "4294967295", "%zu of SIZE_MAX");
 #endif
     snprintf(buf, sizeof buf, "%q %");
     check_str(buf, "%q %", "unknown conversions are printed as written");
@@ -256,8 +307,13 @@ static void test_malloc(void) {
     z = realloc(z, 4000);
     check(z != NULL && z[0] == 0 && z[49] == 49, "realloc keeps the bytes");
     free(z);
-    check(calloc(0x10000, 0x10000) == NULL, "calloc overflow");
+    check(calloc(SIZE_MAX / 2, 3) == NULL && calloc(3, SIZE_MAX / 2) == NULL, "calloc overflow");
     check(malloc(0x7fffffff) == NULL, "malloc of more than there is");
+    check(malloc(SIZE_MAX) == NULL && malloc(SIZE_MAX - 8) == NULL, "malloc of SIZE_MAX does not wrap around");
+#ifdef _LP64
+    /* A size_t of 64 bits, whole: 2^32 + 16 is not 16. */
+    check(malloc(0x100000010ul) == NULL, "malloc of 4 GiB and 16 bytes is more than there is");
+#endif
     /* Many small blocks, freed in an odd order, then one big one. */
     char *many[40];
     for (int i = 0; i < 40; i++) {
@@ -466,6 +522,7 @@ int main(int argc, char **argv) {
         return family();
     }
     test_inet();
+    test_types();
     test_strings();
     test_numbers();
     test_i64();

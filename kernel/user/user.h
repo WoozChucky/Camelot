@@ -18,6 +18,44 @@ typedef long time_t;
 typedef long intptr_t;
 typedef unsigned long uintptr_t;
 
+/* Integers of a given width, as <stdint.h> has them: the same on both
+ * widths. The 64-bit ones are long long, which merlin and clang make a
+ * register on RV64 and a pair of them on RV32 (lib/libgcc.c has the
+ * routines RV32 calls to divide them). */
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef short int16_t;
+typedef unsigned short uint16_t;
+typedef int int32_t;
+typedef unsigned int uint32_t;
+typedef long long int64_t;
+typedef unsigned long long uint64_t;
+
+/* The limits of the integer types, as <limits.h> and <stdint.h> give
+ * them. A long is a register: 64 bits on RV64 (_LP64), 32 on RV32. */
+#define INT_MAX 2147483647
+#define INT_MIN (-INT_MAX - 1)
+#define UINT_MAX 4294967295u
+#ifdef _LP64
+#define LONG_MAX 0x7fffffffffffffffL
+#define ULONG_MAX 0xffffffffffffffffUL
+#else
+#define LONG_MAX 2147483647L
+#define ULONG_MAX 4294967295UL
+#endif
+#define LONG_MIN (-LONG_MAX - 1)
+#define LLONG_MAX 0x7fffffffffffffffLL
+#define LLONG_MIN (-LLONG_MAX - 1)
+#define ULLONG_MAX 0xffffffffffffffffULL
+#define INT32_MAX INT_MAX
+#define INT32_MIN INT_MIN
+#define UINT32_MAX UINT_MAX
+#define INT64_MAX LLONG_MAX
+#define INT64_MIN LLONG_MIN
+#define UINT64_MAX ULLONG_MAX
+#define SIZE_MAX ULONG_MAX
+#define SSIZE_MAX LONG_MAX
+
 #define NULL ((void *)0)
 
 /* Error numbers: a system call that fails returns minus one of them. They
@@ -358,19 +396,13 @@ int memcmp(const void *a, const void *b, size_t n);
  * after "0"); *end (if `end` isn't NULL) is where it stopped, `s` itself
  * when there were no digits. A number out of range gives LONG_MAX, or
  * LONG_MIN with a '-', as in C (*end is still past all its digits). */
-#ifdef _LP64
-#define LONG_MAX 0x7fffffffffffffffL
-#else
-#define LONG_MAX 2147483647L
-#endif
-#define LONG_MIN (-LONG_MAX - 1)
-#define INT_MAX 2147483647
-#define INT_MIN (-INT_MAX - 1)
 int atoi(const char *s);
 long strtol(const char *s, char **end, int base);
 
-/* The heap (lib/malloc.c), on top of sbrk: blocks aligned to 8 bytes,
- * a free list with neighbours merged. malloc(0) and a failure return NULL.
+/* The heap (lib/malloc.c), on top of sbrk: blocks aligned to the size of
+ * malloc's header, two pointers' worth (8 bytes on RV32, 16 on RV64: the
+ * ABI's largest alignment, as glibc's malloc gives), a free list with
+ * neighbours merged. malloc(0) and a failure return NULL.
  * calloc zeroes; realloc keeps the old bytes (up to the smaller size), and
  * realloc(NULL, n) is malloc(n). */
 void *malloc(size_t n);
@@ -418,8 +450,10 @@ void mutex_unlock(struct mutex *m);
 int thread_start(int (*fn)(void *), void *arg, void *stack, uint size);
 
 /* Formatted output (lib/printf.c): %d %u %x %p %s %c %%, with an optional
- * '-' (left align), '0' (zero padding) and width; an 'l' before d/u/x is
- * accepted and ignored (long is int's size). printf and fprintf return the
+ * '-' (left align), '0' (zero padding) and width. d, u and x take an int
+ * (or unsigned int), or with a length before them a wider one: 'l' a long,
+ * 'll' a long long (int64_t), 'z' a size_t (or ssize_t, with d). %p prints
+ * every digit of a pointer, 8 on RV32 and 16 on RV64. printf and fprintf return the
  * bytes written, or a negative error number; snprintf writes at most
  * `size` bytes into `buf`, the last one a NUL, and returns the length the
  * whole text has (longer than `size` - 1 if it was cut). */

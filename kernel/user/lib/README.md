@@ -79,9 +79,15 @@ where its characters go: to a descriptor, through the buffer, for `printf`
 and `fprintf`; into the caller's string for `snprintf`, which keeps
 counting past the end so that it can return the length the whole text
 needs. The conversions are `%d %u %x %p %s %c %%`, with the flags `-` (pad
-on the right) and `0` (pad with zeros, after a minus sign) and a width; an
-`l` before `d`, `u` or `x` is accepted and ignored, since `long` is `int`'s
-size. An unknown conversion is printed as written. It is the kernel's
+on the right) and `0` (pad with zeros, after a minus sign) and a width.
+`d`, `u` and `x` take an `int` (or `unsigned int`), or with a length before
+them a wider integer, as C's `printf` does: `l` a `long`, as wide as a
+register (64 bits on RV64, 32 on RV32), `ll` a `long long` (`int64_t`, 64
+bits on both), `z` a `size_t` (`ssize_t` with `d`). `%p` prints every
+digit of a pointer, 8 on RV32 and 16 on RV64. An unknown conversion is
+printed as written. The digits are divided off a 64-bit value with
+`do_div`, as Linux's `vsprintf.c` does: on RV32 three 32-bit divisions, so
+a program that prints numbers needs no `__udivdi3`. It is the kernel's
 `kprintf` (`kernel/kprintf.c`) with the same formats.
 
 ## Line input
@@ -104,8 +110,12 @@ Two ways, for two kinds of input:
 ## The heap
 
 `malloc.c` is the allocator of K&R's *The C Programming Language*, section
-8.7. Each block starts with an 8-byte header (its size in 8-byte units and,
-while free, the next free block), so every block is 8-byte aligned. The
+8.7. Each block starts with a header of two words, a pointer's size each
+(8 bytes on RV32, 16 on RV64): its size in header-sized units, a `size_t`,
+and, while it is free, the next free block. So every block is aligned to
+the header's size, which on RV64 is the ABI's largest alignment, 16 bytes,
+as glibc's `malloc` gives. A request of more than `LONG_MAX` bytes (what
+`sbrk` takes) fails with `NULL` at once. The
 free blocks form a ring in address order, through a dummy block of size 0;
 `malloc` walks it from where the last search stopped and takes the first
 block big enough, cutting the request off its end. The threads of a

@@ -261,8 +261,10 @@ towards the stack: new pages are mapped R+W and read zero, including bytes
 given back by an earlier shrink and grown again. A negative `increment`
 shrinks it, unmapping and freeing the pages no longer used. Errors:
 `-ENOMEM` when the heap would reach the guard page under the stack's limit
-(`USER_LOAD_TOP`: 0x0B7F_F000 on RV32, 0x7FFF_FF7F_F000 in Sv48) or memory
-runs out (nothing changes), `-EINVAL` when it would shrink below its start.
+(`USER_LOAD_TOP`: 0x0B7F_F000 on RV32, 0x7FFF_FF7F_F000 in Sv48), when it
+would grow by more pages than the whole of RAM has (refused at once, as
+Linux's default overcommit check refuses it), or when memory runs out
+(nothing changes), `-EINVAL` when it would shrink below its start.
 A program whose segments end above 4 GiB has its heap there, and `sbrk`
 returns those addresses whole.
 
@@ -944,7 +946,8 @@ its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 `memmove`, `memcmp`), numbers (`atoi`, `strtol`), the heap (`malloc`,
 `free`, `calloc`, `realloc`, on top of `sbrk`), formatted output (`printf`,
 `fprintf` to a descriptor, `snprintf`; `%d %u %x %p %s %c %%` with `-`, `0`
-and a width, `l` for a `long`), `puts`, line input (`getline`, one read of the console
+and a width, and `l` for a `long`, `ll` for a `long long`, `z` for a
+`size_t`), `puts`, line input (`getline`, one read of the console
 without the newline; readers, `reader_getline`, for files and pipes),
 `strerror`, `stat` (`open`, `fstat`, `close`), `spin` (a busy loop),
 addresses and names (`htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`,
