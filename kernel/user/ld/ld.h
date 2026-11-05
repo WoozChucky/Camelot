@@ -37,6 +37,9 @@
 void die(const char *msg);
 void *xmalloc(uint n);
 void *xcalloc(uint n);
+/* `n`, a byte count computed in 64 bits, of something held in memory:
+ * past 32 bits it is more than a Camelot process has (die). */
+uint mem_len(uint64_t n);
 char *xstrdup(const char *s);
 char *xstrndup(const char *s, uint n);
 /* A growable array: grow(ptr, &cap, count + 1, size) makes room. */

@@ -1175,7 +1175,8 @@ fn elf_class(xlen: Xlen) -> &'static str {
 fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
     // Links that fail, and links that succeed with a warning: what merlin-ld
     // says, word for word, the exit status, and the file (none after an
-    // error, merlin-ld's after a warning). Each case is its inputs, a
+    // error, merlin-ld's after a warning), and on RV64 links of 4 GiB that
+    // do not fit in memory. Each case is its inputs, a
     // script, and more arguments: `--start-lib` makes the last input a
     // library member. The objects are `xlen`'s; the limits that are 4 GiB
     // on RV32 are 2^64 on RV64, and the class an OUTPUT_FORMAT must name
@@ -1406,6 +1407,13 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
             "",
         ),
     ];
+    // The cases whose executable is 4 GiB or more (RV64's, below), which
+    // merlin-ld writes from an image that size in memory. /bin/ld computes
+    // the same sizes and offsets, but holds no such image (this machine has
+    // 4 MiB), so it stops out of memory, as merlin-ld does when it cannot
+    // allocate the file: exit status 2 and no file, where cutting them to
+    // 32 bits wrote a file whose headers point past its end.
+    let mut huge = cases.len()..cases.len();
     if xlen == Xlen::Rv64 {
         // RV64's own: an R_RISCV_32 whose value does not fit in 32 bits, and
         // a script that reads a 64-bit address past 2^63 for the location
@@ -1437,11 +1445,33 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
             "SECTIONS { . = 0x1000; .text : { *(.text) } far = 0x100000000; }".into(),
             "",
         ));
+        // 4 GiB into a segment: .text2, code above .text, shares its
+        // PT_LOAD, 0x100000004 bytes into it; and an output section of
+        // 4 GiB with file contents.
+        huge.start = cases.len();
+        cases.push((
+            vec![obj(
+                ".text\n.globl _start\n_start: nop\n.section .text2, \"ax\"\nnop\n",
+            )],
+            "SECTIONS { . = 0x10000; .text : { *(.text) } . += 0x100000000; .text2 : { *(.text2) } }".into(),
+            "",
+        ));
+        cases.push((
+            vec![obj(".text\n.globl _start\n_start: nop\n.data\n.word 1\n")],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } .data : { . += 0x100000000; *(.data) } }".into(),
+            "",
+        ));
+        huge.end = cases.len();
     }
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut commands = Vec::new();
     // What merlin-ld says and writes for each case.
-    let mut wants: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+    enum Want {
+        Errors(String),
+        Warnings(String, Vec<u8>),
+        OutOfMemory,
+    }
+    let mut wants: Vec<Want> = Vec::new();
     for (k, (objects, script, extra)) in cases.iter().enumerate() {
         // (input, whether it is a library member), in command-line order.
         let mut inputs = Vec::new();
@@ -1476,6 +1506,21 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
             opts.entry = Some(e.to_string());
             args.push_str(&format!(" {extra}"));
         }
+        commands.push(args);
+        if huge.contains(&k) {
+            // merlin-ld's layout, without the 4 GiB image it would write: a
+            // segment whose file part is past 4 GiB, and nothing to say.
+            let plain: Vec<merlin_ld::Input> = inputs.into_iter().map(|(i, _)| i).collect();
+            let layout = merlin_ld::layout(&plain, &opts).unwrap_or_else(|e| panic!("case {k}: {e:?}"));
+            assert!(layout.warnings.is_empty(), "case {k}: {:?}", layout.warnings);
+            let (_, segs) = merlin_ld::write::segments(&layout);
+            assert!(
+                segs.iter().any(|s| s.filesz > u32::MAX.into()),
+                "case {k} fits in 4 GiB"
+            );
+            wants.push(Want::OutOfMemory);
+            continue;
+        }
         // As merlin-ld's command line links (/bin/ld's too).
         let inputs: Vec<(&merlin_ld::Input, bool)> = inputs.iter().map(|(i, lib)| (i, *lib)).collect();
         wants.push(match merlin_ld::link_files(&inputs, &opts) {
@@ -1486,11 +1531,10 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
                     .warnings
                     .iter()
                     .map(|w| format!("ld: warning: {w}\n"));
-                (said.collect(), Some(linked.elf))
+                Want::Warnings(said.collect(), linked.elf)
             }
-            Err(errors) => (errors.iter().map(|e| format!("ld: error: {e}\n")).collect(), None),
+            Err(errors) => Want::Errors(errors.iter().map(|e| format!("ld: error: {e}\n")).collect()),
         });
-        commands.push(args);
     }
     let input = format!("{}\nexit 0\n", commands.join("\n"));
     let (out, disk) = boot(
@@ -1500,17 +1544,26 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
         xlen,
     );
     let fs = Fs::open(&disk).unwrap();
-    for (k, (said, elf)) in wants.iter().enumerate() {
+    for (k, want) in wants.iter().enumerate() {
         let got = shell_output(&out, &commands[k]).replace("\r", "");
         let written = fs.read_file(&format!("/out/{k}")).ok();
-        match elf {
+        match want {
             // An error: the messages, exit status 1, and no file.
-            None => {
+            Want::Errors(said) => {
                 assert_eq!(got, format!("{said}ld: exit 1\n"), "case {k}: {}", commands[k]);
                 assert!(written.is_none(), "case {k} wrote /out/{k}");
             }
+            // More than a Camelot process holds: exit status 2, no file.
+            Want::OutOfMemory => {
+                assert_eq!(
+                    got, "ld: out of memory\nld: exit 2\n",
+                    "case {k}: {}",
+                    commands[k]
+                );
+                assert!(written.is_none(), "case {k} wrote /out/{k}");
+            }
             // A warning: the messages, success, and merlin-ld's file.
-            Some(elf) => {
+            Want::Warnings(said, elf) => {
                 assert_eq!(got, *said, "case {k}: {}", commands[k]);
                 assert!(
                     written.as_ref() == Some(elf),

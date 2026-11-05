@@ -25,6 +25,21 @@ void *xcalloc(uint n) {
     return p;
 }
 
+/* The images ld builds in memory, the output sections' and the file it
+ * writes, have sizes and offsets computed in 64 bits, as merlin-ld
+ * computes them: on ELF64 an output section can be 4 GiB long, or a
+ * section 4 GiB into its segment. merlin-ld then allocates that much and
+ * writes it, or stops when the allocation fails. A Camelot process has
+ * less memory than 4 GiB, so such a count is refused here the way xmalloc
+ * refuses what malloc cannot give, and never cut to 32 bits, which would
+ * write a file whose headers point past its end. */
+uint mem_len(uint64_t n) {
+    if (n > UINT32_MAX) {
+        die("out of memory");
+    }
+    return (uint)n;
+}
+
 char *xstrndup(const char *s, uint n) {
     char *r = xmalloc(n + 1);
     memcpy(r, s, n);

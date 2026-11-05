@@ -133,7 +133,10 @@ static uchar **loaded(struct layout *l) {
         if (os->nobits) {
             continue;
         }
-        images[k] = xcalloc((uint)os->size);
+        /* merlin-ld's vec![0; size]: 4 GiB or more is out of memory here
+         * (mem_len), and every input is inside the image, so its offset
+         * there is a uint. */
+        images[k] = xcalloc(mem_len(os->size));
         for (uint j = 0; j < os->ninputs; j++) {
             struct section *sec = &l->objects[os->inputs[j].object].sections[os->inputs[j].section];
             memcpy(images[k] + (uint)(os->inputs[j].addr - os->addr), sec->data, sec->datalen);
@@ -210,7 +213,7 @@ static uchar **debug(struct layout *l) {
     for (uint k = 0; k < l->ndebug; k++) {
         struct debug_section *ds = &l->debug[k];
         uint64_t tombstone = strcmp(ds->name, ".debug_loc") == 0 || strcmp(ds->name, ".debug_ranges") == 0;
-        images[k] = xcalloc((uint)ds->size);
+        images[k] = xcalloc(mem_len(ds->size)); /* the inputs are inside it */
         for (uint j = 0; j < ds->ninputs; j++) {
             struct input_ref *in = &ds->inputs[j];
             struct object *o = &l->objects[in->object];

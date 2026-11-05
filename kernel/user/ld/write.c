@@ -392,7 +392,7 @@ static uint symtab(struct layout *l, int strip, struct buf *out, struct buf *str
 /* A section header: the same fields in the same order in both classes,
  * sh_flags, sh_addr, sh_offset, sh_size, sh_addralign and sh_entsize
  * address-sized. */
-static void shdr(struct buf *h, uint name, uint type, uint64_t flags, uint64_t addr, uint offset, uint64_t size,
+static void shdr(struct buf *h, uint name, uint type, uint64_t flags, uint64_t addr, uint64_t offset, uint64_t size,
                  uint link, uint info, uint64_t align, uint64_t entsize) {
     buf_u32(h, name);
     buf_u32(h, type);
@@ -425,8 +425,9 @@ static void phdr(struct buf *b, uint type, uint flags, uint64_t offset, uint64_t
     buf_word(b, align);
 }
 
-/* `len` rounded up to a multiple of `a`. */
-static uint align_len(uint len, uint a) {
+/* `len` rounded up to a multiple of `a`, in 64 bits as merlin-ld's
+ * next_multiple_of (an alignment can be 2^31). */
+static uint64_t align_len(uint64_t len, uint a) {
     return (len + a - 1) / a * a;
 }
 
@@ -448,11 +449,15 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
      * so far; another section at the segment's offset plus its distance from
      * the segment's start; a section in no segment (an empty one whose
      * segment was dropped) at the end so far, aligned to its alignment.
-     * Every offset is inside the file being written, a uint. */
-    uint *sec_offset = xcalloc((l->nsections + 1) * sizeof(uint));
+     * The offsets are uint64_t, as merlin-ld's are: an ELF32 link stays
+     * below 4 GiB, but on ELF64 a section can be 4 GiB or more into its
+     * segment. The file is built in memory, though, so the end it is padded
+     * to and every section put there must fit a uint (mem_len), or ld stops
+     * out of memory, as merlin-ld does when it cannot allocate the file. */
+    uint64_t *sec_offset = xcalloc((l->nsections + 1) * sizeof(uint64_t));
     /* The headers' segment, the only one that can be without sections, is
      * at offset 0. */
-    uint *seg_offset = xcalloc((nsegs + 1) * sizeof(uint));
+    uint64_t *seg_offset = xcalloc((nsegs + 1) * sizeof(uint64_t));
     int *seg_of = xcalloc((l->nsections + 1) * sizeof(int));
     for (uint i = 0; i < l->nsections; i++) {
         seg_of[i] = -1;
@@ -464,24 +469,24 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     }
     for (uint i = 0; i < l->nsections; i++) {
         struct output_section *s = &l->sections[i];
-        uint cur = out->len, o;
+        uint64_t cur = out->len, o;
         int k = seg_of[i];
         if (k >= 0 && segs[k].n > 0 && segs[k].first == i && !segs[k].headers) {
             /* The smallest offset >= the end with offset = vaddr (mod p_align). */
             uint64_t a = segs[k].align;
-            seg_offset[k] = (uint)(cur + (segs[k].vaddr % a + a - cur % a) % a);
+            seg_offset[k] = cur + (segs[k].vaddr % a + a - cur % a) % a;
             o = seg_offset[k];
         } else if (s->nobits) {
             o = cur;
         } else if (k < 0) {
             o = align_len(cur, s->align);
         } else {
-            o = seg_offset[k] + (uint)(s->addr - segs[k].vaddr);
+            o = seg_offset[k] + (s->addr - segs[k].vaddr);
         }
         sec_offset[i] = o;
-        buf_pad(out, o);
+        buf_pad(out, mem_len(o));
         if (!s->nobits) {
-            buf_put(out, images[i], (uint)s->size);
+            buf_put(out, images[i], mem_len(s->size));
         }
     }
     free(seg_of);
@@ -514,7 +519,7 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     buf_byte(&strtab, 0);
     buf_byte(&shstrtab, 0);
     uint first_global = symtab(l, strip, &syms, &strtab);
-    buf_pad(out, align_len(out->len, class->word));
+    buf_pad(out, mem_len(align_len(out->len, class->word)));
     uint symtab_off = out->len;
     buf_put(out, syms.data, syms.len);
     uint strtab_off = out->len;
@@ -522,9 +527,9 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     uint ndebug = strip ? 0 : l->ndebug;
     uint *debug_off = xcalloc((ndebug + 1) * sizeof(uint));
     for (uint k = 0; k < ndebug; k++) {
-        buf_pad(out, align_len(out->len, l->debug[k].align));
+        buf_pad(out, mem_len(align_len(out->len, l->debug[k].align)));
         debug_off[k] = out->len;
-        buf_put(out, debug[k], (uint)l->debug[k].size);
+        buf_put(out, debug[k], mem_len(l->debug[k].size));
     }
 
     /* Section headers. */
@@ -549,7 +554,7 @@ void write_elf(struct layout *l, uchar **images, uchar **debug, int strip, struc
     shdr(&h, shstrtab_name, SHT_STRTAB, 0, 0, out->len, shstrtab.len, 0, 0, 1, 0);
     uint nshdrs = h.len / class->shdr;
     buf_put(out, shstrtab.data, shstrtab.len);
-    buf_pad(out, align_len(out->len, class->word));
+    buf_pad(out, mem_len(align_len(out->len, class->word)));
     uint shoff = out->len;
     buf_put(out, h.data, h.len);
 
