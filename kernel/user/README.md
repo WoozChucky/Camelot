@@ -17,7 +17,10 @@ objects and executables there. Assembly that differs between the widths is a
 `.S` file, preprocessed for each with `include/asm.h` (`REG_L`, `SZREG`).
 A program starts as Linux starts one: `main(argc, argv, envp)`, with the
 auxiliary vector after `envp` (docs/camelot-syscalls.md, "Starting a
-program").
+program"); crt0 makes `envp` the C library's `environ`, which `getenv`
+looks in and a program passes on to `spawn` and `exec`. The shell starts
+with the kernel's environment for the first process, Linux's for init
+(`HOME=/`, `TERM=linux`), and passes its exported variables on.
 
 ## The basic programs
 
@@ -27,7 +30,7 @@ for `grep`, whose 1 means "no line matched".
 
 | Program | Usage | What it does |
 |---|---|---|
-| `sh` | `sh` | the shell: commands, `<`, `>`, `\|`, `&`, and the built-ins `cd`, `wait`, `exit`, `exec`, `help`; it reads the console a line at a time, any other input (a connection from `shd`, a pipe, a file) a byte at a time, up to each newline |
+| `sh` | `sh` | the shell: commands, `<`, `>`, `\|`, `&`, `NAME=VALUE` assignments, and the built-ins `cd`, `wait`, `exit`, `exec`, `export`, `unset`, `help`; it reads the console a line at a time, any other input (a connection from `shd`, a pipe, a file) a byte at a time, up to each newline |
 | `ls` | `ls [PATH...]` | lists directories (the working directory without arguments): type, inode, links, size, name |
 | `cat` | `cat [FILE...]` | copies files, or its input, to its output; refuses a directory |
 | `echo` | `echo [-n] [ARG...]` | prints its arguments, with a newline unless `-n` |
@@ -40,6 +43,8 @@ for `grep`, whose 1 means "no line matched".
 | `grep` | `grep [-v] [-c] [-n] PATTERN [FILE...]` | prints the lines that contain a fixed string; `-v` those that don't, `-c` how many, `-n` with their numbers |
 | `ps` | `ps` | lists the processes (`procs`): pid, parent, state, size, name |
 | `harts` | `harts` | lists the harts (`harts`): id, the process running on it (`-` while idle), the ticks it has taken and the processes it has switched to |
+| `env` | `env [-i] [-u NAME]... [NAME=VALUE]... [PROG [ARG...]]` | runs PROG with its environment emptied (`-i`), without NAME (`-u`) or with NAME set, or without PROG prints the environment; 125 if env fails, 127 if there is no PROG, 126 if it can't be run |
+| `printenv` | `printenv [NAME...]` | prints the value of each NAME (`getenv`), a line each, or the whole environment without a NAME; exits 1 if a NAME has no value |
 | `kill` | `kill PID...` | ends processes (`kill`): they exit with status -1; not the shell, whose end is Camelot's |
 | `sleep` | `sleep SECONDS` | waits, `0.5` for half a second (the clock ticks 10 times a second) |
 

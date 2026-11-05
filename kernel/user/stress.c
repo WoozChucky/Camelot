@@ -150,7 +150,7 @@ int main(int argc, char **argv) {
     for (uint w = 0; w < workers; w++) {
         snprintf(id, sizeof id, "%u", w + 1);
         char *args[] = {"stress", "worker", id, count, NULL};
-        pids[w] = spawn("/bin/stress", args);
+        pids[w] = spawn("/bin/stress", args, environ);
         if (pids[w] < 0) {
             break;
         }

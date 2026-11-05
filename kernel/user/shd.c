@@ -125,7 +125,7 @@ static int spawn_shell(int fd) {
     for (int i = 0; i < 3; i++) {
         put_at(i, fd);
     }
-    int pid = spawn("/bin/sh", argv);
+    int pid = spawn("/bin/sh", argv, environ);
     for (int i = 0; i < 3; i++) {
         put_at(i, own[i]);
     }

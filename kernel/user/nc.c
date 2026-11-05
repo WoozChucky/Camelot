@@ -94,7 +94,7 @@ static int start_sender(int sock) {
     argv[0] = "nc";
     argv[1] = "-s";
     argv[2] = NULL;
-    int pid = spawn("/bin/nc", argv);
+    int pid = spawn("/bin/nc", argv, environ);
     close(STDOUT);
     dup(saved);
     close(saved);

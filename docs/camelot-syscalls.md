@@ -113,7 +113,7 @@ checks each size.
 | 4 | `getpid` | | the caller's pid |
 | 5 | `yield` | | 0 |
 | 6 | `sleep` | `uint ticks` | 0 |
-| 7 | `spawn` | `const char *path, char *const argv[]` | the child's pid; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-EAGAIN`, `-ENOMEM`, `-EFAULT` |
+| 7 | `spawn` | `const char *path, char *const argv[], char *const envp[]` | the child's pid; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-EAGAIN`, `-ENOMEM`, `-EFAULT` |
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
 | 9 | `sbrk` | `long increment` | the old end of the heap, a pointer; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
@@ -127,7 +127,7 @@ checks each size.
 | 18 | `chdir` | `const char *path` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EFAULT` |
 | 19 | `dup` | `int fd` | the new descriptor; `-EBADF`, `-EMFILE` |
 | 20 | `pipe` | `int *fds` | 0; `-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT` |
-| 21 | `exec` | `const char *path, char *const argv[]` | does not return; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-ENOMEM`, `-EFAULT` |
+| 21 | `exec` | `const char *path, char *const argv[], char *const envp[]` | does not return; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-ENOMEM`, `-EFAULT` |
 | 22 | `kill` | `int pid` | 0; `-ESRCH`, `-EPERM` |
 | 23 | `procs` | `struct procinfo *buf, uint max` | the number of processes; `-EFAULT` |
 | 24 | `netinfo` | `struct netinfo *info` | 0; `-ENODEV`, `-EFAULT` |
@@ -219,7 +219,7 @@ every timer tick (10 Hz), so yielding is only ever a courtesy.
 the nominal clock) have passed, without using the CPU meanwhile. `sleep(0)`
 returns at once.
 
-**spawn(path, argv)** starts the program at `path` ("Running programs"
+**spawn(path, argv, envp)** starts the program at `path` ("Running programs"
 below) as a new process, a child of the caller, and returns its pid. From
 then on both take turns on the CPU with the other runnable processes. The
 child gets copies of the caller's descriptors 0, 1 and 2 (sharing their
@@ -228,21 +228,41 @@ that closes on exec, since `spawn` stands for a fork and an exec, as
 `posix_spawn` does) and no other, and the caller's working directory. Its name, in the kernel's messages, is the
 last name of `path`. `argv` is the child's argument list, an array of string
 pointers ending with a null pointer, `argv[0]` conventionally the program's
-name; a null `argv` stands for `{ path, NULL }`. The kernel copies the
-strings onto the child's stack ("Starting a program" below), so the caller's
-array can go as soon as `spawn` returns. Errors:
+name; a null `argv` stands for `{ path, NULL }`. `envp` is its environment,
+as `execve` takes it: an array of pointers to `NAME=value` strings ending
+with a null pointer (the kernel copies any string, `=` or not: what a
+`NAME=value` is, is the C library's business, `getenv`'s), which programs
+usually pass on from their own (`environ`, "The user library"); a null
+`envp` is an empty environment, as Linux takes it. The kernel copies the
+strings of both onto the child's stack ("Starting a program" below), so the
+caller's arrays can go as soon as `spawn` returns. Both are read as
+Linux's `execve` reads them (`do_execveat_common` in `fs/exec.c`), in two
+passes: first it counts argv's pointers, then envp's (`count`: an
+unreadable pointer is `-EFAULT`, more than `MAXARG` of them `-E2BIG`),
+before any string is looked at; then it copies the strings, envp's
+before argv's, each array's from its last string to its first
+(`copy_strings`). Of two errors, the call's is the first one found in
+that order: an unreadable argv string with 17 environment strings is
+`-E2BIG`, an unreadable argv string with an environment string too long
+to fit is `-E2BIG` too, and arguments over `ARG_MAX` with an unreadable
+envp are `-EFAULT`. Errors:
 
 - `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`: the path names nothing ("Paths");
 - `-EACCES`: it names a directory or a device;
-- `-E2BIG`: more than `MAXARG` (16) arguments, or their strings, with their
-  NULs, take more than `ARG_MAX` (512) bytes;
+- `-E2BIG`: more than `MAXARG` (16) arguments, or more than `MAXARG`
+  environment strings (Linux's `MAX_ARG_STRINGS` bounds each array alike),
+  or the strings of both together, with their NULs, take more than
+  `ARG_MAX` (1024) bytes (POSIX's `ARG_MAX` counts the environment in; so
+  no one string is longer than that, Linux's `MAX_ARG_STRLEN`; Linux also
+  counts the pointers against its limit, where Camelot bounds them with
+  `MAXARG`);
 - `-ENOEXEC`: the file is not a valid executable (the kernel also prints why
   on the console: `spawn: PATH: REASON`);
 - `-EAGAIN`: every one of the 8 process slots is taken (zombies count until
   they are collected), or every one of the 16 thread slots;
 - `-ENOMEM`: not enough free memory;
-- `-EFAULT`: `path`, `argv` or one of the strings is not readable (a path
-  longer than `MAXPATH` is still read to its NUL).
+- `-EFAULT`: `path`, `argv`, `envp` or one of their strings is not
+  readable (a path longer than `MAXPATH` is still read to its NUL).
 
 **wait(pid, status)** collects a child that has ended and returns its pid:
 the child `pid`, or any child if `pid` is -1. If none has ended yet, it
@@ -397,9 +417,11 @@ read end) and `fds[1]` (the write end), the lowest two free ("Pipes").
 Errors: `-EMFILE`, `-ENFILE`, `-ENOMEM` (no page for its buffer), or
 `-EFAULT` if `fds` is not 8 writable bytes; nothing is opened then.
 
-**exec(path, argv)** replaces the caller's program with the one at `path`:
-its address space goes, and the new program starts as one started by
-`spawn` does ("Starting a program"), with `argv`, in the same process. Its
+**exec(path, argv, envp)** replaces the caller's program with the one at
+`path`: its address space goes, and the new program starts as one started
+by `spawn` does ("Starting a program"), with `argv` and the environment
+`envp` (not the old program's: an `exec` that should keep it passes
+`environ`), in the same process. Its
 pid, parent, descriptors and working directory stay, but for the
 descriptors with `FD_CLOEXEC` set (`fcntl`), which are closed once the new
 program has replaced the old one; its name becomes the last name of `path`. Its other threads, if it has any, end
@@ -903,18 +925,26 @@ stack's first page, each word a `long`, a pointer's size (4 bytes on RV32,
 USER_TOP     a word of zeros, the end marker
              the path the program was started with (AT_EXECFN),
              NUL-terminated
+             the environment's strings, envp[0]'s first, each
+             NUL-terminated
              the argument strings, argv[0]'s first, each NUL-terminated
-             (an environment's strings would go between the two: spawn
-             and exec pass none)
              padding to a multiple of 16
              16 random bytes (AT_RANDOM)
              padding
              the auxiliary vector: pairs of words, a type and a value,
              the last pair AT_NULL
-envp         a null pointer: the environment, empty
+envp         envp[0] ... envp[envc - 1], then a null pointer
 argv         argv[0] ... argv[argc - 1], then a null pointer
 sp           argc
 ```
+
+The strings are in the order Linux copies them down from the top (the
+path, then the environment's, then the arguments', each array's in its
+own order: `copy_string_kernel` and `copy_strings` in `fs/exec.c`), one
+right after another, so argv[0]'s string is the lowest and envp's last
+ends right below the path; each pointer points at its string. The first
+process, the shell, gets the environment Linux gives init
+(`envp_init` in `init/main.c`): `HOME=/` and `TERM=linux`.
 
 The auxiliary vector has Linux's entries, in Linux's order, with Linux's
 type numbers (`AT_*` in `user.h` and `kernel/include/syscall.h`), but for
@@ -944,9 +974,11 @@ signals, no platform string):
 `MAXARG`, `ARG_MAX` and `MAXPATH` keep all of it in the first half of the
 page. Every page the program gets (its segments beyond their file bytes,
 `.bss`, the stack, the heap) reads zero. `_start` loads `argc` from `sp`,
-finds `argv` right above it and `envp` past `argv`'s null pointer, calls
-`main(argc, argv, envp)` and passes its return value to `exit`. A program
-that wants the auxiliary vector walks past `envp`'s null pointer to it.
+finds `argv` right above it and `envp` past `argv`'s null pointer, makes
+`envp` the C library's `environ` (as glibc's `__libc_start_main` does),
+calls `main(argc, argv, envp)` and passes its return value to `exit`. A
+program that wants the auxiliary vector walks past `envp`'s null pointer
+to it.
 
 ## Console input
 
@@ -991,7 +1023,10 @@ its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 and a width, and `l` for a `long`, `ll` for a `long long`, `z` for a
 `size_t`), `puts`, line input (`getline`, one read of the console
 without the newline; readers, `reader_getline`, for files and pipes),
-`strerror`, `stat` (`open`, `fstat`, `close`), `spin` (a busy loop),
+`strerror`, `stat` (`open`, `fstat`, `close`), `spin` (a busy loop), the
+environment (`environ`, which crt0 sets to `main`'s `envp`, and `getenv`,
+`setenv`, `unsetenv` over it, as POSIX has them but for returning a
+negative error number),
 addresses and names (`htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`,
 `inet_addr`, `inet_ntoa`, `sockaddr_set`; `resolve`, a DNS client, and
 `resolve_error`), and threads (`thread_start`; the atomics `atomic_swap`,
@@ -1001,7 +1036,12 @@ spinlock` with `spin_lock` and `spin_unlock`; `struct mutex` with
 `malloc` and its kin may be called from several threads at once; so may
 the rest, but `resolve` (which keeps its DNS messages in static buffers)
 and `inet_ntoa` (which returns one), and a `struct reader` must not be
-shared without a lock.
+shared without a lock. `setenv` and `unsetenv` hold a lock of their own,
+as glibc's do (its `envlock`), so they may run in several threads at
+once, but not alongside `getenv` or anything else that reads `environ`
+(a `setenv` may move the array): as in glibc, and as POSIX allows, where
+none of the three need be thread-safe, a program that changes its
+environment while another thread reads it keeps the two apart itself.
 `syscall(number, a0, a1, a2)` makes any call by number, for tests, and
 returns its `long` result.
 
