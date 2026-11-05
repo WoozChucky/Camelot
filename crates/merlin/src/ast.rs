@@ -19,7 +19,7 @@
 //! Typedefs, struct tags and enum constants are gone even earlier: the parser
 //! resolves them, so the tree only has types and numbers.
 
-use crate::types::{Spelled, Type, Xlen};
+use crate::types::{Spelled, Spellings, Type, Xlen};
 use crate::Pos;
 use std::fmt::Write;
 
@@ -238,11 +238,21 @@ impl Function {
     /// The function's type.
     pub fn ty(&self) -> Type {
         let params = self.params.iter().map(|p| p.ty.unqual().clone()).collect();
-        if self.variadic {
+        let mut ty = if self.variadic {
             Type::variadic_func(self.ret.clone(), params)
         } else {
             Type::func(self.ret.clone(), params)
+        };
+        // The parameters as they were spelled, which tell their enums.
+        if let Type::Func(f) = &mut ty {
+            f.spelled = Spellings(
+                self.params
+                    .iter()
+                    .map(|p| (p.ty.clone(), p.spelled.clone()))
+                    .collect(),
+            );
         }
+        ty
     }
 }
 

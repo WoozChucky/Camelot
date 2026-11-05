@@ -480,11 +480,68 @@ impl FuncType {
                         .iter()
                         .zip(&other.params)
                         .all(|(a, b)| a.unqual().compatible(b.unqual()))
+                    && !self.param_enums_differ(other)
             }
             (false, false) => true,
             (true, false) => !self.variadic && self.params.iter().all(promotes_to_itself),
             (false, true) => !other.variadic && other.params.iter().all(promotes_to_itself),
         }
+    }
+
+    /// The parameter `i` as its declaration spelled it, if the type has
+    /// the spellings ([`Spellings`]).
+    pub fn param_spelled(&self, i: usize) -> Option<&Spelled> {
+        let all = &self.spelled.0;
+        all.get(i)
+            .filter(|_| all.len() == self.params.len())
+            .map(|(_, s)| s)
+    }
+
+    /// Whether a parameter of each is of a different enum ([`distinct_enums`]).
+    fn param_enums_differ(&self, other: &FuncType) -> bool {
+        self.params
+            .iter()
+            .zip(&other.params)
+            .enumerate()
+            .any(
+                |(i, (a, b))| match (self.param_spelled(i), other.param_spelled(i)) {
+                    (Some(sa), Some(sb)) => distinct_enums(a, sa, b, sb),
+                    _ => false,
+                },
+            )
+    }
+}
+
+/// The enum `ty` is, if a declaration `spelled` so declared the type it
+/// is the base of: clang's enum types are types of their own, compatible
+/// with their integer type, where merlin's are that integer type; what
+/// tells them apart is how the declarations spelled them.
+pub fn enum_of<'s>(spelled: &'s Spelled, ty: &Type) -> Option<&'s Arc<EnumType>> {
+    let mut s = spelled;
+    while let Some(Spelling::Typedef(t)) = &s.0 {
+        s = &t.spelled;
+    }
+    match &s.0 {
+        Some(Spelling::Enum(e)) if *ty.unqual() == e.ty => Some(e),
+        _ => None,
+    }
+}
+
+/// Whether `a`, of a declaration `sa` spelled, and `b`, of one `sb`
+/// spelled, are made of two different enums where they are alike: at the
+/// base the declarator builds on (what pointers, arrays and a function's
+/// result lead to), or in a function's parameters (as each spelled its
+/// own). Two such types are not compatible in clang, as two enum types
+/// are not (C99 6.7.2.2p4), though merlin's types are the same.
+pub fn distinct_enums(a: &Type, sa: &Spelled, b: &Type, sb: &Spelled) -> bool {
+    match (a.unqual(), b.unqual()) {
+        (Type::Ptr(x), Type::Ptr(y)) | (Type::Array(x, _), Type::Array(y, _)) => distinct_enums(x, sa, y, sb),
+        (Type::Func(f), Type::Func(g)) => distinct_enums(&f.ret, sa, &g.ret, sb) || f.param_enums_differ(g),
+        (Type::Int(_), Type::Int(_)) => match (enum_of(sa, a), enum_of(sb, b)) {
+            (Some(x), Some(y)) => !Arc::ptr_eq(x, y),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -680,6 +737,17 @@ impl Type {
             (Type::Ptr(a), Type::Ptr(b)) => a.similar(b),
             (Type::Array(a, n), Type::Array(b, m)) => n == m && a.similar(b),
             (a, b) => a == b,
+        }
+    }
+
+    /// The type without its qualifiers, an array's (its elements') too, as
+    /// clang's `getUnqualifiedType`: what pointers to it and to its
+    /// qualified versions point to alike (C99 6.5.16.1p1, 6.5.6p3, 6.5.8p2,
+    /// 6.5.9p2), where [`Self::quals`] are the qualifiers it leaves out.
+    pub fn without_quals(&self) -> Type {
+        match self.unqual() {
+            Type::Array(elem, n) => Type::Array(Box::new(elem.without_quals()), *n),
+            t => t.clone(),
         }
     }
 
@@ -889,44 +957,58 @@ impl Type {
     /// for after it (`'T *' (aka 'int *')`); as an enum, `'enum e'`.
     pub fn named(&self, spelled: &Spelled) -> String {
         // What the type is without its typedef names, clang's "canonical
-        // type": an enum (which merlin's types leave out) is still one.
-        let mut canonical = spelled;
-        while let Some(Spelling::Typedef(t)) = &canonical.0 {
-            canonical = &t.spelled;
-        }
-        let plain = match &canonical.0 {
-            Some(Spelling::Enum(e)) => self.declare_with("", Some((&e.ty, &e.name()))),
-            _ => self.declare(""),
-        };
+        // type" (an enum, which merlin's types leave out, is still one), and
+        // with them: of the base, and of each parameter as it was spelled.
+        let plain = self.spelled_as("", spelled, false);
+        let sugared = self.spelled_as("", spelled, true);
         match &spelled.0 {
-            Some(Spelling::Typedef(t)) => {
-                let sugared = self.declare_with("", Some((&t.ty, &t.name)));
+            Some(Spelling::Typedef(_)) => {
                 if sugared != plain {
                     format!("'{sugared}' (aka '{plain}')")
                 } else {
                     format!("'{sugared}'")
                 }
             }
+            _ if sugared != plain => format!("'{sugared}' (aka '{plain}')"),
             _ => format!("'{plain}'"),
         }
+    }
+
+    /// The type as a declaration of `name` spelled as `spelled` (and its
+    /// parameters as theirs) says: with typedef names if `sugar`, else
+    /// only with enums' names.
+    fn spelled_as(&self, name: &str, spelled: &Spelled, sugar: bool) -> String {
+        let mut base = spelled;
+        while let (Some(Spelling::Typedef(t)), false) = (&base.0, sugar) {
+            base = &t.spelled;
+        }
+        let written = match &base.0 {
+            Some(Spelling::Typedef(t)) => Some((&t.ty, t.name.clone())),
+            Some(Spelling::Enum(e)) => Some((&e.ty, e.name())),
+            None => None,
+        };
+        let written = written.as_ref().map(|(t, n)| (*t, n.as_str()));
+        self.declare_as(name, written, Some(sugar))
     }
 
     /// The type as a C declaration of `name`, e.g. `char *argv[4]`. With an
     /// empty name it is the type name clang prints, e.g. `int (*)[3]`.
     pub fn declare(&self, name: &str) -> String {
-        self.declare_with(name, None)
+        self.declare_as(name, None, None)
     }
 
     /// [`Self::declare`], with the part of the type that is `base.0`
-    /// written as `base.1` (a typedef's name).
-    fn declare_with(&self, name: &str, base: Option<(&Type, &str)>) -> String {
-        fn go(t: &Type, inner: String, base: Option<(&Type, &str)>) -> String {
+    /// written as `base.1` (a typedef's name), and each parameter of a
+    /// function type as it was spelled ([`Self::spelled_as`]) if `params`
+    /// says how (with typedef names or not).
+    fn declare_as(&self, name: &str, base: Option<(&Type, &str)>, params: Option<bool>) -> String {
+        fn go(t: &Type, inner: String, base: Option<(&Type, &str)>, sugar: Option<bool>) -> String {
             if let Some((b, written)) = base {
                 if t == b {
                     return join(written, &inner);
                 }
             }
-            let go = |t: &Type, inner: String| go(t, inner, base);
+            let go = |t: &Type, inner: String| go(t, inner, base, sugar);
             match t {
                 Type::Void => join("void", &inner),
                 Type::Int(k) => join(k.name(), &inner),
@@ -942,7 +1024,11 @@ impl Type {
                     go(elem, format!("{}[{n}]", parenthesize(inner)))
                 }
                 Type::Func(f) => {
-                    let mut params: Vec<String> = f.params.iter().map(|p| p.declare("")).collect();
+                    let param = |(i, p): (usize, &Type)| match (sugar, f.param_spelled(i)) {
+                        (Some(sugar), Some(spelled)) => p.spelled_as("", spelled, sugar),
+                        _ => p.declare(""),
+                    };
+                    let mut params: Vec<String> = f.params.iter().enumerate().map(param).collect();
                     if f.variadic {
                         params.push("...".to_string());
                     }
@@ -974,7 +1060,7 @@ impl Type {
                 format!("{base} {inner}")
             }
         }
-        go(self, name.to_string(), base)
+        go(self, name.to_string(), base, params)
     }
 }
 

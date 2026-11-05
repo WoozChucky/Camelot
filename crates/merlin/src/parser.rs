@@ -93,8 +93,8 @@ use crate::ast::*;
 use crate::consteval;
 use crate::lexer::{Kw, Tok, Token};
 use crate::types::{
-    align_up, common, ptr_size, EnumType, IntKind, Quals, Record, Spelled, Spelling, Spellings, Type,
-    TypedefName, Unprototyped, Xlen, MAX_OBJECT_SIZE,
+    align_up, common, distinct_enums, ptr_size, EnumType, IntKind, Quals, Record, Spelled, Spelling,
+    Spellings, Type, TypedefName, Unprototyped, Xlen, MAX_OBJECT_SIZE,
 };
 use crate::{Error, Pos};
 use std::cell::{Cell, RefCell};
@@ -641,6 +641,8 @@ struct Decl {
     /// parameters, even though merlin takes it as `int f(void)`). `-g` says
     /// which (`DW_AT_prototyped`).
     prototyped: bool,
+    /// When it declares a function: where its parameter list opens.
+    open: Option<Pos>,
     /// Where the first array size of its own the parser folded is
     /// ([`Parser::folded`]), if one is, and where the folded ones are.
     folded: Option<Pos>,
@@ -953,17 +955,36 @@ impl Parser<'_> {
                     *prev_pos,
                 )),
             },
-            Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(..)) => Ok(()),
-            Some((Name::Typedef(prev, _), prev_pos)) if matches!(what, Name::Typedef(..)) => {
-                let Name::Typedef(new, _) = what else {
+            // A typedef name defined again: of the same type, what C11
+            // allows and clang warns of under C99 (the name is then the
+            // later's); of another, an error. Two enums are two types,
+            // though merlin's are their integer type.
+            Some((Name::Typedef(prev, prev_name), prev_pos)) if matches!(what, Name::Typedef(..)) => {
+                let Name::Typedef(new, new_name) = &what else {
                     unreachable!()
                 };
+                // How each typedef's own declaration spelled its type.
+                let base = |name: &Spelled| match &name.0 {
+                    Some(Spelling::Typedef(t)) => t.spelled.clone(),
+                    _ => Spelled::default(),
+                };
+                let (prev_base, new_base) = (base(prev_name), base(new_name));
+                if prev == new && !distinct_enums(prev, &prev_base, new, &new_base) {
+                    let msg = format!("redefinition of typedef '{name}' is a C11 feature");
+                    let w = Error::warning(pos, msg, "typedef-redefinition")
+                        .note(*prev_pos, "previous definition is here");
+                    self.warnings.borrow_mut().push(w);
+                    scope.names.insert(name.to_string(), (what, pos));
+                    return Ok(());
+                }
+                let (new, prev) = (new.named(&new_base), prev.named(&prev_base));
                 Err(Error::new(
                     pos,
-                    format!("typedef redefinition with different types ('{new}' vs '{prev}')"),
+                    format!("typedef redefinition with different types ({new} vs {prev})"),
                 )
                 .note(*prev_pos, "previous definition is here"))
             }
+            Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(..)) => Ok(()),
             Some((Name::EnumConst(..), prev_pos)) if matches!(what, Name::EnumConst(..)) => {
                 Err(redefinition(format!("enumerator '{name}'"), *prev_pos))
             }
@@ -1416,7 +1437,7 @@ impl Parser<'_> {
                 Some(self.value_type(target)?.unqual().clone())
             }
             ExprKind::Call { callee, .. } => match self.value_type(callee)?.pointee()? {
-                Type::Func(f) => Some(f.ret.clone()),
+                Type::Func(f) => Some(f.ret.unqual().clone()),
                 _ => None,
             },
             _ => None,
@@ -2313,6 +2334,7 @@ impl Parser<'_> {
         let mut ty = base.clone();
         let mut func = None;
         let mut prototyped = false;
+        let mut func_open = None;
         let mut folded = None;
         let mut folded_sizes = (None, Vec::new());
         // The sizes that are not constant, which sema reports.
@@ -2414,8 +2436,10 @@ impl Parser<'_> {
                             format!("function cannot return {what} type '{ty}'"),
                         ));
                     }
-                    // A qualified result means nothing: the value is a copy.
-                    let ret = ty.unqual().clone();
+                    // A qualified result is part of the type (`const int
+                    // f(void)` and `int f(void)` conflict), though a call's
+                    // value is unqualified (sema).
+                    let ret = ty.clone();
                     let types = params.iter().map(|p| p.ty.unqual().clone()).collect();
                     ty = if variadic {
                         Type::variadic_func(ret, types)
@@ -2431,6 +2455,7 @@ impl Parser<'_> {
                     if i + 1 == steps {
                         func = Some((params, scope));
                         prototyped = with_prototype;
+                        func_open = Some(open);
                     }
                 }
             }
@@ -2445,6 +2470,7 @@ impl Parser<'_> {
             pos,
             func,
             prototyped,
+            open: func_open,
             folded,
             reach: folded_reach,
             folded_sizes,
@@ -3001,6 +3027,17 @@ impl Parser<'_> {
         for p in params.iter().filter(|p| p.name.is_empty()) {
             let msg = "omitting the parameter name in a function definition is a C23 extension";
             self.warn(Error::warning(p.pos, msg, "c23-extensions"));
+        }
+        // A qualified `void` result, which no value has: clang's warning
+        // of a definition, at its parameter list.
+        if let (Some(f), Some(open)) = (d.ty.func_type(), d.open) {
+            if f.ret.is_void() && !f.ret.quals().is_empty() {
+                let msg = format!(
+                    "function cannot return qualified void type {}",
+                    f.ret.named(&specs.spelled)
+                );
+                self.warn(Error::warning(open, msg, "qualified-void-return-type"));
+            }
         }
         // The body's outermost block shares the parameters' scope.
         self.scopes.push(scope);

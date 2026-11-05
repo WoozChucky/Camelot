@@ -266,5 +266,15 @@ pub fn cases() -> Vec<Case> {
         case("int f(void) { foo x; return 0; }", &["1:15: error: use of undeclared identifier 'foo'; did you mean 'for'?"]).then(&["1:19: error: expected '(' after 'for'"]),
         case("int f(void) { whle x; return 0; }", &["1:15: error: use of undeclared identifier 'whle'; did you mean 'while'?"]).then(&["1:20: error: expected '(' after 'while'"]),
         case("int f(void) { sizof x; return 0; }", &["1:15: error: use of undeclared identifier 'sizof'; did you mean 'sizeof'?"]).then(&["1:21: error: use of undeclared identifier 'x'"]),
+        // A typedef's redefinition: of the same type C11's, of another an error.
+        case("typedef int T; typedef int T;", &["1:28: warning: redefinition of typedef 'T' is a C11 feature [-Wtypedef-redefinition]", "1:13: note: previous definition is here"]),
+        case("typedef int T; typedef long T;", &["1:29: error: typedef redefinition with different types ('long' vs 'int')", "1:13: note: previous definition is here"]),
+        case("typedef int T; typedef int T; typedef T T;", &["1:28: warning: redefinition of typedef 'T' is a C11 feature [-Wtypedef-redefinition]", "1:13: note: previous definition is here", "1:41: warning: redefinition of typedef 'T' is a C11 feature [-Wtypedef-redefinition]", "1:28: note: previous definition is here"]),
+        case("void f(void) { typedef int T; typedef int T; }", &["1:43: warning: redefinition of typedef 'T' is a C11 feature [-Wtypedef-redefinition]", "1:28: note: previous definition is here"]),
+        case("typedef int A[]; typedef int A[3];", &["1:30: error: typedef redefinition with different types ('int[3]' vs 'int[]')", "1:13: note: previous definition is here"]),
+        case("typedef const int C; typedef int const C;", &["1:40: warning: redefinition of typedef 'C' is a C11 feature [-Wtypedef-redefinition]", "1:19: note: previous definition is here"]),
+        case("enum A { X }; enum B { Y }; typedef enum A T; typedef enum B T;", &["1:62: error: typedef redefinition with different types ('enum B' vs 'enum A')", "1:44: note: previous definition is here"]),
+        case("typedef int T; typedef T U; typedef int U;", &["1:41: warning: redefinition of typedef 'U' is a C11 feature [-Wtypedef-redefinition]", "1:26: note: previous definition is here"]),
+        case("typedef int T; void f(void) { typedef int T; }", &[]),
     ]
 }

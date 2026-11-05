@@ -36,7 +36,9 @@
 use crate::abi;
 use crate::ast::*;
 use crate::consteval;
-use crate::types::{common, ptr_size, EnumType, FuncType, IntKind, Spelled, Spelling, Type, Xlen};
+use crate::types::{
+    common, distinct_enums, enum_of, ptr_size, EnumType, FuncType, IntKind, Spelled, Spelling, Type, Xlen,
+};
 use crate::{Error, Pos};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -173,7 +175,9 @@ pub fn arith_type(op: BinOp, l: &Type, r: &Type, x: Xlen) -> Option<Type> {
         // The difference of two pointers counts elements: `ptrdiff_t`, `int`
         // on ILP32 and `long` on LP64. What they point to must be compatible
         // but for qualifiers.
-        (BinOp::Sub, Type::Ptr(a), Type::Ptr(b)) if a.unqual().compatible(b.unqual()) && sized(l) => {
+        (BinOp::Sub, Type::Ptr(a), Type::Ptr(b))
+            if a.without_quals().compatible(&b.without_quals()) && sized(l) =>
+        {
             Some(Type::Int(IntKind::ptrdiff_t(x)))
         }
         _ => None,
@@ -287,21 +291,6 @@ fn sign_pair(a: &Type, b: &Type) -> Option<bool> {
     (x != y && rank(x)? == rank(y)?).then_some(x == Char || y == Char)
 }
 
-/// The enum `ty` is, if a declaration `spelled` so declared the type it
-/// is part of: clang's enum types are types of their own, compatible with
-/// their integer type, where merlin's are that integer type; what tells
-/// them apart is how the declarations spelled them.
-fn enum_of<'s>(spelled: &'s Spelled, ty: &Type) -> Option<&'s Arc<EnumType>> {
-    let mut s = spelled;
-    while let Some(Spelling::Typedef(t)) = &s.0 {
-        s = &t.spelled;
-    }
-    match &s.0 {
-        Some(Spelling::Enum(e)) if *ty.unqual() == e.ty => Some(e),
-        _ => None,
-    }
-}
-
 /// Whether pointers to `a` and to `b`, as `sa` and `sb` spelled them, point
 /// to different types because of an enum, which merlin's types leave out:
 /// two different enums; or an enum whose type is unsigned (`enum { A }`)
@@ -316,15 +305,6 @@ fn enums_differ(a: &Type, sa: &Spelled, b: &Type, sb: &Spelled) -> bool {
             x.ty.is_unsigned() && a.unqual() != b.unqual() && b.is_integer() && a.is_integer()
         }
         (None, None) => false,
-    }
-}
-
-/// Whether two types are the same but for qualifiers, at any depth of
-/// pointers.
-fn alike(a: &Type, b: &Type) -> bool {
-    match (a.unqual(), b.unqual()) {
-        (Type::Ptr(x), Type::Ptr(y)) => alike(x, y),
-        (x, y) => x == y,
     }
 }
 
@@ -504,10 +484,11 @@ fn arity_error(
     })
 }
 
-/// Whether two declarations of a variable agree: their types are
-/// compatible ([`Type::compatible`]).
-fn compatible(a: &Type, b: &Type) -> bool {
-    a.compatible(b)
+/// Whether two declarations agree, of types `a` and `b` as `sa` and `sb`
+/// spelled them: the types are compatible ([`Type::compatible`]), and of
+/// the same enums where merlin's types do not say ([`distinct_enums`]).
+fn agree(a: &Type, sa: &Spelled, b: &Type, sb: &Spelled) -> bool {
+    a.compatible(b) && !distinct_enums(a, sa, b, sb)
 }
 
 /// A function type declared with `()`, which says nothing of the
@@ -539,9 +520,11 @@ fn deprecated_conflict(earlier: (&FuncType, Pos), later: (&FuncType, Pos, bool))
 /// (`()` and `(void)` among them), or one without a prototype and the
 /// other with one whose parameters are each what the default argument
 /// promotions make of themselves (no `char`, `short` or `_Bool`), with no
-/// `...`, and the same result.
-fn functions_compatible(a: &FuncType, b: &FuncType) -> bool {
-    a.compatible(b)
+/// `...`, and the same result (its qualifiers too, and its enum, as the
+/// declarations `sa` and `sb` spelled it).
+fn functions_compatible(a: &FuncType, sa: &Spelled, b: &FuncType, sb: &Spelled) -> bool {
+    let (a, b) = (Type::Func(Box::new(a.clone())), Type::Func(Box::new(b.clone())));
+    agree(&a, sa, &b, sb)
 }
 
 static VOID: Type = Type::Void;
@@ -592,6 +575,11 @@ struct GlobalVar {
     visible: bool,
     /// The first declarator that is not `extern` (a tentative definition).
     tentative: Option<(usize, usize)>,
+    /// The type as of the latest declarator that is not `extern`: what
+    /// clang defines the variable with when no declarator initializes it
+    /// (its "acting definition" is the last tentative one, of the type it
+    /// makes with those before it).
+    tentative_ty: Option<Type>,
 }
 
 enum Global {
@@ -604,7 +592,7 @@ impl Global {
     /// g(void);`) declares what file scope's of the name declare (C99
     /// 6.2.2), which must agree with it, but the name is in scope only in
     /// the block: until file scope declares it, it is kept hidden.
-    fn hidden(pos: Pos, ty: &Type) -> Global {
+    fn hidden(pos: Pos, ty: &Type, spelled: &Spelled) -> Global {
         match ty.func_type() {
             Some(f) => Global::Func(FuncSig {
                 ty: f.clone(),
@@ -614,7 +602,7 @@ impl Global {
                 pos,
                 def: None,
                 params: Vec::new(),
-                spelled: Spelled::default(),
+                spelled: spelled.clone(),
                 bare_def: None,
                 visible: false,
             }),
@@ -624,10 +612,11 @@ impl Global {
                 pos,
                 begin: pos,
                 defines: false,
-                spelled: Spelled::default(),
+                spelled: spelled.clone(),
                 init: None,
                 init_pos: None,
                 tentative: None,
+                tentative_ty: None,
                 visible: false,
             }),
         }
@@ -637,6 +626,14 @@ impl Global {
         match self {
             Global::Func(f) => f.visible,
             Global::Var(v) => v.visible,
+        }
+    }
+
+    /// How its declarations spelled its type (a function's, its result).
+    fn spelled(&self) -> &Spelled {
+        match self {
+            Global::Func(f) => &f.spelled,
+            Global::Var(v) => &v.spelled,
         }
     }
 
@@ -724,7 +721,7 @@ impl Checker {
                 // A definition with `()` has no parameters, and a prototype
                 // must agree in their number (C99 6.7.5.3p15).
                 let takes = |t: &FuncType| t.has_prototype() && (!t.params.is_empty() || t.variadic);
-                let problem = if !functions_compatible(&prev.ty, &sig.ty)
+                let problem = if !functions_compatible(&prev.ty, &prev.spelled, &sig.ty, &sig.spelled)
                     || (sig.defined && unprototyped(&sig.ty) && takes(&prev.ty))
                     || (prev.bare_def.is_some() && takes(&sig.ty))
                 {
@@ -813,7 +810,8 @@ impl Checker {
             item_spelled: Spelled::default(),
             written: &self.written,
             func: &f.name,
-            ret: &f.ret,
+            // What `return` converts to: the value, unqualified.
+            ret: f.ret.unqual(),
             last_param: f
                 .variadic
                 .then(|| f.params.last().map(|p| p.name.clone()))
@@ -899,10 +897,10 @@ impl Checker {
             }
         }
         f.locals = c.locals;
-        for (name, ty, pos) in linked {
+        for (name, ty, pos, spelled) in linked {
             self.globals
                 .entry(name)
-                .or_insert_with(|| Global::hidden(pos, &ty));
+                .or_insert_with(|| Global::hidden(pos, &ty, &spelled));
         }
     }
 
@@ -937,10 +935,12 @@ impl Checker {
             }
             Some(Global::Var(prev)) => {
                 let note = previous(prev.pos, prev.defines);
-                let problem = if !compatible(&prev.ty, &d.ty) {
+                let problem = if !agree(&prev.ty, &prev.spelled, &d.ty, &d.spelled) {
                     let msg = format!(
-                        "redefinition of '{}' with a different type: '{}' vs '{}'",
-                        d.name, d.ty, prev.ty
+                        "redefinition of '{}' with a different type: {} vs {}",
+                        d.name,
+                        d.ty.named(&d.spelled),
+                        prev.ty.named(&prev.spelled)
                     );
                     Some((msg, note))
                 } else if let (Some(first), true) = (prev.init_pos, init.is_some()) {
@@ -968,6 +968,9 @@ impl Checker {
                 // int (*p[])(int);` an `int (*[2])(int)`.
                 prev.ty = prev.ty.composite(&d.ty);
                 d.ty = prev.ty.clone();
+                if tentative.is_some() {
+                    prev.tentative_ty = Some(d.ty.clone());
+                }
                 prev.init = prev.init.or(init);
                 prev.init_pos = prev.init_pos.or(init.map(|_| d.pos));
                 prev.tentative = prev.tentative.or(tentative);
@@ -990,6 +993,7 @@ impl Checker {
                         init,
                         init_pos: init.map(|_| d.pos),
                         tentative,
+                        tentative_ty: tentative.map(|_| d.ty.clone()),
                         visible: true,
                     }),
                 );
@@ -1062,21 +1066,33 @@ impl Checker {
     /// definition, which then means "zero"). Only `extern` declarations: the
     /// variable is defined in another file.
     fn mark_definitions(&mut self, prog: &mut Program) {
-        let mut defs: Vec<((usize, usize), Type)> = Vec::new();
+        let mut defs: Vec<((usize, usize), bool, Type)> = Vec::new();
         for g in self.globals.values() {
             if let Global::Var(v) = g {
                 if let Some(at) = v.init.or(v.tentative) {
-                    defs.push((at, v.ty.clone()));
+                    // The type it is defined with, as clang has it: the
+                    // initialized declarator's, or the last tentative one's;
+                    // the whole of the declarations' when the initializer
+                    // completed it.
+                    let ty = match (v.init, &v.tentative_ty) {
+                        (None, Some(t)) => t.clone(),
+                        _ => v.ty.clone(),
+                    };
+                    defs.push((at, v.init.is_some(), ty));
                 }
             }
         }
-        defs.sort_by_key(|(at, _)| *at);
-        for ((i, j), ty) in defs {
+        defs.sort_by_key(|(at, ..)| *at);
+        for ((i, j), init, ty) in defs {
             let Item::Decl(decls) = &mut prog.items[i] else {
                 unreachable!("recorded from a declaration")
             };
             let d = &mut decls[j];
-            let mut ty = ty;
+            let mut ty = if init && d.ty.size(self.xlen).is_some() {
+                d.ty.clone()
+            } else {
+                ty
+            };
             match &mut ty {
                 // `int a[];` and nothing more: C99 6.9.2p5's example, an
                 // array of one element, with clang's warning.
@@ -1378,7 +1394,7 @@ struct FnChecker<'a> {
     registers: HashSet<usize>,
     /// What its blocks declared with linkage (`extern int x;`), in order:
     /// [`Global::hidden`].
-    linked: Vec<(String, Type, Pos)>,
+    linked: Vec<(String, Type, Pos, Spelled)>,
     /// Where its blocks' declarations are that conflict with an earlier
     /// one (`int h(char);`, then `int h();` in a block): clang marks them
     /// invalid, and says nothing more of what uses them.
@@ -2334,7 +2350,8 @@ impl<'a> FnChecker<'a> {
                 .last_mut()
                 .expect("a scope")
                 .insert(d.name.clone(), binding);
-            self.linked.push((d.name.clone(), d.ty.clone(), d.pos));
+            self.linked
+                .push((d.name.clone(), d.ty.clone(), d.pos, d.spelled.clone()));
             d.var = Some(var);
             if d.init.is_some() {
                 let msg = "declaration of block scope identifier with linkage cannot have an initializer";
@@ -3234,20 +3251,20 @@ impl<'a> FnChecker<'a> {
             }
             (Type::Ptr(_), Type::Ptr(_) | Type::Int(_)) if null => return Ok(()),
             (Type::Ptr(a), Type::Ptr(b)) => {
-                let (au, bu) = (a.unqual(), b.unqual());
-                let funcs = |a: &Type, b: &Type| match (a.func_type(), b.func_type()) {
-                    (Some(f), Some(g)) => functions_compatible(f, g),
-                    _ => a == b,
-                };
+                // What they point to without the qualifiers, an array's
+                // elements' too, which only the qualifiers' check is of.
+                let (au, bu) = (&a.without_quals(), &b.without_quals());
                 if au.is_func() && bu.is_func() {
-                    if funcs(au, bu) {
+                    if agree(au, to_spelled, bu, from_spelled) {
                         return Ok(());
                     }
                     (
                         "incompatible function pointer types",
                         Some("incompatible-function-pointer-types"),
                     )
-                } else if enums_differ(au, to_spelled, bu, from_spelled) {
+                } else if enums_differ(au, to_spelled, bu, from_spelled)
+                    || distinct_enums(au, to_spelled, bu, from_spelled)
+                {
                     ("incompatible pointer types", Some("incompatible-pointer-types"))
                 } else if au.compatible(bu) || au.is_void() || bu.is_void() {
                     if !a.quals().contains(b.quals()) {
@@ -3270,7 +3287,7 @@ impl<'a> FnChecker<'a> {
                     );
                     self.errors.push(Error::warning(at, msg, "pointer-sign"));
                     return Ok(());
-                } else if alike(au, bu) {
+                } else if au.similar(bu) {
                     // `const char **` from `char **`: the same but for
                     // qualifiers further in, which clang only warns of.
                     let msg = format!(
@@ -3501,9 +3518,10 @@ impl<'a> FnChecker<'a> {
             (msg, "previous definition is here")
         } else if ty.is_func() {
             return false;
-        } else if !compatible(&ty, &d.ty) {
+        } else if !agree(&ty, &self.spelling_at(prev), &d.ty, &d.spelled) {
             let what = if external { "redeclaration" } else { "redefinition" };
-            let msg = format!("{what} of '{name}' with a different type: '{}' vs '{ty}'", d.ty);
+            let (new, old) = (d.ty.named(&d.spelled), ty.named(&self.spelling_at(prev)));
+            let msg = format!("{what} of '{name}' with a different type: {new} vs {old}");
             (msg, previous(prev, !linked).1)
         } else if external && linked {
             return false;
@@ -3523,13 +3541,21 @@ impl<'a> FnChecker<'a> {
         true
     }
 
+    /// How the declaration at `pos` spelled its type.
+    fn spelling_at(&self, pos: Pos) -> Spelled {
+        self.spellings.get(&pos).cloned().unwrap_or_default()
+    }
+
     fn linkage_redeclared(&mut self, d: &mut Declarator) -> bool {
         let name = &d.name;
         let earlier = match self.linked.iter().rev().find(|(n, ..)| n == name) {
-            Some((_, ty, pos)) => Some((ty.clone(), *pos, false)),
-            None => self.globals.get(name).map(Global::declaration),
+            Some((_, ty, pos, spelled)) => Some((ty.clone(), *pos, false, spelled.clone())),
+            None => self.globals.get(name).map(|g| {
+                let (ty, pos, definition) = g.declaration();
+                (ty, pos, definition, g.spelled().clone())
+            }),
         };
-        let Some((ty, pos, definition)) = earlier else {
+        let Some((ty, pos, definition, spelled)) = earlier else {
             return false;
         };
         // C23's conflict of one without a prototype and one with, before
@@ -3538,13 +3564,12 @@ impl<'a> FnChecker<'a> {
             let w = deprecated_conflict((a, pos), (b, d.pos, false));
             self.errors.extend(w);
         }
+        let agrees = agree(&ty, &spelled, &d.ty, &d.spelled);
         let msg = match (ty.is_func(), d.ty.is_func()) {
-            (true, true) if !ty.compatible(&d.ty) => format!("conflicting types for '{name}'"),
-            (false, false) if !compatible(&ty, &d.ty) => {
-                format!(
-                    "redeclaration of '{name}' with a different type: '{}' vs '{ty}'",
-                    d.ty
-                )
+            (true, true) if !agrees => format!("conflicting types for '{name}'"),
+            (false, false) if !agrees => {
+                let (new, old) = (d.ty.named(&d.spelled), ty.named(&spelled));
+                format!("redeclaration of '{name}' with a different type: {new} vs {old}")
             }
             (true, false) | (false, true) => {
                 let e = Error::new(
@@ -4100,7 +4125,7 @@ impl<'a> FnChecker<'a> {
                 // names, as clang's notes have it.
                 let local = callee.direct_callee().and_then(|n| {
                     let (_, ty, at) = self.lookup(n)?;
-                    match Global::hidden(*at, ty) {
+                    match Global::hidden(*at, ty, &self.spelling_at(*at)) {
                         // Named and placed by the block's declaration,
                         // defined as the function is.
                         Global::Func(mut sig) => {
@@ -4195,9 +4220,10 @@ impl<'a> FnChecker<'a> {
                         return Err(Reported);
                     }
                     // A struct result is kept in a hidden local of the caller.
-                    *result = Some(self.temp(&ft.ret, "call result", pos));
+                    *result = Some(self.temp(ft.ret.unqual(), "call result", pos));
                 }
-                ft.ret
+                // A value, of the result type without its qualifiers.
+                ft.ret.unqual().clone()
             }
             ExprKind::VaStart { ap, last } => {
                 self.va_start(ap, last, pos)?;
@@ -4549,9 +4575,12 @@ impl<'a> FnChecker<'a> {
                     // without; `void *` and a function pointer, for
                     // equality only.
                     (Type::Ptr(a), Type::Ptr(b)) => {
-                        let (au, bu) = (a.unqual(), b.unqual());
+                        let (au, bu) = (&a.without_quals(), &b.without_quals());
                         let void = equality && (au.is_void() || bu.is_void());
-                        if (!au.compatible(bu) || enums_differ(au, &ls, bu, &rs)) && !void {
+                        let distinct = !au.compatible(bu)
+                            || enums_differ(au, &ls, bu, &rs)
+                            || distinct_enums(au, &ls, bu, &rs);
+                        if distinct && !void {
                             let msg = format!("comparison of distinct pointer types {pair}");
                             self.errors
                                 .push(Error::warning(pos, msg, "compare-distinct-pointer-types"));
@@ -4594,6 +4623,16 @@ impl<'a> FnChecker<'a> {
                 }
                 if op == BinOp::Div {
                     self.sizeof_division(pos, l, r);
+                }
+                // Pointers to two enums, which merlin's types leave out.
+                if let (BinOp::Sub, Type::Ptr(a), Type::Ptr(b)) = (op, &lt, &rt) {
+                    let (ls, rs) = (self.spelled_of(l), self.spelled_of(r));
+                    if distinct_enums(a, &ls, b, &rs) {
+                        let (ln, rn) = (lt.named(&ls), rt.named(&rs));
+                        return Err(
+                            self.err(pos, format!("{ln} and {rn} are not pointers to compatible types"))
+                        );
+                    }
                 }
                 let ty = arith_type(op, &lt, &rt, self.xlen)
                     .ok_or_else(|| self.invalid_operands(op, pos, &l.ty, &r.ty))?;
@@ -5357,6 +5396,7 @@ impl<'a> FnChecker<'a> {
     /// and an integer the pointer; `void` and anything, `void`.
     fn cond_type(&mut self, a: &mut Expr, b: &mut Expr, pos: Pos) -> Result<Type, Reported> {
         let (at, bt) = (a.ty.decay(), b.ty.decay());
+        let (sa, sb) = (self.spelled_of(a), self.spelled_of(b));
         let ty = match (&at, &bt) {
             (Type::Int(x), Type::Int(y)) => Type::Int(common(*x, *y, self.xlen)),
             (Type::Void, _) | (_, Type::Void) => Type::Void,
@@ -5365,21 +5405,25 @@ impl<'a> FnChecker<'a> {
             // when it is `(void *)0` (C99 6.5.15p6).
             (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(a, self.xlen) => bt.clone(),
             (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(b, self.xlen) => at.clone(),
-            // Otherwise both point to the same type (or one to void), and
-            // the result points to it with every qualifier of either side.
+            // Otherwise both point to the same type, but for the qualifiers
+            // of what they point to (an array's elements' are its own), or
+            // one to void and the other to an object, and the result points
+            // to it with every qualifier of either side. Of others clang
+            // warns, and makes the result a `void *` (C99 has none).
             (Type::Ptr(x), Type::Ptr(y)) => {
                 let q = x.quals().union(y.quals());
-                let to = if x.unqual().compatible(y.unqual()) {
-                    x.unqual().composite(y.unqual())
+                let (xu, yu) = (x.unqual(), y.unqual());
+                let void = |t: &Type, other: &Type| t.is_void() && !other.is_func();
+                if xu.compatible(yu) && !distinct_enums(xu, &sa, yu, &sb) {
+                    Type::ptr(xu.composite(yu).qualified(q))
+                } else if void(x, y) || void(y, x) {
+                    Type::ptr(Type::Void.qualified(q))
                 } else {
-                    if !x.is_void() && !y.is_void() {
-                        let msg = format!("pointer type mismatch ('{at}' and '{bt}')");
-                        self.errors
-                            .push(Error::warning(pos, msg, "pointer-type-mismatch"));
-                    }
-                    Type::Void
-                };
-                Type::ptr(to.qualified(q))
+                    let msg = format!("pointer type mismatch ({} and {})", at.named(&sa), bt.named(&sb));
+                    self.errors
+                        .push(Error::warning(pos, msg, "pointer-type-mismatch"));
+                    Type::ptr(Type::Void)
+                }
             }
             (Type::Ptr(_), Type::Int(_)) | (Type::Int(_), Type::Ptr(_)) => {
                 // Only an integer that is a null pointer constant takes the
