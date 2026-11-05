@@ -378,6 +378,9 @@ pub(crate) enum Event {
     Cast(Option<usize>),
     /// String literal `i` of [`Lines`]'s.
     Literal(usize),
+    /// An enumeration constant of this enum, which clang describes as its
+    /// code uses the constant.
+    Enum(usize),
     /// A reference to a symbol (a function's or a global's).
     Ref(String),
 }
@@ -706,6 +709,15 @@ impl Lines {
         // A cast to void has no type to keep.
         if t.is_some() {
             self.events.push(Event::Cast(t));
+        }
+    }
+
+    /// An enumeration constant of the enum `of` spells, in the code
+    /// generated.
+    pub fn enumerator(&mut self, of: &Spelled) {
+        if let Some(s) = &of.0 {
+            let t = self.spelling(s);
+            self.events.push(Event::Enum(t));
         }
     }
 

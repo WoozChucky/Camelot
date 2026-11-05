@@ -30,8 +30,9 @@
 //! initializer); then, as they are first used, the `static` functions and
 //! globals (an unused one is not emitted at all; merlin's come last). Emitting
 //! a function makes its signature's types and then, as its code comes, its
-//! locals', static locals', casts' and string literals'; emitting a global
-//! makes its initializer's string literals and then its type. An enum goes to
+//! locals', static locals', casts' and string literals', and the enums of the
+//! enumeration constants it uses; emitting a global makes its initializer's
+//! casts' types and string literals and then its type. An enum goes to
 //! the `enums` list as it is made, and a function's type or static local to
 //! its `retainedNodes`.
 //!
@@ -282,6 +283,7 @@ impl Lines {
                             make(self.literals[*l].ty, &mut locals);
                             globals.push(Child::Literal(*l));
                         }
+                        Event::Enum(t) => make(Some(*t), &mut locals),
                         Event::Ref(_) => {}
                     }
                 }

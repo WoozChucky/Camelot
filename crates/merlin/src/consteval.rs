@@ -87,7 +87,7 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> 
     use Const::*;
     let eval = |e: &Expr, xlen: Xlen| value(e, xlen, evaluated, checked);
     match &e.kind {
-        ExprKind::Num(v) => Some(Int(*v, e.ty.int_kind()?)),
+        ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => Some(Int(*v, e.ty.int_kind()?)),
         ExprKind::SizeofType(t) => Some(Int(t.size(xlen)?.into(), IntKind::size_t(xlen))),
         ExprKind::Unary(op, x) => {
             let (v, k) = int_of(eval(x, xlen)?)?;

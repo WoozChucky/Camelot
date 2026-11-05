@@ -391,6 +391,14 @@ impl Expr {
 pub enum ExprKind {
     /// An integer or character constant, in range for its type (`ty`).
     Num(i128),
+    /// An enumeration constant `name`, an `int` of value `value`, as a
+    /// number is. `of` is its enum, which `-g` describes when the code
+    /// uses the constant, as clang does.
+    Enumerator {
+        name: String,
+        value: i128,
+        of: Spelled,
+    },
     /// A string literal's bytes, without the terminating NUL; its type is
     /// `char[len + 1]`.
     Str(Vec<u8>),
@@ -713,6 +721,7 @@ impl Dumper {
         let node = |this: &mut Self, text: String| this.line(d, e.pos, &format!("{text} : {ty}"));
         match &e.kind {
             ExprKind::Num(v) => node(self, format!("Num {v}")),
+            ExprKind::Enumerator { name, value, .. } => node(self, format!("Enumerator {name} = {value}")),
             ExprKind::Str(bytes) => node(self, format!("Str {}", quote(bytes))),
             ExprKind::Var { name, var } => node(self, format!("Var {name}{}", where_(var))),
             ExprKind::Assign { op, target, value } => {

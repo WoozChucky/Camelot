@@ -665,7 +665,7 @@ impl<'a> Interp<'a> {
         self.tick()?;
         let x = self.x;
         Ok(match &e.kind {
-            ExprKind::Num(v) => *v,
+            ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => *v,
             ExprKind::Var { .. }
             | ExprKind::Str(_)
             | ExprKind::Deref(_)

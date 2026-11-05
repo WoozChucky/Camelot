@@ -1786,6 +1786,21 @@ impl<'a> FuncGen<'a, '_> {
                 if !self.elided_cases.contains(id) {
                     let label = self.case_label(*id);
                     self.label(&label);
+                    // `-g`: a case value that is an enumeration constant
+                    // describes its enum, as clang's `EmitCaseStmt` does
+                    // (`case RED:`, not `case RED + 1:`).
+                    if let (Some(d), StmtKind::Case { expr, .. }) = (self.file.debug.as_mut(), &s.kind) {
+                        let mut e = expr;
+                        while let ExprKind::Cast {
+                            x, implicit: true, ..
+                        } = &e.kind
+                        {
+                            e = x;
+                        }
+                        if let ExprKind::Enumerator { of, .. } = &e.kind {
+                            d.enumerator(of);
+                        }
+                    }
                 }
                 self.stmt(body);
             }
@@ -1954,7 +1969,7 @@ impl<'a> FuncGen<'a, '_> {
     /// constant (see "Expressions"), and says so. Any other expression is
     /// left to [`Self::expr`].
     fn folded(&mut self, e: &'a Expr) -> bool {
-        if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_)) {
+        if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_) | ExprKind::Enumerator { .. }) {
             return false;
         }
         let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
@@ -2001,6 +2016,9 @@ impl<'a> FuncGen<'a, '_> {
                 Some(true) => self.kept_casts(a),
                 _ => self.kept_casts(b),
             },
+            // clang describes the enum of a constant its code uses
+            // (`CGDebugInfo::EmitGlobalVariable` of the `EnumConstantDecl`).
+            ExprKind::Enumerator { of, .. } => self.file.debug.as_mut().expect("-g").enumerator(of),
             _ => {}
         }
     }
@@ -2026,7 +2044,8 @@ impl<'a> FuncGen<'a, '_> {
             return;
         }
         match &e.kind {
-            ExprKind::Num(v) => {
+            ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => {
+                self.kept_casts(e);
                 // The value as the register holds it: an `unsigned int`
                 // 0xffffffff is `li a0, -1`.
                 let kind = e.ty.int_kind().expect("an integer constant");

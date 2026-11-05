@@ -742,16 +742,15 @@ fn casts_not_evaluated_are_not_kept() {
     );
 }
 
-/// The typedefs `src` describes, in order.
-fn typedefs(src: &str) -> Vec<String> {
-    use elf::dies::dw;
+/// The names of the entries of `tag` that `src` describes, in order.
+fn named(src: &str, tag: u64) -> Vec<String> {
     let asm = merlin::compile_with("c.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
     let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options::default()).unwrap();
     let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
     units[0]
         .dies
         .iter()
-        .filter(|d| d.tag == dw::TAG_TYPEDEF)
+        .filter(|d| d.tag == tag)
         .filter_map(|d| d.name().map(str::to_string))
         .collect()
 }
@@ -779,7 +778,44 @@ fn initializer_casts_are_kept_as_clang_keeps_them() {
          long j = ~(K)3;\n\
          int main(void) { return 0; }\n",
     );
-    assert_eq!(typedefs(&src), ["A", "C", "D", "F", "G", "I", "J"]);
+    assert_eq!(
+        named(&src, elf::dies::dw::TAG_TYPEDEF),
+        ["A", "C", "D", "F", "G", "I", "J"]
+    );
+}
+
+/// clang describes the enum of an enumeration constant its code uses, even
+/// with no variable of it (clang 23): where the code evaluates the constant,
+/// and in a `case` label that is the constant alone; not in a static
+/// initializer, a constant condition, `sizeof`, an operand left out or a
+/// constant `switch`'s labels. An enum a function defines is its own.
+#[test]
+fn enums_are_described_for_the_constants_the_code_uses() {
+    let names = [
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+    ];
+    let mut src: String = names.iter().map(|n| format!("enum {{ {n} = 1 }};\n")).collect();
+    src.push_str(
+        "int g1 = A;\nint arr[4];\n\
+         int f(int x) {\n\
+             if (B) x++;\n\
+             x = C ? 1 : 2;\n\
+             x = sizeof(D);\n\
+             switch (x) { case E: break; case F + 1: break; }\n\
+             x = 0 && G;\n\
+             arr[H] = 1;\n\
+             x = (long)I;\n\
+             x = 1 ? J : K;\n\
+             while (L) break;\n\
+             switch (2) { case M: x = 1; break; case 2: x = N; break; }\n\
+             { enum in { Q = 3 }; x = Q; }\n\
+             return -O + x;\n\
+         }\n",
+    );
+    assert_eq!(
+        named(&src, elf::dies::dw::TAG_ENUMERATOR),
+        ["E", "H", "I", "J", "L", "N", "O", "Q"]
+    );
 }
 
 /// The types a function defines (a typedef, a struct, one in an inner block)
@@ -876,17 +912,14 @@ fn entry_tree(tool: &str, obj: &Path) -> Vec<String> {
 /// the cases whose entries clang's front end makes differently:
 /// - `func_ptrs.c`, `inline.c`: clang emits a `static` (or inline) function
 ///   once it is used, after the others, and its entry with its code; merlin's
-///   code and entries are in the order the functions come;
-/// - `enums.c`, `designated.c`: clang describes an enum whose constant its
-///   generated code uses, even with no variable of it; merlin's parser makes
-///   constants numbers.
+///   code and entries are in the order the functions come.
 ///
 /// Ignored: it needs clang and llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP`
 /// name them if they are not on the PATH).
 #[test]
 #[ignore]
 fn the_entries_are_clangs_in_clangs_order() {
-    const DIFFERENT: [&str; 4] = ["func_ptrs.c", "inline.c", "enums.c", "designated.c"];
+    const DIFFERENT: [&str; 2] = ["func_ptrs.c", "inline.c"];
     let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
     let tool = std::env::var("LLVM_DWARFDUMP").unwrap_or_else(|_| "llvm-dwarfdump".into());
     let dir = std::env::temp_dir().join(format!("merlin-order-{}", std::process::id()));

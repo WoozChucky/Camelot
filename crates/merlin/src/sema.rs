@@ -1301,7 +1301,7 @@ impl<'a> FnChecker<'a> {
         }
         let globals = self.globals;
         let ty = match &mut e.kind {
-            ExprKind::Num(_) | ExprKind::Str(_) => return Ok(()),
+            ExprKind::Num(_) | ExprKind::Enumerator { .. } | ExprKind::Str(_) => return Ok(()),
             ExprKind::Var { name, var } => match self.lookup(name) {
                 Some((v, ty, _)) => {
                     *var = Some(v.clone());
@@ -1903,7 +1903,10 @@ mod tests {
     fn uses(f: &Function) -> Vec<String> {
         fn expr(e: &Expr, out: &mut Vec<String>) {
             match &e.kind {
-                ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::SizeofType(_) => {}
+                ExprKind::Num(_)
+                | ExprKind::Enumerator { .. }
+                | ExprKind::Str(_)
+                | ExprKind::SizeofType(_) => {}
                 ExprKind::Var { name, var: v } => out.push(format!("{name}{}", var(v))),
                 ExprKind::Assign { target, value, .. } => {
                     expr(target, out);
@@ -2003,6 +2006,7 @@ mod tests {
                     x, implicit: false, ..
                 } => format!("(cast {} {})", e.ty, sx(x)),
                 ExprKind::Num(v) => v.to_string(),
+                ExprKind::Enumerator { name, .. } => name.clone(),
                 ExprKind::Var { name, .. } => name.clone(),
                 ExprKind::Binary(op, l, r) => format!("({} {} {})", op.symbol(), sx(l), sx(r)),
                 ExprKind::Assign { target, value, op } => {

@@ -252,8 +252,10 @@ struct Specs {
 enum Name {
     /// A typedef name, the type it stands for, and the name as a spelling.
     Typedef(Type, Spelled),
-    /// An enumeration constant and its value (an `int`).
-    EnumConst(i128),
+    /// An enumeration constant, its value (an `int`) and its enum, once the
+    /// enum's definition is complete (for `-g`: clang describes the enum of
+    /// a constant the code uses).
+    EnumConst(i128, Spelled),
     /// A variable or function, and its declared type: resolved by sema, but
     /// the type lets `sizeof x` size an array ([`Parser::operand_type`]).
     Object(Type),
@@ -457,7 +459,7 @@ impl Parser<'_> {
                     ),
                 ))
             }
-            Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(_)) => Ok(()),
+            Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(..)) => Ok(()),
             Some((Name::Typedef(prev, _), _)) if matches!(what, Name::Typedef(..)) => {
                 let Name::Typedef(new, _) = what else {
                     unreachable!()
@@ -467,7 +469,7 @@ impl Parser<'_> {
                     format!("typedef redefinition with different types ('{new}' vs '{prev}')"),
                 ))
             }
-            Some((Name::EnumConst(_), prev_pos)) if matches!(what, Name::EnumConst(_)) => Err(Error::new(
+            Some((Name::EnumConst(..), prev_pos)) if matches!(what, Name::EnumConst(..)) => Err(Error::new(
                 pos,
                 format!("redefinition of enumerator '{name}' (first declared at {prev_pos})"),
             )),
@@ -547,7 +549,9 @@ impl Parser<'_> {
     /// which leaves the `sizeof` for consteval to refuse.
     fn operand_type(&self, e: &Expr) -> Option<Type> {
         match &e.kind {
-            ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Cast { .. } => Some(e.ty.clone()),
+            ExprKind::Num(_) | ExprKind::Enumerator { .. } | ExprKind::Str(_) | ExprKind::Cast { .. } => {
+                Some(e.ty.clone())
+            }
             // `(int[]){1, 2, 3}`: the list completes the array's size.
             ExprKind::CompoundLit { init, .. } => match &e.ty {
                 Type::Array(elem, None) => Some(Type::array((**elem).clone(), Some(init_len(elem, init)?))),
@@ -1026,7 +1030,7 @@ impl Parser<'_> {
                     format!("enumerator value {value} is not representable as an 'int'"),
                 ));
             }
-            self.bind_name(&name, Name::EnumConst(value), pos)?;
+            self.bind_name(&name, Name::EnumConst(value, Spelled::default()), pos)?;
             negative |= value < 0;
             next = value + 1;
             constants.push((name, value));
@@ -1035,12 +1039,20 @@ impl Parser<'_> {
             }
         }
         let ty = if negative { Type::INT } else { Type::UINT };
+        let names: Vec<String> = constants.iter().map(|(n, _)| n.clone()).collect();
         let spelled = Spelled(Some(Spelling::Enum(Arc::new(EnumType {
             tag: tag.as_ref().map(|(n, _)| n.clone()),
             ty: ty.clone(),
             constants,
             pos: kw_pos,
         }))));
+        // The constants now name their enum, for the code after it.
+        let scope = self.scopes.last_mut().expect("a scope");
+        for name in &names {
+            if let Some((Name::EnumConst(_, of), _)) = scope.names.get_mut(name) {
+                *of = spelled.clone();
+            }
+        }
         if let Some((name, _)) = tag {
             self.bind_tag(&name, Tag::Enum(ty.clone(), spelled.clone()));
         }
@@ -2123,11 +2135,19 @@ impl Parser<'_> {
             }
             Tok::Ident(name) => {
                 match self.lookup_name(&name) {
-                    // An enumeration constant is just an `int`.
-                    Some(Name::EnumConst(v)) => {
-                        let v = *v;
+                    // An enumeration constant is an `int`, which remembers its
+                    // enum (none inside the enum's own definition).
+                    Some(Name::EnumConst(v, of)) => {
+                        let kind = match of.0 {
+                            Some(_) => ExprKind::Enumerator {
+                                name: name.clone(),
+                                value: *v,
+                                of: of.clone(),
+                            },
+                            None => ExprKind::Num(*v),
+                        };
                         self.advance();
-                        return Ok(Expr::new(ExprKind::Num(v), pos));
+                        return Ok(Expr::new(kind, pos));
                     }
                     Some(Name::Typedef(..)) => {
                         return Err(Error::new(
@@ -2248,7 +2268,7 @@ mod tests {
     /// The expression as an s-expression, e.g. `(+ 1 (* 2 3))`.
     pub fn sx(e: &Expr) -> String {
         match &e.kind {
-            ExprKind::Num(v) => v.to_string(),
+            ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => v.to_string(),
             ExprKind::Str(b) => quote(b),
             ExprKind::Var { name, .. } => name.clone(),
             ExprKind::Assign { op, target, value } => {
