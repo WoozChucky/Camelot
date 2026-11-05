@@ -1850,7 +1850,9 @@ impl<'a> FuncGen<'a, '_> {
         let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
             return false;
         };
-        debug_assert_eq!(e.ty.int_kind(), Some(kind), "consteval types it as sema does");
+        // A disagreement would load the wrong registers (on RV32, a `long`
+        // where sema has a `long long` pair): checked in every build.
+        assert_eq!(e.ty.int_kind(), Some(kind), "consteval types it as sema does");
         self.kept_casts(e);
         self.constant(v, kind);
         true
