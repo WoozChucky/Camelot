@@ -19,7 +19,7 @@
 //! Typedefs, struct tags and enum constants are gone even earlier: the parser
 //! resolves them, so the tree only has types and numbers.
 
-use crate::types::{Spelled, Type, Xlen};
+use crate::types::{Spelled, Spellings, Type, Xlen};
 use crate::Pos;
 use std::fmt::Write;
 
@@ -39,6 +39,49 @@ pub struct Program {
     /// The warnings so far (`Error`s of [`crate::Severity::Warning`]):
     /// what is not an error but clang warns of.
     pub warnings: Vec<crate::Error>,
+    /// What the tree does not keep of how the source was written, which
+    /// clang's warnings look at.
+    pub written: Written,
+}
+
+/// How a program was written, past its tree: where an operator had
+/// parentheses around its expression (`(a + b) << c`), and where a macro's
+/// expansion is, by the positions of the expressions: clang gives some
+/// warnings only of what is written out (`a & b == c`), and not in a
+/// macro's expansion.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Written {
+    /// The expressions in parentheses, by their positions (an operator's
+    /// is where its operator is), each with where its outermost `(` is.
+    pub parens: std::collections::HashMap<Pos, Pos>,
+    /// The positions where a macro was expanded (where its tokens are).
+    pub macros: std::collections::HashSet<Pos>,
+    /// Of each subscript `a[i]`, where its `]` is, by where its `[` is:
+    /// clang reports a subscript there.
+    pub brackets: std::collections::HashMap<Pos, Pos>,
+    /// Where an integer literal written in hex or octal is (`0xff`), which
+    /// clang takes for a bit pattern.
+    pub bit_patterns: std::collections::HashSet<Pos>,
+    /// Where each integer literal is (not a character constant): clang's
+    /// warnings of literals (its `IntegerLiteral`) know them from what
+    /// sema folds (`sizeof (int)`).
+    pub int_literals: std::collections::HashSet<Pos>,
+    /// Where each character constant is (`'a'`, clang's `CharacterLiteral`).
+    pub char_literals: std::collections::HashSet<Pos>,
+    /// Of each name read as an expression that nothing declares, the one
+    /// clang's typo correction takes it for, if there is one
+    /// (`crate::parser::correction`): where the name is, by where the
+    /// typo is.
+    pub corrections: std::collections::HashMap<Pos, Correction>,
+}
+
+/// What clang takes a misspelt name for: a name in scope, where it is
+/// declared, and its value if it is an enumeration constant.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Correction {
+    pub name: String,
+    pub pos: Pos,
+    pub enumerator: Option<(i128, crate::types::Spelled)>,
 }
 
 /// An expression the parser needed no value of, for sema to check without
@@ -62,6 +105,10 @@ pub struct Unevaluated {
     /// and took the constant to be this error (where, what) unless sema
     /// finds one in the expression.
     pub untyped: Option<(Pos, String)>,
+    /// clang's error for a constant whose type is no integer, which names
+    /// the type (`size of array has non-integer type`), where the parser
+    /// could not tell, and where: sema gives it in place of `untyped`'s.
+    pub non_integer: Option<(Pos, &'static str)>,
     /// The operand of a `?:` the parser folded, not one of `sizeof`.
     pub folded: bool,
     /// What is said of the array size a declarator folds, kept with the
@@ -72,10 +119,33 @@ pub struct Unevaluated {
     /// clang says nothing of a declarator whose size is in error.
     pub diagnostic: Option<crate::Error>,
     pub with: usize,
+    /// For a declarator at file scope whose folded sizes clang folds with
+    /// its warning ([`Unevaluated::diagnostic`]): those sizes ([`FileVla`]).
+    pub vla: Option<FileVla>,
     /// The parameters in scope where it was (C's prototype scope): those
     /// declared before it in the parameter lists it is in, outermost first,
     /// so `char a[sizeof n]` after `int n` sizes by that `n`.
     pub params: Vec<(String, Type, Pos)>,
+    /// An integer constant expression the parser evaluated (an array's
+    /// size, an enumerator's value, a `_Static_assert`'s condition), as it
+    /// resolved it (its `sizeof`s and the operands a `?:` does not choose
+    /// are theirs): sema checks it as clang checks a constant, with no
+    /// warning of what it does when it runs but of how it overflows
+    /// (-Winteger-overflow).
+    pub constant: bool,
+}
+
+/// The sizes a declarator at file scope folds, as the ranges of their
+/// operands among the declarator's [`Unevaluated`]s (those `with` the
+/// last): its own array's, if it is one, and the others'. If one of its
+/// operands has an error, clang folds none of them: one that has none is
+/// a variable-length array, clang's error at file scope (at `at`, the
+/// declarator's name).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileVla {
+    pub at: Pos,
+    pub top: Option<std::ops::Range<usize>>,
+    pub inner: Vec<std::ops::Range<usize>>,
 }
 
 impl Program {
@@ -116,6 +186,8 @@ pub enum Storage {
     None,
     Static,
     Extern,
+    /// `register`, of an object in a block: its address cannot be taken.
+    Register,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,8 +210,8 @@ pub struct Function {
     /// provides no external definition, so it is emitted without `.globl`.
     pub inline_only: bool,
     /// Declared with a prototype: a parameter list that is not `()`, which
-    /// merlin takes as `(void)` but C as saying nothing of the parameters
-    /// (`DW_AT_prototyped` under `-g`, as clang has it).
+    /// says nothing of the parameters (`DW_AT_prototyped` under `-g`, as
+    /// clang has it).
     pub prototyped: bool,
     /// `None` for a prototype (`int f(int a);`): declared here, defined elsewhere.
     pub body: Option<Vec<Stmt>>,
@@ -166,11 +238,21 @@ impl Function {
     /// The function's type.
     pub fn ty(&self) -> Type {
         let params = self.params.iter().map(|p| p.ty.unqual().clone()).collect();
-        if self.variadic {
+        let mut ty = if self.variadic {
             Type::variadic_func(self.ret.clone(), params)
         } else {
             Type::func(self.ret.clone(), params)
+        };
+        // The parameters as they were spelled, which tell their enums.
+        if let Type::Func(f) = &mut ty {
+            f.spelled = Spellings(
+                self.params
+                    .iter()
+                    .map(|p| (p.ty.clone(), p.spelled.clone()))
+                    .collect(),
+            );
         }
+        ty
     }
 }
 
@@ -184,6 +266,11 @@ pub struct Param {
     pub pos: Pos,
     /// How its type was spelled (for `-g`).
     pub spelled: Spelled,
+    /// Declared `register`: its address cannot be taken.
+    pub register: bool,
+    /// The array type it was declared as, before C adjusted it to a
+    /// pointer (clang's `-Wsizeof-array-argument`).
+    pub array: Option<Type>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,6 +301,9 @@ pub struct Declarator {
     /// else the first that is not `extern`).
     pub define: bool,
     pub pos: Pos,
+    /// Where its declaration begins (its specifiers), where clang's notes
+    /// of an array name it.
+    pub begin: Pos,
     /// How its type was spelled (for `-g`).
     pub spelled: Spelled,
     /// What the parser evaluated away in its declarator (and, for a
@@ -246,17 +336,17 @@ pub enum Init {
 
 /// One step of a designation: a member (`.name`) or an array element
 /// (`[index]`, a constant expression), each with the position of its `.` or
-/// `[`.
+/// `[` (and a member's, of its name too).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Designator {
-    Member(String, Pos),
+    Member(String, Pos, Pos),
     Index(Expr, Pos),
 }
 
 impl Designator {
     pub fn pos(&self) -> Pos {
         match self {
-            Designator::Member(_, pos) | Designator::Index(_, pos) => *pos,
+            Designator::Member(_, pos, _) | Designator::Index(_, pos) => *pos,
         }
     }
 }
@@ -290,8 +380,12 @@ pub enum StmtKind {
     Decl(Vec<Declarator>),
     /// `expr;`
     Expr(Expr),
-    /// `;`
-    Empty,
+    /// `;`. `glued`: on the line of the token before it (the `)` of the
+    /// `if` or loop whose body it is), where clang's `-Wempty-body` warns
+    /// of it.
+    Empty {
+        glued: bool,
+    },
     If {
         cond: Expr,
         then: Box<Stmt>,
@@ -324,12 +418,17 @@ pub enum StmtKind {
     Continue,
     /// `switch (cond) body`. Sema fills in every `case` of this switch (its
     /// value, converted to the promoted type of `cond`, and its id) and the
-    /// id of `default`, if there is one.
+    /// id of `default`, if there is one; and `covered`, whether `cond` is
+    /// an enum every one of whose constants has a case (clang's
+    /// `isAllEnumCasesCovered`), for which clang takes it that no other
+    /// value comes: no `default` is taken, and the switch is not passed by
+    /// ([`crate::flow`]).
     Switch {
         cond: Expr,
         body: Box<Stmt>,
         cases: Vec<(i128, usize)>,
         default: Option<usize>,
+        covered: bool,
     },
     /// `case expr: body`. Sema sets the value and an id, unique in the
     /// function, that its switch refers to. `bare`: the expression is one
@@ -352,8 +451,8 @@ pub enum StmtKind {
         name: String,
         body: Box<Stmt>,
     },
-    /// `goto name;`
-    Goto(String),
+    /// `goto name;`, with where the name is.
+    Goto(String, Pos),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -442,6 +541,8 @@ pub struct Expr {
     /// sema for everything else (before sema it is `int` elsewhere).
     pub ty: Type,
     pub pos: Pos,
+    /// Which expression it is ([`ExprId`]).
+    pub id: ExprId,
 }
 
 impl Expr {
@@ -450,9 +551,46 @@ impl Expr {
             kind,
             ty: Type::INT,
             pos,
+            id: ExprId::new(),
         }
     }
 }
+
+/// An expression's own number, which no other one made has: what tells
+/// apart two expressions at one position (all of a macro's expansion is
+/// where the macro was used), for what [`crate::flow`] finds can run. A
+/// copy has its original's. Never part of comparing trees: any two compare
+/// equal.
+#[derive(Clone, Copy, Debug)]
+pub struct ExprId(pub u64);
+
+static NEXT_EXPR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl ExprId {
+    pub fn new() -> ExprId {
+        ExprId(NEXT_EXPR.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The number the next expression gets: expressions made after this
+    /// call (by this thread) have it or a greater one.
+    pub fn next() -> u64 {
+        NEXT_EXPR.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for ExprId {
+    fn default() -> ExprId {
+        ExprId::new()
+    }
+}
+
+impl PartialEq for ExprId {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ExprId {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExprKind {
@@ -501,8 +639,10 @@ pub enum ExprKind {
     },
     /// `sizeof (type)`; sema replaces it with its value.
     SizeofType(Type),
-    /// `sizeof expr` (not evaluated); sema replaces it with its value.
-    SizeofExpr(Box<Expr>),
+    /// `sizeof expr` (not evaluated), with where the operand begins (its
+    /// `(`, if it has one: clang reports an incomplete type there); sema
+    /// replaces it with its value.
+    SizeofExpr(Box<Expr>, Pos),
     /// `c ? a : b`
     Cond(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `a, b`
@@ -513,6 +653,9 @@ pub enum ExprKind {
         name: String,
         arrow: bool,
         offset: u32,
+        /// Where the member's name is (the expression is at the `.` or
+        /// `->`): clang reports a member it cannot find there.
+        at: Pos,
     },
     /// `callee(args)`. The callee is a function designator (a function's
     /// name, or `*fp`) or a pointer to a function. Set by sema when the call
@@ -524,6 +667,9 @@ pub enum ExprKind {
         args: Vec<Expr>,
         result: Option<LocalId>,
         arg_copies: Vec<Option<LocalId>>,
+        /// Where its `(` and its `)` are, where clang reports a callee that
+        /// is no function and missing arguments.
+        parens: (Pos, Pos),
     },
     /// `__builtin_va_start(ap, last)` (`va_start`, in a variadic function
     /// whose last named parameter is `last`): points the `va_list` `ap` at
@@ -534,8 +680,8 @@ pub enum ExprKind {
     },
     /// `__builtin_va_arg(ap, T)` (`va_arg`): the variadic argument `ap`
     /// points at, of type `T` (the expression's type), and moves `ap` to
-    /// the next one.
-    VaArg(Box<Expr>),
+    /// the next one; with where `T` is written.
+    VaArg(Box<Expr>, Pos),
     /// `__builtin_va_end(ap)`: nothing to do. Sema checks it and turns it
     /// into `(void)ap`.
     VaEnd(Box<Expr>),
@@ -553,12 +699,13 @@ pub enum ExprKind {
 
 impl ExprKind {
     /// A call, before sema: no temporaries yet.
-    pub fn call(callee: Expr, args: Vec<Expr>) -> ExprKind {
+    pub fn call(callee: Expr, args: Vec<Expr>, parens: (Pos, Pos)) -> ExprKind {
         ExprKind::Call {
             callee: Box::new(callee),
             args,
             result: None,
             arg_copies: Vec::new(),
+            parens,
         }
     }
 }
@@ -654,6 +801,7 @@ impl Dumper {
             Storage::None => "",
             Storage::Static => "static ",
             Storage::Extern => "extern ",
+            Storage::Register => "register ",
         };
         let define = if decl.define { " (definition)" } else { "" };
         self.line(
@@ -683,7 +831,7 @@ impl Dumper {
                 let mut text = String::new();
                 for ds in designators {
                     match ds {
-                        Designator::Member(name, _) => text += &format!(".{name}"),
+                        Designator::Member(name, ..) => text += &format!(".{name}"),
                         Designator::Index(e, _) => {
                             text += &format!("[{}]", crate::consteval::int(e, self.xlen).unwrap_or(0))
                         }
@@ -713,7 +861,7 @@ impl Dumper {
                 self.line(d, s.pos, "ExprStmt");
                 self.expr(d + 1, e);
             }
-            StmtKind::Empty => self.line(d, s.pos, "Empty"),
+            StmtKind::Empty { .. } => self.line(d, s.pos, "Empty"),
             StmtKind::Unevaluated(us) => {
                 self.line(d, s.pos, "Unevaluated");
                 for u in us {
@@ -786,7 +934,7 @@ impl Dumper {
                 self.line(d, s.pos, &format!("Label {name}"));
                 self.stmt(d + 1, body);
             }
-            StmtKind::Goto(name) => self.line(d, s.pos, &format!("Goto {name}")),
+            StmtKind::Goto(name, _) => self.line(d, s.pos, &format!("Goto {name}")),
         }
     }
 
@@ -832,7 +980,7 @@ impl Dumper {
                 self.expr(d + 1, x);
             }
             ExprKind::SizeofType(t) => node(self, format!("Sizeof ({t})")),
-            ExprKind::SizeofExpr(x) => {
+            ExprKind::SizeofExpr(x, _) => {
                 node(self, "Sizeof".to_string());
                 self.expr(d + 1, x);
             }
@@ -852,6 +1000,7 @@ impl Dumper {
                 name,
                 arrow,
                 offset,
+                ..
             } => {
                 let op = if *arrow { "->" } else { "." };
                 node(self, format!("Member {op}{name} (offset {offset})"));
@@ -862,6 +1011,7 @@ impl Dumper {
                 args,
                 result,
                 arg_copies,
+                ..
             } => {
                 let mut text = match callee.direct_callee() {
                     Some(name) => format!("Call {name}"),
@@ -889,7 +1039,7 @@ impl Dumper {
                 self.expr(d + 1, ap);
                 self.expr(d + 1, last);
             }
-            ExprKind::VaArg(ap) => {
+            ExprKind::VaArg(ap, _) => {
                 node(self, "VaArg".to_string());
                 self.expr(d + 1, ap);
             }

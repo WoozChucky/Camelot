@@ -32,11 +32,13 @@ pub mod codegen;
 pub mod consteval;
 pub mod debug;
 pub mod elide;
+pub mod flow;
 pub mod lexer;
 pub mod md5;
 pub mod parser;
 pub mod preprocess;
 pub mod sema;
+pub mod sequence;
 pub mod types;
 
 pub use debug::DebugInfo;
@@ -47,8 +49,8 @@ use std::path::Path;
 /// A source position: which file (0 is the file being compiled, the others
 /// are the headers it includes, numbered by the preprocessor in the order
 /// it first reads them), then the 1-based line and column (columns count
-/// characters). Positions order by file first.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+/// bytes, as clang's do). Positions order by file first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Pos {
     pub file: u32,
     pub line: u32,
@@ -66,14 +68,28 @@ impl Pos {
     }
 }
 
+/// Where an unnamed struct, union or enum is declared, as clang's name for
+/// it gives the place (`struct (unnamed at t.c:3:1)`). Only the
+/// preprocessor knows the files' names, so the file is a number between
+/// two [`FILE_MARK`]s, which it replaces with the name
+/// ([`preprocess::Output::name_files`]).
+pub(crate) fn place(pos: Pos) -> String {
+    format!("{FILE_MARK}{}{FILE_MARK}{pos}", pos.file)
+}
+
+/// See [`place`].
+pub(crate) const FILE_MARK: char = '\u{1}';
+
 impl fmt::Display for Pos {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.line, self.col)
     }
 }
 
-/// A diagnostic: an error, which stops the compilation, or a warning, which
-/// does not (what clang warns of by default, as it says it).
+/// A diagnostic, as clang gives it: an error, which stops the compilation,
+/// or a warning, which does not (what clang warns of by default, in its
+/// words), each with the notes that follow it (where what it is about was
+/// declared, say). [`Error::render`] prints it as clang does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     /// Where the problem is, or line 0 when it isn't tied to a place in the source.
@@ -84,15 +100,25 @@ pub struct Error {
     /// friends, which know the names.
     pub file: Option<String>,
     pub severity: Severity,
+    /// The name of clang's `-W` flag for it, which clang prints after the
+    /// message (`[-Wgnu-folding-constant]`): every warning has one, and so
+    /// has an error clang makes of a warning by default
+    /// (`implicit-function-declaration`).
+    pub flag: Option<&'static str>,
+    /// The notes clang gives with it, in order (`'f' declared here`).
+    pub notes: Vec<Error>,
 }
 
 /// How bad a diagnostic is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Error,
-    /// A warning, with the name of clang's flag for it
-    /// (`gnu-folding-constant` for `-Wgnu-folding-constant`).
-    Warning(&'static str),
+    /// An error after which clang gives up the compilation (`'x.h' file
+    /// not found`): `fatal error:`.
+    Fatal,
+    Warning,
+    /// What follows an error or a warning, to explain it.
+    Note,
 }
 
 impl Error {
@@ -102,33 +128,95 @@ impl Error {
             msg: msg.into(),
             file: None,
             severity: Severity::Error,
+            flag: None,
+            notes: Vec::new(),
         }
     }
 
     /// A warning, of clang's warning flag `flag`.
     pub fn warning(pos: Pos, msg: impl Into<String>, flag: &'static str) -> Self {
         Error {
-            severity: Severity::Warning(flag),
+            severity: Severity::Warning,
+            flag: Some(flag),
             ..Error::new(pos, msg)
         }
     }
 
+    /// A warning clang gives with no flag (`character constant too long
+    /// for its type`).
+    pub fn warning_unflagged(pos: Pos, msg: impl Into<String>) -> Self {
+        Error {
+            severity: Severity::Warning,
+            ..Error::new(pos, msg)
+        }
+    }
+
+    /// A fatal error: clang stops there.
+    pub fn fatal(pos: Pos, msg: impl Into<String>) -> Self {
+        Error {
+            severity: Severity::Fatal,
+            ..Error::new(pos, msg)
+        }
+    }
+
+    /// A diagnostic of no place, which clang prints with no file name
+    /// (`fatal error: too many errors emitted, stopping now`).
+    pub fn unplaced(self) -> Self {
+        Error {
+            pos: Pos::default(),
+            file: Some(String::new()),
+            ..self
+        }
+    }
+
+    /// The error, with clang's flag `flag`: one of the warnings clang makes
+    /// an error by default.
+    pub fn flagged(self, flag: &'static str) -> Self {
+        Error {
+            flag: Some(flag),
+            ..self
+        }
+    }
+
+    /// The diagnostic, with a note at `pos` after the ones it has.
+    pub fn note(mut self, pos: Pos, msg: impl Into<String>) -> Self {
+        self.notes.push(Error {
+            severity: Severity::Note,
+            ..Error::new(pos, msg)
+        });
+        self
+    }
+
     pub fn is_warning(&self) -> bool {
-        matches!(self.severity, Severity::Warning(_))
+        self.severity == Severity::Warning
     }
 
     /// Formats the diagnostic the way compilers and editors expect, as
     /// clang does: `file.c:line:col: error: message`, or
     /// `file.c:line:col: warning: message [-Wflag]`, where `file` names the
-    /// file being compiled (one in a header names the header instead).
+    /// file being compiled (one in a header names the header instead), then
+    /// a line `file.c:line:col: note: message` for each note.
     pub fn render(&self, file: &str) -> String {
+        let mut lines = vec![self.first_line(file)];
+        lines.extend(self.notes.iter().map(|n| n.first_line(file)));
+        lines.join("\n")
+    }
+
+    /// The diagnostic's own line, without its notes.
+    pub fn first_line(&self, file: &str) -> String {
         let file = self.file.as_deref().unwrap_or(file);
-        let (what, flag) = match self.severity {
-            Severity::Error => ("error", String::new()),
-            Severity::Warning(flag) => ("warning", format!(" [-W{flag}]")),
+        let what = match self.severity {
+            Severity::Error => "error",
+            Severity::Fatal => "fatal error",
+            Severity::Warning => "warning",
+            Severity::Note => "note",
         };
+        let flag = self.flag.map(|f| format!(" [-W{f}]")).unwrap_or_default();
         if self.pos.line > 0 {
             format!("{file}:{}: {what}: {}{flag}", self.pos, self.msg)
+        } else if file.is_empty() {
+            // Of no file at all ([`Error::unplaced`]).
+            format!("{what}: {}{flag}", self.msg)
         } else {
             format!("{file}: {what}: {}{flag}", self.msg)
         }
@@ -136,6 +224,8 @@ impl Error {
 }
 
 impl fmt::Display for Error {
+    /// `line:col: message`, after the file's name when it is a header's:
+    /// the message alone, without its notes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(file) = &self.file {
             write!(f, "{file}:")?;
@@ -198,7 +288,7 @@ pub fn preprocess(
     opts: &Options,
     load: Loader,
 ) -> Result<preprocess::Output, Vec<Error>> {
-    preprocess::preprocess(name, src, opts, load).map_err(|e| vec![e])
+    preprocess::preprocess(name, src, opts, load)
 }
 
 /// Preprocesses an assembly source (a `.S` file, `-x assembler-with-cpp`)
@@ -215,10 +305,11 @@ pub fn preprocess_asm(name: &str, src: &str, opts: &Options, load: Loader) -> Re
 }
 
 /// Preprocesses, lexes, parses and checks one translation unit. The
-/// preprocessor and the parser stop at the first error; the checker reports
-/// every error it finds. Errors in headers have their [`Error::file`] set.
+/// preprocessor goes on after an error where clang does, the parser stops
+/// at the first; the checker reports every error it finds. Errors in
+/// headers have their [`Error::file`] set.
 pub fn parse_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result<ast::Program, Vec<Error>> {
-    let pp = preprocess(name, src, opts, load)?;
+    let pp = preprocess::preprocess_recovering(name, src, opts, load)?;
     let mut prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
     prog.warnings = pp.name_files(prog.warnings);
     Ok(prog)
@@ -237,7 +328,7 @@ pub fn compile_warned(
     opts: &Options,
     load: Loader,
 ) -> Result<(String, Vec<Error>), Vec<Error>> {
-    let pp = preprocess(name, src, opts, load)?;
+    let pp = preprocess::preprocess_recovering(name, src, opts, load)?;
     let debug = opts.debug.as_ref().map(|d| {
         let sources = debug::Sources {
             names: &pp.files,
@@ -280,28 +371,99 @@ fn file_directive(name: &str) -> String {
 }
 
 /// The front end after the preprocessor: tokens, syntax tree, checks. The
-/// errors come with the warnings, in the order of their positions.
+/// errors come with the warnings, the preprocessor's among them, in
+/// clang's order ([`in_clangs_order`], [`preprocess::Output::merge`]).
 fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec<Error>> {
-    let toks = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| vec![e])?;
-    let mut prog = match parser::parse_salvaging(&toks, xlen) {
-        Ok(prog) => prog,
+    // The lexer's diagnostics: clang goes on after an error in a literal,
+    // or a token that is none, and so does merlin.
+    let (toks, lexed) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| pp.merge(e))?;
+    // The parser's warnings (it stops at its first error) come as it reads,
+    // as the lexer's do; sema's after them.
+    // Where the errors before sema's are, which leave out clang's analysis
+    // of the functions done after them.
+    let earlier: Vec<Pos> = pp
+        .error_points()
+        .chain(lexed.iter().filter(|e| !e.is_warning()).map(|e| e.pos))
+        .collect();
+    let (prog, parsed, checked) = match parser::parse_salvaging(&toks, xlen) {
+        Ok(mut prog) => {
+            prog.written.macros = pp.macros.clone();
+            let parsed = std::mem::take(&mut prog.warnings);
+            // The parser's errors it goes on after count too.
+            let mut earlier = earlier;
+            earlier.extend(parsed.iter().filter(|e| !e.is_warning()).map(|e| e.pos));
+            let checked = match sema::check_after(&mut prog, &earlier) {
+                Ok(()) => std::mem::take(&mut prog.warnings),
+                Err(all) => all,
+            };
+            (Some(prog), parsed, checked)
+        }
         Err(salvaged) => {
             let (e, mut partial) = *salvaged;
-            // The warnings of what came before a syntax error come with it,
-            // as clang gives them; not the errors of what it cut short.
-            let _ = sema::check(&mut partial);
-            let mut errors = partial.warnings;
-            errors.push(e);
-            errors.sort_by_key(|e| e.pos);
-            return Err(errors);
+            partial.written.macros = pp.macros.clone();
+            let parsed = std::mem::take(&mut partial.warnings);
+            let mut earlier = earlier;
+            earlier.extend(parsed.iter().filter(|w| !w.is_warning()).map(|w| w.pos));
+            // What came before a syntax error is checked as clang checks it
+            // as it parses, errors too; the end of the function it is in,
+            // and of the file, come after it.
+            let (mut checked, after) = sema::check_cut(&mut partial, &earlier, e.pos);
+            checked.push(e);
+            checked.extend(after);
+            (None, parsed, checked)
         }
     };
-    if let Err(mut errors) = sema::check(&mut prog) {
-        errors.extend(prog.warnings);
-        errors.sort_by_key(|e| e.pos);
-        return Err(errors);
+    let read = in_clangs_order(lexed, parsed);
+    let diagnostics = error_limit(pp.merge(in_clangs_order(read, checked)));
+    match prog {
+        Some(mut prog) if diagnostics.iter().all(Error::is_warning) => {
+            prog.warnings = diagnostics;
+            Ok(prog)
+        }
+        _ => Err(diagnostics),
     }
-    Ok(prog)
+}
+
+/// How many errors clang gives before it stops (`-ferror-limit=20`): the
+/// one that would be the 20th is its fatal error instead.
+const ERROR_LIMIT: usize = 20;
+
+/// The diagnostics up to clang's error limit ([`ERROR_LIMIT`]), and its
+/// fatal error there if they reach it.
+fn error_limit(diagnostics: Vec<Error>) -> Vec<Error> {
+    let mut errors = 0;
+    let mut out = Vec::with_capacity(diagnostics.len());
+    for d in diagnostics {
+        if !d.is_warning() {
+            errors += 1;
+            if errors == ERROR_LIMIT {
+                let msg = "too many errors emitted, stopping now [-ferror-limit=]";
+                out.push(Error::fatal(Pos::default(), msg).unplaced());
+                break;
+            }
+        }
+        out.push(d);
+    }
+    out
+}
+
+/// The diagnostics of the lexer and those of the parser and sema, in the
+/// order clang gives them: clang lexes as it parses, so a token's
+/// diagnostic comes among those of the code around it, by its position,
+/// while the parser's and sema's keep the order they were found in (which
+/// is not always that of their positions: clang reports a loop's empty
+/// body at the end of its block, say).
+fn in_clangs_order(lexed: Vec<Error>, checked: Vec<Error>) -> Vec<Error> {
+    let mut out = Vec::with_capacity(lexed.len() + checked.len());
+    let mut lexed = lexed.into_iter().peekable();
+    for d in checked {
+        while let Some(l) = lexed.next_if(|l| l.pos <= d.pos) {
+            out.push(l);
+        }
+        out.push(d);
+    }
+    out.extend(lexed);
+    out
 }
 
 /// Compiles the C file at `path`, with headers from the file system.

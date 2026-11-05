@@ -11,14 +11,20 @@
 //!    keywords, integer constants with their C type, the bytes of literals.
 //!
 //! Comments (`//` to end of line and `/* ... */`) count as spaces.
-//! Trigraphs (`??=`...), which C99 rewrites before anything else, are
-//! errors wherever they would change what merlin reads.
+//! Trigraphs (`??=` for `#`, `??/` for `\`...), which C99 replaces before
+//! anything else (phase 1), are replaced as clang replaces them in its C99
+//! mode, with its warning where they are no comment.
 //!
 //! Assembly preprocessed as C (`.S` files, [`lex_pp_asm`]) is split into the
 //! same tokens, as clang's `-x assembler-with-cpp` splits it: what is no C
 //! token (`$`, `@`, `\`, an apostrophe with no closing one on its line)
 //! passes through as it is, and trigraphs are only characters (clang leaves
 //! them alone in its default GNU mode, and only warns).
+//!
+//! The lexer's warnings (a trigraph, a line splice with blanks between the
+//! backslash and the newline) go with the token after them
+//! ([`PpToken::lexed`]): the preprocessor gives them as it reads it, which
+//! is when clang's lexer gives them, and not in a group `#if 0` skips.
 //!
 //! Integer literals get their C type in [`finish`] (C99 6.4.4.1): the first
 //! of the candidate types that holds the value. A decimal literal is `int`,
@@ -53,6 +59,8 @@ pub enum Kw {
     Static,
     Extern,
     Typedef,
+    Register,
+    Auto,
     Inline,
     Sizeof,
     Return,
@@ -89,6 +97,8 @@ pub const KEYWORDS: &[(Kw, &str)] = &[
     (Kw::Static, "static"),
     (Kw::Extern, "extern"),
     (Kw::Typedef, "typedef"),
+    (Kw::Register, "register"),
+    (Kw::Auto, "auto"),
     (Kw::Inline, "inline"),
     (Kw::Sizeof, "sizeof"),
     (Kw::Return, "return"),
@@ -143,6 +153,8 @@ impl Kw {
                 | Kw::Static
                 | Kw::Extern
                 | Kw::Typedef
+                | Kw::Register
+                | Kw::Auto
                 | Kw::Inline
         )
     }
@@ -150,7 +162,7 @@ impl Kw {
 
 /// C keywords that merlin doesn't handle yet. Using one is a clear error rather
 /// than a confusing parse error further on.
-const UNSUPPORTED_KEYWORDS: &[&str] = &["auto", "double", "float", "register", "_Complex", "_Imaginary"];
+const UNSUPPORTED_KEYWORDS: &[&str] = &["double", "float", "_Complex", "_Imaginary"];
 
 /// Punctuators, longest first so `<<=` wins over `<<` and `<`, `->` over `-`
 /// (`a->b` is never `a - > b`), `...` over `.` and `##` over `#`. `#` and
@@ -176,11 +188,12 @@ pub enum PpKind {
     /// A string literal, as written.
     Str,
     Punct(&'static str),
-    /// Text that is no token (an unterminated literal, a stray `@`), with
-    /// the error it is. It is only an error if it reaches the parser: a
-    /// group that `#if 0` skips may hold anything, like an apostrophe in a
-    /// sentence.
-    Invalid(String),
+    /// Text that is no token (an unterminated literal, `''`, a stray `@`),
+    /// with the warning clang gives for it, if any (`missing terminating '
+    /// character`). It only means something if it reaches the parser,
+    /// which expects it nowhere: a group that `#if 0` skips may hold
+    /// anything, like an apostrophe in a sentence.
+    Invalid(Option<String>),
     /// The preprocessor's stand-in for an empty macro argument next to `##`
     /// (C99 6.10.3.3); never in the lexer's output, never in the
     /// preprocessor's.
@@ -206,6 +219,9 @@ pub struct PpToken {
     /// Whitespace or a comment comes right before it. Stringizing (`#x`)
     /// turns that into one space, and `-E` output keeps it.
     pub space: bool,
+    /// The lexer's warnings of what comes before it, from the end of the
+    /// token before (the module's notes).
+    pub lexed: Vec<Error>,
 }
 
 impl PpToken {
@@ -228,6 +244,8 @@ pub enum Tok {
     Str(Vec<u8>),
     Kw(Kw),
     Punct(&'static str),
+    /// What is no token ([`PpKind::Invalid`]): the parser expects it nowhere.
+    Unknown,
     Eof,
 }
 
@@ -240,6 +258,7 @@ impl Tok {
             Tok::Str(_) => "string literal".to_string(),
             Tok::Kw(k) => format!("'{}'", k.as_str()),
             Tok::Punct(p) => format!("'{p}'"),
+            Tok::Unknown => "an invalid token".to_string(),
             Tok::Eof => "end of file".to_string(),
         }
     }
@@ -266,52 +285,125 @@ impl Token {
     }
 }
 
-/// The source after C99's translation phase 2: line splices (a backslash
-/// right before a newline) deleted, every remaining character with its
-/// position in the original text, so that tokens joined by a splice still
-/// say where they were written.
+/// The source after C99's translation phases 1 and 2: trigraphs replaced,
+/// line splices (a backslash right before a newline) deleted, every
+/// remaining character with its position in the original text, so that
+/// tokens joined by a splice still say where they were written.
 struct Spliced {
     chars: Vec<char>,
     at: Vec<Pos>,
+    /// What the lexer may warn of, at the index of the character it comes
+    /// before, in order.
+    marks: Vec<(usize, Mark)>,
     /// Just past the last character.
     end: Pos,
 }
 
-/// Deletes line splices. Blanks between the backslash and the newline are
-/// allowed, as clang allows them.
-fn splice(src: &str, file: u32) -> Spliced {
+/// Something phases 1 and 2 did that clang warns of, but in a comment.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// A trigraph at `pos` replaced by `to`.
+    Trigraph { pos: Pos, to: char },
+    /// A line splice with blanks between the backslash, at `backslash`,
+    /// and the newline: clang warns at the backslash in a `//` comment
+    /// (and not in a `/* */` one), elsewhere at the first blank.
+    Blanks { backslash: Pos, first: Pos },
+}
+
+/// What C99 replaces the trigraph `??c` by.
+fn trigraph(c: char) -> Option<char> {
+    let to = match c {
+        '=' => '#',
+        '(' => '[',
+        '/' => '\\',
+        ')' => ']',
+        '\'' => '^',
+        '<' => '{',
+        '!' => '|',
+        '>' => '}',
+        '-' => '~',
+        _ => return None,
+    };
+    Some(to)
+}
+
+/// Replaces trigraphs (unless `asm`: clang's assembler-with-cpp has none)
+/// and deletes line splices. Blanks between the backslash and the newline
+/// are allowed, as clang allows them, with a warning ([`Mark`]); a `\r`
+/// before the newline is a line's end, no blank.
+fn splice(src: &str, file: u32, asm: bool) -> Spliced {
     let src: Vec<char> = src.chars().collect();
     let (mut chars, mut at) = (Vec::with_capacity(src.len()), Vec::with_capacity(src.len()));
+    let mut marks = Vec::new();
     let (mut line, mut col) = (1, 1);
     let mut k = 0;
+    // A UTF-8 byte-order mark is no character of the source: clang skips
+    // it, its three bytes still in the first line's columns.
+    if src.first() == Some(&'\u{feff}') {
+        k = 1;
+        col = 4;
+    }
     while k < src.len() {
-        if src[k] == '\\' {
-            let mut j = k + 1;
+        // The character here after phase 1, and how many it was written as.
+        let (c, n) = match (src[k], src.get(k + 1), src.get(k + 2).and_then(|&c| trigraph(c))) {
+            ('?', Some('?'), Some(to)) if !asm => (to, 3),
+            (c, ..) => (c, 1),
+        };
+        let pos = Pos::in_file(file, line, col);
+        if c == '\\' {
+            let mut j = k + n;
             while matches!(src.get(j), Some(' ' | '\t' | '\r')) {
                 j += 1;
             }
             if src.get(j) == Some(&'\n') {
+                if n == 3 {
+                    marks.push((chars.len(), Mark::Trigraph { pos, to: c }));
+                }
+                if src[k + n..j].iter().any(|&b| b != '\r') {
+                    let backslash = Pos::in_file(file, line, col + n as u32 - 1);
+                    let first = Pos::in_file(file, line, col + n as u32);
+                    marks.push((chars.len(), Mark::Blanks { backslash, first }));
+                }
                 line += 1;
                 col = 1;
                 k = j + 1;
                 continue;
             }
         }
-        chars.push(src[k]);
-        at.push(Pos::in_file(file, line, col));
-        if src[k] == '\n' {
+        if n == 3 {
+            marks.push((chars.len(), Mark::Trigraph { pos, to: c }));
+        }
+        chars.push(c);
+        at.push(pos);
+        if c == '\n' {
             line += 1;
             col = 1;
         } else {
-            col += 1;
+            // Columns count bytes, as clang's do: `é` is two.
+            col += src[k..k + n].iter().map(|c| c.len_utf8() as u32).sum::<u32>();
         }
-        k += 1;
+        k += n;
     }
+    // The end of a file that ends with a newline is that newline, as
+    // clang has it (its `LexEndOfFile`): no line follows it.
+    let end = match (chars.last(), at.last()) {
+        (Some('\n'), Some(&newline)) => newline,
+        _ => Pos::in_file(file, line, col),
+    };
     Spliced {
         chars,
         at,
-        end: Pos::in_file(file, line, col),
+        marks,
+        end,
     }
+}
+
+/// Where the lexer is, for the warnings of [`Mark`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Context {
+    Code,
+    LineComment,
+    BlockComment,
 }
 
 struct Lexer {
@@ -321,8 +413,11 @@ struct Lexer {
     newline: bool,
     /// Whitespace or a comment was skipped since the last token.
     space: bool,
-    /// Assembler-with-cpp: trigraphs are characters like any other.
-    asm: bool,
+    /// The next of [`Spliced::marks`] to look at, and where the lexer is.
+    mark: usize,
+    context: Context,
+    /// The warnings for the next token.
+    lexed: Vec<Error>,
 }
 
 impl Lexer {
@@ -341,27 +436,36 @@ impl Lexer {
 
     fn bump(&mut self) -> Option<char> {
         let c = self.peek(0)?;
+        self.marks_before(self.i + 1);
         self.i += 1;
         Some(c)
     }
 
-    /// Whether a trigraph (`??=` for `#`, `??/` for `\`, ...) starts here.
-    /// C99 replaces them before anything else, so merlin rejects them rather
-    /// than read `"??="` as three characters.
-    fn at_trigraph(&self) -> bool {
-        self.at("??") && self.peek(2).is_some_and(|c| "=(/)'<!>-".contains(c))
-    }
-
-    /// The error for a trigraph here, if one starts here.
-    fn trigraph(&self) -> Result<(), Error> {
-        if self.asm || !self.at_trigraph() {
-            return Ok(());
+    /// clang's warnings of the [`Mark`]s before index `end`, as where the
+    /// lexer is has them: none for a trigraph in a comment, none for a
+    /// splice's blanks in a `/* */` one.
+    fn marks_before(&mut self, end: usize) {
+        while let Some(&(at, mark)) = self.src.marks.get(self.mark) {
+            if at >= end {
+                return;
+            }
+            self.mark += 1;
+            let warning = match (mark, self.context) {
+                (Mark::Trigraph { pos, to }, Context::Code) => Error::warning(
+                    pos,
+                    format!("trigraph converted to '{to}' character"),
+                    "trigraphs",
+                ),
+                (Mark::Blanks { backslash, .. }, Context::LineComment) => {
+                    Error::warning(backslash, BLANKS, "backslash-newline-escape")
+                }
+                (Mark::Blanks { first, .. }, Context::Code) => {
+                    Error::warning(first, BLANKS, "backslash-newline-escape")
+                }
+                _ => continue,
+            };
+            self.lexed.push(warning);
         }
-        let msg = format!(
-            "trigraphs are not supported ('{}'; write '\\?' for a '?' that starts one)",
-            self.src.chars[self.i..self.i + 3].iter().collect::<String>()
-        );
-        Err(Error::new(self.pos(), msg))
     }
 
     /// Skips whitespace and comments, noting newlines and spaces.
@@ -375,24 +479,16 @@ impl Lexer {
                 }
                 (Some('/'), Some('/')) => {
                     self.space = true;
+                    self.context = Context::LineComment;
                     while self.peek(0).is_some_and(|c| c != '\n') {
-                        // `??/` and a newline would be a line splice, which
-                        // continues the comment on the next line.
-                        if self.at("??/") {
-                            let mut k = 3;
-                            while matches!(self.peek(k), Some(' ' | '\t' | '\r')) {
-                                k += 1;
-                            }
-                            if self.peek(k) == Some('\n') {
-                                self.trigraph()?;
-                            }
-                        }
                         self.bump();
                     }
+                    self.context = Context::Code;
                 }
                 (Some('/'), Some('*')) => {
                     self.space = true;
                     let start = self.pos();
+                    self.context = Context::BlockComment;
                     self.bump();
                     self.bump();
                     loop {
@@ -402,12 +498,21 @@ impl Lexer {
                                 self.bump();
                                 break;
                             }
+                            // A comment does not nest: clang warns of what
+                            // looks like a second one starting.
+                            (Some('/'), Some('*')) => {
+                                let at = self.pos();
+                                self.lexed
+                                    .push(Error::warning(at, "'/*' within block comment", "comment"));
+                                self.bump();
+                            }
                             (Some(_), _) => {
                                 self.bump();
                             }
                             (None, _) => return Err(Error::new(start, "unterminated /* comment")),
                         }
                     }
+                    self.context = Context::Code;
                 }
                 _ => return Ok(()),
             }
@@ -435,21 +540,25 @@ impl Lexer {
     /// the end of the line.
     fn quoted(&mut self, quote: char) -> Result<PpKind, Error> {
         self.bump();
+        // `''`: clang has no empty character constant.
+        if quote == '\'' && self.peek(0) == Some('\'') {
+            self.bump();
+            return Ok(PpKind::Invalid(Some("empty character constant".into())));
+        }
         loop {
             match self.peek(0) {
                 None | Some('\n') => {
-                    let what = if quote == '"' { "string" } else { "character" };
-                    return Ok(PpKind::Invalid(format!("unterminated {what} literal")));
+                    let quote = if quote == '"' { "'\"'" } else { "'" };
+                    return Ok(PpKind::Invalid(Some(format!(
+                        "missing terminating {quote} character"
+                    ))));
                 }
                 Some(c) => {
-                    self.trigraph()?;
                     self.bump();
                     if c == quote {
                         return Ok(if quote == '"' { PpKind::Str } else { PpKind::Char });
                     }
                     if c == '\\' && self.peek(0).is_some_and(|c| c != '\n') {
-                        // `\??/` is `\\` to C, not `\?` and `?/`.
-                        self.trigraph()?;
                         self.bump();
                     }
                 }
@@ -458,17 +567,20 @@ impl Lexer {
     }
 }
 
+/// clang's warning of a line splice with blanks before its newline.
+const BLANKS: &str = "backslash and newline separated by space";
+
 /// Splits one file (`file` is its number, see [`Pos`]) into preprocessing
 /// tokens, and gives the position of its end. Only an unterminated `/*`
-/// comment and trigraphs are errors here; anything else that is no token
-/// becomes a [`PpKind::Invalid`] one.
+/// comment is an error here; anything else that is no token becomes a
+/// [`PpKind::Invalid`] one.
 pub fn lex_pp(src: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
     lex_pp_in(src, file, false)
 }
 
 /// [`lex_pp`] for assembly preprocessed as C (`clang -x assembler-with-cpp`):
-/// the same tokens, but trigraphs are never errors. An unterminated `/*`
-/// comment still is, as in clang.
+/// the same tokens, but trigraphs are only characters. An unterminated `/*`
+/// comment is an error, as in clang.
 pub fn lex_pp_asm(src: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
     lex_pp_in(src, file, true)
 }
@@ -476,20 +588,26 @@ pub fn lex_pp_asm(src: &str, file: u32) -> Result<(Vec<PpToken>, Pos), Error> {
 /// [`lex_pp`] (`asm` false) or [`lex_pp_asm`].
 pub fn lex_pp_in(src: &str, file: u32, asm: bool) -> Result<(Vec<PpToken>, Pos), Error> {
     let mut lx = Lexer {
-        src: splice(src, file),
+        src: splice(src, file, asm),
         i: 0,
         newline: true,
         space: false,
-        asm,
+        mark: 0,
+        context: Context::Code,
+        lexed: Vec::new(),
     };
-    let mut out = Vec::new();
+    let mut out: Vec<PpToken> = Vec::new();
     loop {
         lx.skip_trivia()?;
         let pos = lx.pos();
         let Some(c) = lx.peek(0) else {
+            // What comes after the last token goes with it.
+            lx.marks_before(usize::MAX);
+            if let Some(last) = out.last_mut() {
+                last.lexed.append(&mut lx.lexed);
+            }
             return Ok((out, lx.src.end));
         };
-        lx.trigraph()?;
         let start = lx.i;
         let kind = if c.is_ascii_digit() || (c == '.' && lx.peek(1).is_some_and(|d| d.is_ascii_digit())) {
             lx.number();
@@ -508,7 +626,7 @@ pub fn lex_pp_in(src: &str, file: u32, asm: bool) -> Result<(Vec<PpToken>, Pos),
             PpKind::Punct(p)
         } else {
             lx.bump();
-            PpKind::Invalid(format!("unexpected character '{c}'"))
+            PpKind::Invalid(None)
         };
         // Just past the last character: after a splice inside the token,
         // still on the line where it ends.
@@ -521,58 +639,72 @@ pub fn lex_pp_in(src: &str, file: u32, asm: bool) -> Result<(Vec<PpToken>, Pos),
             end,
             bol: std::mem::take(&mut lx.newline),
             space: std::mem::take(&mut lx.space),
+            lexed: std::mem::take(&mut lx.lexed),
         });
     }
 }
 
 /// Lexes a whole translation unit without preprocessing it: [`lex_pp`]
-/// then [`finish`]. A `#` is an error.
+/// then [`finish`]. Any error is one: the first.
 pub fn lex(src: &str, x: Xlen) -> Result<Vec<Token>, Error> {
     let (toks, end) = lex_pp(src, 0)?;
-    finish(toks, end, x)
+    let (toks, diagnostics) = finish(toks, end, x).map_err(|mut e| e.pop().expect("the error"))?;
+    match diagnostics.into_iter().find(|d| !d.is_warning()) {
+        Some(e) => Err(e),
+        None => Ok(toks),
+    }
 }
 
 /// Turns preprocessing tokens into the parser's tokens (C99 translation
 /// phase 7) and ends them with [`Tok::Eof`] at `end`: identifiers that are
 /// keywords become keywords, numbers integer constants with their C type,
-/// character constants and string literals their bytes. What is left of the
-/// preprocessor's syntax (`#`, `##`) and invalid tokens are errors.
-pub fn finish(toks: Vec<PpToken>, end: Pos, x: Xlen) -> Result<Vec<Token>, Error> {
+/// character constants and string literals their bytes.
+///
+/// It goes on after an error as clang does, with the diagnostics it gives
+/// (clang's, in its words): a literal in error stands as `0` (or the bytes
+/// it has), for the parser to go on with; what is no token (an
+/// unterminated literal, a stray `@` or `\`, `''`) is a [`Tok::Unknown`]
+/// the parser expects nowhere, and the unterminated literal and `''` a
+/// warning too. `#` and `##` are punctuators the parser has no use for.
+/// Only a keyword merlin has not (`float`) stops it: `Err`, with the
+/// diagnostics before it.
+pub fn finish(toks: Vec<PpToken>, end: Pos, x: Xlen) -> Result<(Vec<Token>, Vec<Error>), Vec<Error>> {
     let mut out = Vec::with_capacity(toks.len() + 1);
+    let mut diags = Vec::new();
     for t in toks {
         let tok = match &t.kind {
             PpKind::Ident => {
                 if let Some(k) = Kw::from_str(&t.text) {
                     Tok::Kw(k)
                 } else if UNSUPPORTED_KEYWORDS.contains(&t.text.as_str()) {
-                    return Err(Error::new(t.pos, format!("'{}' is not supported yet", t.text)));
+                    diags.push(Error::new(t.pos, format!("'{}' is not supported yet", t.text)));
+                    return Err(diags);
                 } else {
                     Tok::Ident(t.text.clone())
                 }
             }
-            PpKind::Number => number(&t.text, t.pos, x)?,
-            PpKind::Char => {
-                let bytes = decode(&t.text, t.pos)?;
-                match bytes[..] {
-                    [b] => Tok::Num(b.into(), IntKind::Int),
-                    [] => return Err(Error::new(t.pos, "empty character constant")),
-                    _ => {
-                        return Err(Error::new(
-                            t.pos,
-                            "character constants hold one byte in merlin (no multi-character constants)",
-                        ))
-                    }
+            PpKind::Number => number(&t.text, t.pos, x, &mut diags).unwrap_or_else(|e| {
+                diags.push(e);
+                Tok::Num(0, IntKind::Int)
+            }),
+            PpKind::Char => char_constant(&t.text, t.pos, &mut diags).unwrap_or_else(|e| {
+                diags.push(e);
+                Tok::Num(0, IntKind::Int)
+            }),
+            PpKind::Str => match decode(&t.text, t.pos, &mut diags) {
+                Ok(bytes) => Tok::Str(bytes),
+                Err(e) => {
+                    diags.push(e);
+                    Tok::Str(Vec::new())
                 }
-            }
-            PpKind::Str => Tok::Str(decode(&t.text, t.pos)?),
-            PpKind::Punct(p @ ("#" | "##")) => {
-                return Err(Error::new(
-                    t.pos,
-                    format!("'{p}' is only allowed in preprocessor directives"),
-                ))
-            }
+            },
             PpKind::Punct(p) => Tok::Punct(p),
-            PpKind::Invalid(msg) => return Err(Error::new(t.pos, msg.clone())),
+            PpKind::Invalid(msg) => {
+                if let Some(msg) = msg {
+                    diags.push(Error::warning(t.pos, msg.clone(), "invalid-pp-token"));
+                }
+                Tok::Unknown
+            }
             PpKind::Placemarker | PpKind::Directive => continue,
         };
         out.push(Token {
@@ -588,14 +720,51 @@ pub fn finish(toks: Vec<PpToken>, end: Pos, x: Xlen) -> Result<Vec<Token>, Error
         end,
         text: String::new(),
     });
-    Ok(out)
+    Ok((out, diags))
+}
+
+/// A character constant's value, an `int` (C99 6.4.4.4): its byte, or for
+/// several (`'ab'`) the bytes as the digits of a number in base 256, as
+/// clang computes it, keeping the low 32 bits, with clang's warning for
+/// each (and one more past four bytes, which do not all fit). `''` is no
+/// token at all to clang ([`lex_pp`] leaves it to the parser).
+pub fn char_constant(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Tok, Error> {
+    let before = diags.len();
+    let (bytes, chars) = decode_units(text, pos, diags, true)?;
+    // A character too large for it leaves the constant no value whose
+    // length clang tells of.
+    let too_large = diags[before..].iter().any(|d| !d.is_warning());
+    // Four characters are clang's `-Wfour-char-constants` (`'abcd'`, as
+    // Mac OS's type codes were written), which is off by default. What
+    // counts is characters, each escape one (`'aé'` is two, an error).
+    if chars > 1 && chars != 4 {
+        diags.push(Error::warning(
+            pos,
+            "multi-character character constant",
+            "multichar",
+        ));
+    }
+    if chars > 4 && !too_large {
+        diags.push(Error::warning_unflagged(
+            pos,
+            "character constant too long for its type",
+        ));
+    }
+    let value = match bytes[..] {
+        [] => 0,
+        [b] => b.into(),
+        _ => i128::from(bytes.iter().fold(0u32, |v, &b| (v << 8) | u32::from(b)) as i32),
+    };
+    Ok(Tok::Num(value, IntKind::Int))
 }
 
 /// An integer constant and its C type on the target, from a preprocessing
-/// number.
-pub fn number(text: &str, pos: Pos, x: Xlen) -> Result<Tok, Error> {
+/// number. A decimal one too large for every signed type is an
+/// `unsigned long long`, with clang's warning (C99 gives it no type).
+pub fn number(text: &str, pos: Pos, x: Xlen, diags: &mut Vec<Error>) -> Result<Tok, Error> {
     let IntLit {
         value,
+        low,
         decimal,
         unsigned,
         long,
@@ -614,20 +783,26 @@ pub fn number(text: &str, pos: Pos, x: Xlen) -> Result<Tok, Error> {
         1 => !matches!(k, Int | UInt),
         _ => matches!(k, LongLong | ULongLong),
     });
+    // Too large for any type: clang's error, and it goes on with the low
+    // 64 bits, an `unsigned long long`.
     let Some(value) = value else {
-        return Err(Error::new(
+        diags.push(Error::new(
             pos,
-            format!("integer literal '{text}' is too large to be represented in any integer type"),
+            "integer literal is too large to be represented in any integer type",
         ));
+        return Ok(Tok::Num(low.into(), ULongLong));
     };
     match candidates.into_iter().find(|k| i128::from(value) <= k.range(x).1) {
         Some(&k) => Ok(Tok::Num(value.into(), k)),
-        // A decimal literal past LLONG_MAX: C99 gives it no type (clang
-        // takes it as unsigned, with a warning).
-        None => Err(Error::new(
-            pos,
-            format!("integer literal '{text}' is too large to be represented in a signed integer type"),
-        )),
+        None => {
+            diags.push(Error::warning(
+                pos,
+                "integer literal is too large to be represented in a signed integer type, \
+                 interpreting as unsigned",
+                "implicitly-unsigned-literal",
+            ));
+            Ok(Tok::Num(value.into(), ULongLong))
+        }
     }
 }
 
@@ -636,6 +811,8 @@ pub struct IntLit {
     /// The value; `None` when it does not fit in 64 bits (in C, too large
     /// for any integer type).
     pub value: Option<u64>,
+    /// Its low 64 bits, which clang goes on with when it does not fit.
+    pub low: u64,
     /// Written in decimal (not hex or octal).
     pub decimal: bool,
     /// The suffix has a `u`.
@@ -644,43 +821,79 @@ pub struct IntLit {
     pub long: u8,
 }
 
-/// Reads an integer constant. The preprocessor's `#if` uses it too, where
-/// values are 64 bits wide.
+/// Reads an integer constant, as clang's `NumericLiteralParser` reads one:
+/// the digits of its radix (`0x` hex, a leading `0` octal), then a suffix
+/// of `u` and `l` (`ll` in one case). A digit the radix has not right after
+/// the digits is `invalid digit '9' in octal constant` (`a` to `f` in a
+/// decimal one too), at the digit; anything else after them is `invalid
+/// suffix 'abc' on integer constant`, at the suffix. The preprocessor's
+/// `#if` uses it too, where values are 64 bits wide.
 pub fn integer(text: &str, pos: Pos) -> Result<IntLit, Error> {
     let lower = text.to_ascii_lowercase();
     let hex = lower.starts_with("0x");
     if lower.contains('.') || (!hex && lower.contains('e')) || (hex && lower.contains('p')) {
         return Err(Error::new(pos, "floating-point literals are not supported"));
     }
-    // Split off the suffix: any mix of `u` and `l` at the end.
-    let digits_end = lower.trim_end_matches(['u', 'l']).len();
-    let (digits, suffix) = lower.split_at(digits_end);
-    let (radix, digits) = if let Some(hex) = digits.strip_prefix("0x") {
-        (16, hex)
-    } else if digits.len() > 1 && digits.starts_with('0') {
-        (8, &digits[1..])
+    let chars: Vec<char> = text.chars().collect();
+    let at = |k: usize| Pos::in_file(pos.file, pos.line, pos.col + k as u32);
+    // The leading `0` of an octal constant is one of its digits (`0` and
+    // `0u` are octal).
+    let (radix, start) = if hex {
+        (16, 2)
+    } else if chars.len() > 1 && chars[0] == '0' {
+        (8, 0)
     } else {
-        (10, digits)
+        (10, 0)
     };
-    let invalid = || Error::new(pos, format!("invalid integer literal '{text}'"));
-    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
-        return Err(invalid());
+    let mut k = start;
+    while k < chars.len() && chars[k].is_digit(radix) {
+        k += 1;
     }
-    let (unsigned, long) = match suffix {
+    // An octal constant with an 8 or a 9, or a decimal or octal one with a
+    // hex digit right after its digits (not `e`, which would make it
+    // floating), has an invalid digit.
+    if radix != 16 && k < chars.len() {
+        let c = chars[k];
+        if c.is_ascii_digit() || (c.is_ascii_hexdigit() && !"eE".contains(c)) {
+            let which = if radix == 8 { "octal" } else { "decimal" };
+            return Err(Error::new(
+                at(k),
+                format!("invalid digit '{c}' in {which} constant"),
+            ));
+        }
+    }
+    let digits: String = chars[start..k].iter().collect();
+    // `0x` with no digits is the octal `0` with the suffix `x...`.
+    if hex && k == start {
+        k = 1;
+    }
+    let suffix: String = chars[k..].iter().collect();
+    let (unsigned, long) = match suffix.to_ascii_lowercase().as_str() {
+        _ if hex && digits.is_empty() => (false, 3),
         "" => (false, 0),
         "u" => (true, 0),
         "l" => (false, 1),
         "ul" | "lu" => (true, 1),
-        "ll" | "ull" | "llu" => (suffix.contains('u'), 2),
-        _ => return Err(invalid()),
+        // `ll` is `ll` or `LL`, never `lL` (C99 6.4.4.1).
+        "ll" | "ull" | "llu" if suffix.contains("ll") || suffix.contains("LL") => {
+            (suffix.contains(['u', 'U']), 2)
+        }
+        _ => (false, 3),
     };
-    // `ll` is `ll` or `LL`, never `lL` (C99 6.4.4.1).
-    if long == 2 && !(text.contains("ll") || text.contains("LL")) {
-        return Err(invalid());
+    if long == 3 {
+        return Err(Error::new(
+            at(k),
+            format!("invalid suffix '{suffix}' on integer constant"),
+        ));
     }
     // The digits are valid, so the only way to fail is to overflow.
+    let low = digits.chars().fold(0u64, |v, c| {
+        v.wrapping_mul(u64::from(radix))
+            .wrapping_add(u64::from(c.to_digit(radix).expect("a digit")))
+    });
     Ok(IntLit {
-        value: u64::from_str_radix(digits, radix).ok(),
+        value: u64::from_str_radix(&digits, radix).ok(),
+        low,
         decimal: radix == 10,
         unsigned,
         long,
@@ -688,20 +901,58 @@ pub fn integer(text: &str, pos: Pos) -> Result<IntLit, Error> {
 }
 
 /// The bytes of a character constant or string literal as written (with
-/// its quotes, closed: the lexer made sure), escapes decoded. Characters
-/// outside ASCII come out as their UTF-8 bytes. `pos` is where the literal
-/// starts; an error points at the escape sequence.
-pub fn decode(text: &str, pos: Pos) -> Result<Vec<u8>, Error> {
+/// its quotes, closed: the lexer made sure), escapes decoded, with clang's
+/// warning for an escape C has not (`\q`, the `q`). Characters outside
+/// ASCII come out as their UTF-8 bytes. `pos` is where the literal starts;
+/// an error or a warning points at the escape sequence.
+pub fn decode(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Vec<u8>, Error> {
+    decode_in(text, pos, diags, false)
+}
+
+/// [`decode`] of a character constant (`char_const`) or a string literal,
+/// which differ in what a universal character name may be: a constant
+/// holds one byte.
+fn decode_in(text: &str, pos: Pos, diags: &mut Vec<Error>, char_const: bool) -> Result<Vec<u8>, Error> {
+    decode_units(text, pos, diags, char_const).map(|(bytes, _)| bytes)
+}
+
+/// [`decode_in`], with how many characters the literal has (each escape
+/// one).
+fn decode_units(
+    text: &str,
+    pos: Pos,
+    diags: &mut Vec<Error>,
+    char_const: bool,
+) -> Result<(Vec<u8>, usize), Error> {
     let chars: Vec<char> = text.chars().collect();
     let body = &chars[1..chars.len() - 1];
     // Where character `k` of the body is (the literal is on one line, unless
-    // a line splice ran through it).
-    let at = |k: usize| Pos::in_file(pos.file, pos.line, pos.col + 1 + k as u32);
+    // a line splice ran through it), columns counting bytes.
+    let mut bytes = Vec::with_capacity(body.len() + 1);
+    let mut n = 0;
+    for c in body {
+        bytes.push(n);
+        n += c.len_utf8() as u32;
+    }
+    bytes.push(n);
+    let at = |k: usize| Pos::in_file(pos.file, pos.line, pos.col + 1 + bytes[k.min(body.len())]);
     let mut out = Vec::new();
     let mut k = 0;
+    let mut units = 0;
     while k < body.len() {
         let c = body[k];
+        units += 1;
         if c != '\\' {
+            // A character past ASCII is more than a character constant's
+            // one byte of it: clang's error, the constant's.
+            if char_const && !c.is_ascii() {
+                diags.push(Error::new(
+                    pos,
+                    "character too large for enclosing character literal type",
+                ));
+                k += 1;
+                continue;
+            }
             let mut buf = [0; 4];
             out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             k += 1;
@@ -756,11 +1007,72 @@ pub fn decode(text: &str, pos: Pos) -> Result<Vec<u8>, Error> {
                 let v = u64::from_str_radix(&hex, 16).unwrap_or(u64::MAX);
                 u8::try_from(v).map_err(|_| Error::new(at(start), "hex escape sequence out of range"))?
             }
-            _ => return Err(Error::new(at(start), format!("unknown escape sequence '\\{e}'"))),
+            // GNU's escape for ESC, which clang takes without a word.
+            'e' | 'E' => 27,
+            // clang's other escapes (its `ProcessCharEscape`): the character,
+            // which its pedantic warning only says C has not.
+            '(' | '{' | '[' | '%' => e as u8,
+            // A universal character name (C99 6.4.3): `\u` and four hex
+            // digits, `\U` and eight, the character in UTF-8.
+            'u' | 'U' => {
+                let n = if e == 'u' { 4 } else { 8 };
+                let digits: String = body[k..]
+                    .iter()
+                    .take(n)
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect();
+                k += digits.len();
+                if digits.len() < n {
+                    diags.push(Error::new(at(start), "incomplete universal character name"));
+                    continue;
+                }
+                let v = u32::from_str_radix(&digits, 16).expect("hex digits");
+                // What C99 lets no universal character name be: a control
+                // character, the basic character set but `$`, `@` and `` ` ``,
+                // a surrogate, or what is past Unicode.
+                let problem = match char::from_u32(v) {
+                    None => Some("invalid universal character".to_string()),
+                    Some(c) if c.is_control() => {
+                        Some("universal character name refers to a control character".to_string())
+                    }
+                    Some(c) if v < 0xa0 && !"$@`".contains(c) => Some(format!(
+                        "character '{c}' cannot be specified by a universal character name"
+                    )),
+                    Some(_) if char_const && v > 0x7f => {
+                        // clang's error is the constant's.
+                        diags.push(Error::new(
+                            pos,
+                            "character too large for enclosing character literal type",
+                        ));
+                        continue;
+                    }
+                    Some(_) => None,
+                };
+                match (problem, char::from_u32(v)) {
+                    (Some(msg), _) => diags.push(Error::new(at(start), msg)),
+                    (None, Some(c)) => {
+                        let mut buf = [0; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                    (None, None) => unreachable!("an invalid one has a problem"),
+                }
+                continue;
+            }
+            // clang: the character itself, and a warning.
+            _ => {
+                diags.push(Error::warning(
+                    at(start),
+                    format!("unknown escape sequence '\\{e}'"),
+                    "unknown-escape-sequence",
+                ));
+                let mut buf = [0; 4];
+                out.extend_from_slice(e.encode_utf8(&mut buf).as_bytes());
+                continue;
+            }
         };
         out.push(byte);
     }
-    Ok(out)
+    Ok((out, units))
 }
 
 #[cfg(test)]
@@ -770,10 +1082,6 @@ mod tests {
 
     fn toks(s: &str) -> Vec<Tok> {
         lex(s, Xlen::Rv32).unwrap().into_iter().map(|t| t.tok).collect()
-    }
-
-    fn err(s: &str) -> String {
-        lex(s, Xlen::Rv32).unwrap_err().to_string()
     }
 
     fn num(s: &str) -> (i128, IntKind) {
@@ -885,20 +1193,9 @@ mod tests {
         assert_eq!(num("10ull"), (10, ULongLong));
         assert_eq!(num("10LLU"), (10, ULongLong));
         assert_eq!(num("0x8000000000000000ll"), (1 << 63, ULongLong));
-        assert_eq!(
-            err("99999999999999999999"),
-            "1:1: integer literal '99999999999999999999' is too large to be represented in any integer type"
-        );
-        assert_eq!(
-            err("9223372036854775808"),
-            "1:1: integer literal '9223372036854775808' is too large to be represented in a signed integer type"
-        );
-        assert_eq!(err("10lL"), "1:1: invalid integer literal '10lL'");
-        assert_eq!(err("10lll"), "1:1: invalid integer literal '10lll'");
-        assert_eq!(err("x = 09;"), "1:5: invalid integer literal '09'");
-        assert_eq!(err("12abc"), "1:1: invalid integer literal '12abc'");
-        assert_eq!(err("0x"), "1:1: invalid integer literal '0x'");
-        assert_eq!(err("1uu"), "1:1: invalid integer literal '1uu'");
+        // A decimal literal past LLONG_MAX is unsigned, as clang takes it.
+        assert_eq!(num("9223372036854775808"), (1 << 63, ULongLong));
+        // (The errors of literals are in tests/diagnostics.)
     }
 
     #[test]
@@ -920,8 +1217,9 @@ mod tests {
         assert_eq!(num("0x8000000000000000"), (1 << 63, ULong));
         assert_eq!(num("18446744073709551615u"), (u64::MAX.into(), ULong));
         assert_eq!(num("0xffffffffL"), (0xffff_ffff, Long));
-        // A decimal literal past LONG_MAX would be long long in C.
-        assert!(lex("9223372036854775808", Xlen::Rv64).is_err());
+        // A decimal literal past LONG_MAX would be long long in C, and is
+        // unsigned long long to clang.
+        assert_eq!(num("9223372036854775808"), (1 << 63, ULongLong));
     }
 
     #[test]
@@ -948,19 +1246,16 @@ mod tests {
         ] {
             assert_eq!(num(&format!("'\\{e}'")), (v, Int));
         }
-        assert_eq!(err("''"), "1:1: empty character constant");
-        assert_eq!(
-            err("'ab'"),
-            "1:1: character constants hold one byte in merlin (no multi-character constants)"
-        );
-        assert_eq!(err("'a"), "1:1: unterminated character literal");
-        assert_eq!(err("x = '\\q';"), "1:6: unknown escape sequence '\\q'");
-        assert_eq!(err("'\\x100'"), "1:2: hex escape sequence out of range");
-        assert_eq!(err("'\\400'"), "1:2: octal escape sequence out of range");
-        assert_eq!(err("'\\x'"), "1:2: \\x used with no following hex digits");
+        // Several characters are the digits of a number in base 256, as
+        // clang reads them (with a warning), the low 32 bits of it; an
+        // escape C has not is the character (with a warning too).
+        assert_eq!(num("'ab'"), (0x6162, Int));
+        assert_eq!(num("'\\xff\\xff\\xff\\xff'"), (-1, Int));
+        assert_eq!(num("'abcde'"), (0x6263_6465, Int));
+        assert_eq!(num("'\\q'"), (113, Int));
         // The lexer cannot make a literal that ends in a lone backslash, but
         // decode must not panic on one (the preprocessor's `#` once made it).
-        let e = decode(r#""a\""#, Pos::in_file(0, 1, 1)).unwrap_err();
+        let e = decode(r#""a\""#, Pos::in_file(0, 1, 1), &mut Vec::new()).unwrap_err();
         assert_eq!(e.to_string(), "1:3: '\\' at the end of a literal escapes nothing");
     }
 
@@ -975,8 +1270,6 @@ mod tests {
         // \x takes every hex digit that follows; octal stops at three.
         assert_eq!(toks(r#""\1234""#), [Tok::Str(b"S4".to_vec()), Tok::Eof]);
         assert_eq!(toks("\"é\""), [Tok::Str("é".as_bytes().to_vec()), Tok::Eof]);
-        assert_eq!(err("\"abc\nd\""), "1:1: unterminated string literal");
-        assert_eq!(err("\"abc"), "1:1: unterminated string literal");
         let t = lex(r#"x = "a\tb";"#, Xlen::Rv32).unwrap();
         assert_eq!(t[2].text, r#""a\tb""#);
         assert_eq!(t[2].describe(), "string literal");
@@ -985,10 +1278,9 @@ mod tests {
     #[test]
     fn punctuators_are_not_split() {
         assert_eq!(toks("f(int a, ...)")[5], Tok::Punct("..."));
-        assert_eq!(err("x = 1.5;"), "1:5: floating-point literals are not supported");
         // `.5` and `1e5` are (floating) numbers, `..` two dots.
-        assert_eq!(err("x = .5;"), "1:5: floating-point literals are not supported");
-        assert_eq!(err("x = 1e5;"), "1:5: floating-point literals are not supported");
+        assert_eq!(lex_pp(".5 1e5", 0).unwrap().0[0].kind, PpKind::Number);
+        assert_eq!(lex_pp(".5 1e5", 0).unwrap().0[1].kind, PpKind::Number);
         assert_eq!(toks("a..b")[1..3], [Tok::Punct("."), Tok::Punct(".")]);
         // `->` is one token, `.` another.
         assert_eq!(
@@ -1045,44 +1337,51 @@ mod tests {
         );
     }
 
+    /// What is no token is one the parser expects nowhere; `#` and `##`
+    /// are punctuators, which mean nothing to it.
     #[test]
-    fn errors() {
-        assert_eq!(err("int x;\n  /* oops"), "2:3: unterminated /* comment");
-        assert_eq!(err("a @ b"), "1:3: unexpected character '@'");
-        // Without the preprocessor (crate::preprocess), `#` means nothing.
+    fn what_is_no_token() {
         assert_eq!(
-            err("#include <x.h>"),
-            "1:1: '#' is only allowed in preprocessor directives"
+            toks("a @ b `")[1..],
+            [Tok::Unknown, Tok::Ident("b".into()), Tok::Unknown, Tok::Eof]
         );
+        assert_eq!(toks("a \\ b")[1], Tok::Unknown);
         assert_eq!(
-            err("a ## b"),
-            "1:3: '##' is only allowed in preprocessor directives"
+            toks("# a ## b")[..4],
+            [
+                Tok::Punct("#"),
+                Tok::Ident("a".into()),
+                Tok::Punct("##"),
+                Tok::Ident("b".into())
+            ]
         );
-        assert_eq!(err("int f() { float s; }"), "1:11: 'float' is not supported yet");
-        assert_eq!(err("register int x;"), "1:1: 'register' is not supported yet");
+        assert_eq!(toks("x = '';")[2], Tok::Unknown);
+        assert_eq!(toks("x = 'a;")[2], Tok::Unknown);
     }
 
+    /// Trigraphs are replaced before anything else, with clang's warnings
+    /// (tests/diagnostics has them) going with the token after them.
     #[test]
-    fn trigraphs_are_errors() {
-        let trigraph =
-            |t: &str| format!("trigraphs are not supported ('{t}'; write '\\?' for a '?' that starts one)");
-        // C reads "??=" as "#": an error, never three characters.
-        assert_eq!(err(r#"char *s = "a??=";"#), format!("1:13: {}", trigraph("??=")));
-        assert_eq!(err("int c = '??'';"), format!("1:10: {}", trigraph("??'")));
-        assert_eq!(err(r#"int c = "\??/";"#), format!("1:11: {}", trigraph("??/")));
-        assert_eq!(err("x ??- y"), format!("1:3: {}", trigraph("??-")));
+    fn trigraphs_are_replaced() {
         // A '?' that doesn't start a trigraph is fine, and so is '\?'.
         assert_eq!(
-            toks(r#""???" "?\?=""#)[..2],
-            [Tok::Str(b"???".to_vec()), Tok::Str(b"??=".to_vec())]
+            toks(r#""???" "?\?=" "a??=""#)[..3],
+            [
+                Tok::Str(b"???".to_vec()),
+                Tok::Str(b"??=".to_vec()),
+                Tok::Str(b"a#".to_vec())
+            ]
         );
-        // `??/` and a newline would splice a // comment onto the next line.
-        assert_eq!(
-            err("x; // note ??/  \r\ny = 2;"),
-            format!("1:12: {}", trigraph("??/"))
-        );
+        // `??/` and a newline are a line splice, in a comment too.
+        assert_eq!(toks("x ??/\n= 1 // c ??/\ny = 2;").len(), 4);
         // Elsewhere in comments, trigraphs mean nothing.
         assert_eq!(toks("// a \\ b ??= ??/ c\n/* ??/\n **/ x").len(), 2);
+        let (t, _) = lex_pp("// ??=\nx ??( 1", 0).unwrap();
+        assert!(t[0].lexed.is_empty());
+        assert_eq!(
+            t[1].lexed[0].to_string(),
+            "2:3: trigraph converted to '[' character"
+        );
     }
 
     #[test]
@@ -1105,8 +1404,6 @@ mod tests {
             2,
             "`*/` across a splice ends the comment"
         );
-        // A backslash before anything else is just an invalid character.
-        assert_eq!(err("a \\ b"), "1:3: unexpected character '\\'");
     }
 
     #[test]
@@ -1145,13 +1442,12 @@ mod tests {
         let (t, _) = lex_pp("don't @", 0).unwrap();
         assert_eq!(
             t[1].kind,
-            PpKind::Invalid("unterminated character literal".into())
+            PpKind::Invalid(Some("missing terminating ' character".into()))
         );
         assert_eq!(t[1].text, "'t @");
-        assert_eq!(
-            finish(t, end, Xlen::Rv32).unwrap_err().to_string(),
-            "1:4: unterminated character literal"
-        );
+        let (toks, diags) = finish(t, end, Xlen::Rv32).unwrap();
+        assert_eq!(toks[1].tok, Tok::Unknown);
+        assert_eq!(diags[0].to_string(), "1:4: missing terminating ' character");
         // Files are told apart by number.
         let (t, _) = lex_pp("x", 3).unwrap();
         assert_eq!(t[0].pos, Pos::in_file(3, 1, 1));
@@ -1167,7 +1463,7 @@ mod tests {
             ["la", "a0", ",", "$", "x", "@", "\\", "rs1", "?", "?", "=", "'c'", "#", "it", "'s"]
         );
         assert!(matches!(t[3].kind, PpKind::Invalid(_)));
-        assert!(lex_pp("??=", 0).is_err());
+        assert_eq!(lex_pp("??=", 0).unwrap().0[0].text, "#");
         assert!(lex_pp_asm("/* x", 0).is_err());
     }
 

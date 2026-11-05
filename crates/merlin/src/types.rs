@@ -265,6 +265,10 @@ pub struct Record {
     pub tag: Option<String>,
     /// Where the type was first declared.
     pub pos: Pos,
+    /// The name of the typedef that names it, if it has no tag and is
+    /// what a typedef declares (`typedef struct { ... } S;`): clang calls
+    /// the type by it (`'S'`), C++'s "typedef name for linkage purposes".
+    pub typedef_name: OnceLock<String>,
     /// The members and layout, once the definition has been seen. Until then
     /// the type is incomplete: pointers to it are fine, objects of it are not.
     body: OnceLock<RecordBody>,
@@ -288,8 +292,10 @@ pub struct Member {
     pub offset: u32,
     /// How its declaration spelled its type (for `-g`).
     pub spelled: Spelled,
-    /// Where it is declared.
+    /// Where it is declared, and where its declaration begins (its
+    /// specifiers: clang's notes of an array name it there).
     pub pos: Pos,
+    pub begin: Pos,
 }
 
 impl Record {
@@ -298,6 +304,7 @@ impl Record {
             union,
             tag,
             pos,
+            typedef_name: OnceLock::new(),
             body: OnceLock::new(),
         })
     }
@@ -323,19 +330,25 @@ impl Record {
         let pos = self.pos;
         let members = members
             .into_iter()
-            .map(|(n, t)| (n, t, Spelled::default(), pos))
+            .map(|(n, t)| (n, t, Spelled::default(), pos, pos))
             .collect();
         self.complete_spelled(members, pos, x)
     }
 
-    /// [`Record::complete`], with each member's spelling and position, and
-    /// the definition's, which only `-g` reads.
-    pub fn complete_spelled(&self, members: Vec<(String, Type, Spelled, Pos)>, pos: Pos, x: Xlen) -> bool {
+    /// [`Record::complete`], with each member's spelling, position and
+    /// where its declaration begins, and the definition's position, which
+    /// only `-g` reads.
+    pub fn complete_spelled(
+        &self,
+        members: Vec<(String, Type, Spelled, Pos, Pos)>,
+        pos: Pos,
+        x: Xlen,
+    ) -> bool {
         let mut offset = 0u64;
         let mut size = 0u64;
         let mut align = 1;
         let mut laid_out = Vec::with_capacity(members.len());
-        for (name, ty, spelled, pos) in members {
+        for (name, ty, spelled, pos, begin) in members {
             let (msize, malign) = (u64::from(ty.size(x).expect("complete member")), ty.align(x));
             align = align.max(malign);
             let at = if self.union { 0 } else { align_up(offset, malign) };
@@ -347,6 +360,7 @@ impl Record {
                 offset: at as u32,
                 spelled,
                 pos,
+                begin,
             });
         }
         let size = align_up(size, align);
@@ -361,12 +375,14 @@ impl Record {
             .is_ok()
     }
 
-    /// How the type is written: `struct node`, `union value`, or
-    /// `struct (anonymous at 3:1)`.
+    /// How clang's messages name the type: `struct node`, `union value`;
+    /// without a tag, the typedef's name that names it, or where it is
+    /// declared, `struct (unnamed at t.c:3:1)` ([`crate::place`]).
     pub fn name(&self) -> String {
-        match &self.tag {
-            Some(t) => format!("{} {t}", self.keyword()),
-            None => format!("{} (anonymous at {})", self.keyword(), self.pos),
+        match (&self.tag, self.typedef_name.get()) {
+            (Some(t), _) => format!("{} {t}", self.keyword()),
+            (None, Some(name)) => name.clone(),
+            (None, None) => format!("{} (unnamed at {})", self.keyword(), crate::place(self.pos)),
         }
     }
 }
@@ -421,6 +437,112 @@ pub struct FuncType {
     /// describes a function pointer's parameters so (`const pt` of a
     /// typedef `pt`). Never part of comparing types.
     pub spelled: Spellings,
+    /// Declared with `()`, of which C99 says nothing of the parameters: a
+    /// call passes its arguments promoted, as named ones, and a prototype
+    /// whose parameters are what the promotions make of themselves is
+    /// compatible with it (`crate::sema`). clang names the type `int ()`.
+    pub unprototyped: Unprototyped,
+}
+
+/// Whether a function type was declared with `()` ([`FuncType`]): part of
+/// the type, so `int ()` is not `int (void)`, though the two are
+/// compatible ([`Type::compatible`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Unprototyped(pub bool);
+
+impl FuncType {
+    /// Whether the type has a prototype: all but `()`, which says nothing
+    /// of the parameters (C99 6.7.5.3p14).
+    pub fn has_prototype(&self) -> bool {
+        !(self.unprototyped.0 && self.params.is_empty() && !self.variadic)
+    }
+
+    /// Whether two function types are compatible (C99 6.7.5.3p15): their
+    /// results are, and, with prototypes both, so are their parameters in
+    /// number, `...` and each type (unqualified); one without a prototype is
+    /// compatible with a prototype whose parameters are each what the
+    /// default argument promotions make of themselves (no `char`, `short`
+    /// or `_Bool`), with no `...`.
+    pub fn compatible(&self, other: &FuncType) -> bool {
+        if !self.ret.compatible(&other.ret) {
+            return false;
+        }
+        let promotes_to_itself = |t: &Type| match t.unqual() {
+            Type::Int(k) => k.promoted() == *k,
+            _ => true,
+        };
+        match (self.has_prototype(), other.has_prototype()) {
+            (true, true) => {
+                self.variadic == other.variadic
+                    && self.params.len() == other.params.len()
+                    && self
+                        .params
+                        .iter()
+                        .zip(&other.params)
+                        .all(|(a, b)| a.unqual().compatible(b.unqual()))
+                    && !self.param_enums_differ(other)
+            }
+            (false, false) => true,
+            (true, false) => !self.variadic && self.params.iter().all(promotes_to_itself),
+            (false, true) => !other.variadic && other.params.iter().all(promotes_to_itself),
+        }
+    }
+
+    /// The parameter `i` as its declaration spelled it, if the type has
+    /// the spellings ([`Spellings`]).
+    pub fn param_spelled(&self, i: usize) -> Option<&Spelled> {
+        let all = &self.spelled.0;
+        all.get(i)
+            .filter(|_| all.len() == self.params.len())
+            .map(|(_, s)| s)
+    }
+
+    /// Whether a parameter of each is of a different enum ([`distinct_enums`]).
+    fn param_enums_differ(&self, other: &FuncType) -> bool {
+        self.params
+            .iter()
+            .zip(&other.params)
+            .enumerate()
+            .any(
+                |(i, (a, b))| match (self.param_spelled(i), other.param_spelled(i)) {
+                    (Some(sa), Some(sb)) => distinct_enums(a, sa, b, sb),
+                    _ => false,
+                },
+            )
+    }
+}
+
+/// The enum `ty` is, if a declaration `spelled` so declared the type it
+/// is the base of: clang's enum types are types of their own, compatible
+/// with their integer type, where merlin's are that integer type; what
+/// tells them apart is how the declarations spelled them.
+pub fn enum_of<'s>(spelled: &'s Spelled, ty: &Type) -> Option<&'s Arc<EnumType>> {
+    let mut s = spelled;
+    while let Some(Spelling::Typedef(t)) = &s.0 {
+        s = &t.spelled;
+    }
+    match &s.0 {
+        Some(Spelling::Enum(e)) if *ty.unqual() == e.ty => Some(e),
+        _ => None,
+    }
+}
+
+/// Whether `a`, of a declaration `sa` spelled, and `b`, of one `sb`
+/// spelled, are made of two different enums where they are alike: at the
+/// base the declarator builds on (what pointers, arrays and a function's
+/// result lead to), or in a function's parameters (as each spelled its
+/// own). Two such types are not compatible in clang, as two enum types
+/// are not (C99 6.7.2.2p4), though merlin's types are the same.
+pub fn distinct_enums(a: &Type, sa: &Spelled, b: &Type, sb: &Spelled) -> bool {
+    match (a.unqual(), b.unqual()) {
+        (Type::Ptr(x), Type::Ptr(y)) | (Type::Array(x, _), Type::Array(y, _)) => distinct_enums(x, sa, y, sb),
+        (Type::Func(f), Type::Func(g)) => distinct_enums(&f.ret, sa, &g.ret, sb) || f.param_enums_differ(g),
+        (Type::Int(_), Type::Int(_)) => match (enum_of(sa, a), enum_of(sb, b)) {
+            (Some(x), Some(y)) => !Arc::ptr_eq(x, y),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The declared type and [`Spelled`] of each parameter of a function type,
@@ -493,6 +615,21 @@ pub struct EnumType {
     pub ty: Type,
     pub constants: Vec<(String, i128)>,
     pub pos: Pos,
+    /// The typedef's name that names it, if it has no tag ([`Record::typedef_name`]).
+    pub typedef_name: OnceLock<String>,
+}
+
+impl EnumType {
+    /// How clang's messages name the enum type: `enum color`, or without
+    /// a tag the typedef's name that names it, or where it is declared
+    /// (`enum (unnamed at t.c:1:1)`).
+    pub fn name(&self) -> String {
+        match (&self.tag, self.typedef_name.get()) {
+            (Some(t), _) => format!("enum {t}"),
+            (None, Some(name)) => name.clone(),
+            (None, None) => format!("enum (unnamed at {})", crate::place(self.pos)),
+        }
+    }
 }
 
 impl Spelling {
@@ -509,7 +646,7 @@ impl fmt::Debug for Spelling {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Spelling::Typedef(t) => f.write_str(&t.name),
-            Spelling::Enum(e) => write!(f, "enum {}", e.tag.as_deref().unwrap_or("(anonymous)")),
+            Spelling::Enum(e) => f.write_str(&e.name()),
         }
     }
 }
@@ -552,6 +689,7 @@ impl Type {
             params,
             variadic: false,
             spelled: Spellings::default(),
+            unprototyped: Unprototyped::default(),
         }))
     }
 
@@ -562,6 +700,7 @@ impl Type {
             params,
             variadic: true,
             spelled: Spellings::default(),
+            unprototyped: Unprototyped::default(),
         }))
     }
 
@@ -598,6 +737,17 @@ impl Type {
             (Type::Ptr(a), Type::Ptr(b)) => a.similar(b),
             (Type::Array(a, n), Type::Array(b, m)) => n == m && a.similar(b),
             (a, b) => a == b,
+        }
+    }
+
+    /// The type without its qualifiers, an array's (its elements') too, as
+    /// clang's `getUnqualifiedType`: what pointers to it and to its
+    /// qualified versions point to alike (C99 6.5.16.1p1, 6.5.6p3, 6.5.8p2,
+    /// 6.5.9p2), where [`Self::quals`] are the qualifiers it leaves out.
+    pub fn without_quals(&self) -> Type {
+        match self.unqual() {
+            Type::Array(elem, n) => Type::Array(Box::new(elem.without_quals()), *n),
+            t => t.clone(),
         }
     }
 
@@ -723,6 +873,18 @@ impl Type {
         }
     }
 
+    /// How many bytes adding 1 to a pointer (or a decayed array) of this
+    /// type moves it: the size of what it points to, or 1 for `void` and
+    /// a function, the GNU extension clang takes without a word (as
+    /// `-Wpointer-arith`, which is not on by default, would say).
+    pub fn step(&self, x: Xlen) -> Option<u32> {
+        let to = self.pointee()?;
+        if to.is_void() || to.is_func() {
+            return Some(1);
+        }
+        to.size(x)
+    }
+
     /// What a pointer (or a decayed array) points to.
     pub fn pointee(&self) -> Option<&Type> {
         match self.unqual() {
@@ -742,10 +904,111 @@ impl Type {
         }
     }
 
+    /// Whether two types are compatible (C99 6.2.7): the same, but that an
+    /// array of unknown size is compatible with one of a size, and function
+    /// types as [`FuncType::compatible`] has them, at any depth (a pointer
+    /// to one, an array of them, a parameter of one).
+    pub fn compatible(&self, other: &Type) -> bool {
+        match (self, other) {
+            (Type::Qual(x, p), Type::Qual(y, q)) => p == q && x.compatible(y),
+            (Type::Qual(..), _) | (_, Type::Qual(..)) => false,
+            (Type::Ptr(x), Type::Ptr(y)) => x.compatible(y),
+            (Type::Array(x, n), Type::Array(y, m)) => {
+                x.compatible(y) && (n == m || n.is_none() || m.is_none())
+            }
+            (Type::Func(f), Type::Func(g)) => f.compatible(g),
+            _ => self == other,
+        }
+    }
+
+    /// The composite type of two compatible types (C99 6.2.7p3): an
+    /// array's size if one has it, a function's prototype if one has it,
+    /// part by part.
+    pub fn composite(&self, other: &Type) -> Type {
+        match (self, other) {
+            (Type::Qual(x, q), Type::Qual(y, _)) => Type::Qual(Box::new(x.composite(y)), *q),
+            (Type::Ptr(x), Type::Ptr(y)) => Type::ptr(x.composite(y)),
+            (Type::Array(x, n), Type::Array(y, m)) => Type::Array(Box::new(x.composite(y)), n.or(*m)),
+            (Type::Func(f), Type::Func(g)) => {
+                let ret = f.ret.composite(&g.ret);
+                let mut c = match (f.has_prototype(), g.has_prototype()) {
+                    (false, true) => (**g).clone(),
+                    (true, true) => {
+                        let mut c = (**f).clone();
+                        c.params = f
+                            .params
+                            .iter()
+                            .zip(&g.params)
+                            .map(|(a, b)| a.composite(b))
+                            .collect();
+                        c
+                    }
+                    _ => (**f).clone(),
+                };
+                c.ret = ret;
+                Type::Func(Box::new(c))
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// The type as clang names it in a message, quoted, as a declaration
+    /// `spelled` it: through a typedef name, its name with what it stands
+    /// for after it (`'T *' (aka 'int *')`); as an enum, `'enum e'`.
+    pub fn named(&self, spelled: &Spelled) -> String {
+        // What the type is without its typedef names, clang's "canonical
+        // type" (an enum, which merlin's types leave out, is still one), and
+        // with them: of the base, and of each parameter as it was spelled.
+        let plain = self.spelled_as("", spelled, false);
+        let sugared = self.spelled_as("", spelled, true);
+        match &spelled.0 {
+            Some(Spelling::Typedef(_)) => {
+                if sugared != plain {
+                    format!("'{sugared}' (aka '{plain}')")
+                } else {
+                    format!("'{sugared}'")
+                }
+            }
+            _ if sugared != plain => format!("'{sugared}' (aka '{plain}')"),
+            _ => format!("'{plain}'"),
+        }
+    }
+
+    /// The type as a declaration of `name` spelled as `spelled` (and its
+    /// parameters as theirs) says: with typedef names if `sugar`, else
+    /// only with enums' names.
+    fn spelled_as(&self, name: &str, spelled: &Spelled, sugar: bool) -> String {
+        let mut base = spelled;
+        while let (Some(Spelling::Typedef(t)), false) = (&base.0, sugar) {
+            base = &t.spelled;
+        }
+        let written = match &base.0 {
+            Some(Spelling::Typedef(t)) => Some((&t.ty, t.name.clone())),
+            Some(Spelling::Enum(e)) => Some((&e.ty, e.name())),
+            None => None,
+        };
+        let written = written.as_ref().map(|(t, n)| (*t, n.as_str()));
+        self.declare_as(name, written, Some(sugar))
+    }
+
     /// The type as a C declaration of `name`, e.g. `char *argv[4]`. With an
     /// empty name it is the type name clang prints, e.g. `int (*)[3]`.
     pub fn declare(&self, name: &str) -> String {
-        fn go(t: &Type, inner: String) -> String {
+        self.declare_as(name, None, None)
+    }
+
+    /// [`Self::declare`], with the part of the type that is `base.0`
+    /// written as `base.1` (a typedef's name), and each parameter of a
+    /// function type as it was spelled ([`Self::spelled_as`]) if `params`
+    /// says how (with typedef names or not).
+    fn declare_as(&self, name: &str, base: Option<(&Type, &str)>, params: Option<bool>) -> String {
+        fn go(t: &Type, inner: String, base: Option<(&Type, &str)>, sugar: Option<bool>) -> String {
+            if let Some((b, written)) = base {
+                if t == b {
+                    return join(written, &inner);
+                }
+            }
+            let go = |t: &Type, inner: String| go(t, inner, base, sugar);
             match t {
                 Type::Void => join("void", &inner),
                 Type::Int(k) => join(k.name(), &inner),
@@ -761,11 +1024,15 @@ impl Type {
                     go(elem, format!("{}[{n}]", parenthesize(inner)))
                 }
                 Type::Func(f) => {
-                    let mut params: Vec<String> = f.params.iter().map(|p| p.declare("")).collect();
+                    let param = |(i, p): (usize, &Type)| match (sugar, f.param_spelled(i)) {
+                        (Some(sugar), Some(spelled)) => p.spelled_as("", spelled, sugar),
+                        _ => p.declare(""),
+                    };
+                    let mut params: Vec<String> = f.params.iter().enumerate().map(param).collect();
                     if f.variadic {
                         params.push("...".to_string());
                     }
-                    let params = if params.is_empty() {
+                    let params = if params.is_empty() && !f.unprototyped.0 {
                         "void".to_string()
                     } else {
                         params.join(", ")
@@ -793,7 +1060,7 @@ impl Type {
                 format!("{base} {inner}")
             }
         }
-        go(self, name.to_string())
+        go(self, name.to_string(), base, params)
     }
 }
 
@@ -1049,7 +1316,7 @@ mod tests {
         let s = Record::new(false, Some("node".into()), Pos::default());
         assert_eq!(Type::ptr(Type::Record(s)).declare("next"), "struct node *next");
         let u = Record::new(true, None, Pos::new(3, 1));
-        assert_eq!(Type::Record(u).to_string(), "union (anonymous at 3:1)");
+        assert_eq!(Type::Record(u).to_string(), "union (unnamed at \u{1}0\u{1}3:1)");
     }
 
     #[test]

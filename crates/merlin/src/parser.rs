@@ -1,9 +1,14 @@
-//! Tokens to AST, by recursive descent. Stops at the first error.
+//! Tokens to AST, by recursive descent. Stops at the first error, which
+//! is clang's, in its words and where it puts it (`expected ';' after
+//! expression`, after the expression; `expected ')'`, at the token there
+//! instead, with clang's note `to match this '('`). What clang only warns
+//! of, the parser warns of too, and goes on.
 //!
 //! ```text
 //! program     := item* EOF
 //! item        := specifiers declarator block                            a function definition
-//!              | specifiers (init-decl (',' init-decl)*)? ';'           declarations
+//!              | specifiers (init-decl (',' init-decl)*)? ';'           declarations, of
+//!                                                                       functions too
 //! specifiers  := (storage | qualifier | 'inline' | type-specifier)+    in any order, as in C
 //! storage     := 'static' | 'extern' | 'typedef'
 //! qualifier   := 'const' | 'volatile' | 'restrict'
@@ -17,16 +22,16 @@
 //! direct      := IDENT | '(' declarator ')' | ε                         ε only in parameters and type names
 //! suffix      := '[' constant? ']' | '(' params ')'
 //! init-decl   := declarator ('=' initializer)?
-//! initializer := assign | '{' item (',' item)* ','? '}'
-//! item        := (designator+ '=')? initializer
+//! initializer := assign | '{' (item (',' item)* ','?)? '}'              `{}`: C23's, as clang takes it
+//! item        := (designator+ '=')? initializer                       `[i] x`: GNU's, warned of
 //! designator  := '.' IDENT | '[' constant ']'
 //! params      := ε | 'void' | param (',' param)* (',' '...')?          at most 127
 //! param       := specifiers declarator                                  the name is optional
-//!                                                                       in a prototype
+//!                                                                       (in a definition C23's)
 //! type-name   := specifiers declarator                                  with no name: casts, sizeof
 //! block       := '{' (decl | stmt)* '}'
 //! decl        := specifiers (init-decl (',' init-decl)*)? ';'
-//! stmt        := block | ';' | expr ';' | IDENT ':' stmt
+//! stmt        := block | ';' | expr ';' | IDENT ':' stmt                 no stmt before '}': C23's
 //!              | 'if' '(' expr ')' stmt ('else' stmt)?
 //!              | 'switch' '(' expr ')' stmt | 'case' constant ':' stmt | 'default' ':' stmt
 //!              | 'while' '(' expr ')' stmt
@@ -88,13 +93,13 @@ use crate::ast::*;
 use crate::consteval;
 use crate::lexer::{Kw, Tok, Token};
 use crate::types::{
-    align_up, common, ptr_size, EnumType, IntKind, Quals, Record, Spelled, Spelling, Spellings, Type,
-    TypedefName, Xlen, MAX_OBJECT_SIZE,
+    align_up, common, distinct_enums, ptr_size, EnumType, IntKind, Quals, Record, Spelled, Spelling,
+    Spellings, Type, TypedefName, Unprototyped, Xlen, MAX_OBJECT_SIZE,
 };
 use crate::{Error, Pos};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// clang's warning for an array size it folds (`int a[1 ? 2 : f()];`, see
 /// [`Parser::folded`]), and its flag.
@@ -159,11 +164,24 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         prototype: RefCell::new(Vec::new()),
         folding: Cell::new(false),
         salvaged: RefCell::new(Vec::new()),
+        type_open: Cell::new(Pos::default()),
+        undeclared: RefCell::new(Vec::new()),
         partial: RefCell::new(None),
+        parens: RefCell::new(None),
+        parens_written: RefCell::new(Default::default()),
+        brackets_written: RefCell::new(Default::default()),
+        bit_patterns: RefCell::new(Default::default()),
+        int_literals: RefCell::new(Default::default()),
+        char_literals: RefCell::new(Default::default()),
+        corrections: RefCell::new(Default::default()),
+        trailing_else: Cell::new(None),
+        warnings: RefCell::new(Vec::new()),
     };
     let mut items = Vec::new();
     let mut unevaluated = Vec::new();
     while *p.peek() != Tok::Eof {
+        let mark = p.undeclared.borrow().len();
+        let start = ExprId::next();
         let item = p.item();
         let error = match item {
             Ok(item) => {
@@ -177,12 +195,32 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         };
         let n = items.len();
         unevaluated.extend(p.unevaluated.take().into_iter().map(|u| (n, u)));
+        // A declaration cut short: its undeclared names (a function's are
+        // its blocks').
+        if error.is_some() {
+            if let Some(Stmt {
+                kind: StmtKind::Unevaluated(us),
+                ..
+            }) = p.cut_names(mark, start)
+            {
+                unevaluated.extend(us.into_iter().map(|u| (n, u)));
+            }
+        }
         if let Some(e) = error {
             let partial = Program {
                 items,
                 xlen,
                 unevaluated,
-                warnings: Vec::new(),
+                warnings: p.warnings.take(),
+                written: Written {
+                    parens: p.parens_written.take(),
+                    brackets: p.brackets_written.take(),
+                    bit_patterns: p.bit_patterns.take(),
+                    int_literals: p.int_literals.take(),
+                    char_literals: p.char_literals.take(),
+                    corrections: p.corrections.take(),
+                    ..Written::default()
+                },
             };
             return Err(Box::new((e, partial)));
         }
@@ -191,8 +229,70 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         items,
         xlen,
         unevaluated,
-        warnings: Vec::new(),
+        warnings: p.warnings.take(),
+        written: Written {
+            parens: p.parens_written.take(),
+            brackets: p.brackets_written.take(),
+            bit_patterns: p.bit_patterns.take(),
+            int_literals: p.int_literals.take(),
+            char_literals: p.char_literals.take(),
+            corrections: p.corrections.take(),
+            ..Written::default()
+        },
     })
+}
+
+/// clang's typo correction (`Sema::CorrectTypo`) of `typo` among the
+/// `candidates` (names, and what goes with each): the one closest to it by
+/// edit distance (Levenshtein's: insertions, deletions, replacements),
+/// none if two are as close. A name is a candidate only if the lengths
+/// differ by less than a third of the typo's (`typo.len() / diff >= 3`)
+/// and the distance is at most a third of it, rounded up; and the best is
+/// taken only if the typo is three times as long as the distance or more.
+pub fn correction<'n, T>(
+    typo: &str,
+    candidates: impl IntoIterator<Item = (&'n str, T)>,
+) -> Option<(&'n str, T)> {
+    let len = typo.chars().count();
+    let bound = len.div_ceil(3);
+    let mut best: Option<(usize, &'n str, T)> = None;
+    let mut tied = false;
+    for (name, what) in candidates {
+        let diff = len.abs_diff(name.chars().count());
+        if diff > 0 && len / diff < 3 {
+            continue;
+        }
+        let d = edit_distance(typo, name);
+        if d > bound || d == 0 {
+            continue;
+        }
+        match &best {
+            Some((b, ..)) if d > *b => {}
+            Some((b, ..)) if d == *b => tied = true,
+            _ => {
+                best = Some((d, name, what));
+                tied = false;
+            }
+        }
+    }
+    let (d, name, what) = best?;
+    (!tied && len / d >= 3).then_some((name, what))
+}
+
+/// Levenshtein's distance of `a` and `b`, in characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for j in 0..b.len() {
+            let here = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != b[j])).min(row[j] + 1).min(here + 1);
+            prev = here;
+        }
+    }
+    row[b.len()]
 }
 
 fn binop(t: &Tok) -> Option<(BinOp, u8)> {
@@ -241,9 +341,10 @@ fn assign_op(t: &Tok) -> Option<Option<BinOp>> {
 
 /// The length an initializer gives an array of unknown size with elements
 /// of type `elem`, when it is a plain one: a string literal (or one in
-/// braces) for a character array, or a list of scalars without designators.
-/// `None` for the rest (brace elision, designators), which sema works out.
-fn init_len(elem: &Type, init: &Init) -> Option<u32> {
+/// braces) for a character array, or a list of scalars, each designated by
+/// a constant index or none (`{[3] = 1, 2}` has 5). `None` for the rest
+/// (brace elision, other designators), which sema works out.
+fn init_len(elem: &Type, init: &Init, xlen: Xlen) -> Option<u32> {
     // A character type: 1 byte, on every target.
     let is_char = elem.int_kind().is_some_and(|k| k.size(Xlen::Rv32) == 1);
     let string = |i: &Init| match i {
@@ -255,8 +356,26 @@ fn init_len(elem: &Type, init: &Init) -> Option<u32> {
     };
     match init {
         Init::List(items, _) if items.len() == 1 && string(&items[0]).is_some() => string(&items[0]),
-        Init::List(items, _) if elem.is_scalar() && items.iter().all(|i| matches!(i, Init::Expr(_))) => {
-            u32::try_from(items.len()).ok()
+        Init::List(items, _) if elem.is_scalar() => {
+            // The index of the next element, and the length so far.
+            let (mut next, mut len) = (0u128, 0u128);
+            for item in items {
+                match item {
+                    Init::Expr(_) => {}
+                    Init::Designated(designators, init) if matches!(**init, Init::Expr(_)) => {
+                        match &designators[..] {
+                            [Designator::Index(e, _)] => {
+                                next = u128::try_from(consteval::parsed_int(e, xlen)?).ok()?
+                            }
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                }
+                next += 1;
+                len = len.max(next);
+            }
+            u32::try_from(len).ok()
         }
         _ => string(init),
     }
@@ -305,19 +424,71 @@ enum Class {
     Static,
     Extern,
     Typedef,
+    /// `register`, and C99's `auto`, which says what no storage class does.
+    Register,
+    Auto,
 }
 
 /// What a list of declaration specifiers says.
 struct Specs {
     ty: Type,
     class: Class,
-    inline: bool,
+    /// Where the storage class is (where the specifiers start, if none is).
+    class_pos: Pos,
+    /// Where `inline` is, if it is there.
+    inline: Option<Pos>,
     /// The specifiers declare something by themselves (a struct, union or
     /// enum tag, or enumeration constants), so they may end the declaration
     /// with no declarator: `struct point { int x, y; };`.
     declares: bool,
+    /// They define a struct or union without a tag: `struct { int x; }`.
+    anonymous: bool,
     /// How the type was spelled: a typedef name or an enum (for `-g`).
     spelled: Spelled,
+    /// Where they start.
+    pos: Pos,
+}
+
+/// The width a type's specifiers give it, as clang's `DeclSpec` keeps it
+/// apart from the rest: `short`, `long` or `long long`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Width {
+    Short,
+    Long,
+    LongLong,
+}
+
+impl Width {
+    fn name(self) -> &'static str {
+        match self {
+            Width::Short => "short",
+            Width::Long => "long",
+            Width::LongLong => "long long",
+        }
+    }
+}
+
+/// The one type specifier besides the width and the sign: a keyword, or a
+/// struct, union, enum or typedef name (with the type it names).
+enum Base {
+    Void,
+    Char,
+    Int,
+    Bool,
+    Named(Type, &'static str),
+}
+
+impl Base {
+    /// What clang calls it in its diagnostics.
+    fn name(&self) -> &'static str {
+        match self {
+            Base::Void => "void",
+            Base::Char => "char",
+            Base::Int => "int",
+            Base::Bool => "_Bool",
+            Base::Named(_, name) => name,
+        }
+    }
 }
 
 /// What an ordinary identifier (C's namespace of variables, functions,
@@ -339,8 +510,19 @@ enum Name {
 #[derive(Clone)]
 enum Tag {
     Record(Arc<Record>),
-    /// An enum: the integer type it is, and the enum as a spelling.
-    Enum(Type, Spelled),
+    /// An enum: the integer type it is, the enum as a spelling, and where
+    /// its tag is.
+    Enum(Type, Spelled, Pos),
+}
+
+impl Tag {
+    /// Where the tag was first declared.
+    fn pos(&self) -> Pos {
+        match self {
+            Tag::Record(r) => r.pos,
+            Tag::Enum(.., pos) => *pos,
+        }
+    }
 }
 
 /// One block scope: the file, a function's parameters and body, a block, a
@@ -349,23 +531,56 @@ enum Tag {
 struct Scope {
     names: HashMap<String, (Name, Pos)>,
     tags: HashMap<String, Tag>,
+    /// The names a block declares with linkage (`extern int a[];`, a
+    /// function): at file scope every object and function has it.
+    linked: std::collections::HashSet<String>,
 }
 
 /// One step of a declarator, from the base type towards the declared type.
 enum Derive {
     /// Pointer to the type so far, with these qualifiers.
     Ptr(Quals),
-    /// Array of the type so far (`None`: of unknown size). The third field
-    /// is set when the brackets held qualifiers or `static` (`int a[const
-    /// 3]`): C99 6.7.5.3p7 allows them only on a parameter's outermost
-    /// array, and the qualifiers then apply to the pointer the array is
-    /// adjusted to. The last is where the size is if the parser folded it
-    /// ([`Parser::folded`]).
-    Array(Option<i128>, Pos, Option<Quals>, Option<Pos>),
+    /// Array of the type so far.
+    Array(Array),
     /// Function returning the type so far, with these parameters (and the
-    /// scope holding their names), variadic if `...` ends them, and whether
-    /// the list is a prototype's (not `()`).
-    Func(Vec<Param>, bool, bool, Scope),
+    /// scope holding their names), variadic if `...` ends them, whether
+    /// the list is a prototype's (not `()`), and where its `(` is.
+    Func(Vec<Param>, bool, bool, Scope, Pos),
+}
+
+/// A declarator's array step: `[size]`.
+struct Array {
+    /// How many elements: `None` for `[]`, 1 for a size that is no constant.
+    len: Option<i128>,
+    /// Where the `[` is, and the size (or the `]`).
+    open: Pos,
+    size: Pos,
+    /// The qualifiers in the brackets (`int a[const 3]`), and whether
+    /// `static` was there too: C99 6.7.5.3p7 allows them only on a
+    /// parameter's outermost array, and the qualifiers then apply to the
+    /// pointer the array is adjusted to.
+    quals: Option<(Quals, bool)>,
+    /// Where the size is if the parser folded it ([`Parser::folded`]).
+    folded: Option<Pos>,
+    /// Which of the [`Unevaluated`]s waiting are its size's.
+    entries: std::ops::Range<usize>,
+    /// Whether the size is a constant (or there is none): if not, sema
+    /// reports it ([`Parser::variable_sizes`]).
+    constant: bool,
+}
+
+/// `n` as clang writes a count, its digits grouped by threes with `'`:
+/// `1'073'741'824`.
+fn grouped(n: u128) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('\'');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Where the array sizes a declarator folded are, seen from what it
@@ -384,12 +599,13 @@ enum Reach {
     Function,
 }
 
-/// The [`Reach`] of the folded sizes among the steps of a declarator
-/// (`ops`, the base's first, what is declared last).
-fn reach(ops: &[Derive]) -> Reach {
+/// The [`Reach`] of the arrays `pick` chooses among the steps of a
+/// declarator (`ops`, the base's first, what is declared last): those
+/// whose size is folded, or no constant.
+fn reach(ops: &[Derive], pick: impl Fn(&Array) -> bool) -> Reach {
     let mut reach = Reach::Arrays;
     for (k, op) in ops.iter().enumerate() {
-        if !matches!(op, Derive::Array(.., Some(_))) {
+        if !matches!(op, Derive::Array(a) if pick(a)) {
             continue;
         }
         // From what is declared in to this array.
@@ -402,7 +618,7 @@ fn reach(ops: &[Derive]) -> Reach {
                 }
                 Derive::Ptr(_) if arrays => reach = reach.max(Reach::Other),
                 Derive::Ptr(_) => reach = reach.max(Reach::Pointers),
-                Derive::Array(None, ..) => reach = reach.max(Reach::Other),
+                Derive::Array(a) if a.len.is_none() => reach = reach.max(Reach::Other),
                 Derive::Array(..) => arrays = true,
             }
         }
@@ -425,10 +641,16 @@ struct Decl {
     /// parameters, even though merlin takes it as `int f(void)`). `-g` says
     /// which (`DW_AT_prototyped`).
     prototyped: bool,
+    /// When it declares a function: where its parameter list opens.
+    open: Option<Pos>,
     /// Where the first array size of its own the parser folded is
     /// ([`Parser::folded`]), if one is, and where the folded ones are.
     folded: Option<Pos>,
     reach: Reach,
+    /// Its folded sizes' [`Unevaluated`]s (from its first): its own
+    /// array's, if it is one and folded, and the others' (see
+    /// [`Unevaluated::vla`]).
+    folded_sizes: (Option<std::ops::Range<usize>>, Vec<std::ops::Range<usize>>),
     /// Where its own [`Unevaluated`]s are among those waiting: they came
     /// as it was parsed.
     unevaluated: std::ops::Range<usize>,
@@ -456,7 +678,38 @@ struct Parser<'a> {
     /// The statements of the blocks a syntax error cut short, the innermost
     /// first, and the function they make up so far ([`parse_salvaging`]).
     salvaged: RefCell<Vec<Vec<Stmt>>>,
+    /// Where the `(` around the type name being read is.
+    type_open: Cell<Pos>,
+    /// The names read as expressions that nothing declares (not called:
+    /// that is an implicit declaration), in order, kept for a syntax error
+    /// in the statement or declaration they are in: clang checks them as
+    /// it reads them, so `return a[1;` is the error of the undeclared `a`
+    /// before the syntax error. A block cut short checks those of its
+    /// statement that was cut short ([`Parser::cut_names`]).
+    undeclared: RefCell<Vec<Expr>>,
     partial: RefCell<Option<Item>>,
+    /// While a `_Static_assert`'s condition is parsed, the parenthesized
+    /// expressions in it, and where their `(` is ([`Printer`]).
+    parens: RefCell<Option<Vec<(ParenKey, Pos)>>>,
+    /// The warnings so far: what clang warns of as it parses, and goes on
+    /// (`declaration does not declare anything`).
+    warnings: RefCell<Vec<Error>>,
+    /// Where the operators in parentheses are ([`Written::parens`]), and
+    /// the subscripts' `]` ([`Written::brackets`]).
+    parens_written: RefCell<std::collections::HashMap<Pos, Pos>>,
+    brackets_written: RefCell<std::collections::HashMap<Pos, Pos>>,
+    /// Where the literals written in hex or octal are ([`Written::bit_patterns`]).
+    bit_patterns: RefCell<std::collections::HashSet<Pos>>,
+    /// Where the integer literals are ([`Written::int_literals`]).
+    int_literals: RefCell<std::collections::HashSet<Pos>>,
+    /// Where the character constants are ([`Written::char_literals`]).
+    char_literals: RefCell<std::collections::HashSet<Pos>>,
+    /// Typo corrections ([`Written::corrections`]).
+    corrections: RefCell<HashMap<Pos, Correction>>,
+    /// The `else` of the `if` the statement just parsed ends with, through
+    /// loops and labels, not braces: an `if` without one of its own around
+    /// it is clang's dangling `else` (its `TrailingElseLoc`).
+    trailing_else: Cell<Option<Pos>>,
 }
 
 impl Parser<'_> {
@@ -543,6 +796,89 @@ impl Parser<'_> {
 
     // ---- scopes ----
 
+    /// clang's `unknown type name` of the name here, with what its typo
+    /// correction takes it for ([`Self::correct_type`]).
+    fn unknown_type_name(&self, name: &str) -> Error {
+        let at = self.here();
+        match self.correct_type(name) {
+            Some((to, decl)) => {
+                let e = Error::new(at, format!("unknown type name '{name}'; did you mean '{to}'?"));
+                match decl {
+                    Some(decl) => e.note(decl, format!("'{to}' declared here")),
+                    None => e,
+                }
+            }
+            None => Error::new(at, format!("unknown type name '{name}'")),
+        }
+    }
+
+    /// What clang's typo correction takes the undeclared `typo`, read as
+    /// an expression, for: a variable, function or enumeration constant in
+    /// scope ([`correction`]).
+    fn correct_expr(&self, typo: &str) -> Option<Correction> {
+        let mut seen = std::collections::HashSet::new();
+        let candidates = self
+            .scopes
+            .iter()
+            .rev()
+            .flat_map(|s| &s.names)
+            .filter_map(|(n, (what, at))| {
+                if !seen.insert(n.as_str()) {
+                    return None;
+                }
+                match what {
+                    Name::Typedef(..) => None,
+                    Name::EnumConst(v, of) => Some((n.as_str(), (*at, Some((*v, of.clone()))))),
+                    Name::Object(_) => Some((n.as_str(), (*at, None))),
+                }
+            });
+        let (name, (pos, enumerator)) = correction(typo, candidates)?;
+        Some(Correction {
+            name: name.to_string(),
+            pos,
+            enumerator,
+        })
+    }
+
+    /// What clang's typo correction takes the unknown type name `typo` for:
+    /// a typedef name in scope (where it is declared), or a keyword of a
+    /// type specifier or qualifier ([`correction`]).
+    fn correct_type(&self, typo: &str) -> Option<(String, Option<Pos>)> {
+        const KEYWORDS: [&str; 18] = [
+            "char",
+            "const",
+            "double",
+            "enum",
+            "float",
+            "int",
+            "long",
+            "short",
+            "signed",
+            "struct",
+            "union",
+            "unsigned",
+            "void",
+            "volatile",
+            "_Complex",
+            "_Imaginary",
+            "_Bool",
+            "restrict",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        let typedefs = self
+            .scopes
+            .iter()
+            .rev()
+            .flat_map(|s| &s.names)
+            .filter_map(|(n, (what, at))| {
+                (seen.insert(n.as_str()) && matches!(what, Name::Typedef(..)))
+                    .then_some((n.as_str(), Some(*at)))
+            });
+        let keywords = KEYWORDS.iter().map(|k| (*k, None));
+        let (name, decl) = correction(typo, typedefs.chain(keywords))?;
+        Some((name.to_string(), decl))
+    }
+
     fn lookup_name(&self, name: &str) -> Option<&Name> {
         self.scopes
             .iter()
@@ -573,9 +909,31 @@ impl Parser<'_> {
 
     /// Declares an ordinary identifier in the innermost scope. Declaring a
     /// variable or function again is sema's to judge; any other clash is an
-    /// error here.
+    /// error here, with clang's note where the name was declared before.
+    /// The composite of `ty` and the type of the earlier declaration of
+    /// `name` with linkage this block can see: the innermost around it,
+    /// unless it has no linkage (a local hides the outer ones); `ty` if
+    /// there is none, or it is not compatible (sema's error).
+    fn visible_composite(&self, name: &str, ty: &Type) -> Type {
+        for (depth, scope) in self.scopes.iter().enumerate().rev() {
+            let Some((what, _)) = scope.names.get(name) else {
+                continue;
+            };
+            return match what {
+                Name::Object(t) if (depth == 0 || scope.linked.contains(name)) && t.compatible(ty) => {
+                    t.composite(ty)
+                }
+                _ => ty.clone(),
+            };
+        }
+        ty.clone()
+    }
+
     fn bind_name(&mut self, name: &str, what: Name, pos: Pos) -> Result<(), Error> {
         let scope = self.scopes.last_mut().expect("the file scope");
+        let redefinition = |how: String, prev: Pos| {
+            Error::new(pos, format!("redefinition of {how}")).note(prev, "previous definition is here")
+        };
         match scope.names.get_mut(name) {
             None => {
                 scope.names.insert(name.to_string(), (what, pos));
@@ -584,39 +942,60 @@ impl Parser<'_> {
             // A variable declared again (`extern int a[]; int a[3];`): keep
             // the type that says the most. Whether the types agree is sema's
             // to judge.
-            Some((Name::Object(prev), prev_pos)) => {
-                if let Name::Object(new) = what {
+            Some((Name::Object(prev), prev_pos)) => match what {
+                Name::Object(new) => {
                     if new.size(self.xlen).is_some() || prev.size(self.xlen).is_none() {
                         *prev = new;
                     }
-                    return Ok(());
+                    Ok(())
                 }
-                Err(Error::new(
-                    pos,
-                    format!(
-                        "redefinition of '{name}' as a different kind of symbol (first declared at {prev_pos})"
-                    ),
-                ))
-            }
-            Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(..)) => Ok(()),
-            Some((Name::Typedef(prev, _), _)) if matches!(what, Name::Typedef(..)) => {
-                let Name::Typedef(new, _) = what else {
+                Name::EnumConst(..) => Err(redefinition(format!("'{name}'"), *prev_pos)),
+                Name::Typedef(..) => Err(redefinition(
+                    format!("'{name}' as different kind of symbol"),
+                    *prev_pos,
+                )),
+            },
+            // A typedef name defined again: of the same type, what C11
+            // allows and clang warns of under C99 (the name is then the
+            // later's); of another, an error. Two enums are two types,
+            // though merlin's are their integer type.
+            Some((Name::Typedef(prev, prev_name), prev_pos)) if matches!(what, Name::Typedef(..)) => {
+                let Name::Typedef(new, new_name) = &what else {
                     unreachable!()
                 };
+                // How each typedef's own declaration spelled its type.
+                let base = |name: &Spelled| match &name.0 {
+                    Some(Spelling::Typedef(t)) => t.spelled.clone(),
+                    _ => Spelled::default(),
+                };
+                let (prev_base, new_base) = (base(prev_name), base(new_name));
+                if prev == new && !distinct_enums(prev, &prev_base, new, &new_base) {
+                    let msg = format!("redefinition of typedef '{name}' is a C11 feature");
+                    let w = Error::warning(pos, msg, "typedef-redefinition")
+                        .note(*prev_pos, "previous definition is here");
+                    self.warnings.borrow_mut().push(w);
+                    scope.names.insert(name.to_string(), (what, pos));
+                    return Ok(());
+                }
+                let (new, prev) = (new.named(&new_base), prev.named(&prev_base));
                 Err(Error::new(
                     pos,
-                    format!("typedef redefinition with different types ('{new}' vs '{prev}')"),
-                ))
+                    format!("typedef redefinition with different types ({new} vs {prev})"),
+                )
+                .note(*prev_pos, "previous definition is here"))
             }
-            Some((Name::EnumConst(..), prev_pos)) if matches!(what, Name::EnumConst(..)) => Err(Error::new(
-                pos,
-                format!("redefinition of enumerator '{name}' (first declared at {prev_pos})"),
-            )),
-            Some((_, prev_pos)) => Err(Error::new(
-                pos,
-                format!(
-                    "redefinition of '{name}' as a different kind of symbol (first declared at {prev_pos})"
-                ),
+            Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(..)) => Ok(()),
+            Some((Name::EnumConst(..), prev_pos)) if matches!(what, Name::EnumConst(..)) => {
+                Err(redefinition(format!("enumerator '{name}'"), *prev_pos))
+            }
+            // An enumerator after anything else is plainly a redefinition
+            // to clang.
+            Some((_, prev_pos)) if matches!(what, Name::EnumConst(..)) => {
+                Err(redefinition(format!("'{name}'"), *prev_pos))
+            }
+            Some((_, prev_pos)) => Err(redefinition(
+                format!("'{name}' as different kind of symbol"),
+                *prev_pos,
             )),
         }
     }
@@ -635,7 +1014,17 @@ impl Parser<'_> {
     /// is sure: false if the parser could not type an operand `?:` does not
     /// choose, or found no constant, whose error sema will report (`msg` if
     /// it finds none); the value is then 1, which nothing uses.
-    fn const_int(&self, e: &mut Expr, at: Pos, msg: &str) -> Result<(i128, bool), Error> {
+    /// `non_integer` is clang's error for a constant of a type that is no
+    /// integer, if it has one there: with it, an operand not chosen that
+    /// is none makes sema check the whole expression, whose type clang
+    /// reports (`1 ? 2 : p` is an `int *`).
+    fn const_int(
+        &self,
+        e: &mut Expr,
+        at: Pos,
+        msg: &str,
+        non_integer: Option<&'static str>,
+    ) -> Result<(i128, bool), Error> {
         let mark = self.unevaluated.borrow().len();
         let original = e.clone();
         self.resolve_sizeof(e);
@@ -649,10 +1038,13 @@ impl Parser<'_> {
             self.unevaluated.borrow_mut().push(Unevaluated {
                 expr: original,
                 untyped: Some((at, msg.to_string())),
+                non_integer: non_integer.map(|m| (at, m)),
                 folded: false,
                 diagnostic: None,
                 with: 0,
+                vla: None,
                 params: self.prototype.borrow().clone(),
+                constant: false,
             });
             return Ok((1, false));
         };
@@ -663,6 +1055,42 @@ impl Parser<'_> {
                 sure = false;
             }
         }
+        if !sure && non_integer.is_some() {
+            let mut us = self.unevaluated.borrow_mut();
+            us.truncate(mark);
+            self.folding.set(false);
+            us.push(Unevaluated {
+                expr: original,
+                untyped: Some((at, msg.to_string())),
+                non_integer: non_integer.map(|m| (at, m)),
+                folded: false,
+                diagnostic: None,
+                with: 0,
+                vla: None,
+                params: self.prototype.borrow().clone(),
+                constant: false,
+            });
+            return Ok((1, false));
+        }
+        // The constant itself, for sema to check as clang does: not a lone
+        // literal, constant or `sizeof`, of which there is nothing to say.
+        let leaf = matches!(
+            e.kind,
+            ExprKind::Num(_) | ExprKind::Enumerator { .. } | ExprKind::SizeofType(_)
+        );
+        if sure && !leaf {
+            self.unevaluated.borrow_mut().push(Unevaluated {
+                expr: e.clone(),
+                untyped: None,
+                non_integer: None,
+                folded: false,
+                diagnostic: None,
+                with: 0,
+                vla: None,
+                params: self.prototype.borrow().clone(),
+                constant: true,
+            });
+        }
         Ok((v, sure))
     }
 
@@ -672,15 +1100,18 @@ impl Parser<'_> {
     /// [`Self::not_chosen`] says.
     fn resolve_sizeof(&self, e: &mut Expr) {
         match &mut e.kind {
-            ExprKind::SizeofExpr(x) => {
+            ExprKind::SizeofExpr(x, _) => {
                 if let Some(t) = self.operand_type(x) {
                     self.unevaluated.borrow_mut().push(Unevaluated {
                         expr: (**x).clone(),
                         untyped: None,
+                        non_integer: None,
                         folded: false,
                         diagnostic: None,
                         with: 0,
+                        vla: None,
                         params: self.prototype.borrow().clone(),
+                        constant: false,
                     });
                     e.kind = ExprKind::SizeofType(t);
                 }
@@ -696,6 +1127,7 @@ impl Parser<'_> {
                 name,
                 arrow,
                 offset,
+                ..
             } => {
                 self.resolve_sizeof(base);
                 let record = if *arrow {
@@ -761,6 +1193,7 @@ impl Parser<'_> {
         let original = std::mem::replace(
             e,
             Expr {
+                id: ExprId::new(),
                 kind: ExprKind::Num(0),
                 ty,
                 pos,
@@ -769,10 +1202,13 @@ impl Parser<'_> {
         self.unevaluated.borrow_mut().push(Unevaluated {
             expr: original,
             untyped,
+            non_integer: None,
             folded: true,
             diagnostic: None,
             with: 0,
+            vla: None,
             params: self.prototype.borrow().clone(),
+            constant: false,
         });
         self.folding.set(true);
     }
@@ -825,7 +1261,7 @@ impl Parser<'_> {
                 Class::Static => d.reach == Reach::Arrays,
                 Class::Extern => fixable,
                 Class::Typedef => false,
-                Class::None => init && d.reach == Reach::Arrays,
+                Class::None | Class::Register | Class::Auto => init && d.reach == Reach::Arrays,
             },
             Ctx::Param | Ctx::TypeName => false,
         };
@@ -836,11 +1272,23 @@ impl Parser<'_> {
             Error::new(at, NOT_CONSTANT_SIZE)
         };
         self.fold_diagnostic(d, said);
+        if folds && ctx == Ctx::File {
+            let mut us = self.unevaluated.borrow_mut();
+            let u = us[d.unevaluated.clone()]
+                .last_mut()
+                .expect("a folded size has its operand");
+            u.vla = Some(FileVla {
+                at: d.pos,
+                top: d.folded_sizes.0.clone(),
+                inner: d.folded_sizes.1.clone(),
+            });
+        }
     }
 
     /// A type name's folded size. A compound literal's array (`(int[F]){1,
     /// 2}`, its `(` at `literal`) is folded as an initialized array is,
-    /// with clang's warning at the `(`. At file scope, a type that only
+    /// with clang's warning at the `(`; one clang does not fold
+    /// (`(int[][F]){1}`) is its error. At file scope, a type that only
     /// points to such an array (`(int (*)[F])0`) is clang's variably
     /// modified type, which it takes there without a word: merlin takes it
     /// as the array of the folded size, which the size is at run time too
@@ -852,6 +1300,12 @@ impl Parser<'_> {
             Some(paren) if d.reach == Reach::Arrays => {
                 let (msg, flag) = FOLDED;
                 self.fold_diagnostic(d, Error::warning(paren, msg, flag));
+            }
+            // A literal of an array clang does not fold (`(int[][F]){1}`)
+            // is one of variable length, which nothing initializes.
+            Some(_) if d.ty.is_array() => {
+                let msg = "variable-sized object may not be initialized";
+                self.fold_diagnostic(d, Error::new(at, msg));
             }
             _ if self.scopes.len() == 1 && d.reach > Reach::Arrays => {}
             _ => self.fold_diagnostic(d, Error::new(at, NOT_CONSTANT_SIZE)),
@@ -872,6 +1326,34 @@ impl Parser<'_> {
 
     /// What the declaration or statement just parsed left for sema to
     /// check, as a statement after it, at `pos`.
+    /// The undeclared names read since `mark` that are in the item a syntax
+    /// error cut short (read after `item`, its [`ExprId::next`]), as a
+    /// statement for sema to check, unevaluated; those of the items before
+    /// it are in them. The names since `mark` are taken.
+    fn cut_names(&self, mark: usize, item: u64) -> Option<Stmt> {
+        let names = self.undeclared.borrow_mut().split_off(mark);
+        let us: Vec<Unevaluated> = names
+            .into_iter()
+            .filter(|e| e.id.0 >= item)
+            .map(|expr| Unevaluated {
+                expr,
+                untyped: None,
+                non_integer: None,
+                folded: false,
+                diagnostic: None,
+                with: 0,
+                vla: None,
+                params: Vec::new(),
+                constant: false,
+            })
+            .collect();
+        let pos = us.first()?.expr.pos;
+        Some(Stmt {
+            kind: StmtKind::Unevaluated(us),
+            pos,
+        })
+    }
+
     fn unevaluated_stmt(&self, pos: Pos) -> Option<Stmt> {
         let us = self.unevaluated.take();
         (!us.is_empty()).then_some(Stmt {
@@ -894,10 +1376,13 @@ impl Parser<'_> {
             }
             // `(int[]){1, 2, 3}`: the list completes the array's size.
             ExprKind::CompoundLit { init, .. } => match &e.ty {
-                Type::Array(elem, None) => Some(Type::array((**elem).clone(), Some(init_len(elem, init)?))),
+                Type::Array(elem, None) => Some(Type::array(
+                    (**elem).clone(),
+                    Some(init_len(elem, init, self.xlen)?),
+                )),
                 t => Some(t.clone()),
             },
-            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => Some(Type::Int(IntKind::size_t(self.xlen))),
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(..) => Some(Type::Int(IntKind::size_t(self.xlen))),
             ExprKind::Var { name, .. } => match self.lookup_name(name)? {
                 Name::Object(t) => Some(t.clone()),
                 _ => None,
@@ -952,7 +1437,7 @@ impl Parser<'_> {
                 Some(self.value_type(target)?.unqual().clone())
             }
             ExprKind::Call { callee, .. } => match self.value_type(callee)?.pointee()? {
-                Type::Func(f) => Some(f.ret.clone()),
+                Type::Func(f) => Some(f.ret.unqual().clone()),
                 _ => None,
             },
             _ => None,
@@ -985,29 +1470,120 @@ impl Parser<'_> {
     /// Whether the token after the current one starts a type name: `(` then a
     /// type means a cast or `sizeof (type)`.
     fn type_name_follows(&self) -> bool {
-        match self.peek_at(1) {
+        self.type_name_at(self.peek_at(1))
+    }
+
+    /// Whether the current token starts a type name.
+    fn type_name_here(&self) -> bool {
+        self.type_name_at(self.peek())
+    }
+
+    fn type_name_at(&self, t: &Tok) -> bool {
+        match t {
+            // Not a storage class or `inline`: `(static int)1` is no cast.
+            Tok::Kw(Kw::Static | Kw::Extern | Kw::Typedef | Kw::Register | Kw::Auto | Kw::Inline) => false,
             Tok::Kw(k) => k.starts_decl(),
             t => self.is_typedef(t),
         }
     }
 
-    fn unexpected(&self, what: &str) -> Error {
-        Error::new(
-            self.here(),
-            format!("expected {what}, found {}", self.tok().describe()),
-        )
+    /// clang's error for what the current token is not: `expected
+    /// expression`, `expected ')'`, at the token.
+    fn expected(&self, what: &str) -> Error {
+        Error::new(self.here(), format!("expected {what}"))
     }
 
+    /// A warning, given as the parser goes on.
+    fn warn(&self, w: Error) {
+        self.warnings.borrow_mut().push(w);
+    }
+
+    /// The punctuator `p`, or clang's error: at the token there instead for
+    /// an opening bracket, else where it is missing, right after the
+    /// previous token (clang's `ExpectAndConsume`).
     fn expect_punct(&mut self, p: &str) -> Result<Pos, Error> {
         if self.is_punct(p) {
-            Ok(self.advance().pos)
-        } else {
-            Err(self.unexpected(&format!("'{p}'")))
+            return Ok(self.advance().pos);
         }
+        let at = match p {
+            "(" | "[" | "{" => self.here(),
+            _ => self.after_prev(),
+        };
+        Err(Error::new(at, format!("expected '{p}'")))
+    }
+
+    /// The bracket that closes the one at `open` (`)`, `]` or `}`), or
+    /// clang's error at the token that is there instead, with its note.
+    fn expect_close(&mut self, close: &str, open: Pos) -> Result<Pos, Error> {
+        if self.is_punct(close) {
+            return Ok(self.advance().pos);
+        }
+        let opener = match close {
+            ")" => "(",
+            "]" => "[",
+            _ => "{",
+        };
+        Err(self
+            .expected(&format!("'{close}'"))
+            .note(open, format!("to match this '{opener}'")))
     }
 
     /// `;` is reported right after the previous token, like clang does, since that's
     /// where it's missing.
+    /// The `;` that ends a statement; but where its expression read a name
+    /// nothing declares (since `named` of [`Self::undeclared`]), which
+    /// makes it no expression to clang, what is left of it up to its `;` is
+    /// skipped, as clang skips it, with no error but sema's of the name
+    /// (`retrun 1;`).
+    fn semi_or_skip(&mut self, after: &str, named: usize) -> Result<(), Error> {
+        if self.is_punct(";") || self.undeclared.borrow().len() == named {
+            return self.expect_semi(after);
+        }
+        while !matches!(self.peek(), Tok::Punct(";" | "}") | Tok::Eof) {
+            self.advance();
+        }
+        self.eat_punct(";");
+        Ok(())
+    }
+
+    /// A block's statement that starts with two names, the first declared
+    /// nowhere (`myit x = 1;`): clang's typo correction of it among the
+    /// names in scope, typedefs and the keywords a statement can start with.
+    /// A typedef is clang's `unknown type name ... did you mean`, with where
+    /// it is declared; a keyword `use of undeclared identifier ... did you
+    /// mean`; none, `unknown type name`.
+    fn unknown_statement_name(&self, name: &str) -> Error {
+        const KEYWORDS: [&str; 34] = [
+            "char", "const", "double", "enum", "float", "int", "long", "short", "signed", "struct", "union",
+            "unsigned", "void", "volatile", "_Bool", "restrict", "auto", "register", "static", "extern",
+            "typedef", "inline", "if", "else", "for", "while", "do", "switch", "case", "default", "break",
+            "continue", "goto", "return",
+        ];
+        let at = self.here();
+        let mut seen = std::collections::HashSet::new();
+        let names = self
+            .scopes
+            .iter()
+            .rev()
+            .flat_map(|s| &s.names)
+            .filter_map(|(n, (what, decl))| {
+                seen.insert(n.as_str())
+                    .then_some((n.as_str(), Some((*decl, matches!(what, Name::Typedef(..))))))
+            });
+        let keywords = KEYWORDS.iter().chain(&["sizeof"]).map(|k| (*k, None));
+        match correction(name, names.chain(keywords)) {
+            Some((to, Some((decl, true)))) => {
+                Error::new(at, format!("unknown type name '{name}'; did you mean '{to}'?"))
+                    .note(decl, format!("'{to}' declared here"))
+            }
+            Some((to, None)) => Error::new(
+                at,
+                format!("use of undeclared identifier '{name}'; did you mean '{to}'?"),
+            ),
+            _ => Error::new(at, format!("unknown type name '{name}'")),
+        }
+    }
+
     fn expect_semi(&mut self, after: &str) -> Result<(), Error> {
         if self.eat_punct(";") {
             Ok(())
@@ -1016,10 +1592,10 @@ impl Parser<'_> {
         }
     }
 
-    fn expect_ident(&mut self, what: &str) -> Result<(String, Pos), Error> {
+    fn expect_ident(&mut self) -> Result<(String, Pos), Error> {
         match self.peek().clone() {
             Tok::Ident(name) => Ok((name, self.advance().pos)),
-            _ => Err(self.unexpected(what)),
+            _ => Err(self.expected("identifier")),
         }
     }
 
@@ -1027,30 +1603,49 @@ impl Parser<'_> {
 
     /// Type specifiers, qualifiers, storage class and `inline`, in any order
     /// (`unsigned static int` is as good as `static unsigned int`, as in C).
+    /// They are read as clang's `DeclSpec` reads them: a width (`short`,
+    /// `long`, `long long`), a sign, and one other type specifier (a keyword,
+    /// a struct, union or enum, or a typedef name), each checked as it comes
+    /// against what came before (`cannot combine with previous 'short'
+    /// declaration specifier`; the same one twice, `short short`, is only
+    /// warned of, as a qualifier, storage class or `inline` twice is), then
+    /// the three against each other (`'short char' is invalid`, `'void'
+    /// cannot be signed or unsigned`). With none of them, the type is C89's
+    /// implicit `int`, an error in C99.
     fn specifiers(&mut self, ctx: Ctx) -> Result<Specs, Error> {
         let start = self.here();
-        let mut class = Class::None;
-        let mut inline = false;
+        let mut class: Option<(Class, Kw, Pos)> = None;
+        let mut inline = None;
         let mut quals = Quals::NONE;
-        // A struct, union or enum, or a typedef name: a type on its own.
-        let mut named: Option<Type> = None;
+        let mut restrict = false;
+        let mut width: Option<(Width, Pos)> = None;
+        // `unsigned` (true) or `signed`, and where.
+        let mut sign: Option<(bool, Pos)> = None;
+        let mut base: Option<Base> = None;
         let mut spelled = Spelled::default();
         let mut declares = false;
-        // How many times each type keyword appears.
-        let (mut void, mut char, mut short, mut int, mut long, mut signed, mut unsigned, mut bool_) =
-            (0, 0, 0, 0, 0, 0, 0, 0);
+        let mut anonymous = false;
+        let combine = |pos: Pos, prev: &str| {
+            Error::new(
+                pos,
+                format!("cannot combine with previous '{prev}' declaration specifier"),
+            )
+        };
         loop {
             let pos = self.here();
             let k = match self.peek().clone() {
                 Tok::Kw(k) if k.starts_decl() => k,
-                // A typedef name is a type specifier only where no other is yet:
-                // in `int T;` the `T` is the declarator, even if it names a type.
+                // A typedef name is a type specifier only where no other is
+                // yet: in `int T;` and `unsigned T;` the `T` is the
+                // declarator, even if it names a type.
                 Tok::Ident(name)
-                    if named.is_none()
-                        && void + char + short + int + long + signed + unsigned + bool_ == 0
+                    if base.is_none()
+                        && width.is_none()
+                        && sign.is_none()
                         && self.typedef(&name).is_some() =>
                 {
-                    named = self.typedef(&name).cloned();
+                    let ty = self.typedef(&name).cloned().expect("a typedef name");
+                    base = Some(Base::Named(ty, "type-name"));
                     spelled = self.typedef_spelling(&name);
                     self.advance();
                     continue;
@@ -1058,164 +1653,187 @@ impl Parser<'_> {
                 _ => break,
             };
             self.advance();
-            let count = match k {
-                Kw::Static | Kw::Extern | Kw::Typedef => {
+            // What is there twice, which clang only warns of.
+            let duplicate = |p: &Self| {
+                p.warn(Error::warning(
+                    pos,
+                    format!("duplicate '{}' declaration specifier", k.as_str()),
+                    "duplicate-decl-specifier",
+                ))
+            };
+            match k {
+                Kw::Static | Kw::Extern | Kw::Typedef | Kw::Register | Kw::Auto => {
+                    match ctx {
+                        Ctx::Member | Ctx::TypeName => {
+                            let msg = "type name does not allow storage class to be specified";
+                            return Err(Error::new(pos, msg));
+                        }
+                        // A parameter may be `register`, and nothing else.
+                        Ctx::Param if k != Kw::Register => {
+                            let msg = "invalid storage class specifier in function declarator";
+                            return Err(Error::new(pos, msg));
+                        }
+                        Ctx::Param | Ctx::File | Ctx::Block | Ctx::ForInit => {}
+                    }
                     let c = match k {
                         Kw::Static => Class::Static,
                         Kw::Extern => Class::Extern,
+                        Kw::Register => Class::Register,
+                        Kw::Auto => Class::Auto,
                         _ => Class::Typedef,
                     };
-                    let allowed = match ctx {
-                        Ctx::File => true,
-                        Ctx::Block => k != Kw::Extern,
-                        Ctx::ForInit | Ctx::Param | Ctx::Member | Ctx::TypeName => false,
-                    };
-                    if !allowed {
-                        return Err(Error::new(pos, format!("'{}' is not allowed here", k.as_str())));
+                    match class {
+                        None => class = Some((c, k, pos)),
+                        Some((_, prev, _)) if prev == k => duplicate(self),
+                        Some((_, prev, _)) => return Err(combine(pos, prev.as_str())),
                     }
-                    if class != Class::None {
-                        return Err(Error::new(
-                            pos,
-                            "at most one storage class ('static', 'extern', 'typedef') is allowed",
-                        ));
-                    }
-                    class = c;
-                    continue;
                 }
                 Kw::Inline => {
-                    if ctx != Ctx::File {
-                        return Err(Error::new(pos, "'inline' can only appear on functions"));
+                    match ctx {
+                        Ctx::Member | Ctx::TypeName => {
+                            let msg = "type name does not allow function specifier to be specified";
+                            return Err(Error::new(pos, msg));
+                        }
+                        Ctx::Param => return Err(Error::new(pos, "'inline' can only appear on functions")),
+                        Ctx::File | Ctx::Block | Ctx::ForInit => {}
                     }
-                    inline = true;
-                    continue;
-                }
-                Kw::Const => {
-                    quals.konst = true;
-                    continue;
-                }
-                Kw::Volatile => {
-                    quals.volatile = true;
-                    continue;
-                }
-                // `restrict` promises no aliasing, which merlin never relies on.
-                Kw::Restrict => continue,
-                Kw::Struct | Kw::Union | Kw::Enum => {
-                    if named.is_some() || void + char + short + int + long + signed + unsigned + bool_ > 0 {
-                        return Err(Error::new(start, "invalid combination of type specifiers"));
+                    match inline {
+                        None => inline = Some(pos),
+                        Some(_) => duplicate(self),
                     }
-                    let (ty, d, s) = self.nested(|p| match k {
-                        Kw::Enum => p.enum_spec(pos),
-                        _ => p
-                            .record_spec(k == Kw::Union, pos)
-                            .map(|(t, d)| (t, d, Spelled::default())),
-                    })?;
-                    named = Some(ty);
-                    declares = d;
-                    spelled = s;
-                    continue;
                 }
-                Kw::Void => &mut void,
-                Kw::Char => &mut char,
-                Kw::Short => &mut short,
-                Kw::Int => &mut int,
-                Kw::Long => &mut long,
-                Kw::Signed => &mut signed,
-                Kw::Unsigned => &mut unsigned,
-                Kw::Bool => &mut bool_,
-                _ => unreachable!("starts_decl"),
-            };
-            *count += 1;
-            // `long` may come twice: `long long`.
-            if k == Kw::Long && *count == 3 {
-                return Err(Error::new(pos, "'long long long' is invalid"));
-            }
-            if *count > 1 && !(k == Kw::Long && *count == 2) {
-                return Err(Error::new(pos, format!("duplicate '{}'", k.as_str())));
+                Kw::Const | Kw::Volatile | Kw::Restrict => {
+                    let had = match k {
+                        Kw::Const => std::mem::replace(&mut quals.konst, true),
+                        Kw::Volatile => std::mem::replace(&mut quals.volatile, true),
+                        // `restrict` promises no aliasing, which merlin never relies on.
+                        _ => std::mem::replace(&mut restrict, true),
+                    };
+                    if had {
+                        duplicate(self);
+                    }
+                }
+                Kw::Short | Kw::Long => {
+                    width = match (width, k) {
+                        (None, Kw::Short) => Some((Width::Short, pos)),
+                        (None, _) => Some((Width::Long, pos)),
+                        (Some((Width::Short, at)), Kw::Short) => {
+                            duplicate(self);
+                            Some((Width::Short, at))
+                        }
+                        // `long` may come twice: `long long`, which is where
+                        // the first one is.
+                        (Some((Width::Long, at)), Kw::Long) => Some((Width::LongLong, at)),
+                        (Some((w, _)), _) => return Err(combine(pos, w.name())),
+                    };
+                }
+                Kw::Signed | Kw::Unsigned => {
+                    let unsigned = k == Kw::Unsigned;
+                    match sign {
+                        None => sign = Some((unsigned, pos)),
+                        Some((u, _)) if u == unsigned => duplicate(self),
+                        Some((u, _)) => return Err(combine(pos, if u { "unsigned" } else { "signed" })),
+                    }
+                }
+                _ => {
+                    if let Some(b) = &base {
+                        return Err(combine(pos, b.name()));
+                    }
+                    base = Some(match k {
+                        Kw::Void => Base::Void,
+                        Kw::Char => Base::Char,
+                        Kw::Int => Base::Int,
+                        Kw::Bool => Base::Bool,
+                        Kw::Struct | Kw::Union | Kw::Enum => {
+                            let (ty, d, s, anon) = self.nested(|p| match k {
+                                Kw::Enum => p.enum_spec(pos).map(|(t, d, s)| (t, d, s, false)),
+                                _ => p
+                                    .record_spec(k == Kw::Union, pos)
+                                    .map(|(t, d, anon)| (t, d, Spelled::default(), anon)),
+                            })?;
+                            declares = d;
+                            spelled = s;
+                            anonymous = anon;
+                            Base::Named(ty, k.as_str())
+                        }
+                        _ => unreachable!("starts_decl"),
+                    });
+                }
             }
         }
-        let keywords = void + char + short + int + long + signed + unsigned + bool_;
-        let ty = match named {
-            Some(_) if keywords > 0 => {
-                return Err(Error::new(start, "invalid combination of type specifiers"));
-            }
-            Some(ty) => ty,
-            None if keywords == 0 => {
+        // (Specifiers that end the declaration, `static;`, have none to
+        // give a type: clang only warns that they declare nothing.)
+        if base.is_none() && width.is_none() && sign.is_none() && !self.is_punct(";") {
+            let msg =
+                "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int";
+            return Err(Error::new(self.here(), msg).flagged("implicit-int"));
+        }
+        // Only `char` and `int` have a sign, and only `int` a width (when
+        // there is no other, the type is `int`: `unsigned`, `long long`).
+        if let (Some((_, at)), Some(b)) = (sign, &base) {
+            if !matches!(b, Base::Char | Base::Int) {
                 return Err(Error::new(
-                    self.here(),
-                    format!("expected a type, found {}", self.tok().describe()),
+                    at,
+                    format!("'{}' cannot be signed or unsigned", b.name()),
                 ));
             }
-            None => {
-                // At most one of void, char, short, long (or long long) and
-                // _Bool; `int` may join short and long; `signed` or
-                // `unsigned` may join anything but void and _Bool.
-                let invalid = signed + unsigned > 1
-                    || void + char + short + long.min(1) + bool_ > 1
-                    || int + void + char + bool_ > 1
-                    || void + bool_ + signed + unsigned > 1;
-                if invalid {
-                    return Err(Error::new(start, "invalid combination of type specifiers"));
-                }
-                if void == 1 {
-                    Type::Void
-                } else if bool_ == 1 {
-                    Type::BOOL
-                } else if char == 1 {
-                    Type::Int(match (signed, unsigned) {
-                        (1, _) => IntKind::SChar,
-                        (_, 1) => IntKind::UChar,
-                        _ => IntKind::Char,
-                    })
-                } else if short == 1 {
-                    Type::Int(if unsigned == 1 {
-                        IntKind::UShort
-                    } else {
-                        IntKind::Short
-                    })
-                } else if long == 2 {
-                    Type::Int(if unsigned == 1 {
-                        IntKind::ULongLong
-                    } else {
-                        IntKind::LongLong
-                    })
-                } else if long == 1 {
-                    Type::Int(if unsigned == 1 {
-                        IntKind::ULong
-                    } else {
-                        IntKind::Long
-                    })
-                } else {
-                    Type::Int(if unsigned == 1 {
-                        IntKind::UInt
-                    } else {
-                        IntKind::Int
-                    })
-                }
+        }
+        if let (Some((w, at)), Some(b)) = (width, &base) {
+            if !matches!(b, Base::Int) {
+                return Err(Error::new(at, format!("'{} {}' is invalid", w.name(), b.name())));
             }
+        }
+        let unsigned = matches!(sign, Some((true, _)));
+        let ty = match base {
+            Some(Base::Void) => Type::Void,
+            Some(Base::Bool) => Type::BOOL,
+            Some(Base::Named(ty, _)) => ty,
+            Some(Base::Char) => Type::Int(match sign {
+                Some((true, _)) => IntKind::UChar,
+                Some((false, _)) => IntKind::SChar,
+                None => IntKind::Char,
+            }),
+            Some(Base::Int) | None => Type::Int(match (width.map(|(w, _)| w), unsigned) {
+                (Some(Width::Short), false) => IntKind::Short,
+                (Some(Width::Short), true) => IntKind::UShort,
+                (Some(Width::Long), false) => IntKind::Long,
+                (Some(Width::Long), true) => IntKind::ULong,
+                (Some(Width::LongLong), false) => IntKind::LongLong,
+                (Some(Width::LongLong), true) => IntKind::ULongLong,
+                (None, false) => IntKind::Int,
+                (None, true) => IntKind::UInt,
+            }),
         };
         Ok(Specs {
             ty: ty.qualified(quals),
-            class,
+            class: class.map_or(Class::None, |(c, ..)| c),
+            class_pos: class.map_or(start, |(.., at)| at),
             inline,
             declares,
+            anonymous,
             spelled,
+            pos: start,
         })
     }
 
     /// After `struct` or `union`: a definition (`struct tag { ... }`, the tag
-    /// optional) or a reference to a tag. Returns the type and whether the
-    /// specifier declares a tag by itself.
-    fn record_spec(&mut self, union: bool, kw_pos: Pos) -> Result<(Type, bool), Error> {
+    /// optional) or a reference to a tag. Returns the type, whether the
+    /// specifier declares a tag by itself, and whether it defines a struct
+    /// or union without one.
+    fn record_spec(&mut self, union: bool, kw_pos: Pos) -> Result<(Type, bool, bool), Error> {
         let kw = if union { "union" } else { "struct" };
         let tag = match self.peek().clone() {
             Tok::Ident(name) => Some((name, self.advance().pos)),
             _ => None,
         };
-        let mismatch = |name: &str, pos: Pos| {
+        // A tag of the other kind, first used at `prev`: clang's error is at
+        // the keyword.
+        let mismatch = |name: &str, prev: Pos| {
             Error::new(
-                pos,
+                kw_pos,
                 format!("use of '{name}' with tag type that does not match previous declaration"),
             )
+            .note(prev, "previous use is here")
         };
         if self.is_punct("{") {
             let record = match &tag {
@@ -1223,9 +1841,11 @@ impl Parser<'_> {
                     // `struct s;` earlier in this scope: this completes it.
                     Some(Tag::Record(r)) if r.union == union && r.body().is_none() => r.clone(),
                     Some(Tag::Record(r)) if r.union == union => {
-                        return Err(Error::new(*pos, format!("redefinition of '{kw} {name}'")));
+                        let prev = r.body().map_or(r.pos, |b| b.pos);
+                        return Err(Error::new(*pos, format!("redefinition of '{name}'"))
+                            .note(prev, "previous definition is here"));
                     }
-                    Some(_) => return Err(mismatch(name, *pos)),
+                    Some(t) => return Err(mismatch(name, t.pos())),
                     None => {
                         // Declared before the body, so members can point to it.
                         let r = Record::new(union, Some(name.clone()), *pos);
@@ -1237,11 +1857,15 @@ impl Parser<'_> {
             };
             let at = tag.as_ref().map_or(kw_pos, |(_, pos)| *pos);
             self.record_body(&record, at)?;
+            self.after_definition(kw)?;
             // `struct { int x; };` declares nothing anyone can name.
-            return Ok((Type::Record(record), tag.is_some()));
+            return Ok((Type::Record(record), tag.is_some(), tag.is_none()));
         }
         let Some((name, pos)) = tag else {
-            return Err(self.unexpected(&format!("a name or '{{' after '{kw}'")));
+            return Err(Error::new(
+                kw_pos,
+                format!("declaration of anonymous {kw} must be a definition"),
+            ));
         };
         // `struct s;` on its own declares a new type in this scope, even when
         // an outer scope has a `struct s`.
@@ -1252,14 +1876,14 @@ impl Parser<'_> {
             self.lookup_tag(&name)
         };
         match found {
-            Some(Tag::Record(r)) if r.union == union => Ok((Type::Record(r.clone()), alone)),
-            Some(_) => Err(mismatch(&name, pos)),
+            Some(Tag::Record(r)) if r.union == union => Ok((Type::Record(r.clone()), alone, false)),
+            Some(t) => Err(mismatch(&name, t.pos())),
             None => {
                 // A tag not seen before: an incomplete type, completed by a
                 // definition later in the same scope.
                 let r = Record::new(union, Some(name.clone()), pos);
                 self.bind_tag(&name, Tag::Record(r.clone()));
-                Ok((Type::Record(r), true))
+                Ok((Type::Record(r), true, false))
             }
         }
     }
@@ -1268,23 +1892,29 @@ impl Parser<'_> {
     /// definition is at `at`.
     fn record_body(&mut self, record: &Record, at: Pos) -> Result<(), Error> {
         let open = self.expect_punct("{")?;
-        let mut members: Vec<(String, Type, Spelled, Pos)> = Vec::new();
+        let mut members: Vec<(String, Type, Spelled, Pos, Pos)> = Vec::new();
         let mut seen: HashMap<String, Pos> = HashMap::new();
         // The layout so far, to reject a struct too big before laying it out.
         let mut end = 0u64;
         while !self.eat_punct("}") {
             if !self.at_decl() {
-                return Err(self.unexpected(&format!(
-                    "a member declaration or '}}' in the {}",
-                    record.keyword()
-                )));
+                if *self.peek() == Tok::Eof {
+                    return Err(self.expect_close("}", open).unwrap_err());
+                }
+                return Err(self.expected_specifier());
             }
             let specs = self.specifiers(Ctx::Member)?;
             if self.is_punct(";") {
-                return Err(Error::new(
-                    self.here(),
-                    "declaration does not declare anything (anonymous members are not supported)",
-                ));
+                // C11's anonymous members, which clang takes in C99 too:
+                // merlin's language has none.
+                if specs.anonymous {
+                    let kw = specs.ty.record().map_or("struct", |r| r.keyword());
+                    let msg = format!("anonymous {kw}s are not supported");
+                    return Err(Error::new(specs.pos, msg));
+                }
+                self.advance();
+                self.nothing_declared(&specs);
+                continue;
             }
             loop {
                 let d = self.declarator(&specs.ty, Ctx::Member)?;
@@ -1299,17 +1929,20 @@ impl Parser<'_> {
                     ));
                 }
                 let Some(size) = d.ty.size(self.xlen) else {
-                    let msg = match &d.ty {
-                        Type::Array(_, None) => "flexible array members are not supported yet".to_string(),
-                        t => format!("field '{}' has incomplete type '{t}'", d.name),
-                    };
-                    return Err(Error::new(d.pos, msg));
+                    if let Type::Array(_, None) = &d.ty {
+                        return Err(Error::new(d.pos, "flexible array members are not supported yet"));
+                    }
+                    let e = Error::new(d.pos, format!("field has incomplete type '{}'", d.ty));
+                    return Err(match d.ty.unqual() {
+                        Type::Record(r) => {
+                            e.note(r.pos, format!("forward declaration of '{}'", d.ty.unqual()))
+                        }
+                        _ => e,
+                    });
                 };
                 if let Some(prev) = seen.insert(d.name.clone(), d.pos) {
-                    return Err(Error::new(
-                        d.pos,
-                        format!("duplicate member '{}' (first declared at {prev})", d.name),
-                    ));
+                    return Err(Error::new(d.pos, format!("duplicate member '{}'", d.name))
+                        .note(prev, "previous declaration is here"));
                 }
                 end = if record.union {
                     end.max(u64::from(size))
@@ -1319,12 +1952,18 @@ impl Parser<'_> {
                 if end > MAX_OBJECT_SIZE {
                     return Err(Error::new(d.pos, format!("{} is too large", record.keyword())));
                 }
-                members.push((d.name, d.ty, specs.spelled.clone(), d.pos));
+                members.push((d.name, d.ty, specs.spelled.clone(), d.pos, specs.pos));
                 if !self.eat_punct(",") {
                     break;
                 }
             }
-            self.expect_semi("at end of declaration list")?;
+            // The last member's `;` left out: clang only warns.
+            if self.is_punct("}") {
+                let msg = "expected ';' at end of declaration list";
+                self.warn(Error::warning_unflagged(self.after_prev(), msg));
+            } else {
+                self.expect_semi("at end of declaration list")?;
+            }
         }
         if members.is_empty() {
             return Err(Error::new(open, format!("{} has no members", record.keyword())));
@@ -1333,7 +1972,7 @@ impl Parser<'_> {
             end,
             members
                 .iter()
-                .map(|(_, t, _, _)| t.align(self.xlen))
+                .map(|(_, t, _, _, _)| t.align(self.xlen))
                 .max()
                 .unwrap_or(1),
         ) > MAX_OBJECT_SIZE
@@ -1342,6 +1981,22 @@ impl Parser<'_> {
         }
         record.complete_spelled(members, at, self.xlen);
         Ok(())
+    }
+
+    /// clang's error where a declaration's specifiers should be and are
+    /// not: in a struct (`struct s { 3; }`).
+    fn expected_specifier(&self) -> Error {
+        Error::new(self.here(), "type name requires a specifier or qualifier")
+    }
+
+    /// clang's warning for specifiers that end their declaration and declare
+    /// nothing (`int;`), at their start.
+    fn nothing_declared(&self, specs: &Specs) {
+        self.warn(Error::warning(
+            specs.pos,
+            "declaration does not declare anything",
+            "missing-declarations",
+        ));
     }
 
     /// After `enum`: a definition, whose constants go in scope one by one
@@ -1353,16 +2008,20 @@ impl Parser<'_> {
             Tok::Ident(name) => Some((name, self.advance().pos)),
             _ => None,
         };
+        let mismatch = |name: &str, prev: Pos| {
+            Error::new(
+                kw_pos,
+                format!("use of '{name}' with tag type that does not match previous declaration"),
+            )
+            .note(prev, "previous use is here")
+        };
         if !self.eat_punct("{") {
             let Some((name, pos)) = tag else {
-                return Err(self.unexpected("a name or '{' after 'enum'"));
+                return Err(self.expected("identifier or '{'"));
             };
             return match self.lookup_tag(&name) {
-                Some(Tag::Enum(ty, s)) => Ok((ty.clone(), false, s.clone())),
-                Some(Tag::Record(_)) => Err(Error::new(
-                    pos,
-                    format!("use of '{name}' with tag type that does not match previous declaration"),
-                )),
+                Some(Tag::Enum(ty, s, _)) => Ok((ty.clone(), false, s.clone())),
+                Some(t) => Err(mismatch(&name, t.pos())),
                 None => Err(Error::new(
                     pos,
                     format!(
@@ -1372,8 +2031,13 @@ impl Parser<'_> {
             };
         }
         if let Some((name, pos)) = &tag {
-            if self.scopes.last().unwrap().tags.contains_key(name) {
-                return Err(Error::new(*pos, format!("redefinition of 'enum {name}'")));
+            match self.scopes.last().unwrap().tags.get(name) {
+                Some(Tag::Enum(.., prev)) => {
+                    return Err(Error::new(*pos, format!("redefinition of '{name}'"))
+                        .note(*prev, "previous definition is here"));
+                }
+                Some(t) => return Err(mismatch(name, t.pos())),
+                None => {}
             }
         }
         let (int_min, int_max) = IntKind::Int.range(self.xlen);
@@ -1381,18 +2045,21 @@ impl Parser<'_> {
         let mut negative = false;
         let mut constants = Vec::new();
         loop {
-            if self.eat_punct("}") {
+            if self.is_punct("}") {
                 if constants.is_empty() {
-                    return Err(Error::new(kw_pos, "use of empty enum"));
+                    return Err(Error::new(self.here(), "use of empty enum"));
                 }
+                self.advance();
                 break;
             }
-            let (name, pos) = self.expect_ident("an enumerator name")?;
+            let (name, pos) = self.expect_ident()?;
+            let valued = self.is_punct("=");
             let value = if self.eat_punct("=") {
                 let at = self.here();
                 let mut e = self.cond()?;
-                let msg = "enumerator value is not an integer constant expression";
-                match self.const_int(&mut e, at, msg)? {
+                let msg = "expression is not an integer constant expression";
+                let typed = Some("integer constant expression must have integer type, not");
+                match self.const_int(&mut e, at, msg, typed)? {
                     (v, true) => v,
                     // Sema reports the error.
                     (_, false) => 0,
@@ -1410,9 +2077,18 @@ impl Parser<'_> {
             negative |= value < 0;
             next = value + 1;
             constants.push((name, value));
-            if !self.eat_punct(",") && !self.is_punct("}") {
-                return Err(self.unexpected("',' or '}' in the enum"));
+            if self.eat_punct(",") || self.is_punct("}") {
+                continue;
             }
+            // Another enumerator: clang takes the comma to be missing.
+            if matches!(self.peek(), Tok::Ident(_)) {
+                return Err(Error::new(self.after_prev(), "missing ',' between enumerators"));
+            }
+            return Err(if valued {
+                self.expected("'}' or ','")
+            } else {
+                self.expected("'= constant-expression' or end of enumerator definition")
+            });
         }
         let ty = if negative { Type::INT } else { Type::UINT };
         let names: Vec<String> = constants.iter().map(|(n, _)| n.clone()).collect();
@@ -1421,6 +2097,7 @@ impl Parser<'_> {
             ty: ty.clone(),
             constants,
             pos: kw_pos,
+            typedef_name: OnceLock::new(),
         }))));
         // The constants now name their enum, for the code after it.
         let scope = self.scopes.last_mut().expect("a scope");
@@ -1429,12 +2106,59 @@ impl Parser<'_> {
                 *of = spelled.clone();
             }
         }
-        if let Some((name, _)) = tag {
-            self.bind_tag(&name, Tag::Enum(ty.clone(), spelled.clone()));
+        if let Some((name, pos)) = tag {
+            self.bind_tag(&name, Tag::Enum(ty.clone(), spelled.clone(), pos));
         }
+        self.after_definition("enum")?;
         Ok((ty, true, spelled))
     }
 
+    /// After a struct, union or enum's `}` (the `kw` it is), what can
+    /// follow a type specifier, as clang's `isValidAfterTypeSpecifier` has
+    /// it, else clang's error that the `;` is missing after it: a type
+    /// specifier (`struct s { ... } struct t;`) or a keyword that begins
+    /// none of a declarator. A qualifier or storage class followed by a
+    /// type specifier is taken for the next declaration's, too.
+    fn after_definition(&self, kw: &str) -> Result<(), Error> {
+        let type_specifier = |t: &Tok| match t {
+            Tok::Kw(k) => matches!(
+                k,
+                Kw::Void
+                    | Kw::Char
+                    | Kw::Short
+                    | Kw::Int
+                    | Kw::Long
+                    | Kw::Signed
+                    | Kw::Unsigned
+                    | Kw::Bool
+                    | Kw::Struct
+                    | Kw::Union
+                    | Kw::Enum
+            ),
+            Tok::Ident(name) => matches!(self.lookup_name(name), Some(Name::Typedef(..))),
+            _ => false,
+        };
+        let valid = match self.peek() {
+            Tok::Punct(";" | "*" | ")" | "(" | "," | "[" | "..." | ":" | "}") | Tok::Ident(_) => true,
+            Tok::Kw(
+                Kw::Const
+                | Kw::Volatile
+                | Kw::Restrict
+                | Kw::Inline
+                | Kw::Static
+                | Kw::Extern
+                | Kw::Typedef
+                | Kw::Register
+                | Kw::Auto,
+            ) => !type_specifier(self.peek_at(1)),
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::new(self.after_prev(), format!("expected ';' after {kw}")))
+        }
+    }
     /// `const`, `volatile` and `restrict` after a `*`.
     fn qualifiers(&mut self) -> Quals {
         let mut q = Quals::NONE;
@@ -1482,20 +2206,23 @@ impl Parser<'_> {
         }
         let pos = self.here();
         let (name, pos, inner) = if self.is_punct("(") && self.nested_declarator_follows() {
-            self.advance();
+            let open = self.advance().pos;
             let (name, pos, inner) = self.nested(|p| p.declarator_ops(ctx))?;
-            self.expect_punct(")")?;
+            self.expect_close(")", open)?;
             (name, pos, inner)
         } else if let Tok::Ident(name) = self.peek().clone() {
             if ctx == Ctx::TypeName {
-                return Err(self.unexpected("')' after the type name"));
+                let open = self.type_open.get();
+                return Err(self.expected("')'").note(open, "to match this '('"));
             }
             self.advance();
             (name, pos, Vec::new())
         } else if matches!(ctx, Ctx::Param | Ctx::TypeName) {
             (String::new(), pos, Vec::new())
+        } else if ctx == Ctx::Member {
+            return Err(self.expected("member name or ';' after declaration specifiers"));
         } else {
-            return Err(self.unexpected("a name"));
+            return Err(self.expected("identifier or '('"));
         };
         let suffixes = self.suffixes()?;
         let mut ops = ptrs;
@@ -1505,7 +2232,7 @@ impl Parser<'_> {
     }
 
     /// `('[' constant? ']' | '(' params ')')*` after a declarator's name, in
-    /// source order. In a run of dimensions only the first may be left out.
+    /// source order.
     fn suffixes(&mut self) -> Result<Vec<Derive>, Error> {
         let mut out = Vec::new();
         let mut dims = 0;
@@ -1518,10 +2245,10 @@ impl Parser<'_> {
                 // passes at least that many elements; merlin does not use it).
                 // `declarator` checks they are on a parameter's outermost array.
                 let mut quals = None;
-                let mut is_static = false;
+                let mut is_static = None;
                 loop {
-                    if self.eat_kw(Kw::Static) {
-                        is_static = true;
+                    if *self.peek() == Tok::Kw(Kw::Static) {
+                        is_static = Some(self.advance().pos);
                         quals.get_or_insert(Quals::NONE);
                     } else if matches!(self.peek(), Tok::Kw(Kw::Const | Kw::Volatile | Kw::Restrict)) {
                         let q = self.qualifiers();
@@ -1530,35 +2257,66 @@ impl Parser<'_> {
                         break;
                     }
                 }
-                if is_static && self.is_punct("]") {
-                    return Err(self.unexpected("the array size after 'static'"));
+                if let (Some(at), true) = (is_static, self.is_punct("]")) {
+                    return Err(Error::new(at, "'static' may not be used without an array size"));
                 }
+                let quals = quals.map(|q| (q, is_static.is_some()));
+                let size = self.here();
                 if self.eat_punct("]") {
-                    if dims > 0 {
-                        return Err(Error::new(open, "only the first array dimension may be left out"));
-                    }
-                    out.push(Derive::Array(None, open, quals, None));
+                    out.push(Derive::Array(Array {
+                        len: None,
+                        open,
+                        size,
+                        quals,
+                        folded: None,
+                        entries: 0..0,
+                        constant: true,
+                    }));
                     dims += 1;
                     continue;
                 }
-                let pos = self.here();
+                let first = self.unevaluated.borrow().len();
                 let mut e = self.cond()?;
-                self.expect_punct("]")?;
+                self.expect_close("]", open)?;
                 let outer = self.folding.replace(false);
-                let (n, sure) = self.const_int(&mut e, pos, NOT_CONSTANT_SIZE)?;
-                let folded = self.folding.replace(outer).then_some(pos);
-                // Not sure: sema reports the error, and the size is not used.
-                let n = if sure { n } else { 1 };
-                if n <= 0 {
-                    return Err(Error::new(pos, format!("array size must be positive, not {n}")));
+                let (n, sure) = self.const_int(
+                    &mut e,
+                    size,
+                    NOT_CONSTANT_SIZE,
+                    Some("size of array has non-integer type"),
+                )?;
+                let mut folded = self.folding.replace(outer).then_some(size);
+                let entries = first..self.unevaluated.borrow().len();
+                // A size clang's evaluator notes as no constant expression
+                // (`1 << 40 ? 1 : 2`, `INT_MAX + 1 > 0 ? 1 : 2`) clang folds
+                // wherever it is, with its warning where the size begins,
+                // given unless the size has an error.
+                if let Some((at, note)) = consteval::parsed_note(&e, self.xlen).filter(|_| sure) {
+                    // Not a leaf (one never is noted): the constant is kept.
+                    folded = None;
+                    let mut us = self.unevaluated.borrow_mut();
+                    let with = entries.len() - 1;
+                    let u = us.last_mut().expect("the constant itself");
+                    let (msg, flag) = FOLDED;
+                    u.diagnostic = Some(Error::warning(size, msg, flag).note(at, note));
+                    u.with = with;
                 }
-                out.push(Derive::Array(Some(n), open, quals, folded));
+                // Not sure: sema reports the error, and the size is not used.
+                out.push(Derive::Array(Array {
+                    len: Some(if sure { n } else { 1 }),
+                    open,
+                    size,
+                    quals,
+                    folded,
+                    entries,
+                    constant: sure,
+                }));
                 dims += 1;
             } else if self.is_punct("(") {
-                self.advance();
+                let open = self.advance().pos;
                 let prototyped = !self.is_punct(")");
-                let (params, variadic, scope) = self.params()?;
-                out.push(Derive::Func(params, variadic, prototyped, scope));
+                let (params, variadic, scope) = self.params(open)?;
+                out.push(Derive::Func(params, variadic, prototyped, scope, open));
                 dims = 0;
             } else {
                 return Ok(out);
@@ -1571,12 +2329,18 @@ impl Parser<'_> {
     fn declarator(&mut self, base: &Type, ctx: Ctx) -> Result<Decl, Error> {
         let start = self.unevaluated.borrow().len();
         let (name, pos, ops) = self.declarator_ops(ctx)?;
-        let reach = reach(&ops);
-        let end = self.here();
+        let folded_reach = reach(&ops, |a| a.folded.is_some());
+        let variable = reach(&ops, |a| !a.constant);
         let mut ty = base.clone();
         let mut func = None;
         let mut prototyped = false;
+        let mut func_open = None;
         let mut folded = None;
+        let mut folded_sizes = (None, Vec::new());
+        // The sizes that are not constant, which sema reports.
+        let mut sizes = Vec::new();
+        // An array larger than merlin lays out, though clang takes it.
+        let mut too_large = None;
         // The size of `ty`, kept as it grows: `Type::size` recurses, so asking
         // it at every dimension would be quadratic in the number of dimensions.
         let mut size = ty.size(self.xlen).map(u64::from);
@@ -1587,37 +2351,76 @@ impl Parser<'_> {
                     ty = Type::ptr(ty).qualified(q);
                     size = Some(u64::from(ptr_size(self.xlen)));
                 }
-                Derive::Array(n, open, quals, at) => {
-                    folded = folded.or(at);
+                Derive::Array(a) => {
+                    folded = folded.or(a.folded);
+                    // The last step is what is declared: its own array.
+                    if a.folded.is_some() {
+                        let entries = a.entries.start - start..a.entries.end - start;
+                        if i + 1 == steps {
+                            folded_sizes.0 = Some(entries);
+                        } else {
+                            folded_sizes.1.push(entries);
+                        }
+                    }
+                    if !a.constant {
+                        sizes.push(a.size);
+                    }
                     // Only a parameter's outermost array becomes a pointer,
                     // the one thing the qualifiers in the brackets can apply to.
-                    if quals.is_some() && !(ctx == Ctx::Param && i + 1 == steps) {
-                        return Err(Error::new(
-                            open,
-                            "qualifiers and 'static' inside '[]' are only allowed in the \
-                             outermost array of a function parameter",
-                        ));
+                    if let Some((_, is_static)) = a.quals.filter(|_| !(ctx == Ctx::Param && i + 1 == steps)) {
+                        let what = if is_static { "'static'" } else { "type qualifier" };
+                        let place = if ctx == Ctx::Param {
+                            "non-outermost array type derivation"
+                        } else {
+                            "array declarator outside of function prototype"
+                        };
+                        return Err(Error::new(a.open, format!("{what} used in {place}")));
                     }
                     if ty.is_func() {
                         let what = if name.is_empty() { "type name" } else { &name };
                         return Err(Error::new(
-                            open,
+                            a.open,
                             format!("'{what}' declared as array of functions of type '{ty}'"),
                         ));
                     }
                     let Some(elem_size) = size else {
-                        return Err(Error::new(
-                            end,
-                            format!("array has incomplete element type '{ty}'"),
-                        ));
+                        let e = Error::new(a.open, format!("array has incomplete element type '{ty}'"));
+                        return Err(match ty.unqual() {
+                            Type::Record(r) => {
+                                e.note(r.pos, format!("forward declaration of '{}'", ty.unqual()))
+                            }
+                            _ => e,
+                        });
                     };
-                    let total = u128::from(elem_size) * n.unwrap_or(1) as u128;
-                    if total > u128::from(MAX_OBJECT_SIZE) {
-                        return Err(Error::new(self.after_prev(), "array is too large"));
+                    match a.len {
+                        Some(n) if n < 0 => {
+                            let msg = if name.is_empty() {
+                                "array size is negative".to_string()
+                            } else {
+                                format!("'{name}' declared as an array with a negative size")
+                            };
+                            return Err(Error::new(a.size, msg));
+                        }
+                        // A GNU extension clang takes: merlin's objects all
+                        // have a size.
+                        Some(0) => return Err(Error::new(a.size, "zero-length arrays are not supported")),
+                        _ => {}
+                    }
+                    let n = a.len.map(|n| n as u128);
+                    let total = u128::from(elem_size) * n.unwrap_or(1);
+                    // clang's limit: the size in bytes has to fit in a
+                    // `size_t` (of 61 bits at most).
+                    let bits = (8 * ptr_size(self.xlen)).min(61);
+                    if total >> bits != 0 {
+                        let msg = format!("array is too large ({} elements)", grouped(n.unwrap_or(1)));
+                        return Err(Error::new(a.size, msg));
+                    }
+                    if total > u128::from(MAX_OBJECT_SIZE) && too_large.is_none() {
+                        too_large = Some(a.size);
                     }
                     size = n.map(|_| total as u64);
-                    ty = Type::array(ty, n.map(|n| n as u32));
-                    if let Some(q) = quals {
+                    ty = Type::array(ty, n.map(|n| u32::try_from(n).unwrap_or(u32::MAX)));
+                    if let Some((q, _)) = a.quals {
                         // The parameter adjustment, done here so the
                         // qualifiers land on the pointer: `int a[const 3]`
                         // declares `int *const a`.
@@ -1625,16 +2428,18 @@ impl Parser<'_> {
                         size = Some(u64::from(ptr_size(self.xlen)));
                     }
                 }
-                Derive::Func(params, variadic, with_prototype, scope) => {
+                Derive::Func(params, variadic, with_prototype, scope, open) => {
                     if ty.is_array() || ty.is_func() {
                         let what = if ty.is_array() { "array" } else { "function" };
                         return Err(Error::new(
-                            pos,
+                            open,
                             format!("function cannot return {what} type '{ty}'"),
                         ));
                     }
-                    // A qualified result means nothing: the value is a copy.
-                    let ret = ty.unqual().clone();
+                    // A qualified result is part of the type (`const int
+                    // f(void)` and `int f(void)` conflict), though a call's
+                    // value is unqualified (sema).
+                    let ret = ty.clone();
                     let types = params.iter().map(|p| p.ty.unqual().clone()).collect();
                     ty = if variadic {
                         Type::variadic_func(ret, types)
@@ -1644,14 +2449,20 @@ impl Parser<'_> {
                     if let Type::Func(f) = &mut ty {
                         f.spelled =
                             Spellings(params.iter().map(|p| (p.ty.clone(), p.spelled.clone())).collect());
+                        f.unprototyped = Unprototyped(!with_prototype);
                     }
                     size = None;
                     if i + 1 == steps {
                         func = Some((params, scope));
                         prototyped = with_prototype;
+                        func_open = Some(open);
                     }
                 }
             }
+        }
+        if let Some(at) = too_large {
+            let msg = format!("array is too large: merlin's objects are at most {MAX_OBJECT_SIZE} bytes");
+            return Err(Error::new(at, msg));
         }
         let d = Decl {
             name,
@@ -1659,10 +2470,13 @@ impl Parser<'_> {
             pos,
             func,
             prototyped,
+            open: func_open,
             folded,
-            reach,
+            reach: folded_reach,
+            folded_sizes,
             unevaluated: start..self.unevaluated.borrow().len(),
         };
+        self.variable_sizes(&d, ctx, &sizes, variable);
         // A parameter is never folded (see `folded`); a type name is as its
         // use says (`type_name_folded`).
         if ctx == Ctx::Param {
@@ -1671,19 +2485,46 @@ impl Parser<'_> {
         Ok(d)
     }
 
-    /// After `(`, up to and including `)`: the parameters, in a scope of
-    /// their own, and whether `...` ends them.
-    fn params(&mut self) -> Result<(Vec<Param>, bool, Scope), Error> {
+    /// The sizes of a declarator's own arrays that are no constants (at
+    /// `sizes`, through `reach`), which sema reports as merlin's error of a
+    /// variable-length array, or as clang's where it can have none: at file
+    /// scope and in a member, at the declarator's name.
+    fn variable_sizes(&self, d: &Decl, ctx: Ctx, sizes: &[Pos], reach: Reach) {
+        let msg = match (ctx, reach) {
+            _ if sizes.is_empty() => return,
+            (Ctx::File, Reach::Arrays) => "variable length array declaration not allowed at file scope",
+            (Ctx::File, Reach::Function) => "function declaration cannot have variably modified type",
+            (Ctx::File, _) => "variably modified type declaration not allowed at file scope",
+            (Ctx::Member, _) => {
+                "fields must have a constant size: 'variable length array in structure' extension will \
+                 never be supported"
+            }
+            _ => return,
+        };
+        let mut us = self.unevaluated.borrow_mut();
+        // A size's own (not an operand `?:` did not choose, which sema
+        // could not type: `1 ? 2 : p` of a pointer has no integer type).
+        for u in us[d.unevaluated.clone()].iter_mut().filter(|u| !u.folded) {
+            if let Some(untyped) = &mut u.untyped {
+                if sizes.contains(&untyped.0) && untyped.1 == NOT_CONSTANT_SIZE {
+                    *untyped = (d.pos, msg.to_string());
+                }
+            }
+        }
+    }
+    /// After `(` (at `open`), up to and including `)`: the parameters, in a
+    /// scope of their own, and whether `...` ends them.
+    fn params(&mut self, open: Pos) -> Result<(Vec<Param>, bool, Scope), Error> {
         self.scopes.push(Scope::default());
         let outer = self.prototype.borrow().len();
-        let params = self.params_inner();
+        let params = self.params_inner(open);
         self.prototype.borrow_mut().truncate(outer);
         let scope = self.scopes.pop().expect("pushed above");
         let (params, variadic) = params?;
         Ok((params, variadic, scope))
     }
 
-    fn params_inner(&mut self) -> Result<(Vec<Param>, bool), Error> {
+    fn params_inner(&mut self, open: Pos) -> Result<(Vec<Param>, bool), Error> {
         let mut params = Vec::new();
         if self.eat_punct(")") {
             return Ok((params, false));
@@ -1699,19 +2540,23 @@ impl Parser<'_> {
                 if params.is_empty() {
                     return Err(Error::new(
                         self.here(),
-                        "a named parameter must come before '...'",
+                        "ISO C requires a named parameter before '...'",
                     ));
                 }
                 self.advance();
-                if !self.eat_punct(")") {
-                    return Err(self.unexpected("')' after '...'"));
-                }
+                self.expect_close(")", open)?;
                 return Ok((params, true));
             }
             if !self.at_decl() {
-                return Err(self.unexpected("a parameter type"));
+                // `int f(unsinged x)`: a type's name, misspelt or none.
+                if let (Tok::Ident(name), Tok::Ident(_)) = (self.peek().clone(), self.peek_at(1)) {
+                    return Err(self.unknown_type_name(&name));
+                }
+                if params.is_empty() && matches!(self.peek(), Tok::Ident(_)) {
+                    return Err(self.identifier_list(open));
+                }
+                return Err(self.expected("parameter declarator"));
             }
-            let start = self.here();
             let specs = self.specifiers(Ctx::Param)?;
             let d = self.declarator(&specs.ty, Ctx::Param)?;
             // `(V)` with `typedef void V;` is `(void)` too: what C99 6.7.5.3p10
@@ -1720,7 +2565,27 @@ impl Parser<'_> {
             if params.is_empty() && d.name.is_empty() && d.ty == Type::Void && self.eat_punct(")") {
                 return Ok((params, false));
             }
-            let pos = if d.name.is_empty() { start } else { d.pos };
+            // Where the name is, or would be: clang's place for a
+            // parameter's diagnostics.
+            let pos = d.pos;
+            // Any other `void` parameter is clang's error: a named one, a
+            // qualified one alone (reported at the `(`), or one among
+            // others.
+            if d.ty.is_void() {
+                if !d.name.is_empty() {
+                    return Err(Error::new(pos, "argument may not have 'void' type"));
+                }
+                if params.is_empty() && self.is_punct(")") {
+                    return Err(Error::new(
+                        open,
+                        "'void' as parameter must not have type qualifiers",
+                    ));
+                }
+                return Err(Error::new(
+                    pos,
+                    "'void' must be the first and only parameter if specified",
+                ));
+            }
             if params.len() == MAX_PARAMS {
                 return Err(Error::new(
                     pos,
@@ -1730,12 +2595,17 @@ impl Parser<'_> {
             // C adjusts a parameter declared as an array or a function to a
             // pointer (keeping qualifiers on what it points to).
             let spelled = decayed_spelling(&d.ty, specs.spelled);
+            let array = d.ty.is_array().then(|| d.ty.clone());
             let ty = if d.ty.is_array() || d.ty.is_func() {
                 d.ty.decay()
             } else {
                 d.ty
             };
             if !d.name.is_empty() {
+                if let Some((_, prev)) = self.scopes.last().and_then(|s| s.names.get(&d.name)) {
+                    return Err(Error::new(pos, format!("redefinition of parameter '{}'", d.name))
+                        .note(*prev, "previous declaration is here"));
+                }
                 self.bind_name(&d.name, Name::Object(ty.clone()), pos)?;
                 self.prototype
                     .borrow_mut()
@@ -1746,28 +2616,69 @@ impl Parser<'_> {
                 ty,
                 pos,
                 spelled,
+                register: specs.class == Class::Register,
+                array,
             });
             if self.eat_punct(")") {
                 return Ok((params, false));
             }
             if !self.eat_punct(",") {
-                return Err(self.unexpected("',' or ')' in the parameter list"));
+                return Err(self.expect_close(")", open).unwrap_err());
             }
         }
+    }
+
+    /// `int f(x, y)`: a list of parameter names, C89's, whose types are
+    /// declared after it, before the body. merlin's language has no such
+    /// definitions; clang's error on a name the list leaves undeclared, as
+    /// it does when the body follows (on the last name first), or where a
+    /// declaration has the list.
+    fn identifier_list(&mut self, open: Pos) -> Error {
+        let mut names = Vec::new();
+        loop {
+            match self.expect_ident() {
+                Ok(name) => names.push(name),
+                Err(e) => return e,
+            }
+            if self.eat_punct(")") {
+                break;
+            }
+            if !self.eat_punct(",") {
+                return self.expect_close(")", open).unwrap_err();
+            }
+        }
+        let (name, pos) = names.last().expect("one name at least");
+        if self.is_punct("{") {
+            let msg = format!(
+                "parameter '{name}' was not declared, defaults to 'int'; ISO C99 and later do not support \
+                 implicit int"
+            );
+            return Error::new(*pos, msg).flagged("implicit-int");
+        }
+        let first = names[0].1;
+        if self.at_decl() {
+            return Error::new(first, "old-style parameter declarations are not supported");
+        }
+        Error::new(
+            first,
+            "a parameter list without types is only allowed in a function definition",
+        )
     }
 
     /// A type name, for casts and `sizeof`: specifiers and a declarator
     /// without a name (`int`, `char *[4]`, `int (*)(void)`), no compound
     /// literal's.
-    fn type_name(&mut self) -> Result<Type, Error> {
-        let (d, _) = self.type_name_decl()?;
+    fn type_name(&mut self, open: Pos) -> Result<Type, Error> {
+        let (d, _) = self.type_name_decl(open)?;
         self.type_name_folded(&d, None);
         Ok(d.ty)
     }
 
-    /// A type name's declarator, and how it spelled its base (for `-g`).
-    /// What it folded is for its use to say ([`Self::type_name_folded`]).
-    fn type_name_decl(&mut self) -> Result<(Decl, Spelled), Error> {
+    /// A type name's declarator, and how it spelled its base (for `-g`),
+    /// in parentheses opened at `open`. What it folded is for its use to
+    /// say ([`Self::type_name_folded`]).
+    fn type_name_decl(&mut self, open: Pos) -> Result<(Decl, Spelled), Error> {
+        self.type_open.set(open);
         let specs = self.specifiers(Ctx::TypeName)?;
         let d = self.declarator(&specs.ty, Ctx::TypeName)?;
         Ok((d, specs.spelled))
@@ -1775,7 +2686,7 @@ impl Parser<'_> {
 
     // ---- declarations ----
 
-    /// `'{' ... '}'` or an expression.
+    /// `'{' ... '}'` (empty too, as clang takes it) or an expression.
     fn initializer(&mut self) -> Result<Init, Error> {
         if !self.is_punct("{") {
             return Ok(Init::Expr(self.assign()?));
@@ -1785,12 +2696,6 @@ impl Parser<'_> {
             let mut items = Vec::new();
             loop {
                 if p.eat_punct("}") {
-                    if items.is_empty() {
-                        return Err(Error::new(
-                            pos,
-                            "empty initializer lists are not C99; write '{ 0 }'",
-                        ));
-                    }
                     return Ok(Init::List(items, pos));
                 }
                 if p.is_punct(".") || p.is_punct("[") {
@@ -1801,66 +2706,132 @@ impl Parser<'_> {
                     items.push(p.initializer()?);
                 }
                 if !p.eat_punct(",") && !p.is_punct("}") {
-                    return Err(p.unexpected("',' or '}' in the initializer list"));
+                    return Err(p.expect_close("}", pos).unwrap_err());
                 }
             }
         })
     }
 
-    /// `.member` and `[index]` designators, through the `=`.
+    /// `.member` and `[index]` designators, through the `=`. A lone
+    /// `[index]` may go without it (`[0] 1`): GNU's older syntax, which
+    /// clang takes with a warning.
     fn designation(&mut self) -> Result<Vec<Designator>, Error> {
         let mut out = Vec::new();
         loop {
             if self.is_punct(".") {
                 let pos = self.advance().pos;
-                let (name, _) = self.expect_ident("a member name")?;
-                out.push(Designator::Member(name, pos));
+                let Tok::Ident(name) = self.peek().clone() else {
+                    return Err(self.expected("a field designator, such as '.field = 4'"));
+                };
+                let at = self.advance().pos;
+                out.push(Designator::Member(name, pos, at));
             } else if self.is_punct("[") {
                 let pos = self.advance().pos;
                 let index = self.cond()?;
-                self.expect_punct("]")?;
+                self.expect_close("]", pos)?;
                 out.push(Designator::Index(index, pos));
             } else {
                 break;
             }
         }
-        self.expect_punct("=")?;
-        Ok(out)
+        if self.eat_punct("=") {
+            return Ok(out);
+        }
+        if let [Designator::Index(..)] = out[..] {
+            let msg = "use of GNU 'missing =' extension in designator";
+            self.warn(Error::warning(self.here(), msg, "gnu-designator"));
+            return Ok(out);
+        }
+        Err(self.expected("'=' or another designator"))
     }
 
-    /// The rest of a declaration after its specifiers (and its first
-    /// declarator, if the caller has read it), through the `;`.
-    /// The declarators of a declaration of objects, from `first` on; what
-    /// the declaration left for sema to check from `start` on (in the
-    /// waiting [`Unevaluated`]s) goes with them.
+    /// clang's error for a declaration's missing `;`, which says where it is.
+    fn end_of_declaration(&mut self, ctx: Ctx) -> Result<(), Error> {
+        match ctx {
+            Ctx::File => self.expect_semi("after top level declarator"),
+            Ctx::ForInit => self.for_semi(),
+            _ => self.expect_semi("at end of declaration"),
+        }
+    }
+
+    /// The declarators of a declaration of objects and functions, from
+    /// `first` on, through the `;`; what the declaration left for sema to
+    /// check from `start` on (in the waiting [`Unevaluated`]s) goes with
+    /// them. At file scope a function is an item of its own, between the
+    /// declarations of the objects before and after it (`int x, f(int);`);
+    /// in a block it is a declarator, which sema binds to the function
+    /// outside.
     fn init_declarators(
         &mut self,
         specs: &Specs,
         first: Option<Decl>,
         ctx: Ctx,
         start: usize,
-    ) -> Result<Vec<Declarator>, Error> {
+    ) -> Result<Vec<Item>, Error> {
         let storage = match specs.class {
             Class::Static => Storage::Static,
             Class::Extern => Storage::Extern,
-            Class::None | Class::Typedef => Storage::None,
+            Class::Register => Storage::Register,
+            Class::None | Class::Typedef | Class::Auto => Storage::None,
         };
         let mut first = first;
+        let mut items = Vec::new();
         let mut decls = Vec::new();
         loop {
             let d = match first.take() {
                 Some(d) => d,
                 None => self.declarator(&specs.ty, ctx)?,
             };
-            if d.ty.is_func() {
-                let msg = if ctx == Ctx::File {
-                    "declare a function on its own, not in a list of variables"
-                } else {
-                    "function declarations inside a function are not supported"
-                };
-                return Err(Error::new(d.pos, msg));
+            if d.ty.is_func() && self.is_punct("=") {
+                return Err(Error::new(
+                    d.pos,
+                    "illegal initializer (only variables can be initialized)",
+                ));
             }
-            self.bind_name(&d.name, Name::Object(d.ty.clone()), d.pos)?;
+            // `register` and `auto` are for objects in a block (C99 6.9p2).
+            if matches!(specs.class, Class::Register | Class::Auto) {
+                if d.ty.is_func() {
+                    return Err(Error::new(specs.class_pos, "illegal storage class on function"));
+                }
+                if ctx == Ctx::File {
+                    return Err(Error::new(d.pos, "illegal storage class on file-scoped variable"));
+                }
+            }
+            if d.ty.is_func() && ctx == Ctx::File {
+                self.folded(&d, ctx, specs.class, false);
+                // What the function's declarator left, checked at file scope.
+                let unevaluated = self.unevaluated.borrow_mut().split_off(start);
+                self.bind_name(&d.name, Name::Object(d.ty.clone()), d.pos)?;
+                if !decls.is_empty() {
+                    items.push(Item::Decl(std::mem::take(&mut decls)));
+                }
+                items.push(Item::Func(declared_function(d, specs, unevaluated)));
+                if !self.eat_punct(",") {
+                    break;
+                }
+                continue;
+            }
+            if d.ty.is_func() && specs.class == Class::Static {
+                let msg = "function declared in block scope cannot have 'static' storage class";
+                return Err(Error::new(specs.class_pos, msg));
+            }
+            if let (Some(at), false) = (specs.inline, d.ty.is_func()) {
+                return Err(Error::new(at, "'inline' can only appear on functions"));
+            }
+            // A block's declaration with linkage has the composite type of
+            // it and the earlier one it can see, as sema gives it (C99
+            // 6.2.7p4), for the sizes the parser works out.
+            let linked = ctx != Ctx::File && (specs.class == Class::Extern || d.ty.is_func());
+            let ty = if linked {
+                self.visible_composite(&d.name, &d.ty)
+            } else {
+                d.ty.clone()
+            };
+            self.bind_name(&d.name, Name::Object(ty), d.pos)?;
+            if linked {
+                let scope = self.scopes.last_mut().expect("a scope");
+                scope.linked.insert(d.name.clone());
+            }
             let init = if self.eat_punct("=") {
                 Some(self.initializer()?)
             } else {
@@ -1880,7 +2851,7 @@ impl Parser<'_> {
             let bound = self.scopes.last().and_then(|s| s.names.get(&d.name));
             let incomplete = matches!(bound, Some((Name::Object(t), _)) if t.size(self.xlen).is_none());
             if let (Type::Array(elem, None), Some(init), true) = (&d.ty, &init, incomplete) {
-                if let Some(n) = init_len(elem, init) {
+                if let Some(n) = init_len(elem, init, self.xlen) {
                     let full = Type::array((**elem).clone(), Some(n));
                     self.bind_name(&d.name, Name::Object(full), d.pos)?;
                 }
@@ -1893,6 +2864,7 @@ impl Parser<'_> {
                 var: None,
                 define: false,
                 pos: d.pos,
+                begin: specs.pos,
                 spelled: specs.spelled.clone(),
                 sized,
                 unevaluated,
@@ -1901,17 +2873,23 @@ impl Parser<'_> {
                 break;
             }
         }
-        self.expect_semi("at end of declaration")?;
-        Ok(decls)
+        self.end_of_declaration(ctx)?;
+        if !decls.is_empty() {
+            items.push(Item::Decl(decls));
+        }
+        Ok(items)
     }
 
     /// The declarators of a `typedef`, each binding a name to its type.
     fn typedefs(&mut self, specs: &Specs, first: Decl, ctx: Ctx) -> Result<(), Error> {
+        if let Some(at) = specs.inline {
+            return Err(Error::new(at, "'inline' can only appear on functions"));
+        }
         let mut d = first;
         loop {
             if self.is_punct("=") {
                 return Err(Error::new(
-                    self.here(),
+                    d.pos,
                     "illegal initializer (only variables can be initialized)",
                 ));
             }
@@ -1922,147 +2900,179 @@ impl Parser<'_> {
                 spelled: specs.spelled.clone(),
                 pos: d.pos,
             }))));
+            // A typedef of a struct, union or enum without a tag names it
+            // (the first typedef that is the type itself, unqualified).
+            match (&d.ty, &specs.spelled.0) {
+                (Type::Record(r), _) if r.tag.is_none() => {
+                    let _ = r.typedef_name.set(d.name.clone());
+                }
+                (t, Some(Spelling::Enum(e))) if e.tag.is_none() && *t == e.ty => {
+                    let _ = e.typedef_name.set(d.name.clone());
+                }
+                _ => {}
+            }
             self.bind_name(&d.name, Name::Typedef(d.ty, spelling), d.pos)?;
             if !self.eat_punct(",") {
                 break;
             }
             d = self.declarator(&specs.ty, ctx)?;
         }
-        self.expect_semi("at end of declaration")
+        self.end_of_declaration(ctx)
     }
 
-    /// After specifiers that may stand alone: `;` is fine if they declared
-    /// something (`struct s { ... };`).
-    fn bare_specifiers(&mut self, specs: &Specs) -> Result<(), Error> {
-        let pos = self.here();
+    /// After specifiers that stand alone, at the `;`: they should declare
+    /// something (`struct s { ... };`), or clang warns.
+    fn bare_specifiers(&mut self, specs: &Specs) {
         self.advance(); // ;
-        if specs.declares {
-            Ok(())
-        } else {
-            Err(Error::new(pos, "declaration does not declare anything"))
+        if !specs.declares {
+            self.nothing_declared(specs);
         }
     }
 
-    /// A top-level function or declaration; `None` for a declaration that
-    /// only declares types (a typedef, a struct, an enum).
-    fn item(&mut self) -> Result<Option<Item>, Error> {
+    /// clang's error where a declaration should start at file scope and
+    /// none does.
+    fn not_a_declaration(&mut self) -> Error {
+        match self.peek() {
+            Tok::Punct("}") => Error::new(self.here(), "extraneous closing brace ('}')"),
+            // What would start an Objective-C method, which clang tells
+            // apart at file scope.
+            Tok::Punct("+" | "-") => Error::new(self.here(), "expected external declaration"),
+            // C89's implicit `int` (`f() {}`, `x;`), where what follows the
+            // name can follow a declarator's name, as clang's
+            // `isValidAfterIdentifierInDeclarator` has it; otherwise the
+            // name was meant as a type (`x y;`, `x` at the end).
+            Tok::Ident(_)
+                if matches!(
+                    self.peek_at(1),
+                    Tok::Punct("[" | "(" | ")" | ";" | "," | "=" | "{" | ":")
+                ) =>
+            {
+                // clang reports the missing type once the declaration is
+                // read: a function's declarator that nothing a declaration
+                // can go on with follows (`typeof(int) x;`, `typeof` being
+                // no keyword in C99) is its syntax error instead.
+                let (start, warned) = (self.pos, self.warnings.borrow().len());
+                let (kept, named) = (self.unevaluated.borrow().len(), self.undeclared.borrow().len());
+                let at = self.here();
+                let func = self
+                    .declarator(&Type::INT, Ctx::File)
+                    .is_ok_and(|d| d.ty.is_func());
+                let goes_on = matches!(self.peek(), Tok::Punct(";" | "," | "=" | "{"));
+                let here = self.here();
+                self.pos = start;
+                self.warnings.borrow_mut().truncate(warned);
+                self.unevaluated.borrow_mut().truncate(kept);
+                self.undeclared.borrow_mut().truncate(named);
+                if func && !goes_on {
+                    return Error::new(here, "expected function body after function declarator");
+                }
+                let msg = "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int";
+                Error::new(at, msg).flagged("implicit-int")
+            }
+            Tok::Ident(name) => {
+                let name = name.clone();
+                self.unknown_type_name(&name)
+            }
+            _ => self.expected("identifier or '('"),
+        }
+    }
+
+    /// A top-level function, or a declaration: the items it makes, none for
+    /// one that only declares types (a typedef, a struct, an enum).
+    fn item(&mut self) -> Result<Vec<Item>, Error> {
         if *self.peek() == Tok::Kw(Kw::StaticAssert) {
             self.static_assert()?;
-            return Ok(None);
+            return Ok(Vec::new());
+        }
+        // An empty declaration, which clang takes.
+        if self.eat_punct(";") {
+            return Ok(Vec::new());
         }
         if !self.at_decl() {
-            return Err(self.unexpected("a declaration"));
+            return Err(self.not_a_declaration());
         }
         let start = self.unevaluated.borrow().len();
         let specs = self.specifiers(Ctx::File)?;
         if self.is_punct(";") {
-            self.bare_specifiers(&specs)?;
-            return Ok(None);
+            self.bare_specifiers(&specs);
+            return Ok(Vec::new());
         }
         let d = self.declarator(&specs.ty, Ctx::File)?;
         if specs.class == Class::Typedef {
             self.typedefs(&specs, d, Ctx::File)?;
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        if !d.ty.is_func() {
-            if specs.inline {
-                return Err(Error::new(d.pos, "'inline' can only appear on functions"));
-            }
-            return Ok(Some(Item::Decl(self.init_declarators(
-                &specs,
-                Some(d),
-                Ctx::File,
-                start,
-            )?)));
+        if !d.ty.is_func() || matches!(self.peek(), Tok::Punct(";" | "," | "=")) {
+            return self.init_declarators(&specs, Some(d), Ctx::File, start);
+        }
+        if !self.is_punct("{") {
+            return Err(self.expected("function body after function declarator"));
+        }
+        // `register` and `auto` are for objects in a block (C99 6.9p2):
+        // clang's error, after which it goes on with the function.
+        if matches!(specs.class, Class::Register | Class::Auto) {
+            self.warn(Error::new(specs.class_pos, "illegal storage class on function"));
         }
         self.folded(&d, Ctx::File, specs.class, false);
         // What the function's declarator left, checked at file scope.
         let unevaluated = self.unevaluated.borrow_mut().split_off(start);
         self.bind_name(&d.name, Name::Object(d.ty.clone()), d.pos)?;
         let mut d = d;
-        let body = if self.eat_punct(";") {
-            None
-        } else if self.is_punct("{") {
-            let Some((params, scope)) = d.func.take() else {
-                return Err(Error::new(
-                    d.pos,
-                    "a function definition needs its parameter list",
-                ));
-            };
-            if let Some(p) = params.iter().find(|p| p.name.is_empty()) {
-                return Err(Error::new(
-                    p.pos,
-                    "parameter name omitted in a function definition",
-                ));
-            }
-            // The body's outermost block shares the parameters' scope.
-            self.scopes.push(scope);
-            let body = self.block_body(false);
-            self.scopes.pop();
-            let body = match body {
-                Ok(body) => body,
-                Err(e) => {
-                    // The function as far as it got: each block cut short
-                    // ends with the one inside it.
-                    let mut blocks = self.salvaged.take().into_iter();
-                    let mut body = blocks.next().unwrap_or_default();
-                    for mut outer in blocks {
-                        outer.push(Stmt {
-                            kind: StmtKind::Block(body),
-                            pos: e.pos,
-                        });
-                        body = outer;
-                    }
-                    let f = function(d, params, &specs, Some(body), e.pos, unevaluated);
-                    *self.partial.borrow_mut() = Some(Item::Func(f));
-                    return Err(e);
-                }
-            };
-            // The `}` just read.
-            let end = self.toks[self.pos - 1].pos;
-            return Ok(Some(Item::Func(function(
-                d,
-                params,
-                &specs,
-                Some(body),
-                end,
-                unevaluated,
-            ))));
-        } else if self.is_punct(",") {
+        let Some((params, scope)) = d.func.take() else {
             return Err(Error::new(
                 d.pos,
-                "declare a function on its own, not in a list of variables",
+                "a function definition needs its parameter list",
             ));
-        } else {
-            return Err(self.unexpected("'{' or ';' after the parameter list"));
         };
-        let params = d.func.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| {
-            // Declared through a typedef of a function type: unnamed parameters.
-            d.ty.func_type()
-                .map(|f| {
-                    f.params
-                        .iter()
-                        .map(|t| Param {
-                            name: String::new(),
-                            ty: t.clone(),
-                            pos: d.pos,
-                            spelled: Spelled::default(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        });
-        let end = d.pos;
-        Ok(Some(Item::Func(function(
+        for p in params.iter().filter(|p| p.name.is_empty()) {
+            let msg = "omitting the parameter name in a function definition is a C23 extension";
+            self.warn(Error::warning(p.pos, msg, "c23-extensions"));
+        }
+        // A qualified `void` result, which no value has: clang's warning
+        // of a definition, at its parameter list.
+        if let (Some(f), Some(open)) = (d.ty.func_type(), d.open) {
+            if f.ret.is_void() && !f.ret.quals().is_empty() {
+                let msg = format!(
+                    "function cannot return qualified void type {}",
+                    f.ret.named(&specs.spelled)
+                );
+                self.warn(Error::warning(open, msg, "qualified-void-return-type"));
+            }
+        }
+        // The body's outermost block shares the parameters' scope.
+        self.scopes.push(scope);
+        let body = self.block_body(false);
+        self.scopes.pop();
+        let body = match body {
+            Ok(body) => body,
+            Err(e) => {
+                // The function as far as it got: each block cut short
+                // ends with the one inside it.
+                let mut blocks = self.salvaged.take().into_iter();
+                let mut body = blocks.next().unwrap_or_default();
+                for mut outer in blocks {
+                    outer.push(Stmt {
+                        kind: StmtKind::Block(body),
+                        pos: e.pos,
+                    });
+                    body = outer;
+                }
+                let f = function(d, params, &specs, Some(body), e.pos, unevaluated);
+                *self.partial.borrow_mut() = Some(Item::Func(f));
+                return Err(e);
+            }
+        };
+        // The `}` just read.
+        let end = self.toks[self.pos - 1].pos;
+        Ok(vec![Item::Func(function(
             d,
             params,
             &specs,
-            body,
+            Some(body),
             end,
             unevaluated,
-        ))))
+        ))])
     }
-
     /// `{ item* }`, returning the items; in a new scope unless `new_scope`
     /// is false (a function body continues its parameters' scope).
     fn block_body(&mut self, new_scope: bool) -> Result<Vec<Stmt>, Error> {
@@ -2074,14 +3084,18 @@ impl Parser<'_> {
     }
 
     fn block_items(&mut self) -> Result<Vec<Stmt>, Error> {
-        self.expect_punct("{")?;
+        let open = self.expect_punct("{")?;
         // What the statement around the block left so far (`if (c)`) is
         // checked with that statement, out of the block's scope.
         let outer = self.unevaluated.take();
         let mut items = Vec::new();
-        if let Err(e) = self.block_items_into(&mut items) {
-            // What the error leaves of the block ([`parse_salvaging`]).
+        let mark = self.undeclared.borrow().len();
+        let mut item = ExprId::next();
+        if let Err(e) = self.block_items_into(&mut items, open, &mut item) {
+            // What the error leaves of the block ([`parse_salvaging`]),
+            // and the undeclared names of the item it cut short.
             items.extend(self.unevaluated_stmt(self.here()));
+            items.extend(self.cut_names(mark, item));
             self.salvaged.borrow_mut().push(items);
             *self.unevaluated.borrow_mut() = outer;
             return Err(e);
@@ -2090,14 +3104,17 @@ impl Parser<'_> {
         Ok(items)
     }
 
-    /// The items of a block after its `{`, up to and including its `}`.
-    fn block_items_into(&mut self, items: &mut Vec<Stmt>) -> Result<(), Error> {
+    /// The items of a block after its `{` (at `open`), up to and including
+    /// its `}`; `item` is the [`ExprId::next`] of where the item being read
+    /// began.
+    fn block_items_into(&mut self, items: &mut Vec<Stmt>, open: Pos, item: &mut u64) -> Result<(), Error> {
         loop {
+            *item = ExprId::next();
             if self.eat_punct("}") {
                 return Ok(());
             }
             if *self.peek() == Tok::Eof {
-                return Err(self.unexpected("'}'"));
+                return Err(self.expect_close("}", open).unwrap_err());
             }
             let pos = self.here();
             if *self.peek() == Tok::Kw(Kw::StaticAssert) {
@@ -2114,34 +3131,151 @@ impl Parser<'_> {
     }
 
     /// `_Static_assert(constant, "message");` (C11, which clang accepts in
-    /// C99 too), at file or block scope. The parser evaluates constants, so
-    /// it checks the assertion here; nothing is left of it.
+    /// C99 too; without the message C23's, which clang takes with a
+    /// warning), at file or block scope. The parser evaluates constants, so
+    /// it checks the assertion here; what is left of it is the condition
+    /// for sema to check ([`Unevaluated::constant`]). A failed one is
+    /// clang's error, which says what failed as clang's
+    /// `findFailedBooleanCondition` does ([`Self::failed_requirement`]):
+    /// sema gives it after the condition's diagnostics, unless it has an
+    /// error, and clang goes on after it, as merlin does.
     fn static_assert(&mut self) -> Result<(), Error> {
-        let pos = self.advance().pos;
-        self.expect_punct("(")?;
+        self.advance();
+        let open = self.expect_punct("(")?;
         let at = self.here();
-        let mut cond = self.cond()?;
-        self.expect_punct(",")?;
-        let mut msg = Vec::new();
-        if !matches!(self.peek(), Tok::Str(_)) {
-            return Err(self.unexpected("a string literal"));
+        let first = self.pos;
+        *self.parens.borrow_mut() = Some(Vec::new());
+        let cond = self.cond();
+        let parens = self.parens.take().unwrap_or_default();
+        let mut cond = cond?;
+        let tokens = first..self.pos;
+        let mut msg = None;
+        if self.eat_punct(",") {
+            if !matches!(self.peek(), Tok::Str(_)) {
+                return Err(self.expected("string literal for diagnostic message in static_assert"));
+            }
+            let mut text = Vec::new();
+            while let Tok::Str(s) = self.peek() {
+                text.extend_from_slice(s);
+                self.advance();
+            }
+            msg = Some(String::from_utf8_lossy(&text).into_owned());
+        } else if self.is_punct(")") {
+            let warning = "'_Static_assert' with no message is a C23 extension";
+            self.warn(Error::warning(self.here(), warning, "c23-extensions"));
+        } else {
+            return Err(self.expect_punct(",").unwrap_err());
         }
-        while let Tok::Str(s) = self.peek() {
-            msg.extend_from_slice(s);
-            self.advance();
-        }
-        self.expect_punct(")")?;
-        self.expect_punct(";")?;
-        let not_constant = "static assertion expression is not an integer constant expression";
-        match self.const_int(&mut cond, at, not_constant)? {
+        self.expect_close(")", open)?;
+        self.expect_semi("after '_Static_assert'")?;
+        let original = cond.clone();
+        let not_constant = "static assertion expression is not an integral constant expression";
+        let mark = self.unevaluated.borrow().len();
+        match self.const_int(&mut cond, at, not_constant, None)? {
             // Not sure of the value: sema reports the error.
-            (_, false) => Ok(()),
-            (0, true) => Err(Error::new(
-                pos,
-                format!("static assertion failed: {}", String::from_utf8_lossy(&msg)),
-            )),
-            (_, true) => Ok(()),
+            (v, sure) if !sure || v != 0 => Ok(()),
+            _ => {
+                let printer = Printer {
+                    toks: &self.toks[tokens],
+                    parens: &parens,
+                };
+                let msg = msg.map(|m| format!(": {m}")).unwrap_or_default();
+                let failed = match self.failed_requirement(&original, &cond, &printer) {
+                    Some((term, value)) => {
+                        let what = printer.expr(term, true);
+                        let e = Error::new(
+                            printer.begin(term, true),
+                            format!("static assertion failed due to requirement '{what}'{msg}"),
+                        );
+                        match self.evaluates_to(term, value, &printer) {
+                            Some((at, note)) => e.note(at, note),
+                            None => e,
+                        }
+                    }
+                    None => Error::new(at, format!("static assertion failed{msg}")),
+                };
+                let mut us = self.unevaluated.borrow_mut();
+                if us.len() == mark {
+                    // `_Static_assert(0, "")`: of a lone literal, nothing
+                    // was kept to check.
+                    drop(us);
+                    self.warn(failed);
+                    return Ok(());
+                }
+                let with = us.len() - mark - 1;
+                let u = us.last_mut().expect("the condition itself");
+                u.diagnostic = Some(failed);
+                u.with = with;
+                Ok(())
+            }
         }
+    }
+
+    /// What a `_Static_assert` whose condition is 0 failed on, as clang
+    /// finds it: the first term of the condition's `&&`s (through
+    /// parentheses) that is 0 and no integer literal, else the whole
+    /// condition, or `None` if that is an integer literal itself. Each
+    /// term of the condition as written (`original`) is evaluated as the
+    /// parser has resolved it (`resolved`, of the same shape).
+    fn failed_requirement<'e, 'r>(
+        &self,
+        original: &'e Expr,
+        resolved: &'r Expr,
+        p: &Printer,
+    ) -> Option<(&'e Expr, &'r Expr)> {
+        fn terms<'x>(e: &'x Expr, out: &mut Vec<&'x Expr>) {
+            match &e.kind {
+                ExprKind::Binary(BinOp::LogAnd, l, r) => {
+                    terms(l, out);
+                    terms(r, out);
+                }
+                _ => out.push(e),
+            }
+        }
+        let (mut written, mut values) = (Vec::new(), Vec::new());
+        terms(original, &mut written);
+        terms(resolved, &mut values);
+        let failed = written
+            .iter()
+            .zip(&values)
+            .find(|(w, v)| !p.is_integer_literal(w) && consteval::parsed_int(v, self.xlen) == Some(0));
+        match failed {
+            Some((w, v)) => Some((w, v)),
+            None if p.is_integer_literal(original) => None,
+            None => Some((original, resolved)),
+        }
+    }
+
+    /// clang's note on a failed `_Static_assert` of a binary operator (not
+    /// `&&` or `||`): what its operands evaluate to (`expression evaluates to '2 ==
+    /// 3'`), at the operator, unless both are plain to see, literals or
+    /// what unary operators make of them. `written` is the term as written,
+    /// `value` as the parser resolved it.
+    fn evaluates_to(&self, written: &Expr, value: &Expr, p: &Printer) -> Option<(Pos, String)> {
+        let (ExprKind::Binary(op, wl, wr), ExprKind::Binary(_, l, r)) = (&written.kind, &value.kind) else {
+            return None;
+        };
+        if matches!(op, BinOp::LogOr | BinOp::LogAnd) {
+            return None;
+        }
+        fn plain(e: &Expr, p: &Printer) -> bool {
+            match &e.kind {
+                ExprKind::Unary(_, x) => plain(x, p),
+                ExprKind::Num(_) => p.token(e.pos).is_some_and(|t| matches!(t.tok, Tok::Num(..))),
+                _ => false,
+            }
+        }
+        if plain(wl, p) && plain(wr, p) {
+            return None;
+        }
+        let (a, b) = (
+            consteval::parsed_int(l, self.xlen)?,
+            consteval::parsed_int(r, self.xlen)?,
+        );
+        Some((
+            value.pos,
+            format!("expression evaluates to '{a} {} {b}'", op.symbol()),
+        ))
     }
 
     /// `int a = 1, *b;`, or `None` for one that only declares types.
@@ -2150,7 +3284,7 @@ impl Parser<'_> {
         let start = self.unevaluated.borrow().len();
         let specs = self.specifiers(ctx)?;
         if self.is_punct(";") {
-            self.bare_specifiers(&specs)?;
+            self.bare_specifiers(&specs);
             return Ok(None);
         }
         let d = self.declarator(&specs.ty, ctx)?;
@@ -2158,7 +3292,15 @@ impl Parser<'_> {
             self.typedefs(&specs, d, ctx)?;
             return Ok(None);
         }
-        let decls = self.init_declarators(&specs, Some(d), ctx, start)?;
+        // In a block, functions are declarators too: one declaration.
+        let decls = self
+            .init_declarators(&specs, Some(d), ctx, start)?
+            .into_iter()
+            .flat_map(|item| match item {
+                Item::Decl(decls) => decls,
+                Item::Func(_) => unreachable!("only at file scope"),
+            })
+            .collect();
         Ok(Some(Stmt {
             kind: StmtKind::Decl(decls),
             pos,
@@ -2167,13 +3309,15 @@ impl Parser<'_> {
 
     // ---- statements ----
 
-    fn paren_expr(&mut self) -> Result<Expr, Error> {
-        self.expect_punct("(")?;
-        let e = self.expr()?;
-        if !self.is_punct(")") {
-            return Err(self.unexpected("')'"));
+    /// `(expr)` after the keyword `kw` (`if`, `while`, `switch`, and
+    /// `do/while`, as clang calls it).
+    fn paren_expr(&mut self, kw: &str) -> Result<Expr, Error> {
+        if !self.is_punct("(") {
+            return Err(self.expected(&format!("'(' after '{kw}'")));
         }
-        self.advance();
+        let open = self.advance().pos;
+        let e = self.expr()?;
+        self.expect_close(")", open)?;
         Ok(e)
     }
 
@@ -2181,47 +3325,82 @@ impl Parser<'_> {
         self.nested(Self::stmt_inner)
     }
 
+    /// What a label (or `case` or `default`) labels: a statement, or none
+    /// at the end of a block, which clang takes with a warning (C23 allows
+    /// it).
+    fn labeled(&mut self) -> Result<Box<Stmt>, Error> {
+        if self.is_punct("}") {
+            let msg = "label at end of compound statement is a C23 extension";
+            self.warn(Error::warning(self.here(), msg, "c23-extensions"));
+            return Ok(Box::new(Stmt {
+                kind: StmtKind::Empty { glued: false },
+                pos: self.here(),
+            }));
+        }
+        Ok(Box::new(self.stmt()?))
+    }
+
     fn stmt_inner(&mut self) -> Result<Stmt, Error> {
         let pos = self.here();
+        // A declaration is no statement (`if (c) int x;`): what clang
+        // wanted there is an expression.
         if self.at_decl() {
-            return Err(Error::new(
-                pos,
-                "a declaration is not a statement; wrap it in '{ }'",
-            ));
+            return Err(self.expected("expression"));
+        }
+        if self.is_punct("}") {
+            return Err(self.expected("statement"));
         }
         let kind = match self.peek().clone() {
             Tok::Punct("{") => StmtKind::Block(self.block_body(true)?),
             Tok::Punct(";") => {
+                let glued = self.after_prev().line == self.here().line;
                 self.advance();
-                StmtKind::Empty
+                StmtKind::Empty { glued }
             }
             Tok::Ident(name) if matches!(self.peek_at(1), Tok::Punct(":")) => {
                 self.advance();
                 self.advance();
                 StmtKind::Label {
                     name,
-                    body: Box::new(self.stmt()?),
+                    body: self.labeled()?,
                 }
             }
             Tok::Kw(Kw::If) => {
                 self.advance();
-                let cond = self.paren_expr()?;
+                let cond = self.paren_expr("if")?;
                 let then = Box::new(self.stmt()?);
-                let els = if self.eat_kw(Kw::Else) {
-                    Some(Box::new(self.stmt()?))
+                let inner = self.trailing_else.take();
+                let els = if *self.peek() == Tok::Kw(Kw::Else) {
+                    let at = self.advance().pos;
+                    let els = Box::new(self.stmt()?);
+                    self.trailing_else.set(Some(at));
+                    Some(els)
                 } else {
+                    // `if (a) if (b) x; else y;`: the `else` is the inner
+                    // `if`'s, which clang warns may not be what was meant.
+                    if let Some(at) = inner {
+                        self.warn(Error::warning(
+                            at,
+                            "add explicit braces to avoid dangling else",
+                            "dangling-else",
+                        ));
+                    }
                     None
                 };
-                StmtKind::If { cond, then, els }
+                return Ok(Stmt {
+                    kind: StmtKind::If { cond, then, els },
+                    pos,
+                });
             }
             Tok::Kw(Kw::Switch) => {
                 self.advance();
-                let cond = self.paren_expr()?;
+                let cond = self.paren_expr("switch")?;
                 StmtKind::Switch {
                     cond,
                     body: Box::new(self.stmt()?),
                     cases: Vec::new(),
                     default: None,
+                    covered: false,
                 }
             }
             Tok::Kw(Kw::Case) => {
@@ -2229,26 +3408,31 @@ impl Parser<'_> {
                 let start = self.pos;
                 let expr = self.cond()?;
                 let bare = self.pos == start + 1;
-                self.expect_punct(":")?;
+                // clang's error is where the `:` should be, after the value.
+                if !self.eat_punct(":") {
+                    return Err(Error::new(self.after_prev(), "expected ':' after 'case'"));
+                }
                 StmtKind::Case {
                     expr,
                     value: 0,
                     id: 0,
-                    body: Box::new(self.stmt()?),
+                    body: self.labeled()?,
                     bare,
                 }
             }
             Tok::Kw(Kw::Default) => {
                 self.advance();
-                self.expect_punct(":")?;
+                if !self.eat_punct(":") {
+                    return Err(Error::new(self.after_prev(), "expected ':' after 'default'"));
+                }
                 StmtKind::Default {
                     id: 0,
-                    body: Box::new(self.stmt()?),
+                    body: self.labeled()?,
                 }
             }
             Tok::Kw(Kw::While) => {
                 self.advance();
-                let cond = self.paren_expr()?;
+                let cond = self.paren_expr("while")?;
                 let body = Box::new(self.stmt()?);
                 StmtKind::While { cond, body }
             }
@@ -2256,10 +3440,12 @@ impl Parser<'_> {
                 self.advance();
                 let body = Box::new(self.stmt()?);
                 if !self.eat_kw(Kw::While) {
-                    return Err(self.unexpected("'while' after the body of 'do'"));
+                    return Err(self
+                        .expected("'while' in do/while loop")
+                        .note(pos, "to match this 'do'"));
                 }
-                let cond = self.paren_expr()?;
-                self.expect_semi("after 'do'/'while' statement")?;
+                let cond = self.paren_expr("do/while")?;
+                self.expect_semi("after do/while statement")?;
                 StmtKind::DoWhile { body, cond }
             }
             Tok::Kw(Kw::For) => {
@@ -2271,41 +3457,74 @@ impl Parser<'_> {
                 if self.eat_punct(";") {
                     StmtKind::Return(None)
                 } else {
+                    let named = self.undeclared.borrow().len();
                     let e = self.expr()?;
-                    self.expect_semi("after return statement")?;
+                    self.semi_or_skip("after return statement", named)?;
                     StmtKind::Return(Some(e))
                 }
             }
             Tok::Kw(Kw::Break) => {
                 self.advance();
-                self.expect_semi("after 'break'")?;
+                self.expect_semi("after break statement")?;
                 StmtKind::Break
             }
             Tok::Kw(Kw::Continue) => {
                 self.advance();
-                self.expect_semi("after 'continue'")?;
+                self.expect_semi("after continue statement")?;
                 StmtKind::Continue
             }
             Tok::Kw(Kw::Goto) => {
                 self.advance();
-                let (name, _) = self.expect_ident("a label name after 'goto'")?;
-                self.expect_semi("after 'goto'")?;
-                StmtKind::Goto(name)
+                let (name, at) = self.expect_ident()?;
+                self.expect_semi("after goto statement")?;
+                StmtKind::Goto(name, at)
             }
-            Tok::Kw(Kw::Else) => return Err(Error::new(pos, "'else' without a matching 'if'")),
+            // `x y` of a name nothing declares: what clang's typo
+            // correction of a statement's first name takes it for.
+            Tok::Ident(name)
+                if self.lookup_name(&name).is_none() && matches!(self.peek_at(1), Tok::Ident(_)) =>
+            {
+                return Err(self.unknown_statement_name(&name));
+            }
             _ => {
+                let named = self.undeclared.borrow().len();
                 let e = self.expr()?;
-                self.expect_semi("after expression")?;
+                self.semi_or_skip("after expression", named)?;
                 StmtKind::Expr(e)
             }
         };
+        // Only an `if`, and a statement that ends with one (a loop, a
+        // `switch`, a label), ends with its `else`.
+        if !matches!(
+            kind,
+            StmtKind::While { .. }
+                | StmtKind::For { .. }
+                | StmtKind::Switch { .. }
+                | StmtKind::Label { .. }
+                | StmtKind::Case { .. }
+                | StmtKind::Default { .. }
+        ) {
+            self.trailing_else.set(None);
+        }
         Ok(Stmt { kind, pos })
+    }
+
+    /// The `;` after a `for`'s first and second clauses: clang's error is
+    /// at the token that is there instead.
+    fn for_semi(&mut self) -> Result<(), Error> {
+        if self.eat_punct(";") {
+            return Ok(());
+        }
+        Err(self.expected("';' in 'for' statement specifier"))
     }
 
     /// After `for`: `(init; cond; step) body`, in the `for`'s own scope.
     fn for_rest(&mut self) -> Result<StmtKind, Error> {
         let start = self.unevaluated.borrow().len();
-        self.expect_punct("(")?;
+        if !self.is_punct("(") {
+            return Err(self.expected("'(' after 'for'"));
+        }
+        let open = self.advance().pos;
         let init = if self.at_decl() {
             self.decl(Ctx::ForInit)?.map(Box::new)
         } else if self.eat_punct(";") {
@@ -2313,7 +3532,7 @@ impl Parser<'_> {
         } else {
             let ipos = self.here();
             let e = self.expr()?;
-            self.expect_semi("in 'for' statement")?;
+            self.for_semi()?;
             Some(Box::new(Stmt {
                 kind: StmtKind::Expr(e),
                 pos: ipos,
@@ -2324,15 +3543,13 @@ impl Parser<'_> {
         } else {
             Some(self.expr()?)
         };
-        self.expect_semi("in 'for' statement")?;
+        self.for_semi()?;
         let step = if self.is_punct(")") {
             None
         } else {
             Some(self.expr()?)
         };
-        if !self.eat_punct(")") {
-            return Err(self.unexpected("')'"));
-        }
+        self.expect_close(")", open)?;
         let body = Box::new(self.stmt()?);
         Ok(StmtKind::For {
             init,
@@ -2342,7 +3559,6 @@ impl Parser<'_> {
             unevaluated: self.unevaluated.borrow_mut().split_off(start),
         })
     }
-
     // ---- expressions ----
 
     /// `a, b, c`: the comma operator.
@@ -2389,7 +3605,9 @@ impl Parser<'_> {
         self.nested(|p| {
             let pos = p.advance().pos;
             let a = p.expr()?;
-            p.expect_punct(":")?;
+            if !p.eat_punct(":") {
+                return Err(p.expected("':'").note(pos, "to match this '?'"));
+            }
             let b = p.cond()?;
             Ok(Expr::new(
                 ExprKind::Cond(Box::new(c), Box::new(a), Box::new(b)),
@@ -2449,8 +3667,8 @@ impl Parser<'_> {
             }
             Tok::Punct("(") if self.type_name_follows() => {
                 self.advance();
-                let (d, spelled) = self.type_name_decl()?;
-                self.expect_punct(")")?;
+                let (d, spelled) = self.type_name_decl(pos)?;
+                self.expect_close(")", pos)?;
                 let literal = self.is_punct("{");
                 self.type_name_folded(&d, literal.then_some(pos));
                 let ty = d.ty;
@@ -2460,6 +3678,7 @@ impl Parser<'_> {
                 }
                 let x = self.nested(Self::unary)?;
                 return Ok(Expr {
+                    id: ExprId::new(),
                     kind: ExprKind::Cast {
                         x: Box::new(x),
                         implicit: false,
@@ -2474,19 +3693,24 @@ impl Parser<'_> {
                 self.advance();
                 if self.is_punct("(") && self.type_name_follows() {
                     let at = self.advance().pos;
-                    let (d, _) = self.type_name_decl()?;
-                    self.expect_punct(")")?;
+                    let (d, _) = self.type_name_decl(at)?;
+                    self.expect_close(")", at)?;
                     let literal = self.is_punct("{");
                     self.type_name_folded(&d, literal.then_some(at));
                     let ty = d.ty;
                     if literal {
                         let e = self.compound_literal(ty, at)?;
-                        ExprKind::SizeofExpr(Box::new(self.postfix_ops(e)?))
+                        ExprKind::SizeofExpr(Box::new(self.postfix_ops(e)?), at)
                     } else {
                         ExprKind::SizeofType(ty)
                     }
+                } else if self.type_name_here() {
+                    // Where the `(` belongs, after `sizeof`.
+                    let msg = "expected parentheses around type name in sizeof expression";
+                    return Err(Error::new(self.after_prev(), msg));
                 } else {
-                    ExprKind::SizeofExpr(Box::new(self.nested(Self::unary)?))
+                    let at = self.here();
+                    ExprKind::SizeofExpr(Box::new(self.nested(Self::unary)?), at)
                 }
             }
             _ => return self.postfix(),
@@ -2498,6 +3722,7 @@ impl Parser<'_> {
     fn compound_literal(&mut self, ty: Type, pos: Pos) -> Result<Expr, Error> {
         let init = self.initializer()?;
         Ok(Expr {
+            id: ExprId::new(),
             kind: ExprKind::CompoundLit {
                 init: Box::new(init),
                 local: None,
@@ -2521,7 +3746,9 @@ impl Parser<'_> {
                     self.enter()?;
                     let pos = self.advance().pos;
                     let index = self.expr()?;
-                    self.expect_punct("]")?;
+                    let close = self.here();
+                    self.expect_close("]", pos)?;
+                    self.brackets_written.borrow_mut().insert(pos, close);
                     // a[i] is *(a + i).
                     let sum = Expr::new(ExprKind::Binary(BinOp::Add, Box::new(e), Box::new(index)), pos);
                     e = Expr::new(ExprKind::Deref(Box::new(sum)), pos);
@@ -2529,9 +3756,9 @@ impl Parser<'_> {
                 }
                 Tok::Punct("(") => {
                     self.enter()?;
-                    self.advance();
+                    let open = self.advance().pos;
                     let mut args = Vec::new();
-                    if !self.eat_punct(")") {
+                    if !self.is_punct(")") {
                         loop {
                             if args.len() == MAX_PARAMS {
                                 return Err(Error::new(
@@ -2540,30 +3767,32 @@ impl Parser<'_> {
                                 ));
                             }
                             args.push(self.assign()?);
-                            if self.eat_punct(")") {
+                            if self.is_punct(")") {
                                 break;
                             }
                             if !self.eat_punct(",") {
-                                return Err(self.unexpected("',' or ')' in the argument list"));
+                                return Err(self.expect_close(")", open).unwrap_err());
                             }
                         }
                     }
+                    let close = self.advance().pos;
                     // A call is positioned at its callee, as clang reports it.
                     let pos = e.pos;
-                    e = Expr::new(ExprKind::call(e, args), pos);
+                    e = Expr::new(ExprKind::call(e, args, (open, close)), pos);
                     continue;
                 }
                 Tok::Punct(p @ ("." | "->")) => {
                     let arrow = *p == "->";
                     self.enter()?;
                     let pos = self.advance().pos;
-                    let (name, _) = self.expect_ident("a member name")?;
+                    let (name, at) = self.expect_ident()?;
                     e = Expr::new(
                         ExprKind::Member {
                             base: Box::new(e),
                             name,
                             arrow,
                             offset: 0,
+                            at,
                         },
                         pos,
                     );
@@ -2588,8 +3817,18 @@ impl Parser<'_> {
         let pos = self.here();
         let kind = match self.peek().clone() {
             Tok::Num(v, k) => {
-                self.advance();
+                let t = self.advance();
+                if t.text.len() > 1 && t.text.starts_with('0') && t.text.as_bytes()[1].is_ascii_alphanumeric()
+                {
+                    self.bit_patterns.borrow_mut().insert(pos);
+                }
+                if t.text.ends_with('\'') {
+                    self.char_literals.borrow_mut().insert(pos);
+                } else {
+                    self.int_literals.borrow_mut().insert(pos);
+                }
                 return Ok(Expr {
+                    id: ExprId::new(),
                     kind: ExprKind::Num(v),
                     ty: Type::Int(k),
                     pos,
@@ -2604,6 +3843,7 @@ impl Parser<'_> {
                 }
                 let len = bytes.len() as u32 + 1;
                 return Ok(Expr {
+                    id: ExprId::new(),
                     kind: ExprKind::Str(bytes),
                     ty: Type::array(Type::CHAR, Some(len)),
                     pos,
@@ -2636,16 +3876,67 @@ impl Parser<'_> {
                             format!("unexpected type name '{name}': expected expression"),
                         ));
                     }
-                    _ => {}
+                    Some(_) => {}
+                    // `(unsinged)1`, `sizeof(myit)`: in parentheses alone,
+                    // where a type's name could be, clang takes it for one
+                    // if that is closest.
+                    None if self.pos > 0
+                        && matches!(self.toks[self.pos - 1].tok, Tok::Punct("("))
+                        && matches!(self.peek_at(1), Tok::Punct(")"))
+                        && self
+                            .correct_type(&name)
+                            .is_some_and(|(to, _)| self.correct_expr(&name).is_none_or(|c| c.name != to)) =>
+                    {
+                        let (to, decl) = self.correct_type(&name).expect("just found");
+                        let e = Error::new(
+                            pos,
+                            format!("use of undeclared identifier '{name}'; did you mean '{to}'?"),
+                        );
+                        return Err(match decl {
+                            Some(decl) => e.note(decl, format!("'{to}' declared here")),
+                            None => e,
+                        });
+                    }
+                    None => {
+                        if let Some(c) = self.correct_expr(&name) {
+                            self.corrections.borrow_mut().insert(pos, c);
+                        }
+                        let var = Expr::new(
+                            ExprKind::Var {
+                                name: name.clone(),
+                                var: None,
+                            },
+                            pos,
+                        );
+                        // Called, it is declared implicitly: clang's error
+                        // of that as it reads the name, which a call of no
+                        // arguments gives too.
+                        let e = match self.peek_at(1) {
+                            Tok::Punct("(") => {
+                                let open = self.toks[self.pos + 1].pos;
+                                Expr::new(ExprKind::call(var, Vec::new(), (open, open)), pos)
+                            }
+                            _ => var,
+                        };
+                        self.undeclared.borrow_mut().push(e);
+                    }
                 }
                 self.advance();
                 ExprKind::Var { name, var: None }
             }
             Tok::Punct("(") => {
-                // Keep the inner node; parentheses only steer the tree's shape.
-                return self.paren_expr();
+                // Keep the inner node; parentheses only steer the tree's
+                // shape (and what a failed `_Static_assert` prints).
+                self.advance();
+                let e = self.expr()?;
+                self.expect_close(")", pos)?;
+                if let Some(parens) = self.parens.borrow_mut().as_mut() {
+                    parens.push((paren_key(&e), pos));
+                }
+                self.parens_written.borrow_mut().insert(e.pos, pos);
+                return Ok(e);
             }
-            _ => return Err(self.unexpected("expression")),
+            _ => return Err(self.expected("expression")),
         };
         Ok(Expr::new(kind, pos))
     }
@@ -2656,11 +3947,18 @@ impl Parser<'_> {
     /// `va_arg` takes a type, so the parser knows them by name.
     fn va_builtin(&mut self, name: &str) -> Result<Expr, Error> {
         let pos = self.advance().pos;
-        self.expect_punct("(")?;
+        let open = self.expect_punct("(")?;
         let first = Box::new(self.assign()?);
         let kind = match name {
+            // Calls to clang, which reads their arguments as any call's.
             "__builtin_va_start" | "__builtin_va_copy" => {
-                self.expect_punct(",")?;
+                if self.is_punct(")") {
+                    let msg = "too few arguments to function call, expected 2, have 1";
+                    return Err(Error::new(self.here(), msg));
+                }
+                if !self.eat_punct(",") {
+                    return Err(self.expect_close(")", open).unwrap_err());
+                }
                 let second = Box::new(self.assign()?);
                 if name == "__builtin_va_start" {
                     ExprKind::VaStart {
@@ -2673,10 +3971,12 @@ impl Parser<'_> {
             }
             "__builtin_va_arg" => {
                 self.expect_punct(",")?;
-                let ty = self.type_name()?;
-                self.expect_punct(")")?;
+                let at = self.here();
+                let ty = self.type_name(open)?;
+                self.expect_close(")", open)?;
                 return Ok(Expr {
-                    kind: ExprKind::VaArg(first),
+                    id: ExprId::new(),
+                    kind: ExprKind::VaArg(first, at),
                     // The value is a copy: qualifiers mean nothing on it.
                     ty: ty.unqual().clone(),
                     pos,
@@ -2685,11 +3985,231 @@ impl Parser<'_> {
             "__builtin_va_end" => ExprKind::VaEnd(first),
             _ => return Err(Error::new(pos, format!("unknown builtin '{name}'"))),
         };
-        self.expect_punct(")")?;
+        self.expect_close(")", open)?;
         Ok(Expr::new(kind, pos))
     }
 }
 
+/// What tells a parenthesized expression from the others, the tree
+/// keeping no parentheses: its position and its kind (a call is where its
+/// callee is, but no callee is a call).
+type ParenKey = (Pos, std::mem::Discriminant<ExprKind>);
+
+fn paren_key(e: &Expr) -> ParenKey {
+    (e.pos, std::mem::discriminant(&e.kind))
+}
+
+/// Prints an expression as clang's `StmtPrinter` does, for what a failed
+/// `_Static_assert` says: literals by their values (`0x10` is `16`, an
+/// `unsigned` one `16U`), operators between spaces, the parentheses as
+/// written (`parens`, for the tree has none), types as clang spells them
+/// with their typedefs resolved, and names as written. `toks` are the
+/// tokens of the expression, which say how a literal was written.
+struct Printer<'a> {
+    toks: &'a [Token],
+    parens: &'a [(ParenKey, Pos)],
+}
+
+impl Printer<'_> {
+    fn token(&self, pos: Pos) -> Option<&Token> {
+        self.toks.iter().find(|t| t.pos == pos)
+    }
+
+    /// How many parentheses are around `e`, and where the outermost opens.
+    fn parens_of(&self, e: &Expr) -> (usize, Option<Pos>) {
+        let key = paren_key(e);
+        let opens = self.parens.iter().filter(|(k, _)| *k == key).map(|&(_, at)| at);
+        (opens.clone().count(), opens.min())
+    }
+
+    /// Whether `e` is an integer literal (not a character one).
+    fn is_integer_literal(&self, e: &Expr) -> bool {
+        matches!(e.kind, ExprKind::Num(_))
+            && self
+                .token(e.pos)
+                .is_some_and(|t| matches!(t.tok, Tok::Num(..)) && !t.text.ends_with('\''))
+    }
+
+    /// The `[]` of `a[i]`, which the parser made `*(a + i)` at the `[`.
+    fn subscript<'e>(&self, e: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
+        match &e.kind {
+            ExprKind::Deref(x) if x.pos == e.pos => match &x.kind {
+                ExprKind::Binary(BinOp::Add, a, i) => Some((a, i)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Where `e` starts: clang's place for what is said of it. Its own
+    /// parentheses count unless it is the `top` of what is printed.
+    fn begin(&self, e: &Expr, top: bool) -> Pos {
+        if let (_, Some(open)) = self.parens_of(e) {
+            if !top {
+                return open;
+            }
+        }
+        if let Some((a, _)) = self.subscript(e) {
+            return self.begin(a, false);
+        }
+        match &e.kind {
+            ExprKind::Binary(_, l, _) | ExprKind::Comma(l, _) | ExprKind::Cond(l, ..) => self.begin(l, false),
+            ExprKind::Assign { target, .. }
+            | ExprKind::IncDec {
+                target,
+                prefix: false,
+                ..
+            } => self.begin(target, false),
+            ExprKind::Member { base, .. } => self.begin(base, false),
+            ExprKind::Call { callee, .. } => self.begin(callee, false),
+            _ => e.pos,
+        }
+    }
+
+    /// `e` as clang prints it, without its own parentheses if `top`.
+    fn expr(&self, e: &Expr, top: bool) -> String {
+        let p = |x: &Expr| self.expr(x, false);
+        let text = if let Some((a, i)) = self.subscript(e) {
+            format!("{}[{}]", p(a), p(i))
+        } else {
+            match &e.kind {
+                ExprKind::Num(v) => match self.token(e.pos) {
+                    Some(t) if t.text.ends_with('\'') => char_literal(*v, &t.text),
+                    // An enumeration constant inside its enum.
+                    Some(t) if matches!(t.tok, Tok::Ident(_)) => t.text.clone(),
+                    _ => {
+                        let suffix = match e.ty.int_kind() {
+                            Some(IntKind::UInt) => "U",
+                            Some(IntKind::Long) => "L",
+                            Some(IntKind::ULong) => "UL",
+                            Some(IntKind::LongLong) => "LL",
+                            Some(IntKind::ULongLong) => "ULL",
+                            _ => "",
+                        };
+                        format!("{v}{suffix}")
+                    }
+                },
+                ExprKind::Enumerator { name, .. } | ExprKind::Var { name, .. } => name.clone(),
+                ExprKind::Str(bytes) => {
+                    let chars: String = bytes.iter().map(|&b| escaped(u32::from(b), '"')).collect();
+                    format!("\"{chars}\"")
+                }
+                ExprKind::Binary(op, l, r) => format!("{} {} {}", p(l), op.symbol(), p(r)),
+                ExprKind::Comma(l, r) => format!("{} , {}", p(l), p(r)),
+                ExprKind::Unary(op, x) => format!("{}{}", op.symbol(), p(x)),
+                ExprKind::Addr(x) => format!("&{}", p(x)),
+                ExprKind::Deref(x) => format!("*{}", p(x)),
+                ExprKind::Cast { x, .. } => format!("({}){}", e.ty, p(x)),
+                ExprKind::SizeofType(t) => format!("sizeof({t})"),
+                ExprKind::SizeofExpr(x, _) => format!("sizeof {}", p(x)),
+                ExprKind::Cond(c, a, b) => format!("{} ? {} : {}", p(c), p(a), p(b)),
+                ExprKind::Assign { op, target, value } => {
+                    let op = op.map_or("", |o| o.symbol());
+                    format!("{} {op}= {}", p(target), p(value))
+                }
+                ExprKind::IncDec { inc, prefix, target } => {
+                    let op = if *inc { "++" } else { "--" };
+                    if *prefix {
+                        format!("{op}{}", p(target))
+                    } else {
+                        format!("{}{op}", p(target))
+                    }
+                }
+                ExprKind::Member {
+                    base, name, arrow, ..
+                } => format!("{}{}{name}", p(base), if *arrow { "->" } else { "." }),
+                ExprKind::Call { callee, args, .. } => {
+                    let args: Vec<String> = args.iter().map(p).collect();
+                    format!("{}({})", p(callee), args.join(", "))
+                }
+                ExprKind::CompoundLit { init, .. } => format!("({}){}", e.ty, self.init(init)),
+                ExprKind::VaStart { ap, last } => format!("__builtin_va_start({}, {})", p(ap), p(last)),
+                ExprKind::VaArg(ap, _) => format!("__builtin_va_arg({}, {})", p(ap), e.ty),
+                ExprKind::VaEnd(ap) => format!("__builtin_va_end({})", p(ap)),
+                ExprKind::VaCopy(d, s) => format!("__builtin_va_copy({}, {})", p(d), p(s)),
+            }
+        };
+        let (n, _) = if top { (0, None) } else { self.parens_of(e) };
+        format!("{}{text}{}", "(".repeat(n), ")".repeat(n))
+    }
+
+    fn init(&self, init: &Init) -> String {
+        match init {
+            Init::Expr(e) => self.expr(e, false),
+            Init::List(items, _) => {
+                let items: Vec<String> = items.iter().map(|i| self.init(i)).collect();
+                format!("{{{}}}", items.join(", "))
+            }
+            Init::Designated(designators, init) => {
+                let mut s = String::new();
+                for d in designators {
+                    match d {
+                        Designator::Member(name, ..) => s += &format!(".{name}"),
+                        Designator::Index(e, _) => s += &format!("[{}]", self.expr(e, false)),
+                    }
+                }
+                format!("{s} = {}", self.init(init))
+            }
+        }
+    }
+}
+
+/// A character `c` of a literal quoted by `quote`, as clang prints it:
+/// C's escapes, the printable ones as they are, the rest in hexadecimal.
+fn escaped(c: u32, quote: char) -> String {
+    match char::from_u32(c) {
+        Some('\\') => "\\\\".to_string(),
+        Some(q) if q == quote => format!("\\{q}"),
+        Some('\x07') => "\\a".to_string(),
+        Some('\x08') => "\\b".to_string(),
+        Some('\x0c') => "\\f".to_string(),
+        Some('\n') => "\\n".to_string(),
+        Some('\r') => "\\r".to_string(),
+        Some('\t') => "\\t".to_string(),
+        Some('\x0b') => "\\v".to_string(),
+        Some(ch) if (' '..='~').contains(&ch) => ch.to_string(),
+        _ if c < 0x100 => format!("\\x{c:02x}"),
+        _ if c <= 0xffff => format!("\\u{c:04x}"),
+        _ => format!("\\U{c:08x}"),
+    }
+}
+
+/// A character literal of value `v`, written `text` (`'a'`, `L'a'`), as
+/// clang prints it (`CharacterLiteral::print`).
+fn char_literal(v: i128, text: &str) -> String {
+    let wide = if text.starts_with('L') { "L" } else { "" };
+    let mut c = v as u32;
+    // A plain one may be sign-extended.
+    if wide.is_empty() && c & !0xff == !0xff {
+        c &= 0xff;
+    }
+    format!("{wide}'{}'", escaped(c, '\''))
+}
+
+/// A function's declaration (no body) from its declarator, with what the
+/// declarator left for sema to check.
+fn declared_function(d: Decl, specs: &Specs, unevaluated: Vec<Unevaluated>) -> Function {
+    let params = d.func.as_ref().map(|(p, _)| p.clone()).unwrap_or_else(|| {
+        // Declared through a typedef of a function type: unnamed parameters.
+        d.ty.func_type()
+            .map(|f| {
+                f.params
+                    .iter()
+                    .map(|t| Param {
+                        name: String::new(),
+                        ty: t.clone(),
+                        pos: d.pos,
+                        spelled: Spelled::default(),
+                        register: false,
+                        array: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let end = d.pos;
+    function(d, params, specs, None, end, unevaluated)
+}
 /// A function declaration or definition from its declarator, with what
 /// the declarator left for sema to check.
 fn function(
@@ -2711,7 +4231,7 @@ fn function(
         params,
         variadic,
         is_static: specs.class == Class::Static,
-        is_inline: specs.inline,
+        is_inline: specs.inline.is_some(),
         is_extern: specs.class == Class::Extern,
         inline_only: false,
         prototyped: d.prototyped,
@@ -2785,7 +4305,7 @@ mod tests {
             ExprKind::Deref(x) => format!("(* {})", sx(x)),
             ExprKind::Cast { x, .. } => format!("(cast {} {})", e.ty, sx(x)),
             ExprKind::SizeofType(t) => format!("(sizeof {t})"),
-            ExprKind::SizeofExpr(x) => format!("(sizeof {})", sx(x)),
+            ExprKind::SizeofExpr(x, _) => format!("(sizeof {})", sx(x)),
             ExprKind::Cond(c, a, b) => format!("(? {} {} {})", sx(c), sx(a), sx(b)),
             ExprKind::Comma(a, b) => format!("(, {} {})", sx(a), sx(b)),
             ExprKind::Member {
@@ -2802,7 +4322,7 @@ mod tests {
                 s + ")"
             }
             ExprKind::VaStart { ap, last } => format!("(va_start {} {})", sx(ap), sx(last)),
-            ExprKind::VaArg(ap) => format!("(va_arg {} {})", sx(ap), e.ty),
+            ExprKind::VaArg(ap, _) => format!("(va_arg {} {})", sx(ap), e.ty),
             ExprKind::VaEnd(ap) => format!("(va_end {})", sx(ap)),
             ExprKind::VaCopy(d, s) => format!("(va_copy {} {})", sx(d), sx(s)),
             ExprKind::CompoundLit { init, .. } => format!("(literal {} {})", e.ty, si(init)),
@@ -2817,7 +4337,7 @@ mod tests {
                 let mut s = String::new();
                 for d in ds {
                     match d {
-                        Designator::Member(name, _) => s += &format!(".{name}"),
+                        Designator::Member(name, ..) => s += &format!(".{name}"),
                         Designator::Index(e, _) => s += &format!("[{}]", sx(e)),
                     }
                 }
@@ -2831,6 +4351,7 @@ mod tests {
             Storage::None => "",
             Storage::Static => "static ",
             Storage::Extern => "extern ",
+            Storage::Register => "register ",
         };
         match &d.init {
             Some(i) => format!("{storage}{}={}", d.ty.declare(&d.name), si(i)),
@@ -2845,7 +4366,7 @@ mod tests {
             StmtKind::Block(b) => format!("{{{}}}", b.iter().map(ss).collect::<Vec<_>>().join(" ")),
             StmtKind::Decl(ds) => format!("(decl {})", ds.iter().map(sd).collect::<Vec<_>>().join(", ")),
             StmtKind::Expr(e) => format!("{};", sx(e)),
-            StmtKind::Empty => ";".into(),
+            StmtKind::Empty { .. } => ";".into(),
             StmtKind::Unevaluated(us) => format!(
                 "(unevaluated {})",
                 us.iter().map(|u| sx(&u.expr)).collect::<Vec<_>>().join(" ")
@@ -2877,7 +4398,7 @@ mod tests {
             StmtKind::Case { expr, body, .. } => format!("(case {} {})", sx(expr), ss(body)),
             StmtKind::Default { body, .. } => format!("(default {})", ss(body)),
             StmtKind::Label { name, body } => format!("({name}: {})", ss(body)),
-            StmtKind::Goto(name) => format!("(goto {name})"),
+            StmtKind::Goto(name, _) => format!("(goto {name})"),
         }
     }
 
@@ -2945,8 +4466,8 @@ mod tests {
         let p = prog("typedef void V; int f(V); int g(V) { return 0; }");
         assert!(funcs(&p).iter().all(|f| f.params.is_empty()));
         assert_eq!(globals("typedef void V; int (*h)(V);")[0], "int (*h)(void)");
-        // Only a lone, unnamed, unqualified void is "no parameters".
-        prog("typedef void V; int f(V x); int g(const V); int h(V, int);");
+        // Only a lone, unnamed, unqualified void is "no parameters"
+        // (tests/diagnostics has the errors of the others).
     }
 
     #[test]
@@ -2963,20 +4484,6 @@ mod tests {
             ["char (*const volatile a)[2]", "int *b", "int *const"]
         );
         assert_eq!(params("int f(int a[static const 3]);"), ["int *const a"]);
-        // Anywhere else they have no pointer to qualify.
-        let only = "qualifiers and 'static' inside '[]' are only allowed in the outermost array of a \
-                    function parameter";
-        assert_eq!(err("int a[const 3];"), format!("1:6: {only}"));
-        assert_eq!(err("int f(int a[3][const 2]);"), format!("1:15: {only}"));
-        assert_eq!(err("int f(int (*a)[const 2]);"), format!("1:15: {only}"));
-        assert_eq!(
-            err("int f() { return sizeof(int [const 2]); }"),
-            format!("1:29: {only}")
-        );
-        assert_eq!(
-            err("int f(int a[static]);"),
-            "1:19: expected the array size after 'static', found ']'"
-        );
     }
 
     #[test]
@@ -2999,41 +4506,15 @@ mod tests {
         assert_eq!(ty("static int"), "static int x");
         assert_eq!(ty("int static"), "static int x");
         assert_eq!(ty("extern char"), "extern char x");
-        for bad in [
-            "signed unsigned",
-            "char int",
-            "short char",
-            "short long",
-            "void int",
-            "unsigned void",
-        ] {
-            assert_eq!(
-                err(&format!("{bad} x;")),
-                "1:1: invalid combination of type specifiers",
-                "{bad}"
-            );
-        }
-        assert_eq!(err("int int x;"), "1:5: duplicate 'int'");
-        assert_eq!(err("long long long x;"), "1:11: 'long long long' is invalid");
-        assert_eq!(
-            err("short long long x;"),
-            "1:1: invalid combination of type specifiers"
-        );
-        assert_eq!(err("static x;"), "1:8: expected a type, found identifier 'x'");
-        assert_eq!(
-            err("static extern int x;"),
-            "1:8: at most one storage class ('static', 'extern', 'typedef') is allowed"
-        );
+        // The same specifier twice is only warned of; `long` twice is
+        // `long long`.
+        assert_eq!(ty("unsigned unsigned"), "unsigned int x");
+        assert_eq!(ty("short short int"), "short x");
+        assert_eq!(ty("long unsigned long"), "unsigned long long x");
+        assert_eq!(ty("static static int"), "static int x");
         assert_eq!(ty("_Bool"), "_Bool x");
         assert_eq!(ty("const int"), "const int x");
         assert_eq!(ty("int const volatile"), "const volatile int x");
-        assert_eq!(err("_Bool int x;"), "1:1: invalid combination of type specifiers");
-        assert_eq!(
-            err("unsigned _Bool x;"),
-            "1:1: invalid combination of type specifiers"
-        );
-        assert_eq!(err("int;"), "1:4: declaration does not declare anything");
-        assert_eq!(err("const x;"), "1:7: expected a type, found identifier 'x'");
     }
 
     /// The statements of the last function of `{globals} int f() { {stmts} }`.
@@ -3118,23 +4599,7 @@ mod tests {
             body_with("", "{ typedef char C; C c; } return 0;"),
             ["{(decl char c)}", "(return 0)"]
         );
-        assert_eq!(
-            err("typedef int T; int f() { return T; }"),
-            "1:33: unexpected type name 'T': expected expression"
-        );
-        assert_eq!(
-            err("typedef int T; typedef char T;"),
-            "1:29: typedef redefinition with different types ('char' vs 'int')"
-        );
         prog("typedef int T; typedef int T;");
-        assert_eq!(
-            err("typedef int x = 1;"),
-            "1:15: illegal initializer (only variables can be initialized)"
-        );
-        assert_eq!(
-            err("int T; typedef int T;"),
-            "1:20: redefinition of 'T' as a different kind of symbol (first declared at 1:5)"
-        );
         // A label may have a typedef's name.
         assert_eq!(body_with("typedef int L;", "L: return 1;"), ["(L: (return 1))"]);
     }
@@ -3184,57 +4649,15 @@ mod tests {
         // Anonymous structs and nested definitions (whose tags are in scope outside).
         let t = global_types("struct { struct in { short a; } i; char c; } a; struct in b;");
         assert_eq!((t[0].size(Xlen::Rv32), t[1].size(Xlen::Rv32)), (Some(4), Some(2)));
-        assert_eq!(t[0].to_string(), "struct (anonymous at 1:1)");
-        for (src, msg) in [
-            (
-                "struct s { int a; int a; };",
-                "1:23: duplicate member 'a' (first declared at 1:16)",
-            ),
-            (
-                "struct s { int a; }; struct s { int b; };",
-                "1:29: redefinition of 'struct s'",
-            ),
-            (
-                "struct s { int a; }; union s x;",
-                "1:28: use of 's' with tag type that does not match previous declaration",
-            ),
-            ("struct s { };", "1:10: struct has no members"),
-            (
-                "struct s { int a : 3; };",
-                "1:18: bit-fields are not supported yet",
-            ),
-            (
-                "struct s { struct t m; };",
-                "1:21: field 'm' has incomplete type 'struct t'",
-            ),
-            (
-                "struct s { int f(void); };",
-                "1:16: field 'f' declared as a function",
-            ),
-            (
-                "struct s { int n; int x[]; };",
-                "1:23: flexible array members are not supported yet",
-            ),
-            (
-                "struct s { int; };",
-                "1:15: declaration does not declare anything (anonymous members are not supported)",
-            ),
-            (
-                "struct { int a; };",
-                "1:18: declaration does not declare anything",
-            ),
-            (
-                "struct s { static int a; };",
-                "1:12: 'static' is not allowed here",
-            ),
-            ("struct;", "1:7: expected a name or '{' after 'struct', found ';'"),
-            (
-                "struct s { char c[0x7fffffff]; int i; };",
-                "1:36: struct is too large",
-            ),
-        ] {
-            assert_eq!(err(src), msg, "{src}");
-        }
+        // The file is the preprocessor's to name (crate::place).
+        assert_eq!(t[0].to_string(), "struct (unnamed at \u{1}0\u{1}1:1)");
+        // Specifiers that declare nothing are warned of, and left out.
+        let p = prog("int; struct s { int; char c; } x; struct { int a; };");
+        assert_eq!(p.warnings.len(), 3);
+        assert_eq!(
+            global_types("struct s { int; char c; } x;")[0].size(Xlen::Rv32),
+            Some(1)
+        );
     }
 
     #[test]
@@ -3253,36 +4676,6 @@ mod tests {
             body_with("enum { K = 3 };", "int K = 4; return K;"),
             ["(decl int K=4)", "(return K)"]
         );
-        for (src, msg) in [
-            (
-                "enum e x;",
-                "1:6: use of undefined 'enum e' (merlin needs an enum's constants before its name)",
-            ),
-            (
-                "enum { A, A };",
-                "1:11: redefinition of enumerator 'A' (first declared at 1:8)",
-            ),
-            (
-                "enum { A = 2147483647, B };",
-                "1:24: enumerator value 2147483648 is not representable as an 'int'",
-            ),
-            ("enum { };", "1:1: use of empty enum"),
-            (
-                "int x; enum { x };",
-                "1:15: redefinition of 'x' as a different kind of symbol (first declared at 1:5)",
-            ),
-            (
-                "int y; enum { A = y };",
-                "1:19: enumerator value is not an integer constant expression",
-            ),
-            ("enum e { A }; enum e { B };", "1:20: redefinition of 'enum e'"),
-            (
-                "enum { A B };",
-                "1:10: expected ',' or '}' in the enum, found identifier 'B'",
-            ),
-        ] {
-            assert_eq!(err(src), msg, "{src}");
-        }
     }
 
     #[test]
@@ -3296,18 +4689,8 @@ mod tests {
         assert_eq!(ss(&stmt("goto out;")), "(goto out)");
         assert_eq!(ss(&stmt("out: return 1;")), "(out: (return 1))");
         assert_eq!(ss(&stmt("a: b: ;")), "(a: (b: ;))");
-        assert_eq!(
-            err("int f() { case 1 x; }"),
-            "1:18: expected ':', found identifier 'x'"
-        );
-        assert_eq!(
-            err("int f() { goto 3; }"),
-            "1:16: expected a label name after 'goto', found '3'"
-        );
-        assert_eq!(
-            err("int f() { default x; }"),
-            "1:19: expected ':', found identifier 'x'"
-        );
+        // A label may end a block (C23), which clang takes with a warning.
+        assert_eq!(ss(&stmt("{ x: }")), "{(x: ;)}");
     }
 
     #[test]
@@ -3321,10 +4704,6 @@ mod tests {
         assert_eq!(ex("(*fp)(1)"), "(call (* fp) 1)");
         assert_eq!(ex("table[i](x)"), "(call (* (+ table i)) x)");
         assert_eq!(ex("s.f(1).g"), "(. (call (. s f) 1) g)");
-        assert_eq!(
-            err("int f() { s.(1); }"),
-            "1:13: expected a member name, found '('"
-        );
     }
 
     #[test]
@@ -3346,14 +4725,6 @@ mod tests {
         let p = prog("static inline int twice(int x) { return 2 * x; } inline int g(void);");
         assert!(funcs(&p)[0].is_inline && funcs(&p)[0].is_static);
         assert!(funcs(&p)[1].is_inline && !funcs(&p)[1].is_static);
-        assert_eq!(
-            err("inline int x;"),
-            "1:12: 'inline' can only appear on functions"
-        );
-        assert_eq!(
-            err("int f(inline int x);"),
-            "1:7: 'inline' can only appear on functions"
-        );
     }
 
     /// The operand a constant `?:` does not choose is not evaluated: in an
@@ -3378,16 +4749,11 @@ mod tests {
                 "char d[1]",
             ]
         );
-        // The operand chosen must still be constant.
-        let msg = "array size must be an integer constant expression \
-                   (literals, enum constants, operators, casts and sizeof)";
-        assert_eq!(err("int g; int a[0 ? 2 : g];"), format!("1:14: {msg}"));
-
         // clang folds such an array size only where an array cannot be
         // variable-length: at file scope, in a member, in a `static` local,
-        // in a local array with an initializer. Elsewhere the array is a
+        // in a local array with an initializer. (Elsewhere the array is a
         // variable-length one, which merlin does not have: an error, as
-        // `int a[n]` is.
+        // `int a[n]` is.)
         let p = prog(
             "unsigned u(void); typedef int T[1 ? 2 : u()]; int (*pa)[1 ? 3 : u()];\n\
              int f(void) {\n\
@@ -3399,34 +4765,6 @@ mod tests {
         );
         let body = format!("{:?}", funcs(&p)[1].body);
         assert!(body.contains("Array(Int(Int), Some(2))"), "{body}");
-        let vla = |src: &str, col: usize| {
-            let src = format!("unsigned u(void); {src}");
-            assert_eq!(err(&src), format!("1:{}: {msg}", col + 18), "{src}");
-        };
-        vla("int f(void) { int a[1 ? 2 : u()]; return a[0]; }", 21);
-        vla(
-            "int f(void) { int a[1 ? 2 : u()] = {1}, b[1 ? 3 : u()]; return 0; }",
-            43,
-        );
-        vla("int f(void) { typedef int T[1 ? 2 : u()]; return 0; }", 29);
-        vla("int f(void) { int (*p)[1 ? 2 : u()] = 0; return 0; }", 24);
-        vla("int f(int a[1 ? 2 : u()]) { return a[0]; }", 13);
-        vla("int f(void) { return sizeof(int[1 ? 2 : u()]); }", 33);
-        // A static local or an initialized array folds in its own array
-        // type, not through a pointer, which clang keeps variably modified.
-        vla("int f(void) { static int (*p)[1 ? 2 : u()]; return 0; }", 31);
-        vla("int f(void) { static int (*q[2])[1 ? 2 : u()]; return 0; }", 34);
-        vla("int f(void) { int (*b[2])[1 ? 3 : u()] = {0}; return 0; }", 27);
-        // A compound literal's array type folds as an initialized array's;
-        // any other type name in a function is a variable-length one.
-        vla(
-            "int f(void) { int *q = (int[][1 ? 2 : u()]){{1}}[0]; return *q; }",
-            31,
-        );
-        vla(
-            "int f(void) { void *p = (int (*)[1 ? 2 : u()])0; return p != 0; }",
-            34,
-        );
         let p = prog(
             "unsigned u(void); int *q = (int[1 ? 2 : u()]){1, 2};
              int f(void) { return ((int[1 ? 3 : u()][1]){{1}, {2}, {3}})[2][0]; }",
@@ -3445,29 +4783,6 @@ mod tests {
                 "void *p=(cast int (*)[2] 0)",
                 "int z=(sizeof int (*(*)(void))[2])"
             ]
-        );
-        // Where clang cannot make the type a constant one: through a pointer
-        // after an array, or an array of unknown size, at file scope or in a
-        // member; a function's return type, anywhere.
-        let at = |src: &str| {
-            let src = format!("unsigned u(void);\n{src}");
-            err(&src)
-        };
-        let file = "variably modified type declaration not allowed at file scope";
-        assert_eq!(at("int (*a[2])[1 ? 2 : u()];"), format!("2:7: {file}"));
-        assert_eq!(at("int b[][1 ? 2 : u()] = {{1}};"), format!("2:5: {file}"));
-        assert_eq!(at("typedef int (*T[2])[1 ? 2 : u()];"), format!("2:15: {file}"));
-        assert_eq!(at("int (*(*g)(void))[1 ? 2 : u()];"), format!("2:9: {file}"));
-        assert_eq!(
-            at("struct S { int (*p[2])[1 ? 2 : u()]; } s;"),
-            "2:18: fields must have a constant size: 'variable length array in structure' \
-             extension will never be supported"
-        );
-        let func = "function declaration cannot have variably modified type";
-        assert_eq!(at("int (*fr(void))[1 ? 2 : u()];"), format!("2:7: {func}"));
-        assert_eq!(
-            at("static int (*fr(void))[1 ? 2 : u()] { return 0; }"),
-            format!("2:14: {func}")
         );
     }
 
@@ -3504,9 +4819,15 @@ mod tests {
                  if (sizeof(char[sizeof g])) { int g = 0; x = g; }\n    \
                  return c[0];\n}\n",
         );
-        let list = |us: &[Unevaluated]| -> Vec<String> { us.iter().map(|u| sx(&u.expr)).collect() };
+        // What is evaluated away; the constants kept with it are below.
+        let list = |us: &[Unevaluated]| -> Vec<String> {
+            us.iter().filter(|u| !u.constant).map(|u| sx(&u.expr)).collect()
+        };
         let file: Vec<(usize, String)> = p.unevaluated.iter().map(|(n, u)| (*n, sx(&u.expr))).collect();
-        assert_eq!(file, [(4, "g".to_string())]);
+        // The enumerator's operand not chosen, then the constant as the
+        // parser resolved it, which sema checks as a constant.
+        assert_eq!(file, [(4, "g".to_string()), (4, "(? 0 0 1)".to_string())]);
+        assert!(p.unevaluated[1].1.constant && !p.unevaluated[0].1.constant);
         let Item::Decl(a) = &p.items[2] else { panic!() };
         assert_eq!(list(&a[0].sized), ["(call f)"]);
         let Item::Decl(b) = &p.items[3] else { panic!() };
@@ -3534,7 +4855,8 @@ mod tests {
             [
                 "(decl int x)",
                 "(decl char c[4]={0}, char d=(sizeof char[4]))",
-                "(unevaluated (call f))",
+                // The assertion's operand not chosen, and its condition.
+                "(unevaluated (call f) (? 1 1 0))",
                 "(for (decl int i=0) (< i (sizeof char[4])) (i ++) (x ++);)",
                 "(if (sizeof char[4]) {(decl int g=0) (= x g);})",
                 "(unevaluated g)",
@@ -3609,17 +4931,15 @@ mod tests {
             ["char a[4]", "char b[20]"]
         );
 
-        // What the parser can't type is sema's to check: its error is
-        // clang's, and if it has none, the size is no constant merlin knows.
-        let msg = "array size must be an integer constant expression \
-                   (literals, enum constants, operators, casts and sizeof)";
+        // An array sized by designators (`[3] = 1` makes 4 elements).
         assert_eq!(
-            err("char a[sizeof nothing];"),
-            "1:15: use of undeclared identifier 'nothing'"
-        );
-        assert_eq!(
-            err("int t[] = {[3] = 1}; char a[sizeof t];"),
-            format!("1:29: {msg}")
+            globals(
+                "int t[] = {[3] = 1}; char a[sizeof t]; int u[] = {[1] = 1, 2, [0] = 3}; char b[sizeof u];"
+            )
+            .iter()
+            .filter(|d| d.starts_with("char"))
+            .collect::<Vec<_>>(),
+            ["char a[16]", "char b[12]"]
         );
     }
 
@@ -3637,44 +4957,13 @@ mod tests {
             globals("char buf[4 * sizeof(int) + 1]; int a[(char)258];"),
             ["char buf[17]", "int a[2]"]
         );
-        assert_eq!(err("int a[0];"), "1:7: array size must be positive, not 0");
-        assert_eq!(err("int a[-1];"), "1:7: array size must be positive, not -1");
-        assert_eq!(
-            err("int n; int a[n];"),
-            "1:14: array size must be an integer constant expression \
-             (literals, enum constants, operators, casts and sizeof)"
-        );
-        assert_eq!(
-            err("int a[2][];"),
-            "1:9: only the first array dimension may be left out"
-        );
-        assert_eq!(err("int a[0x40000000][2];"), "1:21: array is too large");
-        assert_eq!(
-            err("void a[2];"),
-            "1:10: array has incomplete element type 'void'"
-        );
-        assert_eq!(
-            err("int f()[2];"),
-            "1:5: function cannot return array type 'int[2]'"
-        );
-        assert_eq!(
-            err("int f()(int);"),
-            "1:5: function cannot return function type 'int (int)'"
-        );
-        assert_eq!(
-            err("int a[2](void);"),
-            "1:6: 'a' declared as array of functions of type 'int (void)'"
-        );
-        assert_eq!(err("int a[1] = {[0] 1};"), "1:17: expected '=', found '1'");
-        assert_eq!(err("int a[1] = {.};"), "1:14: expected a member name, found '}'");
-        assert_eq!(
-            err("int x, f(int);"),
-            "1:8: declare a function on its own, not in a list of variables"
-        );
-        assert_eq!(
-            err("int a[2] = {};"),
-            "1:12: empty initializer lists are not C99; write '{ 0 }'"
-        );
+        // GNU's `[0] 1`, clang's warning, and an empty list (C23).
+        assert_eq!(globals("int a[2] = {[1] 3};"), ["int a[2]={[1]=3}"]);
+        assert_eq!(globals("int b[2] = {};"), ["int b[2]={}"]);
+        // A function declared among variables is an item of its own.
+        let p = prog("int x, f(int), y;");
+        assert_eq!(globals("int x, f(int), y;"), ["int x", "int y"]);
+        assert_eq!(funcs(&p)[0].name, "f");
     }
 
     #[test]
@@ -3704,9 +4993,13 @@ mod tests {
             ds.iter().all(|d| d.var.is_none()),
             "sema resolves variables, not the parser"
         );
+        // `extern` and functions in a block declare what is outside it.
         assert_eq!(
-            err("int f() { extern int x; }"),
-            "1:11: 'extern' is not allowed here"
+            body("extern int x; int g(int), y;")
+                .iter()
+                .map(ss)
+                .collect::<Vec<_>>(),
+            ["(decl extern int x)", "(decl int g(int), int y)"]
         );
     }
 
@@ -3745,14 +5038,6 @@ mod tests {
         assert_eq!(ss(&stmt("do x++; while (x < 3);")), "(do (x ++); (< x 3))");
         assert_eq!(ss(&stmt("do { } while (0);")), "(do {} 0)");
         assert_eq!(
-            err("int f() { do x; until (1); }"),
-            "1:17: expected 'while' after the body of 'do', found identifier 'until'"
-        );
-        assert_eq!(
-            err("int f() { do ; while (1) }"),
-            "1:25: expected ';' after 'do'/'while' statement"
-        );
-        assert_eq!(
             ss(&stmt("for (int i = 0; i < 10; i = i + 1) s = s + i;")),
             "(for (decl int i=0) (< i 10) (= i (+ i 1)) (= s (+ s i));)"
         );
@@ -3763,8 +5048,8 @@ mod tests {
             "(for (decl char *p=s, char c) _ _ ;)"
         );
         assert_eq!(
-            err("int f() { for (static int i = 0;;) ; }"),
-            "1:16: 'static' is not allowed here"
+            ss(&stmt("for (static int i = 0;;) ;")),
+            "(for (decl static int i=0) _ _ ;)"
         );
     }
 
@@ -3929,14 +5214,6 @@ mod tests {
         assert_eq!(ex("sizeof -x"), "(sizeof (- x))");
         assert_eq!(ex("sizeof a[0]"), "(sizeof (* (+ a 0)))");
         assert_eq!(ex("sizeof(int) * 2"), "(* (sizeof int) 2)");
-        assert_eq!(
-            err("int f() { return (int x)1; }"),
-            "1:23: expected ')' after the type name, found identifier 'x'"
-        );
-        assert_eq!(
-            err("int f() { return (static int)1; }"),
-            "1:19: 'static' is not allowed here"
-        );
     }
 
     /// `n` copies of `open`, then `inner`, then `n` copies of `close`.
@@ -4054,115 +5331,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_semicolon() {
-        // Reported right after the previous token, where the `;` belongs.
-        assert_eq!(err("int f() { x = 1 }"), "1:16: expected ';' after expression");
-        assert_eq!(
-            err("int f() {\n  return 1\n}"),
-            "2:11: expected ';' after return statement"
-        );
-        assert_eq!(
-            err("int f() { int x = 1 int y; }"),
-            "1:20: expected ';' at end of declaration"
-        );
-        assert_eq!(
-            err("int x = 1 int y;"),
-            "1:10: expected ';' at end of declaration"
-        );
-        assert_eq!(
-            err("int f() { while (1) break }"),
-            "1:26: expected ';' after 'break'"
-        );
-        assert_eq!(
-            err("int f() { while (1) continue }"),
-            "1:29: expected ';' after 'continue'"
-        );
-        assert_eq!(
-            err("int f() { for (i = 0 i < 3; ) ; }"),
-            "1:21: expected ';' in 'for' statement"
-        );
-        assert_eq!(
-            err("int f() { for (;1) ; }"),
-            "1:18: expected ';' in 'for' statement"
-        );
-    }
-
-    #[test]
-    fn syntax_errors() {
-        assert_eq!(err("int f() { return (1 + 2; }"), "1:24: expected ')', found ';'");
-        assert_eq!(
-            err("int f() { return 1 + ; }"),
-            "1:22: expected expression, found ';'"
-        );
-        assert_eq!(
-            err("int f() { return 1;"),
-            "1:20: expected '}', found end of file"
-        );
-        assert_eq!(
-            err("int f() { if x) return 1; }"),
-            "1:14: expected '(', found identifier 'x'"
-        );
-        assert_eq!(
-            err("int f() { f(1 2); }"),
-            "1:15: expected ',' or ')' in the argument list, found '2'"
-        );
-        // Literals are quoted as written.
-        assert_eq!(
-            err("int f() { f(1 0x7f); }"),
-            "1:15: expected ',' or ')' in the argument list, found '0x7f'"
-        );
-        assert_eq!(
-            err("int f(int a b) {}"),
-            "1:13: expected ',' or ')' in the parameter list, found identifier 'b'"
-        );
-        assert_eq!(
-            err("int f(x) {}"),
-            "1:7: expected a parameter type, found identifier 'x'"
-        );
-        assert_eq!(
-            err("int f(int) { return 0; }"),
-            "1:7: parameter name omitted in a function definition"
-        );
-        assert_eq!(
-            err("int f() return 1;"),
-            "1:9: expected '{' or ';' after the parameter list, found 'return'"
-        );
-        assert_eq!(err("f() {}"), "1:1: expected a declaration, found identifier 'f'");
-        assert_eq!(err("int 3() {}"), "1:5: expected a name, found '3'");
-        assert_eq!(err("int f() { int 1; }"), "1:15: expected a name, found '1'");
-        assert_eq!(err("int f() { else x; }"), "1:11: 'else' without a matching 'if'");
-        assert_eq!(err("int f() { } }"), "1:13: expected a declaration, found '}'");
-        assert_eq!(err("int f() { a ? b; }"), "1:16: expected ':', found ';'");
-        assert_eq!(err("int f() { a[1; }"), "1:14: expected ']', found ';'");
-        assert_eq!(
-            err("int a[2] = {1 2};"),
-            "1:15: expected ',' or '}' in the initializer list, found '2'"
-        );
-    }
-
-    #[test]
-    fn unsupported_constructs() {
-        assert_eq!(
-            err("int f() { if (1) int x = 1; }"),
-            "1:18: a declaration is not a statement; wrap it in '{ }'"
-        );
-        assert_eq!(
-            err("int f() { int g(int a); }"),
-            "1:15: function declarations inside a function are not supported"
-        );
+    fn too_many_parameters() {
         let params: Vec<String> = (0..128).map(|i| format!("int p{i}")).collect();
         let e = err(&format!("int f({}) {{}}", params.join(", ")));
         assert!(
             e.ends_with("too many parameters: merlin supports at most 127"),
             "{e}"
-        );
-        assert_eq!(
-            err("int f(...);"),
-            "1:7: a named parameter must come before '...'"
-        );
-        assert_eq!(
-            err("int f(int a, ..., int b);"),
-            "1:17: expected ')' after '...', found ','"
         );
     }
 
@@ -4177,15 +5351,9 @@ mod tests {
             .len()
                 == 1
         );
-        assert_eq!(
-            err("_Static_assert(1 + 1 == 3, \"math\");"),
-            "1:1: static assertion failed: math"
-        );
-        assert_eq!(
-            err("int x; _Static_assert(x, \"x\");"),
-            "1:23: static assertion expression is not an integer constant expression"
-        );
-        assert_eq!(err("_Static_assert(1);"), "1:17: expected ',', found ')'");
+        // C23's assertion without a message, which clang takes with a warning.
+        let p = prog("_Static_assert(1);");
+        assert_eq!(p.warnings[0].flag, Some("c23-extensions"));
         // offsetof, as <stddef.h> spells it: the member's offset, which sema
         // has not filled in yet when the parser evaluates the assertion.
         let offsetof = "struct s { char c; int n; struct { short a, b; } in; }; \
@@ -4193,10 +5361,6 @@ mod tests {
                         _Static_assert((unsigned long)&((struct s *)0)->in.b == 10, \"in.b\"); \
                         _Static_assert((unsigned long)&(*(struct s *)0).in == 8, \"in\");";
         assert_eq!(prog(offsetof).items.len(), 0);
-        assert_eq!(
-            err("struct s { char c; int n; }; _Static_assert((unsigned long)&((struct s *)0)->n == 0, \"n\");"),
-            "1:30: static assertion failed: n"
-        );
     }
 
     #[test]
@@ -4235,10 +5399,6 @@ mod tests {
                 "(va_copy aq ap);",
                 "(va_end ap);"
             ]
-        );
-        assert_eq!(
-            err("int f() { __builtin_va_arg(ap); }"),
-            "1:30: expected ',', found ')'"
         );
     }
 }
