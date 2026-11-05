@@ -352,12 +352,14 @@ void pagetable_free(pagetable_t pt);
 
 #if __riscv_xlen == 64
 /* The early page table's lower tables (vm.c, setup_vm()), a page each, in
- * .bss after early_pg_dir, the root (entry.S). Sv48 needs at most eleven:
+ * .bss after early_pg_dir, the root (entry.S). Sv48 needs at most twelve:
  * two under the root for each of the image's two addresses (2 MiB leaves),
  * for the direct map of Grail's most RAM, 1 TiB, two tables of 1 GiB
- * leaves and one each of 2 MiB and 4 KiB leaves for its end, and three for
- * the fixmap's pages. Sv39 needs six. */
-#define EARLY_TABLES 11
+ * leaves, one of 2 MiB leaves for its first GiB, which starts after the
+ * firmware's 2 MiB hole (vm.c, direct_map_ranges()), and one each of 2 MiB
+ * and 4 KiB leaves for its end, and three for the fixmap's pages. Sv39
+ * needs seven. */
+#define EARLY_TABLES 12
 #endif
 
 #ifndef __ASSEMBLER__

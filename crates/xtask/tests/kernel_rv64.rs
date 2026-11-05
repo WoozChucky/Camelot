@@ -408,6 +408,7 @@ fn the_rv64_kernels_have_no_m_mode_code() {
 #[test]
 fn the_rv64_kernel_boots_through_its_self_tests() {
     let mut k = Kernel::load(1, RAM);
+    let tree = k.device_tree();
     let r = k.run();
     let out = k.printed();
     assert_eq!(r, RunResult::Exited(0), "output:\n{out}");
@@ -451,6 +452,15 @@ fn the_rv64_kernel_boots_through_its_self_tests() {
     let fdt = k.m.cpu.bus.read_mem(grail::boot::FDT_ADDR_ADDR, 8).unwrap();
     assert_eq!(fdt, 0x8060_0000);
     assert_eq!(k.read64(k.sym("dtb_early_pa")), fdt);
+    // Its pages kept out of the allocator, as Linux memblock_reserve()s the
+    // tree: after a boot whose self-tests take every free page, it is
+    // still there byte for byte.
+    assert!(k.ram(fdt, tree.len()) == tree, "the device tree was overwritten");
+    assert_eq!(k.read64(k.sym("dtb_base")), fdt);
+    assert_eq!(
+        k.read64(k.sym("dtb_size")),
+        (tree.len() as u64).div_ceil(4096) * 4096
+    );
     // Every lock let go, hart 0 out of push_off.
     assert_eq!(k.read32(cpus + CPU_NOFF), 0);
     for name in ["kmem_lock", "proc_lock", "uart_tx_lock", "tickslock"] {
@@ -518,11 +528,44 @@ fn the_page_table_maps_the_kernel_half_only() {
     let ram_end = mode().page_offset + RAM as u64;
     assert!(k.translate(early, ram_end - 4096).is_some());
     assert!(k.translate(early, ram_end).is_none());
+    // Neither table maps the firmware's 2 MiB, which the device tree marks
+    // no-map, as Linux's linear map leaves a MEMBLOCK_NOMAP region out: the
+    // direct map starts after it, still at RAM's base plus PAGE_OFFSET.
+    for (table, name) in [(kpt, "the kernel's"), (early, "the early")] {
+        for off in (0..2 << 20).step_by(4096) {
+            assert!(
+                k.translate(table, mode().page_offset + off).is_none(),
+                "{name} page table maps the firmware at {:#x}",
+                RAM_BASE + off
+            );
+        }
+        let (pa, pte) = k
+            .translate(table, mode().page_offset + (2 << 20))
+            .unwrap_or_else(|| panic!("{name} page table: 0x80200000 unmapped"));
+        assert_eq!(pa, RAM_BASE + (2 << 20), "{name}");
+        assert_eq!(pte & 0xf, 0x7, "{name}: R+W, {pte:#x}");
+    }
     assert!(k.translate(early, mode().vmalloc_start).is_none());
     assert!(k.translate(early, mode().vmalloc_start + 0x1000_0000).is_none());
 }
 
 impl Kernel {
+    /// The `len` bytes of RAM at physical address `at`.
+    fn ram(&self, at: u64, len: usize) -> Vec<u8> {
+        (0..len as u64)
+            .map(|i| self.m.cpu.bus.read_mem(at + i, 1).unwrap() as u8)
+            .collect()
+    }
+
+    /// The device tree the firmware will hand the kernel in a1: its header's
+    /// totalsize of bytes.
+    fn device_tree(&self) -> Vec<u8> {
+        let at = self.m.cpu.bus.read_mem(grail::boot::FDT_ADDR_ADDR, 8).unwrap();
+        let header = self.ram(at, 8);
+        let size = u32::from_be_bytes(header[4..8].try_into().unwrap());
+        self.ram(at, size as usize)
+    }
+
     fn read64_pa(&self, pa: u64) -> u64 {
         let lo = self.m.cpu.bus.peek(pa).unwrap() as u64;
         let hi = self.m.cpu.bus.peek(pa + 4).unwrap() as u64;

@@ -117,6 +117,38 @@ phys_addr_t kernel_pa(uintptr v) {
 }
 #endif
 
+#if __riscv_xlen == 64
+/* RAM [base, base + size) as the direct map holds it: all of it but the
+ * firmware's region [rbase, rbase + rsize) (sysinfo's SYS_RESERVED_BASE and
+ * _SIZE), which the device tree marks no-map, /reserved-memory/firmware@
+ * 80000000, as OpenSBI's own fixup marks its region. The devicetree
+ * binding's no-map says the OS must not map it in its standard mapping, and
+ * Linux's create_linear_mapping_page_table() maps every memblock.memory
+ * range but the MEMBLOCK_NOMAP ones (for_each_mem_range()). va_pa_offset
+ * stays PAGE_OFFSET minus RAM's base, as Linux's phys_ram_base is
+ * memblock_start_of_DRAM(), no-map regions included: the direct map has a
+ * hole where the firmware is, as Linux's has. The pieces below and above
+ * the region, whole pages, go in start[0], len[0] and start[1], len[1],
+ * either empty (a length of 0); without firmware the first is all of RAM.
+ * Runs at physical addresses too (setup_vm()): arguments and locals only. */
+static void direct_map_ranges(phys_addr_t base, u64 size, phys_addr_t rbase, u64 rsize, phys_addr_t *start,
+                              u64 *len) {
+    phys_addr_t end = base + size;
+    phys_addr_t rend = PGROUNDUP(rbase + rsize);
+    rbase = PGROUNDDOWN(rbase);
+    start[0] = base;
+    len[0] = size;
+    start[1] = end;
+    len[1] = 0;
+    if (rsize == 0 || rend <= base || rbase >= end) {
+        return;
+    }
+    len[0] = (rbase > base ? rbase : base) - base;
+    start[1] = rend < end ? rend : end;
+    len[1] = end - start[1];
+}
+#endif
+
 pagetable_t pagetable_create(void) {
     return kzalloc();
 }
@@ -375,8 +407,16 @@ void kvminit(void) {
         panic("kvminit: out of memory");
     }
     /* All of RAM in the direct map (kinit has cut ram_size to what the
-     * direct map holds). */
-    kvmmap((uintptr)va(ram_base), ram_base, ram_size, PAGE_KERNEL);
+     * direct map holds) but the firmware's no-map region, which stays a
+     * hole, as in Linux's linear map (direct_map_ranges()). */
+    phys_addr_t start[2];
+    u64 len[2];
+    direct_map_ranges(ram_base, ram_size, reserved_base, reserved_size, start, len);
+    for (int i = 0; i < 2; i++) {
+        if (len[i] != 0) {
+            kvmmap((uintptr)va(start[i]), start[i], len[i], PAGE_KERNEL);
+        }
+    }
     /* The fixmap, through the early page table's own tables for it, which
      * nothing else uses (as Linux's setup_vm_final() links fixmap_pgd_next
      * into swapper_pg_dir): sysinfo and the UART stay reachable where the
@@ -724,8 +764,11 @@ static void early_map(uintptr va, phys_addr_t pa, u64 size, int max, u32 perm) {
 }
 
 /* Builds the early page table for `levels` (4: Sv48, 3: Sv39), the image
- * loaded at `load`, and the layout's variables for that mode. */
-static void early_build(u32 levels, phys_addr_t load, phys_addr_t base, u64 size) {
+ * loaded at `load`, RAM at `base` of `size` bytes with the firmware's
+ * region at `rbase` of `rsize` bytes in it, and the layout's variables for
+ * that mode. */
+static void early_build(u32 levels, phys_addr_t load, phys_addr_t base, u64 size, phys_addr_t rbase,
+                        u64 rsize) {
     pt_levels = levels;
     if (levels == 4) {
         satp_mode = SATP_MODE_SV48;
@@ -755,10 +798,18 @@ static void early_build(u32 levels, phys_addr_t load, phys_addr_t base, u64 size
     early_map(KERNEL_LINK_ADDR, load, image, 1, PAGE_KERNEL_EXEC);
     /* All of RAM in the direct map, so kinit() and kvminit() can reach
      * every page before the final table exists: exactly RAM (what the
-     * direct map holds of it, whole pages), 1 GiB leaves, then 2 MiB and
-     * 4 KiB ones for its end. */
+     * direct map holds of it, whole pages) but the firmware's no-map
+     * region (direct_map_ranges()), 1 GiB leaves, then 2 MiB and 4 KiB ones
+     * for the ends. */
     u64 ram = (size < direct_map_size ? size : direct_map_size) & ~(PGSIZE - 1);
-    early_map(page_offset, base, ram, 2, PAGE_KERNEL);
+    phys_addr_t start[2];
+    u64 len[2];
+    direct_map_ranges(base, ram, rbase, rsize, start, len);
+    for (int i = 0; i < 2; i++) {
+        if (len[i] != 0) {
+            early_map(page_offset + (start[i] - base), start[i], len[i], 2, PAGE_KERNEL);
+        }
+    }
     /* The fixmap: the devices used before ioremap() works, a page each. */
     early_map(fix_to_virt(FIX_SYSINFO), SYSINFO_BASE, PGSIZE, 0, PAGE_KERNEL);
     early_map(fix_to_virt(FIX_UART), UART_BASE, PGSIZE, 0, PAGE_KERNEL);
@@ -779,6 +830,8 @@ void setup_vm(void) {
     }
     phys_addr_t base = mmio_read64(SYSINFO_BASE + SYS_RAM_BASE);
     u64 size = mmio_read64(SYSINFO_BASE + SYS_RAM_SIZE);
+    phys_addr_t rbase = mmio_read64(SYSINFO_BASE + SYS_RESERVED_BASE);
+    u64 rsize = mmio_read64(SYSINFO_BASE + SYS_RESERVED_SIZE);
     if (base % LEVEL_SIZE(2) != 0) {
         early_panic("setup_vm: RAM does not start at a 1 GiB boundary");
     }
@@ -788,14 +841,14 @@ void setup_vm(void) {
      * turns translation on at once, so it is made with a table that maps
      * this code and its stack where they are (the image at its physical
      * address), and turned off right after (Linux's set_satp_mode()). */
-    early_build(4, load, base, size);
+    early_build(4, load, base, size, rbase, rsize);
     w_satp(early_satp);
     sfence_vma();
     uintptr got = r_satp();
     w_satp(0);
     sfence_vma();
     if ((got & SATP_MODE_MASK) != SATP_MODE_SV48) {
-        early_build(3, load, base, size);
+        early_build(3, load, base, size, rbase, rsize);
     }
     /* From here on, until their drivers ioremap() them, sysinfo and the
      * UART are reached through the fixmap: as soon as paging is on, a

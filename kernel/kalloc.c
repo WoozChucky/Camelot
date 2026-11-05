@@ -24,6 +24,8 @@ phys_addr_t ram_base;
 usize ram_size;
 phys_addr_t reserved_base;
 usize reserved_size;
+phys_addr_t dtb_base;
+usize dtb_size;
 
 static struct spinlock kmem_lock;
 static struct run *freelist;
@@ -36,12 +38,50 @@ static bool in_range(phys_addr_t a, phys_addr_t base, usize size) {
 }
 
 /* Whether physical address `a` is a page the allocator manages: a page of
- * RAM that is neither the kernel image's nor the firmware's. */
+ * RAM that is neither the kernel image's, the firmware's nor the device
+ * tree's. */
 static bool is_free_page(phys_addr_t a) {
     phys_addr_t start = pa(__text_start);
     return a % PGSIZE == 0 && in_range(a, ram_base, ram_size) &&
-           !in_range(a, start, pa(__kernel_end) - start) && !in_range(a, reserved_base, reserved_size);
+           !in_range(a, start, pa(__kernel_end) - start) && !in_range(a, reserved_base, reserved_size) &&
+           !in_range(a, dtb_base, dtb_size);
 }
+
+#if __riscv_xlen == 64
+/* A big-endian 32-bit word of the device tree: every number in one is
+ * big-endian, whatever the machine's byte order. */
+static u32 fdt32(const u8 *p) {
+    return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | (u32)p[3];
+}
+
+/* Keeps the device tree the firmware passed in a1 (dtb_early_pa, entry.S)
+ * out of the free list, its whole pages, as Linux's setup_bootmem()
+ * memblock_reserve()s dtb_early_pa for fdt_totalsize() bytes (rather than
+ * early_init_fdt_reserve_self(), whose __pa() a fixmap pointer defeats):
+ * the tree is still there, intact, for whoever reads it. Only a tree in
+ * the RAM the direct map holds, whose header (the magic, then totalsize)
+ * says it is one; and only RAM's part of it. Camelot's firmware puts it at
+ * the last 2 MiB boundary that leaves it room before the end of RAM, as
+ * QEMU does, OpenSBI's fw_jump at 0x8220_0000 (spec section 7,
+ * "Firmware"). */
+static void reserve_dtb(void) {
+    phys_addr_t dtb = dtb_early_pa;
+    if (dtb % 4 != 0 || !in_range(dtb, ram_base, ram_size) || ram_size - (dtb - ram_base) < 8 ||
+        in_range(dtb, reserved_base, reserved_size)) {
+        return;
+    }
+    const u8 *header = va(dtb);
+    if (fdt32(header) != FDT_MAGIC) {
+        return;
+    }
+    u64 end = dtb + fdt32(header + 4);
+    if (end - ram_base > ram_size) {
+        end = ram_base + ram_size;
+    }
+    dtb_base = PGROUNDDOWN(dtb);
+    dtb_size = PGROUNDUP(end) - dtb_base;
+}
+#endif
 
 void kinit(void) {
     initlock(&kmem_lock, "kmem");
@@ -76,9 +116,10 @@ void kinit(void) {
         kprintf("ram: %lu MiB above the direct map left out\n", (ram_size - direct_map_size) >> 20);
         ram_size = direct_map_size;
     }
+    reserve_dtb();
 #endif
-    /* Every page of RAM but the image's and the firmware's, from the
-     * bottom up, so the highest is handed out first. Count pages rather
+    /* Every page of RAM but the image's, the firmware's and the device
+     * tree's, from the bottom up, so the highest is handed out first. Count pages rather
      * than compare addresses: with 2 GiB of RAM on RV32 the end of RAM is
      * 2^32, which doesn't fit in a u32. One lock for all of them rather
      * than one per kfree(): tens of thousands of pages, and nothing else
