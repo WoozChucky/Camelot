@@ -570,7 +570,8 @@ impl<'a> Interp<'a> {
                             let size = self.size(&d.ty) as usize;
                             self.mem[addr as usize..addr as usize + size].fill(0);
                         }
-                        self.local_init(&d.ty, init, addr, frame)?;
+                        let constant = constant_aggregate(&d.ty, init, self.x);
+                        self.local_init(&d.ty, init, addr, frame, constant)?;
                     }
                 }
                 Flow::Next
@@ -590,19 +591,29 @@ impl<'a> Interp<'a> {
         })
     }
 
-    fn local_init(&mut self, ty: &Type, init: &'a Init, addr: u32, frame: &[u32]) -> Result<(), String> {
+    /// A local's initializer stored at `addr`; `constant`: the object is
+    /// an aggregate of constants, which have the evaluator's values, as
+    /// clang's constant of it has them ([`constant_aggregate`]).
+    fn local_init(
+        &mut self,
+        ty: &Type,
+        init: &'a Init,
+        addr: u32,
+        frame: &[u32],
+        constant: bool,
+    ) -> Result<(), String> {
         match (ty.unqual(), init) {
             // Zero: the object was cleared first.
             (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 for (i, item) in items.iter().enumerate() {
-                    self.local_init(elem, item, addr + i as u32 * self.size(elem), frame)?;
+                    self.local_init(elem, item, addr + i as u32 * self.size(elem), frame, constant)?;
                 }
             }
             (Type::Record(r), Init::List(items, _)) => {
                 let body = r.body().ok_or("incomplete struct")?;
                 for (m, item) in body.members.iter().zip(items) {
-                    self.local_init(&m.ty, item, addr + m.offset, frame)?;
+                    self.local_init(&m.ty, item, addr + m.offset, frame, constant)?;
                 }
             }
             (
@@ -616,7 +627,10 @@ impl<'a> Interp<'a> {
                 self.mem[addr as usize..addr as usize + n].copy_from_slice(&b[..n]);
             }
             (_, Init::Expr(e)) => {
-                let v = self.expr(e, frame)?;
+                let v = match consteval::eval(e, self.x).filter(|_| constant) {
+                    Some(Const::Int(v, _)) => v,
+                    _ => self.expr(e, frame)?,
+                };
                 self.put(addr, ty, v)?;
             }
             _ => return Err("bad initializer shape".into()),
@@ -642,7 +656,8 @@ impl<'a> Interp<'a> {
                 let addr = frame[local.ok_or("compound literal without a local")?.0];
                 let size = self.size(&e.ty) as usize;
                 self.mem[addr as usize..addr as usize + size].fill(0);
-                self.local_init(&e.ty, init, addr, frame)?;
+                let constant = constant_aggregate(&e.ty, init, self.x);
+                self.local_init(&e.ty, init, addr, frame, constant)?;
                 Ok(addr)
             }
             // `s.m`: `s`'s value is its address; `p->m`: `p` is one.
@@ -871,4 +886,19 @@ fn binary(op: BinOp, a: Val, lt: &Type, b: Val, rt: &Type, x: Xlen) -> Result<Va
         BinOp::Ge => (a >= b).into(),
         _ => return Err(format!("no pointer operator {op:?}")),
     })
+}
+
+/// Whether a local of type `ty` initialized by `init` is an array or
+/// struct of integer constants, which clang emits as a constant object.
+fn constant_aggregate(ty: &Type, init: &Init, x: Xlen) -> bool {
+    fn leaves(init: &Init, x: Xlen) -> bool {
+        match init {
+            Init::List(items, _) => items.iter().all(|i| leaves(i, x)),
+            Init::Expr(e) => {
+                matches!(e.kind, ExprKind::Str(_)) || matches!(consteval::eval(e, x), Some(Const::Int(..)))
+            }
+            Init::Designated(..) => false,
+        }
+    }
+    (ty.is_array() || ty.is_record()) && matches!(init, Init::List(..)) && leaves(init, x)
 }

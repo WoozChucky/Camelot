@@ -79,7 +79,7 @@ fn truth(e: &Expr, x: Xlen) -> Option<bool> {
         };
     }
     if e.ty.is_integer() {
-        return consteval::condition(e, x).map(|v| v != 0);
+        return consteval::cfg_condition(e, x).map(|v| v != 0);
     }
     match consteval::eval(e, x)? {
         consteval::Const::Int(v, _) => Some(v != 0),

@@ -3169,7 +3169,15 @@ impl<'a> FuncGen<'a, '_> {
         if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_) | ExprKind::Enumerator { .. }) {
             return false;
         }
-        let Some(Const::Int(v, kind)) = consteval::eval_in_code(e, self.xlen) else {
+        // An item of a local aggregate clang emits as a constant has its
+        // evaluator's value, as a global's has; any other, what the
+        // instructions would compute.
+        let value = if self.constant_init {
+            consteval::eval(e, self.xlen)
+        } else {
+            consteval::eval_in_code(e, self.xlen)
+        };
+        let Some(Const::Int(v, kind)) = value else {
             return false;
         };
         // A disagreement would load the wrong registers (on RV32, a `long`
@@ -4784,6 +4792,39 @@ main:
         assert!(asm.contains("call  f\n"), "{asm}");
         assert!(asm.contains("la    a0, g\n"), "{asm}");
         assert_eq!(asm.matches(".globl").count(), 1);
+    }
+
+    /// A condition clang's evaluator notes undefined behaviour in is not
+    /// decided at compile time, as clang's code generator decides nothing
+    /// of it: both arms are generated. One without is.
+    #[test]
+    fn undefined_conditions_keep_both_arms() {
+        for cond in ["1 << 40", "2147483647 + 1 < 0", "(1 << 32) == 1"] {
+            let asm = compile(&format!(
+                "void a(void); void b(void); void f(void) {{ if ({cond}) a(); else b(); }}"
+            ));
+            assert!(
+                asm.contains(
+                    "call  a
+"
+                ) && asm.contains(
+                    "call  b
+"
+                ),
+                "{cond}: {asm}"
+            );
+        }
+        let asm = compile("void a(void); void b(void); void f(void) { if (1 << 30) a(); else b(); }");
+        assert!(
+            asm.contains(
+                "call  a
+"
+            ) && !asm.contains(
+                "call  b
+"
+            ),
+            "{asm}"
+        );
     }
 
     /// `extern` with an initializer after `static` defines the internal

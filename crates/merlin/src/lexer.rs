@@ -729,23 +729,25 @@ pub fn finish(toks: Vec<PpToken>, end: Pos, x: Xlen) -> Result<(Vec<Token>, Vec<
 /// each (and one more past four bytes, which do not all fit). `''` is no
 /// token at all to clang ([`lex_pp`] leaves it to the parser).
 pub fn char_constant(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Tok, Error> {
-    let bytes = decode_in(text, pos, diags, true)?;
+    let (bytes, chars) = decode_units(text, pos, diags, true)?;
     // Four characters are clang's `-Wfour-char-constants` (`'abcd'`, as
-    // Mac OS's type codes were written), which is off by default.
-    if bytes.len() > 1 && bytes.len() != 4 {
+    // Mac OS's type codes were written), which is off by default. What
+    // counts is characters, each escape one (`'aé'` is two, an error).
+    if chars > 1 && chars != 4 {
         diags.push(Error::warning(
             pos,
             "multi-character character constant",
             "multichar",
         ));
     }
-    if bytes.len() > 4 {
+    if chars > 4 {
         diags.push(Error::warning_unflagged(
             pos,
             "character constant too long for its type",
         ));
     }
     let value = match bytes[..] {
+        [] => 0,
         [b] => b.into(),
         _ => i128::from(bytes.iter().fold(0u32, |v, &b| (v << 8) | u32::from(b)) as i32),
     };
@@ -907,6 +909,17 @@ pub fn decode(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Vec<u8>, E
 /// which differ in what a universal character name may be: a constant
 /// holds one byte.
 fn decode_in(text: &str, pos: Pos, diags: &mut Vec<Error>, char_const: bool) -> Result<Vec<u8>, Error> {
+    decode_units(text, pos, diags, char_const).map(|(bytes, _)| bytes)
+}
+
+/// [`decode_in`], with how many characters the literal has (each escape
+/// one).
+fn decode_units(
+    text: &str,
+    pos: Pos,
+    diags: &mut Vec<Error>,
+    char_const: bool,
+) -> Result<(Vec<u8>, usize), Error> {
     let chars: Vec<char> = text.chars().collect();
     let body = &chars[1..chars.len() - 1];
     // Where character `k` of the body is (the literal is on one line, unless
@@ -921,9 +934,21 @@ fn decode_in(text: &str, pos: Pos, diags: &mut Vec<Error>, char_const: bool) -> 
     let at = |k: usize| Pos::in_file(pos.file, pos.line, pos.col + 1 + bytes[k.min(body.len())]);
     let mut out = Vec::new();
     let mut k = 0;
+    let mut units = 0;
     while k < body.len() {
         let c = body[k];
+        units += 1;
         if c != '\\' {
+            // A character past ASCII is more than a character constant's
+            // one byte of it: clang's error, the constant's.
+            if char_const && !c.is_ascii() {
+                diags.push(Error::new(
+                    pos,
+                    "character too large for enclosing character literal type",
+                ));
+                k += 1;
+                continue;
+            }
             let mut buf = [0; 4];
             out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             k += 1;
@@ -1043,7 +1068,7 @@ fn decode_in(text: &str, pos: Pos, diags: &mut Vec<Error>, char_const: bool) -> 
         };
         out.push(byte);
     }
-    Ok(out)
+    Ok((out, units))
 }
 
 #[cfg(test)]

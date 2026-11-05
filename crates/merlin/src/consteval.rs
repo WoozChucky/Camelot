@@ -404,10 +404,15 @@ fn exact_overflow(e: &Expr, x: Xlen, checked: bool, division: bool) -> Option<(i
 /// their operator. clang folds such an array size into a constant with
 /// its warning and this note; an enumerator or a case value, silently.
 pub fn parsed_note(e: &Expr, x: Xlen) -> Option<(Pos, String)> {
-    let int = |e: &Expr| int_of(value(e, x, true, false, false)?);
-    let go = |e: &Expr| parsed_note(e, x);
+    note(e, x, false)
+}
+
+/// [`parsed_note`] of a tree sema has `checked` or not.
+fn note(e: &Expr, x: Xlen, checked: bool) -> Option<(Pos, String)> {
+    let int = |e: &Expr| int_of(value(e, x, true, checked, false)?);
+    let go = |e: &Expr| note(e, x, checked);
     let overflow = || {
-        let (exact, k) = exact_overflow(e, x, false, true)?;
+        let (exact, k) = exact_overflow(e, x, checked, true)?;
         let msg = format!(
             "value {exact} is outside the range of representable values of type '{}'",
             Type::Int(k)
@@ -521,6 +526,18 @@ pub fn why_not(e: &Expr, x: Xlen) -> Option<(Pos, &'static str)> {
 /// (`&g < &h`). A condition of pointer type is not folded at all
 /// (`if (&g)`): clang folds only integer ones.
 pub fn condition(e: &Expr, x: Xlen) -> Option<i128> {
+    // What has undefined behaviour clang's code generator does not fold
+    // (its `ConstantFoldsToSimpleInteger` fails): it is computed, both
+    // ways kept (`if (1 << 40)`), what the instructions give deciding.
+    if note(e, x, true).is_some() {
+        return None;
+    }
+    cfg_condition(e, x)
+}
+
+/// [`condition`] as clang's CFG builder evaluates it, which folds what has
+/// undefined behaviour too, with its evaluator's value ([`crate::flow`]).
+pub fn cfg_condition(e: &Expr, x: Xlen) -> Option<i128> {
     if !e.ty.is_integer() {
         return None;
     }

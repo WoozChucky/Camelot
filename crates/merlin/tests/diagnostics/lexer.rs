@@ -91,5 +91,9 @@ pub fn cases() -> Vec<Case> {
         case("/* \u{e9}\u{e9} */ int f(void) { return y; }", &["1:33: error: use of undeclared identifier 'y'"]),
         case("int f(void) { char *s = \"\u{20ac}\\q\"; return y; }", &["1:29: warning: unknown escape sequence '\\q' [-Wunknown-escape-sequence]", "1:41: error: use of undeclared identifier 'y'"]),
         case("\u{feff}int x = y;\nint z = w;", &["1:12: error: use of undeclared identifier 'y'", "2:9: error: use of undeclared identifier 'w'"]),
+        // A character past ASCII is too large for a character constant.
+        case("int a = '\u{e9}';\n#if '\u{e9}' == 0xc3a9\nint pp;\n#endif", &["1:9: error: character too large for enclosing character literal type", "2:5: error: character too large for enclosing character literal type"]),
+        case("int b = 'a\u{e9}'; int c = '\u{e9}a'; int e = '\u{20ac}'; int f = 'ab';", &["1:9: error: character too large for enclosing character literal type", "1:9: warning: multi-character character constant [-Wmultichar]", "1:24: error: character too large for enclosing character literal type", "1:24: warning: multi-character character constant [-Wmultichar]", "1:39: error: character too large for enclosing character literal type", "1:54: warning: multi-character character constant [-Wmultichar]"]),
+        case("char *s = \"\u{e9}\"; int g = '\\xe9' + 'abcde';", &["1:34: warning: multi-character character constant [-Wmultichar]", "1:34: warning: character constant too long for its type"]),
     ]
 }
