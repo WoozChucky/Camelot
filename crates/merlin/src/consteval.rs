@@ -3,7 +3,9 @@
 //! Three users: the parser sizes arrays (`int a[4 * sizeof(int)]`), sema finds
 //! null pointer constants and checks that global initializers are constant,
 //! and code generation turns those initializers into data and folds every
-//! integer constant expression in code into one constant, as clang does.
+//! integer constant expression in code into one constant, as clang does, and
+//! decides the conditions clang's code generator decides ([`condition`],
+//! which also knows that an object's address is not null).
 //!
 //! Integer constants carry their C type and wrap the way the generated code
 //! would at run time on the target (each function takes it: an `int` is 32
@@ -304,6 +306,276 @@ fn binary(
     Some(Const::Int(k.wrap(v, x), k))
 }
 
+// ---- conditions ----
+
+/// The value clang's code generator folds a condition to at `-O0`
+/// (`CodeGenFunction::ConstantFoldsToSimpleInteger`, which asks
+/// `Expr::EvaluateAsInt` in its folding mode), or `None` if it does not
+/// fold it. That is an integer constant expression's value, and more:
+/// what is known of where objects are, never null and never one another,
+/// as clang 23 folds it.
+///
+/// * An object's address is not null: a global's, a local's (a
+///   parameter's too), a string literal's, a function's. So `&g != 0` is 1,
+///   `!&g` is 0 and `&g && x` is `x`'s truth.
+/// * Two objects' addresses differ (`&g == &h` is 0), unless one points
+///   just past its object, where the other may start (`&g + 1 == &h`), or
+///   both are string literals whose bytes could be shared (`"a" == "a"`,
+///   not `&"ab"[1] == "ab"`).
+/// * Addresses in one object compare and subtract by their offsets
+///   (`&a[1] < &a[2]` is 1, `&a[2] - &a[0]` is 2).
+///
+/// What is not known stays code: a pointer variable's value (`p != 0`), an
+/// address converted to an integer (`(long)&g`), two objects' order
+/// (`&g < &h`). A condition of pointer type is not folded at all
+/// (`if (&g)`): clang folds only integer ones.
+pub fn condition(e: &Expr, x: Xlen) -> Option<i128> {
+    if !e.ty.is_integer() {
+        return None;
+    }
+    match fold(e, x)? {
+        Folded::Int(v, _) => Some(v),
+        Folded::Addr(..) => None,
+    }
+}
+
+/// A value [`condition`] works out: an integer, or an address in an object
+/// (none: a plain number used as an address, `(char *)16`, or null).
+#[derive(Clone, Debug)]
+enum Folded {
+    Int(i128, IntKind),
+    Addr(Option<Object>, i128),
+}
+
+/// An object whose address [`condition`] knows: what it is, and its size in
+/// bytes (none for a function).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Object {
+    what: Place,
+    size: Option<i128>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Place {
+    /// A global symbol: a global variable, a `static` local, a function.
+    Sym(String),
+    /// A local of the function (a parameter too).
+    Local(LocalId),
+    /// A string literal.
+    Str(Vec<u8>),
+}
+
+/// Whether a value is true, as a condition tests it.
+fn truth(v: &Folded) -> bool {
+    match v {
+        Folded::Int(v, _) => *v != 0,
+        Folded::Addr(Some(_), _) => true,
+        Folded::Addr(None, offset) => *offset != 0,
+    }
+}
+
+fn fold(e: &Expr, x: Xlen) -> Option<Folded> {
+    use Folded::*;
+    // An integer constant expression, as everywhere.
+    if let Some(Const::Int(v, k)) = eval(e, x) {
+        return Some(Int(v, k));
+    }
+    let as_int = |v: Folded| match v {
+        Int(v, k) => Some((v, k)),
+        Addr(..) => None,
+    };
+    match &e.kind {
+        ExprKind::Unary(UnOp::Not, a) => Some(Int((!truth(&fold(a, x)?)).into(), IntKind::Int)),
+        ExprKind::Unary(op, a) => {
+            let (v, k) = as_int(fold(a, x)?)?;
+            let k = k.promoted();
+            Some(Int(
+                match op {
+                    UnOp::Neg => k.wrap(-v, x),
+                    UnOp::BitNot => k.wrap(!v, x),
+                    _ => v,
+                },
+                k,
+            ))
+        }
+        // Short-circuits: what the left operand decides is enough.
+        ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r) => {
+            let l = truth(&fold(l, x)?);
+            let v = if l == (*op == BinOp::LogOr) {
+                l
+            } else {
+                truth(&fold(r, x)?)
+            };
+            Some(Int(v.into(), IntKind::Int))
+        }
+        ExprKind::Binary(op, l, r) => match (fold(l, x)?, fold(r, x)?) {
+            (Int(a, ak), Int(b, bk)) => match binary(*op, (a, ak), (b, bk), x, true)? {
+                Const::Int(v, k) => Some(Int(v, k)),
+                Const::Addr { .. } => None,
+            },
+            // A pointer moved by whole elements.
+            (Addr(o, at), Int(n, _)) if matches!(op, BinOp::Add | BinOp::Sub) => {
+                let n = if *op == BinOp::Sub { -n } else { n };
+                Some(Addr(o, at + n * step(&l.ty, x)?))
+            }
+            (Int(n, _), Addr(o, at)) if *op == BinOp::Add => Some(Addr(o, at + n * step(&r.ty, x)?)),
+            (Addr(a, at), Addr(b, bt)) => compare(*op, (a, at), (b, bt), &l.ty, x),
+            // An address compared with a null pointer constant, `&g != 0`.
+            (Addr(a, at), Int(n, _)) => compare(*op, (a, at), (None, n), &l.ty, x),
+            (Int(n, _), Addr(b, bt)) => compare(*op, (None, n), (b, bt), &r.ty, x),
+        },
+        ExprKind::Cond(c, a, b) => {
+            let v = fold(if truth(&fold(c, x)?) { a } else { b }, x)?;
+            match (v, e.ty.int_kind()) {
+                (Int(v, _), Some(k)) => Some(Int(k.wrap(v, x), k)),
+                (v, _) => Some(v),
+            }
+        }
+        ExprKind::Cast { x: a, .. } => match (e.ty.unqual(), fold(a, x)?) {
+            (Type::Int(IntKind::Bool), v) => Some(Int(truth(&v).into(), IntKind::Bool)),
+            (Type::Int(k), Int(v, _)) => Some(Int(k.wrap(v, x), *k)),
+            // A plain number used as an address is that number again; an
+            // object's address as a number is not known.
+            (Type::Int(k), Addr(None, at)) => Some(Int(k.wrap(at, x), *k)),
+            (Type::Ptr(_), Int(v, _)) => Some(Addr(None, IntKind::ULong.wrap(v, x))),
+            (Type::Ptr(_), a @ Addr(..)) => Some(a),
+            _ => None,
+        },
+        // An array or a function stands for its address.
+        ExprKind::Str(_) | ExprKind::Var { .. } | ExprKind::Deref(_) | ExprKind::Member { .. }
+            if e.ty.is_array() || e.ty.is_func() =>
+        {
+            place(e, x)
+        }
+        ExprKind::Addr(a) => place(a, x),
+        _ => None,
+    }
+}
+
+/// The address of an lvalue, if [`condition`] knows it.
+fn place(e: &Expr, x: Xlen) -> Option<Folded> {
+    let object = |what: Place| {
+        Some(Folded::Addr(
+            Some(Object {
+                what,
+                size: e.ty.size(x).map(i128::from),
+            }),
+            0,
+        ))
+    };
+    match &e.kind {
+        ExprKind::Var {
+            var: Some(VarRef::Global(sym)),
+            ..
+        } => object(Place::Sym(sym.clone())),
+        ExprKind::Var {
+            var: Some(VarRef::Local(id)),
+            ..
+        } => object(Place::Local(*id)),
+        ExprKind::Str(bytes) => object(Place::Str(bytes.clone())),
+        ExprKind::Deref(p) => match fold(p, x)? {
+            a @ Folded::Addr(..) => Some(a),
+            Folded::Int(..) => None,
+        },
+        ExprKind::Member {
+            base,
+            arrow,
+            offset: member,
+            ..
+        } => match if *arrow { fold(base, x)? } else { place(base, x)? } {
+            Folded::Addr(o, at) => Some(Folded::Addr(o, at + i128::from(*member))),
+            Folded::Int(..) => None,
+        },
+        _ => None,
+    }
+}
+
+/// `a op b` of two addresses, `l` the type of the left one: a comparison
+/// or a difference, where what is known of the objects decides it.
+fn compare(
+    op: BinOp,
+    (a, at): (Option<Object>, i128),
+    (b, bt): (Option<Object>, i128),
+    l: &Type,
+    x: Xlen,
+) -> Option<Folded> {
+    let int = |v: bool| Some(Folded::Int(v.into(), IntKind::Int));
+    // Two string literals may share their bytes, or not: they are at one
+    // address only if they could be, their bytes the same where they would
+    // overlap (clang's `ArePotentiallyOverlappingStringLiterals`).
+    if let (
+        Some(Object {
+            what: Place::Str(l), ..
+        }),
+        Some(Object {
+            what: Place::Str(r), ..
+        }),
+    ) = (&a, &b)
+    {
+        if overlap((l, at), (r, bt)) {
+            return None;
+        }
+        return match op {
+            BinOp::Eq => int(false),
+            BinOp::Ne => int(true),
+            _ => None,
+        };
+    }
+    let same = match (&a, &b) {
+        // In one object (or two plain numbers): by the offsets.
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
+        // An object's address is not null; nor any plain number but 0.
+        (Some(_), None) | (None, Some(_)) => {
+            let null = if a.is_none() { at == 0 } else { bt == 0 };
+            return match op {
+                BinOp::Eq if null => int(false),
+                BinOp::Ne if null => int(true),
+                _ => None,
+            };
+        }
+    };
+    if same {
+        return match op {
+            BinOp::Eq => int(at == bt),
+            BinOp::Ne => int(at != bt),
+            BinOp::Lt => int(at < bt),
+            BinOp::Le => int(at <= bt),
+            BinOp::Gt => int(at > bt),
+            BinOp::Ge => int(at >= bt),
+            BinOp::Sub => Some(Folded::Int((at - bt) / step(l, x)?, IntKind::ptrdiff_t(x))),
+            _ => None,
+        };
+    }
+    // Two objects: never at one address, unless one points just past its
+    // end, where the other may start.
+    let (a, b) = (a?, b?);
+    let past = |o: &Object, at: i128| o.size == Some(at);
+    if past(&a, at) || past(&b, bt) {
+        return None;
+    }
+    match op {
+        BinOp::Eq => int(false),
+        BinOp::Ne => int(true),
+        _ => None,
+    }
+}
+
+/// Whether string literals `l` and `r` (their bytes, without the NUL), at
+/// offsets `at` and `bt` in them, could be at one address: where the two
+/// would overlap, their bytes (the NULs too) are the same.
+fn overlap((l, at): (&[u8], i128), (r, bt): (&[u8], i128)) -> bool {
+    let byte = |s: &[u8], i: i128| match usize::try_from(i) {
+        Ok(i) if i < s.len() => Some(s[i]),
+        Ok(i) if i == s.len() => Some(0),
+        _ => None,
+    };
+    // From where the earlier start would be to where the earlier end is.
+    let from = -(at.min(bt));
+    let to = (l.len() as i128 + 1 - at).min(r.len() as i128 + 1 - bt);
+    (from..to).all(|d| byte(l, at + d) == byte(r, bt + d))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +702,80 @@ mod tests {
         // `1 ? 2 : h()` once sema has typed it).
         assert_eq!(ev("1 ? 2 : f()"), None);
         assert_eq!(ev("0 ? f() : 2"), None);
+    }
+
+    /// What [`condition`] folds of `cond`, the condition of an `if` in a
+    /// checked program with globals `g`, `h`, `a[4]`, `s`, a function `fn`,
+    /// a parameter `x` and locals `l` and `p` (pointing to `l`).
+    fn cond(src: &str) -> Option<i128> {
+        let prog = crate::parse(&format!(
+            "int g, h, a[4]; struct {{ int m, n; }} s; int fn(void);\n\
+             int f(int x) {{ int l = x; int *p = &l; if ({src}) return 1; return 0; }}"
+        ))
+        .unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        let f = prog.funcs().find(|f| f.name == "f").unwrap();
+        let body = f.body.as_ref().unwrap();
+        let StmtKind::If { cond, .. } = &body[2].kind else {
+            panic!("{body:?}")
+        };
+        condition(cond, Xlen::Rv32)
+    }
+
+    /// clang 23 folds a condition of addresses it knows: an object's is not
+    /// null, nor another's, and those in one object go by their offsets.
+    #[test]
+    fn conditions_of_addresses_fold_as_clangs() {
+        for (src, v) in [
+            ("&g != 0", 1),
+            ("&g == 0", 0),
+            ("0 != &g", 1),
+            ("&g != (void *)0", 1),
+            ("&a[1] == 0", 0),
+            ("a != 0", 1),
+            ("&s.n != 0", 1),
+            ("\"s\" != 0", 1),
+            ("fn != 0", 1),
+            ("&x != 0", 1),
+            ("&l != 0", 1),
+            ("!&g", 0),
+            ("&g && 1", 1),
+            ("(&g ? 2 : 0) == 2", 1),
+            ("1 && &g != 0", 1),
+            ("(&g != 0) + 1", 2),
+            ("&g == &h", 0),
+            ("&g == &g", 1),
+            ("&l == &x", 0),
+            ("&a[1] == &g", 0),
+            ("&a[5] == &g", 0),
+            ("&a[5] != 0", 1),
+            ("(void *)&g == (void *)&s", 0),
+            ("&s.m == &s.n", 0),
+            ("&a[1] < &a[2]", 1),
+            ("&a[2] - &a[0]", 2),
+            ("&g - &g", 0),
+            ("&g + 1 != 0", 1),
+            ("\"a\" != (char *)&g", 1),
+            ("&\"ab\"[1] == \"ab\"", 0),
+            ("(char *)0 == 0", 1),
+            ("(char *)16 != 0", 1),
+        ] {
+            assert_eq!(cond(src), Some(v), "{src}");
+        }
+        // What is not known: a pointer's value, an address as a number,
+        // two objects' order, one just past its object, literals that could
+        // share bytes, an address as the condition itself.
+        for src in [
+            "p != 0",
+            "(long)&g != 0",
+            "&g < &h",
+            "&g + 1 == &h",
+            "&a[4] == &g",
+            "\"a\" == \"a\"",
+            "&g == (int *)16",
+            "&g",
+            "x",
+        ] {
+            assert_eq!(cond(src), None, "{src}");
+        }
     }
 }

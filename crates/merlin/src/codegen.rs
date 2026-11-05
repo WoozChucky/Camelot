@@ -2075,7 +2075,7 @@ impl<'a> FuncGen<'a, '_> {
                 // On a constant condition, only the statements that run, as
                 // clang has them, when they can be picked out (see [`elide`]):
                 // no compares, no labels, no `break`.
-                if let Some(v) = consteval::int(cond, self.xlen).filter(|_| cond.ty.is_integer()) {
+                if let Some(v) = consteval::condition(cond, self.xlen) {
                     if let Some(run) = elide::case_statements(body, v, cases, *default) {
                         self.elided_cases
                             .extend(cases.iter().map(|&(_, id)| id).chain(*default));
@@ -2161,13 +2161,12 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     /// The value of a condition clang's code generator decides at compile
-    /// time: an integer constant expression (`ConstantFoldsToSimpleInteger`;
-    /// for loops, the `ConstantInt` the condition's code folds to).
+    /// time (`ConstantFoldsToSimpleInteger`; for loops, the `ConstantInt`
+    /// the condition's code folds to): an integer constant expression, or
+    /// one of addresses known not to be null or one another (`&g != 0`,
+    /// [`consteval::condition`]).
     fn constant_condition(&self, e: &Expr) -> Option<bool> {
-        if !e.ty.is_integer() {
-            return None;
-        }
-        consteval::int(e, self.xlen).map(|v| v != 0)
+        consteval::condition(e, self.xlen).map(|v| v != 0)
     }
 
     fn loop_body(&mut self, body: &'a Stmt, cont: &str, brk: &str) {
@@ -2389,7 +2388,7 @@ impl<'a> FuncGen<'a, '_> {
             return;
         }
         self.kept_cast(e);
-        let decided = |c: &Expr| consteval::int(c, self.xlen).map(|v| v != 0);
+        let decided = |c: &Expr| consteval::condition(c, self.xlen).map(|v| v != 0);
         match &e.kind {
             ExprKind::Unary(_, x)
             | ExprKind::Cast { x, .. }
@@ -2541,8 +2540,15 @@ impl<'a> FuncGen<'a, '_> {
                     self.step(ty, -delta);
                 }
             }
-            // `1 && r` and `0 || r` are `r` as 0 or 1, as clang has them
-            // (`0 && r` and `1 || r` are constants, folded above).
+            // `0 && r` and `1 || r` are constants, folded above, and so are
+            // they with a left operand only clang's folding of conditions
+            // decides (`&g != 0 || r`): r is left out, as clang leaves it.
+            ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, _)
+                if self.constant_condition(l) == Some(*op == BinOp::LogOr) =>
+            {
+                self.li("a0", i64::from(*op == BinOp::LogOr));
+            }
+            // `1 && r` and `0 || r` are `r` as 0 or 1, as clang has them.
             ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r)
                 if self.constant_condition(l) == Some(*op == BinOp::LogAnd) =>
             {

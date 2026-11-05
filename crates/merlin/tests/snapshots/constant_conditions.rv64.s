@@ -39,10 +39,11 @@ calls:
 
     .text
 
-    # int main(void): frame 32 bytes
+    # int main(void): frame 48 bytes
     #     -20(s0)  local int r
     #     -24(s0)  local int x
-    #     -28(s0)  local int y
+    #     -32(s0)  local int *p
+    #     -36(s0)  local int y
     .globl main
     .type main, @function
 main:
@@ -50,11 +51,13 @@ main:
     sd    ra, 8(sp)
     sd    s0, 0(sp)
     addi  s0, sp, 16
-    addi  sp, sp, -16
+    addi  sp, sp, -32
     li    a0, 0
     sw    a0, -20(s0)
     li    a0, 3
     sw    a0, -24(s0)
+    addi  a0, s0, -24
+    sd    a0, -32(s0)
     lw    a0, -20(s0)
     addiw a0, a0, 1
     sw    a0, -20(s0)
@@ -224,8 +227,8 @@ main:
 .L.end.9:
 .L.break.8:
     li    a0, 2
-    sw    a0, -28(s0)
-    lw    a0, -28(s0)
+    sw    a0, -36(s0)
+    lw    a0, -36(s0)
     sw    a0, -24(s0)
     lw    a0, -20(s0)
     addi  sp, sp, -8
@@ -253,6 +256,37 @@ main:
 .L.end.10:
     j     .L.label.main.skipped
 .L.label.main.done:
+    ld    a0, -32(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    li    a0, 0
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    xor   a0, a1, a0
+    snez  a0, a0
+    snez  a0, a0
+    beqz  a0, .L.end.11
+    lw    a0, -20(s0)
+    addiw a0, a0, 1
+    sw    a0, -20(s0)
+    addiw a0, a0, -1
+.L.end.11:
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    li    a0, 1
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
+    lw    a0, -20(s0)
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    li    a0, 1
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    addw  a0, a1, a0
+    sw    a0, -20(s0)
     lw    a0, -20(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)

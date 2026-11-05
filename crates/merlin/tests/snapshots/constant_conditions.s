@@ -42,7 +42,8 @@ calls:
     # int main(void): frame 32 bytes
     #     -12(s0)  local int r
     #     -16(s0)  local int x
-    #     -20(s0)  local int y
+    #     -20(s0)  local int *p
+    #     -24(s0)  local int y
     .globl main
     .type main, @function
 main:
@@ -55,6 +56,8 @@ main:
     sw    a0, -12(s0)
     li    a0, 3
     sw    a0, -16(s0)
+    addi  a0, s0, -16
+    sw    a0, -20(s0)
     lw    a0, -12(s0)
     addi  a0, a0, 1
     sw    a0, -12(s0)
@@ -224,8 +227,8 @@ main:
 .L.end.9:
 .L.break.8:
     li    a0, 2
-    sw    a0, -20(s0)
-    lw    a0, -20(s0)
+    sw    a0, -24(s0)
+    lw    a0, -24(s0)
     sw    a0, -16(s0)
     lw    a0, -12(s0)
     addi  sp, sp, -4
@@ -253,6 +256,37 @@ main:
 .L.end.10:
     j     .L.label.main.skipped
 .L.label.main.done:
+    lw    a0, -20(s0)
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    li    a0, 0
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    xor   a0, a1, a0
+    snez  a0, a0
+    snez  a0, a0
+    beqz  a0, .L.end.11
+    lw    a0, -12(s0)
+    addi  a0, a0, 1
+    sw    a0, -12(s0)
+    addi  a0, a0, -1
+.L.end.11:
+    lw    a0, -12(s0)
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    li    a0, 1
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    add   a0, a1, a0
+    sw    a0, -12(s0)
+    lw    a0, -12(s0)
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    li    a0, 1
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    add   a0, a1, a0
+    sw    a0, -12(s0)
     lw    a0, -12(s0)
     addi  sp, sp, -4
     sw    a0, 0(sp)
