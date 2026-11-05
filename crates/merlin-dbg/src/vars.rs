@@ -2366,13 +2366,13 @@ mod tests {
     .section .debug_info,\"\",@progbits
     .word 9                             # the unit's length
     .half 5
-    .byte 1, 4
+    .byte 1, 8
     .word 0
     .byte 9                             # no abbreviation 9
 .Lunit2:
     .word 49
     .half 5
-    .byte 1, 4
+    .byte 1, 8
     .word 0
     .byte 1                             # the compile unit
 .Lptr:
@@ -2443,7 +2443,7 @@ mod tests {
         // of the unit's children (1).
         let unit = |len: usize, body: &str| {
             let length = 8 + 1 + len + 1;
-            format!("    .word {length}\n    .half 5\n    .byte 1, 4\n    .word 0\n    .byte 1\n{body}    .byte 0\n")
+            format!("    .word {length}\n    .half 5\n    .byte 1, 8\n    .word 0\n    .byte 1\n{body}    .byte 0\n")
         };
         let declared = unit(3, "    .byte 2\n    .asciz \"s\"\n");
         let defined = |size: u8| unit(4, &format!("    .byte 3\n    .asciz \"s\"\n    .byte {size}\n"));

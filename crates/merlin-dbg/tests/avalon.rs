@@ -1,13 +1,12 @@
 //! merlin-dbg on a VM of an Avalon server (`merlin-dbg --vm NAME --server ADDR`,
-//! protocol doc, section 6.8), an RV32 VM and then an RV64 one: the server runs in this
-//! process, the VM runs the Camelot kernel of its width to its shell, and Herald is
-//! attached to its console the whole time. The
+//! protocol doc, section 6.8): the server runs in this process, the VM runs the
+//! Camelot kernel to its shell, and Herald is attached to its console the whole time. The
 //! debugger breaks in the kernel's `write` system call, shows where, continues to the
 //! next one and leaves; the console goes on working, and Herald sees nothing but the
 //! VM's state changes, few of them (a VM with a debugger has its notices rate-limited).
 
 use avalon::{Config, Server, ServerThread};
-use avalon_proto::{Connection, HardwareProfile, Message, VmRef, VmState, Xlen};
+use avalon_proto::{Connection, HardwareProfile, Message, VmRef, VmState};
 use herald::{End, Session};
 use std::io::Write;
 use std::net::TcpStream;
@@ -131,40 +130,16 @@ impl Herald {
 
 #[test]
 fn debugging_a_vm_on_avalon_with_herald_attached() {
-    // An RV32 VM and an RV64 one, each running the kernel of its width: the debugger
-    // learns the width from the stub's target description.
-    for (kernel, xlen) in [
-        ("kernel/kernel.elf", Xlen::Rv32),
-        ("kernel/kernel-rv64.elf", Xlen::Rv64),
-    ] {
-        let run = std::panic::catch_unwind(|| debug_a_vm(kernel));
-        if let Err(payload) = run {
-            let message = payload
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_default();
-            panic!("on {xlen}: {message}");
-        }
-    }
-}
-
-/// The test on a VM of width `xlen` running `kernel`.
-fn debug_a_vm(kernel: &str) {
+    let kernel = "kernel/kernel.elf";
     let server = server();
     let mut control = connect(&server);
     let id = match control.request(&Message::CreateVm {
         name: "vm001".into(),
-        // The RV64 kernel runs in S-mode on Camelot's firmware, whose 2 MiB
-        // and its 2.1 MiB image from 0x8020_0000 take 8 MiB.
-        profile: match xlen {
-            Xlen::Rv32 => HardwareProfile {
-                ..HardwareProfile::with_ram(4 * 1024 * 1024)
-            },
-            _ => HardwareProfile {
-                bios: avalon_proto::Bios::Default,
-                ..HardwareProfile::with_ram(8 * 1024 * 1024)
-            },
+        // The kernel runs in S-mode on Camelot's firmware, whose 2 MiB and
+        // its 2.1 MiB image from 0x8020_0000 take 8 MiB.
+        profile: HardwareProfile {
+            bios: avalon_proto::Bios::Default,
+            ..HardwareProfile::with_ram(8 * 1024 * 1024)
         },
         program: std::fs::read(path(kernel)).unwrap(),
     }) {

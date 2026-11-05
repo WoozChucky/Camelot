@@ -256,7 +256,7 @@ mod tests {
             space(8 << 60 | 0xfff_ffff_ffff).unwrap(),
             Space::Paged {
                 mode: SV39,
-                root: 0xfff_ffff_ffff_f000,
+                root: 0xff_ffff_ffff_f000,
             }
         );
         assert_eq!(

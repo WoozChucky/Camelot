@@ -13,11 +13,9 @@
 //! Source-level debugging: breaking on a line of the kernel and of a user program,
 //! stepping by line, `list`, and LLDB reading the same line tables (ignored).
 //!
-//! RV64: the same on RV64 machines, which the stub describes as `riscv:rv64`:
-//! `examples/hello/hello-rv64.elf`, `examples/smp/smp-rv64.elf` with 2 harts, and
-//! `tests/rv64/prog.c`, built here with merlin -g for RV64, for the source lines,
-//! the steps and the LP64 frames, and the RV64 kernel (#154), linked high and run
-//! with Sv48 on.
+//! The machines are RV64, which the stub describes as `riscv:rv64`: besides the
+//! examples and the kernel, linked high and run with Sv48 on, `tests/prog/prog.c`,
+//! built here with merlin -g, for the source lines, the steps and the LP64 frames.
 
 use grail::gdb::Outcome;
 use grail::{Machine, MachineConfig, RunResult};
@@ -71,11 +69,12 @@ fn machine(elf: &str, harts: usize, input: &[u8]) -> (Machine, Console) {
     (m, console)
 }
 
-/// The machine `elf` runs on: the default one, but for the RV64 kernel, which
-/// runs in S-mode on Camelot's firmware (`--bios default`), with the
-/// firmware's 2 MiB and its 2.1 MiB image from 0x8020_0000 in 8 MiB.
+/// The machine `elf` runs on: the default one, with no firmware, for the
+/// bare-metal programs, but for the kernel, which runs in S-mode on Camelot's
+/// firmware (`--bios default`), with the firmware's 2 MiB and its 2.1 MiB image
+/// from 0x8020_0000 in 8 MiB.
 fn config_for(elf: &str) -> MachineConfig {
-    if elf == "kernel/kernel-rv64.elf" {
+    if elf == "kernel/kernel.elf" {
         MachineConfig {
             bios: grail::Bios::Default,
             ram_size: 8 << 20,
@@ -218,70 +217,12 @@ fn connected(elf: &str, harts: usize, input: &[u8], commands: &str) -> String {
 }
 
 #[test]
-fn hello() {
-    let out = connected(
-        "examples/hello/hello.elf",
-        1,
-        b"",
-        "break *puts\n\
-         continue\n\
-         regs\n\
-         x/5b $a0\n\
-         x/2 message\n\
-         x/2g message\n\
-         x/3xh message\n\
-         stepi\n\
-         si 2\n\
-         bt\n\
-         disas $pc-8 3\n\
-         continue\n",
-    );
-    assert_lines(
-        &out,
-        &[
-            "=> 0x00001000:  auipc t0, 0x0",
-            "(merlin-dbg) break *puts",
-            "breakpoint 1 at 0x80000020 <puts>",
-            "(merlin-dbg) continue",
-            "breakpoint 1",
-            "=> 0x80000020 <puts>:  lui t0, 0x10000",
-            "0x80000050 <message>:  0x48  0x65  0x6c  0x6c  0x6f",
-            "0x80000050 <message>:  0x6c6c6548  0x7266206f",
-            // GDB's giants and halfwords on RV32 too.
-            "0x80000050 <message>:  0x7266206f6c6c6548  0x6c656d6143206d6f",
-            "0x80000050 <message>:  0x6548  0x6c6c  0x206f",
-            "=> 0x80000024 <puts+4>:  mv t1, a0",
-            "=> 0x80000028 <puts+8>:  lbu t2, 0x0(t1)",
-            "=> 0x8000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
-            "#0  0x8000002c in puts ()",
-            "#1  0x80000018 in _start ()",
-            "   0x80000024 <puts+4>:  mv t1, a0",
-            "   0x80000028 <puts+8>:  lbu t2, 0x0(t1)",
-            "=> 0x8000002c <puts+12>:  beqz t2, 0x80000048 <puts+40>",
-            "program exited with code 0",
-        ],
-    );
-    // GDB's info registers: the integers signed at 32 bits.
-    assert_eq!(
-        block_after(&out, "(merlin-dbg) regs"),
-        gdb_regs(&[
-            "ra             0x80000018\t0x80000018 <_start+24>",
-            "sp             0x80010070\t0x80010070",
-            "gp             0x0\t0x0",
-            "tp             0x0\t0x0",
-            "t0             0x80000000\t-2147483648",
-            "fp             0x0\t0x0",
-            "a0             0x80000050\t-2147483568",
-            "pc             0x80000020\t0x80000020 <puts>",
-            "priv           0x3\tprv:3 [Machine]",
-        ])
-    );
-}
-
-#[test]
 fn kernel() {
-    // kmain runs in S-mode with paging on: the stub reads memory through the hart's
-    // page table. kvminit is one of its calls.
+    // The kernel (#154) runs at its link addresses, high in the address space, in
+    // S-mode with Sv48 on: a breakpoint by symbol is a link address, which the
+    // hart's pc is once the kernel has jumped there, and the stub reads memory and
+    // the stack through the hart's page table. kvminit is one of kmain's calls. Its
+    // shell (#155) runs hello and exits, which ends the run.
     let out = connected(
         "kernel/kernel.elf",
         1,
@@ -306,6 +247,7 @@ fn kernel() {
     // function's first line of code, cpu_init() in kmain, initlock() in kvminit.
     let (kmain, kmain_off) = past_prologue(&kernel_elf(), "kmain");
     let (kvminit, kvminit_off) = past_prologue(&kernel_elf(), "kvminit");
+    assert!(kmain >= 0xffff_ffff_8000_0000, "{kmain:#x}");
     let kmain_line = line_of("kernel/main.c", "    cpu_init();");
     let kvminit_line = line_of("kernel/vm.c", "    initlock(&uvm_lock, \"uvm\");");
     assert_lines(
@@ -325,7 +267,7 @@ fn kernel() {
         (kmain + 4, format!("kmain+{}", kmain_off + 4), "jalr "),
         (kvminit, format!("kvminit+{kvminit_off}"), ""),
     ] {
-        let want = format!("=> {at:#010x} <{name}>:  {inst}");
+        let want = format!("=> {at:#018x} <{name}>:  {inst}");
         assert!(
             out.lines().any(|l| l.starts_with(&want)),
             "no {want:?} in:\n{out}"
@@ -341,15 +283,20 @@ fn kernel() {
     // The backtrace, as GDB's: kvminit, stopped at the start of a line (so without
     // its pc), called from kmain, called from the assembly that enters S-mode
     // (whose ra kmain saved; the chain ends there, s0 = 0), which has no debug
-    // information.
+    // information: frames read through the page table, the callers' addresses
+    // high in the address space, with 16 digits.
     let bt = backtrace_after(&out, "(merlin-dbg) bt");
     assert_eq!(bt.len(), 3, "{out}");
     assert_eq!(bt[0], format!("#0  kvminit () at kernel/vm.c:{kvminit_line}"));
     assert!(
-        bt[1].starts_with("#1  0x") && bt[1].contains(" in kmain () at kernel/main.c:"),
+        bt[1].starts_with("#1  0xffffffff8") && bt[1].contains(" in kmain () at kernel/main.c:"),
         "{out}"
     );
-    assert!(bt[2].ends_with(" in supervisor_entry ()"), "{out}");
+    assert_eq!(frame_pc(bt[1]).len(), 2 + 16, "{out}");
+    assert!(
+        bt[2].starts_with("#2  0xffffffff8") && bt[2].ends_with(" in supervisor_entry ()"),
+        "{out}"
+    );
     let back = frame_pc(bt[1]);
     // finish comes back there, and says what kvminit returned.
     assert!(
@@ -371,65 +318,6 @@ fn kernel() {
 fn frame_pc(line: &str) -> &str {
     let rest = &line[line.find("  0x").expect("a frame's pc") + 2..];
     rest.split(' ').next().unwrap()
-}
-
-#[test]
-fn the_rv64_kernel() {
-    // The RV64 kernel (#154) runs at its link addresses, high in the address space,
-    // with Sv48 on: a breakpoint by symbol is a link address, which the hart's pc is
-    // once the kernel has jumped there, and the stub reads the stack through the
-    // page table. Its shell (#155) runs hello and exits, which ends the run.
-    let file = std::fs::read(path("kernel/kernel-rv64.elf")).unwrap();
-    let out = connected(
-        "kernel/kernel-rv64.elf",
-        1,
-        b"hello\nexit\n",
-        "break kmain\n\
-         continue\n\
-         regs\n\
-         break kvminit\n\
-         continue\n\
-         bt\n\
-         delete\n\
-         continue\n",
-    );
-    let (kmain, kmain_off) = past_prologue(&file, "kmain");
-    let (kvminit, kvminit_off) = past_prologue(&file, "kvminit");
-    assert!(kmain >= 0xffff_ffff_8000_0000, "{kmain:#x}");
-    let kmain_line = line_of("kernel/main.c", "    cpu_init();");
-    let kvminit_line = line_of("kernel/vm.c", "    initlock(&uvm_lock, \"uvm\");");
-    assert_lines(
-        &out,
-        &[
-            &format!("breakpoint 1 at {kmain:#x} <kmain+{kmain_off}>: kernel/main.c:{kmain_line}"),
-            "breakpoint 1",
-            &format!("kernel/main.c:{kmain_line}:     cpu_init();"),
-            &format!("pc             {kmain:#x}\t{kmain:#x} <kmain+{kmain_off}>"),
-            "priv           0x1\tprv:1 [Supervisor]",
-            &format!("breakpoint 2 at {kvminit:#x} <kvminit+{kvminit_off}>: kernel/vm.c:{kvminit_line}"),
-            "breakpoint 2",
-            &format!("kernel/vm.c:{kvminit_line}:     initlock(&uvm_lock, \"uvm\");"),
-        ],
-    );
-    // kvminit, stopped at the start of a line (so without its pc, as GDB shows it),
-    // called from kmain, called from the assembly that entered S-mode: frames read
-    // through the page table, the callers' addresses with 16 digits.
-    let bt = backtrace_after(&out, "(merlin-dbg) bt");
-    assert_eq!(bt.len(), 3, "{out}");
-    assert_eq!(
-        bt[0],
-        format!("#0  kvminit () at kernel/vm.c:{kvminit_line}"),
-        "{out}"
-    );
-    assert!(
-        bt[1].starts_with("#1  0xffffffff8") && bt[1].contains(" in kmain () at kernel/main.c:"),
-        "{out}"
-    );
-    assert_eq!(frame_pc(bt[1]).len(), 2 + 16, "{out}");
-    assert!(
-        bt[2].starts_with("#2  0xffffffff8") && bt[2].ends_with(" in supervisor_entry ()"),
-        "{out}"
-    );
 }
 
 /// The committed kernel.
@@ -647,77 +535,6 @@ fn lldb_reads_the_line_tables() {
 }
 
 #[test]
-fn harts_and_watchpoints() {
-    let out = connected(
-        "examples/smp/smp.elf",
-        2,
-        b"",
-        "break *work\n\
-         continue\n\
-         continue\n\
-         hart\n\
-         regs\n\
-         hart 0\n\
-         x/1 $sp\n\
-         hart 1\n\
-         si\n\
-         delete 1\n\
-         watch counter\n\
-         watch -r ready\n\
-         continue\n\
-         continue\n\
-         info breakpoints\n\
-         delete\n\
-         hart 3\n\
-         continue\n",
-    );
-    assert_lines(
-        &out,
-        &[
-            "connected: 2 harts",
-            "breakpoint 1 at 0x80000070 <work>",
-            "[hart 0] breakpoint 1",
-            "=> 0x80000070 <work>:  auipc t0, 0x0",
-            "[hart 1] breakpoint 1",
-            "=> 0x80000070 <work>:  auipc t0, 0x0",
-            "* hart 1, M-mode, at 0x80000070 <work>",
-            "hart 0",
-            // Hart 0's stack, past every section: no symbol names it.
-            "(merlin-dbg) x/1 $sp",
-            "0x80010470:  0x00000000",
-            "hart 1",
-            "=> 0x80000074 <work+4>:  addi t0, t0, 0x3c0",
-            "watchpoint 2 (write) at 0x80000430 <counter>, 4 bytes",
-            "watchpoint 3 (read) at 0x8000043c <ready>, 4 bytes",
-            "[hart 0] watchpoint 2 (write) hit at 0x80000430 <counter>",
-            "=> 0x80000084 <work+20>:  addi t1, t1, -0x1",
-            "[hart 1] watchpoint 2 (write) hit at 0x80000430 <counter>",
-            "2    watchpoint  0x80000430 <counter>, 4 bytes, write",
-            "3    watchpoint  0x8000043c <ready>, 4 bytes, read",
-            "error: no hart 3: the machine has 2",
-        ],
-    );
-    // Hart 1's registers, the same at both widths.
-    assert_eq!(
-        block_after(&out, "(merlin-dbg) regs"),
-        gdb_regs(&[
-            "ra             0x0\t0x0",
-            "sp             0x8000f470\t0x8000f470",
-            "gp             0x0\t0x0",
-            "tp             0x0\t0x0",
-            "t0             0x30002000\t805314560",
-            "t1             0x2000004\t33554436",
-            "t2             0x1\t1",
-            "fp             0x1\t0x1",
-            "s1             0x2\t2",
-            "a0             0x1\t1",
-            "pc             0x80000070\t0x80000070 <work>",
-            "priv           0x3\tprv:3 [Machine]",
-        ])
-    );
-}
-
-#[test]
 fn starting_grail_itself() {
     // merlin-dbg -- grail-args: the machine in merlin-dbg's process, its console on
     // merlin-dbg's stdout. Commands from a file (-x), then stdin. puts has no line
@@ -730,6 +547,8 @@ fn starting_grail_itself() {
             "-x",
             script.to_str(),
             "--",
+            "--bios",
+            "none",
             path("examples/hello/hello.elf").to_str().unwrap(),
         ],
         "bogus\nx/1 nowhere\ndelete 7\ncontinue\nregs\n",
@@ -740,7 +559,7 @@ fn starting_grail_itself() {
             "(merlin-dbg) break puts",
             "breakpoint 1 at 0x80000028 <puts+8>",
             "breakpoint 1",
-            "=> 0x80000028 <puts+8>:  lbu t2, 0x0(t1)",
+            "=> 0x0000000080000028 <puts+8>:  lbu t2, 0x0(t1)",
             "(merlin-dbg) delete",
             "(merlin-dbg) bogus",
             "error: unknown command 'bogus' (try help)",
@@ -753,7 +572,7 @@ fn starting_grail_itself() {
     );
 
     // Quitting kills the machine: an endless kernel shell waiting for input it never
-    // gets, stopped at a breakpoint.
+    // gets, stopped at a breakpoint (on Camelot's firmware, grail's default).
     let out = merlin_dbg(
         &["--", path("kernel/kernel.elf").to_str().unwrap()],
         "break kmain\ncontinue\nquit\n",
@@ -801,14 +620,12 @@ fn interrupting_a_running_machine() {
     assert_eq!(thread.join().unwrap(), Outcome::Killed);
 }
 
-// ---- RV64 ----
-
 #[test]
-fn hello_rv64() {
-    // hello's session on an RV64 machine: the same addresses and code, the registers
-    // and addresses with 16 digits, and x/g's 8-byte units.
+fn hello() {
+    // hello's session: the registers and addresses with 16 digits, and x/g's 8-byte
+    // units.
     let out = connected(
-        "examples/hello/hello-rv64.elf",
+        "examples/hello/hello.elf",
         1,
         b"",
         "break *puts\n\
@@ -870,9 +687,9 @@ fn hello_rv64() {
 }
 
 #[test]
-fn harts_and_watchpoints_rv64() {
+fn harts_and_watchpoints() {
     let out = connected(
-        "examples/smp/smp-rv64.elf",
+        "examples/smp/smp.elf",
         2,
         b"",
         "break *work\n\
@@ -920,7 +737,7 @@ fn harts_and_watchpoints_rv64() {
             "error: no hart 3: the machine has 2",
         ],
     );
-    // Hart 1's registers, the same at both widths.
+    // Hart 1's registers.
     assert_eq!(
         block_after(&out, "(merlin-dbg) regs"),
         gdb_regs(&[
@@ -940,24 +757,23 @@ fn harts_and_watchpoints_rv64() {
     );
 }
 
-/// `tests/rv64/prog.c`'s directory, from the repository root: the compilation
-/// directory of its line tables, so they name `crates/merlin-dbg/tests/rv64/prog.c`
+/// `tests/prog/prog.c`'s directory, from the repository root: the compilation
+/// directory of its line tables, so they name `crates/merlin-dbg/tests/prog/prog.c`
 /// (as the kernel's name `kernel/main.c`).
-const RV64_DIR: &str = "crates/merlin-dbg/tests/rv64";
+const PROG_DIR: &str = "crates/merlin-dbg/tests/prog";
 
-/// `tests/rv64/prog.c` and `crt0.s` built for RV64 with our tools, `prog.c` with
-/// its line tables (merlin -g), into an executable at 0x80000000 (merlin-ld's
-/// default layout), written to a file of its own for `test`, removed with the
-/// guard.
-fn rv64_program(test: &str) -> TempFile {
-    program(RV64_DIR, "prog.c", excalibur::Xlen::Rv64, &format!("rv64-{test}"))
+/// `tests/prog/prog.c` and `crt0.s` built with our tools, `prog.c` with its line
+/// tables (merlin -g), into an executable at 0x80000000 (merlin-ld's default
+/// layout), written to a file of its own for `test`, removed with the guard.
+fn prog_program(test: &str) -> TempFile {
+    program(PROG_DIR, "prog.c", &format!("prog-{test}"))
 }
 
-/// `dir/file` (a directory from the repository root) and tests/rv64/crt0.s built
-/// for `xlen` with our tools, `file` with its debug information (merlin -g, `dir`
-/// its compilation directory), into an executable at 0x80000000, written to a
-/// file named for `test`, removed with the guard.
-fn program(dir: &str, file: &str, xlen: excalibur::Xlen, test: &str) -> TempFile {
+/// `dir/file` (a directory from the repository root) and tests/prog/crt0.s built
+/// with our tools, `file` with its debug information (merlin -g, `dir` its
+/// compilation directory), into an executable at 0x80000000, written to a file
+/// named for `test`, removed with the guard.
+fn program(dir: &str, file: &str, test: &str) -> TempFile {
     let opts = merlin::Options {
         debug: Some(merlin::DebugInfo { comp_dir: dir.into() }),
         ..merlin::Options::default()
@@ -965,14 +781,12 @@ fn program(dir: &str, file: &str, xlen: excalibur::Xlen, test: &str) -> TempFile
     let src = std::fs::read_to_string(path(dir).join(file)).unwrap();
     let asm = merlin::compile_with(file, &src, &opts, &merlin::no_files)
         .unwrap_or_else(|e| panic!("merlin: {e:?}"));
-    let crt0 = std::fs::read_to_string(path(RV64_DIR).join("crt0.s")).unwrap();
-    let as_opts = merlin_as::Options { xlen };
+    let crt0 = std::fs::read_to_string(path(PROG_DIR).join("crt0.s")).unwrap();
     let inputs: Vec<merlin_ld::Input> = [("crt0.o", crt0), ("prog.o", asm)]
         .into_iter()
         .map(|(name, asm)| merlin_ld::Input {
             name: name.into(),
-            data: merlin_as::assemble_to_elf_with(&asm, &as_opts)
-                .unwrap_or_else(|e| panic!("merlin-as {name}: {e:?}")),
+            data: merlin_as::assemble_to_elf(&asm).unwrap_or_else(|e| panic!("merlin-as {name}: {e:?}")),
         })
         .collect();
     let linked = merlin_ld::link(&inputs, &merlin_ld::Options::default())
@@ -1006,15 +820,15 @@ fn nth_backtrace(out: &str, n: usize) -> Vec<&str> {
 }
 
 #[test]
-fn source_lines_of_an_rv64_program() {
+fn source_lines_of_a_program() {
     // A breakpoint on main's first line, which stops past main's prologue on the
     // call of puts (`long f;` has no code), next by line over it to the call of
     // fact, step into fact past its prologue, a backtrace with lines, list, and a
     // line with no code.
-    let elf = rv64_program("lines");
+    let elf = prog_program("lines");
     let [fact_at] = addresses(&elf, ["fact"]);
     let (body_at, off) = past_prologue(&std::fs::read(&*elf).unwrap(), "main");
-    let file = format!("{RV64_DIR}/prog.c");
+    let file = format!("{PROG_DIR}/prog.c");
     let main = line_of(&file, "int main(void) {");
     let fact = line_of(&file, "long fact(long n) {");
     let out = connected(
@@ -1098,16 +912,16 @@ fn source_lines_of_an_rv64_program() {
 }
 
 #[test]
-fn stepping_through_an_rv64_program() {
+fn stepping_through_a_program() {
     // Breakpoints in sum, a variadic function (its ra and s0 below the saved
     // argument registers, at CFA-64 and CFA-72), called from fact five deep in its
     // recursion: on its first statement (break sum) and in its loop, at the va_arg
     // line, both past its prologue, so that the backtraces read sum's saved ra and
     // s0 from its frame in memory; finish, next back up the recursion, a
     // watchpoint on a 64-bit global and its doublewords, and step into puts.
-    let elf = rv64_program("steps");
+    let elf = prog_program("steps");
     let [sum_at, total_at] = addresses(&elf, ["sum", "total"]);
-    let file = format!("{RV64_DIR}/prog.c");
+    let file = format!("{PROG_DIR}/prog.c");
     let line = |start: &str| line_of(&file, start);
     let va_arg = line("        s += va_arg(ap, long);");
     let out = connected(
@@ -1225,12 +1039,16 @@ fn stepping_through_an_rv64_program() {
 }
 
 #[test]
-fn starting_an_rv64_grail_and_the_widths_agreeing() {
-    // merlin-dbg -- an RV64 program: the machine is RV64 (the ELF64 program made it
-    // so), and the stub says so. break puts past its prologue by GDB's analysis, as
-    // on RV32.
+fn starting_grail_and_an_rv32_program_left_out() {
+    // merlin-dbg -- a program: the machine is RV64, and the stub says so. break puts
+    // past its prologue by GDB's analysis.
     let out = merlin_dbg(
-        &["--", path("examples/hello/hello-rv64.elf").to_str().unwrap()],
+        &[
+            "--",
+            "--bios",
+            "none",
+            path("examples/hello/hello.elf").to_str().unwrap(),
+        ],
         "break puts\ncontinue\nx/1g $a0\ndelete\ncontinue\n",
     );
     assert_lines(
@@ -1244,27 +1062,25 @@ fn starting_an_rv64_grail_and_the_widths_agreeing() {
             "program exited with code 0",
         ],
     );
-    // An RV32 program's symbols for an RV64 machine: left out with a warning, and the
-    // session goes on without them, as GDB's does. The machine stays stopped at its
-    // first instruction, where the stub waited for merlin-dbg (dropping the
-    // connection would have let it run off), until the session runs it to a
-    // breakpoint and to its end.
-    let (m, console) = machine("examples/hello/hello-rv64.elf", 1, b"");
+    // An RV32 program's symbols (clang's, crates/elf/tests/llvm) for the machine:
+    // left out with a warning, and the session goes on without them, as GDB's does.
+    // The machine stays stopped at its first instruction, where the stub waited for
+    // merlin-dbg (dropping the connection would have let it run off), until the
+    // session runs it to a breakpoint and to its end.
+    let (m, console) = machine("examples/hello/hello.elf", 1, b"");
     let (addr, thread) = stub(m);
+    let rv32 = path("crates/elf/tests/llvm/rv32/prog.elf");
     let out = merlin_dbg(
-        &[
-            "--connect",
-            &addr.to_string(),
-            path("examples/hello/hello.elf").to_str().unwrap(),
-        ],
+        &["--connect", &addr.to_string(), rv32.to_str().unwrap()],
         "break puts\nbreak 0x80000020\ncontinue\ncontinue\n",
     );
     assert_lines(
         &out,
         &[
             &format!(
-                "warning: {}: an RV32 program (ELF32), but the machine is RV64: going on without its symbols",
-                path("examples/hello/hello.elf").display()
+                "warning: {}: an RV32 program (ELF32): merlin-dbg debugs RV64 (ELF64) programs only: going on \
+                 without its symbols",
+                rv32.display()
             ),
             "=> 0x0000000000001000:  auipc t0, 0x0",
             "error: no symbol 'puts'",
@@ -1395,207 +1211,200 @@ fn variables_and_types() {
         "down 9",
         "down",
     ];
-    for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
-        let elf = program(VARS_DIR, "vars.c", &format!("vars-{}", xlen.bits()));
-        let [nodes, counter, walk] = addresses(&elf, ["nodes", "counter", "walk"]);
-        let ptr = u64::from(xlen.bits() / 8);
-        let node = |i: u64| match i {
-            0 => format!("{nodes:#x} <nodes>"),
-            i => format!("{:#x} <nodes+{}>", nodes + i * 2 * ptr, i * 2 * ptr),
-        };
-        let script = format!(
-            "break vars.c:{add}\ncontinue\n{}\ndelete\nbreak area\ncontinue\nbt\ninfo args\nprint b.x - a.x\n\
-             delete\ncontinue\n",
-            commands.join("\n")
-        );
-        let out = connected(elf.to_str(), 1, b"", &script);
-        let r = replies(&out, &commands);
-        let at = |line: u32| format!("at {file}:{line}");
-        // The backtrace: the innermost frame without its pc (it is at the start of
-        // its line), the callers with theirs, each with its arguments and line.
-        let bt: Vec<&str> = r[0].lines().collect();
-        assert_eq!(bt.len(), 5, "{out}");
-        assert_eq!(bt[0], format!("#0  walk (list={}, depth=2) {}", node(2), at(add)));
-        for (i, depth) in [(1, 1), (2, 0)] {
-            assert!(bt[i].starts_with(&format!("#{i}  0x")), "{out}");
-            let want = format!(" in walk (list={}, depth={depth}) {}", node(depth), at(rec));
-            assert!(bt[i].ends_with(&want), "{} in:\n{out}", want);
-        }
-        assert!(bt[3].ends_with(&format!(" in main () {}", at(call))), "{out}");
-        assert!(bt[4].ends_with(" in _start ()"), "{out}");
-        let want = [
-            format!("list = {}\ndepth = 2", node(2)),
-            "sum = 0\ncalls = 3".to_string(),
-            format!("$1 = (Node *) {}", node(2)),
-            "$2 = {value = 30, next = 0x0}".to_string(),
-            "$3 = 30".to_string(),
+    let elf = program(VARS_DIR, "vars.c", "vars");
+    let [nodes, counter, walk] = addresses(&elf, ["nodes", "counter", "walk"]);
+    let ptr = 8;
+    let node = |i: u64| match i {
+        0 => format!("{nodes:#x} <nodes>"),
+        i => format!("{:#x} <nodes+{}>", nodes + i * 2 * ptr, i * 2 * ptr),
+    };
+    let script = format!(
+        "break vars.c:{add}\ncontinue\n{}\ndelete\nbreak area\ncontinue\nbt\ninfo args\nprint b.x - a.x\n\
+         delete\ncontinue\n",
+        commands.join("\n")
+    );
+    let out = connected(elf.to_str(), 1, b"", &script);
+    let r = replies(&out, &commands);
+    let at = |line: u32| format!("at {file}:{line}");
+    // The backtrace: the innermost frame without its pc (it is at the start of
+    // its line), the callers with theirs, each with its arguments and line.
+    let bt: Vec<&str> = r[0].lines().collect();
+    assert_eq!(bt.len(), 5, "{out}");
+    assert_eq!(bt[0], format!("#0  walk (list={}, depth=2) {}", node(2), at(add)));
+    for (i, depth) in [(1, 1), (2, 0)] {
+        assert!(bt[i].starts_with(&format!("#{i}  0x")), "{out}");
+        let want = format!(" in walk (list={}, depth={depth}) {}", node(depth), at(rec));
+        assert!(bt[i].ends_with(&want), "{} in:\n{out}", want);
+    }
+    assert!(bt[3].ends_with(&format!(" in main () {}", at(call))), "{out}");
+    assert!(bt[4].ends_with(" in _start ()"), "{out}");
+    let want = [
+        format!("list = {}\ndepth = 2", node(2)),
+        "sum = 0\ncalls = 3".to_string(),
+        format!("$1 = (Node *) {}", node(2)),
+        "$2 = {value = 30, next = 0x0}".to_string(),
+        "$3 = 30".to_string(),
+        format!(
+            "$4 = {{{{value = 10, next = {}}}, {{value = 20, next = {}}}, {{value = 30, next = 0x0}}}}",
+            node(1),
+            node(2)
+        ),
+        "$5 = 31".to_string(),
+    ];
+    assert_eq!(r[1..8], want, "{out}");
+    assert!(r[8].starts_with("$6 = {color = BLUE, corners = {{x = 1, y = 2}, {x = 30, y = 40}}, name = 0x"));
+    assert!(r[8].ends_with(" \"box\"}"), "{out}");
+    assert_eq!(r[9], "$7 = 40");
+    assert!(
+        r[10].starts_with("$8 = 0x") && r[10].ends_with(" \"box\""),
+        "{out}"
+    );
+    let want = [
+        "$9 = 98 'b'".to_string(),
+        "$10 = {{1, 2, 3}, {4, 5, 6}}".to_string(),
+        "$11 = 6".to_string(),
+        format!("$12 = (int *) {counter:#x} <counter>"),
+        "$13 = 0x3".to_string(),
+        "$14 = -5".to_string(),
+        format!("$15 = {{int (Node *, int)}} {walk:#x} <walk>"),
+        format!("$16 = {}", 2 * ptr),
+        "$17 = 2".to_string(),
+        "type = struct node {\n    int value;\n    struct node *next;\n}".to_string(),
+        "type = struct shape {\n    enum color color;\n    struct point corners[2];\n    const char *name;\n}"
+            .to_string(),
+        "type = enum color {RED, GREEN = 5, BLUE}".to_string(),
+        "type = int (Node *, int)".to_string(),
+        "type = struct node {\n    int value;\n    struct node *next;\n} *".to_string(),
+        "type = Node [3]".to_string(),
+        "type = struct node".to_string(),
+        "type = count_t".to_string(),
+        "type = const char".to_string(),
+    ];
+    assert_eq!(r[11..29], want, "{out}");
+    // up: walk one level out, its line the call's.
+    assert!(r[29].starts_with("#1  0x"), "{out}");
+    assert!(r[29].contains(&format!(" in walk (list={}, depth=1) {}\n", node(1), at(rec))));
+    assert!(r[29].ends_with(&format!(
+        "{file}:{rec}:         sum = walk(list->next, depth + 1);"
+    )));
+    assert_eq!(r[30], format!("list = {}\ndepth = 1", node(1)));
+    // Two more: main, whose block's local comes first.
+    assert!(r[31].contains(&format!(" in main () {}\n", at(call))), "{out}");
+    assert_eq!(
+        r[32..37],
+        [
+            "inner = 6\nw = {u = 287454020, bytes = \"D3\\\"\\021\"}\nletter = 65 'A'\ni = 3\nseen = 1",
+            "$18 = \"D3\\\"\\021\"",
+            "$19 = 65 'A'",
+            "error: no symbol \"depth\" in current context",
+            &format!(
+                "#2  {} in walk (list={}, depth=0) {}\n{file}:{rec}:         sum = walk(list->next, depth + 1);",
+                frame_pc(bt[2]),
+                node(0),
+                at(rec)
+            ),
+        ],
+        "{out}"
+    );
+    assert_eq!(r[37], "$20 = 0");
+    assert!(r[38].starts_with("#0  walk (list="), "{out}");
+    assert_eq!(r[39], "error: no symbol \"nope\" in current context");
+    // GDB's `@`, and C's comparisons, logical operators (the right one not
+    // evaluated when the left decides), shifts and bitwise operators, with
+    // C's conversions: -1 is not below 0u.
+    assert_eq!(
+        r[40..45],
+        [
             format!(
-                "$4 = {{{{value = 10, next = {}}}, {{value = 20, next = {}}}, {{value = 30, next = 0x0}}}}",
+                "$21 = {{{{value = 10, next = {}}}, {{value = 20, next = {}}}}}",
                 node(1),
                 node(2)
             ),
-            "$5 = 31".to_string(),
-        ];
-        assert_eq!(r[1..8], want, "{out}");
-        assert!(
-            r[8].starts_with("$6 = {color = BLUE, corners = {{x = 1, y = 2}, {x = 30, y = 40}}, name = 0x")
-        );
-        assert!(r[8].ends_with(" \"box\"}"), "{out}");
-        assert_eq!(r[9], "$7 = 40");
-        assert!(
-            r[10].starts_with("$8 = 0x") && r[10].ends_with(" \"box\""),
-            "{out}"
-        );
-        let want = [
-            "$9 = 98 'b'".to_string(),
-            "$10 = {{1, 2, 3}, {4, 5, 6}}".to_string(),
-            "$11 = 6".to_string(),
-            format!("$12 = (int *) {counter:#x} <counter>"),
-            "$13 = 0x3".to_string(),
-            "$14 = -5".to_string(),
-            format!("$15 = {{int (Node *, int)}} {walk:#x} <walk>"),
-            format!("$16 = {}", 2 * ptr),
-            "$17 = 2".to_string(),
-            "type = struct node {\n    int value;\n    struct node *next;\n}".to_string(),
-            "type = struct shape {\n    enum color color;\n    struct point corners[2];\n    const char *name;\n}"
-                .to_string(),
-            "type = enum color {RED, GREEN = 5, BLUE}".to_string(),
-            "type = int (Node *, int)".to_string(),
-            "type = struct node {\n    int value;\n    struct node *next;\n} *".to_string(),
-            "type = Node [3]".to_string(),
-            "type = struct node".to_string(),
-            "type = count_t".to_string(),
-            "type = const char".to_string(),
-        ];
-        assert_eq!(r[11..29], want, "{out}");
-        // up: walk one level out, its line the call's.
-        assert!(r[29].starts_with("#1  0x"), "{out}");
-        assert!(r[29].contains(&format!(" in walk (list={}, depth=1) {}\n", node(1), at(rec))));
-        assert!(r[29].ends_with(&format!(
-            "{file}:{rec}:         sum = walk(list->next, depth + 1);"
-        )));
-        assert_eq!(r[30], format!("list = {}\ndepth = 1", node(1)));
-        // Two more: main, whose block's local comes first.
-        assert!(r[31].contains(&format!(" in main () {}\n", at(call))), "{out}");
-        assert_eq!(
-            r[32..37],
-            [
-                "inner = 6\nw = {u = 287454020, bytes = \"D3\\\"\\021\"}\nletter = 65 'A'\ni = 3\nseen = 1",
-                "$18 = \"D3\\\"\\021\"",
-                "$19 = 65 'A'",
-                "error: no symbol \"depth\" in current context",
-                &format!(
-                    "#2  {} in walk (list={}, depth=0) {}\n{file}:{rec}:         sum = walk(list->next, depth + 1);",
-                    frame_pc(bt[2]),
-                    node(0),
-                    at(rec)
-                ),
-            ],
-            "{out}"
-        );
-        assert_eq!(r[37], "$20 = 0");
-        assert!(r[38].starts_with("#0  walk (list="), "{out}");
-        assert_eq!(r[39], "error: no symbol \"nope\" in current context");
-        // GDB's `@`, and C's comparisons, logical operators (the right one not
-        // evaluated when the left decides), shifts and bitwise operators, with
-        // C's conversions: -1 is not below 0u.
-        assert_eq!(
-            r[40..45],
-            [
-                format!(
-                    "$21 = {{{{value = 10, next = {}}}, {{value = 20, next = {}}}}}",
-                    node(1),
-                    node(2)
-                ),
-                "$22 = 1".to_string(),
-                "$23 = 13".to_string(),
-                "$24 = 0".to_string(),
-                "$25 = 1".to_string(),
-            ],
-            "{out}"
-        );
-        // Casts, enums, C's integer types and conversions (a sum of ints wraps
-        // as an int), GDB's `@` at its precedence, /x of a char array, the
-        // registers' types, and the bodies of anonymous members' types.
-        let (word_max, long_size, wide) = match xlen {
-            excalibur::Xlen::Rv32 => ("4294967295", "4", "long long"),
-            excalibur::Xlen::Rv64 => ("18446744073709551615", "8", "long"),
-        };
-        let invalid = "error: Invalid cast.";
-        assert_eq!(
-            r[45..66],
-            [
-                invalid.to_string(),
-                invalid.to_string(),
-                invalid.to_string(),
-                "$26 = 4294967295".to_string(),
-                "$27 = 65 'A'".to_string(),
-                format!("$28 = {word_max}"),
-                "$29 = NEG".to_string(),
-                "$30 = -2".to_string(),
-                "$31 = 1".to_string(),
-                "$32 = 0xfffffffe".to_string(),
-                format!("$33 = {long_size}"),
-                "type = unsigned long".to_string(),
-                "type = long".to_string(),
-                "type = long long".to_string(),
-                "type = long".to_string(),
-                format!("type = {wide}"),
-                "$34 = -2147483648".to_string(),
-                "$35 = {1, 2, 3}".to_string(),
-                "$36 = \"hi\\000\"".to_string(),
-                "$37 = {0x68, 0x69, 0x0, 0x0}".to_string(),
-                "$38 = 0x3".to_string(),
-            ],
-            "{out}"
-        );
-        assert!(
-            r[66].starts_with("$39 = (void (*)()) 0x") && r[66].contains(" <walk+"),
-            "{out}"
-        );
-        assert_eq!(
-            r[67..73],
-            [
-                "type = void *",
-                "type = void (*)()",
-                "type = struct outer {\n    int k;\n    struct {\n        int a;\n        char c;\n    } in;\n    \
-                 union {\n        int i;\n        short s;\n    } un;\n}",
-                "$40 = {k = 1, in = {a = 2, c = 99 'c'}, un = {i = 3, s = 3}}",
-                "type = int ()",
-                "type = int ()",
-            ],
-            "{out}"
-        );
-        // up 9 goes to the outermost frame, and up from there cannot; down 9 to
-        // the innermost, and down from there cannot; frame 9 is no frame.
-        assert!(
-            r[73].starts_with("#4  0x") && r[73].ends_with(" in _start ()"),
-            "{out}"
-        );
-        assert_eq!(r[74], "error: Initial frame selected; you cannot go up.");
-        assert_eq!(r[75], "error: No frame at level 9.");
-        assert!(r[76].starts_with("#0  walk (list="), "{out}");
-        assert_eq!(
-            r[77],
-            "error: Bottom (innermost) frame selected; you cannot go down."
-        );
-        // area's struct arguments: `...` in a backtrace, as GDB's frame-arguments
-        // scalars, and in full in info args.
-        assert_lines(
-            &out,
-            &[
-                &format!(
-                    "#0  area (a=..., b=...) at {file}:{}",
-                    line_of(&file, "    int w = b.x - a.x;")
-                ),
-                "(merlin-dbg) info args",
-                "a = {x = 1, y = 2}",
-                "b = {x = 30, y = 40}",
-                "$41 = 29",
-            ],
-        );
-        assert!(out.contains(&format!(" in main () {}\n", at(area_call))), "{out}");
-    }
+            "$22 = 1".to_string(),
+            "$23 = 13".to_string(),
+            "$24 = 0".to_string(),
+            "$25 = 1".to_string(),
+        ],
+        "{out}"
+    );
+    // Casts, enums, C's integer types and conversions (a sum of ints wraps
+    // as an int), GDB's `@` at its precedence, /x of a char array, the
+    // registers' types, and the bodies of anonymous members' types.
+    let (word_max, long_size, wide) = ("18446744073709551615", "8", "long");
+    let invalid = "error: Invalid cast.";
+    assert_eq!(
+        r[45..66],
+        [
+            invalid.to_string(),
+            invalid.to_string(),
+            invalid.to_string(),
+            "$26 = 4294967295".to_string(),
+            "$27 = 65 'A'".to_string(),
+            format!("$28 = {word_max}"),
+            "$29 = NEG".to_string(),
+            "$30 = -2".to_string(),
+            "$31 = 1".to_string(),
+            "$32 = 0xfffffffe".to_string(),
+            format!("$33 = {long_size}"),
+            "type = unsigned long".to_string(),
+            "type = long".to_string(),
+            "type = long long".to_string(),
+            "type = long".to_string(),
+            format!("type = {wide}"),
+            "$34 = -2147483648".to_string(),
+            "$35 = {1, 2, 3}".to_string(),
+            "$36 = \"hi\\000\"".to_string(),
+            "$37 = {0x68, 0x69, 0x0, 0x0}".to_string(),
+            "$38 = 0x3".to_string(),
+        ],
+        "{out}"
+    );
+    assert!(
+        r[66].starts_with("$39 = (void (*)()) 0x") && r[66].contains(" <walk+"),
+        "{out}"
+    );
+    assert_eq!(
+        r[67..73],
+        [
+            "type = void *",
+            "type = void (*)()",
+            "type = struct outer {\n    int k;\n    struct {\n        int a;\n        char c;\n    } in;\n    \
+             union {\n        int i;\n        short s;\n    } un;\n}",
+            "$40 = {k = 1, in = {a = 2, c = 99 'c'}, un = {i = 3, s = 3}}",
+            "type = int ()",
+            "type = int ()",
+        ],
+        "{out}"
+    );
+    // up 9 goes to the outermost frame, and up from there cannot; down 9 to
+    // the innermost, and down from there cannot; frame 9 is no frame.
+    assert!(
+        r[73].starts_with("#4  0x") && r[73].ends_with(" in _start ()"),
+        "{out}"
+    );
+    assert_eq!(r[74], "error: Initial frame selected; you cannot go up.");
+    assert_eq!(r[75], "error: No frame at level 9.");
+    assert!(r[76].starts_with("#0  walk (list="), "{out}");
+    assert_eq!(
+        r[77],
+        "error: Bottom (innermost) frame selected; you cannot go down."
+    );
+    // area's struct arguments: `...` in a backtrace, as GDB's frame-arguments
+    // scalars, and in full in info args.
+    assert_lines(
+        &out,
+        &[
+            &format!(
+                "#0  area (a=..., b=...) at {file}:{}",
+                line_of(&file, "    int w = b.x - a.x;")
+            ),
+            "(merlin-dbg) info args",
+            "a = {x = 1, y = 2}",
+            "b = {x = 30, y = 40}",
+            "$41 = 29",
+        ],
+    );
+    assert!(out.contains(&format!(" in main () {}\n", at(area_call))), "{out}");
 }
 
 #[test]
@@ -1695,13 +1504,12 @@ fn variables_in_the_kernel() {
 }
 
 /// `tests/vars/vars.c` built by clang (`CLANG`, -O0 -g) and linked by ld.lld (`LLD`)
-/// with tests/rv64/crt0.s (which merlin-as assembles: it has Grail's `xcal.halt`),
-/// for `xlen`, into files named for `test`.
-fn clang_program(xlen: excalibur::Xlen, test: &str) -> TempFile {
+/// with tests/prog/crt0.s (which merlin-as assembles: it has Grail's `xcal.halt`),
+/// into files named for `test`.
+fn clang_program(test: &str) -> TempFile {
     let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
     let lld = std::env::var("LLD").unwrap_or_else(|_| format!("ld.lld{}", std::env::consts::EXE_SUFFIX));
-    let bits = xlen.bits();
-    let abi = if bits == 64 { "lp64" } else { "ilp32" };
+    let (bits, abi) = (64, "lp64");
     let obj = TempFile::new(&format!("{test}-clang-vars-{bits}.o"), b"");
     let out = Command::new(&clang)
         .current_dir(path(VARS_DIR))
@@ -1725,8 +1533,8 @@ fn clang_program(xlen: excalibur::Xlen, test: &str) -> TempFile {
         .output()
         .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let crt0 = std::fs::read_to_string(path(RV64_DIR).join("crt0.s")).unwrap();
-    let crt0 = merlin_as::assemble_to_elf_with(&crt0, &merlin_as::Options { xlen }).unwrap();
+    let crt0 = std::fs::read_to_string(path(PROG_DIR).join("crt0.s")).unwrap();
+    let crt0 = merlin_as::assemble_to_elf(&crt0).unwrap();
     let crt0 = TempFile::new(&format!("{test}-clang-crt0-{bits}.o"), &crt0);
     let elf = TempFile::new(&format!("{test}-clang-vars-{bits}.elf"), b"");
     // Everything in RAM, from 0x80000000, as merlin-ld lays a program out.
@@ -1846,20 +1654,14 @@ fn merlin_dbg_reads_clangs_variables_as_merlins() {
             .map(without_addresses)
             .collect()
     };
-    for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
-        let merlin = program(VARS_DIR, "vars.c", &format!("dbg-vars-{}", xlen.bits()));
-        let clang = clang_program("dbg");
-        let ours = shown(&merlin);
-        assert!(
-            ours.iter().any(|l| l == "$1 = {value = 30, next = ADDR}"),
-            "{ours:#?}"
-        );
-        assert_eq!(
-            ours,
-            shown(&clang),
-            "merlin's (left) and clang's (right), {xlen:?}"
-        );
-    }
+    let merlin = program(VARS_DIR, "vars.c", "dbg-vars");
+    let clang = clang_program("dbg");
+    let ours = shown(&merlin);
+    assert!(
+        ours.iter().any(|l| l == "$1 = {value = 30, next = ADDR}"),
+        "{ours:#?}"
+    );
+    assert_eq!(ours, shown(&clang), "merlin's (left) and clang's (right)");
 }
 
 /// LLDB reads merlin's debug information as it reads clang's: tests/vars/vars.c
@@ -1871,24 +1673,22 @@ fn merlin_dbg_reads_clangs_variables_as_merlins() {
 #[test]
 #[ignore]
 fn lldb_reads_merlins_variables_as_clangs() {
-    for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
-        let merlin = program(VARS_DIR, "vars.c", &format!("lldb-vars-{}", xlen.bits()));
-        let clang = clang_program("lldb");
-        let ours = lldb_variables(&merlin);
-        let theirs = lldb_variables(&clang);
-        assert!(
-            ours.iter().any(|l| l.contains("(Node *) list = ADDR")),
-            "{ours:#?}"
-        );
-        assert!(ours.iter().any(|l| l.contains("(int) depth = 2")), "{ours:#?}");
-        assert!(
-            ours.iter().any(|l| l.contains("(short[2][3]) grid = {")),
-            "{ours:#?}"
-        );
-        assert!(
-            ours.iter().any(|l| l.contains("(count_t) total = 0")),
-            "{ours:#?}"
-        );
-        assert_eq!(ours, theirs, "merlin's (left) and clang's (right), {xlen:?}");
-    }
+    let merlin = program(VARS_DIR, "vars.c", "lldb-vars");
+    let clang = clang_program("lldb");
+    let ours = lldb_variables(&merlin);
+    let theirs = lldb_variables(&clang);
+    assert!(
+        ours.iter().any(|l| l.contains("(Node *) list = ADDR")),
+        "{ours:#?}"
+    );
+    assert!(ours.iter().any(|l| l.contains("(int) depth = 2")), "{ours:#?}");
+    assert!(
+        ours.iter().any(|l| l.contains("(short[2][3]) grid = {")),
+        "{ours:#?}"
+    );
+    assert!(
+        ours.iter().any(|l| l.contains("(count_t) total = 0")),
+        "{ours:#?}"
+    );
+    assert_eq!(ours, theirs, "merlin's (left) and clang's (right)");
 }

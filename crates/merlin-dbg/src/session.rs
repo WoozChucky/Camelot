@@ -672,7 +672,7 @@ impl<'a, W: Write> Session<'a, W> {
         }
     }
 
-    /// `0x80000024 <puts+4>` with all of an address's digits (16 on RV64), as GDB
+    /// `0x0000000080000024 <puts+4>` with all of an address's 16 digits, as GDB
     /// shows a code address in a frame and in disassembly.
     fn show(&self, addr: u64) -> String {
         self.symbols.show(addr)

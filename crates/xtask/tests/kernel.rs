@@ -1822,7 +1822,7 @@ fn parse_panic(out: &str) -> (String, HashMap<String, u64>) {
             );
         }
     }
-    assert!(n >= 1 + 8, "report:\n{report}");
+    assert!(n > 8, "report:\n{report}");
     assert_eq!(values.len(), 4 + 31, "report:\n{report}");
     (cause, values)
 }
@@ -2249,12 +2249,15 @@ fn translate(m: &Machine, root: u64, va: u64) -> Option<(u64, u64)> {
     None
 }
 
+/// A leaf of a page table: (va, pa, pte, the bytes it maps).
+type Leaf = (u64, u64, u64, u64);
+
 /// Every leaf of the page table whose root is at physical address `root`,
 /// in the upper half, as (va, pa, pte, the bytes it maps), and the tables
 /// it has (their physical addresses, the root's among them). Panics on a
 /// reserved encoding, a pointer with D, A, U or G (reserved there) or a
 /// misaligned superpage, which the kernel never makes.
-fn kernel_leaves(m: &Machine, root: u64) -> (Vec<(u64, u64, u64, u64)>, Vec<u64>) {
+fn kernel_leaves(m: &Machine, root: u64) -> (Vec<Leaf>, Vec<u64>) {
     fn walk(
         m: &Machine,
         table: u64,
@@ -2385,7 +2388,7 @@ fn check_kernel_memory(ram_mib: usize) {
         // As large as the place allows, up to a 1 GiB leaf.
         let largest = [1u64 << 30, 1 << 21, PAGE]
             .into_iter()
-            .find(|&s| at % s == 0 && at + s <= ram_end)
+            .find(|&s| at.is_multiple_of(s) && at + s <= ram_end)
             .unwrap();
         assert_eq!(l.3, largest, "the leaf at {at:#x}");
         at += l.3;

@@ -507,7 +507,7 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
         "frame {frame:#x}"
     );
     assert!(
-        frame >= 0xffff_8f80_0000_0000 && frame < 0xffff_af80_0000_0000,
+        (0xffff_8f80_0000_0000..0xffff_af80_0000_0000).contains(&frame),
         "frame {frame:#x}"
     );
 
