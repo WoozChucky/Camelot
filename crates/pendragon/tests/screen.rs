@@ -2,7 +2,8 @@
 //! Pendragon as a page does (masked frames, the token in a subprotocol), against
 //! Avalon in process, with the repository's examples as guests: `colorbars` (the
 //! framebuffer), `flip` (a mode change to 800x600), `kbd-echo` (the keyboard, raw mode
-//! after F12) and `pointer` (a cursor that follows the mouse).
+//! after F12), `pointer` (a cursor that follows the mouse, drawn into the frame) and
+//! `cursor` (the display's cursor plane, which comes apart from the frames).
 
 mod common;
 
@@ -485,6 +486,207 @@ fn the_pointer_reaches_the_guest() {
         canvas.wait_for_pixel(&mut page, 10, 10, 0xffffff);
         page.tap("Escape", "Escape");
         assert_eq!(page_end(&mut page, &mut canvas), "the VM has exited (code 0)");
+    }
+    platform.stop();
+}
+
+/// What Grail's display does running `examples/cursor` to its end: where its cursor
+/// is shown, from the cursor registers at each vertical blank that changed it, and the
+/// picture at the end, the cursor blended over the frame (`0x00RRGGBB`, row by row).
+fn grail_cursor(program: &Path) -> (Vec<(i32, i32)>, Vec<u32>) {
+    let mut m = grail::Machine::with_ram(16 * 1024 * 1024);
+    m.load_elf(&std::fs::read(program).unwrap()).unwrap();
+    let mut places = Vec::new();
+    let mut slices = 0;
+    while m.exit_code().is_none() {
+        m.run_for(1_000_000, &mut |_| {});
+        slices += 1;
+        assert!(slices < 10_000, "the program does not end");
+        let fb = &mut m.cpu.bus.fb;
+        if fb.take_cursor_update() {
+            let c = fb.cursor();
+            assert!(c.on);
+            places.push((c.x, c.y));
+        }
+    }
+    assert_eq!(m.exit_code(), Some(0));
+    let frame = m.cpu.bus.frame();
+    assert!(frame.cursor.is_some(), "the cursor shows at the end");
+    let picture = (0..frame.height)
+        .flat_map(|y| (0..frame.width).map(move |x| (x, y)))
+        .map(|(x, y)| frame.pixel(x, y))
+        .collect();
+    (places, picture)
+}
+
+/// The page's cursor, as the page keeps it from the `cursor_shape` and
+/// `cursor_position` messages: the image (width, height, straight RGBA), and whether
+/// and where it shows.
+#[derive(Debug, Default)]
+struct PageCursor {
+    image: Option<(u32, u32, Vec<u8>)>,
+    visible: bool,
+    x: i64,
+    y: i64,
+}
+
+impl PageCursor {
+    /// Applies a cursor message; whether `msg` was one.
+    fn apply(&mut self, msg: &Json) -> bool {
+        let int = |key: &str| msg.get(key).and_then(Json::as_i64).unwrap();
+        match s(msg, "type") {
+            "cursor_shape" => {
+                let (w, h) = (n(msg, "width") as u32, n(msg, "height") as u32);
+                let px = pendragon::base64::decode(s(msg, "pixels")).unwrap();
+                assert_eq!(px.len(), (w * h * 4) as usize);
+                self.image = Some((w, h, px));
+                true
+            }
+            "cursor_position" => {
+                self.visible = msg.get("visible").and_then(Json::as_bool).unwrap();
+                (self.x, self.y) = (int("x"), int("y"));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// What the browser shows: the cursor's canvas over the screen's, blended as a
+    /// browser blends canvases, on premultiplied pixels: the straight image is
+    /// multiplied by its alpha into the canvas (`putImageData`), each to the nearest,
+    /// and composited source-over, `cursor + screen × (255 − A) / 255`, to the nearest.
+    fn over(&self, canvas: &Canvas) -> Vec<u32> {
+        let mut out: Vec<u32> = (0..canvas.height)
+            .flat_map(|y| (0..canvas.width).map(move |x| (x, y)))
+            .map(|(x, y)| canvas.pixel(x, y))
+            .collect();
+        let Some((w, h, px)) = self.image.as_ref().filter(|_| self.visible) else {
+            return out;
+        };
+        let (w, h) = (*w as i64, *h as i64);
+        for cy in 0..h {
+            for cx in 0..w {
+                let (x, y) = (self.x + cx, self.y + cy);
+                if x < 0 || y < 0 || x >= canvas.width as i64 || y >= canvas.height as i64 {
+                    continue;
+                }
+                let i = ((cy * w + cx) * 4) as usize;
+                let a = px[i + 3] as u32;
+                let screen = &mut out[(y * canvas.width as i64 + x) as usize];
+                let mut blended = 0;
+                for (k, shift) in [16, 8, 0].into_iter().enumerate() {
+                    let cursor = (px[i + k] as u32 * a + 127) / 255;
+                    let under = (*screen >> shift) & 0xff;
+                    blended |= (cursor + (under * (255 - a) + 127) / 255).min(255) << shift;
+                }
+                *screen = blended;
+            }
+        }
+        out
+    }
+}
+
+/// The guest's cursor reaches the page apart from the frames (`examples/cursor`, RV32
+/// and RV64): its image once, in a `cursor_shape` before the first `cursor_position`,
+/// and no frame once it shows. Its places are Grail's cursor registers at the vertical
+/// blanks that moved it (Avalon looks at the screen at its own pace, so the page may
+/// miss a place, never get one out of turn) and it ends at the last; the canvas with
+/// the cursor over it shows, pixel for pixel, what Grail's display does. A page that
+/// opens later gets the cursor as it is, after the full frame.
+#[test]
+fn the_cursor_reaches_the_page_apart_from_the_frames() {
+    let platform = Platform::start("cursor", 64);
+    let api = platform.api();
+    for (name, program) in [("cursor", example("cursor")), ("cursor64", rv64("cursor"))] {
+        let (places, picture) = grail_cursor(&program);
+        let id = create(&api, name, &program, false);
+        let mut page = Page::open(&api, name);
+        let mut canvas = Canvas::new();
+        page.text_of("state", &mut canvas);
+        api.expect(200, api.action(&format!("vms/{id}/start")));
+        let mut cursor = PageCursor::default();
+        let mut shapes = 0;
+        let mut shown = Vec::new();
+        let mut frames_after = 0;
+        loop {
+            match page.recv() {
+                Some(Msg::Rect(x, y, w, h, px)) => {
+                    canvas.draw(x, y, w, h, &px);
+                    if shapes > 0 {
+                        frames_after += 1;
+                    }
+                }
+                Some(Msg::Text(json)) if cursor.apply(&json) => {
+                    if s(&json, "type") == "cursor_shape" {
+                        shapes += 1;
+                    } else {
+                        assert_eq!(shapes, 1, "the image before the place: {json}");
+                        assert!(cursor.visible, "never hidden: {json}");
+                        shown.push((cursor.x as i32, cursor.y as i32));
+                    }
+                }
+                Some(Msg::Text(json)) if s(&json, "type") == "screen" => canvas.resize(&json),
+                Some(Msg::Text(json)) if s(&json, "type") == "end" => break,
+                Some(Msg::Text(_)) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(shapes, 1, "{name}: the image once");
+        assert_eq!(frames_after, 0, "{name}: no frame once the cursor shows");
+        let mut path = places.iter();
+        assert!(
+            shown.iter().all(|place| path.any(|p| p == place)),
+            "{name}: {shown:?} in the order of Grail's {places:?}"
+        );
+        assert_eq!(shown.last(), places.last(), "{name}: the last place");
+        let (w, h, px) = cursor.image.clone().unwrap();
+        assert_eq!((w, h), (64, 64));
+        let pixel = |x: usize, y: usize| &px[(y * 64 + x) * 4..][..4];
+        assert_eq!(pixel(0, 0), [0, 0, 0, 0xff], "the tip, opaque black");
+        assert_eq!(pixel(1, 2), [0xff; 4], "inside, opaque white");
+        assert_eq!(
+            pixel(0, 16),
+            [0, 0, 0xff, 0x80],
+            "the tail, straight blue half covered"
+        );
+        assert_eq!(pixel(40, 40), [0; 4], "clear");
+        assert!(
+            cursor.over(&canvas) == picture,
+            "{name}: the page shows what Grail does"
+        );
+
+        // Opened after the end: the full frame, the cursor's image and place, the end.
+        let mut late = Page::open(&api, name);
+        let mut canvas = Canvas::new();
+        let mut cursor = PageCursor::default();
+        let mut order = Vec::new();
+        loop {
+            match late.recv() {
+                Some(Msg::Rect(x, y, w, h, px)) => {
+                    canvas.draw(x, y, w, h, &px);
+                    order.push("frame".to_string());
+                }
+                Some(Msg::Text(json)) => {
+                    let kind = s(&json, "type").to_string();
+                    match kind.as_str() {
+                        "screen" => canvas.resize(&json),
+                        "end" => break,
+                        _ => {
+                            cursor.apply(&json);
+                        }
+                    }
+                    order.push(kind);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            order,
+            ["screen", "state", "frame", "cursor_shape", "cursor_position"],
+            "{name}"
+        );
+        assert_eq!((cursor.x as i32, cursor.y as i32), *places.last().unwrap());
+        assert!(cursor.over(&canvas) == picture, "{name}: the late page too");
     }
     platform.stop();
 }
