@@ -1,13 +1,3 @@
-    .bss
-
-    # int calls: 4 bytes
-    .globl calls
-    .balign 4
-    .type calls, @object
-    .size calls, 4
-calls:
-    .zero 4
-
     .text
 
     # int bump(void): frame 16 bytes
@@ -36,6 +26,18 @@ bump:
     addi  sp, sp, 16
     ret
     .size bump, . - bump
+
+    .bss
+
+    # int calls: 4 bytes
+    .globl calls
+    .balign 4
+    .type calls, @object
+    .size calls, 4
+calls:
+    .zero 4
+
+    .text
 
     # int main(void): frame 32 bytes
     #     -20(s0)  local int r

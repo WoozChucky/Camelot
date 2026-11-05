@@ -347,9 +347,6 @@ enum TypeKey {
 struct Global {
     var: Var,
     external: bool,
-    /// Defined with an initializer (else a tentative definition, which clang
-    /// emits at the end of the file).
-    initialized: bool,
     /// What its initializer did: the string literals it holds and the
     /// symbols it refers to.
     events: Vec<Event>,
@@ -381,8 +378,6 @@ pub(crate) enum Event {
     /// An enumeration constant of this enum, which clang describes as its
     /// code uses the constant.
     Enum(usize),
-    /// A reference to a symbol (a function's or a global's).
-    Ref(String),
 }
 
 /// The debug information of one translation unit as it is generated.
@@ -398,20 +393,24 @@ pub(crate) struct Lines {
     /// that only declares a type), by number: written before the file's
     /// first `.loc` if it gets one, else with the debug sections.
     pending_files: Vec<(u32, String)>,
+    /// The final `.file` numbers of the numbers given as the code was
+    /// generated ([`Lines::renumber`]).
+    renumbered: HashMap<u32, u32>,
     /// How many blocks have labels.
     blocks: u32,
     functions: Vec<Function>,
     globals: Vec<Global>,
     /// The string literals, in the order they come.
     literals: Vec<Literal>,
-    /// The functions and the globals, in the order they come: indices in
-    /// `functions` (true) or `globals` (false).
+    /// The functions and the globals, in the order clang's front end emits
+    /// them, which code generation follows: indices in `functions` (true) or
+    /// `globals` (false).
     items: Vec<(bool, usize)>,
+    /// The functions in the order of their code, which LLVM describes them
+    /// in (indices in `functions`).
+    code: Vec<usize>,
     /// The events of the function or global being generated.
     events: Vec<Event>,
-    /// The events of the file's compound literals (hidden globals, which are
-    /// not described), by symbol: those of the global that refers to one.
-    hidden: HashMap<String, Vec<Event>>,
     types: Vec<TypeNode>,
     type_ids: HashMap<TypeKey, usize>,
     /// The records, typedefs and enums in the table, kept alive so that
@@ -419,6 +418,16 @@ pub(crate) struct Lines {
     keep: Vec<Arc<dyn std::any::Any>>,
     /// The target, whose addresses are 4 or 8 bytes.
     xlen: Xlen,
+}
+
+/// A `.file` or `.loc` directive `line` of file `from`, of file `to`.
+fn renumbered_line(line: &str, from: u32, to: u32) -> String {
+    let (head, tail) = line.split_at(line.find(['.']).expect("a directive"));
+    let (name, rest) = tail.split_once(' ').expect("a directive's number");
+    let rest = rest
+        .strip_prefix(&from.to_string())
+        .expect("the directive's number");
+    format!("{head}{name} {to}{rest}")
 }
 
 /// `s` as an assembly string literal.
@@ -443,13 +452,14 @@ impl Lines {
             numbers: HashMap::new(),
             by_name: HashMap::new(),
             pending_files: Vec::new(),
+            renumbered: HashMap::new(),
             blocks: 0,
             functions: Vec::new(),
             globals: Vec::new(),
             literals: Vec::new(),
             items: Vec::new(),
+            code: Vec::new(),
             events: Vec::new(),
-            hidden: HashMap::new(),
             types: Vec::new(),
             type_ids: HashMap::new(),
             keep: Vec::new(),
@@ -500,6 +510,61 @@ impl Lines {
         let (n, directive) = self.number(pos.file);
         self.pending_files.extend(directive.map(|d| (n, d)));
         n
+    }
+
+    /// Numbers the files again in the order the output `text` needs them,
+    /// and returns it with its `.file` and `.loc` directives renumbered.
+    /// Code is generated in the order clang's front end emits it, and
+    /// written in the order of its symbols (see "Order" in
+    /// [`crate::codegen`]), so a `.loc` may come before the `.file` given
+    /// as its file was first seen: the numbers go by the output instead,
+    /// then the files only declarations name.
+    pub fn renumber(&mut self, text: &str) -> String {
+        let directive = |l: &str, name: &str| -> Option<u32> {
+            let rest = l.trim_start().strip_prefix(name)?;
+            rest.split_whitespace().next()?.parse().ok()
+        };
+        // Each file's `.file`, wherever it was written: it moves to before
+        // the first `.loc` of the file in the output.
+        let mut files: HashMap<u32, &str> = HashMap::new();
+        for l in text.split_inclusive('\n') {
+            if let Some(n) = directive(l, ".file ").filter(|&n| n != 0) {
+                files.insert(n, l);
+            }
+        }
+        let mut map: HashMap<u32, u32> = HashMap::from([(0, 0)]);
+        let mut out = String::with_capacity(text.len());
+        for l in text.split_inclusive('\n') {
+            if directive(l, ".file ").is_some_and(|n| n != 0) {
+                continue;
+            }
+            let Some(n) = directive(l, ".loc ") else {
+                out.push_str(l);
+                continue;
+            };
+            if !map.contains_key(&n) {
+                let next = map.len() as u32;
+                map.insert(n, next);
+                out.push_str(&renumbered_line(files[&n], n, next));
+            }
+            out.push_str(&renumbered_line(l, n, map[&n]));
+        }
+        for (n, _) in &self.pending_files {
+            let next = map.len() as u32;
+            map.entry(*n).or_insert(next);
+        }
+        self.renumbered = map;
+        out
+    }
+
+    /// The final number of file `n`.
+    fn final_file(&self, n: u32) -> u32 {
+        self.renumbered.get(&n).copied().unwrap_or(n)
+    }
+
+    /// A `DW_AT_decl_file` of file `n`.
+    fn file_val(&self, n: u32) -> Val {
+        Val::Const(self.final_file(n).into())
     }
 
     /// The labels at the start and the end of a new block's code.
@@ -662,35 +727,17 @@ impl Lines {
         }
     }
 
-    /// A global variable the file defines, at symbol `sym`, with an
-    /// initializer or not (`initialized`); the events since the last function
-    /// or global are its initializer's.
-    #[allow(clippy::too_many_arguments)]
-    pub fn global(
-        &mut self,
-        name: &str,
-        sym: &str,
-        ty: (&Type, &Spelled),
-        pos: Pos,
-        external: bool,
-        initialized: bool,
-    ) {
+    /// A global variable the file defines, at symbol `sym`; the events
+    /// since the last function or global are its initializer's.
+    pub fn global(&mut self, name: &str, sym: &str, ty: (&Type, &Spelled), pos: Pos, external: bool) {
         let var = self.var(name, ty.0, ty.1, pos, Location::Symbol(sym.to_string()));
         let events = std::mem::take(&mut self.events);
         self.items.push((false, self.globals.len()));
         self.globals.push(Global {
             var,
             external,
-            initialized,
             events,
         });
-    }
-
-    /// A compound literal of the file's scope, at symbol `sym`: not described,
-    /// its initializer's events are those of the global that refers to it.
-    pub fn hidden(&mut self, sym: &str) {
-        let events = std::mem::take(&mut self.events);
-        self.hidden.insert(sym.to_string(), events);
     }
 
     /// A variable declared in the function being generated, as clang's front
@@ -747,18 +794,12 @@ impl Lines {
         });
     }
 
-    /// A reference to symbol `sym` in the code or the data generated.
-    pub fn reference(&mut self, sym: &str) {
-        self.events.push(Event::Ref(sym.to_string()));
-    }
-
-    /// The events since the last function are its own (its static locals'
-    /// data, emitted after it).
-    pub fn statics_done(&mut self) {
-        let events = std::mem::take(&mut self.events);
-        if let Some(f) = self.functions.last_mut() {
-            f.events.extend(events);
-        }
+    /// The functions, by name, in the order of their code.
+    pub fn code_order(&mut self, names: &[&str]) {
+        self.code = names
+            .iter()
+            .filter_map(|n| self.functions.iter().position(|f| f.name == *n))
+            .collect();
     }
 
     /// Records function `name`, whose code ends at label `end`, for its
@@ -812,7 +853,7 @@ impl Lines {
         let mut d = Die::new(tag, &v.name);
         d.attr(AT_LOCATION, Val::Expr(location));
         d.attr(AT_NAME, Val::Str(v.name.clone()));
-        d.attr(AT_DECL_FILE, Val::Const(v.file.into()));
+        d.attr(AT_DECL_FILE, self.file_val(v.file));
         d.attr(AT_DECL_LINE, Val::Const(v.line.into()));
         if let Some(t) = v.ty {
             d.attr(AT_TYPE, Val::Ref(t));
@@ -826,7 +867,6 @@ impl Lines {
         self.global_die(&Global {
             var: v.clone(),
             external: false,
-            initialized: true,
             events: Vec::new(),
         })
     }
@@ -840,7 +880,7 @@ impl Lines {
         for l in &s.labels {
             let mut d = Die::new(TAG_LABEL, &l.name);
             d.attr(AT_NAME, Val::Str(l.name.clone()));
-            d.attr(AT_DECL_FILE, Val::Const(l.file.into()));
+            d.attr(AT_DECL_FILE, self.file_val(l.file));
             d.attr(AT_DECL_LINE, Val::Const(l.line.into()));
             d.attr(AT_DECL_COLUMN, Val::Const(l.col.into()));
             d.attr(AT_LOW_PC, Val::Addr(l.sym.clone()));
@@ -868,7 +908,7 @@ impl Lines {
         d.attr(AT_HIGH_PC, Val::Len(f.end.clone(), f.name.clone()));
         d.attr(AT_FRAME_BASE, Val::Expr(vec![Expr::Bytes(vec![OP_REG8])]));
         d.attr(AT_NAME, Val::Str(f.name.clone()));
-        d.attr(AT_DECL_FILE, Val::Const(f.file.into()));
+        d.attr(AT_DECL_FILE, self.file_val(f.file));
         d.attr(AT_DECL_LINE, Val::Const(f.line.into()));
         // `int f()` has no prototype; clang says so by leaving this out.
         if f.prototyped {
@@ -914,7 +954,7 @@ impl Lines {
         if let Some(t) = l.ty {
             d.attr(AT_TYPE, Val::Ref(t));
         }
-        d.attr(AT_DECL_FILE, Val::Const(l.file.into()));
+        d.attr(AT_DECL_FILE, self.file_val(l.file));
         d.attr(AT_DECL_LINE, Val::Const(l.line.into()));
         d.attr(AT_LOCATION, Val::Expr(vec![Expr::Addr(l.label.clone())]));
         d
@@ -953,7 +993,7 @@ impl Lines {
         if g.external {
             d.attr(AT_EXTERNAL, Val::Flag);
         }
-        d.attr(AT_DECL_FILE, Val::Const(v.file.into()));
+        d.attr(AT_DECL_FILE, self.file_val(v.file));
         d.attr(AT_DECL_LINE, Val::Const(v.line.into()));
         let Location::Symbol(sym) = &v.location else {
             unreachable!("a global is at its symbol")
@@ -1059,13 +1099,13 @@ impl Lines {
                     Some(body) => d.attr(AT_BYTE_SIZE, Val::Const(body.size.into())),
                     None => d.attr(AT_DECLARATION, Val::Flag),
                 }
-                d.attr(AT_DECL_FILE, Val::Const((*file).into()));
+                d.attr(AT_DECL_FILE, self.file_val(*file));
                 d.attr(AT_DECL_LINE, Val::Const((*line).into()));
                 for (i, (name, ty, offset, file, line)) in members.iter().enumerate() {
                     let mut m = Die::new(TAG_MEMBER, name);
                     m.attr(AT_NAME, Val::Str(name.clone()));
                     typed(&mut m, *ty);
-                    m.attr(AT_DECL_FILE, Val::Const((*file).into()));
+                    m.attr(AT_DECL_FILE, self.file_val(*file));
                     m.attr(AT_DECL_LINE, Val::Const((*line).into()));
                     // A union's members too, at 0, as clang writes them.
                     m.attr(AT_DATA_MEMBER_LOCATION, Val::Const((*offset).into()));
@@ -1110,7 +1150,7 @@ impl Lines {
                 d.attr(AT_NAME, Val::Str(name.clone()));
                 // A builtin one (`__builtin_va_list`) is nowhere in the file.
                 if pos.line != 0 {
-                    d.attr(AT_DECL_FILE, Val::Const((*file).into()));
+                    d.attr(AT_DECL_FILE, self.file_val(*file));
                     d.attr(AT_DECL_LINE, Val::Const(pos.line.into()));
                 }
                 d
@@ -1124,7 +1164,7 @@ impl Lines {
                     d.attr(AT_NAME, Val::Str(t.clone()));
                 }
                 d.attr(AT_BYTE_SIZE, Val::Const(4));
-                d.attr(AT_DECL_FILE, Val::Const((*file).into()));
+                d.attr(AT_DECL_FILE, self.file_val(*file));
                 d.attr(AT_DECL_LINE, Val::Const((*line).into()));
                 let signed = matches!(self.types[*of], TypeNode::Base(k) if k.signed());
                 for (name, value) in constants {
@@ -1160,8 +1200,8 @@ impl Lines {
         if self.types.iter().any(|t| matches!(t, TypeNode::Array(..))) {
             self.intern(TypeKey::ArraySize, || TypeNode::ArraySize);
         }
-        let first = &self.functions[0].name;
-        let last_end = &self.functions[self.functions.len() - 1].end;
+        let first = &self.functions[self.code[0]].name;
+        let last_end = &self.functions[self.code[self.code.len() - 1]].end;
 
         // The attributes in clang's order.
         let mut cu = Die::new(TAG_COMPILE_UNIT, "the compile unit");
@@ -1209,8 +1249,8 @@ impl Lines {
         let end = cu.layout(12, &mut type_offsets);
 
         let mut s = String::new();
-        for (_, f) in &self.pending_files {
-            let _ = writeln!(s, "    {f}");
+        for (n, f) in &self.pending_files {
+            let _ = writeln!(s, "    {}", renumbered_line(f, *n, self.final_file(*n)));
         }
         let _ = writeln!(s, "\n    .section .debug_abbrev,\"\",@progbits");
         let _ = writeln!(s, ".Ldebug_abbrev0:");

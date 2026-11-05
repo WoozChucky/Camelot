@@ -260,6 +260,35 @@ fn headers_get_their_own_file_numbers() {
     assert!(merlin_as::assemble_to_elf(&asm).is_ok());
 }
 
+/// A `static` function is generated once used, after the others, but its
+/// code is where it was first referred to, as clang has it: a header's file
+/// number is given where the output first needs it, which need not be where
+/// the header's code was first generated.
+#[test]
+fn file_numbers_follow_the_output() {
+    let src = "static int sa(void);\nint f(void) {\n    return sa();\n}\n#include \"a.h\"\n";
+    let load = |p: &Path| {
+        (p == Path::new("a.h")).then(|| {
+            "int ea(void) {\n    return 1;\n}\nstatic int sa(void) {\n    return 2;\n}\n".to_string()
+        })
+    };
+    let asm = merlin::compile_with("m.c", src, &debug_opts("src"), &load).unwrap();
+    let labels: Vec<&str> = asm
+        .lines()
+        .filter(|l| matches!(*l, "f:" | "sa:" | "ea:"))
+        .collect();
+    assert_eq!(labels, ["f:", "sa:", "ea:"], "{asm}");
+    let sa = asm.find("sa:").unwrap();
+    assert!(
+        asm[sa..].starts_with("sa:\n    .file 1 \"src\" \"./a.h\"\n    .loc 1 4 0\n"),
+        "{asm}"
+    );
+    assert_eq!(asm.matches(".file 1 ").count(), 1, "{asm}");
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let tables = elf::Elf::parse(&obj).unwrap().line_tables().unwrap();
+    assert_eq!(tables[0].files, ["src/m.c", "src/./a.h"]);
+}
+
 #[test]
 fn the_command_line_takes_g() {
     let dir = std::env::temp_dir().join(format!("merlin-debug-{}", std::process::id()));
@@ -908,18 +937,14 @@ fn entry_tree(tool: &str, obj: &Path) -> Vec<String> {
 
 /// merlin's entries are clang's, in clang's order (see `src/debug/order.rs`):
 /// for [`VARS`], merlin-dbg's tests/vars/vars.c and every test case, at both
-/// widths, the tree of tags and names llvm-dwarfdump shows is the same, but for
-/// the cases whose entries clang's front end makes differently:
-/// - `func_ptrs.c`, `inline.c`: clang emits a `static` (or inline) function
-///   once it is used, after the others, and its entry with its code; merlin's
-///   code and entries are in the order the functions come.
+/// widths, the tree of tags and names llvm-dwarfdump shows is the same, with
+/// no exception.
 ///
 /// Ignored: it needs clang and llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP`
 /// name them if they are not on the PATH).
 #[test]
 #[ignore]
 fn the_entries_are_clangs_in_clangs_order() {
-    const DIFFERENT: [&str; 2] = ["func_ptrs.c", "inline.c"];
     let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
     let tool = std::env::var("LLVM_DWARFDUMP").unwrap_or_else(|_| "llvm-dwarfdump".into());
     let dir = std::env::temp_dir().join(format!("merlin-order-{}", std::process::id()));
@@ -936,9 +961,7 @@ fn the_entries_are_clangs_in_clangs_order() {
     ];
     for p in cases() {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        if !DIFFERENT.contains(&name.as_str()) {
-            sources.push((name, std::fs::read_to_string(&p).unwrap()));
-        }
+        sources.push((name, std::fs::read_to_string(&p).unwrap()));
     }
     for x in [Xlen::Rv32, Xlen::Rv64] {
         let bits = x.bits();

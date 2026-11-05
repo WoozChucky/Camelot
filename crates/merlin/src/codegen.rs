@@ -31,7 +31,9 @@
 //!   definition, kept local); declarations without a definition emit nothing
 //!   (the linker finds them). Like clang, every function and variable gets
 //!   `.type` (`@function` or `@object`) and `.size`, so the symbol table says
-//!   what each address belongs to.
+//!   what each address belongs to. A `static` function or variable (or an
+//!   inline definition) that nothing emitted uses is not emitted, as clang
+//!   leaves it out ("Order" below).
 //! * Semantics: arithmetic wraps at the width of its type (32 bits for `int`,
 //!   and for `long` on RV32; 64 for `long` on RV64), `/` and `%` truncate
 //!   toward zero (`div`/`rem`, or `divu`/`remu` when unsigned), shifts use the
@@ -42,6 +44,39 @@
 //!   order, and nothing is kept in a register across statements. So
 //!   `volatile` needs nothing special: the code generator never caches,
 //!   removes, merges or reorders memory accesses.
+//!
+//! ## Order
+//!
+//! Functions and variables are generated in the order clang's front end
+//! emits them (`CodeGenModule`), and written in the order clang's module has
+//! them, so that `.text`, `.data`, `.bss` and `.rodata` hold them as clang's
+//! output does at `-O0`:
+//!
+//! * *Emitted*: the file is read as it comes. An external function, and an
+//!   external variable with an initializer, is generated where it stands. A
+//!   `static` function or variable (and an inline definition) is deferred:
+//!   generated once something emitted refers to it, or not at all. The
+//!   variables without an initializer (tentative definitions) are generated
+//!   at the end of the file. Then what was used and is still waiting, each
+//!   one's own uses right after it, depth first (`EmitDeferred`).
+//! * *Written*: each symbol where it was first made: a function as its
+//!   generation starts, or the first time code refers to it; a variable when
+//!   its initializer has been generated (a `static` local before it), or the
+//!   first time code or data refers to it ([`FileGen::create`]). So in
+//!
+//!   ```text
+//!   int f(void) { return g() + sh(1); }   int h(void) { ... }
+//!   static int sh(int x) { return x + h(); }   int g(void) { ... }
+//!   ```
+//!
+//!   `sh` is generated last, but its code comes right after `g`'s, before
+//!   `h`'s: `f`, `g`, `sh`, `h`. A `static` local is data made where its
+//!   declaration is generated; a compound literal of the file's scope is
+//!   generated as the initializer that names it is.
+//!
+//! With `-g` the `.file` numbers go by the order of the output too
+//! ([`Lines::renumber`]), and the debug information by both orders, as
+//! LLVM's does ([`crate::debug`]).
 //!
 //! ## Values and types
 //!
@@ -416,7 +451,7 @@ use crate::elide;
 use crate::sema::arith_type;
 use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
 use crate::{Error, Pos};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 /// Generates assembly for a whole translation unit.
@@ -447,102 +482,147 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
     }
 
     let xlen = prog.xlen;
+    // The definitions, in the order they come; a compound literal of the
+    // file's scope is emitted by the initializer that names it.
+    let mut defs = Vec::new();
+    for item in &prog.items {
+        match item {
+            Item::Func(f) if f.body.is_some() => defs.push(Def::Func(f)),
+            Item::Func(_) => {} // a prototype: the definition is elsewhere
+            Item::Decl(decls) => defs.extend(decls.iter().filter(|d| d.define).map(Def::Var)),
+        }
+    }
+    let n = defs.len();
     let mut file = FileGen {
         xlen,
         out: String::new(),
         section: "",
+        pieces: Vec::new(),
         labels: 0,
         strings: Vec::new(),
         debug: debug.map(|(info, names)| Lines::new(info, names, xlen)),
+        by_symbol: defs
+            .iter()
+            .enumerate()
+            .map(|(k, d)| (d.symbol().to_string(), k))
+            .collect(),
+        defs,
+        emitted: vec![false; n],
+        waiting: vec![false; n],
+        queue: Vec::new(),
+        created: Vec::new(),
+        created_set: HashSet::new(),
+        chunks: HashMap::new(),
     };
+
+    // clang's front end (CodeGenModule): the file, as it comes, emits what
+    // must be emitted and keeps the rest for when it is used; then the
+    // tentative definitions; then, what was used, each one's uses right
+    // after it.
+    for k in 0..n {
+        let def = file.defs[k];
+        if def.hidden() || def.tentative() {
+            continue;
+        }
+        if !def.deferrable() {
+            file.emit(k)?;
+        } else if file.created_set.contains(def.symbol()) {
+            file.queue.push(k);
+        } else {
+            file.waiting[k] = true;
+        }
+    }
+    for k in 0..n {
+        let def = file.defs[k];
+        if !def.tentative() || def.hidden() {
+            continue;
+        }
+        if def.deferrable() && !file.created_set.contains(def.symbol()) {
+            file.waiting[k] = true;
+        } else {
+            file.emit(k)?;
+        }
+    }
+    file.deferred()?;
+
+    // The output: each symbol's code or data in the order the symbols were
+    // made (the module's order, which LLVM writes them in), then the string
+    // literals and the debug sections.
+    file.out.clear();
+    file.section = "";
     if let Some(d) = &file.debug {
         let _ = writeln!(file.out, "    {}", d.file0());
     }
-    for item in &prog.items {
-        match item {
-            Item::Func(f) => {
-                let Some(body) = &f.body else {
-                    continue; // a prototype: the definition is elsewhere
-                };
-                // A variadic function keeps the argument registers its named
-                // parameters leave free at the top of its frame.
-                let Type::Func(ft) = f.ty() else {
-                    unreachable!("a function's type")
-                };
-                let (_, named_words) = abi::arguments(&ft, xlen);
-                let va_save = if f.variadic {
-                    word(xlen) * (abi::ARG_REGS - named_words.min(abi::ARG_REGS)) as i32
-                } else {
-                    0
-                };
-                let Some((offsets, frame)) = layout(&f.locals, saved_regs(xlen) + va_save, xlen) else {
-                    let msg = format!("the locals of '{}' need a stack frame larger than 2 GiB", f.name);
-                    return Err(Error::new(f.pos, msg));
-                };
-                let mut g = FuncGen {
-                    xlen,
-                    func: f,
-                    offsets,
-                    frame,
-                    named_words,
-                    va_save,
-                    lines: Vec::new(),
-                    depth: 0,
-                    breaks: Vec::new(),
-                    continues: Vec::new(),
-                    file: &mut file,
-                    ret_label: format!(".L.return.{}", f.name),
-                    statics: Vec::new(),
-                    elided_cases: Vec::new(),
-                    after_prologue: false,
-                    scopes: Vec::new(),
-                };
-                g.function(body);
-                let (lines, statics) = (g.lines, g.statics);
-                file.switch(".text");
-                file.out.push('\n');
-                let long = relax_branches(&lines);
-                check_size(f, &lines, &long)?;
-                render(&lines, &long, &mut file.out);
-                for d in statics {
-                    file.variable(d);
-                }
-                if let Some(d) = file.debug.as_mut() {
-                    d.statics_done();
-                }
+    let created = std::mem::take(&mut file.created);
+    for sym in &created {
+        for (section, text) in file.chunks.remove(sym).unwrap_or_default() {
+            if !section.is_empty() {
+                file.switch(section);
             }
-            Item::Decl(decls) => {
-                for d in decls.iter().filter(|d| d.define) {
-                    file.variable(d);
-                    // A compound literal's hidden variable is not described, as
-                    // clang has it: its string literals go with the global that
-                    // names it.
-                    if d.name.starts_with(".compoundliteral.") {
-                        if let (Some(dbg), Some(VarRef::Global(sym))) = (file.debug.as_mut(), &d.var) {
-                            dbg.hidden(sym);
-                        }
-                        continue;
-                    }
-                    if let (Some(dbg), Some(VarRef::Global(sym))) = (file.debug.as_mut(), &d.var) {
-                        let external = d.storage != Storage::Static;
-                        dbg.global(
-                            &d.name,
-                            sym,
-                            (&d.ty, &d.spelled),
-                            d.pos,
-                            external,
-                            d.init.is_some(),
-                        );
-                    }
-                }
-            }
+            file.out.push_str(&text);
         }
+    }
+    if let Some(d) = &mut file.debug {
+        file.out = d.renumber(&file.out);
     }
     file.strings();
     if let Some(d) = &mut file.debug {
+        let functions: Vec<&str> = created
+            .iter()
+            .filter(|s| {
+                file.by_symbol
+                    .get(*s)
+                    .is_some_and(|&k| matches!(file.defs[k], Def::Func(_)))
+            })
+            .map(String::as_str)
+            .collect();
+        d.code_order(&functions);
         file.out.push_str(&d.sections());
     }
     Ok(file.out)
+}
+
+/// A definition of the file: a function, or a global variable (a compound
+/// literal of the file's scope among them). The order they are emitted in
+/// is clang's (see "Order" in the module's documentation).
+#[derive(Clone, Copy)]
+enum Def<'a> {
+    Func(&'a Function),
+    Var(&'a Declarator),
+}
+
+impl<'a> Def<'a> {
+    fn symbol(&self) -> &'a str {
+        match self {
+            Def::Func(f) => &f.name,
+            Def::Var(d) => match &d.var {
+                Some(VarRef::Global(sym)) => sym,
+                _ => unreachable!("sema gives globals a symbol"),
+            },
+        }
+    }
+
+    /// Emitted only once used: a `static` function or global (and a C99
+    /// inline definition, which merlin keeps local), as clang's
+    /// `MustBeEmitted` says of internal linkage.
+    fn deferrable(&self) -> bool {
+        match self {
+            Def::Func(f) => f.is_static || f.inline_only,
+            Def::Var(d) => d.storage == Storage::Static,
+        }
+    }
+
+    /// A global without an initializer: clang emits it at the end of the
+    /// file (`CompleteTentativeDefinition`).
+    fn tentative(&self) -> bool {
+        matches!(self, Def::Var(d) if d.init.is_none())
+    }
+
+    /// A compound literal of the file's scope, which the initializer that
+    /// names it emits (`GetAddrOfConstantCompoundLiteral`).
+    fn hidden(&self) -> bool {
+        matches!(self, Def::Var(d) if d.name.starts_with(".compoundliteral."))
+    }
 }
 
 /// The bytes of a register, and of an argument word: 4 on RV32, 8 on RV64.
@@ -685,21 +765,41 @@ fn log2(n: u32) -> Option<u32> {
 
 /// What is shared by the whole file: the output, the label counter and the
 /// string literals seen so far.
-struct FileGen {
+struct FileGen<'a> {
     /// The target.
     xlen: Xlen,
+    /// The text being written: the piece of a symbol's output in
+    /// `section` (or the whole file, at the end).
     out: String,
     /// The section the output is in.
     section: &'static str,
+    /// The pieces of the symbol being written so far, each in its section.
+    pieces: Vec<(&'static str, String)>,
     /// Label counter shared by every function in the file, so labels are unique.
     labels: usize,
     /// String literals, emitted at the end; literal `i` is `.L.str.<i>`.
     strings: Vec<Vec<u8>>,
     /// With `-g`, the debug information ([`crate::debug`]).
     debug: Option<Lines>,
+    /// The file's definitions, in the order they come, and by symbol.
+    defs: Vec<Def<'a>>,
+    by_symbol: HashMap<String, usize>,
+    /// The definitions emitted so far.
+    emitted: Vec<bool>,
+    /// Deferred definitions waiting for a use (clang's `DeferredDecls`).
+    waiting: Vec<bool>,
+    /// Used, to be emitted (clang's `DeferredDeclsToEmit`).
+    queue: Vec<usize>,
+    /// Every symbol made so far, defined or referred to, in the order it was
+    /// made: the order of the module's functions and globals, in which the
+    /// output has them.
+    created: Vec<String>,
+    created_set: HashSet<String>,
+    /// The output of each symbol emitted, in pieces by section.
+    chunks: HashMap<String, Vec<(&'static str, String)>>,
 }
 
-impl FileGen {
+impl<'a> FileGen<'a> {
     fn switch(&mut self, section: &'static str) {
         if self.section != section {
             let directive = if section == ".rodata" {
@@ -716,6 +816,148 @@ impl FileGen {
         }
     }
 
+    // ---- the order of the output ----
+
+    /// Makes symbol `sym`, as clang makes a function or global the first
+    /// time it is defined or referred to (`GetOrCreateLLVMFunction`,
+    /// `GetOrCreateLLVMGlobal`): the output has the symbols in this order. A
+    /// deferred definition waiting for its first use is to be emitted now.
+    fn create(&mut self, sym: &str) {
+        if self.created_set.insert(sym.to_string()) {
+            self.created.push(sym.to_string());
+            if let Some(&k) = self.by_symbol.get(sym) {
+                if self.waiting[k] {
+                    self.waiting[k] = false;
+                    self.queue.push(k);
+                }
+            }
+        }
+    }
+
+    /// A reference to symbol `sym` in the code or the data generated. A
+    /// compound literal it names is emitted first, as clang emits one where
+    /// an initializer names it.
+    fn reference(&mut self, sym: &str) {
+        if let Some(&k) = self.by_symbol.get(sym) {
+            if self.defs[k].hidden() && !self.emitted[k] {
+                self.emit(k).expect("a variable is emitted without errors");
+            }
+        }
+        self.create(sym);
+    }
+
+    /// Emits definition `k`: its code or its data, and with `-g` its entry.
+    fn emit(&mut self, k: usize) -> Result<(), Error> {
+        self.emitted[k] = true;
+        match self.defs[k] {
+            Def::Func(f) => self.function(f),
+            Def::Var(d) => {
+                self.variable(d, false);
+                // A compound literal's hidden variable is not described, as
+                // clang has it: its string literals go with the global that
+                // names it, which is being emitted.
+                if self.defs[k].hidden() {
+                    return Ok(());
+                }
+                if let (Some(dbg), Some(VarRef::Global(sym))) = (self.debug.as_mut(), &d.var) {
+                    let external = d.storage != Storage::Static;
+                    dbg.global(&d.name, sym, (&d.ty, &d.spelled), d.pos, external);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Emits what was used and not emitted yet, each one's uses right after
+    /// it, depth first (clang's `EmitDeferred`).
+    fn deferred(&mut self) -> Result<(), Error> {
+        let now = std::mem::take(&mut self.queue);
+        for k in now {
+            if !self.emitted[k] {
+                self.emit(k)?;
+                if !self.queue.is_empty() {
+                    self.deferred()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the output of a symbol.
+    fn begin(&mut self) {
+        self.out.clear();
+        self.section = "";
+        self.pieces.clear();
+    }
+
+    /// Goes on in `section`.
+    fn piece(&mut self, section: &'static str) {
+        if self.section != section {
+            if !self.out.is_empty() {
+                let text = std::mem::take(&mut self.out);
+                self.pieces.push((self.section, text));
+            }
+            self.section = section;
+        }
+    }
+
+    /// Ends the output of symbol `sym`.
+    fn finish(&mut self, sym: &str) {
+        let text = std::mem::take(&mut self.out);
+        self.pieces.push((self.section, text));
+        let pieces = std::mem::take(&mut self.pieces);
+        self.chunks.insert(sym.to_string(), pieces);
+    }
+
+    /// Generates function `f`.
+    fn function(&mut self, f: &'a Function) -> Result<(), Error> {
+        let xlen = self.xlen;
+        let body = f.body.as_ref().expect("a definition has a body");
+        self.create(&f.name);
+        // A variadic function keeps the argument registers its named
+        // parameters leave free at the top of its frame.
+        let Type::Func(ft) = f.ty() else {
+            unreachable!("a function's type")
+        };
+        let (_, named_words) = abi::arguments(&ft, xlen);
+        let va_save = if f.variadic {
+            word(xlen) * (abi::ARG_REGS - named_words.min(abi::ARG_REGS)) as i32
+        } else {
+            0
+        };
+        let Some((offsets, frame)) = layout(&f.locals, saved_regs(xlen) + va_save, xlen) else {
+            let msg = format!("the locals of '{}' need a stack frame larger than 2 GiB", f.name);
+            return Err(Error::new(f.pos, msg));
+        };
+        let mut g = FuncGen {
+            xlen,
+            func: f,
+            offsets,
+            frame,
+            named_words,
+            va_save,
+            lines: Vec::new(),
+            depth: 0,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            file: self,
+            ret_label: format!(".L.return.{}", f.name),
+            elided_cases: Vec::new(),
+            after_prologue: false,
+            scopes: Vec::new(),
+        };
+        g.function(body);
+        let lines = g.lines;
+        self.begin();
+        self.piece(".text");
+        self.out.push('\n');
+        let long = relax_branches(&lines);
+        check_size(f, &lines, &long)?;
+        render(&lines, &long, &mut self.out);
+        self.finish(&f.name);
+        Ok(())
+    }
+
     /// The label of a string literal, at `pos`: the same bytes are one
     /// literal, as clang merges them (C99 6.4.5p6 leaves it open).
     fn string(&mut self, bytes: &[u8], pos: Pos) -> String {
@@ -730,25 +972,35 @@ impl FileGen {
         label
     }
 
-    /// Emits a global variable or `static` local: its symbol and its data.
-    fn variable(&mut self, d: &Declarator) {
+    /// Emits a global variable or, when `local`, a `static` local: its
+    /// symbol and its data. clang makes a global's symbol after its
+    /// initializer (`EmitGlobalVarDefinition`), unless something referred
+    /// to it before, and a static local's before
+    /// (`getOrCreateStaticVarDecl`), so the symbols its initializer refers
+    /// to come before a global's and after a static local's.
+    fn variable(&mut self, d: &Declarator, local: bool) {
         let Some(VarRef::Global(sym)) = &d.var else {
             unreachable!("sema gives globals and statics a symbol")
         };
+        if local {
+            self.create(sym);
+        }
         let mut data = Vec::new();
         if let Some(init) = &d.init {
             self.data(&d.ty, init, &mut data);
         }
+        self.create(sym);
+        self.begin();
         // A `const` object never changes: read-only data, as clang does (a
         // `const volatile` one may be changed from outside, so it stays
         // writable).
         let quals = d.ty.quals();
         if quals.konst && !quals.volatile {
-            self.switch(".rodata");
+            self.piece(".rodata");
         } else if d.init.is_some() {
-            self.switch(".data");
+            self.piece(".data");
         } else {
-            self.switch(".bss");
+            self.piece(".bss");
         }
         let size =
             d.ty.size(self.xlen)
@@ -781,6 +1033,7 @@ impl FileGen {
         for line in data {
             let _ = writeln!(self.out, "    {line}");
         }
+        self.finish(sym);
     }
 
     /// The directives for an object of type `ty` initialized by `init`.
@@ -863,9 +1116,7 @@ impl FileGen {
                     } => {
                         let sym = match base {
                             Base::Sym(s) => {
-                                if let Some(d) = self.debug.as_mut() {
-                                    d.reference(&s);
-                                }
+                                self.reference(&s);
                                 s
                             }
                             Base::Str(bytes) => self.string(&bytes, e.pos),
@@ -1022,11 +1273,9 @@ struct FuncGen<'a, 'f> {
     /// `continue` goes for each enclosing loop, innermost last.
     breaks: Vec<String>,
     continues: Vec<String>,
-    file: &'f mut FileGen,
+    file: &'f mut FileGen<'a>,
     /// Every `return` jumps here, to the epilogue.
     ret_label: String,
-    /// The function's `static` locals, emitted as data after it.
-    statics: Vec<&'a Declarator>,
     /// The ids of the `case`s and `default`s of each `switch` on a constant
     /// generated so far, whose labels nothing jumps to.
     elided_cases: Vec<usize>,
@@ -1068,9 +1317,7 @@ impl<'a> FuncGen<'a, '_> {
 
     /// `la reg, symbol`: `auipc` + `addi`.
     fn la(&mut self, reg: &str, symbol: &str) {
-        if let Some(d) = self.file.debug.as_mut() {
-            d.reference(symbol);
-        }
+        self.file.reference(symbol);
         self.ins_sized(8, "la", format!("{reg}, {symbol}"));
     }
 
@@ -1555,8 +1802,15 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             StmtKind::Decl(decls) => {
-                // Each declarator described, then initialized, as clang does.
+                // Each declarator described, then initialized, as clang does;
+                // a static local's data first, then its entry
+                // (`EmitStaticVarDecl`).
                 for d in decls {
+                    if matches!(d.var, Some(VarRef::Global(_))) {
+                        self.local_decl(d);
+                        self.debug_decl(d);
+                        continue;
+                    }
                     self.debug_decl(d);
                     if d.init.is_some() && matches!(d.var, Some(VarRef::Local(_))) {
                         self.loc(d.pos);
@@ -1872,8 +2126,9 @@ impl<'a> FuncGen<'a, '_> {
 
     fn local_decl(&mut self, d: &'a Declarator) {
         let id = match &d.var {
-            // A static local is data, emitted after the function.
-            Some(VarRef::Global(_)) => return self.statics.push(d),
+            // A static local is data, emitted where it is declared, as clang
+            // emits it.
+            Some(VarRef::Global(_)) => return self.file.variable(d, true),
             Some(VarRef::Local(id)) => *id,
             None => unreachable!("sema resolves every declarator"),
         };
@@ -2983,9 +3238,7 @@ impl<'a> FuncGen<'a, '_> {
         match direct {
             // `call` is `auipc ra` + `jalr ra`: two words.
             Some(name) => {
-                if let Some(d) = self.file.debug.as_mut() {
-                    d.reference(name);
-                }
+                self.file.reference(name);
                 self.ins_sized(8, "call", name)
             }
             None => self.ins("jalr", "t1"),
@@ -3438,13 +3691,43 @@ main:
         // Each function symbol carries its type and size, as clang's do: ten
         // instructions here, and the static one's too.
         let obj = merlin_as::assemble(&compile(
-            "int main(void) { return 42; } static int f(void) { return 1; }",
+            "int main(void) { return 42; } static int f(void) { return 1; } int (*use)(void) = f;",
         ))
         .unwrap();
         for name in ["main", "f"] {
             let s = obj.symbols.iter().find(|s| s.name == name).unwrap();
             assert_eq!((s.size, s.ty), (40, merlin_as::asm::SymType::Func), "{name}");
         }
+    }
+
+    /// Functions and globals come in clang's order (checked against clang
+    /// 23's): each where it was first defined or referred to, a `static`
+    /// one emitted only once used, after the others, and a tentative
+    /// definition at the end; an unused `static` one not at all.
+    #[test]
+    fn definitions_are_in_clangs_order() {
+        let asm = compile(
+            "extern int vb; static int sh(int); int g(void);\n\
+             static int unused_s(void) { return 7; }\n\
+             static int sv = 5; static int sv_unused = 6; int ta;\n\
+             int f(void) { return g() + sh(1) + vb + sv; }\n\
+             int h(void) { return 3; }\n\
+             static int sh(int x) { return x + h(); }\n\
+             static int sd(void) { return 4; }\n\
+             int g(void) { return sd() + ta; }\n\
+             int vb = 2; int vc = 3;\n\
+             int main(void) { static int n = 1; return f() + vc + n; }\n",
+        );
+        let symbols: Vec<&str> = asm
+            .lines()
+            .filter_map(|l| l.strip_suffix(':'))
+            .filter(|l| !l.starts_with('.'))
+            .collect();
+        assert_eq!(
+            symbols,
+            ["f", "g", "sh", "vb", "sv", "h", "sd", "ta", "vc", "main", "main.n"],
+            "{asm}"
+        );
     }
 
     #[test]
@@ -3681,7 +3964,7 @@ main:
         let asm = compile(
             "int g = 5; char c = 'x'; short h[3] = {1, -1}; int *p = &g + 1; char s[] = \"hi\\n\";
              static unsigned u; char *str = \"a\\\"b\\\\\"; char raw[3] = {1, 2, 255}; int zeros[2] = {0};
-             int main() { static int n = 3; return n; }",
+             int main() { static int n = 3; return n + u; }",
         );
         let data = &asm;
         for want in [
@@ -4137,8 +4420,10 @@ main:
         ] {
             assert!(asm.contains(want), "missing {want:?} in\n{asm}");
         }
+        // `cv` is in `.data`, after `v`; the tentative `z` comes last.
+        let before = &asm[..asm.find("cv:").unwrap()];
         assert!(
-            !asm[asm.find("cv:").unwrap() - 200..].contains(".rodata"),
+            before.rfind("    .data\n") > before.rfind(".section .rodata"),
             "{asm}"
         );
     }
