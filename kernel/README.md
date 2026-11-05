@@ -1,13 +1,17 @@
 # Camelot kernel
 
-The Camelot OS kernel, in C with a little assembly. A small M-mode layer sets
-up trap delegation and the timer, then the kernel runs in S-mode: it prints a
-banner and a `kprintf` self-test over the UART, puts every free page of RAM on
+The Camelot OS kernel, in C with a little assembly. It runs in S-mode on an
+SBI, the RISC-V Supervisor Binary Interface that Linux uses and OpenSBI
+provides on boards: Camelot's own on Grail (`machine.S`, in M-mode) sets up
+trap delegation and forwards the timer and IPIs, starts the other harts and
+stops the machine, and the kernel asks for those only through SBI calls
+(`sbi.c`; spec section 10, "Kernel traps"). It prints a banner, what the SBI
+has and a `kprintf` self-test over the UART, puts every free page of RAM on
 the page allocator's free list, turns on Sv32 paging with a kernel page table,
 runs the memory self-tests, lists the disks, takes ten timer ticks, tests the
 first disk if there is one and mounts the filesystem on it, gives the first
 network card an address (DHCP, or a static one), wakes the other harts if
-the machine has several, and starts the shell, a user program, as the first
+the machine has several (the SBI's `hart_start`), and starts the shell, a user program, as the first
 process. User programs run in U-mode, each in its own page table, switching on
 every timer tick, on every hart at once; they call the kernel through system calls
 (`docs/camelot-syscalls.md`): files, directories, the console and pipes
@@ -32,9 +36,11 @@ cargo run --release -p grail -- --clock 10MHz kernel/kernel.elf    # ticks in re
    \____| /_/   \_\ |_|  |_| |_____| |_____|  \___/    |_|
 
 Camelot v0.1.0 booting...
+sbi: v2.0, implementation 0x434d4c54 version 0x1
+sbi: extensions TIME IPI HSM SRST DBCN
 kprintf: d=-42 u=4294967295 x=cafef00d p=0x80000000 s=excalibur c=K %=%
 kprintf self-test: 26/26 passed
-[dbg] pc=80000054 a0 = 0x00000000 (0)
+[dbg] pc=80005128 a0 = 0x00000000 (0)
 ram: 4 MiB at 0x80000000
 paging: on (Sv32)
 vm self-test: 26/26 passed
@@ -164,8 +170,8 @@ PING 10.0.2.2: 56 data bytes
 ```
 
 On a machine of several harts (`--harts N`, up to 8; spec section 10,
-"Kernel SMP"), hart 0 boots the kernel alone, then wakes the others, which
-join the scheduler: any hart runs any runnable thread, so up to N programs,
+"Kernel SMP"), hart 0 boots the kernel alone, while the SBI holds the others,
+then starts them with `hart_start`, and they join the scheduler: any hart runs any runnable thread, so up to N programs,
 or N threads of one program, run at the same time. `harts` shows what each one is doing, and `primes`
 keeps them all busy:
 
@@ -446,13 +452,16 @@ back after a trap from U-mode.
 ## Several harts
 
 `smp.c` says how the kernel runs on several harts (spec section 10, "Kernel
-SMP"). Hart 0 boots alone; `smp_boot()` gives each other hart a stack and
-wakes them with an IPI, and each goes through `_start` and `start()` (its
-own M-mode trap vector, `mscratch` block and timer) into `hart_main()`,
-which runs the scheduler. The thread table is shared: any hart runs any
+SMP"). Hart 0 boots alone, while the SBI holds every other hart STOPPED in
+M-mode (its coldboot woke them out of the boot ROM's park loop, and each set
+up its own M-mode trap vector and `mscratch` block); `smp_boot()` gives each
+a kernel stack and starts it with the SBI's `hart_start` at
+`secondary_entry`, which turns paging on and goes into `hart_main()`: its
+tick, then the scheduler. A hart that fails to start, or doesn't come up
+within a second, is reported and left out. The thread table is shared: any hart runs any
 runnable thread, under `proc_lock`, and a hart with nothing to run waits in
 `wfi` until its next tick, or until another hart makes a thread runnable
-and wakes it with an IPI. Only hart 0 counts the clock (`ticks`, `sleep`,
+and wakes it with an IPI (the SBI's `send_ipi`). Only hart 0 counts the clock (`ticks`, `sleep`,
 the network's timer) and takes the devices' interrupts. Taking away a
 mapping (`unmap_pages()`) shoots it down on the harts that may hold it
 (`tlb_shootdown()`) before the page is reused. A panic on one hart stops
@@ -483,17 +492,18 @@ one process.
 
 | File | What it does |
 |---|---|
-| `entry.S` | `_start` (M-mode): early trap vector, stack (hart 0's, or the one `smp_boot()` gave another hart), zero `.bss` (hart 0 only), `call start`, `mret` to S-mode. `supervisor_entry`: hart 0 calls `kmain`, then `machine_halt` with its return value; the others call `hart_main`. Also `xcal_dbg`/`xcal_halt` for C and the early trap handler (prints `mcause`, `mepc`, `mtval`, exits 0xff). On RV64, with paging off: `setup_vm()` on hart 0, `satp` = the early table, the jump to the link addresses (adding `va_kernel_pa_offset`), the high stack, `stvec`. The early page tables and the harts' overflow stacks |
-| `start.c` | `start()`, on each hart: M-mode setup: `medeleg`/`mideleg`, `stvec`, `mtvec`, the hart's `mscratch` block, its first timer interrupt, `mstatus.MPP = S`, `mepc` |
-| `machine.S` | `machine_vec`, the M-mode trap handler: forwards the machine timer (marking a tick) and IPIs (the machine software interrupt) to S-mode as SSIP, serves machine calls (`MCALL_HALT`, `MCALL_IPI`). `machine_halt()` and `machine_ipi()` make them from S-mode |
+| `entry.S` | `_start` (M-mode): early trap vector; hart 0: boot stack, zero `.bss`, the SBI's coldboot; the others: their M-mode set up, then STOPPED in the SBI. `supervisor_entry` (S-mode, where the coldboot enters, a0 = the hart id, a1 = the device tree): `tp`, `stvec`, `kmain`, then `machine_power_off` with its return value. `secondary_entry` (where `hart_start` starts the other harts, a1 = their stack): as Linux's `secondary_start_sbi`, `sie` and `sip` cleared, a trap vector that needs no stack (`early_s_trap` on RV64), `tp` and `sp`, then paging (on RV64 `early_s_trap`'s high address in `stvec` before `kernel_satp` goes in `satp`), `kernel_vec`, `hart_main`. Also `xcal_dbg` for C and the early trap handler (prints `mcause`, `mepc`, `mtval`, exits 0xff). On RV64, with paging off: `setup_vm()` on hart 0, `relocate_enable_mmu` (`satp` = the early table, return to the link address, adding `va_kernel_pa_offset`), the high stack, `stvec`. The early page tables and the harts' overflow stacks |
+| `machine.S` | Camelot's SBI on Grail, in M-mode (spec section 10, "Kernel traps"): the coldboot (`sbi_coldboot`: sysinfo's harts and RAM, every other hart STOPPED and woken out of the boot ROM), each hart's M-mode (`sbi_hart_init`: delegation, `mtvec`, `mscratch`), a stopped hart's wait for `hart_start` (`sbi_hart_wait`), and `machine_vec`: the machine timer forwarded as STIP, IPIs as SSIP (`msip` cleared, then a `fence o, rw`), and the SBI calls BASE, TIME (`set_timer`), IPI (`send_ipi`: `SBI_ERR_INVALID_PARAM` for a hart the machine doesn't have, and of the harts named only the STARTED or SUSPENDED ones interrupted, the others skipped without an error, as OpenSBI's 110f28518a, which fixed 37eaca4ab3; after a `fence rw, o`), HSM (`hart_start`, `hart_stop`, `hart_get_status`, `hart_suspend`), SRST (`system_reset`: the exit code) and DBCN (the UART); anything else is `SBI_ERR_NOT_SUPPORTED` |
+| `sbi.c` | the kernel's SBI calls, as Linux's `sbi.c`: `sbi_init()` (the version and the extensions, checked at boot), `sbi_set_timer()`, `sbi_send_ipi()` (a failure reported as Linux's `__sbi_send_ipi_v02()` reports it, the error mapped to an errno), `sbi_hart_start()`, `sbi_hart_stop()`, `sbi_hart_get_status()` and `sbi_hart_state_name()`, `sbi_system_reset()`, `machine_power_off()` (an exit code as a shutdown's reason, with a warning for each refused one, Linux's `sbi_srst_reset()` warning), `sbi_strerror()`, `sbi_err_map_linux_errno()` (an SBI error as minus an errno, as Linux maps them) |
+| `sbi_ecall.S` | `sbi_ecall()`: an SBI call, the arguments moved to a0-a5, a6 and a7, `struct sbiret` back in a0 and a1 |
 | `kernelvec.S` | `kernel_vec`, the trap vector for traps from S-mode: saves x1-x31 and the trap CSRs as a `struct trap_frame` on the stack, calls `kernel_trap`, restores, `sret`. Also `illegal_instruction()` for the panic tests. On RV64 it checks first that the frame fits on the stack (one bit of `sp`, the stacks being 32 KiB aligned) and sends a kernel stack overflow to the hart's overflow stack and `kstack_overflow()` |
 | `uservec.S` | `user_vec`, the trap vector for traps from U-mode: saves the user registers in the thread's trap frame (`sscratch`), calls `user_trap` on the thread's kernel stack; `user_return`: frame to registers, `sret` to U-mode |
-| `trap.c` | `kernel_trap()`: counts timer ticks (hart 0's wake sleepers), serves TLB shootdowns, claims/completes PLIC interrupts and runs the console's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
+| `trap.c` | `kernel_trap()`: a timer tick (STIP) sets the next deadline and counts the tick (hart 0's wake sleepers), an IPI (SSIP) serves TLB shootdowns, claims/completes PLIC interrupts and runs the console's or a disk's handler, resumes faulting memory probes, panics on anything else (cause name, `sepc`, `stval`, the PTE for a page fault, register dump); `user_trap()`: a tick yields, an ecall goes to `syscall()`, a fault kills the process; `user_trap_return()`, `trap_init()`, `panic()` |
 | `proc.c` | processes and threads: `proc_create()` (slots, kernel stack, page table, ELF, stack with the arguments, descriptors 0-2 but those that close on exec, and the working directory, inherited), `proc_exec_load()` and `proc_exec_commit()` (a new address space for the same process, loaded first; then the other threads ended, the old space freed and the close-on-exec descriptors closed), `kproc_create()` (a kernel process running a C function), `proc_run_init()` (the shell, with the console as descriptors 0-2), the round-robin `scheduler()` over the threads on every hart (idling in `wfi` while nothing is runnable, woken by an IPI when something is), `yield()`, `sleep()`/`wakeup()`, `proc_exit()` (ending every thread first), `proc_kill()`, `proc_wait()`, `proc_sbrk()`, `thread_create()`/`thread_exit()`/`thread_join()`, `futex_wait()`/`futex_wake()`, and the descriptor table under its lock (`fd_get()`, `fd_install()`, `fd_take()`, `proc_cwd()`) |
 | `swtch.S` | `swtch()`: saves `ra`, `sp`, `s0`-`s11` and loads another thread's |
 | `spinlock.S` | `acquire()`/`release()` (an `amoswap.w` loop; panics on a lock acquired twice or released unheld), `holding()`, `push_off()`/`pop_off()` (nested interrupt disabling), `mycpu()` (`&cpus[tp]`) |
 | `spinlock.c` | `cpus[]`, the per-hart state; `initlock()`, `cpu_init()`, `cpuid()`, and the panic messages that name the lock and the hart |
-| `smp.c` | the other harts: `smp_boot()` (stacks, the IPI that wakes them, the TLB shootdown self-test), `hart_main()`, `tlb_shootdown()`/`tlb_serve()` |
+| `smp.c` | the other harts: `smp_boot()` (stacks, `hart_start`, the wait for them, the TLB shootdown self-test), `hart_main()` (which stops a hart that comes too late, with `hart_stop`), `tlb_shootdown()`/`tlb_serve()` |
 | `sleeplock.c` | sleep locks (xv6's), held across sleeps: `acquiresleep()`/`releasesleep()`, for the buffers, the inodes and each process's heap |
 | `elf.c` | `elf_load()`: checks an ELF32 executable, read from memory or from a file through a `struct elf_file`, and maps its `PT_LOAD` segments into user space |
 | `exec.c` | `exec_spawn()`, `exec_replace()`, `exec_init()`: find the program a path names (a file of the root filesystem, or an embedded program without one) and start it |
@@ -507,7 +517,7 @@ one process.
 | `vmtest.c` | the memory self-tests: allocate and free every page, `kzalloc()` and `pagetable_create()` clear a reused dirty page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |
 | `probe.S` | `probe_load()`/`probe_store()`: a word access that returns the trap cause instead of panicking (`kernel_trap` resumes them at `probe_fault`) |
 | `sysinfo.c` | reads Grail's sysinfo block: registers and the device table |
-| `timer.c` | `timebase_hz()` (sysinfo's `SYS_TIMEBASE_HZ`, read once), `timer_interval()`, `timer_init()` |
+| `timer.c` | `timebase_hz()` (sysinfo's `SYS_TIMEBASE_HZ`, read once), `timer_interval()`, each hart's next deadline: `timer_start()`, `timer_next()` (past any missed ones, which it counts), through `sbi_set_timer()` |
 | `plic.c` | `plic_init()` (UART source enabled for hart 0's S-mode context, which takes every device interrupt), `plic_enable()` (another source, such as a disk's), `plic_claim()`, `plic_complete()` |
 | `blk.c` | disk driver: `blk_init()` finds the disks in the sysinfo device table and enables their completion interrupts; `blk_read()`/`blk_write()`/`blk_flush()` issue one DMA request at a time and sleep until `blk_intr()`, the interrupt handler, wakes them with the `BLK_ERROR` code |
 | `bio.c` | buffer cache (xv6's): 30 one-KiB block buffers in LRU order, `bread()`/`bwrite()`/`brelse()`, each buffer sleep-locked while in use |
@@ -518,15 +528,15 @@ one process.
 | `net/` | the network stack (`docs/camelot-net.md`), a file per layer: `nic.c` (the card driver: descriptor rings, `nic_intr()`, the transmit queue), `pbuf.c` (the buffer pool), `ether.c`, `arp.c` (the cache), `ip.c` (checks, routing, loopback), `icmp.c` (echo, `icmp_ping()`), `udp.c` (the kernel-internal socket API, the echo service), `tcp.c` (connections, retransmission, the kernel-internal socket API), `dhcp.c` (the client), `net.c` (configuration, `net_boot()`, the counters, `net_timer()`, the `netinfo`/`netconf`/`ping` system calls), `socket.c` (the socket system calls: sockets behind file descriptors) |
 | `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console` is made too |
 | `boot/` | the bootloader of a bootable disk (`boot.S`, linked by `link.ld` into the committed `boot.elf` for RV32 and `boot-rv64.elf` for RV64 with `cargo xtask boot`): the boot block, which loads the kernel ELF stored after the filesystem; `camelot-fs mkfs --boot` installs it |
-| `riscv.S` | CSR accessors for C (`r_sstatus`, `w_mepc`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()`, `wfi()`, the atomics `atomic_swap()`/`atomic_add()`/`atomic_or()`, and `fence_rw()` |
-| `main.c` | `kmain()`: banner, `kprintf` self-test, memory setup and self-tests, the disk list, the network cards (`net_init`), ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), the network's address (`net_boot`), the other harts (`smp_boot`), then the user-space shell as the first process |
+| `riscv.S` | S-mode CSR accessors for C (`r_sstatus`, `w_sie`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()`, `wfi()`, the atomics `atomic_swap()`/`atomic_add()`/`atomic_or()`, and `fence_rw()` |
+| `main.c` | `kmain()`: banner, `sbi_init()`, `kprintf` self-test, memory setup and self-tests, the disk list, the network cards (`net_init`), ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), the network's address (`net_boot`), the other harts (`smp_boot`), then the user-space shell as the first process |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
 | `console.c` | the console device (`read` and `write` on it): `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers) |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width |
 | `libgcc.c` | `__divdi3`, `__udivdi3`, `__moddi3`, `__umoddi3`, `__muldi3`: the C library's (`user/lib/libgcc.c`), for `long long` division on RV32 |
 | `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself); `memset` stores whole registers, as Linux's riscv one, the rest a byte at a time |
 | `kernel.lds.S` | the layout, one linker script for both widths, preprocessed first (`merlin -E -P`, as Linux's `vmlinux.lds.S`): `.text` at 0x8000_0000 (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end`; on RV64 linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000 (`AT`), the boot stack 32 KiB aligned |
-| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct thread`, `struct user_program`, sleep and wakeup, the thread and futex calls), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
+| `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `clint.h`, `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct thread`, `struct user_program`, sleep and wakeup, the thread and futex calls), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `pipe.h`, `exec.h`, `sysfile.h`, `errno.h` (`syscall.h`'s error numbers and the kernel's own: `EIO`, `ERANGE`, `ENOTSUPP`), `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
 | `kernel.elf` | the prebuilt image, with the user programs built in, committed so `cargo test` and Grail need no build |
 | `kernel-disk.elf` | the prebuilt disk kernel: the same objects without the user programs, which a bootable root image holds (`cargo xtask fs`) |
 
@@ -570,7 +580,7 @@ merlin-ld -T kernel.lds -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o el
        exec.c.o file.c.o fs.c.o fstest.c.o kalloc.c.o kernelvec.S.o kprintf.c.o libgcc.c.o log.c.o machine.S.o \
        main.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o net/ip.c.o net/net.c.o \
        net/nic.c.o net/pbuf.c.o net/tcp.c.o net/udp.c.o pipe.c.o plic.c.o probe.S.o proc.c.o riscv.S.o \
-       sleeplock.c.o smp.c.o spinlock.c.o spinlock.S.o start.c.o \
+       sbi.c.o sbi_ecall.S.o sleeplock.c.o smp.c.o spinlock.c.o spinlock.S.o \
        string.c.o swtch.S.o syscall.c.o sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
        userprogs.s.o uservec.S.o vm.c.o vmtest.c.o
 ```

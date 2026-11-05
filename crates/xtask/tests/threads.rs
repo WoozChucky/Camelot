@@ -186,7 +186,7 @@ impl Shootdowns {
         Shootdowns {
             entry: sym(elf, "tlb_shootdown"),
             body: function("tlb_shootdown"),
-            ipi: sym(elf, "machine_ipi"),
+            ipi: sym(elf, "sbi_send_ipi"),
             sfence: sym(elf, "sfence_vma"),
             serve: function("tlb_serve"),
             kernel_pt: m.cpu.bus.peek(sym(elf, "kernel_pagetable").into()).unwrap(),

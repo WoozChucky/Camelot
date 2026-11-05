@@ -56,6 +56,51 @@ pub mod rv64 {
     pub const LOCK_CPU: u64 = 8;
 }
 
+/// The SBI's numbers (kernel/include/sbi.h, from the SBI spec v2.0): the
+/// extensions and functions the kernel calls, the errors and the HSM states.
+pub mod sbi {
+    pub const EXT_BASE: u64 = 0x10;
+    pub const EXT_TIME: u64 = 0x5449_4d45;
+    pub const EXT_IPI: u64 = 0x73_5049;
+    pub const EXT_HSM: u64 = 0x48_534d;
+    pub const EXT_SRST: u64 = 0x5352_5354;
+    pub const EXT_DBCN: u64 = 0x4442_434e;
+
+    pub const BASE_GET_SPEC_VERSION: u64 = 0;
+    pub const BASE_GET_IMPL_ID: u64 = 1;
+    pub const BASE_GET_IMPL_VERSION: u64 = 2;
+    pub const BASE_PROBE_EXT: u64 = 3;
+    pub const BASE_GET_MVENDORID: u64 = 4;
+    pub const BASE_GET_MARCHID: u64 = 5;
+    pub const BASE_GET_MIMPID: u64 = 6;
+    pub const TIME_SET_TIMER: u64 = 0;
+    pub const IPI_SEND_IPI: u64 = 0;
+    pub const HSM_HART_START: u64 = 0;
+    pub const HSM_HART_STOP: u64 = 1;
+    pub const HSM_HART_GET_STATUS: u64 = 2;
+    pub const HSM_HART_SUSPEND: u64 = 3;
+    pub const SRST_RESET: u64 = 0;
+    pub const DBCN_WRITE: u64 = 0;
+    pub const DBCN_READ: u64 = 1;
+    pub const DBCN_WRITE_BYTE: u64 = 2;
+
+    pub const SUCCESS: i64 = 0;
+    pub const ERR_NOT_SUPPORTED: i64 = -2;
+    pub const ERR_INVALID_PARAM: i64 = -3;
+    pub const ERR_INVALID_ADDRESS: i64 = -5;
+    pub const ERR_ALREADY_AVAILABLE: i64 = -6;
+
+    pub const STATE_STARTED: i64 = 0;
+    pub const STATE_STOPPED: i64 = 1;
+    pub const STATE_SUSPENDED: i64 = 4;
+
+    /// Version 2.0: the major number in bits 30:24.
+    pub const SPEC_VERSION: i64 = 0x0200_0000;
+    /// Camelot's SBI: "CMLT", unregistered, and its first version.
+    pub const IMPL_ID: i64 = 0x434d_4c54;
+    pub const IMPL_VERSION: i64 = 1;
+}
+
 /// The kernel's spinlocks that are variables of their own (the per-pipe,
 /// per-disk and the log's live inside other structures).
 pub const NAMED_LOCKS: [&str; 10] = [

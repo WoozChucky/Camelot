@@ -1,64 +1,11 @@
 # CSR accessors for C (include/riscv.h). The kernel keeps CSR access in
 # assembly instead of inline asm, which Merlin won't support (#15). Each is a
 # leaf function: argument in a0, result in a0, a whole register (XLEN bits)
-# on either width, so nothing here depends on it but r_time.
+# on either width, so nothing here depends on it but r_time. S-mode CSRs
+# only: the kernel reaches M-mode through SBI calls (include/sbi.h), and
+# only machine.S touches M-mode's CSRs.
 
     .text
-
-    .globl r_mstatus
-r_mstatus:
-    csrr  a0, mstatus
-    ret
-
-    .globl w_mstatus
-w_mstatus:
-    csrw  mstatus, a0
-    ret
-
-    .globl w_mepc
-w_mepc:
-    csrw  mepc, a0
-    ret
-
-    .globl w_mtvec
-w_mtvec:
-    csrw  mtvec, a0
-    ret
-
-    .globl w_mscratch
-w_mscratch:
-    csrw  mscratch, a0
-    ret
-
-    .globl r_medeleg
-r_medeleg:
-    csrr  a0, medeleg
-    ret
-
-    .globl w_medeleg
-w_medeleg:
-    csrw  medeleg, a0
-    ret
-
-    .globl r_mideleg
-r_mideleg:
-    csrr  a0, mideleg
-    ret
-
-    .globl w_mideleg
-w_mideleg:
-    csrw  mideleg, a0
-    ret
-
-    .globl w_mie
-w_mie:
-    csrw  mie, a0
-    ret
-
-    .globl w_mcounteren
-w_mcounteren:
-    csrw  mcounteren, a0
-    ret
 
 # u64 r_time(void). On RV64 one read. On RV32 the 64-bit counter is two
 # CSRs, time and timeh, which can't be read at once: read the high half, the
