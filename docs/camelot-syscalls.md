@@ -20,12 +20,16 @@ and `user.h` by `cargo test` (`crates/xtask/tests/kernel.rs`): change all of
 them together.
 
 Camelot runs on RV32 and RV64 while the switch to 64 bits happens (#141):
-the same calls, with Linux's widths for each. An RV32 program is ILP32
+the same calls, with Linux's widths for each but for RV32's `off_t` and
+`time_t` (below). An RV32 program is ILP32
 (`int`, `long` and pointers 32 bits), an RV64 one LP64 (`int` 32 bits,
 `long` and pointers 64), and every type below is the C type it says, at
-that width: `size_t`, `ssize_t`, `off_t` and `time_t` are a `long` wide, as
-on Linux, so 64-bit on RV64. "Structures" gives what that makes of each
-structure's size.
+that width: `size_t`, `ssize_t`, `off_t` and `time_t` are a `long` wide, so
+64-bit on RV64, as on Linux. On RV32 that leaves `off_t` and `time_t` 32-bit,
+which riscv32 Linux's are not (its glibc has only 64-bit ones): a stopgap
+until RV32 goes (#159), which limits RV32's files to 2^31 - 1 bytes
+(`open`). "Structures" gives what the widths make of each structure's
+size.
 
 ## Calling convention
 
@@ -183,8 +187,8 @@ is `send`: on UDP that is an empty datagram). To a file on the disk, the bytes g
 at the descriptor's offset, which moves past them, and the file grows if they
 run past its end; a write that can write nothing fails with what stopped it:
 `-ENOSPC` (the disk is full), `-EFBIG` (the file would pass the largest the
-kernel writes: on RV64 the format's, 4 TiB; on RV32 2^31 - 1 bytes, what
-its `off_t` reaches), `-EINVAL` (the offset is past the end of the
+kernel writes: on RV64 ext4's, 2^32 - 1 blocks; on RV32 2^31 - 1 bytes,
+what its `off_t` reaches), `-EINVAL` (the offset is past the end of the
 file, which another descriptor has emptied meanwhile), `-ENOMEM` (no page
 free for copying through). To the console, the bytes are printed. To a
 pipe, they wait in it for a reader ("Pipes"); `-EPIPE` if no read end is
@@ -285,8 +289,9 @@ opens:
   `-ENODEV`.
 
 On RV32, a file bigger than 2^31 - 1 bytes is `-EOVERFLOW`: its `off_t` is
-32-bit, so `lseek` could not reach all of it. That is 32-bit Linux's answer
-to an `open` without `O_LARGEFILE` on such a file. The filesystem allows
+32-bit, so `lseek` could not reach all of it. That `off_t` is this
+kernel's stopgap until RV32 goes (#159), not riscv32 Linux's, which is
+64-bit and so opens such a file. The filesystem allows
 files far bigger (docs/camelot-fs.md, "Inodes"), which an RV64 kernel,
 whose `off_t` is 64-bit, opens, reads and writes (or mkfs makes).
 

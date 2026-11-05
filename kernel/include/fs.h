@@ -31,16 +31,22 @@
 #define SUPERBLOCK_NO 1
 #define LOGSTART 2
 
+/* The most blocks a file has: its logical block numbers are u32, and the
+ * last one, 2^32 - 1, is never a file's (ext4's EXT_MAX_BLOCKS, which
+ * ext4_max_size() makes s_maxbytes from). So a file's block count fits a
+ * u32. No file comes near it: a filesystem is at most 2^31 blocks. */
+#define EXT_MAX_BLOCKS 0xffffffffu
+
 /* The largest file the kernel reads or writes, in bytes (Linux's
- * s_maxbytes). On RV64 the format's own limit: 2^32 blocks, its logical
- * block numbers being u32, 4 TiB. On RV32 what an off_t reaches there,
- * 2^31 - 1 bytes: a bigger file (only mkfs, or an RV64 kernel, could make
- * one) fails to open with -EOVERFLOW, as 32-bit Linux's open does for a
- * large file without O_LARGEFILE. The kernel's offsets and sizes are u64
- * on both (the inode's size, readi(), writei(), an open file's offset),
- * as Linux's loff_t is. */
+ * s_maxbytes). On RV64 ext4's: EXT_MAX_BLOCKS blocks, 1 KiB short of
+ * 4 TiB. On RV32 what its 32-bit off_t reaches, 2^31 - 1 bytes: a bigger
+ * file (only mkfs, or an RV64 kernel, could make one) fails to open with
+ * -EOVERFLOW. That off_t is a stopgap until RV32 goes (#159), not riscv32
+ * Linux's, which is 64-bit (types.h). The kernel's offsets and sizes are
+ * u64 on both (the inode's size, readi(), writei(), an open file's
+ * offset), as Linux's loff_t is. */
 #if __riscv_xlen == 64
-#define MAXFILE_BYTES ((u64)BSIZE << 32)
+#define MAXFILE_BYTES ((u64)EXT_MAX_BLOCKS * BSIZE)
 #else
 #define MAXFILE_BYTES 0x7fffffffull
 #endif

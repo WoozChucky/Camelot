@@ -21,12 +21,13 @@ typedef unsigned long usize;
 typedef signed long isize;
 typedef unsigned long uintptr;
 
-/* The system call ABI's types, Linux's (docs/camelot-syscalls.md): a file
- * offset (off_t) and a time in seconds (time_t) are a `long`, so 64 bits on
- * RV64 (LP64) and 32 on RV32 (ILP32, where an offset past 2^31 - 1 has no
- * value, as on 32-bit Linux without O_LARGEFILE). A user address is a
- * uintptr, a byte count a usize and a count or an error an isize (size_t
- * and ssize_t). */
+/* The system call ABI's types (docs/camelot-syscalls.md): a file offset
+ * (off_t) and a time in seconds (time_t) are a `long`, so 64 bits on RV64
+ * (LP64), as Linux's. On RV32 (ILP32) that makes them 32 bits, where an
+ * offset past 2^31 - 1 has no value: not riscv32 Linux's ABI, whose glibc
+ * has only a 64-bit off_t and time_t, but a stopgap until RV32 goes
+ * (#159). A user address is a uintptr, a byte count a usize and a count or
+ * an error an isize (size_t and ssize_t). */
 typedef long off_t;
 typedef long time_t;
 

@@ -898,8 +898,8 @@ int writei(struct inode *ip, const void *src, u64 off, u32 n) {
     u32 done = 0;
     /* The file's blocks: no holes, so exactly the ones its size needs. A
      * block at or past them is the next one, added to the tree. The size
-     * is at most MAXFILE_BYTES, so the count fits a u32, and so does the
-     * block of every byte written. */
+     * is at most MAXFILE_BYTES, at most EXT_MAX_BLOCKS blocks (fs.h), so
+     * the count fits a u32, and so does the block of every byte written. */
     u32 blocks = (u32)((ip->size + BSIZE - 1) >> BSHIFT);
     u32 bn = (u32)(off >> BSHIFT);
     u32 at = (u32)off & (BSIZE - 1);
