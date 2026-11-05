@@ -26,7 +26,9 @@ struct as_op2 {
 #define OPC_LOAD 0x03
 #define OPC_STORE 0x23
 #define OPC_OP_IMM 0x13
+#define OPC_OP_IMM_32 0x1b
 #define OPC_OP 0x33
+#define OPC_OP_32 0x3b
 #define OPC_MISC_MEM 0x0f
 #define OPC_SYSTEM 0x73
 #define OPC_AMO 0x2f
@@ -48,10 +50,16 @@ struct as_op2 {
 #define F_CSRRS 2
 #define F_CSRRC 3
 #define F_CSR_IMM 4
+#define F_SRLI 5
+#define F_AMO_W 2
+#define F_AMO_D 3
 
-/* The encodings of the real instructions, by format (merlin-as's encode.rs). */
+/* The encodings of the real instructions, by format (merlin-as's encode.rs); the
+ * _32_ and _RV64_ ones are RV64's own, looked up only when assembling for RV64. */
 extern const struct as_op3 OP_FUNCT[];
 extern const struct as_op3 SHIFT_FUNCT[];
+extern const struct as_op3 OP_32_FUNCT[];
+extern const struct as_op3 SHIFT_32_FUNCT[];
 extern const struct as_op2 OP_IMM_FUNCT3[];
 extern const struct as_op2 LOAD_FUNCT3[];
 extern const struct as_op2 STORE_FUNCT3[];
@@ -59,12 +67,17 @@ extern const struct as_op2 BRANCH_FUNCT3[];
 extern const struct as_op2 CSR_FUNCT3[];
 extern const struct as_op2 ATOMIC_FUNCT5[];
 extern const struct as_op2 SYSTEM_FUNCT12[];
+extern const struct as_op2 OP_IMM_32_FUNCT3[];
+extern const struct as_op2 LOAD_RV64_FUNCT3[];
+extern const struct as_op2 STORE_RV64_FUNCT3[];
 
 /* Register ABI names, by number (and x0-x31, and fp for s0). */
 extern const char *const REG_NAMES[32];
 
-/* CSR names and numbers (excalibur's csr.rs), and the counters' numbers. */
+/* CSR names and numbers (excalibur's csr.rs): every one RV32 has, and those of them
+ * only RV32 has, which are no name on RV64; and the counters' numbers. */
 extern const struct as_op2 CSR_NAMES[];
+extern const struct as_op2 CSR_RV32_ONLY[];
 #define CSR_CYCLE 0xc00
 #define CSR_TIME 0xc01
 #define CSR_INSTRET 0xc02
@@ -114,7 +127,8 @@ extern const struct as_section PREDEFINED_SECTIONS[];
 #define R_RISCV_LO12_I 27
 #define R_RISCV_LO12_S 28
 
-/* Tag_RISCV_arch in every object's .riscv.attributes (merlin-as's elf.rs). */
+/* Tag_RISCV_arch in every object's .riscv.attributes (merlin-as's elf.rs), by width. */
 #define RISCV_ARCH "rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0"
+#define RISCV_ARCH_RV64 "rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0"
 
 #endif

@@ -1,27 +1,55 @@
-/* ld: reads ELF32 little-endian RISC-V relocatable objects (ET_REL), the
- * subset clang (-c) and merlin-as write (merlin-ld's object.rs). Anything
- * else is refused with a message saying what was found. Sections and
- * symbols keep their ELF indices, so a relocation's symbol index and a
- * symbol's st_shndx are used as they are. */
+/* ld: reads little-endian RISC-V relocatable objects (ET_REL), ELF32 (RV32)
+ * and ELF64 (RV64), the subset clang (-c) and merlin-as write (merlin-ld's
+ * object.rs, whose records the elf crate reads). Anything else is refused
+ * with a message saying what was found. Sections and symbols keep their ELF
+ * indices, so a relocation's symbol index and a symbol's st_shndx are used
+ * as they are.
+ *
+ * Sizes, flags, symbol values, relocation offsets and addends are held at
+ * ELF64's widths whatever the class of the file (an ELF32 file's fields
+ * zero-extended, its addends sign-extended), so the rest of the linker has
+ * one set of types for both; the class is kept in the object. */
 #include "ld.h"
 
-/* The file being read, and the message of the last read that failed. */
+/* What differs between the classes for a reader (the elf crate's Class):
+ * the bytes of an address, offset or size field, and of a section header,
+ * a symbol and a relocation. */
+struct class {
+    uint word;
+    uint shdr;
+    uint sym;
+    uint rela;
+};
+
+static const struct class ELF32 = {4, 40, 16, 12};
+static const struct class ELF64 = {8, 64, 24, 24};
+
+/* The file being read, its class, and the message of the last read that
+ * failed. */
 static uchar *file;
 static uint flen;
+static const struct class *class;
 static char *rd_error;
 
-/* bytes [off, off + len) of the file, off as a 64-bit number (offsets are
- * computed from 32-bit fields, and must not wrap around). */
-static uchar *rd_bytes(i64 off, uint len) {
-    i64 end = i64_add(off, i64_u(len));
-    if (off.hi != 0 || end.hi != 0 || end.lo > flen) {
-        rd_error = fmt("truncated file (needs bytes %s..%s)", i64_hex(off), i64_hex(end));
+/* bytes [off, off + len) of the file. The end is computed in 64 bits and
+ * must not pass 2^64 either (an ELF64 offset plus size may), as the elf
+ * crate's checked_add: then the message's end is the true sum, which
+ * passes 64 bits, written as merlin-ld writes a u128. */
+static uchar *rd_bytes(uint64_t off, uint64_t len) {
+    uint64_t end = off + len;
+    if (end < off) {
+        /* off + len, past 2^64: 0x1 followed by the 64 bits of the sum. */
+        rd_error = fmt("truncated file (needs bytes 0x%llx..0x1%016llx)", off, end);
         return NULL;
     }
-    return file + off.lo;
+    if (end > flen) {
+        rd_error = fmt("truncated file (needs bytes 0x%llx..0x%llx)", off, end);
+        return NULL;
+    }
+    return file + (uint)off;
 }
 
-static int rd_u8(i64 off, uint *v) {
+static int rd_u8(uint64_t off, uint *v) {
     uchar *p = rd_bytes(off, 1);
     if (p == NULL) {
         return 0;
@@ -30,20 +58,33 @@ static int rd_u8(i64 off, uint *v) {
     return 1;
 }
 
-static int rd_u16(i64 off, uint *v) {
-    uchar *p = rd_bytes(off, 2);
-    if (p == NULL) {
-        return 0;
-    }
-    *v = (uint)p[0] | (uint)p[1] << 8;
-    return 1;
+static uint le16(uchar *p) {
+    return (uint)p[0] | (uint)p[1] << 8;
 }
 
 static uint le32(uchar *p) {
     return (uint)p[0] | (uint)p[1] << 8 | (uint)p[2] << 16 | (uint)p[3] << 24;
 }
 
-static int rd_u32(i64 off, uint *v) {
+static uint64_t le64(uchar *p) {
+    return (uint64_t)le32(p) | (uint64_t)le32(p + 4) << 32;
+}
+
+/* An address, offset or size field: 4 or 8 bytes. */
+static uint64_t word_at(uchar *p) {
+    return class->word == 8 ? le64(p) : le32(p);
+}
+
+static int rd_u16(uint64_t off, uint *v) {
+    uchar *p = rd_bytes(off, 2);
+    if (p == NULL) {
+        return 0;
+    }
+    *v = le16(p);
+    return 1;
+}
+
+static int rd_u32(uint64_t off, uint *v) {
     uchar *p = rd_bytes(off, 4);
     if (p == NULL) {
         return 0;
@@ -68,17 +109,18 @@ static int cstr(uchar *table, uint len, uint off, char **out) {
     return 1;
 }
 
-/* A section header, before its contents are interpreted. */
+/* A section header, before its contents are interpreted, at ELF64's
+ * widths. */
 struct shdr {
     uint name;
     uint type;
-    uint flags;
-    uint offset;
-    uint size;
+    uint64_t flags;
+    uint64_t offset;
+    uint64_t size;
     uint link;
     uint info;
-    uint align;
-    uint entsize;
+    uint64_t align;
+    uint64_t entsize;
 };
 
 /* A section's bytes (none for NOBITS). */
@@ -87,12 +129,14 @@ static int contents(struct shdr *h, uchar **p) {
         *p = file;
         return 1;
     }
-    *p = rd_bytes(i64_u(h->offset), h->size);
+    *p = rd_bytes(h->offset, h->size);
     return *p != NULL;
 }
 
+/* How many bytes contents() gave: all inside the file, so they fit in a
+ * uint. */
 static uint contents_len(struct shdr *h) {
-    return h->type == SHT_NOBITS ? 0 : h->size;
+    return h->type == SHT_NOBITS ? 0 : (uint)h->size;
 }
 
 int sym_is_local(struct symbol *s) {
@@ -119,33 +163,29 @@ const char *symbol_display_name(struct object *o, uint index) {
 }
 
 /* The checks of the ELF header; 0 with *err set. */
-static int header(uint *shoff, uint *shentsize, uint *shnum, uint *shstrndx, char **err) {
+static int header(struct object *o, uint64_t *shoff, uint *shentsize, uint *shnum, uint *shstrndx, char **err) {
     uint v;
     if (flen < 4 || file[0] != 0x7f || file[1] != 'E' || file[2] != 'L' || file[3] != 'F') {
         *err = "not an ELF file";
         return 0;
     }
-    if (!rd_u8(i64_u(4), &v)) {
+    if (!rd_u8(4, &v)) {
         return 0;
     }
-    /* merlin-ld's message for a class that is neither; ELFCLASS64 objects
-     * (RV64) are merlin-ld's only, until /bin/ld links RV64 (#157). */
     if (v != 1 && v != 2) {
         *err = fmt("not a 32- or 64-bit ELF file (EI_CLASS is %u)", v);
         return 0;
     }
-    if (v == 2) {
-        *err = "64-bit ELF objects are not supported by this ld";
-        return 0;
-    }
-    if (!rd_u8(i64_u(5), &v)) {
+    o->class = v == 2 ? FORMAT_ELF64 : FORMAT_ELF32;
+    class = v == 2 ? &ELF64 : &ELF32;
+    if (!rd_u8(5, &v)) {
         return 0;
     }
     if (v != 1) {
         *err = "not a little-endian ELF file";
         return 0;
     }
-    if (!rd_u8(i64_u(6), &v)) {
+    if (!rd_u8(6, &v)) {
         return 0;
     }
     if (v != 1) {
@@ -153,7 +193,7 @@ static int header(uint *shoff, uint *shentsize, uint *shnum, uint *shstrndx, cha
         return 0;
     }
     uint e_type;
-    if (!rd_u16(i64_u(16), &e_type)) {
+    if (!rd_u16(16, &e_type)) {
         return 0;
     }
     if (e_type != ET_REL) {
@@ -164,15 +204,18 @@ static int header(uint *shoff, uint *shentsize, uint *shnum, uint *shstrndx, cha
         *err = fmt("%s (e_type %u), expected a relocatable object (ET_REL)", what, e_type);
         return 0;
     }
-    if (!rd_u16(i64_u(18), &v)) {
+    if (!rd_u16(18, &v)) {
         return 0;
     }
     if (v != EM_RISCV) {
         *err = fmt("e_machine is %u, not RISC-V (243)", v);
         return 0;
     }
+    /* e_entry, e_phoff and e_shoff are address-sized, so e_flags and the
+     * fields after it are 12 bytes further on in ELF64: at 36 or 48. */
+    uint rest = 24 + 3 * class->word;
     uint flags;
-    if (!rd_u32(i64_u(36), &flags)) {
+    if (!rd_u32(rest, &flags)) {
         return 0;
     }
     if (flags & 1) {
@@ -180,45 +223,68 @@ static int header(uint *shoff, uint *shentsize, uint *shnum, uint *shstrndx, cha
         return 0;
     }
     if (flags != 0) {
-        *err = fmt("e_flags 0x%x not supported: Excalibur objects use the ilp32 soft-float ABI (e_flags 0)", flags);
+        /* clang's ilp32 and lp64 (and merlin-as's objects) have e_flags 0. */
+        *err = fmt("e_flags 0x%x not supported: Excalibur objects use the %s soft-float ABI (e_flags 0)", flags,
+                   o->class == FORMAT_ELF64 ? "lp64" : "ilp32");
         return 0;
     }
-    return rd_u32(i64_u(32), shoff) && rd_u16(i64_u(46), shentsize) && rd_u16(i64_u(48), shnum) &&
-           rd_u16(i64_u(50), shstrndx);
+    if (!rd_u16(rest + 10, shentsize) || !rd_u16(rest + 12, shnum) || !rd_u16(rest + 14, shstrndx)) {
+        return 0;
+    }
+    /* Then the elf crate reads the whole header, e_shoff (24 + 2 words in)
+     * among it, before the section headers. */
+    uchar *p = rd_bytes(24 + 2 * class->word, class->word);
+    if (p == NULL) {
+        return 0;
+    }
+    *shoff = word_at(p);
+    return 1;
 }
 
 static int parse(const char *name, struct object *o, char **err) {
-    uint shoff, shentsize, shnum, shstrndx;
+    uint64_t shoff;
+    uint shentsize, shnum, shstrndx;
     memset(o, 0, sizeof *o);
     o->name = (char *)name;
-    if (!header(&shoff, &shentsize, &shnum, &shstrndx, err)) {
+    if (!header(o, &shoff, &shentsize, &shnum, &shstrndx, err)) {
         return 0;
     }
     if (shnum == 0) {
         return 1;
     }
-    if (shentsize != 40) {
-        *err = fmt("e_shentsize is %u, expected 40", shentsize);
+    if (shentsize != class->shdr) {
+        *err = fmt("e_shentsize is %u, expected %u", shentsize, class->shdr);
         return 0;
     }
     /* Each section header is read whole, as the elf crate merlin-ld reads
-     * objects with does: a file cut inside one needs all of its 40 bytes. */
+     * objects with does: a file cut inside one needs all of its bytes. The
+     * fields are in the same order in both classes: sh_flags, sh_addr,
+     * sh_offset, sh_size, sh_addralign and sh_entsize address-sized,
+     * sh_name, sh_type, sh_link and sh_info 4 bytes. */
+    uint w = class->word;
     struct shdr *hdrs = xcalloc(shnum * sizeof(struct shdr));
     for (uint i = 0; i < shnum; i++) {
-        uchar *p = rd_bytes(i64_add(i64_u(shoff), i64_u(i * 40)), 40);
+        /* Saturating, as the elf crate computes where a header is: one past
+         * 2^64 is at the last byte of the address space. */
+        uint64_t at = shoff + (uint64_t)i * class->shdr;
+        if (at < shoff) {
+            at = UINT64_MAX;
+        }
+        uchar *p = rd_bytes(at, class->shdr);
         if (p == NULL) {
             return 0;
         }
         struct shdr *s = &hdrs[i];
+        uchar *after = p + 8 + 4 * w; /* sh_link */
         s->name = le32(p);
         s->type = le32(p + 4);
-        s->flags = le32(p + 8);
-        s->offset = le32(p + 16);
-        s->size = le32(p + 20);
-        s->link = le32(p + 24);
-        s->info = le32(p + 28);
-        s->align = le32(p + 32);
-        s->entsize = le32(p + 36);
+        s->flags = word_at(p + 8);
+        s->offset = word_at(p + 8 + 2 * w);
+        s->size = word_at(p + 8 + 3 * w);
+        s->link = le32(after);
+        s->info = le32(after + 4);
+        s->align = word_at(after + 8);
+        s->entsize = word_at(after + 8 + w);
     }
     /* Then every section's name, from the section header string table
      * (SHN_UNDEF, 0, would mean there is none), before any section is
@@ -270,10 +336,15 @@ static int parse(const char *name, struct object *o, char **err) {
             return 0;
         }
         /* The alignment of a section that holds code or data (ld.lld checks
-         * no other), a power of two; 0 means 1. */
+         * no other), a power of two; 0 means 1. Only ELF64's sh_addralign
+         * can be too large for 32 bits. */
         uint align = 1;
         if (h->type != SHT_NULL && h->type != SHT_SYMTAB && h->type != SHT_STRTAB && h->type != SHT_RELA) {
-            align = h->align ? h->align : 1;
+            if (h->align > UINT32_MAX) {
+                *err = fmt("section '%s' has sh_addralign 0x%llx, too large", sname, h->align);
+                return 0;
+            }
+            align = h->align ? (uint)h->align : 1;
             if (align & (align - 1)) {
                 *err = fmt("section '%s' has sh_addralign 0x%x, not a power of 2", sname, align);
                 return 0;
@@ -314,13 +385,14 @@ static int parse(const char *name, struct object *o, char **err) {
             return 0;
         }
         uint strlen_ = contents_len(&hdrs[h->link]);
-        if (h->entsize != 16) {
-            *err = fmt("symbol table entry size is %u, expected 16", h->entsize);
+        uint size = class->sym;
+        if (h->entsize != size) {
+            *err = fmt("symbol table entry size is %llu, expected %u", h->entsize, size);
             return 0;
         }
-        if (h->size % 16) {
-            *err = fmt("section '%s' has sh_size 0x%x, not a multiple of its sh_entsize (16)",
-                       o->sections[symtab].name, h->size);
+        if (h->size % size) {
+            *err = fmt("section '%s' has sh_size 0x%llx, not a multiple of its sh_entsize (%u)",
+                       o->sections[symtab].name, h->size, size);
             return 0;
         }
         uchar *data;
@@ -328,20 +400,31 @@ static int parse(const char *name, struct object *o, char **err) {
             return 0;
         }
         /* Every entry is read (its name too) before any is checked, as the
-         * elf crate reads them for merlin-ld. */
-        uint n = contents_len(h) / 16;
+         * elf crate reads them for merlin-ld. An Elf32_Sym is st_name,
+         * st_value, st_size, st_info, st_other, st_shndx; an Elf64_Sym
+         * puts the three narrow fields before the two 8-byte ones. */
+        uint n = contents_len(h) / size;
         o->symbols = xcalloc((n ? n : 1) * sizeof(struct symbol));
         for (uint k = 0; k < n; k++) {
-            uchar *e = data + 16 * k;
+            uchar *e = data + size * k;
             struct symbol *sym = &o->symbols[k];
             if (!cstr(strtab, strlen_, le32(e), &sym->name)) {
                 return 0;
             }
-            sym->value = le32(e + 4);
-            sym->size = le32(e + 8);
-            sym->bind = e[12] >> 4;
-            sym->type = e[12] & 0xf;
-            sym->shndx = (uint)e[14] | (uint)e[15] << 8;
+            uint info;
+            if (o->class == FORMAT_ELF64) {
+                info = e[4];
+                sym->shndx = le16(e + 6);
+                sym->value = le64(e + 8);
+                sym->size = le64(e + 16);
+            } else {
+                sym->value = le32(e + 4);
+                sym->size = le32(e + 8);
+                info = e[12];
+                sym->shndx = le16(e + 14);
+            }
+            sym->bind = info >> 4;
+            sym->type = info & 0xf;
         }
         o->nsymbols = n;
         for (uint k = 1; k < n; k++) {
@@ -382,29 +465,44 @@ static int parse(const char *name, struct object *o, char **err) {
             *err = fmt("relocation section '%s' patches section index %u", rname, h->info);
             return 0;
         }
-        if (h->entsize != 12) {
-            *err = fmt("relocation section '%s' has entry size %u, expected 12", rname, h->entsize);
+        uint size = class->rela;
+        if (h->entsize != size) {
+            *err = fmt("relocation section '%s' has entry size %llu, expected %u", rname, h->entsize, size);
             return 0;
         }
         uchar *data;
         if (!contents(h, &data)) {
             return 0;
         }
+        /* r_info is sym << 8 | type in ELF32, sym << 32 | type in ELF64;
+         * every entry is read before any is checked, as the elf crate reads
+         * them. */
         struct section *target = &o->sections[h->info];
-        uint n = contents_len(h) / 12;
+        uint n = contents_len(h) / size;
+        uint first = target->nrelocs;
         for (uint k = 0; k < n; k++) {
-            uchar *e = data + 12 * k;
-            uint info = le32(e + 4);
-            if ((info >> 8) >= o->nsymbols) {
-                *err = fmt("relocation in '%s' refers to symbol index %u, past the symbol table", rname, info >> 8);
-                return 0;
-            }
+            uchar *e = data + size * k;
             target->relocs = grow(target->relocs, &target->caprelocs, target->nrelocs + 1, sizeof(struct rela));
             struct rela *r = &target->relocs[target->nrelocs++];
-            r->offset = le32(e);
-            r->type = info & 0xff;
-            r->sym = info >> 8;
-            r->addend = (int)le32(e + 8);
+            if (o->class == FORMAT_ELF64) {
+                r->offset = le64(e);
+                r->type = le32(e + 8);
+                r->sym = le32(e + 12);
+                r->addend = (int64_t)le64(e + 16);
+            } else {
+                uint info = le32(e + 4);
+                r->offset = le32(e);
+                r->type = info & 0xff;
+                r->sym = info >> 8;
+                r->addend = (int)le32(e + 8);
+            }
+        }
+        for (uint k = first; k < target->nrelocs; k++) {
+            if (target->relocs[k].sym >= o->nsymbols) {
+                *err = fmt("relocation in '%s' refers to symbol index %u, past the symbol table", rname,
+                           target->relocs[k].sym);
+                return 0;
+            }
         }
     }
     free(hdrs);

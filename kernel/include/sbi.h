@@ -16,6 +16,7 @@
 
 #ifndef __ASSEMBLER__
 #include "types.h"
+#include "errno.h"
 #endif
 
 /* The version this kernel and machine.S implement: the major number in bits
@@ -197,9 +198,35 @@ const char *sbi_strerror(long error);
  * SBI_ERR_NO_SHMEM, -ETIMEDOUT for SBI_ERR_TIMEOUT, -EIO for SBI_ERR_IO, and
  * -ENOTSUPP for SBI_ERR_NOT_SUPPORTED, SBI_ERR_FAILED and every other error
  * (SBI_ERR_ALREADY_AVAILABLE, SBI_ERR_ALREADY_STARTED and
- * SBI_ERR_ALREADY_STOPPED among them). Linux has it inline in the header;
- * here it is sbi.c's, so that each file including this one has no copy. */
-int sbi_err_map_linux_errno(long err);
+ * SBI_ERR_ALREADY_STOPPED among them). Inline in the header, as Linux has
+ * it: a file that does not call it has no copy, since merlin, as clang,
+ * emits a static function only once something refers to it. */
+static inline int sbi_err_map_linux_errno(long err) {
+    switch (err) {
+    case SBI_SUCCESS:
+        return 0;
+    case SBI_ERR_DENIED:
+    case SBI_ERR_DENIED_LOCKED:
+        return -EPERM;
+    case SBI_ERR_INVALID_PARAM:
+    case SBI_ERR_INVALID_STATE:
+        return -EINVAL;
+    case SBI_ERR_BAD_RANGE:
+        return -ERANGE;
+    case SBI_ERR_INVALID_ADDRESS:
+        return -EFAULT;
+    case SBI_ERR_NO_SHMEM:
+        return -ENOMEM;
+    case SBI_ERR_TIMEOUT:
+        return -ETIMEDOUT;
+    case SBI_ERR_IO:
+        return -EIO;
+    case SBI_ERR_NOT_SUPPORTED:
+    case SBI_ERR_FAILED:
+    default:
+        return -ENOTSUPP;
+    }
+}
 #endif
 
 #endif

@@ -340,9 +340,9 @@ Function int main(void) <116:5>
   ExprStmt <130:5>
     Call copy : void <130:5>
       ImplicitCast : char * <130:10>
-        Var dst #1 : char [8] <130:10>
+        Var dst #1 : char[8] <130:10>
       ImplicitCast : const char * <130:15>
-        Str "abcdefg" : char [8] <130:15>
+        Str "abcdefg" : char[8] <130:15>
       Num 7 : int <130:26>
   ExprStmt <131:5>
     Assign += : int <131:8>
@@ -351,21 +351,21 @@ Function int main(void) <116:5>
         Binary == : int <131:18>
           Deref : char <131:14>
             Binary + : char * <131:14>
-              Var dst #1 : char [8] <131:11>
+              Var dst #1 : char[8] <131:11>
               Num 0 : int <131:15>
           Num 97 : int <131:21>
         Binary == : int <131:35>
           Deref : char <131:31>
             Binary + : char * <131:31>
-              Var dst #1 : char [8] <131:28>
+              Var dst #1 : char[8] <131:28>
               Num 6 : int <131:32>
           Num 103 : int <131:38>
   ExprStmt <132:5>
     Call copy : void <132:5>
       ImplicitCast : char * <132:10>
-        Var dst #1 : char [8] <132:10>
+        Var dst #1 : char[8] <132:10>
       ImplicitCast : const char * <132:15>
-        Str "xyz" : char [4] <132:15>
+        Str "xyz" : char[4] <132:15>
       Num 2 : int <132:22>
   ExprStmt <133:5>
     Assign += : int <133:8>
@@ -374,13 +374,13 @@ Function int main(void) <116:5>
         Binary == : int <133:18>
           Deref : char <133:14>
             Binary + : char * <133:14>
-              Var dst #1 : char [8] <133:11>
+              Var dst #1 : char[8] <133:11>
               Num 1 : int <133:15>
           Num 121 : int <133:21>
         Binary == : int <133:35>
           Deref : char <133:31>
             Binary + : char * <133:31>
-              Var dst #1 : char [8] <133:28>
+              Var dst #1 : char[8] <133:28>
               Num 2 : int <133:32>
           Num 99 : int <133:38>
   ExprStmt <134:5>

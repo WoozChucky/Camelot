@@ -133,29 +133,48 @@ static void test_numbers(void) {
 #endif
 }
 
-/* lib/i64.c: 64-bit integers as two words. */
-static void test_i64(void) {
-    i64 big = i64_add(i64_u(0xffffffffu), i64_u(1));
-    check(big.lo == 0 && big.hi == 1, "i64_add carries into the high word");
-    check_str(i64_dec(i64_sub(i64_u(5), i64_u(7))), "-2", "i64_sub below zero");
-    check_str(i64_hex(i64_of(-16)), "0xfffffffffffffff0", "i64_hex of a negative number");
-    check_str(i64_dec(i64_mul(i64_u(0x80000000u), i64_u(6))), "12884901888", "i64_mul past 32 bits");
-    i64 q, r;
-    check(i64_div(i64_of(-7), i64_of(2), &q) && i64_eq(q, i64_of(-3)), "i64_div truncates toward zero");
-    check(i64_rem(i64_of(-7), i64_of(2), &r) && i64_eq(r, i64_of(-1)), "i64_rem has the dividend's sign");
-    check(!i64_div(i64_u(1), i64_u(0), &q), "i64_div by zero has no result");
-    check_str(i64_hex(i64_shl(i64_u(1), 40)), "0x10000000000", "i64_shl");
-    check_str(i64_dec(i64_sar(i64_of(-64), 3)), "-8", "i64_sar keeps the sign");
-    check_str(i64_hex(i64_shr(i64_of(-64), 3)), "0x1ffffffffffffff8", "i64_shr shifts zeros in");
-    check_str(i64_hex(i64_shr(i64_of(-1), 40)), "0xffffff", "i64_shr past 32 bits");
-    /* The edges: no shift, the high word alone, the top bit alone, and a
-     * count of 64, whose low 6 bits are 0 (Rust's wrapping_shr). */
-    check_str(i64_hex(i64_shr(i64_of(-1), 0)), "0xffffffffffffffff", "i64_shr by 0");
-    check_str(i64_hex(i64_shr(i64_of(-1), 32)), "0xffffffff", "i64_shr by 32");
-    check_str(i64_hex(i64_shr(i64_of(-1), 63)), "0x1", "i64_shr by 63");
-    check_str(i64_hex(i64_shr(i64_of(-16), 64)), "0xfffffffffffffff0", "i64_shr by 64 is by 0");
-    check(i64_cmp(i64_of(-1), i64_u(1)) < 0, "i64_cmp is signed");
-    check(i64_in(i64_u(4), i64_u(4), i64_u(5)) && !i64_in(i64_u(5), i64_u(4), i64_u(5)), "i64_in is half open");
+/* A shift count the compiler cannot fold: the shifts below are the
+ * register pair's code on RV32 (and lib/libgcc.c's division routines the
+ * quotients'), the arithmetic /bin/as and /bin/ld compute with. */
+static int shift_counts[] = {0, 3, 32, 40, 63};
+
+/* The value in hexadecimal, as merlin-as prints a u64 with {:#x}. */
+static const char *hex64(uint64_t v) {
+    static char buf[24];
+    snprintf(buf, sizeof buf, "0x%llx", v);
+    return buf;
+}
+
+/* int64_t and uint64_t, `long long`: 64 bits on both widths. */
+static void test_long_long(void) {
+    uint64_t big = (uint64_t)0xffffffffu + 1;
+    check(big == (uint64_t)1 << 32, "uint64_t addition carries into the high word");
+    int64_t five = 5, seven = 7;
+    check(five - seven == -2, "int64_t subtraction below zero");
+    check_str(hex64((uint64_t)(int64_t)-16), "0xfffffffffffffff0", "a negative int64_t as a uint64_t");
+    check(((uint64_t)0x80000000u * 6) == 12884901888ull, "a product past 32 bits");
+    int64_t m7 = -7, two = 2;
+    check(m7 / two == -3, "int64_t division truncates toward zero");
+    check(m7 % two == -1, "int64_t remainder has the dividend's sign");
+    uint64_t n = 0xfffffffffffffff0ull, three = 3, thousand = 1000;
+    check(n / three == 0x5555555555555550ull, "uint64_t division past 32 bits");
+    check(n / thousand == 18446744073709551ull && n % thousand == 600, "uint64_t division and remainder");
+    check_str(hex64((uint64_t)1 << shift_counts[3]), "0x10000000000", "a left shift past 32 bits");
+    int64_t m64 = -64;
+    check(m64 >> shift_counts[1] == -8, "an int64_t right shift keeps the sign");
+    check_str(hex64((uint64_t)m64 >> shift_counts[1]), "0x1ffffffffffffff8",
+              "a uint64_t right shift shifts zeros in");
+    uint64_t ones = ~(uint64_t)0;
+    check_str(hex64(ones >> shift_counts[3]), "0xffffff", "a right shift past 32 bits");
+    /* The edges of a register pair: no shift, the high word alone, the
+     * top bit alone. */
+    check_str(hex64(ones >> shift_counts[0]), "0xffffffffffffffff", "a right shift by 0");
+    check_str(hex64(ones >> shift_counts[2]), "0xffffffff", "a right shift by 32");
+    check_str(hex64(ones >> shift_counts[4]), "0x1", "a right shift by 63");
+    check(ones << shift_counts[4] == (uint64_t)1 << 63, "a left shift by 63");
+    int64_t m1 = -1, one = 1;
+    check(m1 < one && (uint64_t)m1 > (uint64_t)one, "int64_t compares signed, uint64_t unsigned");
+    check(INT64_MIN < INT64_MAX && (int64_t)0x80000000u > 0, "the 64-bit comparisons see the high word");
 }
 
 static void test_snprintf(void) {
@@ -636,7 +655,7 @@ int main(int argc, char **argv) {
     test_types();
     test_strings();
     test_numbers();
-    test_i64();
+    test_long_long();
     test_snprintf();
     /* First, while the heap is still empty. */
     test_merge();

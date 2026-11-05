@@ -1,13 +1,3 @@
-    .bss
-
-    # int counter: 4 bytes
-    .globl counter
-    .balign 4
-    .type counter, @object
-    .size counter, 4
-counter:
-    .zero 4
-
     .data
 
     # int base: 4 bytes
@@ -25,13 +15,6 @@ base:
     .size pbase, 4
 pbase:
     .word base
-
-    # static int hidden: 4 bytes
-    .balign 4
-    .type hidden, @object
-    .size hidden, 4
-hidden:
-    .word 5
 
     # int table[4]: 16 bytes
     .globl table
@@ -102,6 +85,16 @@ bump:
     addi  sp, sp, 16
     ret
     .size bump, . - bump
+
+    .bss
+
+    # int counter: 4 bytes
+    .globl counter
+    .balign 4
+    .type counter, @object
+    .size counter, 4
+counter:
+    .zero 4
 
     .data
 
@@ -235,3 +228,12 @@ main:
     addi  sp, sp, 16
     ret
     .size main, . - main
+
+    .data
+
+    # static int hidden: 4 bytes
+    .balign 4
+    .type hidden, @object
+    .size hidden, 4
+hidden:
+    .word 5

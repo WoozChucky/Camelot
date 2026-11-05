@@ -25,6 +25,21 @@ void *xcalloc(uint n) {
     return p;
 }
 
+/* The images ld builds in memory, the output sections' and the file it
+ * writes, have sizes and offsets computed in 64 bits, as merlin-ld
+ * computes them: on ELF64 an output section can be 4 GiB long, or a
+ * section 4 GiB into its segment. merlin-ld then allocates that much and
+ * writes it, or stops when the allocation fails. A Camelot process has
+ * less memory than 4 GiB, so such a count is refused here the way xmalloc
+ * refuses what malloc cannot give, and never cut to 32 bits, which would
+ * write a file whose headers point past its end. */
+uint mem_len(uint64_t n) {
+    if (n > UINT32_MAX) {
+        die("out of memory");
+    }
+    return (uint)n;
+}
+
 char *xstrndup(const char *s, uint n) {
     char *r = xmalloc(n + 1);
     memcpy(r, s, n);
@@ -100,13 +115,20 @@ void buf_pad(struct buf *b, uint len) {
 
 /* ---- Messages ---- */
 
-static void put_number(struct buf *b, uint v, uint base, uint width, int zero) {
-    char digits[12];
+static void put_number(struct buf *b, uint64_t v, uint base, uint width, int zero) {
+    char digits[24];
     int n = 0;
-    do {
+    /* In 64 bits while the value needs them (on RV32 a 64-bit division is a
+     * call to libgcc's routine), in 32 for the rest. */
+    while (v > UINT32_MAX) {
         digits[n++] = "0123456789abcdef"[v % base];
         v /= base;
-    } while (v != 0);
+    }
+    uint w = (uint)v;
+    do {
+        digits[n++] = "0123456789abcdef"[w % base];
+        w /= base;
+    } while (w != 0);
     while ((uint)n < width) {
         buf_byte(b, zero ? '0' : ' ');
         width--;
@@ -137,7 +159,25 @@ char *fmt(const char *f, ...) {
             width = width * 10 + (uint)(*f - '0');
             f++;
         }
-        if (*f == 's') {
+        /* `ll`: the argument is a long long, int64_t or uint64_t. */
+        int wide = 0;
+        if (f[0] == 'l' && f[1] == 'l') {
+            wide = 1;
+            f += 2;
+        }
+        if (wide && *f == 'd') {
+            int64_t v = va_arg(ap, int64_t);
+            if (v < 0) {
+                buf_byte(&b, '-');
+                put_number(&b, 0 - (uint64_t)v, 10, width, zero);
+            } else {
+                put_number(&b, (uint64_t)v, 10, width, zero);
+            }
+        } else if (wide && *f == 'u') {
+            put_number(&b, va_arg(ap, uint64_t), 10, width, zero);
+        } else if (wide && *f == 'x') {
+            put_number(&b, va_arg(ap, uint64_t), 16, width, zero);
+        } else if (*f == 's') {
             const char *s = va_arg(ap, const char *);
             buf_put(&b, s, (uint)strlen(s));
         } else if (*f == 'd') {
@@ -233,14 +273,15 @@ void map_put(struct strmap *m, char *key, int value) {
     }
 }
 
-static uint uhash(uint k) {
+static uint uhash(uint64_t key) {
+    uint k = (uint)key ^ (uint)(key >> 32);
     k ^= k >> 16;
     k *= 0x45d9f3bu;
     k ^= k >> 16;
     return k;
 }
 
-int umap_get(struct uintmap *m, uint key, int *value) {
+int umap_get(struct uintmap *m, uint64_t key, int *value) {
     if (m->cap == 0) {
         return 0;
     }
@@ -255,11 +296,11 @@ int umap_get(struct uintmap *m, uint key, int *value) {
     }
 }
 
-void umap_put(struct uintmap *m, uint key, int value) {
+void umap_put(struct uintmap *m, uint64_t key, int value) {
     if ((m->count + 1) * 2 > m->cap) {
         struct uintmap old = *m;
         m->cap = old.cap ? old.cap * 2 : 64;
-        m->keys = xcalloc(m->cap * sizeof(uint));
+        m->keys = xcalloc(m->cap * sizeof(uint64_t));
         m->values = xcalloc(m->cap * sizeof(int));
         m->used = xcalloc(m->cap);
         m->count = 0;

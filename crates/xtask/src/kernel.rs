@@ -637,24 +637,13 @@ impl Build {
             );
         }
         let user = self.kernel_dir.join(USER_DIR);
-        let (programs, text) = match self.xlen {
-            Xlen::Rv32 => {
-                let programs = crate::userprogs::build_all(&user)?;
-                let text = crate::userprogs::generate(
-                    &crate::userprogs::embedded(&programs),
-                    crate::userprogs::CCompiler::Merlin,
-                );
-                (programs, text)
-            }
-            // The programs the RV64 kernel embeds: /bin/as and /bin/ld are
-            // RV32 programs until #157.
-            Xlen::Rv64 => {
-                let programs = crate::userprogs::build_embedded_for(&user, self.xlen)?;
-                let text =
-                    crate::userprogs::generate_for(&programs, crate::userprogs::CCompiler::Merlin, self.xlen);
-                (programs, text)
-            }
-        };
+        let programs =
+            crate::userprogs::build_all_for(&user, crate::userprogs::CCompiler::Merlin, self.xlen)?;
+        let text = crate::userprogs::generate_for(
+            &crate::userprogs::embedded(&programs),
+            crate::userprogs::CCompiler::Merlin,
+            self.xlen,
+        );
         std::fs::write(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         // The programs with their debug information, for merlin-dbg's
         // `add-symbol-file` (the kernel embeds them without).
@@ -831,22 +820,11 @@ pub fn build_reference_for(
     use crate::userprogs::{self, CCompiler};
     std::fs::create_dir_all(work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
     let progs = work.join(USERPROGS);
-    let text = match xlen {
-        Xlen::Rv32 => {
-            let user = userprogs::user_dir(root);
-            let asm = work.join("user");
-            userprogs::compile_clang(clang, &user, &asm, verbose)?;
-            let programs = userprogs::build_all_with(&user, CCompiler::Clang(&asm))?;
-            userprogs::generate(&userprogs::embedded(&programs), CCompiler::Clang(&asm))
-        }
-        Xlen::Rv64 => {
-            let user = userprogs::user_dir(root);
-            let asm = work.join("user");
-            userprogs::compile_clang_for(clang, &user, &asm, verbose, xlen)?;
-            let programs = userprogs::build_embedded_with(&user, CCompiler::Clang(&asm), xlen)?;
-            userprogs::generate_for(&programs, CCompiler::Clang(&asm), xlen)
-        }
-    };
+    let user = userprogs::user_dir(root);
+    let asm = work.join("user");
+    userprogs::compile_clang_for(clang, &user, &asm, verbose, xlen)?;
+    let programs = userprogs::build_all_for(&user, CCompiler::Clang(&asm), xlen)?;
+    let text = userprogs::generate_for(&userprogs::embedded(&programs), CCompiler::Clang(&asm), xlen);
     std::fs::write(&progs, text).map_err(|e| format!("cannot write {}: {e}", progs.display()))?;
     Build {
         kernel_dir: root.join("kernel"),

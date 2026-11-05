@@ -36,8 +36,7 @@ static struct token *push(int kind, uint line) {
      * number too) for every token costs more than lexing it. */
     t->kind = kind;
     t->line = line;
-    t->num.lo = 0;
-    t->num.hi = 0;
+    t->num = 0;
     t->text = NULL;
     t->len = 0;
     t->punct = 0;
@@ -55,45 +54,28 @@ static int digit_value(int c) {
     return 99;
 }
 
-/* x * r for a small r (at most 16), as a 64-bit high and low word. */
-static void mul_small(uint x, uint r, uint *hi, uint *lo) {
-    uint low = (x & 0xffff) * r;
-    uint high = (x >> 16) * r; /* < 2^20 */
-    *lo = low + (high << 16);
-    *hi = (high >> 16) + (*lo < low ? 1 : 0);
-}
-
-/* Rust's u64::from_str_radix: digits of `radix`, at least one, no overflow. */
-static int parse_u64(const char *s, uint n, uint radix, i64 *out) {
+/* Rust's u64::from_str_radix: digits of `radix`, at least one, no overflow.
+ * The bits go in *out as they are: a number of 2^63 or more reads as a
+ * negative int64_t, as merlin-as's `u64 as i64` does. */
+static int parse_u64(const char *s, uint n, uint radix, int64_t *out) {
     if (n == 0) {
         return 0;
     }
-    uint hi = 0, lo = 0;
+    /* The largest value that can take one more digit. */
+    uint64_t limit = UINT64_MAX / radix;
+    uint64_t v = 0;
     for (uint i = 0; i < n; i++) {
         uint d = (uint)digit_value(s[i]);
         if (d >= radix) {
             return 0;
         }
-        /* (hi:lo) * radix + d, which must stay below 2^64. */
-        uint lh, ll, hh, hl;
-        mul_small(lo, radix, &lh, &ll);
-        mul_small(hi, radix, &hh, &hl);
-        uint new_hi = hl + lh;
-        if (hh != 0 || new_hi < hl) {
+        /* v * radix + d, which must stay below 2^64. */
+        if (v > limit || v * radix > UINT64_MAX - d) {
             return 0;
         }
-        uint new_lo = ll + d;
-        if (new_lo < ll) {
-            new_hi++;
-            if (new_hi == 0) {
-                return 0;
-            }
-        }
-        hi = new_hi;
-        lo = new_lo;
+        v = v * radix + d;
     }
-    out->hi = hi;
-    out->lo = lo;
+    *out = (int64_t)v;
     return 1;
 }
 
@@ -141,8 +123,8 @@ static int lex_number(const char *text, uint n, uint line) {
             }
         }
         if (digits) {
-            i64 v;
-            if (!parse_u64(text, n - 1, 10, &v) || v.hi != 0) {
+            int64_t v;
+            if (!parse_u64(text, n - 1, 10, &v) || (uint64_t)v > UINT32_MAX) {
                 error_at(line, "label number too large");
                 return 0;
             }
@@ -163,7 +145,7 @@ static int lex_number(const char *text, uint n, uint line) {
             lower[m++] = c;
         }
     }
-    i64 v;
+    int64_t v;
     int ok;
     int hex = m >= 2 && lower[0] == '0' && lower[1] == 'x';
     if (hex) {
@@ -368,7 +350,7 @@ int lex_statement(struct lexer *lx, struct token **out) {
                 return -1;
             }
             struct token *t = push(T_INT, lx->line);
-            t->num = i64_u(bytes[0]);
+            t->num = bytes[0];
             i = next;
         } else if (c >= '0' && c <= '9') {
             uint start = i;

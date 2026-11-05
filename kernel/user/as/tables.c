@@ -32,6 +32,27 @@ const struct as_op3 SHIFT_FUNCT[] = {
     {0, 0, 0},
 };
 
+const struct as_op3 OP_32_FUNCT[] = {
+    {"addw", 0x0, 0x0},
+    {"subw", 0x0, 0x20},
+    {"sllw", 0x1, 0x0},
+    {"srlw", 0x5, 0x0},
+    {"sraw", 0x5, 0x20},
+    {"mulw", 0x0, 0x1},
+    {"divw", 0x4, 0x1},
+    {"divuw", 0x5, 0x1},
+    {"remw", 0x6, 0x1},
+    {"remuw", 0x7, 0x1},
+    {0, 0, 0},
+};
+
+const struct as_op3 SHIFT_32_FUNCT[] = {
+    {"slliw", 0x1, 0x0},
+    {"srliw", 0x5, 0x0},
+    {"sraiw", 0x5, 0x20},
+    {0, 0, 0},
+};
+
 const struct as_op2 OP_IMM_FUNCT3[] = {
     {"addi", 0x0},
     {"slti", 0x2},
@@ -99,6 +120,22 @@ const struct as_op2 SYSTEM_FUNCT12[] = {
     {"sret", 0x102},
     {"wfi", 0x105},
     {"mret", 0x302},
+    {0, 0},
+};
+
+const struct as_op2 OP_IMM_32_FUNCT3[] = {
+    {"addiw", 0x0},
+    {0, 0},
+};
+
+const struct as_op2 LOAD_RV64_FUNCT3[] = {
+    {"lwu", 0x6},
+    {"ld", 0x3},
+    {0, 0},
+};
+
+const struct as_op2 STORE_RV64_FUNCT3[] = {
+    {"sd", 0x3},
     {0, 0},
 };
 
@@ -320,6 +357,77 @@ const struct as_op2 CSR_NAMES[] = {
     {"mimpid", 0xf13},
     {"mhartid", 0xf14},
     {"mconfigptr", 0xf15},
+    {0, 0},
+};
+
+const struct as_op2 CSR_RV32_ONLY[] = {
+    {"mstatush", 0x310},
+    {"menvcfgh", 0x31a},
+    {"pmpcfg1", 0x3a1},
+    {"pmpcfg3", 0x3a3},
+    {"mcycleh", 0xb80},
+    {"minstreth", 0xb82},
+    {"mhpmcounter3h", 0xb83},
+    {"mhpmcounter4h", 0xb84},
+    {"mhpmcounter5h", 0xb85},
+    {"mhpmcounter6h", 0xb86},
+    {"mhpmcounter7h", 0xb87},
+    {"mhpmcounter8h", 0xb88},
+    {"mhpmcounter9h", 0xb89},
+    {"mhpmcounter10h", 0xb8a},
+    {"mhpmcounter11h", 0xb8b},
+    {"mhpmcounter12h", 0xb8c},
+    {"mhpmcounter13h", 0xb8d},
+    {"mhpmcounter14h", 0xb8e},
+    {"mhpmcounter15h", 0xb8f},
+    {"mhpmcounter16h", 0xb90},
+    {"mhpmcounter17h", 0xb91},
+    {"mhpmcounter18h", 0xb92},
+    {"mhpmcounter19h", 0xb93},
+    {"mhpmcounter20h", 0xb94},
+    {"mhpmcounter21h", 0xb95},
+    {"mhpmcounter22h", 0xb96},
+    {"mhpmcounter23h", 0xb97},
+    {"mhpmcounter24h", 0xb98},
+    {"mhpmcounter25h", 0xb99},
+    {"mhpmcounter26h", 0xb9a},
+    {"mhpmcounter27h", 0xb9b},
+    {"mhpmcounter28h", 0xb9c},
+    {"mhpmcounter29h", 0xb9d},
+    {"mhpmcounter30h", 0xb9e},
+    {"mhpmcounter31h", 0xb9f},
+    {"cycleh", 0xc80},
+    {"timeh", 0xc81},
+    {"instreth", 0xc82},
+    {"hpmcounter3h", 0xc83},
+    {"hpmcounter4h", 0xc84},
+    {"hpmcounter5h", 0xc85},
+    {"hpmcounter6h", 0xc86},
+    {"hpmcounter7h", 0xc87},
+    {"hpmcounter8h", 0xc88},
+    {"hpmcounter9h", 0xc89},
+    {"hpmcounter10h", 0xc8a},
+    {"hpmcounter11h", 0xc8b},
+    {"hpmcounter12h", 0xc8c},
+    {"hpmcounter13h", 0xc8d},
+    {"hpmcounter14h", 0xc8e},
+    {"hpmcounter15h", 0xc8f},
+    {"hpmcounter16h", 0xc90},
+    {"hpmcounter17h", 0xc91},
+    {"hpmcounter18h", 0xc92},
+    {"hpmcounter19h", 0xc93},
+    {"hpmcounter20h", 0xc94},
+    {"hpmcounter21h", 0xc95},
+    {"hpmcounter22h", 0xc96},
+    {"hpmcounter23h", 0xc97},
+    {"hpmcounter24h", 0xc98},
+    {"hpmcounter25h", 0xc99},
+    {"hpmcounter26h", 0xc9a},
+    {"hpmcounter27h", 0xc9b},
+    {"hpmcounter28h", 0xc9c},
+    {"hpmcounter29h", 0xc9d},
+    {"hpmcounter30h", 0xc9e},
+    {"hpmcounter31h", 0xc9f},
     {0, 0},
 };
 

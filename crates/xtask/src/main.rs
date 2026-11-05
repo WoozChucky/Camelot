@@ -36,7 +36,7 @@ tasks:
                made bootable with kernel/boot/boot.elf and kernel/kernel-disk.elf
                (grail --disk target/camelot-fs.img boots it, in the default 4 MiB of RAM);
                then the same for RV64, target/camelot-fs-rv64.img, with the programs built
-               for RV64 (but as and ld), kernel/boot/boot-rv64.elf and
+               for RV64, kernel/boot/boot-rv64.elf and
                kernel/kernel-disk-rv64.elf (grail --xlen 64 --disk target/camelot-fs-rv64.img)
                --xlen 32|64: build only the RV32 or the RV64 image (with -o, RV32 by default)
                -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default

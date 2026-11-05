@@ -162,43 +162,6 @@ apply:
     ret
     .size apply, . - apply
 
-    # int twice(int x): frame 32 bytes
-    #     -20(s0)  param int x
-    .type twice, @function
-twice:
-    addi  sp, sp, -16
-    sd    ra, 8(sp)
-    sd    s0, 0(sp)
-    addi  s0, sp, 16
-    addi  sp, sp, -16
-    sw    a0, -20(s0)
-    li    a0, 2
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    lw    a0, -20(s0)
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    mulw  a0, a1, a0
-.L.return.twice:
-    addi  sp, s0, -16
-    ld    ra, 8(sp)
-    ld    s0, 0(sp)
-    addi  sp, sp, 16
-    ret
-    .size twice, . - twice
-
-    .bss
-
-    # void (*nothing)(void): 8 bytes
-    .globl nothing
-    .balign 8
-    .type nothing, @object
-    .size nothing, 8
-nothing:
-    .zero 8
-
-    .text
-
     # int fold(int (*f)(int, int), const int *a, int n, int acc): frame 48 bytes
     #     -24(s0)  param int (*f)(int, int)
     #     -32(s0)  param const int *a
@@ -767,3 +730,38 @@ main:
     addi  sp, sp, 16
     ret
     .size main, . - main
+
+    # int twice(int x): frame 32 bytes
+    #     -20(s0)  param int x
+    .type twice, @function
+twice:
+    addi  sp, sp, -16
+    sd    ra, 8(sp)
+    sd    s0, 0(sp)
+    addi  s0, sp, 16
+    addi  sp, sp, -16
+    sw    a0, -20(s0)
+    li    a0, 2
+    addi  sp, sp, -8
+    sd    a0, 0(sp)
+    lw    a0, -20(s0)
+    ld    a1, 0(sp)
+    addi  sp, sp, 8
+    mulw  a0, a1, a0
+.L.return.twice:
+    addi  sp, s0, -16
+    ld    ra, 8(sp)
+    ld    s0, 0(sp)
+    addi  sp, sp, 16
+    ret
+    .size twice, . - twice
+
+    .bss
+
+    # void (*nothing)(void): 8 bytes
+    .globl nothing
+    .balign 8
+    .type nothing, @object
+    .size nothing, 8
+nothing:
+    .zero 8

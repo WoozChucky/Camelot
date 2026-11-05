@@ -1,4 +1,4 @@
-// expect: 26
+// expect: 28
 // Integer constant expressions of every integer type are folded: each is one
 // constant in the code, as clang's front end has it at -O0. Each must be
 // what the same operations give at run time, on variables, and what C says
@@ -9,6 +9,12 @@ unsigned bump(void) {
     calls++;
     return 1;
 }
+
+// So in what the parser evaluates too: an enumerator, an array size (a GNU
+// folding in clang, which warns), a _Static_assert.
+enum { NOT_CHOSEN = (1 ? -1 : bump()) < 0 };
+int folded[1 ? 2 : bump()];
+_Static_assert(1 ? 1 : bump(), "the operand chosen decides");
 
 int main() {
     int r = 0;
@@ -52,5 +58,7 @@ int main() {
     // counts (unsigned int here), and it is not called.
     r += (1 ? -1 : bump()) == 0xffffffffu && (1 ? -1 : bump()) > 0;   // 25
     r += (0 ? bump() : 2) == 2 && calls == 0;                         // 26
+    r += NOT_CHOSEN == 0;                             // 27: unsigned, as 25
+    r += sizeof folded == 2 * sizeof(int);                            // 28
     return r;
 }

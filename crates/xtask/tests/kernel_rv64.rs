@@ -836,12 +836,18 @@ fn the_rv64_kernel_boots_from_disk() {
         assert!(out.contains("\nfs: disk 0 mounted: "), "{out}");
         // One more check than without /bin: the programs there ("N
         // programs, the kernel none" for the disk kernel, "N of the
-        // kernel's N programs" for a reference build, which embeds them).
-        let programs = xtask::userprogs::embedded_names(&xtask::userprogs::user_dir(&root)).unwrap();
-        assert!(
-            out.contains(&format!("\nfs: /bin holds {} ", programs.len())),
-            "{out}"
-        );
+        // kernel's N programs" for a reference build, which embeds them):
+        // every program on the disk, as and ld too, which the kernel never
+        // embeds.
+        let user = xtask::userprogs::user_dir(&root);
+        let holds = if UNDER_TEST_USER_ASM.with(|a| a.borrow().is_some()) {
+            let n = xtask::userprogs::embedded_names(&user).unwrap().len();
+            format!("\nfs: /bin holds {n} of the kernel's {n} programs\n")
+        } else {
+            let n = xtask::userprogs::program_names(&user).unwrap().len();
+            format!("\nfs: /bin holds {n} programs, the kernel none\n")
+        };
+        assert!(out.contains(&holds), "{out}");
         assert!(out.contains("\nfs self-test: 12/12 passed\n"), "{out}");
         assert!(!out.contains("FAILED"), "{out}");
         // Then the shell from /bin/sh on the disk, and the programs it

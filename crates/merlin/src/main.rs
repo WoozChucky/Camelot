@@ -190,19 +190,26 @@ fn translate(input: &str, output: Option<&str>, mode: Mode, opts: &Options) -> R
             return Err(ExitCode::from(2));
         }
     };
+    // The text, and the warnings of a compilation that succeeds (those of
+    // one that fails come with its errors).
     let result = match mode {
-        Mode::Compile => merlin::compile_with(input, &src, opts, &merlin::read_file),
+        Mode::Compile => merlin::compile_warned(input, &src, opts, &merlin::read_file),
         Mode::Preprocess if opts.lang == Lang::AssemblerWithCpp => {
-            merlin::preprocess_asm(input, &src, opts, &merlin::read_file)
+            merlin::preprocess_asm(input, &src, opts, &merlin::read_file).map(|t| (t, Vec::new()))
         }
         Mode::Preprocess => merlin::preprocess(input, &src, opts, &merlin::read_file)
-            .map(|pp| merlin::preprocess::spell(&pp.tokens)),
-        Mode::DumpAst => {
-            merlin::parse_with(input, &src, opts, &merlin::read_file).map(|p| merlin::ast::dump(&p))
-        }
+            .map(|pp| (merlin::preprocess::spell(&pp.tokens), Vec::new())),
+        Mode::DumpAst => merlin::parse_with(input, &src, opts, &merlin::read_file)
+            .map(|p| (merlin::ast::dump(&p), p.warnings)),
     };
+    // Diagnostics as clang prints them, on stderr; only errors fail.
     let text = match result {
-        Ok(t) => t,
+        Ok((t, warnings)) => {
+            for w in &warnings {
+                eprintln!("{}", w.render(input));
+            }
+            t
+        }
         Err(errors) => {
             for e in &errors {
                 eprintln!("{}", e.render(input));
