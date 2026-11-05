@@ -45,6 +45,22 @@ fn state(conn: &mut Connection<TcpStream>, vm: u32) -> VmState {
     }
 }
 
+/// sys_write's first line after its prologue, where `break sys_write` stops: the
+/// line that takes the file, the first after the function's own.
+fn sys_write_line() -> usize {
+    let text = std::fs::read_to_string(path("kernel/sysfile.c")).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("long sys_write("))
+        .expect("no sys_write");
+    let take = lines[start..]
+        .iter()
+        .position(|l| l.trim_start().starts_with("struct file *file = fd_get"))
+        .expect("sys_write takes no file");
+    start + take + 1
+}
+
 /// A buffer the test reads while a session writes to it.
 #[derive(Clone, Default)]
 struct Shared(Arc<Mutex<Vec<u8>>>);
@@ -176,7 +192,8 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
         .take_while(|l| !l.starts_with("(merlin-dbg)"))
         .collect();
     assert!(bt[0].starts_with("#0  sys_write (f=0x"), "{text}");
-    assert!(bt[0].ends_with("at kernel/sysfile.c:65"), "{text}");
+    let line = sys_write_line();
+    assert!(bt[0].ends_with(&format!("at kernel/sysfile.c:{line}")), "{text}");
     assert!(bt[1].contains(" in syscall (f=0x"), "{text}");
     // a7 is the system call's number: write, 2.
     assert!(text.contains("\n$1 = 2\n"), "{text}");

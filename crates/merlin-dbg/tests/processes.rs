@@ -323,7 +323,9 @@ fn breaking_in_one_of_two_processes_running_cat() {
     ));
     let out = debugged(&commands);
     assert!(
-        out.contains("(merlin-dbg) break kernel/user/cat.c:19 process 99\nerror: no process 99\n"),
+        out.contains(&format!(
+            "(merlin-dbg) break kernel/user/cat.c:{write} process 99\nerror: no process 99\n"
+        )),
         "{out}"
     );
     assert!(

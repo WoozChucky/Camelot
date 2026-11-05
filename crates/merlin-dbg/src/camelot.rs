@@ -96,13 +96,16 @@ pub fn current<T: Target>(eval: &mut Eval<'_, T>, hart: usize) -> Result<Option<
 mod tests {
     use super::*;
 
-    /// The state names are proc.h's `PROC_` constants, number for number.
+    /// The state names are proc.h's `PROC_` constants, number for number: the ones
+    /// of its "Process states" block, which ends at the thread states.
     #[test]
     fn the_states_are_the_kernels() {
         let header = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/include/proc.h");
         let header = std::fs::read_to_string(header).unwrap();
         let defined: Vec<(u64, String)> = header
             .lines()
+            .skip_while(|l| !l.starts_with("/* Process states."))
+            .take_while(|l| !l.starts_with("/* Thread states:"))
             .filter_map(|l| l.strip_prefix("#define PROC_"))
             .filter_map(|l| {
                 let mut words = l.split_whitespace();
@@ -110,7 +113,6 @@ mod tests {
                 let value = words.next()?.parse().ok()?;
                 Some((value, name))
             })
-            .filter(|(_, name)| name != "name_max" && name != "size")
             .collect();
         let ours: Vec<(u64, String)> = STATES.iter().map(|(n, s)| (*n, s.to_string())).collect();
         assert_eq!(defined, ours);
