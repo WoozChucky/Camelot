@@ -18,17 +18,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 thread_local! {
-    /// The width of the VMs this thread's test makes ([`on_both_widths`]).
-    static XLEN: Cell<Xlen> = const { Cell::new(Xlen::Rv32) };
+    /// The width of the VMs this thread's test makes: set by [`on_both_widths`], and
+    /// carried into the threads the test starts by [`spawn`]; `None` elsewhere.
+    static XLEN: Cell<Option<Xlen>> = const { Cell::new(None) };
 }
 
 /// Runs `test` with RV32 VMs, then with RV64 ones. A failure says which width failed:
 /// the panic is raised again with the width before its message.
 pub fn on_both_widths(test: impl Fn()) {
     for xlen in [Xlen::Rv32, Xlen::Rv64] {
-        XLEN.with(|x| x.set(xlen));
+        XLEN.with(|x| x.set(Some(xlen)));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
-        XLEN.with(|x| x.set(Xlen::Rv32));
+        XLEN.with(|x| x.set(None));
         if let Err(payload) = result {
             let message = if let Some(s) = payload.downcast_ref::<&str>() {
                 s.to_string()
@@ -43,8 +44,30 @@ pub fn on_both_widths(test: impl Fn()) {
 }
 
 /// The width of the VMs the current test makes (RV32 outside [`on_both_widths`]).
+///
+/// A thread the test starts has the width if [`spawn`] started it. In a thread
+/// `std::thread::spawn` starts the width is not set, and RV32 there would make RV32
+/// guests in an RV64 test without a word: asking there panics. Such a thread is told
+/// from the test's own by its name: libtest runs each test in a thread named after it,
+/// and `std::thread::spawn`'s threads have none.
 pub fn xlen() -> Xlen {
-    XLEN.with(Cell::get)
+    XLEN.with(Cell::get).unwrap_or_else(|| {
+        assert!(
+            std::thread::current().name().is_some(),
+            "a thread that asks for the width is started with common::spawn, which gives it the test's width"
+        );
+        Xlen::Rv32
+    })
+}
+
+/// Starts a thread as `std::thread::spawn` does, with the width of the thread that
+/// starts it: what the thread makes ([`xlen`]) is of the test's width.
+pub fn spawn<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> std::thread::JoinHandle<T> {
+    let xlen = xlen();
+    std::thread::spawn(move || {
+        XLEN.with(|x| x.set(Some(xlen)));
+        f()
+    })
 }
 
 /// The create's `xlen` for the current width, as the form sends it: `"32"` or `"64"`.
@@ -370,7 +393,7 @@ pub fn program(name: &str) -> Json {
 
 /// The example `name` built for `xlen`, whatever the current width.
 pub fn example_of(name: &str, xlen: Xlen) -> PathBuf {
-    let was = XLEN.with(|x| x.replace(xlen));
+    let was = XLEN.with(|x| x.replace(Some(xlen)));
     let path = example(name);
     XLEN.with(|x| x.set(was));
     path

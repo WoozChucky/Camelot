@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 pub const MIB: u64 = 1024 * 1024;
 
 thread_local! {
-    /// The width of the VMs this thread's test makes ([`on_both_widths`]).
-    static XLEN: Cell<Xlen> = const { Cell::new(Xlen::Rv32) };
+    /// The width of the VMs this thread's test makes: set by [`on_both_widths`], and
+    /// carried into the threads the test starts by [`spawn`]; `None` elsewhere.
+    static XLEN: Cell<Option<Xlen>> = const { Cell::new(None) };
 }
 
 /// Runs `test` with RV32 VMs, then with RV64 ones: every guest and profile the
@@ -31,9 +32,9 @@ thread_local! {
 /// panic is raised again with the width before its message.
 pub fn on_both_widths(test: impl Fn()) {
     for xlen in [Xlen::Rv32, Xlen::Rv64] {
-        XLEN.with(|x| x.set(xlen));
+        XLEN.with(|x| x.set(Some(xlen)));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
-        XLEN.with(|x| x.set(Xlen::Rv32));
+        XLEN.with(|x| x.set(None));
         if let Err(payload) = result {
             panic!("on {xlen}: {}", panic_message(&*payload));
         }
@@ -52,8 +53,30 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 }
 
 /// The width of the VMs the current test makes ([`on_both_widths`]; RV32 outside it).
+///
+/// A thread the test starts has the width if [`spawn`] started it. In a thread
+/// `std::thread::spawn` starts the width is not set, and RV32 there would make RV32
+/// guests in an RV64 test without a word: asking there panics. Such a thread is told
+/// from the test's own by its name: libtest runs each test in a thread named after it,
+/// and `std::thread::spawn`'s threads have none.
 pub fn xlen() -> Xlen {
-    XLEN.with(Cell::get)
+    XLEN.with(Cell::get).unwrap_or_else(|| {
+        assert!(
+            std::thread::current().name().is_some(),
+            "a thread that asks for the width is started with common::spawn, which gives it the test's width"
+        );
+        Xlen::Rv32
+    })
+}
+
+/// Starts a thread as `std::thread::spawn` does, with the width of the thread that
+/// starts it: what the thread makes ([`xlen`]) is of the test's width.
+pub fn spawn<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> std::thread::JoinHandle<T> {
+    let xlen = xlen();
+    std::thread::spawn(move || {
+        XLEN.with(|x| x.set(Some(xlen)));
+        f()
+    })
 }
 
 /// An address as the examples print one (`netlib.S`'s `print_hex`): as many hex digits

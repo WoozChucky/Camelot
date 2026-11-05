@@ -239,13 +239,16 @@ fn the_new_vm_form_offers_camelot() {
 fn camelot_creates_are_guarded() {
     on_both_widths(|| {
         let platform = Platform::start("camelot-guard", 64);
-        std::fs::write(platform.dir.path().join("os-base"), spinning_image(16)).unwrap();
+        // A VM of this test's width, from the base image of that width.
+        let image = avalon_client::base_image(xlen());
+        std::fs::write(platform.dir.path().join(image), spinning_image(16)).unwrap();
         let api = platform.api();
         let addr = api.addr;
         let token = ("X-Pendragon-Token", api.token.as_str());
         let json = ("Content-Type", "application/json");
         let own = format!("http://{addr}");
-        let body = br#"{"name": "web", "camelot": true}"#;
+        let body = format!(r#"{{"name": "web", "camelot": true, "xlen": {}}}"#, xlen_text());
+        let body = body.as_bytes();
         for (headers, why) in [
             (
                 vec![token, json, ("Origin", "http://evil.example")],
@@ -288,10 +291,13 @@ fn camelot_creates_are_guarded() {
                     ("name", "web".into()),
                     ("camelot", true.into()),
                     ("ram", "8".into()),
+                    ("xlen", xlen_text()),
                 ]),
             ),
         );
         assert_eq!(s(&r, "disk"), "web-disk0");
+        let vms = api.expect(200, api.get("vms"));
+        assert_eq!(s(&list(&vms, "vms")[0], "arch"), arch());
         platform.stop();
     });
 }

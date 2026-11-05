@@ -651,7 +651,8 @@ fn many_clients_at_once() {
         let threads: Vec<_> = (0..8)
             .map(|i| {
                 let mut conn = connect(&server);
-                std::thread::spawn(move || {
+                // A thread of the test's width: its profile and program are of that width.
+                spawn(move || {
                     let name = format!("vm-{i}");
                     let id = create(&mut conn, &name, profile(1 + i as u64, None), exits_with(i));
                     conn.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
@@ -677,6 +678,9 @@ fn many_clients_at_once() {
             Message::VmList { vms } => {
                 assert_eq!(vms.len(), 8);
                 assert!(vms.windows(2).all(|w| w[0].id < w[1].id), "in id order");
+                for vm in &vms {
+                    assert_eq!(vm.profile.xlen, xlen(), "VM {}'s width", vm.id);
+                }
             }
             other => panic!("{other:?}"),
         }

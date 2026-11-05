@@ -770,12 +770,13 @@ fn a_slow_create_holds_up_no_one_else() {
                 source: DiskSource::File(fifo.to_string_lossy().into_owned()),
                 read_only: true,
             })],
-            ..HardwareProfile::with_ram(40 * MIB)
+            ..hardware(40 * MIB)
         };
         let slow = {
             let mut conn = connect(&server);
             conn.get_ref().set_read_timeout(None).unwrap();
-            std::thread::spawn(move || {
+            // A thread of the test's width: the spinner it sends is of that width.
+            spawn(move || {
                 conn.request(&Message::CreateVm {
                     name: "slow".into(),
                     profile: profile_with_fifo,
@@ -802,6 +803,7 @@ fn a_slow_create_holds_up_no_one_else() {
             ErrorCode::OverBudget
         );
         let other = create(&mut rt, "other", profile(20, None), spinner());
+        assert_eq!(info(&mut rt, other).vm.profile.xlen, xlen());
         rt.request_ok(&Message::StartVm { vm: VmRef::Id(other) }).unwrap();
         assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
         assert!(!slow.is_finished());
@@ -812,6 +814,7 @@ fn a_slow_create_holds_up_no_one_else() {
         match slow.join().unwrap() {
             Ok(Message::VmCreated { id }) => {
                 assert_ne!(id, other);
+                assert_eq!(info(&mut rt, id).vm.profile.xlen, xlen());
                 rt.request_ok(&Message::DestroyVm {
                     vm: VmRef::Name("slow".into()),
                 })
