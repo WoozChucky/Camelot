@@ -393,10 +393,9 @@ fn clang_gives_the_tables_diagnostics() {
     for (n, c) in rows.iter().enumerate() {
         let got: Vec<_> = results.iter().filter(|r| r.0 == n).collect();
         let wrong: Vec<_> = got.iter().filter(|(_, _, g)| !agrees(c, g)).collect();
-        if wrong.is_empty() {
-            continue;
-        }
         let same = got.iter().all(|r| r.2 == got[0].2);
+        // Blessing rewrites a row clang agrees with too, when merlin gives
+        // more of clang's notes than the row has.
         if bless_mode && c.then.is_empty() && c.merlin.is_none() && same {
             let merlin = merlin_lines(c, got[0].1);
             let lines: Vec<String> = got[0]
@@ -406,6 +405,9 @@ fn clang_gives_the_tables_diagnostics() {
                     std::iter::once(l.clone()).chain(notes.iter().filter(|n| merlin.contains(n)).cloned())
                 })
                 .collect();
+            if lines == c.want {
+                continue;
+            }
             match bless(c.at, &lines) {
                 Ok(()) => {
                     blessed.push(c.at);
@@ -413,6 +415,9 @@ fn clang_gives_the_tables_diagnostics() {
                 }
                 Err(e) => failures.push(format!("{}:{}: cannot bless: {e}", c.at.file(), c.at.line())),
             }
+        }
+        if wrong.is_empty() {
+            continue;
         }
         for (_, x, g) in wrong {
             failures.push(format!(
