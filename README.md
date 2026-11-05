@@ -18,7 +18,7 @@ You need [Rust](https://rustup.rs) and nothing else: no crates to download, no L
 cargo xtask up --demo
 ```
 
-This builds the platform in release mode (a few minutes the first time), builds the Camelot root image (`target/camelot-fs.img`, the kernel and its programs on a bootable disk) and puts it in Lake's images directory, `target/platform/images`, as the image `os-base`. Then it runs Lake, Avalon and Pendragon, with their output in this terminal, each line prefixed by its server. `--demo` also creates a switch `nat` with a NAT gateway, and a VM `vm001` with the default hardware (4 MiB of RAM) that boots Camelot from `vm001-disk0`, its own copy of the image, plugged into the switch. The gateway forwards 127.0.0.1:2323 to the VM's port 23, and once the VM is at its prompt `up` starts `shd` there, Camelot's shell server (it types `shd &` on the console). Once everything is up, `up` says where it is:
+This builds the platform in release mode (a few minutes the first time), builds the Camelot root images (`target/camelot-fs.img`, the kernel and its programs on a bootable disk, and `target/camelot-fs-rv64.img`, the same for RV64) and puts them in Lake's images directory, `target/platform/images`, as the images `os-base` and `os-base-rv64`. Then it runs Lake, Avalon and Pendragon, with their output in this terminal, each line prefixed by its server. `--demo` also creates a switch `nat` with a NAT gateway, and a VM `vm001` with the default hardware (4 MiB of RAM) that boots Camelot from `vm001-disk0`, its own copy of the image, plugged into the switch. The gateway forwards 127.0.0.1:2323 to the VM's port 23, and once the VM is at its prompt `up` starts `shd` there, Camelot's shell server (it types `shd &` on the console). Once everything is up, `up` says where it is:
 
 ```
 The Avalon platform is up.
@@ -29,7 +29,7 @@ The Avalon platform is up.
   Lake       127.0.0.1:7401, images in C:\...\Camelot\target\platform\images
 ```
 
-Open the Pendragon URL in a browser. Its **New VM** page creates a VM: give it a name and leave *Camelot (boot from disk)* chosen, and the VM gets a disk of its own, `NAME-disk0`, copied from the image `os-base`, and boots from it; its page shows the console, where Camelot's shell waits (`ls /bin`, `echo hi > /hi`, `cat /hi`). The demo's VM is in the VM list already.
+Open the Pendragon URL in a browser. Its **New VM** page creates a VM: give it a name and leave *Camelot (boot from disk)* chosen, and the VM gets a disk of its own, `NAME-disk0`, copied from the image `os-base` (or `os-base-rv64`, with *RV64* chosen as its width), and boots from it; its page shows the console, where Camelot's shell waits (`ls /bin`, `echo hi > /hi`, `cat /hi`). The demo's VM is in the VM list already.
 
 Or, from a second terminal, Round Table creates the VM and Herald attaches the terminal to its console:
 
@@ -487,7 +487,7 @@ round-table disk create backup --from data
 created disk backup (a copy of data, 64 MiB, 131072 sectors)
 ```
 
-**Camelot VMs.** `create --name NAME --camelot` creates a VM that boots Camelot with no program to send: Round Table first has Lake copy the image `os-base` (the bootable root image that [`cargo xtask up`](#quick-start) puts in Lake's directory) to `NAME-disk0`, then creates the VM with that copy as its first disk, `lake://ADDR/NAME-disk0`, where ADDR is the Lake of `--lake` (default `127.0.0.1:7401`; Avalon reaches the disk at the same address). The other `create` options go with it (`--ram`, `--net`, more `--disk`s after the copy, `--start`):
+**Camelot VMs.** `create --name NAME --camelot` creates a VM that boots Camelot with no program to send: Round Table first has Lake copy the image of the VM's width, `os-base`, or `os-base-rv64` with `--xlen 64` (the bootable root images that [`cargo xtask up`](#quick-start) puts in Lake's directory), to `NAME-disk0`, then creates the VM with that copy as its first disk, `lake://ADDR/NAME-disk0`, where ADDR is the Lake of `--lake` (default `127.0.0.1:7401`; Avalon reaches the disk at the same address). The other `create` options go with it (`--ram`, `--net`, more `--disk`s after the copy, `--start`):
 
 ```
 round-table create --name web --camelot --net nat --start
@@ -497,6 +497,18 @@ round-table create --name web --camelot --net nat --start
 created disk web-disk0 (a copy of os-base)
 created VM 1 (web)
 started VM 1 (web)
+```
+
+An RV64 VM boots RV64 Camelot from its copy of `os-base-rv64` (`--paging sv39` gives it Sv39 alone, as most RV64 boards have):
+
+```
+round-table create --name web64 --camelot --xlen 64 --net nat --start
+```
+
+```
+created disk web64-disk0 (a copy of os-base-rv64)
+created VM 2 (web64)
+started VM 2 (web64)
 ```
 
 A Lake without the image says so: `the Lake at 127.0.0.1:7401 has no 'os-base' image to copy (start the platform with 'cargo xtask up', which puts it in Lake's images directory)`. A copy whose name is taken is refused (`already exists`), and so is a copy of an image that a VM writes (`busy`); when Avalon refuses the VM (its name is taken, say), the copy is deleted again. Destroying the VM leaves its disk on Lake, with what Camelot wrote to it, until `disk delete NAME-disk0`. A disk is attached to a VM when the VM is created (`--disk lake://127.0.0.1:7401/data`; a missing image, one another VM writes, or a Lake server that cannot be reached is refused as an invalid hardware profile) and detached when the VM's machine ends: when the VM is stopped, its program exits, or it is destroyed. A stopped or exited VM still lists its disks (`list`, `info`), but no longer holds them. `disk list` shows each image's attachments (one writer, or any number of readers), and an attached image cannot be deleted.
