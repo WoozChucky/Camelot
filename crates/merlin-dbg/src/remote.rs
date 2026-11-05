@@ -1,6 +1,8 @@
 //! The client side of the GDB remote serial protocol: what merlin-dbg says to a stub
 //! (Grail's, `grail --gdb`) to read and change a stopped machine, and to run it until it
-//! stops. The framing is Grail's own ([`grail::gdb::packet`]).
+//! stops. The framing is Grail's own ([`grail::gdb::packet`]). The bytes go over a
+//! [`Link`]: a TCP connection to `grail --gdb`, or a VM's stub tunnelled through an
+//! Avalon session ([`avalon_client::DebugTunnel`], `merlin-dbg --vm`).
 //!
 //! ## The target's width
 //!
@@ -18,6 +20,36 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// What carries the protocol's bytes to the stub and back.
+pub trait Link: Send {
+    fn send(&mut self, data: &[u8]) -> io::Result<()>;
+    /// Reads what has arrived, waiting at most `timeout` for it (forever with none):
+    /// `WouldBlock` or `TimedOut` when nothing came in time, `Ok(0)` or an error once
+    /// the connection has ended.
+    fn receive(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> io::Result<usize>;
+}
+
+impl Link for TcpStream {
+    fn send(&mut self, data: &[u8]) -> io::Result<()> {
+        Write::write_all(self, data)
+    }
+
+    fn receive(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
+        self.set_read_timeout(timeout)?;
+        self.read(buf)
+    }
+}
+
+impl Link for avalon_client::DebugTunnel {
+    fn send(&mut self, data: &[u8]) -> io::Result<()> {
+        avalon_client::DebugTunnel::write_all(self, data)
+    }
+
+    fn receive(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
+        avalon_client::DebugTunnel::read_timeout(self, buf, timeout)
+    }
+}
 
 /// GDB's register numbers (see `grail::gdb::target`).
 pub const PC: usize = 32;
@@ -68,7 +100,7 @@ pub enum StopEvent {
 
 /// A connection to a stub.
 pub struct Remote {
-    stream: TcpStream,
+    stream: Box<dyn Link>,
     decoder: Decoder,
     /// Events read past the one wanted.
     events: VecDeque<Event>,
@@ -115,11 +147,17 @@ pub fn xml_xlen(xml: &str) -> Option<Xlen> {
 pub type Result<T> = std::result::Result<T, String>;
 
 impl Remote {
-    /// Connects to the stub at `addr` and agrees on the protocol: `swbreak` stop
-    /// reasons, no acks if the stub can, the target's width and the list of harts.
+    /// Connects to the stub at `addr`, as [`Remote::over`] a TCP connection.
     pub fn connect(addr: SocketAddr) -> Result<Remote> {
         let stream = TcpStream::connect(addr).map_err(|e| format!("cannot connect to {addr}: {e}"))?;
         let _ = stream.set_nodelay(true);
+        Remote::over(Box::new(stream))
+    }
+
+    /// Talks to the stub at the other end of `stream`, agreeing on the protocol:
+    /// `swbreak` stop reasons, no acks if the stub can, the target's width and the list
+    /// of harts.
+    pub fn over(stream: Box<dyn Link>) -> Result<Remote> {
         let mut r = Remote {
             stream,
             decoder: Decoder::default(),
@@ -205,7 +243,7 @@ impl Remote {
     fn send(&mut self, payload: &[u8]) -> io::Result<()> {
         let frame = packet::frame(payload);
         loop {
-            self.stream.write_all(&frame)?;
+            self.stream.send(&frame)?;
             if self.no_ack {
                 return Ok(());
             }
@@ -229,7 +267,7 @@ impl Remote {
                 None => {
                     if let Some(flag) = interrupt {
                         if !sent && flag.swap(false, Ordering::SeqCst) {
-                            self.stream.write_all(&[0x03])?;
+                            self.stream.send(&[0x03])?;
                             sent = true;
                         }
                         match self.poll_event(Duration::from_millis(50))? {
@@ -244,11 +282,11 @@ impl Remote {
             match event {
                 Event::Packet(p) => {
                     if !self.no_ack {
-                        self.stream.write_all(b"+")?;
+                        self.stream.send(b"+")?;
                     }
                     return Ok(String::from_utf8_lossy(&p).into_owned());
                 }
-                Event::Bad if !self.no_ack => self.stream.write_all(b"-")?,
+                Event::Bad if !self.no_ack => self.stream.send(b"-")?,
                 _ => {}
             }
         }
@@ -264,11 +302,10 @@ impl Remote {
 
     /// The next event, reading for at most `timeout` (forever if zero).
     fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
-        self.stream
-            .set_read_timeout((!timeout.is_zero()).then_some(timeout))?;
+        let timeout = (!timeout.is_zero()).then_some(timeout);
         let mut buf = [0u8; 4096];
         loop {
-            let n = match self.stream.read(&mut buf) {
+            let n = match self.stream.receive(&mut buf, timeout) {
                 Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
                 Ok(n) => n,
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
@@ -337,6 +374,47 @@ impl Remote {
             }
         }
         Ok(out)
+    }
+
+    /// Up to `len` bytes at physical address `addr` (QEMU's `Qqemu.PhyMemMode`, which
+    /// Grail's stub has too): fewer when the memory ends, an error when not even the
+    /// first byte can be read, or the stub cannot read physical memory.
+    pub fn read_physical(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        self.request("Qqemu.PhyMemMode:1")
+            .map_err(|e| format!("cannot read physical memory: {e}"))?;
+        // In u64: a physical address can be past 4 GiB on RV32 (Sv32's 34 bits).
+        let mut out = Vec::with_capacity(len);
+        let mut failed = None;
+        while out.len() < len {
+            let at = addr.wrapping_add(out.len() as u64);
+            let want = (len - out.len()).min(0x800);
+            match self.request(&format!("m{at:x},{want:x}")) {
+                Ok(reply) => match unhex(&reply) {
+                    Some(bytes) => {
+                        let short = bytes.len() < want;
+                        out.extend(bytes);
+                        if short {
+                            break;
+                        }
+                    }
+                    None => {
+                        failed = Some("a malformed memory packet".to_string());
+                        break;
+                    }
+                },
+                Err(e) => {
+                    if out.is_empty() {
+                        failed = Some(format!("cannot read physical memory at {at:#x}: {e}"));
+                    }
+                    break;
+                }
+            }
+        }
+        self.request("Qqemu.PhyMemMode:0")?;
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
     }
 
     /// A word of memory (an instruction), if it can be read.

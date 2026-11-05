@@ -207,10 +207,13 @@ LLDB 23 reads the target description and sees the CSRs. LLDB builds without XML 
 
 ```
 merlin-dbg [--connect ADDR] [-x FILE] [program.elf]
+merlin-dbg --vm VM [--server ADDR] [-x FILE] [program.elf]
 merlin-dbg [-x FILE] -- [grail options] program.elf
 ```
 
 **`--connect ADDR`** connects to a running stub. ADDR is `HOST:PORT` or a port on 127.0.0.1, 127.0.0.1:1234 by default. `program.elf` is only read for its symbols. `quit` detaches and leaves the machine running.
+
+**`--vm VM`** debugs a VM on an Avalon server, VM being its name or its id, as Herald attaches to one. The server is `--server ADDR`, `HOST:PORT` or a host or IP address for port 7400, 127.0.0.1:7400 by default. merlin-dbg becomes the VM's debugger (`DebugAttach`, [`avalon-protocol.md`](avalon-protocol.md), section 6.8) and talks to its stub, Grail's, through the session: the GDB remote protocol travels in `DebugInput` and `DebugOutput` (avalon-client's `DebugTunnel`). Everything else is as with `--connect`. The VM stops when merlin-dbg attaches, in state `debug`, which Round Table and Pendragon show, and it is running while a `continue` runs it. Its console, screen and input go on for whoever is attached to them. `quit` detaches (`D`), and the VM runs on. One debugger at a time: a VM that has one already is `Busy`.
 
 **`-- ARGS`** starts Grail in merlin-dbg's own process, with the same options and program as the `grail` command. The machine is stopped at its first instruction:
 

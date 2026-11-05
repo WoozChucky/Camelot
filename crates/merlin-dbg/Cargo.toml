@@ -11,6 +11,9 @@ elf = { path = "../elf" }
 # The packet framing it shares with Grail's stub, and `merlin-dbg -- grail-args`,
 # which runs a machine under the stub in this process.
 grail = { path = "../grail" }
+# `--vm NAME`: a VM's stub on an Avalon server, through the debugging messages.
+avalon-client = { path = "../avalon-client" }
+avalon-proto = { path = "../avalon-proto" }
 
 [dev-dependencies]
 # tests/session.rs builds a user program with its line tables, as `cargo xtask
@@ -21,3 +24,8 @@ xtask = { path = "../xtask" }
 merlin = { path = "../merlin" }
 merlin-as = { path = "../merlin-as" }
 merlin-ld = { path = "../merlin-ld" }
+# tests/avalon.rs debugs a VM on an Avalon server in process, with Herald attached.
+avalon = { path = "../avalon" }
+herald = { path = "../herald" }
+# tests/processes.rs boots the root image, built as `cargo xtask fs` builds it.
+camelot-fs = { path = "../camelot-fs" }
