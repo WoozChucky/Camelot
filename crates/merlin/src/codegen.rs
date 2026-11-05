@@ -1319,7 +1319,16 @@ impl<'a> FuncGen<'a, '_> {
             let ret = (&f.ret, &f.ret_spelled);
             let external = !f.is_static && !f.inline_only;
             let flags = (external, f.prototyped);
-            d.function(&f.name, &end, f.pos, flags, ret, params, f.variadic, body);
+            d.function(
+                &f.name,
+                &end,
+                (f.pos, f.end),
+                flags,
+                ret,
+                params,
+                f.variadic,
+                body,
+            );
             self.lines.push(Line::Label(end));
         }
         self.lines.push(Line::Text(format!(".size {0}, . - {0}", f.name)));

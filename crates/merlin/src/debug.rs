@@ -43,7 +43,8 @@
 //! * the types they use, each described once: base types (`int`, `unsigned
 //!   char`, ...), pointers, arrays (one `DW_TAG_subrange_type` per dimension,
 //!   as clang does), structs and unions with their members and offsets (an
-//!   anonymous struct, union or enum a member is of inside the record),
+//!   anonymous struct, union or enum a member is of inside the record, and
+//!   a type a function defines inside the function's entry),
 //!   enums with their constants, typedefs, `const` and `volatile`, and
 //!   function types (for function pointers).
 //!
@@ -253,6 +254,8 @@ struct Function {
     /// Its `.file` number and line.
     file: u32,
     line: u32,
+    /// Where it starts (its name) and its body ends.
+    span: (Pos, Pos),
     external: bool,
     /// Declared with a prototype (not `()`).
     prototyped: bool,
@@ -285,11 +288,12 @@ enum TypeNode {
     /// A function type: what it returns, what it takes, and whether `...`
     /// follows.
     Func(Option<usize>, Vec<Option<usize>>, bool),
-    /// A typedef name: what it stands for, and its `.file` number and line.
-    Typedef(String, Option<usize>, u32, u32),
+    /// A typedef name: what it stands for, and its `.file` number and
+    /// position.
+    Typedef(String, Option<usize>, u32, Pos),
     /// An enum: its tag, its integer type, its constants and its `.file`
     /// number and line.
-    Enum(Option<String>, usize, Vec<(String, i128)>, u32, u32),
+    Enum(Option<String>, usize, Vec<(String, i128)>, u32, Pos),
 }
 
 /// What makes two types the same, to describe each once. Records, typedefs
@@ -545,7 +549,7 @@ impl Lines {
                 self.keep.push(t.clone());
                 let of = self.type_of(&t.ty, &t.spelled);
                 let file = self.decl_file(t.pos);
-                let node = TypeNode::Typedef(t.name.clone(), of, file, t.pos.line);
+                let node = TypeNode::Typedef(t.name.clone(), of, file, t.pos);
                 self.intern(key, || node)
             }
             Spelling::Enum(e) => {
@@ -553,7 +557,7 @@ impl Lines {
                 let k = e.ty.int_kind().expect("an enum is an integer type");
                 let of = self.intern(TypeKey::Base(k), || TypeNode::Base(k));
                 let file = self.decl_file(e.pos);
-                let node = TypeNode::Enum(e.tag.clone(), of, e.constants.clone(), file, e.pos.line);
+                let node = TypeNode::Enum(e.tag.clone(), of, e.constants.clone(), file, e.pos);
                 self.intern(key, || node)
             }
         }
@@ -591,7 +595,7 @@ impl Lines {
         &mut self,
         name: &str,
         end: &str,
-        pos: Pos,
+        (pos, body_end): (Pos, Pos),
         (external, prototyped): (bool, bool),
         ret: (&Type, &Spelled),
         params: Vec<Var>,
@@ -605,6 +609,7 @@ impl Lines {
             end: end.to_string(),
             file,
             line: pos.line,
+            span: (pos, body_end),
             external,
             prototyped,
             ret,
@@ -660,7 +665,13 @@ impl Lines {
         }
     }
 
-    fn function_die(&self, f: &Function) -> Die {
+    /// The entry of a function, with the types `local` says are defined in it.
+    fn function_die(
+        &self,
+        f: &Function,
+        local: &[(usize, usize)],
+        nested: &[(usize, (usize, usize))],
+    ) -> Die {
         let mut d = Die::new(TAG_SUBPROGRAM, &f.name);
         d.attr(AT_LOW_PC, Val::Addr(f.name.clone()));
         d.attr(AT_HIGH_PC, Val::Len(f.end.clone(), f.name.clone()));
@@ -691,7 +702,36 @@ impl Lines {
         for v in &f.body.statics {
             d.children.push(self.static_die(v));
         }
+        // The types defined in the function, whatever block defines them,
+        // as clang has them: after the variables.
+        let me = self.functions.iter().position(|g| std::ptr::eq(g, f));
+        for &(t, _) in local.iter().filter(|(_, func)| Some(*func) == me) {
+            d.children.push(self.type_die(t, nested));
+        }
         d
+    }
+
+    /// The structs, unions, enums and typedefs defined inside a function's
+    /// body (where they are declared lies inside its code's), and the
+    /// function: clang describes them in its entry.
+    fn local_types(&self) -> Vec<(usize, usize)> {
+        let inside = |p: Pos, (start, end): (Pos, Pos)| {
+            p.file == start.file
+                && (start.line, start.col) <= (p.line, p.col)
+                && (p.line, p.col) <= (end.line, end.col)
+        };
+        let mut local = Vec::new();
+        for (id, t) in self.types.iter().enumerate() {
+            let pos = match t {
+                TypeNode::Record(r, ..) => r.pos,
+                TypeNode::Typedef(_, _, _, pos) | TypeNode::Enum(_, _, _, _, pos) => *pos,
+                _ => continue,
+            };
+            if let Some(f) = self.functions.iter().position(|f| inside(pos, f.span)) {
+                local.push((id, f));
+            }
+        }
+        local
     }
 
     fn global_die(&self, g: &Global) -> Die {
@@ -855,7 +895,8 @@ impl Lines {
                 }
                 d
             }
-            TypeNode::Typedef(name, of, file, line) => {
+            TypeNode::Typedef(name, of, file, pos) => {
+                let line = &pos.line;
                 let mut d = Die::new(TAG_TYPEDEF, name);
                 typed(&mut d, *of);
                 d.attr(AT_NAME, Val::Str(name.clone()));
@@ -863,7 +904,8 @@ impl Lines {
                 d.attr(AT_DECL_LINE, Val::Const((*line).into()));
                 d
             }
-            TypeNode::Enum(tag, of, constants, file, line) => {
+            TypeNode::Enum(tag, of, constants, file, pos) => {
+                let line = &pos.line;
                 let what = format!("enum {}", tag.as_deref().unwrap_or("(anonymous)"));
                 let mut d = Die::new(TAG_ENUMERATION_TYPE, &what);
                 d.attr(AT_TYPE, Val::Ref(*of));
@@ -921,15 +963,20 @@ impl Lines {
         cu.attr(AT_LOW_PC, Val::Addr(first.clone()));
         cu.attr(AT_HIGH_PC, Val::Len(last_end.clone(), first.clone()));
         cu.attr(AT_ADDR_BASE, Val::SecOffset(".Laddr_table_base0".into()));
+        let nested = self.nested_types();
+        let local: Vec<(usize, usize)> = self
+            .local_types()
+            .into_iter()
+            .filter(|(t, _)| !nested.iter().any(|(n, _)| n == t))
+            .collect();
         for f in &self.functions {
-            cu.children.push(self.function_die(f));
+            cu.children.push(self.function_die(f, &local, &nested));
         }
         for g in &self.globals {
             cu.children.push(self.global_die(g));
         }
-        let nested = self.nested_types();
         for id in 0..self.types.len() {
-            if !nested.iter().any(|(n, _)| *n == id) {
+            if !nested.iter().any(|(n, _)| *n == id) && !local.iter().any(|(t, _)| *t == id) {
                 cu.children.push(self.type_die(id, &nested));
             }
         }

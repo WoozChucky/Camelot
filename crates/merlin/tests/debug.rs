@@ -683,3 +683,40 @@ fn the_forms_are_clangs() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The types a function defines (a typedef, a struct, one in an inner block)
+/// are described in its entry, after its variables and blocks, as clang has
+/// them; a file-scope type of the same tag is the unit's.
+#[test]
+fn a_functions_types_are_its_own() {
+    use elf::dies::dw;
+    let src = "struct pt { long l; } g;\n\
+               int f(void) {\n    typedef int T;\n    T t = 1;\n    struct pt { int q; } loc;\n    loc.q = t;\n    \
+               {\n        struct in { char c; } b;\n        b.c = 2;\n    }\n    return loc.q;\n}\n";
+    let asm = merlin::compile_with("l.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options::default()).unwrap();
+    let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+    let u = &units[0];
+    let f = u.dies.iter().position(|d| d.name() == Some("f")).unwrap();
+    let kids: Vec<(u64, Option<&str>)> = u.dies[f]
+        .children
+        .iter()
+        .map(|&c| (u.dies[c].tag, u.dies[c].name()))
+        .collect();
+    assert_eq!(
+        kids,
+        [
+            (dw::TAG_VARIABLE, Some("t")),
+            (dw::TAG_VARIABLE, Some("loc")),
+            (dw::TAG_LEXICAL_BLOCK, None),
+            (dw::TAG_TYPEDEF, Some("T")),
+            (dw::TAG_STRUCTURE_TYPE, Some("pt")),
+            (dw::TAG_STRUCTURE_TYPE, Some("in")),
+        ]
+    );
+    let outer: Vec<usize> = (0..u.dies.len())
+        .filter(|&i| u.dies[i].tag == dw::TAG_STRUCTURE_TYPE && u.dies[i].parent == Some(0))
+        .collect();
+    assert_eq!(outer.len(), 1);
+    assert_eq!(u.dies[u.dies[outer[0]].children[0]].name(), Some("l"));
+}
