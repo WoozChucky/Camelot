@@ -3395,6 +3395,51 @@ fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
 }
 
+#[test]
+fn a_heap_growth_past_the_whole_of_ram_is_refused_at_once() {
+    // sbrk refuses a growth that maps more pages than RAM holds before it
+    // takes any, as Linux's overcommit check does, counting the pages from
+    // the old end's page boundary to the new end's: RAM and a byte more is
+    // a page more than RAM, refused at once. RAM itself is not: sbrk takes
+    // and zeroes every free page before it runs out, which takes far longer.
+    let ram: usize = 16 << 20;
+    let config = MachineConfig {
+        ram_size: ram,
+        ..MachineConfig::default()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(config, Some(rx));
+    step_to_prompt(&mut m, 1);
+    let before = free_pages(&m, &elf);
+    let steps = |m: &mut Machine, n: usize, prompts: usize| {
+        let line = format!("systest sbrk {n}");
+        for b in format!("{line}\n").bytes() {
+            tx.send(b).unwrap();
+        }
+        let want = format!("systest: sbrk {n}: -12\n");
+        let took = step_until(
+            m,
+            RUN_MAX_STEPS,
+            |_| {},
+            |m| m.cpu.bus.uart.captured.ends_with(want.as_bytes()),
+        );
+        step_to_prompt(m, prompts);
+        assert_eq!(command_output(&printed(m), &line), [want.trim_end()]);
+        assert_eq!(free_pages(m, &elf), before, "{line}");
+        took
+    };
+    let all_of_ram = steps(&mut m, ram, 2);
+    let past_ram = steps(&mut m, ram + 1, 3);
+    assert!(
+        past_ram * 4 < all_of_ram,
+        "RAM and a byte took {past_ram} steps to refuse, RAM {all_of_ram}"
+    );
+    for b in b"exit\n" {
+        tx.send(*b).unwrap();
+    }
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
+}
+
 /// Byte offsets in an ELF32 header and program header.
 const E_TYPE: u32 = 16;
 const E_MACHINE: u32 = 18;

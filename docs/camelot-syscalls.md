@@ -262,8 +262,9 @@ given back by an earlier shrink and grown again. A negative `increment`
 shrinks it, unmapping and freeing the pages no longer used. Errors:
 `-ENOMEM` when the heap would reach the guard page under the stack's limit
 (`USER_LOAD_TOP`: 0x0B7F_F000 on RV32, 0x7FFF_FF7F_F000 in Sv48), when it
-would grow by more pages than the whole of RAM has (refused at once, as
-Linux's default overcommit check refuses it), or when memory runs out
+would map more new pages than the whole of RAM has (those from the old
+end's page boundary to the new end's: refused at once, as Linux's default
+overcommit check refuses it), or when memory runs out
 (nothing changes), `-EINVAL` when it would shrink below its start.
 A program whose segments end above 4 GiB has its heap there, and `sbrk`
 returns those addresses whole.

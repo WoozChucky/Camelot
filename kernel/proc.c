@@ -1207,8 +1207,10 @@ long proc_sbrk(long increment) {
          * as Linux's default overcommit check fails it (mm/util.c,
          * __vm_enough_memory with OVERCOMMIT_GUESS: more pages than RAM and
          * swap hold), rather than after taking and zeroing every free
-         * page. */
-        if (grow / PGSIZE > ram_size / PGSIZE) {
+         * page. The pages counted are those the growth maps, from the old
+         * end's page boundary to the new one's, as Linux's brk counts
+         * PAGE_ALIGN(newbrk) - PAGE_ALIGN(oldbrk) (mm/mmap.c). */
+        if ((PGROUNDUP(old + grow) - PGROUNDUP(old)) / PGSIZE > ram_size / PGSIZE) {
             releasesleep(&p->heap_lock);
             return -ENOMEM;
         }
