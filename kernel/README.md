@@ -245,7 +245,7 @@ dong 4
 ```
 
 The programs live in `user/`, one `.c` or `.s` file each, all linked with the
-runtime (`user/crt0.s`, which calls `main` and then `exit`; `user/usys.s`, the
+runtime (`user/crt0.S`, which calls `main(argc, argv, envp)` and then `exit`; `user/usys.s`, the
 system call stubs), the C library of `user/lib/` (strings, numbers, `malloc`,
 `printf`, a line reader; declared in `user/user.h`, described in
 `user/lib/README.md`, and linked like an archive, so a program gets only the
@@ -494,7 +494,7 @@ one process.
 | `sysfile.c` | the file system calls: `read`, `write`, `open`, `close`, `lseek`, `fstat`, `dup`, `fcntl`, `pipe`, `mkdir`, `unlink`, `link`, `chdir`, each change to the disk in one transaction |
 | `file.c` | open files (xv6's): the table of 64, `filealloc()`/`filedup()`/`fileclose()`, reading and writing an inode (writes 3 KiB per transaction), a device (`devsw`: the console) or a pipe, `filelseek()`, `filestat()` |
 | `pipe.c` | pipes (xv6's): a 512-byte buffer in a page, readers and writers sleeping on each other, end of input when the writers are gone, `-EPIPE` when the readers are |
-| `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.s`, `usys.s`, `user.h`), the C library (`lib/`) and linker script `user.ld`, built with merlin, merlin-as and merlin-ld and embedded in `kernel.elf` through `userprogs.s`, which the build generates (not a file here: see "Building") |
+| `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.S`, `usys.s`, `user.h`), the C library (`lib/`) and linker script `user.ld`, built with merlin, merlin-as and merlin-ld and embedded in `kernel.elf` through `userprogs.s`, which the build generates (not a file here: see "Building") |
 | `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo and frees every page from `__kernel_end` to the end of RAM; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()` |
 | `vm.c` | page tables (Sv32; on RV64 Sv48 or Sv39, with the levels the boot chose): `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on; user address spaces: `uvm_create()`/`uvm_free()`, `uvm_range_ok()`, `copyin()`, `copyout()`, `copyinstr()`; `ioremap()`; the kernel stacks (`kstack_alloc()`: on RV64 16 KiB in the vmalloc area with a guard page); on RV64 `setup_vm()`, the early page table and the `satp` probe |
 | `vmtest.c` | the memory self-tests: allocate and free every page, `kzalloc()` and `pagetable_create()` clear a reused dirty page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |

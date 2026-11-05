@@ -29,7 +29,7 @@ together.
 ## How programs get it
 
 Every `kernel/user/X.c` (or `X.s`) is a program, linked with the runtime
-(`crt0.s`, which calls `main` and then `exit`, and `usys.s`, the system call
+(`crt0.S`, which calls `main` and then `exit`, and `usys.s`, the system call
 stubs) and with the library (`crates/xtask/src/userprogs.rs`). The library
 is linked the way a C library is linked from an archive (`libc.a`): each
 file here is a *member*, compiled and assembled once for all the programs,
@@ -48,7 +48,7 @@ program's objects, in file name order. On its command line the members go
 between `--start-lib` and `--end-lib`, as with ld.lld:
 
 ```
-merlin-ld -T user.ld -o cat cat.c.o crt0.s.o usys.s.o \
+merlin-ld -T user.ld -o cat cat.c.o crt0.S.o usys.s.o \
           --start-lib lib/getline.c.o lib/malloc.c.o lib/printf.c.o lib/spin.c.o \
           lib/stat.c.o lib/stdlib.c.o lib/strerror.c.o lib/string.c.o --end-lib
 ```

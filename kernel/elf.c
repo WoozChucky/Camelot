@@ -77,7 +77,7 @@ static const char *load_segment(pagetable_t pt, const struct elf_file *f, const 
     return NULL;
 }
 
-const char *elf_load(pagetable_t pt, const struct elf_file *f, uintptr *entry, uintptr *end) {
+const char *elf_load(pagetable_t pt, const struct elf_file *f, struct elf_loaded *out) {
     u64 size = f->size;
     elfhdr eh;
     if (size < sizeof eh || !f->read(f, &eh, 0, sizeof eh)) {
@@ -98,6 +98,7 @@ const char *elf_load(pagetable_t pt, const struct elf_file *f, uintptr *entry, u
     }
 
     uintptr top = USER_BASE;
+    uintptr phdr = 0;
     for (u32 i = 0; i < eh.phnum; i++) {
         elf_phdr ph;
         if (!f->read(f, &ph, eh.phoff + i * sizeof ph, sizeof ph)) {
@@ -112,6 +113,11 @@ const char *elf_load(pagetable_t pt, const struct elf_file *f, uintptr *entry, u
         const char *err = load_segment(pt, f, &ph);
         if (err != NULL) {
             return err;
+        }
+        /* The segment whose file bytes hold the program headers loads
+         * them: their address is the auxiliary vector's AT_PHDR. */
+        if (ph.offset <= eh.phoff && eh.phoff < ph.offset + ph.filesz) {
+            phdr = (uintptr)(eh.phoff - ph.offset + ph.vaddr);
         }
         if (PGROUNDUP(ph.vaddr + ph.memsz) > top) {
             top = PGROUNDUP(ph.vaddr + ph.memsz);
@@ -129,7 +135,9 @@ const char *elf_load(pagetable_t pt, const struct elf_file *f, uintptr *entry, u
     if (pte == NULL || (*pte & want) != want) {
         return "entry point not in an executable segment";
     }
-    *entry = (uintptr)eh.entry;
-    *end = top;
+    out->entry = (uintptr)eh.entry;
+    out->end = top;
+    out->phdr = phdr;
+    out->phnum = eh.phnum;
     return NULL;
 }

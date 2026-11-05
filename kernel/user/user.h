@@ -117,6 +117,29 @@ typedef unsigned long long uint64_t;
 #define MAXARG 16
 #define ARG_MAX 512
 
+/* A program starts as Linux starts one (docs/camelot-syscalls.md,
+ * "Starting a program"): crt0 calls main(argc, argv, envp), and after
+ * envp's NULL comes the auxiliary vector, pairs of a type and a value (a
+ * long each), ending with AT_NULL. Its types, Linux's values
+ * (kernel/include/syscall.h's: a test checks they agree). */
+#define AT_NULL 0    /* the end of the vector */
+#define AT_PHDR 3    /* where the program headers are, 0 if not loaded */
+#define AT_PHENT 4   /* a program header's size */
+#define AT_PHNUM 5   /* how many there are */
+#define AT_PAGESZ 6  /* the page size: 4096 */
+#define AT_BASE 7    /* the interpreter's base: 0, there is none */
+#define AT_FLAGS 8   /* flags: 0 */
+#define AT_ENTRY 9   /* the program's entry point, crt0's _start */
+#define AT_UID 11    /* the user and group ids: 0, Camelot has one user */
+#define AT_EUID 12
+#define AT_GID 13
+#define AT_EGID 14
+#define AT_HWCAP 16  /* the ISA's letters, bit 'X' - 'A' for each: I, M and A */
+#define AT_CLKTCK 17 /* how often uptime() ticks a second */
+#define AT_SECURE 23 /* 0: not a setuid program */
+#define AT_RANDOM 25 /* the address of 16 random bytes */
+#define AT_EXECFN 31 /* the path the program was started with */
+
 /* open's flags: one access mode, plus O_CREAT (make the file if it is
  * missing), O_TRUNC (empty it, when opened for writing) and O_CLOEXEC (the
  * descriptor closes on exec). */

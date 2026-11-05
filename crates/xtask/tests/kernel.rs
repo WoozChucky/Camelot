@@ -2260,32 +2260,6 @@ fn user_pages(m: &Machine, satp: u32) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// Reads `len` bytes of user memory at `va` through page table `satp`.
-fn user_read(m: &Machine, satp: u32, va: u32, len: u32) -> Vec<u8> {
-    let (leaves, _, _) = page_table(m, satp);
-    (va..va + len)
-        .map(|a| {
-            let (_, pte) = leaves
-                .iter()
-                .find(|(page, _)| *page == a & !(PAGE - 1))
-                .unwrap_or_else(|| panic!("{a:#x} is not mapped"));
-            peek_byte(&m.cpu.bus, (pte >> 10) * PAGE + a % PAGE)
-        })
-        .collect()
-}
-
-/// The NUL-terminated string at user address `va`.
-fn user_string(m: &Machine, satp: u32, va: u32) -> String {
-    let mut s = Vec::new();
-    for a in va.. {
-        match user_read(m, satp, a, 1)[0] {
-            0 => break,
-            c => s.push(c),
-        }
-    }
-    String::from_utf8(s).unwrap()
-}
-
 /// The name of the process on hart 0 (`cpus[0].proc` in kernel/spinlock.c,
 /// the first field of `struct cpu`), or `None` in the scheduler.
 fn current_name(cpu: &grail::cpu::Cpu, current: u32) -> Option<String> {
@@ -2391,8 +2365,10 @@ fn booting_drops_into_the_user_shell() {
 #[test]
 fn the_shell_is_the_first_process() {
     // The first instruction in U-mode is sh's entry point, crt0's _start,
-    // with every register zero but sp, a0 = argc and a1 = argv, which point
-    // at { "sh", NULL } at the top of the stack.
+    // with the start Linux gives a program (docs/camelot-syscalls.md,
+    // "Starting a program"): every register zero but sp, which points at
+    // argc (1), argv { "sh", NULL }, an empty envp and the auxiliary vector,
+    // the strings "sh" and the path, "/bin/sh", at the top of the stack.
     let (mut m, elf) = load_committed();
     step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
     let c = &m.cpu;
@@ -2403,25 +2379,14 @@ fn the_shell_is_the_first_process() {
         .peek(u64::from(m.cpu.bus.peek(sym(&elf, "cpus").into()).unwrap() + 4));
     assert_eq!(pid, Some(1));
     assert_eq!(c.pc, u64::from(USER_TEXT));
-    let (sp, argv) = (c.x[2] as u32, c.x[x("a1") as usize] as u32);
-    let mut regs = [0u32; 32];
-    regs[2] = sp;
-    regs[x("a0") as usize] = 1;
-    regs[x("a1") as usize] = argv;
-    assert_eq!(regs32(&m), regs);
-    assert_eq!(sp % 16, 0);
-    assert!(
-        sp <= argv && argv < USER_TOP && sp > USER_STACK + PAGE / 2,
-        "sp {sp:#x} argv {argv:#x}"
+    common::start::check(
+        &m,
+        4,
+        u64::from(USER_TOP),
+        &user_program("sh").elf,
+        "/bin/sh",
+        &["sh"],
     );
-    let satp = c.csr.satp as u32;
-    let words = user_read(&m, satp, argv, 8);
-    let argv0 = u32::from_le_bytes(words[..4].try_into().unwrap());
-    assert_eq!(words[4..], [0; 4], "argv[1] is NULL");
-    assert!(argv0 > argv);
-    assert_eq!(user_string(&m, satp, argv0), "sh");
-    // The strings end right at the top: "sh\0" is the last three bytes.
-    assert_eq!(argv0, USER_TOP - 3);
     // Interrupts on, SUM off.
     assert_ne!(c.csr.mstatus & MSTATUS_SIE, 0);
     assert_eq!(c.csr.mstatus & excalibur::csr::MSTATUS_SUM, 0);
