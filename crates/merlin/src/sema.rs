@@ -34,7 +34,7 @@
 use crate::abi;
 use crate::ast::*;
 use crate::consteval;
-use crate::types::{common, FuncType, IntKind, Type, Xlen};
+use crate::types::{common, FuncType, IntKind, Spelled, Type, Xlen};
 use crate::{Error, Pos};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -127,6 +127,7 @@ fn coerce(e: &mut Expr, to: &Type) {
         kind: ExprKind::Cast {
             x: Box::new(inner),
             implicit: true,
+            spelled: Spelled::default(),
         },
         ty: to.clone(),
         pos,
@@ -1743,7 +1744,11 @@ impl<'a> FnChecker<'a> {
             }
             _ => unreachable!("only va_end and va_copy"),
         };
-        e.kind = ExprKind::Cast { x, implicit: false };
+        e.kind = ExprKind::Cast {
+            x,
+            implicit: false,
+            spelled: Spelled::default(),
+        };
         e.ty = Type::Void;
         Ok(())
     }
@@ -1991,8 +1996,12 @@ mod tests {
     fn typed(params: &str, e: &str) -> (String, String) {
         fn sx(e: &Expr) -> String {
             match &e.kind {
-                ExprKind::Cast { x, implicit: true } => format!("({} {})", e.ty, sx(x)),
-                ExprKind::Cast { x, implicit: false } => format!("(cast {} {})", e.ty, sx(x)),
+                ExprKind::Cast {
+                    x, implicit: true, ..
+                } => format!("({} {})", e.ty, sx(x)),
+                ExprKind::Cast {
+                    x, implicit: false, ..
+                } => format!("(cast {} {})", e.ty, sx(x)),
                 ExprKind::Num(v) => v.to_string(),
                 ExprKind::Var { name, .. } => name.clone(),
                 ExprKind::Binary(op, l, r) => format!("({} {} {})", op.symbol(), sx(l), sx(r)),

@@ -113,12 +113,19 @@ pub const MAX_DEPTH: usize = 256;
 /// needs for array bounds, `sizeof` and struct layouts.
 pub fn parse(toks: &[Token], xlen: Xlen) -> Result<Program, Error> {
     // The type clang's `<stdarg.h>` builds `va_list` from: on RISC-V a plain
-    // pointer into the argument words (see `crate::codegen`).
+    // pointer into the argument words (see `crate::codegen`). A typedef of
+    // no position, as clang describes it under `-g`.
     let mut file = Scope::default();
+    let va_list = Spelling::Typedef(Arc::new(TypedefName {
+        name: "__builtin_va_list".to_string(),
+        ty: Type::ptr(Type::Void),
+        spelled: Spelled::default(),
+        pos: Pos::default(),
+    }));
     file.names.insert(
         "__builtin_va_list".to_string(),
         (
-            Name::Typedef(Type::ptr(Type::Void), Spelled::default()),
+            Name::Typedef(Type::ptr(Type::Void), Spelled(Some(va_list))),
             Pos::default(),
         ),
     );
@@ -1343,8 +1350,14 @@ impl Parser<'_> {
     /// A type name, for casts and `sizeof`: specifiers and a declarator
     /// without a name (`int`, `char *[4]`, `int (*)(void)`).
     fn type_name(&mut self) -> Result<Type, Error> {
+        Ok(self.type_name_spelled()?.0)
+    }
+
+    /// A type name, and how it spelled its base (for `-g`).
+    fn type_name_spelled(&mut self) -> Result<(Type, Spelled), Error> {
         let specs = self.specifiers(Ctx::TypeName)?;
-        Ok(self.declarator(&specs.ty, Ctx::TypeName)?.ty)
+        let ty = self.declarator(&specs.ty, Ctx::TypeName)?.ty;
+        Ok((ty, specs.spelled))
     }
 
     // ---- declarations ----
@@ -1949,7 +1962,7 @@ impl Parser<'_> {
             }
             Tok::Punct("(") if self.type_name_follows() => {
                 self.advance();
-                let ty = self.type_name()?;
+                let (ty, spelled) = self.type_name_spelled()?;
                 self.expect_punct(")")?;
                 if self.is_punct("{") {
                     let e = self.compound_literal(ty, pos)?;
@@ -1960,6 +1973,7 @@ impl Parser<'_> {
                     kind: ExprKind::Cast {
                         x: Box::new(x),
                         implicit: false,
+                        spelled,
                     },
                     // A cast's result is a value: qualifiers mean nothing on it.
                     ty: ty.unqual().clone(),

@@ -417,10 +417,12 @@ pub enum ExprKind {
     Addr(Box<Expr>),
     /// `*p` (and `a[i]`, which the parser writes as `*(a + i)`).
     Deref(Box<Expr>),
-    /// `(type) x`, converting to `ty`. Sema adds implicit ones.
+    /// `(type) x`, converting to `ty`. Sema adds implicit ones. `spelled`:
+    /// how an explicit one spelled its type (for `-g`).
     Cast {
         x: Box<Expr>,
         implicit: bool,
+        spelled: Spelled,
     },
     /// `sizeof (type)`; sema replaces it with its value.
     SizeofType(Type),
@@ -742,7 +744,7 @@ impl Dumper {
                 node(self, "Deref".to_string());
                 self.expr(d + 1, x);
             }
-            ExprKind::Cast { x, implicit } => {
+            ExprKind::Cast { x, implicit, .. } => {
                 node(self, if *implicit { "ImplicitCast" } else { "Cast" }.to_string());
                 self.expr(d + 1, x);
             }

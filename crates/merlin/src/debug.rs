@@ -39,7 +39,9 @@
 //!   own address range, nested as the blocks are. A `static` local is at its
 //!   symbol (`DW_OP_addrx`), and is the function's whatever block declares
 //!   it, after the frame's variables and the blocks, as clang has them;
-//! * a `DW_TAG_variable` per global variable the file defines, at its symbol;
+//! * a `DW_TAG_variable` per global variable the file defines, at its symbol,
+//!   and one without a name per string literal; a `DW_TAG_label` per `goto`
+//!   label, in its block;
 //! * the types they use, each described once: base types (`int`, `unsigned
 //!   char`, ...), pointers, arrays (one `DW_TAG_subrange_type` per dimension,
 //!   as clang does), structs and unions with their members and offsets (an
@@ -47,6 +49,9 @@
 //!   a type a function defines inside the function's entry),
 //!   enums with their constants, typedefs, `const` and `volatile`, and
 //!   function types (for function pointers).
+//!
+//! The entries are in clang's order, which [`order`] works out from what the
+//! code generator saw ([`Event`]s): the order LLVM makes them in.
 //!
 //! The forms are clang's for DWARF 5 (see [`Val`]): a string is an index in
 //! `.debug_str_offsets`, whose entries point into `.debug_str`
@@ -63,6 +68,8 @@
 //!
 //! None of it changes the code: labels and directives assemble to no bytes
 //! in `.text`, and the debug sections are not loaded.
+
+mod order;
 
 use crate::types::{ptr_size, IntKind, Record, Spelled, Spelling, Type, Xlen};
 use crate::Pos;
@@ -82,6 +89,7 @@ pub struct DebugInfo {
 const TAG_ARRAY_TYPE: u8 = 0x01;
 const TAG_ENUMERATION_TYPE: u8 = 0x04;
 const TAG_FORMAL_PARAMETER: u8 = 0x05;
+const TAG_LABEL: u8 = 0x0a;
 const TAG_LEXICAL_BLOCK: u8 = 0x0b;
 const TAG_MEMBER: u8 = 0x0d;
 const TAG_POINTER_TYPE: u8 = 0x0f;
@@ -112,6 +120,7 @@ const AT_PRODUCER: u8 = 0x25;
 const AT_PROTOTYPED: u8 = 0x27;
 const AT_COUNT: u8 = 0x37;
 const AT_DATA_MEMBER_LOCATION: u8 = 0x38;
+const AT_DECL_COLUMN: u8 = 0x39;
 const AT_DECL_FILE: u8 = 0x3a;
 const AT_DECL_LINE: u8 = 0x3b;
 const AT_DECLARATION: u8 = 0x3c;
@@ -207,7 +216,12 @@ pub(crate) struct Scope {
     pub begin: String,
     pub end: String,
     vars: Vec<Var>,
+    /// The `goto` labels in it, after its variables, as clang has them.
+    labels: Vec<Label>,
     blocks: Vec<Scope>,
+    /// No lexical block of its own: a block without variables in the frame
+    /// whose labels still are, in the block around it, where it is.
+    transparent: bool,
     /// clang describes every `static` local of a function in the function's
     /// entry, after its variables in the frame and its blocks, in the order they
     /// are declared, whatever block declares them: a block's statics go up to
@@ -224,6 +238,11 @@ impl Scope {
         }
     }
 
+    /// Adds a `goto` label of the scope.
+    pub fn push_label(&mut self, l: Label) {
+        self.labels.push(l);
+    }
+
     /// Adds a variable declared in the scope.
     pub fn push(&mut self, v: Var) {
         match v.location {
@@ -238,12 +257,23 @@ impl Scope {
     /// nothing); its statics come to this scope.
     pub fn add_block(&mut self, mut inner: Scope) {
         self.statics.append(&mut inner.statics);
-        if inner.vars.is_empty() {
+        if inner.vars.is_empty() && inner.labels.is_empty() {
             self.blocks.extend(inner.blocks);
         } else {
+            inner.transparent = inner.vars.is_empty();
             self.blocks.push(inner);
         }
     }
+}
+
+/// A `goto` label: its name, where it is and its code's label.
+#[derive(Clone, Debug)]
+pub(crate) struct Label {
+    name: String,
+    file: u32,
+    line: u32,
+    col: u32,
+    sym: String,
 }
 
 /// A function, for its `DW_TAG_subprogram`.
@@ -260,6 +290,9 @@ struct Function {
     /// Declared with a prototype (not `()`).
     prototyped: bool,
     ret: Option<usize>,
+    /// What its code did that clang's front end does too, in order: see
+    /// [`Event`].
+    events: Vec<Event>,
     params: Vec<Var>,
     variadic: bool,
     /// The variables of its body, and its blocks.
@@ -314,6 +347,39 @@ enum TypeKey {
 struct Global {
     var: Var,
     external: bool,
+    /// Defined with an initializer (else a tentative definition, which clang
+    /// emits at the end of the file).
+    initialized: bool,
+    /// What its initializer did: the string literals it holds and the
+    /// symbols it refers to.
+    events: Vec<Event>,
+}
+
+/// A string literal, which clang describes as a variable without a name: its
+/// label, its type (`char [N]`, its NUL counted) and where it is.
+struct Literal {
+    label: String,
+    ty: Option<usize>,
+    file: u32,
+    line: u32,
+}
+
+/// Something the code of a function or the initializer of a global does that
+/// clang's front end does too as it emits them, in the order it does it, for
+/// [`order`] to work out the order of the unit's entries as clang's.
+#[derive(Clone, Debug)]
+pub(crate) enum Event {
+    /// A local variable is described: its type.
+    Local(Option<usize>),
+    /// A `static` local, at its symbol, of its type.
+    Static(String, Option<usize>),
+    /// An explicit cast to this type, which clang keeps in the unit
+    /// (`DIBuilder::retainType`).
+    Cast(Option<usize>),
+    /// String literal `i` of [`Lines`]'s.
+    Literal(usize),
+    /// A reference to a symbol (a function's or a global's).
+    Ref(String),
 }
 
 /// The debug information of one translation unit as it is generated.
@@ -333,6 +399,16 @@ pub(crate) struct Lines {
     blocks: u32,
     functions: Vec<Function>,
     globals: Vec<Global>,
+    /// The string literals, in the order they come.
+    literals: Vec<Literal>,
+    /// The functions and the globals, in the order they come: indices in
+    /// `functions` (true) or `globals` (false).
+    items: Vec<(bool, usize)>,
+    /// The events of the function or global being generated.
+    events: Vec<Event>,
+    /// The events of the file's compound literals (hidden globals, which are
+    /// not described), by symbol: those of the global that refers to one.
+    hidden: HashMap<String, Vec<Event>>,
     types: Vec<TypeNode>,
     type_ids: HashMap<TypeKey, usize>,
     /// The records, typedefs and enums in the table, kept alive so that
@@ -367,6 +443,10 @@ impl Lines {
             blocks: 0,
             functions: Vec::new(),
             globals: Vec::new(),
+            literals: Vec::new(),
+            items: Vec::new(),
+            events: Vec::new(),
+            hidden: HashMap::new(),
             types: Vec::new(),
             type_ids: HashMap::new(),
             keep: Vec::new(),
@@ -579,11 +659,94 @@ impl Lines {
         }
     }
 
-    /// A global variable the file defines, at symbol `sym`.
+    /// A global variable the file defines, at symbol `sym`, with an
+    /// initializer or not (`initialized`); the events since the last function
+    /// or global are its initializer's.
     #[allow(clippy::too_many_arguments)]
-    pub fn global(&mut self, name: &str, sym: &str, ty: &Type, spelled: &Spelled, pos: Pos, external: bool) {
-        let var = self.var(name, ty, spelled, pos, Location::Symbol(sym.to_string()));
-        self.globals.push(Global { var, external });
+    pub fn global(
+        &mut self,
+        name: &str,
+        sym: &str,
+        ty: (&Type, &Spelled),
+        pos: Pos,
+        external: bool,
+        initialized: bool,
+    ) {
+        let var = self.var(name, ty.0, ty.1, pos, Location::Symbol(sym.to_string()));
+        let events = std::mem::take(&mut self.events);
+        self.items.push((false, self.globals.len()));
+        self.globals.push(Global {
+            var,
+            external,
+            initialized,
+            events,
+        });
+    }
+
+    /// A compound literal of the file's scope, at symbol `sym`: not described,
+    /// its initializer's events are those of the global that refers to it.
+    pub fn hidden(&mut self, sym: &str) {
+        let events = std::mem::take(&mut self.events);
+        self.hidden.insert(sym.to_string(), events);
+    }
+
+    /// A variable declared in the function being generated, as clang's front
+    /// end describes it there ([`Event::Local`], [`Event::Static`]).
+    pub fn declared(&mut self, v: &Var) {
+        let e = match &v.location {
+            Location::Frame(_) => Event::Local(v.ty),
+            Location::Symbol(sym) => Event::Static(sym.clone(), v.ty),
+        };
+        self.events.push(e);
+    }
+
+    /// An explicit cast to `ty` (spelled `spelled`) in the code generated.
+    pub fn cast(&mut self, ty: &Type, spelled: &Spelled) {
+        let t = self.type_of(ty, spelled);
+        // A cast to void has no type to keep.
+        if t.is_some() {
+            self.events.push(Event::Cast(t));
+        }
+    }
+
+    /// `goto` label `name`, at `pos`, whose code starts at label `sym`.
+    pub fn label(&mut self, name: &str, pos: Pos, sym: &str) -> Label {
+        let file = self.decl_file(pos);
+        Label {
+            name: name.to_string(),
+            file,
+            line: pos.line,
+            col: pos.col,
+            sym: sym.to_string(),
+        }
+    }
+
+    /// String literal `label`, of `len` bytes without its NUL, at `pos`.
+    pub fn literal(&mut self, label: &str, len: usize, pos: Pos) {
+        let array = Type::Array(Box::new(Type::Int(IntKind::Char)), Some(len as u32 + 1));
+        let ty = self.type_of(&array, &Spelled::default());
+        let file = self.decl_file(pos);
+        self.events.push(Event::Literal(self.literals.len()));
+        self.literals.push(Literal {
+            label: label.to_string(),
+            ty,
+            file,
+            line: pos.line,
+        });
+    }
+
+    /// A reference to symbol `sym` in the code or the data generated.
+    pub fn reference(&mut self, sym: &str) {
+        self.events.push(Event::Ref(sym.to_string()));
+    }
+
+    /// The events since the last function are its own (its static locals'
+    /// data, emitted after it).
+    pub fn statics_done(&mut self) {
+        let events = std::mem::take(&mut self.events);
+        if let Some(f) = self.functions.last_mut() {
+            f.events.extend(events);
+        }
     }
 
     /// Records function `name`, whose code ends at label `end`, for its
@@ -604,6 +767,8 @@ impl Lines {
     ) {
         let (file, _) = self.number(pos.file);
         let ret = self.type_of(ret.0, ret.1);
+        let events = std::mem::take(&mut self.events);
+        self.items.push((true, self.functions.len()));
         self.functions.push(Function {
             name: name.to_string(),
             end: end.to_string(),
@@ -613,6 +778,7 @@ impl Lines {
             external,
             prototyped,
             ret,
+            events,
             params,
             variadic,
             body,
@@ -648,15 +814,31 @@ impl Lines {
         self.global_die(&Global {
             var: v.clone(),
             external: false,
+            initialized: true,
+            events: Vec::new(),
         })
     }
 
-    /// The entries of a scope's variables in the frame and of its blocks.
+    /// The entries of a scope's variables in the frame, its labels and its
+    /// blocks.
     fn scope_children(&self, s: &Scope, out: &mut Vec<Die>) {
         for v in &s.vars {
             out.push(self.var_die(TAG_VARIABLE, v));
         }
+        for l in &s.labels {
+            let mut d = Die::new(TAG_LABEL, &l.name);
+            d.attr(AT_NAME, Val::Str(l.name.clone()));
+            d.attr(AT_DECL_FILE, Val::Const(l.file.into()));
+            d.attr(AT_DECL_LINE, Val::Const(l.line.into()));
+            d.attr(AT_DECL_COLUMN, Val::Const(l.col.into()));
+            d.attr(AT_LOW_PC, Val::Addr(l.sym.clone()));
+            out.push(d);
+        }
         for b in &s.blocks {
+            if b.transparent {
+                self.scope_children(b, out);
+                continue;
+            }
             let mut d = Die::new(TAG_LEXICAL_BLOCK, "a block");
             d.attr(AT_LOW_PC, Val::Addr(b.begin.clone()));
             d.attr(AT_HIGH_PC, Val::Len(b.end.clone(), b.begin.clone()));
@@ -665,13 +847,10 @@ impl Lines {
         }
     }
 
-    /// The entry of a function, with the types `local` says are defined in it.
-    fn function_die(
-        &self,
-        f: &Function,
-        local: &[(usize, usize)],
-        nested: &[(usize, (usize, usize))],
-    ) -> Die {
+    /// The entry of function `i`, with its static locals and the types it
+    /// defines in the order `local` has them.
+    fn function_die(&self, i: usize, local: &[order::Local], nested: &[(usize, (usize, usize))]) -> Die {
+        let f = &self.functions[i];
         let mut d = Die::new(TAG_SUBPROGRAM, &f.name);
         d.attr(AT_LOW_PC, Val::Addr(f.name.clone()));
         d.attr(AT_HIGH_PC, Val::Len(f.end.clone(), f.name.clone()));
@@ -692,22 +871,40 @@ impl Lines {
         for p in &f.params {
             d.children.push(self.var_die(TAG_FORMAL_PARAMETER, p));
         }
+        // The variables in the frame, the labels and the blocks, then `...`,
+        // then every static local of the function and the types it defines,
+        // whatever block declares them, as clang has them.
+        self.scope_children(&f.body, &mut d.children);
         if f.variadic {
             d.children
                 .push(Die::new(TAG_UNSPECIFIED_PARAMETERS, "the variadic arguments"));
         }
-        // The variables in the frame and the blocks, then every static local
-        // of the function, as clang has them.
-        self.scope_children(&f.body, &mut d.children);
-        for v in &f.body.statics {
-            d.children.push(self.static_die(v));
+        for l in local {
+            match l {
+                order::Local::Type(t) => d.children.push(self.type_die(*t, nested)),
+                order::Local::Static(sym) => {
+                    let v = f
+                        .body
+                        .statics
+                        .iter()
+                        .find(|v| matches!(&v.location, Location::Symbol(s) if s == sym));
+                    d.children.extend(v.map(|v| self.static_die(v)));
+                }
+            }
         }
-        // The types defined in the function, whatever block defines them,
-        // as clang has them: after the variables.
-        let me = self.functions.iter().position(|g| std::ptr::eq(g, f));
-        for &(t, _) in local.iter().filter(|(_, func)| Some(*func) == me) {
-            d.children.push(self.type_die(t, nested));
+        d
+    }
+
+    /// The entry of a string literal: a variable without a name, as clang
+    /// describes one.
+    fn literal_die(&self, l: &Literal) -> Die {
+        let mut d = Die::new(TAG_VARIABLE, &format!("the string literal {}", l.label));
+        if let Some(t) = l.ty {
+            d.attr(AT_TYPE, Val::Ref(t));
         }
+        d.attr(AT_DECL_FILE, Val::Const(l.file.into()));
+        d.attr(AT_DECL_LINE, Val::Const(l.line.into()));
+        d.attr(AT_LOCATION, Val::Expr(vec![Expr::Addr(l.label.clone())]));
         d
     }
 
@@ -896,12 +1093,14 @@ impl Lines {
                 d
             }
             TypeNode::Typedef(name, of, file, pos) => {
-                let line = &pos.line;
                 let mut d = Die::new(TAG_TYPEDEF, name);
                 typed(&mut d, *of);
                 d.attr(AT_NAME, Val::Str(name.clone()));
-                d.attr(AT_DECL_FILE, Val::Const((*file).into()));
-                d.attr(AT_DECL_LINE, Val::Const((*line).into()));
+                // A builtin one (`__builtin_va_list`) is nowhere in the file.
+                if pos.line != 0 {
+                    d.attr(AT_DECL_FILE, Val::Const((*file).into()));
+                    d.attr(AT_DECL_LINE, Val::Const(pos.line.into()));
+                }
                 d
             }
             TypeNode::Enum(tag, of, constants, file, pos) => {
@@ -969,16 +1168,16 @@ impl Lines {
             .into_iter()
             .filter(|(t, _)| !nested.iter().any(|(n, _)| n == t))
             .collect();
-        for f in &self.functions {
-            cu.children.push(self.function_die(f, &local, &nested));
-        }
-        for g in &self.globals {
-            cu.children.push(self.global_die(g));
-        }
-        for id in 0..self.types.len() {
-            if !nested.iter().any(|(n, _)| *n == id) && !local.iter().any(|(t, _)| *t == id) {
-                cu.children.push(self.type_die(id, &nested));
-            }
+        // The entries in clang's order (see [`order`]).
+        let order = self.order(&nested, &local);
+        for child in &order.unit {
+            let die = match *child {
+                order::Child::Function(i) => self.function_die(i, &order.locals[i], &nested),
+                order::Child::Global(i) => self.global_die(&self.globals[i]),
+                order::Child::Literal(i) => self.literal_die(&self.literals[i]),
+                order::Child::Type(t) => self.type_die(t, &nested),
+            };
+            cu.children.push(die);
         }
 
         // The strings and the addresses, each once, by their index in
@@ -1071,6 +1270,7 @@ fn tag_name(tag: u8) -> &'static str {
         TAG_ARRAY_TYPE => "DW_TAG_array_type",
         TAG_ENUMERATION_TYPE => "DW_TAG_enumeration_type",
         TAG_FORMAL_PARAMETER => "DW_TAG_formal_parameter",
+        TAG_LABEL => "DW_TAG_label",
         TAG_LEXICAL_BLOCK => "DW_TAG_lexical_block",
         TAG_MEMBER => "DW_TAG_member",
         TAG_POINTER_TYPE => "DW_TAG_pointer_type",

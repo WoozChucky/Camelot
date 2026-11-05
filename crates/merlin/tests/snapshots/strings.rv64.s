@@ -117,7 +117,7 @@ main:
     la    a0, .L.str.1
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    la    a0, .L.str.2
+    la    a0, .L.str.1
     mv    a1, a0
     ld    a0, 0(sp)
     addi  sp, sp, 8
@@ -126,10 +126,10 @@ main:
     addi  sp, sp, 8
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    la    a0, .L.str.3
+    la    a0, .L.str.1
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    la    a0, .L.str.4
+    la    a0, .L.str.2
     mv    a1, a0
     ld    a0, 0(sp)
     addi  sp, sp, 8
@@ -183,7 +183,7 @@ main:
     lw    a0, -28(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    la    a0, .L.str.5
+    la    a0, .L.str.3
     addi  sp, sp, -8
     sd    a0, 0(sp)
     li    a0, 2
@@ -199,7 +199,7 @@ main:
     subw  a0, a1, a0
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    la    a0, .L.str.6
+    la    a0, .L.str.4
     addi  sp, sp, -8
     sd    a0, 0(sp)
     li    a0, 3
@@ -249,7 +249,7 @@ main:
     seqz  a0, a0
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    la    a0, .L.str.7
+    la    a0, .L.str.5
     addi  sp, sp, -8
     sd    a0, 0(sp)
     li    a0, 1
@@ -279,7 +279,7 @@ main:
     lbu   a0, -29(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    la    a0, .L.str.8
+    la    a0, .L.str.6
     addi  sp, sp, -8
     sd    a0, 0(sp)
     li    a0, 1
@@ -318,22 +318,16 @@ main:
     .asciz "abc"
 
 .L.str.2:
-    .asciz "abc"
-
-.L.str.3:
-    .asciz "abc"
-
-.L.str.4:
     .asciz "abd"
 
-.L.str.5:
+.L.str.3:
     .asciz "ABC"
 
-.L.str.6:
+.L.str.4:
     .asciz "tab\there"
 
-.L.str.7:
+.L.str.5:
     .asciz "q"
 
-.L.str.8:
+.L.str.6:
     .asciz "\"\\"

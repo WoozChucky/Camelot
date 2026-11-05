@@ -720,3 +720,147 @@ fn a_functions_types_are_its_own() {
     assert_eq!(outer.len(), 1);
     assert_eq!(u.dies[u.dies[outer[0]].children[0]].name(), Some("l"));
 }
+
+/// The entries of a unit as llvm-dwarfdump shows them: each one's depth, tag
+/// and name (or, without one, the name of its type), the unit's own left out.
+fn entry_tree(tool: &str, obj: &Path) -> Vec<String> {
+    let out = std::process::Command::new(tool)
+        .arg("--debug-info")
+        .arg(obj)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {tool}: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut entries: Vec<(usize, String, String, String)> = Vec::new();
+    for l in text.lines() {
+        if let Some(rest) = l
+            .strip_prefix("0x")
+            .and_then(|r| r.split_once(':'))
+            .map(|(_, r)| r)
+        {
+            let tag = rest.trim_start();
+            if tag.starts_with("DW_TAG_") || tag == "NULL" {
+                let depth = rest.len() - tag.len();
+                let tag = tag.split_whitespace().next().unwrap().to_string();
+                entries.push((depth, tag, String::new(), String::new()));
+                continue;
+            }
+        }
+        let Some(e) = entries.last_mut() else { continue };
+        let quoted = |l: &str| {
+            l.split_once("(\"")
+                .map(|(_, r)| r.trim_end_matches("\")").to_string())
+        };
+        if l.trim_start().starts_with("DW_AT_name") {
+            // The unit's file and directory names are paths, which differ.
+            e.2 = quoted(l)
+                .filter(|n| !n.contains(['/', '\\', ':']))
+                .unwrap_or_default();
+        } else if l.trim_start().starts_with("DW_AT_type") {
+            e.3 = l
+                .split_once(" \"")
+                .map(|(_, r)| r.trim_end_matches("\")").to_string())
+                .unwrap_or_default();
+        }
+    }
+    entries
+        .into_iter()
+        .filter(|e| e.1 != "DW_TAG_compile_unit")
+        .map(|(depth, tag, name, ty)| {
+            let what = if name.is_empty() { format!("-> {ty}") } else { name };
+            format!("{}{tag} {what}", " ".repeat(depth))
+        })
+        .collect()
+}
+
+/// merlin's entries are clang's, in clang's order (see `src/debug/order.rs`):
+/// for [`VARS`], merlin-dbg's tests/vars/vars.c and every test case, at both
+/// widths, the tree of tags and names llvm-dwarfdump shows is the same, but for
+/// the cases whose entries clang's front end makes differently:
+/// - `func_ptrs.c`, `inline.c`: clang emits a `static` (or inline) function
+///   once it is used, after the others, and its entry with its code; merlin's
+///   code and entries are in the order the functions come;
+/// - `enums.c`, `designated.c`: clang describes an enum whose constant its
+///   generated code uses, even with no variable of it; merlin's parser makes
+///   constants numbers;
+/// - `predefined_types.c`, `static_address_casts.c`: clang keeps the type of a
+///   cast its code generator visits, which leaves out operands it folds (`1 &&
+///   x`) and takes in some constant initializers; merlin keeps every explicit
+///   cast its code evaluates.
+///
+/// Ignored: it needs clang and llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP`
+/// name them if they are not on the PATH).
+#[test]
+#[ignore]
+fn the_entries_are_clangs_in_clangs_order() {
+    const DIFFERENT: [&str; 6] = [
+        "func_ptrs.c",
+        "inline.c",
+        "enums.c",
+        "designated.c",
+        "predefined_types.c",
+        "static_address_casts.c",
+    ];
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let tool = std::env::var("LLVM_DWARFDUMP").unwrap_or_else(|_| "llvm-dwarfdump".into());
+    let dir = std::env::temp_dir().join(format!("merlin-order-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut sources: Vec<(String, String)> = vec![
+        ("v.c".into(), VARS.into()),
+        (
+            "vars.c".into(),
+            std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../merlin-dbg/tests/vars/vars.c"),
+            )
+            .unwrap(),
+        ),
+    ];
+    for p in cases() {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        if !DIFFERENT.contains(&name.as_str()) {
+            sources.push((name, std::fs::read_to_string(&p).unwrap()));
+        }
+    }
+    for x in [Xlen::Rv32, Xlen::Rv64] {
+        let bits = x.bits();
+        let abi = if bits == 64 { "lp64" } else { "ilp32" };
+        let opts = Options {
+            xlen: x,
+            ..debug_opts("dir")
+        };
+        for (name, src) in &sources {
+            let source = dir.join(name);
+            std::fs::write(&source, src).unwrap();
+            let asm = merlin::compile_with(name, src, &opts, &merlin::no_files).unwrap();
+            let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
+            let ours = dir.join(format!("{name}-merlin-{bits}.o"));
+            std::fs::write(&ours, obj).unwrap();
+            let theirs = dir.join(format!("{name}-clang-{bits}.o"));
+            let out = std::process::Command::new(&clang)
+                .args([
+                    &format!("--target=riscv{bits}"),
+                    &format!("-march=rv{bits}ima_zicsr_zifencei"),
+                    &format!("-mabi={abi}"),
+                    "-O0",
+                    "-g",
+                    "-ffreestanding",
+                    "-fno-builtin",
+                    "-w",
+                    "-c",
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(&theirs)
+                .output()
+                .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let (ours, theirs) = (entry_tree(&tool, &ours), entry_tree(&tool, &theirs));
+            assert!(ours.len() > 2, "{name}: {ours:#?}");
+            assert_eq!(ours, theirs, "{name}: merlin's (left) and clang's (right), {x:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

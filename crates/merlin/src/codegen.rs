@@ -342,7 +342,8 @@
 //! `.ascii` and `.zero` (struct padding too), after a `.balign` for the
 //! type. A `static` local's symbol is
 //! `function.name`, a local symbol (no `.globl`). Each string literal gets a
-//! label `.L.str.<n>` in `.rodata`.
+//! label `.L.str.<n>` in `.rodata`, one for literals of the same bytes, as
+//! clang merges them.
 //!
 //! ## Control flow
 //!
@@ -385,7 +386,7 @@ use crate::consteval::{self, Base, Const};
 use crate::debug::{DebugInfo, Lines, Location, Scope, Var};
 use crate::sema::arith_type;
 use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
-use crate::Error;
+use crate::{Error, Pos};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -476,13 +477,32 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
                 for d in statics {
                     file.variable(d);
                 }
+                if let Some(d) = file.debug.as_mut() {
+                    d.statics_done();
+                }
             }
             Item::Decl(decls) => {
                 for d in decls.iter().filter(|d| d.define) {
                     file.variable(d);
+                    // A compound literal's hidden variable is not described, as
+                    // clang has it: its string literals go with the global that
+                    // names it.
+                    if d.name.starts_with(".compoundliteral.") {
+                        if let (Some(dbg), Some(VarRef::Global(sym))) = (file.debug.as_mut(), &d.var) {
+                            dbg.hidden(sym);
+                        }
+                        continue;
+                    }
                     if let (Some(dbg), Some(VarRef::Global(sym))) = (file.debug.as_mut(), &d.var) {
                         let external = d.storage != Storage::Static;
-                        dbg.global(&d.name, sym, &d.ty, &d.spelled, d.pos, external);
+                        dbg.global(
+                            &d.name,
+                            sym,
+                            (&d.ty, &d.spelled),
+                            d.pos,
+                            external,
+                            d.init.is_some(),
+                        );
                     }
                 }
             }
@@ -666,10 +686,18 @@ impl FileGen {
         }
     }
 
-    /// The label of a new string literal.
-    fn string(&mut self, bytes: &[u8]) -> String {
+    /// The label of a string literal, at `pos`: the same bytes are one
+    /// literal, as clang merges them (C99 6.4.5p6 leaves it open).
+    fn string(&mut self, bytes: &[u8], pos: Pos) -> String {
+        if let Some(i) = self.strings.iter().position(|s| s == bytes) {
+            return format!(".L.str.{i}");
+        }
         self.strings.push(bytes.to_vec());
-        format!(".L.str.{}", self.strings.len() - 1)
+        let label = format!(".L.str.{}", self.strings.len() - 1);
+        if let Some(d) = self.debug.as_mut() {
+            d.literal(&label, bytes.len(), pos);
+        }
+        label
     }
 
     /// Emits a global variable or `static` local: its symbol and its data.
@@ -803,8 +831,13 @@ impl FileGen {
                         offset,
                     } => {
                         let sym = match base {
-                            Base::Sym(s) => s,
-                            Base::Str(bytes) => self.string(&bytes),
+                            Base::Sym(s) => {
+                                if let Some(d) = self.debug.as_mut() {
+                                    d.reference(&s);
+                                }
+                                s
+                            }
+                            Base::Str(bytes) => self.string(&bytes, e.pos),
                         };
                         match offset {
                             0 => sym,
@@ -969,6 +1002,9 @@ impl<'a> FuncGen<'a, '_> {
 
     /// `la reg, symbol`: `auipc` + `addi`.
     fn la(&mut self, reg: &str, symbol: &str) {
+        if let Some(d) = self.file.debug.as_mut() {
+            d.reference(symbol);
+        }
         self.ins_sized(8, "la", format!("{reg}, {symbol}"));
     }
 
@@ -1385,22 +1421,21 @@ impl<'a> FuncGen<'a, '_> {
             .collect()
     }
 
-    /// `-g`: the variables `decls` declares, in the innermost scope: a local
-    /// in its slot, a `static` local at its symbol. (A block's `extern`
+    /// `-g`: the variable `decl` declares, in the innermost scope: a local in
+    /// its slot, a `static` local at its symbol. (A block's `extern`
     /// declaration defines nothing.)
-    fn debug_decls(&mut self, decls: &[Declarator]) {
+    fn debug_decl(&mut self, decl: &Declarator) {
         let Some(d) = self.file.debug.as_mut() else {
             return;
         };
-        for decl in decls {
-            let at = match &decl.var {
-                Some(VarRef::Local(id)) => Location::Frame(self.offsets[id.0]),
-                Some(VarRef::Global(sym)) if decl.storage == Storage::Static => Location::Symbol(sym.clone()),
-                _ => continue,
-            };
-            let v = d.var(&decl.name, &decl.ty, &decl.spelled, decl.pos, at);
-            self.scopes.last_mut().expect("a scope").push(v);
-        }
+        let at = match &decl.var {
+            Some(VarRef::Local(id)) => Location::Frame(self.offsets[id.0]),
+            Some(VarRef::Global(sym)) if decl.storage == Storage::Static => Location::Symbol(sym.clone()),
+            _ => return,
+        };
+        let v = d.var(&decl.name, &decl.ty, &decl.spelled, decl.pos, at);
+        d.declared(&v);
+        self.scopes.last_mut().expect("a scope").push(v);
     }
 
     // ---- statements ----
@@ -1451,8 +1486,9 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             StmtKind::Decl(decls) => {
-                self.debug_decls(decls);
+                // Each declarator described, then initialized, as clang does.
                 for d in decls {
+                    self.debug_decl(d);
                     if d.init.is_some() && matches!(d.var, Some(VarRef::Local(_))) {
                         self.loc(d.pos);
                     }
@@ -1642,6 +1678,11 @@ impl<'a> FuncGen<'a, '_> {
             StmtKind::Label { name, body } => {
                 let label = self.goto_label(name);
                 self.label(&label);
+                // `-g`: clang describes the label, in its block.
+                if let Some(d) = self.file.debug.as_mut() {
+                    let l = d.label(name, s.pos, &label);
+                    self.scopes.last_mut().expect("a scope").push_label(l);
+                }
                 self.stmt(body);
             }
             StmtKind::Goto(name) => {
@@ -1784,6 +1825,22 @@ impl<'a> FuncGen<'a, '_> {
 
     // ---- expressions: each leaves its value in a0 ----
 
+    /// `-g`: clang keeps the type of an explicit cast in the unit (and
+    /// describes it as it is evaluated).
+    fn kept_cast(&mut self, e: &Expr) {
+        if let (
+            Some(d),
+            ExprKind::Cast {
+                implicit: false,
+                spelled,
+                ..
+            },
+        ) = (self.file.debug.as_mut(), &e.kind)
+        {
+            d.cast(&e.ty, spelled);
+        }
+    }
+
     fn expr(&mut self, e: &'a Expr) {
         match &e.kind {
             ExprKind::Num(v) => {
@@ -1793,7 +1850,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.constant(*v, kind);
             }
             ExprKind::Str(bytes) => {
-                let label = self.file.string(bytes);
+                let label = self.file.string(bytes, e.pos);
                 self.la("a0", &label);
             }
             ExprKind::Var { var, .. } => match var {
@@ -1955,12 +2012,14 @@ impl<'a> FuncGen<'a, '_> {
             }
             // A constant converted (`char c = 1;`): just the converted value.
             ExprKind::Cast { x, .. } if e.ty.is_integer() && matches!(x.kind, ExprKind::Num(_)) => {
+                self.kept_cast(e);
                 let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
                     unreachable!("an integer literal cast to an integer type is constant")
                 };
                 self.constant(v, kind);
             }
             ExprKind::Cast { x, .. } => {
+                self.kept_cast(e);
                 self.expr(x);
                 self.convert(&x.ty, &e.ty);
             }
@@ -2712,7 +2771,12 @@ impl<'a> FuncGen<'a, '_> {
     fn jump_to(&mut self, direct: Option<&str>) {
         match direct {
             // `call` is `auipc ra` + `jalr ra`: two words.
-            Some(name) => self.ins_sized(8, "call", name),
+            Some(name) => {
+                if let Some(d) = self.file.debug.as_mut() {
+                    d.reference(name);
+                }
+                self.ins_sized(8, "call", name)
+            }
             None => self.ins("jalr", "t1"),
         }
     }
