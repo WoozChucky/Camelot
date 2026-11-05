@@ -2265,6 +2265,49 @@ impl Pp<'_> {
         let mut warnings = Vec::new();
         let bytes = lexer::decode(&t.text, t.pos, &mut warnings)?;
         self.report_all(warnings);
+        // The name is a string nothing evaluates, which has only the simple
+        // escapes (`\\`, `\n`...) and universal character names: an octal
+        // or hex one, or one C has not, is clang's error, at its backslash.
+        let body = &t.text[1..t.text.len() - 1];
+        let mut chars = body.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            if c != '\\' {
+                continue;
+            }
+            let Some((_, e)) = chars.next() else { break };
+            let mut seq = format!("\\{e}");
+            match e {
+                '\'' | '"' | '?' | '\\' | 'a' | 'b' | 'f' | 'n' | 'r' | 't' | 'v' => continue,
+                '0'..='7' => {
+                    for _ in 0..2 {
+                        match chars.peek() {
+                            Some(&(_, d @ '0'..='7')) => {
+                                seq.push(d);
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                'x' => {
+                    while let Some(&(_, d)) = chars.peek().filter(|(_, d)| d.is_ascii_hexdigit()) {
+                        seq.push(d);
+                        chars.next();
+                    }
+                }
+                // A universal character name is one character, which it may have.
+                'u' | 'U' => continue,
+                _ => {}
+            }
+            let at = Pos {
+                col: t.pos.col + 1 + i as u32,
+                ..t.pos
+            };
+            return Err(Error::new(
+                at,
+                format!("invalid escape sequence '{seq}' in an unevaluated string literal"),
+            ));
+        }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 

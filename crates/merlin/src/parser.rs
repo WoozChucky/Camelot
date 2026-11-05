@@ -2796,7 +2796,7 @@ impl Parser<'_> {
 
     /// clang's error where a declaration should start at file scope and
     /// none does.
-    fn not_a_declaration(&self) -> Error {
+    fn not_a_declaration(&mut self) -> Error {
         match self.peek() {
             Tok::Punct("}") => Error::new(self.here(), "extraneous closing brace ('}')"),
             // What would start an Objective-C method, which clang tells
@@ -2812,8 +2812,27 @@ impl Parser<'_> {
                     Tok::Punct("[" | "(" | ")" | ";" | "," | "=" | "{" | ":")
                 ) =>
             {
+                // clang reports the missing type once the declaration is
+                // read: a function's declarator that nothing a declaration
+                // can go on with follows (`typeof(int) x;`, `typeof` being
+                // no keyword in C99) is its syntax error instead.
+                let (start, warned) = (self.pos, self.warnings.borrow().len());
+                let (kept, named) = (self.unevaluated.borrow().len(), self.undeclared.borrow().len());
+                let at = self.here();
+                let func = self
+                    .declarator(&Type::INT, Ctx::File)
+                    .is_ok_and(|d| d.ty.is_func());
+                let goes_on = matches!(self.peek(), Tok::Punct(";" | "," | "=" | "{"));
+                let here = self.here();
+                self.pos = start;
+                self.warnings.borrow_mut().truncate(warned);
+                self.unevaluated.borrow_mut().truncate(kept);
+                self.undeclared.borrow_mut().truncate(named);
+                if func && !goes_on {
+                    return Error::new(here, "expected function body after function declarator");
+                }
                 let msg = "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int";
-                Error::new(self.here(), msg).flagged("implicit-int")
+                Error::new(at, msg).flagged("implicit-int")
             }
             Tok::Ident(name) => {
                 let (at, name) = (self.here(), name.clone());

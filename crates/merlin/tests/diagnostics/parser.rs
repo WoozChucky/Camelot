@@ -240,5 +240,11 @@ pub fn cases() -> Vec<Case> {
         case("_Static_assert(1, 2);", &["1:19: error: expected string literal for diagnostic message in static_assert"]),
         case("_Static_assert(1 \"a\");", &["1:17: error: expected ','"]).then(&["1:21: error: expected identifier or '('"]),
         case("_Static_assert(1, \"a\") int x;", &["1:23: error: expected ';' after '_Static_assert'"]),
+        // The missing type of a declaration, once it is read.
+        case("typeof(int) x;", &["1:13: error: expected function body after function declarator"]),
+        case("foo(int) x;", &["1:10: error: expected function body after function declarator"]),
+        case("foo(int);", &["1:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"]),
+        case("f() { return 0; }", &["1:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"]),
+        case("x[3];", &["1:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"]),
     ]
 }

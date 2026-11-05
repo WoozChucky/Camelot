@@ -89,5 +89,12 @@ pub fn cases() -> Vec<Case> {
         case("#warn\n", &["1:2: error: invalid preprocessing directive"]),
         case("#define P(a, b) a ## b\nP(., x)", &["2:1: error: pasting formed '.x', an invalid preprocessing token", "2:1: error: expected identifier or '('"]).partial("merlin gives no notes of where a macro was expanded"),
         case("??=", &["1:1: warning: trigraph converted to '#' character [-Wtrigraphs]"]),
+        // A `#line` name has only the simple escapes.
+        case("#line 5 \"a\\101.c\"\nint x = y;", &["1:11: error: invalid escape sequence '\\101' in an unevaluated string literal", "2:9: error: use of undeclared identifier 'y'"]),
+        case("#line 5 \"a\\x41.c\"\nint x = y;", &["1:11: error: invalid escape sequence '\\x41' in an unevaluated string literal", "2:9: error: use of undeclared identifier 'y'"]),
+        case("#line 5 \"a\\\\b.c\"\nint x = y;", &["a/b.c:5:9: error: use of undeclared identifier 'y'"]),
+        case("# 5 \"a\\101.c\"\nint x = y;", &["1:7: error: invalid escape sequence '\\101' in an unevaluated string literal", "2:9: error: use of undeclared identifier 'y'"]),
+        case("#line 5 \"a\\q.c\"\nint x = y;", &["1:11: warning: unknown escape sequence '\\q' [-Wunknown-escape-sequence]", "1:11: error: invalid escape sequence '\\q' in an unevaluated string literal", "2:9: error: use of undeclared identifier 'y'"]),
+        case("#line 5 \"a\\u00e9.c\"\nint x = y;", &["aé.c:5:9: error: use of undeclared identifier 'y'"]),
     ]
 }
