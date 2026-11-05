@@ -234,6 +234,30 @@ fn init_len(elem: &Type, init: &Init) -> Option<u32> {
     }
 }
 
+/// How a parameter declared with type `declared` and spelling `spelled`
+/// spells its adjusted type, for `-g`. Declared as an array through an array
+/// typedef, its own (`arr3 b`, `typedef u32 arr3[3];`), it is a pointer to
+/// the elements, and the typedef is gone with the array it named: what is
+/// left is spelled as the typedef's own declaration spelled it (`u32 *`),
+/// as clang has it. Again while that is a typedef of the same array
+/// (`typedef arr3 arr3b;`); not when it names only the elements
+/// (`typedef row mat[2];`: `mat m` is a `row *`). Qualifiers go to the
+/// elements, so `const row r` is a `const u32 *`. A parameter declared as
+/// an array of the typedef's arrays (`arr3 b[2]`), or as a function, keeps
+/// its spelling: the decayed type still has the typedef's type (`arr3 *`).
+fn decayed_spelling(declared: &Type, mut spelled: Spelled) -> Spelled {
+    if !declared.is_array() {
+        return spelled;
+    }
+    while let Some(Spelling::Typedef(t)) = &spelled.0 {
+        if !t.ty.is_array() || declared.quals_added_to(&t.ty).is_none() {
+            break;
+        }
+        spelled = t.spelled.clone();
+    }
+    spelled
+}
+
 /// Where a declaration appears: what storage classes and declarators it may have.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctx {
@@ -1537,6 +1561,7 @@ impl Parser<'_> {
             }
             // C adjusts a parameter declared as an array or a function to a
             // pointer (keeping qualifiers on what it points to).
+            let spelled = decayed_spelling(&d.ty, specs.spelled);
             let ty = if d.ty.is_array() || d.ty.is_func() {
                 d.ty.decay()
             } else {
@@ -1549,7 +1574,7 @@ impl Parser<'_> {
                 name: d.name,
                 ty,
                 pos,
-                spelled: specs.spelled.clone(),
+                spelled,
             });
             if self.eat_punct(")") {
                 return Ok((params, false));

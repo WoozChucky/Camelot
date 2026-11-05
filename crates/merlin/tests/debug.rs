@@ -362,6 +362,45 @@ long walk(Node *list, color_t c) {
 int old() { return 1; }
 ";
 
+/// A type as C writes it, from its entries (`void` for none).
+fn spell(u: &elf::dies::InfoUnit, i: Option<usize>) -> String {
+    let Some(i) = i else {
+        return "void".into();
+    };
+    use elf::dies::dw;
+    let d = &u.dies[i];
+    let inner = || d.reference(dw::AT_TYPE).and_then(|o| u.index_of(o));
+    match d.tag {
+        dw::TAG_BASE_TYPE | dw::TAG_TYPEDEF => d.name().unwrap().to_string(),
+        dw::TAG_STRUCTURE_TYPE => format!("struct {}", d.name().unwrap()),
+        dw::TAG_UNION_TYPE => format!("union {}", d.name().unwrap()),
+        dw::TAG_ENUMERATION_TYPE => format!("enum {}", d.name().unwrap()),
+        dw::TAG_POINTER_TYPE => format!("{} *", spell(u, inner())),
+        dw::TAG_CONST_TYPE => format!("const {}", spell(u, inner())),
+        dw::TAG_VOLATILE_TYPE => format!("volatile {}", spell(u, inner())),
+        dw::TAG_ARRAY_TYPE => {
+            let dims: String = d
+                .children
+                .iter()
+                .map(|&c| format!("[{}]", u.dies[c].unsigned(dw::AT_COUNT).unwrap()))
+                .collect();
+            format!("{}{dims}", spell(u, inner()))
+        }
+        dw::TAG_SUBROUTINE_TYPE => {
+            let params: Vec<String> = d
+                .children
+                .iter()
+                .map(|&c| match u.dies[c].tag {
+                    dw::TAG_UNSPECIFIED_PARAMETERS => "...".to_string(),
+                    _ => spell(u, u.dies[c].reference(dw::AT_TYPE).and_then(|o| u.index_of(o))),
+                })
+                .collect();
+            format!("{}({})", spell(u, inner()), params.join(", "))
+        }
+        t => panic!("tag {t:#x}"),
+    }
+}
+
 /// The entries merlin writes for [`VARS`], read back with `elf::dies` from the
 /// object (its relocations applied): a function's parameters and locals where
 /// its frame has them, the blocks around the code that declares them, globals
@@ -390,43 +429,6 @@ fn variables_and_types_are_described() {
                 .unwrap_or_else(|| panic!("no {name} ({x:?}) in\n{asm}"))
         };
         let ty = |d: &Die| u.index_of(d.reference(dw::AT_TYPE).expect("a type")).unwrap();
-        // A type as C writes it, from its entries.
-        fn spell(u: &InfoUnit, i: Option<usize>) -> String {
-            let Some(i) = i else {
-                return "void".into();
-            };
-            let d = &u.dies[i];
-            let inner = || d.reference(dw::AT_TYPE).and_then(|o| u.index_of(o));
-            match d.tag {
-                dw::TAG_BASE_TYPE | dw::TAG_TYPEDEF => d.name().unwrap().to_string(),
-                dw::TAG_STRUCTURE_TYPE => format!("struct {}", d.name().unwrap()),
-                dw::TAG_UNION_TYPE => format!("union {}", d.name().unwrap()),
-                dw::TAG_ENUMERATION_TYPE => format!("enum {}", d.name().unwrap()),
-                dw::TAG_POINTER_TYPE => format!("{} *", spell(u, inner())),
-                dw::TAG_CONST_TYPE => format!("const {}", spell(u, inner())),
-                dw::TAG_VOLATILE_TYPE => format!("volatile {}", spell(u, inner())),
-                dw::TAG_ARRAY_TYPE => {
-                    let dims: String = d
-                        .children
-                        .iter()
-                        .map(|&c| format!("[{}]", u.dies[c].unsigned(dw::AT_COUNT).unwrap()))
-                        .collect();
-                    format!("{}{dims}", spell(u, inner()))
-                }
-                dw::TAG_SUBROUTINE_TYPE => {
-                    let params: Vec<String> = d
-                        .children
-                        .iter()
-                        .map(|&c| match u.dies[c].tag {
-                            dw::TAG_UNSPECIFIED_PARAMETERS => "...".to_string(),
-                            _ => spell(u, u.dies[c].reference(dw::AT_TYPE).and_then(|o| u.index_of(o))),
-                        })
-                        .collect();
-                    format!("{}({})", spell(u, inner()), params.join(", "))
-                }
-                t => panic!("tag {t:#x}"),
-            }
-        }
         let type_of = |i: usize| spell(u, Some(ty(at(i))));
 
         // The function: its frame base is s0, and each parameter and local is
@@ -1001,6 +1003,60 @@ fn function_pointer_parameters_are_described_as_declared() {
     assert_eq!(to.tag, dw::TAG_CONST_TYPE);
     let t = u.die_at(to.reference(dw::AT_TYPE).unwrap()).unwrap();
     assert_eq!(t.name(), Some("pt"));
+}
+
+/// A parameter declared as an array through an array typedef is a pointer
+/// to the elements, spelled as the typedef's declaration spells them
+/// (`arr3 b` a `u32 *`, `mat m` a `row *`, `const row r` a `const u32 *`),
+/// a function pointer's parameters too; a qualified array typedef is the
+/// typedef qualified (`const row`), as clang 23 describes them.
+#[test]
+fn array_typedef_parameters_decay_as_clangs() {
+    use elf::dies::dw;
+    let src = "typedef unsigned int u32;
+typedef u32 arr3[3];
+typedef arr3 arr3b;
+               typedef u32 row[4];
+typedef row mat[2];
+const row gr;
+               int h(arr3 b, mat m, const row r, arr3b c, const mat cm, arr3 d[2]) {
+                   return b[0] + m[0][0] + r[0] + c[0] + cm[0][0] + d[0][0];
+               }
+               int (*g1)(arr3 b, const mat cm);
+";
+    for x in [Xlen::Rv32, Xlen::Rv64] {
+        let opts = Options {
+            xlen: x,
+            ..debug_opts("dir")
+        };
+        let asm = merlin::compile_with("c.c", src, &opts, &merlin::no_files).unwrap();
+        let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
+        let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+        let u = &units[0];
+        let type_of = |d: &elf::dies::Die| spell(u, d.reference(dw::AT_TYPE).and_then(|o| u.index_of(o)));
+        let typed: Vec<(&str, String)> = u
+            .dies
+            .iter()
+            .filter(|d| matches!(d.tag, dw::TAG_FORMAL_PARAMETER | dw::TAG_VARIABLE))
+            .map(|d| (d.name().unwrap_or(""), type_of(d)))
+            .collect();
+        assert_eq!(
+            typed,
+            [
+                ("b", "u32 *".to_string()),
+                ("m", "row *".into()),
+                ("r", "const u32 *".into()),
+                ("c", "u32 *".into()),
+                ("cm", "const row *".into()),
+                ("d", "arr3 *".into()),
+                ("gr", "const row".into()),
+                ("g1", "int(u32 *, const row *) *".into()),
+                ("", "u32 *".into()),
+                ("", "const row *".into()),
+            ],
+            "{x:?}"
+        );
+    }
 }
 
 /// clang emits an array whose initializers hold more than 16 bytes as a

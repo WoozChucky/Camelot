@@ -76,7 +76,7 @@
 
 mod order;
 
-use crate::types::{ptr_size, IntKind, Record, Spelled, Spelling, Type, Xlen};
+use crate::types::{ptr_size, IntKind, Quals, Record, Spelled, Spelling, Type, Xlen};
 use crate::Pos;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -684,6 +684,13 @@ impl Lines {
             if ty == s.ty() {
                 return Some(self.spelling(s));
             }
+            // A typedef of an array, qualified (`const row`): merlin's type
+            // has the qualifiers on the elements, clang's describes the
+            // typedef qualified, `const` of `row`.
+            if let Some(q) = s.ty().is_array().then(|| ty.quals_added_to(s.ty())).flatten() {
+                let id = Some(self.spelling(s));
+                return self.qualify(id, q);
+            }
         }
         match ty {
             Type::Void => None,
@@ -698,7 +705,12 @@ impl Lines {
                 let mut dims = Vec::new();
                 let mut t = ty;
                 while let Type::Array(elem, n) = t {
-                    if spelled.0.as_ref().is_some_and(|s| t == s.ty()) {
+                    // From an array typedef on, qualified or not.
+                    if spelled
+                        .0
+                        .as_ref()
+                        .is_some_and(|s| s.ty().is_array() && t.quals_added_to(s.ty()).is_some())
+                    {
                         break;
                     }
                     dims.push(*n);
@@ -709,16 +721,9 @@ impl Lines {
                 Some(self.intern(key, || TypeNode::Array(elem, dims)))
             }
             Type::Record(r) => Some(self.record(r)),
-            // `const volatile T` is const of volatile of T, as clang has it.
             Type::Qual(t, q) => {
-                let mut id = self.type_of(t, spelled);
-                if q.volatile {
-                    id = Some(self.intern(TypeKey::Qual(false, id), || TypeNode::Qual(false, id)));
-                }
-                if q.konst {
-                    id = Some(self.intern(TypeKey::Qual(true, id), || TypeNode::Qual(true, id)));
-                }
-                id
+                let id = self.type_of(t, spelled);
+                self.qualify(id, *q)
             }
             Type::Func(f) => {
                 let ret = self.type_of(&f.ret, spelled);
@@ -738,6 +743,18 @@ impl Lines {
                 Some(self.intern(key, || TypeNode::Func(ret, params, f.variadic)))
             }
         }
+    }
+
+    /// Type `id` with qualifiers `q`: `const volatile T` is const of
+    /// volatile of T, as clang has it.
+    fn qualify(&mut self, mut id: Option<usize>, q: Quals) -> Option<usize> {
+        if q.volatile {
+            id = Some(self.intern(TypeKey::Qual(false, id), || TypeNode::Qual(false, id)));
+        }
+        if q.konst {
+            id = Some(self.intern(TypeKey::Qual(true, id), || TypeNode::Qual(true, id)));
+        }
+        id
     }
 
     /// The index of a type, added to the table if it is new.

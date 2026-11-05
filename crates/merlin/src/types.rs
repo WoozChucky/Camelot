@@ -611,6 +611,20 @@ impl Type {
         }
     }
 
+    /// The qualifiers `self` adds to `of`, if it is `of` with qualifiers
+    /// added: on an array they go to its elements, so `const row`, of a
+    /// typedef `row` of `u32[4]`, is `const u32[4]`, and adds `const` to
+    /// `row` (as clang describes it: a const typedef). `None` if `self` is
+    /// not `of` so qualified.
+    pub fn quals_added_to(&self, of: &Type) -> Option<Quals> {
+        let (mine, its) = (self.quals(), of.quals());
+        let added = Quals {
+            konst: mine.konst && !its.konst,
+            volatile: mine.volatile && !its.volatile,
+        };
+        (of.clone().qualified(added) == *self).then_some(added)
+    }
+
     /// `sizeof`: `None` for `void`, functions, arrays of unknown size and
     /// incomplete structs and unions.
     pub fn size(&self, x: Xlen) -> Option<u32> {
