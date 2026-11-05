@@ -5,11 +5,12 @@
 //!   pause, resume, stop, destroy) and the virtual network (switches, plugging cards
 //!   into them, captures) talk to Avalon; disk management (create, list, delete) talks
 //!   to Lake. Each operation is one request and its typed reply.
-//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, widths, disk sources,
-//!   disk sizes and network cards, so every front end accepts the same syntax (`--ram`
-//!   and `--clock` are Grail's own parsers).
-//! - [`show`]: the same values as text again (sizes, frequencies, widths, device names, MAC
-//!   addresses).
+//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, widths and
+//!   paging modes, disk sources, disk sizes and network cards, so every front end
+//!   accepts the same syntax (`--ram`, `--clock`, `--xlen` and `--paging` are Grail's
+//!   own parsers).
+//! - [`show`]: the same values as text again (sizes, frequencies, widths, device
+//!   names, MAC addresses).
 //! - [`VmAction::allowed_in`], [`holds_disks`] and [`lake_disks`]: what a VM's state
 //!   and profile mean for what a person may do with it and its disks.
 //! - [`create_camelot_vm`]: a VM that boots Camelot from its own copy of Lake's

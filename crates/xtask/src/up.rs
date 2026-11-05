@@ -230,16 +230,6 @@ pub struct RootImages {
     pub rv64: Vec<u8>,
 }
 
-impl RootImages {
-    /// The image of width `xlen`.
-    pub fn of(&self, xlen: Xlen) -> &[u8] {
-        match xlen {
-            Xlen::Rv32 => &self.rv32,
-            Xlen::Rv64 => &self.rv64,
-        }
-    }
-}
-
 /// Builds the binaries (`cargo build --release -p ...`, its output on this process's
 /// stderr) and the bootable root images, RV32's written to `options.image` and RV64's
 /// to `options.image_rv64`, as `cargo xtask fs` and `cargo xtask fs --xlen 64` build
