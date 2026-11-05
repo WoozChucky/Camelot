@@ -541,6 +541,7 @@ impl<'a> Interp<'a> {
                 body,
                 cases,
                 default,
+                ..
             } => {
                 if seek.is_none() {
                     let v = self.expr(cond, frame)?;

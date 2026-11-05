@@ -265,6 +265,10 @@ pub struct Record {
     pub tag: Option<String>,
     /// Where the type was first declared.
     pub pos: Pos,
+    /// The name of the typedef that names it, if it has no tag and is
+    /// what a typedef declares (`typedef struct { ... } S;`): clang calls
+    /// the type by it (`'S'`), C++'s "typedef name for linkage purposes".
+    pub typedef_name: OnceLock<String>,
     /// The members and layout, once the definition has been seen. Until then
     /// the type is incomplete: pointers to it are fine, objects of it are not.
     body: OnceLock<RecordBody>,
@@ -298,6 +302,7 @@ impl Record {
             union,
             tag,
             pos,
+            typedef_name: OnceLock::new(),
             body: OnceLock::new(),
         })
     }
@@ -361,12 +366,14 @@ impl Record {
             .is_ok()
     }
 
-    /// How the type is written: `struct node`, `union value`, or
-    /// `struct (anonymous at 3:1)`.
+    /// How clang's messages name the type: `struct node`, `union value`;
+    /// without a tag, the typedef's name that names it, or where it is
+    /// declared, `struct (unnamed at t.c:3:1)` ([`crate::place`]).
     pub fn name(&self) -> String {
-        match &self.tag {
-            Some(t) => format!("{} {t}", self.keyword()),
-            None => format!("{} (anonymous at {})", self.keyword(), self.pos),
+        match (&self.tag, self.typedef_name.get()) {
+            (Some(t), _) => format!("{} {t}", self.keyword()),
+            (None, Some(name)) => name.clone(),
+            (None, None) => format!("{} (unnamed at {})", self.keyword(), crate::place(self.pos)),
         }
     }
 }
@@ -513,6 +520,21 @@ pub struct EnumType {
     pub ty: Type,
     pub constants: Vec<(String, i128)>,
     pub pos: Pos,
+    /// The typedef's name that names it, if it has no tag ([`Record::typedef_name`]).
+    pub typedef_name: OnceLock<String>,
+}
+
+impl EnumType {
+    /// How clang's messages name the enum type: `enum color`, or without
+    /// a tag the typedef's name that names it, or where it is declared
+    /// (`enum (unnamed at t.c:1:1)`).
+    pub fn name(&self) -> String {
+        match (&self.tag, self.typedef_name.get()) {
+            (Some(t), _) => format!("enum {t}"),
+            (None, Some(name)) => name.clone(),
+            (None, None) => format!("enum (unnamed at {})", crate::place(self.pos)),
+        }
+    }
 }
 
 impl Spelling {
@@ -529,7 +551,7 @@ impl fmt::Debug for Spelling {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Spelling::Typedef(t) => f.write_str(&t.name),
-            Spelling::Enum(e) => write!(f, "enum {}", e.tag.as_deref().unwrap_or("(anonymous)")),
+            Spelling::Enum(e) => f.write_str(&e.name()),
         }
     }
 }
@@ -780,19 +802,26 @@ impl Type {
     /// `spelled` it: through a typedef name, its name with what it stands
     /// for after it (`'T *' (aka 'int *')`); as an enum, `'enum e'`.
     pub fn named(&self, spelled: &Spelled) -> String {
-        let plain = self.declare("");
-        let base = match &spelled.0 {
-            Some(Spelling::Typedef(t)) => (t.ty.clone(), t.name.clone()),
-            Some(Spelling::Enum(e)) => match &e.tag {
-                Some(tag) => (e.ty.clone(), format!("enum {tag}")),
-                None => return format!("'{plain}'"),
-            },
-            None => return format!("'{plain}'"),
+        // What the type is without its typedef names, clang's "canonical
+        // type": an enum (which merlin's types leave out) is still one.
+        let mut canonical = spelled;
+        while let Some(Spelling::Typedef(t)) = &canonical.0 {
+            canonical = &t.spelled;
+        }
+        let plain = match &canonical.0 {
+            Some(Spelling::Enum(e)) => self.declare_with("", Some((&e.ty, &e.name()))),
+            _ => self.declare(""),
         };
-        let sugared = self.declare_with("", Some((&base.0, &base.1)));
         match &spelled.0 {
-            Some(Spelling::Typedef(_)) if sugared != plain => format!("'{sugared}' (aka '{plain}')"),
-            _ => format!("'{sugared}'"),
+            Some(Spelling::Typedef(t)) => {
+                let sugared = self.declare_with("", Some((&t.ty, &t.name)));
+                if sugared != plain {
+                    format!("'{sugared}' (aka '{plain}')")
+                } else {
+                    format!("'{sugared}'")
+                }
+            }
+            _ => format!("'{plain}'"),
         }
     }
 
@@ -1115,7 +1144,7 @@ mod tests {
         let s = Record::new(false, Some("node".into()), Pos::default());
         assert_eq!(Type::ptr(Type::Record(s)).declare("next"), "struct node *next");
         let u = Record::new(true, None, Pos::new(3, 1));
-        assert_eq!(Type::Record(u).to_string(), "union (anonymous at 3:1)");
+        assert_eq!(Type::Record(u).to_string(), "union (unnamed at \u{1}0\u{1}3:1)");
     }
 
     #[test]

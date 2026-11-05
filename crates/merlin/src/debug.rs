@@ -1215,7 +1215,11 @@ impl Lines {
                 } else {
                     TAG_STRUCTURE_TYPE
                 };
-                let mut d = Die::new(tag, &r.name());
+                let what = match &r.tag {
+                    Some(t) => format!("{} {t}", r.keyword()),
+                    None => format!("{} (anonymous at {})", r.keyword(), r.pos),
+                };
+                let mut d = Die::new(tag, &what);
                 if let Some(t) = &r.tag {
                     d.attr(AT_NAME, Val::Str(t.clone()));
                 }

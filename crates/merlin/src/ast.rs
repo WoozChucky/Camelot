@@ -375,12 +375,17 @@ pub enum StmtKind {
     Continue,
     /// `switch (cond) body`. Sema fills in every `case` of this switch (its
     /// value, converted to the promoted type of `cond`, and its id) and the
-    /// id of `default`, if there is one.
+    /// id of `default`, if there is one; and `covered`, whether `cond` is
+    /// an enum every one of whose constants has a case (clang's
+    /// `isAllEnumCasesCovered`), for which clang takes it that no other
+    /// value comes: no `default` is taken, and the switch is not passed by
+    /// ([`crate::flow`]).
     Switch {
         cond: Expr,
         body: Box<Stmt>,
         cases: Vec<(i128, usize)>,
         default: Option<usize>,
+        covered: bool,
     },
     /// `case expr: body`. Sema sets the value and an id, unique in the
     /// function, that its switch refers to. `bare`: the expression is one

@@ -2080,6 +2080,7 @@ impl<'a> FuncGen<'a, '_> {
                 body,
                 cases,
                 default,
+                ..
             } => {
                 // A chain of compares, one per `case`, in source order; then
                 // `default` (or the end, when there is none). The body is

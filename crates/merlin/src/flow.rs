@@ -103,8 +103,9 @@ struct Walk<'a> {
 /// Which labels of a `switch` it jumps to.
 #[derive(Clone, Copy)]
 enum Entry {
-    /// Any: the condition is not constant.
-    All,
+    /// Any: the condition is not constant; and `default`, unless the
+    /// switch covers every constant of its enum.
+    All { default: bool },
     /// The case of this value, if one has it (the bool), else `default`.
     Only(i128, bool),
     /// None: the switch is not reached.
@@ -194,13 +195,16 @@ impl Walk<'_> {
                 body,
                 cases,
                 default,
+                covered,
             } => {
                 self.expr(cond, live);
                 let v = consteval::int(cond, self.x);
-                let matched = v.is_some_and(|v| cases.iter().any(|&(c, _)| c == v));
+                // A switch that covers its enum takes a case or nothing:
+                // clang's CFG has no edge to `default`, nor past the switch.
+                let matched = *covered || v.is_some_and(|v| cases.iter().any(|&(c, _)| c == v));
                 self.switches.push(match v {
                     _ if !live => Entry::Nothing,
-                    None => Entry::All,
+                    None => Entry::All { default: !covered },
                     Some(v) => Entry::Only(v, matched),
                 });
                 self.breaks.push(false);
@@ -209,12 +213,12 @@ impl Walk<'_> {
                 let broke = self.breaks.pop().expect("pushed");
                 self.switches.pop();
                 // With no case taken, the switch is passed by.
-                let passed = live && default.is_none() && (v.is_none() || !matched);
+                let passed = live && !covered && default.is_none() && (v.is_none() || !matched);
                 out || broke || passed
             }
             StmtKind::Case { value, body, .. } => {
                 let entry = match self.switches.last() {
-                    Some(Entry::All) => true,
+                    Some(Entry::All { .. }) => true,
                     Some(&Entry::Only(v, _)) => v == *value,
                     Some(Entry::Nothing) | None => false,
                 };
@@ -222,7 +226,7 @@ impl Walk<'_> {
             }
             StmtKind::Default { body, .. } => {
                 let entry = match self.switches.last() {
-                    Some(Entry::All) => true,
+                    Some(&Entry::All { default }) => default,
                     Some(&Entry::Only(_, matched)) => !matched,
                     Some(Entry::Nothing) | None => false,
                 };

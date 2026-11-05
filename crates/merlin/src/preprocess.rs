@@ -731,8 +731,24 @@ fn name_files(files: &[String], errors: &mut [Error]) {
         if e.pos.file != 0 && e.file.is_none() {
             e.file = files.get(e.pos.file as usize).cloned();
         }
+        if e.msg.contains(crate::FILE_MARK) {
+            e.msg = name_places(files, &e.msg);
+        }
         name_files(files, &mut e.notes);
     }
+}
+
+/// `msg` with the file of each place in it ([`crate::place`]) named.
+fn name_places(files: &[String], msg: &str) -> String {
+    let mut parts = msg.split(crate::FILE_MARK);
+    let mut out = parts.next().unwrap_or_default().to_string();
+    while let (Some(file), Some(rest)) = (parts.next(), parts.next()) {
+        let name = file.parse::<usize>().ok().and_then(|n| files.get(n));
+        out.push_str(name.map_or("", String::as_str));
+        out.push(':');
+        out.push_str(rest);
+    }
+    out
 }
 
 /// Preprocesses the source `src` of the file `name` (its name for

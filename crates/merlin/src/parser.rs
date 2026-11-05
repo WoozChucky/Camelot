@@ -99,7 +99,7 @@ use crate::types::{
 use crate::{Error, Pos};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// clang's warning for an array size it folds (`int a[1 ? 2 : f()];`, see
 /// [`Parser::folded`]), and its flag.
@@ -1772,6 +1772,7 @@ impl Parser<'_> {
             ty: ty.clone(),
             constants,
             pos: kw_pos,
+            typedef_name: OnceLock::new(),
         }))));
         // The constants now name their enum, for the code after it.
         let scope = self.scopes.last_mut().expect("a scope");
@@ -2484,6 +2485,17 @@ impl Parser<'_> {
                 spelled: specs.spelled.clone(),
                 pos: d.pos,
             }))));
+            // A typedef of a struct, union or enum without a tag names it
+            // (the first typedef that is the type itself, unqualified).
+            match (&d.ty, &specs.spelled.0) {
+                (Type::Record(r), _) if r.tag.is_none() => {
+                    let _ = r.typedef_name.set(d.name.clone());
+                }
+                (t, Some(Spelling::Enum(e))) if e.tag.is_none() && *t == e.ty => {
+                    let _ = e.typedef_name.set(d.name.clone());
+                }
+                _ => {}
+            }
             self.bind_name(&d.name, Name::Typedef(d.ty, spelling), d.pos)?;
             if !self.eat_punct(",") {
                 break;
@@ -2871,6 +2883,7 @@ impl Parser<'_> {
                     body: Box::new(self.stmt()?),
                     cases: Vec::new(),
                     default: None,
+                    covered: false,
                 }
             }
             Tok::Kw(Kw::Case) => {
@@ -4061,7 +4074,8 @@ mod tests {
         // Anonymous structs and nested definitions (whose tags are in scope outside).
         let t = global_types("struct { struct in { short a; } i; char c; } a; struct in b;");
         assert_eq!((t[0].size(Xlen::Rv32), t[1].size(Xlen::Rv32)), (Some(4), Some(2)));
-        assert_eq!(t[0].to_string(), "struct (anonymous at 1:1)");
+        // The file is the preprocessor's to name (crate::place).
+        assert_eq!(t[0].to_string(), "struct (unnamed at \u{1}0\u{1}1:1)");
         // Specifiers that declare nothing are warned of, and left out.
         let p = prog("int; struct s { int; char c; } x; struct { int a; };");
         assert_eq!(p.warnings.len(), 3);

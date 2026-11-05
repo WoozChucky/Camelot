@@ -34,9 +34,10 @@
 use crate::abi;
 use crate::ast::*;
 use crate::consteval;
-use crate::types::{common, FuncType, IntKind, Spelled, Type, Xlen};
+use crate::types::{common, EnumType, FuncType, IntKind, Spelled, Spelling, Type, Xlen};
 use crate::{Error, Pos};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
     check_after(prog, false)
@@ -236,6 +237,38 @@ fn sign_pair(a: &Type, b: &Type) -> Option<bool> {
     (x != y && rank(x)? == rank(y)?).then_some(x == Char || y == Char)
 }
 
+/// The enum `ty` is, if a declaration `spelled` so declared the type it
+/// is part of: clang's enum types are types of their own, compatible with
+/// their integer type, where merlin's are that integer type; what tells
+/// them apart is how the declarations spelled them.
+fn enum_of<'s>(spelled: &'s Spelled, ty: &Type) -> Option<&'s Arc<EnumType>> {
+    let mut s = spelled;
+    while let Some(Spelling::Typedef(t)) = &s.0 {
+        s = &t.spelled;
+    }
+    match &s.0 {
+        Some(Spelling::Enum(e)) if *ty.unqual() == e.ty => Some(e),
+        _ => None,
+    }
+}
+
+/// Whether pointers to `a` and to `b`, as `sa` and `sb` spelled them, point
+/// to different types because of an enum, which merlin's types leave out:
+/// two different enums; or an enum whose type is unsigned (`enum { A }`)
+/// and another integer type, where clang's check of the sign compares the
+/// unsigned of the other with the enum, which is no integer type (a
+/// signed enum's, `enum { B = -1 }`, it makes unsigned, and so gives
+/// -Wpointer-sign of it and `unsigned int`).
+fn enums_differ(a: &Type, sa: &Spelled, b: &Type, sb: &Spelled) -> bool {
+    match (enum_of(sa, a), enum_of(sb, b)) {
+        (Some(x), Some(y)) => !Arc::ptr_eq(x, y),
+        (Some(x), None) | (None, Some(x)) => {
+            x.ty.is_unsigned() && a.unqual() != b.unqual() && b.is_integer() && a.is_integer()
+        }
+        (None, None) => false,
+    }
+}
+
 /// Whether two types are the same but for qualifiers, at any depth of
 /// pointers.
 fn alike(a: &Type, b: &Type) -> bool {
@@ -376,7 +409,14 @@ fn previous(pos: Pos, definition: bool) -> (Pos, &'static str) {
 /// many, too few at the call's `)` (`close`). A function called by name
 /// (`sig`) gets clang's note on its declaration, and when it has one
 /// parameter to give, a message naming it.
-fn arity_error(ft: &FuncType, args: &[Expr], sig: Option<(&str, &FuncSig)>, close: Pos) -> Option<Error> {
+/// `begin` gives where an argument begins.
+fn arity_error(
+    ft: &FuncType,
+    args: &[Expr],
+    sig: Option<(&str, &FuncSig)>,
+    close: Pos,
+    begin: impl Fn(&Expr) -> Pos,
+) -> Option<Error> {
     let (have, arity) = (args.len(), ft.params.len());
     // The one parameter of a function called by name, if it is named.
     let single = || {
@@ -445,6 +485,8 @@ struct FuncSig {
     /// it leaves unnamed) and where they are, which clang's messages and
     /// notes on a call name.
     params: Vec<(String, Pos, Spelled)>,
+    /// How the latest declaration spelled the result's type.
+    spelled: Spelled,
     /// Declared at file scope (not only in a block, [`Global::hidden`]).
     visible: bool,
 }
@@ -487,6 +529,7 @@ impl Global {
                 pos,
                 def: None,
                 params: Vec::new(),
+                spelled: Spelled::default(),
                 visible: false,
             }),
             None => Global::Var(GlobalVar {
@@ -555,6 +598,7 @@ impl Checker {
                 .iter()
                 .map(|p| (p.name.clone(), p.pos, p.spelled.clone()))
                 .collect(),
+            spelled: f.ret_spelled.clone(),
             visible: true,
         };
         // Functions are visible from their declaration onwards, so a function can
@@ -593,6 +637,7 @@ impl Checker {
                         prev.inline_only = (prev.inline_only || !prev.visible) && sig.inline_only;
                         prev.pos = sig.pos;
                         prev.params = sig.params;
+                        prev.spelled = sig.spelled;
                         prev.visible = true;
                     }
                 }
@@ -998,9 +1043,65 @@ struct SwitchCtx {
     /// The promoted type of the controlling expression: case values convert
     /// to it.
     kind: IntKind,
-    cases: Vec<(i128, usize)>,
-    seen: HashMap<i128, Pos>,
+    /// Its cases, in order, which clang checks as the switch ends.
+    labels: Vec<CaseLabel>,
+    /// Whether a case's expression is in error (clang's
+    /// `CaseListIsIncomplete`): its checks of the cases are left out.
+    incomplete: bool,
     default: Option<(usize, Pos)>,
+}
+
+/// A `case` of a switch: its value (converted), its id, where its
+/// expression begins and where clang reports it, and the enumeration
+/// constant it names, if it is one (cast or in parentheses too), by which
+/// clang's messages of duplicates call it.
+struct CaseLabel {
+    value: i128,
+    id: usize,
+    begin: Pos,
+    loc: Pos,
+    name: Option<String>,
+}
+
+/// Whether `e`'s value can only be 0 or 1, as clang's
+/// `isKnownToHaveBooleanValue` finds (`-Wswitch-bool`): a comparison, a
+/// `!`, `&&` or `||`, a `_Bool`, and what has the value of one of those
+/// (`&`, `|`, `^` of two of them, an assignment, a comma, a `?:` of two).
+fn known_boolean(e: &Expr) -> bool {
+    if *e.ty.unqual() == Type::Int(IntKind::Bool) {
+        return true;
+    }
+    if !e.ty.is_integer() {
+        return false;
+    }
+    match &e.kind {
+        ExprKind::Unary(UnOp::Plus, x) => known_boolean(x),
+        ExprKind::Unary(UnOp::Not, _) => true,
+        // Only conversions it does not write: `(int)(a && b)` is any int.
+        ExprKind::Cast {
+            x, implicit: true, ..
+        } => known_boolean(x),
+        ExprKind::Binary(op, a, b) => match op {
+            BinOp::LogAnd | BinOp::LogOr => true,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => known_boolean(a) && known_boolean(b),
+            op => op.is_comparison(),
+        },
+        ExprKind::Comma(_, x)
+        | ExprKind::Assign {
+            op: None, value: x, ..
+        } => known_boolean(x),
+        ExprKind::Cond(_, a, b) => known_boolean(a) && known_boolean(b),
+        _ => false,
+    }
+}
+
+/// The enumeration constant a case's expression names, through casts.
+fn case_name(e: &Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Cast { x, .. } => case_name(x),
+        ExprKind::Enumerator { name, .. } => Some(name.clone()),
+        _ => None,
+    }
 }
 
 /// An element of an initializer list not yet matched to a subobject, and
@@ -1369,12 +1470,23 @@ impl<'a> FnChecker<'a> {
                 body,
                 cases,
                 default,
+                covered,
             } => {
+                // The type of the condition before it is promoted: an enum's
+                // constants are what clang's -Wswitch checks the cases with.
+                let mut before = None;
                 // The controlling expression is promoted; case values convert to it.
                 let kind = match self.expr(cond) {
                     Err(_) => IntKind::Int,
                     Ok(()) => match cond.ty.decay() {
                         Type::Int(k) => {
+                            if known_boolean(cond) {
+                                let msg = "switch condition has boolean value";
+                                self.errors.push(Error::warning(s.pos, msg, "switch-bool"));
+                            }
+                            let spelled = self.spelled_of(cond);
+                            before =
+                                enum_of(&spelled, &cond.ty).map(|e| (e.clone(), cond.ty.named(&spelled)));
                             coerce(cond, &Type::Int(k.promoted()));
                             k.promoted()
                         }
@@ -1388,26 +1500,26 @@ impl<'a> FnChecker<'a> {
                 };
                 self.switches.push(SwitchCtx {
                     kind,
-                    cases: Vec::new(),
-                    seen: HashMap::new(),
+                    labels: Vec::new(),
+                    incomplete: false,
                     default: None,
                 });
                 self.break_depth += 1;
                 self.scoped(|c| c.stmt(body));
                 self.break_depth -= 1;
+                let ctx = self.switches.pop().expect("pushed above");
+                *covered = self.finish_switch(&ctx, cond, before);
                 if self.empty_body(body) {
                     self.errors.push(empty_body(body.pos, "switch statement"));
                 }
-                let ctx = self.switches.pop().expect("pushed above");
-                // A constant condition no case matches, with no default:
-                // clang's warning, as the switch ends.
-                if let (Some(v), None) = (consteval::int(cond, self.xlen), ctx.default) {
-                    if !ctx.cases.iter().any(|&(c, _)| c == v) {
-                        let msg = format!("no case matching constant switch condition '{v}'");
-                        self.errors.push(Error::warning_unflagged(expr_loc(cond), msg));
-                    }
-                }
-                *cases = ctx.cases;
+                // The first case of each value is the one taken.
+                let mut seen = HashSet::new();
+                *cases = ctx
+                    .labels
+                    .iter()
+                    .filter(|l| seen.insert(l.value))
+                    .map(|l| (l.value, l.id))
+                    .collect();
                 *default = ctx.default.map(|(id, _)| id);
             }
             StmtKind::Case {
@@ -1421,23 +1533,27 @@ impl<'a> FnChecker<'a> {
                 let checked = self.expr(expr);
                 if self.switches.is_empty() {
                     self.err(pos, "'case' statement not in switch statement");
-                } else if checked.is_ok() {
+                } else if checked.is_err() {
+                    self.switches.last_mut().expect("checked above").incomplete = true;
+                } else {
                     match consteval::int(expr, self.xlen).filter(|_| expr.ty.is_integer()) {
                         None => {
                             self.err(expr.pos, "expression is not an integer constant expression");
+                            self.switches.last_mut().expect("checked above").incomplete = true;
                         }
                         Some(v) => {
                             *id = self.next_case;
                             self.next_case += 1;
+                            let (begin, loc) = (self.begin_written(expr), self.loc_written(expr));
                             let sw = self.switches.last_mut().expect("checked above");
                             *value = sw.kind.wrap(v, self.xlen);
-                            if let Some(prev) = sw.seen.insert(*value, expr.pos) {
-                                let msg = format!("duplicate case value '{}'", *value);
-                                let e = Error::new(expr.pos, msg).note(prev, "previous case defined here");
-                                self.errors.push(e);
-                            } else {
-                                sw.cases.push((*value, *id));
-                            }
+                            sw.labels.push(CaseLabel {
+                                value: *value,
+                                id: *id,
+                                begin,
+                                loc,
+                                name: case_name(expr),
+                            });
                         }
                     }
                 }
@@ -1477,6 +1593,140 @@ impl<'a> FnChecker<'a> {
         }
     }
 
+    /// clang's checks of a switch's cases, as it ends (its
+    /// `ActOnFinishSwitchStmt`): values that are the same; a constant
+    /// condition no case has, without a `default`; and of a condition of
+    /// an enum (`before`: it, and its type as messages name it), cases that
+    /// are none of its constants, and without a `default`, constants no
+    /// case has (-Wswitch). Whether the cases cover every constant of the
+    /// enum.
+    fn finish_switch(
+        &mut self,
+        ctx: &SwitchCtx,
+        cond: &Expr,
+        before: Option<(Arc<EnumType>, String)>,
+    ) -> bool {
+        // clang sorts the cases by value (keeping their order among equal
+        // ones): each duplicate is reported against the one before it, in
+        // that order.
+        let mut sorted: Vec<&CaseLabel> = ctx.labels.iter().collect();
+        sorted.sort_by_key(|l| l.value);
+        let mut erroneous = false;
+        for w in sorted.windows(2) {
+            let (prev, cur) = (w[0], w[1]);
+            if prev.value != cur.value {
+                continue;
+            }
+            erroneous = true;
+            let value = prev.value.to_string();
+            let msg = if prev.name == cur.name {
+                format!("duplicate case value '{}'", prev.name.as_ref().unwrap_or(&value))
+            } else {
+                format!(
+                    "duplicate case value: '{}' and '{}' both equal '{value}'",
+                    prev.name.as_ref().unwrap_or(&value),
+                    cur.name.as_ref().unwrap_or(&value)
+                )
+            };
+            let e = Error::new(cur.begin, msg).note(prev.begin, "previous case defined here");
+            self.errors.push(e);
+        }
+        if erroneous || ctx.incomplete {
+            return false;
+        }
+        // A constant condition no case matches, with no default.
+        let mut constant = false;
+        if ctx.default.is_none() {
+            if let Some(v) = consteval::int(cond, self.xlen) {
+                constant = true;
+                if !ctx.labels.iter().any(|l| l.value == v) {
+                    let msg = format!("no case matching constant switch condition '{v}'");
+                    self.errors
+                        .push(Error::warning_unflagged(self.loc_written(cond), msg));
+                }
+            }
+        }
+        let Some((en, named)) = before.filter(|_| !constant) else {
+            return false;
+        };
+        // The enum's constants as the condition's promoted type has them,
+        // by value, the first of each value.
+        let mut constants: Vec<(i128, &str)> = en
+            .constants
+            .iter()
+            .map(|(n, v)| (ctx.kind.wrap(*v, self.xlen), n.as_str()))
+            .collect();
+        constants.sort_by_key(|&(v, _)| v);
+        constants.dedup_by_key(|&mut (v, _)| v);
+        let known: HashSet<i128> = constants.iter().map(|&(v, _)| v).collect();
+        for l in &sorted {
+            if !known.contains(&l.value) {
+                let msg = format!("case value not in enumerated type {named}");
+                self.errors.push(Error::warning(l.loc, msg, "switch"));
+            }
+        }
+        let handled: HashSet<i128> = sorted.iter().map(|l| l.value).collect();
+        let unhandled: Vec<String> = constants
+            .iter()
+            .filter(|(v, _)| !handled.contains(v))
+            .map(|(_, n)| format!("'{n}'"))
+            .collect();
+        if ctx.default.is_none() && !unhandled.is_empty() {
+            let msg = match unhandled.as_slice() {
+                [a] => format!("enumeration value {a} not handled in switch"),
+                [a, b] => format!("enumeration values {a} and {b} not handled in switch"),
+                [a, b, c] => format!("enumeration values {a}, {b}, and {c} not handled in switch"),
+                [a, b, c, ..] => {
+                    format!(
+                        "{} enumeration values not handled in switch: {a}, {b}, {c}...",
+                        unhandled.len()
+                    )
+                }
+                [] => unreachable!("not empty"),
+            };
+            // At where the condition begins: clang's condition of an enum
+            // is always converted, which it reports where it begins.
+            let at = self.begin_written(cond);
+            self.errors.push(Error::warning(at, msg, "switch"));
+        }
+        unhandled.is_empty()
+    }
+
+    /// Where clang reports `e` ([`expr_loc`]) where it does not look
+    /// through parentheses: at the outermost `(` around it.
+    fn loc_written(&self, e: &Expr) -> Pos {
+        match self.written.parens.get(&e.pos) {
+            Some(&open) => open,
+            None => expr_loc(e),
+        }
+    }
+
+    /// Where `e` begins as written: at the outermost `(` around it or
+    /// around what it begins with, as clang's `getBeginLoc` has it.
+    fn begin_written(&self, e: &Expr) -> Pos {
+        if let Some(&open) = self.written.parens.get(&e.pos) {
+            return open;
+        }
+        match &e.kind {
+            ExprKind::Binary(_, l, _) | ExprKind::Comma(l, _) | ExprKind::Cond(l, ..) => {
+                self.begin_written(l)
+            }
+            ExprKind::Assign { target, .. } => self.begin_written(target),
+            ExprKind::IncDec {
+                prefix: false,
+                target,
+                ..
+            } => self.begin_written(target),
+            ExprKind::Member { base, .. } => self.begin_written(base),
+            ExprKind::Call { callee, .. } => self.begin_written(callee),
+            ExprKind::Deref(x) if x.pos == e.pos => self.begin_written(x),
+            ExprKind::Cast {
+                x, implicit: true, ..
+            } => self.begin_written(x),
+            _ => e.pos,
+        }
+    }
+
     fn ret(&mut self, e: Option<&mut Expr>, pos: Pos) {
         let ret = self.ret;
         match e {
@@ -1491,7 +1741,13 @@ impl<'a> FnChecker<'a> {
                         self.errors.push(Error::new(pos, msg).flagged("return-mismatch"));
                     }
                 } else if self
-                    .convert(e, ret, &self.ret_spelled.clone(), Conv::Return, begin(e))
+                    .convert(
+                        e,
+                        ret,
+                        &self.ret_spelled.clone(),
+                        Conv::Return,
+                        self.begin_written(e),
+                    )
                     .is_ok()
                 {
                     coerce(e, ret);
@@ -1705,7 +1961,7 @@ impl<'a> FnChecker<'a> {
         let t = e.ty.decay();
         if !t.is_scalar() {
             let msg = format!("used type '{t}' where arithmetic or pointer type is required");
-            return Err(self.err(begin(e), msg));
+            return Err(self.err(self.begin_written(e), msg));
         }
         self.bool_like(e);
         Ok(())
@@ -2321,7 +2577,7 @@ impl<'a> FnChecker<'a> {
         checked: bool,
         decl: Option<Pos>,
     ) -> Checked {
-        let at = decl.unwrap_or_else(|| begin(e));
+        let at = decl.unwrap_or_else(|| self.begin_written(e));
         match ty {
             Type::Array(elem, n) if is_char_array_elem(elem) => {
                 let ExprKind::Str(bytes) = &mut e.kind else {
@@ -2387,8 +2643,9 @@ impl<'a> FnChecker<'a> {
     fn convert(&mut self, e: &Expr, to: &Type, to_spelled: &Spelled, how: Conv, at: Pos) -> Checked {
         let null = consteval::is_null_pointer(e, self.xlen);
         let from = e.ty.clone();
-        let named = from.named(&self.spelled_of(e));
-        self.convert_value(e, &from, &named, null, to, to_spelled, how, at)?;
+        let from_spelled = self.spelled_of(e);
+        let named = from.named(&from_spelled);
+        self.convert_value(e, &from, &named, &from_spelled, null, to, to_spelled, how, at)?;
         self.constant_conversion(e, to);
         Ok(())
     }
@@ -2404,7 +2661,7 @@ impl<'a> FnChecker<'a> {
         param: Option<&(String, Pos, Spelled)>,
     ) -> Checked {
         let mark = self.errors.len();
-        let checked = self.convert(e, to, &to_spelled, Conv::Arg, begin(e));
+        let checked = self.convert(e, to, &to_spelled, Conv::Arg, self.begin_written(e));
         if let (Some((name, pos, _)), true) = (param, self.errors.len() > mark) {
             let what = if name.is_empty() {
                 "passing argument to parameter here".to_string()
@@ -2435,6 +2692,7 @@ impl<'a> FnChecker<'a> {
         e: &Expr,
         from: &Type,
         named: &str,
+        from_spelled: &Spelled,
         null: bool,
         to: &Type,
         to_spelled: &Spelled,
@@ -2462,6 +2720,8 @@ impl<'a> FnChecker<'a> {
                         "incompatible function pointer types",
                         Some("incompatible-function-pointer-types"),
                     )
+                } else if enums_differ(au, to_spelled, bu, from_spelled) {
+                    ("incompatible pointer types", Some("incompatible-pointer-types"))
                 } else if au == bu || au.is_void() || bu.is_void() {
                     if !a.quals().contains(b.quals()) {
                         let msg = format!("{} discards qualifiers", how.phrase(&to_named, named));
@@ -2633,17 +2893,34 @@ impl<'a> FnChecker<'a> {
         }
     }
 
-    /// How the type of `e` was spelled, where its declaration says: of a
-    /// variable, a member, a cast (and so how clang names it).
+    /// How the type of `e` was spelled, where its declaration says (and
+    /// so how clang names it, [`Type::named`]): of a variable, a function,
+    /// a member, a cast; and of what keeps the type its operand's is built
+    /// from, as `&x`, `*p`, `p + 1`, a call, keeps the spelling of its base
+    /// (a declaration's spelling is of the base its declarator builds on).
     fn spelled_of(&self, e: &Expr) -> Spelled {
         match &e.kind {
             ExprKind::Var { name, .. } => match self.lookup(name) {
                 Some((_, _, pos)) => self.spellings.get(pos).cloned().unwrap_or_default(),
                 None => match self.global(name) {
                     Some(Global::Var(g)) => g.spelled.clone(),
-                    _ => Spelled::default(),
+                    Some(Global::Func(f)) => f.spelled.clone(),
+                    None => Spelled::default(),
                 },
             },
+            ExprKind::Addr(x) | ExprKind::Deref(x) => self.spelled_of(x),
+            ExprKind::Call { callee, .. } => self.spelled_of(callee),
+            ExprKind::Assign { target, .. } => self.spelled_of(target),
+            ExprKind::Comma(_, x) => self.spelled_of(x),
+            ExprKind::Binary(BinOp::Add | BinOp::Sub, a, b) if e.ty.is_ptr() => {
+                let x = if a.ty.decay().is_ptr() { a } else { b };
+                self.spelled_of(x)
+            }
+            // An array or a function as a pointer is still as spelled; any
+            // other implicit conversion makes a type of its own.
+            ExprKind::Cast {
+                x, implicit: true, ..
+            } if matches!(x.ty.unqual(), Type::Array(..) | Type::Func(_)) => self.spelled_of(x),
             ExprKind::Member {
                 base, name, arrow, ..
             } => {
@@ -2885,6 +3162,7 @@ impl<'a> FnChecker<'a> {
                             value,
                             &r,
                             &named,
+                            &Spelled::default(),
                             false,
                             &target.ty,
                             &spelled,
@@ -2986,7 +3264,7 @@ impl<'a> FnChecker<'a> {
                 if !from.is_scalar() {
                     let msg =
                         format!("operand of type '{from}' where arithmetic or pointer type is required");
-                    return Err(self.err(begin(x), msg));
+                    return Err(self.err(self.begin_written(x), msg));
                 }
                 // A pointer to an integer narrower than it loses the address.
                 if let (Type::Int(k), Type::Ptr(_)) = (to.unqual(), &from) {
@@ -3144,7 +3422,7 @@ impl<'a> FnChecker<'a> {
                     Some((name, Some(Global::Func(sig)))) => Some((name, sig)),
                     _ => None,
                 };
-                if let Some(e) = arity_error(&ft, args, sig, *close) {
+                if let Some(e) = arity_error(&ft, args, sig, *close, |e| self.begin_written(e)) {
                     return Err(Reported).inspect_err(|_| self.errors.push(e));
                 }
                 if !ok {
@@ -3309,7 +3587,7 @@ impl<'a> FnChecker<'a> {
         // merlin does not need it, and clang only warns.
         if !matches!(&last.kind, ExprKind::Var { name, .. } if *name == param) {
             self.errors.push(Error::warning(
-                begin(last),
+                self.begin_written(last),
                 "second argument to 'va_start' is not the last non-variadic parameter",
                 "varargs",
             ));
@@ -3318,7 +3596,7 @@ impl<'a> FnChecker<'a> {
             // where the caller put it.
             if ty.int_kind().is_some_and(|k| k.promoted() != k) {
                 let e = Error::warning(
-                    begin(last),
+                    self.begin_written(last),
                     "passing an object that undergoes default argument promotion to 'va_start' has undefined behavior",
                     "varargs",
                 )
@@ -3340,7 +3618,7 @@ impl<'a> FnChecker<'a> {
                 "first argument to 'va_arg' is of type '{}' and not 'va_list'",
                 ap.ty
             );
-            return Err(self.err(begin(ap), msg));
+            return Err(self.err(self.begin_written(ap), msg));
         }
         if t.is_void() || t.is_func() || t.size(self.xlen).is_none() {
             let mut e = Error::new(
@@ -3383,7 +3661,7 @@ impl<'a> FnChecker<'a> {
                  type '{}'",
                 ap.ty
             );
-            return Err(self.err(begin(ap), msg));
+            return Err(self.err(self.begin_written(ap), msg));
         }
         if target {
             self.assignable(ap, ap.pos)?;
@@ -3494,7 +3772,8 @@ impl<'a> FnChecker<'a> {
                         self.errors.push(e);
                     }
                 }
-                let pair = format!("('{lt}' and '{rt}')");
+                let (ls, rs) = (self.spelled_of(l), self.spelled_of(r));
+                let pair = format!("({} and {})", lt.named(&ls), rt.named(&rs));
                 match (&lt, &rt) {
                     (Type::Int(_), Type::Int(_)) => {}
                     // Pointers to different types compare as addresses,
@@ -3505,7 +3784,7 @@ impl<'a> FnChecker<'a> {
                     (Type::Ptr(a), Type::Ptr(b)) => {
                         let (au, bu) = (a.unqual(), b.unqual());
                         let void = equality && (au.is_void() || bu.is_void());
-                        if au != bu && !void {
+                        if (au != bu || enums_differ(au, &ls, bu, &rs)) && !void {
                             let msg = format!("comparison of distinct pointer types {pair}");
                             self.errors
                                 .push(Error::warning(pos, msg, "compare-distinct-pointer-types"));

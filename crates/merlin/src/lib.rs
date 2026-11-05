@@ -66,6 +66,18 @@ impl Pos {
     }
 }
 
+/// Where an unnamed struct, union or enum is declared, as clang's name for
+/// it gives the place (`struct (unnamed at t.c:3:1)`). Only the
+/// preprocessor knows the files' names, so the file is a number between
+/// two [`FILE_MARK`]s, which it replaces with the name
+/// ([`preprocess::Output::name_files`]).
+pub(crate) fn place(pos: Pos) -> String {
+    format!("{FILE_MARK}{}{FILE_MARK}{pos}", pos.file)
+}
+
+/// See [`place`].
+pub(crate) const FILE_MARK: char = '\u{1}';
+
 impl fmt::Display for Pos {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.line, self.col)
