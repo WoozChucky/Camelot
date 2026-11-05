@@ -734,10 +734,7 @@ main:
     sw    a0, -32(s0)
     li    a0, 40
     sw    a0, -28(s0)
-    li    a0, 2
-    negw  a0, a0
-    slli  a0, a0, 56
-    srai  a0, a0, 56
+    li    a0, -2
     sb    a0, -41(s0)
     li    a0, 65535
     sh    a0, -44(s0)
@@ -930,32 +927,7 @@ main:
     call  mix
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 2
-    negw  a0, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 5
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 0
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 6
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 50
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
+    li    a0, 59
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0
@@ -979,19 +951,7 @@ main:
     call  mix
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 7
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 65
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 7000
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
+    li    a0, 7072
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0
@@ -1097,19 +1057,7 @@ main:
     addi  sp, sp, 80
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 28
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 6
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 100
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
+    li    a0, 134
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0
@@ -1171,13 +1119,7 @@ main:
     addi  sp, sp, 112
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 73
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 45
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    subw  a0, a1, a0
+    li    a0, 28
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0

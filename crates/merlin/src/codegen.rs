@@ -280,6 +280,20 @@
 //! `p` points to (a shift for powers of two), and `p - q` divides the byte
 //! difference by it.
 //!
+//! An integer constant expression (C99 6.6) is one constant, of any integer
+//! type, at both widths: `8 * (1024ul * 1024ul)` is `li a0, 8388608`, and
+//! `3LL << 40` on RV32 is `li a0, 0` and `li a1, 768` (a pair). clang does
+//! the same at `-O0`, since its front end folds them whatever the type.
+//! [`crate::consteval`] works the value out with the semantics above (the
+//! usual arithmetic conversions, wrapping at the type's width, shift amounts
+//! masked as the hardware masks them), so the constant is what the
+//! instructions would have computed. A division by zero is not folded and
+//! stays a `div` at run time (clang warns, then has no value for it); in a
+//! larger expression only the parts around it are folded. Where an operand
+//! is not constant (`x * (2 * 3)`) the constant parts are folded and the
+//! rest is computed as above: nothing is reassociated (`x * 2 * 3` is two
+//! multiplies), as at `-O0`.
+//!
 //! ## Places: where assignments store
 //!
 //! The target of `=`, `op=`, `++` and `--` is a *place*. A scalar local is
@@ -1825,6 +1839,60 @@ impl<'a> FuncGen<'a, '_> {
 
     // ---- expressions: each leaves its value in a0 ----
 
+    /// An integer constant expression other than a literal (`1024ul *
+    /// 1024ul`, `(char)300`, `sizeof(int) * 4`): loads its value, as one
+    /// constant (see "Expressions"), and says so. Any other expression is
+    /// left to [`Self::expr`].
+    fn folded(&mut self, e: &'a Expr) -> bool {
+        if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_)) {
+            return false;
+        }
+        let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
+            return false;
+        };
+        debug_assert_eq!(e.ty.int_kind(), Some(kind), "consteval types it as sema does");
+        self.kept_casts(e);
+        self.constant(v, kind);
+        true
+    }
+
+    /// `-g`: the explicit casts inside a folded constant, in the order
+    /// clang meets them. Its front end still walks a constant's expression,
+    /// keeping the types of the casts it emits, and its IR builder folds
+    /// what it emits; but it emits only what is evaluated: of `c ? a : b`
+    /// with a constant `c`, the operand chosen (not `c`), and of `l && r`
+    /// or `l || r` with a constant `l`, `r` when it decides the result
+    /// (`1 && r`, `0 || r`) and nothing otherwise (clang's
+    /// `VisitAbstractConditionalOperator`, `VisitBinLAnd`, `VisitBinLOr`).
+    fn kept_casts(&mut self, e: &'a Expr) {
+        if self.file.debug.is_none() {
+            return;
+        }
+        self.kept_cast(e);
+        let decided = |c: &Expr| consteval::int(c, self.xlen).map(|v| v != 0);
+        match &e.kind {
+            ExprKind::Unary(_, x)
+            | ExprKind::Cast { x, .. }
+            | ExprKind::Addr(x)
+            | ExprKind::Deref(x)
+            | ExprKind::Member { base: x, .. } => self.kept_casts(x),
+            ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r) => {
+                if decided(l) == Some(*op == BinOp::LogAnd) {
+                    self.kept_casts(r);
+                }
+            }
+            ExprKind::Binary(_, l, r) => {
+                self.kept_casts(l);
+                self.kept_casts(r);
+            }
+            ExprKind::Cond(c, a, b) => match decided(c) {
+                Some(true) => self.kept_casts(a),
+                _ => self.kept_casts(b),
+            },
+            _ => {}
+        }
+    }
+
     /// `-g`: clang keeps the type of an explicit cast in the unit (and
     /// describes it as it is evaluated).
     fn kept_cast(&mut self, e: &Expr) {
@@ -1842,6 +1910,9 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     fn expr(&mut self, e: &'a Expr) {
+        if self.folded(e) {
+            return;
+        }
         match &e.kind {
             ExprKind::Num(v) => {
                 // The value as the register holds it: an `unsigned int`
@@ -2009,14 +2080,6 @@ impl<'a> FuncGen<'a, '_> {
             ExprKind::Deref(p) => {
                 self.expr(p);
                 self.load(&e.ty);
-            }
-            // A constant converted (`char c = 1;`): just the converted value.
-            ExprKind::Cast { x, .. } if e.ty.is_integer() && matches!(x.kind, ExprKind::Num(_)) => {
-                self.kept_cast(e);
-                let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
-                    unreachable!("an integer literal cast to an integer type is constant")
-                };
-                self.constant(v, kind);
             }
             ExprKind::Cast { x, .. } => {
                 self.kept_cast(e);
@@ -4034,6 +4097,51 @@ main:
     }
 
     /// `long long` on RV32: register pairs.
+    #[test]
+    fn constant_expressions_are_folded() {
+        // Every integer type, as clang's front end folds them at -O0: a
+        // long long is a pair, its low word in a0.
+        let f = |ty: &str, e: &str| {
+            let asm = compile(&format!("{ty} f(void) {{ return {e}; }}"));
+            body_of(&asm, "f")[4..].join("; ")
+        };
+        assert_eq!(f("long", "8 * (1024ul * 1024ul)"), "li a0, 8388608");
+        assert_eq!(f("int", "8 * (1024 * 1024)"), "li a0, 8388608");
+        assert_eq!(f("unsigned long", "0ul - 1"), "li a0, -1");
+        assert_eq!(
+            f("long", "2147483647L + 1"),
+            "li a0, -2147483648",
+            "wraps at 32 bits"
+        );
+        assert_eq!(f("long long", "3LL << 40"), "li a0, 0; li a1, 768");
+        assert_eq!(
+            f("unsigned long long", "(0ull - 1) / 3 + 1"),
+            "li a0, 1431655766; li a1, 1431655765"
+        );
+        assert_eq!(f("long long", "-1LL >> 63"), "li a0, -1; li a1, -1");
+        assert_eq!(
+            f("long long", "1LL << 65"),
+            "li a0, 2; li a1, 0",
+            "the low 6 bits of the amount"
+        );
+        assert_eq!(f("long long", "(long long)-1"), "li a0, -1; li a1, -1");
+        assert_eq!(f("int", "(int)(1LL << 32 | 7)"), "li a0, 7");
+        assert_eq!(f("int", "(0LL - 1) < 0ull"), "li a0, 0", "an unsigned comparison");
+        assert_eq!(f("char", "(char)300 + 1"), "li a0, 45");
+        assert_eq!(f("unsigned", "sizeof(long long) * 3"), "li a0, 24");
+        assert_eq!(f("int", "1 && 2LL || 0"), "li a0, 1");
+        // Division by zero is left to run time; the rest is folded.
+        assert_eq!(
+            f("int", "(2 * 3) / 0"),
+            "li a0, 6; addi sp, sp, -4; sw a0, 0(sp); li a0, 0; lw a1, 0(sp); addi sp, sp, 4; div a0, a1, a0"
+        );
+        // Only the constant parts of an expression, and nothing reassociated.
+        let asm = compile("int x; int f(void) { return x * (2 * 3) + x * 2 * 3; }");
+        let body = body_of(&asm, "f").join("; ");
+        assert_eq!(body.matches("mul ").count(), 3, "{body}");
+        assert!(body.contains("li a0, 6"), "{body}");
+    }
+
     mod pairs {
         use super::{body_of, compile};
 
@@ -4360,10 +4468,8 @@ main:
         #[test]
         fn big_constants() {
             // li takes 64-bit values; an unsigned int is held sign-extended.
-            assert_eq!(
-                main_body("", "return 0xffffffffu == 0;").split("; ").next(),
-                Some("li a0, -1")
-            );
+            let body = main_body("", "unsigned u; u = 0xffffffffu; return 0;");
+            assert!(body.contains("; li a0, -1; sw a0"), "{body}");
             let body = main_body("", "long l; l = 0x123456789abcdef0L; return 0;");
             assert!(body.contains("li a0, 1311768467463790320; sd a0"), "{body}");
             let body = main_body("", "unsigned long u; u = 0xffffffffffffffffUL; return 0;");
@@ -4371,6 +4477,55 @@ main:
             // A constant converted is the converted constant.
             let body = main_body("", "unsigned long u; u = 4294967295u; return 0;");
             assert!(body.contains("; li a0, 4294967295; sd a0"), "{body}");
+        }
+
+        #[test]
+        fn constant_expressions_are_folded() {
+            // Every integer type, as clang's front end folds them at -O0.
+            let f = |ty: &str, e: &str| {
+                let asm = compile(&format!("{ty} f(void) {{ return {e}; }}"));
+                body_of(&asm, "f")[4..].join("; ")
+            };
+            assert_eq!(f("long", "8 * (1024ul * 1024ul)"), "li a0, 8388608");
+            assert_eq!(f("int", "8 * (1024 * 1024)"), "li a0, 8388608");
+            assert_eq!(f("long long", "3LL << 40"), "li a0, 3298534883328");
+            assert_eq!(
+                f("unsigned long long", "(0ull - 1) / 3 + 1"),
+                "li a0, 6148914691236517206"
+            );
+            assert_eq!(f("unsigned long", "0ul - 1"), "li a0, -1");
+            assert_eq!(
+                f("long", "-9223372036854775807L - 1"),
+                "li a0, -9223372036854775808"
+            );
+            // The 32-bit invariant: an unsigned int is held sign-extended.
+            assert_eq!(f("unsigned", "0x80000000u | 1"), "li a0, -2147483647");
+            assert_eq!(
+                f("long", "(long)(0xffffffffu + 1)"),
+                "li a0, 0",
+                "unsigned int wraps at 32 bits"
+            );
+            assert_eq!(f("long", "1L << 65"), "li a0, 2", "the low 6 bits of the amount");
+            assert_eq!(
+                f("int", "1 << 33"),
+                "li a0, 2",
+                "the low 5 bits of a 32-bit one's"
+            );
+            assert_eq!(
+                f("long", "(-9223372036854775807L - 1) / -1"),
+                "li a0, -9223372036854775808"
+            );
+            assert_eq!(f("unsigned long", "sizeof(long) * 3"), "li a0, 24");
+            assert_eq!(
+                f("int", "0 ? 1 / 0 : 2L > 1"),
+                "li a0, 1",
+                "the operand not chosen is not divided"
+            );
+            // Division by zero is left to run time; the rest is folded.
+            assert_eq!(
+                f("long", "(2L * 3) / 0"),
+                "li a0, 6; addi sp, sp, -8; sd a0, 0(sp); li a0, 0; ld a1, 0(sp); addi sp, sp, 8; div a0, a1, a0"
+            );
         }
 
         #[test]

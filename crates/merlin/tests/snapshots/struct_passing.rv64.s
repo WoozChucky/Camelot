@@ -766,10 +766,7 @@ main:
     sb    zero, -247(s0)
     sb    zero, -246(s0)
     sb    zero, -245(s0)
-    li    a0, 3
-    negw  a0, a0
-    slli  a0, a0, 48
-    srai  a0, a0, 48
+    li    a0, -3
     sh    a0, -248(s0)
     li    a0, 4
     sh    a0, -246(s0)
@@ -1264,8 +1261,7 @@ main:
     lh    a0, 0(a0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 3
-    negw  a0, a0
+    li    a0, -3
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0
@@ -1356,25 +1352,7 @@ main:
     addi  sp, sp, 8
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 30
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 1
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 3
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 15
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
+    li    a0, 49
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0
@@ -1636,25 +1614,7 @@ main:
     lw    a0, -20(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 6
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 6
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    xor   a0, a1, a0
-    seqz  a0, a0
-    beqz  a0, .L.and.15
     li    a0, 1
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 1
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    xor   a0, a1, a0
-    seqz  a0, a0
-.L.and.15:
-    snez  a0, a0
     ld    a1, 0(sp)
     addi  sp, sp, 8
     addw  a0, a1, a0

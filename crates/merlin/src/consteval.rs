@@ -63,9 +63,21 @@ pub fn is_null_pointer(e: &Expr, xlen: Xlen) -> bool {
 }
 
 /// The constant value of `e`, or `None` if it is not a constant expression
-/// merlin can evaluate (that includes dividing by zero).
+/// merlin can evaluate (that includes dividing by zero, where the division
+/// is evaluated).
 pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
+    value(e, xlen, true)
+}
+
+/// [`eval`] of an operand that is `evaluated` or not. C99 6.6p3 and p11
+/// hold a constant expression to what it evaluates: in `1 ? 2 : 1 / 0` the
+/// third operand is never divided, only its type counts (the result's is
+/// the operands' common type), so there dividing by zero is no error and
+/// gives 0, a value nothing reads. clang has it so: `int a[1 ? 2 : 1 / 0];`
+/// has two elements.
+fn value(e: &Expr, xlen: Xlen, evaluated: bool) -> Option<Const> {
     use Const::*;
+    let eval = |e: &Expr, xlen: Xlen| value(e, xlen, evaluated);
     match &e.kind {
         ExprKind::Num(v) => Some(Int(*v, e.ty.int_kind()?)),
         ExprKind::SizeofType(t) => Some(Int(t.size(xlen)?.into(), IntKind::size_t(xlen))),
@@ -90,7 +102,7 @@ pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
         ExprKind::Binary(op, l, r) => {
             let (lc, rc) = (eval(l, xlen)?, eval(r, xlen)?);
             match (lc, rc) {
-                (Int(a, ak), Int(b, bk)) => binary(*op, a, ak, b, bk, xlen),
+                (Int(a, ak), Int(b, bk)) => binary(*op, (a, ak), (b, bk), xlen, evaluated),
                 // Address arithmetic: pointer plus or minus an integer, by
                 // whole elements, or an address converted to an integer
                 // plus or minus one, by bytes.
@@ -113,14 +125,17 @@ pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
             }
         }
         ExprKind::Cond(c, a, b) => {
-            let c = int_of(eval(c, xlen)?)?.0;
-            match (eval(a, xlen)?, eval(b, xlen)?) {
+            // Only the chosen operand is evaluated.
+            let c = int_of(eval(c, xlen)?)?.0 != 0;
+            let a = value(a, xlen, evaluated && c)?;
+            let b = value(b, xlen, evaluated && !c)?;
+            match (a, b) {
                 // The result has the operands' common type, whichever is chosen.
                 (Int(x, xk), Int(y, yk)) => {
                     let k = common(xk, yk, xlen);
-                    Some(Int(k.wrap(if c != 0 { x } else { y }, xlen), k))
+                    Some(Int(k.wrap(if c { x } else { y }, xlen), k))
                 }
-                (x, y) => Some(if c != 0 { x } else { y }),
+                (x, y) => Some(if c { x } else { y }),
             }
         }
         ExprKind::Cast { x, .. } => {
@@ -151,9 +166,9 @@ pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
         ExprKind::Str(_) | ExprKind::Var { .. } | ExprKind::Deref(_) | ExprKind::Member { .. }
             if e.ty.is_array() || e.ty.is_func() =>
         {
-            addr_of(e, xlen)
+            addr_of(e, xlen, evaluated)
         }
-        ExprKind::Addr(x) => addr_of(x, xlen),
+        ExprKind::Addr(x) => addr_of(x, xlen, evaluated),
         _ => None,
     }
 }
@@ -161,7 +176,7 @@ pub fn eval(e: &Expr, xlen: Xlen) -> Option<Const> {
 /// The address of an lvalue, if it is an address constant: a global object
 /// (or a member or element of one, at a constant offset), a string literal,
 /// or what a constant pointer points to.
-fn addr_of(e: &Expr, xlen: Xlen) -> Option<Const> {
+fn addr_of(e: &Expr, xlen: Xlen, evaluated: bool) -> Option<Const> {
     match &e.kind {
         ExprKind::Var {
             var: Some(VarRef::Global(sym)),
@@ -174,7 +189,7 @@ fn addr_of(e: &Expr, xlen: Xlen) -> Option<Const> {
             base: Some(Base::Str(bytes.clone())),
             offset: 0,
         }),
-        ExprKind::Deref(p) => match eval(p, xlen)? {
+        ExprKind::Deref(p) => match value(p, xlen, evaluated)? {
             a @ Const::Addr { .. } => Some(a),
             Const::Int(..) => None,
         },
@@ -185,9 +200,9 @@ fn addr_of(e: &Expr, xlen: Xlen) -> Option<Const> {
             ..
         } => {
             let at = if *arrow {
-                eval(base, xlen)?
+                value(base, xlen, evaluated)?
             } else {
-                addr_of(base, xlen)?
+                addr_of(base, xlen, evaluated)?
             };
             match at {
                 Const::Addr { base, offset } => Some(Const::Addr {
@@ -217,8 +232,16 @@ fn int_of(c: Const) -> Option<(i128, IntKind)> {
     }
 }
 
-/// An arithmetic, bitwise or comparison operator on two integer constants.
-fn binary(op: BinOp, a: i128, ak: IntKind, b: i128, bk: IntKind, x: Xlen) -> Option<Const> {
+/// An arithmetic, bitwise or comparison operator on two integer constants,
+/// each a value and its type. Dividing by zero is not constant where it is
+/// `evaluated` (see [`value`]).
+fn binary(
+    op: BinOp,
+    (a, ak): (i128, IntKind),
+    (b, bk): (i128, IntKind),
+    x: Xlen,
+    evaluated: bool,
+) -> Option<Const> {
     // Shifts take the promoted left operand's type; the others the common type.
     let k = match op {
         BinOp::Shl | BinOp::Shr => ak.promoted(),
@@ -239,9 +262,9 @@ fn binary(op: BinOp, a: i128, ak: IntKind, b: i128, bk: IntKind, x: Xlen) -> Opt
         BinOp::Add => a + b,
         BinOp::Sub => a - b,
         BinOp::Mul => a.wrapping_mul(b),
-        BinOp::Div if b == 0 => return None,
-        BinOp::Rem if b == 0 => return None,
-        // i64 division truncates toward zero, like C; `INT_MIN / -1` wraps below.
+        BinOp::Div | BinOp::Rem if b == 0 && evaluated => return None,
+        BinOp::Div | BinOp::Rem if b == 0 => 0,
+        // i128 division truncates toward zero, like C; `INT_MIN / -1` wraps below.
         BinOp::Div => a / b,
         BinOp::Rem => a % b,
         BinOp::Shl => a << shift,
@@ -362,9 +385,23 @@ mod tests {
     }
 
     #[test]
+    fn only_what_is_evaluated_counts() {
+        // C99 6.6p3, as clang has it: the operand not chosen is not divided.
+        assert_eq!(int("1 ? 2 : 1 / 0"), (2, Int));
+        assert_eq!(int("0 ? 1 / 0 : 2"), (2, Int));
+        assert_eq!(int("0 ? 1 % 0 : 2u"), (2, UInt), "its type still counts");
+        assert_eq!(int_for("1 ? 2 : 1L / 0", Xlen::Rv64), (2, Long));
+        assert_eq!(int("1 ? 2 : (0 ? 3 : 4 / 0)"), (2, Int));
+        assert_eq!(int("0 && 1 / 0"), (0, Int));
+        assert_eq!(int("1 || 1 / 0"), (1, Int));
+    }
+
+    #[test]
     fn not_constant() {
         assert_eq!(ev("1 / 0"), None);
         assert_eq!(ev("1 % (2 - 2)"), None);
+        assert_eq!(ev("0 ? 2 : 1 / 0"), None, "the operand chosen is divided");
+        assert_eq!(ev("1 ? (0 ? 2 : 1 / 0) : 3"), None);
         assert_eq!(ev("y"), None);
         assert_eq!(ev("f()"), None);
         assert_eq!(ev("(1, 2)"), None, "C: comma is not a constant expression");

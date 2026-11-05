@@ -782,22 +782,21 @@ fn entry_tree(tool: &str, obj: &Path) -> Vec<String> {
 /// - `enums.c`, `designated.c`: clang describes an enum whose constant its
 ///   generated code uses, even with no variable of it; merlin's parser makes
 ///   constants numbers;
-/// - `predefined_types.c`, `static_address_casts.c`: clang keeps the type of a
-///   cast its code generator visits, which leaves out operands it folds (`1 &&
-///   x`) and takes in some constant initializers; merlin keeps every explicit
-///   cast its code evaluates.
+/// - `static_address_casts.c`: clang keeps the type of a cast its code
+///   generator visits, which takes in some in constant initializers; merlin
+///   keeps the explicit casts its code evaluates (in a folded constant, those
+///   clang visits: not the operands `?:`, `&&` and `||` leave out).
 ///
 /// Ignored: it needs clang and llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP`
 /// name them if they are not on the PATH).
 #[test]
 #[ignore]
 fn the_entries_are_clangs_in_clangs_order() {
-    const DIFFERENT: [&str; 6] = [
+    const DIFFERENT: [&str; 5] = [
         "func_ptrs.c",
         "inline.c",
         "enums.c",
         "designated.c",
-        "predefined_types.c",
         "static_address_casts.c",
     ];
     let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());

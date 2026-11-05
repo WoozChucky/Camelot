@@ -92,10 +92,7 @@ main:
     # short h[4] = ...
     sw    zero, -48(s0)
     sw    zero, -44(s0)
-    li    a0, 1
-    neg   a0, a0
-    slli  a0, a0, 16
-    srai  a0, a0, 16
+    li    a0, -1
     sh    a0, -48(s0)
     li    a0, 300
     sh    a0, -46(s0)
@@ -196,13 +193,7 @@ main:
     lw    a0, -52(s0)
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 16
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
     li    a0, 4
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    divu  a0, a1, a0
     addi  sp, sp, -4
     sw    a0, 0(sp)
     la    a0, inferred
