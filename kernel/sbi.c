@@ -71,13 +71,45 @@ long sbi_hart_start(uintptr hartid, phys_addr_t start, uintptr opaque) {
     return sbi_ecall(SBI_EXT_HSM, SBI_HSM_HART_START, hartid, start, opaque, 0, 0, 0).error;
 }
 
+long sbi_hart_stop(void) {
+    return sbi_ecall(SBI_EXT_HSM, SBI_HSM_HART_STOP, 0, 0, 0, 0, 0, 0).error;
+}
+
 long sbi_hart_get_status(uintptr hartid) {
     struct sbiret r = sbi_ecall(SBI_EXT_HSM, SBI_HSM_HART_GET_STATUS, hartid, 0, 0, 0, 0, 0);
     return r.error != SBI_SUCCESS ? r.error : r.value;
 }
 
+const char *sbi_hart_state_name(long state) {
+    switch (state) {
+    case SBI_HSM_STATE_STARTED:
+        return "STARTED";
+    case SBI_HSM_STATE_STOPPED:
+        return "STOPPED";
+    case SBI_HSM_STATE_START_PENDING:
+        return "START_PENDING";
+    case SBI_HSM_STATE_STOP_PENDING:
+        return "STOP_PENDING";
+    case SBI_HSM_STATE_SUSPENDED:
+        return "SUSPENDED";
+    case SBI_HSM_STATE_SUSPEND_PENDING:
+        return "SUSPEND_PENDING";
+    case SBI_HSM_STATE_RESUME_PENDING:
+        return "RESUME_PENDING";
+    }
+    /* A negative one is the call's error. */
+    return state < 0 ? sbi_strerror(state) : "an unknown state";
+}
+
 long sbi_system_reset(u32 type, u32 reason) {
     return sbi_ecall(SBI_EXT_SRST, SBI_SRST_RESET, type, reason, 0, 0, 0, 0).error;
+}
+
+/* A reset that, if it returns at all, failed: said so, as Linux's
+ * sbi_srst_reset() does. */
+static void sbi_srst_reset(u32 type, u32 reason) {
+    long err = sbi_system_reset(type, reason);
+    kprintf("sbi: system_reset type 0x%x reason 0x%x failed (%s)\n", type, reason, sbi_strerror(err));
 }
 
 void machine_power_off(u32 code) {
@@ -93,11 +125,11 @@ void machine_power_off(u32 code) {
          * 0xff. */
         reason = SBI_SRST_REASON_SBI_START | (code & (SBI_SRST_REASON_SBI_END - SBI_SRST_REASON_SBI_START));
     }
-    sbi_system_reset(SBI_SRST_TYPE_SHUTDOWN, reason);
+    sbi_srst_reset(SBI_SRST_TYPE_SHUTDOWN, reason);
     /* Still here: the SBI refused the reason (OpenSBI takes only "no
      * reason" and "system failure"), or cannot shut down at all. */
     if (reason != SBI_SRST_REASON_NONE && reason != SBI_SRST_REASON_SYSFAIL) {
-        sbi_system_reset(SBI_SRST_TYPE_SHUTDOWN, SBI_SRST_REASON_SYSFAIL);
+        sbi_srst_reset(SBI_SRST_TYPE_SHUTDOWN, SBI_SRST_REASON_SYSFAIL);
     }
     intr_off();
     for (;;) {

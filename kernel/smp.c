@@ -8,7 +8,10 @@
  * There it turns paging on and runs hart_main(): its struct cpu, the kernel
  * page table, its interrupts and its tick, then the scheduler, never to
  * return. A hart the SBI can't start, or that doesn't come up within a
- * second, is reported and left out; the kernel runs on the others.
+ * second, is reported and left out; the kernel runs on the others. One that
+ * comes up after all, once it has been given up on, stops itself with the
+ * SBI's hart_stop, as arm64's cpu_die_early() does, rather than join a
+ * kernel that has counted it out.
  *
  * IPIs. A hart interrupts others with the SBI's send_ipi, which raises the
  * supervisor software interrupt on each of them (on Grail through their
@@ -55,6 +58,16 @@
 /* The harts running the kernel, a bit each. Bits are only ever added
  * (atomic_or), so it is read without a lock. */
 static volatile u32 harts_up;
+
+/* Who got there first, for each started hart: the hart, saying it is in
+ * hart_main (HART_ARRIVED), or hart 0, giving up on it once the second is
+ * over (HART_GIVEN_UP). Each sets its bit with one atomic_or and looks at
+ * the other's in the old value, so exactly one of them wins: a hart either
+ * joins, and is counted, or stops. */
+static volatile u32 hart_claims;
+#define HART_ARRIVED(i) (1u << (i))
+#define HART_GIVEN_UP(i) (1u << (16 + (i)))
+_Static_assert(NCPU <= 16, "hart_claims has 16 bits a side");
 
 /* TLB shootdown requests, per hart: made of it, and served by it. */
 static volatile u32 tlb_asked[NCPU];
@@ -209,17 +222,27 @@ int smp_boot(void) {
     }
     /* Each says so in hart_main(). One that doesn't within a second may
      * have crashed, or never got going: it is left out, as Linux leaves out
-     * a CPU that "failed to come online". Its stack stays where it is, as
-     * the hart may still be using it. */
+     * a CPU that "failed to come online", with the state the SBI has it in
+     * (START_PENDING: it never left the SBI; STARTED: it is stuck in the
+     * kernel). Its stack stays where it is, as the hart may still be using
+     * it; should it get to hart_main(), it stops there. */
     u64 deadline = r_time() + timebase_hz();
     while ((harts_up & started) != started && r_time() < deadline) {
     }
-    u32 up = harts_up & started;
     for (u32 i = 1; i < n; i++) {
-        if ((started & (1u << i)) != 0 && (up & (1u << i)) == 0) {
-            kprintf("smp: hart %u failed to come online\n", i);
+        if ((started & (1u << i)) == 0 || (harts_up & (1u << i)) != 0) {
+            continue;
         }
+        if ((atomic_or(&hart_claims, HART_GIVEN_UP(i)) & HART_ARRIVED(i)) != 0) {
+            /* It got to hart_main() first, just: it joins, in a moment. */
+            while ((harts_up & (1u << i)) == 0) {
+            }
+            continue;
+        }
+        kprintf("smp: hart %u failed to come online (%s)\n", i, sbi_hart_state_name(sbi_hart_get_status(i)));
+        started &= ~(1u << i);
     }
+    u32 up = harts_up & started;
     int failed = tlb_selftest(up);
     u32 count = 1;
     for (u32 i = 1; i < n; i++) {
@@ -235,11 +258,23 @@ void hart_main(void) {
     /* This hart's struct cpu, which every lock uses: first of all. */
     cpu_init();
     kvminithart();
+    u32 me = cpuid();
+    if ((atomic_or(&hart_claims, HART_ARRIVED(me)) & HART_GIVEN_UP(me)) != 0) {
+        /* Too late: smp_boot() has gone on without this hart. Back to the
+         * SBI, STOPPED, as arm64's cpu_die_early() stops a CPU that can't
+         * join. If the SBI won't stop it, it is a bug, as Linux's riscv
+         * sbi_cpu_stop() and arch_cpu_idle_dead() take it. */
+        kprintf("smp: hart %u came online too late, stopping\n", me);
+        long err = sbi_hart_stop();
+        char msg[64];
+        ksnprintf(msg, sizeof msg, "smp: hart %u can't stop (%s)", me, sbi_strerror(err));
+        panic(msg);
+    }
     /* Its tick and IPIs. The devices' interrupts stay with hart 0 (plic.c),
      * so not SEIE. */
     w_sie(r_sie() | SIE_STIE | SIE_SSIE);
     timer_start();
-    atomic_or(&harts_up, 1u << cpuid());
+    atomic_or(&harts_up, 1u << me);
     /* Interrupts come on in the scheduler loop. */
     scheduler();
     panic("hart_main: the scheduler returned");

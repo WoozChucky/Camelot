@@ -567,6 +567,45 @@ fn machine_power_off_turns_exit_codes_into_reset_reasons() {
     }
 }
 
+#[test]
+fn machine_power_off_says_so_and_falls_back_when_the_reason_is_refused() {
+    // An SBI that refuses Camelot's own reasons, as OpenSBI does: the shell
+    // exits 7, and the test turns the first system_reset's reason into a
+    // reserved one (2) as the call reaches the SBI, which answers
+    // SBI_ERR_INVALID_PARAM. The kernel says so, as Linux's sbi_srst_reset()
+    // warns, and asks again for a system failure.
+    for xlen in WIDTHS {
+        let mut s = Sbi::at_kmain(xlen, 1);
+        s.m.set_uart_input(kernel::typed(b"exit 7\n"));
+        let machine_vec = s.pa(s.sym("machine_vec"));
+        let mut reasons = Vec::new();
+        for _ in 0..BOOT_MAX_STEPS {
+            if s.m.cpu.bus.exit.is_some() {
+                break;
+            }
+            let h = s.m.cpu.hart_mut(0);
+            if h.pc == machine_vec && h.x[17] == EXT_SRST {
+                reasons.push(h.x[11] & 0xffff_ffff);
+                if reasons.len() == 1 {
+                    h.set_reg(11, 2);
+                }
+            }
+            s.m.cpu.step();
+        }
+        let out = s.printed();
+        assert_eq!(
+            s.m.cpu.bus.exit,
+            Some(grail::bus::Exit::Code(0xfe)),
+            "{xlen:?}:\n{out}"
+        );
+        assert_eq!(reasons, [0xe000_0007, 1], "{xlen:?}");
+        assert!(
+            out.ends_with("\nsbi: system_reset type 0x0 reason 0xe0000007 failed (SBI_ERR_INVALID_PARAM)\n"),
+            "{xlen:?}:\n{out}"
+        );
+    }
+}
+
 /// A committed kernel on a 4-hart machine with `exit` typed for its shell,
 /// stepped until hart 0 reaches kmain.
 fn four_harts_at_kmain(xlen: Xlen) -> Sbi {
@@ -619,12 +658,85 @@ fn a_hart_that_never_comes_online_is_reported_after_a_second() {
             Some(grail::bus::Exit::Code(0)),
             "{xlen:?}:\n{out}"
         );
+        // With the state the SBI has it in: it left the SBI, so STARTED.
         assert!(
-            out.contains("\nsmp: hart 2 failed to come online\nsmp: 3 harts running\n"),
+            out.contains("\nsmp: hart 2 failed to come online (STARTED)\nsmp: 3 harts running\n"),
             "{xlen:?}:\n{out}"
         );
         // A second of the nominal 10 MHz timebase, at least.
         assert!(s.m.cpu.bus.clint.mtime - started >= 10_000_000);
+    }
+}
+
+#[test]
+fn a_hart_that_comes_online_too_late_stops_itself() {
+    // Hart 2 held at its first instruction until hart 0 has given up on it,
+    // then let go: in hart_main() it finds it was given up on, says so and
+    // stops itself with hart_stop, STOPPED in the SBI again, rather than
+    // join a kernel that counts three harts.
+    for xlen in WIDTHS {
+        let mut s = four_harts_at_kmain(xlen);
+        let entry = s.pa(s.sym("secondary_entry"));
+        s.step_until(|m| m.cpu.hart(2).pc == entry);
+        let given_up = b"smp: hart 2 failed to come online (STARTED)\n";
+        let mut steps = 0;
+        while !s.m.cpu.bus.uart.captured.ends_with(given_up) {
+            steps += 1;
+            assert!(
+                steps < BOOT_MAX_STEPS,
+                "{xlen:?}: not given up on:\n{}",
+                s.printed()
+            );
+            s.m.cpu.step();
+            s.m.cpu.hart_mut(2).pc = entry;
+        }
+        let r = s.m.run(Some(BOOT_MAX_STEPS), |_| {});
+        let out = s.printed();
+        assert_eq!(r, RunResult::Exited(0), "{xlen:?}:\n{out}");
+        assert!(
+            out.contains("\nsmp: hart 2 came online too late, stopping\n"),
+            "{xlen:?}:\n{out}"
+        );
+        assert!(out.contains("\nsmp: 3 harts running\n"), "{xlen:?}:\n{out}");
+        // Back in the SBI, waiting for a hart_start.
+        let word = u64::from(xlen.bits() / 8);
+        let state = s.pa(s.sym("machine_scratch")) + 2 * 16 * word + 6 * word;
+        assert_eq!(s.m.cpu.bus.peek(state), Some(STATE_STOPPED as u32), "{xlen:?}");
+        let h = s.m.cpu.hart(2);
+        assert_eq!(h.mode, Mode::M, "{xlen:?}");
+        assert!(
+            function_contains(&s, "sbi_hart_wait", h.pc),
+            "{xlen:?} {:#x}",
+            h.pc
+        );
+    }
+}
+
+#[test]
+fn a_trap_on_a_starting_hart_stops_the_machine() {
+    // Hart 2, started, fetches from address 0 (an instruction access fault)
+    // as soon as its trap vector is set: on RV64 early_s_trap, paging still
+    // off and the hart's stack, in the vmalloc area, not mapped yet; on RV32
+    // kernel_vec, on the stack hart_start gave it. Either way the machine
+    // stops, rather than the hart trapping again and again on a stack it
+    // can't use: with 0xff from early_s_trap, or 0xfe from the panic.
+    for xlen in WIDTHS {
+        let mut s = four_harts_at_kmain(xlen);
+        let entry = s.pa(s.sym("secondary_entry"));
+        s.step_until(|m| m.cpu.hart(2).pc == entry);
+        s.step_until(|m| m.cpu.hart(2).csr.stvec != 0);
+        assert_eq!(s.m.cpu.hart(2).mode, Mode::S);
+        s.m.cpu.hart_mut(2).pc = 0;
+        let r = s.m.run(Some(BOOT_MAX_STEPS), |_| {});
+        let out = s.printed();
+        let code = match xlen {
+            Xlen::Rv32 => 0xfe,
+            Xlen::Rv64 => 0xff,
+        };
+        assert_eq!(r, RunResult::Exited(code), "{xlen:?}:\n{out}");
+        if xlen == Xlen::Rv32 {
+            assert!(out.contains("panic: "), "{xlen:?}:\n{out}");
+        }
     }
 }
 

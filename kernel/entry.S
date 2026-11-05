@@ -42,6 +42,7 @@
 #   xcal.halt a0 = 0x0005100b   (rs1 = a0 = x10, funct3 = 001, custom-0)
 
 #include <asm.h>
+#include "sbi.h"                /* SBI_EXT_SRST, SBI_SRST_* */
 #include "spinlock.h"           /* NCPU */
 #include "trap.h"               /* EXIT_UNEXPECTED_TRAP */
 #include "vm.h"                 /* EARLY_TABLES, OVERFLOW_STACK_SIZE */
@@ -112,7 +113,15 @@ supervisor_entry:
 # runs the scheduler until hart 0 stops the machine.
     .globl secondary_entry
 secondary_entry:
+    # tp and sp first, as Linux's secondary_start_sbi loads them before
+    # anything else, so that nothing runs here without them: on RV32 the
+    # stack is a page at its physical address, which paging maps where it
+    # is, so kernel_vec can use it from the start. On RV64 it is at its link
+    # address in the vmalloc area, usable once kernel_satp is in satp: until
+    # then the trap vector is early_s_trap, which uses no stack (as Linux's
+    # .Lsecondary_park doesn't).
     mv    tp, a0
+    mv    sp, a1
     # Nothing enabled or pending from whatever ran before (Linux does the
     # same).
     csrw  sie, zero
@@ -135,7 +144,6 @@ secondary_entry:
     la    t0, kernel_vec
     csrw  stvec, t0
 #endif
-    mv    sp, a1
     call  hart_main
 1:  j     1b
 
@@ -181,7 +189,13 @@ early_trap:
 #if __riscv_xlen == 64
 # A trap in S-mode before stvec points at kernel_vec, at the high address
 # (paging off, or going on): a bug. Show scause, sepc and stval on the debug
-# console and stop with exit code 0xff, through the SBI.
+# console and stop with exit code 0xff, through the SBI. No stack: a hart
+# from secondary_entry has one that neither paging off nor the early page
+# table maps, so this is machine_power_off(EXIT_UNEXPECTED_TRAP) without
+# its C (include/sbi.h): an SRST shutdown with Camelot's SBI's reason
+# 0xE000_0000 | 0xff, then, if an SBI refuses that one, "system failure";
+# then wait for good. No warning on the console: the UART may not be
+# mapped yet.
     .align 2
 early_s_trap:
     csrr  a0, scause
@@ -190,8 +204,16 @@ early_s_trap:
     .word 0x0005000b            # xcal.dbg a0
     csrr  a0, stval
     .word 0x0005000b            # xcal.dbg a0
-    li    a0, EXIT_UNEXPECTED_TRAP
-    call  machine_power_off
+    li    a7, SBI_EXT_SRST
+    li    a6, SBI_SRST_RESET
+    li    a0, SBI_SRST_TYPE_SHUTDOWN
+    li    a1, SBI_SRST_REASON_SBI_START | EXIT_UNEXPECTED_TRAP
+    ecall
+    li    a0, SBI_SRST_TYPE_SHUTDOWN
+    li    a1, SBI_SRST_REASON_SYSFAIL
+    ecall
+1:  wfi
+    j     1b
 
 # The early page table and the pool of its lower tables (vm.c, setup_vm()),
 # page aligned, and each hart's overflow stack (kernelvec.S), 16-aligned.
