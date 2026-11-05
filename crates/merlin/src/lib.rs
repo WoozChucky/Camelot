@@ -48,7 +48,7 @@ use std::path::Path;
 /// A source position: which file (0 is the file being compiled, the others
 /// are the headers it includes, numbered by the preprocessor in the order
 /// it first reads them), then the 1-based line and column (columns count
-/// characters). Positions order by file first.
+/// bytes, as clang's do). Positions order by file first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Pos {
     pub file: u32,

@@ -210,8 +210,8 @@ pub struct Function {
     /// provides no external definition, so it is emitted without `.globl`.
     pub inline_only: bool,
     /// Declared with a prototype: a parameter list that is not `()`, which
-    /// merlin takes as `(void)` but C as saying nothing of the parameters
-    /// (`DW_AT_prototyped` under `-g`, as clang has it).
+    /// says nothing of the parameters (`DW_AT_prototyped` under `-g`, as
+    /// clang has it).
     pub prototyped: bool,
     /// `None` for a prototype (`int f(int a);`): declared here, defined elsewhere.
     pub body: Option<Vec<Stmt>>,
