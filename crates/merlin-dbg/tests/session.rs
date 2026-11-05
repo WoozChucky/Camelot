@@ -1624,7 +1624,7 @@ fn variables_in_the_kernel() {
     // sys_write's first line of code, the one after its name's.
     let body = format!(
         "kernel/sysfile.c:{}",
-        line_of("kernel/sysfile.c", "int sys_write(struct trap_frame *f) {") + 1
+        line_of("kernel/sysfile.c", "long sys_write(struct trap_frame *f) {") + 1
     );
     assert_eq!(bt[0], format!("#0  sys_write (f={f}) at {body}"));
     assert!(bt[1].ends_with(&format!(
