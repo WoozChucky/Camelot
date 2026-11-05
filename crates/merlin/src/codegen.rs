@@ -4098,7 +4098,6 @@ main:
         compile("int main() { int a0 = 1; return a0; }");
     }
 
-    /// `long long` on RV32: register pairs.
     #[test]
     fn constant_expressions_are_folded() {
         // Every integer type, as clang's front end folds them at -O0: a
@@ -4144,6 +4143,7 @@ main:
         assert!(body.contains("li a0, 6"), "{body}");
     }
 
+    /// `long long` on RV32: register pairs.
     mod pairs {
         use super::{body_of, compile};
 
