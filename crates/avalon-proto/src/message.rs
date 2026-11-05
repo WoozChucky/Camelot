@@ -205,13 +205,95 @@ pub const DEFAULT_NOMINAL_HZ: u32 = 10_000_000;
 /// Harts of [`HardwareProfile::default`], as for Grail's default.
 pub const DEFAULT_HARTS: u32 = 1;
 
+/// A VM's register width, as `grail::Xlen`: what QEMU picks with its binary,
+/// `qemu-system-riscv32` or `qemu-system-riscv64`. On the wire a `u8`, the width in
+/// bits: 32 or 64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Xlen {
+    /// RV32: Sv32 paging, at most 2 GiB of RAM. The default while both widths exist
+    /// (#159 removes it).
+    #[default]
+    Rv32,
+    /// RV64: Sv48 and Sv39 paging (or Sv39 alone, [`Paging`]), up to 1 TiB of RAM.
+    Rv64,
+}
+
+impl Xlen {
+    /// The width in bits, 32 or 64: what the wire carries.
+    pub fn bits(self) -> u8 {
+        match self {
+            Xlen::Rv32 => 32,
+            Xlen::Rv64 => 64,
+        }
+    }
+
+    /// The width of `bits`, if it is 32 or 64.
+    pub fn from_bits(bits: u8) -> Option<Xlen> {
+        match bits {
+            32 => Some(Xlen::Rv32),
+            64 => Some(Xlen::Rv64),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Xlen {
+    /// `RV32` or `RV64`.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "RV{}", self.bits())
+    }
+}
+
+/// The paging modes an RV64 VM's harts implement, as `grail::Paging`: QEMU's
+/// `-cpu rv64` (Sv48 too, the default) or `-cpu rv64,sv48=off`. On the wire a `u8`,
+/// the widest mode as `satp.MODE` numbers it (privileged spec, "satp"): 9 for Sv48
+/// (and Sv39), 8 for Sv39 alone. An RV32 VM has Sv32 whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Paging {
+    /// Sv48 and Sv39 (and Bare): `satp.MODE` 9 is the widest.
+    #[default]
+    Sv48,
+    /// Sv39 (and Bare) only, as on most RV64 boards: a write of MODE 9 to `satp` is
+    /// refused (WARL), which is how the guest finds out.
+    Sv39,
+}
+
+impl Paging {
+    /// The widest mode's `satp.MODE` value, 9 or 8: what the wire carries.
+    pub fn satp_mode(self) -> u8 {
+        match self {
+            Paging::Sv48 => 9,
+            Paging::Sv39 => 8,
+        }
+    }
+
+    /// The paging of `mode`, if it is 9 (Sv48) or 8 (Sv39).
+    pub fn from_satp_mode(mode: u8) -> Option<Paging> {
+        match mode {
+            9 => Some(Paging::Sv48),
+            8 => Some(Paging::Sv39),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Paging {
+    /// `sv48` or `sv39`, as Grail's `--paging` takes it.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Paging::Sv48 => "sv48",
+            Paging::Sv39 => "sv39",
+        })
+    }
+}
+
 /// A VM's hardware, mirroring `grail::MachineConfig` field for field (a test in this
 /// crate fails to compile when `MachineConfig` gains a field this does not have).
 /// The server validates it as Grail does and answers `InvalidProfile` if it is wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareProfile {
     /// RAM size in bytes: a non-zero multiple of 4 KiB, at most 1 TiB (2 GiB for an RV32
-    /// VM, which a VM is unless its program is ELF64).
+    /// VM).
     pub ram_size: u64,
     /// Real-time clock in instructions per second, or `None` to run at full speed.
     pub clock_hz: Option<u32>,
@@ -219,6 +301,14 @@ pub struct HardwareProfile {
     pub nominal_hz: u32,
     /// Harts (cores), each running at the clock: 1 to `grail::MAX_HARTS` (8).
     pub harts: u32,
+    /// The harts' width, chosen as QEMU's binary chooses it. An ELF64 program makes
+    /// an RV32 VM RV64 when it is loaded, as Grail's `Machine::load_elf` does, and the
+    /// VM's profile says RV64 from then on (`VmList`, `VmInfo`); an ELF32 program
+    /// cannot run on an RV64 VM. A VM that boots from disk is as wide as this says:
+    /// so are its boot ROM and the boot block it runs.
+    pub xlen: Xlen,
+    /// The paging modes an RV64 VM's harts implement; an RV32 VM has Sv32.
+    pub paging: Paging,
     /// Optional hardware beyond the fixed machine (spec section 7), in the order the
     /// guest should see it.
     pub devices: Vec<DeviceSpec>,
@@ -231,6 +321,8 @@ impl Default for HardwareProfile {
             clock_hz: None,
             nominal_hz: DEFAULT_NOMINAL_HZ,
             harts: DEFAULT_HARTS,
+            xlen: Xlen::default(),
+            paging: Paging::default(),
             devices: Vec::new(),
         }
     }
@@ -1704,6 +1796,8 @@ fn put_profile(w: &mut Writer, p: &HardwareProfile) {
     w.option(&p.clock_hz, |w, hz| w.u32(*hz));
     w.u32(p.nominal_hz);
     w.u32(p.harts);
+    w.u8(p.xlen.bits());
+    w.u8(p.paging.satp_mode());
     w.list(&p.devices, |w, d| match d {
         DeviceSpec::Disk(disk) => {
             w.u8(1);
@@ -1734,6 +1828,16 @@ fn get_profile(r: &mut Reader) -> Result<HardwareProfile> {
         clock_hz: r.option(|r| r.u32())?,
         nominal_hz: r.u32()?,
         harts: r.u32()?,
+        xlen: {
+            let bits = r.u8()?;
+            Xlen::from_bits(bits)
+                .ok_or_else(|| Error::Invalid(format!("register width {bits}, not 32 or 64")))?
+        },
+        paging: {
+            let mode = r.u8()?;
+            Paging::from_satp_mode(mode)
+                .ok_or_else(|| Error::Invalid(format!("paging mode {mode}, not 9 (Sv48) or 8 (Sv39)")))?
+        },
         devices: r.list(|r| match r.u8()? {
             1 => {
                 let source = match r.u8()? {

@@ -105,49 +105,51 @@ fn interrupt(child: &Child) -> bool {
 
 #[test]
 fn serves_clients_and_shuts_down_gracefully() {
-    let (mut child, addr, mut stderr) = start(&["--max-ram", "8"]);
-    let mut rt = Connection::connect(addr.as_str(), "test").unwrap();
-    rt.get_ref().set_read_timeout(Some(SLOW)).unwrap();
-    let id = create(&mut rt, "spin", profile(8, None), spinner());
-    assert_eq!(
-        error_of(
-            &mut rt,
-            &Message::CreateVm {
-                name: "more".into(),
-                profile: profile(1, None),
-                program: spinner(),
-            }
-        ),
-        avalon_proto::ErrorCode::OverBudget
-    );
-    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-    assert_eq!(state(&mut rt, id), VmState::Running);
+    on_both_widths(|| {
+        let (mut child, addr, mut stderr) = start(&["--max-ram", "8"]);
+        let mut rt = Connection::connect(addr.as_str(), "test").unwrap();
+        rt.get_ref().set_read_timeout(Some(SLOW)).unwrap();
+        let id = create(&mut rt, "spin", profile(8, None), spinner());
+        assert_eq!(
+            error_of(
+                &mut rt,
+                &Message::CreateVm {
+                    name: "more".into(),
+                    profile: profile(1, None),
+                    program: spinner(),
+                }
+            ),
+            avalon_proto::ErrorCode::OverBudget
+        );
+        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+        assert_eq!(state(&mut rt, id), VmState::Running);
 
-    if !interrupt(&child) {
-        eprintln!("cannot send Ctrl-C here; stopping avalon the hard way");
-        child.kill().unwrap();
-        child.wait().unwrap();
-        return;
-    }
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if start.elapsed() > SLOW {
+        if !interrupt(&child) {
+            eprintln!("cannot send Ctrl-C here; stopping avalon the hard way");
             child.kill().unwrap();
-            let mut log = String::new();
-            stderr.read_to_string(&mut log).unwrap();
-            panic!("avalon did not shut down: {log}");
+            child.wait().unwrap();
+            return;
         }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert!(status.success(), "{status:?}");
-    let mut log = String::new();
-    stderr.read_to_string(&mut log).unwrap();
-    assert!(log.contains("shutting down"), "{log}");
-    assert!(log.contains("VM 1 ('spin') stopped"), "{log}");
-    assert!(log.contains("shut down (1 VMs stopped)"), "{log}");
-    // The connection was closed.
-    assert!(rt.request(&Message::ListVms).is_err());
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() > SLOW {
+                child.kill().unwrap();
+                let mut log = String::new();
+                stderr.read_to_string(&mut log).unwrap();
+                panic!("avalon did not shut down: {log}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "{status:?}");
+        let mut log = String::new();
+        stderr.read_to_string(&mut log).unwrap();
+        assert!(log.contains("shutting down"), "{log}");
+        assert!(log.contains("VM 1 ('spin') stopped"), "{log}");
+        assert!(log.contains("shut down (1 VMs stopped)"), "{log}");
+        // The connection was closed.
+        assert!(rt.request(&Message::ListVms).is_err());
+    });
 }

@@ -10,9 +10,10 @@ use xtask::{examples, repo_root, tools};
 const USAGE: &str = "usage: cargo xtask <task> [options]
 
 tasks:
-  up           bring the Avalon platform up: build it, put the Camelot root image in Lake's
-               images directory (target/platform/images) as the image os-base, and run Lake,
-               Avalon and Pendragon until Ctrl-C. --demo also starts a Camelot VM, vm001;
+  up           bring the Avalon platform up: build it, put the Camelot root images in Lake's
+               images directory (target/platform/images) as the images os-base (RV32) and
+               os-base-rv64 (RV64), and run Lake, Avalon and Pendragon until Ctrl-C. --demo
+               also starts a Camelot VM, vm001;
                cargo xtask up --help lists the options
   examples     build every example (or the ones named) with merlin-as + merlin-ld, for
                RV32 into examples/<dir>/<name>.elf and for RV64 into

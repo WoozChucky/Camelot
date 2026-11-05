@@ -1,19 +1,100 @@
 //! Helpers for the server tests: an in-process Avalon on an ephemeral port, clients,
 //! console readers, screen viewers, and guest programs.
+//!
+//! The tests of VMs run twice ([`on_both_widths`]): with RV32 VMs, then with RV64
+//! ones. Meanwhile every guest this module makes or reads is of that width: the
+//! examples' `-rv64.elf` builds ([`example`], [`example_in`]), the guests assembled
+//! here ([`guest`]), and the profiles ([`profile`], [`hardware`]) say it.
 
 #![allow(dead_code)]
 
 use avalon::{Config, Server, ServerThread};
 use avalon_proto::{
     Connection, HardwareProfile, KeyEvent, Message, MessageKind, PointerChange, Rect, Screen, VmDetails,
-    VmRef, VmState,
+    VmRef, VmState, Xlen,
 };
+use std::cell::Cell;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 pub const MIB: u64 = 1024 * 1024;
+
+thread_local! {
+    /// The width of the VMs this thread's test makes: set by [`on_both_widths`], and
+    /// carried into the threads the test starts by [`spawn`]; `None` elsewhere.
+    static XLEN: Cell<Option<Xlen>> = const { Cell::new(None) };
+}
+
+/// Runs `test` with RV32 VMs, then with RV64 ones: every guest and profile the
+/// helpers make meanwhile is of that width. A failure says which width failed: the
+/// panic is raised again with the width before its message.
+pub fn on_both_widths(test: impl Fn()) {
+    for xlen in [Xlen::Rv32, Xlen::Rv64] {
+        XLEN.with(|x| x.set(Some(xlen)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
+        XLEN.with(|x| x.set(None));
+        if let Err(payload) = result {
+            panic!("on {xlen}: {}", panic_message(&*payload));
+        }
+    }
+}
+
+/// What a panic said: its message, if it had one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s
+    } else {
+        "a panic with no message"
+    }
+}
+
+/// The width of the VMs the current test makes ([`on_both_widths`]; RV32 outside it).
+///
+/// A thread the test starts has the width if [`spawn`] started it. In a thread
+/// `std::thread::spawn` starts the width is not set, and RV32 there would make RV32
+/// guests in an RV64 test without a word: asking there panics. Such a thread is told
+/// from the test's own by its name: libtest runs each test in a thread named after it,
+/// and `std::thread::spawn`'s threads have none.
+pub fn xlen() -> Xlen {
+    XLEN.with(Cell::get).unwrap_or_else(|| {
+        assert!(
+            std::thread::current().name().is_some(),
+            "a thread that asks for the width is started with common::spawn, which gives it the test's width"
+        );
+        Xlen::Rv32
+    })
+}
+
+/// Starts a thread as `std::thread::spawn` does, with the width of the thread that
+/// starts it: what the thread makes ([`xlen`]) is of the test's width.
+pub fn spawn<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> std::thread::JoinHandle<T> {
+    let xlen = xlen();
+    std::thread::spawn(move || {
+        XLEN.with(|x| x.set(Some(xlen)));
+        f()
+    })
+}
+
+/// An address as the examples print one (`netlib.S`'s `print_hex`): as many hex digits
+/// as the width's registers hold, `0x10009000` on RV32, `0x0000000010009000` on RV64.
+pub fn addr_text(addr: u64) -> String {
+    match xlen() {
+        Xlen::Rv32 => format!("{addr:#010x}"),
+        Xlen::Rv64 => format!("{addr:#018x}"),
+    }
+}
+
+/// The same width as Grail's (and merlin-as's: both are excalibur's `Xlen`).
+pub fn grail_xlen() -> grail::Xlen {
+    match xlen() {
+        Xlen::Rv32 => grail::Xlen::Rv32,
+        Xlen::Rv64 => grail::Xlen::Rv64,
+    }
+}
 
 /// Generous ceiling for anything that should take well under a second, so a loaded CI
 /// machine does not make the tests flaky.
@@ -43,9 +124,20 @@ pub fn connect(server: &ServerThread) -> Connection<TcpStream> {
     conn
 }
 
+/// The example `name` (`examples/<name>/<name>.elf`), built for the current width.
 pub fn example(name: &str) -> Vec<u8> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../examples/{name}/{name}.elf"));
-    std::fs::read(path).unwrap()
+    example_in(name, name)
+}
+
+/// The program `name` of the example directory `dir` (`examples/net`'s `net-ping`),
+/// built for the current width: `<name>.elf`, or `<name>-rv64.elf` (`cargo xtask
+/// examples` builds both from one source).
+pub fn example_in(dir: &str, name: &str) -> Vec<u8> {
+    let file = match xlen() {
+        Xlen::Rv32 => format!("{name}.elf"),
+        Xlen::Rv64 => format!("{name}-rv64.elf"),
+    };
+    std::fs::read(examples_dir().join(dir).join(file)).unwrap()
 }
 
 pub fn examples_dir() -> PathBuf {
@@ -65,10 +157,13 @@ pub fn pcap_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
     frames
 }
 
-/// Assembles and links a guest with merlin-as and merlin-ld (`.text` at 0x80000000,
-/// entry `_start`).
+/// Assembles and links a guest of the current width with merlin-as and merlin-ld
+/// (`.text` at 0x80000000, entry `_start`). The guests here are written to assemble
+/// on both: their addresses fit `li`'s 32 bits and they use no `lw` or `sw` of a
+/// pointer.
 pub fn guest(asm: &str) -> Vec<u8> {
-    let obj = merlin_as::assemble_to_elf(asm).unwrap_or_else(|e| panic!("{e:?}"));
+    let options = merlin_as::Options { xlen: grail_xlen() };
+    let obj = merlin_as::assemble_to_elf_with(asm, &options).unwrap_or_else(|e| panic!("{e:?}"));
     let inputs = [merlin_ld::Input {
         name: "guest.o".into(),
         data: obj,
@@ -144,10 +239,19 @@ pub fn rv64_spinner() -> Vec<u8> {
     f
 }
 
+/// A profile of the current width with `ram_mib` MiB and the clock `clock_hz`.
 pub fn profile(ram_mib: u64, clock_hz: Option<u32>) -> HardwareProfile {
     HardwareProfile {
         clock_hz,
-        ..HardwareProfile::with_ram(ram_mib * MIB)
+        ..hardware(ram_mib * MIB)
+    }
+}
+
+/// The default profile of the current width with `ram_size` bytes of RAM.
+pub fn hardware(ram_size: u64) -> HardwareProfile {
+    HardwareProfile {
+        xlen: xlen(),
+        ..HardwareProfile::with_ram(ram_size)
     }
 }
 
@@ -532,7 +636,8 @@ impl Drop for Viewer {
 }
 
 /// The framebuffer a program leaves when Grail runs it to its end on its own, for
-/// comparing with what a viewer received: black where the display is off.
+/// comparing with what a viewer received: black where the display is off. (Its
+/// ELF class makes the machine as wide as it.)
 pub fn grail_screen(program: &[u8]) -> Vec<u8> {
     let mut m = grail::Machine::with_ram(16 * 1024 * 1024);
     m.load_elf(program).unwrap();
@@ -545,10 +650,30 @@ pub fn grail_screen(program: &[u8]) -> Vec<u8> {
     }
 }
 
-/// What `examples/sysinfo` prints on a machine with this RAM and clock and no disks
-/// (as in grail's tests/machine.rs).
+/// What `examples/sysinfo` prints on a machine of the current width with this RAM
+/// and clock and no disks (as in grail's tests/machine.rs): on RV64 version 2 of the
+/// sysinfo block, its 64-bit addresses and sizes.
 pub fn sysinfo_output(ram_mib: u32, hz: u32, real_time: bool) -> String {
     let kind = if real_time { "real time" } else { "nominal" };
+    if xlen() == Xlen::Rv64 {
+        return format!(
+            "sysinfo v2
+RAM      {ram_mib} MiB at 0x0000000080000000
+CPU      {hz} Hz ({kind})
+timebase {hz} Hz
+9 devices:
+  test      0x0000000000100000 + 0x0000000000001000
+  CLINT     0x0000000002000000 + 0x0000000000010000
+  PLIC      0x000000000c000000 + 0x0000000004000000
+  UART      0x0000000010000000 + 0x0000000000000100  irq 1
+  fb-ctrl   0x0000000030000000 + 0x0000000000001000  irq 16
+  keyboard  0x0000000030001000 + 0x0000000000001000  irq 2
+  sysinfo   0x0000000030002000 + 0x0000000000001000
+  pointer   0x0000000030003000 + 0x0000000000001000  irq 11
+  fb-vram   0x0000000031000000 + 0x000000000012c000
+"
+        );
+    }
     format!(
         "sysinfo v1
 RAM      {ram_mib} MiB at 0x80000000

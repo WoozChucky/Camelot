@@ -1,12 +1,13 @@
 //! merlin-dbg on a VM of an Avalon server (`merlin-dbg --vm NAME --server ADDR`,
-//! protocol doc, section 6.8): the server runs in this process, the VM runs the Camelot
-//! kernel to its shell, and Herald is attached to its console the whole time. The
+//! protocol doc, section 6.8), an RV32 VM and then an RV64 one: the server runs in this
+//! process, the VM runs the Camelot kernel of its width to its shell, and Herald is
+//! attached to its console the whole time. The
 //! debugger breaks in the kernel's `write` system call, shows where, continues to the
 //! next one and leaves; the console goes on working, and Herald sees nothing but the
 //! VM's state changes, few of them (a VM with a debugger has its notices rate-limited).
 
 use avalon::{Config, Server, ServerThread};
-use avalon_proto::{Connection, HardwareProfile, Message, VmRef, VmState};
+use avalon_proto::{Connection, HardwareProfile, Message, VmRef, VmState, Xlen};
 use herald::{End, Session};
 use std::io::Write;
 use std::net::TcpStream;
@@ -130,12 +131,35 @@ impl Herald {
 
 #[test]
 fn debugging_a_vm_on_avalon_with_herald_attached() {
+    // An RV32 VM and an RV64 one, each running the kernel of its width: the debugger
+    // learns the width from the stub's target description.
+    for (kernel, xlen) in [
+        ("kernel/kernel.elf", Xlen::Rv32),
+        ("kernel/kernel-rv64.elf", Xlen::Rv64),
+    ] {
+        let run = std::panic::catch_unwind(|| debug_a_vm(kernel, xlen));
+        if let Err(payload) = run {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            panic!("on {xlen}: {message}");
+        }
+    }
+}
+
+/// The test on a VM of width `xlen` running `kernel`.
+fn debug_a_vm(kernel: &str, xlen: Xlen) {
     let server = server();
     let mut control = connect(&server);
     let id = match control.request(&Message::CreateVm {
         name: "vm001".into(),
-        profile: HardwareProfile::with_ram(4 * 1024 * 1024),
-        program: std::fs::read(path("kernel/kernel.elf")).unwrap(),
+        profile: HardwareProfile {
+            xlen,
+            ..HardwareProfile::with_ram(4 * 1024 * 1024)
+        },
+        program: std::fs::read(path(kernel)).unwrap(),
     }) {
         Ok(Message::VmCreated { id }) => id,
         other => panic!("{other:?}"),
@@ -148,13 +172,7 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
 
     // The debugger attaches, the VM stops for it; what is typed meanwhile waits.
     let mut dbg = Command::new(env!("CARGO_BIN_EXE_merlin-dbg"))
-        .args([
-            "--vm",
-            "vm001",
-            "--server",
-            &server.addr().to_string(),
-            "kernel/kernel.elf",
-        ])
+        .args(["--vm", "vm001", "--server", &server.addr().to_string(), kernel])
         .current_dir(path("."))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

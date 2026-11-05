@@ -1,7 +1,7 @@
 //! What people type, as protocol values. Every front end (Round Table's flags,
 //! Pendragon's forms) parses with these, so they all accept the same syntax.
 
-use avalon_proto::{validate_name, DiskSource, FwdProto, NetSpec, PortForward, SECTOR_SIZE};
+use avalon_proto::{validate_name, DiskSource, FwdProto, NetSpec, Paging, PortForward, Xlen, SECTOR_SIZE};
 use grail::net::MacAddr;
 use std::net::{IpAddr, SocketAddr};
 
@@ -10,10 +10,28 @@ use std::net::{IpAddr, SocketAddr};
 pub use grail::parse_clock;
 
 /// Parses a `--ram` value as Grail's `--ram` does: MiB, or a number with a unit,
-/// `M`/`MiB` or `G`/`GiB` in any case, 1 MiB to 1 TiB (an RV32 VM, which every VM is
-/// until its program is ELF64, takes at most 2 GiB: the server says so). Returns bytes.
+/// `M`/`MiB`, `G`/`GiB` or `T`/`TiB` in any case, 1 MiB to 1 TiB (an RV32 VM takes at
+/// most 2 GiB: the server says so, since an ELF64 program makes a VM RV64). Returns
+/// bytes.
 pub fn parse_ram(s: &str) -> Result<u64, String> {
     grail::parse_ram_size(s).map(|bytes| bytes as u64)
+}
+
+/// Parses an `--xlen` value as Grail's `--xlen` does: `32` (RV32) or `64` (RV64).
+pub fn parse_xlen(s: &str) -> Result<Xlen, String> {
+    Ok(match grail::config::parse_xlen(s)? {
+        grail::Xlen::Rv32 => Xlen::Rv32,
+        grail::Xlen::Rv64 => Xlen::Rv64,
+    })
+}
+
+/// Parses a `--paging` value as Grail's `--paging` does: `sv48` (Sv48 and Sv39) or
+/// `sv39` (Sv39 alone).
+pub fn parse_paging(s: &str) -> Result<Paging, String> {
+    Ok(match grail::config::parse_paging(s)? {
+        grail::Paging::Sv48 => Paging::Sv48,
+        grail::Paging::Sv39 => Paging::Sv39,
+    })
 }
 
 /// Parses a RAM budget (Pendragon's `--avalon-max-ram`, as Avalon's `--max-ram`):
@@ -177,6 +195,36 @@ pub fn parse_hostfwd(s: &str) -> Result<PortForward, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widths_and_paging_modes() {
+        assert_eq!(parse_xlen("32"), Ok(Xlen::Rv32));
+        assert_eq!(parse_xlen(" 64 "), Ok(Xlen::Rv64));
+        assert_eq!(parse_paging("sv48"), Ok(Paging::Sv48));
+        assert_eq!(parse_paging("sv39"), Ok(Paging::Sv39));
+        // What the clients show parses back.
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            assert_eq!(parse_xlen(&xlen.bits().to_string()), Ok(xlen));
+        }
+        for paging in [Paging::Sv48, Paging::Sv39] {
+            assert_eq!(parse_paging(&paging.to_string()), Ok(paging));
+        }
+        assert_eq!(
+            parse_xlen("128").unwrap_err(),
+            "'128' is not a register width (32 or 64)"
+        );
+        assert_eq!(
+            parse_paging("sv57").unwrap_err(),
+            "'sv57' is not a paging mode (sv39 or sv48)"
+        );
+        // RAM up to RV64's 1 TiB; an RV32 VM's 2 GiB is the server's to say.
+        assert_eq!(parse_ram("1T"), Ok(1 << 40));
+        assert_eq!(parse_ram("16G"), Ok(16 << 30));
+        assert_eq!(
+            parse_ram("1025G").unwrap_err(),
+            "1025G is out of range (1 MiB to 1 TiB)"
+        );
+    }
 
     #[test]
     fn forwarding_rules() {

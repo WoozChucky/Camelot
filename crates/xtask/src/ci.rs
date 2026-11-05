@@ -95,6 +95,18 @@ const STEPS: &[Step] = &[
         args: &["-p", "avalon", "--test", "debug"],
     },
     Step {
+        what: "Avalon: a VM's width, its profile's or its program's, and RV64's RAM",
+        args: &[
+            "-p",
+            "avalon",
+            "--test",
+            "server",
+            "--",
+            "a_vm_is_as_wide_as_its_profile_or_its_program",
+            "an_rv64_vm_has_more_ram_than_the_host",
+        ],
+    },
+    Step {
         what: "merlin-dbg on an Avalon VM: the kernel's write system call, Herald attached",
         args: &["-p", "merlin-dbg", "--test", "avalon"],
     },

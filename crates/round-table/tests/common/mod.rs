@@ -1,17 +1,100 @@
 //! Helpers for Round Table's tests: an in-process Avalon, a stand-in Lake that speaks
 //! the disk-management part of the protocol, and Round Table's command layer.
+//!
+//! The tests of VMs run twice ([`on_both_widths`]): with RV32 VMs, then with RV64
+//! ones. Meanwhile the examples are the width's builds ([`example`]), and
+//! [`xlen_arg`], [`arch`] and [`arch_text`] give what Round Table takes and shows of
+//! the width.
 
 #![allow(dead_code)]
 
 use avalon::{Config, Server, ServerThread};
-use avalon_proto::{validate_name, Connection, DiskInfo, ErrorCode, Message, VmRef, VmState};
+use avalon_proto::{validate_name, Connection, DiskInfo, ErrorCode, Message, VmRef, VmState, Xlen};
 use round_table::Failure;
+use std::cell::Cell;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+thread_local! {
+    /// The width of the VMs this thread's test makes: set by [`on_both_widths`], and
+    /// carried into the threads the test starts by [`spawn`]; `None` elsewhere.
+    static XLEN: Cell<Option<Xlen>> = const { Cell::new(None) };
+}
+
+/// Runs `test` with RV32 VMs, then with RV64 ones. A failure says which width failed:
+/// the panic is raised again with the width before its message.
+pub fn on_both_widths(test: impl Fn()) {
+    for xlen in [Xlen::Rv32, Xlen::Rv64] {
+        XLEN.with(|x| x.set(Some(xlen)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
+        XLEN.with(|x| x.set(None));
+        if let Err(payload) = result {
+            let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "a panic with no message".to_string()
+            };
+            panic!("on {xlen}: {message}");
+        }
+    }
+}
+
+/// The width of the VMs the current test makes (RV32 outside [`on_both_widths`]).
+///
+/// A thread the test starts has the width if [`spawn`] started it. In a thread
+/// `std::thread::spawn` starts the width is not set, and RV32 there would make RV32
+/// guests in an RV64 test without a word: asking there panics. Such a thread is told
+/// from the test's own by its name: libtest runs each test in a thread named after it,
+/// and `std::thread::spawn`'s threads have none.
+pub fn xlen() -> Xlen {
+    XLEN.with(Cell::get).unwrap_or_else(|| {
+        assert!(
+            std::thread::current().name().is_some(),
+            "a thread that asks for the width is started with common::spawn, which gives it the test's width"
+        );
+        Xlen::Rv32
+    })
+}
+
+/// Starts a thread as `std::thread::spawn` does, with the width of the thread that
+/// starts it: what the thread makes ([`xlen`]) is of the test's width.
+pub fn spawn<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> std::thread::JoinHandle<T> {
+    let xlen = xlen();
+    std::thread::spawn(move || {
+        XLEN.with(|x| x.set(Some(xlen)));
+        f()
+    })
+}
+
+/// `create`'s `--xlen` value for the current width: `32` or `64`.
+pub fn xlen_arg() -> &'static str {
+    match xlen() {
+        Xlen::Rv32 => "32",
+        Xlen::Rv64 => "64",
+    }
+}
+
+/// What `list` shows of a VM of the current width: `RV32` or `RV64`.
+pub fn arch() -> &'static str {
+    match xlen() {
+        Xlen::Rv32 => "RV32",
+        Xlen::Rv64 => "RV64",
+    }
+}
+
+/// What `info` shows of a VM of the current width with the default paging.
+pub fn arch_text() -> &'static str {
+    match xlen() {
+        Xlen::Rv32 => "RV32 (Sv32 paging)",
+        Xlen::Rv64 => "RV64 (Sv48 and Sv39 paging)",
+    }
+}
 
 pub const MIB: u64 = 1024 * 1024;
 
@@ -59,8 +142,17 @@ pub fn refused(addr: SocketAddr, args: &[&str]) -> String {
     }
 }
 
+/// The example `name`, built for the current width: `<name>.elf` or
+/// `<name>-rv64.elf`.
 pub fn example(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../examples/{name}/{name}.elf"))
+    let file = match xlen() {
+        Xlen::Rv32 => format!("{name}.elf"),
+        Xlen::Rv64 => format!("{name}-rv64.elf"),
+    };
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(name)
+        .join(file)
 }
 
 pub fn example_str(name: &str) -> String {

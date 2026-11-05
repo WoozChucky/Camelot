@@ -12,6 +12,8 @@ pub fn profile() -> HardwareProfile {
         clock_hz: Some(2_000_000),
         nominal_hz: 10_000_000,
         harts: 4,
+        xlen: Xlen::Rv64,
+        paging: Paging::Sv39,
         devices: vec![
             DeviceSpec::Disk(DiskSpec {
                 source: DiskSource::File("C:\\vms\\root.img".into()),
