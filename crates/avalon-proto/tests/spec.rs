@@ -172,13 +172,14 @@ fn simple_profile() -> HardwareProfile {
         harts: 1,
         xlen: Xlen::Rv32,
         paging: Paging::Sv48,
+        bios: Bios::None,
         devices: Vec::new(),
     }
 }
 
 /// `simple_profile` per the HardwareProfile table.
 fn simple_profile_bytes(p: P) -> P {
-    p.u64(0x1000).u8(0).u32(10).u32(1).u8(32).u8(9).u32(0)
+    p.u64(0x1000).u8(0).u32(10).u32(1).u8(32).u8(9).u8(0).u32(0)
 }
 
 /// One message of every type, each field a different value, with its layout per the
@@ -232,6 +233,7 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                     harts: 3,
                     xlen: Xlen::Rv64,
                     paging: Paging::Sv39,
+                    bios: Bios::File("b".into()),
                     devices: vec![
                         DeviceSpec::Disk(DiskSpec {
                             source: DiskSource::File("f".into()),
@@ -265,6 +267,8 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 .u32(3)
                 .u8(64)
                 .u8(8)
+                .u8(2)
+                .str("b")
                 .u32(4)
                 .u8(1)
                 .u8(1)
@@ -858,17 +862,17 @@ fn optional_fields_are_tagged() {
 
 #[test]
 fn doc_examples_are_exact() {
-    // Section 6.1: Hello version 12 from agent "rt".
+    // Section 6.1: Hello version 13 from agent "rt".
     assert_eq!(
         encode(&Message::Hello {
-            version: 12,
+            version: 13,
             agent: "rt".into()
         })
         .unwrap(),
-        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x0c, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
+        [0x0e, 0, 0, 0, 0x01, 0x00, 0x41, 0x56, 0x4c, 0x4e, 0x0d, 0x00, 0x02, 0, 0, 0, 0x72, 0x74]
     );
     // Section 7: the version this document describes.
-    assert_eq!(PROTOCOL_VERSION, 12);
+    assert_eq!(PROTOCOL_VERSION, 13);
     // Section 6.2: StartVm by id 5.
     assert_eq!(
         encode(&Message::StartVm { vm: VmRef::Id(5) }).unwrap(),

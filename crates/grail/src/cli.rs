@@ -5,8 +5,8 @@
 use crate::config::DiskSource;
 use crate::net::Hub;
 use crate::{
-    parse_clock, parse_harts, parse_paging, parse_ram_size, parse_xlen, DiskConfig, Machine, MachineConfig,
-    NetConfig,
+    parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_xlen, DiskConfig, Machine,
+    MachineConfig, NetConfig,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,7 +15,9 @@ pub const USAGE: &str = "usage: grail [options] [program.elf]
 
 Runs the program. Without one, boots from disk 0 (--disk): the boot ROM loads
 its boot block (its first 1 KiB) and runs it, as camelot-fs mkfs --boot makes
-for the Camelot kernel (spec section 7, \"Boot from disk\").
+for the Camelot kernel (spec section 7, \"Boot from disk\"). With firmware
+(--bios), the firmware runs first, in M-mode, and starts the program, or the
+disk's boot block, in S-mode.
 
   --trace         print every instruction before it runs (with its hart's
                   number, h0, h1, ..., on a machine of several harts)
@@ -35,6 +37,13 @@ for the Camelot kernel (spec section 7, \"Boot from disk\").
   --paging MODE   the paging modes of an RV64 hart: sv48 (Sv48 and Sv39, the
                   default) or sv39 (Sv39 only, as on most RV64 boards: satp then
                   refuses Sv48)
+  --bios FW       the firmware, as QEMU's -bios: none (the default: the program
+                  starts in M-mode), default (Camelot's firmware, built in: an SBI
+                  in M-mode, which starts the program in S-mode, or boots from disk
+                  0 without one) or a file, an ELF or a raw binary loaded at
+                  0x80000000 (OpenSBI's fw_jump.bin, say). The firmware has the
+                  first 2 MiB of RAM and the program loads at 0x80200000; Grail
+                  passes it a device tree of the machine. RV64 machines only
   --harts N       N harts (cores), 1 to 8 (default 1). They share memory and
                   devices and take turns, one instruction each per step, so
                   with --clock each runs at FREQ. Hart 0 starts the program;
@@ -147,6 +156,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
             "--harts" => config.harts = parsed("--harts", value("--harts")?, parse_harts)?,
             "--xlen" => config.xlen = parsed("--xlen", value("--xlen")?, parse_xlen)?,
             "--paging" => config.paging = parsed("--paging", value("--paging")?, parse_paging)?,
+            "--bios" => config.bios = parsed("--bios", value("--bios")?, parse_bios)?,
             "--disk" | "--disk-ro" => {
                 let disk = parsed(&a, value(&a)?, DiskConfig::parse)?;
                 config.disks.push(disk.with_read_only(a == "--disk-ro"));

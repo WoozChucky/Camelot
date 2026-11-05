@@ -68,6 +68,13 @@ pub fn card_configs(vm: &str, profile: &HardwareProfile) -> Result<Vec<CardConfi
 /// (Grail's `max_ram_size`: 1 TiB, 2 GiB on RV32). An ELF32 program on an RV64 VM is
 /// left for `load_elf` to refuse (`InvalidProgram`). A VM that boots from disk (no
 /// program) has the profile's width, and its boot ROM with it.
+///
+/// Firmware (`bios`) is checked here too, as the hardware it is: an RV32 VM (an RV32
+/// profile whose program, if any, is not ELF64) has none, and the firmware must be
+/// one Grail can load (`grail::firmware::Image::of`: a file that can be read, an ELF
+/// of RV64 or a raw binary, that fits in the firmware's 2 MiB). A file is on Avalon's
+/// host, relative to its working directory, as a disk image's; and as a disk image
+/// that cannot be opened, firmware that cannot be loaded is `InvalidProfile`.
 pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<MachineConfig, String> {
     let HardwareProfile {
         ram_size,
@@ -76,6 +83,7 @@ pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<Machi
         harts,
         xlen,
         paging,
+        bios,
         devices,
     } = profile;
     let ram_size = usize::try_from(*ram_size)
@@ -112,9 +120,31 @@ pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<Machi
             avalon_proto::Paging::Sv48 => grail::Paging::Sv48,
             avalon_proto::Paging::Sv39 => grail::Paging::Sv39,
         },
+        bios: machine_bios(bios),
     };
     config.validate()?;
+    if config.bios.is_some() {
+        if config.xlen == Xlen::Rv32 {
+            return Err(
+                "firmware (bios) is for RV64 VMs only: an RV32 VM, which an RV32 profile is \
+                        unless its program is ELF64, boots its program or disk in M-mode (bios none)"
+                    .into(),
+            );
+        }
+        // Loaded and dropped: the machine loads it again when it is built.
+        grail::firmware::Image::of(&config.bios, Xlen::Rv64)?;
+    }
     Ok(config)
+}
+
+/// Grail's firmware for a profile's `bios`: a file on Avalon's host, relative to its
+/// working directory, as a disk image's.
+pub fn machine_bios(bios: &avalon_proto::Bios) -> grail::Bios {
+    match bios {
+        avalon_proto::Bios::None => grail::Bios::None,
+        avalon_proto::Bios::Default => grail::Bios::Default,
+        avalon_proto::Bios::File(path) => grail::Bios::File(path.into()),
+    }
 }
 
 /// The protocol's name for Grail's width `xlen`: what a VM's profile says once its
@@ -140,6 +170,7 @@ mod tests {
             harts: 4,
             xlen: avalon_proto::Xlen::Rv64,
             paging: avalon_proto::Paging::Sv39,
+            bios: avalon_proto::Bios::Default,
             devices: vec![
                 DeviceSpec::Disk(DiskSpec {
                     source: DiskSource::File("a.img".into()),
@@ -173,6 +204,7 @@ mod tests {
                 nets: Vec::new(),
                 xlen: Xlen::Rv64,
                 paging: grail::Paging::Sv39,
+                bios: grail::Bios::Default,
             }
         );
         assert_eq!(

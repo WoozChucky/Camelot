@@ -81,7 +81,7 @@ fn keys_before_the_detach_key_are_sent() {
 fn the_kernel_shell() {
     on_both_widths(|| {
         let server = server();
-        let id = start_vm(&server, "vm001", 4, kernel());
+        let id = start_kernel_vm(&server, "vm001");
         let mut herald = Herald::attach(&server, VmRef::Name("vm001".into()));
         herald.wait_for("Type help for the list of commands.\n$ ");
         herald.type_keys(b"ticks\r");

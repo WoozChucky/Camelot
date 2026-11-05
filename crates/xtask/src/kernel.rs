@@ -19,7 +19,7 @@
 //! and RV64 exist side by side (#141): the RV32 kernel (`kernel.elf`:
 //! everything at 0x8000_0000, identity mapped) and the RV64 one
 //! (`kernel-rv64.elf`: a higher-half kernel linked at 0xffff_ffff_8000_0000
-//! and loaded at 0x8000_0000, #154), which embeds the user programs built for
+//! and loaded at 0x8020_0000 after the firmware, #154 and #174), which embeds the user programs built for
 //! RV64 (#155, [`crate::userprogs::generated_for`]).
 //!
 //! The reference build ([`Toolchain::Clang`], `cargo xtask kernel --cc
@@ -143,8 +143,8 @@ pub const ASM_INCLUDE_DIRS: &[&str] = &["../include", INCLUDE_DIR];
 pub const DEBUG_DIR: &str = "kernel";
 /// The kernel's linker script, in the kernel directory: one for both widths,
 /// preprocessed for each ([`linker_script`]), as Linux's `vmlinux.lds.S`.
-/// RV32 links everything at 0x8000_0000; RV64 links high and loads at the
-/// start of RAM (`AT`).
+/// RV32 links everything at 0x8000_0000; RV64 links high and loads at
+/// 0x8020_0000, after the firmware (`AT`).
 pub const SCRIPT: &str = "kernel.lds.S";
 /// The preprocessed script, in the object directory, for ld.lld (and for
 /// reading: merlin-ld links with it in memory).

@@ -124,8 +124,8 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
-        what: "Grail: riscv-tests, RV64, paging and atomics semantics, disk boot, the committed disk \
-               image, the display controller, the keyboard's two modes",
+        what: "Grail: riscv-tests, RV64, paging and atomics semantics, disk boot, firmware and the \
+               device tree, the committed disk image, the display controller, the keyboard's two modes",
         args: &[
             "-p",
             "grail",
@@ -139,6 +139,8 @@ const STEPS: &[Step] = &[
             "atomics",
             "--test",
             "disk_boot",
+            "--test",
+            "firmware",
             "--test",
             "block",
             "--test",
@@ -167,6 +169,10 @@ const STEPS: &[Step] = &[
     Step {
         what: "the kernels' SBI: every call and error on both widths, a fence before every IPI (#170)",
         args: &["-p", "xtask", "--test", "sbi"],
+    },
+    Step {
+        what: "the RV64 kernel on OpenSBI v1.9's fw_jump, the reference firmware, on 1, 4 and 8 harts",
+        args: &["-p", "xtask", "--test", "opensbi"],
     },
     Step {
         what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
@@ -233,6 +239,7 @@ const STEPS: &[Step] = &[
             "up",
             "--",
             "the_rom_the_bootloader_mkfs_and_the_documents_agree",
+            "the_firmware_grail_the_kernel_and_the_documents_agree",
             "the_spec_gives_the_root_images_size",
             "the_format_document_matches",
             "the_system_call_document_matches",

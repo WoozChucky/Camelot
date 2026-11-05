@@ -121,13 +121,34 @@ pub fn kernel() -> Vec<u8> {
 /// Creates VM `name` of the current width running `program` with `ram_mib` MiB at full
 /// speed, and starts it.
 pub fn start_vm(server: &ServerThread, name: &str, ram_mib: u64, program: Vec<u8>) -> u32 {
+    let profile = HardwareProfile {
+        xlen: xlen(),
+        ..HardwareProfile::with_ram(ram_mib * MIB)
+    };
+    start_vm_with(server, name, profile, program)
+}
+
+/// Creates VM `name` running the Camelot kernel of the current width, and starts
+/// it: the RV32 kernel on 4 MiB; the RV64 one on Camelot's firmware, whose 2 MiB
+/// and the image's 2.1 MiB from 0x8020_0000 take 8 MiB.
+pub fn start_kernel_vm(server: &ServerThread, name: &str) -> u32 {
+    let profile = match xlen() {
+        Xlen::Rv32 => HardwareProfile::with_ram(4 * MIB),
+        Xlen::Rv64 => HardwareProfile {
+            xlen: Xlen::Rv64,
+            bios: avalon_proto::Bios::Default,
+            ..HardwareProfile::with_ram(8 * MIB)
+        },
+    };
+    start_vm_with(server, name, profile, kernel())
+}
+
+/// Creates VM `name` with `profile` running `program`, and starts it.
+pub fn start_vm_with(server: &ServerThread, name: &str, profile: HardwareProfile, program: Vec<u8>) -> u32 {
     let mut rt = connect(server);
     let id = match rt.request(&Message::CreateVm {
         name: name.into(),
-        profile: HardwareProfile {
-            xlen: xlen(),
-            ..HardwareProfile::with_ram(ram_mib * MIB)
-        },
+        profile,
         program,
     }) {
         Ok(Message::VmCreated { id }) => id,

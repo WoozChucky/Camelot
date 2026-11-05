@@ -64,6 +64,7 @@ fn run(setup: Setup, input: &[u8]) -> String {
         harts: setup.harts,
         ram_size: setup.ram,
         xlen: grail::Xlen::Rv64,
+        bios: grail::Bios::Default,
         paging: setup.paging,
         disks: setup.disks,
         nets: setup.nets,
@@ -166,6 +167,7 @@ fn a_program_starts_as_linux_starts_one() {
         let mut m = Machine::new(MachineConfig {
             ram_size: 16 * MIB,
             xlen: grail::Xlen::Rv64,
+            bios: grail::Bios::Default,
             paging,
             ..MachineConfig::default()
         })
@@ -256,7 +258,8 @@ fn pointers_into_the_kernel_half_are_refused() {
             ["badptr: every bad pointer refused"],
             "{paging:?}"
         );
-        // A load from the kernel image in U-mode: mapped, without U.
+        // A load from the kernel image in U-mode: mapped (its link address
+        // to its load address, after the firmware's 2 MiB), without U.
         let badload = command_output(&out, "badload");
         assert!(
             badload[0].ends_with(" (badload) killed: load page fault"),
@@ -264,7 +267,7 @@ fn pointers_into_the_kernel_half_are_refused() {
         );
         assert!(badload[1].ends_with("stval 0xffffffff80000000"), "{out}");
         assert!(
-            badload[2].starts_with("  va 0xffffffff80000000 maps to pa 0x0000000080000000")
+            badload[2].starts_with("  va 0xffffffff80000000 maps to pa 0x0000000080200000")
                 && badload[2].ends_with(" DAG-X-RV"),
             "{out}"
         );

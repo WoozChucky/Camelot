@@ -47,6 +47,11 @@ impl Vm {
         let config = MachineConfig {
             ram_size: 16 << 20,
             xlen: grail_xlen(),
+            // The RV64 kernel runs in S-mode, on Camelot's firmware.
+            bios: match grail_xlen() {
+                grail::Xlen::Rv32 => grail::Bios::None,
+                grail::Xlen::Rv64 => grail::Bios::Default,
+            },
             ..MachineConfig::default()
         };
         let mut m = Machine::with_devices(config, Vec::new(), vec![(card.mac, backend)]).unwrap();

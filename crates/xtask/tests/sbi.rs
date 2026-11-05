@@ -1,7 +1,8 @@
-//! Camelot's SBI (kernel/machine.S), driven directly: every call the SBI
+//! Camelot's SBI (firmware/sbi.S), driven directly: every call the SBI
 //! v2.0 defines for BASE, TIME, IPI, HSM, SRST and DBCN, made with an
 //! `ecall` from S-mode as the kernel makes them, on both committed kernels
-//! (kernel/kernel.elf, RV32, and kernel/kernel-rv64.elf, RV64), with each
+//! (kernel/kernel.elf, RV32, which carries it, and kernel/kernel-rv64.elf,
+//! RV64, on the firmware that carries it, crates/grail/rom/firmware.elf), with each
 //! call's results and errors, and every register but a0 and a1 kept. Then
 //! the kernel's own side: the exit codes machine_power_off() gives, and its
 //! warning and fallback when a reason is refused; sbi_send_ipi()'s report
@@ -27,23 +28,52 @@ use std::path::PathBuf;
 use xtask::kernel::{self, BOOT_MAX_STEPS};
 use xtask::repo_root;
 
-/// Where the RV64 kernel is linked, and so the distance between its
-/// symbols' addresses and their physical ones (kernel/kernel.lds.S).
+/// Where the RV64 kernel is linked and loaded, and so the distance between
+/// its symbols' addresses and their physical ones (kernel/kernel.lds.S).
 const RV64_LINK: u64 = 0xffff_ffff_8000_0000;
+const RV64_LOAD: u64 = 0x8020_0000;
 
 /// The CLINT's msip registers, a u32 per hart (spec section 7).
 const CLINT_MSIP: u64 = 0x0200_0000;
 
-/// Scratch RAM, at physical addresses near the end of the 4 MiB machine,
-/// far above either kernel image: buffers for the debug console, and code a
-/// started hart runs. Free while the kernel is stopped at kmain, before
-/// kinit() hands the pages out.
-const BUFFER: u64 = RAM_BASE + 0x3e_0000;
-const HART_CODE: u64 = RAM_BASE + 0x3f_0000;
-const RAM_END: u64 = RAM_BASE + 0x40_0000;
+/// The machines' RAM, both widths': 8 MiB, which the RV64 kernel needs on
+/// its firmware (the firmware's 2 MiB, then the image's 2.1 MiB from
+/// 0x8020_0000, then the device tree at 0x8060_0000).
+const RAM: usize = 8 << 20;
 
-/// What every test runs on: both kernels.
+/// Scratch RAM, at physical addresses near the end of the machine's RAM,
+/// far above either kernel image and the device tree: buffers for the debug
+/// console, and code a started hart runs. Free while the kernel is stopped
+/// at kmain, before kinit() hands the pages out.
+const BUFFER: u64 = RAM_BASE + 0x7e_0000;
+const HART_CODE: u64 = RAM_BASE + 0x7f_0000;
+const RAM_END: u64 = RAM_BASE + RAM as u64;
+
+/// What every test runs on: both kernels, RV32's with its own M-mode layer
+/// (machine.S, which is the firmware's sbi.S), RV64's on the firmware.
 const WIDTHS: [Xlen; 2] = [Xlen::Rv32, Xlen::Rv64];
+
+/// The machine a kernel of `xlen` runs on: RV64's with Camelot's firmware.
+fn config(xlen: Xlen) -> MachineConfig {
+    MachineConfig {
+        xlen,
+        ram_size: RAM,
+        bios: match xlen {
+            Xlen::Rv32 => grail::Bios::None,
+            Xlen::Rv64 => grail::Bios::Default,
+        },
+        ..MachineConfig::default()
+    }
+}
+
+/// The ELF the SBI's symbols are in: the RV32 kernel, which carries it, or
+/// the firmware.
+fn sbi_elf(xlen: Xlen) -> grail::elf::Elf {
+    match xlen {
+        Xlen::Rv32 => grail::elf::parse(&std::fs::read(kernel_file(xlen)).unwrap()).unwrap(),
+        Xlen::Rv64 => grail::elf::parse(grail::firmware::FIRMWARE_ELF).unwrap(),
+    }
+}
 
 fn kernel_file(xlen: Xlen) -> PathBuf {
     let name = match xlen {
@@ -59,6 +89,8 @@ fn kernel_file(xlen: Xlen) -> PathBuf {
 struct Sbi {
     m: Machine,
     elf: grail::elf::Elf,
+    /// Where the SBI's symbols are ([`sbi_elf`]).
+    fw: grail::elf::Elf,
     xlen: Xlen,
     /// kmain's address, where the ecall is: the pc runs from here to here + 4.
     kmain: u64,
@@ -80,31 +112,45 @@ impl Sbi {
         let file = std::fs::read(kernel_file(xlen)).unwrap();
         let elf = grail::elf::parse(&file).unwrap();
         let mut m = Machine::new(MachineConfig {
-            xlen,
             harts,
-            ..MachineConfig::default()
+            ..config(xlen)
         })
         .unwrap();
         m.cpu.bus.uart.capture = true;
         m.load_elf(&file).unwrap();
         let kmain = elf.symbol("kmain").unwrap();
-        let mut sbi = Sbi { m, elf, xlen, kmain };
+        let fw = sbi_elf(xlen);
+        let mut sbi = Sbi {
+            m,
+            elf,
+            fw,
+            xlen,
+            kmain,
+        };
         sbi.step_until(|m| m.cpu.hart(0).pc == kmain);
         assert_eq!(sbi.m.cpu.hart(0).mode, Mode::S);
         sbi
     }
 
+    /// A kernel symbol's address (a link address on RV64: see `pa`).
     fn sym(&self, name: &str) -> u64 {
         self.elf
             .symbol(name)
             .unwrap_or_else(|| panic!("no symbol {name}"))
     }
 
+    /// An SBI symbol's physical address, where M-mode reaches it.
+    fn fw_sym(&self, name: &str) -> u64 {
+        self.fw
+            .symbol(name)
+            .unwrap_or_else(|| panic!("no SBI symbol {name}"))
+    }
+
     /// The physical address of kernel address `va`.
     fn pa(&self, va: u64) -> u64 {
         match self.xlen {
             Xlen::Rv32 => va,
-            Xlen::Rv64 => va - RV64_LINK + RAM_BASE,
+            Xlen::Rv64 => va - RV64_LINK + RV64_LOAD,
         }
     }
 
@@ -352,7 +398,7 @@ fn send_ipi_interrupts_the_harts_in_its_mask() {
         assert_eq!(s.call(EXT_HSM, HSM_HART_START, &[1, HART_CODE, 0]), (0, 0));
         s.step_until(|m| m.cpu.hart(1).pc == HART_CODE);
         let word = u64::from(xlen.bits() / 8);
-        let state3 = s.pa(s.sym("machine_scratch")) + 3 * 16 * word + 6 * word;
+        let state3 = s.fw_sym("machine_scratch") + 3 * 16 * word + 6 * word;
         s.m.cpu
             .bus
             .load(state3, &(STATE_SUSPENDED as u32).to_le_bytes())
@@ -405,6 +451,13 @@ fn hart_start_starts_a_stopped_hart_and_hart_stop_stops_it() {
         for addr in [HART_CODE + 2, 0x1000, RAM_BASE - 4, RAM_END] {
             assert_eq!(start(&mut s, 1, addr), ERR_INVALID_ADDRESS, "{xlen:?} {addr:#x}");
         }
+        // On RV64, the firmware's own RAM (sysinfo's reserved range): S-mode
+        // may not start a hart there, as an OpenSBI domain keeps its region.
+        if xlen == Xlen::Rv64 {
+            for addr in [RAM_BASE, RAM_BASE + 0x1000, RV64_LOAD - 4] {
+                assert_eq!(start(&mut s, 1, addr), ERR_INVALID_ADDRESS, "{addr:#x}");
+            }
+        }
         assert_eq!(s.status(1), STATE_STOPPED);
 
         // hart 1 at HART_CODE: j . until the test makes it a nop, then li a7,
@@ -449,23 +502,18 @@ fn hart_start_starts_a_stopped_hart_and_hart_stop_stops_it() {
     }
 }
 
-/// Whether `pc`, an M-mode (physical) address, is in the code from label
-/// `name` up to the next label after it (machine.S's routines have no
+/// Whether `pc`, an M-mode (physical) address, is in the SBI's code from
+/// label `name` up to the next label after it (sbi.S's routines have no
 /// sizes).
 fn function_contains(s: &Sbi, name: &str, pc: u64) -> bool {
-    let pc = match s.xlen {
-        Xlen::Rv32 => pc,
-        Xlen::Rv64 => pc - RAM_BASE + RV64_LINK,
-    };
-    let start = s.sym(name);
-    let next = s
-        .elf
-        .symbols
-        .iter()
-        .map(|&(_, v)| v)
-        .filter(|&v| v > start)
-        .min()
-        .unwrap();
+    let start = s.fw_sym(name);
+    let next =
+        s.fw.symbols
+            .iter()
+            .map(|&(_, v)| v)
+            .filter(|&v| v > start)
+            .min()
+            .unwrap();
     (start..next).contains(&pc)
 }
 
@@ -488,8 +536,7 @@ fn hart_suspend_waits_for_an_interrupt() {
             Xlen::Rv64 => vec![deadline],
         };
         assert_eq!(s.call(EXT_TIME, TIME_SET_TIMER, &args), (0, 0));
-        let state = s.sym("machine_scratch") + 6 * u64::from(xlen.bits() / 8);
-        let state_pa = s.pa(state);
+        let state_pa = s.fw_sym("machine_scratch") + 6 * u64::from(xlen.bits() / 8);
         s.set_up(EXT_HSM, HSM_HART_SUSPEND, &[0, 0, 0]);
         s.step_until(|m| m.cpu.hart(0).waiting);
         assert_eq!(s.m.cpu.bus.peek(state_pa), Some(STATE_SUSPENDED as u32));
@@ -546,15 +593,31 @@ fn the_debug_console_writes_and_reads_the_uart() {
         assert_eq!(s.call(EXT_DBCN, DBCN_WRITE, &[5, BUFFER, 0]), (0, 5));
         assert_eq!(s.call(EXT_DBCN, DBCN_WRITE, &[0, BUFFER, 0]), (0, 0));
         assert_eq!(&s.printed()[printed..], "Zhello", "{xlen:?}");
-        // Memory that isn't all RAM, or above XLEN bits.
-        for (n, lo, hi) in [
+        // Memory that isn't all RAM, or above XLEN bits; on RV64 the
+        // firmware's RAM too, any byte of it.
+        let mut bad = vec![
             (1, BUFFER, 1),
             (4, 0x1000, 0),
             (16, RAM_END - 8, 0),
             (1, RAM_END, 0),
-        ] {
-            assert_eq!(s.call(EXT_DBCN, DBCN_WRITE, &[n, lo, hi]), (ERR_INVALID_PARAM, 0));
+        ];
+        if xlen == Xlen::Rv64 {
+            bad.extend([(1, RAM_BASE, 0), (8, RV64_LOAD - 4, 0), (1, RV64_LOAD - 1, 0)]);
+            s.m.cpu.bus.load(RV64_LOAD, b"k").unwrap();
+        }
+        for (n, lo, hi) in bad {
+            assert_eq!(
+                s.call(EXT_DBCN, DBCN_WRITE, &[n, lo, hi]),
+                (ERR_INVALID_PARAM, 0),
+                "{xlen:?} {n} at {lo:#x}"
+            );
             assert_eq!(s.call(EXT_DBCN, DBCN_READ, &[n, lo, hi]), (ERR_INVALID_PARAM, 0));
+        }
+        if xlen == Xlen::Rv64 {
+            // Right after it: the kernel's RAM.
+            let printed = s.printed().len();
+            assert_eq!(s.call(EXT_DBCN, DBCN_WRITE, &[1, RV64_LOAD, 0]), (0, 1));
+            assert_eq!(&s.printed()[printed..], "k");
         }
         // Reading: what the UART has, up to the count, without waiting.
         s.m.set_uart_input(kernel::typed(b"ab"));
@@ -589,7 +652,7 @@ fn machine_power_off_turns_exit_codes_into_reset_reasons() {
             h.pc = power_off;
             let mut reasons = Vec::new();
             // M-mode runs at physical addresses.
-            let machine_vec = s.pa(s.sym("machine_vec"));
+            let machine_vec = s.fw_sym("machine_vec");
             let r = s.m.run(Some(100_000), |cpu| {
                 if cpu.pc == machine_vec && cpu.x[17] == EXT_SRST {
                     reasons.push((cpu.x[10], cpu.x[11] & 0xffff_ffff));
@@ -611,7 +674,7 @@ fn machine_power_off_says_so_and_falls_back_when_the_reason_is_refused() {
     for xlen in WIDTHS {
         let mut s = Sbi::at_kmain(xlen, 1);
         s.m.set_uart_input(kernel::typed(b"exit 7\n"));
-        let machine_vec = s.pa(s.sym("machine_vec"));
+        let machine_vec = s.fw_sym("machine_vec");
         let mut reasons = Vec::new();
         for _ in 0..BOOT_MAX_STEPS {
             if s.m.cpu.bus.exit.is_some() {
@@ -685,7 +748,7 @@ fn a_hart_the_sbi_cannot_start_is_reported_and_left_out() {
     // other three.
     for xlen in WIDTHS {
         let mut s = four_harts_at_kmain(xlen);
-        let block = s.pa(s.sym("machine_scratch")) + 2 * 16 * u64::from(xlen.bits() / 8);
+        let block = s.fw_sym("machine_scratch") + 2 * 16 * u64::from(xlen.bits() / 8);
         let state = block + 6 * u64::from(xlen.bits() / 8);
         s.m.cpu.bus.load(state, &0u32.to_le_bytes()).unwrap();
         let r = s.m.run(Some(BOOT_MAX_STEPS), |_| {});
@@ -764,7 +827,7 @@ fn a_hart_that_comes_online_too_late_stops_itself() {
         assert!(out.contains("\nsmp: 3 harts running\n"), "{xlen:?}:\n{out}");
         // Back in the SBI, waiting for a hart_start.
         let word = u64::from(xlen.bits() / 8);
-        let state = s.pa(s.sym("machine_scratch")) + 2 * 16 * word + 6 * word;
+        let state = s.fw_sym("machine_scratch") + 2 * 16 * word + 6 * word;
         assert_eq!(s.m.cpu.bus.peek(state), Some(STATE_STOPPED as u32), "{xlen:?}");
         let h = s.m.cpu.hart(2);
         assert_eq!(h.mode, Mode::M, "{xlen:?}");
@@ -867,7 +930,7 @@ impl Ordering {
         let h = cpu.id as usize;
         let pc = match (cpu.mode, self.xlen) {
             (Mode::U, _) => return,
-            (_, Xlen::Rv64) if cpu.pc >= RV64_LINK => cpu.pc - RV64_LINK + RAM_BASE,
+            (_, Xlen::Rv64) if cpu.pc >= RV64_LINK => cpu.pc - RV64_LINK + RV64_LOAD,
             _ => cpu.pc,
         };
         let Some(word) = cpu.bus.peek(pc) else { return };
@@ -939,16 +1002,14 @@ fn every_ipi_comes_after_a_fence_and_s_mode_never_touches_the_sbi() {
     // hart_start, the TLB shootdowns and the idle kicks.
     for xlen in WIDTHS {
         let file = std::fs::read(kernel_file(xlen)).unwrap();
-        let elf = grail::elf::parse(&file).unwrap();
         let mut m = Machine::new(MachineConfig {
-            xlen,
             harts: 4,
-            ..MachineConfig::default()
+            ..config(xlen)
         })
         .unwrap();
         m.load_elf(&file).unwrap();
         m.set_uart_input(kernel::typed(b"ding & dong\nwait\nexit\n"));
-        let scratch = elf.symbol("machine_scratch").unwrap();
+        let scratch = sbi_elf(xlen).symbol("machine_scratch").unwrap();
         let size = 4 * 16 * u64::from(xlen.bits() / 8);
         let mut watch = Ordering {
             xlen,

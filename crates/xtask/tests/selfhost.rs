@@ -321,20 +321,24 @@ fn image_of(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)], xlen: Xle
     fs.finish()
 }
 
-/// The machine of `xlen`, as Grail names it, with the default 4 MiB of RAM.
+/// The machine of `xlen`, as Grail names it: an RV32 one with the default
+/// 4 MiB of RAM; an RV64 one on Camelot's firmware, the kernel's SBI, with
+/// the firmware's 2 MiB on top of those 4.
 fn machine_config(xlen: Xlen) -> MachineConfig {
-    MachineConfig {
-        xlen: match xlen {
-            Xlen::Rv32 => grail::Xlen::Rv32,
-            Xlen::Rv64 => grail::Xlen::Rv64,
+    match xlen {
+        Xlen::Rv32 => MachineConfig::default(),
+        Xlen::Rv64 => MachineConfig {
+            xlen: grail::Xlen::Rv64,
+            bios: grail::Bios::Default,
+            ram_size: grail::DEFAULT_RAM_SIZE + grail::firmware::FW_SIZE as usize,
+            ..MachineConfig::default()
         },
-        ..MachineConfig::default()
     }
 }
 
 /// Boots the `xlen` disk kernel on `image`, types `input` (ending with
-/// `exit`). Returns what it printed and the disk afterwards. The machine has
-/// the default 4 MiB of RAM, which the assembler is written to fit in.
+/// `exit`). Returns what it printed and the disk afterwards. The kernel has
+/// 4 MiB of RAM, which the assembler is written to fit in.
 fn boot(image: Vec<u8>, input: &str, max_steps: u64, xlen: Xlen) -> (String, Vec<u8>) {
     let config = machine_config(xlen);
     let disk = MemDisk::from_image(image).unwrap();
@@ -763,7 +767,12 @@ fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs(xlen: Xlen) {
     }
     let elf = Fs::open(&disk).unwrap().read_file("/out/hello").unwrap();
     assert!(elf == host.elf, "/out/hello is not {}", ex.elf_name(xlen));
-    let mut m = Machine::new(machine_config(xlen)).unwrap();
+    // Bare metal: in M-mode, with no firmware.
+    let bare = MachineConfig {
+        bios: grail::Bios::None,
+        ..machine_config(xlen)
+    };
+    let mut m = Machine::new(bare).unwrap();
     m.cpu.bus.uart.capture = true;
     m.load_elf(&elf).unwrap();
     assert_eq!(m.run(Some(10_000_000), |_| {}), RunResult::Exited(0));
