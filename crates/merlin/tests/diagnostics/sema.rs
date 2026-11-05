@@ -312,5 +312,12 @@ pub fn cases() -> Vec<Case> {
         case("void a(void) { extern int w; } int b(void) { return w; }", &["1:53: error: use of undeclared identifier 'w'"]),
         case("int f(void) { static int y; extern int y; return y; }", &["1:40: error: non-static declaration of 'y' follows static declaration", "1:26: note: previous definition is here"]),
         case("int g; int f(void) { extern int g(void); return 0; }", &["1:33: error: redefinition of 'g' as different kind of symbol", "1:5: note: previous definition is here"]),
+        // Types named as their declarations spelled them, as clang names
+        // them: a typedef's name, what it stands for after it.
+        case("typedef int T; T *f(long *p) { return p; }", &["1:39: error: incompatible pointer types returning 'long *' from a function with result type 'T *' (aka 'int *') [-Wincompatible-pointer-types]"]),
+        case("typedef unsigned long size_t; typedef int *IP; void g(IP q); int f(size_t *n, char *c) { IP p = c; g(c); p = n; return 0; }", &["1:93: error: incompatible pointer types initializing 'IP' (aka 'int *') with an expression of type 'char *' [-Wincompatible-pointer-types]", "1:102: error: incompatible pointer types passing 'char *' to parameter of type 'IP' (aka 'int *') [-Wincompatible-pointer-types]", "1:58: note: passing argument to parameter 'q' here", "1:108: error: incompatible pointer types assigning to 'IP' (aka 'int *') from 'size_t *' (aka 'unsigned long *') [-Wincompatible-pointer-types]"]),
+        case("typedef struct s { int a; } S; enum e { A }; int f(S v, enum e x) { int *p = v; p = x; return 0; }", &["1:74: error: initializing 'int *' with an expression of incompatible type 'S' (aka 'struct s')", "1:83: error: incompatible integer to pointer conversion assigning to 'int *' from 'enum e' [-Wint-conversion]"]),
+        case("typedef const int CI; int f(CI *c) { int *p = c; return *p; }", &["1:43: warning: initializing 'int *' with an expression of type 'CI *' (aka 'const int *') discards qualifiers [-Wincompatible-pointer-types-discards-qualifiers]"]),
+        case("struct q { long *m; }; typedef char C; int f(struct q *s, C *c) { s->m = c; return (int)(C)1; }", &["1:72: error: incompatible pointer types assigning to 'long *' from 'C *' (aka 'char *') [-Wincompatible-pointer-types]"]),
     ]
 }

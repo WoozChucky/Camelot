@@ -776,10 +776,42 @@ impl Type {
         }
     }
 
+    /// The type as clang names it in a message, quoted, as a declaration
+    /// `spelled` it: through a typedef name, its name with what it stands
+    /// for after it (`'T *' (aka 'int *')`); as an enum, `'enum e'`.
+    pub fn named(&self, spelled: &Spelled) -> String {
+        let plain = self.declare("");
+        let base = match &spelled.0 {
+            Some(Spelling::Typedef(t)) => (t.ty.clone(), t.name.clone()),
+            Some(Spelling::Enum(e)) => match &e.tag {
+                Some(tag) => (e.ty.clone(), format!("enum {tag}")),
+                None => return format!("'{plain}'"),
+            },
+            None => return format!("'{plain}'"),
+        };
+        let sugared = self.declare_with("", Some((&base.0, &base.1)));
+        match &spelled.0 {
+            Some(Spelling::Typedef(_)) if sugared != plain => format!("'{sugared}' (aka '{plain}')"),
+            _ => format!("'{sugared}'"),
+        }
+    }
+
     /// The type as a C declaration of `name`, e.g. `char *argv[4]`. With an
     /// empty name it is the type name clang prints, e.g. `int (*)[3]`.
     pub fn declare(&self, name: &str) -> String {
-        fn go(t: &Type, inner: String) -> String {
+        self.declare_with(name, None)
+    }
+
+    /// [`Self::declare`], with the part of the type that is `base.0`
+    /// written as `base.1` (a typedef's name).
+    fn declare_with(&self, name: &str, base: Option<(&Type, &str)>) -> String {
+        fn go(t: &Type, inner: String, base: Option<(&Type, &str)>) -> String {
+            if let Some((b, written)) = base {
+                if t == b {
+                    return join(written, &inner);
+                }
+            }
+            let go = |t: &Type, inner: String| go(t, inner, base);
             match t {
                 Type::Void => join("void", &inner),
                 Type::Int(k) => join(k.name(), &inner),
@@ -827,7 +859,7 @@ impl Type {
                 format!("{base} {inner}")
             }
         }
-        go(self, name.to_string())
+        go(self, name.to_string(), base)
     }
 }
 

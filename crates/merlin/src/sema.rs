@@ -380,7 +380,7 @@ fn arity_error(ft: &FuncType, args: &[Expr], sig: Option<(&str, &FuncSig)>, clos
     let (have, arity) = (args.len(), ft.params.len());
     // The one parameter of a function called by name, if it is named.
     let single = || {
-        let (name, _) = sig?.1.params.first()?;
+        let (name, ..) = sig?.1.params.first()?;
         (!name.is_empty()).then_some(name)
     };
     let e = if have > arity && !ft.variadic {
@@ -444,7 +444,7 @@ struct FuncSig {
     /// The parameters of the latest declaration, their names (empty for one
     /// it leaves unnamed) and where they are, which clang's messages and
     /// notes on a call name.
-    params: Vec<(String, Pos)>,
+    params: Vec<(String, Pos, Spelled)>,
     /// Declared at file scope (not only in a block, [`Global::hidden`]).
     visible: bool,
 }
@@ -456,6 +456,7 @@ struct GlobalVar {
     /// (not `extern`: a tentative definition is one), for clang's notes.
     pos: Pos,
     defines: bool,
+    spelled: Spelled,
     /// The declarator with an initializer, as (item, declarator) indices,
     /// and where it is.
     init: Option<(usize, usize)>,
@@ -493,6 +494,7 @@ impl Global {
                 is_static: false,
                 pos,
                 defines: false,
+                spelled: Spelled::default(),
                 init: None,
                 init_pos: None,
                 tentative: None,
@@ -548,7 +550,11 @@ impl Checker {
             inline_only: f.is_inline && !f.is_extern,
             pos: f.pos,
             def: f.body.is_some().then_some(f.pos),
-            params: f.params.iter().map(|p| (p.name.clone(), p.pos)).collect(),
+            params: f
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), p.pos, p.spelled.clone()))
+                .collect(),
             visible: true,
         };
         // Functions are visible from their declaration onwards, so a function can
@@ -618,6 +624,9 @@ impl Checker {
         let body = f.body.as_mut().expect("checked above");
         let mut c = FnChecker {
             globals: &self.globals,
+            spellings: f.params.iter().map(|p| (p.pos, p.spelled.clone())).collect(),
+            ret_spelled: f.ret_spelled.clone(),
+            init_spelled: Spelled::default(),
             written: &self.written,
             func: &f.name,
             ret: &f.ret,
@@ -762,6 +771,7 @@ impl Checker {
                 prev.pos = d.pos;
                 prev.defines = d.storage != Storage::Extern;
                 prev.visible = true;
+                prev.spelled = d.spelled.clone();
             }
             None => {
                 self.globals.insert(
@@ -771,6 +781,7 @@ impl Checker {
                         is_static,
                         pos: d.pos,
                         defines: d.storage != Storage::Extern,
+                        spelled: d.spelled.clone(),
                         init,
                         init_pos: init.map(|_| d.pos),
                         tentative,
@@ -787,6 +798,7 @@ impl Checker {
             self.literals.len(),
             self.xlen,
         );
+        fc.init_spelled = d.spelled.clone();
         let checked = fc.init_object(&mut d.ty, d_init, true, d.pos);
         // The warnings of what an initializer does when it runs come after
         // its other diagnostics.
@@ -897,25 +909,25 @@ enum Conv {
 }
 
 impl Conv {
-    /// What converts what, as clang words it: `from` is the source type
-    /// as messages name it, quotes included.
-    fn phrase(self, to: &Type, from: &str) -> String {
+    /// What converts what, as clang words it: `to` and `from` are the
+    /// types as messages name them, quotes included ([`Type::named`]).
+    fn phrase(self, to: &str, from: &str) -> String {
         match self {
-            Conv::Assign => format!("assigning to '{to}' from {from}"),
-            Conv::Init => format!("initializing '{to}' with an expression of type {from}"),
-            Conv::Arg => format!("passing {from} to parameter of type '{to}'"),
-            Conv::Return => format!("returning {from} from a function with result type '{to}'"),
+            Conv::Assign => format!("assigning to {to} from {from}"),
+            Conv::Init => format!("initializing {to} with an expression of type {from}"),
+            Conv::Arg => format!("passing {from} to parameter of type {to}"),
+            Conv::Return => format!("returning {from} from a function with result type {to}"),
         }
     }
 
     /// clang's message for a conversion between types C does not convert
     /// between at all (a struct and anything else, `void`).
-    fn incompatible(self, to: &Type, from: &str) -> String {
+    fn incompatible(self, to: &str, from: &str) -> String {
         match self {
-            Conv::Assign => format!("assigning to '{to}' from incompatible type {from}"),
-            Conv::Init => format!("initializing '{to}' with an expression of incompatible type {from}"),
-            Conv::Arg => format!("passing {from} to parameter of incompatible type '{to}'"),
-            Conv::Return => format!("returning {from} from a function with incompatible result type '{to}'"),
+            Conv::Assign => format!("assigning to {to} from incompatible type {from}"),
+            Conv::Init => format!("initializing {to} with an expression of incompatible type {from}"),
+            Conv::Arg => format!("passing {from} to parameter of incompatible type {to}"),
+            Conv::Return => format!("returning {from} from a function with incompatible result type {to}"),
         }
     }
 }
@@ -1018,6 +1030,13 @@ struct Pending {
 
 struct FnChecker<'a> {
     globals: &'a HashMap<String, Global>,
+    /// How the type of each local and parameter was spelled, by where it
+    /// is declared, for clang's names of types ([`Type::named`]); of the
+    /// function's result; and of the object an initializer being checked
+    /// initializes.
+    spellings: HashMap<Pos, Spelled>,
+    ret_spelled: Spelled,
+    init_spelled: Spelled,
     /// How the source was written ([`Written`]).
     written: &'a Written,
     /// The function being checked (empty at file scope).
@@ -1083,6 +1102,9 @@ impl<'a> FnChecker<'a> {
     ) -> Self {
         FnChecker {
             globals,
+            spellings: HashMap::new(),
+            ret_spelled: Spelled::default(),
+            init_spelled: Spelled::default(),
             written,
             func: "",
             ret: &VOID,
@@ -1468,7 +1490,10 @@ impl<'a> FnChecker<'a> {
                         let msg = format!("void function '{}' should not return a value", self.func);
                         self.errors.push(Error::new(pos, msg).flagged("return-mismatch"));
                     }
-                } else if self.convert(e, ret, Conv::Return, begin(e)).is_ok() {
+                } else if self
+                    .convert(e, ret, &self.ret_spelled.clone(), Conv::Return, begin(e))
+                    .is_ok()
+                {
                     coerce(e, ret);
                 }
                 self.full_expression(e);
@@ -1695,6 +1720,7 @@ impl<'a> FnChecker<'a> {
     }
 
     fn local_var(&mut self, d: &mut Declarator) {
+        self.spellings.insert(d.pos, d.spelled.clone());
         // A block's `extern` declaration, or a function's: in the block the
         // name is the object or function outside it, which it defines
         // nothing of.
@@ -1753,6 +1779,7 @@ impl<'a> FnChecker<'a> {
             let var = VarRef::Global(label);
             self.bind(&d.name, var.clone(), &d.ty, d.pos, "");
             if let Some(init) = &mut d.init {
+                self.init_spelled = d.spelled.clone();
                 if self.init_object(&mut d.ty, init, true, d.pos).is_err() {
                     return;
                 }
@@ -1770,6 +1797,7 @@ impl<'a> FnChecker<'a> {
             }
             d.var = Some(VarRef::Local(id));
             if let Some(init) = &mut d.init {
+                self.init_spelled = d.spelled.clone();
                 if self.init_object(&mut d.ty, init, false, d.pos).is_err() {
                     return;
                 }
@@ -1788,13 +1816,16 @@ impl<'a> FnChecker<'a> {
     /// compound literal of its type may initialize as its list would (a GNU
     /// extension clang takes, [`Self::init_by_literal`]).
     fn init_object(&mut self, ty: &mut Type, init: &mut Init, constant: bool, at: Pos) -> Checked {
-        match self.init_by_literal(ty, init, constant, at) {
+        let checked = match self.init_by_literal(ty, init, constant, at) {
             Some(checked) => checked,
             None => match init {
                 Init::Expr(e) => self.init_expr(ty, e, constant, false, Some(at)),
                 _ => self.init(ty, init, constant, Some(at)),
             },
-        }
+        };
+        // The declarator's spelling is its own initializer's only.
+        self.init_spelled = Spelled::default();
+        checked
     }
 
     /// An array or struct initialized by a compound literal of its type,
@@ -2332,7 +2363,12 @@ impl<'a> FnChecker<'a> {
                 if !checked {
                     self.value(e, constant)?;
                 }
-                self.convert(e, ty, Conv::Init, at)?;
+                let spelled = if decl.is_some() {
+                    std::mem::take(&mut self.init_spelled)
+                } else {
+                    Spelled::default()
+                };
+                self.convert(e, ty, &spelled, Conv::Init, at)?;
                 coerce(e, ty);
                 self.full_expression(e);
                 if constant && consteval::eval(e, self.xlen).is_none() {
@@ -2348,10 +2384,11 @@ impl<'a> FnChecker<'a> {
     /// Checks whether `e`'s value may be converted to `to` as if by
     /// assignment ([`Self::convert_value`]), with clang's diagnostics at
     /// `at`.
-    fn convert(&mut self, e: &Expr, to: &Type, how: Conv, at: Pos) -> Checked {
+    fn convert(&mut self, e: &Expr, to: &Type, to_spelled: &Spelled, how: Conv, at: Pos) -> Checked {
         let null = consteval::is_null_pointer(e, self.xlen);
         let from = e.ty.clone();
-        self.convert_value(e, &from, &format!("'{from}'"), null, to, how, at)?;
+        let named = from.named(&self.spelled_of(e));
+        self.convert_value(e, &from, &named, null, to, to_spelled, how, at)?;
         self.constant_conversion(e, to);
         Ok(())
     }
@@ -2359,10 +2396,16 @@ impl<'a> FnChecker<'a> {
     /// An argument converted to its parameter's type `to`: at the argument,
     /// with clang's note on the parameter `param` (its name and where it
     /// is) of a function called by name.
-    fn convert_arg(&mut self, e: &Expr, to: &Type, param: Option<&(String, Pos)>) -> Checked {
+    fn convert_arg(
+        &mut self,
+        e: &Expr,
+        to: &Type,
+        to_spelled: Spelled,
+        param: Option<&(String, Pos, Spelled)>,
+    ) -> Checked {
         let mark = self.errors.len();
-        let checked = self.convert(e, to, Conv::Arg, begin(e));
-        if let (Some((name, pos)), true) = (param, self.errors.len() > mark) {
+        let checked = self.convert(e, to, &to_spelled, Conv::Arg, begin(e));
+        if let (Some((name, pos, _)), true) = (param, self.errors.len() > mark) {
             let what = if name.is_empty() {
                 "passing argument to parameter here".to_string()
             } else {
@@ -2394,10 +2437,12 @@ impl<'a> FnChecker<'a> {
         named: &str,
         null: bool,
         to: &Type,
+        to_spelled: &Spelled,
         how: Conv,
         at: Pos,
     ) -> Checked {
         let to = to.unqual();
+        let to_named = to.named(to_spelled);
         let value = from.decay();
         let (problem, flag) = match (to, &value) {
             (Type::Int(_), Type::Int(_)) => return Ok(()),
@@ -2419,7 +2464,7 @@ impl<'a> FnChecker<'a> {
                     )
                 } else if au == bu || au.is_void() || bu.is_void() {
                     if !a.quals().contains(b.quals()) {
-                        let msg = format!("{} discards qualifiers", how.phrase(to, named));
+                        let msg = format!("{} discards qualifiers", how.phrase(&to_named, named));
                         let flag = "incompatible-pointer-types-discards-qualifiers";
                         self.errors.push(Error::warning(at, msg, flag));
                     }
@@ -2434,7 +2479,7 @@ impl<'a> FnChecker<'a> {
                     };
                     let msg = format!(
                         "{} converts between pointers to integer types {why}",
-                        how.phrase(to, named)
+                        how.phrase(&to_named, named)
                     );
                     self.errors.push(Error::warning(at, msg, "pointer-sign"));
                     return Ok(());
@@ -2443,7 +2488,7 @@ impl<'a> FnChecker<'a> {
                     // qualifiers further in, which clang only warns of.
                     let msg = format!(
                         "{} discards qualifiers in nested pointer types",
-                        how.phrase(to, named)
+                        how.phrase(&to_named, named)
                     );
                     let flag = "incompatible-pointer-types-discards-qualifiers";
                     self.errors.push(Error::warning(at, msg, flag));
@@ -2464,9 +2509,9 @@ impl<'a> FnChecker<'a> {
         };
         let hint = conversion_hint(e, from, to);
         let msg = if problem.is_empty() {
-            format!("{}{hint}", how.incompatible(to, named))
+            format!("{}{hint}", how.incompatible(&to_named, named))
         } else {
-            format!("{problem} {}{hint}", how.phrase(to, named))
+            format!("{problem} {}{hint}", how.phrase(&to_named, named))
         };
         let e = Error::new(at, msg);
         match flag {
@@ -2585,6 +2630,40 @@ impl<'a> FnChecker<'a> {
                 base, arrow: false, ..
             } => self.in_register(base),
             _ => false,
+        }
+    }
+
+    /// How the type of `e` was spelled, where its declaration says: of a
+    /// variable, a member, a cast (and so how clang names it).
+    fn spelled_of(&self, e: &Expr) -> Spelled {
+        match &e.kind {
+            ExprKind::Var { name, .. } => match self.lookup(name) {
+                Some((_, _, pos)) => self.spellings.get(pos).cloned().unwrap_or_default(),
+                None => match self.global(name) {
+                    Some(Global::Var(g)) => g.spelled.clone(),
+                    _ => Spelled::default(),
+                },
+            },
+            ExprKind::Member {
+                base, name, arrow, ..
+            } => {
+                let outer = if *arrow {
+                    base.ty.decay().pointee().cloned()
+                } else {
+                    Some(base.ty.clone())
+                };
+                outer
+                    .as_ref()
+                    .and_then(Type::record)
+                    .and_then(|r| Some(r.body()?.member(name)?.spelled.clone()))
+                    .unwrap_or_default()
+            }
+            ExprKind::Cast {
+                implicit: false,
+                spelled,
+                ..
+            } => spelled.clone(),
+            _ => Spelled::default(),
         }
     }
 
@@ -2782,7 +2861,8 @@ impl<'a> FnChecker<'a> {
                 self.assignable(target, pos)?;
                 match op {
                     None => {
-                        self.convert(value, &target.ty, Conv::Assign, pos)?;
+                        let spelled = self.spelled_of(target);
+                        self.convert(value, &target.ty, &spelled, Conv::Assign, pos)?;
                         coerce(value, &target.ty);
                     }
                     Some(op) => {
@@ -2800,7 +2880,17 @@ impl<'a> FnChecker<'a> {
                         } else {
                             format!("'{r}'")
                         };
-                        self.convert_value(value, &r, &named, false, &target.ty, Conv::Assign, pos)?;
+                        let spelled = self.spelled_of(target);
+                        self.convert_value(
+                            value,
+                            &r,
+                            &named,
+                            false,
+                            &target.ty,
+                            &spelled,
+                            Conv::Assign,
+                            pos,
+                        )?;
                         self.bad_shift_or_divisor(*op, pos, id, &t, value);
                     }
                 }
@@ -3065,7 +3155,13 @@ impl<'a> FnChecker<'a> {
                     // Each argument converts to its parameter's type as if
                     // assigned, with clang's note on the parameter.
                     let param = sig.and_then(|(_, s)| s.params.get(i));
-                    if self.convert_arg(a, p, param).is_err() {
+                    // The parameter's spelling: its declaration's, else the
+                    // function type's (a pointer's).
+                    let spelled = match param {
+                        Some((_, _, s)) => s.clone(),
+                        None => ft.spelled.0.get(i).map(|(_, s)| s.clone()).unwrap_or_default(),
+                    };
+                    if self.convert_arg(a, p, spelled, param).is_err() {
                         ok = false;
                         continue;
                     }
