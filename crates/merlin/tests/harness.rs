@@ -1308,14 +1308,15 @@ fn data_units(d: &str) -> Option<Vec<Unit>> {
 }
 
 /// merlin names the symbols it makes as clang does (the spec's "Symbol
-/// names"): for every case, and every C file of the kernel and its user
-/// programs, at both widths, the objects merlin's assembly defines are
-/// clang's (`-O0 -S`), by name, size and contents (each byte, and the
-/// symbol each address is of, so that two names swapped show): the string
-/// literals (`.L.str`,
-/// `.L.str.N`), the compound literals at file scope (`.compoundliteral`,
+/// names"): for every case, every C file of the multi-file programs and
+/// every C file of the kernel and its user programs, at both widths, the
+/// objects merlin's assembly defines are clang's (`-O0 -S`), by name, size
+/// and contents (each byte, and the symbol each address is of, so that two
+/// names swapped show): the string literals (`.L.str`, `.L.str.N`), the
+/// compound literals at file scope (`.compoundliteral`,
 /// `.compoundliteral.N`), the `static` locals (`f.x`, `f.x.N`) and the
-/// globals. The numbers come from one counter, in the order the symbols are
+/// globals, which keep their own names (`clang_name_var`, `clang_name_func`:
+/// a C name a constant had before). The numbers come from one counter, in the order the symbols are
 /// emitted, so a difference in that order, or a name clang takes that merlin
 /// does not count, changes them. Left out of clang's are the constants it
 /// copies a local's initializer from, `__const.f.a` or an array's
@@ -1330,6 +1331,10 @@ fn symbol_names_are_clangs() {
         .into_iter()
         .map(|c| (c.path, Vec::new()))
         .collect();
+    for m in multi_cases() {
+        let includes: Vec<PathBuf> = m.include.into_iter().collect();
+        sources.extend(m.c_files.into_iter().map(|c| (c, includes.clone())));
+    }
     sources.extend(kernel_c_files());
     let mut failures = Vec::new();
     for x in WIDTHS {

@@ -453,6 +453,12 @@
 //! ([`FileGen::defined`]). Code control cannot reach takes no names
 //! ("Unreachable code" below).
 //!
+//! A function or file-scope variable keeps its own name, which other files
+//! link to: LLVM never renames one. When a constant counted has its name
+//! (`int constinit = 3;` after an array copied from clang's `constinit`),
+//! the definition takes the name over, as clang's does, a variable with
+//! one more number, a function with none ([`FileGen::take_over`]).
+//!
 //! ## Control flow
 //!
 //! Conditions are evaluated into `a0` and tested with `beqz`/`bnez`. Jumps go
@@ -614,6 +620,7 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
         created: Vec::new(),
         created_set: HashSet::new(),
         referred_as: HashMap::new(),
+        held: HashSet::new(),
         chunks: HashMap::new(),
         dry: false,
     };
@@ -1031,6 +1038,10 @@ struct FileGen<'a> {
     /// The type a variable was declared with where a reference made its
     /// symbol, before its definition was emitted ([`Self::defined`]).
     referred_as: HashMap<String, Type>,
+    /// The names of the constants merlin counts but does not output
+    /// ([`Self::take_name`]) that a function or variable could have, until
+    /// its definition takes the name over.
+    held: HashSet<String>,
     /// The output of each symbol emitted, in pieces by section.
     chunks: HashMap<String, Vec<(&'static str, String)>>,
     /// A function's first pass is being generated, which makes nothing
@@ -1068,7 +1079,16 @@ impl<'a> FileGen<'a> {
             return;
         }
         if self.created_set.insert(sym.to_string()) {
-            let name = self.symbols.insert(symbol_base(sym));
+            // A function or file-scope variable keeps its own name, which
+            // linking needs: LLVM never renames one ([`Self::take_over`]).
+            // The names sema makes up (`f.x`, `.compoundliteral`, keys with
+            // a `#`) are made unique.
+            let name = if is_c_name(sym) {
+                self.symbols.taken.insert(sym.to_string());
+                sym.to_string()
+            } else {
+                self.symbols.insert(symbol_base(sym))
+            };
             self.names.insert(sym.to_string(), name);
             self.created.push(sym.to_string());
             if let Some(&k) = self.by_symbol.get(sym) {
@@ -1121,7 +1141,14 @@ impl<'a> FileGen<'a> {
     ///   int *p = a;
     ///   int a[3] = {1, 2, 3};    ([3 x i32]: a new global, a.1, renamed a)
     /// ```
+    ///
+    /// The new global is made where the definition is, after the symbols
+    /// made so far: the output has the variable there.
     fn defined(&mut self, d: &Declarator, sym: &str) {
+        if self.take_over(sym, true) {
+            self.referred_as.remove(sym);
+            return;
+        }
         let Some(referred) = self.referred_as.remove(sym) else {
             return;
         };
@@ -1132,7 +1159,36 @@ impl<'a> FileGen<'a> {
         if !same {
             let name = self.name(sym).to_string();
             self.symbols.rename(&name);
+            self.made_now(sym);
         }
+    }
+
+    /// The definition of function or variable `sym` (a C name), when a
+    /// constant clang made, counted but not output ([`Self::take_name`]),
+    /// has its name: `constinit`, of an array copied from it, before `int
+    /// constinit = 3;`. A reference to the symbol finds that constant
+    /// (`GetGlobalValue`), so clang makes the symbol's global only for its
+    /// definition, which takes the name over (`takeName`): a variable is
+    /// named `constinit.N` for a moment (`GetOrCreateLLVMGlobal`), one more
+    /// number; a function is made without a name
+    /// (`GetOrCreateLLVMFunction`), none. Either is made there, after the
+    /// symbols made so far. Whether the name was the constant's.
+    fn take_over(&mut self, sym: &str, variable: bool) -> bool {
+        if self.dry || !self.held.remove(sym) {
+            return false;
+        }
+        if variable {
+            self.symbols.rename(sym);
+        }
+        self.made_now(sym);
+        true
+    }
+
+    /// Moves symbol `sym`, made already, to after every symbol made so
+    /// far: clang made its global again, now.
+    fn made_now(&mut self, sym: &str) {
+        self.created.retain(|s| s != sym);
+        self.created.push(sym.to_string());
     }
 
     /// Whether the constant clang makes of `init`, the initializer of an
@@ -1310,6 +1366,7 @@ impl<'a> FileGen<'a> {
         let xlen = self.xlen;
         let body = f.body.as_ref().expect("a definition has a body");
         self.create(&f.name);
+        self.take_over(&f.name, false);
         // A variadic function keeps the argument registers its named
         // parameters leave free at the top of its frame.
         let Type::Func(ft) = f.ty() else {
@@ -1419,9 +1476,16 @@ impl<'a> FileGen<'a> {
     /// object for (a constant clang copies a local's initializer from,
     /// [`FuncGen::local_decl`]): the counter goes on as clang's ("Symbol
     /// names" above). A function's first pass takes none.
+    ///
+    /// The constant keeps a name a C symbol could have (`constinit`) until
+    /// that symbol's definition takes it over ([`Self::take_over`]).
     fn take_name(&mut self, base: &str) {
-        if !self.dry {
-            self.symbols.insert(base);
+        if self.dry {
+            return;
+        }
+        let name = self.symbols.insert(base);
+        if is_c_name(&name) {
+            self.held.insert(name);
         }
     }
 
@@ -1773,6 +1837,12 @@ fn referred_type<'e>(e: &'e Expr, sym: &str) -> Option<&'e Type> {
         ExprKind::Cond(c, t, f) => sub(c).or_else(|| sub(t)).or_else(|| sub(f)),
         _ => None,
     }
+}
+
+/// Whether symbol key `key` is a C name (a function or file-scope
+/// variable), not one sema makes up: those have a `.` or a `#`.
+fn is_c_name(key: &str) -> bool {
+    !key.contains(['.', '#'])
 }
 
 /// Whether `s` is visited even where control cannot reach it: clang's
