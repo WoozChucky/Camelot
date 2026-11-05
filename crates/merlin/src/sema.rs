@@ -45,7 +45,12 @@ pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
         literals: Vec::new(),
         xlen: prog.xlen,
     };
+    // What the parser evaluated away at file scope is checked where it was,
+    // after the items before it.
+    let mut unevaluated = std::mem::take(&mut prog.unevaluated);
+    let mut next = 0;
     for (i, item) in prog.items.iter_mut().enumerate() {
+        next = c.unevaluated(&mut unevaluated, next, i);
         match item {
             Item::Func(f) => c.function(f),
             Item::Decl(decls) => {
@@ -55,6 +60,8 @@ pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
             }
         }
     }
+    c.unevaluated(&mut unevaluated, next, usize::MAX);
+    prog.unevaluated = unevaluated;
     c.mark_definitions(prog);
     // File-scope compound literals: the objects their expressions name.
     let literals = std::mem::take(&mut c.literals);
@@ -70,7 +77,10 @@ pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
             }
         }
     }
-    let mut errors = c.errors;
+    // The warnings go with the program, the errors stop it.
+    let (warnings, mut errors): (Vec<Error>, Vec<Error>) = c.errors.into_iter().partition(Error::is_warning);
+    prog.warnings.extend(warnings);
+    prog.warnings.sort_by_key(|e| e.pos);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -430,6 +440,21 @@ impl Checker {
         }
     }
 
+    /// Checks the expressions of the file's scope the parser evaluated away
+    /// that come before item `before`, from `from` on; returns where the
+    /// rest start.
+    fn unevaluated(&mut self, us: &mut [(usize, Unevaluated)], from: usize, before: usize) -> usize {
+        let to = from + us[from..].iter().take_while(|(n, _)| *n <= before).count();
+        if to > from {
+            let mut fc =
+                FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len(), self.xlen);
+            for (_, u) in &mut us[from..to] {
+                fc.unevaluated(u);
+            }
+        }
+        to
+    }
+
     /// Marks the declarator that defines each global variable: the one with an
     /// initializer, or the first that is not `extern` (C's tentative
     /// definition, which then means "zero"). Only `extern` declarations: the
@@ -586,6 +611,25 @@ impl<'a> FnChecker<'a> {
         Reported
     }
 
+    /// An expression the parser evaluated away ([`Unevaluated`]): checked
+    /// as the operand of `sizeof` is, never evaluated, so a compound literal
+    /// in it is no object. One the parser could not type made its constant
+    /// an error, reported here if the expression has none of its own.
+    fn unevaluated(&mut self, u: &mut Unevaluated) {
+        let mark = self.literals.len();
+        let checked = self.expr(&mut u.expr);
+        self.literals.truncate(mark);
+        if checked.is_ok() {
+            match (&u.untyped, &u.warning) {
+                (Some((pos, msg)), _) => {
+                    self.err(*pos, msg.clone());
+                }
+                (None, Some(w)) => self.errors.push(w.clone()),
+                (None, None) => {}
+            }
+        }
+    }
+
     fn declare(&mut self, name: &str, ty: &Type, pos: Pos, what: &str) -> LocalId {
         let id = LocalId(self.locals.len());
         self.locals.push(Local {
@@ -653,6 +697,7 @@ impl<'a> FnChecker<'a> {
             }
             StmtKind::Return(e) => self.ret(e.as_mut(), s.pos),
             StmtKind::Empty => {}
+            StmtKind::Unevaluated(us) => us.iter_mut().for_each(|u| self.unevaluated(u)),
             StmtKind::If { cond, then, els } => {
                 let _ = self.condition(cond);
                 self.scoped(|c| c.stmt(then));
@@ -1899,6 +1944,68 @@ mod tests {
         }
     }
 
+    /// What the parser evaluated away in an array size, an enumerator or a
+    /// `_Static_assert` (the operand a constant `?:` does not choose, that
+    /// of `sizeof`) is checked as clang 23 checks it, without evaluating it:
+    /// its errors are reported, at file scope and in a block, where it was
+    /// (a local's name is in scope). One the parser could not type is an
+    /// error even without one of its own. The warning of an array size
+    /// folded goes with the program, unless its operand has an error.
+    #[test]
+    fn what_the_parser_evaluated_away_is_checked() {
+        assert_eq!(
+            err("int f(void); int a[1 ? 2 : f(1, 2)];"),
+            "1:28: too many arguments to 'f': expected 0, have 2 (declared at 1:5)"
+        );
+        assert_eq!(
+            err("int f(int); enum { A = 1 ? 2 : f() };"),
+            "1:32: too few arguments to 'f': expected 1, have 0 (declared at 1:5)"
+        );
+        assert_eq!(
+            err("int f(void); int a[1 ? 2 : sizeof(f(3))];"),
+            "1:35: too many arguments to 'f': expected 0, have 1 (declared at 1:5)"
+        );
+        assert_eq!(
+            err("int f(void); int a[sizeof(f(3))];"),
+            "1:27: too many arguments to 'f': expected 0, have 1 (declared at 1:5)"
+        );
+        assert_eq!(
+            err("int f(void); _Static_assert(0 ? f(1) : 1, \"m\");"),
+            "1:33: too many arguments to 'f': expected 0, have 1 (declared at 1:5)"
+        );
+        assert_eq!(
+            err("int f(void); int g(void) { int a[1 ? 2 : f(1, 2)] = {1}; return a[0]; }"),
+            "1:42: too many arguments to 'f': expected 0, have 2 (declared at 1:5)"
+        );
+        assert_eq!(
+            err("struct S { int x; } s; _Static_assert(1 ? 1 : s.y, \"m\");"),
+            "1:48: no member named 'y' in 'struct S'"
+        );
+        assert_eq!(
+            err("int a[1 ? 2 : nothing];"),
+            "1:15: use of undeclared identifier 'nothing'"
+        );
+        // A pointer is valid, but makes the size no integer constant.
+        assert_eq!(
+            err("int *p; int a[1 ? 2 : p];"),
+            "1:15: array size must be an integer constant expression \
+             (literals, enum constants, operators, casts and sizeof)"
+        );
+        // Checked where it was: a local is in scope.
+        let p = ok("int g(void) { int n = 3; enum { B = 1 ? 2 : n }; return B; }");
+        assert!(p.warnings.is_empty());
+        let p = ok("unsigned u(void); int a[1 ? 2 : u()];");
+        let w: Vec<String> = p.warnings.iter().map(|w| w.to_string()).collect();
+        assert_eq!(
+            w,
+            ["1:23: variable length array folded to constant array as an extension"]
+        );
+        assert_eq!(
+            p.warnings[0].severity,
+            crate::Severity::Warning("gnu-folding-constant")
+        );
+    }
+
     /// `name#slot` (or `name@symbol`) for every variable use in the function, in
     /// source order.
     fn uses(f: &Function) -> Vec<String> {
@@ -1947,6 +2054,7 @@ mod tests {
         fn stmt(s: &Stmt, out: &mut Vec<String>) {
             match &s.kind {
                 StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, out)),
+                StmtKind::Unevaluated(us) => us.iter().for_each(|u| expr(&u.expr, out)),
                 StmtKind::Decl(ds) => {
                     for d in ds {
                         out.push(format!("decl {}{}", d.name, var(&d.var)));

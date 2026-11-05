@@ -30,6 +30,33 @@ pub struct Program {
     /// The target the program is for: its types' sizes, and the code
     /// generated for it ([`crate::types`]).
     pub xlen: Xlen,
+    /// The expressions of the file's scope the parser evaluated away, each
+    /// after how many items it comes, for sema to check
+    /// ([`Unevaluated`]); a block's are statements of their own.
+    pub unevaluated: Vec<(usize, Unevaluated)>,
+    /// The warnings so far (`Error`s of [`crate::Severity::Warning`]):
+    /// what is not an error but clang warns of.
+    pub warnings: Vec<crate::Error>,
+}
+
+/// An expression the parser needed no value of, for sema to check without
+/// evaluating it, as clang's checks it: in an array size, an enumerator or
+/// a `_Static_assert`, whose values the parser works out before sema runs,
+/// the operand of a `sizeof` and the operand a constant `?:` does not
+/// choose. Its type is all that counts there, which the parser works out,
+/// but it must still be valid C (`f(1, 2)` of an `int f(void)` is not).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unevaluated {
+    pub expr: Expr,
+    /// The parser could not work out its type (or it is no integer type),
+    /// and took the constant to be this error (where, what) unless sema
+    /// finds one in the expression.
+    pub untyped: Option<(Pos, String)>,
+    /// The operand of a `?:` the parser folded, not one of `sizeof`.
+    pub folded: bool,
+    /// The warning clang gives the array size it folds by this operand,
+    /// which it leaves out if the operand has an error.
+    pub warning: Option<crate::Error>,
 }
 
 impl Program {
@@ -226,6 +253,10 @@ pub struct Stmt {
 pub enum StmtKind {
     /// `{ ... }`, a new scope.
     Block(Vec<Stmt>),
+    /// No statement: what the declaration or statement before it in its
+    /// block had that the parser evaluated away, for sema to check
+    /// ([`Unevaluated`]). It generates nothing.
+    Unevaluated(Vec<Unevaluated>),
     /// `int a = 1, *b;`
     Decl(Vec<Declarator>),
     /// `expr;`
@@ -650,6 +681,12 @@ impl Dumper {
                 self.expr(d + 1, e);
             }
             StmtKind::Empty => self.line(d, s.pos, "Empty"),
+            StmtKind::Unevaluated(us) => {
+                self.line(d, s.pos, "Unevaluated");
+                for u in us {
+                    self.expr(d + 1, &u.expr);
+                }
+            }
             StmtKind::If { cond, then, els } => {
                 self.line(d, s.pos, "If");
                 self.expr(d + 1, cond);

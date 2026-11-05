@@ -71,6 +71,8 @@ impl fmt::Display for Pos {
     }
 }
 
+/// A diagnostic: an error, which stops the compilation, or a warning, which
+/// does not (what clang warns of by default, as it says it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     /// Where the problem is, or line 0 when it isn't tied to a place in the source.
@@ -80,6 +82,16 @@ pub struct Error {
     /// being compiled (a header it includes). Set by [`compile_with`] and
     /// friends, which know the names.
     pub file: Option<String>,
+    pub severity: Severity,
+}
+
+/// How bad a diagnostic is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    /// A warning, with the name of clang's flag for it
+    /// (`gnu-folding-constant` for `-Wgnu-folding-constant`).
+    Warning(&'static str),
 }
 
 impl Error {
@@ -88,18 +100,36 @@ impl Error {
             pos,
             msg: msg.into(),
             file: None,
+            severity: Severity::Error,
         }
     }
 
-    /// Formats the error the way compilers and editors expect:
-    /// `file.c:line:col: error: message`, where `file` names the file being
-    /// compiled (an error in a header names the header instead).
+    /// A warning, of clang's warning flag `flag`.
+    pub fn warning(pos: Pos, msg: impl Into<String>, flag: &'static str) -> Self {
+        Error {
+            severity: Severity::Warning(flag),
+            ..Error::new(pos, msg)
+        }
+    }
+
+    pub fn is_warning(&self) -> bool {
+        matches!(self.severity, Severity::Warning(_))
+    }
+
+    /// Formats the diagnostic the way compilers and editors expect, as
+    /// clang does: `file.c:line:col: error: message`, or
+    /// `file.c:line:col: warning: message [-Wflag]`, where `file` names the
+    /// file being compiled (one in a header names the header instead).
     pub fn render(&self, file: &str) -> String {
         let file = self.file.as_deref().unwrap_or(file);
+        let (what, flag) = match self.severity {
+            Severity::Error => ("error", String::new()),
+            Severity::Warning(flag) => ("warning", format!(" [-W{flag}]")),
+        };
         if self.pos.line > 0 {
-            format!("{file}:{}: error: {}", self.pos, self.msg)
+            format!("{file}:{}: {what}: {}{flag}", self.pos, self.msg)
         } else {
-            format!("{file}: error: {}", self.msg)
+            format!("{file}: {what}: {}{flag}", self.msg)
         }
     }
 }
@@ -188,23 +218,44 @@ pub fn preprocess_asm(name: &str, src: &str, opts: &Options, load: Loader) -> Re
 /// every error it finds. Errors in headers have their [`Error::file`] set.
 pub fn parse_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result<ast::Program, Vec<Error>> {
     let pp = preprocess(name, src, opts, load)?;
-    check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))
+    let mut prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
+    prog.warnings = pp.name_files(prog.warnings);
+    Ok(prog)
 }
 
-/// Compiles one translation unit to assembly text for merlin-as.
+/// Compiles one translation unit to assembly text for merlin-as. The
+/// errors come with the warnings before them, if any ([`Error::severity`]).
 pub fn compile_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result<String, Vec<Error>> {
+    compile_warned(name, src, opts, load).map(|(asm, _)| asm)
+}
+
+/// [`compile_with`], with the warnings of a compilation that succeeds.
+pub fn compile_warned(
+    name: &str,
+    src: &str,
+    opts: &Options,
+    load: Loader,
+) -> Result<(String, Vec<Error>), Vec<Error>> {
     let pp = preprocess(name, src, opts, load)?;
     let debug = opts.debug.as_ref().map(|d| (d, pp.files.as_slice()));
-    check(&pp, opts.xlen)
-        .and_then(|prog| codegen::generate_with(&prog, debug).map_err(|e| vec![e]))
-        .map_err(|errors| pp.name_files(errors))
+    let prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
+    let warnings = pp.name_files(prog.warnings.clone());
+    match codegen::generate_with(&prog, debug) {
+        Ok(asm) => Ok((asm, warnings)),
+        Err(e) => Err(warnings.into_iter().chain(pp.name_files(vec![e])).collect()),
+    }
 }
 
-/// The front end after the preprocessor: tokens, syntax tree, checks.
+/// The front end after the preprocessor: tokens, syntax tree, checks. The
+/// errors come with the warnings, in the order of their positions.
 fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec<Error>> {
     let toks = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| vec![e])?;
     let mut prog = parser::parse(&toks, xlen).map_err(|e| vec![e])?;
-    sema::check(&mut prog)?;
+    if let Err(mut errors) = sema::check(&mut prog) {
+        errors.extend(prog.warnings);
+        errors.sort_by_key(|e| e.pos);
+        return Err(errors);
+    }
     Ok(prog)
 }
 

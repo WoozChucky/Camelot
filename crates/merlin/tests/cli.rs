@@ -181,6 +181,51 @@ fn errors_use_file_line_col_format() {
     assert!(!t.dir.join("bad.s").exists(), "no output on error");
 }
 
+/// A warning is printed as clang prints it, `file:line:col: warning: ...
+/// [-Wflag]`, and the file still compiles: clang 23's for each array size
+/// it folds where an array cannot be variable-length (a file-scope array,
+/// a member, a `static` local, a local array with an initializer), none
+/// for an enumerator or a `_Static_assert` folded the same way. One whose
+/// operand has an error is not given, as clang gives it not.
+#[test]
+fn warnings_are_printed_as_clangs() {
+    let t = TempSrc::new(
+        "warnings",
+        "w.c",
+        "unsigned u(void);\nint a[1 ? 2 : u()];\nstruct s { int m[1 ? 3 : u()]; };\n\
+         enum { E = 1 ? 4 : u() };\n_Static_assert(1 ? 1 : u(), \"folded silently\");\n\
+         int f(void) {\n    static int b[1 ? 2 : u()];\n    int c[1 ? 2 : u()] = {1, 2};\n    \
+         return a[0] + b[0] + c[0] + E;\n}\n",
+    );
+    let out = merlin(&[&t.file]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let file = t.file.display().to_string();
+    let warning = "warning: variable length array folded to constant array as an extension \
+                   [-Wgnu-folding-constant]";
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "{file}:2:5: {warning}\n{file}:3:16: {warning}\n{file}:7:16: {warning}\n{file}:8:9: {warning}\n"
+        )
+    );
+    assert!(t.dir.join("w.s").exists());
+    // With an error in the operand folded: the error alone.
+    std::fs::write(
+        &t.file,
+        "int f(void);\nint a[1 ? 2 : f(1, 2)];\nint b[1 ? 2 : f()];\n",
+    )
+    .unwrap();
+    let out = merlin(&[&t.file]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "{file}:2:15: error: too many arguments to 'f': expected 0, have 2 (declared at 1:5)\n\
+             {file}:3:5: {warning}\n"
+        )
+    );
+}
+
 #[test]
 fn deep_nesting_is_an_error_not_a_crash() {
     let limit = merlin::parser::MAX_DEPTH;

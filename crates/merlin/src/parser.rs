@@ -92,8 +92,20 @@ use crate::types::{
     MAX_OBJECT_SIZE,
 };
 use crate::{Error, Pos};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// clang's warning for an array size it folds (`int a[1 ? 2 : f()];`, see
+/// [`Parser::folded`]), and its flag.
+const FOLDED: (&str, &str) = (
+    "variable length array folded to constant array as an extension",
+    "gnu-folding-constant",
+);
+
+/// The error of an array size that is no integer constant expression.
+const NOT_CONSTANT_SIZE: &str = "array size must be an integer constant expression \
+                                 (literals, enum constants, operators, casts and sizeof)";
 
 /// At most this many parameters in a function, and arguments in a call:
 /// C99's translation limit (5.2.4.1), which keeps every argument within
@@ -135,14 +147,24 @@ pub fn parse(toks: &[Token], xlen: Xlen) -> Result<Program, Error> {
         depth: 0,
         scopes: vec![file],
         xlen,
+        unevaluated: RefCell::new(Vec::new()),
+        folding: Cell::new(false),
     };
     let mut items = Vec::new();
+    let mut unevaluated = Vec::new();
     while *p.peek() != Tok::Eof {
         if let Some(item) = p.item()? {
             items.push(item);
         }
+        let n = items.len();
+        unevaluated.extend(p.unevaluated.take().into_iter().map(|u| (n, u)));
     }
-    Ok(Program { items, xlen })
+    Ok(Program {
+        items,
+        xlen,
+        unevaluated,
+        warnings: Vec::new(),
+    })
 }
 
 fn binop(t: &Tok) -> Option<(BinOp, u8)> {
@@ -281,11 +303,13 @@ struct Scope {
 enum Derive {
     /// Pointer to the type so far, with these qualifiers.
     Ptr(Quals),
-    /// Array of the type so far (`None`: of unknown size). The last field is
-    /// set when the brackets held qualifiers or `static` (`int a[const 3]`):
-    /// C99 6.7.5.3p7 allows them only on a parameter's outermost array, and
-    /// the qualifiers then apply to the pointer the array is adjusted to.
-    Array(Option<i128>, Pos, Option<Quals>),
+    /// Array of the type so far (`None`: of unknown size). The third field
+    /// is set when the brackets held qualifiers or `static` (`int a[const
+    /// 3]`): C99 6.7.5.3p7 allows them only on a parameter's outermost
+    /// array, and the qualifiers then apply to the pointer the array is
+    /// adjusted to. The last is where the size is if the parser folded it
+    /// ([`Parser::folded`]).
+    Array(Option<i128>, Pos, Option<Quals>, Option<Pos>),
     /// Function returning the type so far, with these parameters (and the
     /// scope holding their names), variadic if `...` ends them, and whether
     /// the list is a prototype's (not `()`).
@@ -307,6 +331,12 @@ struct Decl {
     /// parameters, even though merlin takes it as `int f(void)`). `-g` says
     /// which (`DW_AT_prototyped`).
     prototyped: bool,
+    /// Where the first array size of its own the parser folded is
+    /// ([`Parser::folded`]), if one is.
+    folded: Option<Pos>,
+    /// How many [`Unevaluated`]s were waiting as the declarator began: its
+    /// own come after.
+    unevaluated: usize,
 }
 
 struct Parser<'a> {
@@ -318,6 +348,13 @@ struct Parser<'a> {
     scopes: Vec<Scope>,
     /// The target, for sizes.
     xlen: Xlen,
+    /// The expressions the constants evaluated so far have that sema must
+    /// still check ([`Unevaluated`]), until the declaration or statement
+    /// they are in is done.
+    unevaluated: RefCell<Vec<Unevaluated>>,
+    /// Whether the constant being evaluated folded an operand that is not
+    /// constant ([`Parser::not_chosen`]).
+    folding: Cell<bool>,
 }
 
 impl Parser<'_> {
@@ -485,27 +522,44 @@ impl Parser<'_> {
     // ---- constant expressions ----
 
     /// The value of an integer constant expression the parser needs now: an
-    /// array size, an enumerator's value or a `_Static_assert`. Each
-    /// `sizeof expr` in it whose operand's type the parser can work out
-    /// becomes `sizeof (type)` first, so `char buf[sizeof x]` and
-    /// `int b[sizeof a / sizeof a[0]]` work before sema has typed anything;
-    /// and so does each operand a constant `?:` does not choose, whose type
-    /// alone counts (see [`Self::resolve_sizeof`]).
-    fn const_int(&self, e: &mut Expr) -> Option<i128> {
+    /// array size, an enumerator's value or a `_Static_assert`; or the error
+    /// `msg` at `at` if it is none. Each `sizeof expr` in it whose operand's
+    /// type the parser can work out becomes `sizeof (type)` first, so
+    /// `char buf[sizeof x]` and `int b[sizeof a / sizeof a[0]]` work before
+    /// sema has typed anything; and so does each operand a constant `?:`
+    /// does not choose, whose type alone counts (see
+    /// [`Self::resolve_sizeof`]). Those operands are not evaluated, but sema
+    /// still checks them ([`Unevaluated`]). The flag says whether the value
+    /// is sure: false if the parser could not type an operand `?:` does not
+    /// choose, whose error sema will report (`msg` if it finds none).
+    fn const_int(&self, e: &mut Expr, at: Pos, msg: &str) -> Result<(i128, bool), Error> {
+        let mark = self.unevaluated.borrow().len();
         self.resolve_sizeof(e);
-        consteval::parsed_int(e, self.xlen)
+        let v = consteval::parsed_int(e, self.xlen).ok_or_else(|| Error::new(at, msg))?;
+        let mut sure = true;
+        for u in &mut self.unevaluated.borrow_mut()[mark..] {
+            if let Some(error) = &mut u.untyped {
+                *error = (at, msg.to_string());
+                sure = false;
+            }
+        }
+        Ok((v, sure))
     }
 
     /// Rewrites `sizeof expr` into `sizeof (type)` throughout the operators
-    /// [`consteval`] evaluates, where [`Self::operand_type`] knows the type.
-    /// The operand a constant `?:` does not choose is not evaluated (C99
-    /// 6.6p3): only its type counts, which the result's depends on, so one
-    /// that is not constant (`1 ? 2 : f()`) becomes a 0 of its type, as sema
-    /// types it, and clang takes it (in an array size as a GNU folding).
+    /// [`consteval`] evaluates, where [`Self::operand_type`] knows the type,
+    /// and the operand a constant `?:` does not choose as
+    /// [`Self::not_chosen`] says.
     fn resolve_sizeof(&self, e: &mut Expr) {
         match &mut e.kind {
             ExprKind::SizeofExpr(x) => {
                 if let Some(t) = self.operand_type(x) {
+                    self.unevaluated.borrow_mut().push(Unevaluated {
+                        expr: (**x).clone(),
+                        untyped: None,
+                        folded: false,
+                        warning: None,
+                    });
                     e.kind = ExprKind::SizeofType(t);
                 }
             }
@@ -541,24 +595,108 @@ impl Parser<'_> {
             }
             ExprKind::Cond(c, a, b) => {
                 self.resolve_sizeof(c);
-                self.resolve_sizeof(a);
-                self.resolve_sizeof(b);
-                if let Some(v) = consteval::parsed_int(c, self.xlen) {
-                    let other = if v != 0 { b } else { a };
-                    if consteval::parsed_int(other, self.xlen).is_none() {
-                        if let Some(t) = self.value_type(other).filter(Type::is_integer) {
-                            let pos = other.pos;
-                            **other = Expr {
-                                kind: ExprKind::Num(0),
-                                ty: t.unqual().clone(),
-                                pos,
-                            };
-                        }
+                match consteval::parsed_int(c, self.xlen) {
+                    Some(v) => {
+                        let (chosen, other) = if v != 0 { (a, b) } else { (b, a) };
+                        self.resolve_sizeof(chosen);
+                        self.not_chosen(other);
+                    }
+                    None => {
+                        self.resolve_sizeof(a);
+                        self.resolve_sizeof(b);
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    /// The operand a constant `?:` does not choose. It is not evaluated
+    /// (C99 6.6p3): only its type counts, which the result's depends on. One
+    /// that is no integer constant expression (`1 ? 2 : f()`) becomes a 0
+    /// of its type, as sema types it, and sema checks what it was
+    /// ([`Unevaluated`]); clang takes it, folding it (`folding`: an array
+    /// sized so is folded, [`Self::folded`]). If the parser cannot work out
+    /// its type, or it is no integer type (which makes the `?:` no integer
+    /// constant expression), the 0 is an `int` and sema reports the error.
+    fn not_chosen(&self, e: &mut Expr) {
+        let mark = self.unevaluated.borrow().len();
+        let mut resolved = e.clone();
+        self.resolve_sizeof(&mut resolved);
+        if consteval::parsed_int(&resolved, self.xlen).is_some() {
+            *e = resolved;
+            return;
+        }
+        // The whole operand is checked, so not what is in it again.
+        self.unevaluated.borrow_mut().truncate(mark);
+        let (ty, untyped) = match self.value_type(e) {
+            Some(t) if t.is_integer() => (t.unqual().clone(), None),
+            _ => (Type::INT, Some((e.pos, String::new()))),
+        };
+        let pos = e.pos;
+        let original = std::mem::replace(
+            e,
+            Expr {
+                kind: ExprKind::Num(0),
+                ty,
+                pos,
+            },
+        );
+        self.unevaluated.borrow_mut().push(Unevaluated {
+            expr: original,
+            untyped,
+            folded: true,
+            warning: None,
+        });
+        self.folding.set(true);
+    }
+
+    /// An array size folded (`int a[1 ? 2 : f()]`, whose `f()` is no
+    /// constant): clang takes the array as a constant one where an array
+    /// cannot be variable-length, warning that it folds it (GNU's folding
+    /// of a constant): at file scope, in a struct or union member, in a
+    /// `static` or `extern` local and in a local array with an initializer.
+    /// Elsewhere (a local array without one, a local typedef, a pointer to
+    /// such an array, a parameter, a type name) it is a variable-length
+    /// array, which merlin does not have: the size is an error, as
+    /// `int a[n]` is. `d` is declared in `ctx` with storage class `class`,
+    /// and an initializer if `init`.
+    fn folded(&self, d: &Decl, ctx: Ctx, class: Class, init: bool) -> Result<(), Error> {
+        let Some(at) = d.folded else { return Ok(()) };
+        let folds = match ctx {
+            Ctx::File | Ctx::Member => true,
+            Ctx::Block | Ctx::ForInit => match class {
+                Class::Static | Class::Extern => true,
+                Class::Typedef => false,
+                Class::None => init && d.ty.is_array(),
+            },
+            Ctx::Param | Ctx::TypeName => false,
+        };
+        if !folds {
+            return Err(Error::new(at, NOT_CONSTANT_SIZE));
+        }
+        // The warning goes with the operand folded, for sema to give if the
+        // operand has no error, as clang does: the last of the declarator's
+        // own.
+        let (msg, flag) = FOLDED;
+        let mut us = self.unevaluated.borrow_mut();
+        let u = us[d.unevaluated..]
+            .iter_mut()
+            .rev()
+            .find(|u| u.folded)
+            .expect("a folded size has its operand");
+        u.warning = Some(Error::warning(d.pos, msg, flag));
+        Ok(())
+    }
+
+    /// What the declaration or statement just parsed left for sema to
+    /// check, as a statement after it, at `pos`.
+    fn unevaluated_stmt(&self, pos: Pos) -> Option<Stmt> {
+        let us = self.unevaluated.take();
+        (!us.is_empty()).then_some(Stmt {
+            kind: StmtKind::Unevaluated(us),
+            pos,
+        })
     }
 
     /// The type of `sizeof`'s operand (or of an operand `?:` does not
@@ -969,6 +1107,7 @@ impl Parser<'_> {
             }
             loop {
                 let d = self.declarator(&specs.ty, Ctx::Member)?;
+                self.folded(&d, Ctx::Member, Class::None, false)?;
                 if self.is_punct(":") {
                     return Err(Error::new(self.here(), "bit-fields are not supported yet"));
                 }
@@ -1071,8 +1210,8 @@ impl Parser<'_> {
             let value = if self.eat_punct("=") {
                 let at = self.here();
                 let mut e = self.cond()?;
-                self.const_int(&mut e)
-                    .ok_or_else(|| Error::new(at, "enumerator value is not an integer constant expression"))?
+                let msg = "enumerator value is not an integer constant expression";
+                self.const_int(&mut e, at, msg)?.0
             } else {
                 next
             };
@@ -1213,24 +1352,20 @@ impl Parser<'_> {
                     if dims > 0 {
                         return Err(Error::new(open, "only the first array dimension may be left out"));
                     }
-                    out.push(Derive::Array(None, open, quals));
+                    out.push(Derive::Array(None, open, quals, None));
                     dims += 1;
                     continue;
                 }
                 let pos = self.here();
                 let mut e = self.cond()?;
                 self.expect_punct("]")?;
-                let n = self.const_int(&mut e).ok_or_else(|| {
-                    Error::new(
-                        pos,
-                        "array size must be an integer constant expression \
-                         (literals, enum constants, operators, casts and sizeof)",
-                    )
-                })?;
+                let outer = self.folding.replace(false);
+                let n = self.const_int(&mut e, pos, NOT_CONSTANT_SIZE)?.0;
+                let folded = self.folding.replace(outer).then_some(pos);
                 if n <= 0 {
                     return Err(Error::new(pos, format!("array size must be positive, not {n}")));
                 }
-                out.push(Derive::Array(Some(n), open, quals));
+                out.push(Derive::Array(Some(n), open, quals, folded));
                 dims += 1;
             } else if self.is_punct("(") {
                 self.advance();
@@ -1247,11 +1382,13 @@ impl Parser<'_> {
     /// A declarator, applied to `base`. In a parameter list or a type name
     /// the name may be missing.
     fn declarator(&mut self, base: &Type, ctx: Ctx) -> Result<Decl, Error> {
+        let unevaluated = self.unevaluated.borrow().len();
         let (name, pos, ops) = self.declarator_ops(ctx)?;
         let end = self.here();
         let mut ty = base.clone();
         let mut func = None;
         let mut prototyped = false;
+        let mut folded = None;
         // The size of `ty`, kept as it grows: `Type::size` recurses, so asking
         // it at every dimension would be quadratic in the number of dimensions.
         let mut size = ty.size(self.xlen).map(u64::from);
@@ -1262,7 +1399,8 @@ impl Parser<'_> {
                     ty = Type::ptr(ty).qualified(q);
                     size = Some(u64::from(ptr_size(self.xlen)));
                 }
-                Derive::Array(n, open, quals) => {
+                Derive::Array(n, open, quals, at) => {
+                    folded = folded.or(at);
                     // Only a parameter's outermost array becomes a pointer,
                     // the one thing the qualifiers in the brackets can apply to.
                     if quals.is_some() && !(ctx == Ctx::Param && i + 1 == steps) {
@@ -1323,13 +1461,20 @@ impl Parser<'_> {
                 }
             }
         }
-        Ok(Decl {
+        let d = Decl {
             name,
             ty,
             pos,
             func,
             prototyped,
-        })
+            folded,
+            unevaluated,
+        };
+        // A parameter or a type name is never folded (see `folded`).
+        if matches!(ctx, Ctx::Param | Ctx::TypeName) {
+            self.folded(&d, ctx, Class::None, false)?;
+        }
+        Ok(d)
     }
 
     /// After `(`, up to and including `)`: the parameters, in a scope of
@@ -1513,6 +1658,7 @@ impl Parser<'_> {
             } else {
                 None
             };
+            self.folded(&d, ctx, specs.class, init.is_some())?;
             // `int a[] = {1, 2, 3};`: the size the initializer gives, for a
             // later `sizeof a` in an array size. (The declaration keeps its
             // incomplete type: sema completes it, the same way.) Unless an
@@ -1553,6 +1699,7 @@ impl Parser<'_> {
                     "illegal initializer (only variables can be initialized)",
                 ));
             }
+            self.folded(&d, ctx, Class::Typedef, false)?;
             let spelling = Spelled(Some(Spelling::Typedef(Arc::new(TypedefName {
                 name: d.name.clone(),
                 ty: d.ty.clone(),
@@ -1610,6 +1757,7 @@ impl Parser<'_> {
                 Ctx::File,
             )?)));
         }
+        self.folded(&d, Ctx::File, specs.class, false)?;
         self.bind_name(&d.name, Name::Object(d.ty.clone()), d.pos)?;
         let mut d = d;
         let body = if self.eat_punct(";") {
@@ -1683,6 +1831,7 @@ impl Parser<'_> {
             if *self.peek() == Tok::Eof {
                 return Err(self.unexpected("'}'"));
             }
+            let pos = self.here();
             if *self.peek() == Tok::Kw(Kw::StaticAssert) {
                 self.static_assert()?;
             } else if self.at_decl() {
@@ -1692,6 +1841,7 @@ impl Parser<'_> {
             } else {
                 items.push(self.stmt()?);
             }
+            items.extend(self.unevaluated_stmt(pos));
         }
     }
 
@@ -1714,16 +1864,15 @@ impl Parser<'_> {
         }
         self.expect_punct(")")?;
         self.expect_punct(";")?;
-        match self.const_int(&mut cond) {
-            None => Err(Error::new(
-                at,
-                "static assertion expression is not an integer constant expression",
-            )),
-            Some(0) => Err(Error::new(
+        let not_constant = "static assertion expression is not an integer constant expression";
+        match self.const_int(&mut cond, at, not_constant)? {
+            // Not sure of the value: sema reports the error.
+            (_, false) => Ok(()),
+            (0, true) => Err(Error::new(
                 pos,
                 format!("static assertion failed: {}", String::from_utf8_lossy(&msg)),
             )),
-            Some(_) => Ok(()),
+            (_, true) => Ok(()),
         }
     }
 
@@ -2405,6 +2554,10 @@ mod tests {
             StmtKind::Decl(ds) => format!("(decl {})", ds.iter().map(sd).collect::<Vec<_>>().join(", ")),
             StmtKind::Expr(e) => format!("{};", sx(e)),
             StmtKind::Empty => ";".into(),
+            StmtKind::Unevaluated(us) => format!(
+                "(unevaluated {})",
+                us.iter().map(|u| sx(&u.expr)).collect::<Vec<_>>().join(" ")
+            ),
             StmtKind::If { cond, then, els } => match els {
                 Some(e) => format!("(if {} {} {})", sx(cond), ss(then), ss(e)),
                 None => format!("(if {} {})", sx(cond), ss(then)),
@@ -2936,6 +3089,66 @@ mod tests {
         let msg = "array size must be an integer constant expression \
                    (literals, enum constants, operators, casts and sizeof)";
         assert_eq!(err("int g; int a[0 ? 2 : g];"), format!("1:14: {msg}"));
+
+        // clang folds such an array size only where an array cannot be
+        // variable-length: at file scope, in a member, in a `static` local,
+        // in a local array with an initializer. Elsewhere the array is a
+        // variable-length one, which merlin does not have: an error, as
+        // `int a[n]` is.
+        let p = prog(
+            "unsigned u(void); typedef int T[1 ? 2 : u()]; int (*pa)[1 ? 3 : u()];\n\
+             int f(void) {\n\
+                 static int s[1 ? 2 : u()];\n\
+                 int i[1 ? 2 : u()] = {1, 2};\n\
+                 struct m { char c[1 ? 4 : u()]; } v;\n\
+                 return s[0] + i[0] + v.c[0];\n\
+             }",
+        );
+        let body = format!("{:?}", funcs(&p)[1].body);
+        assert!(body.contains("Array(Int(Int), Some(2))"), "{body}");
+        let vla = |src: &str, col: usize| {
+            let src = format!("unsigned u(void); {src}");
+            assert_eq!(err(&src), format!("1:{}: {msg}", col + 18), "{src}");
+        };
+        vla("int f(void) { int a[1 ? 2 : u()]; return a[0]; }", 21);
+        vla(
+            "int f(void) { int a[1 ? 2 : u()] = {1}, b[1 ? 3 : u()]; return 0; }",
+            43,
+        );
+        vla("int f(void) { typedef int T[1 ? 2 : u()]; return 0; }", 29);
+        vla("int f(void) { int (*p)[1 ? 2 : u()] = 0; return 0; }", 24);
+        vla("int f(int a[1 ? 2 : u()]) { return a[0]; }", 13);
+        vla("int f(void) { return sizeof(int[1 ? 2 : u()]); }", 33);
+    }
+
+    /// The operands the parser evaluates away in a constant it needs (an
+    /// array size, an enumerator, a `_Static_assert`) are left for sema to
+    /// check: those of `sizeof` and those a constant `?:` does not choose,
+    /// as statements after the declaration in a block, and in the program
+    /// at file scope after the items before them.
+    #[test]
+    fn what_is_evaluated_away_is_left_for_sema() {
+        let p = prog(
+            "int f(void); int g;\nint a[1 ? 2 : f()];\nint b[sizeof g];\nenum { E = 0 ? g : 1 };\n\
+             int h(void) {\n    int x;\n    char c[sizeof x] = {0};\n    _Static_assert(1 ? 1 : f(), \"\");\n\
+                 return c[0];\n}\n",
+        );
+        let file: Vec<(usize, String)> = p.unevaluated.iter().map(|(n, u)| (*n, sx(&u.expr))).collect();
+        assert_eq!(
+            file,
+            [(3, "(call f)".to_string()), (4, "g".into()), (4, "g".into())]
+        );
+        let body: Vec<String> = funcs(&p)[1].body.as_ref().unwrap().iter().map(ss).collect();
+        assert_eq!(
+            body,
+            [
+                "(decl int x)",
+                "(decl char c[4]={0})",
+                "(unevaluated x)",
+                "(unevaluated (call f))",
+                "(return (* (+ c 0)))"
+            ]
+        );
     }
 
     #[test]

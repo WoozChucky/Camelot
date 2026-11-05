@@ -577,7 +577,7 @@ impl<'a> Interp<'a> {
                 self.expr(e, frame)?;
                 Flow::Next
             }
-            StmtKind::Empty => Flow::Next,
+            StmtKind::Empty | StmtKind::Unevaluated(_) => Flow::Next,
             StmtKind::Return(e) => Flow::Return(match e {
                 Some(e) => self.expr(e, frame)?,
                 None => 0,

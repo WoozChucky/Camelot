@@ -1862,6 +1862,7 @@ impl<'a> FuncGen<'a, '_> {
             StmtKind::Block(_)
             | StmtKind::Decl(_)
             | StmtKind::Empty
+            | StmtKind::Unevaluated(_)
             | StmtKind::If { .. }
             | StmtKind::While { .. }
             | StmtKind::DoWhile { .. }
@@ -1900,7 +1901,8 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             StmtKind::Expr(e) => self.expr(e),
-            StmtKind::Empty => {}
+            // Only checked: nothing is evaluated.
+            StmtKind::Empty | StmtKind::Unevaluated(_) => {}
             StmtKind::If { cond, then, els } => {
                 // A constant condition runs one arm: only that one is
                 // generated, unless the other has a label (see [`elide`]).
