@@ -7,10 +7,10 @@
 //! other access is a fault.
 //!
 //! Version 1 of the interfaces (RV32 machines) has 32-bit registers only, so it takes
-//! no 8-byte access at all, not even of unused space. The framebuffer's `FB_SCANOUT` is
-//! newer than version 1 and 64-bit at both widths, so the framebuffer takes 8-byte
-//! accesses on RV32 too. A device describes its layout with [`Field`]s, and [`access`]
-//! applies the rules.
+//! no 8-byte access at all, not even of unused space. The framebuffer's `FB_SCANOUT` and
+//! `FB_CURSOR_ADDR` are newer than version 1 and 64-bit at both widths, so the
+//! framebuffer takes 8-byte accesses on RV32 too. A device describes its layout with
+//! [`Field`]s, and [`access`] applies the rules.
 
 use crate::bus::BusFault;
 

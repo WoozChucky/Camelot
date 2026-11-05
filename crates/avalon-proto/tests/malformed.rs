@@ -458,6 +458,48 @@ fn encoder_refuses_what_the_decoder_would_reject() {
             height: 3,
             pixels: vec![0; 35],
         },
+        // A cursor's pixels must be its size, the size 1 to MAX_CURSOR_SIZE each way,
+        // and the hotspot in it.
+        Message::CursorShape {
+            vm: 1,
+            width: 2,
+            height: 2,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: vec![0; 15],
+        },
+        Message::CursorShape {
+            vm: 1,
+            width: 0,
+            height: 2,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: Vec::new(),
+        },
+        Message::CursorShape {
+            vm: 1,
+            width: 1,
+            height: MAX_CURSOR_SIZE + 1,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: vec![0; (MAX_CURSOR_SIZE as usize + 1) * 4],
+        },
+        Message::CursorShape {
+            vm: 1,
+            width: 2,
+            height: 2,
+            hot_x: 2,
+            hot_y: 0,
+            pixels: vec![0; 16],
+        },
+        Message::CursorShape {
+            vm: 1,
+            width: 2,
+            height: 2,
+            hot_x: 0,
+            hot_y: 2,
+            pixels: vec![0; 16],
+        },
         Message::PointerInput {
             vm: 1,
             pointer: PointerChange {

@@ -373,6 +373,10 @@ pub struct Viewer {
     pub rects: Vec<Rect>,
     /// Each `ScreenResized`: how many frames had come before it, and the new size.
     pub resizes: Vec<(usize, u32, u32)>,
+    /// The cursor as the `CursorShape` and `CursorPosition` received so far give it.
+    pub cursor: avalon_proto::Cursor,
+    /// Each of those messages: how many frames had come before it, and it.
+    pub cursor_messages: Vec<(usize, Message)>,
     /// Other events, in order.
     pub events: Vec<Message>,
     rx: Receiver<Message>,
@@ -414,6 +418,8 @@ impl Viewer {
             screen: Screen::new(width, height),
             rects: Vec::new(),
             resizes: Vec::new(),
+            cursor: avalon_proto::Cursor::default(),
+            cursor_messages: Vec::new(),
             events: Vec::new(),
             rx,
         };
@@ -454,6 +460,11 @@ impl Viewer {
                 assert_eq!((vm, format), (self.vm, avalon_proto::PIXEL_FORMAT_XRGB8888));
                 self.screen = Screen::new(width, height);
                 self.resizes.push((self.rects.len(), width, height));
+                true
+            }
+            Ok(msg @ (Message::CursorShape { .. } | Message::CursorPosition { .. })) => {
+                assert!(self.cursor.apply(&msg));
+                self.cursor_messages.push((self.rects.len(), msg));
                 true
             }
             Ok(other) => {

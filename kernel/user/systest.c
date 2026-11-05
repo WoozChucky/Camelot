@@ -23,7 +23,16 @@
  *                         exits 0 if its pid is PID and descriptor 3 is
  *                         still open
  *   systest execfail      execs paths that fail, then exits 0 if each failed
- *                         as it should and the program is still its own
+ *                         as it should and the program is still its own,
+ *                         a descriptor that closes on exec still open
+ *   systest cloexec       makes descriptors 3 to 6, copies of its output,
+ *                         4 and 5 closing on exec (FD_CLOEXEC, set by
+ *                         F_DUPFD_CLOEXEC and by F_SETFD) and 3 and 6 not
+ *                         (6's cleared by F_SETFD), and execs `systest
+ *                         aftercloexec PID`, which exits 0 if its pid is
+ *                         PID, 3 and 6 are open without the flag and 4 and
+ *                         5 are closed
+ *   systest nostderr      exits 0 if it has descriptors 0 and 1 but not 2
  *   systest spin          spins until it is killed
  *   systest waiter        spawns `systest sleep 1000` and waits for it
  *   systest killreader    spawns `systest count` reading the console, kills
@@ -188,18 +197,53 @@ static int after_exec(const char *pid) {
     return fstat(3, &st) == 0 && st.type == T_DEVICE ? 0 : 2;
 }
 
-/* Exec calls that must fail, leaving this program running. */
+/* Exec calls that must fail, leaving this program running, and its
+ * descriptors as they were: one that closes on exec too. */
 static int exec_fail(void) {
     char *many[MAXARG + 2];
     for (int i = 0; i <= MAXARG; i++) {
         many[i] = "x";
     }
     many[MAXARG + 1] = NULL;
+    int keep = fcntl(STDOUT, F_DUPFD_CLOEXEC, 0);
+    if (keep != 3) {
+        return 2;
+    }
     if (exec("/bin/nope", NULL) != -ENOENT || exec("", NULL) != -ENOENT ||
         exec("/bin/systest", many) != -E2BIG || exec("/bin/systest", (char **)KERNEL_ADDR) != -EFAULT) {
         return 1;
     }
-    return 0;
+    return fcntl(keep, F_GETFD, 0) == FD_CLOEXEC ? 0 : 3;
+}
+
+/* systest cloexec: see the top of the file. */
+static int exec_cloexec(void) {
+    if (dup(STDOUT) != 3 || fcntl(STDOUT, F_DUPFD_CLOEXEC, 0) != 4 || fcntl(STDOUT, F_DUPFD, 0) != 5 ||
+        fcntl(5, F_SETFD, FD_CLOEXEC) != 0 || fcntl(STDOUT, F_DUPFD_CLOEXEC, 0) != 6 ||
+        fcntl(6, F_SETFD, 0) != 0) {
+        return 1;
+    }
+    char pid[12];
+    char *argv[] = {"systest", "aftercloexec", decimal(getpid(), pid), NULL};
+    exec("/bin/systest", argv);
+    return 2; /* exec returned: it failed */
+}
+
+static int after_cloexec(const char *pid) {
+    struct stat st;
+    if (getpid() != atoi(pid)) {
+        return 1;
+    }
+    if (fstat(3, &st) != 0 || fstat(6, &st) != 0 || fcntl(3, F_GETFD, 0) != 0 || fcntl(6, F_GETFD, 0) != 0) {
+        return 2;
+    }
+    return fstat(4, &st) == -EBADF && fstat(5, &st) == -EBADF ? 0 : 3;
+}
+
+/* systest nostderr: see the top of the file. */
+static int no_stderr(void) {
+    struct stat st;
+    return fstat(STDIN, &st) == 0 && fstat(STDOUT, &st) == 0 && fstat(STDERR, &st) == -EBADF ? 0 : 1;
 }
 
 static int kill_reader(void);
@@ -226,6 +270,15 @@ static int child(int argc, char **argv) {
     }
     if (strcmp(argv[1], "execfail") == 0) {
         return exec_fail();
+    }
+    if (strcmp(argv[1], "cloexec") == 0) {
+        return exec_cloexec();
+    }
+    if (strcmp(argv[1], "aftercloexec") == 0 && argc == 3) {
+        return after_cloexec(argv[2]);
+    }
+    if (strcmp(argv[1], "nostderr") == 0) {
+        return no_stderr();
     }
     if (strcmp(argv[1], "sbrk") == 0 && argc == 3) {
         return grow(atoi(argv[2]));
@@ -292,7 +345,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(47, 0, 0, 0), -ENOSYS, "call 47");
+    check_eq(syscall(48, 0, 0, 0), -ENOSYS, "call 48");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
     /* The result is a long, sign-extended in a0: an error is negative
      * whatever the width, as a long and as an ssize_t (read's). */
@@ -513,6 +566,61 @@ static void test_descriptors(void) {
     }
     check_eq(dup(STDERR), 3, "and they are free again");
     close(3);
+}
+
+/* fcntl: copies of a descriptor, and its one flag, FD_CLOEXEC. */
+static void test_fcntl(void) {
+    char one;
+    check_eq(fcntl(9, F_GETFD, 0), -EBADF, "F_GETFD on a closed descriptor");
+    check_eq(fcntl(NOFILE, F_GETFD, 0), -EBADF, "F_GETFD past the table");
+    check_eq(fcntl(-1, F_GETFD, 0), -EBADF, "F_GETFD on -1");
+    check_eq(fcntl(9, 99, 0), -EBADF, "the descriptor is checked before the command");
+    check_eq(fcntl(STDOUT, 99, 0), -EINVAL, "an unknown command");
+    check_eq(fcntl(STDOUT, F_GETFD, 0), 0, "the console's descriptors stay open on exec");
+    check_eq(fcntl(STDOUT, F_DUPFD, NOFILE), -EINVAL, "F_DUPFD from past the table");
+    check_eq(fcntl(STDOUT, F_DUPFD_CLOEXEC, -1), -EINVAL, "F_DUPFD_CLOEXEC from -1");
+
+    /* F_DUPFD: the lowest free descriptor from arg up, sharing the file. */
+    check_eq(fcntl(STDOUT, F_DUPFD, 5), 5, "F_DUPFD from 5");
+    check_eq(fcntl(5, F_GETFD, 0), 0, "without FD_CLOEXEC");
+    check_eq(write(5, "", 0), 0, "a write to the copy");
+    check_eq(read(5, &one, 1), -EBADF, "the copy is write-only too");
+    check_eq(fcntl(STDOUT, F_DUPFD, 5), 6, "5 is taken: 6");
+    check_eq(fcntl(STDOUT, F_DUPFD, 0), 3, "from 0: the lowest free");
+    check_eq(fcntl(STDOUT, F_DUPFD_CLOEXEC, 5), 7, "F_DUPFD_CLOEXEC");
+    check_eq(fcntl(7, F_GETFD, 0), FD_CLOEXEC, "with FD_CLOEXEC");
+    check_eq(dup(7), 4, "dup a descriptor that closes on exec");
+    check_eq(fcntl(4, F_GETFD, 0), 0, "its copy doesn't");
+    check_eq(fcntl(5, F_SETFD, FD_CLOEXEC | 0x10), 0, "F_SETFD");
+    check_eq(fcntl(5, F_GETFD, 0), FD_CLOEXEC, "sets FD_CLOEXEC, and only it");
+    check_eq(fcntl(6, F_GETFD, 0), 0, "on that descriptor alone");
+    check_eq(fcntl(5, F_SETFD, 0), 0, "F_SETFD 0");
+    check_eq(fcntl(5, F_GETFD, 0), 0, "clears it");
+    check_eq(fcntl(9, F_SETFD, FD_CLOEXEC), -EBADF, "F_SETFD on a closed descriptor");
+    check_eq(close(7), 0, "close the one that closes on exec");
+    check_eq(fcntl(STDOUT, F_DUPFD, 7), 7, "its number again");
+    check_eq(fcntl(7, F_GETFD, 0), 0, "close took its FD_CLOEXEC away");
+
+    /* No free descriptor from arg up, though there is one below. */
+    while (fcntl(STDERR, F_DUPFD, 0) >= 0) {
+    }
+    check_eq(close(3), 0, "free descriptor 3");
+    check_eq(fcntl(STDERR, F_DUPFD, 4), -EMFILE, "F_DUPFD with every descriptor from 4 up taken");
+    check_eq(fcntl(STDERR, F_DUPFD_CLOEXEC, 4), -EMFILE, "F_DUPFD_CLOEXEC too");
+    check_eq(fcntl(STDERR, F_DUPFD, 0), 3, "from 0 there is one");
+    for (int i = 3; i < NOFILE; i++) {
+        close(i);
+    }
+
+    /* spawn is a fork and an exec in one: a standard descriptor that closes
+     * on exec doesn't reach the child. */
+    check_eq(fcntl(STDERR, F_SETFD, FD_CLOEXEC), 0, "descriptor 2 closes on exec");
+    check_eq(run_child("nostderr", NULL), 0, "spawn passes it on to no child");
+    check_eq(fcntl(STDERR, F_SETFD, 0), 0, "and it doesn't any more");
+    check_eq(run_child("nostderr", NULL), 1, "the child gets it again");
+
+    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "cloexec", NULL})), 0,
+             "exec closes the descriptors that close on exec, and only them");
 }
 
 static void test_pipes(void) {
@@ -889,6 +997,7 @@ int main(int argc, char **argv) {
     test_spawn_and_wait();
     test_sbrk();
     test_descriptors();
+    test_fcntl();
     test_pipes();
     test_exec();
     test_procs_and_kill();

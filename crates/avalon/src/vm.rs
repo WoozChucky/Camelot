@@ -19,17 +19,21 @@
 //! (VRAM or a buffer in RAM, at its mode's size) with it and sends the rectangles that
 //! changed to every viewer; an unchanged screen sends nothing. A screen whose size
 //! changed (the guest set another mode) starts again at the new size: `ScreenResized`
-//! to every viewer, then the whole screen. Two limits keep a busy guest from flooding
-//! the link:
+//! to every viewer, then the whole screen. The framebuffer's cursor plane is not in the
+//! screen: the VM keeps a [`Cursor`] too, what the viewers have of it, and each look
+//! sends after the rectangles what changed of it, its image (`CursorShape`) or its place
+//! (`CursorPosition`), so a cursor that moves sends no rectangle. Two limits keep a busy
+//! guest from flooding the link:
 //!
 //! - **Rate**: the thread looks at the screen at most once per [`SCREEN_INTERVAL`]
 //!   (~30 times a second), however often the guest redraws. Changes between two looks
 //!   go out together, as their final pixels.
 //! - **Backlog**: a viewer with more than [`screen_backlog`] bytes still queued (a slow
-//!   link), a little over one full frame of the screen, is sent no rectangles, and is
-//!   marked behind. Once its queue has drained it
-//!   gets one full frame, which brings it level with the others. So a slow viewer sees
-//!   fewer frames rather than falling ever further behind and being cut off.
+//!   link), a little over one full frame of the screen, is sent no rectangles and nothing
+//!   of the cursor (an image is up to 256 KiB), and is marked behind. Once its queue has
+//!   drained it gets one full frame and the whole cursor, which bring it level with the
+//!   others. So a slow viewer sees fewer frames rather than falling ever further behind
+//!   and being cut off.
 //!
 //! The comparison is skipped while nobody is attached; the VM only remembers that the
 //! machine ran since its last look. A viewer that attaches is sent the screen as it
@@ -63,8 +67,9 @@ use crate::outbox::Outbox;
 use crate::switch::Card;
 use crate::{lock, Fail};
 use avalon_proto::{
-    AttachKind, DeviceEntry, DeviceSpec, ErrorCode, Frame, HardwareProfile, KeyEvent, Message, NetSpec,
-    PointerChange, PointerMotion, Screen, VmDetails, VmState, VmSummary, PIXEL_FORMAT_XRGB8888,
+    AttachKind, Cursor, CursorView, DeviceEntry, DeviceSpec, ErrorCode, Frame, HardwareProfile, KeyEvent,
+    Message, NetSpec, PointerChange, PointerMotion, Screen, VmDetails, VmState, VmSummary,
+    PIXEL_FORMAT_XRGB8888,
 };
 use excalibur::csr::IRQ_M_TIMER;
 use grail::framebuffer::{FB_HEIGHT, FB_WIDTH};
@@ -102,13 +107,14 @@ pub const SCREEN_BACKLOG_MIN: usize = 2 * 1024 * 1024;
 pub const SCREEN_BACKLOG_MARGIN: usize = 512 * 1024;
 
 /// A viewer with more than this many bytes queued and not yet written is sent no screen
-/// updates until it has caught up (then one full frame). It follows the size of the
-/// screen, `width` × `height`: a little over one full frame of it
+/// or cursor updates until it has caught up (then one full frame and the cursor). It
+/// follows the size of the screen, `width` × `height`: a little over one full frame of it
 /// ([`SCREEN_BACKLOG_MARGIN`] more), and at least [`SCREEN_BACKLOG_MIN`]. So a slow viewer
 /// of a small screen falls no further behind (in frames, and in time on its link) than it
 /// would if no bigger screen could be shown; one of a screen in the framebuffer's largest
 /// mode (1920x1080, 8.3 MB a frame) may have 8.4 MiB queued, below [`crate::MAX_QUEUED`]
-/// by more than two more full frames, so a viewer that is held back is never cut off.
+/// by more than two more full frames (and a frame is far more than a cursor's image), so
+/// a viewer that is held back is never cut off.
 pub const fn screen_backlog(width: u32, height: u32) -> usize {
     let backlog = width as usize * height as usize * 4 + SCREEN_BACKLOG_MARGIN;
     if backlog > SCREEN_BACKLOG_MIN {
@@ -179,6 +185,8 @@ struct Inner {
     viewers: Vec<Viewer>,
     /// The screen as the viewers have it: what was captured last.
     screen: Screen,
+    /// The cursor as the viewers have it, captured with the screen.
+    cursor: Cursor,
     /// The machine has run since the last capture, so its framebuffer may differ.
     screen_owed: bool,
     /// When the screen was last looked at, for [`SCREEN_INTERVAL`].
@@ -356,6 +364,7 @@ impl Vm {
                 consoles: Vec::new(),
                 viewers: Vec::new(),
                 screen: Screen::new(FB_WIDTH, FB_HEIGHT),
+                cursor: Cursor::default(),
                 screen_owed: false,
                 screen_looked: None,
                 keys: VecDeque::new(),
@@ -396,6 +405,11 @@ impl Vm {
     /// How many clients are attached to the screen.
     pub fn viewer_count(&self) -> usize {
         self.lock().viewers.len()
+    }
+
+    /// How many viewers are behind: held back over [`screen_backlog`], owed a full frame.
+    pub fn behind_count(&self) -> usize {
+        self.lock().viewers.iter().filter(|v| v.behind).count()
     }
 
     /// How many keys, and how many pointer changes, wait for the machine.
@@ -719,7 +733,9 @@ impl Vm {
             format: PIXEL_FORMAT_XRGB8888,
         });
         let full = event_frame(&inner.screen.frame(self.id, inner.screen.bounds()));
-        if client.event(&full) {
+        // Then the cursor, its image and, if it shows, its place.
+        let cursor = inner.cursor.messages(self.id);
+        if client.event(&full) && cursor.iter().all(|m| client.event(&event_frame(m))) {
             match inner.viewers.iter_mut().find(|v| v.outbox.id == client.id) {
                 Some(v) => v.behind = false,
                 None => inner.viewers.push(Viewer::new(client)),
@@ -847,8 +863,10 @@ impl Vm {
             let steps = machine.run_for(SLICE, &mut |_| {});
             // `run_for` ends a slice early once the guest has shown a new frame (written
             // FB_PRESENT, made a modeset that took effect, or a page flip took effect at a
-            // vertical blank), until the host takes that frame: take it, or every later
-            // slice is a single step.
+            // vertical blank), and once a vertical blank has changed the cursor (moved,
+            // shown or hidden it, or given it an image). A present also waits
+            // for the host to take it: take it, so that `present_pending` does not say a
+            // frame is waiting when none is.
             // The screen goes out at the pace of `look`, not on presents: viewers see
             // the framebuffer, presented or not, as Grail's window does.
             machine.cpu.bus.fb.take_present();
@@ -931,10 +949,14 @@ impl Vm {
         self.update_viewers(inner, machine, true);
     }
 
-    /// Captures the screen if the machine has run since the last capture, and sends
-    /// the rectangles that changed to every viewer that keeps up. A viewer over
-    /// [`screen_backlog`] of the screen gets nothing and is marked behind; a viewer that is behind
-    /// gets a full frame once it is under it again (or at once when `last`).
+    /// Captures the screen and the cursor if the machine has run since the last
+    /// capture, and sends every viewer that keeps up the rectangles that changed, then
+    /// what changed of the cursor (protocol doc, section 6.4, **Cursor**). A viewer over
+    /// [`screen_backlog`] of the screen when something changed gets nothing and is marked
+    /// behind: a cursor's image is up to 256 KiB, so an animated cursor would otherwise run
+    /// a stalled viewer up to [`crate::MAX_QUEUED`] as frames would. A viewer that is behind
+    /// gets a full frame, then the whole cursor (as one attaching does), once it is under
+    /// it again (or at once when `last`).
     ///
     /// The screen is what the framebuffer scans out, at its mode's size. When the guest
     /// has changed modes, the screen starts again at the new size: every viewer, behind
@@ -944,9 +966,20 @@ impl Vm {
         inner.screen_looked = Some(Instant::now());
         let id = self.id;
         let mut resized = None;
+        let mut cursor_changes = Vec::new();
         let rects = if std::mem::take(&mut inner.screen_owed) {
-            // A display that is off shows black, as Grail's window does.
+            // A display that is off shows black, as Grail's window does, and no cursor.
             let frame = machine.cpu.bus.frame();
+            let shown = frame.cursor.map(|c| CursorView {
+                width: c.width,
+                height: c.height,
+                hot_x: c.hot_x,
+                hot_y: c.hot_y,
+                pixels: c.pixels,
+                x: c.x,
+                y: c.y,
+            });
+            cursor_changes = inner.cursor.update(id, shown).iter().map(event_frame).collect();
             if (frame.width, frame.height) == (inner.screen.width(), inner.screen.height()) {
                 inner.screen.update(frame.pixels)
             } else {
@@ -966,6 +999,7 @@ impl Vm {
         let Inner {
             viewers,
             screen,
+            cursor,
             keys,
             pointer,
             kick,
@@ -974,6 +1008,7 @@ impl Vm {
         let frames: Vec<Frame> = rects.iter().map(|&r| event_frame(&screen.frame(id, r))).collect();
         let backlog = screen_backlog(screen.width(), screen.height());
         let mut full = None;
+        let mut whole_cursor = None;
         // Whether viewer `v` stays: false once its client is gone (or cut off).
         let mut send = |v: &mut Viewer| {
             // Every viewer learns the new size, so that what it is sent next fits.
@@ -988,10 +1023,13 @@ impl Vm {
                     return true;
                 }
                 v.behind = false;
+                // Level with the others: the screen and the cursor as they have them.
                 let full = full.get_or_insert_with(|| event_frame(&screen.frame(id, screen.bounds())));
-                return v.outbox.event(full);
+                let whole_cursor = whole_cursor
+                    .get_or_insert_with(|| cursor.messages(id).iter().map(event_frame).collect::<Vec<_>>());
+                return v.outbox.event(full) && whole_cursor.iter().all(|f| v.outbox.event(f));
             }
-            if frames.is_empty() {
+            if frames.is_empty() && cursor_changes.is_empty() {
                 return true;
             }
             if !(keeping_up || last) {
@@ -999,7 +1037,7 @@ impl Vm {
                 return true;
             }
             // `event` is false once the client is gone (or cut off): it is dropped.
-            frames.iter().all(|f| v.outbox.event(f))
+            frames.iter().chain(&cursor_changes).all(|f| v.outbox.event(f))
         };
         for mut v in std::mem::take(viewers) {
             if send(&mut v) {

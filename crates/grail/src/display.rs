@@ -4,13 +4,16 @@
 //! Everything happens on the calling thread, and the window belongs to this call, not to
 //! a process-wide singleton: each machine can have its own. The CPU runs until the
 //! program shows a new frame (writes `FB_PRESENT`, makes a modeset that takes effect, or
-//! a page flip takes effect at a vertical blank) or a slice of `SLICE` steps is done (or, with a real-time
-//! clock, until it is ahead of the wall clock); then the window's messages are pumped
-//! and it is redrawn on a present, on a repaint request, or when ~16 ms of host time
-//! have passed since the last redraw (~60 Hz). The window shows what the framebuffer
-//! scans out, VRAM or a buffer in RAM, at the size of its mode. Keys typed into the
-//! keyboard device, and the mouse over it the pointer device, at the same points,
-//! between slices.
+//! a page flip takes effect at a vertical blank), a vertical blank moves, shows or hides
+//! the cursor or gives it an image (takes a write of `FB_CURSOR_ADDR`, even of the
+//! address it had: an image redrawn in place), or a slice of `SLICE` steps is done (or,
+//! with a real-time clock, until it is ahead of the wall clock); then the window's
+//! messages are pumped and it is redrawn in full on a new frame, on a repaint request,
+//! or when ~16 ms of host time have passed since the last full redraw (~60 Hz), and only
+//! where the cursor was and is on a change of the cursor alone. The window shows what
+//! the framebuffer scans out, VRAM or a buffer in RAM, at the size of its mode, with the
+//! cursor plane over it. Keys typed into the keyboard device, and the mouse over it the
+//! pointer device, at the same points, between slices.
 
 use crate::cpu::Cpu;
 use crate::framebuffer::FrameDumper;
@@ -28,7 +31,8 @@ pub struct DisplayOptions {
     /// Open a window showing the framebuffer. Ignored where `WINDOW_SUPPORTED` is false.
     pub window: bool,
     /// Write `frame-NNNN.ppm` here on every new frame shown (`FB_PRESENT`, a modeset, a
-    /// page flip taking effect) and once at exit.
+    /// page flip taking effect), on every vertical blank that changes the cursor (moves,
+    /// shows or hides it, or gives it an image) and once at exit.
     pub dump_dir: Option<PathBuf>,
     /// Window title.
     pub title: String,
@@ -78,11 +82,14 @@ pub fn run(
             break Outcome::Program(RunResult::StepLimit);
         }
         steps += m.run_for(budget, &mut trace);
+        // A new frame, or the cursor changed over the old one: either way the picture
+        // changed, so it is dumped and drawn.
         let presented = m.cpu.bus.fb.take_present();
-        if presented {
+        let cursor = m.cpu.bus.fb.take_cursor_update();
+        if presented || cursor {
             dump(m)?;
         }
-        if !screen.update(m, presented) {
+        if !screen.update(m, presented, cursor) {
             break Outcome::WindowClosed;
         }
         // Real-time clock: wait for the wall clock to catch up, but keep pumping the
@@ -127,9 +134,12 @@ impl Screen {
     }
 
     /// Pumps the window, hands the keys typed into it to the machine's keyboard and what
-    /// the mouse did to its pointer, and redraws if due. Returns false once the window
-    /// has been closed.
-    fn update(&mut self, m: &mut Machine, presented: bool) -> bool {
+    /// the mouse did to its pointer, and redraws if due: in full on a new frame, a
+    /// repaint request or every `REFRESH`, and only where the cursor was and is when
+    /// the cursor alone changed (the frame's other changes, drawn into it without a
+    /// present, show at the next full drawing, as they always do). Returns false once
+    /// the window has been closed.
+    fn update(&mut self, m: &mut Machine, presented: bool, cursor: bool) -> bool {
         let Some(w) = &mut self.window else {
             return true;
         };
@@ -147,6 +157,8 @@ impl Screen {
         if presented || w.take_repaint() || self.last_draw.elapsed() >= Self::REFRESH {
             Self::draw(w, m);
             self.last_draw = std::time::Instant::now();
+        } else if cursor {
+            w.draw_cursor(m.cpu.bus.frame());
         }
         true
     }
@@ -184,7 +196,7 @@ impl Screen {
         Ok(Screen)
     }
 
-    fn update(&mut self, _m: &mut Machine, _presented: bool) -> bool {
+    fn update(&mut self, _m: &mut Machine, _presented: bool, _cursor: bool) -> bool {
         true
     }
 

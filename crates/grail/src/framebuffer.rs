@@ -13,6 +13,12 @@
 //!   (`drmModePageFlip`), so a program that draws into one buffer while the other is
 //!   shown never shows a half-drawn frame.
 //! - Every vertical blank sets `FB_IRQ`'s pending bit, which interrupts while enabled.
+//! - A **cursor plane** (KMS's cursor plane, `DRM_IOCTL_MODE_CURSOR`): a 64x64 ARGB8888
+//!   image in RAM, premultiplied, which the host blends over the frame where the guest
+//!   puts it, so that moving the pointer redraws nothing. Its registers are
+//!   double-buffered: what the guest writes takes effect at the next vertical blank, as a
+//!   flip does. A write of `FB_CURSOR_ADDR`, even of the address it holds, is a new image
+//!   (as a write of Intel's `CURBASE` is), so an image redrawn in place is shown again.
 //!
 //! The vertical blank is guest time: [`Framebuffer::advance`] counts the machine's ticks
 //! (one per step, as `mtime`), and a frame is a sixtieth of a second of them
@@ -37,13 +43,21 @@ pub const FB_STRIDE: u32 = FB_WIDTH * 4;
 pub const FB_FORMAT_XRGB8888: u32 = 0;
 /// The built-in VRAM: one 640x480 frame. Bigger modes scan out of RAM.
 pub const VRAM_SIZE: u32 = FB_STRIDE * FB_HEIGHT;
-/// `FB_VERSION`: 1 is the display controller of spec section 9.3. The framebuffer before
-/// it had nothing at that offset, which read as 0.
-pub const FB_VERSION: u32 = 1;
+/// `FB_VERSION`: 2 is the display controller of spec section 9.3 with its cursor plane;
+/// 1 was the same without it (no cursor registers: they read as 0). The framebuffer
+/// before that had nothing at this offset, which read as 0.
+pub const FB_VERSION: u32 = 2;
 /// Vertical blanks per second of guest time.
 pub const REFRESH_HZ: u32 = 60;
 /// A scanout buffer in RAM starts on a page.
 pub const SCANOUT_ALIGN: u64 = 4096;
+/// The cursor image's width and height in pixels: 64x64, the size KMS drivers commonly
+/// give (`DRM_CAP_CURSOR_WIDTH` and `DRM_CAP_CURSOR_HEIGHT`), and the only one this
+/// cursor plane has. `FB_CURSOR_SIZE` says so.
+pub const CURSOR_SIZE: u32 = 64;
+/// Bytes of the cursor image: 64 rows of 64 pixels of 4 bytes, packed, 16 KiB. It starts
+/// on a page in RAM, as a scanout buffer does.
+pub const CURSOR_BYTES: u64 = (CURSOR_SIZE * CURSOR_SIZE * 4) as u64;
 
 /// A display mode. Rows are packed: the stride is `width * 4` bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +138,12 @@ pub const REG_SCANOUT: u32 = 0x38;
 pub const REG_FLIP: u32 = 0x40;
 pub const REG_IRQ: u32 = 0x44;
 pub const REG_VBLANKS: u32 = 0x48;
+pub const REG_CURSOR_CTRL: u32 = 0x4c;
+/// 64-bit: 0x50 is its low half, 0x54 its high half.
+pub const REG_CURSOR_ADDR: u32 = 0x50;
+pub const REG_CURSOR_POS: u32 = 0x58;
+pub const REG_CURSOR_HOT: u32 = 0x5c;
+pub const REG_CURSOR_SIZE: u32 = 0x60;
 
 /// `FB_CTRL` bit 0: display enable. The other bits are reserved and read as 0.
 pub const CTRL_ENABLE: u32 = 1 << 0;
@@ -135,7 +155,18 @@ pub const STATUS_BAD_MODE: u32 = 1 << 1;
 /// `FB_STATUS` bit 2 (write 1 to clear): a modeset or a flip was refused because
 /// `FB_SCANOUT` named no buffer for the mode.
 pub const STATUS_BAD_SCANOUT: u32 = 1 << 2;
-const STATUS_ERRORS: u32 = STATUS_BAD_MODE | STATUS_BAD_SCANOUT;
+/// `FB_STATUS` bit 3 (read-only): cursor registers were written since the last vertical
+/// blank, which has yet to take them.
+pub const STATUS_CURSOR_PENDING: u32 = 1 << 3;
+/// `FB_STATUS` bit 4 (write 1 to clear): a vertical blank took an enabled cursor whose
+/// `FB_CURSOR_ADDR` named no cursor image, and showed no cursor.
+pub const STATUS_BAD_CURSOR: u32 = 1 << 4;
+const STATUS_ERRORS: u32 = STATUS_BAD_MODE | STATUS_BAD_SCANOUT | STATUS_BAD_CURSOR;
+
+/// `FB_CURSOR_CTRL` bit 0: the cursor plane is on. The other bits are reserved.
+pub const CURSOR_CTRL_ENABLE: u32 = 1 << 0;
+/// `FB_CURSOR_HOT`'s bits: the hotspot's x in bits 5:0, its y in bits 21:16, each 0 to 63.
+const CURSOR_HOT_MASK: u32 = 0x003f_003f;
 
 /// `FB_IRQ` bit 0: vertical-blank interrupt enable.
 pub const IRQ_VBLANK_ENABLE: u32 = 1 << 0;
@@ -164,36 +195,251 @@ enum Reg {
     Flip,
     Irq,
     Vblanks,
+    CursorCtrl,
+    /// 64-bit.
+    CursorAddr,
+    CursorPos,
+    CursorHot,
+    CursorSize,
+}
+
+/// The cursor plane as a vertical blank latched it: what the display shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CursorState {
+    /// Shown: `FB_CURSOR_CTRL` enabled it and `FB_CURSOR_ADDR` named an image.
+    pub on: bool,
+    /// The image's physical address in RAM, page-aligned (meaningful while `on`).
+    pub addr: u64,
+    /// Where the image's top left pixel is on the screen: negative, or past the mode's
+    /// size, for an image that hangs off an edge (KMS's `CRTC_X` and `CRTC_Y`).
+    pub x: i32,
+    pub y: i32,
+    /// The hotspot, the pixel of the image that points. The display does not use it (the
+    /// image is placed by its top left corner); a viewer that draws the cursor at its
+    /// own pointer does (KMS's `HOTSPOT_X` and `HOTSPOT_Y`, for virtual hardware).
+    pub hot_x: u32,
+    pub hot_y: u32,
+}
+
+/// The cursor plane over a [`Frame`]: an image of `width` × `height` pixels in ARGB8888
+/// with premultiplied alpha (little-endian words 0xAARRGGBB, so bytes B, G, R, A, each
+/// colour already multiplied by A), its top left pixel at (`x`, `y`) of the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorPlane<'a> {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// The hotspot, for a viewer that draws the cursor at its own pointer; blending does
+    /// not use it.
+    pub hot_x: u32,
+    pub hot_y: u32,
+    /// `width * 4` bytes per row, `height` rows, top row first.
+    pub pixels: &'a [u8],
+}
+
+/// `a` × `b` / 255, rounded to the nearest, for 8-bit values: pixman's `MUL_UN8`.
+fn mul_un8(a: u8, b: u8) -> u8 {
+    let t = u32::from(a) * u32::from(b) + 0x80;
+    (((t >> 8) + t) >> 8) as u8
+}
+
+/// Blends the premultiplied ARGB8888 pixel `src` over the XRGB8888 pixel `dst`, with
+/// Porter and Duff's OVER: each colour becomes `src + dst × (255 - alpha) / 255`,
+/// saturated, as pixman computes it. `dst`'s X byte is kept.
+pub fn blend_pixel(dst: &mut [u8], src: &[u8]) {
+    let alpha = src[3];
+    for c in 0..3 {
+        dst[c] = src[c].saturating_add(mul_un8(dst[c], 255 - alpha));
+    }
+}
+
+impl CursorPlane<'_> {
+    /// The pixel of the image at frame position (`fx`, `fy`), if the image covers it.
+    fn source(&self, fx: u32, fy: u32) -> Option<&[u8]> {
+        let sx = i64::from(fx) - i64::from(self.x);
+        let sy = i64::from(fy) - i64::from(self.y);
+        if !(0..i64::from(self.width)).contains(&sx) || !(0..i64::from(self.height)).contains(&sy) {
+            return None;
+        }
+        let at = (sy as usize * self.width as usize + sx as usize) * 4;
+        Some(&self.pixels[at..at + 4])
+    }
+
+    /// The part of a `width` × `height` frame the image covers: columns `left..right`
+    /// of rows `top..bottom`, empty when it is wholly off the frame.
+    fn covers(&self, width: u32, height: u32) -> Covered {
+        let clamp = |at: i64, size: u32| at.clamp(0, i64::from(size)) as u32;
+        Covered {
+            left: clamp(i64::from(self.x), width),
+            right: clamp(i64::from(self.x) + i64::from(self.width), width),
+            top: clamp(i64::from(self.y), height),
+            bottom: clamp(i64::from(self.y) + i64::from(self.height), height),
+        }
+    }
+
+    /// Blends the cursor over `dst`, a `width` × `height` XRGB8888 frame (rows packed,
+    /// top row first), with OVER on premultiplied alpha ([`blend_pixel`]), as KMS's
+    /// default blend mode ("Pre-multiplied") and pixman do. What of the image is off the
+    /// frame is left out.
+    pub fn blend_into(&self, dst: &mut [u8], width: u32, height: u32) {
+        let Covered {
+            left,
+            right,
+            top,
+            bottom,
+        } = self.covers(width, height);
+        for fy in top..bottom {
+            for fx in left..right {
+                let src = self.source(fx, fy).expect("inside the image");
+                let at = (fy as usize * width as usize + fx as usize) * 4;
+                blend_pixel(&mut dst[at..at + 4], src);
+            }
+        }
+    }
+}
+
+/// Columns `left..right` of rows `top..bottom` of a frame: what a cursor covers of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Covered {
+    left: u32,
+    right: u32,
+    top: u32,
+    bottom: u32,
+}
+
+/// A host's picture of the display, the cursor blended over the frame, kept from one
+/// drawing to the next (Grail's window, and Herald's, which is the same window), as a
+/// compositor keeps its output. Drawing a frame with a cursor over it then allocates
+/// nothing once the frame's size is known, and a drawing for a change of the cursor
+/// alone (it moved, took another image or went) touches only the rectangle it covered,
+/// restored from the frame, and the one it covers now, blended again. A frame with no
+/// cursor over it is shown as it is, not copied.
+#[derive(Debug, Default)]
+pub struct Composite {
+    /// The picture, `width * 4` bytes a row, while `kept`.
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// `pixels` is the picture last drawn, which a change of the cursor alone can start
+    /// from: false until a frame with a cursor over it is drawn, and after a frame with
+    /// none (shown as it is) or a disabled display.
+    kept: bool,
+    /// What the cursor covers of `pixels`.
+    cursor: Option<Covered>,
+}
+
+impl Composite {
+    pub fn new() -> Composite {
+        Composite::default()
+    }
+
+    /// The whole picture of `frame`, whose pixels may have changed anywhere: its pixels
+    /// with the cursor blended over them (the pixels themselves when no cursor shows).
+    /// `None` while the display is disabled: black.
+    pub fn draw<'a>(&'a mut self, frame: &Frame<'a>) -> Option<&'a [u8]> {
+        self.kept = false;
+        let pixels = frame.pixels?;
+        if frame.cursor.is_none() {
+            return Some(pixels);
+        }
+        self.pixels.clear();
+        self.pixels.extend_from_slice(pixels);
+        (self.width, self.height, self.kept, self.cursor) = (frame.width, frame.height, true, None);
+        self.blend(frame);
+        Some(&self.pixels)
+    }
+
+    /// The picture after a change of the cursor alone since the last drawing: the
+    /// rectangle it covered is restored from `frame`, it is blended where it is now, and
+    /// the rest is the picture of the last drawing. So `frame` is that drawing's frame,
+    /// or a newer one that a full drawing ([`Composite::draw`]) shows soon, as Grail's
+    /// window draws in full every 16 ms. With nothing kept to start from (no cursor
+    /// showed, or the frame has another size now), it is a full drawing.
+    pub fn draw_cursor<'a>(&'a mut self, frame: &Frame<'a>) -> Option<&'a [u8]> {
+        let pixels = frame.pixels?;
+        if !self.kept || (self.width, self.height) != (frame.width, frame.height) {
+            return self.draw(frame);
+        }
+        let row = frame.width as usize * 4;
+        if let Some(Covered {
+            left,
+            right,
+            top,
+            bottom,
+        }) = self.cursor.take()
+        {
+            for y in top as usize..bottom as usize {
+                let span = y * row + left as usize * 4..y * row + right as usize * 4;
+                self.pixels[span.clone()].copy_from_slice(&pixels[span]);
+            }
+        }
+        self.blend(frame);
+        Some(&self.pixels)
+    }
+
+    /// Blends `frame`'s cursor, if it shows, over the picture, and notes what it covers.
+    fn blend(&mut self, frame: &Frame) {
+        if let Some(cursor) = &frame.cursor {
+            cursor.blend_into(&mut self.pixels, frame.width, frame.height);
+            self.cursor = Some(cursor.covers(frame.width, frame.height));
+        }
+    }
 }
 
 /// What the display shows: the current mode's size and, while the display is enabled,
-/// its pixels.
+/// its pixels, and the cursor plane over them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frame<'a> {
     pub width: u32,
     pub height: u32,
     /// `width * 4` bytes per row, `height` rows, top row first, XRGB8888 (bytes B, G, R,
     /// X: a 32-bpp Windows DIB as well). `None` while the display is disabled: black.
+    /// This is the plane that scans out the frame, without the cursor.
     pub pixels: Option<&'a [u8]>,
+    /// The cursor plane over it, while one is shown (never while the display is
+    /// disabled).
+    pub cursor: Option<CursorPlane<'a>>,
 }
 
 impl Frame<'_> {
-    /// Pixel at (x, y) as 0x00RRGGBB; black while the display is disabled.
+    /// Pixel at (x, y) as 0x00RRGGBB, with the cursor blended over it where it covers
+    /// it; black while the display is disabled.
     pub fn pixel(&self, x: u32, y: u32) -> u32 {
         let Some(p) = self.pixels else {
             return 0;
         };
         let off = (y as usize * self.width as usize + x as usize) * 4;
-        u32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]]) & 0x00ff_ffff
+        let mut px = [p[off], p[off + 1], p[off + 2], p[off + 3]];
+        if let Some(src) = self.cursor.as_ref().and_then(|c| c.source(x, y)) {
+            blend_pixel(&mut px, src);
+        }
+        u32::from_le_bytes(px) & 0x00ff_ffff
     }
 
-    /// The frame as a binary PPM (P6). A disabled display is black.
+    /// What the display shows, `width * 4` bytes per row: the pixels with the cursor
+    /// blended over them (a copy only while there is a cursor). `None` while the display
+    /// is disabled.
+    pub fn composited(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        let pixels = self.pixels?;
+        Some(match &self.cursor {
+            None => std::borrow::Cow::Borrowed(pixels),
+            Some(cursor) => {
+                let mut out = pixels.to_vec();
+                cursor.blend_into(&mut out, self.width, self.height);
+                std::borrow::Cow::Owned(out)
+            }
+        })
+    }
+
+    /// The frame as a binary PPM (P6), the cursor blended over it. A disabled display is
+    /// black.
     pub fn to_ppm(&self) -> Vec<u8> {
         let header = format!("P6\n{} {}\n255\n", self.width, self.height);
         let len = header.len() + self.width as usize * self.height as usize * 3;
         let mut out = Vec::with_capacity(len);
         out.extend_from_slice(header.as_bytes());
-        let Some(pixels) = self.pixels else {
+        let Some(pixels) = self.composited() else {
             out.resize(len, 0);
             return out;
         };
@@ -238,6 +484,31 @@ pub struct Framebuffer {
     period: u64,
     /// Ticks until the next vertical blank, 1 to `period`.
     to_vblank: u64,
+    /// The cursor registers as written (`FB_CURSOR_CTRL`, `FB_CURSOR_ADDR`,
+    /// `FB_CURSOR_POS`, `FB_CURSOR_HOT`): what the next vertical blank takes.
+    cursor_ctrl: u32,
+    cursor_addr: u64,
+    cursor_pos: u32,
+    cursor_hot: u32,
+    /// A cursor register was written since the last vertical blank (`FB_STATUS` bit 3).
+    cursor_armed: bool,
+    /// `FB_CURSOR_ADDR` was written since the last vertical blank, of any value: the
+    /// image is new, a new one or the old one redrawn in place.
+    cursor_image_written: bool,
+    /// The cursor the display shows, as the last vertical blank that took the registers
+    /// latched it.
+    cursor: CursorState,
+    /// How many vertical blanks changed the cursor shown (`cursor`): it moved, appeared,
+    /// went, or took an image (a write of `FB_CURSOR_ADDR`, of a new address or of the
+    /// same one). A new hotspot alone is none: the display does not use it, so the picture
+    /// is the same.
+    pub cursor_updates: u64,
+    /// Set when a vertical blank changes the cursor shown; cleared by the host with
+    /// `take_cursor_update`.
+    cursor_update: bool,
+    /// The size of RAM, as the last register write gave it: a vertical blank checks the
+    /// cursor's address against it (only a write arms the cursor registers).
+    ram_len: u64,
 }
 
 impl Default for Framebuffer {
@@ -270,7 +541,22 @@ impl Framebuffer {
             irq: 0,
             period,
             to_vblank: period,
+            cursor_ctrl: 0,
+            cursor_addr: 0,
+            cursor_pos: 0,
+            cursor_hot: 0,
+            cursor_armed: false,
+            cursor_image_written: false,
+            cursor: CursorState::default(),
+            cursor_updates: 0,
+            cursor_update: false,
+            ram_len: 0,
         }
+    }
+
+    /// The cursor the display shows: what the last vertical blank latched.
+    pub fn cursor(&self) -> CursorState {
+        self.cursor
     }
 
     /// The current mode.
@@ -311,6 +597,12 @@ impl Framebuffer {
             REG_FLIP => Reg::Flip,
             REG_IRQ => Reg::Irq,
             REG_VBLANKS => Reg::Vblanks,
+            REG_CURSOR_CTRL => Reg::CursorCtrl,
+            REG_CURSOR_ADDR => return Field::Low(Reg::CursorAddr),
+            o if o == REG_CURSOR_ADDR + 4 => return Field::High(Reg::CursorAddr),
+            REG_CURSOR_POS => Reg::CursorPos,
+            REG_CURSOR_HOT => Reg::CursorHot,
+            REG_CURSOR_SIZE => Reg::CursorSize,
             _ => return Field::Unused,
         })
     }
@@ -321,6 +613,11 @@ impl Framebuffer {
         let sel = MODES.get(self.mode_sel as usize);
         let flip = if self.pending.is_some() {
             STATUS_FLIP_PENDING
+        } else {
+            0
+        };
+        let cursor = if self.cursor_armed {
+            STATUS_CURSOR_PENDING
         } else {
             0
         };
@@ -337,19 +634,24 @@ impl Framebuffer {
             Reg::ModeWidth => sel.map_or(0, |m| m.width),
             Reg::ModeHeight => sel.map_or(0, |m| m.height),
             Reg::ModeStride => sel.map_or(0, |m| m.stride()),
-            Reg::Status => self.errors | flip,
+            Reg::Status => self.errors | flip | cursor,
             Reg::Scanout => return self.scanout_reg,
             Reg::Irq => self.irq,
             Reg::Vblanks => self.vblanks as u32,
+            Reg::CursorCtrl => self.cursor_ctrl,
+            Reg::CursorAddr => return self.cursor_addr,
+            Reg::CursorPos => self.cursor_pos,
+            Reg::CursorHot => self.cursor_hot,
+            Reg::CursorSize => CURSOR_SIZE | CURSOR_SIZE << 16,
             Reg::Present | Reg::Flip => 0, // write-only
         })
     }
 
     /// Reads a register, at the widths of spec section 9 ([`mmio::access`]): 32-bit
-    /// registers take 4-byte accesses, `FB_SCANOUT` an 8-byte one or either 4-byte half,
-    /// and unused offsets read as 0 at 4 and 8 bytes. `FB_SCANOUT` is 64-bit on an RV32
-    /// machine too (it has no version 1 layout), so the device takes 8-byte accesses at
-    /// both widths.
+    /// registers take 4-byte accesses, `FB_SCANOUT` and `FB_CURSOR_ADDR` an 8-byte one or
+    /// either 4-byte half, and unused offsets read as 0 at 4 and 8 bytes. Those two are
+    /// 64-bit on an RV32 machine too (they have no version 1 layout), so the device takes
+    /// 8-byte accesses at both widths.
     pub fn read(&mut self, off: u32, size: u32) -> Result<u64, BusFault> {
         let access = mmio::access(off, size, true, Self::field)?;
         Ok(access.read(|reg| self.value(reg)))
@@ -360,6 +662,8 @@ impl Framebuffer {
     /// which a scanout buffer must lie in.
     pub fn write(&mut self, off: u32, size: u32, val: u64, ram_len: u64) -> Result<(), BusFault> {
         let access = mmio::access(off, size, true, Self::field)?;
+        // For the vertical blank, which checks the cursor's address against RAM.
+        self.ram_len = ram_len;
         let Some(reg) = access.reg() else {
             return Ok(());
         };
@@ -381,6 +685,28 @@ impl Framebuffer {
                 let pending = self.irq & IRQ_VBLANK & !(word & IRQ_VBLANK);
                 self.irq = pending | word & IRQ_VBLANK_ENABLE;
             }
+            // The cursor's registers are double-buffered: a write, of any of them, is
+            // taken at the next vertical blank, with whatever the others hold then.
+            Reg::CursorCtrl => {
+                self.cursor_ctrl = word & CURSOR_CTRL_ENABLE;
+                self.cursor_armed = true;
+            }
+            // A write of the address, even of the one it holds, is a new image: a
+            // program that redraws its cursor in place writes it again to show it, as
+            // one writes Intel's CURBASE.
+            Reg::CursorAddr => {
+                self.cursor_addr = access.merge(self.cursor_addr, val);
+                self.cursor_armed = true;
+                self.cursor_image_written = true;
+            }
+            Reg::CursorPos => {
+                self.cursor_pos = word;
+                self.cursor_armed = true;
+            }
+            Reg::CursorHot => {
+                self.cursor_hot = word & CURSOR_HOT_MASK;
+                self.cursor_armed = true;
+            }
             Reg::Width
             | Reg::Height
             | Reg::Stride
@@ -390,7 +716,8 @@ impl Framebuffer {
             | Reg::ModeWidth
             | Reg::ModeHeight
             | Reg::ModeStride
-            | Reg::Vblanks => {} // read-only
+            | Reg::Vblanks
+            | Reg::CursorSize => {} // read-only
         }
         Ok(())
     }
@@ -470,6 +797,56 @@ impl Framebuffer {
             self.flips += 1;
             self.present = true;
         }
+        if std::mem::take(&mut self.cursor_armed) {
+            self.latch_cursor();
+        }
+    }
+
+    /// The vertical blank takes the cursor registers: the cursor is shown from now on
+    /// as they say, if they enable it and `FB_CURSOR_ADDR` names an image (a page with
+    /// [`CURSOR_BYTES`] of RAM from it); an enabled cursor with no image is not shown,
+    /// and sets BAD_CURSOR.
+    fn latch_cursor(&mut self) {
+        let enabled = self.cursor_ctrl & CURSOR_CTRL_ENABLE != 0;
+        let fits = Self::fits_cursor(self.cursor_addr, self.ram_len);
+        if enabled && !fits {
+            self.errors |= STATUS_BAD_CURSOR;
+        }
+        // Signed 16-bit halves, so that an image can hang off the left and top edges.
+        let next = CursorState {
+            on: enabled && fits,
+            addr: self.cursor_addr,
+            x: i32::from(self.cursor_pos as u16 as i16),
+            y: i32::from((self.cursor_pos >> 16) as u16 as i16),
+            hot_x: self.cursor_hot & 0xffff,
+            hot_y: self.cursor_hot >> 16,
+        };
+        // What the picture shows of the cursor: whether it is on and where; and, while it
+        // is on, its image, new at each write of FB_CURSOR_ADDR. What a hidden cursor
+        // holds does not show (hiding or keeping it hidden is one change at most), nor
+        // does the hotspot, which the display does not use.
+        let image = std::mem::take(&mut self.cursor_image_written);
+        let shown = |c: CursorState| c.on.then_some((c.x, c.y));
+        if shown(next) != shown(self.cursor) || (next.on && image) {
+            self.cursor_updates += 1;
+            self.cursor_update = true;
+        }
+        self.cursor = next;
+    }
+
+    /// Whether `addr` names a cursor image: page-aligned, with [`CURSOR_BYTES`] of RAM
+    /// from it.
+    fn fits_cursor(addr: u64, ram_len: u64) -> bool {
+        addr.checked_sub(RAM_BASE).is_some_and(|off| {
+            addr.is_multiple_of(SCANOUT_ALIGN)
+                && off.checked_add(CURSOR_BYTES).is_some_and(|end| end <= ram_len)
+        })
+    }
+
+    /// Whether a vertical blank changed the cursor shown since the last call: the host
+    /// then shows the frame again, with the cursor where it is now.
+    pub fn take_cursor_update(&mut self) -> bool {
+        std::mem::take(&mut self.cursor_update)
     }
 
     /// Level of the framebuffer's PLIC line: high while the vertical-blank interrupt is
@@ -479,7 +856,10 @@ impl Framebuffer {
     }
 
     /// What the display shows now: VRAM, or a buffer in `ram` (all of RAM, from
-    /// `RAM_BASE`).
+    /// `RAM_BASE`), and the cursor's image in `ram` over it. The image is read as it is
+    /// now, as the frame is: a program that changes the cursor's look draws the new one
+    /// into another image and points `FB_CURSOR_ADDR` at it, or redraws it in place and
+    /// writes `FB_CURSOR_ADDR` again, so that the vertical blank counts the change.
     pub fn frame<'a>(&'a self, ram: &'a [u8]) -> Frame<'a> {
         let mode = self.mode();
         let len = mode.frame_size() as usize;
@@ -490,10 +870,24 @@ impl Framebuffer {
                 &ram[off..off + len]
             }
         });
+        let c = self.cursor;
+        let cursor = (pixels.is_some() && c.on).then(|| {
+            let off = (c.addr - RAM_BASE) as usize;
+            CursorPlane {
+                x: c.x,
+                y: c.y,
+                width: CURSOR_SIZE,
+                height: CURSOR_SIZE,
+                hot_x: c.hot_x,
+                hot_y: c.hot_y,
+                pixels: &ram[off..off + CURSOR_BYTES as usize],
+            }
+        });
         Frame {
             width: mode.width,
             height: mode.height,
             pixels,
+            cursor,
         }
     }
 
@@ -519,6 +913,15 @@ impl Framebuffer {
     /// effect and modesets. [`crate::Machine::run_for`] stops when it changes.
     pub fn shown(&self) -> u64 {
         self.presents + self.flips + self.modesets
+    }
+
+    /// How many times what the display shows changed by the program's doing: the new
+    /// frames of [`Framebuffer::shown`], and the vertical blanks that moved, showed or
+    /// hid the cursor or gave it an image (`cursor_updates`), which change the picture
+    /// without a new frame.
+    /// [`crate::Machine::run_for`] stops when it changes.
+    pub fn changes(&self) -> u64 {
+        self.shown() + self.cursor_updates
     }
 
     /// Pixel at (x, y) of the built-in VRAM, as 0x00RRGGBB.
@@ -577,10 +980,11 @@ mod tests {
         assert_eq!(fb.read(REG_HEIGHT, 4), Ok(480));
         assert_eq!(fb.read(REG_STRIDE, 4), Ok(2560));
         assert_eq!(fb.read(REG_FORMAT, 4), Ok(0));
-        assert_eq!(fb.read(REG_VERSION, 4), Ok(1));
+        assert_eq!(fb.read(REG_VERSION, 4), Ok(2));
         assert_eq!(fb.read(REG_MODES, 4), Ok(6));
         assert_eq!(fb.read(REG_MODE, 4), Ok(0));
-        assert_eq!(fb.read(0x4c, 4), Ok(0));
+        assert_eq!(fb.read(REG_CURSOR_SIZE, 4), Ok(64 | 64 << 16));
+        assert_eq!(fb.read(0x64, 4), Ok(0));
         assert_eq!(fb.read(0xffc, 4), Ok(0));
         assert_eq!(VRAM_SIZE, 0x12_c000);
         assert_eq!(MAX_FRAME_SIZE, 1920 * 1080 * 4);
@@ -600,6 +1004,7 @@ mod tests {
             REG_MODE_HEIGHT,
             REG_MODE_STRIDE,
             REG_VBLANKS,
+            REG_CURSOR_SIZE,
         ];
         let before: Vec<u64> = ro.iter().map(|&reg| r(&mut fb, reg)).collect();
         for reg in ro {
@@ -670,7 +1075,7 @@ mod tests {
     fn unused_offsets_read_as_zero_at_four_and_eight_bytes() {
         let mut fb = Framebuffer::default();
         fb.write(REG_SCANOUT, 8, 0x1234_5678_9abc_d000, RAM).unwrap();
-        for off in [0x50, 0x100, 0xff8] {
+        for off in [0x68, 0x100, 0xff8] {
             assert_eq!(fb.read(off, 8), Ok(0), "{off:#x}");
             assert_eq!(fb.read(off, 4), Ok(0), "{off:#x}");
             assert_eq!(fb.write(off, 8, !0, RAM), Ok(()), "{off:#x}");
@@ -993,6 +1398,338 @@ mod tests {
         assert!(fb.irq(), "the vertical blank interrupts");
         let frame = fb.frame(&[]);
         assert_eq!((frame.width, frame.height, frame.pixels), (800, 600, None));
+    }
+
+    /// `FB_CURSOR_POS` for an image whose top left pixel is at (`x`, `y`).
+    fn pos(x: i16, y: i16) -> u64 {
+        u64::from(x as u16) | u64::from(y as u16) << 16
+    }
+
+    #[test]
+    fn cursor_registers_hold_what_is_written() {
+        let mut fb = Framebuffer::default();
+        assert_eq!(r(&mut fb, REG_CURSOR_SIZE), 64 | 64 << 16);
+        for reg in [REG_CURSOR_CTRL, REG_CURSOR_POS, REG_CURSOR_HOT] {
+            assert_eq!(r(&mut fb, reg), 0, "{reg:#x} at reset");
+        }
+        assert_eq!(fb.read(REG_CURSOR_ADDR, 8), Ok(0));
+        assert_eq!(fb.cursor(), CursorState::default());
+        // Reserved bits read as 0; the position is a whole word, the hotspot 6 bits a half.
+        w(&mut fb, REG_CURSOR_CTRL, 0xffff_ffff);
+        assert_eq!(r(&mut fb, REG_CURSOR_CTRL), 1);
+        w(&mut fb, REG_CURSOR_POS, 0xfff6_8001);
+        assert_eq!(r(&mut fb, REG_CURSOR_POS), 0xfff6_8001);
+        w(&mut fb, REG_CURSOR_HOT, 0xffff_ffff);
+        assert_eq!(r(&mut fb, REG_CURSOR_HOT), 0x003f_003f);
+        // FB_CURSOR_ADDR is 64-bit: whole, or by its halves, which keep each other.
+        fb.write(REG_CURSOR_ADDR, 8, 0x1122_3344_5566_7000, RAM).unwrap();
+        assert_eq!(fb.read(REG_CURSOR_ADDR, 4), Ok(0x5566_7000));
+        assert_eq!(fb.read(REG_CURSOR_ADDR + 4, 4), Ok(0x1122_3344));
+        fb.write(REG_CURSOR_ADDR + 4, 4, 0, RAM).unwrap();
+        assert_eq!(fb.read(REG_CURSOR_ADDR, 8), Ok(0x5566_7000));
+        // The other registers are 32-bit, and 2-byte accesses fault as anywhere.
+        assert_eq!(fb.read(REG_CURSOR_POS, 8), Err(BusFault));
+        assert_eq!(
+            fb.write(REG_CURSOR_CTRL, 8, 1, RAM),
+            Err(BusFault),
+            "a register and the next"
+        );
+        assert_eq!(
+            fb.read(REG_CURSOR_ADDR + 4, 8),
+            Err(BusFault),
+            "the high half is 4 bytes"
+        );
+        assert_eq!(fb.write(REG_CURSOR_HOT, 2, 0, RAM), Err(BusFault));
+        // Nothing is shown until a vertical blank takes it.
+        assert_eq!(r(&mut fb, REG_STATUS), u64::from(STATUS_CURSOR_PENDING));
+        assert_eq!(fb.cursor(), CursorState::default());
+        assert!(!fb.present_pending());
+    }
+
+    /// The cursor's registers are double-buffered: written any time, all taken together
+    /// at the next vertical blank, which shows the cursor as they say from then on.
+    /// Moving the cursor is no new frame: no present, nothing for `shown`.
+    #[test]
+    fn the_cursor_is_latched_at_the_vertical_blank() {
+        let mut fb = Framebuffer::new(6000); // 100 ticks a frame
+        let image = RAM_BASE + 0x1000;
+        fb.write(REG_CURSOR_ADDR, 8, image, RAM).unwrap();
+        w(&mut fb, REG_CURSOR_POS, pos(-10, 20));
+        w(&mut fb, REG_CURSOR_HOT, 3 | 5 << 16);
+        w(&mut fb, REG_CURSOR_CTRL, 1);
+        fb.advance(99);
+        assert_eq!(fb.cursor(), CursorState::default(), "not yet");
+        assert!(!fb.take_cursor_update());
+        fb.advance(1);
+        let shown = CursorState {
+            on: true,
+            addr: image,
+            x: -10,
+            y: 20,
+            hot_x: 3,
+            hot_y: 5,
+        };
+        assert_eq!(fb.cursor(), shown);
+        assert_eq!(r(&mut fb, REG_STATUS), 0, "taken");
+        assert!(fb.take_cursor_update(), "the host shows it");
+        assert!(!fb.take_cursor_update());
+        assert_eq!((fb.cursor_updates, fb.shown(), fb.changes()), (1, 0, 1));
+        assert!(!fb.present_pending(), "no new frame");
+
+        // A move written in two steps within a frame is one change, at the blank.
+        w(&mut fb, REG_CURSOR_POS, pos(300, 20));
+        w(&mut fb, REG_CURSOR_POS, pos(300, 200));
+        fb.advance(50);
+        assert_eq!((fb.cursor().x, fb.cursor().y), (-10, 20));
+        fb.advance(50);
+        assert_eq!((fb.cursor().x, fb.cursor().y), (300, 200));
+        assert_eq!(fb.cursor_updates, 2);
+        // A write of what is shown already changes nothing, nor does a blank with none.
+        w(&mut fb, REG_CURSOR_POS, pos(300, 200));
+        fb.advance(100);
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 2);
+        assert!(fb.take_cursor_update());
+        assert!(!fb.take_cursor_update());
+
+        // Hiding it is a change; moving it while hidden is not, until it shows again.
+        w(&mut fb, REG_CURSOR_CTRL, 0);
+        fb.advance(100);
+        assert!(!fb.cursor().on);
+        assert_eq!(fb.cursor_updates, 3);
+        w(&mut fb, REG_CURSOR_POS, pos(1, 2));
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 3);
+        w(&mut fb, REG_CURSOR_CTRL, 1);
+        fb.advance(100);
+        assert_eq!((fb.cursor().on, fb.cursor().x, fb.cursor().y), (true, 1, 2));
+        assert_eq!(fb.cursor_updates, 4);
+        // Frames skipped at once (an idle machine) are one blank for the cursor too.
+        w(&mut fb, REG_CURSOR_POS, pos(7, 7));
+        fb.advance(1000);
+        assert_eq!((fb.cursor().x, fb.cursor_updates), (7, 5));
+        assert!(fb.take_cursor_update());
+        // A write of the address it holds is a new image (one redrawn in place), at the
+        // blank, as a write of Intel's CURBASE is; on RV32, written by halves, it is one.
+        fb.write(REG_CURSOR_ADDR, 8, image, RAM).unwrap();
+        fb.advance(99);
+        assert_eq!(fb.cursor_updates, 5, "not yet");
+        fb.advance(1);
+        assert!(fb.take_cursor_update());
+        assert_eq!((fb.cursor().addr, fb.cursor_updates, fb.changes()), (image, 6, 6));
+        fb.write(REG_CURSOR_ADDR, 4, image & 0xffff_ffff, RAM).unwrap();
+        fb.write(REG_CURSOR_ADDR + 4, 4, image >> 32, RAM).unwrap();
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 7);
+        // The hotspot alone changes nothing the display shows: taken, and no change.
+        w(&mut fb, REG_CURSOR_HOT, 9 | 1 << 16);
+        fb.advance(100);
+        assert_eq!((fb.cursor().hot_x, fb.cursor().hot_y), (9, 1));
+        assert_eq!(fb.cursor_updates, 7);
+        // An image for a hidden cursor shows nothing; showing it again is one change.
+        w(&mut fb, REG_CURSOR_CTRL, 0);
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 8);
+        fb.write(REG_CURSOR_ADDR, 8, image, RAM).unwrap();
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 8);
+        w(&mut fb, REG_CURSOR_CTRL, 1);
+        fb.write(REG_CURSOR_ADDR, 8, image, RAM).unwrap();
+        fb.advance(100);
+        assert_eq!(fb.cursor_updates, 9);
+        assert!(fb.take_cursor_update());
+        // A modeset keeps the cursor where it is, as a CRTC keeps its cursor plane.
+        fb.write(REG_SCANOUT, 8, RAM_BASE + 0x10_0000, RAM).unwrap();
+        w(&mut fb, REG_MODE, 1);
+        assert_eq!(fb.cursor().x, 7);
+        assert_eq!(fb.flips, 0);
+    }
+
+    #[test]
+    fn a_cursor_with_no_image_is_refused_at_the_vertical_blank() {
+        let mut fb = Framebuffer::new(6000);
+        for (addr, why) in [
+            (0, "VRAM holds no cursor"),
+            (RAM_BASE + 0x800, "not page-aligned"),
+            (RAM_BASE - SCANOUT_ALIGN, "below RAM"),
+            (RAM_BASE + RAM - SCANOUT_ALIGN, "runs past the end of RAM"),
+            (!0xfff, "overflows"),
+        ] {
+            fb.write(REG_CURSOR_ADDR, 8, addr, RAM).unwrap();
+            w(&mut fb, REG_CURSOR_CTRL, 1);
+            assert_eq!(r(&mut fb, REG_STATUS), u64::from(STATUS_CURSOR_PENDING), "{why}");
+            fb.advance(100);
+            assert_eq!(r(&mut fb, REG_STATUS), u64::from(STATUS_BAD_CURSOR), "{why}");
+            assert!(!fb.cursor().on, "{why}");
+            w(&mut fb, REG_STATUS, u64::from(STATUS_BAD_CURSOR));
+            assert_eq!(r(&mut fb, REG_STATUS), 0, "write 1 to clear");
+        }
+        assert_eq!(fb.cursor_updates, 0, "never shown");
+        // A disabled cursor needs no image; one that ends at the end of RAM is fine.
+        fb.write(REG_CURSOR_ADDR, 8, 0, RAM).unwrap();
+        w(&mut fb, REG_CURSOR_CTRL, 0);
+        fb.advance(100);
+        assert_eq!(r(&mut fb, REG_STATUS), 0);
+        fb.write(REG_CURSOR_ADDR, 8, RAM_BASE + RAM - CURSOR_BYTES, RAM)
+            .unwrap();
+        w(&mut fb, REG_CURSOR_CTRL, 1);
+        fb.advance(100);
+        assert_eq!(r(&mut fb, REG_STATUS), 0);
+        assert!(fb.cursor().on);
+    }
+
+    #[test]
+    fn mul_un8_rounds_to_the_nearest() {
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                let exact = f64::from(a) * f64::from(b) / 255.0;
+                assert_eq!(mul_un8(a, b), exact.round() as u8, "{a} x {b}");
+            }
+        }
+    }
+
+    /// The display shows the cursor blended over the frame with OVER on premultiplied
+    /// alpha: an opaque pixel replaces the frame's, a clear one keeps it, one half
+    /// covered adds its colour to half the frame's; the image hangs off the edges.
+    #[test]
+    fn the_frame_shows_the_cursor_blended_over_it() {
+        let mut ram = vec![0u8; RAM as usize];
+        let mut fb = Framebuffer::new(6000);
+        fb.vram.fill(0x80); // every pixel 0x80 in each byte: grey
+        fb.ctrl = CTRL_ENABLE;
+        // The image at RAM + 0x2000: pixel (0, 0) opaque red, (1, 0) half-covered green
+        // (premultiplied: 0x80 of alpha, 0x80 of green), (2, 0) clear, (63, 63) white.
+        let image = 0x2000;
+        let px = |x: usize, y: usize| image + (y * 64 + x) * 4;
+        ram[px(0, 0)..px(0, 0) + 4].copy_from_slice(&0xffff_0000u32.to_le_bytes());
+        ram[px(1, 0)..px(1, 0) + 4].copy_from_slice(&0x8000_8000u32.to_le_bytes());
+        ram[px(63, 63)..px(63, 63) + 4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        fb.write(REG_CURSOR_ADDR, 8, RAM_BASE + image as u64, RAM)
+            .unwrap();
+        w(&mut fb, REG_CURSOR_POS, pos(10, 20));
+        w(&mut fb, REG_CURSOR_CTRL, 1);
+        assert_eq!(fb.frame(&ram).cursor, None, "until the vertical blank");
+        fb.advance(100);
+        let frame = fb.frame(&ram);
+        let cursor = frame.cursor.unwrap();
+        assert_eq!(
+            (cursor.x, cursor.y, cursor.width, cursor.height),
+            (10, 20, 64, 64)
+        );
+        assert_eq!(cursor.pixels.len(), CURSOR_BYTES as usize);
+        assert_eq!(frame.pixel(10, 20), 0xff_0000, "opaque");
+        // Green: 0x80 + 0x80 * 0x7f / 255 = 0x80 + 0x40; red and blue 0x80 * 0x7f / 255.
+        assert_eq!(frame.pixel(11, 20), 0x40_c040, "half covered");
+        assert_eq!(frame.pixel(12, 20), 0x80_8080, "clear");
+        assert_eq!(frame.pixel(73, 83), 0xff_ffff);
+        assert_eq!(frame.pixel(9, 20), 0x80_8080, "outside");
+        assert_eq!(frame.pixel(74, 84), 0x80_8080, "outside");
+        // The composited frame is the same pixels; the scanout plane is untouched.
+        let all = frame.composited().unwrap();
+        for (x, y) in [(10, 20), (11, 20), (12, 20), (73, 83), (0, 0)] {
+            let at = (y * 640 + x) * 4;
+            let word = u32::from_le_bytes(all[at..at + 4].try_into().unwrap()) & 0xff_ffff;
+            assert_eq!(word, frame.pixel(x as u32, y as u32), "({x}, {y})");
+        }
+        assert!(fb.vram.iter().all(|&b| b == 0x80));
+        let ppm = frame.to_ppm();
+        let at = b"P6\n640 480\n255\n".len() + (20 * 640 + 10) * 3;
+        assert_eq!(&ppm[at..at + 6], &[0xff, 0, 0, 0x40, 0xc0, 0x40]);
+
+        // Off the top left corner only (63, 63) is left, at (0, 0); off the bottom
+        // right only (0, 0), at (639, 479); wholly off, nothing.
+        for (x, y, at, want) in [
+            (-63, -63, (0, 0), 0xff_ffff),
+            (639, 479, (639, 479), 0xff_0000),
+            (-64, 0, (0, 0), 0x80_8080),
+            (640, 0, (639, 0), 0x80_8080),
+            (i16::MIN, i16::MAX, (0, 479), 0x80_8080),
+        ] {
+            w(&mut fb, REG_CURSOR_POS, pos(x, y));
+            fb.advance(100);
+            let frame = fb.frame(&ram);
+            assert_eq!(frame.pixel(at.0, at.1), want, "at ({x}, {y})");
+            frame.to_ppm(); // clipped, not out of bounds
+        }
+        // A display that is off shows nothing, the cursor included.
+        fb.ctrl = 0;
+        let frame = fb.frame(&ram);
+        assert_eq!((frame.pixels, frame.cursor), (None, None));
+    }
+
+    /// The kept picture: a full drawing is the composited frame; a change of the cursor
+    /// alone (a move, another image, one off an edge or the frame, hiding it) gives what
+    /// a full drawing of the new frame would; a frame with no cursor is not copied; a new
+    /// size is drawn whole, and a display that is off is black.
+    #[test]
+    fn a_composite_redraws_only_the_cursor() {
+        let (width, height) = (16u32, 8u32);
+        let pixels: Vec<u8> = (0..width * height * 4).map(|i| (i * 7) as u8).collect();
+        let image_a = [0xffu8; 4 * 4 * 4];
+        let image_b: Vec<u8> = (0..3 * 2 * 4).map(|i| [0x40, 0, 0x20, 0x80][i % 4]).collect();
+        let cursor = |x, y, w, h, pixels| CursorPlane {
+            x,
+            y,
+            width: w,
+            height: h,
+            hot_x: 0,
+            hot_y: 0,
+            pixels,
+        };
+        let frame = |cursor, pixels| Frame {
+            width,
+            height,
+            pixels: Some(pixels),
+            cursor,
+        };
+        let full = |f: &Frame| f.composited().unwrap().into_owned();
+        let mut composite = Composite::new();
+        let shown = frame(Some(cursor(2, 1, 4, 4, &image_a[..])), &pixels[..]);
+        assert_eq!(composite.draw(&shown).unwrap(), full(&shown));
+        for next in [
+            Some(cursor(9, 3, 4, 4, &image_a[..])),
+            Some(cursor(9, 3, 3, 2, &image_b[..])),
+            Some(cursor(-2, -1, 4, 4, &image_a[..])),
+            Some(cursor(14, 7, 3, 2, &image_b[..])),
+            Some(cursor(40, 40, 4, 4, &image_a[..])),
+            None,
+            Some(cursor(5, 5, 3, 2, &image_b[..])),
+        ] {
+            let next = frame(next, &pixels[..]);
+            let want = full(&next);
+            assert_eq!(composite.draw_cursor(&next).unwrap(), want, "{:?}", next.cursor);
+        }
+        // No cursor: the frame itself, not a copy; a cursor that shows again then starts
+        // from the whole frame.
+        let bare = frame(None, &pixels[..]);
+        assert!(std::ptr::eq(composite.draw(&bare).unwrap(), &pixels[..]));
+        let back = frame(Some(cursor(0, 0, 4, 4, &image_a[..])), &pixels[..]);
+        assert_eq!(composite.draw_cursor(&back).unwrap(), full(&back));
+        // Another size: drawn whole.
+        let small = [0x33u8; 4 * 4 * 4];
+        let resized = Frame {
+            width: 4,
+            height: 4,
+            pixels: Some(&small[..]),
+            cursor: Some(cursor(1, 1, 4, 4, &image_a[..])),
+        };
+        assert_eq!(composite.draw_cursor(&resized).unwrap(), full(&resized));
+        // The display off: black.
+        let off = Frame {
+            pixels: None,
+            cursor: None,
+            ..resized
+        };
+        assert_eq!(composite.draw_cursor(&off), None);
+    }
+
+    /// Saturation: a pixel that is not validly premultiplied (colour above alpha) adds
+    /// up to 255 at most, as pixman's saturating add does.
+    #[test]
+    fn blending_saturates() {
+        let mut dst = [0xf0, 0x10, 0x00, 0x00];
+        blend_pixel(&mut dst, &[0x80, 0x80, 0x80, 0x00]);
+        assert_eq!(dst, [0xff, 0x90, 0x80, 0x00]);
     }
 
     #[test]

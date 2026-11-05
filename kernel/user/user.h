@@ -80,12 +80,22 @@ typedef unsigned long uintptr_t;
 #define ARG_MAX 512
 
 /* open's flags: one access mode, plus O_CREAT (make the file if it is
- * missing) and O_TRUNC (empty it, when opened for writing). */
+ * missing), O_TRUNC (empty it, when opened for writing) and O_CLOEXEC (the
+ * descriptor closes on exec). */
 #define O_RDONLY 0x000
 #define O_WRONLY 0x001
 #define O_RDWR 0x002
 #define O_CREAT 0x040
 #define O_TRUNC 0x200
+#define O_CLOEXEC 0x80000
+
+/* fcntl's commands, and the descriptor flag F_GETFD and F_SETFD read and
+ * set. */
+#define F_DUPFD 0            /* a copy at the lowest free descriptor >= arg */
+#define F_GETFD 1            /* the descriptor's flags */
+#define F_SETFD 2            /* sets them to arg */
+#define F_DUPFD_CLOEXEC 1030 /* F_DUPFD, the copy closing on exec */
+#define FD_CLOEXEC 1         /* the descriptor closes on exec */
 
 /* lseek's `whence`. */
 #define SEEK_SET 0
@@ -281,6 +291,7 @@ int thread_join(int tid, int *status);
 int gettid(void);
 int futex_wait(int *addr, int val);
 int futex_wake(int *addr, int n);
+int fcntl(int fd, int cmd, int arg);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);

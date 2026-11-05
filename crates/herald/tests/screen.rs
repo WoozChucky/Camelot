@@ -2,14 +2,16 @@
 //! no window: the view is a few vectors behind a lock, so the test can type and move
 //! the mouse into it while the session runs, and look at what it was asked to draw.
 //! The guests are the repository's examples: `colorbars` (the framebuffer example),
-//! `pointer` (a cursor that follows the mouse; Esc ends it).
+//! `pointer` (a cursor that follows the mouse; Esc ends it), `cursor` (the cursor plane
+//! moved over a still frame).
 
 mod common;
 
 use avalon_proto::{
-    Connection, KeyEvent, Message, PointerChange, PointerMotion, Screen, VmRef, VmState, POINTER_LEFT,
+    Connection, Cursor, KeyEvent, Message, PointerChange, PointerMotion, Screen, VmRef, VmState, POINTER_LEFT,
 };
 use common::*;
+use grail::framebuffer::Composite;
 use herald::screen::{Input, ScreenSession, View};
 use herald::End;
 use std::sync::{Arc, Mutex};
@@ -23,9 +25,17 @@ struct ViewState {
     closed: bool,
     /// Input waiting for the session to take it.
     input: Vec<Input>,
-    /// The screen as last drawn, and how many times it was drawn.
+    /// The screen and the cursor as last drawn, and how many times they were drawn.
     drawn: Option<Screen>,
+    cursor: Cursor,
     draws: usize,
+    /// How many of those were for a change of the cursor alone (`View::draw_cursor`).
+    cursor_draws: usize,
+    /// What the last drawing showed: the screen with the cursor blended over it, as the
+    /// window shows it (`herald::screen::frame`, kept from one drawing to the next as
+    /// the window keeps it).
+    shown: Vec<u8>,
+    composite: Composite,
     /// Ask for a redraw, as an uncovered window does.
     redraw: bool,
     /// Every state the session reported.
@@ -51,10 +61,12 @@ impl View for FakeView {
         std::mem::take(&mut self.0.lock().unwrap().redraw)
     }
 
-    fn draw(&mut self, screen: &Screen) {
-        let mut st = self.0.lock().unwrap();
-        st.drawn = Some(screen.clone());
-        st.draws += 1;
+    fn draw(&mut self, screen: &Screen, cursor: &Cursor) {
+        self.show(screen, cursor, false);
+    }
+
+    fn draw_cursor(&mut self, screen: &Screen, cursor: &Cursor) {
+        self.show(screen, cursor, true);
     }
 
     fn vm_state(&mut self, state: VmState) {
@@ -63,6 +75,23 @@ impl View for FakeView {
 }
 
 impl FakeView {
+    /// Draws as the window does: the whole picture, or only the cursor's part of it.
+    fn show(&self, screen: &Screen, cursor: &Cursor, cursor_only: bool) {
+        let mut st = self.0.lock().unwrap();
+        let st = &mut *st;
+        st.drawn = Some(screen.clone());
+        st.cursor = cursor.clone();
+        let frame = herald::screen::frame(screen, cursor);
+        let shown = if cursor_only {
+            st.composite.draw_cursor(&frame)
+        } else {
+            st.composite.draw(&frame)
+        };
+        st.shown = shown.unwrap().to_vec();
+        st.draws += 1;
+        st.cursor_draws += usize::from(cursor_only);
+    }
+
     fn send(&self, input: Input) {
         self.0.lock().unwrap().input.push(input);
     }
@@ -114,6 +143,20 @@ impl Running {
 fn attach(server: &avalon::ServerThread, vm: VmRef) -> ScreenSession {
     let conn = Connection::connect(server.addr(), herald::AGENT).unwrap();
     ScreenSession::attach(conn, &vm).unwrap_or_else(|e| panic!("attach {vm}: {e}"))
+}
+
+/// What Grail's display shows after running `program` to its end: the frame with the
+/// cursor plane blended over it, as Grail's window and dumps show it.
+fn grail_picture(program: &[u8]) -> Vec<u8> {
+    let mut m = grail::Machine::with_ram(16 * 1024 * 1024);
+    m.load_elf(program).unwrap();
+    assert_eq!(m.run(Some(100_000_000), |_| {}), grail::RunResult::Exited(0));
+    m.cpu
+        .bus
+        .frame()
+        .composited()
+        .expect("the display is on")
+        .into_owned()
 }
 
 /// What Grail's framebuffer holds after running `program` to its end.
@@ -211,6 +254,41 @@ fn a_mode_change_resizes_the_view() {
     let drawn = st.drawn.as_ref().unwrap();
     assert_eq!((drawn.width(), drawn.height()), (800, 600));
     assert!(drawn.pixels() == expected, "drawn as received");
+    drop(st);
+    server.stop().unwrap();
+}
+
+/// Acceptance of #203, Herald shows the cursor: a guest that moves the framebuffer's
+/// cursor over a frame it draws once (`examples/cursor`) ends with the view showing
+/// pixel for pixel what Grail's display does, its frame with the cursor blended over it
+/// where the guest left it, though no frame carried the cursor: the session's screen is
+/// Grail's frame without it, and its cursor the guest's.
+#[test]
+fn the_view_shows_the_cursor() {
+    let server = server();
+    let id = create(&server, "cursor", example("cursor"));
+    let running = Running::start(attach(&server, VmRef::Id(id)));
+    wait_until("the first drawing", || running.view.draws() > 0);
+    connect(&server)
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let view = running.view.clone();
+    let (end, session) = running.end();
+    assert_eq!(end.unwrap(), End::VmEnded(VmState::Exited(0)));
+    assert!(
+        session.screen.pixels() == grail_screen(&example("cursor")),
+        "no cursor in the frames"
+    );
+    let (image, x, y) = session.cursor.shown().expect("the cursor shows");
+    assert_eq!((image.width, image.height, x, y), (64, 64, 0, 0));
+    let picture = grail_picture(&example("cursor"));
+    assert!(
+        picture != grail_screen(&example("cursor")),
+        "the cursor changes the picture"
+    );
+    let st = view.0.lock().unwrap();
+    assert!(st.shown == picture, "the view shows Grail's picture");
+    assert_eq!(st.cursor, session.cursor);
     drop(st);
     server.stop().unwrap();
 }
@@ -504,6 +582,136 @@ fn a_resize_makes_a_new_screen() {
     assert_eq!(session.screen.pixel(5, 1), 0x33, "the frame after the resize");
     assert_eq!(session.screen.pixel(0, 0), 0, "black, not the old screen");
     assert_eq!((session.resizes, session.frames), (1, 2));
+    server.join().unwrap();
+}
+
+/// The cursor from a scripted server: its image and place are drawn over the screen,
+/// a move alone redraws it (no frame comes), a resize keeps it where it is, hiding it
+/// shows the screen alone, and another VM's cursor is passed over.
+#[test]
+fn cursor_messages_draw_the_cursor() {
+    // The test lets the server go on to its next batch once it has seen the last one.
+    let (next, batches) = std::sync::mpsc::channel::<()>();
+    let (addr, server) = fake_server(move |mut conn| {
+        fake_screen_attach(&mut conn, 4, 4, 0);
+        // A 2x1 image: an opaque red pixel, then a half-covered green one.
+        let shape = Message::CursorShape {
+            vm: 1,
+            width: 2,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: vec![0, 0, 0xff, 0xff, 0, 0x80, 0, 0x80],
+        };
+        // VM 2's cursor, after VM 1's: an opaque blue pixel at (0, 0), which a session
+        // that took it would show there instead.
+        let other = Message::CursorShape {
+            vm: 2,
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: vec![0xff, 0, 0, 0xff],
+        };
+        let at = |vm, visible, x, y| Message::CursorPosition { vm, visible, x, y };
+        // Then a frame of VM 1's, a pixel at (3, 0), to know the session has taken them all.
+        let mark = Message::ScreenFrame {
+            vm: 1,
+            x: 3,
+            y: 0,
+            width: 1,
+            height: 1,
+            pixels: vec![0x22, 0, 0, 0],
+        };
+        let script = [
+            vec![shape, at(1, true, -1, 2), other, at(2, true, 0, 0), mark],
+            vec![at(1, true, 3, 3)],
+            vec![Message::ScreenResized {
+                vm: 1,
+                width: 6,
+                height: 6,
+                format: 0,
+            }],
+            vec![at(1, false, 0, 0)],
+        ];
+        for batch in script {
+            for msg in batch {
+                conn.send(&msg).unwrap();
+            }
+            batches.recv().unwrap();
+        }
+        let _ = conn.recv();
+    });
+    let conn = Connection::connect(addr.as_str(), herald::AGENT).unwrap();
+    let session = ScreenSession::attach(conn, &VmRef::Id(1)).unwrap();
+    let running = Running::start(session);
+    let view = running.view.clone();
+    // Pixel (x, y) of what the view shows, 0x00RRGGBB.
+    let shown = |x: usize, y: usize, width: usize| {
+        let st = view.0.lock().unwrap();
+        let at = (y * width + x) * 4;
+        st.shown
+            .get(at..at + 4)
+            .map(|p| u32::from_le_bytes(p.try_into().unwrap()) & 0xff_ffff)
+    };
+    // The screen is 0x11 in every byte; the green pixel of the image over it: blue and
+    // red 0x11 * 0x7f / 255 = 8, green 0x80 + 8.
+    wait_until("the frame after the cursors", || shown(3, 0, 4) == Some(0x22));
+    assert_eq!(shown(0, 2, 4), Some(0x08_8808), "the cursor at (-1, 2)");
+    assert_eq!(shown(1, 2, 4), Some(0x11_1111), "beside it");
+    assert_eq!(shown(0, 0, 4), Some(0x11_1111), "VM 2's cursor passed over");
+    let frames = running
+        .view
+        .0
+        .lock()
+        .unwrap()
+        .drawn
+        .as_ref()
+        .map(|s| s.pixels().to_vec());
+    next.send(()).unwrap();
+    wait_until("the cursor moved to (3, 3)", || shown(3, 3, 4) == Some(0xff_0000));
+    assert_eq!(shown(0, 2, 4), Some(0x11_1111), "gone from where it was");
+    assert!(
+        view.0.lock().unwrap().cursor_draws > 0,
+        "only the cursor's part drawn again"
+    );
+    assert_eq!(
+        running
+            .view
+            .0
+            .lock()
+            .unwrap()
+            .drawn
+            .as_ref()
+            .map(|s| s.pixels().to_vec()),
+        frames,
+        "the screen itself unchanged"
+    );
+    next.send(()).unwrap();
+    wait_until("the resize", || {
+        view.0
+            .lock()
+            .unwrap()
+            .drawn
+            .as_ref()
+            .is_some_and(|s| s.width() == 6)
+    });
+    wait_until("the cursor still at (3, 3)", || shown(3, 3, 6) == Some(0xff_0000));
+    next.send(()).unwrap();
+    wait_until("the cursor hidden", || shown(3, 3, 6) == Some(0));
+    assert!(
+        view.0.lock().unwrap().shown.iter().all(|&b| b == 0),
+        "black, no cursor"
+    );
+    next.send(()).unwrap();
+    running.view.close();
+    let (_, session) = running.end();
+    assert!(!session.cursor.visible);
+    assert_eq!(
+        session.cursor.image.as_ref().map(|i| i.width),
+        Some(2),
+        "the image kept"
+    );
     server.join().unwrap();
 }
 

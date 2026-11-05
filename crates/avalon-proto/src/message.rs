@@ -49,6 +49,8 @@ pub mod ty {
     pub const SCREEN_DETACH: u16 = 0x0305;
     pub const POINTER_INPUT: u16 = 0x0306;
     pub const SCREEN_RESIZED: u16 = 0x0307;
+    pub const CURSOR_SHAPE: u16 = 0x0308;
+    pub const CURSOR_POSITION: u16 = 0x0309;
     // Block I/O.
     pub const BLOCK_OPEN: u16 = 0x0401;
     pub const BLOCK_OPENED: u16 = 0x0402;
@@ -111,6 +113,8 @@ pub const CATALOGUE: &[(u16, &str, MessageKind)] = {
         (ty::SCREEN_DETACH, "ScreenDetach", Request),
         (ty::POINTER_INPUT, "PointerInput", Event),
         (ty::SCREEN_RESIZED, "ScreenResized", Event),
+        (ty::CURSOR_SHAPE, "CursorShape", Event),
+        (ty::CURSOR_POSITION, "CursorPosition", Event),
         (ty::BLOCK_OPEN, "BlockOpen", Request),
         (ty::BLOCK_OPENED, "BlockOpened", Reply),
         (ty::BLOCK_READ, "BlockRead", Request),
@@ -176,6 +180,11 @@ pub const PIXEL_FORMAT_XRGB8888: u32 = 0;
 /// of `n` pixel bytes fits in one frame if `n + SCREEN_FRAME_OVERHEAD` is at most
 /// [`crate::MAX_FRAME_LEN`].
 pub const SCREEN_FRAME_OVERHEAD: usize = 2 + 5 * 4 + 4;
+
+/// The largest cursor image `CursorShape` carries, in pixels each way: 256, four times
+/// Grail's 64 × 64 (some display controllers' cursor planes, Intel's among them, go up
+/// to 256 × 256).
+pub const MAX_CURSOR_SIZE: u32 = 256;
 
 /// RAM size of [`HardwareProfile::default`], as for `grail::DEFAULT_RAM_SIZE`.
 pub const DEFAULT_RAM_SIZE: u64 = 4 * 1024 * 1024;
@@ -791,6 +800,29 @@ pub enum Message {
         height: u32,
         format: u32,
     },
+    /// Server: the image of the VM's cursor (its framebuffer's cursor plane), from now
+    /// on: `width` × `height` pixels of ARGB8888 with premultiplied alpha (bytes B, G, R,
+    /// A), row by row, its hotspot at (`hot_x`, `hot_y`). Sent when the image changes,
+    /// apart from where the cursor is (`CursorPosition`), as VNC's cursor
+    /// pseudo-encoding and SPICE's cursor channel send it.
+    CursorShape {
+        vm: u32,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        pixels: Vec<u8>,
+    },
+    /// Server: where the VM's cursor is now, the image's top left pixel at (`x`, `y`) of
+    /// the screen (either may be negative, or past the screen's size), or that it is
+    /// hidden (`visible` false: `x` and `y` then mean nothing). Moving the cursor sends
+    /// this, and no `ScreenFrame`.
+    CursorPosition {
+        vm: u32,
+        visible: bool,
+        x: i32,
+        y: i32,
+    },
 
     // ---- Block I/O (Lake) ----
     /// Attach a disk image. Answered by `BlockOpened` with a handle for the requests
@@ -934,6 +966,8 @@ impl Message {
             ScreenDetach { .. } => ty::SCREEN_DETACH,
             PointerInput { .. } => ty::POINTER_INPUT,
             ScreenResized { .. } => ty::SCREEN_RESIZED,
+            CursorShape { .. } => ty::CURSOR_SHAPE,
+            CursorPosition { .. } => ty::CURSOR_POSITION,
             BlockOpen { .. } => ty::BLOCK_OPEN,
             BlockOpened { .. } => ty::BLOCK_OPENED,
             BlockRead { .. } => ty::BLOCK_READ,
@@ -994,6 +1028,33 @@ impl Message {
                 if pixels.len() as u128 != want {
                     return invalid(format!(
                         "{width}x{height} rectangle needs {want} pixel bytes, got {}",
+                        pixels.len()
+                    ));
+                }
+            }
+            Message::CursorShape {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                pixels,
+                ..
+            } => {
+                let size = 1..=MAX_CURSOR_SIZE;
+                if !size.contains(width) || !size.contains(height) {
+                    return invalid(format!(
+                        "a {width}x{height} cursor (1 to {MAX_CURSOR_SIZE} pixels each way)"
+                    ));
+                }
+                if hot_x >= width || hot_y >= height {
+                    return invalid(format!(
+                        "hotspot ({hot_x}, {hot_y}) outside a {width}x{height} cursor"
+                    ));
+                }
+                let want = *width as usize * *height as usize * 4;
+                if pixels.len() != want {
+                    return invalid(format!(
+                        "{width}x{height} cursor needs {want} pixel bytes, got {}",
                         pixels.len()
                     ));
                 }
@@ -1140,6 +1201,27 @@ impl Message {
                 w.u32(*width);
                 w.u32(*height);
                 w.bytes(pixels);
+            }
+            CursorShape {
+                vm,
+                width,
+                height,
+                hot_x,
+                hot_y,
+                pixels,
+            } => {
+                w.u32(*vm);
+                w.u32(*width);
+                w.u32(*height);
+                w.u32(*hot_x);
+                w.u32(*hot_y);
+                w.bytes(pixels);
+            }
+            CursorPosition { vm, visible, x, y } => {
+                w.u32(*vm);
+                w.bool(*visible);
+                w.i32(*x);
+                w.i32(*y);
             }
             KeyInput { vm, key } => {
                 w.u32(*vm);
@@ -1356,6 +1438,20 @@ impl Message {
                 width: r.u32()?,
                 height: r.u32()?,
                 pixels: r.bytes()?,
+            },
+            ty::CURSOR_SHAPE => CursorShape {
+                vm: r.u32()?,
+                width: r.u32()?,
+                height: r.u32()?,
+                hot_x: r.u32()?,
+                hot_y: r.u32()?,
+                pixels: r.bytes()?,
+            },
+            ty::CURSOR_POSITION => CursorPosition {
+                vm: r.u32()?,
+                visible: r.bool()?,
+                x: r.i32()?,
+                y: r.i32()?,
             },
             ty::KEY_INPUT => {
                 let vm = r.u32()?;

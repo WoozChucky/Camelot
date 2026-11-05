@@ -19,6 +19,7 @@ long sys_unlink(struct trap_frame *f);
 long sys_link(struct trap_frame *f);
 long sys_chdir(struct trap_frame *f);
 long sys_dup(struct trap_frame *f);
+long sys_fcntl(struct trap_frame *f);
 long sys_pipe(struct trap_frame *f);
 
 /* Copies the path at user address `va` in `pt` to `buf` (MAXPATH + 1

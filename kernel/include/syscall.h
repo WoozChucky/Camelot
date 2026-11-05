@@ -64,6 +64,7 @@
 #define SYS_gettid 44        /* gettid(): the caller's thread id */
 #define SYS_futex_wait 45    /* futex_wait(addr, val): 0 once woken, if *addr was val */
 #define SYS_futex_wake 46    /* futex_wake(addr, n): the number of threads woken */
+#define SYS_fcntl 47         /* fcntl(fd, cmd, arg): a descriptor's flags, or a copy of it */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
@@ -118,14 +119,22 @@
 #define FD_STDOUT 1
 #define FD_STDERR 2
 
-/* open's flags (Linux's values): one access mode, plus O_CREAT and
- * O_TRUNC. */
+/* open's flags (Linux's values): one access mode, plus O_CREAT, O_TRUNC
+ * and O_CLOEXEC (the new descriptor closes on exec). */
 #define O_RDONLY 0x000
 #define O_WRONLY 0x001
 #define O_RDWR 0x002
 #define O_ACCMODE 0x003
 #define O_CREAT 0x040
 #define O_TRUNC 0x200
+#define O_CLOEXEC 0x80000
+
+/* fcntl's commands and its descriptor flag (Linux's values). */
+#define F_DUPFD 0            /* a copy at the lowest free descriptor >= arg */
+#define F_GETFD 1            /* the descriptor's flags */
+#define F_SETFD 2            /* sets them to arg */
+#define F_DUPFD_CLOEXEC 1030 /* F_DUPFD, the copy closing on exec */
+#define FD_CLOEXEC 1         /* the descriptor closes on exec */
 
 /* lseek's `whence`. */
 #define SEEK_SET 0

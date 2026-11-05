@@ -52,6 +52,8 @@ impl Default for Limits {
 pub struct Request {
     /// `GET`, `POST`, ... (a valid token, case kept: methods are case-sensitive).
     pub method: String,
+    /// `HTTP/1.1` or `HTTP/1.0`.
+    pub version: String,
     /// The target's path as sent (still percent-encoded), always starting with `/`.
     pub path: String,
     /// The path's segments, percent-decoded: `/api/vms/3` is `["api", "vms", "3"]`,
@@ -220,6 +222,12 @@ pub struct Head {
 }
 
 impl Head {
+    /// The request (its body not read) and what was read after its head: for a
+    /// connection that becomes something else (a WebSocket), the first bytes of that.
+    pub fn into_parts(self) -> (Request, Vec<u8>) {
+        (self.request, self.rest)
+    }
+
     /// The body's length, as `Content-Length` says.
     pub fn body_length(&self) -> usize {
         self.length
@@ -427,6 +435,7 @@ fn parse_request_line(line: &[u8]) -> Result<Request, HttpError> {
         .collect::<Result<_, HttpError>>()?;
     Ok(Request {
         method: method.to_string(),
+        version: version.to_string(),
         path: path.to_string(),
         segments,
         query,

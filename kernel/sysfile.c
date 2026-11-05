@@ -1,6 +1,6 @@
 /* The file system calls (docs/camelot-syscalls.md), after xv6's sysfile.c:
- * descriptors (read, write, close, dup, lseek, fstat), pipes, and the calls
- * that take paths (open, mkdir, unlink, link, chdir).
+ * descriptors (read, write, close, dup, fcntl, lseek, fstat), pipes, and the
+ * calls that take paths (open, mkdir, unlink, link, chdir).
  *
  * Every change to the disk happens inside one transaction (begin_op() to
  * end_op(), log.h), so a crash leaves all of a call or none of it: open's
@@ -92,6 +92,45 @@ long sys_dup(struct trap_frame *f) {
         fileclose(file);
     }
     return fd;
+}
+
+/* fcntl(fd, cmd, arg), Linux's for the descriptor's flags and copies: the
+ * descriptor is checked first, as Linux does, then the command. */
+long sys_fcntl(struct trap_frame *f) {
+    u32 fd = (u32)arg(f, 0);
+    u32 cmd = (u32)arg(f, 1);
+    u32 a = (u32)arg(f, 2);
+    struct file *file = fd_get(fd);
+    if (file == NULL) {
+        return -EBADF;
+    }
+    int r;
+    switch (cmd) {
+    case F_DUPFD:
+    case F_DUPFD_CLOEXEC:
+        /* No descriptor reaches `a`: Linux's answer past RLIMIT_NOFILE
+         * (a negative int is a huge one there too). */
+        if (a >= NOFILE) {
+            r = -EINVAL;
+            break;
+        }
+        r = fd_install_from(file, a, cmd == F_DUPFD_CLOEXEC);
+        if (r >= 0) {
+            return r; /* our reference is the new descriptor's */
+        }
+        break;
+    case F_GETFD:
+        r = fd_flags(fd);
+        break;
+    case F_SETFD:
+        r = fd_set_flags(fd, a);
+        break;
+    default:
+        r = -EINVAL;
+        break;
+    }
+    fileclose(file);
+    return r;
 }
 
 long sys_lseek(struct trap_frame *f) {
@@ -190,7 +229,7 @@ long sys_open(struct trap_frame *f) {
     }
     u32 flags = (u32)arg(f, 1);
     u32 mode = flags & O_ACCMODE;
-    if ((flags & ~(O_ACCMODE | O_CREAT | O_TRUNC)) != 0 || mode == O_ACCMODE) {
+    if ((flags & ~(O_ACCMODE | O_CREAT | O_TRUNC | O_CLOEXEC)) != 0 || mode == O_ACCMODE) {
         return -EINVAL;
     }
     if (!fs_mounted) {
@@ -252,7 +291,7 @@ long sys_open(struct trap_frame *f) {
     /* The descriptor last, once the file is whole: no other thread can use
      * it half set up. It fails only if another thread took the last free
      * one meanwhile. */
-    int fd = fd_install(file);
+    int fd = fd_install_from(file, 0, (flags & O_CLOEXEC) != 0);
     if (fd < 0) {
         fileclose(file);
     }
