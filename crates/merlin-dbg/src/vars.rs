@@ -28,7 +28,6 @@
 
 use crate::symbols::Symbols;
 use elf::dies::{dw, Attr, Die, InfoUnit};
-use excalibur::Xlen;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -92,6 +91,9 @@ pub struct Frame {
 }
 
 const S0: usize = 8;
+
+/// A register's bytes, as many as a pointer's and a `long`'s (LP64).
+const WORD: u64 = 8;
 
 /// A type: one of the program's, or one an expression makes (`&x` of a sub-array,
 /// a number, a difference of pointers).
@@ -289,10 +291,10 @@ impl Debug {
     /// typedef name or a base type. An integer type may be spelled any way C
     /// allows (`unsigned`, `long int`, `long unsigned`), and is C's own (as
     /// GDB knows them) if the program describes none of that name.
-    pub fn type_named(&self, name: &str, xlen: Xlen) -> Option<Ty> {
+    pub fn type_named(&self, name: &str) -> Option<Ty> {
         let name = name.trim();
         let words: Vec<&str> = name.split_whitespace().collect();
-        if let Some((canonical, size, signed)) = c_integer(&words, xlen) {
+        if let Some((canonical, size, signed)) = c_integer(&words) {
             return self.described(&[dw::TAG_BASE_TYPE], canonical).or(Some(Ty::Int {
                 name: canonical,
                 size,
@@ -458,7 +460,7 @@ impl Debug {
 
     /// The rank of an integer type: by its C name (`unsigned long`, `long long
     /// int`), else by its size.
-    fn rank(&self, t: &Ty, xlen: Xlen) -> Rank {
+    fn rank(&self, t: &Ty) -> Rank {
         let name = match t {
             Ty::Int { name, .. } => Some(*name),
             Ty::Die(t) => self.strip(*t).and_then(|r| {
@@ -467,7 +469,7 @@ impl Debug {
             }),
             _ => None,
         };
-        let size = self.size(t, xlen).unwrap_or(4);
+        let size = self.size(t).unwrap_or(4);
         match name {
             Some(n) if n.contains("_Bool") || n == "bool" => Rank::Bool,
             Some(n) if n.contains("char") => Rank::Char,
@@ -479,7 +481,7 @@ impl Debug {
                 1 => Rank::Char,
                 2 => Rank::Short,
                 4 => Rank::Int,
-                _ if u64::from(xlen.bits() / 8) == size => Rank::Long,
+                8 => Rank::Long,
                 _ => Rank::LongLong,
             },
         }
@@ -497,19 +499,19 @@ impl Debug {
     /// The size of a type in bytes (none: unknown, as of `void` or an incomplete
     /// struct, or past [`DEPTH`] arrays, an array of itself in broken
     /// information).
-    fn size(&self, t: &Ty, xlen: Xlen) -> Option<u64> {
-        self.size_at(t, xlen, 0)
+    fn size(&self, t: &Ty) -> Option<u64> {
+        self.size_at(t, 0)
     }
 
-    fn size_at(&self, t: &Ty, xlen: Xlen, depth: usize) -> Option<u64> {
+    fn size_at(&self, t: &Ty, depth: usize) -> Option<u64> {
         if depth > DEPTH {
             return None;
         }
         match self.shape(t) {
             Shape::Void | Shape::Func(_) => None,
             Shape::Int { size, .. } | Shape::Enum(_, size, _) => Some(size),
-            Shape::Ptr(_) => Some(u64::from(xlen.bits() / 8)),
-            Shape::Array(elem, n) => self.size_at(&elem, xlen, depth + 1)?.checked_mul(n?),
+            Shape::Ptr(_) => Some(WORD),
+            Shape::Array(elem, n) => self.size_at(&elem, depth + 1)?.checked_mul(n?),
             Shape::Record(r) => self.die(r).unsigned(dw::AT_BYTE_SIZE),
         }
     }
@@ -883,7 +885,6 @@ struct Parser<'a> {
     toks: &'a [Tok],
     at: usize,
     debug: &'a Debug,
-    xlen: Xlen,
 }
 
 impl Parser<'_> {
@@ -923,8 +924,7 @@ impl Parser<'_> {
         let is_type = matches!(
             words.first().map(String::as_str),
             Some("struct" | "union" | "enum")
-        ) || self.debug.type_named(&base, self.xlen).is_some()
-            && self.debug.global(&base, None).is_none();
+        ) || self.debug.type_named(&base).is_some() && self.debug.global(&base, None).is_none();
         if words.is_empty() || !is_type || !matches!(self.peek(), Some(Tok::Punct(")"))) {
             self.at = save;
             return None;
@@ -1123,12 +1123,11 @@ pub struct Eval<'a, T: Target> {
     pub target: T,
     /// The selected frame, if the machine has one with debugging information.
     pub frame: Option<Frame>,
-    pub xlen: Xlen,
 }
 
-/// C's integer type of `rank`, signed or not, at the width: `long` is 4 bytes on
-/// RV32 and 8 on RV64 (`int` 4 and `long long` 8 on both).
-fn c_int(rank: Rank, signed: bool, xlen: Xlen) -> Ty {
+/// C's integer type of `rank`, signed or not, as LP64 has them: `int` 4 bytes,
+/// `long` and `long long` 8.
+fn c_int(rank: Rank, signed: bool) -> Ty {
     let (name, size) = match (rank, signed) {
         (Rank::Bool, _) => ("_Bool", 1),
         (Rank::Char, true) => ("signed char", 1),
@@ -1137,8 +1136,8 @@ fn c_int(rank: Rank, signed: bool, xlen: Xlen) -> Ty {
         (Rank::Short, false) => ("unsigned short", 2),
         (Rank::Int, true) => ("int", 4),
         (Rank::Int, false) => ("unsigned int", 4),
-        (Rank::Long, true) => ("long", u64::from(xlen.bits() / 8)),
-        (Rank::Long, false) => ("unsigned long", u64::from(xlen.bits() / 8)),
+        (Rank::Long, true) => ("long", WORD),
+        (Rank::Long, false) => ("unsigned long", WORD),
         (Rank::LongLong, true) => ("long long", 8),
         (Rank::LongLong, false) => ("unsigned long long", 8),
     };
@@ -1150,7 +1149,7 @@ fn c_int(rank: Rank, signed: bool, xlen: Xlen) -> Ty {
 /// An integer type spelled as C allows, its words in any order (`unsigned`, `long
 /// int`, `long unsigned long`): its name as GDB writes it, its size and whether
 /// it is signed. Plain `char` is unsigned, as on RISC-V.
-fn c_integer(words: &[&str], xlen: Xlen) -> Option<(&'static str, u64, bool)> {
+fn c_integer(words: &[&str]) -> Option<(&'static str, u64, bool)> {
     let count = |w: &str| words.iter().filter(|&&x| x == w).count();
     let (unsigned, signed, longs, short, char_, int, bool_) = (
         count("unsigned"),
@@ -1192,7 +1191,7 @@ fn c_integer(words: &[&str], xlen: Xlen) -> Option<(&'static str, u64, bool)> {
     } else {
         Rank::Int
     };
-    let Ty::Int { name, size, signed } = c_int(rank, unsigned == 0, xlen) else {
+    let Ty::Int { name, size, signed } = c_int(rank, unsigned == 0) else {
         unreachable!("c_int makes integers")
     };
     Some((name, size, signed))
@@ -1218,7 +1217,6 @@ impl<T: Target> Eval<'_, T> {
             toks: &toks,
             at: 0,
             debug: self.debug,
-            xlen: self.xlen,
         };
         let e = p.expr()?;
         if p.at != toks.len() {
@@ -1255,7 +1253,7 @@ impl<T: Target> Eval<'_, T> {
         if self.debug.global(base, None).is_some() && !base.contains(' ') {
             return None;
         }
-        let mut t = self.debug.type_named(base, self.xlen)?;
+        let mut t = self.debug.type_named(base)?;
         for _ in 0..stars {
             t = Ty::Ptr(Box::new(t));
         }
@@ -1263,12 +1261,12 @@ impl<T: Target> Eval<'_, T> {
     }
 
     fn word(&self) -> u64 {
-        u64::from(self.xlen.bits() / 8)
+        WORD
     }
 
-    /// C's integer type of `rank` at the machine's width.
+    /// C's integer type of `rank`.
     fn int_ty(&self, rank: Rank, signed: bool) -> Ty {
-        c_int(rank, signed, self.xlen)
+        c_int(rank, signed)
     }
 
     /// `int`, the type of a comparison, of `!` and of a character constant.
@@ -1280,10 +1278,7 @@ impl<T: Target> Eval<'_, T> {
         match &v.loc {
             Loc::Bytes(b) => Ok(b.clone()),
             Loc::Mem(a) => {
-                let n = self
-                    .debug
-                    .size(&v.ty, self.xlen)
-                    .ok_or("a value of unknown size")?;
+                let n = self.debug.size(&v.ty).ok_or("a value of unknown size")?;
                 if n > 1 << 20 {
                     return Err(format!("a value of {n} bytes is too big to show"));
                 }
@@ -1311,10 +1306,7 @@ impl<T: Target> Eval<'_, T> {
     /// The number `n` as a value of the integer, enum or pointer type `ty`: its
     /// low bytes, as many as the type has (at most 16, an `i128`'s).
     fn int_value(&self, ty: Ty, n: i128) -> Result<Value> {
-        let size = self
-            .debug
-            .size(&ty, self.xlen)
-            .ok_or("a number of a type of unknown size")?;
+        let size = self.debug.size(&ty).ok_or("a number of a type of unknown size")?;
         if size > 16 {
             return Err(format!("a number cannot be {size} bytes"));
         }
@@ -1370,7 +1362,6 @@ impl<T: Target> Eval<'_, T> {
         }
         stack
             .pop()
-            .map(|a| crate::remote::wrap(self.xlen, a))
             .ok_or_else(|| format!("'{name}' has an empty location"))
     }
 
@@ -1472,10 +1463,7 @@ impl<T: Target> Eval<'_, T> {
                         }
                 };
                 let fits = |&(rank, signed): &(Rank, bool)| {
-                    let size = self
-                        .debug
-                        .size(&self.int_ty(rank, signed), self.xlen)
-                        .unwrap_or(8);
+                    let size = self.debug.size(&self.int_ty(rank, signed)).unwrap_or(8);
                     let bits = 8 * size as u32;
                     let max = if signed {
                         (1u128 << (bits - 1)) - 1
@@ -1581,18 +1569,12 @@ impl<T: Target> Eval<'_, T> {
             // GDB's `sizeof` is an `unsigned long`, as a `size_t` is.
             Expr::Sizeof(e) => {
                 let v = self.eval(e)?;
-                let n = self
-                    .debug
-                    .size(&v.ty, self.xlen)
-                    .ok_or("sizeof of a type of unknown size")?;
+                let n = self.debug.size(&v.ty).ok_or("sizeof of a type of unknown size")?;
                 self.int_value(self.int_ty(Rank::Long, false), i128::from(n))
             }
             Expr::SizeofType(t) => {
                 let t = self.type_name(t).ok_or_else(|| format!("no type named {t}"))?;
-                let n = self
-                    .debug
-                    .size(&t, self.xlen)
-                    .ok_or("sizeof of a type of unknown size")?;
+                let n = self.debug.size(&t).ok_or("sizeof of a type of unknown size")?;
                 self.int_value(self.int_ty(Rank::Long, false), i128::from(n))
             }
             Expr::Cast(t, e) => {
@@ -1628,7 +1610,7 @@ impl<T: Target> Eval<'_, T> {
     /// `$pc` and `$ra` code pointers (`void (*)()`), `$sp`, `$gp` and `$tp` data
     /// pointers (`void *`), the others `long`.
     fn register(&mut self, r: &str) -> Result<Value> {
-        let n = crate::session::register_number(r, self.xlen).ok_or_else(|| format!("no register ${r}"))?;
+        let n = crate::session::register_number(r).ok_or_else(|| format!("no register ${r}"))?;
         let v = match n {
             0..=31 => self.frame.as_ref().and_then(|f| f.regs[n]),
             crate::remote::PC => self.frame.as_ref().map(|f| f.at),
@@ -1640,7 +1622,6 @@ impl<T: Target> Eval<'_, T> {
             2..=4 => Ty::Ptr(Box::new(Ty::Die(None))),
             _ => self.int_ty(Rank::Long, true),
         };
-        let v = crate::remote::wrap(self.xlen, v);
         let v = match ty {
             Ty::Int { .. } => from_le(&v.to_le_bytes()[..self.word() as usize], true),
             _ => i128::from(v),
@@ -1656,7 +1637,7 @@ impl<T: Target> Eval<'_, T> {
     fn promoted(&self, ty: &Ty) -> Result<Ty> {
         match self.debug.shape(ty) {
             Shape::Int { signed, .. } => {
-                let rank = self.debug.rank(ty, self.xlen);
+                let rank = self.debug.rank(ty);
                 Ok(if rank < Rank::Int {
                     self.int()
                 } else {
@@ -1683,8 +1664,8 @@ impl<T: Target> Eval<'_, T> {
     fn common(&self, a: &Ty, b: &Ty) -> Ty {
         let info = |t: &Ty| {
             let signed = matches!(self.debug.shape(t), Shape::Int { signed: true, .. });
-            let size = self.debug.size(t, self.xlen).unwrap_or(4);
-            (self.debug.rank(t, self.xlen), signed, size)
+            let size = self.debug.size(t).unwrap_or(4);
+            (self.debug.rank(t), signed, size)
         };
         let ((ra, sa, za), (rb, sb, zb)) = (info(a), info(b));
         if sa == sb {
@@ -1738,12 +1719,11 @@ impl<T: Target> Eval<'_, T> {
         };
         let size = self
             .debug
-            .size(&to, self.xlen)
+            .size(&to)
             .ok_or("pointer arithmetic on a type of unknown size")?;
         let a = self.number(&p)?;
         let a = a.wrapping_add(n.wrapping_mul(i128::from(size)));
-        let a = crate::remote::wrap(self.xlen, a as u64);
-        self.int_value(p.ty, i128::from(a))
+        self.int_value(p.ty, i128::from(a as u64))
     }
 
     /// Member `name` of the struct or union `v`.
@@ -1768,7 +1748,7 @@ impl<T: Target> Eval<'_, T> {
         let loc = match v.loc {
             Loc::Mem(a) => Loc::Mem(a.wrapping_add(off)),
             Loc::Bytes(b) => {
-                let n = self.debug.size(&ty, self.xlen).unwrap_or(0) as usize;
+                let n = self.debug.size(&ty).unwrap_or(0) as usize;
                 let off = off as usize;
                 Loc::Bytes(b.get(off..off + n).ok_or("a member past its struct")?.to_vec())
             }
@@ -1791,7 +1771,7 @@ impl<T: Target> Eval<'_, T> {
             }
             // A difference of pointers is a `long`, as a `ptrdiff_t` is.
             ("-", Shape::Ptr(a), Shape::Ptr(_)) => {
-                let size = self.debug.size(a, self.xlen).unwrap_or(1).max(1);
+                let size = self.debug.size(a).unwrap_or(1).max(1);
                 let d = self.number(&l)?.wrapping_sub(self.number(&r)?) / i128::from(size);
                 self.int_value(self.int_ty(Rank::Long, true), d)
             }
@@ -1811,7 +1791,7 @@ impl<T: Target> Eval<'_, T> {
                 self.promoted(&r.ty)?;
                 let x = convert(self.number(&l)?, &ty);
                 let y = self.number(&r)?;
-                let bits = 8 * self.debug.size(&ty, self.xlen).unwrap_or(4) as i128;
+                let bits = 8 * self.debug.size(&ty).unwrap_or(4) as i128;
                 if !(0..bits).contains(&y) {
                     return Err(format!("a shift by {y} of a {bits}-bit value"));
                 }
@@ -1880,11 +1860,7 @@ impl<T: Target> Eval<'_, T> {
             return "...".into();
         }
         // A member past the end of its struct, in broken information.
-        if self
-            .debug
-            .size(ty, self.xlen)
-            .is_some_and(|n| (b.len() as u64) < n)
-        {
+        if self.debug.size(ty).is_some_and(|n| (b.len() as u64) < n) {
             return "<unavailable>".into();
         }
         match self.debug.shape(ty) {
@@ -1923,7 +1899,7 @@ impl<T: Target> Eval<'_, T> {
                     } else {
                         i128::from(v.unsigned()?)
                     };
-                    (convert(v, &c_int(Rank::LongLong, signed, self.xlen)) == n)
+                    (convert(v, &c_int(Rank::LongLong, signed)) == n)
                         .then(|| e.name().unwrap_or("?").to_string())
                 });
                 name.unwrap_or_else(|| n.to_string())
@@ -1958,7 +1934,7 @@ impl<T: Target> Eval<'_, T> {
                 let Some(n) = n else {
                     return "0x0".into();
                 };
-                let esize = self.debug.size(&elem, self.xlen).unwrap_or(0) as usize;
+                let esize = self.debug.size(&elem).unwrap_or(0) as usize;
                 // An array of characters is a string, but with /x: its elements
                 // in hex, as GDB shows it.
                 if let (
@@ -2004,7 +1980,7 @@ impl<T: Target> Eval<'_, T> {
                 let parts: Vec<String> = members
                     .into_iter()
                     .map(|(name, t, off)| {
-                        let size = self.debug.size(&t, self.xlen).unwrap_or(0) as usize;
+                        let size = self.debug.size(&t).unwrap_or(0) as usize;
                         let part = usize::try_from(off)
                             .ok()
                             .and_then(|off| b.get(off..off.checked_add(size)?))
@@ -2312,9 +2288,8 @@ mod tests {
             _ => "",
         };
         assert_eq!((punct(1), punct(3), punct(5)), ("<=", "<<", "&&"));
-        let x32 = Xlen::Rv32;
-        assert_eq!(convert(-1, &c_int(Rank::Int, false, x32)), 0xffff_ffff);
-        assert_eq!(convert(0x1_0000_0005, &c_int(Rank::Int, true, x32)), 5);
+        assert_eq!(convert(-1, &c_int(Rank::Int, false)), 0xffff_ffff);
+        assert_eq!(convert(0x1_0000_0005, &c_int(Rank::Int, true)), 5);
         assert_eq!(hex_of(-2, 4), "0xfffffffe");
         let t = tokens("p->next[2].x + 0x10 * 'a'").unwrap();
         assert_eq!(t.len(), 12);
@@ -2340,20 +2315,16 @@ mod tests {
 
     #[test]
     fn integer_types_as_c_spells_them() {
-        let (x32, x64) = (Xlen::Rv32, Xlen::Rv64);
-        let c = |s: &str, x| c_integer(&s.split_whitespace().collect::<Vec<_>>(), x);
-        assert_eq!(c("unsigned", x32), Some(("unsigned int", 4, false)));
-        assert_eq!(c("signed", x32), Some(("int", 4, true)));
-        assert_eq!(c("long int", x32), Some(("long", 4, true)));
-        assert_eq!(c("long int", x64), Some(("long", 8, true)));
-        assert_eq!(
-            c("long unsigned long", x32),
-            Some(("unsigned long long", 8, false))
-        );
-        assert_eq!(c("short int", x64), Some(("short", 2, true)));
-        assert_eq!(c("char", x64), Some(("char", 1, false)));
-        assert_eq!(c("signed char", x64), Some(("signed char", 1, true)));
-        assert_eq!(c("_Bool", x64), Some(("_Bool", 1, false)));
+        let c = |s: &str| c_integer(&s.split_whitespace().collect::<Vec<_>>());
+        assert_eq!(c("unsigned"), Some(("unsigned int", 4, false)));
+        assert_eq!(c("signed"), Some(("int", 4, true)));
+        assert_eq!(c("long int"), Some(("long", 8, true)));
+        assert_eq!(c("unsigned long"), Some(("unsigned long", 8, false)));
+        assert_eq!(c("long unsigned long"), Some(("unsigned long long", 8, false)));
+        assert_eq!(c("short int"), Some(("short", 2, true)));
+        assert_eq!(c("char"), Some(("char", 1, false)));
+        assert_eq!(c("signed char"), Some(("signed char", 1, true)));
+        assert_eq!(c("_Bool"), Some(("_Bool", 1, false)));
         for bad in [
             "long long long",
             "long char",
@@ -2362,7 +2333,7 @@ mod tests {
             "int int",
             "node",
         ] {
-            assert_eq!(c(bad, x64), None, "{bad}");
+            assert_eq!(c(bad), None, "{bad}");
         }
     }
 
@@ -2427,8 +2398,7 @@ mod tests {
     .word .Ltypedef - .Lunit2
     .byte 0
 ";
-        let xlen = Xlen::Rv32;
-        let elf = merlin_as::assemble_to_elf_with(src, &merlin_as::Options { xlen }).unwrap();
+        let elf = merlin_as::assemble_to_elf(src).unwrap();
         let mut debug = Debug::default();
         debug.add_elf(&elf).unwrap();
         assert_eq!(debug.files[0].len(), 1);
@@ -2438,7 +2408,7 @@ mod tests {
         assert!(debug.declare(&ptr, "p").starts_with("? *"));
         assert!(debug.ptype(&ptr).starts_with("? *"));
         assert!(debug.declare(&array, "").starts_with('?'));
-        assert_eq!(debug.size(&array, xlen), None);
+        assert_eq!(debug.size(&array), None);
         assert_eq!(debug.ptype(&typedef), "T");
         assert_eq!(debug.ptype(&record), "struct loop {\n    struct loop self;\n}");
         let mut eval = Eval {
@@ -2446,7 +2416,6 @@ mod tests {
             symbols: &Symbols::default(),
             target: &mut Zeros,
             frame: None,
-            xlen,
         };
         let v = Value {
             ty: record,
@@ -2478,16 +2447,13 @@ mod tests {
         };
         let declared = unit(3, "    .byte 2\n    .asciz \"s\"\n");
         let defined = |size: u8| unit(4, &format!("    .byte 3\n    .asciz \"s\"\n    .byte {size}\n"));
-        let options = merlin_as::Options { xlen: Xlen::Rv32 };
         let other = format!("{abbrevs}{}", defined(8));
         let own = format!("{abbrevs}{declared}{}", defined(4));
         let mut debug = Debug::default();
         debug
-            .add_elf(&merlin_as::assemble_to_elf_with(&other, &options).unwrap())
+            .add_elf(&merlin_as::assemble_to_elf(&other).unwrap())
             .unwrap();
-        debug
-            .add_elf(&merlin_as::assemble_to_elf_with(&own, &options).unwrap())
-            .unwrap();
+        debug.add_elf(&merlin_as::assemble_to_elf(&own).unwrap()).unwrap();
         let decl = debug
             .all()
             .find(|&r| debug.die(r).flag(dw::AT_DECLARATION))
@@ -2495,10 +2461,10 @@ mod tests {
         assert_eq!(decl.file, 1);
         let def = debug.complete(decl);
         assert_eq!((def.file, def.unit), (1, 1), "its own program's");
-        assert_eq!(debug.size(&Ty::Die(Some(decl)), Xlen::Rv32), Some(4));
+        assert_eq!(debug.size(&Ty::Die(Some(decl))), Some(4));
         assert_eq!(debug.completed.borrow().get(&decl), Some(&def));
         debug
-            .add_elf(&merlin_as::assemble_to_elf_with(&other, &options).unwrap())
+            .add_elf(&merlin_as::assemble_to_elf(&other).unwrap())
             .unwrap();
         assert!(debug.completed.borrow().is_empty());
     }

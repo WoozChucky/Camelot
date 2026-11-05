@@ -190,14 +190,13 @@ fn start(
             Remote::over(Box::new(tunnel))?
         }
     };
-    // The machine's width, from the stub, must be the program's: an ELF32 program's
-    // symbols would be wrong for an RV64 machine. A program of the other width is
-    // left out with a warning and the session goes on without its symbols, as GDB
-    // warns and goes on: ending it would drop the connection without `D`, which
-    // leaves the machine stopped for a debugger that has gone (as QEMU's stub does).
-    // (Started with `--`, the machine is the program's width.)
+    // The machine is RV64 (the stub said so), and so must the program be: an ELF32
+    // program's symbols would be wrong for it. One is left out with a warning and the
+    // session goes on without its symbols, as GDB warns and goes on: ending it would
+    // drop the connection without `D`, which leaves the machine stopped for a
+    // debugger that has gone (as QEMU's stub does).
     let program = match program {
-        Some((path, program)) => match symbols::check_xlen(program.file(), remote.xlen) {
+        Some((path, program)) => match symbols::check_program(program.file()) {
             Ok(()) => Some(program),
             Err(e) => {
                 let _ = writeln!(out, "warning: {path}: {e}: going on without its symbols");
@@ -301,10 +300,9 @@ fn start_grail(args: Vec<String>) -> Result<(SocketAddr, MachineThread, Option<S
             if tracing {
                 let word = cpu.bus.peek(cpu.pc);
                 let text = word.map_or("<unmapped>".to_string(), |w| {
-                    excalibur::decode(w, cpu.xlen()).to_string()
+                    excalibur::decode(w, excalibur::Xlen::Rv64).to_string()
                 });
-                let digits = cpu.xlen().bits() as usize / 4;
-                eprintln!("h{} {:?} {:0digits$x}: {}", cpu.id, cpu.mode, cpu.pc, text);
+                eprintln!("h{} {:?} {:016x}: {}", cpu.id, cpu.mode, cpu.pc, text);
             }
         };
         grail::gdb::serve(&mut m, listener, true, &mut trace)
