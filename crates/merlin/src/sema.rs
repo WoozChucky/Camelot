@@ -801,6 +801,7 @@ impl Checker {
             globals: &self.globals,
             array_params: HashMap::new(),
             subscript: false,
+            list_depth: 0,
             subscript_add: false,
             literal_texts: HashMap::new(),
             param_pos: HashSet::new(),
@@ -1298,6 +1299,8 @@ struct Pending {
 
 struct FnChecker<'a> {
     globals: &'a HashMap<String, Global>,
+    /// How many lists are being checked around what is checked now.
+    list_depth: usize,
     /// The expression about to be checked is a subscript's `+`; and the
     /// `+` [`Self::binary`] checks is.
     subscript: bool,
@@ -1395,6 +1398,7 @@ impl<'a> FnChecker<'a> {
             globals,
             array_params: HashMap::new(),
             subscript: false,
+            list_depth: 0,
             subscript_add: false,
             literal_texts: HashMap::new(),
             param_pos: HashSet::new(),
@@ -1717,6 +1721,10 @@ impl<'a> FnChecker<'a> {
                         }
                     },
                 };
+                // The condition is a full expression, checked as one.
+                if cond.ty.is_integer() {
+                    self.full_expression(cond);
+                }
                 self.switches.push(SwitchCtx {
                     kind,
                     labels: Vec::new(),
@@ -2399,7 +2407,16 @@ impl<'a> FnChecker<'a> {
             Some(checked) => checked,
             None => match init {
                 Init::Expr(e) => self.init_expr(ty, e, constant, false, Some(at)),
-                _ => self.init(ty, init, constant, Some(at)),
+                _ => {
+                    // A list is one full expression of unsequenced items.
+                    let checked = self.init(ty, init, constant, Some(at));
+                    if checked.is_ok() && self.unevaluated == 0 {
+                        for f in crate::sequence::check_init(init, self.xlen) {
+                            self.runtime(Error::warning(f.at, f.msg, "unsequenced"), f.of);
+                        }
+                    }
+                    checked
+                }
             },
         };
         // The declarator's spelling is its own initializer's only.
@@ -2557,6 +2574,15 @@ impl<'a> FnChecker<'a> {
 
     /// [`Self::init`] itself.
     fn init_list(&mut self, ty: &mut Type, init: &mut Init, constant: bool, decl: Option<Pos>) -> Checked {
+        let list = matches!(init, Init::List(..));
+        self.list_depth += usize::from(list);
+        let checked = self.init_items(ty, init, constant, decl);
+        self.list_depth -= usize::from(list);
+        checked
+    }
+
+    /// [`Self::init_list`], of the items.
+    fn init_items(&mut self, ty: &mut Type, init: &mut Init, constant: bool, decl: Option<Pos>) -> Checked {
         let Init::List(items, pos) = init else {
             let Init::Expr(e) = init else { unreachable!() };
             return self.init_expr(ty, e, constant, false, None);
@@ -4212,7 +4238,11 @@ impl<'a> FnChecker<'a> {
         for (a, copy) in args.iter_mut().zip(copies) {
             let t = a.ty.decay();
             if t.is_void() || (t.is_record() && t.size(self.xlen).is_none()) {
-                self.err(a.pos, format!("argument type '{t}' is incomplete"));
+                let mut e = Error::new(a.pos, format!("argument type '{t}' is incomplete"));
+                if let Some(r) = t.record() {
+                    e = e.note(r.pos, format!("forward declaration of '{}'", r.name()));
+                }
+                self.errors.push(e);
                 ok = false;
                 continue;
             }
@@ -5027,7 +5057,8 @@ impl<'a> FnChecker<'a> {
     /// conversions and comparisons ([`Self::full`]), then its overflows.
     fn full_expression(&mut self, e: &Expr) {
         self.full(e);
-        if self.unevaluated == 0 {
+        // An item of a list is no full expression of its own.
+        if self.unevaluated == 0 && self.list_depth == 0 {
             for f in crate::sequence::check(e, self.xlen) {
                 self.runtime(Error::warning(f.at, f.msg, "unsequenced"), f.of);
             }

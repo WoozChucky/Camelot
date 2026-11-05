@@ -791,6 +791,22 @@ impl Parser<'_> {
 
     // ---- scopes ----
 
+    /// clang's `unknown type name` of the name here, with what its typo
+    /// correction takes it for ([`Self::correct_type`]).
+    fn unknown_type_name(&self, name: &str) -> Error {
+        let at = self.here();
+        match self.correct_type(name) {
+            Some((to, decl)) => {
+                let e = Error::new(at, format!("unknown type name '{name}'; did you mean '{to}'?"));
+                match decl {
+                    Some(decl) => e.note(decl, format!("'{to}' declared here")),
+                    None => e,
+                }
+            }
+            None => Error::new(at, format!("unknown type name '{name}'")),
+        }
+    }
+
     /// What clang's typo correction takes the undeclared `typo`, read as
     /// an expression, for: a variable, function or enumeration constant in
     /// scope ([`correction`]).
@@ -1471,6 +1487,60 @@ impl Parser<'_> {
 
     /// `;` is reported right after the previous token, like clang does, since that's
     /// where it's missing.
+    /// The `;` that ends a statement; but where its expression read a name
+    /// nothing declares (since `named` of [`Self::undeclared`]), which
+    /// makes it no expression to clang, what is left of it up to its `;` is
+    /// skipped, as clang skips it, with no error but sema's of the name
+    /// (`retrun 1;`).
+    fn semi_or_skip(&mut self, after: &str, named: usize) -> Result<(), Error> {
+        if self.is_punct(";") || self.undeclared.borrow().len() == named {
+            return self.expect_semi(after);
+        }
+        while !matches!(self.peek(), Tok::Punct(";" | "}") | Tok::Eof) {
+            self.advance();
+        }
+        self.eat_punct(";");
+        Ok(())
+    }
+
+    /// A block's statement that starts with two names, the first declared
+    /// nowhere (`myit x = 1;`): clang's typo correction of it among the
+    /// names in scope, typedefs and the keywords a statement can start with.
+    /// A typedef is clang's `unknown type name ... did you mean`, with where
+    /// it is declared; a keyword `use of undeclared identifier ... did you
+    /// mean`; none, `unknown type name`.
+    fn unknown_statement_name(&self, name: &str) -> Error {
+        const KEYWORDS: [&str; 34] = [
+            "char", "const", "double", "enum", "float", "int", "long", "short", "signed", "struct", "union",
+            "unsigned", "void", "volatile", "_Bool", "restrict", "auto", "register", "static", "extern",
+            "typedef", "inline", "if", "else", "for", "while", "do", "switch", "case", "default", "break",
+            "continue", "goto", "return",
+        ];
+        let at = self.here();
+        let mut seen = std::collections::HashSet::new();
+        let names = self
+            .scopes
+            .iter()
+            .rev()
+            .flat_map(|s| &s.names)
+            .filter_map(|(n, (what, decl))| {
+                seen.insert(n.as_str())
+                    .then_some((n.as_str(), Some((*decl, matches!(what, Name::Typedef(..))))))
+            });
+        let keywords = KEYWORDS.iter().chain(&["sizeof"]).map(|k| (*k, None));
+        match correction(name, names.chain(keywords)) {
+            Some((to, Some((decl, true)))) => {
+                Error::new(at, format!("unknown type name '{name}'; did you mean '{to}'?"))
+                    .note(decl, format!("'{to}' declared here"))
+            }
+            Some((to, None)) => Error::new(
+                at,
+                format!("use of undeclared identifier '{name}'; did you mean '{to}'?"),
+            ),
+            _ => Error::new(at, format!("unknown type name '{name}'")),
+        }
+    }
+
     fn expect_semi(&mut self, after: &str) -> Result<(), Error> {
         if self.eat_punct(";") {
             Ok(())
@@ -2430,6 +2500,10 @@ impl Parser<'_> {
                 return Ok((params, true));
             }
             if !self.at_decl() {
+                // `int f(unsinged x)`: a type's name, misspelt or none.
+                if let (Tok::Ident(name), Tok::Ident(_)) = (self.peek().clone(), self.peek_at(1)) {
+                    return Err(self.unknown_type_name(&name));
+                }
                 if params.is_empty() && matches!(self.peek(), Tok::Ident(_)) {
                     return Err(self.identifier_list(open));
                 }
@@ -2835,17 +2909,8 @@ impl Parser<'_> {
                 Error::new(at, msg).flagged("implicit-int")
             }
             Tok::Ident(name) => {
-                let (at, name) = (self.here(), name.clone());
-                match self.correct_type(&name) {
-                    Some((to, decl)) => {
-                        let e = Error::new(at, format!("unknown type name '{name}'; did you mean '{to}'?"));
-                        match decl {
-                            Some(decl) => e.note(decl, format!("'{to}' declared here")),
-                            None => e,
-                        }
-                    }
-                    None => Error::new(at, format!("unknown type name '{name}'")),
-                }
+                let name = name.clone();
+                self.unknown_type_name(&name)
             }
             _ => self.expected("identifier or '('"),
         }
@@ -3320,8 +3385,9 @@ impl Parser<'_> {
                 if self.eat_punct(";") {
                     StmtKind::Return(None)
                 } else {
+                    let named = self.undeclared.borrow().len();
                     let e = self.expr()?;
-                    self.expect_semi("after return statement")?;
+                    self.semi_or_skip("after return statement", named)?;
                     StmtKind::Return(Some(e))
                 }
             }
@@ -3341,9 +3407,17 @@ impl Parser<'_> {
                 self.expect_semi("after goto statement")?;
                 StmtKind::Goto(name, at)
             }
+            // `x y` of a name nothing declares: what clang's typo
+            // correction of a statement's first name takes it for.
+            Tok::Ident(name)
+                if self.lookup_name(&name).is_none() && matches!(self.peek_at(1), Tok::Ident(_)) =>
+            {
+                return Err(self.unknown_statement_name(&name));
+            }
             _ => {
+                let named = self.undeclared.borrow().len();
                 let e = self.expr()?;
-                self.expect_semi("after expression")?;
+                self.semi_or_skip("after expression", named)?;
                 StmtKind::Expr(e)
             }
         };
@@ -3731,6 +3805,26 @@ impl Parser<'_> {
                         ));
                     }
                     Some(_) => {}
+                    // `(unsinged)1`, `sizeof(myit)`: in parentheses alone,
+                    // where a type's name could be, clang takes it for one
+                    // if that is closest.
+                    None if self.pos > 0
+                        && matches!(self.toks[self.pos - 1].tok, Tok::Punct("("))
+                        && matches!(self.peek_at(1), Tok::Punct(")"))
+                        && self
+                            .correct_type(&name)
+                            .is_some_and(|(to, _)| self.correct_expr(&name).is_none_or(|c| c.name != to)) =>
+                    {
+                        let (to, decl) = self.correct_type(&name).expect("just found");
+                        let e = Error::new(
+                            pos,
+                            format!("use of undeclared identifier '{name}'; did you mean '{to}'?"),
+                        );
+                        return Err(match decl {
+                            Some(decl) => e.note(decl, format!("'{to}' declared here")),
+                            None => e,
+                        });
+                    }
                     None => {
                         if let Some(c) = self.correct_expr(&name) {
                             self.corrections.borrow_mut().insert(pos, c);

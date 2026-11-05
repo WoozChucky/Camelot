@@ -263,5 +263,10 @@ pub fn cases() -> Vec<Case> {
         case("enum e { A, B }; int f(enum e x) { if (x == A || x != A) return 1; }", &[]),
         case("int f(int x, int y) { if (x > 5 || y <= 5) return 1; }", &["1:54: warning: non-void function does not return a value in all control paths [-Wreturn-type]"]),
         case("int f(int x) { if (x > -5 || x <= -5) return 1; }", &[]),
+        // -Wunsequenced of a list, a compound literal's items, a switch's
+        // condition.
+        case("struct S { int a, b; }; int f(int i) { int b[2] = {i++, i++}; struct S s = {i++, i}; int a[2] = { i, i++ }; return b[0] + s.a + a[0]; }", &["1:53: warning: multiple unsequenced modifications to 'i' [-Wunsequenced]", "1:78: warning: unsequenced modification and access to 'i' [-Wunsequenced]", "1:103: warning: unsequenced modification and access to 'i' [-Wunsequenced]"]),
+        case("struct S { int a, b; }; int f(int i) { return (int[]){i++, i++}[0] + (struct S){i, i++}.a; }", &["1:56: warning: multiple unsequenced modifications to 'i' [-Wunsequenced]"]),
+        case("int f(int i, int x) { switch (i++ + i) { case 1: break; } switch (x = x++) { default: break; } switch (2147483647 + 1) { default: break; } return 0; }", &["1:115: warning: overflow in expression; result is -2'147'483'648 with type 'int' [-Winteger-overflow]", "1:32: warning: unsequenced modification and access to 'i' [-Wunsequenced]", "1:72: warning: multiple unsequenced modifications to 'x' [-Wunsequenced]"]),
     ]
 }

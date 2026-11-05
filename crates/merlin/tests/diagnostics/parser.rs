@@ -246,5 +246,25 @@ pub fn cases() -> Vec<Case> {
         case("foo(int);", &["1:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"]),
         case("f() { return 0; }", &["1:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"]),
         case("x[3];", &["1:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"]),
+        // Typo correction and unknown type names in blocks and parameters;
+        // a statement that read a name nothing declares is skipped to its `;`.
+        case("typedef int myint; int f(void) { myit x = 1; return x; }", &["1:34: error: unknown type name 'myit'; did you mean 'myint'?", "1:13: note: 'myint' declared here"]),
+        case("int f(void) { int y; unsinged x = 1; return x; }", &["1:22: error: use of undeclared identifier 'unsinged'; did you mean 'unsigned'?"]),
+        case("int f(unsinged x) { return x; }", &["1:7: error: unknown type name 'unsinged'; did you mean 'unsigned'?"]),
+        case("int g(foo x);", &["1:7: error: unknown type name 'foo'"]),
+        case("stuct s *p;", &["1:1: error: unknown type name 'stuct'; did you mean 'struct'?"]),
+        case("int f(void) { return sizeof(unsinged); }", &["1:29: error: use of undeclared identifier 'unsinged'; did you mean 'unsigned'?"]),
+        case("int f(void) { return (unsinged)1; }", &["1:23: error: use of undeclared identifier 'unsinged'; did you mean 'unsigned'?"]),
+        case("int f(void) { retrun 1; }", &["1:15: error: use of undeclared identifier 'retrun'"]),
+        case("int f(void) { foo *x; return 0; }", &["1:15: error: use of undeclared identifier 'foo'", "1:20: error: use of undeclared identifier 'x'"]),
+        case("int f(int x) { retrun x; }", &["1:16: error: use of undeclared identifier 'retrun'; did you mean 'return'?"]),
+        case("int f(void) { statc int x; return 0; }", &["1:15: error: use of undeclared identifier 'statc'"]),
+        case("int f(void) { struc s *p; return 0; }", &["1:15: error: use of undeclared identifier 'struc'; did you mean 'struct'?"]),
+        case("int f(void) { regster int x = 0; return x; }", &["1:15: error: use of undeclared identifier 'regster'", "1:41: error: use of undeclared identifier 'x'"]),
+        case("typedef int myint; int f(void) { return (myit)1; }", &["1:42: error: use of undeclared identifier 'myit'; did you mean 'myint'?", "1:13: note: 'myint' declared here"]),
+        case("int f(int a) { return (b)1; }", &["1:24: error: use of undeclared identifier 'b'"]),
+        case("int f(void) { foo x; return 0; }", &["1:15: error: use of undeclared identifier 'foo'; did you mean 'for'?"]).then(&["1:19: error: expected '(' after 'for'"]),
+        case("int f(void) { whle x; return 0; }", &["1:15: error: use of undeclared identifier 'whle'; did you mean 'while'?"]).then(&["1:20: error: expected '(' after 'while'"]),
+        case("int f(void) { sizof x; return 0; }", &["1:15: error: use of undeclared identifier 'sizof'; did you mean 'sizeof'?"]).then(&["1:21: error: use of undeclared identifier 'x'"]),
     ]
 }

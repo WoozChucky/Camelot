@@ -407,5 +407,11 @@ pub fn cases() -> Vec<Case> {
         case("int f(int); int g(void) { int f(int); return f(1, 2); }", &["1:51: error: too many arguments to function call, expected 1, have 2", "1:31: note: 'f' declared here"]),
         case("int f(void) { extern int g(); return g(1); } int g(int a, int b) { return a; }", &["1:39: warning: passing arguments to 'g' without a prototype is deprecated in all versions of C and is not supported in C23 [-Wdeprecated-non-prototype]", "1:26: warning: a function declaration without a prototype is deprecated in all versions of C and is treated as a zero-parameter prototype in C23, conflicting with a subsequent definition [-Wdeprecated-non-prototype]", "1:50: note: conflicting prototype is here"]),
         case("int g(void) { int h(int); return h(); }", &["1:36: error: too few arguments to function call, expected 1, have 0", "1:19: note: 'h' declared here"]),
+        // An incomplete argument, with where its struct is declared.
+        case("struct T; int f(); int g(struct T *p) { return f(*p); }", &["1:49: warning: passing arguments to 'f' without a prototype is deprecated in all versions of C and is not supported in C23 [-Wdeprecated-non-prototype]", "1:50: error: argument type 'struct T' is incomplete", "1:8: note: forward declaration of 'struct T'"]),
+        case("struct T; int f(int, ...); int g(struct T *p) { return f(1, *p); }", &["1:61: error: argument type 'struct T' is incomplete", "1:8: note: forward declaration of 'struct T'"]),
+        // Identifiers past ASCII are not merlin's.
+        case("int \u{e9} = 1;", &["1:5: error: expected identifier or '('"]).merlin("merlin's identifiers are ASCII"),
+        case("int \\u00e9 = 2;", &["1:5: error: expected identifier or '('"]).merlin("merlin's identifiers are ASCII"),
     ]
 }

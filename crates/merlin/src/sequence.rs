@@ -115,7 +115,21 @@ struct Checker {
 
 /// The `-Wunsequenced` warnings of the full expression `e`, in order.
 pub fn check(e: &Expr, xlen: Xlen) -> Vec<Found> {
-    let mut c = Checker {
+    let mut c = checker(xlen);
+    c.value(e);
+    c.found
+}
+
+/// Of a declaration's list `init`, one full expression whose items C
+/// leaves unsequenced (clang's `VisitInitListExpr` in C): `{i++, i++}`.
+pub fn check_init(init: &Init, xlen: Xlen) -> Vec<Found> {
+    let mut c = checker(xlen);
+    c.init(init);
+    c.found
+}
+
+fn checker(xlen: Xlen) -> Checker {
+    Checker {
         tree: Tree {
             nodes: vec![(0, false)],
         },
@@ -124,9 +138,7 @@ pub fn check(e: &Expr, xlen: Xlen) -> Vec<Found> {
         side_effects: None,
         found: Vec::new(),
         xlen,
-    };
-    c.value(e);
-    c.found
+    }
 }
 
 /// The variable `e` designates, through casts, as a modification's target
@@ -361,6 +373,8 @@ impl Checker {
                 }
             }),
             ExprKind::SizeofExpr(..) | ExprKind::SizeofType(_) => {}
+            // A compound literal's items, in the region it is in.
+            ExprKind::CompoundLit { init, .. } => self.init(init),
             ExprKind::Binary(_, a, b) | ExprKind::VaCopy(a, b) => {
                 self.value(a);
                 self.value(b);
@@ -373,6 +387,22 @@ impl Checker {
                 self.value(x)
             }
             _ => {}
+        }
+    }
+
+    /// The items of a list, all in the current region.
+    fn init(&mut self, init: &Init) {
+        match init {
+            Init::Expr(e) => self.value(e),
+            Init::List(items, _) => items.iter().for_each(|i| self.init(i)),
+            Init::Designated(ds, v) => {
+                for d in ds {
+                    if let Designator::Index(e, _) = d {
+                        self.value(e);
+                    }
+                }
+                self.init(v);
+            }
         }
     }
 
