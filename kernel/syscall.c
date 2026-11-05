@@ -226,8 +226,8 @@ void syscall(struct trap_frame *f) {
         ret = sys_pipe(f);
         break;
     case SYS_exec:
-        /* On success the frame is the new program's, and the result its
-         * argc, which belongs in its a0. */
+        /* On success the frame is the new program's, and the result 0,
+         * which belongs in its a0 (proc.c, "The program's start"). */
         ret = sys_run(f, true);
         break;
     case SYS_kill:

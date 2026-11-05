@@ -247,7 +247,8 @@ struct thread *mythread(void);
  * program loaded, a stack holding `args` with sp below them, a kernel
  * stack, a pid, copies of the parent's descriptors 0, 1 and 2 (the others
  * are not passed on) and its working directory. It starts at the program's
- * entry point with a0 = argc, a1 = argv. Returns its pid, or -EAGAIN (no
+ * entry point, sp pointing at argc, argv, envp and the auxiliary vector
+ * (proc.c, "The program's start"), `path` the vector's AT_EXECFN. Returns its pid, or -EAGAIN (no
  * free process or thread slot), -ENOMEM or -ENOEXEC (a bad ELF image: the
  * loader's reason is printed as "spawn: PATH: REASON", `path` being what
  * the caller asked for) when it can't; nothing is left allocated then.
@@ -268,8 +269,8 @@ struct exec_image {
 };
 
 /* Loads `prog` into a new address space as proc_create() does, for the
- * current process: registers all zero but pc, sp, a0 (argc) and a1
- * (argv). Returns 0, or -ENOMEM or -ENOEXEC ("exec: PATH: REASON") with
+ * current process: registers all zero but pc and sp, and the program's
+ * start on its stack (argc, argv, envp, the auxiliary vector: proc.c). Returns 0, or -ENOMEM or -ENOEXEC ("exec: PATH: REASON") with
  * nothing allocated; the process is untouched either way. Reading `prog`
  * may sleep. */
 int proc_exec_load(const struct elf_file *prog, const char *path, const struct proc_args *args,
@@ -277,12 +278,13 @@ int proc_exec_load(const struct elf_file *prog, const char *path, const struct p
 
 /* Replaces the current process's program with `img`, called `name`. Every
  * other thread of the process ends first; the descriptors, the working
- * directory, the pid and the parent stay. Returns argc (the new program's
- * a0, which the system call leaves there); or -EINTR, with the old program
+ * directory, the pid and the parent stay. Returns 0 (the new program's
+ * a0, which the system call leaves there: the psABI's atexit function,
+ * none); or -EINTR, with the old program
  * untouched and `img` freed, if another thread is ending the process
  * meanwhile. Must be called holding no sleep lock and no transaction: it
  * waits for threads that may need them to end. */
-int proc_exec_commit(struct exec_image *img, const char *name, const struct proc_args *args);
+int proc_exec_commit(struct exec_image *img, const char *name);
 
 /* Frees a loaded `img` that won't run. */
 void proc_exec_abandon(struct exec_image *img);

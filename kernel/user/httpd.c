@@ -485,7 +485,7 @@ int main(int argc, char **argv) {
     }
     printf("httpd: serving %s on port %d\n", root, port);
     struct timeval wait;
-    wait.tv_sec = (int)seconds;
+    wait.tv_sec = seconds;
     wait.tv_usec = 0;
     for (long served = 0; count < 0 || served < count; served++) {
         struct sockaddr_in peer;

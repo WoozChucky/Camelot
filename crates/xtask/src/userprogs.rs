@@ -2,7 +2,7 @@
 //! "Kernel processes").
 //!
 //! Every `kernel/user/*.c`, `*.s` and `*.S` is one program, but for the runtime
-//! linked into each of them ([`RUNTIME`]: `crt0.s` and the system call stubs
+//! linked into each of them ([`RUNTIME`]: `crt0.S` and the system call stubs
 //! `usys.s`), and so is every subdirectory but `lib/`: a program of several
 //! files (`kernel/user/as/*.c` is `as`), each compiled and assembled on its
 //! own and linked together, in name order. The C library, `kernel/user/lib/` ([`LIB_DIR`]), is linked as
@@ -42,7 +42,7 @@ use std::process::Command;
 /// The user programs' directory, relative to the repository root.
 pub const USER_DIR: &str = "kernel/user";
 /// The runtime linked into every program (none of them is a program).
-pub const RUNTIME: &[&str] = &["crt0.s", "usys.s"];
+pub const RUNTIME: &[&str] = &["crt0.S", "usys.s"];
 /// The C library's directory, under [`USER_DIR`]: every `.c` and `.s` file
 /// in it is a library member.
 pub const LIB_DIR: &str = "lib";
@@ -656,7 +656,7 @@ pub fn generate_for<P: std::borrow::Borrow<Program>>(programs: &[P], cc: CCompil
          #\n\
          # The user programs as ELF images for the kernel's loader: each one's C\n\
          # compiled by {cc}, assembled by merlin-as and linked by merlin-ld with\n\
-         # the runtime (crt0.s, usys.s), the members of the C library (lib/) it\n\
+         # the runtime (crt0.S, usys.s), the members of the C library (lib/) it\n\
          # needs and kernel/user/user.ld (crates/xtask/src/userprogs.rs). The\n\
          # table is the array\n\
          # kernel/include/proc.h declares:\n\
@@ -755,7 +755,7 @@ mod tests {
     /// an ecall, and the library has one function.
     fn write_runtime(dir: &Path) {
         std::fs::write(
-            dir.join("crt0.s"),
+            dir.join("crt0.S"),
             "    .section .text.start\n    .globl _start\n_start:\n    call main\n    call exit\n",
         )
         .unwrap();

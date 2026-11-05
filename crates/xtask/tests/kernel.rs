@@ -1793,6 +1793,11 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     // The ten boot ticks, and maybe one more while the shell starts.
     let start = tick_count(&m);
     assert!((10..=11).contains(&start), "{start} ticks at the prompt");
+    // The shell still has its read to make after the prompt: the count starts once
+    // the hart first waits, so that a tick that comes on the way (the timing of boot
+    // and of the shell's start decides it) is not counted as one it waited for.
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == u64::from(wfi));
+    let start = tick_count(&m);
     let idle_end = start + 50;
 
     // Fifty idle ticks: the hart spends them in wfi (Grail skips the wait to
@@ -2260,32 +2265,6 @@ fn user_pages(m: &Machine, satp: u32) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// Reads `len` bytes of user memory at `va` through page table `satp`.
-fn user_read(m: &Machine, satp: u32, va: u32, len: u32) -> Vec<u8> {
-    let (leaves, _, _) = page_table(m, satp);
-    (va..va + len)
-        .map(|a| {
-            let (_, pte) = leaves
-                .iter()
-                .find(|(page, _)| *page == a & !(PAGE - 1))
-                .unwrap_or_else(|| panic!("{a:#x} is not mapped"));
-            peek_byte(&m.cpu.bus, (pte >> 10) * PAGE + a % PAGE)
-        })
-        .collect()
-}
-
-/// The NUL-terminated string at user address `va`.
-fn user_string(m: &Machine, satp: u32, va: u32) -> String {
-    let mut s = Vec::new();
-    for a in va.. {
-        match user_read(m, satp, a, 1)[0] {
-            0 => break,
-            c => s.push(c),
-        }
-    }
-    String::from_utf8(s).unwrap()
-}
-
 /// The name of the process on hart 0 (`cpus[0].proc` in kernel/spinlock.c,
 /// the first field of `struct cpu`), or `None` in the scheduler.
 fn current_name(cpu: &grail::cpu::Cpu, current: u32) -> Option<String> {
@@ -2391,8 +2370,10 @@ fn booting_drops_into_the_user_shell() {
 #[test]
 fn the_shell_is_the_first_process() {
     // The first instruction in U-mode is sh's entry point, crt0's _start,
-    // with every register zero but sp, a0 = argc and a1 = argv, which point
-    // at { "sh", NULL } at the top of the stack.
+    // with the start Linux gives a program (docs/camelot-syscalls.md,
+    // "Starting a program"): every register zero but sp, which points at
+    // argc (1), argv { "sh", NULL }, an empty envp and the auxiliary vector,
+    // the strings "sh" and the path, "/bin/sh", at the top of the stack.
     let (mut m, elf) = load_committed();
     step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
     let c = &m.cpu;
@@ -2403,25 +2384,14 @@ fn the_shell_is_the_first_process() {
         .peek(u64::from(m.cpu.bus.peek(sym(&elf, "cpus").into()).unwrap() + 4));
     assert_eq!(pid, Some(1));
     assert_eq!(c.pc, u64::from(USER_TEXT));
-    let (sp, argv) = (c.x[2] as u32, c.x[x("a1") as usize] as u32);
-    let mut regs = [0u32; 32];
-    regs[2] = sp;
-    regs[x("a0") as usize] = 1;
-    regs[x("a1") as usize] = argv;
-    assert_eq!(regs32(&m), regs);
-    assert_eq!(sp % 16, 0);
-    assert!(
-        sp <= argv && argv < USER_TOP && sp > USER_STACK + PAGE / 2,
-        "sp {sp:#x} argv {argv:#x}"
+    common::start::check(
+        &m,
+        4,
+        u64::from(USER_TOP),
+        &user_program("sh").elf,
+        "/bin/sh",
+        &["sh"],
     );
-    let satp = c.csr.satp as u32;
-    let words = user_read(&m, satp, argv, 8);
-    let argv0 = u32::from_le_bytes(words[..4].try_into().unwrap());
-    assert_eq!(words[4..], [0; 4], "argv[1] is NULL");
-    assert!(argv0 > argv);
-    assert_eq!(user_string(&m, satp, argv0), "sh");
-    // The strings end right at the top: "sh\0" is the last three bytes.
-    assert_eq!(argv0, USER_TOP - 3);
     // Interrupts on, SUM off.
     assert_ne!(c.csr.mstatus & MSTATUS_SIE, 0);
     assert_eq!(c.csr.mstatus & excalibur::csr::MSTATUS_SUM, 0);
@@ -3430,6 +3400,51 @@ fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
 }
 
+#[test]
+fn a_heap_growth_past_the_whole_of_ram_is_refused_at_once() {
+    // sbrk refuses a growth that maps more pages than RAM holds before it
+    // takes any, as Linux's overcommit check does, counting the pages from
+    // the old end's page boundary to the new end's: RAM and a byte more is
+    // a page more than RAM, refused at once. RAM itself is not: sbrk takes
+    // and zeroes every free page before it runs out, which takes far longer.
+    let ram: usize = 16 << 20;
+    let config = MachineConfig {
+        ram_size: ram,
+        ..MachineConfig::default()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(config, Some(rx));
+    step_to_prompt(&mut m, 1);
+    let before = free_pages(&m, &elf);
+    let steps = |m: &mut Machine, n: usize, prompts: usize| {
+        let line = format!("systest sbrk {n}");
+        for b in format!("{line}\n").bytes() {
+            tx.send(b).unwrap();
+        }
+        let want = format!("systest: sbrk {n}: -12\n");
+        let took = step_until(
+            m,
+            RUN_MAX_STEPS,
+            |_| {},
+            |m| m.cpu.bus.uart.captured.ends_with(want.as_bytes()),
+        );
+        step_to_prompt(m, prompts);
+        assert_eq!(command_output(&printed(m), &line), [want.trim_end()]);
+        assert_eq!(free_pages(m, &elf), before, "{line}");
+        took
+    };
+    let all_of_ram = steps(&mut m, ram, 2);
+    let past_ram = steps(&mut m, ram + 1, 3);
+    assert!(
+        past_ram * 4 < all_of_ram,
+        "RAM and a byte took {past_ram} steps to refuse, RAM {all_of_ram}"
+    );
+    for b in b"exit\n" {
+        tx.send(*b).unwrap();
+    }
+    assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
+}
+
 /// Byte offsets in an ELF32 header and program header.
 const E_TYPE: u32 = 16;
 const E_MACHINE: u32 = 18;
@@ -3917,6 +3932,18 @@ fn the_system_call_document_matches_the_code() {
                 panic!("{dir} on {xlen:?}: {}", errors.join("\n"));
             }
         }
+    }
+
+    // The auxiliary vector's types, in the order the kernel writes them
+    // (proc.c's push_start; tests/common's start::check checks the vector).
+    let mut auxv = doc_table(&doc, "## Starting a program");
+    assert_eq!(auxv.len(), 17, "{auxv:?}");
+    assert_eq!(auxv.last().map(|a| a.0), Some(0), "AT_NULL last");
+    auxv.sort();
+    for (text, what) in [(&header, "syscall.h"), (&user_h, "user.h")] {
+        let mut defined = defines(text, "AT_");
+        defined.sort();
+        assert_eq!(defined, auxv, "{what}");
     }
 
     // And the limits.

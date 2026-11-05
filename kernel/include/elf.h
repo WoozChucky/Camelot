@@ -124,15 +124,28 @@ struct elf_file {
     struct inode *inode; /* a file, locked */
 };
 
+/* What elf_load() tells about a program it loaded: where it starts and
+ * where its heap can, and what the auxiliary vector says of its program
+ * headers (proc.c, "The program's start"). */
+struct elf_loaded {
+    uintptr entry; /* the entry point */
+    uintptr end;   /* the page boundary after the highest segment */
+    /* Where the program headers are in its memory: in the file bytes of
+     * the PT_LOAD segment whose file range holds them, as Linux's
+     * load_elf_binary finds them; 0 if no segment loads them (user.ld
+     * starts the first segment at 0x1000, after the headers). */
+    uintptr phdr;
+    u32 phnum; /* how many program headers there are */
+};
+
 /* Loads the executable `f` into the user part of `pt`: every PT_LOAD
  * segment goes into fresh zeroed pages, mapped with U and the segment's
- * permissions. Returns NULL and sets *entry and *end (the page boundary
- * after the highest segment, where the heap can start), or returns what is
- * wrong with the image. Segments must lie in [USER_BASE, USER_LOAD_TOP) and
- * not share pages, and the entry point must be 4-byte aligned and in an
+ * permissions. Returns NULL and fills in *out, or returns what is wrong
+ * with the image. Segments must lie in [USER_BASE, USER_LOAD_TOP) and not
+ * share pages, and the entry point must be 4-byte aligned and in an
  * executable one. On an error, the pages mapped so far stay in `pt` for
  * uvm_free() to release. */
-const char *elf_load(pagetable_t pt, const struct elf_file *f, uintptr *entry, uintptr *end);
+const char *elf_load(pagetable_t pt, const struct elf_file *f, struct elf_loaded *out);
 
 /* An elf_file for the `size`-byte image at `image`. */
 void elf_from_memory(struct elf_file *f, const u8 *image, u32 size);

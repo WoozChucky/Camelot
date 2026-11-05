@@ -10,6 +10,9 @@
 //! As in kernel_sockets.rs, the machine runs in this thread by step counts with the
 //! gateway on a clock that follows them. The clients are this thread's too, read
 //! without blocking between the machine's turns; every wait is for something to happen.
+//!
+//! Every test runs on the RV32 kernel and then on the RV64 one (#156:
+//! `common::on_both_widths`), with the same programs built for RV64.
 
 mod common;
 
@@ -239,7 +242,7 @@ fn start_shd_on(vm: &mut Vm, args: &str, port: u16) -> u32 {
 /// Kills shd, collects it, waits for every TCP socket to be free (TIME-WAIT is 60
 /// seconds) and every packet buffer back, checks that the free pages are `pages` again,
 /// and leaves the console's shell: the machine stops, so no process is left.
-fn finish(mut vm: Vm, shd: u32, pages: u32) {
+fn finish(mut vm: Vm, shd: u32, pages: kstacks::Pages) {
     assert_eq!(console(&mut vm, &format!("kill {shd}")), "");
     assert_eq!(console(&mut vm, "wait"), format!("[{shd}] shd: exit -1\n"));
     let ps = parse_ps(&console(&mut vm, "ps"));
@@ -256,7 +259,7 @@ fn finish(mut vm: Vm, shd: u32, pages: u32) {
         );
     }
     assert_buffers_back(&mut vm);
-    assert_eq!(vm.read_var("nfree"), pages, "pages leaked:\n{}", vm.out());
+    assert_eq!(vm.pages(), pages, "pages leaked:\n{}", vm.out());
     vm.type_line("exit 0");
     assert_eq!(
         vm.m.run(Some(MAX_STEPS), |_| {}),
@@ -268,7 +271,7 @@ fn finish(mut vm: Vm, shd: u32, pages: u32) {
 
 /// The free pages once the programs these tests run have each run once (whatever the
 /// first run of one costs is then paid on both sides of the comparison).
-fn warm_up(vm: &mut Vm) -> u32 {
+fn warm_up(vm: &mut Vm) -> kstacks::Pages {
     assert_eq!(
         console(vm, "shd -x"),
         "usage: shd [-p PORT] [-n MAX] [-v]\nshd: exit 1\n"
@@ -276,191 +279,195 @@ fn warm_up(vm: &mut Vm) -> u32 {
     assert_eq!(console(vm, "sleep 0"), "");
     assert_eq!(console(vm, "echo x | cat"), "x\n");
     parse_ps(&console(vm, "ps"));
-    vm.read_var("nfree")
+    vm.pages()
 }
 
 #[test]
 fn sessions_run_side_by_side_and_end_with_their_connections() {
-    // Issue #117's first and second criteria: two sessions run commands at the same
-    // time, one stuck in `sleep 5000` while the other keeps working and the console's
-    // shell too; closing a connection ends its shell; a client that disconnects in the
-    // middle of a command hangs up, and nothing is left behind.
-    let (mut vm, addr) = shd_vm();
-    let pages = warm_up(&mut vm);
-    let shd = start_shd(&mut vm, "");
-    let mut a = session(&mut vm, addr);
-    let mut b = session(&mut vm, addr);
-    wait_console(&mut vm, &mut [], " connected\n", 2);
+    on_both_widths(|| {
+        // Issue #117's first and second criteria: two sessions run commands at the same
+        // time, one stuck in `sleep 5000` while the other keeps working and the console's
+        // shell too; closing a connection ends its shell; a client that disconnects in the
+        // middle of a command hangs up, and nothing is left behind.
+        let (mut vm, addr) = shd_vm();
+        let pages = warm_up(&mut vm);
+        let shd = start_shd(&mut vm, "");
+        let mut a = session(&mut vm, addr);
+        let mut b = session(&mut vm, addr);
+        wait_console(&mut vm, &mut [], " connected\n", 2);
 
-    // A sleeps for over an hour; B looks until it sees A's sleep, as the processes go.
-    a.send(b"sleep 5000\n");
-    let ps = loop {
-        let ps = parse_ps(&command(&mut vm, &mut [&mut a, &mut b], 1, "ps"));
-        if ps.iter().any(|p| p.name == "sleep") {
-            break ps;
-        }
-    };
-    let find = |name: &str, ppid: u32| -> Vec<&Proc> {
-        ps.iter().filter(|p| p.name == name && p.ppid == ppid).collect()
-    };
-    let console_sh = find("sh", 0);
-    assert_eq!(console_sh.len(), 1, "{ps:#?}");
-    assert_eq!(find("shd", console_sh[0].pid)[0].pid, shd, "{ps:#?}");
-    let shells = find("sh", shd);
-    assert_eq!(shells.len(), 2, "{ps:#?}");
-    let (sh_a, sh_b) = (shells[0].pid, shells[1].pid);
-    assert_eq!(find("sleep", sh_a).len(), 1, "{ps:#?}");
-    assert_eq!(find("ps", sh_b)[0].state, "run", "{ps:#?}");
-    assert_eq!(ps.len(), 6, "{ps:#?}");
+        // A sleeps for over an hour; B looks until it sees A's sleep, as the processes go.
+        a.send(b"sleep 5000\n");
+        let ps = loop {
+            let ps = parse_ps(&command(&mut vm, &mut [&mut a, &mut b], 1, "ps"));
+            if ps.iter().any(|p| p.name == "sleep") {
+                break ps;
+            }
+        };
+        let find = |name: &str, ppid: u32| -> Vec<&Proc> {
+            ps.iter().filter(|p| p.name == name && p.ppid == ppid).collect()
+        };
+        let console_sh = find("sh", 0);
+        assert_eq!(console_sh.len(), 1, "{ps:#?}");
+        assert_eq!(find("shd", console_sh[0].pid)[0].pid, shd, "{ps:#?}");
+        let shells = find("sh", shd);
+        assert_eq!(shells.len(), 2, "{ps:#?}");
+        let (sh_a, sh_b) = (shells[0].pid, shells[1].pid);
+        assert_eq!(find("sleep", sh_a).len(), 1, "{ps:#?}");
+        assert_eq!(find("ps", sh_b)[0].state, "run", "{ps:#?}");
+        assert_eq!(ps.len(), 6, "{ps:#?}");
 
-    // B carries on: programs, a pipeline, errors on its own connection (stderr too),
-    // built-ins, and two lines sent at once, each run in turn.
-    let mut clients = [&mut a, &mut b];
-    assert_eq!(
-        command(&mut vm, &mut clients, 1, "echo hello from b"),
-        "hello from b\n"
-    );
-    assert_eq!(command(&mut vm, &mut clients, 1, "echo one two | wc"), "1 2 8\n");
-    assert_eq!(
-        command(&mut vm, &mut clients, 1, "nosuch"),
-        "sh: nosuch: no such program\n"
-    );
-    assert_eq!(
-        command(&mut vm, &mut clients, 1, "help").lines().next(),
-        Some("help            this list")
-    );
-    // A telnet client's line end.
-    assert_eq!(command(&mut vm, &mut clients, 1, "echo crlf\r"), "crlf\n");
-    let before = clients[1].got.len();
-    clients[1].send(b"echo first\necho second\n");
-    run(&mut vm, &mut clients, |_, c| {
-        c[1].text()[before..].matches(PROMPT).count() == 2
-    });
-    assert_eq!(&clients[1].text()[before..], "first\n$ second\n$ ");
-    // A program reads the same connection: what follows its line is its input, none of
-    // it taken by the shell. It is killed from the console.
-    let before = clients[1].got.len();
-    clients[1].send(b"cat\nfor cat\n");
-    run(&mut vm, &mut clients, |_, c| {
-        c[1].text()[before..].contains("for cat\n")
-    });
-    let ps = parse_ps(&console(&mut vm, "ps"));
-    let cat = ps.iter().find(|p| p.name == "cat" && p.ppid == sh_b).unwrap().pid;
-    assert_eq!(console(&mut vm, &format!("kill {cat}")), "");
-    run(&mut vm, &mut [&mut a, &mut b], |_, c| {
-        c[1].got.ends_with(PROMPT.as_bytes())
-    });
-    assert_eq!(&b.text()[before..], "for cat\ncat: exit -1\n$ ");
-
-    // The console is unaffected throughout.
-    assert_eq!(console(&mut vm, "echo console"), "console\n");
-    let ps = parse_ps(&console(&mut vm, "ps"));
-    assert_eq!(ps.iter().filter(|p| p.name == "sh").count(), 3, "{ps:#?}");
-
-    // A is still asleep: nothing more came on its connection.
-    assert_eq!(a.text(), GREETING);
-
-    // B closes its connection between commands: its shell reads the end of its input
-    // and ends, with the status of its last program, the killed cat.
-    b.close();
-    wait_console(&mut vm, &mut [&mut a], " ended, exit -1\n", 1);
-    // A goes away in the middle of `sleep 5000`: shd hangs the session up, killing the
-    // sleep; its shell then ends.
-    a.close();
-    wait_console(&mut vm, &mut [], " ended, exit -1\n", 2);
-    let ps = parse_ps(&console(&mut vm, "ps"));
-    let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
-
-    // C leaves between commands too.
-    let mut c = session(&mut vm, addr);
-    assert_eq!(command(&mut vm, &mut [&mut c], 0, "echo c"), "c\n");
-    c.close();
-    wait_console(&mut vm, &mut [], " ended, exit 0\n", 1);
-    // D's shell ends with `exit 3`, a background program still running: the connection
-    // ends with the shell, for the client too.
-    let mut d = session(&mut vm, addr);
-    let job = command(&mut vm, &mut [&mut d], 0, "sleep 1 &");
-    job_pid(&job);
-    d.send(b"exit 3\n");
-    run(&mut vm, &mut [&mut d], |_, d| d[0].closed);
-    assert_eq!(d.text(), format!("{GREETING}{job}$ "));
-    wait_console(&mut vm, &mut [], " ended, exit 3\n", 1);
-
-    assert_eq!(
-        shd_log(&vm.out()),
-        [
-            "[] 10.0.2.2: connected",
-            "[] 10.0.2.2: connected",
-            "[] 10.0.2.2: hung up",
-            "[] 10.0.2.2: ended, exit -1",
-            "[] 10.0.2.2: hung up",
-            "[] 10.0.2.2: ended, exit -1",
-            "[] 10.0.2.2: connected",
-            "[] 10.0.2.2: hung up",
-            "[] 10.0.2.2: ended, exit 0",
-            "[] 10.0.2.2: connected",
-            "[] 10.0.2.2: ended, exit 3",
-        ]
-    );
-
-    // D's `sleep 1` outlives its shell, as a background job does: wait for it.
-    loop {
+        // B carries on: programs, a pipeline, errors on its own connection (stderr too),
+        // built-ins, and two lines sent at once, each run in turn.
+        let mut clients = [&mut a, &mut b];
+        assert_eq!(
+            command(&mut vm, &mut clients, 1, "echo hello from b"),
+            "hello from b\n"
+        );
+        assert_eq!(command(&mut vm, &mut clients, 1, "echo one two | wc"), "1 2 8\n");
+        assert_eq!(
+            command(&mut vm, &mut clients, 1, "nosuch"),
+            "sh: nosuch: no such program\n"
+        );
+        assert_eq!(
+            command(&mut vm, &mut clients, 1, "help").lines().next(),
+            Some("help            this list")
+        );
+        // A telnet client's line end.
+        assert_eq!(command(&mut vm, &mut clients, 1, "echo crlf\r"), "crlf\n");
+        let before = clients[1].got.len();
+        clients[1].send(b"echo first\necho second\n");
+        run(&mut vm, &mut clients, |_, c| {
+            c[1].text()[before..].matches(PROMPT).count() == 2
+        });
+        assert_eq!(&clients[1].text()[before..], "first\n$ second\n$ ");
+        // A program reads the same connection: what follows its line is its input, none of
+        // it taken by the shell. It is killed from the console.
+        let before = clients[1].got.len();
+        clients[1].send(b"cat\nfor cat\n");
+        run(&mut vm, &mut clients, |_, c| {
+            c[1].text()[before..].contains("for cat\n")
+        });
         let ps = parse_ps(&console(&mut vm, "ps"));
-        if !ps.iter().any(|p| p.name == "sleep") {
-            break;
+        let cat = ps.iter().find(|p| p.name == "cat" && p.ppid == sh_b).unwrap().pid;
+        assert_eq!(console(&mut vm, &format!("kill {cat}")), "");
+        run(&mut vm, &mut [&mut a, &mut b], |_, c| {
+            c[1].got.ends_with(PROMPT.as_bytes())
+        });
+        assert_eq!(&b.text()[before..], "for cat\ncat: exit -1\n$ ");
+
+        // The console is unaffected throughout.
+        assert_eq!(console(&mut vm, "echo console"), "console\n");
+        let ps = parse_ps(&console(&mut vm, "ps"));
+        assert_eq!(ps.iter().filter(|p| p.name == "sh").count(), 3, "{ps:#?}");
+
+        // A is still asleep: nothing more came on its connection.
+        assert_eq!(a.text(), GREETING);
+
+        // B closes its connection between commands: its shell reads the end of its input
+        // and ends, with the status of its last program, the killed cat.
+        b.close();
+        wait_console(&mut vm, &mut [&mut a], " ended, exit -1\n", 1);
+        // A goes away in the middle of `sleep 5000`: shd hangs the session up, killing the
+        // sleep; its shell then ends.
+        a.close();
+        wait_console(&mut vm, &mut [], " ended, exit -1\n", 2);
+        let ps = parse_ps(&console(&mut vm, "ps"));
+        let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
+
+        // C leaves between commands too.
+        let mut c = session(&mut vm, addr);
+        assert_eq!(command(&mut vm, &mut [&mut c], 0, "echo c"), "c\n");
+        c.close();
+        wait_console(&mut vm, &mut [], " ended, exit 0\n", 1);
+        // D's shell ends with `exit 3`, a background program still running: the connection
+        // ends with the shell, for the client too.
+        let mut d = session(&mut vm, addr);
+        let job = command(&mut vm, &mut [&mut d], 0, "sleep 1 &");
+        job_pid(&job);
+        d.send(b"exit 3\n");
+        run(&mut vm, &mut [&mut d], |_, d| d[0].closed);
+        assert_eq!(d.text(), format!("{GREETING}{job}$ "));
+        wait_console(&mut vm, &mut [], " ended, exit 3\n", 1);
+
+        assert_eq!(
+            shd_log(&vm.out()),
+            [
+                "[] 10.0.2.2: connected",
+                "[] 10.0.2.2: connected",
+                "[] 10.0.2.2: hung up",
+                "[] 10.0.2.2: ended, exit -1",
+                "[] 10.0.2.2: hung up",
+                "[] 10.0.2.2: ended, exit -1",
+                "[] 10.0.2.2: connected",
+                "[] 10.0.2.2: hung up",
+                "[] 10.0.2.2: ended, exit 0",
+                "[] 10.0.2.2: connected",
+                "[] 10.0.2.2: ended, exit 3",
+            ]
+        );
+
+        // D's `sleep 1` outlives its shell, as a background job does: wait for it.
+        loop {
+            let ps = parse_ps(&console(&mut vm, "ps"));
+            if !ps.iter().any(|p| p.name == "sleep") {
+                break;
+            }
         }
-    }
-    finish(vm, shd, pages);
+        finish(vm, shd, pages);
+    });
 }
 
 #[test]
 fn the_session_limit_turns_connections_away() {
-    // Issue #117's second criterion, the limit: with -n 1, a second connection is told
-    // so and closed while the first session lasts, and gets in once it has ended.
-    let (mut vm, addr) = shd_vm();
-    let pages = warm_up(&mut vm);
-    let shd = start_shd(&mut vm, " -n 1");
-    let mut a = session(&mut vm, addr);
-    let mut b = Client::connect(addr);
-    run(&mut vm, &mut [&mut a, &mut b], |_, c| c[1].closed);
-    assert_eq!(b.text(), "shd: too many sessions (1), try again later\n");
-    assert_eq!(
-        command(&mut vm, &mut [&mut a], 0, "echo still here"),
-        "still here\n"
-    );
-    a.send(b"exit\n");
-    run(&mut vm, &mut [&mut a], |_, c| c[0].closed);
-    wait_console(&mut vm, &mut [], " ended, exit 0\n", 1);
-    let mut c = session(&mut vm, addr);
-    assert_eq!(command(&mut vm, &mut [&mut c], 0, "echo in"), "in\n");
-    c.send(b"exit 0\n");
-    run(&mut vm, &mut [&mut c], |_, c| c[0].closed);
-    wait_console(&mut vm, &mut [], " ended, exit 0\n", 2);
-    assert_eq!(
-        shd_log(&vm.out()),
-        [
-            "[] 10.0.2.2: connected",
-            "10.0.2.2: turned away: too many sessions",
-            "[] 10.0.2.2: ended, exit 0",
-            "[] 10.0.2.2: connected",
-            "[] 10.0.2.2: ended, exit 0",
-        ]
-    );
-    // Bad options.
-    for args in ["-n 0", "-n 9", "-p 0", "-p", "-q"] {
+    on_both_widths(|| {
+        // Issue #117's second criterion, the limit: with -n 1, a second connection is told
+        // so and closed while the first session lasts, and gets in once it has ended.
+        let (mut vm, addr) = shd_vm();
+        let pages = warm_up(&mut vm);
+        let shd = start_shd(&mut vm, " -n 1");
+        let mut a = session(&mut vm, addr);
+        let mut b = Client::connect(addr);
+        run(&mut vm, &mut [&mut a, &mut b], |_, c| c[1].closed);
+        assert_eq!(b.text(), "shd: too many sessions (1), try again later\n");
         assert_eq!(
-            console(&mut vm, &format!("shd {args}")),
-            "usage: shd [-p PORT] [-n MAX] [-v]\nshd: exit 1\n",
-            "{args}"
+            command(&mut vm, &mut [&mut a], 0, "echo still here"),
+            "still here\n"
         );
-    }
-    // The port is taken: by shd itself.
-    assert_eq!(
-        console(&mut vm, "shd"),
-        "shd: port 23: address in use\nshd: exit 1\n"
-    );
-    finish(vm, shd, pages);
+        a.send(b"exit\n");
+        run(&mut vm, &mut [&mut a], |_, c| c[0].closed);
+        wait_console(&mut vm, &mut [], " ended, exit 0\n", 1);
+        let mut c = session(&mut vm, addr);
+        assert_eq!(command(&mut vm, &mut [&mut c], 0, "echo in"), "in\n");
+        c.send(b"exit 0\n");
+        run(&mut vm, &mut [&mut c], |_, c| c[0].closed);
+        wait_console(&mut vm, &mut [], " ended, exit 0\n", 2);
+        assert_eq!(
+            shd_log(&vm.out()),
+            [
+                "[] 10.0.2.2: connected",
+                "10.0.2.2: turned away: too many sessions",
+                "[] 10.0.2.2: ended, exit 0",
+                "[] 10.0.2.2: connected",
+                "[] 10.0.2.2: ended, exit 0",
+            ]
+        );
+        // Bad options.
+        for args in ["-n 0", "-n 9", "-p 0", "-p", "-q"] {
+            assert_eq!(
+                console(&mut vm, &format!("shd {args}")),
+                "usage: shd [-p PORT] [-n MAX] [-v]\nshd: exit 1\n",
+                "{args}"
+            );
+        }
+        // The port is taken: by shd itself.
+        assert_eq!(
+            console(&mut vm, "shd"),
+            "shd: port 23: address in use\nshd: exit 1\n"
+        );
+        finish(vm, shd, pages);
+    });
 }
 
 /// Runs console `ps` until no process is named `name`; a few tries, each a command's
@@ -477,65 +484,67 @@ fn wait_gone(vm: &mut Vm, name: &str) {
 
 #[test]
 fn a_hang_up_ends_background_jobs_and_typed_ahead_sessions() {
-    // shd on another port (-p), forwarded to. The gateway gives up on a half-closed
-    // connection where nothing moves after 3 seconds rather than a minute, to keep the
-    // test short.
-    let (mut vm, addr) = shd_vm_on(2323, Duration::from_secs(3));
-    let pages = warm_up(&mut vm);
-    let shd = start_shd_on(&mut vm, " -p 2323", 2323);
+    on_both_widths(|| {
+        // shd on another port (-p), forwarded to. The gateway gives up on a half-closed
+        // connection where nothing moves after 3 seconds rather than a minute, to keep the
+        // test short.
+        let (mut vm, addr) = shd_vm_on(2323, Duration::from_secs(3));
+        let pages = warm_up(&mut vm);
+        let shd = start_shd_on(&mut vm, " -p 2323", 2323);
 
-    // A starts a background job and leaves between commands: its shell reads the end
-    // of its input at once and ends, too soon for shd to find the job by its parent,
-    // so the shell kills it itself. Nothing of the session is left.
-    let mut a = session(&mut vm, addr);
-    wait_console(&mut vm, &mut [], " connected\n", 1);
-    let job = command(&mut vm, &mut [&mut a], 0, "sleep 5000 &");
-    let sleep_pid = job_pid(&job);
-    let ps = parse_ps(&console(&mut vm, "ps"));
-    assert!(
-        ps.iter().any(|p| p.pid == sleep_pid && p.name == "sleep"),
-        "{ps:#?}"
-    );
-    a.close();
-    wait_console(&mut vm, &mut [], " ended, exit 0\n", 1);
-    wait_gone(&mut vm, "sleep");
-    let ps = parse_ps(&console(&mut vm, "ps"));
-    let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
-
-    // B types `ls` while `sleep 5000` runs, then leaves: the line waits unread, so
-    // after B's FIN the session looks like a script that still reads. Nothing moves on
-    // the connection, and after a while (here 3 s) the gateway resets it: that drops the unread
-    // line, shd hangs up and kills the sleep, and the shell, reading the reset, ends
-    // without running `ls` (its status is still the killed sleep's).
-    let mut b = session(&mut vm, addr);
-    wait_console(&mut vm, &mut [], " connected\n", 2);
-    b.send(b"sleep 5000\nls\n");
-    loop {
+        // A starts a background job and leaves between commands: its shell reads the end
+        // of its input at once and ends, too soon for shd to find the job by its parent,
+        // so the shell kills it itself. Nothing of the session is left.
+        let mut a = session(&mut vm, addr);
+        wait_console(&mut vm, &mut [], " connected\n", 1);
+        let job = command(&mut vm, &mut [&mut a], 0, "sleep 5000 &");
+        let sleep_pid = job_pid(&job);
         let ps = parse_ps(&console(&mut vm, "ps"));
-        if ps.iter().any(|p| p.name == "sleep") {
-            break;
-        }
-    }
-    b.close();
-    wait_console(&mut vm, &mut [], " ended, exit -1\n", 1);
-    wait_gone(&mut vm, "sleep");
-    let ps = parse_ps(&console(&mut vm, "ps"));
-    let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
+        assert!(
+            ps.iter().any(|p| p.pid == sleep_pid && p.name == "sleep"),
+            "{ps:#?}"
+        );
+        a.close();
+        wait_console(&mut vm, &mut [], " ended, exit 0\n", 1);
+        wait_gone(&mut vm, "sleep");
+        let ps = parse_ps(&console(&mut vm, "ps"));
+        let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
 
-    assert_eq!(
-        shd_log(&vm.out()),
-        [
-            "[] 10.0.2.2: connected",
-            "[] 10.0.2.2: hung up",
-            "[] 10.0.2.2: ended, exit 0",
-            "[] 10.0.2.2: connected",
-            "[] 10.0.2.2: hung up",
-            "[] 10.0.2.2: ended, exit -1",
-        ]
-    );
-    finish(vm, shd, pages);
+        // B types `ls` while `sleep 5000` runs, then leaves: the line waits unread, so
+        // after B's FIN the session looks like a script that still reads. Nothing moves on
+        // the connection, and after a while (here 3 s) the gateway resets it: that drops the unread
+        // line, shd hangs up and kills the sleep, and the shell, reading the reset, ends
+        // without running `ls` (its status is still the killed sleep's).
+        let mut b = session(&mut vm, addr);
+        wait_console(&mut vm, &mut [], " connected\n", 2);
+        b.send(b"sleep 5000\nls\n");
+        loop {
+            let ps = parse_ps(&console(&mut vm, "ps"));
+            if ps.iter().any(|p| p.name == "sleep") {
+                break;
+            }
+        }
+        b.close();
+        wait_console(&mut vm, &mut [], " ended, exit -1\n", 1);
+        wait_gone(&mut vm, "sleep");
+        let ps = parse_ps(&console(&mut vm, "ps"));
+        let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
+
+        assert_eq!(
+            shd_log(&vm.out()),
+            [
+                "[] 10.0.2.2: connected",
+                "[] 10.0.2.2: hung up",
+                "[] 10.0.2.2: ended, exit 0",
+                "[] 10.0.2.2: connected",
+                "[] 10.0.2.2: hung up",
+                "[] 10.0.2.2: ended, exit -1",
+            ]
+        );
+        finish(vm, shd, pages);
+    });
 }
 
 /// Turns a shell may outlive its client by, alone, before shd kills it, and how long a
@@ -546,55 +555,57 @@ const TURN_TICKS: u32 = 5;
 
 #[test]
 fn a_shell_left_alone_after_its_client_has_gone_is_killed() {
-    // Issue #127: the session's shell outlives its client with nothing under it for
-    // shd to kill, and neither reads its input nor ends: here it has replaced itself
-    // with `exec sleep 5000` (POSIX's exec, kernel/user/sh.c), so the session's
-    // process is a sleep with no children. Once the client has closed its side, shd
-    // finds the connection gone with every byte read and no descendant to kill,
-    // waits LINGER_TURNS turns, then logs the hang-up and kills the process itself;
-    // the session ends with the killed status, and nothing of it is left behind.
-    let (mut vm, addr) = shd_vm();
-    let pages = warm_up(&mut vm);
-    let shd = start_shd(&mut vm, "");
-    let mut a = session(&mut vm, addr);
-    wait_console(&mut vm, &mut [], " connected\n", 1);
-    a.send(b"exec sleep 5000\n");
-    let (session_pid, ps) = (0..20)
-        .find_map(|_| {
-            let ps = parse_ps(&console(&mut vm, "ps"));
-            let pid = ps.iter().find(|p| p.ppid == shd && p.name == "sleep")?.pid;
-            Some((pid, ps))
-        })
-        .unwrap_or_else(|| panic!("the session never became a sleep:\n{}", vm.out()));
-    // The sleep is the session's process, shd's child, with nothing under it: no
-    // shell is left but the console's.
-    assert!(!ps.iter().any(|p| p.ppid == session_pid), "{ps:#?}");
-    assert_eq!(ps.iter().filter(|p| p.name == "sh").count(), 1, "{ps:#?}");
-    // exec printed nothing: no prompt, no error.
-    a.pump();
-    assert_eq!(a.text(), GREETING);
+    on_both_widths(|| {
+        // Issue #127: the session's shell outlives its client with nothing under it for
+        // shd to kill, and neither reads its input nor ends: here it has replaced itself
+        // with `exec sleep 5000` (POSIX's exec, kernel/user/sh.c), so the session's
+        // process is a sleep with no children. Once the client has closed its side, shd
+        // finds the connection gone with every byte read and no descendant to kill,
+        // waits LINGER_TURNS turns, then logs the hang-up and kills the process itself;
+        // the session ends with the killed status, and nothing of it is left behind.
+        let (mut vm, addr) = shd_vm();
+        let pages = warm_up(&mut vm);
+        let shd = start_shd(&mut vm, "");
+        let mut a = session(&mut vm, addr);
+        wait_console(&mut vm, &mut [], " connected\n", 1);
+        a.send(b"exec sleep 5000\n");
+        let (session_pid, ps) = (0..20)
+            .find_map(|_| {
+                let ps = parse_ps(&console(&mut vm, "ps"));
+                let pid = ps.iter().find(|p| p.ppid == shd && p.name == "sleep")?.pid;
+                Some((pid, ps))
+            })
+            .unwrap_or_else(|| panic!("the session never became a sleep:\n{}", vm.out()));
+        // The sleep is the session's process, shd's child, with nothing under it: no
+        // shell is left but the console's.
+        assert!(!ps.iter().any(|p| p.ppid == session_pid), "{ps:#?}");
+        assert_eq!(ps.iter().filter(|p| p.name == "sh").count(), 1, "{ps:#?}");
+        // exec printed nothing: no prompt, no error.
+        a.pump();
+        assert_eq!(a.text(), GREETING);
 
-    let closed_at = vm.read_var("ticks");
-    a.close();
-    wait_console(&mut vm, &mut [], " hung up\n", 1);
-    let lingered = vm.read_var("ticks") - closed_at;
-    assert!(
-        lingered >= LINGER_TURNS * TURN_TICKS,
-        "hung up {lingered} ticks after the client left:\n{}",
-        vm.out()
-    );
-    wait_console(&mut vm, &mut [], " ended, exit -1\n", 1);
-    assert_eq!(
-        shd_log(&vm.out()),
-        [
-            "[] 10.0.2.2: connected",
-            "[] 10.0.2.2: hung up",
-            "[] 10.0.2.2: ended, exit -1",
-        ]
-    );
-    wait_gone(&mut vm, "sleep");
-    let ps = parse_ps(&console(&mut vm, "ps"));
-    let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
-    finish(vm, shd, pages);
+        let closed_at = vm.read_var("ticks");
+        a.close();
+        wait_console(&mut vm, &mut [], " hung up\n", 1);
+        let lingered = vm.read_var("ticks") - closed_at;
+        assert!(
+            lingered >= LINGER_TURNS * TURN_TICKS,
+            "hung up {lingered} ticks after the client left:\n{}",
+            vm.out()
+        );
+        wait_console(&mut vm, &mut [], " ended, exit -1\n", 1);
+        assert_eq!(
+            shd_log(&vm.out()),
+            [
+                "[] 10.0.2.2: connected",
+                "[] 10.0.2.2: hung up",
+                "[] 10.0.2.2: ended, exit -1",
+            ]
+        );
+        wait_gone(&mut vm, "sleep");
+        let ps = parse_ps(&console(&mut vm, "ps"));
+        let names: Vec<&str> = ps.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["sh", "shd", "ps"], "{ps:#?}");
+        finish(vm, shd, pages);
+    });
 }

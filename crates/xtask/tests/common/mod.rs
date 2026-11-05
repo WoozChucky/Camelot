@@ -245,3 +245,220 @@ impl LockWatch {
         self.was_user[h] = is_user;
     }
 }
+
+/// The width of the kernel a test runs, for the tests that run on both
+/// ([`width::on_both`]): the RV32 kernel and then the RV64 one (#156).
+pub mod width {
+    use std::cell::Cell;
+    use xtask::kernel::Xlen;
+
+    thread_local! {
+        static XLEN: Cell<Xlen> = const { Cell::new(Xlen::Rv32) };
+    }
+
+    /// Runs `test` for RV32, then for RV64: [`get`] says which. A failure
+    /// says which width failed: the panic is raised again with the width
+    /// before its message.
+    pub fn on_both(test: impl Fn()) {
+        for xlen in xtask::kernel::XLENS {
+            XLEN.with(|x| x.set(xlen));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
+            XLEN.with(|x| x.set(Xlen::Rv32));
+            if let Err(payload) = result {
+                let name = match xlen {
+                    Xlen::Rv32 => "RV32",
+                    Xlen::Rv64 => "RV64",
+                };
+                panic!("on {name}: {}", panic_message(&*payload));
+            }
+        }
+    }
+
+    /// What a panic said: its message, if it had one.
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            s
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s
+        } else {
+            "(a panic without a message)"
+        }
+    }
+
+    /// The width under test.
+    pub fn get() -> Xlen {
+        XLEN.with(|x| x.get())
+    }
+
+    /// The same, as Grail names it.
+    pub fn machine() -> grail::Xlen {
+        match get() {
+            Xlen::Rv32 => grail::Xlen::Rv32,
+            Xlen::Rv64 => grail::Xlen::Rv64,
+        }
+    }
+
+    /// Where the RV64 kernel image is linked, and where it is loaded.
+    const KERNEL_LINK_ADDR_RV64: u64 = 0xffff_ffff_8000_0000;
+    const LOAD_ADDR: u64 = 0x8000_0000;
+
+    /// The physical address of `va`, an address in the kernel image: the
+    /// same on RV32; on RV64, linked in the upper half, its load address.
+    pub fn image_pa(va: u64) -> u64 {
+        if va >= KERNEL_LINK_ADDR_RV64 {
+            va - KERNEL_LINK_ADDR_RV64 + LOAD_ADDR
+        } else {
+            va
+        }
+    }
+}
+
+/// A program's start, as the kernel puts it on the stack of a program it
+/// starts (docs/camelot-syscalls.md, "Starting a program"; kernel/proc.c,
+/// push_start), Linux's layout: read through the current hart's
+/// translation, which must be the new program's, before it has run.
+pub mod start {
+    use grail::debug::Space;
+    use grail::Machine;
+
+    /// The auxiliary vector's types (kernel/include/syscall.h's `AT_*`,
+    /// Linux's values).
+    pub const AT_NULL: u64 = 0;
+    pub const AT_PHDR: u64 = 3;
+    pub const AT_PHENT: u64 = 4;
+    pub const AT_PHNUM: u64 = 5;
+    pub const AT_PAGESZ: u64 = 6;
+    pub const AT_BASE: u64 = 7;
+    pub const AT_FLAGS: u64 = 8;
+    pub const AT_ENTRY: u64 = 9;
+    pub const AT_UID: u64 = 11;
+    pub const AT_EUID: u64 = 12;
+    pub const AT_GID: u64 = 13;
+    pub const AT_EGID: u64 = 14;
+    pub const AT_HWCAP: u64 = 16;
+    pub const AT_CLKTCK: u64 = 17;
+    pub const AT_SECURE: u64 = 23;
+    pub const AT_RANDOM: u64 = 25;
+    pub const AT_EXECFN: u64 = 31;
+
+    /// `n` bytes at user address `va`.
+    fn read(m: &Machine, va: u64, n: usize) -> Vec<u8> {
+        let mut buf = vec![0; n];
+        assert_eq!(
+            m.read_memory(va, &mut buf, Space::Virtual),
+            n,
+            "{va:#x} is not mapped"
+        );
+        buf
+    }
+
+    /// The `size`-byte little-endian word at `va`.
+    fn word(m: &Machine, va: u64, size: u64) -> u64 {
+        let b = read(m, va, size as usize);
+        b.iter().rev().fold(0, |v, &x| v << 8 | u64::from(x))
+    }
+
+    /// The NUL-terminated string at `va`.
+    fn string(m: &Machine, va: u64) -> String {
+        let mut s = Vec::new();
+        for a in va.. {
+            match read(m, a, 1)[0] {
+                0 => break,
+                c => s.push(c),
+            }
+        }
+        String::from_utf8(s).unwrap()
+    }
+
+    /// Checks the start of program `elf`, run as `path` with `argv`, on the
+    /// stack under `user_top` that ends at the current hart's sp, with
+    /// `word_size`-byte pointers: every register zero but sp (a0, the
+    /// psABI's atexit function, is 0 too); at sp, 16-byte aligned, argc,
+    /// then argv, a NULL, an empty envp, and the auxiliary vector in the
+    /// kernel's order; the strings, argv's in order, then the path and a
+    /// zero word at the very top; the 16 random bytes between the two,
+    /// aligned.
+    pub fn check(m: &Machine, word_size: u64, user_top: u64, elf: &[u8], path: &str, argv: &[&str]) {
+        let w = |va: u64| word(m, va, word_size);
+        let regs = m.cpu.x;
+        let sp = regs[2];
+        for (r, &v) in regs.iter().enumerate() {
+            if r != 2 {
+                assert_eq!(v, 0, "x{r} is not zero");
+            }
+        }
+        assert_eq!(sp % 16, 0, "sp {sp:#x}");
+        assert!(sp < user_top && sp > user_top - 2048, "sp {sp:#x}");
+        let mut at = sp;
+        assert_eq!(w(at), argv.len() as u64, "argc");
+        at += word_size;
+        let mut ptrs = Vec::new();
+        for want in argv {
+            let p = w(at);
+            assert_eq!(&string(m, p), want);
+            ptrs.push(p);
+            at += word_size;
+        }
+        assert_eq!(w(at), 0, "argv's NULL");
+        assert_eq!(w(at + word_size), 0, "envp's NULL: no environment");
+        at += 2 * word_size;
+        let mut auxv = Vec::new();
+        loop {
+            let (ty, val) = (w(at), w(at + word_size));
+            auxv.push((ty, val));
+            at += 2 * word_size;
+            if ty == AT_NULL {
+                break;
+            }
+        }
+        // The strings: contiguous, argv's then the path, then the marker.
+        let mut s = ptrs[0];
+        for (p, want) in ptrs.iter().zip(argv) {
+            assert_eq!(*p, s);
+            s += want.len() as u64 + 1;
+        }
+        let execfn = s;
+        assert_eq!(string(m, execfn), path);
+        assert_eq!(execfn + path.len() as u64 + 1 + word_size, user_top);
+        assert_eq!(w(user_top - word_size), 0, "the end marker");
+        // The random bytes: below the strings, above the vector.
+        let random = auxv.iter().find(|a| a.0 == AT_RANDOM).unwrap().1;
+        assert_eq!(random % 16, 0);
+        assert!(random >= at && random + 16 <= ptrs[0], "random {random:#x}");
+        assert!(read(m, random, 16).iter().any(|&b| b != 0));
+        // The vector: what the ELF says of the program, and Camelot's
+        // constants. AT_PHDR is where a PT_LOAD loads the headers (as
+        // Linux's load_elf_binary finds it), 0 if none does.
+        let e = elf::Elf::parse(elf).unwrap();
+        let phdr = e
+            .segments
+            .iter()
+            .filter(|s| s.ty == 1 && s.offset <= e.header.phoff && e.header.phoff < s.offset + s.filesz)
+            .map(|s| e.header.phoff - s.offset + s.vaddr)
+            .next_back()
+            .unwrap_or(0);
+        let hwcap: u64 = b"IMA".iter().map(|&c| 1 << (c - b'A')).sum();
+        assert_eq!(
+            auxv,
+            [
+                (AT_HWCAP, hwcap),
+                (AT_PAGESZ, 4096),
+                (AT_CLKTCK, 10),
+                (AT_PHDR, phdr),
+                (AT_PHENT, u64::from(e.header.phentsize)),
+                (AT_PHNUM, u64::from(e.header.phnum)),
+                (AT_BASE, 0),
+                (AT_FLAGS, 0),
+                (AT_ENTRY, e.header.entry),
+                (AT_UID, 0),
+                (AT_EUID, 0),
+                (AT_GID, 0),
+                (AT_EGID, 0),
+                (AT_SECURE, 0),
+                (AT_RANDOM, random),
+                (AT_EXECFN, execfn),
+                (AT_NULL, 0),
+            ]
+        );
+    }
+}

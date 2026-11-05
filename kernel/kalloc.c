@@ -11,6 +11,7 @@
 #include "kprintf.h"
 #include "memlayout.h"
 #include "spinlock.h"
+#include "string.h"
 #include "sysinfo.h"
 #include "trap.h"
 #include "vm.h"
@@ -83,11 +84,11 @@ void *kalloc(void) {
 }
 
 void *kzalloc(void) {
-    u32 *p = kalloc();
+    void *p = kalloc();
     if (p != NULL) {
-        for (u32 i = 0; i < PGSIZE / 4; i++) {
-            p[i] = 0;
-        }
+        /* Linux's clear_page() on riscv without Zicboz: memset(), with
+         * register-wide stores. */
+        memset(p, 0, PGSIZE);
     }
     return p;
 }
