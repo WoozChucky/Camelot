@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
         snprintf(from, sizeof from, "%u", (uint)w * slice);
         snprintf(to, sizeof to, "%u", w == workers - 1 ? (uint)limit : (uint)(w + 1) * slice);
         char *args[] = {"primes", "worker", from, to, NULL};
-        pids[w] = spawn("/bin/primes", args);
+        pids[w] = spawn("/bin/primes", args, environ);
         if (pids[w] < 0) {
             fprintf(STDERR, "primes: cannot start worker %d: %s\n", w + 1, strerror(-pids[w]));
             /* Collect the ones already running before giving up. */

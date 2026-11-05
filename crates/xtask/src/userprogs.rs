@@ -53,8 +53,10 @@ pub const SCRIPT: &str = "user.ld";
 pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
 /// Programs the root image's `/bin` holds but the kernel does not build in:
 /// they read and write files, which a machine without a disk has none of,
-/// and their copies would not fit in the 2 MiB the kernel boots in (`as` is
-/// over 100 KB, `ld` not much less).
+/// and their copies would cost every machine memory for nothing: `as` is
+/// over 200 KB, `ld` not much less, nearly half together of what the
+/// smallest machine, 3 MiB, has left once the kernel and the programs it
+/// embeds, a little over 2 MiB, are loaded.
 pub const DISK_ONLY: &[&str] = &["as", "ld"];
 
 /// The programs the kernel builds in: all but [`DISK_ONLY`], by name.

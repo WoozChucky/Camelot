@@ -13,8 +13,9 @@
 //!   `sbrk`'s pointers above 4 GiB (`the_calls_take_and_return_64_bit_values`);
 //! - a 32-bit program is refused, with no compat mode
 //!   (`an_elf32_program_is_refused`);
-//! - a program starts as Linux starts one, with 8-byte words
-//!   (`a_program_starts_as_linux_starts_one`).
+//! - a program starts as Linux starts one, with 8-byte words, its
+//!   environment's among them (`a_program_starts_as_linux_starts_one`,
+//!   `the_shell_passes_its_environment_on`).
 
 mod common;
 
@@ -150,10 +151,12 @@ fn rv64_root_disk(blocks: u32, extra: &[(&str, &[u8])]) -> DiskConfig {
 fn a_program_starts_as_linux_starts_one() {
     // The first instruction in U-mode, the shell's _start, with Linux's
     // start (docs/camelot-syscalls.md, "Starting a program"): sp at argc,
-    // a long, then argv, envp and the auxiliary vector, 8 bytes each, under
-    // USER_TOP, which depends on the paging mode. The programs it runs get
-    // the same: systest checks its own start, and its children's after a
-    // spawn and an exec (the_system_calls_do_what_the_document_says).
+    // a long, then argv, envp (Linux's environment for init, HOME=/ and
+    // TERM=linux) and the auxiliary vector, 8 bytes each, under USER_TOP,
+    // which depends on the paging mode; the strings, argv's then envp's,
+    // above. The programs it runs get the same: systest checks its own
+    // start, its environment's strings among them, and its children's
+    // after a spawn and an exec (the_system_calls_do_what_the_document_says).
     let user = xtask::userprogs::user_dir(&repo_root());
     let sh = xtask::userprogs::build_named_for(&user, "sh", kernel::Xlen::Rv64).unwrap();
     for (paging, top) in [
@@ -175,8 +178,17 @@ fn a_program_starts_as_linux_starts_one() {
             steps += 1;
         }
         assert_eq!(m.cpu.pc, 0x1000, "{paging:?}");
-        common::start::check(&m, 8, top, &sh.elf, "/bin/sh", &["sh"]);
+        common::start::check(&m, 8, top, &sh.elf, "/bin/sh", &["sh"], common::start::INIT_ENV);
     }
+}
+
+#[test]
+fn the_shell_passes_its_environment_on() {
+    // The environment session of tests/common, as kernel.rs runs it on
+    // RV32: 64-bit programs get their environment from the shell, envp's
+    // pointers 8 bytes each, and the shell keeps its variables.
+    let out = run(Setup::default(), common::environment::INPUT);
+    common::environment::check(&out, command_output);
 }
 
 #[test]
