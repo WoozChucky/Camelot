@@ -19,14 +19,14 @@ use std::sync::mpsc::{Receiver, Sender};
 use xtask::kernel::{self, BOOT_MAX_STEPS};
 use xtask::repo_root;
 
+#[path = "../../grail/tests/common/kstacks.rs"]
+mod kstacks;
+
 const PROMPT: &str = "$ ";
 const MIB: usize = 1 << 20;
 /// Steps for a command (the longest here, stress on one hart's worth of
 /// turns, takes about 60 million).
 const RUN_MAX_STEPS: u64 = 300_000_000;
-/// Where the kernel image is linked and where it is loaded.
-const KERNEL_LINK_ADDR: u64 = 0xffff_ffff_8000_0000;
-const LOAD_ADDR: u64 = 0x8000_0000;
 
 fn committed() -> Vec<u8> {
     let path = repo_root().join("kernel").join(kernel::KERNEL_ELF_RV64);
@@ -34,10 +34,9 @@ fn committed() -> Vec<u8> {
 }
 
 /// The committed RV64 kernel on `harts` harts with `disks`, the UART
-/// reading `input`; and its symbols.
-fn load(harts: usize, input: Receiver<u8>, disks: Vec<DiskConfig>) -> (Machine, grail::elf::Elf) {
+/// reading `input`.
+fn load(harts: usize, input: Receiver<u8>, disks: Vec<DiskConfig>) -> Machine {
     let file = committed();
-    let elf = grail::elf::parse(&file).unwrap();
     let mut m = Machine::new(MachineConfig {
         harts,
         ram_size: 16 * MIB,
@@ -49,45 +48,22 @@ fn load(harts: usize, input: Receiver<u8>, disks: Vec<DiskConfig>) -> (Machine, 
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
     m.set_uart_input(input);
-    (m, elf)
+    m
 }
 
 fn printed(m: &Machine) -> String {
     String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned()
 }
 
-/// The byte at `va` in the kernel image, which is linked at
-/// KERNEL_LINK_ADDR and loaded at LOAD_ADDR.
-fn image_byte(m: &Machine, va: u64) -> u8 {
-    let pa = va - KERNEL_LINK_ADDR + LOAD_ADDR;
-    (m.cpu.bus.peek(pa & !3).unwrap() >> (8 * (pa & 3))) as u8
-}
-
-/// The pages the kernel has not lost: the free ones (`nfree`,
-/// kernel/kalloc.c) and those of every kernel stack mapped in the vmalloc
-/// area (`kstack_state`, kernel/vm.c: a slot in use, or freed and kept
-/// mapped, in its hart's cache or waiting for kstack_reclaim(), as Linux
-/// keeps freed thread stacks: KSTACK_SIZE, 4 pages, each). A process that
-/// ends gives its pages back, but its kernel stack may stay mapped for the
-/// next one, so nfree alone need not come back to where it was. Nor do the
+/// The pages the kernel has not lost, and the kernel stacks in use
+/// (kstacks.rs, shared with Grail's network tests). A process that ends
+/// gives its pages back, but its kernel stack may stay mapped for the next
+/// one, so nfree alone need not come back to where it was. Nor do the
 /// tables of the kernel's page table that mapping a stack slot no thread
 /// had used before makes: they stay, as Linux's kernel page tables do. So
 /// a test runs its command once before it counts ([`warm_up`]).
-fn pages(m: &Machine, elf: &grail::elf::Elf) -> u32 {
-    let file = committed();
-    let parsed = elf::Elf::parse(&file).unwrap();
-    let state = parsed
-        .symbols()
-        .unwrap()
-        .into_iter()
-        .find(|s| s.name == "kstack_state")
-        .expect("no kstack_state");
-    let mapped = (0..state.size)
-        .filter(|&i| image_byte(m, state.value + i) != 0)
-        .count() as u32;
-    let va = elf.symbol("nfree").expect("no nfree");
-    let free = m.cpu.bus.peek(va - KERNEL_LINK_ADDR + LOAD_ADDR).unwrap();
-    free + 4 * mapped
+fn pages(m: &Machine) -> kstacks::Pages {
+    kstacks::pages(m, &committed())
 }
 
 /// Steps `m` until the shell has printed its first prompt.
@@ -207,7 +183,7 @@ fn primes_workers_run_side_by_side_on_four_harts() {
     const LINE: &str = "primes 4 40000";
     const LIMIT: u32 = 40000;
     let (tx, rx) = std::sync::mpsc::channel();
-    let (mut m, _) = load(4, rx, Vec::new());
+    let mut m = load(4, rx, Vec::new());
     step_to_prompt(&mut m);
     let mut user = UserHarts::new(4);
     run_command(&mut m, &tx, LINE, |cpu| user.step(cpu));
@@ -268,22 +244,22 @@ fn stress_holds_up_on_four_harts() {
     // and U-mode code on every hart.
     const LINE: &str = "stress 6 3";
     let (tx, rx) = std::sync::mpsc::channel();
-    let (mut m, elf) = load(4, rx, Vec::new());
+    let mut m = load(4, rx, Vec::new());
     step_to_prompt(&mut m);
     warm_up(&mut m, &tx, LINE, "stress: 6 workers, 3 rounds, 3600 bytes: ok");
-    let before = pages(&m, &elf);
+    let before = pages(&m);
     let mut user = UserHarts::new(4);
     run_command(&mut m, &tx, LINE, |cpu| user.step(cpu));
     let out = printed(&m);
     check_stress_output(&command_output(&out, LINE), 6, 3);
-    assert_eq!(pages(&m, &elf), before, "pages leaked");
+    assert_eq!(pages(&m), before, "pages leaked");
     assert_eq!(user.ran.len(), 4, "stress ran on harts {:?}", user.ran);
     exit_shell(&mut m, &tx);
 }
 
 #[test]
 fn systest_passes_on_four_harts() {
-    let (mut m, _) = load(4, kernel::typed(b"systest\nexit 0\n"), Vec::new());
+    let mut m = load(4, kernel::typed(b"systest\nexit 0\n"), Vec::new());
     let r = m.run(Some(2 * RUN_MAX_STEPS), |_| {});
     let out = printed(&m);
     assert_eq!(r, RunResult::Exited(0), "{out}");
@@ -354,7 +330,7 @@ fn threads_add_up_under_a_mutex_on_one_and_four_harts() {
     const LINE: &str = "threads 4 300";
     for harts in [1, 4] {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (mut m, elf) = load(harts, rx, Vec::new());
+        let mut m = load(harts, rx, Vec::new());
         step_to_prompt(&mut m);
         warm_up(
             &mut m,
@@ -362,7 +338,7 @@ fn threads_add_up_under_a_mutex_on_one_and_four_harts() {
             LINE,
             "threads: 4 threads, 300 rounds: counter 1200, spun 1200: ok",
         );
-        let before = pages(&m, &elf);
+        let before = pages(&m);
         let mut user = UserHarts::new(harts);
         run_command(&mut m, &tx, LINE, |cpu| user.step(cpu));
         let out = printed(&m);
@@ -371,7 +347,7 @@ fn threads_add_up_under_a_mutex_on_one_and_four_harts() {
             ["threads: 4 threads, 300 rounds: counter 1200, spun 1200: ok"],
             "{harts} harts"
         );
-        assert_eq!(pages(&m, &elf), before, "{harts} harts: pages leaked");
+        assert_eq!(pages(&m), before, "{harts} harts: pages leaked");
         if harts == 1 {
             assert_eq!(user.most, 1);
         } else {
@@ -398,11 +374,11 @@ fn threads_using_the_filesystem_end_with_their_process_on_one_and_four_harts() {
     let before = fsck::check(&image).unwrap_or_else(|p| panic!("{p:#?}"));
     for harts in [1, 4] {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (mut m, elf) = load(harts, rx, vec![DiskConfig::memory(image.clone())]);
+        let mut m = load(harts, rx, vec![DiskConfig::memory(image.clone())]);
         step_to_prompt(&mut m);
         let fs_line = format!("threadtest fs: {THREADTEST_FS_CHECKS} checks, 0 failed");
         warm_up(&mut m, &tx, "threadtest fs", &fs_line);
-        let start = pages(&m, &elf);
+        let start = pages(&m);
         run_command(&mut m, &tx, "threadtest fs", |_| {});
         let out = printed(&m);
         assert_eq!(
@@ -410,7 +386,7 @@ fn threads_using_the_filesystem_end_with_their_process_on_one_and_four_harts() {
             [format!("threadtest fs: {THREADTEST_FS_CHECKS} checks, 0 failed")],
             "{harts} harts"
         );
-        assert_eq!(pages(&m, &elf), start, "{harts} harts: pages leaked");
+        assert_eq!(pages(&m), start, "{harts} harts: pages leaked");
         exit_shell(&mut m, &tx);
         let d = &mut m.cpu.bus.disks[0];
         let mut disk = vec![0; d.capacity() as usize * 512];

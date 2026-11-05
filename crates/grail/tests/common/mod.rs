@@ -10,6 +10,8 @@
 //! is linked in the upper half and loaded at 0x8000_0000.
 #![allow(dead_code)]
 
+pub mod kstacks;
+
 use grail::net::{Hub, HubPort, MacAddr, NetBackend, POLL_STEPS};
 use grail::{Machine, MachineConfig, NetConfig, RunResult, Xlen};
 use std::cell::Cell;
@@ -177,23 +179,18 @@ impl Vm {
         self.m.cpu.bus.load(var_addr(name), &value.to_le_bytes()).unwrap();
     }
 
-    /// The pages the kernel has not lost: the free ones (`nfree`,
-    /// kernel/kalloc.c) and, on RV64, those of every kernel stack mapped in
-    /// the vmalloc area (`kstack_state`, kernel/vm.c, 4 pages each: in use,
-    /// or freed and kept mapped for the next thread, as Linux keeps freed
-    /// thread stacks). A process that ends gives its pages back, but its
-    /// kernel stack may stay mapped, so on RV64 nfree alone need not come
-    /// back to where it was. On RV32 a kernel stack is a page of free RAM.
-    pub fn pages(&self) -> u32 {
-        let free = self.read_var("nfree");
+    /// The pages the kernel has not lost ([`kstacks::pages`]): on RV32 the
+    /// free ones (`nfree`, kernel/kalloc.c), a kernel stack being a page of
+    /// free RAM; on RV64 those and the pages of every mapped kernel stack,
+    /// and the stacks in use.
+    pub fn pages(&self) -> kstacks::Pages {
         if xlen() == Xlen::Rv32 {
-            return free;
+            return kstacks::Pages {
+                total: self.read_var("nfree").into(),
+                stacks_in_use: 0,
+            };
         }
-        let (state, size) = symbol_range("kstack_state");
-        let mapped = (0..size)
-            .filter(|&i| self.m.cpu.bus.read_mem(image_pa(state + i), 1).unwrap() != 0)
-            .count() as u32;
-        free + 4 * mapped
+        kstacks::pages(&self.m, &kernel_elf())
     }
 }
 
@@ -209,19 +206,6 @@ pub fn var_addr(name: &str) -> u64 {
             let elf = grail::elf::parse(&file).unwrap();
             image_pa(elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}")))
         })
-}
-
-/// The address (virtual, as linked) and size of the kernel's symbol `name`.
-pub fn symbol_range(name: &str) -> (u64, u64) {
-    let file = kernel_elf();
-    let s = elf::Elf::parse(&file)
-        .unwrap()
-        .symbols()
-        .unwrap()
-        .into_iter()
-        .find(|s| s.name == name)
-        .unwrap_or_else(|| panic!("no symbol {name}"));
-    (s.value, s.size)
 }
 
 /// Runs the machines in turns, letting `host` (if any) see what they send between

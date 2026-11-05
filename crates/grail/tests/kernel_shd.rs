@@ -242,7 +242,7 @@ fn start_shd_on(vm: &mut Vm, args: &str, port: u16) -> u32 {
 /// Kills shd, collects it, waits for every TCP socket to be free (TIME-WAIT is 60
 /// seconds) and every packet buffer back, checks that the free pages are `pages` again,
 /// and leaves the console's shell: the machine stops, so no process is left.
-fn finish(mut vm: Vm, shd: u32, pages: u32) {
+fn finish(mut vm: Vm, shd: u32, pages: kstacks::Pages) {
     assert_eq!(console(&mut vm, &format!("kill {shd}")), "");
     assert_eq!(console(&mut vm, "wait"), format!("[{shd}] shd: exit -1\n"));
     let ps = parse_ps(&console(&mut vm, "ps"));
@@ -271,7 +271,7 @@ fn finish(mut vm: Vm, shd: u32, pages: u32) {
 
 /// The free pages once the programs these tests run have each run once (whatever the
 /// first run of one costs is then paid on both sides of the comparison).
-fn warm_up(vm: &mut Vm) -> u32 {
+fn warm_up(vm: &mut Vm) -> kstacks::Pages {
     assert_eq!(
         console(vm, "shd -x"),
         "usage: shd [-p PORT] [-n MAX] [-v]\nshd: exit 1\n"
