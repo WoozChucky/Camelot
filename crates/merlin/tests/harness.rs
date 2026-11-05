@@ -1142,93 +1142,177 @@ fn clang_reference_for(x: Xlen) {
     });
 }
 
-/// The objects an assembly file defines, by name, with their sizes: those
-/// with a `.type NAME, @object` and a `.size NAME, N`, as both compilers
-/// write them, and merlin's string literals (`.L.str`, `.L.str.N`), whose
-/// size is that of the data after their label, as merlin writes it (clang
-/// gives them a `.size`). Sorted by name.
-fn objects(asm: &str) -> Vec<(String, u64)> {
+/// One unit of an object's contents: a byte, or an address of `size`
+/// bytes, `sym+off`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Unit {
+    Byte(u8),
+    Addr { sym: String, off: i64, size: u8 },
+}
+
+/// An object an assembly file defines: its name, its size and what its data
+/// directives put in it.
+#[derive(Debug, PartialEq, Eq)]
+struct Object {
+    name: String,
+    size: u64,
+    data: Vec<Unit>,
+}
+
+/// The objects an assembly file defines, sorted by name: those with a
+/// `.type NAME, @object` and a `.size NAME, N` (or `.comm NAME, N`), as both
+/// compilers write them, and merlin's string literals (`.L.str`,
+/// `.L.str.N`), whose size is that of the data after their label (clang
+/// gives them a `.size`). An object's data is what the data directives
+/// right after its label give, up to the first line that is not one
+/// ([`data_units`]): its bytes, and each address as the symbol and offset
+/// it names, so two objects of one size whose names are swapped differ. An
+/// object with none (clang's `.comm`) is zeros.
+fn objects(asm: &str) -> Vec<Object> {
+    // A directive's operands (`.word NAME` gives `NAME`), without the
+    // comment clang writes after them (`.type .L.str,@object # @.str`).
+    fn operands<'l>(l: &'l str, name: &str) -> Option<&'l str> {
+        let r = l.strip_prefix(name).filter(|r| r.starts_with([' ', '\t']))?;
+        Some(r.split('#').next().unwrap_or(r).trim())
+    }
     let mut typed = std::collections::HashSet::new();
     let mut sizes = std::collections::HashMap::new();
+    let mut data = std::collections::HashMap::new();
     let mut lines = asm.lines().peekable();
     while let Some(line) = lines.next() {
         let l = line.trim();
-        // A directive's operands, without the comment clang writes after
-        // them (`.type .L.str,@object # @.str`).
-        let directive = |name: &str| {
-            l.strip_prefix(name)
-                .filter(|r| r.starts_with([' ', '\t']))
-                .map(|r| r.split('#').next().unwrap_or(r).trim())
-        };
-        if let Some(rest) = directive(".type") {
+        if let Some(rest) = operands(l, ".type") {
             if let Some((sym, kind)) = rest.split_once(',') {
                 if kind.trim() == "@object" {
                     typed.insert(sym.trim().to_string());
                 }
             }
-        } else if let Some(rest) = directive(".size").or_else(|| directive(".comm")) {
+        } else if let Some(rest) = operands(l, ".size").or_else(|| operands(l, ".comm")) {
             // `.size NAME, N`, or `.comm NAME, N, ALIGN` (clang's for a
             // zero `static`, after a `.local NAME`).
-            let mut operands = rest.split(',').map(str::trim);
-            if let (Some(sym), Some(Ok(n))) = (operands.next(), operands.next().map(str::parse::<u64>)) {
+            let mut ops = rest.split(',').map(str::trim);
+            if let (Some(sym), Some(Ok(n))) = (ops.next(), ops.next().map(str::parse::<u64>)) {
                 sizes.insert(sym.to_string(), n);
             }
         } else if let Some(label) = line.strip_suffix(':') {
-            // merlin's literal: `.asciz`, `.ascii` and `.byte` up to a blank
-            // line (clang's has its `.type` and `.size`).
+            let mut units = Vec::new();
+            while let Some(d) = lines.next_if(|d| data_units(d.trim()).is_some()) {
+                units.extend(data_units(d.trim()).unwrap());
+            }
+            // merlin's literal (clang's has its `.type` and `.size`).
             let numbered = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
             let literal = label == ".L.str" || label.strip_prefix(".L.str.").is_some_and(numbered);
             if literal && !typed.contains(label) {
-                let mut size = 0;
-                while let Some(d) = lines.next_if(|d| !d.trim().is_empty()) {
-                    size += data_size(d.trim()).unwrap_or_else(|| panic!("{label}: {d}"));
-                }
+                let size = units
+                    .iter()
+                    .map(|u| match u {
+                        Unit::Byte(_) => 1,
+                        Unit::Addr { size, .. } => u64::from(*size),
+                    })
+                    .sum();
                 typed.insert(label.to_string());
                 sizes.insert(label.to_string(), size);
             }
+            data.insert(label.to_string(), units);
         }
     }
-    let mut objects: Vec<(String, u64)> = typed
+    let mut objects: Vec<Object> = typed
         .into_iter()
-        .map(|sym| {
-            let size = sizes
-                .get(&sym)
-                .copied()
-                .unwrap_or_else(|| panic!("{sym} has no .size"));
-            (sym, size)
+        .map(|name| {
+            let size = *sizes.get(&name).unwrap_or_else(|| panic!("{name} has no .size"));
+            let mut data = data.remove(&name).unwrap_or_default();
+            if data.is_empty() {
+                data = vec![Unit::Byte(0); size as usize];
+            }
+            Object { name, size, data }
         })
         .collect();
-    objects.sort();
+    objects.sort_by(|a, b| a.name.cmp(&b.name));
     objects
 }
 
-/// The bytes a data directive of merlin's string literals gives: `.ascii
-/// "..."`, `.asciz "..."` (one more, the NUL), `.byte a, b, ...`.
-fn data_size(d: &str) -> Option<u64> {
-    if let Some(list) = d.strip_prefix(".byte ") {
-        return Some(list.split(',').count() as u64);
-    }
-    let (text, nul) = match d.strip_prefix(".asciz ") {
-        Some(t) => (t, 1),
-        None => (d.strip_prefix(".ascii ")?, 0),
-    };
-    let text = text.strip_prefix('"')?.strip_suffix('"')?;
-    // Every escape merlin writes (`\n \t \" \\`) is one byte.
-    let mut n = 0;
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            chars.next()?;
+/// The units of data directive `d`, if it is one: `.byte`, `.half`,
+/// `.word`, `.quad` (numbers, little-endian, or addresses `sym`, `sym+N`,
+/// `sym-N`), `.zero N` (`.zero N, B`: N bytes B), `.ascii "..."` and
+/// `.asciz "..."` (one more, the NUL), with the escapes either compiler
+/// writes (`\n \t \b \" \\`..., octal).
+fn data_units(d: &str) -> Option<Vec<Unit>> {
+    let (dir, rest) = d.split_once([' ', '\t'])?;
+    let rest = rest.trim();
+    let mut out = Vec::new();
+    let size = match dir {
+        ".byte" => 1,
+        ".half" => 2,
+        ".word" => 4,
+        ".quad" => 8,
+        ".zero" => {
+            // `.zero N` or `.zero N, BYTE` (clang's for bytes all one value).
+            let mut ops = rest.split('#').next().unwrap().split(',').map(str::trim);
+            let n: usize = ops.next()?.parse().ok()?;
+            let fill = ops.next().map_or(Some(0), |b| b.parse::<i16>().ok())? as u8;
+            return Some(vec![Unit::Byte(fill); n]);
         }
-        n += 1;
+        ".ascii" | ".asciz" => {
+            let mut chars = rest.strip_prefix('"')?.chars().peekable();
+            while let Some(c) = chars.next() {
+                let byte = match c {
+                    '"' => break,
+                    '\\' => match chars.next()? {
+                        'n' => b'\n',
+                        't' => b'\t',
+                        'r' => b'\r',
+                        'b' => 8,
+                        'f' => 12,
+                        'v' => 11,
+                        'a' => 7,
+                        d @ '0'..='7' => {
+                            let mut v = d.to_digit(8).unwrap();
+                            for _ in 0..2 {
+                                let Some(n) = chars.peek().and_then(|c| c.to_digit(8)) else {
+                                    break;
+                                };
+                                v = v * 8 + n;
+                                chars.next();
+                            }
+                            v as u8
+                        }
+                        c => u8::try_from(c).ok()?,
+                    },
+                    c => u8::try_from(c).ok()?,
+                };
+                out.push(Unit::Byte(byte));
+            }
+            if dir == ".asciz" {
+                out.push(Unit::Byte(0));
+            }
+            return Some(out);
+        }
+        _ => return None,
+    };
+    for op in rest.split('#').next().unwrap().split(',').map(str::trim) {
+        if let Ok(v) = op.parse::<i128>() {
+            out.extend(v.to_le_bytes()[..size].iter().map(|&b| Unit::Byte(b)));
+            continue;
+        }
+        let (sym, off) = match op.find(['+', '-']) {
+            Some(i) => (&op[..i], op[i..].trim_start_matches('+').parse().ok()?),
+            None => (op, 0),
+        };
+        out.push(Unit::Addr {
+            sym: sym.to_string(),
+            off,
+            size: size as u8,
+        });
     }
-    Some(n + nul)
+    Some(out)
 }
 
 /// merlin names the symbols it makes as clang does (the spec's "Symbol
 /// names"): for every case, and every C file of the kernel and its user
 /// programs, at both widths, the objects merlin's assembly defines are
-/// clang's (`-O0 -S`), by name and size: the string literals (`.L.str`,
+/// clang's (`-O0 -S`), by name, size and contents (each byte, and the
+/// symbol each address is of, so that two names swapped show): the string
+/// literals (`.L.str`,
 /// `.L.str.N`), the compound literals at file scope (`.compoundliteral`,
 /// `.compoundliteral.N`), the `static` locals (`f.x`, `f.x.N`) and the
 /// globals. The numbers come from one counter, in the order the symbols are
@@ -1274,22 +1358,30 @@ fn symbol_names_are_clangs() {
                 failures.push(format!("  {what}: {e}"));
                 continue;
             }
-            let theirs: Vec<(String, u64)> = objects(&std::fs::read_to_string(&s).unwrap())
+            let theirs: Vec<Object> = objects(&std::fs::read_to_string(&s).unwrap())
                 .into_iter()
-                .filter(|(sym, _)| {
-                    let constinit = sym == ".Lconstinit" || sym.starts_with(".Lconstinit.");
-                    !sym.starts_with(".L__const.") && !constinit
+                .filter(|o| {
+                    let constinit = o.name == ".Lconstinit" || o.name.starts_with(".Lconstinit.");
+                    !o.name.starts_with(".L__const.") && !constinit
                 })
                 .collect();
             if ours != theirs {
-                let only = |a: &[(String, u64)], b: &[(String, u64)]| -> Vec<String> {
+                let same_size = |o: &Object, p: &Object| p.name == o.name && p.size == o.size;
+                let only = |a: &[Object], b: &[Object]| -> Vec<String> {
                     a.iter()
-                        .filter(|o| !b.contains(o))
-                        .map(|(s, n)| format!("{s} ({n})"))
+                        .filter(|o| !b.iter().any(|p| same_size(o, p)))
+                        .map(|o| format!("{} ({})", o.name, o.size))
                         .collect()
                 };
                 let (o, t) = (only(&ours, &theirs), only(&theirs, &ours));
-                failures.push(format!("  {what}: merlin's only {o:?}, clang's only {t:?}"));
+                let contents: Vec<&str> = ours
+                    .iter()
+                    .filter(|o| theirs.iter().any(|p| same_size(o, p) && p != *o))
+                    .map(|o| o.name.as_str())
+                    .collect();
+                failures.push(format!(
+                    "  {what}: merlin's only {o:?}, clang's only {t:?}, other contents {contents:?}"
+                ));
             }
         }
     }
