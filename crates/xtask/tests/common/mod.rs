@@ -99,10 +99,6 @@ pub mod sbi {
     /// Camelot's SBI: "CMLT", unregistered, and its first version.
     pub const IMPL_ID: i64 = 0x434d_4c54;
     pub const IMPL_VERSION: i64 = 1;
-
-    /// What `sbi_init()` prints at boot.
-    pub const BOOT_LINES: &str = "sbi: v2.0, implementation 0x434d4c54 version 0x1\n\
-                                  sbi: extensions TIME IPI HSM SRST DBCN\n";
 }
 
 /// The kernel's spinlocks that are variables of their own (the per-pipe,

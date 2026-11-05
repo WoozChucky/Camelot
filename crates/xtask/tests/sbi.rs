@@ -3,10 +3,11 @@
 //! `ecall` from S-mode as the kernel makes them, on both committed kernels
 //! (kernel/kernel.elf, RV32, and kernel/kernel-rv64.elf, RV64), with each
 //! call's results and errors, and every register but a0 and a1 kept. Then
-//! the kernel's own side: the exit codes machine_power_off() gives, and,
-//! over whole boots, that every IPI store comes after a fence that orders
-//! the stores before it (#170) and that S-mode never touches the CLINT or
-//! the SBI's scratch blocks.
+//! the kernel's own side: the exit codes machine_power_off() gives, a hart
+//! that hart_start can't start and one that never comes online, both
+//! reported and left out, and, over whole boots, that every IPI store comes
+//! after a fence that orders the stores before it (#170) and that S-mode
+//! never touches the CLINT or the SBI's scratch blocks.
 
 mod common;
 
@@ -29,7 +30,8 @@ const CLINT_MSIP: u64 = 0x0200_0000;
 
 /// Scratch RAM, at physical addresses near the end of the 4 MiB machine,
 /// far above either kernel image: buffers for the debug console, and code a
-/// started hart runs.
+/// started hart runs. Free while the kernel is stopped at kmain, before
+/// kinit() hands the pages out.
 const BUFFER: u64 = RAM_BASE + 0x3e_0000;
 const HART_CODE: u64 = RAM_BASE + 0x3f_0000;
 const RAM_END: u64 = RAM_BASE + 0x40_0000;
@@ -58,6 +60,17 @@ struct Sbi {
 
 impl Sbi {
     fn new(xlen: Xlen, harts: usize) -> Sbi {
+        let mut sbi = Sbi::at_kmain(xlen, harts);
+        let code: Vec<u8> = [0x0000_0073u32, 0x0000_006f] // ecall; j .
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        sbi.m.cpu.bus.load(sbi.pa(sbi.kmain), &code).unwrap();
+        sbi
+    }
+
+    /// The kernel as it is, stopped at kmain.
+    fn at_kmain(xlen: Xlen, harts: usize) -> Sbi {
         let file = std::fs::read(kernel_file(xlen)).unwrap();
         let elf = grail::elf::parse(&file).unwrap();
         let mut m = Machine::new(MachineConfig {
@@ -72,11 +85,6 @@ impl Sbi {
         let mut sbi = Sbi { m, elf, xlen, kmain };
         sbi.step_until(|m| m.cpu.hart(0).pc == kmain);
         assert_eq!(sbi.m.cpu.hart(0).mode, Mode::S);
-        let code: Vec<u8> = [0x0000_0073u32, 0x0000_006f] // ecall; j .
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-        sbi.m.cpu.bus.load(sbi.pa(kmain), &code).unwrap();
         sbi
     }
 
@@ -510,6 +518,67 @@ fn machine_power_off_turns_exit_codes_into_reset_reasons() {
             assert_eq!(r, RunResult::Exited(exit), "{xlen:?} {code:#x}");
             assert_eq!(reasons, [(0, reason)], "{xlen:?} {code:#x}");
         }
+    }
+}
+
+/// A committed kernel on a 4-hart machine with `exit` typed for its shell,
+/// stepped until hart 0 reaches kmain.
+fn four_harts_at_kmain(xlen: Xlen) -> Sbi {
+    let mut s = Sbi::at_kmain(xlen, 4);
+    s.m.set_uart_input(kernel::typed(b"exit\n"));
+    s
+}
+
+#[test]
+fn a_hart_the_sbi_cannot_start_is_reported_and_left_out() {
+    // Hart 2 marked STARTED in the SBI before smp_boot(): its hart_start
+    // fails with SBI_ERR_ALREADY_AVAILABLE, and the kernel goes on with the
+    // other three.
+    for xlen in WIDTHS {
+        let mut s = four_harts_at_kmain(xlen);
+        let block = s.pa(s.sym("machine_scratch")) + 2 * 16 * u64::from(xlen.bits() / 8);
+        let state = block + 6 * u64::from(xlen.bits() / 8);
+        s.m.cpu.bus.load(state, &0u32.to_le_bytes()).unwrap();
+        let r = s.m.run(Some(BOOT_MAX_STEPS), |_| {});
+        let out = s.printed();
+        assert_eq!(r, RunResult::Exited(0), "{xlen:?}:\n{out}");
+        assert!(
+            out.contains("\nsmp: hart 2 failed to start (SBI_ERR_ALREADY_AVAILABLE)\nsmp: 3 harts running\n"),
+            "{xlen:?}:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn a_hart_that_never_comes_online_is_reported_after_a_second() {
+    // Hart 2 starts, but gets stuck at its first instruction (the test puts
+    // it back there after every step): hart 0 waits a second of `time` for
+    // it, says so, and goes on with the other three rather than wait for
+    // good.
+    for xlen in WIDTHS {
+        let mut s = four_harts_at_kmain(xlen);
+        let entry = s.pa(s.sym("secondary_entry"));
+        s.step_until(|m| m.cpu.hart(2).pc == entry);
+        let started = s.m.cpu.bus.clint.mtime;
+        for _ in 0..BOOT_MAX_STEPS {
+            if s.m.cpu.bus.exit.is_some() {
+                break;
+            }
+            s.m.cpu.step();
+            s.m.cpu.hart_mut(2).pc = entry;
+        }
+        let out = s.printed();
+        assert_eq!(
+            s.m.cpu.bus.exit,
+            Some(grail::bus::Exit::Code(0)),
+            "{xlen:?}:\n{out}"
+        );
+        assert!(
+            out.contains("\nsmp: hart 2 failed to come online\nsmp: 3 harts running\n"),
+            "{xlen:?}:\n{out}"
+        );
+        // A second of the nominal 10 MHz timebase, at least.
+        assert!(s.m.cpu.bus.clint.mtime - started >= 10_000_000);
     }
 }
 
