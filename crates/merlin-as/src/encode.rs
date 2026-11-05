@@ -89,6 +89,12 @@ pub const CSRRS: u32 = 0b010;
 pub const CSRRC: u32 = 0b011;
 /// The immediate CSR forms (`csrrwi` ...) are the register forms with bit 2 of funct3 set.
 pub const CSR_IMM: u32 = 0b100;
+/// `srli`'s funct3, for the RV64 `li` sequences and `zext.w`.
+pub const SRLI: u32 = 0b101;
+/// The width of an A instruction, in funct3: `.w` (a word) or `.d` (a
+/// doubleword, RV64).
+pub const AMO_W: u32 = 0b010;
+pub const AMO_D: u32 = 0b011;
 
 /// The funct3 values above, by name, for tables generated from these
 /// (the C assembler's, `crates/xtask/src/c_tables.rs`).
@@ -108,16 +114,10 @@ pub const NAMED_FUNCT3: &[(&str, u32)] = &[
     ("CSRRS", CSRRS),
     ("CSRRC", CSRRC),
     ("CSR_IMM", CSR_IMM),
+    ("SRLI", SRLI),
+    ("AMO_W", AMO_W),
+    ("AMO_D", AMO_D),
 ];
-
-// funct3 values only the RV64 encoder needs, kept out of NAMED_FUNCT3 (whose
-// names go into the C assembler's tables.h, which stays RV32 until #157).
-/// `srli`'s funct3, for the RV64 `li` sequences and `zext.w`.
-const SRLI: u32 = 0b101;
-/// The width of an A instruction, in funct3: `.w` (a word) or `.d` (a
-/// doubleword, RV64).
-const AMO_W: u32 = 0b010;
-const AMO_D: u32 = 0b011;
 
 // Registers the pseudo-instructions use.
 const ZERO: Reg = 0;
@@ -662,9 +662,9 @@ pub const SYSTEM_FUNCT12: &[(&str, u32)] = &[
 // RV64-only tables (RV64I and RV64M), in the same shapes as the ones above.
 //
 // Separate tables rather than more rows in the RV32 ones: the encoder looks
-// them up only on RV64, so on RV32 `addw` or `ld` stay unknown instructions,
-// and the RV32 tables stay exactly what the C assembler (`kernel/user/as`,
-// RV32 until #157) is generated from.
+// them up only on RV64, so on RV32 `addw` or `ld` stay unknown instructions.
+// The C assembler (`kernel/user/as`) gets them as tables of their own too
+// (`crates/xtask/src/c_tables.rs`), and looks them up only on RV64 as well.
 // -------------------------------------------------------------------
 
 /// OP-32: `rd = sext32(rs1 <op> rs2)` on the low 32 bits of the registers,
