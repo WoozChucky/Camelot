@@ -5,9 +5,19 @@
 //!
 //! 1. as the module begins, the enums (the unit's `enums` list) and then the
 //!    retained types (the types of explicit casts, which clang keeps:
-//!    `CGDebugInfo::EmitExplicitCastType`);
-//! 2. as each function's code is done, its `DW_TAG_subprogram`, in the order
-//!    of the code, with its variables and blocks but none of their types;
+//!    `CGDebugInfo::EmitExplicitCastType`), `DwarfDebug::beginModule`;
+//!    but not a type a function defines (`(LT)v` of a local typedef `LT`),
+//!    which clang's `DIBuilder` keeps in the function's `retainedNodes`
+//!    instead, made in phase 4. A retained type of the unit that refers
+//!    to a function's type (`(struct N *)v` of a local `struct N`) makes
+//!    that type here, and with it, in its place among the unit's
+//!    children, the function's `DW_TAG_subprogram`, which is the type's
+//!    context (`getOrCreateContextDIE`): an entry without attributes yet,
+//!    as LLVM fills a definition's in later, whose first children are the
+//!    types made so;
+//! 2. as each function's code is done, its `DW_TAG_subprogram` (unless
+//!    phase 1 made it), in the order of the code, with its variables and
+//!    blocks but none of their types;
 //! 3. as the module ends, the unit's globals (its `globals` list, string
 //!    literals among them);
 //! 4. then each function's static locals and the types it defines, inside its
@@ -15,6 +25,10 @@
 //! 5. then each function's return type;
 //! 6. then the types of each function's parameters and locals, in the order
 //!    they are declared.
+//!
+//! Phases 4 to 6 go through the functions as 2 does, in the order of their
+//! code (LLVM's list of the subprograms it made), not the order they were
+//! emitted in: a `static` function emitted last may have its code first.
 //!
 //! Making an entry makes the types it refers to that are not made yet, depth
 //! first, each one added before those it refers to (a pointer before what it
@@ -24,25 +38,37 @@
 //! made first), a type a function defines to the function.
 //!
 //! The lists of phases 1, 3 and 4 are clang's front end's, in the order it
-//! makes them, which is the order it emits the file's functions and globals:
-//! the external functions, and the external globals with an initializer, as
-//! they come; then the tentative definitions (globals without an
-//! initializer); then, as they are first used, the `static` functions and
-//! globals (an unused one is not emitted at all; merlin's come last). Emitting
-//! a function makes its signature's types and then, as its code comes, its
-//! locals', static locals', casts' and string literals'; emitting a global
-//! makes its initializer's string literals and then its type. An enum goes to
-//! the `enums` list as it is made, and a function's type or static local to
-//! its `retainedNodes`.
+//! makes them, which is the order it emits the file's functions and globals
+//! (`CodeGenModule`): the external functions, and the external globals with
+//! an initializer, as they come; then the tentative definitions (globals
+//! without an initializer); then, as they are first used, the `static`
+//! functions and globals (an unused one is not emitted at all). merlin's code
+//! generator emits them in that order too ("Order" in [`crate::codegen`]),
+//! so its items are in it already. Emitting a function makes its signature's
+//! types and then, as its code comes, its locals', static locals' (after
+//! their initializers'), casts' and string literals', and the enums of the
+//! enumeration constants it uses; emitting a global makes its initializer's
+//! casts' types and string literals and then its type. An enum goes to the
+//! `enums` list as it is made, and a function's type or static local to its
+//! `retainedNodes`.
 //!
 //! A compound literal of the file's scope is not described (as in clang), but
-//! its string literals are, as clang emits them: when it emits the global that
-//! refers to the compound literal, before that global.
+//! its string literals and casts are, as clang emits them: as it emits the
+//! initializer that names the compound literal, which merlin does too.
 //!
-//! merlin's code is in the order the functions come (clang's emits the
-//! `static` ones later), so its entries follow that, as clang's follow its
-//! code. What clang's front end describes that merlin's does not, and the
-//! other way round, is in the spec's "Debug information".
+//! Phase 2 follows the code, which is in the order clang's module has the
+//! functions: the order each was first defined or referred to, so a `static`
+//! function emitted later than the others may come before some of them.
+//!
+//! The order LLVM makes the entries in is also the order it numbers the
+//! files they are declared in (`DW_AT_decl_file`), each the first time an
+//! entry needs it ([`Lines::renumber`] has the numbering): an entry's file
+//! is given once the types it refers to are made, as LLVM adds
+//! `DW_AT_decl_file` after `DW_AT_type` (a typedef's file after the type it
+//! stands for's, a struct's after its members'), but a variable's before
+//! its type's, and a function's before its return type's. A struct only
+//! declared, never completed, has no file (`isForwardDecl`), and neither
+//! has `__builtin_va_list`.
 
 use super::{Event, Lines, TypeKey, TypeNode};
 use std::collections::HashMap;
@@ -64,30 +90,29 @@ pub(super) enum Local {
     Static(String),
 }
 
-/// Where each entry goes.
+/// Where each entry goes, and the files they name in the order LLVM
+/// numbers them.
 pub(super) struct Order {
     /// The unit's children.
     pub unit: Vec<Child>,
     /// Each function's types and static locals, after its blocks.
     pub locals: Vec<Vec<Local>>,
+    /// Each function's types made as the module begins (phase 1), its
+    /// first children, before its parameters.
+    pub first: Vec<Vec<usize>>,
+    /// Whether the module begins by describing something (phase 1 has
+    /// entries): LLVM makes the unit then.
+    pub begins: bool,
+    /// The files the entries of phase 1 are declared in, in the order LLVM
+    /// needs them (numbers given as the code was generated; some more than
+    /// once, file 0 among them).
+    pub begin_files: Vec<u32>,
+    /// The same, for the entries LLVM makes as the module ends (phases 3 to
+    /// 6).
+    pub end_files: Vec<u32>,
 }
 
 impl Lines {
-    /// `events`, a compound literal's in place of a reference to it (clang
-    /// emits one as it emits what refers to it).
-    fn flat(&self, events: &[Event], depth: usize) -> Vec<Event> {
-        let mut out = Vec::new();
-        for e in events {
-            if let Event::Ref(s) = e {
-                if let Some(inner) = self.hidden.get(s).filter(|_| depth < 64) {
-                    out.extend(self.flat(inner, depth + 1));
-                }
-            }
-            out.push(e.clone());
-        }
-        out
-    }
-
     /// The types a type's entry refers to, in the order LLVM makes them
     /// (`__ARRAY_SIZE_TYPE__` after an array's element type).
     fn referred(&self, t: usize) -> Vec<usize> {
@@ -114,116 +139,7 @@ impl Lines {
         let local_of: HashMap<usize, usize> = local.iter().copied().collect();
         let record_of: HashMap<usize, usize> = nested.iter().map(|&(t, (r, _))| (t, r)).collect();
 
-        // ---- clang's front end: what it emits, in what order ----
         let items = &self.items;
-        let symbol = |&(func, i): &(bool, usize)| -> &str {
-            if func {
-                &self.functions[i].name
-            } else {
-                match &self.globals[i].var.location {
-                    super::Location::Symbol(s) => s,
-                    super::Location::Frame(_) => unreachable!("a global is at its symbol"),
-                }
-            }
-        };
-        let by_symbol: HashMap<&str, usize> =
-            items.iter().enumerate().map(|(k, it)| (symbol(it), k)).collect();
-        let deferrable = |&(func, i): &(bool, usize)| {
-            if func {
-                !self.functions[i].external
-            } else {
-                !self.globals[i].external
-            }
-        };
-        let tentative = |&(func, i): &(bool, usize)| !func && !self.globals[i].initialized;
-        let flat: Vec<Vec<Event>> = items
-            .iter()
-            .map(|&(func, i)| {
-                let events = if func {
-                    &self.functions[i].events
-                } else {
-                    &self.globals[i].events
-                };
-                self.flat(events, 0)
-            })
-            .collect();
-        let events = |k: usize| &flat[k];
-        struct Emitter {
-            emitted: Vec<bool>,
-            referenced: Vec<bool>,
-            /// Definitions seen, waiting for a use (`DeferredDecls`).
-            waiting: Vec<bool>,
-            /// Used, to be emitted (`DeferredDeclsToEmit`).
-            queue: Vec<usize>,
-            order: Vec<usize>,
-        }
-        let n = items.len();
-        let mut em = Emitter {
-            emitted: vec![false; n],
-            referenced: vec![false; n],
-            waiting: vec![false; n],
-            queue: Vec::new(),
-            order: Vec::new(),
-        };
-        let emit = |em: &mut Emitter, k: usize| {
-            em.emitted[k] = true;
-            em.order.push(k);
-            for e in events(k) {
-                if let Event::Ref(s) = e {
-                    if let Some(&j) = by_symbol.get(s.as_str()) {
-                        if !em.referenced[j] {
-                            em.referenced[j] = true;
-                            if em.waiting[j] {
-                                em.waiting[j] = false;
-                                em.queue.push(j);
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        // The file, as it comes.
-        for (k, item) in items.iter().enumerate() {
-            if tentative(item) {
-                continue;
-            }
-            if !deferrable(item) {
-                emit(&mut em, k);
-            } else if em.referenced[k] {
-                em.queue.push(k);
-            } else {
-                em.waiting[k] = true;
-            }
-        }
-        // The tentative definitions; a static one not used yet waits.
-        for k in (0..n).filter(|&k| tentative(&items[k])) {
-            if deferrable(&items[k]) && !em.referenced[k] {
-                em.waiting[k] = true;
-            } else {
-                emit(&mut em, k);
-            }
-        }
-        // What was used, each one's uses right after it (`EmitDeferred`).
-        fn deferred(em: &mut Emitter, emit: &dyn Fn(&mut Emitter, usize)) {
-            let now = std::mem::take(&mut em.queue);
-            for k in now {
-                if !em.emitted[k] {
-                    emit(em, k);
-                    if !em.queue.is_empty() {
-                        deferred(em, emit);
-                    }
-                }
-            }
-        }
-        deferred(&mut em, &emit);
-        // What clang would not emit, unused: last, as it comes.
-        for k in 0..n {
-            if !em.emitted[k] {
-                em.emitted[k] = true;
-                em.order.push(k);
-            }
-        }
-
         // What the front end makes as it emits them: the enums, the kept
         // types, the globals and each function's types and static locals.
         let mut made = vec![false; self.types.len()];
@@ -256,8 +172,7 @@ impl Lines {
                 }
             }
         }
-        for &k in &em.order {
-            let (func, i) = items[k];
+        for &(func, i) in items {
             let mut make = |t: Option<usize>, locals: &mut Vec<Vec<Local>>| {
                 make(self, t, &mut made, &mut enums, locals, &local_of)
             };
@@ -267,29 +182,38 @@ impl Lines {
                 for p in &f.params {
                     make(p.ty, &mut locals);
                 }
-                for e in events(k) {
+                for e in &f.events {
                     match e {
-                        Event::Local(t) => make(*t, &mut locals),
+                        Event::Local(t, _) => make(*t, &mut locals),
                         Event::Static(sym, t) => {
                             make(*t, &mut locals);
                             locals[i].push(Local::Static(sym.clone()));
                         }
                         Event::Cast(t) => {
                             make(*t, &mut locals);
-                            retained.extend(t.filter(|t| !retained.contains(t)));
+                            // The unit retains it, unless it is a type the
+                            // function defines, which the function does.
+                            retained.extend(t.filter(|t| !retained.contains(t) && !local_of.contains_key(t)));
                         }
                         Event::Literal(l) => {
                             make(self.literals[*l].ty, &mut locals);
                             globals.push(Child::Literal(*l));
                         }
-                        Event::Ref(_) => {}
+                        Event::Enum(t) => make(Some(*t), &mut locals),
                     }
                 }
             } else {
-                for e in events(k) {
-                    if let Event::Literal(l) = e {
-                        make(self.literals[*l].ty, &mut locals);
-                        globals.push(Child::Literal(*l));
+                for e in &self.globals[i].events {
+                    match e {
+                        Event::Literal(l) => {
+                            make(self.literals[*l].ty, &mut locals);
+                            globals.push(Child::Literal(*l));
+                        }
+                        Event::Cast(t) => {
+                            make(*t, &mut locals);
+                            retained.extend(t.filter(|t| !retained.contains(t)));
+                        }
+                        _ => {}
                     }
                 }
                 make(self.globals[i].var.ty, &mut locals);
@@ -320,8 +244,18 @@ impl Lines {
             unit: Vec<Child>,
             record_of: HashMap<usize, usize>,
             local_of: HashMap<usize, usize>,
+            /// The files the entries made so far name, in order.
+            files: Vec<u32>,
+            /// Whether phase 1 is over.
+            begun: bool,
+            /// Which functions' entries are in `unit`.
+            opened: Vec<bool>,
+            /// Each function's types made in phase 1 ([`Order::first`]).
+            first: Vec<Vec<usize>>,
         }
         impl Maker<'_> {
+            /// Makes type `t`'s entry if it is not made yet: the types it
+            /// refers to, and the file it is declared in after theirs.
             fn ty(&mut self, t: Option<usize>) {
                 let Some(t) = t else { return };
                 if self.made[t] {
@@ -340,8 +274,40 @@ impl Lines {
                 if !self.record_of.contains_key(&t) && !self.local_of.contains_key(&t) {
                     self.unit.push(Child::Type(t));
                 }
-                for r in self.lines.referred(t) {
-                    self.ty(Some(r));
+                // A function's type made as the module begins makes the
+                // function's entry, its context, where it is.
+                if let (Some(&f), false) = (self.local_of.get(&t), self.begun) {
+                    if !self.opened[f] {
+                        self.opened[f] = true;
+                        self.unit.push(Child::Function(f));
+                    }
+                    self.first[f].push(t);
+                }
+                match &self.lines.types[t] {
+                    // Each member's type, then its file; the record's own
+                    // last, if it is defined.
+                    TypeNode::Record(r, members, file, _) => {
+                        for &(_, ty, _, file, _) in members {
+                            self.ty(ty);
+                            self.files.push(file);
+                        }
+                        if r.body().is_some() {
+                            self.files.push(*file);
+                        }
+                    }
+                    node => {
+                        for r in self.lines.referred(t) {
+                            self.ty(Some(r));
+                        }
+                        match node {
+                            TypeNode::Typedef(_, _, file, pos) | TypeNode::Enum(_, _, _, file, pos)
+                                if pos.line != 0 =>
+                            {
+                                self.files.push(*file)
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -351,58 +317,93 @@ impl Lines {
             unit: Vec::new(),
             record_of,
             local_of,
+            files: Vec::new(),
+            begun: false,
+            opened: vec![false; self.functions.len()],
+            first: vec![Vec::new(); self.functions.len()],
         };
         // 1. The enums, then the kept types.
         for &t in enums.iter().chain(&retained) {
             m.ty(Some(t));
         }
-        // 2. The functions.
-        m.unit.extend((0..self.functions.len()).map(Child::Function));
-        // 3. The globals.
+        let begins = !enums.is_empty() || !retained.is_empty();
+        let begin_files = std::mem::take(&mut m.files);
+        m.begun = true;
+        // 2. The functions, in the order of their code, but those phase 1
+        // made already.
+        for &i in &self.code {
+            if !m.opened[i] {
+                m.opened[i] = true;
+                m.unit.push(Child::Function(i));
+            }
+        }
+        // The types phase 1 made are no longer the function's to make.
+        for (l, first) in locals.iter_mut().zip(&m.first) {
+            l.retain(|x| !matches!(x, Local::Type(t) if first.contains(t)));
+        }
+        // 3. The globals: each one's type, then its file.
         for g in globals {
             m.unit.push(g);
-            m.ty(match g {
-                Child::Global(i) => self.globals[i].var.ty,
-                Child::Literal(l) => self.literals[l].ty,
-                _ => None,
-            });
+            let (ty, file) = match g {
+                Child::Global(i) => (self.globals[i].var.ty, self.globals[i].var.file),
+                Child::Literal(l) => (self.literals[l].ty, self.literals[l].file),
+                _ => unreachable!("a global or a string literal"),
+            };
+            m.ty(ty);
+            m.files.push(file);
         }
-        // 4. Each function's types and static locals.
-        for l in &locals {
-            for x in l {
+        // 4. Each function's types and static locals, the functions in the
+        // order of their code (LLVM's list of subprograms), as 5 and 6.
+        for &i in &self.code {
+            for x in &locals[i] {
                 match x {
                     Local::Type(t) => m.ty(Some(*t)),
                     Local::Static(sym) => {
-                        let ty = self
+                        let v = self
                             .functions
                             .iter()
                             .flat_map(|f| &f.body.statics)
-                            .find(|v| matches!(&v.location, super::Location::Symbol(s) if s == sym))
-                            .and_then(|v| v.ty);
-                        m.ty(ty);
+                            .find(|v| matches!(&v.location, super::Location::Symbol(s) if s == sym));
+                        if let Some(v) = v {
+                            m.ty(v.ty);
+                            m.files.push(v.file);
+                        }
                     }
                 }
             }
         }
-        // 5. Each function's return type.
-        for f in &self.functions {
-            m.ty(f.ret);
+        // 5. Each function's return type, after its own file.
+        for &i in &self.code {
+            m.files.push(self.functions[i].file);
+            m.ty(self.functions[i].ret);
         }
-        // 6. Each function's parameters' and locals' types.
-        for f in &self.functions {
+        // 6. Each function's parameters' and locals' types, each after the
+        // variable's file, and its labels' files.
+        for &i in &self.code {
+            let f = &self.functions[i];
             for p in &f.params {
+                m.files.push(p.file);
                 m.ty(p.ty);
             }
             for e in &f.events {
-                if let Event::Local(t) = e {
+                if let Event::Local(t, file) = e {
+                    m.files.push(*file);
                     m.ty(*t);
                 }
             }
+            f.body.label_files(&mut m.files);
         }
         // Anything else merlin describes (none should be left).
         for t in 0..self.types.len() {
             m.ty(Some(t));
         }
-        Order { unit: m.unit, locals }
+        Order {
+            unit: m.unit,
+            locals,
+            first: m.first,
+            begins,
+            begin_files,
+            end_files: m.files,
+        }
     }
 }

@@ -8,14 +8,21 @@ typedef __builtin_va_list va_list;
 
 /* v in `base`, at least `width` wide (padded with zeros or spaces), its
  * hexadecimal digits in upper case if `upper`. */
-static void put_number(struct buf *b, uint v, uint base, uint width, int zero, int upper) {
+static void put_number(struct buf *b, uint64_t v, uint base, uint width, int zero, int upper) {
     const char *names = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    char digits[12];
+    char digits[24];
     int n = 0;
-    do {
+    /* In 64 bits while the value needs them (on RV32 a 64-bit division is a
+     * call to libgcc's routine), in 32 for the rest. */
+    while (v > UINT32_MAX) {
         digits[n++] = names[v % base];
         v /= base;
-    } while (v != 0);
+    }
+    uint w = (uint)v;
+    do {
+        digits[n++] = names[w % base];
+        w /= base;
+    } while (w != 0);
     while ((uint)n < width) {
         buf_byte(b, zero ? '0' : ' ');
         width--;
@@ -46,7 +53,25 @@ char *fmt(const char *f, ...) {
             width = width * 10 + (uint)(*f - '0');
             f++;
         }
-        if (*f == 's') {
+        /* `ll`: the argument is a long long, int64_t or uint64_t. */
+        int wide = 0;
+        if (f[0] == 'l' && f[1] == 'l') {
+            wide = 1;
+            f += 2;
+        }
+        if (wide && *f == 'd') {
+            int64_t v = va_arg(ap, int64_t);
+            if (v < 0) {
+                buf_byte(&b, '-');
+                put_number(&b, 0 - (uint64_t)v, 10, width, zero, 0);
+            } else {
+                put_number(&b, (uint64_t)v, 10, width, zero, 0);
+            }
+        } else if (wide && *f == 'u') {
+            put_number(&b, va_arg(ap, uint64_t), 10, width, zero, 0);
+        } else if (wide && (*f == 'x' || *f == 'X')) {
+            put_number(&b, va_arg(ap, uint64_t), 16, width, zero, *f == 'X');
+        } else if (*f == 's') {
             const char *s = va_arg(ap, const char *);
             buf_put(&b, s, (uint)strlen(s));
         } else if (*f == 'd') {
@@ -81,10 +106,16 @@ void die(const char *msg) {
 /* ---- Memory ---- */
 
 /* An allocator's blocks: each starts with a header, the block before and
- * its own size. */
+ * its own size (struct block), HEADER bytes, which keeps what follows it
+ * 8-aligned on both widths. */
 struct pool {
     char *block;
     uint used;
+    uint size;
+};
+
+struct block {
+    char *prev;
     uint size;
 };
 
@@ -92,7 +123,7 @@ static struct pool perm_pool;
 static struct pool tmp_pool;
 
 #define BLOCK_SIZE (64 * 1024)
-#define HEADER 8
+#define HEADER ((sizeof(struct block) + 7) & ~7u)
 
 static void *pool_alloc(struct pool *p, uint n) {
     n = (n + 7) & ~7u;
@@ -102,8 +133,8 @@ static void *pool_alloc(struct pool *p, uint n) {
         if (b == NULL) {
             die("out of memory");
         }
-        *(char **)b = p->block;
-        *(uint *)(b + 4) = size;
+        ((struct block *)b)->prev = p->block;
+        ((struct block *)b)->size = size;
         p->block = b;
         p->used = HEADER;
         p->size = size;
@@ -128,15 +159,15 @@ void tmp_reset(void) {
         return;
     }
     char *b = tmp_pool.block;
-    char *prev = *(char **)b;
+    char *prev = ((struct block *)b)->prev;
     while (prev != NULL) {
         free(b);
         b = prev;
-        prev = *(char **)b;
+        prev = ((struct block *)b)->prev;
     }
     tmp_pool.block = b;
     tmp_pool.used = HEADER;
-    tmp_pool.size = *(uint *)(b + 4);
+    tmp_pool.size = ((struct block *)b)->size;
 }
 
 char *perm_strdup(const char *s) {

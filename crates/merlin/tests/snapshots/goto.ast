@@ -162,7 +162,7 @@ Function int main(void) <62:5>
       Binary == : int <65:26>
         Call find : int <65:11>
           ImplicitCast : int * <65:16>
-            Var a #1 : int [5] <65:16>
+            Var a #1 : int[5] <65:16>
           Num 5 : int <65:19>
           Num 15 : int <65:22>
         Num 2 : int <65:29>
@@ -172,7 +172,7 @@ Function int main(void) <62:5>
       Binary == : int <66:26>
         Call find : int <66:11>
           ImplicitCast : int * <66:16>
-            Var a #1 : int [5] <66:16>
+            Var a #1 : int[5] <66:16>
           Num 5 : int <66:19>
           Num 42 : int <66:22>
         Unary - : int <66:29>

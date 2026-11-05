@@ -33,6 +33,7 @@ fn children(s: &Stmt) -> Vec<&Stmt> {
         StmtKind::Decl(_)
         | StmtKind::Expr(_)
         | StmtKind::Empty
+        | StmtKind::Unevaluated(_)
         | StmtKind::Return(_)
         | StmtKind::Break
         | StmtKind::Continue

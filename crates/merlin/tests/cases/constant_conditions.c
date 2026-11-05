@@ -1,4 +1,4 @@
-// expect: 12
+// expect: 15
 // A constant condition is decided at compile time, as clang's code generator
 // decides it at -O0: only what runs is generated (the arm of an if, the
 // operand of ?:, the right operand of 1 && and 0 ||, the statements of a
@@ -11,9 +11,17 @@ int bump(void) {
     return 1;
 }
 
+// Only ever called where a condition clang folds rules it out, so never
+// emitted (a static function nothing emitted uses is left out).
+static int never(void) {
+    calls += 100;
+    return 0;
+}
+
 int main() {
     int r = 0;
     int x = 3;
+    int *p = &x;
 
     if (0) {
         int dead = (short)bump();
@@ -78,6 +86,15 @@ int main() {
     }
     goto skipped;
 done:
-    r += calls == 0;                                // 12
+    // An object's address is not null, nor another object's: clang folds
+    // such a condition too, and leaves out what it rules out. A pointer's
+    // value is not known (p is tested).
+    if (&calls == 0)
+        r = never();
+    if (&calls != 0 && &x != &calls && p != 0)
+        r++;                                        // 12
+    r += "s" != 0 ? 1 : never();                    // 13
+    r += &x != 0 || never();                        // 14
+    r += calls == 0;                                // 15
     return r;
 }

@@ -149,8 +149,23 @@ static int find_symbol(const char *name) {
 }
 
 /* `.size`s of symbols nothing has named yet (merlin-as's pending_sizes):
- * `.size` alone makes no symbol, as in LLVM. */
+ * `.size` alone makes no symbol, as in LLVM. The map gives each name its
+ * place in `pending` plus one (0: none, or taken). */
 static struct strmap pending_sizes;
+static uint64_t *pending;
+static uint npending, cappending;
+
+/* Remembers `size` for the symbol `name`, which nothing has named yet. */
+static void pend_size(const char *name, uint64_t size) {
+    int k;
+    if (map_get(&pending_sizes, name, &k) && k > 0) {
+        pending[k - 1] = size;
+        return;
+    }
+    pending = grow(pending, &cappending, npending + 1, sizeof(uint64_t));
+    pending[npending++] = size;
+    map_put(&pending_sizes, perm_strdup(name), (int)npending);
+}
 
 static int symbol_index(const char *name) {
     int i = find_symbol(name);
@@ -162,9 +177,9 @@ static int symbol_index(const char *name) {
     memset(s, 0, sizeof *s);
     s->name = perm_strdup(name);
     s->section = -1;
-    int size;
-    if (map_get(&pending_sizes, name, &size)) {
-        s->size = (uint)size;
+    int k;
+    if (map_get(&pending_sizes, name, &k) && k > 0) {
+        s->size = pending[k - 1];
         map_put(&pending_sizes, perm_strdup(name), 0);
     }
     map_put(&by_name, s->name, (int)nsymbols);
@@ -216,8 +231,8 @@ static void label(const char *name) {
 
 /* ---- Expressions ---- */
 
-static int eval(struct expr *e, i64 *out) {
-    i64 a, b;
+static int eval(struct expr *e, int64_t *out) {
+    int64_t a, b;
     int i;
     switch (e->kind) {
     case E_NUM:
@@ -234,13 +249,13 @@ static int eval(struct expr *e, i64 *out) {
         if (!eval(e->a, &a)) {
             return 0;
         }
-        *out = i64_neg(a);
+        *out = WRAP_NEG(a);
         return 1;
     case E_NOT:
         if (!eval(e->a, &a)) {
             return 0;
         }
-        *out = i64_not(a);
+        *out = ~a;
         return 1;
     case E_BIN:
         if (!eval(e->a, &a) || !eval(e->b, &b)) {
@@ -248,34 +263,40 @@ static int eval(struct expr *e, i64 *out) {
         }
         switch (e->op) {
         case B_ADD:
-            *out = i64_add(a, b);
+            *out = WRAP_ADD(a, b);
             return 1;
         case B_SUB:
-            *out = i64_sub(a, b);
+            *out = WRAP_SUB(a, b);
             return 1;
         case B_MUL:
-            *out = i64_mul(a, b);
+            *out = WRAP_MUL(a, b);
             return 1;
         case B_DIV:
-            return i64_div(a, b, out);
         case B_REM:
-            return i64_rem(a, b, out);
+            /* Rust's checked_div and checked_rem: no value for a division
+             * by zero, or for INT64_MIN / -1, which overflows. */
+            if (b == 0 || (a == INT64_MIN && b == -1)) {
+                return 0;
+            }
+            *out = e->op == B_DIV ? a / b : a % b;
+            return 1;
         case B_SHL:
-            *out = i64_shl(a, b.lo);
+            /* wrapping_shl: by the low 6 bits of the amount. */
+            *out = (int64_t)((uint64_t)a << ((uint)b & 63));
             return 1;
         case B_SHR:
             /* Logical, as in LLVM (and merlin-as): -16 >> 2 is
              * 0x3ffffffffffffffc. */
-            *out = i64_shr(a, b.lo);
+            *out = (int64_t)((uint64_t)a >> ((uint)b & 63));
             return 1;
         case B_AND:
-            *out = i64_and(a, b);
+            *out = a & b;
             return 1;
         case B_OR:
-            *out = i64_or(a, b);
+            *out = a | b;
             return 1;
         default:
-            *out = i64_xor(a, b);
+            *out = a ^ b;
             return 1;
         }
     default:
@@ -305,14 +326,14 @@ static int add_term(int section, int sign) {
     return 1;
 }
 
-static i64 times(int sign, i64 v) {
-    return sign < 0 ? i64_neg(v) : v;
+static int64_t times(int sign, int64_t v) {
+    return sign < 0 ? WRAP_NEG(v) : v;
 }
 
-static int relative_terms(struct expr *e, int sign, i64 *out) {
-    i64 a, b;
+static int relative_terms(struct expr *e, int sign, int64_t *out) {
+    int64_t a, b;
     if (e->kind == E_SYM && strcmp(e->sym, DOT) == 0) {
-        *out = times(sign, i64_u(sections[current].size));
+        *out = times(sign, (int64_t)sections[current].size);
         return add_term(current, sign);
     }
     if (e->kind == E_SYM) {
@@ -326,7 +347,7 @@ static int relative_terms(struct expr *e, int sign, i64 *out) {
             return 1;
         }
         if (s->section >= 0 && s->defined) {
-            *out = times(sign, i64_u(s->value));
+            *out = times(sign, (int64_t)s->value);
             return add_term(s->section, sign);
         }
         return 0;
@@ -335,7 +356,7 @@ static int relative_terms(struct expr *e, int sign, i64 *out) {
         if (!relative_terms(e->a, sign, &a) || !relative_terms(e->b, e->op == B_ADD ? sign : -sign, &b)) {
             return 0;
         }
-        *out = i64_add(a, b);
+        *out = WRAP_ADD(a, b);
         return 1;
     }
     if (e->kind == E_NEG) {
@@ -349,7 +370,7 @@ static int relative_terms(struct expr *e, int sign, i64 *out) {
 }
 
 /* A number from labels whose offsets cancel out (see asm.rs). */
-static int eval_relative(struct expr *e, i64 *out) {
+static int eval_relative(struct expr *e, int64_t *out) {
     nterms = 0;
     if (!relative_terms(e, 1, out)) {
         return 0;
@@ -362,15 +383,17 @@ static int eval_relative(struct expr *e, i64 *out) {
     return 1;
 }
 
-int ctx_constant(struct expr *e, i64 *v) {
+int ctx_constant(struct expr *e, int64_t *v) {
     return eval(e, v);
 }
 
-int ctx_symbol(struct expr *e, char **name, i64 *addend) {
-    i64 c, v;
+/* The addend wraps around in 64 bits, as every other sum of constants does
+ * (eval): `sym + BIG + BIG` with 64-bit `.equ` values must not overflow. */
+int ctx_symbol(struct expr *e, char **name, int64_t *addend) {
+    int64_t c, v;
     if (e->kind == E_SYM && !eval(e, &v)) {
         *name = resolve_name(e->sym);
-        *addend = i64_u(0);
+        *addend = 0;
         return 1;
     }
     /* `c + sym` */
@@ -378,7 +401,7 @@ int ctx_symbol(struct expr *e, char **name, i64 *addend) {
         if (!ctx_symbol(e->b, name, addend)) {
             return 0;
         }
-        *addend = i64_add(*addend, c);
+        *addend = WRAP_ADD(*addend, c);
         return 1;
     }
     /* `sym + c`, `sym - c` */
@@ -386,7 +409,7 @@ int ctx_symbol(struct expr *e, char **name, i64 *addend) {
         if (!ctx_symbol(e->a, name, addend) || !eval(e->b, &c)) {
             return 0;
         }
-        *addend = e->op == B_ADD ? i64_add(*addend, c) : i64_sub(*addend, c);
+        *addend = e->op == B_ADD ? WRAP_ADD(*addend, c) : WRAP_SUB(*addend, c);
         return 1;
     }
     return 0;
@@ -400,16 +423,18 @@ int ctx_undefined(const char *name) {
     return i < 0 || !symbols[i].defined;
 }
 
+/* A CSR operand: a name of the width being assembled (csr_parse), or any
+ * 12-bit number, on either width, as LLVM takes it. */
 int ctx_csr(struct expr *e, uint *addr) {
     if (e->kind == E_SYM && csr_parse(e->sym, addr)) {
         return 1;
     }
-    i64 v;
+    int64_t v;
     if (!eval(e, &v)) {
         return 0;
     }
-    if (i64_in(v, i64_u(0), i64_u(4096))) {
-        *addr = v.lo;
+    if (v >= 0 && v < 4096) {
+        *addr = (uint)v;
         return 1;
     }
     return 0;
@@ -471,6 +496,11 @@ static void new_section(const char *name, struct sec_attrs attrs) {
  * a run of data, even data of no bytes. A local symbol of its own, which no
  * name finds (not in by_name). */
 static void mapping_symbol(int kind) {
+    /* `$x` and the ISA's name, the width's: made once. */
+    static char *code_name;
+    if (code_name == NULL) {
+        code_name = perm_strdup(fmt("$x%s", riscv_arch()));
+    }
     struct section *sec = &sections[current];
     if (sec->mapping == kind) {
         return;
@@ -479,7 +509,7 @@ static void mapping_symbol(int kind) {
     symbols = grow(symbols, &capsymbols, nsymbols + 1, sizeof(struct symbol));
     struct symbol *s = &symbols[nsymbols++];
     memset(s, 0, sizeof *s);
-    s->name = kind == MAP_CODE ? "$x" RISCV_ARCH : "$d";
+    s->name = kind == MAP_CODE ? code_name : "$d";
     s->section = current;
     s->value = sec->size;
     s->defined = 1;
@@ -545,7 +575,7 @@ static void emit_zeros(uint n) {
     s->size += n;
 }
 
-static void add_reloc(uint offset, int kind, char *symbol, i64 addend) {
+static void add_reloc(uint offset, int kind, char *symbol, int64_t addend) {
     symbol_index(symbol);
     struct section *s = &sections[current];
     s->relocs = grow(s->relocs, &s->cap, s->nrelocs + 1, sizeof(struct reloc));
@@ -643,7 +673,10 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
         }
     }
     /* The hidden labels on auipcs a later %pcrel_lo refers to. */
-    char *auipc_labels[2] = {NULL, NULL};
+    char *auipc_labels[MAX_EMITS];
+    for (int i = 0; i < n; i++) {
+        auipc_labels[i] = NULL;
+    }
     for (int i = 0; i < n; i++) {
         int j = emits[i].auipc;
         if (emits[i].has_fixup && j >= 0) {
@@ -667,10 +700,10 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
         struct emit *e = &emits[i];
         if (e->has_fixup) {
             char *symbol;
-            i64 addend;
+            int64_t addend;
             if (e->auipc >= 0) {
                 symbol = auipc_labels[e->auipc];
-                addend = i64_u(0);
+                addend = 0;
             } else {
                 symbol = e->name;
                 addend = e->addend;
@@ -698,7 +731,7 @@ static void place(const char *mnemonic, struct emit *emits, int n) {
 
 /* ---- Directives ---- */
 
-static int arg_const(struct dirarg *args, uint nargs, uint i, const char *what, i64 *out) {
+static int arg_const(struct dirarg *args, uint nargs, uint i, const char *what, int64_t *out) {
     char *msg;
     if (i < nargs && args[i].kind == DA_EXPR) {
         if (eval(args[i].e, out)) {
@@ -727,13 +760,13 @@ static char *arg_name(struct dirarg *args, uint nargs, uint i, const char *what)
 
 /* Whether v can be written in size bytes, as a signed or an unsigned value
  * (merlin-as's fits_in_bytes, LLVM's isIntN || isUIntN). */
-static int fits_in_bytes(i64 v, uint size) {
+static int fits_in_bytes(int64_t v, uint size) {
     if (size >= 8) {
         return 1;
     }
-    i64 top = i64_shl(i64_u(1), 8 * size);
-    i64 bottom = i64_neg(i64_shl(i64_u(1), 8 * size - 1));
-    return i64_in(v, bottom, top);
+    int64_t top = (int64_t)1 << (8 * size);
+    int64_t bottom = -((int64_t)1 << (8 * size - 1));
+    return v >= bottom && v < top;
 }
 
 /* .byte, .half, .word and .dword: merlin-as's Assembler::data. A number
@@ -749,17 +782,17 @@ static void data(struct dirarg *args, uint nargs, uint size) {
             continue;
         }
         struct expr *e = args[k].e;
-        i64 v;
+        int64_t v;
         if (eval(e, &v) || eval_relative(e, &v)) {
             if (!fits_in_bytes(v, size)) {
                 const char *unit = size == 1 ? "byte" : "bytes";
-                error(fmt("data value %s does not fit in %u %s", i64_dec(v), size, unit));
+                error(fmt("data value %lld does not fit in %u %s", v, size, unit));
                 continue;
             }
+            /* Little-endian, the low `size` bytes. */
             uchar bytes[8];
-            for (uint i = 0; i < 4; i++) {
-                bytes[i] = (uchar)(v.lo >> (8 * i));
-                bytes[4 + i] = (uchar)(v.hi >> (8 * i));
+            for (uint i = 0; i < 8; i++) {
+                bytes[i] = (uchar)((uint64_t)v >> (8 * i));
             }
             mapping_symbol(MAP_DATA);
             emit_bytes(bytes, size);
@@ -770,7 +803,7 @@ static void data(struct dirarg *args, uint nargs, uint size) {
             continue;
         }
         char *name;
-        i64 addend;
+        int64_t addend;
         if (!ctx_symbol(e, &name, &addend)) {
             error("expected a constant or symbol(+offset)");
             continue;
@@ -791,7 +824,7 @@ static void data(struct dirarg *args, uint nargs, uint size) {
 static void alias(const char *directive, const char *name, struct expr *e) {
     char *msg;
     char *target;
-    i64 addend;
+    int64_t addend;
     if (!ctx_symbol(e, &target, &addend)) {
         msg = fmt("%s: expected a constant or label(+offset)", directive);
         error(msg);
@@ -804,13 +837,15 @@ static void alias(const char *directive, const char *name, struct expr *e) {
         error(msg);
         return;
     }
-    i64 value = i64_add(i64_u(t->value), addend);
-    if (value.hi != 0) {
+    /* The sum wraps like every other; whatever it comes to, it must land
+     * in the section. */
+    int64_t value = WRAP_ADD((int64_t)t->value, addend);
+    if (value < 0 || value > UINT32_MAX) {
         msg = fmt("%s: '%s' would be outside its section", directive, name);
         error(msg);
         return;
     }
-    define(name, t->section, value.lo);
+    define(name, t->section, (uint)value);
 }
 
 /* `.section name[, "flags"[, @type[, entsize]]]` (merlin-as's
@@ -873,21 +908,21 @@ static void section_directive(struct dirarg *args, uint nargs) {
                 error(".section: a mergeable section (M) must give its entry size");
                 return;
             }
-            i64 n;
+            int64_t n;
             if (!arg_const(args, nargs, 3, ".section", &n)) {
                 return;
             }
-            if (i64_is_neg(n) || (n.hi == 0 && n.lo == 0)) {
+            if (n <= 0) {
                 error(".section: the entry size must be positive");
                 return;
             }
             /* sh_entsize is 32 bits in ELF32, and LLVM keeps an entry size
              * in 32 bits (a larger one fails its own check). */
-            if (n.hi != 0) {
-                error(fmt(".section: entry size %s does not fit in 32 bits", i64_dec(n)));
+            if (n > UINT32_MAX) {
+                error(fmt(".section: entry size %lld does not fit in 32 bits", n));
                 return;
             }
-            want.entsize = n.lo;
+            want.entsize = (uint)n;
             used = 4;
         }
         if (nargs > used) {
@@ -920,12 +955,8 @@ static void section_directive(struct dirarg *args, uint nargs) {
     }
 }
 
-static int is_pow2(i64 v) {
-    if (i64_is_neg(v) || (v.lo == 0 && v.hi == 0)) {
-        return 0;
-    }
-    i64 m = i64_and(v, i64_sub(v, i64_u(1)));
-    return m.lo == 0 && m.hi == 0;
+static int is_pow2(int64_t v) {
+    return v > 0 && (v & (v - 1)) == 0;
 }
 
 /* `.p2align n[, fill[, max]]` (`.align` too) and `.balign bytes[, fill[,
@@ -933,23 +964,23 @@ static int is_pow2(i64 v) {
  * out (`,,`); a max below 1 is LLVM's error, one of at least the alignment
  * changes nothing. */
 static void align_directive(const char *name, struct dirarg *args, uint nargs) {
-    i64 v;
+    int64_t v;
     if (!arg_const(args, nargs, 0, name, &v)) {
         return;
     }
     uint align;
     if (strcmp(name, ".balign") == 0) {
-        if (!is_pow2(v) || i64_cmp(v, i64_u(1u << 16)) > 0) {
+        if (!is_pow2(v) || v > 1 << 16) {
             error(".balign: alignment must be a power of two, at most 65536");
             return;
         }
-        align = v.lo;
+        align = (uint)v;
     } else {
-        if (!i64_in(v, i64_u(0), i64_u(17))) {
+        if (v < 0 || v >= 17) {
             error(fmt("%s: power of two must be 0..16", name));
             return;
         }
-        align = 1u << v.lo;
+        align = 1u << (uint)v;
     }
     if (nargs > 3) {
         error(fmt("%s: expected at most an alignment, a fill and a maximum", name));
@@ -958,27 +989,27 @@ static void align_directive(const char *name, struct dirarg *args, uint nargs) {
     int has_fill = 0;
     uint fill = 0;
     if (nargs > 1 && args[1].kind != DA_EMPTY) {
-        i64 f;
+        int64_t f;
         if (!arg_const(args, nargs, 1, name, &f)) {
             return;
         }
         has_fill = 1;
-        fill = f.lo & 0xff;
+        fill = (uint)f & 0xff;
     }
     int has_max = 0;
     uint max = 0;
     if (nargs > 2) {
-        i64 m;
+        int64_t m;
         if (!arg_const(args, nargs, 2, name, &m)) {
             return;
         }
-        if (i64_cmp(m, i64_u(1)) < 0) {
+        if (m < 1) {
             error("alignment directive can never be satisfied in this many bytes, ignoring maximum bytes expression");
             return;
         }
-        if (i64_cmp(m, i64_u(align)) < 0) {
+        if (m < align) {
             has_max = 1;
-            max = m.lo;
+            max = (uint)m;
         }
     }
     align_with(align, has_fill, fill, has_max, max);
@@ -996,7 +1027,7 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
         error(fmt(".comm: '%s' is not .local; common symbols are not supported (use -fno-common)", sym));
         return;
     }
-    i64 size, align;
+    int64_t size, align;
     if (!arg_const(args, nargs, 1, directive, &size)) {
         return;
     }
@@ -1010,11 +1041,11 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
             return;
         }
     } else {
-        align = i64_u(1);
+        align = 1;
     }
     /* LLVM's messages; a size too big for the section is the 4 GiB error
      * below, as for `.space`. */
-    if (i64_is_neg(size)) {
+    if (size < 0) {
         error(fmt("%s: size must be non-negative", directive));
         return;
     }
@@ -1023,25 +1054,25 @@ static void common(const char *directive, struct dirarg *args, uint nargs) {
         return;
     }
     /* merlin-as's own limit, `.p2align`'s too. */
-    if (i64_cmp(align, i64_u(1u << 16)) > 0) {
+    if (align > 1 << 16) {
         error(fmt("%s: alignment must be at most 65536", directive));
         return;
     }
     int back = current;
     switch_section(".bss");
-    align_to(align.lo);
+    align_to((uint)align);
     uint off = sections[current].size;
     define(sym, current, off);
     int i = symbol_index(sym);
-    symbols[i].size = size.lo;
+    symbols[i].size = (uint64_t)size;
     if (symbols[i].ty == SYM_NOTYPE) {
         symbols[i].ty = SYM_OBJECT;
     }
     mapping_symbol(MAP_DATA);
-    if (size.hi != 0) {
+    if (size > UINT32_MAX) {
         no_room();
     } else {
-        emit_zeros(size.lo);
+        emit_zeros((uint)size);
     }
     current = back;
 }
@@ -1081,12 +1112,12 @@ static void file_directive(struct dirarg *args, uint nargs) {
         error(".file: expected a file number or a name");
         return;
     }
-    i64 v;
-    if (!eval(args[0].e, &v) || v.hi != 0) {
+    int64_t v;
+    if (!eval(args[0].e, &v) || (uint64_t)v > UINT32_MAX) {
         error(".file: expected a file number");
         return;
     }
-    uint n = v.lo;
+    uint n = (uint)v;
     char *strings[2];
     uint nstrings = 0;
     uint i = 1;
@@ -1115,9 +1146,8 @@ static void file_directive(struct dirarg *args, uint nargs) {
             memcpy(file.md5, sum->wide, 16);
         } else if (sum->kind == DA_EXPR && sum->e->kind == E_NUM) {
             /* A number that fits 64 bits: the low half, big-endian. */
-            for (uint b = 0; b < 4; b++) {
-                file.md5[8 + b] = (uchar)(sum->e->num.hi >> (24 - 8 * b));
-                file.md5[12 + b] = (uchar)(sum->e->num.lo >> (24 - 8 * b));
+            for (uint b = 0; b < 8; b++) {
+                file.md5[8 + b] = (uchar)((uint64_t)sum->e->num >> (56 - 8 * b));
             }
         } else {
             error(".file: md5 needs a 128-bit number");
@@ -1172,12 +1202,12 @@ static void loc_directive(struct dirarg *args, uint nargs) {
     uint nnums = 0;
     uint i = 0;
     while (nnums < 3 && i < nargs && args[i].kind == DA_EXPR && args[i].e->kind != E_SYM) {
-        i64 v;
-        if (!eval(args[i].e, &v) || v.hi != 0) {
+        int64_t v;
+        if (!eval(args[i].e, &v) || (uint64_t)v > UINT32_MAX) {
             error(".loc: expected a number");
             return;
         }
-        nums[nnums++] = v.lo;
+        nums[nnums++] = (uint)v;
         i++;
     }
     if (nnums == 0) {
@@ -1225,22 +1255,22 @@ static void loc_directive(struct dirarg *args, uint nargs) {
             continue;
         }
         /* An option with a number after it. */
-        i64 v;
-        if (!(i < nargs && args[i].kind == DA_EXPR && eval(args[i].e, &v) && v.hi == 0)) {
+        int64_t v;
+        if (!(i < nargs && args[i].kind == DA_EXPR && eval(args[i].e, &v) && (uint64_t)v <= UINT32_MAX)) {
             error(fmt(".loc: %s needs a number", opt));
             return;
         }
         i++;
         if (strcmp(opt, "is_stmt") == 0) {
-            if (v.lo > 1) {
+            if (v > 1) {
                 error(".loc: is_stmt must be 0 or 1");
                 return;
             }
-            stmt = v.lo == 1;
+            stmt = v == 1;
         } else if (strcmp(opt, "isa") == 0) {
-            loc.isa = v.lo;
+            loc.isa = (uint)v;
         } else {
-            loc.discriminator = v.lo;
+            loc.discriminator = (uint)v;
         }
     }
     is_stmt = stmt;
@@ -1435,11 +1465,11 @@ static int isa_parse(const char *s, uint *bits, struct isa *x) {
 }
 
 static uint isa_bits(void) {
-    return strncmp(RISCV_ARCH, "rv64", 4) == 0 ? 64 : 32;
+    return xlen;
 }
 
 static void isa_other(const char *directive) {
-    error(fmt("%s: merlin-as assembles only -march's ISA (%s), and this names another", directive, RISCV_ARCH));
+    error(fmt("%s: merlin-as assembles only -march's ISA (%s), and this names another", directive, riscv_arch()));
 }
 
 /* `.attribute arch, "isa"`. */
@@ -1529,13 +1559,13 @@ static void option_directive(struct dirarg *args, uint nargs) {
 /* `.attribute TAG, value`: arch (5) must name -march's ISA; the others are
  * ignored. */
 static void attribute_directive(struct dirarg *args, uint nargs) {
-    i64 v;
+    int64_t v;
     int arch = 0;
     if (nargs > 0 && args[0].kind == DA_EXPR) {
         if (args[0].e->kind == E_SYM) {
             arch = strcmp(args[0].e->sym, "arch") == 0;
         } else {
-            arch = eval(args[0].e, &v) && v.hi == 0 && v.lo == 5;
+            arch = eval(args[0].e, &v) && v == 5;
         }
     }
     if (!arch) {
@@ -1552,7 +1582,7 @@ static const char *const IGNORED[] = {".ident", ".addrsig", ".addrsig_sym", ".cf
 
 static void directive(const char *name, struct dirarg *args, uint nargs) {
     char *msg;
-    i64 v;
+    int64_t v;
     if (strcmp(name, ".text") == 0 || strcmp(name, ".data") == 0 || strcmp(name, ".rodata") == 0 ||
         strcmp(name, ".bss") == 0) {
         switch_section(name);
@@ -1633,31 +1663,32 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         if (!arg_const(args, nargs, 0, name, &v)) {
             return;
         }
-        i64 fill = i64_u(0);
+        int64_t fill = 0;
         if (nargs > 1 && !arg_const(args, nargs, 1, name, &fill)) {
             return;
         }
-        if (i64_is_neg(v)) {
+        if (v < 0) {
             error("invalid number of bytes");
             return;
         }
         /* Checked before the bytes are made, so that a huge count is an
          * error rather than a huge allocation. */
-        if (v.hi != 0) {
+        if (v > UINT32_MAX) {
             no_room();
             return;
         }
-        if (!has_room(v.lo)) {
+        uint count = (uint)v;
+        if (!has_room(count)) {
             return;
         }
         mapping_symbol(MAP_DATA);
-        uint byte = fill.lo & 0xff;
-        if (byte == 0 || v.lo == 0) {
-            emit_zeros(v.lo);
+        uint byte = (uint)fill & 0xff;
+        if (byte == 0 || count == 0) {
+            emit_zeros(count);
         } else {
-            uchar *bytes = tmp_alloc(v.lo);
-            memset(bytes, (int)byte, v.lo);
-            emit_bytes(bytes, v.lo);
+            uchar *bytes = tmp_alloc(count);
+            memset(bytes, (int)byte, count);
+            emit_bytes(bytes, count);
         }
     } else if (strcmp(name, ".align") == 0 || strcmp(name, ".p2align") == 0 || strcmp(name, ".balign") == 0) {
         align_directive(name, args, nargs);
@@ -1677,18 +1708,18 @@ static void directive(const char *name, struct dirarg *args, uint nargs) {
         }
     } else if (strcmp(name, ".size") == 0) {
         /* `.size f, . - f` (merlin's), `.size f, .Lfunc_end0 - f` (clang's)
-         * or a constant. Any value is taken, as LLVM takes it, and an
-         * ELF32 st_size keeps its low 32 bits (clang riscv32 writes 0 for
-         * 0x100000000 and 0xfffffffc for -4). */
+         * or a constant. Any value is taken, as LLVM takes it, in 64 bits:
+         * an ELF32 st_size keeps its low 32 (clang riscv32 writes 0 for
+         * 0x100000000 and 0xfffffffc for -4), an ELF64 one all of them. */
         char *n = arg_name(args, nargs, 0, ".size");
         if (n != NULL) {
             int ok = nargs > 1 && args[1].kind == DA_EXPR && eval_relative(args[1].e, &v);
             if (ok) {
                 int k = find_symbol(n);
                 if (k >= 0) {
-                    symbols[k].size = v.lo;
+                    symbols[k].size = (uint64_t)v;
                 } else {
-                    map_put(&pending_sizes, perm_strdup(n), (int)v.lo);
+                    pend_size(n, (uint64_t)v);
                 }
             } else {
                 error(".size: expected a constant, or a difference of '.' and labels defined earlier in this "
@@ -1724,7 +1755,7 @@ void asm_statement(struct stmt *s) {
     } else if (s->kind == S_DIRECTIVE) {
         directive(s->name, s->args, s->nargs);
     } else {
-        struct emit emits[2];
+        struct emit emits[MAX_EMITS];
         char *err = NULL;
         int n = encode(s->name, s->ops, s->nops, emits, &err);
         if (n > 0) {
@@ -1782,7 +1813,7 @@ static void check_pcrel_lo(void) {
 
 /* The distance from `offset` in `section` to a fixup's target, if that is
  * a local label defined in the same section. */
-static int local_distance(int section, uint offset, const char *symbol, i64 addend, i64 *out) {
+static int local_distance(int section, uint offset, const char *symbol, int64_t addend, int64_t *out) {
     int i = find_symbol(symbol);
     if (i < 0) {
         return 0;
@@ -1791,30 +1822,23 @@ static int local_distance(int section, uint offset, const char *symbol, i64 adde
     if (!s->defined || s->global || s->has_constant || s->section != section) {
         return 0;
     }
-    *out = i64_sub(i64_add(i64_u(s->value), addend), i64_u(offset));
+    *out = WRAP_SUB(WRAP_ADD((int64_t)s->value, addend), (int64_t)offset);
     return 1;
 }
 
 /* `{:+}`: a number with its sign. */
-static const char *signed_text(i64 v) {
-    if (i64_is_neg(v)) {
-        return i64_dec(v);
-    }
-    const char *d = i64_dec(v);
-    char *r = tmp_alloc((uint)strlen(d) + 2);
-    r[0] = '+';
-    strcpy(r + 1, d);
-    return r;
+static const char *signed_text(int64_t v) {
+    return v < 0 ? fmt("%lld", v) : fmt("+%lld", v);
 }
 
-static int check_jump(i64 distance, uint bits, const char *what, char **msg) {
-    i64 half = i64_shl(i64_u(1), bits - 1);
-    if (!i64_in(distance, i64_neg(half), half)) {
-        *msg = fmt("%s target out of range: %s bytes (limit %s..=+%s)", what, signed_text(distance),
-                 i64_dec(i64_neg(half)), i64_dec(i64_sub(half, i64_u(2))));
+static int check_jump(int64_t distance, uint bits, const char *what, char **msg) {
+    int64_t half = (int64_t)1 << (bits - 1);
+    if (distance < -half || distance >= half) {
+        *msg = fmt("%s target out of range: %s bytes (limit %lld..=+%lld)", what, signed_text(distance), -half,
+                   half - 2);
         return 0;
     }
-    if (distance.lo & 1) {
+    if (distance & 1) {
         *msg = fmt("%s target at an odd distance (%s bytes)", what, signed_text(distance));
         return 0;
     }
@@ -1832,23 +1856,25 @@ static void or_word(struct section *s, uint at, uint bits) {
 }
 
 /* Writes a resolved distance into the word(s) at `offset`, as a linker would. */
-static int patch(int section, uint offset, int kind, i64 distance, char **msg) {
+static int patch(int section, uint offset, int kind, int64_t distance, char **msg) {
     uint hi;
     int lo;
     struct section *s = &sections[section];
-    hi_lo((int)distance.lo, &hi, &lo);
+    /* A distance within a section always fits auipc's 2 GiB reach. */
+    int d = (int)(uint)distance;
+    hi_lo(d, &hi, &lo);
     switch (kind) {
     case R_RISCV_BRANCH:
         if (!check_jump(distance, 13, "branch", msg)) {
             return 0;
         }
-        or_word(s, offset, b_imm((int)distance.lo));
+        or_word(s, offset, b_imm(d));
         return 1;
     case R_RISCV_JAL:
         if (!check_jump(distance, 21, "jump", msg)) {
             return 0;
         }
-        or_word(s, offset, j_imm((int)distance.lo));
+        or_word(s, offset, j_imm(d));
         return 1;
     case R_RISCV_PCREL_HI20:
         or_word(s, offset, u_imm(hi));
@@ -1870,7 +1896,7 @@ static int patch(int section, uint offset, int kind, i64 distance, char **msg) {
 struct auipc_distance {
     int section;
     uint offset;
-    i64 distance;
+    int64_t distance;
 };
 
 static void resolve_local_fixups(void) {
@@ -1881,7 +1907,7 @@ static void resolve_local_fixups(void) {
         uint kept = 0;
         for (uint k = 0; k < s->nrelocs; k++) {
             struct reloc r = s->relocs[k];
-            i64 distance;
+            int64_t distance;
             int resolved = (r.kind == R_RISCV_BRANCH || r.kind == R_RISCV_JAL || r.kind == R_RISCV_CALL_PLT || r.kind == R_RISCV_PCREL_HI20) &&
                            local_distance((int)sec, r.offset, r.symbol, r.addend, &distance);
             if (!resolved) {
@@ -1993,8 +2019,12 @@ static void line_table(void) {
     uint base = section_size(".debug_line");
     uint str_base = section_size(".debug_line_str");
     struct line_table t;
+    /* A code address is as wide as a register: 4 bytes on RV32, 8 on RV64
+     * (DWARF's address_size), relocated by R_RISCV_32 or R_RISCV_64. A
+     * string's offset is a 4-byte DWARF32 field on both (R_RISCV_32, as
+     * clang writes it). */
     dwarf_encode(&file0, files + 1, nfiles > 0 ? nfiles - 1 : 0, rows, nrows, sections, nsections, base, str_base,
-                 &t);
+                 xlen / 8, &t);
     int line_sec = append(".debug_line", &t.line);
     int str_sec = append(".debug_line_str", &t.line_str);
     for (uint k = 0; k < t.nfixups; k++) {
@@ -2005,9 +2035,9 @@ static void line_table(void) {
         struct reloc *r = &s->relocs[s->nrelocs++];
         memset(r, 0, sizeof *r);
         r->offset = f->at;
-        r->kind = R_RISCV_32;
+        r->kind = f->section < 0 || xlen == 32 ? R_RISCV_32 : R_RISCV_64;
         r->symbol = symbol;
-        r->addend = i64_u(f->off);
+        r->addend = f->off;
         r->line = at;
     }
     free(t.line.data);
@@ -2033,7 +2063,7 @@ static void debug_relocs_to_sections(void) {
             }
             uint value = symbols[i].value;
             r->symbol = section_symbol(symbols[i].section);
-            r->addend = i64_add(r->addend, i64_u(value));
+            r->addend = WRAP_ADD(r->addend, (int64_t)value);
         }
     }
 }

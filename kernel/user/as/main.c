@@ -1,10 +1,31 @@
-/* as: `as [-o out.o] input.s`, merlin-as's command line (main.rs). One
- * pass over the text, a statement at a time. */
+/* as: `as [-march=ISA] [-o out.o] input.s`, merlin-as's command line
+ * (main.rs). One pass over the text, a statement at a time. */
 #include "as.h"
 
-static const char USAGE[] = "usage: as [-o output.o] input.s\n"
+static const char USAGE[] = "usage: as [-march=ISA] [-o output.o] input.s\n"
                             "\n"
-                            "  -o FILE   output object (default: input with .o extension)";
+                            "  -march=ISA  rv32ima_zicsr_zifencei (default) or rv64ima_zicsr_zifencei\n"
+                            "  -o FILE     output object (default: input with .o extension)";
+
+uint xlen = 32;
+
+/* The `-march=` strings, merlin-as's MARCH: the ISA it implements at either
+ * width, spelled as clang spells it. Nothing else is taken: there is no
+ * other extension to turn on or off. */
+static const char *const MARCH[2] = {"rv32ima_zicsr_zifencei", "rv64ima_zicsr_zifencei"};
+static const uint MARCH_XLEN[2] = {32, 64};
+
+/* The width `-march=` names (merlin_as::parse_march), or 0 after printing
+ * merlin-as's error. */
+static uint parse_march(const char *s) {
+    for (int i = 0; i < 2; i++) {
+        if (strcmp(s, MARCH[i]) == 0) {
+            return MARCH_XLEN[i];
+        }
+    }
+    fprintf(2, "as: unsupported -march '%s' (merlin-as takes %s or %s)\n", s, MARCH[0], MARCH[1]);
+    return 0;
+}
 
 /* Whether the bytes are valid UTF-8, as Rust's read_to_string checks. */
 static int valid_utf8(const uchar *s, uint n) {
@@ -107,6 +128,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             printf("%s\n", USAGE);
             return 0;
+        } else if (strncmp(a, "-march=", 7) == 0) {
+            /* Only the `=` form, as in clang; the last one wins. */
+            xlen = parse_march(a + 7);
+            if (xlen == 0) {
+                return 2;
+            }
         } else if (a[0] == '-') {
             fprintf(2, "as: unknown option %s\n%s\n", a, USAGE);
             return 2;

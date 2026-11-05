@@ -14,9 +14,9 @@
 //! [`IMAGE_SIZE`] blocks: the filesystem gets the blocks the kernel leaves.
 //!
 //! The RV64 root image ([`build_bootable_for`] with [`Xlen::Rv64`], `cargo
-//! xtask fs --xlen 64`) is the same with the programs built for RV64 (all
-//! but [`userprogs::RV32_ONLY`]'s, `as` and `ld`, until #157), the RV64
-//! bootloader (`kernel/boot/boot-rv64.elf`) and the RV64 disk kernel,
+//! xtask fs --xlen 64`) is the same with the programs built for RV64 (every
+//! one, `/bin/as` and `/bin/ld` writing RV64 objects and executables), the
+//! RV64 bootloader (`kernel/boot/boot-rv64.elf`) and the RV64 disk kernel,
 //! [`KERNEL_RV64`], in an image of the same size, [`IMAGE_SIZE`]. An RV64
 //! machine boots it:
 //!
@@ -91,23 +91,13 @@ pub fn build(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
 /// kernel checks that `/bin` holds the programs it embeds, so it needs an
 /// image of its own.
 pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>, String> {
-    let mut fs = Mkfs::new(opts)?;
-    fs.add_host_dir(&root.join(ROOT_DIR), "/")?;
-    fs.mkdir(DEV)?;
-    fs.add_device(&format!("{DEV}/console"), CONSOLE_MAJOR, 0)?;
-    fs.mkdir(BIN)?;
-    for prog in userprogs::build_all_with(&userprogs::user_dir(root), cc)? {
-        fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
-    }
-    Ok(fs.finish())
+    build_for_with(root, opts, Xlen::Rv32, cc)
 }
 
 /// The root filesystem of the `xlen` kernel, `opts`' shape: on RV32
 /// [`build`]'s; on RV64 the same files with the programs built for RV64 in
-/// `/bin` ([`userprogs::build_all_for`]: not the
-/// [`userprogs::RV32_ONLY`] ones, `as` and `ld`, which write RV32 code until
-/// #157). What the RV64 kernel's tests boot from disk, and what
-/// [`build_bootable_for`] makes bootable.
+/// `/bin` ([`userprogs::build_all_for`]). What the RV64 kernel's tests boot
+/// from disk, and what [`build_bootable_for`] makes bootable.
 pub fn build_for(root: &Path, opts: &Options, xlen: Xlen) -> Result<Vec<u8>, String> {
     build_for_with(root, opts, xlen, CCompiler::Merlin)
 }
@@ -115,9 +105,6 @@ pub fn build_for(root: &Path, opts: &Options, xlen: Xlen) -> Result<Vec<u8>, Str
 /// [`build_for`], with the programs' C compiled by `cc`: for a reference
 /// kernel, which checks that `/bin` holds the programs it embeds.
 pub fn build_for_with(root: &Path, opts: &Options, xlen: Xlen, cc: CCompiler) -> Result<Vec<u8>, String> {
-    if xlen == Xlen::Rv32 {
-        return build_with(root, opts, cc);
-    }
     let mut fs = Mkfs::new(opts)?;
     fs.add_host_dir(&root.join(ROOT_DIR), "/")?;
     fs.mkdir(DEV)?;

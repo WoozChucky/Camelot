@@ -11,7 +11,6 @@ together.
 |---|---|
 | `string.c` | `strlen`, `strcmp`, `strncmp`, `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`, `memmove`, `memcmp` |
 | `stdlib.c` | `atoi`, `strtol` (bases 2 to 36, or 0 for C's prefixes; out of range gives `LONG_MAX` or `LONG_MIN`) |
-| `i64.c` | `i64`, 64-bit integers as two words (written before merlin had `long long`; #157 moves the tools to it): arithmetic, shifts, comparisons, checked division, and `i64_dec`/`i64_hex` to print them; the assembler and the linker compute with them |
 | `libgcc.c` | `__divdi3`, `__udivdi3`, `__moddi3`, `__umoddi3`, `__muldi3`: the routines merlin and clang call for `long long` division on RV32 (libgcc's names), with RISC-V's results for division by zero and `LLONG_MIN / -1`; the kernel has the same ones (`kernel/libgcc.c`) |
 | `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk`, under a mutex |
 | `printf.c` | `printf`, `fprintf` (to a descriptor), `snprintf`, `puts` |

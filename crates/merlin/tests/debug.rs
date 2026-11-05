@@ -244,10 +244,25 @@ fn headers_get_their_own_file_numbers() {
         (p == Path::new("inc/h.h")).then(|| "static int twice(int x) {\n    return 2 * x;\n}\n".to_string())
     };
     let asm = merlin::compile_with("m.c", src, &debug_opts("src"), &load).unwrap();
-    assert!(asm.starts_with("    .file 0 \"src\" \"m.c\"\n"), "{asm}");
+    // No globals, enums or casts: LLVM makes the unit for the first
+    // function's code, and `.file 0` comes with its first `.loc`, as clang
+    // writes it.
+    assert!(
+        asm.contains("main:\n    .file 0 \"src\" \"m.c\"\n    .loc 0 2 0\n"),
+        "{asm}"
+    );
+    assert_eq!(asm.matches(".file 0 ").count(), 1, "{asm}");
     assert!(
         asm.contains("    .file 1 \"src\" \"./inc/h.h\"\n    .loc 1 1 0\n"),
         "{asm}"
+    );
+    // Nor when the only cast is to a type a function defines, which the
+    // function retains, not the unit.
+    let src = "int g(int a) { return a; }\nint f(long v) { typedef short LT; return (LT)v; }\n";
+    let local = merlin::compile_with("l.c", src, &debug_opts("src"), &merlin::no_files).unwrap();
+    assert!(
+        local.contains("g:\n    .file 0 \"src\" \"l.c\"\n    .loc 0 1 0\n"),
+        "{local}"
     );
     let obj = merlin_as::assemble_to_elf(&asm).unwrap();
     let tables = elf::Elf::parse(&obj).unwrap().line_tables().unwrap();
@@ -260,11 +275,41 @@ fn headers_get_their_own_file_numbers() {
     assert!(merlin_as::assemble_to_elf(&asm).is_ok());
 }
 
+/// A `static` function is generated once used, after the others, but its
+/// code is where it was first referred to, as clang has it: a header's file
+/// number is given where the output first needs it, which need not be where
+/// the header's code was first generated.
+#[test]
+fn file_numbers_follow_the_output() {
+    let src = "static int sa(void);\nint f(void) {\n    return sa();\n}\n#include \"a.h\"\n";
+    let load = |p: &Path| {
+        (p == Path::new("a.h")).then(|| {
+            "int ea(void) {\n    return 1;\n}\nstatic int sa(void) {\n    return 2;\n}\n".to_string()
+        })
+    };
+    let asm = merlin::compile_with("m.c", src, &debug_opts("src"), &load).unwrap();
+    let labels: Vec<&str> = asm
+        .lines()
+        .filter(|l| matches!(*l, "f:" | "sa:" | "ea:"))
+        .collect();
+    assert_eq!(labels, ["f:", "sa:", "ea:"], "{asm}");
+    let sa = asm.find("sa:").unwrap();
+    assert!(
+        asm[sa..].starts_with("sa:\n    .file 1 \"src\" \"./a.h\"\n    .loc 1 4 0\n"),
+        "{asm}"
+    );
+    assert_eq!(asm.matches(".file 1 ").count(), 1, "{asm}");
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let tables = elf::Elf::parse(&obj).unwrap().line_tables().unwrap();
+    assert_eq!(tables[0].files, ["src/m.c", "src/./a.h"]);
+}
+
 #[test]
 fn the_command_line_takes_g() {
     let dir = std::env::temp_dir().join(format!("merlin-debug-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("a.c"), "int f(void) { return 1; }\n").unwrap();
+    // With a global, `.file 0` is the first line.
+    std::fs::write(dir.join("a.c"), "int g;\nint f(void) { return g; }\n").unwrap();
     let run = |args: &[&str]| {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_merlin"))
             .args(args)
@@ -325,6 +370,45 @@ long walk(Node *list, color_t c) {
 int old() { return 1; }
 ";
 
+/// A type as C writes it, from its entries (`void` for none).
+fn spell(u: &elf::dies::InfoUnit, i: Option<usize>) -> String {
+    let Some(i) = i else {
+        return "void".into();
+    };
+    use elf::dies::dw;
+    let d = &u.dies[i];
+    let inner = || d.reference(dw::AT_TYPE).and_then(|o| u.index_of(o));
+    match d.tag {
+        dw::TAG_BASE_TYPE | dw::TAG_TYPEDEF => d.name().unwrap().to_string(),
+        dw::TAG_STRUCTURE_TYPE => format!("struct {}", d.name().unwrap()),
+        dw::TAG_UNION_TYPE => format!("union {}", d.name().unwrap()),
+        dw::TAG_ENUMERATION_TYPE => format!("enum {}", d.name().unwrap()),
+        dw::TAG_POINTER_TYPE => format!("{} *", spell(u, inner())),
+        dw::TAG_CONST_TYPE => format!("const {}", spell(u, inner())),
+        dw::TAG_VOLATILE_TYPE => format!("volatile {}", spell(u, inner())),
+        dw::TAG_ARRAY_TYPE => {
+            let dims: String = d
+                .children
+                .iter()
+                .map(|&c| format!("[{}]", u.dies[c].unsigned(dw::AT_COUNT).unwrap()))
+                .collect();
+            format!("{}{dims}", spell(u, inner()))
+        }
+        dw::TAG_SUBROUTINE_TYPE => {
+            let params: Vec<String> = d
+                .children
+                .iter()
+                .map(|&c| match u.dies[c].tag {
+                    dw::TAG_UNSPECIFIED_PARAMETERS => "...".to_string(),
+                    _ => spell(u, u.dies[c].reference(dw::AT_TYPE).and_then(|o| u.index_of(o))),
+                })
+                .collect();
+            format!("{}({})", spell(u, inner()), params.join(", "))
+        }
+        t => panic!("tag {t:#x}"),
+    }
+}
+
 /// The entries merlin writes for [`VARS`], read back with `elf::dies` from the
 /// object (its relocations applied): a function's parameters and locals where
 /// its frame has them, the blocks around the code that declares them, globals
@@ -353,43 +437,6 @@ fn variables_and_types_are_described() {
                 .unwrap_or_else(|| panic!("no {name} ({x:?}) in\n{asm}"))
         };
         let ty = |d: &Die| u.index_of(d.reference(dw::AT_TYPE).expect("a type")).unwrap();
-        // A type as C writes it, from its entries.
-        fn spell(u: &InfoUnit, i: Option<usize>) -> String {
-            let Some(i) = i else {
-                return "void".into();
-            };
-            let d = &u.dies[i];
-            let inner = || d.reference(dw::AT_TYPE).and_then(|o| u.index_of(o));
-            match d.tag {
-                dw::TAG_BASE_TYPE | dw::TAG_TYPEDEF => d.name().unwrap().to_string(),
-                dw::TAG_STRUCTURE_TYPE => format!("struct {}", d.name().unwrap()),
-                dw::TAG_UNION_TYPE => format!("union {}", d.name().unwrap()),
-                dw::TAG_ENUMERATION_TYPE => format!("enum {}", d.name().unwrap()),
-                dw::TAG_POINTER_TYPE => format!("{} *", spell(u, inner())),
-                dw::TAG_CONST_TYPE => format!("const {}", spell(u, inner())),
-                dw::TAG_VOLATILE_TYPE => format!("volatile {}", spell(u, inner())),
-                dw::TAG_ARRAY_TYPE => {
-                    let dims: String = d
-                        .children
-                        .iter()
-                        .map(|&c| format!("[{}]", u.dies[c].unsigned(dw::AT_COUNT).unwrap()))
-                        .collect();
-                    format!("{}{dims}", spell(u, inner()))
-                }
-                dw::TAG_SUBROUTINE_TYPE => {
-                    let params: Vec<String> = d
-                        .children
-                        .iter()
-                        .map(|&c| match u.dies[c].tag {
-                            dw::TAG_UNSPECIFIED_PARAMETERS => "...".to_string(),
-                            _ => spell(u, u.dies[c].reference(dw::AT_TYPE).and_then(|o| u.index_of(o))),
-                        })
-                        .collect();
-                    format!("{}({})", spell(u, inner()), params.join(", "))
-                }
-                t => panic!("tag {t:#x}"),
-            }
-        }
         let type_of = |i: usize| spell(u, Some(ty(at(i))));
 
         // The function: its frame base is s0, and each parameter and local is
@@ -620,12 +667,14 @@ fn llvm_dwarfdump_verifies_every_case() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Every attribute merlin writes for [`VARS`] has the form clang gives it, at
-/// both widths: the `DW_AT_* [DW_FORM_*]` pairs llvm-dwarfdump -v shows for
-/// merlin's object are those it shows for clang's (clang -O0 -g; its own, such as
-/// the producer's, are the same forms). Ignored: it needs clang and
-/// llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP` name them if they are not on the
-/// PATH).
+/// Every attribute merlin writes for [`VARS`] has the form clang gives it, in
+/// the order clang writes it, at both widths: entry by entry, the tag and its
+/// `DW_AT_* [DW_FORM_*]` pairs, in order, that llvm-dwarfdump -v shows for
+/// merlin's object are those it shows for clang's (clang -O0 -g; its own, such
+/// as the producer's, are the same forms). The order is the abbreviation's,
+/// which LLVM decides by the order it adds the attributes in. Ignored: it
+/// needs clang and llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP` name them if
+/// they are not on the PATH).
 #[test]
 #[ignore]
 fn the_forms_are_clangs() {
@@ -635,20 +684,27 @@ fn the_forms_are_clangs() {
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("v.c");
     std::fs::write(&source, VARS).unwrap();
-    let forms = |obj: &Path| -> std::collections::BTreeSet<String> {
+    // Each entry as a line: its tag, then its attributes and their forms.
+    let forms = |obj: &Path| -> Vec<String> {
         let out = std::process::Command::new(&tool)
             .args(["--debug-info", "-v"])
             .arg(obj)
             .output()
             .unwrap_or_else(|e| panic!("cannot run {tool}: {e}"));
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                let end = l.find(']')?;
-                (l.starts_with("DW_AT_") && l.contains("[DW_FORM_")).then(|| l[..=end].to_string())
-            })
-            .collect()
+        let mut entries: Vec<String> = Vec::new();
+        for l in text.lines() {
+            let l = l.trim();
+            if let Some(tag) = l.split_whitespace().nth(1).filter(|t| t.starts_with("DW_TAG_")) {
+                entries.push(tag.to_string());
+            } else if let (Some(e), Some(end)) = (entries.last_mut(), l.find(']')) {
+                if l.starts_with("DW_AT_") && l.contains("[DW_FORM_") {
+                    e.push(' ');
+                    e.push_str(&l[..=end]);
+                }
+            }
+        }
+        entries
     };
     for x in [Xlen::Rv32, Xlen::Rv64] {
         let bits = x.bits();
@@ -678,7 +734,10 @@ fn the_forms_are_clangs() {
             .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let (ours, theirs) = (forms(&ours), forms(&theirs));
-        assert!(ours.contains("DW_AT_name [DW_FORM_strx1]"), "{ours:#?}");
+        assert!(
+            ours.iter().any(|e| e.contains("DW_AT_name [DW_FORM_strx1]")),
+            "{ours:#?}"
+        );
         assert_eq!(ours, theirs, "merlin's (left) and clang's (right), {x:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -742,6 +801,293 @@ fn casts_not_evaluated_are_not_kept() {
     );
 }
 
+/// The names of the entries of `tag` that `src` describes, in order.
+fn named(src: &str, tag: u64) -> Vec<String> {
+    let asm = merlin::compile_with("c.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options::default()).unwrap();
+    let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+    units[0]
+        .dies
+        .iter()
+        .filter(|d| d.tag == tag)
+        .filter_map(|d| d.name().map(str::to_string))
+        .collect()
+}
+
+/// In a static initializer, clang keeps the types of the explicit casts its
+/// `ConstExprEmitter` visits (clang 23): an element's own cast, and the casts
+/// inside a cast that changes nothing or converts an integer to an integer,
+/// or inside a unary `-`; not those under any other operator, `?:` or a
+/// cast of an address to an integer.
+#[test]
+fn initializer_casts_are_kept_as_clang_keeps_them() {
+    let names = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"];
+    let mut src: String = names.iter().map(|n| format!("typedef long {n};\n")).collect();
+    src.push_str(
+        "int x[4];\nstruct s { long a, b; };\n\
+         long a = (A)&x;\n\
+         long b = (B)&x + 4;\n\
+         long c[2] = {(C)&x, 0};\n\
+         struct s d = {(D)&x, 0};\n\
+         int *e = (int *)(E)&x;\n\
+         long f = (F)(G)&x;\n\
+         long g = 1 ? (H)&x : 0;\n\
+         long h = -(I)3;\n\
+         int i = (J)3;\n\
+         long j = ~(K)3;\n\
+         int main(void) { return 0; }\n",
+    );
+    assert_eq!(
+        named(&src, elf::dies::dw::TAG_TYPEDEF),
+        ["A", "C", "D", "F", "G", "I", "J"]
+    );
+    // A local array, struct or union with a constant initializer is
+    // emitted as a static's (`EmitAutoVarInit`, `IsConstantAggregate`), so
+    // its casts are kept by the same rules; one that is not constant is
+    // code, all its casts kept.
+    let names = ["M", "N", "O", "P", "Q", "R", "S", "T", "U", "V"];
+    let mut src: String = names.iter().map(|n| format!("typedef long {n};\n")).collect();
+    src.push_str(
+        "int x[4];\nint f(long y) {\n\
+             long a[1] = {(M)1 + (N)2};\n\
+             long b[2] = {1 ? (O)1 : 2};\n\
+             long c[1] = {(P)&x + 4};\n\
+             int *d[1] = {(int *)(Q)&x};\n\
+             long e[1] = {(R)&x};\n\
+             long h[2] = {(S)(T)3, 0};\n\
+             long k[1] = {(U)y + (V)1};\n\
+             return a[0] + b[0] + c[0] + *d[0] + e[0] + h[0] + k[0];\n\
+         }\n",
+    );
+    assert_eq!(named(&src, elf::dies::dw::TAG_TYPEDEF), ["R", "S", "T", "U", "V"]);
+    // A cast between pointers to similar types (the same but for
+    // qualifiers, at any level) changes nothing (`CK_NoOp`), so the emitter
+    // goes into it; one between other pointers (`CK_BitCast`) it does not.
+    let src = "int x[4];\ntypedef char *P1;\ntypedef int *P2;\ntypedef const char *P3;\n\
+               typedef int **P4;\ntypedef int **P5;\ntypedef int (*P6)[2];\ntypedef int *P7;\n\
+               const char *v1 = (const char *)(P1)&x;\n\
+               volatile int *v2 = (volatile int *)(P2)&x;\n\
+               char *v3 = (char *)(P3)&x;\n\
+               const int **v4 = (const int **)(P4)&x;\n\
+               int *const *v5 = (int *const *)(P5)&x;\n\
+               const int (*v6)[2] = (const int (*)[2])(P6)&x;\n\
+               const unsigned *v7 = (const unsigned *)(P7)&x;\n\
+               int main(void) { return 0; }\n";
+    assert_eq!(
+        named(src, elf::dies::dw::TAG_TYPEDEF),
+        ["P1", "P2", "P3", "P4", "P5", "P6"]
+    );
+}
+
+/// clang describes the enum of an enumeration constant its code uses, even
+/// with no variable of it (clang 23): where the code evaluates the constant,
+/// and in a `case` label that is the constant alone (not in parentheses,
+/// `case (Z):`); not in a static initializer, a constant condition,
+/// `sizeof`, an operand left out or a constant `switch`'s labels. An enum
+/// a function defines is its own.
+#[test]
+fn enums_are_described_for_the_constants_the_code_uses() {
+    let names = [
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "Z",
+    ];
+    let mut src: String = names.iter().map(|n| format!("enum {{ {n} = 1 }};\n")).collect();
+    src.push_str(
+        "int g1 = A;\nint arr[4];\n\
+         int f(int x) {\n\
+             if (B) x++;\n\
+             x = C ? 1 : 2;\n\
+             x = sizeof(D);\n\
+             switch (x) { case E: break; case F + 1: break; }\n\
+             switch (x) { case (Z): break; }\n\
+             x = 0 && G;\n\
+             arr[H] = 1;\n\
+             x = (long)I;\n\
+             x = 1 ? J : K;\n\
+             while (L) break;\n\
+             switch (2) { case M: x = 1; break; case 2: x = N; break; }\n\
+             { enum in { Q = 3 }; x = Q; }\n\
+             return -O + x;\n\
+         }\n",
+    );
+    assert_eq!(
+        named(&src, elf::dies::dw::TAG_ENUMERATOR),
+        ["E", "H", "I", "J", "L", "N", "O", "Q"]
+    );
+    // Nor in a local array, struct or union with a constant initializer
+    // (addresses of globals and compound literals among them), which clang
+    // emits as a static's; but in one that is not constant, and in a
+    // scalar's.
+    let names = ["P", "R", "S", "T", "U", "V", "W"];
+    let mut src: String = names.iter().map(|n| format!("enum {{ {n} = 1 }};\n")).collect();
+    src.push_str(
+        "int arr[4];\nunion un { int i; long l; };\nstruct st { int p; int *q; };\n\
+         int g(int x) {\n\
+             int a[2] = {P, 1};\n\
+             int m[2][2] = {{R}, {1}};\n\
+             union un u = {S};\n\
+             struct st s = {T, &arr[0]};\n\
+             struct st t = {U, &x};\n\
+             struct st c = (struct st){V, 0};\n\
+             int sc = W;\n\
+             return a[0] + m[0][0] + u.i + s.p + t.p + c.p + sc;\n\
+         }\n",
+    );
+    assert_eq!(named(&src, elf::dies::dw::TAG_ENUMERATOR), ["U", "W"]);
+}
+
+/// A null pointer constant made a pointer by assignment, passing, return or
+/// `?:`, or an integer one cast to a pointer, is clang's `CK_NullToPointer`,
+/// whose operand its code generator does not visit: `NULL` returned keeps
+/// no `void *`. Compared, or cast to a pointer explicitly, `(void *)0` is a
+/// bit cast and its cast is kept. A static initializer's `ConstExprEmitter`
+/// does visit the operand (clang 23).
+#[test]
+fn null_pointer_constants_keep_casts_as_clangs() {
+    use elf::dies::dw;
+    let names = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+    let mut src = String::new();
+    for (n, t) in names.iter().zip([
+        "void *", "int ", "void *", "int ", "int *", "void *", "void *", "void *", "long ", "int *",
+    ]) {
+        src.push_str(&format!("typedef {t}{n};\n"));
+    }
+    src.push_str(
+        "struct b;\nvoid take(int *);\n\
+         struct b *f(int x, int *p) {\n\
+             take((A)0);\n\
+             p = (B)0;\n\
+             if (p == (C)0) x++;\n\
+             p = (E)(D)0;\n\
+             p = x ? (F)0 : p;\n\
+             if (x) return (G)0;\n\
+             p = (J)(I)0 + 0;\n\
+             return 0;\n\
+         }\n\
+         void *g(void) { return (H)0; }\n",
+    );
+    assert_eq!(named(&src, dw::TAG_TYPEDEF), ["C", "E", "J", "H"]);
+    let src = "typedef long L;\ntypedef int I;\nint *p = (void *)0;\nint *q = (I)0;\nint *r = (int *)(L)0;\n\
+               int main(void) { return 0; }\n";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["I", "L"]);
+    // A function pointer's `NULL` too.
+    let src = "typedef void *K1;
+typedef void *K2;
+typedef void *K3;
+typedef void *K4;
+               int (*gfp)(void) = (K4)0;
+void take(void (*cb)(int));
+               int (*f(int x))(void) {
+                   int (*fp)(void) = (K1)0;
+                   take((K2)0);
+                   if (x) return (K3)0;
+                   return fp;
+               }
+";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["K4"]);
+}
+
+/// A function pointer's parameters are described as declared, by their
+/// typedefs and with their qualifiers, as clang 23 describes them (the
+/// function's type itself leaves the qualifiers out).
+#[test]
+fn function_pointer_parameters_are_described_as_declared() {
+    use elf::dies::dw;
+    let src = "typedef unsigned long *pt;\ntypedef int cnt;\nstruct d { int (*read)(pt, cnt); } dv;\n\
+               void (*hook)(const pt, cnt *);\nint main(void) { return 0; }\n";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["pt", "cnt"]);
+    let asm = merlin::compile_with("c.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+    let u = &units[0];
+    // `hook`'s function type: its first parameter is `const pt`.
+    let types: Vec<&elf::dies::Die> = u
+        .dies
+        .iter()
+        .filter(|d| d.tag == dw::TAG_SUBROUTINE_TYPE)
+        .collect();
+    assert_eq!(types.len(), 2);
+    let first = &u.dies[types[1].children[0]];
+    let to = u.die_at(first.reference(dw::AT_TYPE).unwrap()).unwrap();
+    assert_eq!(to.tag, dw::TAG_CONST_TYPE);
+    let t = u.die_at(to.reference(dw::AT_TYPE).unwrap()).unwrap();
+    assert_eq!(t.name(), Some("pt"));
+}
+
+/// A parameter declared as an array through an array typedef is a pointer
+/// to the elements, spelled as the typedef's declaration spells them
+/// (`arr3 b` a `u32 *`, `mat m` a `row *`, `const row r` a `const u32 *`),
+/// a function pointer's parameters too; a qualified array typedef is the
+/// typedef qualified (`const row`), as clang 23 describes them.
+#[test]
+fn array_typedef_parameters_decay_as_clangs() {
+    use elf::dies::dw;
+    let src = "typedef unsigned int u32;
+typedef u32 arr3[3];
+typedef arr3 arr3b;
+               typedef u32 row[4];
+typedef row mat[2];
+const row gr;
+               int h(arr3 b, mat m, const row r, arr3b c, const mat cm, arr3 d[2]) {
+                   return b[0] + m[0][0] + r[0] + c[0] + cm[0][0] + d[0][0];
+               }
+               int (*g1)(arr3 b, const mat cm);
+";
+    for x in [Xlen::Rv32, Xlen::Rv64] {
+        let opts = Options {
+            xlen: x,
+            ..debug_opts("dir")
+        };
+        let asm = merlin::compile_with("c.c", src, &opts, &merlin::no_files).unwrap();
+        let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
+        let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+        let u = &units[0];
+        let type_of = |d: &elf::dies::Die| spell(u, d.reference(dw::AT_TYPE).and_then(|o| u.index_of(o)));
+        let typed: Vec<(&str, String)> = u
+            .dies
+            .iter()
+            .filter(|d| matches!(d.tag, dw::TAG_FORMAL_PARAMETER | dw::TAG_VARIABLE))
+            .map(|d| (d.name().unwrap_or(""), type_of(d)))
+            .collect();
+        assert_eq!(
+            typed,
+            [
+                ("b", "u32 *".to_string()),
+                ("m", "row *".into()),
+                ("r", "const u32 *".into()),
+                ("c", "u32 *".into()),
+                ("cm", "const row *".into()),
+                ("d", "arr3 *".into()),
+                ("gr", "const row".into()),
+                ("g1", "int(u32 *, const row *) *".into()),
+                ("", "u32 *".into()),
+                ("", "const row *".into()),
+            ],
+            "{x:?}"
+        );
+    }
+}
+
+/// clang emits an array whose initializers hold more than 16 bytes as a
+/// constant if it can (`EmitArrayInit`'s `ConstantEmitter`), a compound
+/// literal's too: then its casts are kept as a static initializer's and
+/// its enumeration constants describe no enum. A smaller one is code
+/// (clang 23).
+#[test]
+fn big_arrays_are_described_as_constants() {
+    use elf::dies::dw;
+    let src = "enum { A = 1 };\nenum { B = 1 };\nenum { D = 1 };\ntypedef void *V1;\ntypedef void *V2;\n\
+               void take(char **);\nvoid ti(int *);\n\
+               int f(void) {\n\
+                   take((char *[]){\"a\", \"b\", \"c\", \"d\", (V1)0});\n\
+                   take((char *[]){\"a\", \"b\", (V2)0});\n\
+                   ti((int[]){A, B, 1, 2, 3});\n\
+                   ti((int[]){D, 1});\n\
+                   return 0;\n\
+               }\n";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["V1"]);
+    assert_eq!(named(src, dw::TAG_ENUMERATOR), ["D"]);
+}
+
 /// The types a function defines (a typedef, a struct, one in an inner block)
 /// are described in its entry, after its variables and blocks, as clang has
 /// them; a file-scope type of the same tag is the unit's.
@@ -777,6 +1123,40 @@ fn a_functions_types_are_its_own() {
         .collect();
     assert_eq!(outer.len(), 1);
     assert_eq!(u.dies[u.dies[outer[0]].children[0]].name(), Some("l"));
+}
+
+/// The types LLVM makes after the globals (each function's static locals
+/// and own types, then its return type, then its parameters' and locals'
+/// types) come in the order of the functions' code, not the order they were
+/// emitted in: a `static` function emitted last whose code is first has its
+/// types first (clang 23).
+#[test]
+fn a_functions_late_types_follow_its_code() {
+    use elf::dies::dw;
+    // `sh` is emitted after `g`, as it is first used, but its code is
+    // written where `f` refers to it, before `g`'s.
+    let src = "struct X { int a; };
+struct Y { int b; };
+static int sh(void);
+               int f(void) { return sh(); }
+               int g(void) { struct Y y; y.b = 2; return y.b; }
+               static int sh(void) { struct X x; x.a = 3; return x.a; }
+";
+    assert_eq!(named(src, dw::TAG_STRUCTURE_TYPE), ["X", "Y"]);
+    let src = "typedef long RX;
+typedef short RY;
+static RX sh(void);
+               int f(void) { return sh(); }
+RY g(void) { return 2; }
+               static RX sh(void) { return 3; }
+";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["RX", "RY"]);
+    let src = "static int sh(void);
+int f(void) { return sh(); }
+               int g(void) { static short s; return s; }
+               static int sh(void) { static long l; return l; }
+";
+    assert_eq!(named(src, dw::TAG_BASE_TYPE), ["long", "short", "int"]);
 }
 
 /// The entries of a unit as llvm-dwarfdump shows them: each one's depth, tag
@@ -832,32 +1212,14 @@ fn entry_tree(tool: &str, obj: &Path) -> Vec<String> {
 
 /// merlin's entries are clang's, in clang's order (see `src/debug/order.rs`):
 /// for [`VARS`], merlin-dbg's tests/vars/vars.c and every test case, at both
-/// widths, the tree of tags and names llvm-dwarfdump shows is the same, but for
-/// the cases whose entries clang's front end makes differently:
-/// - `func_ptrs.c`, `inline.c`: clang emits a `static` (or inline) function
-///   once it is used, after the others, and its entry with its code; merlin's
-///   code and entries are in the order the functions come;
-/// - `enums.c`, `designated.c`: clang describes an enum whose constant its
-///   generated code uses, even with no variable of it; merlin's parser makes
-///   constants numbers;
-/// - `static_address_casts.c`: clang keeps the type of a cast its code
-///   generator visits, which takes in some in constant initializers; merlin
-///   keeps the explicit casts its code evaluates (in a folded constant, those
-///   clang visits: not the operands `?:`, `&&` and `||` leave out; nor what a
-///   constant condition leaves out, where merlin generates what clang does).
+/// widths, the tree of tags and names llvm-dwarfdump shows is the same, with
+/// no exception.
 ///
 /// Ignored: it needs clang and llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP`
 /// name them if they are not on the PATH).
 #[test]
 #[ignore]
 fn the_entries_are_clangs_in_clangs_order() {
-    const DIFFERENT: [&str; 5] = [
-        "func_ptrs.c",
-        "inline.c",
-        "enums.c",
-        "designated.c",
-        "static_address_casts.c",
-    ];
     let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
     let tool = std::env::var("LLVM_DWARFDUMP").unwrap_or_else(|_| "llvm-dwarfdump".into());
     let dir = std::env::temp_dir().join(format!("merlin-order-{}", std::process::id()));
@@ -871,12 +1233,26 @@ fn the_entries_are_clangs_in_clangs_order() {
             )
             .unwrap(),
         ),
+        // A cast to a function's own type, which the function retains, not
+        // the unit; casts to pointers to a function's types, in a block or
+        // through a local typedef, which make the function's entry as the
+        // module begins, those types its first children.
+        (
+            "local_casts.c".into(),
+            "int g(int a) { return a; }\nint f(long v) { typedef short LT; return (LT)v; }\n".into(),
+        ),
+        (
+            "local_pointers.c".into(),
+            "typedef unsigned char u8;\ntypedef long R;\nint g(int a) { return a; }\n\
+             R f(void *v) {\n    int k = 1;\n    { struct N { u8 y; int z; }; k += ((struct N *)v)->z; }\n    \
+             typedef struct M { short s; } MT;\n    MT *mp = (MT *)v;\n    return k + mp->s;\n}\n\
+             int h(void *v) { typedef short LT; struct P { char c; }; return (LT)((struct P *)v)->c; }\n"
+                .into(),
+        ),
     ];
     for p in cases() {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        if !DIFFERENT.contains(&name.as_str()) {
-            sources.push((name, std::fs::read_to_string(&p).unwrap()));
-        }
+        sources.push((name, std::fs::read_to_string(&p).unwrap()));
     }
     for x in [Xlen::Rv32, Xlen::Rv64] {
         let bits = x.bits();
@@ -918,6 +1294,206 @@ fn the_entries_are_clangs_in_clangs_order() {
             let (ours, theirs) = (entry_tree(&tool, &ours), entry_tree(&tool, &theirs));
             assert!(ours.len() > 2, "{name}: {ours:#?}");
             assert_eq!(ours, theirs, "{name}: merlin's (left) and clang's (right), {x:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Each `.debug_line` file's name without its directory, in the table's
+/// order, and each entry's tag and name with the number of the file it is
+/// declared in, in the unit's order: what `.file` numbering decides.
+fn file_numbers(obj: &[u8]) -> (Vec<String>, Vec<String>) {
+    use elf::dies::dw;
+    let elf = elf::Elf::parse(obj).unwrap();
+    let base = |p: &str| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string();
+    let files = elf.line_tables().unwrap()[0]
+        .files
+        .iter()
+        .map(|f| base(f))
+        .collect();
+    let units = elf.debug_entries().unwrap();
+    let entries = units[0]
+        .dies
+        .iter()
+        .skip(1)
+        .map(|d| {
+            let file = d.unsigned(dw::AT_DECL_FILE).map_or("-".into(), |n| n.to_string());
+            format!("{:#x} {} {file}", d.tag, d.name().unwrap_or(""))
+        })
+        .collect();
+    (files, entries)
+}
+
+/// The files are numbered as clang 23 numbers them, which is the order LLVM
+/// needs them in (`Lines::renumber`): first the files of the enums and the
+/// types of casts, a type's after those of the types it refers to; then the
+/// files the code comes from, in the output's order; then the files of the
+/// other entries, in the order they are made. So the line table lists the
+/// same files in the same order, and every `DW_AT_decl_file` is the same,
+/// for small programs of several headers and for kernel files that include
+/// many (a struct declared in one header and defined in another, or in the
+/// file, is declared where it is defined; one never defined has no file).
+///
+/// Ignored: it needs clang (`CLANG` names it if it is not on the PATH).
+#[test]
+#[ignore]
+fn the_files_are_numbered_as_clangs() {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let dir = std::env::temp_dir().join(format!("merlin-files-{}", std::process::id()));
+    // Each case: its files, the first the one compiled.
+    let cases: &[&[(&str, &str)]] = &[
+        // An enum's and a cast type's headers first, a local's at the end.
+        &[
+            (
+                "s1.c",
+                "#include \"e1.h\"\n#include \"e2.h\"\n#include \"t1.h\"\n\
+                 int ea(void);\nint f(void) { struct s1 x = {1}; return GREEN + (int)(ul)ea(); }\n",
+            ),
+            ("e1.h", "enum col { RED, GREEN };\n"),
+            ("e2.h", "typedef unsigned long ul;\n"),
+            ("t1.h", "struct s1 { int a; };\n"),
+        ],
+        // A global's type, then each function's locals', in the code's order.
+        &[
+            (
+                "q1.c",
+                "#include \"t1.h\"\n#include \"t2.h\"\n#include \"t3.h\"\n\
+                 static int k(void);\nint f(void) { struct B x; x.b = k(); return x.b; }\n\
+                 struct C gl;\nint g(void) { struct D y; y.d = 2; return y.d; }\n\
+                 static int k(void) { struct A z; z.a = 2; return z.a; }\n",
+            ),
+            ("t1.h", "struct A { int a; };\n"),
+            ("t2.h", "struct B { int b; };\nstruct D { int d; };\n"),
+            ("t3.h", "struct C { int c; };\n"),
+        ],
+        // A cast's type's header before the code's, a global's after.
+        &[
+            (
+                "r.c",
+                "#include \"hC.h\"\n#include \"hB.h\"\n#include \"hA.h\"\nstruct C gc;\n\
+                 int main(void) { void *p = &gc; return hb(((struct A *)p)->x); }\n",
+            ),
+            ("hC.h", "struct C { int c; };\n"),
+            ("hB.h", "static inline int hb(int x) { return x + 1; }\n"),
+            ("hA.h", "struct A { int x; };\n"),
+        ],
+        // An enum the code uses, from a header after the code's.
+        &[
+            (
+                "e.c",
+                "#include \"hB.h\"\n#include \"hE.h\"\nint main(void) { return hb(E1); }\n",
+            ),
+            ("hB.h", "static inline int hb(int x) { return x + 1; }\n"),
+            ("hE.h", "enum E { E0, E1 };\n"),
+        ],
+        // A cast to a pointer to a struct whose member's typedef is in
+        // another header: that header first.
+        &[
+            (
+                "po.c",
+                "#include \"ps.h\"\nint g;\nint f(void) { return ((struct ps *)&g)->v; }\n",
+            ),
+            ("pt.h", "typedef unsigned short w16;\n"),
+            ("ps.h", "#include \"pt.h\"\nstruct ps { w16 v; };\n"),
+        ],
+        // Declared in a header, defined in the file; and one never defined.
+        &[
+            (
+                "d.c",
+                "#include \"d.h\"\nstruct p { int n; };\nstruct p vp;\nQ *vq;\n\
+                 int f(void) { return vp.n + (vq != 0); }\n",
+            ),
+            ("d.h", "struct p;\nstruct q;\ntypedef struct q Q;\n"),
+        ],
+        // A cast to a pointer to a type a function defines: its members'
+        // headers as the module begins. A cast to the function's own type,
+        // its header with the function's.
+        &[
+            (
+                "lc.c",
+                "#include \"t1.h\"\n#include \"t2.h\"\nint g(int a) { return a; }\n\
+                 int f(void *v) {\n    struct N { u8 y; s16 z; };\n    return ((struct N *)v)->z;\n}\n\
+                 int h(long v) { typedef s16 LT; return (LT)v; }\n",
+            ),
+            ("t1.h", "typedef unsigned char u8;\n"),
+            ("t2.h", "typedef short s16;\n"),
+        ],
+        &[
+            (
+                "ll.c",
+                "#include \"t2.h\"\nint g(int a) { return a; }\n\
+                 int h(long v) { typedef s16 LT; return (LT)v; }\n",
+            ),
+            ("t2.h", "typedef short s16;\n"),
+        ],
+    ];
+    let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel");
+    // Each unit: its directory, where both compilers run (so that the
+    // names are as short as the kernel's build has them), its file and
+    // whether it includes the kernel's headers.
+    let mut units: Vec<(PathBuf, &str, bool)> = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let d = dir.join(i.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        for (name, text) in case.iter() {
+            std::fs::write(d.join(name), text).unwrap();
+        }
+        units.push((d, case[0].0, false));
+    }
+    for f in ["fs.c", "pipe.c", "proc.c", "bio.c", "file.c"] {
+        units.push((kernel.clone(), f, true));
+    }
+    for x in [Xlen::Rv32, Xlen::Rv64] {
+        let bits = x.bits();
+        let abi = if bits == 64 { "lp64" } else { "ilp32" };
+        for (k, (at, name, kernel)) in units.iter().enumerate() {
+            let includes: Vec<&str> = if *kernel { vec!["include"] } else { Vec::new() };
+            let opts = Options {
+                xlen: x,
+                include_dirs: includes.iter().map(PathBuf::from).collect(),
+                ..debug_opts("dir")
+            };
+            let load = |p: &Path| std::fs::read_to_string(at.join(p)).ok();
+            let src = load(Path::new(name)).unwrap();
+            let asm = merlin::compile_with(name, &src, &opts, &load).unwrap();
+            let ours = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
+            let theirs = dir.join(format!("{k}-clang-{bits}.o"));
+            let out = std::process::Command::new(&clang)
+                .args([
+                    &format!("--target=riscv{bits}"),
+                    &format!("-march=rv{bits}ima_zicsr_zifencei"),
+                    &format!("-mabi={abi}"),
+                    "-mno-relax",
+                    "-O0",
+                    "-g",
+                    "-ffreestanding",
+                    "-fno-builtin",
+                    "-w",
+                    "-c",
+                ])
+                .args(includes.iter().map(|i| format!("-I{i}")))
+                .arg(name)
+                .arg("-o")
+                .arg(&theirs)
+                .current_dir(at)
+                .output()
+                .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let theirs = std::fs::read(&theirs).unwrap();
+            let (ours, theirs) = (file_numbers(&ours), file_numbers(&theirs));
+            assert!(ours.0.len() > 1, "{name}: {ours:#?}");
+            assert_eq!(
+                ours.0, theirs.0,
+                "{name}: merlin's files (left) and clang's (right), {x:?}"
+            );
+            assert_eq!(
+                ours.1, theirs.1,
+                "{name}: merlin's entries (left) and clang's (right), {x:?}"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
