@@ -361,11 +361,6 @@ impl Checker {
     }
 
     fn function(&mut self, f: &mut Function) {
-        for p in &f.params {
-            if p.ty.is_void() {
-                self.err(p.pos, "parameter has incomplete type 'void'");
-            }
-        }
         let Type::Func(mut ty) = f.ty() else {
             unreachable!("a function's type")
         };
@@ -426,15 +421,6 @@ impl Checker {
             f.is_static = s.is_static;
         }
         if f.body.is_none() {
-            // A declaration names each parameter once too.
-            let mut seen: HashMap<&str, Pos> = HashMap::new();
-            for p in f.params.iter().filter(|p| !p.name.is_empty()) {
-                if let Some(prev) = seen.insert(&p.name, p.pos) {
-                    let msg = format!("redefinition of parameter '{}'", p.name);
-                    self.errors
-                        .push(Error::new(p.pos, msg).note(prev, "previous declaration is here"));
-                }
-            }
             return;
         }
         // A definition needs complete parameter and result types.
@@ -928,12 +914,30 @@ impl<'a> FnChecker<'a> {
             self.locals.truncate(locals);
             let ok = checked.is_ok() && u.untyped.is_none();
             if let (Ok(()), Some((pos, msg))) = (checked, &u.untyped) {
-                self.err(*pos, msg.clone());
+                let t = u.expr.ty.decay();
+                match u.non_integer {
+                    Some((at, what)) if !t.is_integer() => self.err(at, format!("{what} '{t}'")),
+                    _ => self.err(*pos, msg.clone()),
+                };
             }
             clean.push(ok);
             if let Some(said) = &u.diagnostic {
-                if clean[clean.len() - 1 - u.with..].iter().all(|&ok| ok) {
+                let own = &clean[clean.len() - 1 - u.with..];
+                if own.iter().all(|&ok| ok) {
                     self.errors.push(said.clone());
+                } else if let Some(FileVla { at, top, inner }) = &u.vla {
+                    // A size with an error clang takes as a constant, and
+                    // folds none of the others: those are of variable
+                    // length, which file scope has not.
+                    let variable = |r: &std::ops::Range<usize>| own[r.clone()].iter().all(|&ok| ok);
+                    if top.as_ref().is_some_and(variable) {
+                        self.err(*at, "variable length array declaration not allowed at file scope");
+                    } else if inner.iter().any(variable) {
+                        self.err(
+                            *at,
+                            "variably modified type declaration not allowed at file scope",
+                        );
+                    }
                 }
             }
         }
@@ -975,13 +979,6 @@ impl<'a> FnChecker<'a> {
             let note = previous(prev, what.is_empty());
             let e = Error::new(pos, format!("redefinition of {what}'{name}'")).note(note.0, note.1);
             self.errors.push(e);
-            if !what.is_empty() && !self.func.is_empty() {
-                self.errors.push(Error::warning(
-                    pos,
-                    "omitting the parameter name in a function definition is a C23 extension",
-                    "c23-extensions",
-                ));
-            }
         }
     }
 

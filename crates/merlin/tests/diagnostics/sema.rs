@@ -22,6 +22,9 @@ pub fn cases() -> Vec<Case> {
         case("struct S { int x; } s; _Static_assert(1 ? 1 : s.y, \"m\");", &["1:49: error: no member named 'y' in 'struct S'"]),
         case("int a[1 ? 2 : nothing];", &["1:15: error: use of undeclared identifier 'nothing'"]),
         case("int *p; int a[1 ? 2 : p];", &["1:17: warning: pointer/integer type mismatch in conditional expression ('int' and 'int *') [-Wconditional-type-mismatch]", "1:15: error: size of array has non-integer type 'int *'"]),
+        case("int *p; enum { A = 1 ? 2 : p };", &["1:22: warning: pointer/integer type mismatch in conditional expression ('int' and 'int *') [-Wconditional-type-mismatch]", "1:20: error: integer constant expression must have integer type, not 'int *'"]),
+        case("int *p; int a[p];", &["1:15: error: size of array has non-integer type 'int *'"]),
+        case("struct s { int x; } v; int a[1 ? 2 : v];", &["1:32: error: incompatible operand types ('int' and 'struct s')"]),
         case("unsigned u(void); int a[1 ? 2 : u()];", &["1:23: warning: variable length array folded to constant array as an extension [-Wgnu-folding-constant]"]),
         // folding_warnings_are_clangs
         // clang gives a declarator no folding warning when one of its sizes
@@ -70,7 +73,7 @@ pub fn cases() -> Vec<Case> {
         case("int f(void); int (*fr(void))[1 ? 2 : f(1, 2)];", &["1:40: error: too many arguments to function call, expected 0, have 2", "1:5: note: 'f' declared here"]),
         case("int f(void); struct S { int (*p[2])[1 ? 2 : f(1, 2)]; } s;", &["1:47: error: too many arguments to function call, expected 0, have 2", "1:5: note: 'f' declared here"]),
         case("int f(void); int g(void) { static int (*p)[1 ? 2 : f(1, 2)]; return 0; }", &["1:54: error: too many arguments to function call, expected 0, have 2", "1:5: note: 'f' declared here"]),
-        case("int f(void) { int n = 1; char a[n]; return 0; }", &[]),
+        case("int f(void) { int n = 1; char a[n]; return 0; }", &["1:33: error: array size must be an integer constant expression (literals, enum constants, operators, casts and sizeof)"]).merlin("no variable-length arrays"),
         // for_scope
         case("int f() { for (int i = 0; i < 3; i = i + 1) {} return i; }", &["1:55: error: use of undeclared identifier 'i'"]),
         // initializer_sees_its_own_name
@@ -116,11 +119,11 @@ pub fn cases() -> Vec<Case> {
         case("char s[2] = \"abc\";", &["1:13: warning: initializer-string for char array is too long [-Wexcess-initializers]"]),
         case("int a[2] = 5;", &["1:5: error: array initializer must be an initializer list or wide string literal"]),
         case("int a[2] = \"ab\";", &["1:5: error: initializing wide char array with non-wide string literal"]),
-        case("struct p { int x, y; }; struct r { struct p p; int z; }; int f(struct p v) { struct r r = {v, .p.y = 9}; return r.p.x; }", &["1:97: warning: initializer partially overrides prior initialization of this subobject [-Winitializer-overrides]"]),
+        case("struct p { int x, y; }; struct r { struct p p; int z; }; int f(struct p v) { struct r r = {v, .p.y = 9}; return r.p.x; }", &["1:97: error: designator partially overrides an initializer of type 'struct p' given by an expression; merlin does not support this"]).merlin("a designator into a struct an expression initialized"),
         case("int a[2] = {[2] = 1};", &["1:14: error: array designator index (2) exceeds array bounds (2)"]),
         case("int a[2] = {[-1] = 1};", &["1:14: error: array designator value '-1' is negative"]),
         case("int n; int a[2] = {[n] = 1};", &["1:21: error: expression is not an integer constant expression"]),
-        case("int a[] = {[1 << 20] = 1};", &[]),
+        case("int a[] = {[1 << 20] = 1};", &["1:15: error: array designator index (1048576) is too large: merlin supports up to 1048575"]).merlin("array designators up to 2^20"),
         case("struct p { int x; } v = {.y = 1};", &["1:27: error: field designator 'y' does not refer to any field in type 'struct p'"]),
         case("struct p { int x; } v = {[0] = 1};", &["1:26: error: array designator cannot initialize non-array type 'struct p'"]),
         case("int a[2] = {.x = 1};", &["1:13: error: field designator cannot initialize a non-struct, non-union type 'int[2]'"]),
@@ -181,6 +184,10 @@ pub fn cases() -> Vec<Case> {
         case("int f() { return; }", &["1:11: error: non-void function 'f' should return a value [-Wreturn-mismatch]"]),
         case("char *f() { return 1; }", &["1:20: error: incompatible integer to pointer conversion returning 'int' from a function with result type 'char *' [-Wint-conversion]"]),
         case("void f(void x);", &["1:13: error: argument may not have 'void' type"]),
+        case("void f(int, void);", &["1:17: error: 'void' must be the first and only parameter if specified"]),
+        case("void f(void, int);", &["1:12: error: 'void' must be the first and only parameter if specified"]),
+        case("typedef void V; void f(int a, const V);", &["1:38: error: 'void' must be the first and only parameter if specified"]),
+        case("typedef void V; void f(V v);", &["1:26: error: argument may not have 'void' type"]),
         case("typedef void V; void f(const V);", &["1:23: error: 'void' as parameter must not have type qualifiers"]),
         case("int f(int a[const 3]) { a = 0; return 0; }", &["1:27: error: cannot assign to variable 'a' with const-qualified type 'int *const'", "1:11: note: variable 'a' declared const here"]),
         // conditions_must_be_scalar
@@ -202,7 +209,7 @@ pub fn cases() -> Vec<Case> {
         case("int z(void);\nint f() { return z(0); }", &["2:20: error: too many arguments to function call, expected 0, have 1", "1:5: note: 'z' declared here"]),
         // redefinitions
         case("int f() { int a; int a; return 0; }", &["1:22: error: redefinition of 'a'", "1:15: note: previous definition is here"]),
-        case("int f(int a, int a) { return a; }", &["1:18: error: redefinition of parameter 'a'", "1:11: note: previous declaration is here", "1:18: warning: omitting the parameter name in a function definition is a C23 extension [-Wc23-extensions]"]),
+        case("int f(int a, int a) { return a; }", &["1:18: error: redefinition of parameter 'a'", "1:11: note: previous declaration is here"]).then(&["1:18: warning: omitting the parameter name in a function definition is a C23 extension [-Wc23-extensions]"]),
         case("int f(int a) { int a = 1; return a; }", &["1:20: error: redefinition of 'a'", "1:11: note: previous definition is here"]),
         case("int f() { return 0; }\nint f() { return 1; }", &["2:5: error: redefinition of 'f'", "1:5: note: previous definition is here"]),
         case("int f();\nint f() { return 0; }\nint f() { return 1; }", &["3:5: error: redefinition of 'f'", "2:5: note: previous definition is here"]),

@@ -62,6 +62,10 @@ pub struct Unevaluated {
     /// and took the constant to be this error (where, what) unless sema
     /// finds one in the expression.
     pub untyped: Option<(Pos, String)>,
+    /// clang's error for a constant whose type is no integer, which names
+    /// the type (`size of array has non-integer type`), where the parser
+    /// could not tell, and where: sema gives it in place of `untyped`'s.
+    pub non_integer: Option<(Pos, &'static str)>,
     /// The operand of a `?:` the parser folded, not one of `sizeof`.
     pub folded: bool,
     /// What is said of the array size a declarator folds, kept with the
@@ -72,10 +76,26 @@ pub struct Unevaluated {
     /// clang says nothing of a declarator whose size is in error.
     pub diagnostic: Option<crate::Error>,
     pub with: usize,
+    /// For a declarator at file scope whose folded sizes clang folds with
+    /// its warning ([`Unevaluated::diagnostic`]): those sizes ([`FileVla`]).
+    pub vla: Option<FileVla>,
     /// The parameters in scope where it was (C's prototype scope): those
     /// declared before it in the parameter lists it is in, outermost first,
     /// so `char a[sizeof n]` after `int n` sizes by that `n`.
     pub params: Vec<(String, Type, Pos)>,
+}
+
+/// The sizes a declarator at file scope folds, as the ranges of their
+/// operands among the declarator's [`Unevaluated`]s (those `with` the
+/// last): its own array's, if it is one, and the others'. If one of its
+/// operands has an error, clang folds none of them: one that has none is
+/// a variable-length array, clang's error at file scope (at `at`, the
+/// declarator's name).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileVla {
+    pub at: Pos,
+    pub top: Option<std::ops::Range<usize>>,
+    pub inner: Vec<std::ops::Range<usize>>,
 }
 
 impl Program {

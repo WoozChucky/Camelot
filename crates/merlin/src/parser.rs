@@ -466,6 +466,8 @@ struct Array {
     quals: Option<(Quals, bool)>,
     /// Where the size is if the parser folded it ([`Parser::folded`]).
     folded: Option<Pos>,
+    /// Which of the [`Unevaluated`]s waiting are its size's.
+    entries: std::ops::Range<usize>,
     /// Whether the size is a constant (or there is none): if not, sema
     /// reports it ([`Parser::variable_sizes`]).
     constant: bool,
@@ -547,6 +549,10 @@ struct Decl {
     /// ([`Parser::folded`]), if one is, and where the folded ones are.
     folded: Option<Pos>,
     reach: Reach,
+    /// Its folded sizes' [`Unevaluated`]s (from its first): its own
+    /// array's, if it is one and folded, and the others' (see
+    /// [`Unevaluated::vla`]).
+    folded_sizes: (Option<std::ops::Range<usize>>, Vec<std::ops::Range<usize>>),
     /// Where its own [`Unevaluated`]s are among those waiting: they came
     /// as it was parsed.
     unevaluated: std::ops::Range<usize>,
@@ -763,7 +769,17 @@ impl Parser<'_> {
     /// is sure: false if the parser could not type an operand `?:` does not
     /// choose, or found no constant, whose error sema will report (`msg` if
     /// it finds none); the value is then 1, which nothing uses.
-    fn const_int(&self, e: &mut Expr, at: Pos, msg: &str) -> Result<(i128, bool), Error> {
+    /// `non_integer` is clang's error for a constant of a type that is no
+    /// integer, if it has one there: with it, an operand not chosen that
+    /// is none makes sema check the whole expression, whose type clang
+    /// reports (`1 ? 2 : p` is an `int *`).
+    fn const_int(
+        &self,
+        e: &mut Expr,
+        at: Pos,
+        msg: &str,
+        non_integer: Option<&'static str>,
+    ) -> Result<(i128, bool), Error> {
         let mark = self.unevaluated.borrow().len();
         let original = e.clone();
         self.resolve_sizeof(e);
@@ -777,9 +793,11 @@ impl Parser<'_> {
             self.unevaluated.borrow_mut().push(Unevaluated {
                 expr: original,
                 untyped: Some((at, msg.to_string())),
+                non_integer: non_integer.map(|m| (at, m)),
                 folded: false,
                 diagnostic: None,
                 with: 0,
+                vla: None,
                 params: self.prototype.borrow().clone(),
             });
             return Ok((1, false));
@@ -790,6 +808,22 @@ impl Parser<'_> {
                 *error = (at, msg.to_string());
                 sure = false;
             }
+        }
+        if !sure && non_integer.is_some() {
+            let mut us = self.unevaluated.borrow_mut();
+            us.truncate(mark);
+            self.folding.set(false);
+            us.push(Unevaluated {
+                expr: original,
+                untyped: Some((at, msg.to_string())),
+                non_integer: non_integer.map(|m| (at, m)),
+                folded: false,
+                diagnostic: None,
+                with: 0,
+                vla: None,
+                params: self.prototype.borrow().clone(),
+            });
+            return Ok((1, false));
         }
         Ok((v, sure))
     }
@@ -805,9 +839,11 @@ impl Parser<'_> {
                     self.unevaluated.borrow_mut().push(Unevaluated {
                         expr: (**x).clone(),
                         untyped: None,
+                        non_integer: None,
                         folded: false,
                         diagnostic: None,
                         with: 0,
+                        vla: None,
                         params: self.prototype.borrow().clone(),
                     });
                     e.kind = ExprKind::SizeofType(t);
@@ -898,9 +934,11 @@ impl Parser<'_> {
         self.unevaluated.borrow_mut().push(Unevaluated {
             expr: original,
             untyped,
+            non_integer: None,
             folded: true,
             diagnostic: None,
             with: 0,
+            vla: None,
             params: self.prototype.borrow().clone(),
         });
         self.folding.set(true);
@@ -965,6 +1003,17 @@ impl Parser<'_> {
             Error::new(at, NOT_CONSTANT_SIZE)
         };
         self.fold_diagnostic(d, said);
+        if folds && ctx == Ctx::File {
+            let mut us = self.unevaluated.borrow_mut();
+            let u = us[d.unevaluated.clone()]
+                .last_mut()
+                .expect("a folded size has its operand");
+            u.vla = Some(FileVla {
+                at: d.pos,
+                top: d.folded_sizes.0.clone(),
+                inner: d.folded_sizes.1.clone(),
+            });
+        }
     }
 
     /// A type name's folded size. A compound literal's array (`(int[F]){1,
@@ -1657,7 +1706,8 @@ impl Parser<'_> {
                 let at = self.here();
                 let mut e = self.cond()?;
                 let msg = "expression is not an integer constant expression";
-                match self.const_int(&mut e, at, msg)? {
+                let typed = Some("integer constant expression must have integer type, not");
+                match self.const_int(&mut e, at, msg, typed)? {
                     (v, true) => v,
                     // Sema reports the error.
                     (_, false) => 0,
@@ -1817,16 +1867,24 @@ impl Parser<'_> {
                         size,
                         quals,
                         folded: None,
+                        entries: 0..0,
                         constant: true,
                     }));
                     dims += 1;
                     continue;
                 }
+                let first = self.unevaluated.borrow().len();
                 let mut e = self.cond()?;
                 self.expect_close("]", open)?;
                 let outer = self.folding.replace(false);
-                let (n, sure) = self.const_int(&mut e, size, NOT_CONSTANT_SIZE)?;
+                let (n, sure) = self.const_int(
+                    &mut e,
+                    size,
+                    NOT_CONSTANT_SIZE,
+                    Some("size of array has non-integer type"),
+                )?;
                 let folded = self.folding.replace(outer).then_some(size);
+                let entries = first..self.unevaluated.borrow().len();
                 // Not sure: sema reports the error, and the size is not used.
                 out.push(Derive::Array(Array {
                     len: Some(if sure { n } else { 1 }),
@@ -1834,6 +1892,7 @@ impl Parser<'_> {
                     size,
                     quals,
                     folded,
+                    entries,
                     constant: sure,
                 }));
                 dims += 1;
@@ -1860,6 +1919,7 @@ impl Parser<'_> {
         let mut func = None;
         let mut prototyped = false;
         let mut folded = None;
+        let mut folded_sizes = (None, Vec::new());
         // The sizes that are not constant, which sema reports.
         let mut sizes = Vec::new();
         // An array larger than merlin lays out, though clang takes it.
@@ -1876,6 +1936,15 @@ impl Parser<'_> {
                 }
                 Derive::Array(a) => {
                     folded = folded.or(a.folded);
+                    // The last step is what is declared: its own array.
+                    if a.folded.is_some() {
+                        let entries = a.entries.start - start..a.entries.end - start;
+                        if i + 1 == steps {
+                            folded_sizes.0 = Some(entries);
+                        } else {
+                            folded_sizes.1.push(entries);
+                        }
+                    }
                     if !a.constant {
                         sizes.push(a.size);
                     }
@@ -1983,6 +2052,7 @@ impl Parser<'_> {
             prototyped,
             folded,
             reach: folded_reach,
+            folded_sizes,
             unevaluated: start..self.unevaluated.borrow().len(),
         };
         self.variable_sizes(&d, ctx, &sizes, variable);
@@ -2073,6 +2143,24 @@ impl Parser<'_> {
             // Where the name is, or would be: clang's place for a
             // parameter's diagnostics.
             let pos = d.pos;
+            // Any other `void` parameter is clang's error: a named one, a
+            // qualified one alone (reported at the `(`), or one among
+            // others.
+            if d.ty.is_void() {
+                if !d.name.is_empty() {
+                    return Err(Error::new(pos, "argument may not have 'void' type"));
+                }
+                if params.is_empty() && self.is_punct(")") {
+                    return Err(Error::new(
+                        open,
+                        "'void' as parameter must not have type qualifiers",
+                    ));
+                }
+                return Err(Error::new(
+                    pos,
+                    "'void' must be the first and only parameter if specified",
+                ));
+            }
             if params.len() == MAX_PARAMS {
                 return Err(Error::new(
                     pos,
@@ -2581,7 +2669,7 @@ impl Parser<'_> {
         self.expect_semi("after '_Static_assert'")?;
         let original = cond.clone();
         let not_constant = "static assertion expression is not an integral constant expression";
-        match self.const_int(&mut cond, at, not_constant)? {
+        match self.const_int(&mut cond, at, not_constant, None)? {
             // Not sure of the value: sema reports the error.
             (v, sure) if !sure || v != 0 => Ok(()),
             _ => {
@@ -3722,8 +3810,8 @@ mod tests {
         let p = prog("typedef void V; int f(V); int g(V) { return 0; }");
         assert!(funcs(&p).iter().all(|f| f.params.is_empty()));
         assert_eq!(globals("typedef void V; int (*h)(V);")[0], "int (*h)(void)");
-        // Only a lone, unnamed, unqualified void is "no parameters".
-        prog("typedef void V; int f(V x); int g(const V); int h(V, int);");
+        // Only a lone, unnamed, unqualified void is "no parameters"
+        // (tests/diagnostics has the errors of the others).
     }
 
     #[test]
