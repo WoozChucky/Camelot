@@ -89,7 +89,7 @@ use crate::consteval;
 use crate::lexer::{Kw, Tok, Token};
 use crate::types::{
     align_up, common, ptr_size, EnumType, IntKind, Quals, Record, Spelled, Spelling, Spellings, Type,
-    TypedefName, Xlen, MAX_OBJECT_SIZE,
+    TypedefName, Unprototyped, Xlen, MAX_OBJECT_SIZE,
 };
 use crate::{Error, Pos};
 use std::cell::{Cell, RefCell};
@@ -672,7 +672,7 @@ impl Parser<'_> {
     /// [`Self::not_chosen`] says.
     fn resolve_sizeof(&self, e: &mut Expr) {
         match &mut e.kind {
-            ExprKind::SizeofExpr(x) => {
+            ExprKind::SizeofExpr(x, _) => {
                 if let Some(t) = self.operand_type(x) {
                     self.unevaluated.borrow_mut().push(Unevaluated {
                         expr: (**x).clone(),
@@ -696,6 +696,7 @@ impl Parser<'_> {
                 name,
                 arrow,
                 offset,
+                ..
             } => {
                 self.resolve_sizeof(base);
                 let record = if *arrow {
@@ -897,7 +898,7 @@ impl Parser<'_> {
                 Type::Array(elem, None) => Some(Type::array((**elem).clone(), Some(init_len(elem, init)?))),
                 t => Some(t.clone()),
             },
-            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => Some(Type::Int(IntKind::size_t(self.xlen))),
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(..) => Some(Type::Int(IntKind::size_t(self.xlen))),
             ExprKind::Var { name, .. } => match self.lookup_name(name)? {
                 Name::Object(t) => Some(t.clone()),
                 _ => None,
@@ -1644,6 +1645,7 @@ impl Parser<'_> {
                     if let Type::Func(f) = &mut ty {
                         f.spelled =
                             Spellings(params.iter().map(|p| (p.ty.clone(), p.spelled.clone())).collect());
+                        f.unprototyped = Unprototyped(!with_prototype);
                     }
                     size = None;
                     if i + 1 == steps {
@@ -1813,8 +1815,8 @@ impl Parser<'_> {
         loop {
             if self.is_punct(".") {
                 let pos = self.advance().pos;
-                let (name, _) = self.expect_ident("a member name")?;
-                out.push(Designator::Member(name, pos));
+                let (name, at) = self.expect_ident("a member name")?;
+                out.push(Designator::Member(name, pos, at));
             } else if self.is_punct("[") {
                 let pos = self.advance().pos;
                 let index = self.cond()?;
@@ -2192,8 +2194,9 @@ impl Parser<'_> {
         let kind = match self.peek().clone() {
             Tok::Punct("{") => StmtKind::Block(self.block_body(true)?),
             Tok::Punct(";") => {
+                let glued = self.after_prev().line == self.here().line;
                 self.advance();
-                StmtKind::Empty
+                StmtKind::Empty { glued }
             }
             Tok::Ident(name) if matches!(self.peek_at(1), Tok::Punct(":")) => {
                 self.advance();
@@ -2288,9 +2291,9 @@ impl Parser<'_> {
             }
             Tok::Kw(Kw::Goto) => {
                 self.advance();
-                let (name, _) = self.expect_ident("a label name after 'goto'")?;
+                let (name, at) = self.expect_ident("a label name after 'goto'")?;
                 self.expect_semi("after 'goto'")?;
-                StmtKind::Goto(name)
+                StmtKind::Goto(name, at)
             }
             Tok::Kw(Kw::Else) => return Err(Error::new(pos, "'else' without a matching 'if'")),
             _ => {
@@ -2481,12 +2484,13 @@ impl Parser<'_> {
                     let ty = d.ty;
                     if literal {
                         let e = self.compound_literal(ty, at)?;
-                        ExprKind::SizeofExpr(Box::new(self.postfix_ops(e)?))
+                        ExprKind::SizeofExpr(Box::new(self.postfix_ops(e)?), at)
                     } else {
                         ExprKind::SizeofType(ty)
                     }
                 } else {
-                    ExprKind::SizeofExpr(Box::new(self.nested(Self::unary)?))
+                    let at = self.here();
+                    ExprKind::SizeofExpr(Box::new(self.nested(Self::unary)?), at)
                 }
             }
             _ => return self.postfix(),
@@ -2529,9 +2533,9 @@ impl Parser<'_> {
                 }
                 Tok::Punct("(") => {
                     self.enter()?;
-                    self.advance();
+                    let open = self.advance().pos;
                     let mut args = Vec::new();
-                    if !self.eat_punct(")") {
+                    if !self.is_punct(")") {
                         loop {
                             if args.len() == MAX_PARAMS {
                                 return Err(Error::new(
@@ -2540,7 +2544,7 @@ impl Parser<'_> {
                                 ));
                             }
                             args.push(self.assign()?);
-                            if self.eat_punct(")") {
+                            if self.is_punct(")") {
                                 break;
                             }
                             if !self.eat_punct(",") {
@@ -2548,22 +2552,24 @@ impl Parser<'_> {
                             }
                         }
                     }
+                    let close = self.advance().pos;
                     // A call is positioned at its callee, as clang reports it.
                     let pos = e.pos;
-                    e = Expr::new(ExprKind::call(e, args), pos);
+                    e = Expr::new(ExprKind::call(e, args, (open, close)), pos);
                     continue;
                 }
                 Tok::Punct(p @ ("." | "->")) => {
                     let arrow = *p == "->";
                     self.enter()?;
                     let pos = self.advance().pos;
-                    let (name, _) = self.expect_ident("a member name")?;
+                    let (name, at) = self.expect_ident("a member name")?;
                     e = Expr::new(
                         ExprKind::Member {
                             base: Box::new(e),
                             name,
                             arrow,
                             offset: 0,
+                            at,
                         },
                         pos,
                     );
@@ -2673,10 +2679,11 @@ impl Parser<'_> {
             }
             "__builtin_va_arg" => {
                 self.expect_punct(",")?;
+                let at = self.here();
                 let ty = self.type_name()?;
                 self.expect_punct(")")?;
                 return Ok(Expr {
-                    kind: ExprKind::VaArg(first),
+                    kind: ExprKind::VaArg(first, at),
                     // The value is a copy: qualifiers mean nothing on it.
                     ty: ty.unqual().clone(),
                     pos,
@@ -2785,7 +2792,7 @@ mod tests {
             ExprKind::Deref(x) => format!("(* {})", sx(x)),
             ExprKind::Cast { x, .. } => format!("(cast {} {})", e.ty, sx(x)),
             ExprKind::SizeofType(t) => format!("(sizeof {t})"),
-            ExprKind::SizeofExpr(x) => format!("(sizeof {})", sx(x)),
+            ExprKind::SizeofExpr(x, _) => format!("(sizeof {})", sx(x)),
             ExprKind::Cond(c, a, b) => format!("(? {} {} {})", sx(c), sx(a), sx(b)),
             ExprKind::Comma(a, b) => format!("(, {} {})", sx(a), sx(b)),
             ExprKind::Member {
@@ -2802,7 +2809,7 @@ mod tests {
                 s + ")"
             }
             ExprKind::VaStart { ap, last } => format!("(va_start {} {})", sx(ap), sx(last)),
-            ExprKind::VaArg(ap) => format!("(va_arg {} {})", sx(ap), e.ty),
+            ExprKind::VaArg(ap, _) => format!("(va_arg {} {})", sx(ap), e.ty),
             ExprKind::VaEnd(ap) => format!("(va_end {})", sx(ap)),
             ExprKind::VaCopy(d, s) => format!("(va_copy {} {})", sx(d), sx(s)),
             ExprKind::CompoundLit { init, .. } => format!("(literal {} {})", e.ty, si(init)),
@@ -2817,7 +2824,7 @@ mod tests {
                 let mut s = String::new();
                 for d in ds {
                     match d {
-                        Designator::Member(name, _) => s += &format!(".{name}"),
+                        Designator::Member(name, ..) => s += &format!(".{name}"),
                         Designator::Index(e, _) => s += &format!("[{}]", sx(e)),
                     }
                 }
@@ -2845,7 +2852,7 @@ mod tests {
             StmtKind::Block(b) => format!("{{{}}}", b.iter().map(ss).collect::<Vec<_>>().join(" ")),
             StmtKind::Decl(ds) => format!("(decl {})", ds.iter().map(sd).collect::<Vec<_>>().join(", ")),
             StmtKind::Expr(e) => format!("{};", sx(e)),
-            StmtKind::Empty => ";".into(),
+            StmtKind::Empty { .. } => ";".into(),
             StmtKind::Unevaluated(us) => format!(
                 "(unevaluated {})",
                 us.iter().map(|u| sx(&u.expr)).collect::<Vec<_>>().join(" ")
@@ -2877,7 +2884,7 @@ mod tests {
             StmtKind::Case { expr, body, .. } => format!("(case {} {})", sx(expr), ss(body)),
             StmtKind::Default { body, .. } => format!("(default {})", ss(body)),
             StmtKind::Label { name, body } => format!("({name}: {})", ss(body)),
-            StmtKind::Goto(name) => format!("(goto {name})"),
+            StmtKind::Goto(name, _) => format!("(goto {name})"),
         }
     }
 

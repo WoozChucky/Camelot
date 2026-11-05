@@ -578,14 +578,14 @@ impl<'a> Interp<'a> {
                 self.expr(e, frame)?;
                 Flow::Next
             }
-            StmtKind::Empty | StmtKind::Unevaluated(_) => Flow::Next,
+            StmtKind::Empty { .. } | StmtKind::Unevaluated(_) => Flow::Next,
             StmtKind::Return(e) => Flow::Return(match e {
                 Some(e) => self.expr(e, frame)?,
                 None => 0,
             }),
             StmtKind::Break => Flow::Break,
             StmtKind::Continue => Flow::Continue,
-            StmtKind::Goto(label) => Flow::Goto(label.clone()),
+            StmtKind::Goto(label, _) => Flow::Goto(label.clone()),
         })
     }
 
@@ -735,7 +735,7 @@ impl<'a> Interp<'a> {
                 let v = self.expr(from, frame)?;
                 convert(v, &e.ty, x)
             }
-            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => return Err("sizeof survived sema".into()),
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(..) => return Err("sizeof survived sema".into()),
             ExprKind::Cond(c, a, b) => {
                 if self.expr(c, frame)? != 0 {
                     self.expr(a, frame)?
@@ -765,7 +765,7 @@ impl<'a> Interp<'a> {
                 self.store(a, &ap.ty, area.into())?;
                 0
             }
-            ExprKind::VaArg(ap) => {
+            ExprKind::VaArg(ap, _) => {
                 let a = self.addr(ap, frame)?;
                 let mut at = self.load(a, &ap.ty)?;
                 let pass = abi::classify(&e.ty, x);

@@ -246,17 +246,17 @@ pub enum Init {
 
 /// One step of a designation: a member (`.name`) or an array element
 /// (`[index]`, a constant expression), each with the position of its `.` or
-/// `[`.
+/// `[` (and a member's, of its name too).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Designator {
-    Member(String, Pos),
+    Member(String, Pos, Pos),
     Index(Expr, Pos),
 }
 
 impl Designator {
     pub fn pos(&self) -> Pos {
         match self {
-            Designator::Member(_, pos) | Designator::Index(_, pos) => *pos,
+            Designator::Member(_, pos, _) | Designator::Index(_, pos) => *pos,
         }
     }
 }
@@ -290,8 +290,12 @@ pub enum StmtKind {
     Decl(Vec<Declarator>),
     /// `expr;`
     Expr(Expr),
-    /// `;`
-    Empty,
+    /// `;`. `glued`: on the line of the token before it (the `)` of the
+    /// `if` or loop whose body it is), where clang's `-Wempty-body` warns
+    /// of it.
+    Empty {
+        glued: bool,
+    },
     If {
         cond: Expr,
         then: Box<Stmt>,
@@ -352,8 +356,8 @@ pub enum StmtKind {
         name: String,
         body: Box<Stmt>,
     },
-    /// `goto name;`
-    Goto(String),
+    /// `goto name;`, with where the name is.
+    Goto(String, Pos),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -501,8 +505,10 @@ pub enum ExprKind {
     },
     /// `sizeof (type)`; sema replaces it with its value.
     SizeofType(Type),
-    /// `sizeof expr` (not evaluated); sema replaces it with its value.
-    SizeofExpr(Box<Expr>),
+    /// `sizeof expr` (not evaluated), with where the operand begins (its
+    /// `(`, if it has one: clang reports an incomplete type there); sema
+    /// replaces it with its value.
+    SizeofExpr(Box<Expr>, Pos),
     /// `c ? a : b`
     Cond(Box<Expr>, Box<Expr>, Box<Expr>),
     /// `a, b`
@@ -513,6 +519,9 @@ pub enum ExprKind {
         name: String,
         arrow: bool,
         offset: u32,
+        /// Where the member's name is (the expression is at the `.` or
+        /// `->`): clang reports a member it cannot find there.
+        at: Pos,
     },
     /// `callee(args)`. The callee is a function designator (a function's
     /// name, or `*fp`) or a pointer to a function. Set by sema when the call
@@ -524,6 +533,9 @@ pub enum ExprKind {
         args: Vec<Expr>,
         result: Option<LocalId>,
         arg_copies: Vec<Option<LocalId>>,
+        /// Where its `(` and its `)` are, where clang reports a callee that
+        /// is no function and missing arguments.
+        parens: (Pos, Pos),
     },
     /// `__builtin_va_start(ap, last)` (`va_start`, in a variadic function
     /// whose last named parameter is `last`): points the `va_list` `ap` at
@@ -534,8 +546,8 @@ pub enum ExprKind {
     },
     /// `__builtin_va_arg(ap, T)` (`va_arg`): the variadic argument `ap`
     /// points at, of type `T` (the expression's type), and moves `ap` to
-    /// the next one.
-    VaArg(Box<Expr>),
+    /// the next one; with where `T` is written.
+    VaArg(Box<Expr>, Pos),
     /// `__builtin_va_end(ap)`: nothing to do. Sema checks it and turns it
     /// into `(void)ap`.
     VaEnd(Box<Expr>),
@@ -553,12 +565,13 @@ pub enum ExprKind {
 
 impl ExprKind {
     /// A call, before sema: no temporaries yet.
-    pub fn call(callee: Expr, args: Vec<Expr>) -> ExprKind {
+    pub fn call(callee: Expr, args: Vec<Expr>, parens: (Pos, Pos)) -> ExprKind {
         ExprKind::Call {
             callee: Box::new(callee),
             args,
             result: None,
             arg_copies: Vec::new(),
+            parens,
         }
     }
 }
@@ -683,7 +696,7 @@ impl Dumper {
                 let mut text = String::new();
                 for ds in designators {
                     match ds {
-                        Designator::Member(name, _) => text += &format!(".{name}"),
+                        Designator::Member(name, ..) => text += &format!(".{name}"),
                         Designator::Index(e, _) => {
                             text += &format!("[{}]", crate::consteval::int(e, self.xlen).unwrap_or(0))
                         }
@@ -713,7 +726,7 @@ impl Dumper {
                 self.line(d, s.pos, "ExprStmt");
                 self.expr(d + 1, e);
             }
-            StmtKind::Empty => self.line(d, s.pos, "Empty"),
+            StmtKind::Empty { .. } => self.line(d, s.pos, "Empty"),
             StmtKind::Unevaluated(us) => {
                 self.line(d, s.pos, "Unevaluated");
                 for u in us {
@@ -786,7 +799,7 @@ impl Dumper {
                 self.line(d, s.pos, &format!("Label {name}"));
                 self.stmt(d + 1, body);
             }
-            StmtKind::Goto(name) => self.line(d, s.pos, &format!("Goto {name}")),
+            StmtKind::Goto(name, _) => self.line(d, s.pos, &format!("Goto {name}")),
         }
     }
 
@@ -832,7 +845,7 @@ impl Dumper {
                 self.expr(d + 1, x);
             }
             ExprKind::SizeofType(t) => node(self, format!("Sizeof ({t})")),
-            ExprKind::SizeofExpr(x) => {
+            ExprKind::SizeofExpr(x, _) => {
                 node(self, "Sizeof".to_string());
                 self.expr(d + 1, x);
             }
@@ -852,6 +865,7 @@ impl Dumper {
                 name,
                 arrow,
                 offset,
+                ..
             } => {
                 let op = if *arrow { "->" } else { "." };
                 node(self, format!("Member {op}{name} (offset {offset})"));
@@ -862,6 +876,7 @@ impl Dumper {
                 args,
                 result,
                 arg_copies,
+                ..
             } => {
                 let mut text = match callee.direct_callee() {
                     Some(name) => format!("Call {name}"),
@@ -889,7 +904,7 @@ impl Dumper {
                 self.expr(d + 1, ap);
                 self.expr(d + 1, last);
             }
-            ExprKind::VaArg(ap) => {
+            ExprKind::VaArg(ap, _) => {
                 node(self, "VaArg".to_string());
                 self.expr(d + 1, ap);
             }

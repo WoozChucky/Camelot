@@ -310,40 +310,64 @@ pub fn compile_warned(
 }
 
 /// The front end after the preprocessor: tokens, syntax tree, checks. The
-/// errors come with the warnings, in the order of their positions.
+/// errors come with the warnings, in the order clang gives them.
 fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec<Error>> {
-    // The lexer's diagnostics, then everything after: clang goes on after
+    // The preprocessor's and the lexer's diagnostics: clang goes on after
     // an error in a literal, or a token that is none, and so does merlin.
-    let mut diagnostics = pp.warnings.clone();
-    let (toks, lexed) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|mut e| {
-        diagnostics.append(&mut e);
-        diagnostics.clone()
+    let mut lexed = pp.warnings.clone();
+    let (toks, more) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|mut e| {
+        lexed.append(&mut e);
+        lexed.clone()
     })?;
-    diagnostics.extend(lexed);
-    let mut prog = match parser::parse_salvaging(&toks, xlen) {
-        Ok(prog) => prog,
+    lexed.extend(more);
+    let (prog, checked) = match parser::parse_salvaging(&toks, xlen) {
+        Ok(mut prog) => {
+            let checked = match sema::check(&mut prog) {
+                Ok(()) => std::mem::take(&mut prog.warnings),
+                Err(all) => all,
+            };
+            (Some(prog), checked)
+        }
         Err(salvaged) => {
             let (e, mut partial) = *salvaged;
             // The warnings of what came before a syntax error come with it,
             // as clang gives them; not the errors of what it cut short.
-            let _ = sema::check(&mut partial);
-            diagnostics.extend(partial.warnings);
-            diagnostics.push(e);
-            diagnostics.sort_by_key(|e| e.pos);
-            return Err(diagnostics);
+            let all = match sema::check(&mut partial) {
+                Ok(()) => partial.warnings,
+                Err(all) => all,
+            };
+            let mut checked: Vec<Error> = all.into_iter().filter(Error::is_warning).collect();
+            checked.push(e);
+            (None, checked)
         }
     };
-    let checked = sema::check(&mut prog);
-    diagnostics.append(&mut prog.warnings);
-    if let Err(errors) = checked {
-        diagnostics.extend(errors);
+    let diagnostics = in_clangs_order(lexed, checked);
+    match prog {
+        Some(mut prog) if diagnostics.iter().all(Error::is_warning) => {
+            prog.warnings = diagnostics;
+            Ok(prog)
+        }
+        _ => Err(diagnostics),
     }
-    diagnostics.sort_by_key(|e| e.pos);
-    if diagnostics.iter().any(|d| !d.is_warning()) {
-        return Err(diagnostics);
+}
+
+/// The diagnostics of the lexer (with the preprocessor's) and those of the
+/// parser and sema, in the order clang gives them: clang lexes as it
+/// parses, so a token's diagnostic comes among those of the code around it,
+/// by its position, while the parser's and sema's keep the order they were
+/// found in (which is not always that of their positions: clang reports a
+/// loop's empty body at the end of its block, say).
+fn in_clangs_order(lexed: Vec<Error>, checked: Vec<Error>) -> Vec<Error> {
+    let mut out = Vec::with_capacity(lexed.len() + checked.len());
+    let mut lexed = lexed.into_iter().peekable();
+    for d in checked {
+        while let Some(l) = lexed.next_if(|l| l.pos <= d.pos) {
+            out.push(l);
+        }
+        out.push(d);
     }
-    prog.warnings = diagnostics;
-    Ok(prog)
+    out.extend(lexed);
+    out
 }
 
 /// Compiles the C file at `path`, with headers from the file system.

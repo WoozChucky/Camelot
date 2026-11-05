@@ -251,7 +251,7 @@ fn step(t: &Type, xlen: Xlen) -> Option<i128> {
     if t.is_integer() {
         return Some(1);
     }
-    Some(i128::from(t.pointee()?.size(xlen)?))
+    Some(i128::from(t.step(xlen)?))
 }
 
 /// Whether a constant is true, as a condition tests it: an object's

@@ -74,8 +74,11 @@ impl Pass {
 }
 
 /// How a value of type `ty` (complete, not void) travels on the target.
+/// An array is an aggregate as a struct is: no argument is one (it decays
+/// to a pointer), but `va_arg` may read one, as clang reads it (the words
+/// in place, or through the address of a copy).
 pub fn classify(ty: &Type, x: Xlen) -> Pass {
-    if !ty.is_record() {
+    if !ty.is_record() && !ty.is_array() {
         return if ty.size(x) == Some(2 * ptr_size(x)) {
             Pass::Pair
         } else {
@@ -238,6 +241,7 @@ mod tests {
             params: vec![Type::INT, record(6), record(16), record(2)],
             variadic: false,
             spelled: Default::default(),
+            unprototyped: Default::default(),
         };
         let (regs, total) = arguments(&f, Xlen::Rv32);
         assert_eq!(
@@ -256,6 +260,7 @@ mod tests {
             params: vec![Type::INT],
             variadic: false,
             spelled: Default::default(),
+            unprototyped: Default::default(),
         };
         assert_eq!(arguments(&f, Xlen::Rv32), (vec![(1, Pass::Scalar)], 2));
         // Past a7, words go on the stack; a pair may straddle a7 and the stack.

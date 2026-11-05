@@ -1879,7 +1879,7 @@ impl<'a> FuncGen<'a, '_> {
         match &s.kind {
             StmtKind::Block(_)
             | StmtKind::Decl(_)
-            | StmtKind::Empty
+            | StmtKind::Empty { .. }
             | StmtKind::Unevaluated(_)
             | StmtKind::If { .. }
             | StmtKind::While { .. }
@@ -1920,7 +1920,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             StmtKind::Expr(e) => self.expr(e),
             // Only checked: nothing is evaluated.
-            StmtKind::Empty | StmtKind::Unevaluated(_) => {}
+            StmtKind::Empty { .. } | StmtKind::Unevaluated(_) => {}
             StmtKind::If { cond, then, els } => {
                 // A constant condition runs one arm: only that one is
                 // generated, unless the other has a label (see [`elide`]).
@@ -2172,7 +2172,7 @@ impl<'a> FuncGen<'a, '_> {
                 }
                 self.stmt(body);
             }
-            StmtKind::Goto(name) => {
+            StmtKind::Goto(name, _) => {
                 let label = self.goto_label(name);
                 self.ins("j", label);
             }
@@ -2575,7 +2575,7 @@ impl<'a> FuncGen<'a, '_> {
             ExprKind::IncDec { inc, prefix, target } => {
                 let ty = &target.ty;
                 let step = match ty.unqual() {
-                    Type::Ptr(to) => to.size(self.xlen).expect("sema: pointer to a complete type") as i32,
+                    Type::Ptr(_) => ty.step(self.xlen).expect("sema: pointer to a complete type") as i32,
                     _ => 1,
                 };
                 let delta = if *inc { step } else { -step };
@@ -2702,7 +2702,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.expr(x);
                 self.convert(&x.ty, &e.ty);
             }
-            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => unreachable!("sema folds sizeof"),
+            ExprKind::SizeofType(_) | ExprKind::SizeofExpr(..) => unreachable!("sema folds sizeof"),
             // A constant condition: only the operand it chooses, as clang has
             // it (an expression has no labels to keep).
             ExprKind::Cond(c, a, b) if self.constant_condition(c).is_some() => {
@@ -2743,6 +2743,7 @@ impl<'a> FuncGen<'a, '_> {
                 args,
                 result,
                 arg_copies,
+                ..
             } => self.call(callee, args, *result, arg_copies),
             ExprKind::CompoundLit { init, local } => {
                 self.compound_literal(&e.ty, init, *local);
@@ -2751,7 +2752,7 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             ExprKind::VaStart { ap, .. } => self.va_start(ap),
-            ExprKind::VaArg(ap) => self.va_arg(ap, &e.ty),
+            ExprKind::VaArg(ap, _) => self.va_arg(ap, &e.ty),
             ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => unreachable!("sema rewrites them"),
         }
     }
@@ -3282,11 +3283,7 @@ impl<'a> FuncGen<'a, '_> {
         let unsigned = l.is_unsigned() || r.is_unsigned();
         let pick = |s: &'static str, u: &'static str| if unsigned { u } else { s };
         let x = self.xlen;
-        let elem_size = |t: &Type| {
-            t.pointee()
-                .and_then(|t| t.size(x))
-                .expect("sema: complete pointee")
-        };
+        let elem_size = |t: &Type| t.step(x).expect("sema: complete pointee");
         // The W form of an instruction for 32-bit arithmetic on RV64.
         let w32 = self.is_w(l);
         let w = |op: &'static str| -> String {

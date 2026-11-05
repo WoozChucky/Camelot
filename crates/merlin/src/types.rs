@@ -421,6 +421,26 @@ pub struct FuncType {
     /// describes a function pointer's parameters so (`const pt` of a
     /// typedef `pt`). Never part of comparing types.
     pub spelled: Spellings,
+    /// Declared with `()`, of which C99 says nothing of the parameters
+    /// (merlin takes it as `(void)`): clang names the type `int ()`.
+    pub unprototyped: Unprototyped,
+}
+
+/// Whether a function type was declared with `()` ([`FuncType`]). Any two
+/// compare equal: `int ()` is compatible with `int (void)`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Unprototyped(pub bool);
+
+impl PartialEq for Unprototyped {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Unprototyped {}
+
+impl Hash for Unprototyped {
+    fn hash<H: Hasher>(&self, _: &mut H) {}
 }
 
 /// The declared type and [`Spelled`] of each parameter of a function type,
@@ -552,6 +572,7 @@ impl Type {
             params,
             variadic: false,
             spelled: Spellings::default(),
+            unprototyped: Unprototyped::default(),
         }))
     }
 
@@ -562,6 +583,7 @@ impl Type {
             params,
             variadic: true,
             spelled: Spellings::default(),
+            unprototyped: Unprototyped::default(),
         }))
     }
 
@@ -723,6 +745,18 @@ impl Type {
         }
     }
 
+    /// How many bytes adding 1 to a pointer (or a decayed array) of this
+    /// type moves it: the size of what it points to, or 1 for `void` and
+    /// a function, the GNU extension clang takes without a word (as
+    /// `-Wpointer-arith`, which is not on by default, would say).
+    pub fn step(&self, x: Xlen) -> Option<u32> {
+        let to = self.pointee()?;
+        if to.is_void() || to.is_func() {
+            return Some(1);
+        }
+        to.size(x)
+    }
+
     /// What a pointer (or a decayed array) points to.
     pub fn pointee(&self) -> Option<&Type> {
         match self.unqual() {
@@ -765,7 +799,7 @@ impl Type {
                     if f.variadic {
                         params.push("...".to_string());
                     }
-                    let params = if params.is_empty() {
+                    let params = if params.is_empty() && !f.unprototyped.0 {
                         "void".to_string()
                     } else {
                         params.join(", ")
