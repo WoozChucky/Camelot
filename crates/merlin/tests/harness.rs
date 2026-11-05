@@ -1139,7 +1139,7 @@ fn data_units(d: &str) -> Option<Vec<Unit>> {
 
 /// merlin names the symbols it makes as clang does (the spec's "Symbol
 /// names"): for every case, every C file of the multi-file programs and
-/// every C file of the kernel and its user programs, at both widths, the
+/// every C file of the kernel and its user programs, the
 /// objects merlin's assembly defines are clang's (`-O0 -S`), by name, size
 /// and contents (each byte, and the symbol each address is of, so that two
 /// names swapped show): the string literals (`.L.str`, `.L.str.N`), the

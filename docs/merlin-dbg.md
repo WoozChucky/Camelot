@@ -160,7 +160,7 @@ Packets are `$payload#checksum`, with `+`/`-` acks until `QStartNoAckMode`. A 0x
 | `qqemu.PhyMemMode` | `1` or `0`: which they use |
 | `qXfer:features:read:target.xml:off,len` | the target description: `riscv:rv64` with every register 64 bits wide (`bitsize`), the `org.gnu.gdb.riscv.cpu` registers, every CSR Grail implements (an RV64 hart has no `cycleh`), and `priv` |
 | `qRegisterInfoN` | LLDB's register description, for `x0`-`x31` and `pc`, as wide as `g`'s and at their offsets in it (LLDB builds without XML support, such as LLVM 21's Windows build, ask for these instead of `target.xml`) |
-| `qHostInfo`, `qProcessInfo` | LLDB's: triple `riscv32-unknown-unknown-elf` and 4-byte pointers, or `riscv64-unknown-unknown-elf` and 8-byte pointers; little endian |
+| `qHostInfo`, `qProcessInfo` | LLDB's: triple `riscv64-unknown-unknown-elf` and 8-byte pointers; little endian |
 | `k`, `vKill` | `X09` (ended by SIGKILL), then kills the machine. GDB expects no reply to `k` and ignores it; LLDB waits for one |
 | `D` | `OK`, then detaches |
 | anything else | empty: not supported |
@@ -351,15 +351,15 @@ The line tables (`.debug_line`, the spec's section 10, "Debug information") map 
 
 ```
 $ cargo run -p merlin-dbg -- -- kernel/kernel.elf
-(merlin-dbg) break kernel/main.c:273
-breakpoint 1 at 0x8001ccb4 <kmain+16>: kernel/main.c:275
+(merlin-dbg) break kernel/main.c:333
+breakpoint 1 at 0xffffffff8001a3d4 <kmain+20>: kernel/main.c:335
 (merlin-dbg) continue
 breakpoint 1
-=> 0x8001ccb4 <kmain+16>:  auipc ra, 0x23
-kernel/main.c:275:     cpu_init();
+=> 0xffffffff8001a3d4 <kmain+20>:  auipc ra, 0x26
+kernel/main.c:335:     cpu_init();
 (merlin-dbg) next
-=> 0x8001ccbc <kmain+24>:  auipc ra, 0x2a
-kernel/main.c:276:     uart_init();
+=> 0xffffffff8001a3dc <kmain+28>:  auipc ra, 0x2d
+kernel/main.c:337:     uart_init();
 (merlin-dbg) step
 ...
 (merlin-dbg) add-symbol-file target/kernel/obj/user/sh.elf
@@ -382,48 +382,48 @@ LLDB reads the same tables: `image lookup -a ADDR` gives the line, `breakpoint s
 | `frame [N]`, `f` | selects frame N of the backtrace (shows the selected one without N), and shows it and its line; past the outermost frame, GDB's `No frame at level N.` |
 | `up [N]`, `down [N]` | selects the frame N (1) further out, or further in, as far as there are frames (`up 9` selects the outermost); alone at the outermost or the innermost frame, GDB's `Initial frame selected; you cannot go up.` or `Bottom (innermost) frame selected; you cannot go down.` |
 
-An expression is C's, the part a debugger needs, with C's precedence: variables, numbers (of C's types: `int`, `long` or `long long` for a decimal number, their unsigned types too for a hex or octal one, only those with a `u`, and from `long` with an `L`, from `long long` with `LL`: `sizeof(1L)` is 8) and character constants, registers, members (`s.m`, `p->m`), elements (`a[i]`, `m[i][j]`), `*p`, `&x`, `-`, `!`, `~`, the arithmetic, bitwise, shift and comparison operators with C's integer promotions and usual arithmetic conversions, by rank (`-1 < 0u` is 0; an enum is its integer type, so with `enum sign {NEG = -2, ...}` `sv + 0` is -2; the arithmetic is done wide and cut to the result's type, so `2147483647 + 1` is `-2147483648`, an `int`), `&&` and `||` (the right operand evaluated only when the left one does not decide), pointer arithmetic (an element at a time, and the difference of two pointers) and comparisons, `sizeof x`, `sizeof (TYPE)` and casts to a named type (`(struct node *) $a0`, `(unsigned) x`; to `_Bool`, 0 or 1; to `void`), and GDB's `x@N`, N objects like `x` from where it is, as an array (`*p@3`, `buf[2]@4`), which binds as in GDB's grammar, tighter than the shifts and looser than `+` and `-` (`a@n+1` is `a@(n+1)`, `a@2 == b` is `(a@2) == b`). A cast is of a scalar (an integer, an enum or a pointer) to a scalar or `void`: to or from a struct, a union, an array or a function it is GDB's `Invalid cast.`. A TYPE is `struct TAG`, `union TAG`, `enum TAG`, a typedef name or a base type, with `*`s; an integer type in any of C's spellings (`unsigned`, `long int`, `long unsigned long`), which is C's own type (GDB's) if the program describes none of that name. The types of what an expression makes are GDB's for LP64: `int` (4 bytes), `long` and `long long` (8, so an 8-byte integer is a `long`); `sizeof` is an `unsigned long` and a difference of pointers a `long`. The registers are of the types GDB gives them on RISC-V: `$pc` and `$ra` are code pointers (`void (*)()`, `$1 = (void (*)()) 0x80000044 <walk+40>`), `$sp`, `$gp` and `$tp` data pointers (`void *`), the others `long`; a caller's `$pc` is its return address, and only its `$sp` and `$fp` are known. A name is looked up as C scopes it, and as GDB looks it up: the blocks of the selected frame's function that hold its pc, the innermost first, then its parameters, then the variables of the file's scope (of the unit holding the pc first, then of any other), then the functions. A symbol without debug information is GDB's error, `'puts' has unknown type; cast it to its declared type`.
+An expression is C's, the part a debugger needs, with C's precedence: variables, numbers (of C's types: `int`, `long` or `long long` for a decimal number, their unsigned types too for a hex or octal one, only those with a `u`, and from `long` with an `L`, from `long long` with `LL`: `sizeof(1L)` is 8) and character constants, registers, members (`s.m`, `p->m`), elements (`a[i]`, `m[i][j]`), `*p`, `&x`, `-`, `!`, `~`, the arithmetic, bitwise, shift and comparison operators with C's integer promotions and usual arithmetic conversions, by rank (`-1 < 0u` is 0; an enum is its integer type, so with `enum sign {NEG = -2, ...}` `sv + 0` is -2; the arithmetic is done wide and cut to the result's type, so `2147483647 + 1` is `-2147483648`, an `int`), `&&` and `||` (the right operand evaluated only when the left one does not decide), pointer arithmetic (an element at a time, and the difference of two pointers) and comparisons, `sizeof x`, `sizeof (TYPE)` and casts to a named type (`(struct node *) $a0`, `(unsigned) x`; to `_Bool`, 0 or 1; to `void`), and GDB's `x@N`, N objects like `x` from where it is, as an array (`*p@3`, `buf[2]@4`), which binds as in GDB's grammar, tighter than the shifts and looser than `+` and `-` (`a@n+1` is `a@(n+1)`, `a@2 == b` is `(a@2) == b`). A cast is of a scalar (an integer, an enum or a pointer) to a scalar or `void`: to or from a struct, a union, an array or a function it is GDB's `Invalid cast.`. A TYPE is `struct TAG`, `union TAG`, `enum TAG`, a typedef name or a base type, with `*`s; an integer type in any of C's spellings (`unsigned`, `long int`, `long unsigned long`), which is C's own type (GDB's) if the program describes none of that name. The types of what an expression makes are GDB's for LP64: `int` (4 bytes), `long` and `long long` (8, so an 8-byte integer is a `long`); `sizeof` is an `unsigned long` and a difference of pointers a `long`. The registers are of the types GDB gives them on RISC-V: `$pc` and `$ra` are code pointers (`void (*)()`, `$1 = (void (*)()) 0x80000110 <walk+164>`), `$sp`, `$gp` and `$tp` data pointers (`void *`), the others `long`; a caller's `$pc` is its return address, and only its `$sp` and `$fp` are known. A name is looked up as C scopes it, and as GDB looks it up: the blocks of the selected frame's function that hold its pc, the innermost first, then its parameters, then the variables of the file's scope (of the unit holding the pc first, then of any other), then the functions. A symbol without debug information is GDB's error, `'puts' has unknown type; cast it to its declared type`.
 
 Where a variable lives is a DWARF expression (`DW_AT_location`), which merlin-dbg evaluates in the selected frame: merlin's `DW_OP_fbreg N` (N bytes from the function's frame base, `DW_OP_reg8`, `s0`) and `DW_OP_addrx` (an address in `.debug_addr`), clang's at -O0, `DW_OP_breg2 N` (from `sp`) and `DW_OP_addrx`, and `DW_OP_addr` (the address in the expression itself). The innermost frame has every register; a caller has what the unwinder found: its frame pointer, and its `sp`, which is the CFA of the frame it called (that frame's `s0`, as merlin and clang lay frames out), or the called frame's own `sp` when that frame is not built (a leaf, or a stop in a prologue). Every stop selects the innermost frame again.
 
 Values are shown as GDB shows C's:
 
 - integers in decimal (`print/x` in hex: their bits, `0xfffffffe` for an `int` -2), a character type as its value and its character (`65 'A'`, `0 '\000'`, `255 '\377'`), `_Bool` as `true` or `false`, an enum by its constant's name (its number if none has it);
-- a pointer in hex, with the symbol it points into (`0x80001018 <nodes+16>`), a `char *` with the string it points to (`0x8004e0a5 "heap"`, at most 200 characters, then `...`), a function as `{int (Node *, int)} 0x80000064 <walk>`; `print` gives a pointer's type first, `(Node *) 0x80001018 <nodes+16>`, as GDB does except for `char *`;
+- a pointer in hex, with the symbol it points into (`0x800006b0 <nodes+16>`), a `char *` with the string it points to (`0x80000638 "box"`, at most 200 characters, then `...`), a function as `{int (Node *, int)} 0x8000006c <walk>`; `print` gives a pointer's type first, `(Node *) 0x800006b0 <nodes+16>`, as GDB does except for `char *`;
 - a struct or union as `{x = 1, y = 2}`, an array as `{1, 2, 3}`, an array of characters as a string (its last NUL left out; with `/x` its elements in hex, `{0x68, 0x69, 0x0, 0x0}`), at most 200 elements (then `...`), and ten or more equal elements in a row once, `0x0 <repeats 13 times>` (`"sh", '\000' <repeats 13 times>` in a string).
 
 Types are written as C declares them, as GDB writes them: `Node *`, `int [3]`, `short [2][3]`, `const char *`, `char * const`, `int (*)(int)`, `struct node {...}`, `int (void)` for a function with a prototype and none of parameters and `int ()` for one without a prototype. `ptype` shows the body of a member's type when that type has no name (an anonymous struct, union or enum), indented inside the record's, as GDB does. Broken debug information whose types are parts of themselves (a pointer to itself, a struct of itself) is cut short at 64 levels (`?`, `...`), and a unit whose first entry cannot be read is left out, the others read.
 
-**The backtrace** is GDB's too: each frame's function, from the debug information (or the symbols, or `??`), its arguments and its line, `#1  0x80000108 in walk (list=0x800005d0 <nodes+8>, depth=1) at crates/merlin-dbg/tests/vars/vars.c:51`. A caller's pc is its return address, and its line and block those of the call before it. The innermost frame's pc is left out when it is at the start of a line, as GDB leaves it out. An argument that is a struct, a union or an array is `...` (GDB's `print frame-arguments scalars`); `info args` shows it whole. A function without debug information has no arguments shown: `#4  0x80000010 in _start ()`.
+**The backtrace** is GDB's too: each frame's function, from the debug information (or the symbols, or `??`), its arguments and its line, `#1  0x0000000080000110 in walk (list=0x800006b0 <nodes+16>, depth=1) at crates/merlin-dbg/tests/vars/vars.c:76`. A caller's pc is its return address, and its line and block those of the call before it. The innermost frame's pc is left out when it is at the start of a line, as GDB leaves it out. An argument that is a struct, a union or an array is `...` (GDB's `print frame-arguments scalars`); `info args` shows it whole. A function without debug information has no arguments shown: `#4  0x0000000080000014 in _start ()`.
 
 The shell's first `write`, in the kernel:
 
 ```
 (merlin-dbg) break sys_write
-breakpoint 1 at 0x80042edc <sys_write+24>: kernel/sysfile.c:65
+breakpoint 1 at 0xffffffff80043f6c <sys_write+24>: kernel/sysfile.c:66
 (merlin-dbg) continue
 breakpoint 1
-=> 0x80042edc <sys_write+24>:  lw a0, -0xc(s0)
-kernel/sysfile.c:65:     struct file *file = fd_get(arg(f, 0));
+=> 0xffffffff80043f6c <sys_write+24>:  ld a0, -0x18(s0)
+kernel/sysfile.c:66:     struct file *file = fd_get((u32)arg(f, 0));
 (merlin-dbg) bt
-#0  sys_write (f=0x803f8f60) at kernel/sysfile.c:65
-#1  0x80041a8c in syscall (f=0x803f8f60) at kernel/syscall.c:164
-#2  0x8004630c in user_trap (f=0x803f8f60) at kernel/trap.c:272
+#0  sys_write (f=0xffff8f8000003ed0) at kernel/sysfile.c:66
+#1  0xffffffff8004191c in syscall (f=0xffff8f8000003ed0) at kernel/syscall.c:231
+#2  0xffffffff80046eac in user_trap (f=0xffff8f8000003ed0) at kernel/trap.c:312
 (merlin-dbg) print f->regs[17]
 $1 = 2
 (merlin-dbg) up
-#1  0x80041a8c in syscall (f=0x803f8f60) at kernel/syscall.c:164
-kernel/syscall.c:164:         ret = sys_write(f);
+#1  0xffffffff8004191c in syscall (f=0xffff8f8000003ed0) at kernel/syscall.c:231
+kernel/syscall.c:231:         ret = sys_write(f);
 (merlin-dbg) info locals
-p = 0x801cc370 <procs>
-ret = -2143318036
+p = 0xffffffff80244550 <procs>
+ret = -123695058108440
 num = 2
-sp = 201326224
+sp = 140737488354512
 net = 0
 (merlin-dbg) print p->name
 $2 = "sh", '\000' <repeats 13 times>
 (merlin-dbg) print p->ofile
-$3 = {0x801c395c <ftable>, 0x801c3980 <ftable+36>, 0x801c39a4 <ftable+72>, 0x0 <repeats 13 times>}
+$3 = {0xffffffff80239020 <ftable>, 0xffffffff80239058 <ftable+56>, 0xffffffff80239090 <ftable+112>, 0x0 <repeats 13 times>}
 (merlin-dbg) ptype p
 type = struct proc {
     u32 state;
@@ -457,7 +457,7 @@ The state numbers are `kernel/include/proc.h`'s `PROC_` constants, which are `#d
 | `add-symbol-file FILE program NAME` | FILE's symbols, line tables and variables apply only where program NAME runs (keyed by address space): see below |
 | `process PID` | `print` and `x` read memory through process PID's page table until the next stop; `process` alone says whose memory they read |
 
-**Breakpoints in one process.** A breakpoint hit by another process is not a stop: merlin-dbg sees the stop, finds that the breakpoint does not apply there, and runs the machine on, as GDB does with a breakpoint whose condition is false (`bpstat_check_breakpoint_conditions`). Nothing is reported, and nothing about the run changes, since every stop of Grail's debug interface resumes exactly where it stopped ("Determinism"). If the process table cannot be read, the breakpoint stops and says why, as GDB stops on a condition it cannot evaluate. Every program runs at the same virtual addresses (`USER_LOAD` and up), so without a limit a breakpoint in one program stops in every process at that address: in another copy of the same program, and in another program whose code is there. `info breakpoints` lists the limits after the address (`0x00001128 <copy+276>, process 8, program cat`).
+**Breakpoints in one process.** A breakpoint hit by another process is not a stop: merlin-dbg sees the stop, finds that the breakpoint does not apply there, and runs the machine on, as GDB does with a breakpoint whose condition is false (`bpstat_check_breakpoint_conditions`). Nothing is reported, and nothing about the run changes, since every stop of Grail's debug interface resumes exactly where it stopped ("Determinism"). If the process table cannot be read, the breakpoint stops and says why, as GDB stops on a condition it cannot evaluate. Every program runs at the same virtual addresses (`USER_LOAD` and up), so without a limit a breakpoint in one program stops in every process at that address: in another copy of the same program, and in another program whose code is there. `info breakpoints` lists the limits after the address (`0x0000000000001484 <copy+280>, process 40, program cat`).
 
 **Symbols keyed by address space.** The kernel's symbols, and those of `add-symbol-file FILE`, apply everywhere. Those of `add-symbol-file FILE program NAME` apply only in the address spaces of the processes that run program NAME: at each stop, merlin-dbg uses the symbols of every address space and those of the program the stopping hart's process runs. A breakpoint's location is looked for in every symbol file, as GDB's linespecs look in every objfile: it gets a breakpoint wherever it is found, one in the global symbols that stops everywhere, and one in each program's own files that stops only where that program runs (`program cat`). So `break kernel/user/cat.c:19` never stops in the shell running other code at that address, and with cat's and the shell's symbols keyed, `break main` is two breakpoints, cat's main where cat runs and the shell's where the shell does. Keyed by the program rather than by a pid, the symbols follow the program across processes and `exec`s.
 
@@ -469,32 +469,32 @@ The shell's pipeline `cat /README /README /README | cat` runs two processes of `
 (merlin-dbg) add-symbol-file target/kernel/obj/user/cat.elf program cat
 added the symbols of target/kernel/obj/user/cat.elf, for program cat
 (merlin-dbg) break main
-breakpoint 1 at 0x1244 <main+28>: kernel/user/cat.c:28, program cat
+breakpoint 1 at 0x1050 <main+28>: kernel/user/cat.c:28, program cat
 (merlin-dbg) continue
 breakpoint 1
-=> 0x00001244 <main+28>:  lw a0, -0xc(s0)
+=> 0x0000000000001050 <main+28>:  lw a0, -0x14(s0)
 kernel/user/cat.c:28:     if (argc < 2) {
 (merlin-dbg) print argv[1]
-$1 = 0xbffffe8 "/README"
+$1 = 0x7fffffffffc5 "/README"
 (merlin-dbg) info processes
   PID  State     Name             satp
-  6    live      sh               0x800803fa
-* 7    live      cat              0x800803e7  hart 0
-  8    live      cat              0x800803dd
+  1    live      sh               0x9000000000087fec
+* 39   live      cat              0x9000000000087fd1  hart 0
+  40   live      cat              0x9000000000087fc0
 (merlin-dbg) delete
-(merlin-dbg) break kernel/user/cat.c:19 process 8
-breakpoint 2 at 0x1128 <copy+276>: kernel/user/cat.c:19, process 8, program cat
+(merlin-dbg) break kernel/user/cat.c:19 process 40
+breakpoint 2 at 0x1484 <copy+280>: kernel/user/cat.c:19, process 40, program cat
 (merlin-dbg) continue
 breakpoint 2
-=> 0x00001128 <copy+276>:  li a0, 0x1
+=> 0x0000000000001484 <copy+280>:  li a0, 0x1
 kernel/user/cat.c:19:         int w = write(STDOUT, buf, (uint)n);
 (merlin-dbg) info args
 fd = 0
-name = 0x4016 "input"
-(merlin-dbg) process 7
-process 7 (cat), satp 0x800803e7
-(merlin-dbg) print (char *) 0xbffffe8
-$2 = 0xbffffe8 "/README"
+name = 0x4000 "input"
+(merlin-dbg) process 39
+process 39 (cat), satp 0x9000000000087fd1
+(merlin-dbg) print (char *) 0x7fffffffffc5
+$2 = 0x7fffffffffc5 "/README"
 ```
 
 The writer passed line 19 first, twice, without stopping: the breakpoint is the reader's.

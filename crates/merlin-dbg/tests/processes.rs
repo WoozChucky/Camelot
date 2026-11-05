@@ -275,7 +275,7 @@ fn cat_pipeline(s: Setup) {
     // that writes, each in its turn. The writer (`cat /README /README /README`) runs
     // first, to its main; then the reader (`cat`, its input the pipe) reaches its
     // main, before or after some of the writer's writes (the scheduler decides, and
-    // decides otherwise at each width and paging mode). Each stop after the writer's
+    // decides otherwise in each paging mode). Each stop after the writer's
     // main is one of them: which, `breakpoint N` says.
     let mut commands = format!(
         "add-symbol-file {cat_file} program cat\n\

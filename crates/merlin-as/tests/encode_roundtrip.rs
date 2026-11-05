@@ -887,7 +887,7 @@ fn expected64() -> Rows {
             "csrr a0, 0xc80",
             vec![csr(CsrOp::Rs, A0, CsrSrc::Reg(ZERO), 0xc80)],
         ),
-        // li, as LLVM's RISCVMatInt builds 64-bit values (rv64/li.golden has
+        // li, as LLVM's RISCVMatInt builds 64-bit values (golden/li.golden has
         // many more, word for word): addiw only where addi would be wrong,
         // then shifts, a final srli for leading zeros, xori for leading ones.
         (

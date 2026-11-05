@@ -1114,7 +1114,7 @@ fn replies(out: &str, commands: &[&str]) -> Vec<String> {
 
 #[test]
 fn variables_and_types() {
-    // tests/vars/vars.c at both widths: stopped in walk three deep in its
+    // tests/vars/vars.c: stopped in walk three deep in its
     // recursion, the arguments and locals of each frame (up and down), globals of
     // every kind of type, members, elements, pointers followed, the types, and a
     // function's struct arguments.
@@ -1184,7 +1184,7 @@ fn variables_and_types() {
         "print sv + 0",
         "print sv < 0",
         "print/x sv",
-        // C's integer types, named as GDB names them at each width.
+        // C's integer types, named as GDB names them for LP64.
         "print sizeof(1L)",
         "whatis sizeof(int)",
         "whatis &nodes[2] - &nodes[0]",
@@ -1633,7 +1633,7 @@ fn without_addresses(line: &str) -> String {
 /// arguments and locals of each frame, values of every kind of type and `ptype`
 /// are the same, addresses aside. clang's locations are `DW_OP_breg2` (from `sp`,
 /// a caller's from the CFA of the frame it called) and `DW_OP_addrx`, merlin's
-/// `DW_OP_fbreg` and `DW_OP_addr`. At both widths. Ignored: it needs clang and
+/// `DW_OP_fbreg` and `DW_OP_addr`. Ignored: it needs clang and
 /// ld.lld (`CLANG` and `LLD` name them if they are not on the PATH).
 #[test]
 #[ignore]
@@ -1667,7 +1667,7 @@ fn merlin_dbg_reads_clangs_variables_as_merlins() {
 /// LLDB reads merlin's debug information as it reads clang's: tests/vars/vars.c
 /// built by each, stopped at the same line, shows the same variables, of the same
 /// types, with the same values, in walk's frames and in main, and the same globals.
-/// At both widths. Ignored: it needs LLDB (with a Python runtime on the PATH on
+/// Ignored: it needs LLDB (with a Python runtime on the PATH on
 /// Windows, see crates/grail/tests/gdb.rs), clang and ld.lld (`LLDB`, `CLANG` and
 /// `LLD` name them if they are not on the PATH).
 #[test]

@@ -78,12 +78,12 @@ docs/                   the ISA spec, the Avalon protocol, Pendragon's API, the 
 You need [Rust](https://rustup.rs). No crates, no cross compiler, no QEMU.
 
 ```
-cargo run --release -p grail -- examples/hello/hello.elf
+cargo run --release -p grail -- --bios none examples/hello/hello.elf
 ```
 
 ```
 Hello from Camelot!
-[dbg] pc=80000018 a0 = 0x00000014 (20)
+[dbg] pc=0000000080000018 a0 = 0x0000000000000014 (20)
 ```
 
 The kernel runs the same way: `cargo run --release -p grail -- kernel/kernel.elf`. It boots into a user-space shell that runs programs by name (`hello`, `echo a b`, `ticks`; `ding & dong` runs two side by side; `exit` stops the machine); with `--disk IMG` it lists the disk and runs a read/write self-test on it at boot, leaving the image as it was; when stdin is a terminal, Grail switches it to raw mode so each key reaches the guest as it is typed and the guest does the echoing (Windows consoles and Linux terminals; restored on exit and on Ctrl-C).
@@ -108,7 +108,7 @@ Every example is built into `examples/<dir>/<name>.elf`: a `.S` file goes throug
 `examples/multiobj` links two objects (`main.S` calls `puts` in `print.S`, which counts bytes in its `.bss`; `main.S` keeps a string table and a counter in `.data`) and exits with code 42:
 
 ```
-cargo run --release -p grail -- examples/multiobj/multiobj.elf
+cargo run --release -p grail -- --bios none examples/multiobj/multiobj.elf
 ```
 
 The top of each source also has the clang + ld.lld command that builds the same program, for comparison only; [spec section 10](docs/excalibur-spec.md) ("Examples") lists how the two executables differ (the loaded bytes don't).
@@ -116,7 +116,7 @@ The top of each source also has the clang + ld.lld command that builds the same 
 `examples/uart-echo` is interrupt-driven: it sleeps in `wfi`, and every byte on stdin raises a machine external interrupt through the PLIC. It echoes until it receives EOT (0x04):
 
 ```
-printf 'hi\n\004' | cargo run --release -p grail -- examples/uart-echo/uart-echo.elf
+printf 'hi\n\004' | cargo run --release -p grail -- --bios none examples/uart-echo/uart-echo.elf
 ```
 
 Options: `--trace` prints every instruction with its disassembly, `--max-steps N` stops a runaway program, `--ram SIZE` sets RAM size (MiB, or with a unit, `M`/`MiB` or `G`/`GiB`: `--ram 64`, `--ram 16G`; 1 MiB to 1 TiB; default 128 MiB; backed lazily, so a big machine costs the host only what its guest touches), `--clock FREQ` runs in real time at FREQ instructions per second (`10MHz`, `500kHz`, `1.5MHz`, `5Hz`; without it Grail runs at full speed and deterministically, reporting a nominal 10 MHz), `--disk IMG` attaches a disk image (repeat for up to 8 disks; `--disk-ro IMG` attaches one read-only), the machine is RV64 (an ELF32 program, RV32 code, is refused), `--bios default`, the default, boots Camelot's firmware first, as QEMU's `virt` boots OpenSBI (`--bios FILE` another, OpenSBI's `fw_jump.bin` say; spec section 7, "Firmware"): it keeps the first 2 MiB of RAM, passes the program a device tree and starts it in S-mode at 0x8020_0000, or boots the disk with no program, which is how the Camelot kernel runs (`kernel/kernel.elf`, or `--ram 6 --disk target/camelot-fs.img`); `--bios none` runs the program from 0x8000_0000 in M-mode instead, as the examples and riscv-tests want, and with no program boots the disk through the boot ROM's loader, in M-mode, `--harts N` builds a machine of N harts (1 to 8, default 1; spec section 7, "Harts": they take turns one instruction at a time, deterministically, and the harts other than 0 wait in the boot ROM for an IPI). `examples/smp` starts every hart and has them race on shared counters: `cargo run --release -p grail -- --bios none --harts 4 examples/smp/smp.elf`. Grail's exit code is the program's (`xcal.halt`, the test device, or riscv-tests' `tohost`).
@@ -124,17 +124,17 @@ Options: `--trace` prints every instruction with its disassembly, `--max-steps N
 Software finds the RAM size, the clock and the devices in the Xcal sysinfo block (spec section 9.5). `examples/sysinfo` prints them:
 
 ```
-cargo run --release -p grail -- --ram 64 --clock 2MHz examples/sysinfo/sysinfo.elf
+cargo run --release -p grail -- --bios none --ram 64 --clock 2MHz examples/sysinfo/sysinfo.elf
 ```
 
 ```
-sysinfo v1
-RAM      64 MiB at 0x80000000
+sysinfo v2
+RAM      64 MiB at 0x0000000080000000
 CPU      2000000 Hz (real time)
 timebase 2000000 Hz
 9 devices:
-  test      0x00100000 + 0x00001000
-  CLINT     0x02000000 + 0x00010000
+  test      0x0000000000100000 + 0x0000000000001000
+  CLINT     0x0000000002000000 + 0x0000000000010000
 ...
 ```
 
@@ -147,7 +147,7 @@ cargo run --release -p merlin-objdump -- -d examples/hello/hello.elf
 ```
 
 ```
-80000000 <_start>:
+0000000080000000 <_start>:
 80000000: 00010117     	auipc	sp, 0x10
 80000004: 07010113     	addi	sp, sp, 0x70
 ...
@@ -163,7 +163,7 @@ The options are llvm-objdump's: `-d` disassemble, `-r` relocations (under each i
 `merlin-dbg` debugs a program running in Grail at the machine level, and by source line and by variable where the program has debug information ([docs/merlin-dbg.md](docs/merlin-dbg.md)). Given `--` and Grail's arguments, it starts the machine itself, stopped at its first instruction:
 
 ```
-cargo run --release -p merlin-dbg -- -- examples/hello/hello.elf
+cargo run --release -p merlin-dbg -- -- --bios none examples/hello/hello.elf
 ```
 
 ```
@@ -171,10 +171,10 @@ cargo run --release -p merlin-dbg -- -- examples/hello/hello.elf
 breakpoint 1 at 0x80000028 <puts+8>
 (merlin-dbg) continue
 breakpoint 1
-=> 0x80000028 <puts+8>:  lbu t2, 0x0(t1)
+=> 0x0000000080000028 <puts+8>:  lbu t2, 0x0(t1)
 (merlin-dbg) bt
-#0  0x80000028 in puts ()
-#1  0x80000018 in _start ()
+#0  0x0000000080000028 in puts ()
+#1  0x0000000080000018 in _start ()
 ```
 
 As in GDB, `break FUNC` stops past the function's prologue (here, by GDB's prologue analysis, past `li` and `mv`), and `break *FUNC` at its first instruction.
@@ -188,15 +188,15 @@ cargo run --release -p merlin-dbg -- -- kernel/kernel.elf
 ```
 
 ```
-(merlin-dbg) break kernel/main.c:273
-breakpoint 1 at 0x8001ccb4 <kmain+16>: kernel/main.c:275
+(merlin-dbg) break kernel/main.c:333
+breakpoint 1 at 0xffffffff8001a3d4 <kmain+20>: kernel/main.c:335
 (merlin-dbg) continue
 breakpoint 1
-=> 0x8001ccb4 <kmain+16>:  auipc ra, 0x23
-kernel/main.c:275:     cpu_init();
+=> 0xffffffff8001a3d4 <kmain+20>:  auipc ra, 0x26
+kernel/main.c:335:     cpu_init();
 (merlin-dbg) next
-=> 0x8001ccbc <kmain+24>:  auipc ra, 0x2a
-kernel/main.c:276:     uart_init();
+=> 0xffffffff8001a3dc <kmain+28>:  auipc ra, 0x2d
+kernel/main.c:337:     uart_init();
 ```
 
 A user program's line tables are in `target/kernel/obj/user/<name>.elf` after `cargo xtask kernel`: `add-symbol-file target/kernel/obj/user/sh.elf`, then `break kernel/user/sh.c:502`. With `program NAME` after the file, its symbols apply only where program NAME runs, and so do its breakpoints. merlin-dbg reads the kernel's process table: `info processes` lists the processes, `break LOC process PID` (or `satp VALUE`) stops in one of them only, though every program runs at the same addresses, and `process PID` reads that process's memory through its page table.
@@ -217,10 +217,10 @@ A debugged run executes exactly the instructions an undebugged one does (spec se
 Programs can draw into a framebuffer (spec section 9.3), a small display controller in the model of Linux's KMS: it starts at 640×480 from its own VRAM, and offers modes up to 1920×1080, shown from any page-aligned buffer in RAM (`FB_SCANOUT`), with page flips that take effect at the next vertical blank (`FB_FLIP`) a vertical-blank interrupt (PLIC source 16), 60 times a second of guest time, and a hardware cursor plane (a 64×64 ARGB8888 image in RAM, premultiplied, blended over the frame where the guest puts it and moved at the vertical blank, so moving the pointer redraws nothing). Grail is headless by default; `--fb` opens a native window showing it (Windows only, plain Win32 GDI through hand-written FFI; elsewhere Grail warns and stays headless), which takes the size of a new mode. `--fb-dump DIR` writes `DIR/frame-NNNN.ppm` (at least four digits) on every new frame (an `FB_PRESENT`, a mode change, a flip taking effect) or change of the cursor (moved, shown, hidden, or given an image by a write of `FB_CURSOR_ADDR`, even of the address it had), and when the machine stops, with or without a window. `--headless` turns the window off even if `--fb` is given. `examples/flip` switches to 800×600 and double-buffers eight moving frames with page flips, and `examples/cursor` moves a cursor over a frame it draws once:
 
 ```
-cargo run --release -p grail -- --fb examples/colorbars/colorbars.elf
-cargo run --release -p grail -- --fb-dump frames examples/colorbars/colorbars.elf
-cargo run --release -p grail -- --fb --clock 50MHz examples/flip/flip.elf
-cargo run --release -p grail -- --fb --clock 50MHz examples/cursor/cursor.elf
+cargo run --release -p grail -- --bios none --fb examples/colorbars/colorbars.elf
+cargo run --release -p grail -- --bios none --fb-dump frames examples/colorbars/colorbars.elf
+cargo run --release -p grail -- --bios none --fb --clock 50MHz examples/flip/flip.elf
+cargo run --release -p grail -- --bios none --fb --clock 50MHz examples/cursor/cursor.elf
 ```
 
 Closing the window stops the emulator. When the program stops first, the window stays open on the last frame until you close it.
@@ -230,7 +230,7 @@ Closing the window stops the emulator. When the program stops first, the window 
 Keys typed into the framebuffer window go to the Xcal keyboard device (spec section 9.4): a FIFO of press/release events, polled through `KBD_STATUS`/`KBD_DATA` or delivered as PLIC interrupts (source 2). In ASCII mode (the default) an event is the character typed with Shift and Ctrl flags; in raw mode (`KBD_CTRL` bit 1) it is the physical key, as the USB HID usage a USB keyboard sends, with a press and a release for every key, modifiers included, which is what a desktop needs. Without a window the keyboard stays empty and stdin keeps feeding the UART. `examples/kbd-echo` echoes key presses to the terminal, polling (`kbd-echo.elf`) or interrupt-driven (`kbd-echo-irq.elf`); in the polling one F12 switches to raw mode and back, where it prints every event's usage (`+e1 +04 -04 -e1 ` for Shift+a); Esc stops it:
 
 ```
-cargo run --release -p grail -- --fb examples/kbd-echo/kbd-echo.elf
+cargo run --release -p grail -- --bios none --fb examples/kbd-echo/kbd-echo.elf
 ```
 
 Programs embedding Grail as a library feed it keys with `Machine::key_event`, the same entry point the window uses.
@@ -240,7 +240,7 @@ Programs embedding Grail as a library feed it keys with `Machine::key_event`, th
 The mouse over the framebuffer window goes to the Xcal pointer device (spec section 9.7): a FIFO of events with the position in framebuffer pixels (absolute mode, the default, like a tablet; the mapping follows the window when it is resized) or the motion since the last event (relative mode), the left, right and middle buttons and the wheel, polled or delivered as PLIC interrupts (source 11). `examples/pointer` draws a cursor that follows the mouse and changes colour while a button is held; Esc stops it:
 
 ```
-cargo run --release -p grail -- --fb examples/pointer/pointer.elf
+cargo run --release -p grail -- --bios none --fb examples/pointer/pointer.elf
 ```
 
 Programs embedding Grail as a library feed it pointer input with `Machine::pointer_event`.
@@ -250,11 +250,11 @@ Programs embedding Grail as a library feed it pointer input with `Machine::point
 `--disk IMG` gives the machine a disk backed by the raw image file IMG (a whole number of 512-byte sectors; the program's writes change the file), `--disk-ro IMG` a read-only one. Repeat either for up to 8 disks. Each disk is an Xcal block device (spec section 9.6): a page of registers where software names a sector range and a buffer in RAM, then a command (read, write, flush); the device copies the data itself and signals completion in a status register and on its own PLIC source (3 for the first disk). Software finds the disks in the sysinfo device table. `examples/disk` prints sector 0 of a disk as text and runs a write/read-back test that leaves the image as it was:
 
 ```
-cargo run --release -p grail -- --disk examples/disk/disk.img examples/disk/disk.elf
+cargo run --release -p grail -- --bios none --disk examples/disk/disk.img examples/disk/disk.elf
 ```
 
 ```
-disk 0x10001000, irq 3: 8 sectors
+disk 0x0000000010001000, irq 3: 8 sectors
 sector 0:
 Hello from sector 0 of disk.img!
 This text is on the disk image, not in the program.
@@ -282,13 +282,13 @@ cargo run --release -p camelot-fs -- cat disk.img /README
 `--net hub` gives the machine an Ethernet card (spec section 9.8) on a port of an in-process hub; repeat it for up to 4 cards, each with its own MAC address (`02:ca:00:00:00:01` for port 1, or `--net hub,mac=ADDR`). The card moves raw Ethernet II frames between two rings of descriptors in guest RAM and its backend, interrupts on PLIC source 12 (13-15 for the other cards), and drops and counts frames that arrive while the guest has no free receive buffer. `--pcap FILE` captures every frame the card of the last `--net` sends or receives into FILE, in the classic pcap format that Wireshark and tcpdump read:
 
 ```
-cargo run --release -p grail -- --net hub --pcap ping.pcap examples/net/net-ping.elf
+cargo run --release -p grail -- --bios none --net hub --pcap ping.pcap examples/net/net-ping.elf
 ```
 
 `examples/net` is a pair: `net-pong` waits for a frame on its receive interrupt and answers it, `net-ping` broadcasts one and polls for the answer. A single `grail` process runs one machine, so the ping above goes unanswered (exit code 3) but lands in the capture; `crates/grail/tests/net.rs` runs both on one hub in one process:
 
 ```
-net 0x10009000, irq 12, mac 02:ca:00:00:00:01, link up
+net 0x0000000010009000, irq 12, mac 02:ca:00:00:00:01, link up
 sent 60 bytes to ff:ff:ff:ff:ff:ff
 received 60 bytes from 02:ca:00:00:00:02, type 0x88b5: Hello back from pong!
 ```
@@ -304,7 +304,7 @@ cargo run --release -p grail -- --net user,hostfwd=tcp::8080-:80 my-server.elf
 `examples/net/net-user` gets its address by DHCP and takes commands on the UART: `c PORT` connects to the host's port PORT through 10.0.2.2, `l PORT` accepts a forwarded connection and echoes it, `q` exits. With something listening on the host's port 8000 (`crates/grail/tests/net_user.rs` does both directions):
 
 ```
-printf 'c 8000\nq\n' | cargo run --release -p grail -- --net user examples/net/net-user.elf
+printf 'c 8000\nq\n' | cargo run --release -p grail -- --bios none --net user examples/net/net-user.elf
 ```
 
 Camelot itself has sockets and network programs ([docs/camelot-net.md](docs/camelot-net.md)): with the root image, `httpd &` serves its files on the host's port 8080, and `fetch http://10.0.2.2:8000/FILE > FILE` downloads from a server on the host (`crates/grail/tests/kernel_sockets.rs` tests both, and `crates/avalon/tests/sockets.rs` runs `nc` between two VMs on a switch):
@@ -442,7 +442,7 @@ arch     RV64 (Sv48 and Sv39 paging)
 RAM      64 MiB
 clock    2 MHz (real time)
 harts    1
-steps    6461
+steps    8726
 disks    none
 nets     none
 devices  9

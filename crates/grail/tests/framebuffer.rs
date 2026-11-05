@@ -451,7 +451,7 @@ fn check_flip_dumps(dir: &Path) {
     }
 }
 
-/// `examples/flip` through `grail --fb-dump`, at both widths: one dump per frame it
+/// `examples/flip` through `grail --fb-dump`: one dump per frame it
 /// shows, at 800x600, in order.
 #[test]
 fn flip_dumps_every_frame_it_shows() {
@@ -468,7 +468,7 @@ fn flip_dumps_every_frame_it_shows() {
 
 /// Acceptance of #176: `examples/flip` switches to 800x600 and double-buffers in RAM
 /// with page flips on the vertical-blank interrupt, and shows its moving bands with no
-/// tearing, at both widths.
+/// tearing.
 ///
 /// The display scans out the buffer it shows for a whole frame, from one vertical blank
 /// to the next, so a frame is torn if that buffer is drawn into meanwhile. The machine
@@ -664,7 +664,7 @@ fn cursor_ppm(at: Option<(i32, i32)>) -> Vec<u8> {
     out
 }
 
-/// Acceptance of #203: `examples/cursor` through `grail --fb-dump`, at both widths:
+/// Acceptance of #203: `examples/cursor` through `grail --fb-dump`:
 /// the frame it presents once, then one dump per place the cursor is shown at, each the
 /// frame with the cursor blended over it there (off the corners too), then the last
 /// again at exit.
@@ -709,7 +709,7 @@ fn cursor_dumps_every_place_it_moves_to() {
 /// frame is not redrawn. Run in slices, as a host runs it: a slice ends where the
 /// cursor changed, at a vertical blank, and there the cursor is at the next place of
 /// the path; the program presents once, flips and sets no mode, and VRAM is the same
-/// from the present to the end. At both widths, each place shown at the first vertical
+/// from the present to the end. Each place shown at the first vertical
 /// blank after its write, woken by its interrupt.
 #[test]
 fn cursor_moves_over_a_frame_that_is_not_redrawn() {

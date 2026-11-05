@@ -1248,8 +1248,8 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
                 .into(),
             "",
         ),
-        // OUTPUT_FORMAT: an unknown name, and the other class's with these
-        // objects, every one of them reported, library members too.
+        // OUTPUT_FORMAT: an unknown name, and ELF32's, a class merlin-ld does
+        // not write, with a library member among the files.
         (
             vec![start.clone()],
             format!("OUTPUT_FORMAT(\"{class}-littleriscv\", \"elf64-bigriscv\")"),

@@ -1817,8 +1817,7 @@ fn file_symbols(obj: &[u8]) -> Vec<(usize, elf::Symbol)> {
 /// `sub/n.c`, `sub/../m.c`, an absolute name, `café.c`, quoted in octal,
 /// and on Windows `sub\n.c`),
 /// whatever `#line` says; and merlin-as makes of it clang -c's `STT_FILE`
-/// symbol, the object's first, local and absolute, the only one, on both
-/// widths.
+/// symbol, the object's first, local and absolute, the only one.
 ///
 /// Ignored: it needs clang (`CLANG` names it if it is not on the PATH).
 #[test]
