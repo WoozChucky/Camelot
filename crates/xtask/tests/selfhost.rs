@@ -11,24 +11,78 @@
 //! compile unit) and without, data of every size (`DATA`) and sections of
 //! every kind (`SECTIONS`). An ignored test adds merlin's `-g` assembly for
 //! two big C files, the shell and the kernel's vm.c.
+//!
+//! Every test runs on both widths (#157), each in a module of its own,
+//! `rv32` and `rv64`: on RV64 the disk kernel is `kernel-disk-rv64.elf`,
+//! the programs on the image are built for RV64, `/bin/as` assembles with
+//! `-march=rv64ima_zicsr_zifencei` (and its corpus has merlin-as's RV64
+//! references too) and every object `/bin/ld` links is an RV64 one, all
+//! compared with what merlin-as and merlin-ld make for RV64.
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
 use grail::block::MemDisk;
 use grail::{Machine, MachineConfig, RunResult};
 use std::path::PathBuf;
+use xtask::toolchain::Xlen;
 use xtask::{kernel, repo_root, toolchain, userprogs};
 
 const PROMPT: &str = "$ ";
 
-/// The corpus: (name on the image, text); `big` adds merlin's assembly
-/// for the shell and the kernel's vm.c. A `.S` source (the examples, the
-/// boot ROM) goes in as merlin's preprocessor makes it for RV32, as `cargo
-/// xtask examples` gives it to merlin-as (Camelot has no preprocessor), and
-/// is named `.s` on the image. RV32 only: /bin/as writes RV32 until #157, so
-/// the RV64 builds of those sources are left out, as merlin-as's RV64
-/// references are.
-fn corpus(big: bool) -> Vec<(String, String)> {
+/// The tests of each width: the same, run on an RV32 machine and on an
+/// RV64 one.
+macro_rules! on_both_widths {
+    ($($(#[$attr:meta])* $name:ident;)*) => {
+        mod rv32 {
+            $( #[test] $(#[$attr])* fn $name() { super::$name(super::Xlen::Rv32) } )*
+        }
+        mod rv64 {
+            $( #[test] $(#[$attr])* fn $name() { super::$name(super::Xlen::Rv64) } )*
+        }
+    };
+}
+
+on_both_widths! {
+    the_assembler_on_camelot_writes_what_merlin_as_writes;
+    /// The same with merlin's assembly for the shell and vm.c too: a few
+    /// minutes.
+    #[ignore]
+    the_assembler_on_camelot_assembles_big_c_files_as_merlin_as_does;
+    the_assembler_on_camelot_reports_merlin_as_errors;
+    the_linker_on_camelot_links_every_user_program_as_merlin_ld_does;
+    /// Every program with the line tables too: twice the links, and the
+    /// bigger files.
+    #[ignore]
+    the_linker_on_camelot_keeps_the_line_tables_as_merlin_ld_does;
+    hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs;
+    the_linker_on_camelot_links_scripts_as_merlin_ld_does;
+    the_linker_on_camelot_reports_merlin_ld_errors_and_warnings;
+}
+
+/// `/bin/as`'s `-march=` for `xlen`, and a space; none on RV32, the
+/// default, so that the default is what the RV32 tests use.
+fn march(xlen: Xlen) -> &'static str {
+    match xlen {
+        Xlen::Rv32 => "",
+        Xlen::Rv64 => "-march=rv64ima_zicsr_zifencei ",
+    }
+}
+
+/// merlin-as's object of `src` for `xlen`, or its errors.
+fn merlin_as_object(src: &str, xlen: Xlen) -> Result<Vec<u8>, Vec<merlin_as::Error>> {
+    merlin_as::assemble_to_elf_with(src, &merlin_as::Options { xlen })
+}
+
+/// The corpus for `xlen`: (name on the image, text); `big` adds merlin's
+/// assembly for the shell and the kernel's vm.c. A `.S` source (the
+/// examples, the boot ROM) goes in as merlin's preprocessor makes it for
+/// the width, as `cargo xtask examples` gives it to merlin-as (Camelot has
+/// no preprocessor), and is named `.s` on the image. On RV64 merlin-as's
+/// RV64 references join it, the RV64-only encodings
+/// (`tests/golden/rv64/encode.s`, which merlin-as assembles after
+/// `golden/encode.s` for its RV64 golden) and the RV64 line tables
+/// (`tests/debug_line/rv64`), and merlin's assembly is its RV64 code.
+fn corpus(big: bool, xlen: Xlen) -> Vec<(String, String)> {
     let root = repo_root();
     // Assembly sources, not the preprocessed linker script (kernel.lds.S).
     let assembly = |p: &std::path::Path| {
@@ -38,14 +92,21 @@ fn corpus(big: bool) -> Vec<(String, String)> {
                 .is_some_and(|n| n.to_string_lossy().ends_with(".lds.S"))
     };
     let mut files: Vec<PathBuf> = vec![root.join("crates/merlin-as/tests/golden/encode.s")];
-    for dir in [
+    if xlen == Xlen::Rv64 {
+        files.push(root.join("crates/merlin-as/tests/golden/rv64/encode.s"));
+    }
+    let mut dirs = vec![
         "kernel",
         "kernel/user",
         "kernel/boot",
         "crates/grail/rom",
         "crates/merlin-as/tests/debug_line",
         "crates/merlin-as/tests/mapping",
-    ] {
+    ];
+    if xlen == Xlen::Rv64 {
+        dirs.push("crates/merlin-as/tests/debug_line/rv64");
+    }
+    for dir in dirs {
         let mut more: Vec<PathBuf> = std::fs::read_dir(root.join(dir))
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -84,7 +145,7 @@ fn corpus(big: bool) -> Vec<(String, String)> {
             } else {
                 &[xtask::examples::INCLUDE_DIR]
             };
-            let text = xtask::examples::assembly_of(&root, &rel, dirs, xtask::examples::Xlen::Rv32).unwrap();
+            let text = xtask::examples::assembly_of(&root, &rel, dirs, xlen).unwrap();
             let name = rel.strip_suffix(".S").map_or(rel.clone(), |s| format!("{s}.s"));
             (name.replace('/', "_"), text)
         })
@@ -92,7 +153,9 @@ fn corpus(big: bool) -> Vec<(String, String)> {
     // merlin's assembly, as the kernel and the programs are built (-g), and
     // without debug information.
     let user = root.join("kernel/user");
-    let plain = toolchain::without_debug_info(|| toolchain::compile_c(&user, "hello.c", &[], "kernel/user"));
+    let plain = toolchain::without_debug_info(|| {
+        toolchain::compile_c_for(&user, "hello.c", &[], "kernel/user", xlen)
+    });
     out.push(("kernel_user_hello.c.s".into(), plain.unwrap()));
     let mut c_files = vec![("kernel/user", "hello.c", &[][..])];
     if big {
@@ -102,7 +165,7 @@ fn corpus(big: bool) -> Vec<(String, String)> {
         ]);
     }
     for (dir, file, includes) in c_files {
-        let text = toolchain::compile_c(&root.join(dir), file, includes, dir).unwrap();
+        let text = toolchain::compile_c_for(&root.join(dir), file, includes, dir, xlen).unwrap();
         assert!(text.contains(".loc "), "{file} has no line information");
         out.push((format!("{}_{file}.g.s", dir.replace('/', "_")), text));
     }
@@ -183,21 +246,21 @@ fn short(i: usize) -> String {
     format!("f{i}")
 }
 
-/// An image with the shell and the assembler in /bin, `inputs` in /src
-/// (named by `short`), and an empty /out.
-fn image(inputs: &[(String, String)]) -> Vec<u8> {
+/// An image with the shell and the assembler in /bin, built for `xlen`,
+/// `inputs` in /src (named by `short`), and an empty /out.
+fn image(inputs: &[(String, String)], xlen: Xlen) -> Vec<u8> {
     let files: Vec<(String, Vec<u8>)> = inputs
         .iter()
         .enumerate()
         .map(|(i, (_, text))| (format!("/src/{}.s", short(i)), text.as_bytes().to_vec()))
         .collect();
-    image_of(&["as"], &["/src"], &files)
+    image_of(&["as"], &["/src"], &files, xlen)
 }
 
 /// An image with the shell and `bins` in /bin (the user programs of those
-/// names), the directories `dirs`, `files` (path, contents) and an empty
-/// /out.
-fn image_of(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)]) -> Vec<u8> {
+/// names, built for `xlen`), the directories `dirs`, `files` (path,
+/// contents) and an empty /out.
+fn image_of(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)], xlen: Xlen) -> Vec<u8> {
     let bytes: usize = files.iter().map(|(_, t)| t.len()).sum();
     let blocks = 2048 + 3 * bytes / camelot_fs::BSIZE;
     let mut fs = Mkfs::new(&Options {
@@ -211,7 +274,7 @@ fn image_of(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)]) -> Vec<u8
     fs.mkdir("/bin").unwrap();
     let user = userprogs::user_dir(&repo_root());
     for name in std::iter::once(&"sh").chain(bins) {
-        let prog = userprogs::build_named(&user, name).unwrap();
+        let prog = userprogs::build_named_for(&user, name, xlen).unwrap();
         fs.add_file(&format!("/bin/{name}"), &prog.elf).unwrap();
     }
     for d in dirs.iter().chain(&["/out"]) {
@@ -223,15 +286,26 @@ fn image_of(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)]) -> Vec<u8
     fs.finish()
 }
 
-/// Boots the disk kernel on `image`, types `input` (ending with `exit`).
-/// Returns what it printed and the disk afterwards. The machine has the
-/// default 4 MiB of RAM, which the assembler is written to fit in.
-fn boot(image: Vec<u8>, input: &str, max_steps: u64) -> (String, Vec<u8>) {
-    let config = MachineConfig::default();
+/// The machine of `xlen`, as Grail names it, with the default 4 MiB of RAM.
+fn machine_config(xlen: Xlen) -> MachineConfig {
+    MachineConfig {
+        xlen: match xlen {
+            Xlen::Rv32 => grail::Xlen::Rv32,
+            Xlen::Rv64 => grail::Xlen::Rv64,
+        },
+        ..MachineConfig::default()
+    }
+}
+
+/// Boots the `xlen` disk kernel on `image`, types `input` (ending with
+/// `exit`). Returns what it printed and the disk afterwards. The machine has
+/// the default 4 MiB of RAM, which the assembler is written to fit in.
+fn boot(image: Vec<u8>, input: &str, max_steps: u64, xlen: Xlen) -> (String, Vec<u8>) {
+    let config = machine_config(xlen);
     let disk = MemDisk::from_image(image).unwrap();
     let mut m = Machine::with_backends(config, vec![Box::new(disk)]).unwrap();
     m.cpu.bus.uart.capture = true;
-    let elf = std::fs::read(repo_root().join("kernel").join(kernel::DISK_KERNEL)).unwrap();
+    let elf = std::fs::read(repo_root().join("kernel").join(kernel::disk_kernel_elf(xlen))).unwrap();
     m.load_elf(&elf).unwrap();
     m.set_uart_input(kernel::typed(input.as_bytes()));
     let r = m.run(Some(max_steps), |_| {});
@@ -254,23 +328,19 @@ fn shell_output<'a>(out: &'a str, command: &str) -> &'a str {
     &out[start..end]
 }
 
-#[test]
-fn the_assembler_on_camelot_writes_what_merlin_as_writes() {
-    assemble_corpus(false);
+fn the_assembler_on_camelot_writes_what_merlin_as_writes(xlen: Xlen) {
+    assemble_corpus(false, xlen);
 }
 
-/// The same with merlin's assembly for the shell and vm.c too: a few minutes.
-#[test]
-#[ignore]
-fn the_assembler_on_camelot_assembles_big_c_files_as_merlin_as_does() {
-    assemble_corpus(true);
+fn the_assembler_on_camelot_assembles_big_c_files_as_merlin_as_does(xlen: Xlen) {
+    assemble_corpus(true, xlen);
 }
 
 /// Machines the corpus is split over, run side by side.
 const MACHINES: usize = 3;
 
-fn assemble_corpus(big: bool) {
-    let inputs = corpus(big);
+fn assemble_corpus(big: bool, xlen: Xlen) {
+    let inputs = corpus(big, xlen);
     assert!(inputs.len() > 30, "{}", inputs.len());
     // Each machine gets every MACHINES-th file, so the big ones spread out.
     let shares: Vec<Vec<(String, String)>> = (0..MACHINES)
@@ -279,26 +349,26 @@ fn assemble_corpus(big: bool) {
     let wrong: Vec<String> = std::thread::scope(|scope| {
         let runs: Vec<_> = shares
             .iter()
-            .map(|share| scope.spawn(move || assemble_on_camelot(share)))
+            .map(|share| scope.spawn(move || assemble_on_camelot(share, xlen)))
             .collect();
         runs.into_iter().flat_map(|r| r.join().unwrap()).collect()
     });
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Boots a machine that assembles `inputs` with /bin/as. Returns what came
-/// out different from merlin-as's objects.
-fn assemble_on_camelot(inputs: &[(String, String)]) -> Vec<String> {
+/// Boots an `xlen` machine that assembles `inputs` with /bin/as for that
+/// width. Returns what came out different from merlin-as's objects.
+fn assemble_on_camelot(inputs: &[(String, String)], xlen: Xlen) -> Vec<String> {
     let commands: Vec<String> = (0..inputs.len())
-        .map(|i| format!("as /src/{0}.s -o /out/{0}.o", short(i)))
+        .map(|i| format!("as {}/src/{1}.s -o /out/{1}.o", march(xlen), short(i)))
         .collect();
     let input = format!("{}\nexit 0\n", commands.join("\n"));
-    let (out, disk) = boot(image(inputs), &input, 20_000_000_000);
+    let (out, disk) = boot(image(inputs, xlen), &input, 20_000_000_000, xlen);
     let fs = Fs::open(&disk).unwrap();
     let mut wrong = Vec::new();
     for (i, (name, text)) in inputs.iter().enumerate() {
         let said = shell_output(&out, &commands[i]);
-        let want = merlin_as::assemble_to_elf(text).unwrap();
+        let want = merlin_as_object(text, xlen).unwrap_or_else(|e| panic!("{name}: {e:?}"));
         match fs.read_file(&format!("/out/{}.o", short(i))) {
             Ok(got) if got == want && said.is_empty() => {}
             Ok(got) => wrong.push(format!(
@@ -318,15 +388,35 @@ fn assemble_on_camelot(inputs: &[(String, String)]) -> Vec<String> {
     wrong
 }
 
-#[test]
-fn the_assembler_on_camelot_reports_merlin_as_errors() {
+/// Inputs merlin-as refuses on RV32 only: what RV64 has (its instructions,
+/// a 64-bit `li`).
+const RV32_ERRORS: &[&str] = &[
+    "    li a0, 0x1000000000\n",
+    "    addw a0, a1, a2\n    ld a0, 0(a1)\n    sd a0, 8(sp)\n    lwu a0, x\n    sext.w a0, a1\n    negw a0, a1\n\
+     zext.w a0, a1\n    lr.d a0, (a1)\n    amoadd.d.aqrl a0, a1, (a2)\n    slliw a0, a1, 3\n    addiw a0, a1, 1\n",
+    "    slli a0, a1, 32\n    lui a0, %hi(0x100000000)\n",
+];
+
+/// Inputs merlin-as refuses on RV64 only: what RV32 has and RV64 does not
+/// (the high halves of the counters and of the 64-bit CSRs), and RV64's
+/// own instructions given wrong operands.
+const RV64_ERRORS: &[&str] = &[
+    "    rdcycleh a0\n    rdtimeh\n    rdinstreth a0, a1\n    csrr a0, cycleh\n    csrw mstatush, a0\n\
+     csrr a0, pmpcfg1\n    csrr a0, 0xc80\n",
+    "    slli a0, a1, 64\n    slliw a0, a1, 32\n    srai a0, a1, -1\n    addiw a0, a1, 2048\n    sext.w a0\n\
+     negw a0, 5\n    zext.w a0, a1, a2\n",
+    "    lr.d a0, 4(a1)\n    sc.d a0, a1\n    amoswap.d.aq a0, a1, 8(a2)\n    sd a0, sym\n    ld a0, %hi(x)(a1)\n\
+     lwu a0, 4096(a1)\n",
+    "    mulw a0, a1\n    remuw a0, a1, 5\n    li a0, x\n    .equ x, 3\n    addw a0, a1, x99\n",
+];
+
+fn the_assembler_on_camelot_reports_merlin_as_errors(xlen: Xlen) {
     // Bad inputs: the messages, file and line merlin-as gives.
-    let cases = [
+    let common = [
         "    nop\n    frobnicate a0\n",
         "    addi a0, a1, 5000\n    beq a0, a1, 3\n",
         "    .word \"x\"\n    lw a0, %hi(sym)(a1)\n",
         "1:  nop\n    j 2b\n",
-        "    li a0, 0x1000000000\n",
         "    sgt a0, a1\n    sgtu a0, a1, 5\n    sgt a0, x99, a1\n",
         "    .equ x, 1 / 0\n",
         "    addi a0, a1,\n    .bogus 1\n",
@@ -395,19 +485,44 @@ nop
         ".p2align 2, 0x55, 0\n.balign 8,, -1\n.p2align 3,,\n.p2align 2,\n.balign 3\n.p2align 2, 1, 2, 3\n\
          .p2align 2, x\n.balign 8, 0, x\n.p2align 17\n",
     ];
-    let inputs: Vec<(String, String)> = cases
+    let own = match xlen {
+        Xlen::Rv32 => RV32_ERRORS,
+        Xlen::Rv64 => RV64_ERRORS,
+    };
+    let inputs: Vec<(String, String)> = common
         .iter()
+        .chain(own)
         .enumerate()
         .map(|(i, c)| (format!("case{i}"), c.to_string()))
         .collect();
-    let commands: Vec<String> = (0..inputs.len())
-        .map(|i| format!("as /src/{0}.s -o /out/{0}.o", short(i)))
+    let mut commands: Vec<String> = (0..inputs.len())
+        .map(|i| format!("as {}/src/{1}.s -o /out/{1}.o", march(xlen), short(i)))
         .collect();
+    // The command line: an ISA merlin-as does not take, as merlin-as says it
+    // (its main.rs, with `as` for `merlin-as` before the message), and
+    // `-march` without `=`, an unknown option, as in clang.
+    let bad_march = "as -march=rv64gc /src/f0.s -o /out/x.o";
+    let bare_march = "as -march rv64ima_zicsr_zifencei /src/f0.s";
+    commands.push(bad_march.into());
+    commands.push(bare_march.into());
     let input = format!("{}\nexit 0\n", commands.join("\n"));
-    let (out, _) = boot(image(&inputs), &input, 2_000_000_000);
+    let (out, disk) = boot(image(&inputs, xlen), &input, 2_000_000_000, xlen);
+    assert_eq!(
+        shell_output(&out, bad_march).replace("\r", ""),
+        "as: unsupported -march 'rv64gc' (merlin-as takes rv32ima_zicsr_zifencei or rv64ima_zicsr_zifencei)\n\
+         as: exit 2\n"
+    );
+    assert!(Fs::open(&disk).unwrap().read_file("/out/x.o").is_err());
+    assert!(
+        shell_output(&out, bare_march)
+            .replace("\r", "")
+            .starts_with("as: unknown option -march\nusage: as [-march=ISA] [-o output.o] input.s\n"),
+        "{}",
+        shell_output(&out, bare_march)
+    );
     for (i, (_, text)) in inputs.iter().enumerate() {
         let file = format!("/src/{}.s", short(i));
-        let errors = merlin_as::assemble_to_elf(text).unwrap_err();
+        let errors = merlin_as_object(text, xlen).unwrap_err();
         let want: String = errors
             .iter()
             .map(|e| match e.line {
@@ -444,27 +559,23 @@ fn the_c_tools_tables_are_the_host_tools() {
 /// writes them to target/kernel/obj/user (the debug sections, their
 /// relocations and headers): programs of C with the library's members, and
 /// `as`, of several files.
-#[test]
-fn the_linker_on_camelot_links_every_user_program_as_merlin_ld_does() {
-    link_every_program(&|name| ["hello", "cat", "grep", "as"].contains(&name));
+fn the_linker_on_camelot_links_every_user_program_as_merlin_ld_does(xlen: Xlen) {
+    link_every_program(&|name| ["hello", "cat", "grep", "as"].contains(&name), xlen);
 }
 
-/// Every program with the line tables too: twice the links, and the bigger
-/// files.
-#[test]
-#[ignore]
-fn the_linker_on_camelot_keeps_the_line_tables_as_merlin_ld_does() {
-    link_every_program(&|_| true);
+fn the_linker_on_camelot_keeps_the_line_tables_as_merlin_ld_does(xlen: Xlen) {
+    link_every_program(&|_| true, xlen);
 }
 
-/// Links every user program on Camelot with `-S`, and without it those
-/// `with_debug` names, and compares the executables with merlin-ld's. The
-/// objects go in `/o`, each program's command line in a response file in
-/// `/a` (a link line is longer than a console line), the results in `/out`.
-fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
+/// Links every user program, built for `xlen`, on an `xlen` Camelot with
+/// `-S`, and without it those `with_debug` names, and compares the
+/// executables with merlin-ld's. The objects go in `/o`, each program's
+/// command line in a response file in `/a` (a link line is longer than a
+/// console line), the results in `/out`.
+fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync), xlen: Xlen) {
     use userprogs::CCompiler;
     let dir = userprogs::user_dir(&repo_root());
-    let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
+    let rt = userprogs::build_runtime_for(&dir, CCompiler::Merlin, xlen).unwrap();
     let progs = userprogs::programs(&dir).unwrap();
     // What every machine has: the script, the runtime's objects and the
     // library's members.
@@ -543,7 +654,12 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
                         commands.push(c.clone());
                     }
                     let input = format!("{}\nexit 0\n", commands.join("\n"));
-                    let (out, disk) = boot(image_of(&["ld"], &["/o", "/a"], &files), &input, 20_000_000_000);
+                    let (out, disk) = boot(
+                        image_of(&["ld"], &["/o", "/a"], &files, xlen),
+                        &input,
+                        20_000_000_000,
+                        xlen,
+                    );
                     let fs = Fs::open(&disk).unwrap();
                     let mut wrong = Vec::new();
                     for (command, file, job, want) in &checks {
@@ -581,16 +697,14 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
 /// and `/bin/ld`, is the host's `examples/hello/hello.elf` byte for byte, and
 /// it runs (on a machine of its own: it is a bare-metal program). Camelot has
 /// no preprocessor: `/bin/as` gets hello.S as merlin's makes it on the host,
-/// the text the host's merlin-as assembles.
-#[test]
-fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
+/// the text the host's merlin-as assembles. On RV64 the same is
+/// `examples/hello/hello-rv64.elf`, assembled and linked inside RV64
+/// Camelot.
+fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs(xlen: Xlen) {
     let root = repo_root();
     let ex = xtask::examples::find("hello").unwrap();
-    let host = xtask::examples::build(&root, ex, xtask::examples::Xlen::Rv32).unwrap();
-    assert_eq!(
-        host.elf,
-        std::fs::read(ex.elf_path(&root, xtask::examples::Xlen::Rv32)).unwrap()
-    );
+    let host = xtask::examples::build(&root, ex, xlen).unwrap();
+    assert_eq!(host.elf, std::fs::read(ex.elf_path(&root, xlen)).unwrap());
     let files: Vec<(String, Vec<u8>)> = vec![
         ("/src/hello.s".into(), host.assembly[0].text.clone().into_bytes()),
         (
@@ -599,17 +713,22 @@ fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
         ),
     ];
     let commands = [
-        "as /src/hello.s -o /out/hello.o",
-        "ld -T /src/link.ld /out/hello.o -o /out/hello",
+        format!("as {}/src/hello.s -o /out/hello.o", march(xlen)),
+        "ld -T /src/link.ld /out/hello.o -o /out/hello".to_string(),
     ];
     let input = format!("{}\nexit 0\n", commands.join("\n"));
-    let (out, disk) = boot(image_of(&["as", "ld"], &["/src"], &files), &input, 2_000_000_000);
-    for c in commands {
+    let (out, disk) = boot(
+        image_of(&["as", "ld"], &["/src"], &files, xlen),
+        &input,
+        2_000_000_000,
+        xlen,
+    );
+    for c in &commands {
         assert_eq!(shell_output(&out, c), "", "{c}");
     }
     let elf = Fs::open(&disk).unwrap().read_file("/out/hello").unwrap();
-    assert!(elf == host.elf, "/out/hello is not examples/hello/hello.elf");
-    let mut m = Machine::new(MachineConfig::default()).unwrap();
+    assert!(elf == host.elf, "/out/hello is not {}", ex.elf_name(xlen));
+    let mut m = Machine::new(machine_config(xlen)).unwrap();
     m.cpu.bus.uart.capture = true;
     m.load_elf(&elf).unwrap();
     assert_eq!(m.run(Some(10_000_000), |_| {}), RunResult::Exited(0));
@@ -617,37 +736,54 @@ fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
     assert!(said.contains("Hello"), "{said:?}");
 }
 
-/// An object from merlin-as.
-fn object(src: &str) -> Vec<u8> {
-    merlin_as::assemble_to_elf(src).unwrap_or_else(|e| panic!("{e:?}\n{src}"))
+/// An object from merlin-as, for `xlen`.
+fn object(src: &str, xlen: Xlen) -> Vec<u8> {
+    merlin_as_object(src, xlen).unwrap_or_else(|e| panic!("{e:?}\n{src}"))
+}
+
+/// Whether `obj` is an ELF64 file (`EI_CLASS`): the field offsets the
+/// helpers below change differ between the classes.
+fn is_elf64(obj: &[u8]) -> bool {
+    obj[4] == 2
+}
+
+/// A section header field: (offset in an Elf32_Shdr, offset in an
+/// Elf64_Shdr, size in an ELF64 one; 4 in an ELF32 one).
+#[derive(Clone, Copy)]
+struct ShdrField(usize, usize, usize);
+const SH_FLAGS: ShdrField = ShdrField(8, 8, 8);
+const SH_SIZE: ShdrField = ShdrField(20, 32, 8);
+const SH_ADDRALIGN: ShdrField = ShdrField(32, 48, 8);
+const SH_ENTSIZE: ShdrField = ShdrField(36, 56, 8);
+
+/// `obj` with field `field` of section `name`'s header set to `f` of its
+/// value.
+fn shdr_field(mut obj: Vec<u8>, name: &str, field: ShdrField, f: impl Fn(u64) -> u64) -> Vec<u8> {
+    let wide = is_elf64(&obj);
+    let at = {
+        let elf = elf::Elf::parse(&obj).unwrap();
+        let i = elf.sections.iter().position(|s| s.name == name).unwrap();
+        let (at, entsize) = if wide { (field.1, 64) } else { (field.0, 40) };
+        elf.header.shoff as usize + entsize * i + at
+    };
+    if wide && field.2 == 8 {
+        let v = u64::from_le_bytes(obj[at..at + 8].try_into().unwrap());
+        obj[at..at + 8].copy_from_slice(&f(v).to_le_bytes());
+    } else {
+        let v = u32::from_le_bytes(obj[at..at + 4].try_into().unwrap());
+        obj[at..at + 4].copy_from_slice(&(f(v.into()) as u32).to_le_bytes());
+    }
+    obj
 }
 
 /// `obj` with its section `name` made a mergeable string section
 /// (`SHF_MERGE | SHF_STRINGS`, entries of one byte), as clang's
 /// `.rodata.str1.1` is: merlin-as writes none.
-fn mergeable(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
-    let at = {
-        let elf = elf::Elf::parse(&obj).unwrap();
-        let i = elf.sections.iter().position(|s| s.name == name).unwrap();
-        elf.header.shoff as usize + 40 * i
-    };
-    let flags = u32::from_le_bytes(obj[at + 8..at + 12].try_into().unwrap());
-    obj[at + 8..at + 12].copy_from_slice(&(flags | (elf::SHF_MERGE | elf::SHF_STRINGS) as u32).to_le_bytes());
-    obj[at + 36..at + 40].copy_from_slice(&1u32.to_le_bytes());
-    obj
-}
-
-/// `obj` with the 32-bit field at `field` of section `name`'s ELF32 header
-/// set to `f` of its value.
-fn shdr_field(mut obj: Vec<u8>, name: &str, field: usize, f: impl Fn(u32) -> u32) -> Vec<u8> {
-    let at = {
-        let elf = elf::Elf::parse(&obj).unwrap();
-        let i = elf.sections.iter().position(|s| s.name == name).unwrap();
-        elf.header.shoff as usize + 40 * i + field
-    };
-    let v = u32::from_le_bytes(obj[at..at + 4].try_into().unwrap());
-    obj[at..at + 4].copy_from_slice(&f(v).to_le_bytes());
-    obj
+fn mergeable(obj: Vec<u8>, name: &str) -> Vec<u8> {
+    let obj = shdr_field(obj, name, SH_FLAGS, |flags| {
+        flags | elf::SHF_MERGE | elf::SHF_STRINGS
+    });
+    shdr_field(obj, name, SH_ENTSIZE, |_| 1)
 }
 
 /// A program for [`the_linker_on_camelot_links_scripts_as_merlin_ld_does`]:
@@ -708,22 +844,26 @@ far:    ret
 fargone: nop
 ";
 
-/// `obj`, an ELF32 object, with its relocations, in section order, given
-/// the types and offsets of `relocs`: merlin-as emits no ADD/SUB/SET,
-/// 32_PCREL or ALIGN.
+/// `obj` with its relocations, in section order, given the types and
+/// offsets of `relocs`: merlin-as emits no ADD/SUB/SET, 32_PCREL or ALIGN.
+/// An Elf32_Rela is r_offset, r_info (the type in its low byte) and
+/// r_addend, 4 bytes each; an Elf64_Rela the same, 8 bytes each (the type
+/// in r_info's low 32 bits).
 fn retype(mut obj: Vec<u8>, relocs: &[(u8, u32)]) -> Vec<u8> {
+    let (size, word) = if is_elf64(&obj) { (24, 8) } else { (12, 4) };
     let at: Vec<usize> = {
         let elf = elf::Elf::parse(&obj).unwrap();
         elf.sections
             .iter()
             .filter(|s| s.ty == elf::SHT_RELA)
-            .flat_map(|s| (0..s.size / 12).map(move |i| (s.offset + i * 12) as usize))
+            .flat_map(|s| (0..s.size / size).map(move |i| (s.offset + i * size) as usize))
             .collect()
     };
     assert_eq!(at.len(), relocs.len());
     for (&e, &(ty, off)) in at.iter().zip(relocs) {
+        obj[e..e + word].fill(0);
         obj[e..e + 4].copy_from_slice(&off.to_le_bytes());
-        obj[e + 4] = ty;
+        obj[e + word] = ty;
     }
     obj
 }
@@ -769,23 +909,25 @@ const DIFFS_RELOCS: [(u8, u32); 18] = [
     (56, 8),
 ];
 
-/// `obj`, an ELF32 object, with its global symbol `name` made weak
-/// (merlin-as has no `.weak`).
+/// `obj` with its global symbol `name` made weak (merlin-as has no
+/// `.weak`).
 fn weaken(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
+    // An Elf32_Sym's st_info is after st_name, st_value and st_size; an
+    // Elf64_Sym's right after st_name.
+    let (size, info) = if is_elf64(&obj) { (24, 4) } else { (16, 12) };
     let at = {
         let elf = elf::Elf::parse(&obj).unwrap();
         let symtab = elf.sections.iter().find(|s| s.ty == elf::SHT_SYMTAB).unwrap();
         let strtab = elf.sections[symtab.link as usize].offset as usize;
-        (0..symtab.size / 16)
-            .map(|i| (symtab.offset + i * 16) as usize)
+        (0..symtab.size / size)
+            .map(|i| (symtab.offset + i * size) as usize)
             .find(|&e| {
                 let n = strtab + u32::from_le_bytes(obj[e..e + 4].try_into().unwrap()) as usize;
                 obj[n..].split(|&b| b == 0).next() == Some(name.as_bytes())
             })
             .unwrap()
     };
-    // st_info, after st_name, st_value and st_size.
-    obj[at + 12] = (elf::STB_WEAK << 4) | (obj[at + 12] & 0xf);
+    obj[at + info] = (elf::STB_WEAK << 4) | (obj[at + info] & 0xf);
     obj
 }
 
@@ -799,10 +941,11 @@ fn weaken(mut obj: Vec<u8>, name: &str) -> Vec<u8> {
 /// section), a segment aligned past the page, a section without inputs
 /// after the code, a run of RELRO sections, empty orphans (placed as ld.lld
 /// places them), and the file offsets of NOBITS sections and of an empty
-/// section whose segment is dropped.
-#[test]
-fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
-    let objects = [weaken(object(SCRIPTED), "wu"), object(FAR)];
+/// section whose segment is dropped. The objects are `xlen`'s, and the
+/// scripts' OUTPUT_FORMAT names their class.
+fn the_linker_on_camelot_links_scripts_as_merlin_ld_does(xlen: Xlen) {
+    let class = elf_class(xlen);
+    let objects = [weaken(object(SCRIPTED, xlen), "wu"), object(FAR, xlen)];
     // `.text`, `more`, the rest from `start`.
     let rest = ".rodata : { *(.rodata) } .two : { *(.rodata.two) } .data : { *(.data) } .bss : { *(.bss) } \
                 /DISCARD/ : { *(.text.gone) }";
@@ -860,14 +1003,14 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
         // OUTPUT_FORMAT's three arguments, a -freebsd name, and ADDR of
         // /DISCARD/, which is 0.
         format!(
-            "OUTPUT_FORMAT(\"elf32-littleriscv-freebsd\", \"elf32-littleriscv\", \"elf32-littleriscv\") \
+            "OUTPUT_FORMAT(\"{class}-littleriscv-freebsd\", \"{class}-littleriscv\", \"{class}-littleriscv\") \
              ENTRY(_start) SECTIONS {{ . = 0x80100000; .text : {{ *(.text) }} . = 0x80000000; \
              gone = ADDR(/DISCARD/); {rest} }}"
         ),
         // Names with dashes, unquoted (`-` is a character of a name outside
         // expressions, an operator in them), and ALIGN(0), which is 1.
         format!(
-            "OUTPUT_FORMAT(elf32-littleriscv) ENTRY(_start) SECTIONS {{ . = 0x80000000; . = ALIGN(0); \
+            "OUTPUT_FORMAT({class}-littleriscv) ENTRY(_start) SECTIONS {{ . = 0x80000000; . = ALIGN(0); \
              .text-x : ALIGN(0) {{ *(.text .text-none) }} a-b = ADDR(.text-x)-4; {rest} }}"
         ),
         // Empty sections kept because their AT or ALIGN uses a symbol.
@@ -897,6 +1040,7 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
 .section .eb, \"aw\", @nobits
 .section .two, \"a\"
 ",
+        xlen,
     );
     for script in [
         from("0x80000001", "foo = .;"),
@@ -911,14 +1055,14 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
     }
     // Label differences and set values.
     links.push((
-        vec![retype(object(DIFFS), &DIFFS_RELOCS)],
+        vec![retype(object(DIFFS, xlen), &DIFFS_RELOCS)],
         "SECTIONS { g = 0x100; . = 0x80000000; .text : { *(.text) } .data : { *(.data) } \
          /DISCARD/ : { *(.text.gone) } }"
             .into(),
     ));
     // No section at all: the headers in the last page.
     links.push((
-        vec![object("    .globl _start\n    .set _start, 0x80000000\n")],
+        vec![object("    .globl _start\n    .set _start, 0x80000000\n", xlen)],
         "SECTIONS { /DISCARD/ : { *(.text) } }".into(),
     ));
 
@@ -965,7 +1109,12 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
         commands.push(c.clone());
     }
     let input = format!("{}\nexit 0\n", commands.join("\n"));
-    let (out, disk) = boot(image_of(&["ld"], &["/s"], &files), &input, 2_000_000_000);
+    let (out, disk) = boot(
+        image_of(&["ld"], &["/s"], &files, xlen),
+        &input,
+        2_000_000_000,
+        xlen,
+    );
     let fs = Fs::open(&disk).unwrap();
     for (command, file, want) in &checks {
         assert_eq!(shell_output(&out, command), "", "{command}");
@@ -980,145 +1129,184 @@ fn the_linker_on_camelot_links_scripts_as_merlin_ld_does() {
     }
 }
 
-#[test]
-fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
+/// The ELF class of `xlen`'s objects, as an OUTPUT_FORMAT names it.
+fn elf_class(xlen: Xlen) -> &'static str {
+    match xlen {
+        Xlen::Rv32 => "elf32",
+        Xlen::Rv64 => "elf64",
+    }
+}
+
+fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings(xlen: Xlen) {
     // Links that fail, and links that succeed with a warning: what merlin-ld
     // says, word for word, the exit status, and the file (none after an
     // error, merlin-ld's after a warning). Each case is its inputs, a
     // script, and more arguments: `--start-lib` makes the last input a
-    // library member.
+    // library member. The objects are `xlen`'s; the limits that are 4 GiB
+    // on RV32 are 2^64 on RV64, and the class an OUTPUT_FORMAT must name
+    // is the objects'.
+    let obj = |src: &str| object(src, xlen);
+    let class = elf_class(xlen);
+    let other = match xlen {
+        Xlen::Rv32 => "elf64",
+        Xlen::Rv64 => "elf32",
+    };
     let script = "ENTRY(_start)\nSECTIONS\n{\n    . = 0x1000;\n    .text : { *(.text) }\n    .rodata : { *(.rodata) }\n    .data : { *(.data) }\n}\n";
-    let start = object(".text\n.globl _start\n_start: nop\n");
+    let start = obj(".text\n.globl _start\n_start: nop\n");
     let truncated = start[..start.len() - 50].to_vec();
     // EI_CLASS 3: neither ELFCLASS32 nor ELFCLASS64.
     let mut bad_class = start.clone();
     bad_class[4] = 3;
     let strings = ".rodata\n.asciz \"hello\"\n.asciz \"world\"\n";
-    let with_rodata = object(".text\n.globl _start\n_start: nop\n.rodata\n.word 1\n");
-    let cases: Vec<(Vec<Vec<u8>>, &str, &str)> = vec![
+    let with_rodata = obj(".text\n.globl _start\n_start: nop\n.rodata\n.word 1\n");
+    // The top of the address space: 4 GiB on RV32, 2^64 on RV64, and the
+    // address `n` bytes below it.
+    let below_top = |n: u64| match xlen {
+        Xlen::Rv32 => format!("{:#x}", (1u64 << 32) - n),
+        Xlen::Rv64 => format!("{:#x}", 0u64.wrapping_sub(n)),
+    };
+    let mut cases: Vec<(Vec<Vec<u8>>, String, &str)> = vec![
         // Errors.
         (
-            vec![object(
-                ".text\n.globl _start\n_start: call missing\n    call gone\n",
-            )],
-            script,
+            vec![obj(".text\n.globl _start\n_start: call missing\n    call gone\n")],
+            script.into(),
             "",
         ),
-        (vec![start.clone(), start.clone()], script, ""),
-        (vec![bad_class], script, ""),
-        (vec![start.clone()], "SECTIONS { .text 0x100 : { *(.text) } }", ""),
+        (vec![start.clone(), start.clone()], script.into(), ""),
+        (vec![bad_class], script.into(), ""),
         (
-            vec![object(
-                ".text\n.globl _start\n_start: nop\n.section .extra, \"aw\"\n.word 1\n",
-            )],
-            script,
+            vec![start.clone()],
+            "SECTIONS { .text 0x100 : { *(.text) } }".into(),
+            "",
+        ),
+        (
+            vec![obj(".text\n.globl _start\n_start: nop\n.section .extra, \"aw\"\n.word 1\n")],
+            script.into(),
             "",
         ),
         (
             vec![
-                object(".text\n.globl _start\n_start: beq a0, a1, far\n"),
-                object(".text\n.zero 8192\n.globl far\nfar: nop\n"),
+                obj(".text\n.globl _start\n_start: beq a0, a1, far\n"),
+                obj(".text\n.zero 8192\n.globl far\nfar: nop\n"),
             ],
-            script,
+            script.into(),
             "",
         ),
         // A branch out of range and odd (two errors), R_RISCV_ALIGN, and a
         // SET32 out of range.
         (
-            vec![object(".text\n.globl _start\n_start: beq a0, a1, odd\n")],
-            "SECTIONS { . = 0x1000; .text : { *(.text) } odd = 0x1000 + 4097; }",
+            vec![obj(".text\n.globl _start\n_start: beq a0, a1, odd\n")],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } odd = 0x1000 + 4097; }".into(),
             "",
         ),
         (
             vec![retype(
-                object(".text\n.globl _start\n_start: nop\n.data\n.word _start\n.word big\n"),
+                obj(".text\n.globl _start\n_start: nop\n.data\n.word _start\n.word big\n"),
                 &[(43, 0), (56, 4)],
             )],
-            "SECTIONS { . = 0x1000; .text : { *(.text) } .data : { *(.data) } big = 0x80000000; }",
+            "SECTIONS { . = 0x1000; .text : { *(.text) } .data : { *(.data) } big = 0x80000000; }".into(),
             "",
         ),
-        (vec![start.clone()], script, "-e nosuch"),
-        (vec![start.clone()], script, "-e 0x+10"),
+        (vec![start.clone()], script.into(), "-e nosuch"),
+        (vec![start.clone()], script.into(), "-e 0x+10"),
         (
             vec![start.clone()],
-            "SECTIONS { . = 0x1000; .text : { *(.text) . = . - 0x10; } x = nothere; }",
+            "SECTIONS { . = 0x1000; .text : { *(.text) . = . - 0x10; } x = nothere; }".into(),
             "",
         ),
         // A top-level `.` moved backward: the sections over each other.
         (
             vec![with_rodata.clone()],
-            "SECTIONS { . = 0x1000; .text : { *(.text) } . = 0x1000; .rodata : { *(.rodata) } }",
+            "SECTIONS { . = 0x1000; .text : { *(.text) } . = 0x1000; .rodata : { *(.rodata) } }".into(),
             "",
         ),
-        // Past 4 GiB, and the next section placed after it nonetheless.
+        // Past the top, and the next section placed after it nonetheless.
         (
             vec![with_rodata.clone()],
-            "SECTIONS { . = 0xfffffff8; .text : { *(.text) . += 8; } .rodata : { *(.rodata) } }",
+            format!(
+                "SECTIONS {{ . = {}; .text : {{ *(.text) . += 8; }} .rodata : {{ *(.rodata) }} }}",
+                below_top(8)
+            ),
             "",
         ),
         (
-            vec![object(".text\n.globl _start\n_start: nop\n.zero 64\n")],
-            "MEMORY { RAM : ORIGIN = 0x1000, LENGTH = 32 }\nSECTIONS { .text : { *(.text) } > RAM }",
+            vec![obj(".text\n.globl _start\n_start: nop\n.zero 64\n")],
+            "MEMORY { RAM : ORIGIN = 0x1000, LENGTH = 32 }\nSECTIONS { .text : { *(.text) } > RAM }".into(),
             "",
         ),
         (
             vec![start.clone()],
-            "SECTIONS { . = 0xfffffff0; .text : { *(.text) . += 0x20; } }",
+            format!(
+                "SECTIONS {{ . = {}; .text : {{ *(.text) . += 0x20; }} }}",
+                below_top(0x10)
+            ),
             "",
         ),
         (
             vec![start.clone()],
-            "MEMORY { a : o = 0, l = 1 b : o = 1, l = 1 }",
+            "MEMORY { a : o = 0, l = 1 b : o = 1, l = 1 }".into(),
             "",
         ),
         (
-            vec![object(
+            vec![obj(
                 ".text\n.globl _start\n_start: la a0, x\n.data\n.globl x\nx: .word _start\n",
             )],
-            "SECTIONS { /DISCARD/ : { *(.data) } .text : { *(.text) } }",
+            "SECTIONS { /DISCARD/ : { *(.data) } .text : { *(.text) } }".into(),
             "",
         ),
-        (vec![b"not an object".to_vec()], script, ""),
-        (vec![start.clone(), truncated.clone()], script, ""),
-        // An alignment that is not a power of two (sh_addralign at 32), a
-        // symbol table whose size is not a multiple of 16 (sh_size at 20).
-        (vec![shdr_field(start.clone(), ".text", 32, |_| 12)], script, ""),
-        (vec![shdr_field(start.clone(), ".symtab", 20, |size| size + 4)], script, ""),
+        (vec![b"not an object".to_vec()], script.into(), ""),
+        (vec![start.clone(), truncated.clone()], script.into(), ""),
+        // An alignment that is not a power of two, a symbol table whose size
+        // is not a multiple of a symbol's.
+        (
+            vec![shdr_field(start.clone(), ".text", SH_ADDRALIGN, |_| 12)],
+            script.into(),
+            "",
+        ),
+        (
+            vec![shdr_field(start.clone(), ".symtab", SH_SIZE, |size| size + 4)],
+            script.into(),
+            "",
+        ),
         // Load addresses: two sections loaded over each other, a load range
-        // past 4 GiB, AT after ALIGN, /DISCARD/ with an ALIGN not a power of
-        // two (its NOLOAD and AT mean nothing, as in ld.lld).
+        // past the top, AT after ALIGN, /DISCARD/ with an ALIGN not a power
+        // of two (its NOLOAD and AT mean nothing, as in ld.lld).
         (
             vec![with_rodata.clone()],
-            "SECTIONS { . = 0x1000; .text : { *(.text) } .rodata : AT(0x1000) { *(.rodata) } }",
+            "SECTIONS { . = 0x1000; .text : { *(.text) } .rodata : AT(0x1000) { *(.rodata) } }".into(),
             "",
         ),
         (
             vec![with_rodata.clone()],
-            "SECTIONS { . = 0x1000; .text : AT(0xfffffffe) { *(.text) } .rodata : AT(0 - 4) { *(.rodata) } }",
+            format!(
+                "SECTIONS {{ . = 0x1000; .text : AT({}) {{ *(.text) }} .rodata : AT(0 - 4) {{ *(.rodata) }} }}",
+                below_top(2)
+            ),
             "",
         ),
         (
             vec![start.clone()],
-            "SECTIONS { .text : ALIGN(4) AT(0x100) { *(.text) } }",
+            "SECTIONS { .text : ALIGN(4) AT(0x100) { *(.text) } }".into(),
             "",
         ),
         (
             vec![start.clone()],
-            "SECTIONS { /DISCARD/ (NOLOAD) : AT(nowhere) ALIGN(3) { *(.comment) } }",
+            "SECTIONS { /DISCARD/ (NOLOAD) : AT(nowhere) ALIGN(3) { *(.comment) } }".into(),
             "",
         ),
         // The headers in the read-only first section's segment, whose load
         // address leaves no room below it for them.
         (
             vec![with_rodata.clone()],
-            "SECTIONS { . = 0x80000400; .rodata : AT(0x10) { *(.rodata) } .text : { *(.text) } }",
+            "SECTIONS { . = 0x80000400; .rodata : AT(0x10) { *(.rodata) } .text : { *(.text) } }".into(),
             "",
         ),
         // ADDR: of a section not placed yet, in its own ALIGN, of none.
         (
             vec![start.clone()],
             "SECTIONS { . = 0x1000; x = ADDR(.text); .text : ALIGN(ADDR(.text)) { *(.text) } \
-             y = ADDR(.nope); }",
+             y = ADDR(.nope); }"
+                .into(),
             "",
         ),
         // ALIGN: not a power of two, in an expression and on a section, and
@@ -1126,59 +1314,84 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         (
             vec![with_rodata.clone()],
             "SECTIONS { . = 0x1001; . = ALIGN(3); .text : ALIGN(24) { *(.text) } \
-             .rodata : ALIGN(0x100000000) { *(.rodata) } }",
+             .rodata : ALIGN(0x100000000) { *(.rodata) } }"
+                .into(),
             "",
         ),
-        // OUTPUT_FORMAT: an unknown name, and elf64-littleriscv with RV32
+        // OUTPUT_FORMAT: an unknown name, and the other class's with these
         // objects, every one of them reported, library members too.
         (
             vec![start.clone()],
-            "OUTPUT_FORMAT(\"elf32-littleriscv\", \"elf64-bigriscv\")",
+            format!("OUTPUT_FORMAT(\"{class}-littleriscv\", \"elf64-bigriscv\")"),
             "",
         ),
         (
-            vec![start.clone(), object(".text\n.globl f\nf: nop\n")],
-            "OUTPUT_FORMAT(\"elf64-littleriscv\")\nSECTIONS { . = 0x1000; .text : { *(.text) } }",
+            vec![start.clone(), obj(".text\n.globl f\nf: nop\n")],
+            format!("OUTPUT_FORMAT(\"{other}-littleriscv\")\nSECTIONS {{ . = 0x1000; .text : {{ *(.text) }} }}"),
             "--start-lib",
         ),
-        // ld.lld's order: the script read first, for 64-bit values, its
-        // errors before the objects' and hiding the classes'; then the
-        // files, a library member among them, in command-line order.
+        // ld.lld's order: the script read first, its errors before the
+        // objects'; then the files, a library member among them, in
+        // command-line order.
         (
             vec![start.clone(), truncated.clone()],
-            "OUTPUT_FORMAT(elf64-littleriscv) SECTIONS {",
+            format!("OUTPUT_FORMAT({other}-littleriscv) SECTIONS {{"),
             "",
         ),
         (
-            vec![start.clone(), object(".text\n.globl f\nf: nop\n"), start.clone()],
-            "OUTPUT_FORMAT(elf64-littleriscv) SECTIONS { . = 0xffffffffffffffff; MEMORY_TOP = 0x8000000000000000; }",
+            vec![start.clone(), obj(".text\n.globl f\nf: nop\n"), start.clone()],
+            format!(
+                "OUTPUT_FORMAT({other}-littleriscv) SECTIONS {{ . = 0xffffffffffffffff; \
+                 MEMORY_TOP = 0x8000000000000000; }}"
+            ),
             "--start-lib 1",
         ),
         // Warnings: no entry symbol (the first code section's address is
         // used), and duplicate strings in mergeable sections.
         (
-            vec![object(".text\nmain: nop\n")],
-            "SECTIONS { . = 0x1000; .text : { *(.text) } }",
+            vec![obj(".text\nmain: nop\n")],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } }".into(),
             "",
         ),
         // The same, loaded elsewhere, and with the headers loaded below it.
         (
-            vec![object(".text\nmain: nop\n")],
-            "SECTIONS { . = 0x1400; .text : AT(0x800) { *(.text) } }",
+            vec![obj(".text\nmain: nop\n")],
+            "SECTIONS { . = 0x1400; .text : AT(0x800) { *(.text) } }".into(),
             "",
         ),
         (
             vec![
                 mergeable(
-                    object(&format!("{}{strings}", ".text\n.globl _start\n_start: nop\n")),
+                    obj(&format!("{}{strings}", ".text\n.globl _start\n_start: nop\n")),
                     ".rodata",
                 ),
-                mergeable(object(strings), ".rodata"),
+                mergeable(obj(strings), ".rodata"),
             ],
-            script,
+            script.into(),
             "",
         ),
     ];
+    if xlen == Xlen::Rv64 {
+        // RV64's own: an R_RISCV_32 whose value does not fit in 32 bits, and
+        // a script that reads a 64-bit address past 2^63 for the location
+        // counter, then for a section's load address.
+        cases.push((
+            vec![obj(
+                ".text\n.globl _start\n_start: nop\n.data\n.word _start\n.word far\n",
+            )],
+            "SECTIONS { . = 0x1000; .text : { *(.text) } .data : { *(.data) } far = 0x100000000; }".into(),
+            "",
+        ));
+        cases.push((
+            vec![obj(
+                ".text\n.globl _start\n_start: nop\n.data\n.dword _start\n.word -1\n",
+            )],
+            "SECTIONS { . = 0x8000000000000000; .text : { *(.text) } .data : AT(0xfffffffffffffff0) \
+             { *(.data) } }"
+                .into(),
+            "",
+        ));
+    }
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut commands = Vec::new();
     // What merlin-ld says and writes for each case.
@@ -1234,7 +1447,12 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         commands.push(args);
     }
     let input = format!("{}\nexit 0\n", commands.join("\n"));
-    let (out, disk) = boot(image_of(&["ld"], &["/e"], &files), &input, 2_000_000_000);
+    let (out, disk) = boot(
+        image_of(&["ld"], &["/e"], &files, xlen),
+        &input,
+        2_000_000_000,
+        xlen,
+    );
     let fs = Fs::open(&disk).unwrap();
     for (k, (said, elf)) in wants.iter().enumerate() {
         let got = shell_output(&out, &commands[k]).replace("\r", "");
