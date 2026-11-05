@@ -153,6 +153,10 @@ const STEPS: &[Step] = &[
         args: &["-p", "xtask", "--test", "kernel_rv64"],
     },
     Step {
+        what: "the kernels' SBI: every call and error on both widths, a fence before every IPI (#170)",
+        args: &["-p", "xtask", "--test", "sbi"],
+    },
+    Step {
         what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
                Linux's start",
         args: &[

@@ -26,11 +26,11 @@
 #include "vm.h"
 #include "kalloc.h"
 #include "kprintf.h"
-#include "machine.h"
 #include "memlayout.h"
 #include "mmio.h"
 #include "proc.h"
 #include "riscv.h"
+#include "sbi.h"
 #include "smp.h"
 #include "spinlock.h"
 #include "string.h"
@@ -393,8 +393,8 @@ void kvminit(void) {
 
     /* Every MMIO range the machine has that S-mode uses, whole pages, never
      * executable: not the CLINT and the test device, which only M-mode
-     * touches (machine_vec, at their physical addresses; start.c), as Linux
-     * under an SBI never maps them. The table doesn't promise that devices
+     * touches (Camelot's SBI, machine.S, at their physical addresses), as
+     * Linux under an SBI never maps them. The table doesn't promise that devices
      * are page aligned, so two of them can share a page: kvmmap() skips
      * pages already mapped. */
     u32 count = sysinfo_device_count();
@@ -681,7 +681,7 @@ static void early_panic(const char *msg) {
         uart_putc_phys(*msg);
     }
     uart_putc_phys('\n');
-    machine_halt(PANIC_EXIT_CODE);
+    machine_power_off(PANIC_EXIT_CODE);
 }
 
 static pagetable_t early_table(void) {

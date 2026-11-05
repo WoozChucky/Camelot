@@ -6,7 +6,11 @@
 #ifndef CAMELOT_SYSINFO_H
 #define CAMELOT_SYSINFO_H
 
+/* Assembly includes this file too (machine.S, for the registers): the C is
+ * under #ifndef __ASSEMBLER__ (const.h). */
+#ifndef __ASSEMBLER__
 #include "types.h"
+#endif
 
 #define SYSINFO_BASE 0x30002000
 
@@ -69,6 +73,7 @@
 #define DEV_POINTER 10
 #define DEV_NET 11 /* a network card, one entry each (spec section 9.8) */
 
+#ifndef __ASSEMBLER__
 struct sysinfo_device {
     u32 type;
     phys_addr_t base; /* physical: ioremap() gives the kernel's address */
@@ -77,8 +82,8 @@ struct sysinfo_device {
 };
 
 /* Where the block's registers are reached: SYSINFO_BASE, its physical
- * address (M-mode reads it once, on hart 0 before kmain, timer.c, and so
- * does setup_vm() with paging off); on RV64 the fixmap's page from setup_vm()
+ * address (as setup_vm() reads it, with paging off; M-mode reads it there
+ * too, machine.S); on RV64 the fixmap's page from setup_vm()
  * on (vm.h); then its ioremap() mapping (sysinfo_map()). */
 extern uintptr sysinfo_regs;
 
@@ -102,5 +107,6 @@ u32 sysinfo_device_count(void);
 
 /* Reads device table entry `i` (< sysinfo_device_count()) into `dev`. */
 void sysinfo_device(u32 i, struct sysinfo_device *dev);
+#endif
 
 #endif
