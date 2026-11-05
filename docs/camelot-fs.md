@@ -485,7 +485,10 @@ to the end of the last one; the section headers, symbols and their names are
 left out (the header says there are no sections), which saves about 60 KiB.
 
 `cargo xtask fs` makes the root image this way, with the disk kernel,
-`kernel/kernel-disk.elf`: the kernel linked without the user programs that
+`kernel/kernel-disk.elf` (and the RV64 one, `target/camelot-fs-rv64.img`,
+with the RV64 bootloader, `kernel/boot/boot-rv64.elf`, and the RV64 disk
+kernel, `kernel/kernel-disk-rv64.elf`, whose ELF64 segments the
+bootloader loads the same way): the kernel linked without the user programs that
 `kernel/kernel.elf` carries for running without a disk, since the image has
 them in `/bin`. It is Linux's split: a kernel image and the programs on the
 root filesystem, with `kernel.elf` playing the part of an initramfs for a
