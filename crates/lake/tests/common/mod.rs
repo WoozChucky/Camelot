@@ -1,14 +1,134 @@
 //! Helpers for the Lake tests: an in-process Lake on an ephemeral port serving a fresh
 //! temporary directory, clients, and guest programs.
+//!
+//! The tests of machines on Lake disks run twice ([`on_both_widths`]): with RV32
+//! machines, then with RV64 ones, whose disks have version 2's registers (Excalibur
+//! spec section 9.6). Meanwhile the guests this module makes ([`guest`],
+//! [`blk_equates`]) and the examples it reads ([`example_in`]) are of that width.
 
 #![allow(dead_code)]
 
 use avalon_proto::{Connection, DiskInfo, ErrorCode, Message};
+use grail::Xlen;
 use lake::{Config, Server, ServerThread};
+use std::cell::Cell;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+thread_local! {
+    /// The width of the machines this thread's test makes ([`on_both_widths`]).
+    static XLEN: Cell<Xlen> = const { Cell::new(Xlen::Rv32) };
+}
+
+/// Runs `test` with RV32 machines, then with RV64 ones. A failure says which width
+/// failed: the panic is raised again with the width before its message.
+pub fn on_both_widths(test: impl Fn()) {
+    for xlen in [Xlen::Rv32, Xlen::Rv64] {
+        XLEN.with(|x| x.set(xlen));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test));
+        XLEN.with(|x| x.set(Xlen::Rv32));
+        if let Err(payload) = result {
+            let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "a panic with no message".to_string()
+            };
+            panic!("on RV{}: {message}", xlen.bits());
+        }
+    }
+}
+
+/// The width of the machines the current test makes (RV32 outside [`on_both_widths`]).
+pub fn xlen() -> Xlen {
+    XLEN.with(Cell::get)
+}
+
+/// The same width as the protocol says it, for a VM's profile.
+pub fn profile_xlen() -> avalon_proto::Xlen {
+    match xlen() {
+        Xlen::Rv32 => avalon_proto::Xlen::Rv32,
+        Xlen::Rv64 => avalon_proto::Xlen::Rv64,
+    }
+}
+
+/// The program `name` of the example directory `dir`, built for the current width:
+/// `<name>.elf` or `<name>-rv64.elf`.
+pub fn example_in(dir: &str, name: &str) -> Vec<u8> {
+    let file = match xlen() {
+        Xlen::Rv32 => format!("{name}.elf"),
+        Xlen::Rv64 => format!("{name}-rv64.elf"),
+    };
+    std::fs::read(examples_dir().join(dir).join(file)).unwrap()
+}
+
+/// An address as the examples print one: as many hex digits as the width's
+/// registers hold.
+pub fn addr_text(addr: u64) -> String {
+    match xlen() {
+        Xlen::Rv32 => format!("{addr:#010x}"),
+        Xlen::Rv64 => format!("{addr:#018x}"),
+    }
+}
+
+/// Where a disk's registers are and how wide, on the current width (spec section
+/// 9.6): version 1's on RV32, all 32-bit; version 2's on RV64, `BLK_SECTOR` and
+/// `BLK_DMA` 64-bit.
+#[derive(Debug, Clone, Copy)]
+pub struct BlkRegs {
+    pub sector: u32,
+    pub dma: u32,
+    pub count: u32,
+    pub cmd: u32,
+    pub error: u32,
+    /// The size of an access to `BLK_SECTOR` and `BLK_DMA`: 4 or 8 bytes.
+    pub wide: u32,
+}
+
+pub fn blk_regs() -> BlkRegs {
+    use grail::block;
+    match xlen() {
+        Xlen::Rv32 => BlkRegs {
+            sector: block::REG_SECTOR,
+            dma: block::REG_DMA,
+            count: block::REG_COUNT,
+            cmd: block::REG_CMD,
+            error: block::REG_ERROR,
+            wide: 4,
+        },
+        Xlen::Rv64 => BlkRegs {
+            sector: block::v2::REG_SECTOR,
+            dma: block::v2::REG_DMA,
+            count: block::v2::REG_COUNT,
+            cmd: block::v2::REG_CMD,
+            error: block::v2::REG_ERROR,
+            wide: 8,
+        },
+    }
+}
+
+/// A guest's names for its disk's registers on the current width ([`blk_regs`]):
+/// `.equ`s of `BLK_SECTOR`, `BLK_DMA`, `BLK_COUNT`, `BLK_CMD` and `BLK_ERROR`. A guest
+/// stores `BLK_SECTOR` and `BLK_DMA` with [`wide_store`].
+pub fn blk_equates() -> String {
+    let r = blk_regs();
+    format!(
+        "    .equ BLK_SECTOR, {:#x}\n    .equ BLK_DMA, {:#x}\n    .equ BLK_COUNT, {:#x}\n    \
+         .equ BLK_CMD, {:#x}\n    .equ BLK_ERROR, {:#x}\n",
+        r.sector, r.dma, r.count, r.cmd, r.error
+    )
+}
+
+/// The store of a 64-bit register on the current width: `sw` on RV32, `sd` on RV64.
+pub fn wide_store() -> &'static str {
+    match xlen() {
+        Xlen::Rv32 => "sw",
+        Xlen::Rv64 => "sd",
+    }
+}
 
 /// Generous ceiling for anything that should take well under a second, so a loaded CI
 /// machine does not make the tests flaky.
@@ -148,10 +268,11 @@ pub fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// Assembles and links a guest with merlin-as and merlin-ld (`.text` at 0x80000000,
-/// entry `_start`).
+/// Assembles and links a guest of the current width with merlin-as and merlin-ld
+/// (`.text` at 0x80000000, entry `_start`).
 pub fn guest(asm: &str) -> Vec<u8> {
-    let obj = merlin_as::assemble_to_elf(asm).unwrap_or_else(|e| panic!("{e:?}"));
+    let options = merlin_as::Options { xlen: xlen() };
+    let obj = merlin_as::assemble_to_elf_with(asm, &options).unwrap_or_else(|e| panic!("{e:?}"));
     let inputs = [merlin_ld::Input {
         name: "guest.o".into(),
         data: obj,
