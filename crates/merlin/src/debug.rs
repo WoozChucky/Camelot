@@ -1185,9 +1185,10 @@ impl Lines {
         }
     }
 
-    /// String literal `label`, of `len` bytes without its NUL, at `pos`.
+    /// String literal `label`, a `char` array of `len` bytes (its NUL
+    /// included, if it has one), at `pos`.
     pub fn literal(&mut self, label: &str, len: usize, pos: Pos) {
-        let array = Type::Array(Box::new(Type::Int(IntKind::Char)), Some(len as u32 + 1));
+        let array = Type::Array(Box::new(Type::Int(IntKind::Char)), Some(len as u32));
         let ty = self.type_of(&array, &Spelled::default());
         let file = self.decl_file(pos);
         self.events.push(Event::Literal(self.literals.len()));

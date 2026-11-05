@@ -886,7 +886,7 @@ main:
     li    a0, 4
     j     .L.return.main
 .L.end.23:
-    la    a0, .L.str.0
+    la    a0, .L.str
     addi  sp, sp, -8
     sd    a0, 0(sp)
     lb    a0, -41(s0)
@@ -1253,7 +1253,7 @@ main:
 
     .section .rodata
 
-.L.str.0:
+.L.str:
     .asciz "ciupb"
 
 .L.str.1:

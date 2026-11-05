@@ -410,8 +410,54 @@
 //! `.ascii` and `.zero` (struct padding too), after a `.balign` for the
 //! type. A `static` local's symbol is
 //! `function.name`, a local symbol (no `.globl`). Each string literal gets a
-//! label `.L.str.<n>` in `.rodata`, one for literals of the same bytes, as
+//! label `.L.str` in `.rodata`, one for literals of the same bytes, as
 //! clang merges them.
+//!
+//! ## Symbol names
+//!
+//! The names merlin makes are clang's: `.str` for a string literal (written
+//! `.L.str`, a private label), `.compoundliteral` for the object of a
+//! compound literal at file scope, `function.name` for a `static` local.
+//! Several of one name are told apart as LLVM tells apart any two globals
+//! of the same name (`ValueSymbolTable::makeUniqueName`): the first keeps
+//! the name, and each one after gets `.N`, N the next value of one counter
+//! for the whole module (`LastUnique`), shared by every name. So the numbers
+//! skip:
+//!
+//! ```text
+//!   const char *a = "x";         .L.str
+//!   int *b = (int[]){1};         .compoundliteral
+//!   const char *c = "y";         .L.str.1
+//!   int *d = (int[]){2};         .compoundliteral.2
+//!   int f(void) {
+//!       static int x;            f.x
+//!       { static int x; }        f.x.3
+//!   }
+//! ```
+//!
+//! A symbol takes its name when clang makes its global ([`FileGen::create`]
+//! for a variable, [`FileGen::string`] for a string literal): in the order
+//! the output is generated (see "Order"), not the order of the source. A
+//! `static` global emitted at the end, where it is used, names its compound
+//! literals there. Sema gives each such variable a key, which tells apart
+//! those of one name ([`crate::sema::symbol_key`]); [`FileGen::name`] is the
+//! symbol a key was given.
+//!
+//! Some globals of clang's take numbers though merlin has no object for
+//! them, so merlin counts them all the same: the constants clang copies a
+//! local's initializer from (`__const.f.a`, an array's `constinit`:
+//! [`FileGen::take_name`]), and a global clang makes a second time, of its
+//! definition's LLVM type, when a reference made it with another (an
+//! `extern int a[]` used before `int a[3] = {1, 2, 3};`), which takes a
+//! number for a moment before the name moves over to it
+//! ([`FileGen::defined`]). Code control cannot reach takes no names
+//! ("Unreachable code" below).
+//!
+//! A function or file-scope variable keeps its own name, which other files
+//! link to: LLVM never renames one. When a constant counted has its name
+//! (`int constinit = 3;` after an array copied from clang's `constinit`),
+//! the definition takes the name over, as clang's does, a variable with
+//! one more number, a function with none ([`FileGen::take_over`]).
 //!
 //! ## Control flow
 //!
@@ -440,6 +486,46 @@
 //! variables of an arm left out are not described, and the types of its
 //! casts are not kept.
 //!
+//! ## Unreachable code
+//!
+//! Nor is code control cannot reach generated, as clang's `EmitStmt` leaves
+//! it out at `-O0` (`CGStmt.cpp`). clang generates into an insertion point,
+//! the block it is filling; a jump (`return`, `break`, `continue`, `goto`)
+//! takes it away, and a statement with no insertion point is skipped, so
+//! its string literals take no names, its casts and enums are not
+//! described. [`FuncGen::reachable`] is that insertion point:
+//!
+//! ```text
+//!   return 0;
+//!   puts("dead");        no code, no .str
+//!   int n = f();         a slot for n, but no call and no -g description
+//!   static int s;        emitted all the same (a declaration is visited)
+//! again:
+//!   puts("live");        a label: reachable again
+//! ```
+//!
+//! A label or a `case` gives the insertion point back ([`FuncGen::block`]),
+//! and a statement with a label in it is generated from its start, as
+//! clang's `EnsureInsertPoint` makes a new block for it. Where the paths
+//! of a statement meet ([`FuncGen::join`]: after an `if`, a loop, a
+//! `switch`), control is there if it falls in or a jump generated so far
+//! goes there, as clang deletes a block that has no uses. So after `if (c)
+//! return 1; else return 2;` nothing is reached; nor after a `while (1)`
+//! or `for (;;)` without a `break` control reaches, nor after a `switch`
+//! with a `default` whose cases all return; and the statements of a
+//! `switch` body before its first `case`. Some blocks are emitted whatever
+//! reaches them: a `do`'s condition and a `for`'s step, so what follows a
+//! `do` loop is always reached. A static local's declaration, a block, a
+//! label and a jump are visited even where control cannot reach them
+//! (clang's `EmitSimpleStmt`): a local declared there still gets its slot,
+//! as clang allocates it, but no initialization and no `-g` description.
+//!
+//! (LLVM then deletes, as it generates the machine code, every block no
+//! path from the function's entry reaches, such as that of a label after a
+//! `return` that no `goto` control reaches jumps to; merlin keeps that
+//! code. Its globals are made all the same, so that changes no name, only
+//! what `-g` describes of the label's code.)
+//!
 //! A conditional branch reaches only ±4 KiB, and merlin-as reports a branch
 //! that cannot reach its label as an error rather than rewriting it. So once a
 //! function is generated, [`relax_branches`] estimates every instruction's
@@ -465,12 +551,13 @@ use crate::ast::*;
 use crate::consteval::{self, Base, Const};
 use crate::debug::{DebugInfo, Lines, Location, Scope, Sources, Var};
 use crate::elide;
-use crate::sema::arith_type;
-use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
+use crate::sema::{arith_type, symbol_base, LITERAL};
+use crate::types::{ptr_size, FuncType, IntKind, Member, RecordBody, Type, Xlen};
 use crate::{Error, Pos};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::sync::Arc;
 
 /// Generates assembly for a whole translation unit.
 pub fn generate(prog: &Program) -> Result<String, Error> {
@@ -518,6 +605,8 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, Sources)>) -> Re
         pieces: Vec::new(),
         labels: 0,
         strings: Vec::new(),
+        symbols: SymbolTable::default(),
+        names: HashMap::new(),
         debug: debug.map(|(info, sources)| Lines::new(info, sources, xlen)),
         by_symbol: defs
             .iter()
@@ -530,6 +619,8 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, Sources)>) -> Re
         queue: Vec::new(),
         created: Vec::new(),
         created_set: HashSet::new(),
+        referred_as: HashMap::new(),
+        held: HashSet::new(),
         chunks: HashMap::new(),
         dry: false,
     };
@@ -642,7 +733,7 @@ impl<'a> Def<'a> {
     /// A compound literal of the file's scope, which the initializer that
     /// names it emits (`GetAddrOfConstantCompoundLiteral`).
     fn hidden(&self) -> bool {
-        matches!(self, Def::Var(d) if d.name.starts_with(".compoundliteral."))
+        matches!(self, Def::Var(d) if d.name == LITERAL)
     }
 }
 
@@ -805,6 +896,108 @@ fn log2(n: u32) -> Option<u32> {
     n.is_power_of_two().then(|| n.trailing_zeros())
 }
 
+/// The names of the module's symbols (its functions and globals), as LLVM's
+/// `ValueSymbolTable` keeps them: a name asked for that is taken already is
+/// made unique with `.N`, N from a counter of the whole table (see "Symbol
+/// names" above).
+#[derive(Default)]
+struct SymbolTable {
+    taken: HashSet<String>,
+    /// The last number appended (`LastUnique`): the next one is one more,
+    /// whichever name it is for.
+    last_unique: u32,
+}
+
+impl SymbolTable {
+    /// Takes the name `base`, or, if it is taken, `base.N` for the first N
+    /// after the last one given that makes a name not taken
+    /// (`makeUniqueName`).
+    fn insert(&mut self, base: &str) -> String {
+        if self.taken.insert(base.to_string()) {
+            return base.to_string();
+        }
+        loop {
+            self.last_unique += 1;
+            let name = format!("{base}.{}", self.last_unique);
+            if self.taken.insert(name.clone()) {
+                return name;
+            }
+        }
+    }
+
+    /// A second global made under the name `base` of one that has it, which
+    /// then takes the name over (`takeName`): the second is named
+    /// `base.N` for a moment, so the counter moves on, and no name is left
+    /// taken.
+    fn rename(&mut self, base: &str) {
+        loop {
+            self.last_unique += 1;
+            if !self.taken.contains(&format!("{base}.{}", self.last_unique)) {
+                return;
+            }
+        }
+    }
+}
+
+/// What clang's `emitStoresForConstant` looks at in the constant
+/// initializer of a local array, struct or union, to choose how to store it
+/// ([`FuncGen::local_decl`]): its bytes and its scalars.
+struct ConstantImage {
+    /// Each byte of the object, `None` for those of an address (which no
+    /// byte value stands for). Padding and what the list leaves out are
+    /// zero, as C has them and clang's constant spells them out.
+    bytes: Vec<Option<u8>>,
+    /// How many scalars are not zero: a store each, after clearing.
+    nonzero: usize,
+    /// One is the address of a symbol itself (no offset, not converted to
+    /// an integer), a global in LLVM's constant, which
+    /// `canEmitInitWithFewStoresAfterBZero` gives up on.
+    symbol: bool,
+}
+
+impl ConstantImage {
+    fn new(size: u32) -> ConstantImage {
+        ConstantImage {
+            bytes: vec![Some(0); size as usize],
+            nonzero: 0,
+            symbol: false,
+        }
+    }
+
+    /// A scalar of bytes `bytes` at byte `at`.
+    fn scalar(&mut self, at: usize, bytes: &[u8], nonzero: bool) {
+        for (i, &b) in bytes.iter().enumerate() {
+            self.bytes[at + i] = Some(b);
+        }
+        self.nonzero += usize::from(nonzero);
+    }
+
+    /// An address of `size` bytes at byte `at`; `symbol`: a symbol's own.
+    fn address(&mut self, at: usize, size: usize, symbol: bool) {
+        self.bytes[at..at + size].fill(None);
+        self.nonzero += 1;
+        self.symbol |= symbol;
+    }
+
+    /// Whether clang copies the object from a constant global, at `-O0`:
+    /// not when every byte is zero (a `memset` of zeros), and for more than
+    /// 32 bytes not when at most 6 scalars are not zero and no one is a
+    /// symbol's address (zeros, then a store each:
+    /// `shouldUseBZeroPlusStoresToInitialize`), nor when every byte is the
+    /// same (a `memset`: `shouldUseMemSetToInitialize`).
+    fn copied(&self) -> bool {
+        if self.bytes.iter().all(|&b| b == Some(0)) {
+            return false;
+        }
+        if self.bytes.len() <= 32 {
+            return true;
+        }
+        let few_stores = !self.symbol && self.nonzero <= 6;
+        let one_byte = self.bytes[0].is_some() && self.bytes.iter().all(|&b| b == self.bytes[0]);
+        !few_stores && !one_byte
+    }
+}
+
 /// What is shared by the whole file: the output, the label counter and the
 /// string literals seen so far.
 struct FileGen<'a> {
@@ -819,8 +1012,13 @@ struct FileGen<'a> {
     pieces: Vec<(&'static str, String)>,
     /// Label counter shared by every function in the file, so labels are unique.
     labels: usize,
-    /// String literals, emitted at the end; literal `i` is `.L.str.<i>`.
-    strings: Vec<Vec<u8>>,
+    /// String literals, emitted at the end: each one's bytes (its whole
+    /// array, the NUL included) and label.
+    strings: Vec<(Vec<u8>, String)>,
+    /// The names of the module's symbols, and the symbol each key sema
+    /// gave a variable is written as ("Symbol names" above).
+    symbols: SymbolTable,
+    names: HashMap<String, String>,
     /// With `-g`, the debug information ([`crate::debug`]).
     debug: Option<Lines>,
     /// The file's definitions, in the order they come, and by symbol.
@@ -837,6 +1035,13 @@ struct FileGen<'a> {
     /// output has them.
     created: Vec<String>,
     created_set: HashSet<String>,
+    /// The type a variable was declared with where a reference made its
+    /// symbol, before its definition was emitted ([`Self::defined`]).
+    referred_as: HashMap<String, Type>,
+    /// The names of the constants merlin counts but does not output
+    /// ([`Self::take_name`]) that a function or variable could have, until
+    /// its definition takes the name over.
+    held: HashSet<String>,
     /// The output of each symbol emitted, in pieces by section.
     chunks: HashMap<String, Vec<(&'static str, String)>>,
     /// A function's first pass is being generated, which makes nothing
@@ -863,15 +1068,28 @@ impl<'a> FileGen<'a> {
 
     // ---- the order of the output ----
 
-    /// Makes symbol `sym`, as clang makes a function or global the first
-    /// time it is defined or referred to (`GetOrCreateLLVMFunction`,
-    /// `GetOrCreateLLVMGlobal`): the output has the symbols in this order. A
-    /// deferred definition waiting for its first use is to be emitted now.
+    /// Makes symbol `sym` (a key sema gave it), as clang makes a function or
+    /// global the first time it is defined or referred to
+    /// (`GetOrCreateLLVMFunction`, `GetOrCreateLLVMGlobal`): the output has
+    /// the symbols in this order, and the symbol takes its name now ("Symbol
+    /// names" above). A deferred definition waiting for its first use is to
+    /// be emitted now.
     fn create(&mut self, sym: &str) {
         if self.dry {
             return;
         }
         if self.created_set.insert(sym.to_string()) {
+            // A function or file-scope variable keeps its own name, which
+            // linking needs: LLVM never renames one ([`Self::take_over`]).
+            // The names sema makes up (`f.x`, `.compoundliteral`, keys with
+            // a `#`) are made unique.
+            let name = if is_c_name(sym) {
+                self.symbols.taken.insert(sym.to_string());
+                sym.to_string()
+            } else {
+                self.symbols.insert(symbol_base(sym))
+            };
+            self.names.insert(sym.to_string(), name);
             self.created.push(sym.to_string());
             if let Some(&k) = self.by_symbol.get(sym) {
                 if self.waiting[k] {
@@ -882,10 +1100,21 @@ impl<'a> FileGen<'a> {
         }
     }
 
-    /// A reference to symbol `sym` in the code or the data generated. A
-    /// compound literal it names is emitted first, as clang emits one where
-    /// an initializer names it.
-    fn reference(&mut self, sym: &str) {
+    /// The symbol made for key `sym` ([`Self::create`]). A function's first
+    /// pass, which makes nothing, writes the key, and its output is thrown
+    /// away.
+    fn name<'s>(&'s self, sym: &'s str) -> &'s str {
+        debug_assert!(
+            self.dry || self.names.contains_key(sym),
+            "'{sym}' is used before it is made"
+        );
+        self.names.get(sym).map_or(sym, String::as_str)
+    }
+
+    /// A reference to symbol `sym` in the code or the data generated, of a
+    /// variable declared there with type `ty`. A compound literal it names
+    /// is emitted first, as clang emits one where an initializer names it.
+    fn reference(&mut self, sym: &str, ty: Option<&Type>) {
         if self.dry {
             return;
         }
@@ -894,7 +1123,176 @@ impl<'a> FileGen<'a> {
                 self.emit(k).expect("a variable is emitted without errors");
             }
         }
+        if let Some(ty) = ty.filter(|_| !self.created_set.contains(sym)) {
+            self.referred_as.insert(sym.to_string(), ty.clone());
+        }
         self.create(sym);
+    }
+
+    /// The definition of global `d` (key `sym`), its initializer's data
+    /// made: if a reference made its symbol before, as clang makes a
+    /// global of the type the variable was declared with there, and the
+    /// constant clang makes of the initializer is of another type, clang
+    /// makes a new global of that type, under the name, and moves the name
+    /// over to it (`GetOrCreateLLVMGlobal`): the name counter moves on.
+    ///
+    /// ```text
+    ///   extern int a[];          (a [0 x i32] global, where p refers to it)
+    ///   int *p = a;
+    ///   int a[3] = {1, 2, 3};    ([3 x i32]: a new global, a.1, renamed a)
+    /// ```
+    ///
+    /// The new global is made where the definition is, after the symbols
+    /// made so far: the output has the variable there.
+    fn defined(&mut self, d: &Declarator, sym: &str) {
+        if self.take_over(sym, true) {
+            self.referred_as.remove(sym);
+            return;
+        }
+        let Some(referred) = self.referred_as.remove(sym) else {
+            return;
+        };
+        let same = same_llvm_type(&referred, &d.ty, self.xlen)
+            && d.init
+                .as_ref()
+                .is_none_or(|init| self.constant_has_type(&d.ty, init));
+        if !same {
+            let name = self.name(sym).to_string();
+            self.symbols.rename(&name);
+            self.made_now(sym);
+        }
+    }
+
+    /// The definition of function or variable `sym` (a C name), when a
+    /// constant clang made, counted but not output ([`Self::take_name`]),
+    /// has its name: `constinit`, of an array copied from it, before `int
+    /// constinit = 3;`. A reference to the symbol finds that constant
+    /// (`GetGlobalValue`), so clang makes the symbol's global only for its
+    /// definition, which takes the name over (`takeName`): a variable is
+    /// named `constinit.N` for a moment (`GetOrCreateLLVMGlobal`), one more
+    /// number; a function is made without a name
+    /// (`GetOrCreateLLVMFunction`), none. Either is made there, after the
+    /// symbols made so far. Whether the name was the constant's.
+    fn take_over(&mut self, sym: &str, variable: bool) -> bool {
+        if self.dry || !self.held.remove(sym) {
+            return false;
+        }
+        if variable {
+            self.symbols.rename(sym);
+        }
+        self.made_now(sym);
+        true
+    }
+
+    /// Moves symbol `sym`, made already, to after every symbol made so
+    /// far: clang made its global again, now.
+    fn made_now(&mut self, sym: &str) {
+        self.created.retain(|s| s != sym);
+        self.created.push(sym.to_string());
+    }
+
+    /// Whether the constant clang makes of `init`, the initializer of an
+    /// object of type `ty`, has the LLVM type clang gives such an object
+    /// in memory (`ConvertTypeForMem`), as clang's `ConstExprEmitter`
+    /// builds it:
+    ///
+    /// - a scalar's, and a `char` array's string (the array's size), have
+    ///   it; so does a subobject the list leaves out (an empty list here),
+    ///   clang's `EmitNullConstant`;
+    /// - an array's (`EmitArrayConstant`) is an array of its elements'
+    ///   type, which is the array's if every element's is, unless 8 zeros
+    ///   or more end it (a struct then, the zeros an array of their own);
+    ///   all zeros is the array's own `zeroinitializer`;
+    /// - a struct's is the struct's if every member's constant has its type
+    ///   and the struct has no padding: C has clang spell the padding out as
+    ///   arrays of zeros (`DoZeroInitPadding`), which the struct's own type
+    ///   leaves to the layout;
+    /// - a union's has the member it initializes and padding to the
+    ///   union's size, the union's own type if that member's constant has
+    ///   the LLVM type of the member the union's type holds (the most
+    ///   aligned, then the largest, the first of those: `lowerUnion`).
+    fn constant_has_type(&self, ty: &Type, init: &Init) -> bool {
+        let x = self.xlen;
+        match (ty.unqual(), init) {
+            (_, Init::List(items, _)) if items.is_empty() => true,
+            (Type::Array(elem, Some(n)), Init::List(items, _)) => {
+                let nonzero = items
+                    .iter()
+                    .rposition(|i| !self.constant_is_null(elem, i))
+                    .map_or(0, |i| i + 1);
+                nonzero == 0
+                    || (*n as usize - nonzero < 8 && items.iter().all(|i| self.constant_has_type(elem, i)))
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().expect("sema: initialized objects are complete");
+                if r.union {
+                    let held = &body.members[items.len() - 1];
+                    let storage = union_storage(body, x);
+                    return same_llvm_type(&held.ty, &storage.ty, x)
+                        && self.constant_has_type(&held.ty, &items[items.len() - 1]);
+                }
+                !padded(body, x)
+                    && body
+                        .members
+                        .iter()
+                        .zip(items)
+                        .all(|(m, i)| self.constant_has_type(&m.ty, i))
+            }
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_has_type(lit, init),
+            _ => true,
+        }
+    }
+
+    /// Whether the constant clang makes of `init` (of an object of type
+    /// `ty`) is all zeros (LLVM's `isNullValue`): what ends an array's
+    /// elements before [`Self::constant_has_type`] counts its zeros.
+    fn constant_is_null(&self, ty: &Type, init: &Init) -> bool {
+        match (ty.unqual(), init) {
+            (Type::Array(elem, _), Init::List(items, _)) => {
+                items.iter().all(|i| self.constant_is_null(elem, i))
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                // (A union's: the member it initializes, its last item.)
+                let body = r.body().expect("sema: initialized objects are complete");
+                let first = if r.union { items.len().saturating_sub(1) } else { 0 };
+                body.members[first..]
+                    .iter()
+                    .zip(&items[first..])
+                    .all(|(m, i)| self.constant_is_null(&m.ty, i))
+            }
+            (_, Init::List(items, _)) => items.is_empty(),
+            (
+                Type::Array(_, Some(n)),
+                Init::Expr(Expr {
+                    kind: ExprKind::Str(bytes),
+                    ..
+                }),
+            ) => bytes.iter().take(*n as usize).all(|&b| b == 0),
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_is_null(lit, init),
+            (_, Init::Expr(e)) => matches!(
+                consteval::eval(e, self.xlen),
+                Some(Const::Int(0, _))
+                    | Some(Const::Addr {
+                        base: None,
+                        offset: 0
+                    })
+            ),
+            (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
+        }
     }
 
     /// Emits definition `k`: its code or its data, and with `-g` its entry.
@@ -910,9 +1308,12 @@ impl<'a> FileGen<'a> {
                 if self.defs[k].hidden() {
                     return Ok(());
                 }
-                if let (Some(dbg), Some(VarRef::Global(sym))) = (self.debug.as_mut(), &d.var) {
-                    let external = d.storage != Storage::Static;
-                    dbg.global(&d.name, sym, (&d.ty, &d.spelled), d.pos, external);
+                if let Some(VarRef::Global(sym)) = &d.var {
+                    let sym = self.name(sym).to_string();
+                    if let Some(dbg) = self.debug.as_mut() {
+                        let external = d.storage != Storage::Static;
+                        dbg.global(&d.name, &sym, (&d.ty, &d.spelled), d.pos, external);
+                    }
                 }
                 Ok(())
             }
@@ -965,6 +1366,7 @@ impl<'a> FileGen<'a> {
         let xlen = self.xlen;
         let body = f.body.as_ref().expect("a definition has a body");
         self.create(&f.name);
+        self.take_over(&f.name, false);
         // A variadic function keeps the argument registers its named
         // parameters leave free at the top of its frame.
         let Type::Func(ft) = f.ty() else {
@@ -998,6 +1400,8 @@ impl<'a> FileGen<'a> {
                 scopes: Vec::new(),
                 used: (0..n).map(|i| Cell::new(i < f.params.len())).collect(),
                 slots,
+                reachable: true,
+                reached: HashSet::new(),
             };
             g.function(body);
             let used: Vec<bool> = g.used.iter().map(Cell::get).collect();
@@ -1035,18 +1439,54 @@ impl<'a> FileGen<'a> {
     }
 
     /// The label of a string literal, at `pos`: the same bytes are one
-    /// literal, as clang merges them (C99 6.4.5p6 leaves it open).
+    /// literal, as clang merges them (C99 6.4.5p6 leaves it open). A new
+    /// one is named `.str` now, as clang names its private global
+    /// (`GetAddrOfConstantStringFromLiteral`), `.L.str` in the assembly
+    /// (`.L`: a private symbol, which the object leaves out).
     fn string(&mut self, bytes: &[u8], pos: Pos) -> String {
-        if let Some(i) = self.strings.iter().position(|s| s == bytes) {
-            return format!(".L.str.{i}");
+        let mut array = bytes.to_vec();
+        array.push(0);
+        self.string_array(&array, pos)
+    }
+
+    /// The label of a string literal whose array is `array` (its bytes,
+    /// the NUL included if it has one): [`Self::string`]'s, or that of one
+    /// that initializes a longer or shorter `char` array, whose type sema
+    /// makes that array's (C99 6.7.8p14). Literals are the same when their
+    /// arrays are, as clang's are the same constant.
+    fn string_array(&mut self, array: &[u8], pos: Pos) -> String {
+        if let Some((_, label)) = self.strings.iter().find(|(s, _)| s == array) {
+            return label.clone();
         }
-        self.strings.push(bytes.to_vec());
-        // (A first pass's literals are taken back: see [`Self::function`].)
-        let label = format!(".L.str.{}", self.strings.len() - 1);
+        // A first pass's literals are taken back ([`Self::function`]): they
+        // take no name.
+        let label = if self.dry {
+            String::from(".L.str")
+        } else {
+            format!(".L{}", self.symbols.insert(".str"))
+        };
+        self.strings.push((array.to_vec(), label.clone()));
         if let Some(d) = self.debug.as_mut() {
-            d.literal(&label, bytes.len(), pos);
+            d.literal(&label, array.len(), pos);
         }
         label
+    }
+
+    /// Takes the name `base` for a global clang makes that merlin has no
+    /// object for (a constant clang copies a local's initializer from,
+    /// [`FuncGen::local_decl`]): the counter goes on as clang's ("Symbol
+    /// names" above). A function's first pass takes none.
+    ///
+    /// The constant keeps a name a C symbol could have (`constinit`) until
+    /// that symbol's definition takes it over ([`Self::take_over`]).
+    fn take_name(&mut self, base: &str) {
+        if self.dry {
+            return;
+        }
+        let name = self.symbols.insert(base);
+        if is_c_name(&name) {
+            self.held.insert(name);
+        }
     }
 
     /// Emits a global variable or, when `local`, a `static` local: its
@@ -1069,7 +1509,9 @@ impl<'a> FileGen<'a> {
         if let Some(init) = &d.init {
             self.data(&d.ty, init, &mut data);
         }
+        self.defined(d, sym);
         self.create(sym);
+        let name = self.name(sym).to_string();
         self.begin();
         // A `const` object never changes: read-only data, as clang does (a
         // `const volatile` one may be changed from outside, so it stays
@@ -1091,22 +1533,24 @@ impl<'a> FileGen<'a> {
             ""
         };
         let bytes = if size == 1 { "byte" } else { "bytes" };
+        // A compound literal has no name in C: its symbol's.
+        let shown = if d.name == LITERAL { &name } else { &d.name };
         let _ = writeln!(
             self.out,
             "\n    # {storage}{}: {size} {bytes}",
-            d.ty.declare(&d.name)
+            d.ty.declare(shown)
         );
-        if d.storage != Storage::Static && !sym.contains('.') {
-            let _ = writeln!(self.out, "    .globl {sym}");
+        if d.storage != Storage::Static {
+            let _ = writeln!(self.out, "    .globl {name}");
         }
         if d.ty.align(self.xlen) > 1 {
             let _ = writeln!(self.out, "    .balign {}", d.ty.align(self.xlen));
         }
         // An object symbol with its size, as for functions: debuggers and
         // tests find what an address belongs to from the symbol table.
-        let _ = writeln!(self.out, "    .type {sym}, @object");
-        let _ = writeln!(self.out, "    .size {sym}, {size}");
-        let _ = writeln!(self.out, "{sym}:");
+        let _ = writeln!(self.out, "    .type {name}, @object");
+        let _ = writeln!(self.out, "    .size {name}, {size}");
+        let _ = writeln!(self.out, "{name}:");
         if d.init.is_none() {
             data.push(format!(".zero {size}"));
         }
@@ -1196,8 +1640,8 @@ impl<'a> FileGen<'a> {
                     } => {
                         let sym = match base {
                             Base::Sym(s) => {
-                                self.reference(&s);
-                                s
+                                self.reference(&s, referred_type(e, &s));
+                                self.name(&s).to_string()
                             }
                             Base::Str(bytes) => self.string(&bytes, e.pos),
                         };
@@ -1255,11 +1699,9 @@ impl<'a> FileGen<'a> {
             return;
         }
         self.switch(".rodata");
-        for (i, bytes) in std::mem::take(&mut self.strings).iter().enumerate() {
-            let _ = writeln!(self.out, "\n.L.str.{i}:");
-            let mut with_nul = bytes.clone();
-            with_nul.push(0);
-            for line in byte_directives(&with_nul) {
+        for (bytes, label) in std::mem::take(&mut self.strings) {
+            let _ = writeln!(self.out, "\n{label}:");
+            for line in byte_directives(&bytes) {
                 let _ = writeln!(self.out, "    {line}");
             }
         }
@@ -1334,6 +1776,97 @@ enum Place {
     Pushed,
 }
 
+/// Whether clang gives objects of types `a` and `b` one LLVM type in memory
+/// (`ConvertTypeForMem`): integers of one size (`iN`, whatever their
+/// signedness, `_Bool` an `i8`), any two pointers (`ptr`), arrays of as many
+/// such elements (`[0 x T]` for an unknown size), the same struct or union
+/// (a named type of its own).
+fn same_llvm_type(a: &Type, b: &Type, x: Xlen) -> bool {
+    match (a.unqual(), b.unqual()) {
+        (Type::Int(k), Type::Int(l)) => k.size(x) == l.size(x),
+        (Type::Ptr(_), Type::Ptr(_)) => true,
+        (Type::Array(e, n), Type::Array(f, m)) => n.unwrap_or(0) == m.unwrap_or(0) && same_llvm_type(e, f, x),
+        (Type::Record(r), Type::Record(s)) => Arc::ptr_eq(r, s),
+        _ => false,
+    }
+}
+
+/// The member whose type a union's LLVM type holds (then padding to the
+/// union's size): the most aligned, of those the largest, of those the
+/// first (`CGRecordLowering::lowerUnion`).
+fn union_storage(body: &RecordBody, x: Xlen) -> &Member {
+    let key = |m: &Member| (m.ty.align(x), m.ty.size(x).unwrap_or(0));
+    let mut best = &body.members[0];
+    for m in &body.members[1..] {
+        if key(m) > key(best) {
+            best = m;
+        }
+    }
+    best
+}
+
+/// Whether a struct has padding: a member that does not start where the
+/// one before ends, or bytes after the last.
+fn padded(body: &RecordBody, x: Xlen) -> bool {
+    let mut end = 0;
+    for m in &body.members {
+        if m.offset != end {
+            return true;
+        }
+        end = m.offset + m.ty.size(x).unwrap_or(0);
+    }
+    end != body.size
+}
+
+/// The type of the first reference to global `sym` in `e`, the variable as
+/// it was declared there (an expression the symbol of a static initializer
+/// came from, [`consteval::eval`]'s `Base::Sym`).
+fn referred_type<'e>(e: &'e Expr, sym: &str) -> Option<&'e Type> {
+    let sub = |x: &'e Expr| referred_type(x, sym);
+    match &e.kind {
+        ExprKind::Var {
+            var: Some(VarRef::Global(s)),
+            ..
+        } if s == sym => Some(&e.ty),
+        ExprKind::Addr(x)
+        | ExprKind::Deref(x)
+        | ExprKind::Unary(_, x)
+        | ExprKind::Cast { x, .. }
+        | ExprKind::Member { base: x, .. } => sub(x),
+        ExprKind::Binary(_, l, r) | ExprKind::Comma(l, r) => sub(l).or_else(|| sub(r)),
+        ExprKind::Cond(c, t, f) => sub(c).or_else(|| sub(t)).or_else(|| sub(f)),
+        _ => None,
+    }
+}
+
+/// Whether symbol key `key` is a C name (a function or file-scope
+/// variable), not one sema makes up: those have a `.` or a `#`.
+fn is_c_name(key: &str) -> bool {
+    !key.contains(['.', '#'])
+}
+
+/// Whether `s` is visited even where control cannot reach it: clang's
+/// `EmitSimpleStmt` statements, which `EmitStmt` handles before it asks
+/// whether there is an insertion point. A block's statements are each
+/// asked in turn; a declaration still gives its locals their slots and
+/// emits its static locals; a label or `case` makes the code after it
+/// reachable; a jump does nothing there.
+fn always_visited(s: &Stmt) -> bool {
+    matches!(
+        s.kind,
+        StmtKind::Block(_)
+            | StmtKind::Decl(_)
+            | StmtKind::Empty
+            | StmtKind::Unevaluated(_)
+            | StmtKind::Label { .. }
+            | StmtKind::Goto(_)
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Case { .. }
+            | StmtKind::Default { .. }
+    )
+}
+
 /// Per-function code generator state. `'a` is the tree's lifetime, `'f` the
 /// (shorter) borrow of the file's state.
 struct FuncGen<'a, 'f> {
@@ -1377,6 +1910,14 @@ struct FuncGen<'a, 'f> {
     used: Vec<Cell<bool>>,
     /// The locals the frame has slots for: those the code uses.
     slots: Vec<bool>,
+    /// Whether control can reach the code being generated: clang's
+    /// insertion point (`HaveInsertPoint`), which a jump takes away and a
+    /// label gives back ("Unreachable code" above).
+    reachable: bool,
+    /// The labels the jumps and branches generated so far go to: those
+    /// control reaches other than by falling into them (clang's blocks
+    /// that have uses).
+    reached: HashSet<String>,
 }
 
 impl<'a> FuncGen<'a, '_> {
@@ -1407,10 +1948,18 @@ impl<'a> FuncGen<'a, '_> {
         self.ins_sized(size, "li", format!("{reg}, {value}"));
     }
 
-    /// `la reg, symbol`: `auipc` + `addi`.
-    fn la(&mut self, reg: &str, symbol: &str) {
-        self.file.reference(symbol);
-        self.ins_sized(8, "la", format!("{reg}, {symbol}"));
+    /// `la reg, symbol`: `auipc` + `addi`, for the symbol of key `symbol`
+    /// (a function or variable, declared there with type `ty`).
+    fn la(&mut self, reg: &str, symbol: &str, ty: &Type) {
+        self.file.reference(symbol, Some(ty));
+        let name = self.file.name(symbol).to_string();
+        self.la_label(reg, &name);
+    }
+
+    /// `la reg, label`, of a label that is no symbol of the module's (a
+    /// string literal's).
+    fn la_label(&mut self, reg: &str, label: &str) {
+        self.ins_sized(8, "la", format!("{reg}, {label}"));
     }
 
     fn comment(&mut self, text: impl AsRef<str>) {
@@ -1422,6 +1971,7 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     fn branch(&mut self, op: &'static str, regs: &'static str, target: &str) {
+        self.reached.insert(target.to_string());
         self.lines.push(Line::Branch {
             op,
             regs,
@@ -1435,6 +1985,38 @@ impl<'a> FuncGen<'a, '_> {
 
     fn branch_if_nonzero(&mut self, target: &str) {
         self.branch("bnez", "a0", target);
+    }
+
+    /// A statement's jump to `target` (`return`, `break`, `continue`,
+    /// `goto`, the end of an `if`'s arm, a loop's way back), as clang's
+    /// `EmitBranch`: generated only from code control reaches, and nothing
+    /// after it is reached until a label is.
+    fn jump(&mut self, target: &str) {
+        if self.reachable {
+            self.reached.insert(target.to_string());
+            self.ins("j", target);
+        }
+        self.reachable = false;
+    }
+
+    /// A label code is generated after whether or not anything reaches it
+    /// (a `goto` label, a `case`, a loop's top): clang's
+    /// `EmitBlock(block)`, which makes the block the insertion point.
+    fn block(&mut self, name: &str) {
+        self.label(name);
+        self.reachable = true;
+    }
+
+    /// The label where the paths of a statement meet (after an `if`, a
+    /// loop, a `switch`): clang's `EmitBlock(block, IsFinished = true)`,
+    /// which deletes a block nothing falls or jumps into, so the code after
+    /// it is reached only if control falls in or a jump generated so far
+    /// goes there.
+    fn join(&mut self, name: &str) {
+        self.reachable |= self.reached.contains(name);
+        if self.reachable {
+            self.label(name);
+        }
     }
 
     /// A fresh label name, `.L.<what>.<n>`.
@@ -1739,7 +2321,9 @@ impl<'a> FuncGen<'a, '_> {
             self.lines.remove(i);
         }
         self.loc(f.end);
-        if !returned {
+        // (Only if control reaches the end: not after a `return`, nor
+        // after a loop no `break` leaves.)
+        if self.reachable {
             self.li("a0", 0);
             if self.is_pair(&f.ret) {
                 self.li("a1", 0);
@@ -1833,14 +2417,17 @@ impl<'a> FuncGen<'a, '_> {
     /// its slot, a `static` local at its symbol. (A block's `extern`
     /// declaration defines nothing.)
     fn debug_decl(&mut self, decl: &Declarator) {
-        let Some(d) = self.file.debug.as_mut() else {
+        if self.file.debug.is_none() {
             return;
-        };
+        }
         let at = match &decl.var {
             Some(VarRef::Local(id)) => Location::Frame(self.offsets[id.0]),
-            Some(VarRef::Global(sym)) if decl.storage == Storage::Static => Location::Symbol(sym.clone()),
+            Some(VarRef::Global(sym)) if decl.storage == Storage::Static => {
+                Location::Symbol(self.file.name(sym).to_string())
+            }
             _ => return,
         };
+        let d = self.file.debug.as_mut().expect("-g");
         let v = d.var(&decl.name, &decl.ty, &decl.spelled, decl.pos, at);
         d.declared(&v);
         self.scopes.last_mut().expect("a scope").push(v);
@@ -1851,6 +2438,17 @@ impl<'a> FuncGen<'a, '_> {
     /// A statement. With `-g`, a block, and a `for` that declares its
     /// variable, is a scope of its own, with labels around its code.
     fn stmt(&mut self, s: &'a Stmt) {
+        // Code control cannot reach is not generated, as clang's `EmitStmt`
+        // leaves it out ("Unreachable code" above): a statement but those
+        // it always visits (a block, a declaration, a label, a jump, a
+        // `case`), unless a label in it can be jumped to, which makes it
+        // reachable from its start (`EnsureInsertPoint`).
+        if !self.reachable && !always_visited(s) {
+            if !elide::contains_label(s, false) {
+                return;
+            }
+            self.reachable = true;
+        }
         let scoped = match &s.kind {
             StmtKind::Block(_) => true,
             StmtKind::For { init: Some(init), .. } => matches!(init.kind, StmtKind::Decl(_)),
@@ -1889,7 +2487,10 @@ impl<'a> FuncGen<'a, '_> {
             | StmtKind::Case { .. }
             | StmtKind::Default { .. }
             | StmtKind::Label { .. } => {}
-            _ => self.loc(s.pos),
+            // (A jump control cannot reach is no code: clang's `EmitBreakStmt`,
+            // `EmitGotoStmt` give a location only with an insertion point.)
+            _ if self.reachable => self.loc(s.pos),
+            _ => {}
         }
         match &s.kind {
             StmtKind::Block(body) => {
@@ -1909,6 +2510,13 @@ impl<'a> FuncGen<'a, '_> {
                     if matches!(d.var, Some(VarRef::Global(_))) {
                         self.local_decl(d);
                         self.debug_decl(d);
+                        continue;
+                    }
+                    // A local declared where control cannot reach has its
+                    // slot, but no initialization and no description: clang
+                    // allocates it (`EmitAutoVarAlloca`), but describes it and
+                    // emits its initializer only at an insertion point.
+                    if !self.reachable {
                         continue;
                     }
                     self.debug_decl(d);
@@ -1944,6 +2552,8 @@ impl<'a> FuncGen<'a, '_> {
                 //                             .L.else.N:
                 //                               <els>
                 //                             .L.end.N:
+                // (Control reaches the end if an arm falls off its end, or,
+                // with no `else`, when the test fails.)
                 self.loc(s.pos);
                 self.test(cond);
                 match els {
@@ -1951,17 +2561,17 @@ impl<'a> FuncGen<'a, '_> {
                         let end = self.new_label("end");
                         self.branch_if_zero(&end);
                         self.stmt(then);
-                        self.label(&end);
+                        self.join(&end);
                     }
                     Some(els) => {
                         let else_ = self.new_label("else");
                         let end = self.new_label("end");
                         self.branch_if_zero(&else_);
                         self.stmt(then);
-                        self.ins("j", &end);
-                        self.label(&else_);
+                        self.jump(&end);
+                        self.block(&else_);
                         self.stmt(els);
-                        self.label(&end);
+                        self.join(&end);
                     }
                 }
             }
@@ -1972,9 +2582,12 @@ impl<'a> FuncGen<'a, '_> {
                 //     <body>
                 //     j    .L.continue.N
                 //   .L.break.N:
+                // (The code after the loop is reached when the test fails or
+                // a `break` control reaches leaves: not after a `while (1)`
+                // without one.)
                 let cont = self.new_label("continue");
                 let brk = self.new_label("break");
-                self.label(&cont);
+                self.block(&cont);
                 if self.constant_condition(cond) == Some(true) {
                     // `while (1)`: nothing to test, as clang has it. Its
                     // code generator still visits the condition (`-g`).
@@ -1985,8 +2598,8 @@ impl<'a> FuncGen<'a, '_> {
                     self.branch_if_zero(&brk);
                 }
                 self.loop_body(body, &cont, &brk);
-                self.ins("j", &cont);
-                self.label(&brk);
+                self.jump(&cont);
+                self.join(&brk);
             }
             StmtKind::DoWhile { body, cond } => {
                 //   .L.do.N:
@@ -1995,12 +2608,16 @@ impl<'a> FuncGen<'a, '_> {
                 //     <cond>
                 //     bnez a0, .L.do.N
                 //   .L.break.N:
+                //
+                // The condition is generated even when neither the body's end
+                // nor a `continue` reaches it, as clang emits its block
+                // (`EmitDoStmt`), so the code after the loop is too.
                 let top = self.new_label("do");
                 let cont = self.new_label("continue");
                 let brk = self.new_label("break");
-                self.label(&top);
+                self.block(&top);
                 self.loop_body(body, &cont, &brk);
-                self.label(&cont);
+                self.block(&cont);
                 if self.constant_condition(cond) == Some(false) {
                     // `do ... while (0)`: nothing to test, as clang has it.
                     self.kept_casts(cond);
@@ -2009,7 +2626,7 @@ impl<'a> FuncGen<'a, '_> {
                     self.test(cond);
                     self.branch_if_nonzero(&top);
                 }
-                self.label(&brk);
+                self.join(&brk);
             }
             StmtKind::For {
                 init,
@@ -2030,23 +2647,30 @@ impl<'a> FuncGen<'a, '_> {
                 if let Some(init) = init {
                     self.stmt(init);
                 }
+                //
+                // The step is generated even when neither the body's end nor
+                // a `continue` reaches it, as clang emits its block
+                // (`EmitForStmt`); the code after the loop is reached when the
+                // test fails or a `break` control reaches leaves.
                 let top = self.new_label("loop");
                 let cont = self.new_label("continue");
                 let brk = self.new_label("break");
-                self.label(&top);
+                self.block(&top);
                 if let Some(cond) = cond {
                     self.loc(cond.pos);
                     self.test(cond);
                     self.branch_if_zero(&brk);
                 }
                 self.loop_body(body, &cont, &brk);
-                self.label(&cont);
                 if let Some(step) = step {
+                    self.block(&cont);
                     self.loc(step.pos);
                     self.expr(step);
+                } else {
+                    self.join(&cont);
                 }
-                self.ins("j", &top);
-                self.label(&brk);
+                self.jump(&top);
+                self.join(&brk);
             }
             StmtKind::Return(e) => {
                 if let Some(e) = e {
@@ -2056,7 +2680,7 @@ impl<'a> FuncGen<'a, '_> {
                     }
                 }
                 let ret = self.ret_label.clone();
-                self.ins("j", ret);
+                self.jump(&ret);
             }
             StmtKind::Break => {
                 let brk = self
@@ -2064,11 +2688,11 @@ impl<'a> FuncGen<'a, '_> {
                     .last()
                     .expect("sema: break in a loop or switch")
                     .clone();
-                self.ins("j", brk);
+                self.jump(&brk);
             }
             StmtKind::Continue => {
                 let cont = self.continues.last().expect("sema: continue in a loop").clone();
-                self.ins("j", cont);
+                self.jump(&cont);
             }
             StmtKind::Switch {
                 cond,
@@ -2131,17 +2755,22 @@ impl<'a> FuncGen<'a, '_> {
                     Some(id) => self.case_label(*id),
                     None => brk.clone(),
                 };
-                self.ins("j", otherwise);
+                // Control enters the body only at its labels (clang clears
+                // the insertion point before it): a statement before the
+                // first `case` is not generated. The code after it is
+                // reached without a `default`, by a `break` control reaches,
+                // or falling off the body's end.
+                self.jump(&otherwise);
                 self.breaks.push(brk.clone());
                 self.stmt(body);
                 self.breaks.pop();
-                self.label(&brk);
+                self.join(&brk);
             }
             StmtKind::Case { id, body, .. } | StmtKind::Default { id, body } => {
                 // (Nothing jumps to the label of a switch on a constant.)
                 if !self.elided_cases.contains(id) {
                     let label = self.case_label(*id);
-                    self.label(&label);
+                    self.block(&label);
                     // `-g`: a case value that is an enumeration constant
                     // describes its enum, as clang's `EmitCaseStmt` does
                     // (`case RED:`, not `case RED + 1:` or `case (RED):`).
@@ -2164,7 +2793,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             StmtKind::Label { name, body } => {
                 let label = self.goto_label(name);
-                self.label(&label);
+                self.block(&label);
                 // `-g`: clang describes the label, in its block.
                 if let Some(d) = self.file.debug.as_mut() {
                     let l = d.label(name, s.pos, &label);
@@ -2174,7 +2803,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             StmtKind::Goto(name) => {
                 let label = self.goto_label(name);
-                self.ins("j", label);
+                self.jump(&label);
             }
         }
     }
@@ -2244,16 +2873,90 @@ impl<'a> FuncGen<'a, '_> {
             self.comment(format!("{} = ...", d.ty.declare(&d.name)));
             self.clear_local(off, d.ty.size(self.xlen).unwrap() as i32);
         }
-        // `-g`: clang emits an array, struct or union with a constant
-        // initializer as a static's (`EmitAutoVarInit`, its
-        // `IsConstantAggregate`: `ConstantEmitter`), not as code: what
-        // its debug information keeps of it is a static initializer's.
-        let constant = self.file.debug.is_some()
-            && (d.ty.is_array() || d.ty.is_record())
-            && self.constant_initializer(&d.ty, init);
+        // clang emits an array, struct or union with a constant initializer
+        // as a static's (`EmitAutoVarInit`, its `IsConstantAggregate`:
+        // `ConstantEmitter`), not as code: with `-g`, what its debug
+        // information keeps of it is a static initializer's.
+        let constant = (d.ty.is_array() || d.ty.is_record()) && self.constant_initializer(&d.ty, init);
         self.constant_init = constant;
         self.init_local(&d.ty, init, off);
         self.constant_init = false;
+        // It copies the object from a constant of its own, which takes a
+        // name after the string literals in it, unless it clears the object
+        // and stores the few scalars that are not zero, or fills it with
+        // one byte ([`ConstantImage::copied`]).
+        if constant {
+            let size = d.ty.size(self.xlen).expect("sema: locals have complete types");
+            let mut image = ConstantImage::new(size);
+            self.constant_image(&d.ty, init, 0, &mut image);
+            if image.copied() {
+                self.file
+                    .take_name(&format!("__const.{}.{}", self.func.name, d.name));
+            }
+        }
+    }
+
+    /// The bytes and scalars of `init`, a constant initializer of an object
+    /// of type `ty` at byte `at` of `image`, as clang's constant has them.
+    fn constant_image(&self, ty: &Type, init: &Init, at: usize, image: &mut ConstantImage) {
+        match (ty.unqual(), init) {
+            (Type::Array(elem, _), Init::List(items, _)) => {
+                let size = elem.size(self.xlen).expect("sema: locals have complete types") as usize;
+                for (i, item) in items.iter().enumerate() {
+                    self.constant_image(elem, item, at + i * size, image);
+                }
+            }
+            // A union's list has empty items before the member it holds.
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().expect("sema: locals have complete types");
+                for (m, item) in body.members.iter().zip(items) {
+                    self.constant_image(&m.ty, item, at + m.offset as usize, image);
+                }
+            }
+            (_, Init::List(items, _)) => {
+                for item in items {
+                    self.constant_image(ty, item, at, image);
+                }
+            }
+            (
+                Type::Array(_, Some(n)),
+                Init::Expr(Expr {
+                    kind: ExprKind::Str(bytes),
+                    ..
+                }),
+            ) => {
+                // Each `char` a scalar of its own (LLVM's
+                // `ConstantDataArray`).
+                for (i, &b) in bytes.iter().take(*n as usize).enumerate() {
+                    image.scalar(at + i, &b.to_le_bytes(), b != 0);
+                }
+            }
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_image(lit, init, at, image),
+            (_, Init::Expr(e)) => {
+                let size = ty.size(self.xlen).expect("a scalar's size") as usize;
+                match consteval::eval(e, self.xlen).expect("a constant initializer") {
+                    Const::Int(v, _) => image.scalar(at, &v.to_le_bytes()[..size], v != 0),
+                    Const::Addr { base: None, offset } => {
+                        image.scalar(at, &offset.to_le_bytes()[..size], offset != 0)
+                    }
+                    // An address: no bytes are known. A pointer to a
+                    // symbol itself is LLVM's global; with an offset, or
+                    // converted to an integer, a constant expression.
+                    Const::Addr {
+                        base: Some(_),
+                        offset,
+                    } => image.address(at, size, ty.is_ptr() && offset == 0),
+                }
+            }
+            (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
+        }
     }
 
     /// Whether `init` is a constant initializer of an object of type `ty`,
@@ -2345,18 +3048,24 @@ impl<'a> FuncGen<'a, '_> {
             (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 let size = elem.size(self.xlen).unwrap() as i32;
-                // `-g`: clang emits an array whose initializers hold more
-                // than 16 bytes as a constant if it can (`EmitArrayInit`'s
-                // `ConstantEmitter`), visiting them as a static
-                // initializer's first; else element by element.
+                // clang emits an array whose initializers hold more than 16
+                // bytes as a constant if it can (`EmitArrayInit`'s
+                // `ConstantEmitter`, which with `-g` visits them as a static
+                // initializer's), copied from a global it names
+                // `constinit` after the string literals in it; else element
+                // by element.
                 let was = self.constant_init;
-                if !was && self.file.debug.is_some() && items.len() as i64 * i64::from(size) > 16 {
-                    self.constant_init = items.iter().all(|i| self.constant_visit(elem, i));
-                }
+                let whole = !was
+                    && items.len() as i64 * i64::from(size) > 16
+                    && items.iter().all(|i| self.constant_visit(elem, i));
+                self.constant_init = was || whole;
                 for (i, item) in items.iter().enumerate() {
                     self.init_local(elem, item, off + i as i32 * size);
                 }
                 self.constant_init = was;
+                if whole {
+                    self.file.take_name("constinit");
+                }
             }
             (Type::Record(r), Init::List(items, _)) => {
                 // Sema's list is fully braced: one item per member, in order.
@@ -2375,14 +3084,29 @@ impl<'a> FuncGen<'a, '_> {
                 Type::Array(_, Some(n)),
                 Init::Expr(Expr {
                     kind: ExprKind::Str(bytes),
+                    pos,
                     ..
                 }),
             ) => {
-                for (i, &b) in bytes.iter().take(*n as usize).enumerate() {
-                    if b != 0 {
-                        self.li("a0", b.into());
-                        self.access_local("sb", "a0", off + i as i32);
+                if self.constant_init {
+                    // Bytes of a constant clang emits whole.
+                    for (i, &b) in bytes.iter().take(*n as usize).enumerate() {
+                        if b != 0 {
+                            self.li("a0", b.into());
+                            self.access_local("sb", "a0", off + i as i32);
+                        }
                     }
+                } else {
+                    // Otherwise clang copies the array from the literal,
+                    // whose array is this one, cut or padded with zeros
+                    // (`EmitAggExpr` of the string literal).
+                    let mut array = bytes.clone();
+                    array.push(0);
+                    array.resize(*n as usize, 0);
+                    let label = self.file.string_array(&array, *pos);
+                    self.la_label("a0", &label);
+                    self.add_imm("a1", "s0", off);
+                    self.copy("a1", "a0", ty);
                 }
             }
             (_, Init::Expr(e)) => {
@@ -2517,7 +3241,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             ExprKind::Str(bytes) => {
                 let label = self.file.string(bytes, e.pos);
-                self.la("a0", &label);
+                self.la_label("a0", &label);
             }
             ExprKind::Var { var, .. } => match var {
                 Some(VarRef::Local(id)) => {
@@ -2529,7 +3253,7 @@ impl<'a> FuncGen<'a, '_> {
                     }
                 }
                 Some(VarRef::Global(sym)) => {
-                    self.la("a0", sym);
+                    self.la("a0", sym, &e.ty);
                     self.load(&e.ty);
                 }
                 None => unreachable!("sema resolves every variable"),
@@ -2870,7 +3594,7 @@ impl<'a> FuncGen<'a, '_> {
                     let off = self.offset(*id);
                     self.add_imm("a0", "s0", off);
                 }
-                Some(VarRef::Global(sym)) => self.la("a0", sym),
+                Some(VarRef::Global(sym)) => self.la("a0", sym, &e.ty),
                 None => unreachable!("sema resolves every variable"),
             },
             // The address of *p is p.
@@ -3382,7 +4106,7 @@ impl<'a> FuncGen<'a, '_> {
         // (`EmitCallee`, then `EmitCallArgs`): in `f(g())`, `f`'s symbol is
         // made first ("Order" above).
         if let Some(name) = direct {
-            self.file.reference(name);
+            self.file.reference(name, None);
         }
         if used > abi::ARG_REGS {
             let hidden = if abi::returns_in_memory(&ft.ret, self.xlen) {
@@ -3466,7 +4190,7 @@ impl<'a> FuncGen<'a, '_> {
         match direct {
             // `call` is `auipc ra` + `jalr ra`: two words.
             Some(name) => {
-                self.file.reference(name);
+                self.file.reference(name, None);
                 self.ins_sized(8, "call", name)
             }
             None => self.ins("jalr", "t1"),
@@ -4264,11 +4988,11 @@ main:
             "p:\n    .word g+4\n",
             "s:\n    .ascii \"hi\\n\"\n    .zero 1\n",
             "    .bss\n\n    # static unsigned int u: 4 bytes\n    .balign 4\n    .type u, @object\n    .size u, 4\nu:\n    .zero 4\n",
-            "str:\n    .word .L.str.0\n",
+            "str:\n    .word .L.str\n",
             "raw:\n    .byte 1\n    .byte 2\n    .byte 255\n",
             "zeros:\n    .word 0\n    .zero 4\n",
             "\n    # static int n: 4 bytes\n    .balign 4\n    .type main.n, @object\n    .size main.n, 4\nmain.n:\n    .word 3\n",
-            "    .section .rodata\n\n.L.str.0:\n    .asciz \"a\\\"b\\\\\"\n",
+            "    .section .rodata\n\n.L.str:\n    .asciz \"a\\\"b\\\\\"\n",
         ] {
             assert!(data.contains(want), "missing {want:?} in\n{data}");
         }
@@ -4287,7 +5011,7 @@ main:
             "a:\n    .word i\n",
             "b:\n    .word i+2\n",
             "c:\n    .word i+8\n",
-            "d:\n    .word .L.str.0+1\n",
+            "d:\n    .word .L.str+1\n",
         ] {
             assert!(asm.contains(want), "missing {want:?} in\n{asm}");
         }
@@ -4296,9 +5020,9 @@ main:
     #[test]
     fn string_literals() {
         let asm = compile("char *f() { return \"one\"; } int main() { return f()[0] + \"\\x01\\x02z\"[1]; }");
-        assert!(asm.contains("la    a0, .L.str.0\n"), "{asm}");
+        assert!(asm.contains("la    a0, .L.str\n"), "{asm}");
         assert!(asm.ends_with(
-            "    .section .rodata\n\n.L.str.0:\n    .asciz \"one\"\n\n.L.str.1:\n    .byte 1, 2\n    .asciz \"z\"\n"
+            "    .section .rodata\n\n.L.str:\n    .asciz \"one\"\n\n.L.str.1:\n    .byte 1, 2\n    .asciz \"z\"\n"
         ), "{asm}");
     }
 
@@ -5289,7 +6013,7 @@ main:
                 "    # long g: 8 bytes\n    .globl g\n    .balign 8\n    .type g, @object\n    .size g, 8\ng:\n    .quad -2\n",
                 "i:\n    .word 5\n",
                 "    .balign 8\n    .type p, @object\n    .size p, 8\np:\n    .quad i+4\n",
-                "s:\n    .quad .L.str.0\n",
+                "s:\n    .quad .L.str\n",
                 "u:\n    .quad 1\n",
             ] {
                 assert!(asm.contains(want), "missing {want:?} in\n{asm}");

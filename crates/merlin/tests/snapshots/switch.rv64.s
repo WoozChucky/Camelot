@@ -48,9 +48,6 @@ classify:
     j     .L.return.classify
 .L.case.classify.5:
     li    a0, -1
-    j     .L.return.classify
-.L.break.1:
-    li    a0, 0
 .L.return.classify:
     addi  sp, s0, -16
     ld    ra, 8(sp)
@@ -785,7 +782,7 @@ main:
     addi  a0, s0, -32
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    la    a0, .L.str.0
+    la    a0, .L.str
     addi  sp, sp, -8
     sd    a0, 0(sp)
     li    a0, 7
@@ -999,7 +996,7 @@ main:
 
     .section .rodata
 
-.L.str.0:
+.L.str:
     .asciz "abcdefg"
 
 .L.str.1:
