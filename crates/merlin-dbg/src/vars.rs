@@ -11,9 +11,9 @@
 //!
 //! Where a variable lives is a DWARF expression (`DW_AT_location`). merlin's are
 //! `DW_OP_fbreg N`, N bytes from the function's frame base (`DW_AT_frame_base`,
-//! `DW_OP_reg8`: `s0`, the frame pointer), or `DW_OP_addr A` for a global or a
-//! `static` local; clang's at -O0 are `DW_OP_breg2 N` (from `sp`) and `DW_OP_addrx
-//! I` (an address in `.debug_addr`). [`Frame`] gives the registers a frame has: all
+//! `DW_OP_reg8`: `s0`, the frame pointer), or `DW_OP_addrx I` (an address in
+//! `.debug_addr`) for a global or a `static` local; clang's at -O0 are
+//! `DW_OP_breg2 N` (from `sp`) and `DW_OP_addrx I`; `DW_OP_addr A` is read too. [`Frame`] gives the registers a frame has: all
 //! of them in the innermost one; in a caller its `s0` (the frame pointer the
 //! unwinder found) and its `sp`, which is the CFA of the frame it called (the `sp`
 //! of the call).
@@ -548,7 +548,9 @@ impl Debug {
                                 _ => None,
                             })
                             .collect();
-                        if params.is_empty() {
+                        // `int (void)` takes nothing; `int ()`, without a
+                        // prototype, says nothing of what it takes (GDB's way).
+                        if params.is_empty() && d.flag(dw::AT_PROTOTYPED) {
                             params.push("void".into());
                         }
                         let ret = Ty::Die(self.type_of(*r));
@@ -2299,5 +2301,96 @@ mod tests {
         ] {
             assert_eq!(c(bad, x64), None, "{bad}");
         }
+    }
+
+    /// Memory of zeros.
+    struct Zeros;
+
+    impl Target for Zeros {
+        fn read(&mut self, _addr: u64, len: usize) -> Result<Vec<u8>> {
+            Ok(vec![0; len])
+        }
+    }
+
+    /// Broken debug information: a unit whose first entry has no abbreviation
+    /// (left out, the next unit read all the same), then a pointer to itself, an
+    /// array of itself, a struct whose member is itself and a typedef of itself.
+    /// Each ends short instead of recursing without end.
+    #[test]
+    fn types_that_are_parts_of_themselves() {
+        let src = "
+    .section .debug_abbrev,\"\",@progbits
+    .byte 1, 0x11, 1, 0, 0              # 1: compile unit, with children
+    .byte 2, 0x0f, 0, 0x49, 0x13, 0, 0  # 2: pointer type: DW_AT_type ref4
+    .byte 3, 0x01, 1, 0x49, 0x13, 0, 0  # 3: array type
+    .byte 4, 0x21, 0, 0x37, 0x0b, 0, 0  # 4: subrange: DW_AT_count data1
+    .byte 5, 0x13, 1, 0x03, 0x08, 0x0b, 0x0b, 0, 0  # 5: struct: name, byte size
+    .byte 6, 0x0d, 0, 0x03, 0x08, 0x49, 0x13, 0x38, 0x0b, 0, 0  # 6: member
+    .byte 7, 0x16, 0, 0x03, 0x08, 0x49, 0x13, 0, 0  # 7: typedef: name, type
+    .byte 0
+
+    .section .debug_info,\"\",@progbits
+    .word 9                             # the unit's length
+    .half 5
+    .byte 1, 4
+    .word 0
+    .byte 9                             # no abbreviation 9
+.Lunit2:
+    .word 49
+    .half 5
+    .byte 1, 4
+    .word 0
+    .byte 1                             # the compile unit
+.Lptr:
+    .byte 2
+    .word .Lptr - .Lunit2
+.Larray:
+    .byte 3
+    .word .Larray - .Lunit2
+    .byte 4, 2
+    .byte 0
+.Lstruct:
+    .byte 5
+    .asciz \"loop\"
+    .byte 4
+    .byte 6
+    .asciz \"self\"
+    .word .Lstruct - .Lunit2
+    .byte 0
+    .byte 0
+.Ltypedef:
+    .byte 7
+    .asciz \"T\"
+    .word .Ltypedef - .Lunit2
+    .byte 0
+";
+        let xlen = Xlen::Rv32;
+        let elf = merlin_as::assemble_to_elf_with(src, &merlin_as::Options { xlen }).unwrap();
+        let mut debug = Debug::default();
+        debug.add_elf(&elf).unwrap();
+        assert_eq!(debug.files[0].len(), 1);
+        let find = |tag: u64| Ty::Die(debug.all().find(|&r| debug.die(r).tag == tag));
+        let (ptr, array) = (find(dw::TAG_POINTER_TYPE), find(dw::TAG_ARRAY_TYPE));
+        let (record, typedef) = (find(dw::TAG_STRUCTURE_TYPE), find(dw::TAG_TYPEDEF));
+        assert!(debug.declare(&ptr, "p").starts_with("? *"));
+        assert!(debug.ptype(&ptr).starts_with("? *"));
+        assert!(debug.declare(&array, "").starts_with('?'));
+        assert_eq!(debug.size(&array, xlen), None);
+        assert_eq!(debug.ptype(&typedef), "T");
+        assert_eq!(debug.ptype(&record), "struct loop {\n    struct loop self;\n}");
+        let mut eval = Eval {
+            debug: &debug,
+            symbols: &Symbols::default(),
+            target: &mut Zeros,
+            frame: None,
+            xlen,
+        };
+        let v = Value {
+            ty: record,
+            loc: Loc::Mem(0x1000),
+        };
+        let shown = eval.show(&v, true, false).unwrap();
+        assert!(shown.starts_with("{self = {self = "), "{shown}");
+        assert!(shown.contains("..."), "{shown}");
     }
 }

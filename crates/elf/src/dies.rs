@@ -218,7 +218,8 @@ impl InfoUnit {
 impl Elf<'_> {
     /// Every compile unit's entries (none if there is no `.debug_info`).
     /// Type units are left out. An entry that cannot be read ends its unit,
-    /// those before it kept, as LLVM's reader does.
+    /// those before it kept, as LLVM's reader does (a unit whose first entry
+    /// cannot be read is left out); the other units are read all the same.
     pub fn debug_entries(&self) -> Result<Vec<InfoUnit>, Error> {
         let Some(s) = self.debug_sections()? else {
             return Ok(Vec::new());
@@ -230,7 +231,11 @@ impl Elf<'_> {
                 at = s.next_unit(at)?;
                 continue;
             };
-            let first = h.entry()?;
+            // A unit whose first entry cannot be read has none to keep.
+            let Ok(first) = h.entry() else {
+                at = h.next;
+                continue;
+            };
             let attrs = first.as_ref().map_or(&[][..], |d| &d.attrs[..]);
             let unit = crate::units::Unit::new(&s, h.version, h.addr_size, attrs);
             let mut dies: Vec<Die> = Vec::new();

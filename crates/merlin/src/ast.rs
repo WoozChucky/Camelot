@@ -91,6 +91,10 @@ pub struct Function {
     /// (every file-scope declaration says `inline` and none `extern`): it
     /// provides no external definition, so it is emitted without `.globl`.
     pub inline_only: bool,
+    /// Declared with a prototype: a parameter list that is not `()`, which
+    /// merlin takes as `(void)` but C as saying nothing of the parameters
+    /// (`DW_AT_prototyped` under `-g`, as clang has it).
+    pub prototyped: bool,
     /// `None` for a prototype (`int f(int a);`): declared here, defined elsewhere.
     pub body: Option<Vec<Stmt>>,
     /// Filled in by sema: parameters first (in order), then every local declared in

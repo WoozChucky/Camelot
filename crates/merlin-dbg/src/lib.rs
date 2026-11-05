@@ -31,9 +31,9 @@ pub const USAGE: &str = "usage: merlin-dbg [--connect ADDR] [-x FILE] [program.e
 Debugs a program running in Grail, at the machine level: breakpoints,
 watchpoints, steps, registers, memory, disassembly and backtraces; and by
 source line and variable where the program has debug information (merlin
--g): break FILE:LINE, step and next by line, list, print, info locals,
-info args, ptype, frames with their arguments, up and down. Sources are found relative to the current
-directory (directory DIR adds others).
+-g): break FILE:LINE, step and next by line, list, print, info locals, info
+args, ptype, frames with their arguments, up and down. Sources are found
+relative to the current directory (directory DIR adds others).
 
   --connect ADDR  the GDB stub of a running grail --gdb (default 127.0.0.1:1234):
                   HOST:PORT or a port on 127.0.0.1. program.elf gives the symbols.

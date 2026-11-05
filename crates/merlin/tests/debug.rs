@@ -109,9 +109,9 @@ fn debug_information_changes_no_code() {
     }
 }
 
-/// On RV64 the compile unit's addresses are 8 bytes: its header says so,
-/// `DW_FORM_addr` is a `.quad` (an R_RISCV_64 relocation), and the unit's
-/// length counts them. The line table reads back as on RV32.
+/// On RV64 the compile unit's addresses are 8 bytes: its header says so, and
+/// so does `.debug_addr`'s, whose addresses (`DW_FORM_addrx` indexes them) are
+/// `.quad`s (R_RISCV_64 relocations). The line table reads back as on RV32.
 #[test]
 fn rv64_addresses_are_eight_bytes() {
     let src = "int f(int n) {\n    return n + 1;\n}\nlong g(long x) {\n    return f(x);\n}\n";
@@ -121,18 +121,22 @@ fn rv64_addresses_are_eight_bytes() {
     assert!(!asm.contains(".word f\n"), "{asm}");
     let obj = assemble_rv64(&asm);
     let elf = elf::Elf::parse(&obj).unwrap();
-    let (i, info) = elf
-        .sections
-        .iter()
-        .enumerate()
-        .find(|(_, s)| s.name == ".debug_info")
-        .unwrap();
+    let info = elf.sections.iter().find(|s| s.name == ".debug_info").unwrap();
     let data = elf.section_data(info).unwrap();
     let length = u32::from_le_bytes(data[..4].try_into().unwrap());
     assert_eq!(length as usize + 4, data.len());
     assert_eq!(u16::from_le_bytes([data[4], data[5]]), 5, "DWARF 5");
     assert_eq!(data[7], 8, "address size");
-    // The unit's low_pc and each function's: 8-byte relocations.
+    let (i, addr) = elf
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.name == ".debug_addr")
+        .unwrap();
+    let data = elf.section_data(addr).unwrap();
+    assert_eq!(data[6], 8, "address size");
+    assert_eq!(data.len(), 8 + 2 * 8);
+    // The unit's low_pc, which is f's, and g's: 8-byte relocations.
     let symbols = elf.symbols().unwrap();
     let rela = elf
         .sections
@@ -146,7 +150,7 @@ fn rv64_addresses_are_eight_bytes() {
         .filter(|r| elf::reloc_name(r.ty) == Some("R_RISCV_64"))
         .map(|r| symbols[r.sym as usize].name.clone())
         .collect();
-    assert_eq!(addrs, ["f", "f", "g"]);
+    assert_eq!(addrs, ["f", "g"]);
     // The line table: both functions, in order.
     let tables = elf.line_tables().unwrap();
     assert_eq!(tables[0].files, ["dir/w.c"]);
@@ -217,16 +221,20 @@ void empty(void) {
     assert_eq!(seq.rows.last().unwrap().addr, elf.sections[text].size);
 
     // The compile unit's length covers .debug_info exactly; it names the
-    // file, the directory and the functions.
-    let info = elf.sections.iter().find(|s| s.name == ".debug_info").unwrap();
-    let data = elf.section_data(info).unwrap();
+    // file, the directory and the functions, in .debug_str (each string once,
+    // in the order the entries name them), which .debug_str_offsets indexes.
+    let section = |name: &str| {
+        let s = elf.sections.iter().find(|s| s.name == name).unwrap();
+        elf.section_data(s).unwrap()
+    };
+    let data = section(".debug_info");
     let length = u32::from_le_bytes(data[..4].try_into().unwrap());
     assert_eq!(length as usize + 4, data.len());
-    let text_of = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-    let strings = text_of(data);
-    for s in ["merlin\0", "loop.c\0dir\0", "f\0", "empty\0"] {
-        assert!(strings.contains(s), "{s:?} in {strings:?}");
-    }
+    let strings = String::from_utf8_lossy(section(".debug_str")).into_owned();
+    assert!(strings.starts_with("merlin\0loop.c\0dir\0f\0"), "{strings:?}");
+    assert!(strings.contains("\0empty\0"), "{strings:?}");
+    let offsets = section(".debug_str_offsets");
+    assert_eq!(offsets.len(), 8 + 4 * strings.matches('\0').count());
 }
 
 #[test]
@@ -297,12 +305,15 @@ Node head;
 static short grid[2][3];
 const char *volatile name;
 int (*pick)(int, ...);
+struct box { int k; struct { char c; } in; enum { ON, OFF } state; } bx;
 long walk(Node *list, color_t c) {
     static int calls;
     long sum = 0;
     calls++;
     {
         union word w;
+        static int seen;
+        seen++;
         w.u = c;
         for (int i = 0; i < 2; i++) {
             Node *p = list;
@@ -311,6 +322,7 @@ long walk(Node *list, color_t c) {
     }
     return sum;
 }
+int old() { return 1; }
 ";
 
 /// The entries merlin writes for [`VARS`], read back with `elf::dies` from the
@@ -386,6 +398,14 @@ fn variables_and_types_are_described() {
         assert_eq!(at(walk).block(dw::AT_FRAME_BASE), Some(&[0x58][..]));
         assert_eq!(type_of(walk), "long");
         assert!(at(walk).flag(dw::AT_EXTERNAL));
+        // `int old()` has no prototype, as clang says by leaving it out.
+        assert!(at(walk).flag(dw::AT_PROTOTYPED));
+        assert!(!at(named(dw::TAG_SUBPROGRAM, "old")).flag(dw::AT_PROTOTYPED));
+        // A symbol's address: DW_OP_addrx and its index in .debug_addr.
+        let address = |loc: &[u8]| {
+            assert_eq!((loc[0], loc.len()), (0xa1, 2), "DW_OP_addrx");
+            u.addr_pool[usize::from(loc[1])]
+        };
         let slot = |what: &str| -> Vec<u8> {
             let line = asm
                 .lines()
@@ -423,21 +443,26 @@ fn variables_and_types_are_described() {
         );
         assert_eq!(type_of(list), "Node *");
         assert_eq!(type_of(kids[1]), "color_t");
-        assert_eq!(at(kids[1]).unsigned(dw::AT_DECL_LINE), Some(12));
-        // The local in the frame, then the static one, at its symbol (clang's
-        // order, though `calls` is declared first).
+        assert_eq!(at(kids[1]).unsigned(dw::AT_DECL_LINE), Some(13));
+        // The local in the frame, then the blocks, then the function's static
+        // locals, its block's too, in the order they are declared, at their
+        // symbols (clang's order, though `calls` is declared first).
         assert_eq!(at(kids[2]).name(), Some("sum"));
         assert_eq!(
             at(kids[2]).block(dw::AT_LOCATION).unwrap(),
             slot("local long sum").as_slice()
         );
-        let calls = kids[3];
-        assert_eq!(at(calls).name(), Some("calls"));
-        let loc = at(calls).block(dw::AT_LOCATION).unwrap();
-        assert_eq!((loc[0], loc.len() as u64), (0x03, 1 + ptr), "DW_OP_addr");
+        assert_eq!(kids.len(), 6);
+        let symbols = elf.symbols().unwrap();
+        let symbol = |name: &str| symbols.iter().find(|s| s.name.contains(name)).unwrap().value;
+        for (i, name) in [(4, "calls"), (5, "seen")] {
+            let s = kids[i];
+            assert_eq!(at(s).name(), Some(name));
+            assert_eq!(address(at(s).block(dw::AT_LOCATION).unwrap()), symbol(name));
+        }
         // The block of `w`, and in it the `for`'s, with `i` and its body's,
         // with `p`: each inside the one around it.
-        let block = kids[4];
+        let block = kids[3];
         assert_eq!(at(block).tag, dw::TAG_LEXICAL_BLOCK);
         let (wlo, whi) = at(walk).ranges[0];
         let inside = |inner: usize, outer: (u64, u64)| {
@@ -462,7 +487,6 @@ fn variables_and_types_are_described() {
 
         // The globals, at their symbols (relocated in the object: section
         // offsets), with their types.
-        let symbols = elf.symbols().unwrap();
         for (name, spelled) in [
             ("head", "Node"),
             ("grid", "short[2][3]"),
@@ -476,8 +500,7 @@ fn variables_and_types_are_described() {
             assert_eq!(type_of(g), spelled, "{name}");
             let loc = at(g).block(dw::AT_LOCATION).unwrap();
             let sym = symbols.iter().find(|s| s.name == name).unwrap();
-            let addr = loc[1..].iter().rev().fold(0u64, |a, &b| a << 8 | u64::from(b));
-            assert_eq!((loc[0], addr), (0x03, sym.value), "{name}");
+            assert_eq!(address(loc), sym.value, "{name}");
             assert_eq!(at(g).flag(dw::AT_EXTERNAL), name != "grid", "{name}");
         }
 
@@ -502,12 +525,30 @@ fn variables_and_types_are_described() {
                 ("next".to_string(), "struct node *".to_string(), Some(ptr)),
             ]
         );
+        // A union's members are at 0, which clang says too.
         let word = named(dw::TAG_UNION_TYPE, "word");
         assert_eq!(at(word).unsigned(dw::AT_BYTE_SIZE), Some(4));
         assert!(children(word)
             .iter()
-            .all(|&m| at(m).attr(dw::AT_DATA_MEMBER_LOCATION).is_none()));
+            .all(|&m| at(m).unsigned(dw::AT_DATA_MEMBER_LOCATION) == Some(0)));
         assert_eq!(type_of(children(word)[1]), "unsigned char[4]");
+        // The anonymous struct and enum of box's members are inside box, each
+        // after the member that is of it, as clang has them.
+        let bx = named(dw::TAG_STRUCTURE_TYPE, "box");
+        let tags: Vec<(u64, Option<&str>)> =
+            children(bx).iter().map(|&c| (at(c).tag, at(c).name())).collect();
+        assert_eq!(
+            tags,
+            [
+                (dw::TAG_MEMBER, Some("k")),
+                (dw::TAG_MEMBER, Some("in")),
+                (dw::TAG_STRUCTURE_TYPE, None),
+                (dw::TAG_MEMBER, Some("state")),
+                (dw::TAG_ENUMERATION_TYPE, None),
+            ]
+        );
+        assert_eq!(ty(at(children(bx)[1])), children(bx)[2]);
+        assert_eq!(ty(at(children(bx)[3])), children(bx)[4]);
         let color = named(dw::TAG_ENUMERATION_TYPE, "color");
         assert_eq!(type_of(color), "unsigned int");
         let constants: Vec<(&str, Option<i64>)> = children(color)
@@ -536,7 +577,8 @@ fn variables_and_types_are_described() {
 }
 
 /// llvm-dwarfdump finds nothing wrong with the debug information of any test
-/// case, at either width, linked. Ignored: it needs llvm-dwarfdump (`LLVM_DWARFDUMP`
+/// case, at either width, in its object as merlin-as assembles it (not linked:
+/// a case need not be a whole program). Ignored: it needs llvm-dwarfdump (`LLVM_DWARFDUMP`
 /// names it if it is not on the PATH).
 #[test]
 #[ignore]
@@ -574,6 +616,70 @@ fn llvm_dwarfdump_verifies_every_case() {
                 "{name} ({x:?}):\n{text}"
             );
         }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every attribute merlin writes for [`VARS`] has the form clang gives it, at
+/// both widths: the `DW_AT_* [DW_FORM_*]` pairs llvm-dwarfdump -v shows for
+/// merlin's object are those it shows for clang's (clang -O0 -g; its own, such as
+/// the producer's, are the same forms). Ignored: it needs clang and
+/// llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP` name them if they are not on the
+/// PATH).
+#[test]
+#[ignore]
+fn the_forms_are_clangs() {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let tool = std::env::var("LLVM_DWARFDUMP").unwrap_or_else(|_| "llvm-dwarfdump".into());
+    let dir = std::env::temp_dir().join(format!("merlin-forms-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("v.c");
+    std::fs::write(&source, VARS).unwrap();
+    let forms = |obj: &Path| -> std::collections::BTreeSet<String> {
+        let out = std::process::Command::new(&tool)
+            .args(["--debug-info", "-v"])
+            .arg(obj)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {tool}: {e}"));
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let end = l.find(']')?;
+                (l.starts_with("DW_AT_") && l.contains("[DW_FORM_")).then(|| l[..=end].to_string())
+            })
+            .collect()
+    };
+    for x in [Xlen::Rv32, Xlen::Rv64] {
+        let bits = x.bits();
+        let opts = Options {
+            xlen: x,
+            ..debug_opts("dir")
+        };
+        let asm = merlin::compile_with("v.c", VARS, &opts, &merlin::no_files).unwrap();
+        let obj = merlin_as::assemble_to_elf_with(&asm, &merlin_as::Options { xlen: x }).unwrap();
+        let ours = dir.join(format!("merlin-{bits}.o"));
+        std::fs::write(&ours, obj).unwrap();
+        let theirs = dir.join(format!("clang-{bits}.o"));
+        let abi = if bits == 64 { "lp64" } else { "ilp32" };
+        let out = std::process::Command::new(&clang)
+            .args([
+                &format!("--target=riscv{bits}"),
+                &format!("-march=rv{bits}ima_zicsr_zifencei"),
+                &format!("-mabi={abi}"),
+                "-O0",
+                "-g",
+                "-c",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&theirs)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let (ours, theirs) = (forms(&ours), forms(&theirs));
+        assert!(ours.contains("DW_AT_name [DW_FORM_strx1]"), "{ours:#?}");
+        assert_eq!(ours, theirs, "merlin's (left) and clang's (right), {x:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

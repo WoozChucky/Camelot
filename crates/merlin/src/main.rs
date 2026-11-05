@@ -17,7 +17,9 @@ const USAGE: &str = "usage: merlin [options] input.c...
                     left out); -D 'F(x)=VALUE' defines a function-like one
   -U NAME           undefine a macro (-D and -U apply in order)
   -g                debug information: which source line each instruction
-                    comes from (.file, .loc), and a DWARF compile unit
+                    comes from (.file, .loc), and a DWARF compile unit with
+                    the functions, their parameters and locals, the globals
+                    and the types, for debuggers (merlin-dbg, lldb)
   -fdebug-compilation-dir=DIR
                     the directory -g says file names are relative to
                     (default: the current directory)

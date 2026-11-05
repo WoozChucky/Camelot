@@ -278,8 +278,9 @@ enum Derive {
     /// the qualifiers then apply to the pointer the array is adjusted to.
     Array(Option<i128>, Pos, Option<Quals>),
     /// Function returning the type so far, with these parameters (and the
-    /// scope holding their names), variadic if `...` ends them.
-    Func(Vec<Param>, bool, Scope),
+    /// scope holding their names), variadic if `...` ends them, and whether
+    /// the list is a prototype's (not `()`).
+    Func(Vec<Param>, bool, bool, Scope),
 }
 
 /// A parsed declarator: the name, the full type, and where the name is.
@@ -292,6 +293,11 @@ struct Decl {
     /// list): the parameters with their names, and their scope, which a
     /// function body continues.
     func: Option<(Vec<Param>, Scope)>,
+    /// When it declares a function: whether with a prototype, a parameter list
+    /// that is not `()` (C99 6.7.5.3p14: `int f()` says nothing of the
+    /// parameters, even though merlin takes it as `int f(void)`). `-g` says
+    /// which (`DW_AT_prototyped`).
+    prototyped: bool,
 }
 
 struct Parser<'a> {
@@ -1157,8 +1163,9 @@ impl Parser<'_> {
                 dims += 1;
             } else if self.is_punct("(") {
                 self.advance();
+                let prototyped = !self.is_punct(")");
                 let (params, variadic, scope) = self.params()?;
-                out.push(Derive::Func(params, variadic, scope));
+                out.push(Derive::Func(params, variadic, prototyped, scope));
                 dims = 0;
             } else {
                 return Ok(out);
@@ -1173,6 +1180,7 @@ impl Parser<'_> {
         let end = self.here();
         let mut ty = base.clone();
         let mut func = None;
+        let mut prototyped = false;
         // The size of `ty`, kept as it grows: `Type::size` recurses, so asking
         // it at every dimension would be quadratic in the number of dimensions.
         let mut size = ty.size(self.xlen).map(u64::from);
@@ -1220,7 +1228,7 @@ impl Parser<'_> {
                         size = Some(u64::from(ptr_size(self.xlen)));
                     }
                 }
-                Derive::Func(params, variadic, scope) => {
+                Derive::Func(params, variadic, with_prototype, scope) => {
                     if ty.is_array() || ty.is_func() {
                         let what = if ty.is_array() { "array" } else { "function" };
                         return Err(Error::new(
@@ -1239,11 +1247,18 @@ impl Parser<'_> {
                     size = None;
                     if i + 1 == steps {
                         func = Some((params, scope));
+                        prototyped = with_prototype;
                     }
                 }
             }
         }
-        Ok(Decl { name, ty, pos, func })
+        Ok(Decl {
+            name,
+            ty,
+            pos,
+            func,
+            prototyped,
+        })
     }
 
     /// After `(`, up to and including `)`: the parameters, in a scope of
@@ -2176,6 +2191,7 @@ fn function(d: Decl, params: Vec<Param>, specs: &Specs, body: Option<Vec<Stmt>>,
         is_inline: specs.inline,
         is_extern: specs.class == Class::Extern,
         inline_only: false,
+        prototyped: d.prototyped,
         body,
         locals: Vec::new(),
         ret_ptr: None,

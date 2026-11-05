@@ -1318,7 +1318,8 @@ impl<'a> FuncGen<'a, '_> {
             let d = self.file.debug.as_mut().expect("-g");
             let ret = (&f.ret, &f.ret_spelled);
             let external = !f.is_static && !f.inline_only;
-            d.function(&f.name, &end, f.pos, external, ret, params, f.variadic, body);
+            let flags = (external, f.prototyped);
+            d.function(&f.name, &end, f.pos, flags, ret, params, f.variadic, body);
             self.lines.push(Line::Label(end));
         }
         self.lines.push(Line::Text(format!(".size {0}, . - {0}", f.name)));

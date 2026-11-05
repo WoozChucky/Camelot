@@ -1342,6 +1342,44 @@ fn variables_and_types() {
         "print counter << 2 | 1",
         "print -1 < 0u",
         "print list->value > 25 || nope",
+        // Casts: a struct is no cast's result or operand.
+        "print (struct big)big",
+        "print (struct point)big",
+        "print (Node)counter",
+        "print (unsigned)-1",
+        "print (char)65",
+        "print (long unsigned int)1 - 2",
+        // An enum's values signed as its type (int) is.
+        "print sv",
+        "print sv + 0",
+        "print sv < 0",
+        "print/x sv",
+        // C's integer types, named as GDB names them at each width.
+        "print sizeof(1L)",
+        "whatis sizeof(int)",
+        "whatis &nodes[2] - &nodes[0]",
+        "whatis big + 1",
+        "whatis 1L",
+        "whatis 4294967296",
+        "print 2147483647 + 1",
+        // `@` between the shifts and `+`: grid[0][0]@(1+2).
+        "print grid[0][0]@1+2",
+        "print hi",
+        "print/x hi",
+        "print /x counter",
+        "print $pc",
+        "whatis $sp",
+        "whatis $ra",
+        "ptype nest",
+        "print nest",
+        "ptype old",
+        "whatis old",
+        // Frames past the outermost: up N goes as far as there are.
+        "up 9",
+        "up",
+        "frame 9",
+        "down 9",
+        "down",
     ];
     for xlen in [excalibur::Xlen::Rv32, excalibur::Xlen::Rv64] {
         let elf = program(VARS_DIR, "vars.c", xlen, &format!("vars-{}", xlen.bits()));
@@ -1428,7 +1466,7 @@ fn variables_and_types() {
         assert_eq!(
             r[32..37],
             [
-                "inner = 6\nw = {u = 287454020, bytes = \"D3\\\"\\021\"}\nletter = 65 'A'\ni = 3",
+                "inner = 6\nw = {u = 287454020, bytes = \"D3\\\"\\021\"}\nletter = 65 'A'\ni = 3\nseen = 1",
                 "$18 = \"D3\\\"\\021\"",
                 "$19 = 65 'A'",
                 "error: no symbol \"depth\" in current context",
@@ -1462,6 +1500,71 @@ fn variables_and_types() {
             ],
             "{out}"
         );
+        // Casts, enums, C's integer types and conversions (a sum of ints wraps
+        // as an int), GDB's `@` at its precedence, /x of a char array, the
+        // registers' types, and the bodies of anonymous members' types.
+        let (word_max, long_size, wide) = match xlen {
+            excalibur::Xlen::Rv32 => ("4294967295", "4", "long long"),
+            excalibur::Xlen::Rv64 => ("18446744073709551615", "8", "long"),
+        };
+        let invalid = "error: Invalid cast.";
+        assert_eq!(
+            r[45..66],
+            [
+                invalid.to_string(),
+                invalid.to_string(),
+                invalid.to_string(),
+                "$26 = 4294967295".to_string(),
+                "$27 = 65 'A'".to_string(),
+                format!("$28 = {word_max}"),
+                "$29 = NEG".to_string(),
+                "$30 = -2".to_string(),
+                "$31 = 1".to_string(),
+                "$32 = 0xfffffffe".to_string(),
+                format!("$33 = {long_size}"),
+                "type = unsigned long".to_string(),
+                "type = long".to_string(),
+                "type = long long".to_string(),
+                "type = long".to_string(),
+                format!("type = {wide}"),
+                "$34 = -2147483648".to_string(),
+                "$35 = {1, 2, 3}".to_string(),
+                "$36 = \"hi\\000\"".to_string(),
+                "$37 = {0x68, 0x69, 0x0, 0x0}".to_string(),
+                "$38 = 0x3".to_string(),
+            ],
+            "{out}"
+        );
+        assert!(
+            r[66].starts_with("$39 = (void (*)()) 0x") && r[66].contains(" <walk+"),
+            "{out}"
+        );
+        assert_eq!(
+            r[67..73],
+            [
+                "type = void *",
+                "type = void (*)()",
+                "type = struct outer {\n    int k;\n    struct {\n        int a;\n        char c;\n    } in;\n    \
+                 union {\n        int i;\n        short s;\n    } un;\n}",
+                "$40 = {k = 1, in = {a = 2, c = 99 'c'}, un = {i = 3, s = 3}}",
+                "type = int ()",
+                "type = int ()",
+            ],
+            "{out}"
+        );
+        // up 9 goes to the outermost frame, and up from there cannot; down 9 to
+        // the innermost, and down from there cannot; frame 9 is no frame.
+        assert!(
+            r[73].starts_with("#4  0x") && r[73].ends_with(" in _start ()"),
+            "{out}"
+        );
+        assert_eq!(r[74], "error: Initial frame selected; you cannot go up.");
+        assert_eq!(r[75], "error: No frame at level 9.");
+        assert!(r[76].starts_with("#0  walk (list="), "{out}");
+        assert_eq!(
+            r[77],
+            "error: Bottom (innermost) frame selected; you cannot go down."
+        );
         // area's struct arguments: `...` in a backtrace, as GDB's frame-arguments
         // scalars, and in full in info args.
         assert_lines(
@@ -1474,7 +1577,7 @@ fn variables_and_types() {
                 "(merlin-dbg) info args",
                 "a = {x = 1, y = 2}",
                 "b = {x = 30, y = 40}",
-                "$26 = 29",
+                "$41 = 29",
             ],
         );
         assert!(out.contains(&format!(" in main () {}\n", at(area_call))), "{out}");
