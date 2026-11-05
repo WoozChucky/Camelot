@@ -33,6 +33,7 @@ pub mod consteval;
 pub mod debug;
 pub mod elide;
 pub mod lexer;
+pub mod md5;
 pub mod parser;
 pub mod preprocess;
 pub mod sema;
@@ -237,7 +238,13 @@ pub fn compile_warned(
     load: Loader,
 ) -> Result<(String, Vec<Error>), Vec<Error>> {
     let pp = preprocess(name, src, opts, load)?;
-    let debug = opts.debug.as_ref().map(|d| (d, pp.files.as_slice()));
+    let debug = opts.debug.as_ref().map(|d| {
+        let sources = debug::Sources {
+            names: &pp.files,
+            md5: &pp.checksums,
+        };
+        (d, sources)
+    });
     let prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
     let warnings = pp.name_files(prog.warnings.clone());
     match codegen::generate_with(&prog, debug) {
