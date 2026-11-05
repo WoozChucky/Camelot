@@ -36,7 +36,10 @@
 #define CAUSE_LOAD_PAGE_FAULT 13
 #define CAUSE_STORE_PAGE_FAULT 15
 
-/* mcounteren.TM: S-mode may read the time CSR. */
-#define MCOUNTEREN_TM (1 << 1)
+/* The bits of mcounteren and scounteren (privileged spec, section 3.1.11):
+ * the next mode down may read cycle, time, instret. */
+#define COUNTEREN_CY (1 << 0)
+#define COUNTEREN_TM (1 << 1)
+#define COUNTEREN_IR (1 << 2)
 
 #endif

@@ -4,7 +4,7 @@
 //! the machine, QEMU `virt`'s nodes for Grail's devices; sysinfo's reserved range;
 //! Camelot's built-in firmware starting a program, or a disk's boot block, in S-mode at
 //! 0x8020_0000; and what a machine with firmware refuses. The Camelot kernel on the
-//! firmware is xtask's tests (kernel_rv64.rs, firmware.rs).
+//! firmware is xtask's tests (kernel_rv64.rs, sbi.rs, and opensbi.rs on OpenSBI's).
 
 use grail::boot::{BOOT_BLOCK_SIZE, BOOT_ENTRY_ADDR, FDT_ADDR_ADDR, FW_HANDOFF_PC};
 use grail::bus::{BLK_BASE, SYSINFO_BASE};
@@ -332,6 +332,33 @@ fn camelots_firmware_starts_the_program_in_s_mode() {
         }
         assert_eq!(m.run(Some(100_000), |_| {}), RunResult::Exited(42));
     }
+}
+
+/// `csrr rd, csr` (`csrrs rd, csr, zero`), as `rdcycle`, `rdtime` and `rdinstret` are.
+fn csrr(rd: u32, csr: u32) -> u32 {
+    csr << 20 | 2 << 12 | rd << 7 | 0x73
+}
+const CYCLE: u32 = 0xc00;
+const TIME: u32 = 0xc01;
+const INSTRET: u32 = 0xc02;
+
+#[test]
+fn camelots_firmware_lets_s_mode_read_the_counters_as_opensbi_does() {
+    // The device tree promises S-mode Zicntr, and OpenSBI's mstatus_init() writes
+    // mcounteren all ones (Grail keeps CY, TM and IR) and scounteren TM. A program
+    // that reads cycle, time and instret in S-mode exits 42: one the firmware did
+    // not let would take an illegal-instruction trap to stvec 0 instead.
+    let mut code = vec![csrr(A0, CYCLE), csrr(A0, TIME), csrr(A0, INSTRET)];
+    code.extend(shutdown(42));
+    let mut m = Machine::new(rv64(1, 8 << 20, Bios::Default)).unwrap();
+    m.load_elf(&elf64(FW_JUMP_ADDR, &bytes(&code))).unwrap();
+    step_until(&mut m, |m| m.cpu.hart(0).pc == FW_JUMP_ADDR);
+    let h = m.cpu.hart(0);
+    assert_eq!(
+        (h.mode, h.csr.mcounteren, h.csr.scounteren),
+        (Mode::S, 0b111, 0b010)
+    );
+    assert_eq!(m.run(Some(100_000), |_| {}), RunResult::Exited(42));
 }
 
 /// A disk whose boot block is `code`, sealed, followed by blank sectors.

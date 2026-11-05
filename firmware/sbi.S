@@ -101,8 +101,8 @@ sbi_coldboot:
     # What the machine has, from sysinfo (spec section 9.5): the harts (1
     # to FW_MAX_HARTS, the scratch blocks there are), RAM, and on RV64 the
     # region it reserves for the firmware, which S-mode may neither start a
-    # hart in nor hand the console (sbi_check_range), as an OpenSBI domain
-    # keeps its own region from S-mode. Without sysinfo: one hart and no
+    # hart in (hart_start's check) nor hand the console (sbi_check_buffer),
+    # as an OpenSBI domain keeps its own region from S-mode. Without sysinfo: one hart and no
     # RAM, so nothing can be started (a kernel stops at once anyway: it
     # reads sysinfo too).
     li    t0, SYSINFO_BASE
@@ -167,8 +167,8 @@ sbi_coldboot:
     j     sbi_enter_supervisor
 
 # The M-mode state of the hart it runs on, the same on every hart: the trap
-# vector, the scratch block, which traps S-mode takes itself, the `time`
-# CSR for S-mode, and only the IPI enabled (set_timer enables the timer). A
+# vector, the scratch block, which traps S-mode takes itself, the counters
+# S-mode and U-mode may read, and only the IPI enabled (set_timer enables the timer). A
 # leaf: t0 and t1 only, no stack.
     .globl sbi_hart_init
 sbi_hart_init:
@@ -183,10 +183,16 @@ sbi_hart_init:
     csrw  medeleg, t0
     li    t0, KERNEL_INTERRUPTS
     csrw  mideleg, t0
-    # S-mode reads the clock through the time CSR, not the CLINT, which its
-    # page tables don't map.
-    li    t0, MCOUNTEREN_TM
+    # The counters, as OpenSBI's mstatus_init(): S-mode may read all of
+    # them (mcounteren all ones, which Grail keeps as CY, TM and IR, the
+    # counters it has), so the Zicntr the device tree promises S-mode is
+    # there, and the clock is the time CSR, not the CLINT, which its page
+    # tables don't map. U-mode gets the time CSR only (scounteren = TM),
+    # until S-mode lets it have more.
+    li    t0, -1
     csrw  mcounteren, t0
+    li    t0, COUNTEREN_TM
+    csrw  scounteren, t0
     li    t0, MIE_MSIE
     csrw  mie, t0
     ret
