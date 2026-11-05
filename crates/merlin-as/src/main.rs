@@ -1,22 +1,17 @@
 //! `merlin-as [-march=ISA] [-o out.o] input.s`
 
-use merlin_as::Options;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: merlin-as [-march=ISA] [-o output.o] input.s
 
-  -march=ISA  rv32ima_zicsr_zifencei (default) or rv64ima_zicsr_zifencei
+  -march=ISA  rv64ima_zicsr_zifencei, the one ISA (the default)
   -o FILE     output object (default: input with .o extension)";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
-    Assemble {
-        input: String,
-        output: Option<String>,
-        opts: Options,
-    },
+    Assemble { input: String, output: Option<String> },
 }
 
 /// Reads the arguments (without the program name). An error is the text to
@@ -27,7 +22,6 @@ enum Command {
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut input = None;
     let mut output = None;
-    let mut opts = Options::default();
     let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -37,26 +31,25 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             },
             "-h" | "--help" => return Ok(Command::Help),
             _ if a.starts_with("-march=") => {
-                opts.xlen =
-                    merlin_as::parse_march(&a["-march=".len()..]).map_err(|e| format!("merlin-as: {e}"))?;
+                merlin_as::parse_march(&a["-march=".len()..]).map_err(|e| format!("merlin-as: {e}"))?;
             }
             _ if a.starts_with('-') => return Err(format!("merlin-as: unknown option {a}\n{USAGE}")),
             _ => input = Some(a),
         }
     }
     match input {
-        Some(input) => Ok(Command::Assemble { input, output, opts }),
+        Some(input) => Ok(Command::Assemble { input, output }),
         None => Err(USAGE.to_string()),
     }
 }
 
 fn main() -> ExitCode {
-    let (input, output, opts) = match parse_args(std::env::args().skip(1)) {
+    let (input, output) = match parse_args(std::env::args().skip(1)) {
         Ok(Command::Help) => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Ok(Command::Assemble { input, output, opts }) => (input, output, opts),
+        Ok(Command::Assemble { input, output }) => (input, output),
         Err(msg) => {
             eprintln!("{msg}");
             return ExitCode::from(2);
@@ -77,7 +70,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match merlin_as::assemble_to_elf_with(&src, &opts) {
+    match merlin_as::assemble_to_elf(&src) {
         Ok(bytes) => {
             if let Err(e) = std::fs::write(&output, bytes) {
                 eprintln!("merlin-as: cannot write {output}: {e}");
@@ -102,39 +95,24 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use merlin_as::Xlen;
 
     fn parse(args: &[&str]) -> Result<Command, String> {
         parse_args(args.iter().map(|a| a.to_string()))
     }
 
-    fn assemble(input: &str, output: Option<&str>, xlen: Xlen) -> Result<Command, String> {
+    fn assemble(input: &str, output: Option<&str>) -> Result<Command, String> {
         Ok(Command::Assemble {
             input: input.to_string(),
             output: output.map(str::to_string),
-            opts: Options { xlen },
         })
     }
 
     #[test]
-    fn the_width_is_rv32_unless_march_says_otherwise() {
-        assert_eq!(parse(&["a.s"]), assemble("a.s", None, Xlen::Rv32));
+    fn march_may_name_the_isa() {
+        assert_eq!(parse(&["a.s"]), assemble("a.s", None));
         assert_eq!(
             parse(&["-march=rv64ima_zicsr_zifencei", "-o", "b.o", "a.s"]),
-            assemble("a.s", Some("b.o"), Xlen::Rv64)
-        );
-        assert_eq!(
-            parse(&["a.s", "-march=rv32ima_zicsr_zifencei"]),
-            assemble("a.s", None, Xlen::Rv32)
-        );
-        // The last -march wins, as in clang.
-        assert_eq!(
-            parse(&[
-                "-march=rv32ima_zicsr_zifencei",
-                "-march=rv64ima_zicsr_zifencei",
-                "a.s"
-            ]),
-            assemble("a.s", None, Xlen::Rv64)
+            assemble("a.s", Some("b.o"))
         );
     }
 
@@ -142,8 +120,15 @@ mod tests {
     fn march_must_name_an_isa_merlin_as_assembles() {
         assert_eq!(
             parse(&["-march=rv64gc", "a.s"]),
-            Err("merlin-as: unsupported -march 'rv64gc' \
-                 (merlin-as takes rv32ima_zicsr_zifencei or rv64ima_zicsr_zifencei)"
+            Err(
+                "merlin-as: unsupported -march 'rv64gc' (merlin-as takes rv64ima_zicsr_zifencei)".to_string()
+            )
+        );
+        // RV32 is not an ISA merlin-as assembles: the same message.
+        assert_eq!(
+            parse(&["-march=rv32ima_zicsr_zifencei", "a.s"]),
+            Err("merlin-as: unsupported -march 'rv32ima_zicsr_zifencei' \
+                 (merlin-as takes rv64ima_zicsr_zifencei)"
                 .to_string())
         );
         // Only the `=` form: `-march ISA` is an unknown option.

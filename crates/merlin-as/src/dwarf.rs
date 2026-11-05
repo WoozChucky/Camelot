@@ -36,13 +36,12 @@
 //! * `is_stmt` is sticky from one `.loc` to the next (as in GNU as); the other
 //!   flags, the ISA and the discriminator belong to one `.loc`.
 //!
-//! The two widths write the same table but for the size of an address: the
-//! header's `address_size` (4 on RV32, 8 on RV64) and the operand of
-//! `DW_LNE_set_address`, a 4-byte `R_RISCV_32` or an 8-byte `R_RISCV_64`
-//! field. Everything else is DWARF32 in both, as clang writes it: the unit and
-//! header lengths and the `.debug_line_str` offsets stay 4 bytes (and
-//! `R_RISCV_32`), since DWARF32 is about the size of the debug sections, not
-//! of the program's addresses.
+//! An address is as wide as the target's: the header's `address_size` is 8,
+//! and the operand of `DW_LNE_set_address` an 8-byte `R_RISCV_64` field.
+//! Everything else is DWARF32, as clang writes it: the unit and header lengths
+//! and the `.debug_line_str` offsets are 4 bytes (and `R_RISCV_32`), since
+//! DWARF32 is about the size of the debug sections, not of the program's
+//! addresses.
 
 /// `DW_LNS_*`: the standard opcodes.
 const COPY: u8 = 1;
@@ -217,7 +216,7 @@ impl<'a> Strings<'a> {
 /// Encodes the line table. `base` is where it goes in `.debug_line` (after
 /// whatever the source put there) and `str_base` where its strings go in
 /// `.debug_line_str`: fixups count from the sections' starts.
-/// `address_size` is the bytes in a target address, 4 on RV32 and 8 on RV64.
+/// `address_size` is the bytes in a target address: 8 on RV64.
 pub fn encode(
     comp_dir: &str,
     root: &File,
@@ -483,13 +482,11 @@ mod tests {
         assert_eq!(enc(0, 20), [CONST_ADD_PC, (5 + 13 + 3 * 14) as u8]);
     }
 
-    /// The whole table of one sequence on both widths: they differ only in
-    /// `address_size` and in `DW_LNE_set_address`'s operand (and so in
-    /// `unit_length`). The bytes are `llvm-objdump -s -j .debug_line` of
-    /// this source, assembled by clang 23 with `-mno-relax` for
-    /// `--target=riscv32 -march=rv32ima_zicsr_zifencei -mabi=ilp32` and
-    /// `--target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64`; the
-    /// fixups are its `.rela.debug_line` (`llvm-readelf -r`):
+    /// The whole table of one sequence, with its 8-byte `DW_LNE_set_address`
+    /// operand. The bytes are `llvm-objdump -s -j .debug_line` of this source,
+    /// assembled by clang 23 with `-mno-relax` for `--target=riscv64
+    /// -march=rv64ima_zicsr_zifencei -mabi=lp64`; the fixups are its
+    /// `.rela.debug_line` (`llvm-readelf -r`):
     ///
     /// ```text
     ///     .file 0 "/src" "t.c"
@@ -532,29 +529,18 @@ mod tests {
             )
         };
 
-        let rv32 = table(4);
-        let clang32 = "42000000 05000400 25000000 010101fb 0e0d0001 01010100 00000100 00010101 \
-                       1f010000 00000201 1f020f01 00000000 00040005 05000502 00000000 1405010a \
-                       4b020400 0101";
-        assert_eq!(rv32.line, hex(clang32));
-        // R_RISCV_32 .debug_line_str+0 and +5, R_RISCV_32 .text+0.
-        let fixups = vec![
-            (0x22, Target::LineStr(0)),
-            (0x2c, Target::LineStr(5)),
-            (0x38, Target::Section(0, 0)),
-        ];
-        assert_eq!(rv32.fixups, fixups);
-        assert_eq!(rv32.line_str, b"/src\0t.c\0");
-
         let rv64 = table(8);
         let clang64 = "46000000 05000800 25000000 010101fb 0e0d0001 01010100 00000100 00010101 \
                        1f010000 00000201 1f020f01 00000000 00040005 05000902 00000000 00000000 \
                        1405010a 4b020400 0101";
         assert_eq!(rv64.line, hex(clang64));
-        // R_RISCV_32 .debug_line_str+0 and +5, R_RISCV_64 .text+0: the same
-        // places, since nothing before the address (the header, set_file,
-        // set_column) depends on its width.
+        // R_RISCV_32 .debug_line_str+0 and +5, R_RISCV_64 .text+0.
+        let fixups = vec![
+            (0x22, Target::LineStr(0)),
+            (0x2c, Target::LineStr(5)),
+            (0x38, Target::Section(0, 0)),
+        ];
         assert_eq!(rv64.fixups, fixups);
-        assert_eq!(rv64.line_str, rv32.line_str);
+        assert_eq!(rv64.line_str, b"/src\0t.c\0");
     }
 }

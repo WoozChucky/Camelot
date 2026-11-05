@@ -3,26 +3,24 @@
 //! Turns one instruction (mnemonic + parsed operands) into machine words.
 //! Everything around it (lexing, parsing, labels, sections, directives,
 //! relocations, ELF output) lives elsewhere; this module is the whole ISA:
-//! RV32I or RV64I, M, A, Zicsr, Zifencei, the privileged instructions, Xcal
-//! (spec section 9), the standard pseudo-instructions and the `.insn` directive.
+//! RV64I, M, A, Zicsr, Zifencei, the privileged instructions, Xcal (spec
+//! section 9), the standard pseudo-instructions and the `.insn` directive.
 //!
-//! ## The two widths
+//! ## RV64
 //!
-//! The width ([`Ctx::xlen`], from `-march=`) changes little: every instruction
-//! word is 32 bits on both, and RV64 is RV32 plus a few things.
+//! Every instruction word is 32 bits. What RV64 has beyond RV32's base set:
 //!
-//! * RV64-only instructions: the 32-bit operations `addiw`, `slliw`, `addw`,
-//!   `mulw`... (opcodes OP-IMM-32 and OP-32, their result sign-extended from
-//!   bit 31), the doubleword loads and stores `ld`, `lwu`, `sd`, and the `.d`
-//!   atomics. They live in tables of their own (`OP_32_FUNCT` ...), looked up
-//!   only on RV64, so on RV32 they are unknown instructions as before.
-//! * Shift amounts are 6 bits on RV64 (`slli a0, a0, 63`), 5 on RV32.
-//! * `li` takes any 64-bit constant on RV64, in up to 8 instructions.
-//! * RV32-only: the high halves of the counters (`rdcycleh`, CSR `cycleh`...),
-//!   which RV64 does not need: its CSRs hold all 64 bits.
+//! * the 32-bit operations `addiw`, `slliw`, `addw`, `mulw`... (opcodes
+//!   OP-IMM-32 and OP-32, their result sign-extended from bit 31), the
+//!   doubleword loads and stores `ld`, `lwu`, `sd`, and the `.d` atomics. They
+//!   live in tables of their own (`OP_32_FUNCT` ...), as in the ISA manual's
+//!   chapter on RV64I;
+//! * shift amounts of 6 bits (`slli a0, a0, 63`), 5 for the 32-bit shifts;
+//! * `li` of any 64-bit constant, in up to 8 instructions.
 //!
-//! Every place that looks at the width tests `rv64` (or matches on
-//! [`Xlen`]), so the RV32 paths are easy to find once RV32 goes (#159).
+//! What only RV32 has, the high halves of the counters (`rdcycleh`, CSR
+//! `cycleh`...), is an error that says so, as in LLVM: RV64's CSRs hold all 64
+//! bits. (Until #159 merlin-as assembled RV32 too.)
 //!
 //! ## Contract with the assembler driver ([`crate::asm`])
 //!
@@ -288,13 +286,8 @@ fn imm(e: &Expr, ctx: &Ctx) -> Result<Imm, String> {
     }
     if let Expr::Mod(m, inner) = e {
         if let Some(v) = ctx.constant(inner) {
-            // `%hi(0x12345678)`: no symbol, so split the number right here.
-            // RV64 takes any constant, as LLVM does (on both widths); RV32
-            // keeps merlin-as's check that the value is a 32-bit word.
-            let v = match ctx.xlen() {
-                Xlen::Rv32 => word(v, &format!("{}() value", m.name()))? as i64,
-                Xlen::Rv64 => v,
-            };
+            // `%hi(0x12345678)`: no symbol, so split the number right here. Any
+            // 64-bit constant, as LLVM takes.
             return match m {
                 Modifier::Hi => Ok(Imm::Num(hi_lo64(v).0 as i64)),
                 Modifier::Lo => Ok(Imm::Num(hi_lo64(v).1 as i64)),
@@ -309,15 +302,6 @@ fn imm(e: &Expr, ctx: &Ctx) -> Result<Imm, String> {
     match ctx.symbol(e) {
         Some((name, addend)) => Ok(Imm::Label(name, addend)),
         None => Err("expected a number, a constant or symbol+offset".into()),
-    }
-}
-
-/// A 32-bit value, signed or unsigned (`-1` and `0xffffffff` are the same word).
-fn word(v: i64, what: &str) -> Result<i32, String> {
-    if (-(1 << 31)..1 << 32).contains(&v) {
-        Ok(v as u32 as i32)
-    } else {
-        Err(format!("{what} {v} does not fit in 32 bits"))
     }
 }
 
@@ -659,12 +643,10 @@ pub const SYSTEM_FUNCT12: &[(&str, u32)] = &[
 ];
 
 // -------------------------------------------------------------------
-// RV64-only tables (RV64I and RV64M), in the same shapes as the ones above.
-//
-// Separate tables rather than more rows in the RV32 ones: the encoder looks
-// them up only on RV64, so on RV32 `addw` or `ld` stay unknown instructions.
-// The C assembler (`kernel/user/as`) gets them as tables of their own too
-// (`crates/xtask/src/c_tables.rs`), and looks them up only on RV64 as well.
+// RV64I's and RV64M's own instructions, in the same shapes as the tables
+// above: tables of their own, as the ISA manual gives them a chapter of their
+// own. The C assembler (`kernel/user/as`) gets them as tables of their own too
+// (`crates/xtask/src/c_tables.rs`).
 // -------------------------------------------------------------------
 
 /// OP-32: `rd = sext32(rs1 <op> rs2)` on the low 32 bits of the registers,
@@ -740,36 +722,33 @@ fn csr_funct3(m: &str) -> Option<u32> {
     find(CSR_FUNCT3, m)
 }
 
-// The RV64-only tables, seen only when `rv64`: on RV32 these mnemonics find
-// nothing and end up as unknown instructions.
-
-fn op_32_funct(m: &str, rv64: bool) -> Option<(u32, u32)> {
-    find2(OP_32_FUNCT, m).filter(|_| rv64)
+fn op_32_funct(m: &str) -> Option<(u32, u32)> {
+    find2(OP_32_FUNCT, m)
 }
 
-fn op_imm_32_funct3(m: &str, rv64: bool) -> Option<u32> {
-    find(OP_IMM_32_FUNCT3, m).filter(|_| rv64)
+fn op_imm_32_funct3(m: &str) -> Option<u32> {
+    find(OP_IMM_32_FUNCT3, m)
 }
 
-fn shift_32_funct(m: &str, rv64: bool) -> Option<(u32, u32)> {
-    find2(SHIFT_32_FUNCT, m).filter(|_| rv64)
+fn shift_32_funct(m: &str) -> Option<(u32, u32)> {
+    find2(SHIFT_32_FUNCT, m)
 }
 
-fn load_rv64_funct3(m: &str, rv64: bool) -> Option<u32> {
-    find(LOAD_RV64_FUNCT3, m).filter(|_| rv64)
+fn load_rv64_funct3(m: &str) -> Option<u32> {
+    find(LOAD_RV64_FUNCT3, m)
 }
 
-fn store_rv64_funct3(m: &str, rv64: bool) -> Option<u32> {
-    find(STORE_RV64_FUNCT3, m).filter(|_| rv64)
+fn store_rv64_funct3(m: &str) -> Option<u32> {
+    find(STORE_RV64_FUNCT3, m)
 }
 
 /// Splits an A mnemonic into its base (`amoadd.w`), its funct5, its width
 /// as funct3 ([`AMO_W`] or [`AMO_D`]) and its ordering bits aq|rl, from the
 /// suffix: none, `.aq` (10), `.rl` (01) or `.aqrl` (11).
 ///
-/// A `.d` form (RV64 only) is its `.w` form with funct3 = 011: the same
-/// operation on a doubleword, so [`ATOMIC_FUNCT5`] lists only the `.w` names.
-fn atomic(m: &str, rv64: bool) -> Option<(&str, u32, u32, u32)> {
+/// A `.d` form is its `.w` form with funct3 = 011: the same operation on a
+/// doubleword, so [`ATOMIC_FUNCT5`] lists only the `.w` names.
+fn atomic(m: &str) -> Option<(&str, u32, u32, u32)> {
     let (base, aqrl) = [(".aqrl", 0b11), (".aq", 0b10), (".rl", 0b01)]
         .into_iter()
         .find_map(|(suffix, bits)| Some((m.strip_suffix(suffix)?, bits)))
@@ -777,7 +756,7 @@ fn atomic(m: &str, rv64: bool) -> Option<(&str, u32, u32, u32)> {
     if let Some(funct5) = find(ATOMIC_FUNCT5, base) {
         return Some((base, funct5, AMO_W, aqrl));
     }
-    let op = base.strip_suffix(".d").filter(|_| rv64)?; // `amoadd` of `amoadd.d`
+    let op = base.strip_suffix(".d")?; // `amoadd` of `amoadd.d`
     let funct5 = ATOMIC_FUNCT5
         .iter()
         .find(|e| e.0.strip_suffix(".w") == Some(op))?
@@ -807,14 +786,10 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
             Err(format!("usage: {m} {form}"))
         }
     };
-    // RV64 adds instructions, widens the shift amounts and `li`, and drops the
-    // `rd*h` counter reads; everything else is the same on both widths.
-    let rv64 = ctx.xlen() == Xlen::Rv64;
-
-    // ----- R-type: OP and M, and their 32-bit forms OP-32 (RV64) -----
+    // ----- R-type: OP and M, and their 32-bit forms OP-32 -----
     if let Some((opcode, (funct3, funct7))) = op_funct(m)
         .map(|f| (OP, f))
-        .or_else(|| op_32_funct(m, rv64).map(|f| (OP_32, f)))
+        .or_else(|| op_32_funct(m).map(|f| (OP_32, f)))
     {
         let [rd, rs1, rs2] = ops else {
             return usage("rd, rs1, rs2");
@@ -822,10 +797,10 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
         return one(r_type(opcode, funct3, funct7, reg(rd)?, reg(rs1)?, reg(rs2)?));
     }
 
-    // ----- I-type: OP-IMM, and OP-IMM-32's addiw (RV64) -----
+    // ----- I-type: OP-IMM, and OP-IMM-32's addiw -----
     if let Some((opcode, funct3)) = op_imm_funct3(m)
         .map(|f| (OP_IMM, f))
-        .or_else(|| op_imm_32_funct3(m, rv64).map(|f| (OP_IMM_32, f)))
+        .or_else(|| op_imm_32_funct3(m).map(|f| (OP_IMM_32, f)))
     {
         let [rd, rs1, imm] = ops else {
             return usage("rd, rs1, imm");
@@ -835,27 +810,27 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
         return Ok(vec![f.emit(word)]);
     }
     // Shifts by an immediate. The shift amount has as many bits as it takes
-    // to count the bits of the value shifted: 6 for RV64's 64-bit registers,
-    // 5 for RV32's and for the 32-bit shifts of OP-IMM-32 (`slliw`...).
+    // to count the bits of the value shifted: 6 for the 64-bit registers, 5
+    // for the 32-bit shifts of OP-IMM-32 (`slliw`...).
     if let Some((opcode, bits, (funct3, funct7))) = shift_funct(m)
-        .map(|f| (OP_IMM, if rv64 { 6 } else { 5 }, f))
-        .or_else(|| shift_32_funct(m, rv64).map(|f| (OP_IMM_32, 5, f)))
+        .map(|f| (OP_IMM, 6, f))
+        .or_else(|| shift_32_funct(m).map(|f| (OP_IMM_32, 5, f)))
     {
         let [rd, rs1, shamt] = ops else {
             return usage("rd, rs1, shamt");
         };
         let shamt = uimm(expr(shamt)?, ctx, bits, "shift amount")?;
-        // funct7 sits in imm[11:5], the shift amount in imm[4:0] (RV64:
-        // imm[5:0], where funct7's bit 0, always clear, leaves room for it).
+        // funct7 sits in imm[11:5], the shift amount in imm[5:0], where
+        // funct7's bit 0, always clear, leaves room for its bit 5.
         let imm = (funct7 << 5 | shamt) as i32;
         return one(i_type(opcode, funct3, reg(rd)?, reg(rs1)?, imm));
     }
 
-    // ----- loads (I-type) and stores (S-type); RV64 adds ld, lwu and sd -----
-    if let Some(funct3) = load_funct3(m).or_else(|| load_rv64_funct3(m, rv64)) {
+    // ----- loads (I-type) and stores (S-type), RV64's ld, lwu and sd too -----
+    if let Some(funct3) = load_funct3(m).or_else(|| load_rv64_funct3(m)) {
         return load(m, funct3, ops, ctx);
     }
-    if let Some(funct3) = store_funct3(m).or_else(|| store_rv64_funct3(m, rv64)) {
+    if let Some(funct3) = store_funct3(m).or_else(|| store_rv64_funct3(m)) {
         return store(m, funct3, ops, ctx);
     }
 
@@ -887,8 +862,8 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
 
     // ----- A extension (R-type, AMO opcode) -----
     // funct7 is funct5 followed by the aq and rl bits; funct3 is the width,
-    // 010 (word) or 011 (doubleword, RV64). lr has no rs2 (the field is zero).
-    if let Some((base, funct5, width, aqrl)) = atomic(m, rv64) {
+    // 010 (word) or 011 (doubleword). lr has no rs2 (the field is zero).
+    if let Some((base, funct5, width, aqrl)) = atomic(m) {
         let (rd, rs2, addr) = match (base, ops) {
             ("lr.w" | "lr.d", [rd, addr]) => (rd, ZERO, addr),
             ("lr.w" | "lr.d", _) => return usage("rd, (rs1)"),
@@ -970,18 +945,9 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
             let [rd, value] = ops else { return usage("rd, imm") };
             let rd = reg(rd)?;
             match imm(expr(value)?, ctx)? {
-                // The value LLVM's `li` takes: a 32-bit word, signed or
-                // unsigned, on RV32 (`li a0, 0xffffffff` is -1), and any
-                // 64-bit value on RV64 (`li a0, 0xffffffff` is 2^32 - 1).
-                // On RV32 the word is then read signed, as the hart's
-                // register holds it, so `li_steps` sees one value per word.
-                Imm::Num(v) => {
-                    let v = match ctx.xlen() {
-                        Xlen::Rv32 => word(v, "li value")? as i64,
-                        Xlen::Rv64 => v,
-                    };
-                    Ok(li_words(rd, &li_steps(v, ctx.xlen())))
-                }
+                // The value LLVM's `li` takes: any 64-bit value (`li a0,
+                // 0xffffffff` is 2^32 - 1).
+                Imm::Num(v) => Ok(li_words(rd, &li_steps(v))),
                 Imm::Label(name, _) if ctx.undefined(&name) => Err(format!(
                     "{} (li loads a number; la loads an address)",
                     not_yet_constant(&name)
@@ -1015,8 +981,8 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
             let funct3 = if m == "sgt" { 0b010 } else { 0b011 }; // slt's, sltu's
             one(r_type(OP, funct3, 0, rd, rt, rs))
         }
-        // RV64's 32-bit forms: sign-extend the low word, or negate it.
-        "sext.w" | "negw" if rv64 => {
+        // The 32-bit forms: sign-extend the low word, or negate it.
+        "sext.w" | "negw" => {
             let [rd, rs] = ops else { return usage("rd, rs") };
             let (rd, rs) = (reg(rd)?, reg(rs)?);
             one(match m {
@@ -1024,9 +990,9 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
                 _ => r_type(OP_32, 0, 0b0100000, rd, ZERO, rs), // negw: subw rd, zero, rs
             })
         }
-        // Zero-extend the low word (RV64): without Zba's `add.uw`, two
-        // shifts, as LLVM expands it. slli rd, rs, 32; srli rd, rd, 32.
-        "zext.w" if rv64 => {
+        // Zero-extend the low word: without Zba's `add.uw`, two shifts, as
+        // LLVM expands it. slli rd, rs, 32; srli rd, rd, 32.
+        "zext.w" => {
             let [rd, rs] = ops else { return usage("rd, rs") };
             let (rd, rs) = (reg(rd)?, reg(rs)?);
             Ok(vec![
@@ -1133,7 +1099,7 @@ pub fn encode(m: &str, ops: &[Operand], ctx: &Ctx) -> Result<Vec<Emit>, String> 
             };
             // The `h` forms read the high half of a 64-bit counter on RV32.
             // RV64 has no such CSRs: its `rdcycle` reads the whole counter.
-            if rv64 && csr::rv32_only(counter) {
+            if csr::rv32_only(counter) {
                 let full = m.strip_suffix('h').unwrap_or(m);
                 return Err(format!(
                     "'{m}' exists only on RV32 (on RV64, {full} reads all 64 bits)"
@@ -1264,17 +1230,17 @@ fn csr_op(funct3: u32, rd: Reg, csr: &Operand, src: &Operand, ctx: &Ctx) -> Resu
 /// far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
-    /// `lui rd, imm20`: `imm20 << 12`, sign-extended from bit 31 on RV64.
+    /// `lui rd, imm20`: `imm20 << 12`, sign-extended from bit 31.
     Lui(u32),
     /// `addi rd, rs, imm`, a 12-bit signed immediate.
     Addi(i32),
-    /// `addiw rd, rs, imm` (RV64): the sum's low 32 bits, sign-extended.
+    /// `addiw rd, rs, imm`: the sum's low 32 bits, sign-extended.
     Addiw(i32),
     /// `slli rd, rd, shamt`.
     Slli(u32),
-    /// `srli rd, rd, shamt` (RV64).
+    /// `srli rd, rd, shamt`.
     Srli(u32),
-    /// `xori rd, rd, imm` (RV64), with imm always -1: `not rd, rd`.
+    /// `xori rd, rd, imm`, with imm always -1: `not rd, rd`.
     Xori(i32),
 }
 
@@ -1291,17 +1257,17 @@ fn fits(v: i64, bits: u32) -> bool {
 /// weigh the compressed ones; merlin-as has none of them, so the cost of a
 /// sequence is its length.
 ///
-/// On RV32 `value` is a sign-extended 32-bit value, and the answer is one or
-/// two instructions:
+/// A 32-bit value takes one or two instructions:
 ///
 /// * fits in 12 signed bits: `addi rd, zero, value`;
 /// * low 12 bits zero: `lui rd, value >> 12`;
 /// * an even value `c << s` with `c` in -32..=31: `addi rd, zero, c` +
 ///   `slli rd, rd, s` (step 2 below: `li a0, 2048` is `addi a0, zero, 1;
 ///   slli a0, a0, 11`);
-/// * anything else: `lui rd, hi` + `addi rd, rd, lo`, split by [`hi_lo64`].
+/// * anything else: `lui rd, hi` + `addi rd, rd, lo` (or `addiw`), split by
+///   [`hi_lo64`].
 ///
-/// On RV64 any 64-bit value takes from 1 to 8 instructions
+/// Any 64-bit value takes from 1 to 8 instructions
 /// (`li a0, 0x123456789abcdef0` is `lui`, `addi`, then `slli`+`addi` three
 /// times). The length depends only on the value, so `li` with a constant
 /// keeps the assembler single pass.
@@ -1313,11 +1279,11 @@ fn fits(v: i64, bits: u32) -> bool {
 ///    low 12 bits are an `addi` at the end and the rest is built shifted
 ///    right, then shifted back with `slli`.
 /// 2. Trailing zeros: build `value >> tz` and add one `slli tz`. Kept when
-///    shorter, or (as on RV32) when the shifted value fits in 6 bits, where
-///    with C both would be 16-bit instructions (LLVM prefers that shape even
-///    without C, "to minimize differences in generated code").
+///    shorter, or when the shifted value fits in 6 bits, where with C both
+///    would be 16-bit instructions (LLVM prefers that shape even without C,
+///    "to minimize differences in generated code").
 ///
-///    One or two instructions cannot be beaten: every RV32 value stops here.
+///    One or two instructions cannot be beaten: every 32-bit value stops here.
 /// 3. Low 13 bits from 0x1001 to 0x17ff: build `value + (0x800 - low 12
 ///    bits)`, whose low bits are then 0x1800 (one `addi -0x800` short of
 ///    more trailing zeros), and finish with an `addi` that takes it back.
@@ -1327,22 +1293,16 @@ fn fits(v: i64, bits: u32) -> bool {
 ///    `0xffffffff` is `addi -1; srli 32`.
 /// 5. A negative value: build its complement as in 4 and finish with
 ///    `xori -1` (`not`).
-pub fn li_steps(value: i64, xlen: Xlen) -> Vec<Step> {
-    let rv64 = xlen == Xlen::Rv64;
-    debug_assert!(
-        rv64 || fits(value, 32),
-        "an RV32 li value is a sign-extended word"
-    );
-
+pub fn li_steps(value: i64) -> Vec<Step> {
     // 1.
-    let mut best = li_base(value, rv64);
+    let mut best = li_base(value);
 
     // 2. Trailing zeros. (`value & 0xfff != 0`: with the low 12 bits zero,
     // step 1 already shifted them away.)
     if value & 0xfff != 0 && value & 1 == 0 && best.len() >= 2 {
         let tz = value.trailing_zeros();
         let shifted = value >> tz;
-        let mut seq = li_base(shifted, rv64);
+        let mut seq = li_base(shifted);
         if seq.len() + 1 < best.len() || fits(shifted, 6) {
             seq.push(Step::Slli(tz));
             best = seq;
@@ -1356,7 +1316,7 @@ pub fn li_steps(value: i64, xlen: Xlen) -> Vec<Step> {
     // them 0x1800, which the next `addi -0x800` turns into 13 zero bits.
     if value & 0xfff != 0 && value & 0x1800 == 0x1000 {
         let imm12 = -(0x800 - (value & 0xfff)); // -0x7ff..=-1
-        let mut seq = li_base(value.wrapping_sub(imm12), rv64);
+        let mut seq = li_base(value.wrapping_sub(imm12));
         if seq.len() + 1 < best.len() {
             seq.push(Step::Addi(imm12 as i32));
             best = seq;
@@ -1365,7 +1325,7 @@ pub fn li_steps(value: i64, xlen: Xlen) -> Vec<Step> {
 
     // 4. Leading zeros of a positive value.
     if value > 0 && best.len() > 2 {
-        li_leading_zeros(value, rv64, &mut best);
+        li_leading_zeros(value, &mut best);
     }
 
     // 5. A negative value as the complement of a positive one. (Only when it
@@ -1373,7 +1333,7 @@ pub fn li_steps(value: i64, xlen: Xlen) -> Vec<Step> {
     // beat what we have.)
     if value < 0 && best.len() > 3 {
         let mut seq = Vec::new();
-        li_leading_zeros(!value, rv64, &mut seq);
+        li_leading_zeros(!value, &mut seq);
         if !seq.is_empty() && seq.len() + 1 < best.len() {
             seq.push(Step::Xori(-1));
             best = seq;
@@ -1385,13 +1345,13 @@ pub fn li_steps(value: i64, xlen: Xlen) -> Vec<Step> {
 /// LLVM's `generateInstSeqImpl`: the plain sequence for `value`.
 ///
 /// A 32-bit value is `lui hi` + `addi lo` ([`hi_lo64`]), either one left out
-/// when it is zero (`addi` stays if both are: `li a0, 0`). On RV64 `lui`
+/// when it is zero (`addi` stays if both are: `li a0, 0`). `lui`
 /// sign-extends from bit 31, so `lui 0x80000` + `addi -1` would give
 /// 0xffffffff_7fffffff, not 0x7fffffff: when the 64-bit sum leaves the 32-bit
 /// range (only for 0x7ffff800..=0x7fffffff), the second instruction is
 /// `addiw`, which sign-extends the 32-bit sum instead.
 ///
-/// A wider value (RV64 only) is built from the most significant bits down,
+/// A wider value is built from the most significant bits down,
 /// though worked out from the least significant up: its low 12 bits become an
 /// `addi` at the end (taking them away can carry into bit 12, as in
 /// [`hi_lo64`]), and what is left is shifted right past its trailing zeros
@@ -1400,13 +1360,13 @@ pub fn li_steps(value: i64, xlen: Xlen) -> Vec<Step> {
 /// instructions. When the shift is more than 12 and the shifted value is too
 /// wide for one `addi`, 12 bits less of shift leave its low 12 bits zero, for
 /// a `lui` to make in one instruction.
-fn li_base(value: i64, rv64: bool) -> Vec<Step> {
+fn li_base(value: i64) -> Vec<Step> {
     let mut seq = Vec::new();
-    li_base_into(value, rv64, &mut seq);
+    li_base_into(value, &mut seq);
     seq
 }
 
-fn li_base_into(value: i64, rv64: bool, seq: &mut Vec<Step>) {
+fn li_base_into(value: i64, seq: &mut Vec<Step>) {
     let (hi20, lo12) = hi_lo64(value);
     if fits(value, 32) {
         if hi20 != 0 {
@@ -1414,7 +1374,7 @@ fn li_base_into(value: i64, rv64: bool, seq: &mut Vec<Step>) {
         }
         if lo12 != 0 || hi20 == 0 {
             let lui = (hi20 << 12) as i32 as i64; // what lui leaves, sign-extended
-            let addiw = rv64 && hi20 != 0 && !fits(lui + lo12 as i64, 32);
+            let addiw = hi20 != 0 && !fits(lui + lo12 as i64, 32);
             seq.push(if addiw {
                 Step::Addiw(lo12)
             } else {
@@ -1423,7 +1383,6 @@ fn li_base_into(value: i64, rv64: bool, seq: &mut Vec<Step>) {
         }
         return;
     }
-    debug_assert!(rv64, "only RV64 has values wider than 32 bits");
     // Wrapping: 0x7fffffff_fffff800 - (-0x800) is 2^63.
     let mut rest = value.wrapping_sub(lo12 as i64);
     let mut shift = 0;
@@ -1435,7 +1394,7 @@ fn li_base_into(value: i64, rv64: bool, seq: &mut Vec<Step>) {
             rest <<= 12;
         }
     }
-    li_base_into(rest, rv64, seq);
+    li_base_into(rest, seq);
     if shift != 0 {
         seq.push(Step::Slli(shift));
     }
@@ -1450,13 +1409,13 @@ fn li_base_into(value: i64, rv64: bool, seq: &mut Vec<Step>) {
 /// first (`0x0000ffff_ffffffff` becomes -1, one `addi`), then all zeros. Each
 /// replaces `best` if it is shorter, or if `best` is empty (step 5 of
 /// [`li_steps`]) and it is a sequence at all (at most 7 + the `srli`).
-fn li_leading_zeros(value: i64, rv64: bool, best: &mut Vec<Step>) {
+fn li_leading_zeros(value: i64, best: &mut Vec<Step>) {
     debug_assert!(value > 0);
     let lz = value.leading_zeros(); // 1..=63
     let low = ((1u64 << lz) - 1) as i64; // the lz bits shifted in
     let ones = value << lz | low;
     for shifted in [ones, ones & !low] {
-        let mut seq = li_base(shifted, rv64);
+        let mut seq = li_base(shifted);
         if seq.len() + 1 < best.len() || (best.is_empty() && seq.len() < 8) {
             seq.push(Step::Srli(lz));
             *best = seq;
@@ -1588,7 +1547,7 @@ mod tests {
     use excalibur::{AluOp, BranchOp, Inst, StoreOp, Xlen};
 
     fn decode(w: u32) -> Inst {
-        excalibur::decode(w, Xlen::Rv32)
+        excalibur::decode(w, Xlen::Rv64)
     }
 
     #[test]
@@ -1680,7 +1639,7 @@ mod tests {
     #[test]
     fn li_picks_the_shortest_sequence() {
         let words = |v: i32| {
-            li_words(10, &li_steps(v as i64, Xlen::Rv32))
+            li_words(10, &li_steps(v as i64))
                 .iter()
                 .map(|e| e.word)
                 .collect::<Vec<_>>()
@@ -1695,9 +1654,9 @@ mod tests {
 
     // ----- RV64 -----
 
-    /// The `.text` words of `src` assembled for `xlen`, or the first error.
-    fn words_for(src: &str, xlen: Xlen) -> Result<Vec<u32>, String> {
-        let obj = crate::assemble_with(src, &crate::Options { xlen }).map_err(|e| e[0].msg.clone())?;
+    /// The `.text` words of `src`, or the first error.
+    fn words_for(src: &str) -> Result<Vec<u32>, String> {
+        let obj = crate::assemble(src).map_err(|e| e[0].msg.clone())?;
         let text = &obj.sections[0].data;
         Ok(text
             .chunks(4)
@@ -1706,13 +1665,12 @@ mod tests {
     }
 
     fn words64(src: &str) -> Vec<u32> {
-        words_for(src, Xlen::Rv64).unwrap_or_else(|e| panic!("{src}: {e}"))
+        words_for(src).unwrap_or_else(|e| panic!("{src}: {e}"))
     }
 
-    /// Runs a `li` sequence the way the hart would, with RV32's registers
-    /// kept sign-extended from bit 31 as on RV64 (as Grail does).
-    fn run(steps: &[Step], xlen: Xlen) -> i64 {
-        let word = |v: i64| if xlen == Xlen::Rv32 { v as i32 as i64 } else { v };
+    /// Runs a `li` sequence the way the hart would.
+    fn run(steps: &[Step]) -> i64 {
+        let word = |v: i64| v;
         steps.iter().fold(0, |rd, &step| match step {
             Step::Lui(imm20) => (imm20 << 12) as i32 as i64,
             Step::Addi(imm) => word(rd.wrapping_add(imm as i64)),
@@ -1822,65 +1780,26 @@ mod tests {
         (0xffff_c000_42e9_8fff, "bd167537 01251513 01255513 fff54513"),
     ];
 
-    /// `li a0, value` on RV32, as llvm-mc 23 `--triple=riscv32` assembles it:
-    /// the same algorithm, never more than two instructions.
-    const LI32: &[(u32, &str)] = &[
-        (0x0, "00000513"),
-        (0x7ff, "7ff00513"),
-        (0xffff_f800, "80000513"),
-        (0x800, "00100513 00b51513"),
-        (0x801, "00001537 80150513"),
-        (0x1000_0000, "10000537"),
-        (0x1234_5678, "12345537 67850513"),
-        (0x7fff_f800, "80000537 80050513"),
-        (0x7fff_ffff, "80000537 fff50513"),
-        (0x8000_0000, "80000537"),
-        (0x8040_0000, "80400537"),
-        (0xdead_beef, "deadc537 eef50513"),
-        (0xffff_ffff, "fff00513"),
-    ];
-
     #[test]
     fn li_steps_are_llvms_on_rv64() {
         for &(value, words) in LI64 {
             let words = hex_words(words);
-            let steps = li_steps(value as i64, Xlen::Rv64);
+            let steps = li_steps(value as i64);
             let got: Vec<u32> = li_words(10, &steps).iter().map(|e| e.word).collect();
             assert_eq!(got, words, "li a0, {value:#x}: {steps:?}");
-            assert_eq!(run(&steps, Xlen::Rv64), value as i64, "{value:#x}: {steps:?}");
+            assert_eq!(run(&steps), value as i64, "{value:#x}: {steps:?}");
             // And through the assembler.
             assert_eq!(words64(&format!("li a0, {value:#x}")), words, "{value:#x}");
         }
     }
 
     #[test]
-    fn li_steps_are_llvms_on_rv32() {
-        for &(word, words) in LI32 {
-            let (value, words) = (word as i32 as i64, hex_words(words));
-            let steps = li_steps(value, Xlen::Rv32);
-            let got: Vec<u32> = li_words(10, &steps).iter().map(|e| e.word).collect();
-            assert_eq!(got, words, "li a0, {word:#x}: {steps:?}");
-            assert_eq!(run(&steps, Xlen::Rv32), value, "{word:#x}: {steps:?}");
-            assert_eq!(
-                words_for(&format!("li a0, {word:#x}"), Xlen::Rv32),
-                Ok(words),
-                "{word:#x}"
-            );
-        }
-    }
-
-    #[test]
     fn li_takes_the_width_of_the_value() {
-        // RV32 reads 0xffffffff as the word -1; RV64 as 2^32 - 1.
-        assert_eq!(words_for("li a0, 0xffffffff", Xlen::Rv32), Ok(vec![0xfff0_0513]));
+        // 0xffffffff is 2^32 - 1, not the word -1.
         assert_eq!(words64("li a0, 0xffffffff"), [0xfff0_0513, 0x0205_5513]);
         // `li sp, 0x80400000`, the stack of examples linked at 0x80000000.
-        assert_eq!(words_for("li sp, 0x80400000", Xlen::Rv32), Ok(vec![0x8040_0137]));
         assert_eq!(words64("li sp, 0x80400000"), [0x2010_0113, 0x0161_1113]);
-        assert_eq!(
-            words_for("li a0, 0x100000000", Xlen::Rv32),
-            Err("li value 4294967296 does not fit in 32 bits".into())
-        );
+        assert_eq!(words64("li a0, 0x100000000"), [0x0010_0513, 0x0205_1513]);
         // 64-bit expressions wrap, as in LLVM: -2^63 - 1 is 2^63 - 1.
         assert_eq!(
             words64("li a0, -0x8000000000000000 - 1"),
@@ -2084,7 +2003,7 @@ mod tests {
                 RelocKind::PcrelLo12S,
             ),
         ] {
-            let obj = crate::assemble_with(line, &crate::Options { xlen: Xlen::Rv64 }).unwrap();
+            let obj = crate::assemble(line).unwrap();
             assert_eq!(words64(line), words, "{line}");
             let kinds: Vec<_> = obj.sections[0]
                 .relocs
@@ -2098,7 +2017,7 @@ mod tests {
 
     #[test]
     fn hi_lo_of_a_constant_takes_64_bits_on_rv64() {
-        // LLVM's words, on both widths; RV32 keeps its 32-bit check.
+        // LLVM's words: any 64-bit constant.
         assert_eq!(words64("lui a0, %hi(0x123456789)"), [0x2345_6537]);
         assert_eq!(words64("addi a0, a0, %lo(0x123456789)"), [0x7895_0513]);
         assert_eq!(words64("lui a0, %hi(0xffffffff80000000)"), [0x8000_0537]);
@@ -2106,10 +2025,6 @@ mod tests {
         assert_eq!(words64("lui a0, %hi(-1)"), [0x0000_0537]);
         assert_eq!(words64("addi a0, a0, %lo(-1)"), [0xfff5_0513]);
         assert_eq!(words64("lui a0, %hi(0x7fffffffffffffff)"), [0x0000_0537]);
-        assert_eq!(
-            words_for("lui a0, %hi(0x123456789)", Xlen::Rv32),
-            Err("%hi() value 4886718345 does not fit in 32 bits".into())
-        );
         // hi_lo64 agrees with hi_lo on every 32-bit value.
         for v in [
             0,
@@ -2130,7 +2045,7 @@ mod tests {
     #[test]
     fn shift_amounts_have_the_width_of_the_register() {
         assert_eq!(words64("slli a0, a0, 63"), [0x03f5_1513]);
-        let rv64 = |line: &str| words_for(line, Xlen::Rv64);
+        let rv64 = |line: &str| words_for(line);
         assert_eq!(
             rv64("slli a0, a0, 64"),
             Err("shift amount 64 out of range (0..=63)".into())
@@ -2142,10 +2057,6 @@ mod tests {
         // The 32-bit shifts keep 5 bits.
         assert_eq!(
             rv64("slliw a0, a0, 32"),
-            Err("shift amount 32 out of range (0..=31)".into())
-        );
-        assert_eq!(
-            words_for("slli a0, a0, 32", Xlen::Rv32),
             Err("shift amount 32 out of range (0..=31)".into())
         );
         assert_eq!(

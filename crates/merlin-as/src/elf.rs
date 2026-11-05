@@ -1,5 +1,4 @@
-//! Writes an [`Object`] as a little-endian relocatable ELF file (ET_REL):
-//! ELF32 for an RV32 object, ELF64 for an RV64 one ([`Object::xlen`]).
+//! Writes an [`Object`] as a little-endian relocatable ELF64 file (ET_REL).
 //!
 //! Not the `elf` crate, which reads ELF files: merlin-as only uses that one
 //! in its tests (a dev-dependency), where `elf::` names the crate. In this
@@ -8,7 +7,7 @@
 //! Layout:
 //!
 //! ```text
-//! ELF header (52 or 64 bytes)
+//! ELF header (64 bytes)
 //! section contents (.text, .data, ... then .rela.*, .symtab, .strtab, .shstrtab)
 //! section header table
 //! ```
@@ -20,42 +19,28 @@
 //! with the section names in it, and each `.rela.X` after its section; no
 //! tool cares, and the tests compare sections, not whole files.)
 //!
-//! # The two classes
+//! # ELF64
 //!
-//! ELF64 is ELF32 with the fields that hold an address, an offset or a size
-//! widened to 8 bytes (the gABI's `Elf64_Addr`, `Elf64_Off`, `Elf64_Xword`);
-//! the counts, indices and types stay 4 or 2 bytes. So one writer serves both,
-//! with [`Class`] saying how wide those fields are, and only two records
-//! change shape beyond that:
+//! The fields that hold an address, an offset or a size are 8 bytes (the
+//! gABI's `Elf64_Addr`, `Elf64_Off`, `Elf64_Xword`); the counts, indices and
+//! types 4 or 2 bytes. Two records are laid out for that:
 //!
 //! * A symbol (`Elf64_Sym`) puts `st_info`, `st_other` and `st_shndx` before
 //!   `st_value` and `st_size`, so the 8-byte fields are 8-aligned.
 //! * A relocation (`Elf64_Rela`) packs the symbol index and the type into
-//!   `r_info` as `sym << 32 | type`, where ELF32 has `sym << 8 | type`, and
-//!   keeps the whole 64-bit addend.
+//!   `r_info` as `sym << 32 | type`, and keeps the whole 64-bit addend.
 //!
 //! The tables of 8-byte fields (`.rela.*`, `.symtab`, the section headers)
-//! start at 8-byte offsets in an ELF64 file, as clang writes them.
+//! start at 8-byte offsets, as clang writes them. (Until #159 this writer made
+//! ELF32 objects for RV32 too.)
 
 use crate::asm::{Object, SymType};
-use crate::Xlen;
 
-/// The ISA merlin-as assembles for RV32, in the psABI's `Tag_RISCV_arch`
-/// spelling: exactly what clang writes for `-march=rv32ima_zicsr_zifencei`
-/// (M implies Zmmul, A implies Zaamo and Zalrsc). Without it llvm-objdump
-/// assumes plain RV32I and prints the M and A instructions as `<unknown>`.
-pub const ARCH: &str = "rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0";
-
-/// The same for RV64: what clang writes for `-march=rv64ima_zicsr_zifencei`.
-pub const ARCH_RV64: &str = "rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0";
-
-/// The `Tag_RISCV_arch` string of an object of this width.
-pub fn arch(xlen: Xlen) -> &'static str {
-    match xlen {
-        Xlen::Rv32 => ARCH,
-        Xlen::Rv64 => ARCH_RV64,
-    }
-}
+/// The ISA merlin-as assembles, in the psABI's `Tag_RISCV_arch` spelling:
+/// exactly what clang writes for `-march=rv64ima_zicsr_zifencei` (M implies
+/// Zmmul, A implies Zaamo and Zalrsc). Without it llvm-objdump assumes plain
+/// RV64I and prints the M and A instructions as `<unknown>`.
+pub const ARCH: &str = "rv64i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0";
 
 // The types and flags of the object's sections are crate::section's; these
 // are the writer's own sections'.
@@ -73,67 +58,19 @@ const STT_FUNC: u8 = 2;
 const STT_SECTION: u8 = 3;
 const STT_FILE: u8 = 4;
 const EM_RISCV: u16 = 243;
-const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
 
-/// What differs between ELF32 and ELF64 for this writer: the width of an
-/// address, offset or size field (4 or 8 bytes) and the sizes of the records
-/// built from them.
-struct Class {
-    /// `e_ident[EI_CLASS]`.
-    ident: u8,
-    /// Bytes in an address, an offset or a size; also the alignment of the
-    /// tables made of them.
-    word: usize,
-    /// `e_ehsize`: the ELF header.
-    ehsize: u16,
-    /// `e_shentsize`: a section header.
-    shentsize: u16,
-    /// A symbol table entry (`Elf32_Sym` / `Elf64_Sym`).
-    sym: usize,
-    /// A relocation with addend (`Elf32_Rela` / `Elf64_Rela`).
-    rela: usize,
-}
-
-const ELF32: Class = Class {
-    ident: ELFCLASS32,
-    word: 4,
-    ehsize: 52,
-    shentsize: 40,
-    sym: 16,
-    rela: 12,
-};
-
-const ELF64: Class = Class {
-    ident: ELFCLASS64,
-    word: 8,
-    ehsize: 64,
-    shentsize: 64,
-    sym: 24,
-    rela: 24,
-};
-
-impl Class {
-    fn of(xlen: Xlen) -> &'static Class {
-        match xlen {
-            Xlen::Rv32 => &ELF32,
-            Xlen::Rv64 => &ELF64,
-        }
-    }
-
-    /// Appends an address, offset or size field. In ELF32 the value must fit
-    /// in 4 bytes: everything this writer puts there does (file offsets and
-    /// section sizes are 32-bit in [`Object`], and an RV32 constant or
-    /// symbol size is cut to 32 bits before it gets here).
-    fn put_word(&self, b: &mut Vec<u8>, v: u64) {
-        if self.word == 4 {
-            debug_assert!(u32::try_from(v).is_ok(), "{v:#x} in a 4-byte ELF32 field");
-            put32(b, v as u32);
-        } else {
-            put64(b, v);
-        }
-    }
-}
+/// Bytes in an address, an offset or a size; also the alignment of the tables
+/// made of them.
+const WORD: usize = 8;
+/// `e_ehsize`: the ELF header.
+const EHSIZE: u16 = 64;
+/// `e_shentsize`: a section header.
+const SHENTSIZE: u16 = 64;
+/// A symbol table entry (`Elf64_Sym`).
+const SYM: usize = 24;
+/// A relocation with addend (`Elf64_Rela`).
+const RELA: usize = 24;
 
 /// A string table under construction. A string already in it is not added
 /// again: the mapping symbols share a few names (`$d`, `$x<isa>`) among
@@ -160,9 +97,8 @@ impl StrTab {
     }
 }
 
-/// A section header, its fields as wide as ELF64's; [`Class::put_word`]
-/// narrows the address-sized ones for ELF32. (`sh_addr` is always 0 in a
-/// relocatable file, so it has no field here.)
+/// A section header. (`sh_addr` is always 0 in a relocatable file, so it has
+/// no field here.)
 struct Shdr {
     name: u32,
     ty: u32,
@@ -192,8 +128,7 @@ fn align(b: &mut Vec<u8>, a: usize) {
 
 /// Contents of `.riscv.attributes` (psABI "Attributes"): format version `A`,
 /// then one vendor subsection `riscv` holding one `Tag_File` subsubsection
-/// with `Tag_RISCV_arch` = `arch` ([`ARCH`] or [`ARCH_RV64`], the same length,
-/// so the two sections differ only in "32" / "64"). Lengths count themselves.
+/// with `Tag_RISCV_arch` = `arch` ([`ARCH`]). Lengths count themselves.
 pub fn riscv_attributes(arch: &str) -> Vec<u8> {
     const TAG_FILE: u8 = 1;
     const TAG_RISCV_ARCH: u8 = 5;
@@ -211,10 +146,9 @@ pub fn riscv_attributes(arch: &str) -> Vec<u8> {
 }
 
 pub fn write(obj: &Object) -> Vec<u8> {
-    let class = Class::of(obj.xlen);
     let mut shstr = StrTab::new();
     let mut strtab = StrTab::new();
-    let mut out = vec![0u8; class.ehsize.into()]; // header, filled in at the end
+    let mut out = vec![0u8; EHSIZE.into()]; // header, filled in at the end
     let mut shdrs = vec![Shdr {
         name: 0,
         ty: 0,
@@ -263,7 +197,7 @@ pub fn write(obj: &Object) -> Vec<u8> {
     let first_global = order.len() + 1;
     order.extend((0..obj.symbols.len()).filter(|&i| is_global(&obj.symbols[i])));
     let mut sym_index = vec![0u32; obj.symbols.len()];
-    let mut symtab = vec![0u8; class.sym];
+    let mut symtab = vec![0u8; SYM];
     for (n, &i) in order.iter().enumerate() {
         let s = &obj.symbols[i];
         sym_index[i] = n as u32 + 1;
@@ -276,14 +210,10 @@ pub fn write(obj: &Object) -> Vec<u8> {
             SymType::File => STT_FILE,
         };
         // An `.equ` constant is an absolute symbol whose value is the
-        // constant: cut to 32 bits in ELF32 (as LLVM does on riscv32), whole
-        // in ELF64, so `.equ K, -1` is 0xffffffff or 0xffffffffffffffff.
+        // constant, all 64 bits: `.equ K, -1` is 0xffffffffffffffff.
         let (value, shndx) = match (s.constant, s.section) {
             _ if s.ty == SymType::File => (0, SHN_ABS),
-            (Some(c), _) => match obj.xlen {
-                Xlen::Rv32 => (u64::from(c as u32), SHN_ABS),
-                Xlen::Rv64 => (c as u64, SHN_ABS),
-            },
+            (Some(c), _) => (c as u64, SHN_ABS),
             (None, Some(sec)) => (s.value.into(), sec as u16 + 1),
             (None, None) => (0, SHN_UNDEF),
         };
@@ -295,25 +225,12 @@ pub fn write(obj: &Object) -> Vec<u8> {
         };
         let info = (bind << 4) | ty;
         let other = 0; // st_other: default visibility
-        match obj.xlen {
-            // Elf32_Sym: st_name, st_value, st_size, st_info, st_other, st_shndx.
-            // The size is cut to the field's 32 bits, as LLVM writes it.
-            Xlen::Rv32 => {
-                put32(&mut symtab, name);
-                class.put_word(&mut symtab, value);
-                class.put_word(&mut symtab, u64::from(s.size as u32));
-                symtab.extend_from_slice(&[info, other]);
-                put16(&mut symtab, shndx);
-            }
-            // Elf64_Sym: st_name, st_info, st_other, st_shndx, st_value, st_size.
-            Xlen::Rv64 => {
-                put32(&mut symtab, name);
-                symtab.extend_from_slice(&[info, other]);
-                put16(&mut symtab, shndx);
-                class.put_word(&mut symtab, value);
-                class.put_word(&mut symtab, s.size);
-            }
-        }
+                       // Elf64_Sym: st_name, st_info, st_other, st_shndx, st_value, st_size.
+        put32(&mut symtab, name);
+        symtab.extend_from_slice(&[info, other]);
+        put16(&mut symtab, shndx);
+        put64(&mut symtab, value);
+        put64(&mut symtab, s.size);
     }
     let symtab_index = (shdrs.len() + obj.sections.iter().filter(|s| !s.relocs.is_empty()).count()) as u32;
 
@@ -322,7 +239,7 @@ pub fn write(obj: &Object) -> Vec<u8> {
         if s.relocs.is_empty() {
             continue;
         }
-        align(&mut out, class.word);
+        align(&mut out, WORD);
         let offset = out.len() as u64;
         for r in &s.relocs {
             let sym = sym_index[obj
@@ -331,39 +248,25 @@ pub fn write(obj: &Object) -> Vec<u8> {
                 .position(|x| x.name == r.symbol && !matches!(x.ty, SymType::Mapping | SymType::File))
                 .expect("reloc symbol exists")];
             let ty = r.kind.elf_type();
-            class.put_word(&mut out, r.offset.into());
-            match obj.xlen {
-                // ELF32_R_INFO(sym, type); the addend field holds 32 bits, so
-                // a wider addend loses its high bits, as LLVM cuts it. For a
-                // 32-bit field (`.word sym`, an instruction) that changes
-                // nothing, since an RV32 address wraps at 32 bits; for the
-                // 64-bit field of `.dword sym + 0x100000000` the high word of
-                // the addend is lost (clang's R_RISCV_64 is `sym + 0` too).
-                Xlen::Rv32 => {
-                    put32(&mut out, (sym << 8) | ty);
-                    put32(&mut out, r.addend as i32 as u32);
-                }
-                // ELF64_R_INFO(sym, type), and the whole 64-bit addend.
-                Xlen::Rv64 => {
-                    put64(&mut out, (u64::from(sym) << 32) | u64::from(ty));
-                    put64(&mut out, r.addend as u64);
-                }
-            }
+            // r_offset, ELF64_R_INFO(sym, type), and the whole 64-bit addend.
+            put64(&mut out, r.offset.into());
+            put64(&mut out, (u64::from(sym) << 32) | u64::from(ty));
+            put64(&mut out, r.addend as u64);
         }
         shdrs.push(Shdr {
             name: shstr.add(&format!(".rela{}", s.name)),
             ty: SHT_RELA,
             flags: SHF_INFO_LINK,
             offset,
-            size: (class.rela * s.relocs.len()) as u64,
+            size: (RELA * s.relocs.len()) as u64,
             link: symtab_index,
             info: i as u32 + 1,
-            align: class.word as u64,
-            entsize: class.rela as u64,
+            align: WORD as u64,
+            entsize: RELA as u64,
         });
     }
 
-    align(&mut out, class.word);
+    align(&mut out, WORD);
     let symtab_name = shstr.add(".symtab");
     shdrs.push(Shdr {
         name: symtab_name,
@@ -373,8 +276,8 @@ pub fn write(obj: &Object) -> Vec<u8> {
         size: symtab.len() as u64,
         link: symtab_index + 1,
         info: first_global as u32,
-        align: class.word as u64,
-        entsize: class.sym as u64,
+        align: WORD as u64,
+        entsize: SYM as u64,
     });
     out.extend_from_slice(&symtab);
 
@@ -406,41 +309,40 @@ pub fn write(obj: &Object) -> Vec<u8> {
     });
     out.extend_from_slice(&shstr.0);
 
-    // Section headers: the same fields in the same order in both classes,
-    // the address-sized ones (flags, addr, offset, size, addralign, entsize)
-    // 4 or 8 bytes.
-    align(&mut out, class.word);
+    // Section headers, the address-sized fields (flags, addr, offset, size,
+    // addralign, entsize) 8 bytes.
+    align(&mut out, WORD);
     let shoff = out.len() as u64;
     for h in &shdrs {
         put32(&mut out, h.name);
         put32(&mut out, h.ty);
-        class.put_word(&mut out, h.flags);
-        class.put_word(&mut out, 0); // sh_addr
-        class.put_word(&mut out, h.offset);
-        class.put_word(&mut out, h.size);
+        put64(&mut out, h.flags);
+        put64(&mut out, 0); // sh_addr
+        put64(&mut out, h.offset);
+        put64(&mut out, h.size);
         put32(&mut out, h.link);
         put32(&mut out, h.info);
-        class.put_word(&mut out, h.align);
-        class.put_word(&mut out, h.entsize);
+        put64(&mut out, h.align);
+        put64(&mut out, h.entsize);
     }
 
     // ELF header.
-    let mut hdr = Vec::with_capacity(class.ehsize.into());
+    let mut hdr = Vec::with_capacity(EHSIZE.into());
     hdr.extend_from_slice(b"\x7fELF");
-    hdr.extend_from_slice(&[class.ident, 1, 1, 0]); // class, little-endian, version 1, SysV ABI
+    hdr.extend_from_slice(&[ELFCLASS64, 1, 1, 0]); // class, little-endian, version 1, SysV ABI
     hdr.extend_from_slice(&[0; 8]);
     put16(&mut hdr, 1); // ET_REL
     put16(&mut hdr, EM_RISCV);
     put32(&mut hdr, 1); // e_version
-    class.put_word(&mut hdr, 0); // e_entry
-    class.put_word(&mut hdr, 0); // e_phoff
-    class.put_word(&mut hdr, shoff);
-    // e_flags: the soft-float ABI (ilp32 or lp64) and no RVC are both 0.
+    put64(&mut hdr, 0); // e_entry
+    put64(&mut hdr, 0); // e_phoff
+    put64(&mut hdr, shoff);
+    // e_flags: the soft-float ABI (lp64) and no RVC are both 0.
     put32(&mut hdr, 0);
-    put16(&mut hdr, class.ehsize);
+    put16(&mut hdr, EHSIZE);
     put16(&mut hdr, 0); // e_phentsize
     put16(&mut hdr, 0); // e_phnum
-    put16(&mut hdr, class.shentsize);
+    put16(&mut hdr, SHENTSIZE);
     put16(&mut hdr, shdrs.len() as u16);
     put16(&mut hdr, shdrs.len() as u16 - 1); // e_shstrndx
     out[..hdr.len()].copy_from_slice(&hdr);
@@ -461,23 +363,11 @@ mod tests {
 
     #[test]
     fn attributes_match_clang() {
-        // `llvm-objdump -s -j .riscv.attributes` of examples/hello/hello.S
-        // built by clang 21 with -march=rv32ima_zicsr_zifencei.
-        let clang = "41540000 00726973 63760001 4a000000 05727633 32693270 315f6d32 70305f61 \
-                     3270315f 7a696373 72327030 5f7a6966 656e6365 69327030 5f7a6d6d 756c3170 \
-                     305f7a61 616d6f31 70305f7a 616c7273 63317030 00";
-        assert_eq!(riscv_attributes(ARCH), bytes(clang));
-        assert_eq!(arch(Xlen::Rv32), ARCH);
-    }
-
-    #[test]
-    fn rv64_attributes_match_clang() {
         // `llvm-objdump -s -j .riscv.attributes` of a `nop` built by clang 23
         // with --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64.
         let clang = "41540000 00726973 63760001 4a000000 05727636 34693270 315f6d32 70305f61 \
                      3270315f 7a696373 72327030 5f7a6966 656e6365 69327030 5f7a6d6d 756c3170 \
                      305f7a61 616d6f31 70305f7a 616c7273 63317030 00";
-        assert_eq!(riscv_attributes(ARCH_RV64), bytes(clang));
-        assert_eq!(arch(Xlen::Rv64), ARCH_RV64);
+        assert_eq!(riscv_attributes(ARCH), bytes(clang));
     }
 }

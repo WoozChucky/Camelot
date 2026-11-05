@@ -1,9 +1,9 @@
 
-align.o:	file format elf32-littleriscv
+align.o:	file format elf64-littleriscv
 
 Disassembly of section .text:
 
-00000000 <.text>:
+0000000000000000 <.text>:
        0: 00000013     	nop
        4: 01 00 00 00  	.word	0x00000001
        8: 00000013     	nop

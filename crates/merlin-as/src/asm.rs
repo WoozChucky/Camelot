@@ -156,14 +156,9 @@ pub struct Symbol {
 pub struct Object {
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
-    /// The width it was assembled for: the ELF writer makes an ELF32 object
-    /// for RV32 and an ELF64 one for RV64.
-    pub xlen: Xlen,
 }
 
 pub struct Assembler {
-    /// RV32 or RV64, for the whole file (`-march=`).
-    xlen: Xlen,
     sections: Vec<Section>,
     current: usize,
     symbols: Vec<Symbol>,
@@ -212,13 +207,6 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    /// The width being assembled for. The encoder asks it to choose between
-    /// the RV32 and RV64 forms of an instruction (shift amounts, `li`) and
-    /// to refuse the instructions of the other width.
-    pub fn xlen(&self) -> Xlen {
-        self.asm.xlen
-    }
-
     /// Evaluates an expression made only of numbers and `.equ` constants.
     /// Returns None if it mentions a label or a `%modifier`.
     pub fn constant(&self, e: &Expr) -> Option<i64> {
@@ -269,14 +257,13 @@ impl Ctx<'_> {
 
     /// A CSR operand: a name like `mstatus` or a number like `0x300`.
     ///
-    /// Names are those of the width being assembled
-    /// ([`excalibur::csr::rv32_only`]): the high halves of 64-bit registers
-    /// (`cycleh`, `mstatush`, ...) and the odd `pmpcfg`s exist only on RV32,
-    /// where a CSR holds 32 bits, so on RV64 they are no CSR name. A number is
-    /// any 12-bit address on either width, as LLVM takes it.
+    /// Names are RV64's ([`excalibur::csr::rv32_only`]): the high halves of
+    /// 64-bit registers (`cycleh`, `mstatush`, ...) and the odd `pmpcfg`s
+    /// exist only on RV32, where a CSR holds 32 bits, so they are no CSR name.
+    /// A number is any 12-bit address, as LLVM takes it.
     pub fn csr(&self, e: &Expr) -> Option<u16> {
         if let Expr::Sym(name) = e {
-            if let Some(addr) = excalibur::csr::parse(name, self.asm.xlen) {
+            if let Some(addr) = excalibur::csr::parse(name, Xlen::Rv64) {
                 return Some(addr);
             }
         }
@@ -286,10 +273,9 @@ impl Ctx<'_> {
 }
 
 impl Assembler {
-    /// An assembler for `xlen` (RV32 or RV64) with an empty `.text` section.
-    pub fn new(xlen: Xlen) -> Self {
+    /// An assembler with an empty `.text` section.
+    pub fn new() -> Self {
         let mut a = Assembler {
-            xlen,
             sections: Vec::new(),
             current: 0,
             symbols: Vec::new(),
@@ -371,7 +357,6 @@ impl Assembler {
         Ok(Object {
             sections: self.sections,
             symbols,
-            xlen: self.xlen,
         })
     }
 
@@ -737,7 +722,7 @@ impl Assembler {
         }
         self.mapping[sec] = Some(kind);
         let name = match kind {
-            Mapping::Code => format!("$x{}", crate::elf::arch(self.xlen)),
+            Mapping::Code => format!("$x{}", crate::elf::ARCH),
             Mapping::Data => "$d".to_string(),
         };
         // Not in `by_name`: no reference can name it.
@@ -767,7 +752,7 @@ impl Assembler {
         };
         self.new_section(".riscv.attributes", attrs);
         self.mapping_symbol(Mapping::Data);
-        self.emit_bytes(&crate::elf::riscv_attributes(crate::elf::arch(self.xlen)));
+        self.emit_bytes(&crate::elf::riscv_attributes(crate::elf::ARCH));
         self.current = back;
     }
 
@@ -984,8 +969,8 @@ impl Assembler {
     /// A label's address is only known at link time, so `.word sym` and
     /// `.dword sym` leave zeros and a relocation (`R_RISCV_32`, `R_RISCV_64`)
     /// for the linker to fill. The width of the data, not of the machine,
-    /// picks it: LLVM writes `R_RISCV_64` for a `.dword` on RV32 too, and
-    /// `R_RISCV_32` for a `.word` on RV64. The psABI has no 1- or 2-byte
+    /// picks it: LLVM writes `R_RISCV_32` for a `.word` on RV64, and
+    /// `R_RISCV_64` for a `.dword` on RV32. The psABI has no 1- or 2-byte
     /// absolute relocation.
     fn data(&mut self, args: &[DirArg], size: u32) {
         if !args.is_empty() {
@@ -1231,8 +1216,8 @@ impl Assembler {
             .collect();
         let result = match items.first().map(String::as_str) {
             None => Err(".option: expected an option such as push, pop or arch".into()),
-            Some("arch") => crate::isa::check_option_arch(&items[1..], self.xlen),
-            Some("rvc") => Err(crate::isa::rvc(self.xlen)),
+            Some("arch") => crate::isa::check_option_arch(&items[1..]),
+            Some("rvc") => Err(crate::isa::rvc()),
             _ => Ok(()),
         };
         if let Err(msg) = result {
@@ -1253,7 +1238,7 @@ impl Assembler {
             return;
         }
         let result = match args.get(1) {
-            Some(DirArg::Str(s)) => crate::isa::check_attribute(&String::from_utf8_lossy(s), self.xlen),
+            Some(DirArg::Str(s)) => crate::isa::check_attribute(&String::from_utf8_lossy(s)),
             _ => Err(".attribute arch: expected a string".into()),
         };
         if let Err(msg) = result {
@@ -1714,14 +1699,10 @@ impl Assembler {
         }
         let base = self.section_size(".debug_line");
         let str_base = self.section_size(".debug_line_str");
-        // A code address is as wide as the target's registers: 4 bytes on
-        // RV32 and 8 on RV64 (DWARF's address_size), relocated by R_RISCV_32
-        // or R_RISCV_64. A string's offset is a 4-byte DWARF32 field on both
-        // widths (R_RISCV_32, as clang writes it).
-        let (address_size, address) = match self.xlen {
-            Xlen::Rv32 => (4, RelocKind::Abs32),
-            Xlen::Rv64 => (8, RelocKind::Abs64),
-        };
+        // A code address is as wide as the target's registers: 8 bytes
+        // (DWARF's address_size), relocated by R_RISCV_64. A string's offset
+        // is a 4-byte DWARF32 field (R_RISCV_32, as clang writes it).
+        let (address_size, address) = (8, RelocKind::Abs64);
         let table = dwarf::encode(&root.dir, &root, &files, &sequences, base, str_base, address_size);
         let (line_sec, _) = self.append(".debug_line", &table.line);
         let (str_sec, _) = self.append(".debug_line_str", &table.line_str);
@@ -1791,9 +1772,8 @@ fn fits_in_bytes(v: i64, size: u32) -> bool {
 }
 
 impl Default for Assembler {
-    /// RV32, until the migration to RV64 ends (#159).
     fn default() -> Self {
-        Self::new(Xlen::Rv32)
+        Self::new()
     }
 }
 
@@ -1862,7 +1842,7 @@ mod tests {
     /// Feeds `place` the words an encoder would return, one instruction per
     /// line, with `labels` defined just before the instruction on that line.
     fn assemble(lines: &[(&[&str], Emit)]) -> Result<Object, Vec<Error>> {
-        let mut a = Assembler::new(Xlen::Rv32);
+        let mut a = Assembler::new();
         for (i, (labels, emit)) in lines.iter().enumerate() {
             a.line = i + 1;
             for l in *labels {
@@ -1904,7 +1884,7 @@ mod tests {
 
     #[test]
     fn pcrel_lo_label_in_another_section_is_an_error() {
-        let mut a = Assembler::new(Xlen::Rv32);
+        let mut a = Assembler::new();
         a.line = 1;
         a.label("1");
         a.place("test", vec![hi("target")]);
@@ -2019,7 +1999,7 @@ data:   .word 0
         nop
 data:   .dword 5
 ";
-        let obj = assemble_for(src, Xlen::Rv64).unwrap();
+        let obj = crate::assemble(src).unwrap();
         let text = &obj.sections[0];
         let words: Vec<u32> = text
             .data
@@ -2553,11 +2533,6 @@ f:      nop
         assert!(errs[0].msg.contains("expected a constant or symbol"), "{errs:?}");
     }
 
-    /// Assembles `src` for the width `xlen`.
-    fn assemble_for(src: &str, xlen: Xlen) -> Result<Object, Vec<Error>> {
-        crate::assemble_with(src, &crate::Options { xlen })
-    }
-
     /// A relocation as (offset, kind, the target's section and value, addend).
     fn relocs_of(obj: &Object, sec: &Section) -> Vec<(u32, RelocKind, Option<usize>, u32, i64)> {
         sec.relocs
@@ -2602,73 +2577,64 @@ x:      .dword x + 8, .
             0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // -1
             0, 0, 0, 0,                                     // x
         ];
-        for xlen in [Xlen::Rv32, Xlen::Rv64] {
-            let obj = assemble_for(src, xlen).unwrap();
-            let (i, data) = section(&obj, ".data");
-            assert_eq!(data.data, want, "{xlen:?}");
-            // `.` is a hidden label at its own word, as clang's `.L0`.
-            assert_eq!(
-                relocs_of(&obj, data),
-                [
-                    (0x22, RelocKind::Abs64, Some(i), 0x22, 8),
-                    (0x2a, RelocKind::Abs64, Some(i), 0x2a, 0),
-                    (0x32, RelocKind::Abs64, Some(i), 0x32, 0),
-                    (0x42, RelocKind::Abs32, Some(i), 0x22, 0),
-                ],
-                "{xlen:?}"
-            );
-        }
+        let obj = crate::assemble(src).unwrap();
+        let (i, data) = section(&obj, ".data");
+        assert_eq!(data.data, want);
+        // `.` is a hidden label at its own word, as clang's `.L0`.
+        assert_eq!(
+            relocs_of(&obj, data),
+            [
+                (0x22, RelocKind::Abs64, Some(i), 0x22, 8),
+                (0x2a, RelocKind::Abs64, Some(i), 0x2a, 0),
+                (0x32, RelocKind::Abs64, Some(i), 0x32, 0),
+                (0x42, RelocKind::Abs32, Some(i), 0x22, 0),
+            ],
+        );
     }
 
     #[test]
     fn data_must_fit_its_size() {
         // llvm-mc says "out of range literal value" for each number here,
         // and "2-byte data relocations not supported" for `.half x`.
-        for xlen in [Xlen::Rv32, Xlen::Rv64] {
-            for (src, want) in [
-                (".byte 256", "data value 256 does not fit in 1 byte"),
-                (".byte -129", "data value -129 does not fit in 1 byte"),
-                (".half 0x10000", "data value 65536 does not fit in 2 bytes"),
-                (".short -32769", "data value -32769 does not fit in 2 bytes"),
-                (
-                    ".word 0x100000000",
-                    "data value 4294967296 does not fit in 4 bytes",
-                ),
-                (
-                    ".4byte -0x80000001",
-                    "data value -2147483649 does not fit in 4 bytes",
-                ),
-                // Logical: a negative value shifted right is a big one.
-                (
-                    ".word -16 >> 2",
-                    "data value 4611686018427387900 does not fit in 4 bytes",
-                ),
-                // An `.equ` holds any 64-bit value; it is checked where used.
-                (
-                    ".equ BIG, 0x123456789\n.word BIG",
-                    "data value 4886718345 does not fit in 4 bytes",
-                ),
-                (
-                    ".byte 1, 2\n.byte 3, 0x100, 4",
-                    "data value 256 does not fit in 1 byte",
-                ),
-                ("x: .half x", "only .word and .dword can hold a symbol address"),
-                (".byte .", "only .word and .dword can hold a symbol address"),
-            ] {
-                let errs = assemble_for(&format!(".data\n{src}\n"), xlen).unwrap_err();
-                let line = 1 + src.lines().count();
-                assert_eq!(errs.len(), 1, "{src}: {errs:?}");
-                assert_eq!(
-                    (errs[0].line, errs[0].msg.as_str()),
-                    (line, want),
-                    "{xlen:?} {src}"
-                );
-            }
-            // The edges of each range, and any `.dword`.
-            let src = ".data\n.byte -128, 255\n.half -32768, 65535\n.word -0x80000000, 0xffffffff\n\
-                       .dword -0x8000000000000000, 0xffffffffffffffff\n";
-            assert!(assemble_for(src, xlen).is_ok(), "{xlen:?}");
+        for (src, want) in [
+            (".byte 256", "data value 256 does not fit in 1 byte"),
+            (".byte -129", "data value -129 does not fit in 1 byte"),
+            (".half 0x10000", "data value 65536 does not fit in 2 bytes"),
+            (".short -32769", "data value -32769 does not fit in 2 bytes"),
+            (
+                ".word 0x100000000",
+                "data value 4294967296 does not fit in 4 bytes",
+            ),
+            (
+                ".4byte -0x80000001",
+                "data value -2147483649 does not fit in 4 bytes",
+            ),
+            // Logical: a negative value shifted right is a big one.
+            (
+                ".word -16 >> 2",
+                "data value 4611686018427387900 does not fit in 4 bytes",
+            ),
+            // An `.equ` holds any 64-bit value; it is checked where used.
+            (
+                ".equ BIG, 0x123456789\n.word BIG",
+                "data value 4886718345 does not fit in 4 bytes",
+            ),
+            (
+                ".byte 1, 2\n.byte 3, 0x100, 4",
+                "data value 256 does not fit in 1 byte",
+            ),
+            ("x: .half x", "only .word and .dword can hold a symbol address"),
+            (".byte .", "only .word and .dword can hold a symbol address"),
+        ] {
+            let errs = crate::assemble(&format!(".data\n{src}\n")).unwrap_err();
+            let line = 1 + src.lines().count();
+            assert_eq!(errs.len(), 1, "{src}: {errs:?}");
+            assert_eq!((errs[0].line, errs[0].msg.as_str()), (line, want), "{src}");
         }
+        // The edges of each range, and any `.dword`.
+        let src = ".data\n.byte -128, 255\n.half -32768, 65535\n.word -0x80000000, 0xffffffff\n\
+                   .dword -0x8000000000000000, 0xffffffffffffffff\n";
+        assert!(crate::assemble(src).is_ok());
     }
 
     #[test]
@@ -2676,16 +2642,15 @@ x:      .dword x + 8, .
         // llvm-mc 23 -show-encoding: `li a0, -1 >> 32` is `li a0, -1` on
         // riscv32 (0xffffffff is -1 in 32 bits) and `li a0, -1; srli a0, a0,
         // 32` on riscv64; `-16 >> 60` is 15 on both.
-        let words = |src: &str, xlen| {
-            let obj = assemble_for(src, xlen).unwrap();
+        let words = |src: &str| {
+            let obj = crate::assemble(src).unwrap();
             let data = &obj.sections[0].data;
             data.chunks(4)
                 .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
                 .collect::<Vec<_>>()
         };
         let src = "li a0, -1 >> 32\nli a1, -16 >> 60\n";
-        assert_eq!(words(src, Xlen::Rv32), [0xfff0_0513, 0x00f0_0593]);
-        assert_eq!(words(src, Xlen::Rv64), [0xfff0_0513, 0x0205_5513, 0x00f0_0593]);
+        assert_eq!(words(src), [0xfff0_0513, 0x0205_5513, 0x00f0_0593]);
     }
 
     #[test]
@@ -2695,18 +2660,15 @@ x:      .dword x + 8, .
         // where an unchecked sum would overflow (`sym + c` and `c + sym`).
         let src =
             ".data\nx: .word 0\n.equ BIG, 0x7fffffffffffffff\n.dword x + BIG + 1\n.word 1 + (BIG + x)\n";
-        for xlen in [Xlen::Rv32, Xlen::Rv64] {
-            let obj = assemble_for(src, xlen).unwrap();
-            let (i, data) = section(&obj, ".data");
-            assert_eq!(
-                relocs_of(&obj, data),
-                [
-                    (4, RelocKind::Abs64, Some(i), 0, i64::MIN),
-                    (12, RelocKind::Abs32, Some(i), 0, i64::MIN),
-                ],
-                "{xlen:?}"
-            );
-        }
+        let obj = crate::assemble(src).unwrap();
+        let (i, data) = section(&obj, ".data");
+        assert_eq!(
+            relocs_of(&obj, data),
+            [
+                (4, RelocKind::Abs64, Some(i), 0, i64::MIN),
+                (12, RelocKind::Abs32, Some(i), 0, i64::MIN),
+            ],
+        );
     }
 
     #[test]
@@ -2723,23 +2685,21 @@ f:      nop
         .dword f + 2
         .8byte .Lend - f
 ";
-        for xlen in [Xlen::Rv32, Xlen::Rv64] {
-            let obj = assemble_for(src, xlen).unwrap();
-            let (_, info) = section(&obj, ".debug_info");
-            let mut want = [0; 24];
-            want[16] = 4;
-            assert_eq!(info.data, want, "{xlen:?}");
-            let r = &info.relocs;
-            assert_eq!(r.len(), 2, "{xlen:?}");
-            assert_eq!((r[0].offset, r[0].kind, r[0].addend), (0, RelocKind::Abs64, 4));
-            let s = sym(&obj, &r[0].symbol);
-            assert_eq!((s.ty, s.section), (SymType::Section, Some(0)));
-            assert_eq!(
-                (r[1].offset, r[1].kind, r[1].symbol.as_str(), r[1].addend),
-                (8, RelocKind::Abs64, "f", 2)
-            );
-            assert!(obj.symbols.iter().all(|s| !s.name.starts_with(".L")));
-        }
+        let obj = crate::assemble(src).unwrap();
+        let (_, info) = section(&obj, ".debug_info");
+        let mut want = [0; 24];
+        want[16] = 4;
+        assert_eq!(info.data, want);
+        let r = &info.relocs;
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].offset, r[0].kind, r[0].addend), (0, RelocKind::Abs64, 4));
+        let s = sym(&obj, &r[0].symbol);
+        assert_eq!((s.ty, s.section), (SymType::Section, Some(0)));
+        assert_eq!(
+            (r[1].offset, r[1].kind, r[1].symbol.as_str(), r[1].addend),
+            (8, RelocKind::Abs64, "f", 2)
+        );
+        assert!(obj.symbols.iter().all(|s| !s.name.starts_with(".L")));
     }
 
     #[test]
