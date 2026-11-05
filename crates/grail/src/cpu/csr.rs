@@ -1,16 +1,15 @@
 //! The control and status register file, with privilege checks and WARL rules.
 //!
 //! Every CSR is kept in 64 bits (`mcounteren`, `scounteren` and `mcountinhibit`, 32
-//! bits wide on both widths, in 32). An RV32 hart's CSRs are 32 bits wide: a write
-//! keeps the low 32 bits of the value written ([`Hart::csr_store`]), so they read back
-//! zero-extended, and the high halves of the 64-bit counters are CSRs of their own.
-//! On RV64 those RV32-only CSRs do not exist ([`excalibur::csr::rv32_only`]).
+//! bits wide, in 32). The CSRs only RV32 has, the high halves of the 64-bit counters
+//! and of `mstatus` and `menvcfg`, and the odd `pmpcfg` registers
+//! ([`excalibur::csr::rv32_only`]), do not exist: accessing them is an illegal
+//! instruction, as on every RV64 hart.
 
 use super::{Hart, Mode};
 use crate::bus::Bus;
 use crate::trap::{Exception, Trap};
 use excalibur::csr::*;
-use excalibur::Xlen;
 
 /// mstatus bits software can write. FS/VS/XS stay 0 (no F/V extensions), and so does
 /// SD; UXL and SXL are read-only (see [`Hart::mstatus_xl`]).
@@ -26,7 +25,7 @@ const MSTATUS_WMASK: u64 = MSTATUS_SIE
     | MSTATUS_TVM
     | MSTATUS_TW
     | MSTATUS_TSR;
-/// The subset of mstatus visible through sstatus (and UXL, on RV64).
+/// The subset of mstatus visible through sstatus (and UXL).
 const SSTATUS_MASK: u64 = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR;
 
 const S_INTERRUPTS: u64 = (1 << IRQ_S_SOFT) | (1 << IRQ_S_TIMER) | (1 << IRQ_S_EXT);
@@ -39,24 +38,19 @@ const MEDELEG_MASK: u64 = 0xb3ff;
 /// misa's extensions: A, I, M, S, U, and X (non-standard: Xcal).
 const MISA_EXTENSIONS: u64 = (1 << 0) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20) | (1 << 23);
 
-/// `misa` on a hart `xlen` wide: MXL in its top two bits (1 for RV32, 2 for RV64) and
-/// the extensions: 0x4094_1101 on RV32, 0x8000_0000_0094_1101 on RV64.
-pub fn misa(xlen: Xlen) -> u64 {
-    match xlen {
-        Xlen::Rv32 => (1 << 30) | MISA_EXTENSIONS,
-        Xlen::Rv64 => (2 << 62) | MISA_EXTENSIONS,
-    }
-}
+/// `misa`: MXL in its top two bits (2: 64-bit) and the extensions,
+/// 0x8000_0000_0094_1101.
+pub const MISA_VALUE: u64 = (2 << 62) | MISA_EXTENSIONS;
 
-/// `pmpaddr` on RV64 holds address bits 55:2, so its top 10 bits read 0.
-const PMPADDR_RV64_MASK: u64 = (1 << 54) - 1;
+/// `pmpaddr` holds address bits 55:2, so its top 10 bits read 0.
+const PMPADDR_MASK: u64 = (1 << 54) - 1;
 
-/// RV64 `satp`: MODE [63:60] and PPN [43:0] (spec section 5). There are no ASIDs, so
-/// the ASID field [59:44] reads 0, and physical addresses are 48 bits, so the PPN keeps
-/// its low 36 bits (bits 43:36 read 0).
-pub(super) const SATP_RV64_MODE_SHIFT: u32 = 60;
-pub(super) const SATP_RV64_PPN: u64 = (1 << 36) - 1;
-/// `satp`'s modes on RV64: Bare (no translation), Sv39 and Sv48.
+/// `satp`: MODE [63:60] and PPN [43:0] (spec section 5). There are no ASIDs, so the
+/// ASID field [59:44] reads 0, and physical addresses are 48 bits, so the PPN keeps its
+/// low 36 bits (bits 43:36 read 0).
+pub(super) const SATP_MODE_SHIFT: u32 = 60;
+pub(super) const SATP_PPN: u64 = (1 << 36) - 1;
+/// `satp`'s modes: Bare (no translation), Sv39 and Sv48.
 const SATP_MODE_BARE: u64 = 0;
 pub(super) const SATP_MODE_SV39: u64 = 8;
 pub(super) const SATP_MODE_SV48: u64 = 9;
@@ -86,9 +80,9 @@ pub struct Csrs {
     pub satp: u64,
     pub mcycle: u64,
     pub minstret: u64,
-    /// `pmpcfg0`-`pmpcfg3`. On RV64 only the even two exist, each with 8 entries'
-    /// configuration bytes.
-    pub pmpcfg: [u64; 4],
+    /// `pmpcfg0` and `pmpcfg2`, each with 8 entries' configuration bytes (RV64 has no
+    /// odd `pmpcfg` registers).
+    pub pmpcfg: [u64; 2],
     pub pmpaddr: [u64; 16],
 }
 
@@ -125,15 +119,6 @@ impl Hart {
             mip |= 1 << IRQ_S_EXT;
         }
         mip
-    }
-
-    /// mstatus's read-only XLEN fields: on RV64, UXL and SXL hard-wired to 2 (64-bit, no
-    /// compat mode); RV32 has neither.
-    fn mstatus_xl(&self) -> u64 {
-        match self.xlen {
-            Xlen::Rv64 => MSTATUS_UXL_64 | MSTATUS_SXL_64,
-            Xlen::Rv32 => 0,
-        }
     }
 
     /// The value csrrs/csrrc modify. Same as a read, except that in `mip` the SEIP bit is the
@@ -174,35 +159,22 @@ impl Hart {
 
     pub fn csr_read(&mut self, bus: &Bus, addr: u16) -> Result<u64, Trap> {
         self.check_access(addr, false)?;
-        let counter = (CYCLE..=0xc1f).contains(&addr) || (CYCLEH..=0xc9f).contains(&addr);
-        if counter && !self.counter_allowed(addr) {
+        if (CYCLE..=0xc1f).contains(&addr) && !self.counter_allowed(addr) {
             return Err(illegal());
         }
         self.csr_value(bus, addr).ok_or_else(illegal)
     }
 
-    /// Whether the hart has CSR `addr` at all: the RV32-only ones are missing on RV64.
-    /// (Grail's other unknown CSRs are the ones [`Hart::csr_value`] does not list.)
-    fn csr_exists(&self, addr: u16) -> bool {
-        self.xlen == Xlen::Rv32 || !rv32_only(addr)
-    }
-
     /// The value of CSR `addr` as an M-mode read would see it, without the privilege
     /// checks: `None` if the hart has no such CSR. For [`Hart::csr_read`], and for a
     /// debugger, which may read any CSR whatever the hart's mode.
+    ///
+    /// `mstatus`'s UXL and SXL read 2 (64-bit): they are hard-wired, as there is no
+    /// 32-bit compat mode.
     pub fn csr_value(&self, bus: &Bus, addr: u16) -> Option<u64> {
-        if !self.csr_exists(addr) {
-            return None;
-        }
         let c = &self.csr;
-        // A 64-bit counter as one CSR shows it: whole on RV64, its low half on RV32
-        // (whose high half is the `...h` CSR).
-        let low = |v: u64| match self.xlen {
-            Xlen::Rv64 => v,
-            Xlen::Rv32 => v as u32 as u64,
-        };
         Some(match addr {
-            SSTATUS => (c.mstatus & SSTATUS_MASK) | (self.mstatus_xl() & MSTATUS_UXL),
+            SSTATUS => (c.mstatus & SSTATUS_MASK) | MSTATUS_UXL_64,
             SIE => c.mie & c.mideleg,
             STVEC => c.stvec,
             SCOUNTEREN => c.scounteren.into(),
@@ -214,42 +186,32 @@ impl Hart {
             SIP => self.mip(bus) & c.mideleg,
             SATP => c.satp,
 
-            MSTATUS => c.mstatus | self.mstatus_xl(),
-            MISA => misa(self.xlen),
+            MSTATUS => c.mstatus | MSTATUS_UXL_64 | MSTATUS_SXL_64,
+            MISA => MISA_VALUE,
             MEDELEG => c.medeleg,
             MIDELEG => c.mideleg,
             MIE => c.mie,
             MTVEC => c.mtvec,
             MCOUNTEREN => c.mcounteren.into(),
-            MENVCFG | MENVCFGH | MSTATUSH => 0,
+            MENVCFG => 0,
             MCOUNTINHIBIT => c.mcountinhibit.into(),
             MSCRATCH => c.mscratch,
             MEPC => c.mepc,
             MCAUSE => c.mcause,
             MTVAL => c.mtval,
             MIP => self.mip(bus),
-            a if (PMPCFG0..PMPCFG0 + 4).contains(&a) => c.pmpcfg[(a - PMPCFG0) as usize],
+            a if a == PMPCFG0 || a == PMPCFG0 + 2 => c.pmpcfg[(a - PMPCFG0) as usize / 2],
             a if (PMPADDR0..PMPADDR0 + 16).contains(&a) => c.pmpaddr[(a - PMPADDR0) as usize],
             MHPMEVENT3..=0x33f => 0,
 
-            MCYCLE => low(c.mcycle),
-            MCYCLEH => c.mcycle >> 32,
-            MINSTRET => low(c.minstret),
-            MINSTRETH => c.minstret >> 32,
-            MHPMCOUNTER3..=0xb1f | MHPMCOUNTER3H..=0xb9f => 0,
+            MCYCLE => c.mcycle,
+            MINSTRET => c.minstret,
+            MHPMCOUNTER3..=0xb1f => 0,
 
-            CYCLE..=0xc1f | CYCLEH..=0xc9f => {
-                let time = bus.clint.mtime;
-                match addr {
-                    CYCLE => low(c.mcycle),
-                    CYCLEH => c.mcycle >> 32,
-                    TIME => low(time),
-                    TIMEH => time >> 32,
-                    INSTRET => low(c.minstret),
-                    INSTRETH => c.minstret >> 32,
-                    _ => 0,
-                }
-            }
+            CYCLE => c.mcycle,
+            TIME => bus.clint.mtime,
+            INSTRET => c.minstret,
+            HPMCOUNTER3..=0xc1f => 0,
 
             // Debug triggers: tselect hard-wired to a non-zero value means "no triggers".
             TSELECT => 1,
@@ -270,35 +232,23 @@ impl Hart {
         }
     }
 
-    /// The new `satp` after a write of `v` (WARL). RV32: any value, MODE [31] picking
-    /// Bare or Sv32. RV64: a write whose MODE the hart does not implement changes
-    /// nothing, as the privileged spec requires; the others keep MODE and the PPN bits
-    /// a 48-bit physical address has (spec section 5): Bare, Sv39 and Sv48, or Bare
-    /// and Sv39 on a hart without Sv48 ([`crate::Paging::Sv39`]).
+    /// The new `satp` after a write of `v` (WARL). A write whose MODE the hart does not
+    /// implement changes nothing, as the privileged spec requires; the others keep MODE
+    /// and the PPN bits a 48-bit physical address has (spec section 5): Bare, Sv39 and
+    /// Sv48, or Bare and Sv39 on a hart without Sv48 ([`crate::Paging::Sv39`]).
     fn warl_satp(&self, v: u64) -> u64 {
-        match self.xlen {
-            Xlen::Rv32 => v,
-            Xlen::Rv64 => match v >> SATP_RV64_MODE_SHIFT {
-                SATP_MODE_SV48 if !self.sv48 => self.csr.satp,
-                SATP_MODE_BARE | SATP_MODE_SV39 | SATP_MODE_SV48 => {
-                    v & ((0xf << SATP_RV64_MODE_SHIFT) | SATP_RV64_PPN)
-                }
-                _ => self.csr.satp,
-            },
+        match v >> SATP_MODE_SHIFT {
+            SATP_MODE_SV48 if !self.sv48 => self.csr.satp,
+            SATP_MODE_BARE | SATP_MODE_SV39 | SATP_MODE_SV48 => v & ((0xf << SATP_MODE_SHIFT) | SATP_PPN),
+            _ => self.csr.satp,
         }
     }
 
     /// Writes `v` to CSR `addr` as an M-mode write would, with its WARL rules but
     /// without the privilege and read-only checks: false if the hart has no such CSR or
     /// it is read-only (`misa`'s writes are ignored, a read-only counter's are refused).
-    /// On RV32 only `v`'s low 32 bits are written. For [`Hart::csr_write`], and for a
-    /// debugger.
+    /// For [`Hart::csr_write`], and for a debugger.
     pub fn csr_store(&mut self, addr: u16, v: u64) -> bool {
-        if !self.csr_exists(addr) {
-            return false;
-        }
-        let rv64 = self.xlen == Xlen::Rv64;
-        let v = if rv64 { v } else { v as u32 as u64 };
         let satp = self.warl_satp(v);
         let c = &mut self.csr;
         match addr {
@@ -326,7 +276,7 @@ impl Hart {
                 }
                 c.mstatus = (c.mstatus & !MSTATUS_WMASK) | v;
             }
-            MISA | MENVCFG | MENVCFGH | MSTATUSH => {}
+            MISA | MENVCFG => {}
             MEDELEG => c.medeleg = v & MEDELEG_MASK,
             MIDELEG => c.mideleg = v & S_INTERRUPTS,
             MIE => c.mie = v & (S_INTERRUPTS | M_INTERRUPTS),
@@ -338,24 +288,18 @@ impl Hart {
             MCAUSE => c.mcause = v,
             MTVAL => c.mtval = v,
             MIP => c.mip = (c.mip & !MIP_WMASK) | (v & MIP_WMASK),
-            a if (PMPCFG0..PMPCFG0 + 4).contains(&a) => c.pmpcfg[(a - PMPCFG0) as usize] = v,
+            a if a == PMPCFG0 || a == PMPCFG0 + 2 => c.pmpcfg[(a - PMPCFG0) as usize / 2] = v,
             a if (PMPADDR0..PMPADDR0 + 16).contains(&a) => {
-                c.pmpaddr[(a - PMPADDR0) as usize] = if rv64 { v & PMPADDR_RV64_MASK } else { v }
+                c.pmpaddr[(a - PMPADDR0) as usize] = v & PMPADDR_MASK
             }
             MHPMEVENT3..=0x33f => {}
 
-            MCYCLE if rv64 => c.mcycle = v,
-            MCYCLE => c.mcycle = (c.mcycle & !0xffff_ffff) | v,
-            MCYCLEH => c.mcycle = (c.mcycle & 0xffff_ffff) | (v << 32),
+            MCYCLE => c.mcycle = v,
             MINSTRET => {
-                c.minstret = if rv64 { v } else { (c.minstret & !0xffff_ffff) | v };
+                c.minstret = v;
                 self.instret_written = true;
             }
-            MINSTRETH => {
-                c.minstret = (c.minstret & 0xffff_ffff) | (v << 32);
-                self.instret_written = true;
-            }
-            MHPMCOUNTER3..=0xb1f | MHPMCOUNTER3H..=0xb9f => {}
+            MHPMCOUNTER3..=0xb1f => {}
 
             TSELECT..=TCONTROL => {}
             _ => return false,

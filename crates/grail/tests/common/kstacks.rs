@@ -1,10 +1,10 @@
-//! The pages the RV64 kernel has not lost, read from a machine's RAM: what
-//! the tests that check every page comes back compare (Grail's network
-//! tests through tests/common, and xtask's tests/smp_rv64.rs, which
-//! includes this file).
+//! The pages the kernel has not lost, read from a machine's RAM: what the
+//! tests that check every page comes back compare (Grail's network tests
+//! through tests/common, and xtask's tests/smp.rs, which includes this
+//! file).
 //!
-//! On RV64 a kernel stack is not a page of free RAM, as on RV32, but
-//! KSTACK_SIZE (16 KiB, 4 pages) mapped in the vmalloc area (kernel/vm.c's
+//! A kernel stack is not a page of free RAM (as it was on RV32, until #159)
+//! but KSTACK_SIZE (16 KiB, 4 pages) mapped in the vmalloc area (kernel/vm.c's
 //! kstack_alloc()). A freed stack stays mapped: in its hart's cache
 //! (`kstack_cached`), as Linux keeps NR_CACHED_STACKS freed thread stacks
 //! per CPU, or on the list of those waiting for kstack_reclaim() to unmap
@@ -16,7 +16,7 @@
 
 use grail::Machine;
 
-/// Where the RV64 kernel image is linked, and where it is loaded: after the
+/// Where the kernel image is linked, and where it is loaded: after the
 /// firmware's 2 MiB.
 const KERNEL_LINK_ADDR: u64 = 0xffff_ffff_8000_0000;
 const LOAD_ADDR: u64 = 0x8020_0000;

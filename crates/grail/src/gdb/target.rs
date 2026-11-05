@@ -2,8 +2,8 @@
 //! GDB manual, "Target Descriptions"): which registers there are, their names, sizes
 //! and numbers in `p`/`P` packets.
 //!
-//! Every register is as wide as the machine's harts: 32 bits on RV32, 64 on RV64, as
-//! GDB's own RISC-V descriptions have them (`riscv:rv32` and `riscv:rv64`).
+//! Every register is 64 bits wide, as GDB's own RISC-V description of RV64 has them
+//! (`riscv:rv64`).
 //!
 //! The numbers are GDB's for RISC-V, so a client without the description agrees with
 //! them: `x0`-`x31` are 0-31, `pc` 32 (in a `g` packet, these 33 come in this order),
@@ -11,7 +11,8 @@
 //! `n` is 65 + `n`. `priv`, the hart's privilege mode (0 U, 1 S, 3 M), is GDB's
 //! "virtual" register, numbered after the last CSR.
 
-use crate::{Machine, Xlen};
+use crate::Machine;
+use excalibur::Xlen;
 use std::fmt::Write;
 
 /// The `x` registers and `pc`, the ones a `g` packet carries.
@@ -43,28 +44,21 @@ impl Reg {
     }
 }
 
-/// The bytes of one register of `m`'s harts: 4, or 8 on RV64.
-pub fn reg_bytes(m: &Machine) -> usize {
-    m.config().xlen.bits() as usize / 8
-}
+/// The bytes of one register: 8.
+pub const REG_BYTES: usize = 8;
 
-/// The CSRs a client is told about: those Grail implements that have a name for the
-/// machine's width (RV64 has no `cycleh`).
+/// The CSRs a client is told about: those Grail implements, by their names.
 pub fn csrs(m: &Machine) -> Vec<(u16, &'static str)> {
-    let xlen = m.config().xlen;
     (0..4096u16)
         .filter(|&a| m.csr(a).is_some())
-        .filter_map(|a| excalibur::csr::name(a, xlen).map(|n| (a, n)))
+        .filter_map(|a| excalibur::csr::name(a, Xlen::Rv64).map(|n| (a, n)))
         .collect()
 }
 
 /// The target description of `m`'s harts (all alike).
 pub fn xml(m: &Machine) -> String {
-    let bits = m.config().xlen.bits();
-    let arch = match m.config().xlen {
-        Xlen::Rv32 => "riscv:rv32",
-        Xlen::Rv64 => "riscv:rv64",
-    };
+    let bits = 8 * REG_BYTES;
+    let arch = "riscv:rv64";
     let mut x = format!(
         "<?xml version=\"1.0\"?>\n<!DOCTYPE target SYSTEM \"gdb-target.dtd\">\n<target version=\"1.0\">\n\
          <architecture>{arch}</architecture>\n<feature name=\"org.gnu.gdb.riscv.cpu\">\n",
@@ -158,44 +152,25 @@ mod tests {
     fn describes_the_registers_and_csrs() {
         let m = Machine::with_ram(64 * 1024);
         let x = xml(&m);
-        assert!(x.contains("<architecture>riscv:rv32</architecture>"));
-        assert!(x.contains("<reg name=\"zero\" bitsize=\"32\" type=\"int\" regnum=\"0\"/>"));
-        assert!(x.contains("<reg name=\"sp\" bitsize=\"32\" type=\"data_ptr\" regnum=\"2\"/>"));
-        assert!(x.contains("<reg name=\"fp\" bitsize=\"32\" type=\"data_ptr\" regnum=\"8\"/>"));
-        assert!(x.contains("<reg name=\"pc\" bitsize=\"32\" type=\"code_ptr\" regnum=\"32\"/>"));
+        assert!(x.contains("<architecture>riscv:rv64</architecture>"));
+        assert!(x.contains("<reg name=\"zero\" bitsize=\"64\" type=\"int\" regnum=\"0\"/>"));
+        assert!(x.contains("<reg name=\"sp\" bitsize=\"64\" type=\"data_ptr\" regnum=\"2\"/>"));
+        assert!(x.contains("<reg name=\"fp\" bitsize=\"64\" type=\"data_ptr\" regnum=\"8\"/>"));
+        assert!(x.contains("<reg name=\"pc\" bitsize=\"64\" type=\"code_ptr\" regnum=\"32\"/>"));
         // mstatus is CSR 0x300: register 65 + 768.
         assert!(
-            x.contains("<reg name=\"mstatus\" bitsize=\"32\" type=\"int\" regnum=\"833\" group=\"csr\"/>")
+            x.contains("<reg name=\"mstatus\" bitsize=\"64\" type=\"int\" regnum=\"833\" group=\"csr\"/>")
         );
         assert!(x.contains("name=\"satp\""));
         assert!(x.contains("name=\"mhartid\""));
         assert!(x.contains("name=\"pmpaddr15\""));
         // Named but not implemented: not described.
         assert!(!x.contains("mnstatus"));
-        assert!(x.contains("<reg name=\"priv\" bitsize=\"32\" type=\"int\" regnum=\"4161\""));
+        assert!(x.contains("<reg name=\"priv\" bitsize=\"64\" type=\"int\" regnum=\"4161\""));
         assert_eq!(x.matches("<reg ").count(), 33 + csrs(&m).len() + 1);
-        assert!(x.contains("name=\"cycleh\""));
-    }
-
-    #[test]
-    fn an_rv64_machine_is_described_with_64_bit_registers() {
-        let m = Machine::new(crate::MachineConfig {
-            xlen: Xlen::Rv64,
-            ..crate::MachineConfig::with_ram(64 * 1024)
-        })
-        .unwrap();
-        let x = xml(&m);
-        assert!(x.contains("<architecture>riscv:rv64</architecture>"));
-        assert!(x.contains("<reg name=\"sp\" bitsize=\"64\" type=\"data_ptr\" regnum=\"2\"/>"));
-        assert!(x.contains("<reg name=\"pc\" bitsize=\"64\" type=\"code_ptr\" regnum=\"32\"/>"));
-        assert!(
-            x.contains("<reg name=\"mstatus\" bitsize=\"64\" type=\"int\" regnum=\"833\" group=\"csr\"/>")
-        );
-        assert!(x.contains("<reg name=\"priv\" bitsize=\"64\""));
         // RV32's high halves are not RV64's registers.
         assert!(!x.contains("cycleh") && !x.contains("mstatush"));
         assert!(!x.contains("bitsize=\"32\""));
-        assert_eq!(reg_bytes(&m), 8);
         assert_eq!(
             lldb_register_info(2, 8).unwrap(),
             "name:sp;alt-name:x2;bitsize:64;offset:16;encoding:uint;format:hex;set:General Purpose Registers;dwarf:2;generic:sp;"

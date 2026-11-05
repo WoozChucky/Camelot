@@ -85,16 +85,13 @@ fn at(ram: &mut [u8], addr: u32, len: usize) -> &mut [u8] {
 /// Writes descriptor `slot` of the ring at `ring`: buffer address and length; status 0xffff
 /// so the test sees that the card wrote it.
 fn set_desc(ram: &mut [u8], ring: u32, slot: u32, addr: u32, len: u16) {
-    let d = at(ram, ring + slot * DESC_SIZE, 8);
-    d[..4].copy_from_slice(&addr.to_le_bytes());
-    d[4..6].copy_from_slice(&len.to_le_bytes());
-    d[6..].copy_from_slice(&0xffffu16.to_le_bytes());
+    set_desc_v2(ram, ring, slot, addr.into(), len);
 }
 
 /// Descriptor `slot`'s length and status fields.
 fn desc(ram: &mut [u8], ring: u32, slot: u32) -> (u16, u16) {
-    let d = at(ram, ring + slot * DESC_SIZE, 8);
-    (u16::from_le_bytes([d[4], d[5]]), u16::from_le_bytes([d[6], d[7]]))
+    let (len, status, _) = desc_v2(ram, ring, slot);
+    (len, status)
 }
 
 /// A frame of `len` bytes from MAC, every payload byte `fill`.
@@ -150,7 +147,7 @@ fn reset_state() {
         REG_RX_SIZE,
         REG_RX_HEAD,
         REG_RX_TAIL,
-        0x40,
+        0x4c,
         0xffc,
     ] {
         assert_eq!(r(&d, off), 0, "offset {off:#x}");
@@ -172,7 +169,7 @@ fn read_only_registers_ignore_writes() {
         REG_TX_HEAD,
         REG_RX_HEAD,
         0x1c,
-        0x40,
+        0x4c,
         0xffc,
     ] {
         w(&mut d, &mut ram, off, 0xdead_beef);
@@ -181,7 +178,7 @@ fn read_only_registers_ignore_writes() {
     assert_eq!(r(&d, REG_MAC_HI), 0x4433);
     assert_eq!(r(&d, REG_STATUS), STATUS_LINK_UP);
     assert_eq!([r(&d, REG_TX_HEAD), r(&d, REG_RX_HEAD)], [0, 0]);
-    assert_eq!([r(&d, 0x1c), r(&d, 0x40), r(&d, 0xffc)], [0, 0, 0]);
+    assert_eq!([r(&d, 0x1c), r(&d, 0x4c), r(&d, 0xffc)], [0, 0, 0]);
     assert!(ram.iter().all(|&b| b == 0), "no DMA");
     // Reserved interrupt bits read 0.
     w(&mut d, &mut ram, REG_IRQ_ENABLE, u32::MAX);
@@ -212,13 +209,13 @@ fn ring_registers() {
     assert_eq!(r(&d, REG_ERROR), error::NONE);
 
     // Writing BASE or SIZE starts the ring over.
-    w(&mut d, &mut ram, REG_RX_BASE, RX_RING + 8);
+    w(&mut d, &mut ram, REG_RX_BASE, RX_RING + 16);
     assert_eq!([r(&d, REG_RX_HEAD), r(&d, REG_RX_TAIL)], [0, 0]);
     assert_eq!(r(&d, REG_RX_SIZE), 8, "the size stays");
     w(&mut d, &mut ram, REG_RX_TAIL, 2);
     w(&mut d, &mut ram, REG_RX_SIZE, 4);
     assert_eq!([r(&d, REG_RX_HEAD), r(&d, REG_RX_TAIL)], [0, 0]);
-    assert_eq!(r(&d, REG_RX_BASE), RX_RING + 8, "the base stays");
+    assert_eq!(r(&d, REG_RX_BASE), RX_RING + 16, "the base stays");
     assert_eq!(r(&d, REG_TX_SIZE), 8, "the other ring is untouched");
 
     // Sizes are powers of two from 1 to MAX_RING; anything else leaves no ring.
@@ -354,7 +351,7 @@ fn bad_transmit_descriptors_are_errors_not_panics() {
 fn a_transmit_ring_outside_ram_stops_transmit() {
     let (mut d, wire, mut ram) = setup();
     let end = RAM_BASE + RAM_SIZE as u32;
-    for base in [0, RAM_BASE - 8, end - 4, end, 0xffff_fffc] {
+    for base in [0, RAM_BASE - 16, end, 0xffff_fff0] {
         w(&mut d, &mut ram, REG_TX_BASE, base);
         w(&mut d, &mut ram, REG_TX_SIZE, 2);
         w(&mut d, &mut ram, REG_IRQ_STATUS, u32::MAX);
@@ -365,9 +362,9 @@ fn a_transmit_ring_outside_ram_stops_transmit() {
     }
     // A ring whose first slot is in RAM but whose second is not: the first goes.
     w(&mut d, &mut ram, REG_ERROR, 0);
-    w(&mut d, &mut ram, REG_TX_BASE, end - 8);
+    w(&mut d, &mut ram, REG_TX_BASE, end - 16);
     at(&mut ram, BUFS, 20).copy_from_slice(&frame(20, 1));
-    set_desc(&mut ram, end - 8, 0, BUFS, 20);
+    set_desc(&mut ram, end - 16, 0, BUFS, 20);
     w(&mut d, &mut ram, REG_TX_TAIL, 2);
     assert_eq!(wire.sent().len(), 1);
     assert_eq!([r(&d, REG_TX_HEAD), r(&d, REG_ERROR)], [1, error::BAD_RING]);
@@ -437,7 +434,7 @@ fn receive_reports_the_ram_it_writes() {
     d.poll(&mut ram, &mut |addr, len| writes.push((addr as u32, len)));
     assert_eq!(
         writes,
-        [(BUFS, 60), (RX_RING + 4, 4), (RX_RING + DESC_SIZE + 4, 4)]
+        [(BUFS, 60), (RX_RING + 8, 4), (RX_RING + DESC_SIZE + 8, 4)]
     );
     // Nothing arrives, nothing is written; tick and skip poll the same way.
     writes.clear();
@@ -450,7 +447,7 @@ fn receive_reports_the_ram_it_writes() {
     for _ in 0..POLL_STEPS {
         d.tick(&mut ram, &mut |addr, len| writes.push((addr as u32, len)));
     }
-    assert_eq!(writes, [(BUFS, 20), (RX_RING + 2 * DESC_SIZE + 4, 4)]);
+    assert_eq!(writes, [(BUFS, 20), (RX_RING + 2 * DESC_SIZE + 8, 4)]);
 }
 
 /// Completing a transmit descriptor is a RAM write too: the card reports each
@@ -468,7 +465,7 @@ fn transmit_reports_the_ram_it_writes() {
     })
     .unwrap();
     assert_eq!(wire.sent().len(), 1);
-    assert_eq!(writes, [(TX_RING + 4, 4), (TX_RING + DESC_SIZE + 4, 4)]);
+    assert_eq!(writes, [(TX_RING + 8, 4), (TX_RING + DESC_SIZE + 8, 4)]);
     // Other registers write no RAM.
     writes.clear();
     d.write(REG_IRQ_STATUS, 4, IRQ_ALL.into(), &mut ram, &mut |addr, len| {
@@ -746,13 +743,7 @@ fn devices_and_backends_are_send() {
     assert_send::<Pcap>();
 }
 
-// Version 2: an RV64 machine's card, with 64-bit ring bases and 16-byte descriptors.
-
-fn setup_v2() -> (NetDevice, TestBackend, Vec<u8>) {
-    let (mut d, wire, ram) = setup();
-    d.set_xlen(Xlen::Rv64);
-    (d, wire, ram)
-}
+// The 64-bit ring bases and the 16-byte descriptors, at every width they take.
 
 /// Writes `val` to `off` with a `size`-byte access, which must not fault.
 fn w2(d: &mut NetDevice, ram: &mut [u8], off: u32, size: u32, val: u64) {
@@ -761,7 +752,7 @@ fn w2(d: &mut NetDevice, ram: &mut [u8], off: u32, size: u32, val: u64) {
 
 /// The RAM bytes of 16-byte descriptor `slot` of the ring at `ring`.
 fn desc_v2_bytes(ram: &mut [u8], ring: u32, slot: u32) -> &mut [u8] {
-    at(ram, ring + slot * v2::DESC_SIZE, 16)
+    at(ram, ring + slot * DESC_SIZE, 16)
 }
 
 /// Writes 16-byte descriptor `slot`: buffer address and length; status 0xffff and the
@@ -786,95 +777,88 @@ fn desc_v2(ram: &mut [u8], ring: u32, slot: u32) -> (u16, u16, u32) {
 
 #[test]
 fn version_2_registers() {
-    let (mut d, _, mut ram) = setup_v2();
-    // The registers before the rings are version 1's.
+    let (mut d, _, mut ram) = setup();
+    // The registers before the rings.
     assert_eq!(d.read(REG_MAC_LO, 4), Ok(0x2211_ca02));
     assert_eq!(d.read(REG_STATUS, 4), Ok(STATUS_LINK_UP.into()));
     // The ring bases are 64-bit: whole, or by halves keeping the other half.
-    w2(&mut d, &mut ram, v2::REG_TX_BASE, 8, 0x1_2345_6780);
-    assert_eq!(d.read(v2::REG_TX_BASE, 8), Ok(0x1_2345_6780));
-    assert_eq!(d.read(v2::REG_TX_BASE, 4), Ok(0x2345_6780));
-    assert_eq!(d.read(v2::REG_TX_BASE + 4, 4), Ok(1));
-    w2(&mut d, &mut ram, v2::REG_RX_BASE, 4, RX_RING.into());
-    w2(&mut d, &mut ram, v2::REG_RX_BASE + 4, 4, 2);
-    assert_eq!(d.read(v2::REG_RX_BASE, 8), Ok(0x2_0000_0000 | u64::from(RX_RING)));
-    w2(&mut d, &mut ram, v2::REG_RX_BASE + 4, 4, 0);
-    assert_eq!(d.read(v2::REG_RX_BASE, 8), Ok(RX_RING.into()));
+    w2(&mut d, &mut ram, REG_TX_BASE, 8, 0x1_2345_6780);
+    assert_eq!(d.read(REG_TX_BASE, 8), Ok(0x1_2345_6780));
+    assert_eq!(d.read(REG_TX_BASE, 4), Ok(0x2345_6780));
+    assert_eq!(d.read(REG_TX_BASE + 4, 4), Ok(1));
+    w2(&mut d, &mut ram, REG_RX_BASE, 4, RX_RING.into());
+    w2(&mut d, &mut ram, REG_RX_BASE + 4, 4, 2);
+    assert_eq!(d.read(REG_RX_BASE, 8), Ok(0x2_0000_0000 | u64::from(RX_RING)));
+    w2(&mut d, &mut ram, REG_RX_BASE + 4, 4, 0);
+    assert_eq!(d.read(REG_RX_BASE, 8), Ok(RX_RING.into()));
     // The 32-bit ring registers, at their new offsets.
-    w2(&mut d, &mut ram, v2::REG_TX_SIZE, 4, 8);
-    w2(&mut d, &mut ram, v2::REG_RX_SIZE, 4, 4);
-    w2(&mut d, &mut ram, v2::REG_RX_TAIL, 4, 3);
-    assert_eq!(d.read(v2::REG_TX_SIZE, 4), Ok(8));
-    assert_eq!(d.read(v2::REG_RX_SIZE, 4), Ok(4));
-    assert_eq!(d.read(v2::REG_RX_TAIL, 4), Ok(3));
-    assert_eq!(d.read(v2::REG_RX_HEAD, 4), Ok(0));
-    assert_eq!(d.read(v2::REG_TX_HEAD, 4), Ok(0));
+    w2(&mut d, &mut ram, REG_TX_SIZE, 4, 8);
+    w2(&mut d, &mut ram, REG_RX_SIZE, 4, 4);
+    w2(&mut d, &mut ram, REG_RX_TAIL, 4, 3);
+    assert_eq!(d.read(REG_TX_SIZE, 4), Ok(8));
+    assert_eq!(d.read(REG_RX_SIZE, 4), Ok(4));
+    assert_eq!(d.read(REG_RX_TAIL, 4), Ok(3));
+    assert_eq!(d.read(REG_RX_HEAD, 4), Ok(0));
+    assert_eq!(d.read(REG_TX_HEAD, 4), Ok(0));
     assert_eq!(d.read(0x34, 4), Ok(0), "reserved");
     assert_eq!(d.read(0x50, 8), Ok(0), "unused");
     // 32-bit registers take no 8-byte access, and a faulting write does nothing.
-    assert_eq!(d.read(v2::REG_RX_SIZE, 8), Err(BusFault));
+    assert_eq!(d.read(REG_RX_SIZE, 8), Err(BusFault));
     assert_eq!(
         d.read(REG_RX_DROPPED, 8),
         Err(BusFault),
         "a counter and reserved space"
     );
     assert_eq!(
-        d.write(v2::REG_RX_SIZE, 8, 1, &mut ram, &mut |_, _| {}),
+        d.write(REG_RX_SIZE, 8, 1, &mut ram, &mut |_, _| {}),
         Err(BusFault)
     );
-    assert_eq!(d.read(v2::REG_RX_SIZE, 4), Ok(4));
-    assert_eq!(d.read(v2::REG_TX_BASE + 4, 8), Err(BusFault), "misaligned");
+    assert_eq!(d.read(REG_RX_SIZE, 4), Ok(4));
+    assert_eq!(d.read(REG_TX_BASE + 4, 8), Err(BusFault), "misaligned");
 }
 
 /// A version 2 ring's base is a multiple of 16: another is kept in the register, but
 /// the ring has no descriptors and NET_ERROR says why.
 #[test]
 fn version_2_ring_bases_are_aligned() {
-    let (mut d, _, mut ram) = setup_v2();
-    w2(&mut d, &mut ram, v2::REG_RX_SIZE, 4, 4);
-    w2(&mut d, &mut ram, v2::REG_RX_BASE, 8, u64::from(RX_RING) + 8);
+    let (mut d, _, mut ram) = setup();
+    w2(&mut d, &mut ram, REG_RX_SIZE, 4, 4);
+    w2(&mut d, &mut ram, REG_RX_BASE, 8, u64::from(RX_RING) + 8);
     assert_eq!(
-        d.read(v2::REG_RX_BASE, 8),
+        d.read(REG_RX_BASE, 8),
         Ok(u64::from(RX_RING) + 8),
         "it reads back"
     );
-    assert_eq!(d.read(v2::REG_RX_SIZE, 4), Ok(0));
+    assert_eq!(d.read(REG_RX_SIZE, 4), Ok(0));
     assert_eq!(d.read(REG_ERROR, 4), Ok(error::BAD_BASE.into()));
     assert_eq!(d.read(REG_IRQ_STATUS, 4), Ok(IRQ_ERROR.into()));
     // A SIZE is refused the same way while the base is wrong; turning the ring off is not.
     w2(&mut d, &mut ram, REG_ERROR, 4, 0);
-    w2(&mut d, &mut ram, v2::REG_RX_SIZE, 4, 0);
+    w2(&mut d, &mut ram, REG_RX_SIZE, 4, 0);
     assert_eq!(d.read(REG_ERROR, 4), Ok(0));
-    w2(&mut d, &mut ram, v2::REG_RX_SIZE, 4, 4);
-    assert_eq!(d.read(v2::REG_RX_SIZE, 4), Ok(0));
+    w2(&mut d, &mut ram, REG_RX_SIZE, 4, 4);
+    assert_eq!(d.read(REG_RX_SIZE, 4), Ok(0));
     assert_eq!(d.read(REG_ERROR, 4), Ok(error::BAD_BASE.into()));
     // Fixed, by the low half alone; then the size takes.
     w2(&mut d, &mut ram, REG_ERROR, 4, 0);
-    w2(&mut d, &mut ram, v2::REG_RX_BASE, 4, RX_RING.into());
-    w2(&mut d, &mut ram, v2::REG_RX_SIZE, 4, 4);
-    assert_eq!(d.read(v2::REG_RX_SIZE, 4), Ok(4));
+    w2(&mut d, &mut ram, REG_RX_BASE, 4, RX_RING.into());
+    w2(&mut d, &mut ram, REG_RX_SIZE, 4, 4);
+    assert_eq!(d.read(REG_RX_SIZE, 4), Ok(4));
     assert_eq!(d.read(REG_ERROR, 4), Ok(0));
     // Only the low bits count: the high half never misaligns a base.
-    w2(&mut d, &mut ram, v2::REG_TX_SIZE, 4, 2);
-    w2(&mut d, &mut ram, v2::REG_TX_BASE + 4, 4, 0xffff_ffff);
+    w2(&mut d, &mut ram, REG_TX_SIZE, 4, 2);
+    w2(&mut d, &mut ram, REG_TX_BASE + 4, 4, 0xffff_ffff);
     assert_eq!(d.read(REG_ERROR, 4), Ok(0));
-    assert_eq!(d.read(v2::REG_TX_SIZE, 4), Ok(2));
-    // Version 1's descriptors may be anywhere.
-    let (mut d, _, mut ram) = setup();
-    rings(&mut d, &mut ram, 4);
-    w(&mut d, &mut ram, REG_RX_BASE, RX_RING + 8);
-    w(&mut d, &mut ram, REG_RX_SIZE, 4);
-    assert_eq!(r(&d, REG_RX_SIZE), 4);
-    assert_eq!(r(&d, REG_ERROR), error::NONE);
+    assert_eq!(d.read(REG_TX_SIZE, 4), Ok(2));
 }
 
 #[test]
 fn version_2_descriptors_move_frames() {
-    let (mut d, wire, mut ram) = setup_v2();
-    w2(&mut d, &mut ram, v2::REG_TX_BASE, 8, TX_RING.into());
-    w2(&mut d, &mut ram, v2::REG_TX_SIZE, 4, 4);
-    w2(&mut d, &mut ram, v2::REG_RX_BASE, 8, RX_RING.into());
-    w2(&mut d, &mut ram, v2::REG_RX_SIZE, 4, 4);
+    let (mut d, wire, mut ram) = setup();
+    w2(&mut d, &mut ram, REG_TX_BASE, 8, TX_RING.into());
+    w2(&mut d, &mut ram, REG_TX_SIZE, 4, 4);
+    w2(&mut d, &mut ram, REG_RX_BASE, 8, RX_RING.into());
+    w2(&mut d, &mut ram, REG_RX_SIZE, 4, 4);
 
     // Transmit: one good frame, then buffers above 4 GiB and at the top of the
     // address space, which are not RAM.
@@ -884,7 +868,7 @@ fn version_2_descriptors_move_frames() {
     set_desc_v2(&mut ram, TX_RING, 1, u64::from(BUFS) + (1 << 32), 60);
     set_desc_v2(&mut ram, TX_RING, 2, u64::MAX - 10, 60);
     let mut writes = Vec::new();
-    d.write(v2::REG_TX_TAIL, 4, 3, &mut ram, &mut |addr, len| {
+    d.write(REG_TX_TAIL, 4, 3, &mut ram, &mut |addr, len| {
         writes.push((addr, len))
     })
     .unwrap();
@@ -901,13 +885,13 @@ fn version_2_descriptors_move_frames() {
         desc_v2(&mut ram, TX_RING, 2),
         (60, status::BAD_DMA as u16, 0xaaaa_aaaa)
     );
-    assert_eq!(d.read(v2::REG_TX_HEAD, 4), Ok(3));
+    assert_eq!(d.read(REG_TX_HEAD, 4), Ok(3));
     let tx = u64::from(TX_RING);
     assert_eq!(writes, [(tx + 8, 4), (tx + 24, 4), (tx + 40, 4)]);
 
     // Receive into the buffer of the descriptor at RX_HEAD.
     set_desc_v2(&mut ram, RX_RING, 0, u64::from(BUFS) + 0x800, 0x800);
-    w2(&mut d, &mut ram, v2::REG_RX_TAIL, 4, 1);
+    w2(&mut d, &mut ram, REG_RX_TAIL, 4, 1);
     wire.arrive(frame(60, 7));
     writes.clear();
     d.poll(&mut ram, &mut |addr, len| writes.push((addr, len)));
@@ -916,7 +900,7 @@ fn version_2_descriptors_move_frames() {
         desc_v2(&mut ram, RX_RING, 0),
         (60, status::OK as u16, 0xaaaa_aaaa)
     );
-    assert_eq!(d.read(v2::REG_RX_HEAD, 4), Ok(1));
+    assert_eq!(d.read(REG_RX_HEAD, 4), Ok(1));
     let rx = u64::from(RX_RING);
     assert_eq!(writes, [(u64::from(BUFS) + 0x800, 60), (rx + 8, 4)]);
 }
@@ -924,11 +908,11 @@ fn version_2_descriptors_move_frames() {
 /// A ring whose descriptors would run past 2^64 is a ring error, not a wrap-around.
 #[test]
 fn a_version_2_ring_at_the_top_of_the_address_space() {
-    let (mut d, wire, mut ram) = setup_v2();
-    w2(&mut d, &mut ram, v2::REG_TX_BASE, 8, u64::MAX - 15);
-    w2(&mut d, &mut ram, v2::REG_TX_SIZE, 4, 4);
-    w2(&mut d, &mut ram, v2::REG_TX_TAIL, 4, 2);
+    let (mut d, wire, mut ram) = setup();
+    w2(&mut d, &mut ram, REG_TX_BASE, 8, u64::MAX - 15);
+    w2(&mut d, &mut ram, REG_TX_SIZE, 4, 4);
+    w2(&mut d, &mut ram, REG_TX_TAIL, 4, 2);
     assert_eq!(d.read(REG_ERROR, 4), Ok(error::BAD_RING.into()));
-    assert_eq!(d.read(v2::REG_TX_HEAD, 4), Ok(0));
+    assert_eq!(d.read(REG_TX_HEAD, 4), Ok(0));
     assert!(wire.sent().is_empty());
 }

@@ -2,15 +2,10 @@
 //!
 //! A device's registers are 32-bit or 64-bit. A 32-bit register takes 4-byte accesses
 //! only; a 64-bit one takes an 8-byte access of the whole register or a 4-byte access
-//! of either half (the low half at the lower address), so that a 32-bit driver can
-//! still reach it. Unused offsets read as 0 and ignore writes at either width. Every
-//! other access is a fault.
-//!
-//! Version 1 of the interfaces (RV32 machines) has 32-bit registers only, so it takes
-//! no 8-byte access at all, not even of unused space. The framebuffer's `FB_SCANOUT` and
-//! `FB_CURSOR_ADDR` are newer than version 1 and 64-bit at both widths, so the
-//! framebuffer takes 8-byte accesses on RV32 too. A device describes its layout with
-//! [`Field`]s, and [`access`] applies the rules.
+//! of either half (the low half at the lower address), as a driver that writes it by
+//! halves does. Unused offsets read as 0 and ignore writes at either width. Every other
+//! access is a fault. A device describes its layout with [`Field`]s, and [`access`]
+//! applies the rules.
 
 use crate::bus::BusFault;
 
@@ -41,15 +36,8 @@ pub enum Access<R> {
 }
 
 /// Checks an access of `size` bytes at `off` against a device's layout (`field` tells
-/// what each 4-byte-aligned offset holds). `wide` says the device has 64-bit registers
-/// (version 2 of the interfaces, or the framebuffer at either width); without it, 8-byte
-/// accesses fault.
-pub fn access<R>(
-    off: u32,
-    size: u32,
-    wide: bool,
-    field: impl Fn(u32) -> Field<R>,
-) -> Result<Access<R>, BusFault> {
+/// what each 4-byte-aligned offset holds).
+pub fn access<R>(off: u32, size: u32, field: impl Fn(u32) -> Field<R>) -> Result<Access<R>, BusFault> {
     // The harts fault on misaligned accesses before they reach the bus; whatever else
     // asks (a debugger) finds nothing between registers.
     let field = |off: u32| {
@@ -66,7 +54,7 @@ pub fn access<R>(
             Field::High(r) => Access::High(r),
             Field::Unused => Access::Unused,
         }),
-        8 if wide && off.is_multiple_of(8) => match (field(off), field(off + 4)) {
+        8 if off.is_multiple_of(8) => match (field(off), field(off + 4)) {
             (Field::Low(r), _) => Ok(Access::Whole(r)),
             (Field::Unused, Field::Unused) => Ok(Access::Unused),
             // A 32-bit register, or two, or one and unused space: not a width they take.
@@ -126,24 +114,19 @@ mod tests {
 
     #[test]
     fn widths() {
-        let a = |off, size, wide| access(off, size, wide, layout);
-        for wide in [false, true] {
-            assert_eq!(a(0, 4, wide), Ok(Access::Word('w')));
-            assert_eq!(a(8, 4, wide), Ok(Access::Low('d')));
-            assert_eq!(a(0xc, 4, wide), Ok(Access::High('d')));
-            assert_eq!(a(0x10, 4, wide), Ok(Access::Unused));
-            assert_eq!(a(2, 4, wide), Ok(Access::Unused), "between registers");
-            for size in [1, 2, 3, 16] {
-                assert_eq!(a(0, size, wide), Err(BusFault));
-            }
+        let a = |off, size| access(off, size, layout);
+        assert_eq!(a(0, 4), Ok(Access::Word('w')));
+        assert_eq!(a(8, 4), Ok(Access::Low('d')));
+        assert_eq!(a(0xc, 4), Ok(Access::High('d')));
+        assert_eq!(a(0x10, 4), Ok(Access::Unused));
+        assert_eq!(a(2, 4), Ok(Access::Unused), "between registers");
+        for size in [1, 2, 3, 16] {
+            assert_eq!(a(0, size), Err(BusFault));
         }
-        assert_eq!(a(8, 8, true), Ok(Access::Whole('d')));
-        assert_eq!(a(0x10, 8, true), Ok(Access::Unused));
-        assert_eq!(a(0, 8, true), Err(BusFault), "a word and unused space");
-        assert_eq!(a(0xc, 8, true), Err(BusFault), "misaligned");
-        // Version 1: no 8-byte access, of anything.
-        assert_eq!(a(8, 8, false), Err(BusFault));
-        assert_eq!(a(0x10, 8, false), Err(BusFault));
+        assert_eq!(a(8, 8), Ok(Access::Whole('d')));
+        assert_eq!(a(0x10, 8), Ok(Access::Unused));
+        assert_eq!(a(0, 8), Err(BusFault), "a word and unused space");
+        assert_eq!(a(0xc, 8), Err(BusFault), "misaligned");
     }
 
     #[test]

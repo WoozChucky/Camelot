@@ -135,39 +135,37 @@ fn refused(m: &mut Machine, message: &str) {
 
 #[test]
 fn loads_the_boot_block_and_jumps_to_it() {
-    for xlen in XLENS {
-        // auipc t0, 0: where it runs. Then stop with exit code 0.
-        let block = boot_block(&[auipc(T0), HALT]);
-        let mut m = machine(xlen, 1, disk(&block, 8));
-        assert_eq!(m.cpu.xlen(), xlen);
-        assert_eq!(m.cpu.bus.read(BOOT_ROM_BASE + 16, width(xlen)), Ok(DISK_BOOT_PC));
-        let loader = boot::disk_loader(xlen);
-        let at = DISK_BOOT_PC as usize - BOOT_ROM_BASE as usize;
-        assert_eq!(
-            &m.cpu.bus.rom[at..],
-            &loader[..],
-            "{xlen:?}: the loader of its width"
-        );
-        assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
-        assert_eq!(uart(&m), "", "nothing to say");
-        assert_eq!(
-            reg(&m, 0, T0),
-            LOAD_ADDR.into(),
-            "{xlen:?}: the last 64 KiB of RAM"
-        );
-        assert_eq!(boot::boot_block_addr(RAM), Some(LOAD_ADDR.into()));
-        assert_eq!(reg(&m, 0, A0), 0, "the hart id");
-        assert_eq!(reg(&m, 0, A1), SYSINFO_BASE);
-        assert_eq!(reg(&m, 0, A2), BLK_BASE, "disk 0's registers");
-        // The whole block is in RAM, and nothing after it.
-        let at = (LOAD_ADDR - 0x8000_0000) as usize;
-        assert_eq!(&m.cpu.bus.ram[at..at + BOOT_BLOCK_SIZE], &block[..]);
-        assert!(m.cpu.bus.ram[at + BOOT_BLOCK_SIZE..].iter().all(|&b| b == 0));
-        // The ROM's trap handler is still in place, and the disk's DONE acknowledged.
-        let h = m.cpu.hart(0);
-        assert!((DISK_BOOT_PC..BOOT_ROM_BASE + 0x1000).contains(&h.csr.mtvec));
-        assert_eq!(m.cpu.bus.read(BLK_BASE + blk_status(xlen), 4), Ok(0), "{xlen:?}");
-    }
+    // auipc t0, 0: where it runs. Then stop with exit code 0.
+    let block = boot_block(&[auipc(T0), HALT]);
+    let mut m = machine(1, disk(&block, 8));
+    assert_eq!(m.cpu.xlen(), xlen);
+    assert_eq!(m.cpu.bus.read(BOOT_ROM_BASE + 16, 8), Ok(DISK_BOOT_PC));
+    let loader = boot::disk_loader(xlen);
+    let at = DISK_BOOT_PC as usize - BOOT_ROM_BASE as usize;
+    assert_eq!(
+        &m.cpu.bus.rom[at..],
+        &loader[..],
+        "{xlen:?}: the loader of its width"
+    );
+    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
+    assert_eq!(uart(&m), "", "nothing to say");
+    assert_eq!(
+        reg(&m, 0, T0),
+        LOAD_ADDR.into(),
+        "{xlen:?}: the last 64 KiB of RAM"
+    );
+    assert_eq!(boot::boot_block_addr(RAM), Some(LOAD_ADDR.into()));
+    assert_eq!(reg(&m, 0, A0), 0, "the hart id");
+    assert_eq!(reg(&m, 0, A1), SYSINFO_BASE);
+    assert_eq!(reg(&m, 0, A2), BLK_BASE, "disk 0's registers");
+    // The whole block is in RAM, and nothing after it.
+    let at = (LOAD_ADDR - 0x8000_0000) as usize;
+    assert_eq!(&m.cpu.bus.ram[at..at + BOOT_BLOCK_SIZE], &block[..]);
+    assert!(m.cpu.bus.ram[at + BOOT_BLOCK_SIZE..].iter().all(|&b| b == 0));
+    // The ROM's trap handler is still in place, and the disk's DONE acknowledged.
+    let h = m.cpu.hart(0);
+    assert!((DISK_BOOT_PC..BOOT_ROM_BASE + 0x1000).contains(&h.csr.mtvec));
+    assert_eq!(m.cpu.bus.read(BLK_BASE + BLK_STATUS, 4), Ok(0));
 }
 
 #[test]
@@ -184,7 +182,6 @@ fn the_boot_area_follows_the_ram_size() {
         (Xlen::Rv64, 5 << 10),
     ] {
         let config = MachineConfig {
-            xlen,
             ram_size: mib << 20,
             disks: vec![DiskConfig::memory(disk(&block, 2))],
             ..MachineConfig::default()
@@ -200,27 +197,23 @@ fn the_boot_area_follows_the_ram_size() {
 
 #[test]
 fn an_empty_disk_is_not_bootable() {
-    for xlen in XLENS {
-        let mut m = machine(xlen, 1, vec![0; 4096]);
-        refused(&mut m, "disk 0 is not bootable (no boot signature)");
-    }
+    let mut m = machine(1, vec![0; 4096]);
+    refused(&mut m, "disk 0 is not bootable (no boot signature)");
 }
 
 #[test]
 fn a_corrupt_boot_block_is_refused() {
-    for xlen in XLENS {
-        let mut block = boot_block(&[auipc(T0), HALT]);
-        block[4] ^= 0x10; // one bit of the code
-        let mut m = machine(xlen, 1, disk(&block, 2));
-        refused(&mut m, "the boot block on disk 0 is corrupt (bad checksum)");
+    let mut block = boot_block(&[auipc(T0), HALT]);
+    block[4] ^= 0x10; // one bit of the code
+    let mut m = machine(1, disk(&block, 2));
+    refused(&mut m, "the boot block on disk 0 is corrupt (bad checksum)");
 
-        // Random bytes have no signature either.
-        let noise: Vec<u8> = (0..2048u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect();
-        let mut m = machine(xlen, 1, noise);
-        refused(&mut m, "disk 0 is not bootable (no boot signature)");
-    }
+    // Random bytes have no signature either.
+    let noise: Vec<u8> = (0..2048u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut m = machine(1, noise);
+    refused(&mut m, "disk 0 is not bootable (no boot signature)");
 }
 
 /// The checksum is modulo 2^32 at both widths. Two words of 0x8000_0000 (data after
@@ -228,20 +221,16 @@ fn a_corrupt_boot_block_is_refused() {
 /// them: the RV64 loader adds with `addw`, and boots the block.
 #[test]
 fn the_checksum_is_32_bit_on_both_widths() {
-    for xlen in XLENS {
-        let block = boot_block(&[auipc(T0), HALT, 0x8000_0000, 0x8000_0000]);
-        let mut m = machine(xlen, 1, disk(&block, 2));
-        assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0), "{xlen:?}");
-        assert_eq!(uart(&m), "", "{xlen:?}");
-    }
+    let block = boot_block(&[auipc(T0), HALT, 0x8000_0000, 0x8000_0000]);
+    let mut m = machine(1, disk(&block, 2));
+    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
+    assert_eq!(uart(&m), "");
 }
 
 #[test]
 fn a_disk_of_one_sector_is_too_small() {
-    for xlen in XLENS {
-        let mut m = machine(xlen, 1, vec![0; 512]);
-        refused(&mut m, "disk 0 is too small to hold a boot block");
-    }
+    let mut m = machine(1, vec![0; 512]);
+    refused(&mut m, "disk 0 is too small to hold a boot block");
 }
 
 /// A disk whose reads all fail (an I/O error on the host side).
@@ -267,16 +256,14 @@ impl BlockBackend for Broken {
 
 #[test]
 fn a_read_error_is_reported() {
-    for xlen in XLENS {
-        let config = MachineConfig {
-            xlen,
-            ..MachineConfig::with_ram(RAM)
-        };
-        let mut m = Machine::with_backends(config, vec![Box::new(Broken)]).unwrap();
-        m.boot_from_disk().unwrap();
-        m.cpu.bus.uart.capture = true;
-        refused(&mut m, "cannot read the boot block from disk 0");
-    }
+    let config = MachineConfig {
+        xlen,
+        ..MachineConfig::with_ram(RAM)
+    };
+    let mut m = Machine::with_backends(config, vec![Box::new(Broken)]).unwrap();
+    m.boot_from_disk().unwrap();
+    m.cpu.bus.uart.capture = true;
+    refused(&mut m, "cannot read the boot block from disk 0");
 }
 
 #[test]
@@ -303,14 +290,12 @@ fn a_trap_in_the_boot_block_is_reported() {
 
 #[test]
 fn no_disk_no_disk_boot() {
-    for xlen in XLENS {
-        let config = MachineConfig {
-            xlen,
-            ..MachineConfig::with_ram(RAM)
-        };
-        let mut m = Machine::new(config).unwrap();
-        assert!(m.boot_from_disk().unwrap_err().contains("no disk"));
-    }
+    let config = MachineConfig {
+        xlen,
+        ..MachineConfig::with_ram(RAM)
+    };
+    let mut m = Machine::new(config).unwrap();
+    assert!(m.boot_from_disk().unwrap_err().contains("no disk"));
 }
 
 /// The boot area is the last 64 KiB of RAM: a smaller machine cannot boot from disk,
@@ -319,29 +304,26 @@ fn no_disk_no_disk_boot() {
 #[test]
 fn disk_boot_takes_64_kib_of_ram() {
     let block = boot_block(&[auipc(T0), HALT]);
-    for xlen in XLENS {
-        for kib in [4, 32, 60] {
-            let config = MachineConfig {
-                xlen,
-                ram_size: kib << 10,
-                disks: vec![DiskConfig::memory(disk(&block, 2))],
-                ..MachineConfig::default()
-            };
-            let mut m = Machine::new(config).unwrap();
-            let err = m.boot_from_disk().unwrap_err();
-            assert!(err.contains("at least 64 KiB of RAM"), "{kib} KiB: {err}");
-        }
+    for kib in [4, 32, 60] {
         let config = MachineConfig {
-            xlen,
-            ram_size: 64 << 10,
+            ram_size: kib << 10,
             disks: vec![DiskConfig::memory(disk(&block, 2))],
             ..MachineConfig::default()
         };
         let mut m = Machine::new(config).unwrap();
-        m.boot_from_disk().unwrap();
-        assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
-        assert_eq!(reg(&m, 0, T0), 0x8000_0000, "all of RAM is the boot area");
+        let err = m.boot_from_disk().unwrap_err();
+        assert!(err.contains("at least 64 KiB of RAM"), "{kib} KiB: {err}");
     }
+    let config = MachineConfig {
+        xlen,
+        ram_size: 64 << 10,
+        disks: vec![DiskConfig::memory(disk(&block, 2))],
+        ..MachineConfig::default()
+    };
+    let mut m = Machine::new(config).unwrap();
+    m.boot_from_disk().unwrap();
+    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
+    assert_eq!(reg(&m, 0, T0), 0x8000_0000, "all of RAM is the boot area");
 }
 
 /// The boot block of a two-hart machine points the ROM's entry point at code of its
@@ -351,45 +333,39 @@ fn disk_boot_takes_64_kib_of_ram() {
 /// entry point is a word on RV32 and a doubleword on RV64, written whole.
 #[test]
 fn the_boot_block_can_start_the_other_harts() {
-    for xlen in XLENS {
-        let block = boot_block(&[
-            auipc(T0),            // 0x00
-            addi(T0, T0, 0x20),   //      t0 = hart 1's code, at 0x20
-            lui(T1, 1),           //      t1 = the boot ROM
-            sx(xlen, T0, T1, 16), //    the entry point
-            lui(T1, 0x2000),      //      the CLINT
-            addi(A3, ZERO, 1),    //
-            sw(A3, T1, 4),        //      msip of hart 1
-            STOP,                 // 0x1c
-            addi(A1, A0, 0x10),   // 0x20: hart 1, with a0 = 1
-            HALT,
-        ]);
-        let mut m = machine(xlen, 2, disk(&block, 2));
-        m.cpu.bus.write(0x0200_0004, 4, 1).unwrap(); // an early IPI
-        for _ in 0..40 {
-            m.cpu.step();
-        }
-        let h1 = m.cpu.hart(1);
-        assert!(
-            h1.waiting && (PARK_PC..PARK_PC + 0x40).contains(&h1.pc),
-            "{xlen:?}: parked again"
-        );
-        assert_eq!(m.cpu.bus.read(0x0200_0004, 4), Ok(0), "the early IPI was taken");
-
-        assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0), "{xlen:?}");
-        let entry = u64::from(LOAD_ADDR + 0x20);
-        assert_eq!(
-            m.cpu.bus.read(BOOT_ROM_BASE + 16, width(xlen)),
-            Ok(entry),
-            "{xlen:?}"
-        );
-        assert_eq!(reg(&m, 1, A1), 0x11, "{xlen:?}: hart 1 ran the code with a0 = 1");
-        assert_eq!(
-            m.cpu.hart(0).pc,
-            u64::from(LOAD_ADDR + 0x1c),
-            "hart 0 waits at its j ."
-        );
+    let block = boot_block(&[
+        auipc(T0),          // 0x00
+        addi(T0, T0, 0x20), //      t0 = hart 1's code, at 0x20
+        lui(T1, 1),         //      t1 = the boot ROM
+        sd(T0, T1, 16),     //    the entry point
+        lui(T1, 0x2000),    //      the CLINT
+        addi(A3, ZERO, 1),  //
+        sw(A3, T1, 4),      //      msip of hart 1
+        STOP,               // 0x1c
+        addi(A1, A0, 0x10), // 0x20: hart 1, with a0 = 1
+        HALT,
+    ]);
+    let mut m = machine(2, disk(&block, 2));
+    m.cpu.bus.write(0x0200_0004, 4, 1).unwrap(); // an early IPI
+    for _ in 0..40 {
+        m.cpu.step();
     }
+    let h1 = m.cpu.hart(1);
+    assert!(
+        h1.waiting && (PARK_PC..PARK_PC + 0x40).contains(&h1.pc),
+        "{xlen:?}: parked again"
+    );
+    assert_eq!(m.cpu.bus.read(0x0200_0004, 4), Ok(0), "the early IPI was taken");
+
+    assert_eq!(m.run(Some(STEPS), |_| {}), RunResult::Exited(0));
+    let entry = u64::from(LOAD_ADDR + 0x20);
+    assert_eq!(m.cpu.bus.read(BOOT_ROM_BASE + 16, 8), Ok(entry), "{xlen:?}");
+    assert_eq!(reg(&m, 1, A1), 0x11, "hart 1 ran the code with a0 = 1");
+    assert_eq!(
+        m.cpu.hart(0).pc,
+        u64::from(LOAD_ADDR + 0x1c),
+        "hart 0 waits at its j ."
+    );
 }
 
 // The `grail` binary, booting the Camelot kernel.

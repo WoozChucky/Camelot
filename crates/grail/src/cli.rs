@@ -5,7 +5,7 @@
 use crate::config::DiskSource;
 use crate::net::Hub;
 use crate::{
-    parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_xlen, DiskConfig, Machine,
+    parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, Bios, DiskConfig, Machine,
     MachineConfig, NetConfig,
 };
 use std::net::SocketAddr;
@@ -13,37 +13,35 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "usage: grail [options] [program.elf]
 
-Runs the program. Without one, boots from disk 0 (--disk): the boot ROM loads
-its boot block (its first 1 KiB) and runs it, as camelot-fs mkfs --boot makes
-for the Camelot kernel (spec section 7, \"Boot from disk\"). With firmware
-(--bios), the firmware runs first, in M-mode, and starts the program, or the
-disk's boot block, in S-mode.
+Runs the program on an RV64 machine. Without one, boots from disk 0 (--disk):
+its boot block (its first 1 KiB), as camelot-fs mkfs --boot makes for the
+Camelot kernel (spec section 7, \"Boot from disk\"). The firmware (--bios) runs
+first, in M-mode, and starts the program, or the disk's boot block, in S-mode;
+with --bios none the program, or the boot ROM's disk loader, starts in M-mode.
 
   --trace         print every instruction before it runs (with its hart's
                   number, h0, h1, ..., on a machine of several harts)
   --max-steps N   stop after N steps (exit code 124)
   --ram SIZE      RAM size: MiB, or a number with a unit, M/MiB or G/GiB, any
-                  case (--ram 64, --ram 64M, --ram 16G); 1 MiB to 1 TiB, RV32 at
-                  most 2 GiB (default 4 MiB). Backed lazily: the host pays for
-                  what the guest touches
+                  case (--ram 64, --ram 64M, --ram 16G); 1 MiB to 1 TiB (default
+                  4 MiB). Backed lazily: the host pays for what the guest touches
   --clock FREQ    real time: run FREQ instructions per second, and mtime ticks at FREQ.
                   FREQ is a number with an optional unit, Hz, kHz or MHz (any case;
                   no unit = Hz); fractions are fine if the result is whole Hz:
                   --clock 10MHz, --clock 500kHz, --clock 1.5MHz, --clock 5Hz.
                   Without it Grail runs at full speed, deterministically, and reports
                   a nominal 10 MHz clock to software
-  --xlen 32|64    the harts' width, RV32 or RV64 (default 32; an ELF64 program
-                  makes the machine RV64)
-  --paging MODE   the paging modes of an RV64 hart: sv48 (Sv48 and Sv39, the
+  --paging MODE   the paging modes of the harts: sv48 (Sv48 and Sv39, the
                   default) or sv39 (Sv39 only, as on most RV64 boards: satp then
                   refuses Sv48)
-  --bios FW       the firmware, as QEMU's -bios: none (the default: the program
-                  starts in M-mode), default (Camelot's firmware, built in: an SBI
-                  in M-mode, which starts the program in S-mode, or boots from disk
-                  0 without one) or a file, an ELF or a raw binary loaded at
-                  0x80000000 (OpenSBI's fw_jump.bin, say). The firmware has the
-                  first 2 MiB of RAM and the program loads at 0x80200000; Grail
-                  passes it a device tree of the machine. RV64 machines only
+  --bios FW       the firmware, as QEMU's -bios: default (the default: Camelot's
+                  firmware, built in, an SBI in M-mode, which starts the program
+                  in S-mode, or boots from disk 0 without one), a file, an ELF or
+                  a raw binary loaded at 0x80000000 (OpenSBI's fw_jump.bin, say),
+                  or none (the program starts in M-mode at its entry: riscv-tests
+                  and bare-metal programs linked at 0x80000000). The firmware has
+                  the first 2 MiB of RAM and the program loads at 0x80200000;
+                  Grail passes it a device tree of the machine
   --harts N       N harts (cores), 1 to 8 (default 1). They share memory and
                   devices and take turns, one instruction each per step, so
                   with --clock each runs at FREQ. Hart 0 starts the program;
@@ -122,7 +120,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
     let mut o = Options {
         trace: false,
         max_steps: None,
-        config: MachineConfig::default(),
+        // Camelot's firmware unless --bios says otherwise, as QEMU's `virt` machine
+        // boots OpenSBI unless told `-bios none`.
+        config: MachineConfig {
+            bios: Bios::Default,
+            ..MachineConfig::default()
+        },
         program: None,
         fb: false,
         headless: false,
@@ -154,7 +157,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
             "--ram" => config.ram_size = parsed("--ram", value("--ram")?, parse_ram_size)?,
             "--clock" => config.clock_hz = Some(parsed("--clock", value("--clock")?, parse_clock)?),
             "--harts" => config.harts = parsed("--harts", value("--harts")?, parse_harts)?,
-            "--xlen" => config.xlen = parsed("--xlen", value("--xlen")?, parse_xlen)?,
+
             "--paging" => config.paging = parsed("--paging", value("--paging")?, parse_paging)?,
             "--bios" => config.bios = parsed("--bios", value("--bios")?, parse_bios)?,
             "--disk" | "--disk-ro" => {
@@ -222,11 +225,6 @@ impl Options {
             None => None,
         };
         let shown = self.shown();
-        // An ELF64 program makes the machine RV64 (`Machine::load_elf`): it is built
-        // so from the start, so that its RAM is checked against RV64's limit.
-        if let Some(crate::Xlen::Rv64) = file.as_deref().and_then(crate::elf::class) {
-            self.config.xlen = crate::Xlen::Rv64;
-        }
         let mut m = Machine::new(std::mem::take(&mut self.config))?;
         match &file {
             Some(file) => m.load_elf(file),
@@ -283,22 +281,25 @@ mod tests {
     }
 
     #[test]
-    fn an_elf64_program_gets_an_rv64_machine_and_its_ram() {
-        // 16 GiB is past RV32's 2 GiB: the machine is built RV64 from the start, as
-        // the program's class says, and its RAM reserved (lazily: this costs nothing).
+    fn a_program_gets_its_machine_and_its_ram() {
+        // 16 GiB, reserved lazily: this costs nothing. A program linked at the start
+        // of RAM runs without firmware, which would have its first 2 MiB.
         let path = std::env::temp_dir().join(format!("grail-cli-{}.elf", std::process::id()));
         std::fs::write(&path, tiny_elf64()).unwrap();
         let file = path.to_str().unwrap().to_string();
-        let mut o = parse(vec!["--ram".into(), "16G".into(), file.clone()]).unwrap();
+        let mut o = parse(args("--bios none --ram 16G").into_iter().chain([file.clone()])).unwrap();
         let m = o.machine().unwrap();
-        assert_eq!(m.config().xlen, crate::Xlen::Rv64);
         assert_eq!(m.cpu.bus.ram.len(), 16 << 30);
-        // (An RV32 program with that much is refused: tests/machine.rs.)
+        assert_eq!(m.config().bios, Bios::None);
+        // With the firmware, the default, it is refused: the next stage loads at
+        // 0x80200000, and the message says how to run it.
+        let mut o = parse(vec![file.clone()]).unwrap();
+        let e = o.machine().err().unwrap();
+        assert!(
+            e.contains("is in the firmware's RAM") && e.contains("--bios none"),
+            "{e}"
+        );
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(crate::elf::class(b"\x7fELF\x01"), Some(crate::Xlen::Rv32));
-        assert_eq!(crate::elf::class(b"\x7fELF\x02"), Some(crate::Xlen::Rv64));
-        assert_eq!(crate::elf::class(b"\x7fELF\x03"), None);
-        assert_eq!(crate::elf::class(b"MZ"), None);
     }
 
     #[test]
@@ -324,12 +325,19 @@ mod tests {
         let o = parse(args("--harts 2 --ram 8 --trace p.elf")).unwrap();
         assert_eq!(o.program.as_deref(), Some("p.elf"));
         assert_eq!((o.config.harts, o.config.ram_size, o.trace), (2, 8 << 20, true));
-        assert_eq!(o.config.xlen, crate::Xlen::Rv32);
-        let o = parse(args("--xlen 64 p.elf")).unwrap();
-        assert_eq!(o.config.xlen, crate::Xlen::Rv64);
-        assert!(parse(args("--xlen 128 p.elf")).is_err());
+        assert_eq!(
+            o.config.bios,
+            Bios::Default,
+            "the firmware, as QEMU's virt machine"
+        );
+        assert_eq!(parse(args("--bios none p.elf")).unwrap().config.bios, Bios::None);
+        // Every machine is RV64: there is no width to choose.
+        assert_eq!(
+            parse(args("--xlen 64 p.elf")).err(),
+            Some(usage("unknown option --xlen"))
+        );
         assert_eq!(o.config.paging, crate::Paging::Sv48);
-        let o = parse(args("--xlen 64 --paging sv39 p.elf")).unwrap();
+        let o = parse(args("--paging sv39 p.elf")).unwrap();
         assert_eq!(o.config.paging, crate::Paging::Sv39);
         assert!(parse(args("--paging sv32 p.elf")).is_err());
         assert_eq!(parse(args("-h")).err(), Some(Error::Help));

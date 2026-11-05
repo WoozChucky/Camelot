@@ -1,12 +1,7 @@
 //! Exception and interrupt causes (spec section 6).
 
-use excalibur::Xlen;
-
-/// The bit of `xcause` that marks an interrupt: its top bit, bit 63 on RV64 and bit
-/// 31 on RV32.
-pub fn interrupt_bit(xlen: Xlen) -> u64 {
-    1 << (xlen.bits() - 1)
-}
+/// The bit of `xcause` that marks an interrupt: its top bit, bit 63.
+pub const INTERRUPT_BIT: u64 = 1 << 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]

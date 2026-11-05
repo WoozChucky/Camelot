@@ -12,7 +12,6 @@ use crate::net::NetDevice;
 use crate::pointer::Pointer;
 use crate::ram::Ram;
 use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
-use excalibur::Xlen;
 use std::io::Write;
 
 pub const BOOT_ROM_BASE: u64 = 0x0000_1000;
@@ -130,8 +129,6 @@ pub struct Bus {
     pub exit: Option<Exit>,
     /// A debugger's watchpoints, which the harts' loads and stores report to.
     pub(crate) watches: crate::debug::Watches,
-    /// The harts' width, which the boot ROM's code follows ([`Bus::set_boot_entry`]).
-    xlen: Xlen,
     /// Hart `i`'s LR/SC reservation. They live here, next to memory, because every
     /// write to memory goes through the bus: a hart's store, an AMO or an `sc`
     /// ([`Bus::snoop_store`]), and a device's DMA ([`Bus::tick`], [`Bus::write`]), so
@@ -179,9 +176,7 @@ impl Bus {
             exit: None,
             watches: Default::default(),
             reservations: vec![Reservation::default(); harts],
-            xlen: config.xlen,
         };
-        bus.set_device_versions(config.xlen);
         if harts > 1 {
             // The park loop must be there before any program is loaded: the other harts
             // run it from reset.
@@ -195,30 +190,6 @@ impl Bus {
         self.reservations.len()
     }
 
-    /// The width of the harts on this bus.
-    pub fn xlen(&self) -> Xlen {
-        self.xlen
-    }
-
-    /// Makes the bus's harts `xlen` wide ([`crate::cpu::Cpu::set_xlen`]): the boot ROM's
-    /// code is written again for that width, and the devices present that width's
-    /// interface version (spec section 9).
-    pub(crate) fn set_xlen(&mut self, xlen: Xlen) {
-        self.xlen = xlen;
-        self.set_device_versions(xlen);
-        if self.harts() > 1 {
-            self.set_boot_entry(0);
-        }
-    }
-
-    /// Gives the devices the registers of an `xlen` machine's: version 2 of the
-    /// interfaces on RV64, 1 on RV32 (spec section 9).
-    fn set_device_versions(&mut self, xlen: Xlen) {
-        self.sysinfo.set_xlen(xlen);
-        self.disks.iter_mut().for_each(|d| d.set_xlen(xlen));
-        self.nets.iter_mut().for_each(|n| n.set_xlen(xlen));
-    }
-
     /// Fills the boot ROM (spec section 7, "Boot"). Hart 0 starts at `BOOT_ROM_BASE`, a
     /// stub that jumps to `entry` with a0 = its hart id, 0. On a machine with more harts
     /// the others start at [`PARK_PC`], a loop that waits in `wfi` until the hart's
@@ -226,23 +197,18 @@ impl Bus {
     /// A one-hart machine's ROM has only the stub.
     ///
     /// The entry point is the doubleword at 0x1010 ([`boot::BOOT_ENTRY_ADDR`]), which
-    /// an RV64 machine's code reads with `ld` (`lw` would sign-extend an entry point at
-    /// or above 2 GiB); an RV32 machine's reads its low word with `lw`.
+    /// the code reads with `ld` (`lw` would sign-extend an entry point at or above
+    /// 2 GiB).
     pub fn set_boot_entry(&mut self, entry: u64) {
-        let load_entry = match self.xlen {
-            Xlen::Rv32 => 0x0102_a283, // lw t0, 16(t0)
-            Xlen::Rv64 => 0x0102_b283, // ld t0, 16(t0)
-        };
+        let load_entry = 0x0102_b283; // ld t0, 16(t0)
         let mut words = vec![
-            0x0000_0297,  // 0x1000: auipc t0, 0
-            load_entry,   //         ld    t0, 16(t0)     the entry point
-            0x0000_0513,  //         li    a0, 0
-            0x0002_8067,  //         jr    t0
-            entry as u32, // 0x1010: the entry point (its low word on RV64)
+            0x0000_0297,          // 0x1000: auipc t0, 0
+            load_entry,           //         ld    t0, 16(t0)     the entry point
+            0x0000_0513,          //         li    a0, 0
+            0x0002_8067,          //         jr    t0
+            entry as u32,         // 0x1010: the entry point, its low word
+            (entry >> 32) as u32, // 0x1014: and its high word
         ];
-        if self.xlen == Xlen::Rv64 {
-            words.push((entry >> 32) as u32); // 0x1014: its high word
-        }
         if self.harts() > 1 {
             words.resize(((PARK_PC - BOOT_ROM_BASE) / 4) as usize, 0);
             words.extend([
@@ -267,12 +233,11 @@ impl Bus {
 
     /// Fills the boot ROM to boot from disk 0 (spec section 7, "Boot from disk"): the
     /// stub and the park loop of [`Bus::set_boot_entry`], with the entry point at the
-    /// disk loader ([`boot::DISK_BOOT_PC`]) of the machine's width, which this adds to
-    /// the ROM.
+    /// disk loader ([`boot::DISK_BOOT_PC`]), which this adds to the ROM.
     pub fn set_disk_boot(&mut self) {
         self.set_boot_entry(boot::DISK_BOOT_PC);
         self.rom.resize((boot::DISK_BOOT_PC - BOOT_ROM_BASE) as usize, 0);
-        self.rom.extend(boot::disk_loader(self.xlen));
+        self.rom.extend(boot::disk_loader());
     }
 
     /// Fills the boot ROM to start firmware (spec section 7, "Firmware"): the stub and
@@ -290,10 +255,8 @@ impl Bus {
     ///         jr    t0
     /// ```
     ///
-    /// The `fw_dynamic_info` is QEMU's, six doublewords ([`firmware::Handoff`]). RV64
-    /// only, as firmware is.
+    /// The `fw_dynamic_info` is QEMU's, six doublewords ([`firmware::Handoff`]).
     pub fn set_firmware_boot(&mut self, handoff: &firmware::Handoff) {
-        assert_eq!(self.xlen, Xlen::Rv64, "firmware runs on RV64 machines");
         self.set_boot_entry(boot::FW_HANDOFF_PC);
         let at = |addr: u64| (addr - BOOT_ROM_BASE) as usize;
         let put = |rom: &mut Vec<u8>, addr: u64, bytes: &[u8]| {
@@ -553,14 +516,9 @@ impl Bus {
             return Ok(());
         }
         // The ROM's entry point, its one writable location: a bootloader points the
-        // harts it has not started yet at its kernel. Written whole, a doubleword on
-        // RV64 (the word on RV32): no halves, so a hart woken in between never jumps to
-        // half of one.
-        let entry_size = match self.xlen {
-            Xlen::Rv32 => 4,
-            Xlen::Rv64 => 8,
-        };
-        if addr == boot::BOOT_ENTRY_ADDR && size == entry_size {
+        // harts it has not started yet at its kernel. Written whole, a doubleword: no
+        // halves, so a hart woken in between never jumps to half of one.
+        if addr == boot::BOOT_ENTRY_ADDR && size == 8 {
             let at = (boot::BOOT_ENTRY_ADDR - BOOT_ROM_BASE) as usize;
             if self.rom.len() < at + size as usize {
                 self.rom.resize(at + size as usize, 0);
@@ -701,7 +659,7 @@ mod tests {
     use super::*;
     use crate::block::{self, MemDisk, SECTOR_SIZE};
     use crate::net::{Hub, MacAddr, NetBackend};
-    use crate::sysinfo::{self, DEV_ENTRY_SIZE, DEV_TABLE};
+    use crate::sysinfo::{self, DEV_BASE, DEV_ENTRY_SIZE, DEV_IRQ, DEV_SIZE, DEV_TABLE, DEV_TYPE};
     use std::sync::{Arc, Mutex};
 
     fn small_bus() -> Bus {
@@ -729,7 +687,8 @@ mod tests {
     }
 
     #[test]
-    fn the_rom_has_one_writable_word() {
+    fn the_rom_has_one_writable_doubleword() {
+        let entry = boot::BOOT_ENTRY_ADDR;
         for harts in [1, 2] {
             let config = MachineConfig {
                 harts,
@@ -738,25 +697,28 @@ mod tests {
             let mut bus = Bus::new(&config, Vec::new());
             bus.set_boot_entry(RAM_BASE);
             let stub = bus.peek(BOOT_ROM_BASE);
-            // The entry word takes 32-bit stores; nothing else in the ROM does.
-            assert_eq!(bus.write(BOOT_ROM_BASE + 16, 4, 0x8000_1234), Ok(()));
-            assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(0x8000_1234));
-            assert_eq!(bus.read(BOOT_ROM_BASE + 16, 4), Ok(0x8000_1234));
+            // The entry doubleword takes 8-byte stores; nothing else in the ROM does.
+            assert_eq!(bus.write(entry, 8, 0x1_8000_1234), Ok(()));
+            assert_eq!(bus.read(entry, 8), Ok(0x1_8000_1234));
+            assert_eq!(bus.peek(entry), Some(0x8000_1234));
+            assert_eq!(bus.peek(entry + 4), Some(1));
             for (addr, size) in [
-                (BOOT_ROM_BASE + 16, 1),
-                (BOOT_ROM_BASE + 16, 2),
-                (BOOT_ROM_BASE, 4),
+                (entry, 1),
+                (entry, 2),
+                (entry, 4),
+                (entry + 4, 4),
+                (BOOT_ROM_BASE, 8),
             ] {
                 assert_eq!(bus.write(addr, size, 0), Err(BusFault), "{addr:#x}/{size}");
             }
-            assert_eq!(bus.write(BOOT_ROM_BASE + 0x200, 4, 0), Err(BusFault));
+            assert_eq!(bus.write(BOOT_ROM_BASE + 0x200, 8, 0), Err(BusFault));
             assert_eq!(bus.peek(BOOT_ROM_BASE), stub);
-            assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(0x8000_1234));
+            assert_eq!(bus.read(entry, 8), Ok(0x1_8000_1234));
         }
-        // On an empty ROM too (no program yet): the word is there to write.
+        // On an empty ROM too (no program yet): the doubleword is there to write.
         let mut bus = Bus::new(&MachineConfig::with_ram(4096), Vec::new());
-        assert_eq!(bus.write(BOOT_ROM_BASE + 16, 4, 7), Ok(()));
-        assert_eq!(bus.peek(BOOT_ROM_BASE + 16), Some(7));
+        assert_eq!(bus.write(entry, 8, 7), Ok(()));
+        assert_eq!(bus.read(entry, 8), Ok(7));
     }
 
     #[test]
@@ -771,7 +733,7 @@ mod tests {
             Some(0xf140_22f3),
             "csrr t0, mhartid"
         );
-        let loader = boot::disk_loader(Xlen::Rv32);
+        let loader = boot::disk_loader();
         let at = (boot::DISK_BOOT_PC - BOOT_ROM_BASE) as usize;
         assert_eq!(&bus.rom[at..], &loader[..]);
         assert!(
@@ -883,10 +845,10 @@ mod tests {
         for (i, d) in table.iter().enumerate() {
             // The entry as software reads it.
             let at = |field: u32| SYSINFO_BASE + u64::from(DEV_TABLE + i as u32 * DEV_ENTRY_SIZE + field);
-            assert_eq!(bus.read(at(0), 4), Ok(d.kind as u64));
-            assert_eq!(bus.read(at(4), 4), Ok(d.base));
-            assert_eq!(bus.read(at(8), 4), Ok(d.size));
-            assert_eq!(bus.read(at(12), 4), Ok(d.irq.into()));
+            assert_eq!(bus.read(at(DEV_TYPE), 4), Ok(d.kind as u64));
+            assert_eq!(bus.read(at(DEV_BASE), 8), Ok(d.base));
+            assert_eq!(bus.read(at(DEV_SIZE), 8), Ok(d.size));
+            assert_eq!(bus.read(at(DEV_IRQ), 4), Ok(d.irq.into()));
 
             // Both ends of the range are decoded (UART registers are bytes, the rest words),
             // and the byte past it is not this device.
@@ -1000,8 +962,8 @@ mod tests {
         // at RAM_BASE + 64.
         let frame: Vec<u8> = (0..20).collect();
         bus.ram[64..84].copy_from_slice(&frame);
-        bus.ram[..4].copy_from_slice(&((RAM_BASE + 64) as u32).to_le_bytes());
-        bus.ram[4..6].copy_from_slice(&20u16.to_le_bytes());
+        bus.ram[..8].copy_from_slice(&(RAM_BASE + 64).to_le_bytes());
+        bus.ram[8..10].copy_from_slice(&20u16.to_le_bytes());
         bus.write(card1 + u64::from(net::REG_TX_BASE), 4, RAM_BASE)
             .unwrap();
         bus.write(card1 + u64::from(net::REG_TX_SIZE), 4, 1).unwrap();
@@ -1262,22 +1224,21 @@ mod tests {
         assert_eq!(bus.device_deadline(), None, "no interrupt, nothing to wake");
     }
 
-    /// The cursor plane through the bus, on an RV32 and an RV64 machine alike:
-    /// `FB_CURSOR_ADDR` is 64-bit at both widths (whole with an 8-byte access, or by its
-    /// halves), the other cursor registers 32-bit; what is written shows from the
-    /// vertical blank of a tick on, blended over the frame, and changes no frame.
+    /// The cursor plane through the bus: `FB_CURSOR_ADDR` is 64-bit (whole with an
+    /// 8-byte access, or by its halves), the other cursor registers 32-bit; what is
+    /// written shows from the vertical blank of a tick on, blended over the frame, and
+    /// changes no frame.
     #[test]
-    fn cursor_plane_on_the_bus_at_both_widths() {
+    fn cursor_plane_on_the_bus() {
         use crate::framebuffer as fb;
-        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+        {
             let config = MachineConfig {
                 nominal_hz: 6000, // 100 ticks a frame
-                xlen,
                 ..MachineConfig::with_ram(1 << 20)
             };
             let mut bus = Bus::new(&config, Vec::new());
             let reg = |r: u32| FB_CTRL_BASE + u64::from(r);
-            assert_eq!(bus.read(reg(fb::REG_VERSION), 4), Ok(2), "{xlen:?}");
+            assert_eq!(bus.read(reg(fb::REG_VERSION), 4), Ok(2));
             assert_eq!(bus.read(reg(fb::REG_CURSOR_SIZE), 4), Ok(64 | 64 << 16));
             let (a, b) = (RAM_BASE + 0x4000, RAM_BASE + 0x8000);
             bus.write(a, 4, 0xff00_00ff).unwrap(); // image A's (0, 0): opaque blue
@@ -1286,15 +1247,11 @@ mod tests {
             bus.write(reg(fb::REG_CTRL), 4, 1).unwrap();
 
             bus.write(reg(fb::REG_CURSOR_ADDR), 8, a).unwrap();
-            assert_eq!(bus.read(reg(fb::REG_CURSOR_ADDR), 8), Ok(a), "{xlen:?}");
+            assert_eq!(bus.read(reg(fb::REG_CURSOR_ADDR), 8), Ok(a));
             bus.write(reg(fb::REG_CURSOR_POS), 4, 4 | 5 << 16).unwrap();
             bus.write(reg(fb::REG_CURSOR_CTRL), 4, 1).unwrap();
-            assert_eq!(bus.read(reg(fb::REG_CURSOR_POS), 8), Err(BusFault), "{xlen:?}");
-            assert_eq!(
-                bus.write(reg(fb::REG_CURSOR_HOT), 8, 0),
-                Err(BusFault),
-                "{xlen:?}"
-            );
+            assert_eq!(bus.read(reg(fb::REG_CURSOR_POS), 8), Err(BusFault));
+            assert_eq!(bus.write(reg(fb::REG_CURSOR_HOT), 8, 0), Err(BusFault));
             assert_eq!(
                 bus.frame().pixel(4, 5),
                 0x12_3456,
@@ -1303,18 +1260,18 @@ mod tests {
             for _ in 0..100 {
                 bus.tick();
             }
-            assert_eq!(bus.frame().pixel(4, 5), 0x00_00ff, "{xlen:?}: image A");
+            assert_eq!(bus.frame().pixel(4, 5), 0x00_00ff, "image A");
             assert_eq!(bus.frame().pixel(5, 5), 0x00_0000, "a clear pixel over black");
-            // B by its halves, as an RV32 driver writes it, low half first.
+            // B by its halves, low half first.
             bus.write(reg(fb::REG_CURSOR_ADDR), 4, b & 0xffff_ffff).unwrap();
             bus.write(reg(fb::REG_CURSOR_ADDR + 4), 4, b >> 32).unwrap();
             assert_eq!(bus.read(reg(fb::REG_CURSOR_ADDR), 8), Ok(b));
             for _ in 0..100 {
                 bus.tick();
             }
-            assert_eq!(bus.frame().pixel(4, 5), 0x00_ff00, "{xlen:?}: image B");
+            assert_eq!(bus.frame().pixel(4, 5), 0x00_ff00, "image B");
             assert_eq!(bus.read(reg(fb::REG_STATUS), 4), Ok(0));
-            assert_eq!((bus.fb.cursor_updates, bus.fb.shown()), (2, 0), "{xlen:?}");
+            assert_eq!((bus.fb.cursor_updates, bus.fb.shown()), (2, 0));
         }
     }
 

@@ -2,72 +2,50 @@
 //! it runs on (RAM, clock, harts) and a table of the devices it has, so a kernel
 //! discovers its hardware instead of hard-coding it.
 //!
-//! Two layouts: **version 2**, which every RV64 machine presents, with 64-bit registers
-//! for the RAM base and size and 24-byte device entries whose base and size are 64-bit;
-//! and **version 1**, all 32-bit, which RV32 machines keep until RV32 is removed. The
-//! constants at the top of this module are version 1's, [`v2`]'s the new layout's.
+//! The layout is version 2's (spec section 9.5): 64-bit registers for the RAM base and
+//! size and for the firmware's reserved RAM, and 24-byte device entries whose base and
+//! size are 64-bit. (Version 1, all 32-bit, was RV32's, and went with it.)
 
 use crate::bus::{BusFault, RAM_BASE};
 use crate::config::MachineConfig;
 use crate::mmio::{self, Field};
-use excalibur::Xlen;
 
 /// "SYSI" when the register is read as big-endian hex: 53 59 53 49.
 pub const SYSINFO_MAGIC: u32 = 0x5359_5349;
-/// Version 1's layout (RV32 machines). A version changes only if existing registers
-/// change meaning or place; new registers and new device types do not need one.
-pub const SYSINFO_VERSION: u32 = 1;
+/// The layout's version, 2. A version changes only if existing registers change
+/// meaning or place; new registers and new device types do not need one.
+pub const SYSINFO_VERSION: u32 = 2;
 
-// Version 1's register offsets from the start of the block, all 32-bit.
+// Register offsets from the start of the block.
 pub const REG_MAGIC: u32 = 0x00;
 pub const REG_VERSION: u32 = 0x04;
+/// 64-bit.
 pub const REG_RAM_BASE: u32 = 0x08;
-pub const REG_RAM_SIZE: u32 = 0x0c;
-pub const REG_TIMEBASE_HZ: u32 = 0x10;
-pub const REG_CPU_HZ: u32 = 0x14;
-pub const REG_FLAGS: u32 = 0x18;
-pub const REG_DEV_COUNT: u32 = 0x1c;
+/// 64-bit.
+pub const REG_RAM_SIZE: u32 = 0x10;
+pub const REG_TIMEBASE_HZ: u32 = 0x18;
+pub const REG_CPU_HZ: u32 = 0x1c;
+pub const REG_FLAGS: u32 = 0x20;
+pub const REG_DEV_COUNT: u32 = 0x24;
 /// Number of harts; their `mhartid`s are 0 to this minus 1.
-pub const REG_HARTS: u32 = 0x20;
-/// First device table entry (both versions).
+pub const REG_HARTS: u32 = 0x28;
+/// 64-bit: where the RAM the firmware keeps for itself starts (spec section 7,
+/// "Firmware"), 0 without firmware.
+pub const REG_RESERVED_BASE: u32 = 0x30;
+/// 64-bit: its size, 0 without firmware.
+pub const REG_RESERVED_SIZE: u32 = 0x38;
+/// First device table entry.
 pub const DEV_TABLE: u32 = 0x40;
-/// Bytes per version 1 device table entry: type, base, size, irq.
-pub const DEV_ENTRY_SIZE: u32 = 16;
-/// Version 1 entries that fit in the 4 KiB block.
+/// Bytes per device table entry: type (+0), irq (+4), base (+8, 64-bit), size
+/// (+0x10, 64-bit).
+pub const DEV_ENTRY_SIZE: u32 = 24;
+/// The fields of a device table entry, as offsets into it.
+pub const DEV_TYPE: u32 = 0x00;
+pub const DEV_IRQ: u32 = 0x04;
+pub const DEV_BASE: u32 = 0x08;
+pub const DEV_SIZE: u32 = 0x10;
+/// Entries that fit in the 4 KiB block.
 pub const DEV_MAX: usize = ((0x1000 - DEV_TABLE) / DEV_ENTRY_SIZE) as usize;
-
-/// Version 2, the layout of RV64 machines (spec section 9.5): the RAM base and size
-/// are 64-bit, and so are each device entry's base and size.
-pub mod v2 {
-    use super::DEV_TABLE;
-
-    pub const VERSION: u32 = 2;
-    // `REG_MAGIC` and `REG_VERSION` are where version 1 has them.
-    /// 64-bit.
-    pub const REG_RAM_BASE: u32 = 0x08;
-    /// 64-bit.
-    pub const REG_RAM_SIZE: u32 = 0x10;
-    pub const REG_TIMEBASE_HZ: u32 = 0x18;
-    pub const REG_CPU_HZ: u32 = 0x1c;
-    pub const REG_FLAGS: u32 = 0x20;
-    pub const REG_DEV_COUNT: u32 = 0x24;
-    pub const REG_HARTS: u32 = 0x28;
-    /// 64-bit: where the RAM the firmware keeps for itself starts (spec section 7,
-    /// "Firmware"), 0 without firmware.
-    pub const REG_RESERVED_BASE: u32 = 0x30;
-    /// 64-bit: its size, 0 without firmware.
-    pub const REG_RESERVED_SIZE: u32 = 0x38;
-    /// Bytes per device table entry: type (+0), irq (+4), base (+8, 64-bit), size
-    /// (+0x10, 64-bit).
-    pub const DEV_ENTRY_SIZE: u32 = 24;
-    /// The fields of a device table entry, as offsets into it.
-    pub const DEV_TYPE: u32 = 0x00;
-    pub const DEV_IRQ: u32 = 0x04;
-    pub const DEV_BASE: u32 = 0x08;
-    pub const DEV_SIZE: u32 = 0x10;
-    /// Entries that fit in the 4 KiB block.
-    pub const DEV_MAX: usize = ((0x1000 - DEV_TABLE) / DEV_ENTRY_SIZE) as usize;
-}
 
 /// `SYS_FLAGS` bit 0: the clock is real time (`--clock`), not just nominal.
 pub const FLAG_REAL_TIME: u32 = 1 << 0;
@@ -118,18 +96,12 @@ pub struct Sysinfo {
     devices: Vec<DeviceEntry>,
     /// The RAM the firmware keeps, as (base, size): (0, 0) without firmware.
     reserved: (u64, u64),
-    /// Which layout the block presents: version 2 on RV64, 1 on RV32.
-    xlen: Xlen,
 }
 
 impl Sysinfo {
-    /// `config` must be valid (see [`MachineConfig::validate`]). The layout is the one
-    /// of `config.xlen`'s machines.
+    /// `config` must be valid (see [`MachineConfig::validate`]).
     pub fn new(config: &MachineConfig, devices: Vec<DeviceEntry>) -> Self {
-        assert!(
-            devices.len() <= v2::DEV_MAX,
-            "too many devices for the sysinfo table"
-        );
+        assert!(devices.len() <= DEV_MAX, "too many devices for the sysinfo table");
         Sysinfo {
             ram_size: config.ram_size as u64,
             cpu_hz: config.cpu_hz(),
@@ -141,12 +113,11 @@ impl Sysinfo {
             harts: u32::try_from(config.harts).expect("a valid hart count fits in 32 bits"),
             devices,
             reserved: (0, 0),
-            xlen: config.xlen,
         }
     }
 
     /// The RAM the machine's firmware keeps for itself, `size` bytes from `base`
-    /// (`SYS_RESERVED_BASE`, `SYS_RESERVED_SIZE`, version 2 only): set when the
+    /// (`SYS_RESERVED_BASE`, `SYS_RESERVED_SIZE`): set when the
     /// firmware is loaded ([`crate::Machine::load_elf`] with `--bios`).
     pub fn set_reserved(&mut self, base: u64, size: u64) {
         self.reserved = (base, size);
@@ -157,89 +128,39 @@ impl Sysinfo {
         self.reserved
     }
 
-    /// Presents the layout of an `xlen` machine (an ELF64 program made the machine
-    /// RV64, [`crate::Machine::load_elf`]).
-    pub fn set_xlen(&mut self, xlen: Xlen) {
-        self.xlen = xlen;
-    }
-
     pub fn devices(&self) -> &[DeviceEntry] {
         &self.devices
     }
 
-    /// The version this block presents.
-    pub fn version(&self) -> u32 {
-        match self.xlen {
-            Xlen::Rv32 => SYSINFO_VERSION,
-            Xlen::Rv64 => v2::VERSION,
-        }
-    }
-
-    /// What `off` holds in this block's layout, with the register's value.
+    /// What `off` holds, with the register's value.
     fn field(&self, off: u32) -> Field<u64> {
-        match self.xlen {
-            Xlen::Rv32 => self.field_v1(off),
-            Xlen::Rv64 => self.field_v2(off),
-        }
-    }
-
-    fn field_v1(&self, off: u32) -> Field<u64> {
         let word = match off {
             REG_MAGIC => SYSINFO_MAGIC,
             REG_VERSION => SYSINFO_VERSION,
-            REG_RAM_BASE => RAM_BASE as u32,
-            // At most 2 GiB on RV32.
-            REG_RAM_SIZE => self.ram_size as u32,
+            REG_RAM_BASE => return Field::Low(RAM_BASE),
+            o if o == REG_RAM_BASE + 4 => return Field::High(RAM_BASE),
+            REG_RAM_SIZE => return Field::Low(self.ram_size),
+            o if o == REG_RAM_SIZE + 4 => return Field::High(self.ram_size),
             // One instruction = one cycle = one mtime tick: both run at the same rate.
             REG_TIMEBASE_HZ | REG_CPU_HZ => self.cpu_hz,
             REG_FLAGS => self.flags,
             REG_DEV_COUNT => self.devices.len() as u32,
             REG_HARTS => self.harts,
+            REG_RESERVED_BASE => return Field::Low(self.reserved.0),
+            o if o == REG_RESERVED_BASE + 4 => return Field::High(self.reserved.0),
+            REG_RESERVED_SIZE => return Field::Low(self.reserved.1),
+            o if o == REG_RESERVED_SIZE + 4 => return Field::High(self.reserved.1),
             o if o >= DEV_TABLE => {
                 let index = ((o - DEV_TABLE) / DEV_ENTRY_SIZE) as usize;
                 let Some(d) = self.devices.get(index) else {
                     return Field::Unused;
                 };
-                // Every device is below 4 GiB.
-                match (o - DEV_TABLE) % DEV_ENTRY_SIZE {
-                    0 => d.kind as u32,
-                    4 => d.base as u32,
-                    8 => d.size as u32,
-                    _ => d.irq,
-                }
-            }
-            _ => return Field::Unused,
-        };
-        Field::Word(word.into())
-    }
-
-    fn field_v2(&self, off: u32) -> Field<u64> {
-        let word = match off {
-            REG_MAGIC => SYSINFO_MAGIC,
-            REG_VERSION => v2::VERSION,
-            v2::REG_RAM_BASE => return Field::Low(RAM_BASE),
-            o if o == v2::REG_RAM_BASE + 4 => return Field::High(RAM_BASE),
-            v2::REG_RAM_SIZE => return Field::Low(self.ram_size),
-            o if o == v2::REG_RAM_SIZE + 4 => return Field::High(self.ram_size),
-            v2::REG_TIMEBASE_HZ | v2::REG_CPU_HZ => self.cpu_hz,
-            v2::REG_FLAGS => self.flags,
-            v2::REG_DEV_COUNT => self.devices.len() as u32,
-            v2::REG_HARTS => self.harts,
-            v2::REG_RESERVED_BASE => return Field::Low(self.reserved.0),
-            o if o == v2::REG_RESERVED_BASE + 4 => return Field::High(self.reserved.0),
-            v2::REG_RESERVED_SIZE => return Field::Low(self.reserved.1),
-            o if o == v2::REG_RESERVED_SIZE + 4 => return Field::High(self.reserved.1),
-            o if o >= DEV_TABLE => {
-                let index = ((o - DEV_TABLE) / v2::DEV_ENTRY_SIZE) as usize;
-                let Some(d) = self.devices.get(index) else {
-                    return Field::Unused;
-                };
-                return match (o - DEV_TABLE) % v2::DEV_ENTRY_SIZE {
-                    v2::DEV_TYPE => Field::Word(d.kind as u64),
-                    v2::DEV_IRQ => Field::Word(d.irq.into()),
-                    v2::DEV_BASE => Field::Low(d.base),
-                    f if f == v2::DEV_BASE + 4 => Field::High(d.base),
-                    v2::DEV_SIZE => Field::Low(d.size),
+                return match (o - DEV_TABLE) % DEV_ENTRY_SIZE {
+                    DEV_TYPE => Field::Word(d.kind as u64),
+                    DEV_IRQ => Field::Word(d.irq.into()),
+                    DEV_BASE => Field::Low(d.base),
+                    f if f == DEV_BASE + 4 => Field::High(d.base),
+                    DEV_SIZE => Field::Low(d.size),
                     _ => Field::High(d.size),
                 };
             }
@@ -251,7 +172,7 @@ impl Sysinfo {
     /// Reads a register, at the widths of spec section 9 ([`mmio::access`]). Unused
     /// offsets, and entries past the device count, read as 0.
     pub fn read(&self, off: u32, size: u32) -> Result<u64, BusFault> {
-        let access = mmio::access(off, size, self.xlen == Xlen::Rv64, |o| self.field(o))?;
+        let access = mmio::access(off, size, |o| self.field(o))?;
         Ok(access.read(|value| value))
     }
 
@@ -284,18 +205,11 @@ mod tests {
         ]
     }
 
-    fn rv64(config: MachineConfig) -> MachineConfig {
-        MachineConfig {
-            xlen: Xlen::Rv64,
-            ..config
-        }
-    }
-
     #[test]
     fn header_registers() {
         let s = Sysinfo::new(&MachineConfig::with_ram(64 * MIB), devices());
         assert_eq!(s.read(REG_MAGIC, 4), Ok(0x5359_5349));
-        assert_eq!(s.read(REG_VERSION, 4), Ok(1));
+        assert_eq!(s.read(REG_VERSION, 4), Ok(2));
         assert_eq!(s.read(REG_RAM_BASE, 4), Ok(0x8000_0000));
         assert_eq!(s.read(REG_RAM_SIZE, 4), Ok(0x0400_0000));
         assert_eq!(s.read(REG_TIMEBASE_HZ, 4), Ok(10_000_000));
@@ -303,11 +217,9 @@ mod tests {
         assert_eq!(s.read(REG_FLAGS, 4), Ok(0), "nominal clock");
         assert_eq!(s.read(REG_DEV_COUNT, 4), Ok(2));
         assert_eq!(s.read(REG_HARTS, 4), Ok(1));
-        for reserved in [0x24, 0x28, 0x3c] {
-            assert_eq!(s.read(reserved, 4), Ok(0));
-        }
-        // Version 1 has no 64-bit registers: no 8-byte reads.
-        assert_eq!(s.read(REG_RAM_BASE, 8), Err(BusFault));
+        assert_eq!(s.read(REG_RESERVED_BASE, 8), Ok(0), "no firmware");
+        assert_eq!(s.read(REG_RESERVED_SIZE, 8), Ok(0));
+        assert_eq!(s.read(0x2c, 4), Ok(0), "reserved");
     }
 
     #[test]
@@ -329,7 +241,7 @@ mod tests {
             ..MachineConfig::default()
         };
         let s = Sysinfo::new(&config, Vec::new());
-        assert_eq!(s.read(REG_RAM_SIZE, 4), Ok(0x8000_0000));
+        assert_eq!(s.read(REG_RAM_SIZE, 8), Ok(0x8000_0000));
         assert_eq!(s.read(REG_TIMEBASE_HZ, 4), Ok(1_500_000));
         assert_eq!(s.read(REG_CPU_HZ, 4), Ok(1_500_000));
         assert_eq!(s.read(REG_FLAGS, 4), Ok(FLAG_REAL_TIME.into()));
@@ -349,24 +261,6 @@ mod tests {
     }
 
     #[test]
-    fn device_table_entries() {
-        let s = Sysinfo::new(&MachineConfig::default(), devices());
-        let entry = |i: u32, field: u32| s.read(DEV_TABLE + i * DEV_ENTRY_SIZE + field, 4).unwrap();
-        assert_eq!(
-            [entry(0, 0), entry(0, 4), entry(0, 8), entry(0, 12)],
-            [3, 0x1000_0000, 0x100, 1]
-        );
-        assert_eq!(
-            [entry(1, 0), entry(1, 4), entry(1, 8), entry(1, 12)],
-            [1, 0x0200_0000, 0x1_0000, 0]
-        );
-        // Past the count, and up to the end of the block: zeros.
-        assert_eq!([entry(2, 0), entry(2, 4)], [0, 0]);
-        assert_eq!(s.read(0xffc, 4), Ok(0));
-        assert_eq!(DEV_MAX, 252);
-    }
-
-    #[test]
     fn read_only_and_word_only() {
         let s = Sysinfo::new(&MachineConfig::default(), devices());
         for off in [REG_MAGIC, REG_RAM_SIZE, REG_CPU_HZ, REG_DEV_COUNT, DEV_TABLE] {
@@ -378,32 +272,32 @@ mod tests {
         assert_eq!(s.read(REG_MAGIC, 2), Err(BusFault));
         assert_eq!(s.write(REG_MAGIC, 1, 0), Err(BusFault));
         assert_eq!(s.write(REG_MAGIC, 2, 0), Err(BusFault));
-        assert_eq!(s.write(REG_RAM_BASE, 8, 0), Err(BusFault));
+        assert_eq!(s.write(REG_MAGIC, 8, 0), Err(BusFault));
     }
 
     #[test]
     fn version_2_header() {
-        let config = rv64(MachineConfig {
+        let config = MachineConfig {
             ram_size: 0x100_0000_0000,
             clock_hz: Some(1_500_000),
             harts: 3,
             ..MachineConfig::default()
-        });
+        };
         let s = Sysinfo::new(&config, devices());
         assert_eq!(s.read(REG_MAGIC, 4), Ok(0x5359_5349));
         assert_eq!(s.read(REG_VERSION, 4), Ok(2));
         // The 64-bit registers, whole and by halves.
-        assert_eq!(s.read(v2::REG_RAM_BASE, 8), Ok(0x8000_0000));
-        assert_eq!(s.read(v2::REG_RAM_BASE, 4), Ok(0x8000_0000));
-        assert_eq!(s.read(v2::REG_RAM_BASE + 4, 4), Ok(0));
-        assert_eq!(s.read(v2::REG_RAM_SIZE, 8), Ok(0x100_0000_0000), "1 TiB");
-        assert_eq!(s.read(v2::REG_RAM_SIZE, 4), Ok(0));
-        assert_eq!(s.read(v2::REG_RAM_SIZE + 4, 4), Ok(0x100));
-        assert_eq!(s.read(v2::REG_TIMEBASE_HZ, 4), Ok(1_500_000));
-        assert_eq!(s.read(v2::REG_CPU_HZ, 4), Ok(1_500_000));
-        assert_eq!(s.read(v2::REG_FLAGS, 4), Ok(FLAG_REAL_TIME.into()));
-        assert_eq!(s.read(v2::REG_DEV_COUNT, 4), Ok(2));
-        assert_eq!(s.read(v2::REG_HARTS, 4), Ok(3));
+        assert_eq!(s.read(REG_RAM_BASE, 8), Ok(0x8000_0000));
+        assert_eq!(s.read(REG_RAM_BASE, 4), Ok(0x8000_0000));
+        assert_eq!(s.read(REG_RAM_BASE + 4, 4), Ok(0));
+        assert_eq!(s.read(REG_RAM_SIZE, 8), Ok(0x100_0000_0000), "1 TiB");
+        assert_eq!(s.read(REG_RAM_SIZE, 4), Ok(0));
+        assert_eq!(s.read(REG_RAM_SIZE + 4, 4), Ok(0x100));
+        assert_eq!(s.read(REG_TIMEBASE_HZ, 4), Ok(1_500_000));
+        assert_eq!(s.read(REG_CPU_HZ, 4), Ok(1_500_000));
+        assert_eq!(s.read(REG_FLAGS, 4), Ok(FLAG_REAL_TIME.into()));
+        assert_eq!(s.read(REG_DEV_COUNT, 4), Ok(2));
+        assert_eq!(s.read(REG_HARTS, 4), Ok(3));
         for reserved in [0x2c, 0x30, 0x3c] {
             assert_eq!(s.read(reserved, 4), Ok(0));
         }
@@ -414,12 +308,12 @@ mod tests {
         );
         // 32-bit registers take no 8-byte reads, alone or in pairs.
         assert_eq!(s.read(REG_MAGIC, 8), Err(BusFault));
-        assert_eq!(s.read(v2::REG_TIMEBASE_HZ, 8), Err(BusFault));
-        assert_eq!(s.read(v2::REG_HARTS, 8), Err(BusFault), "harts and reserved");
-        assert_eq!(s.read(v2::REG_RAM_BASE, 2), Err(BusFault));
+        assert_eq!(s.read(REG_TIMEBASE_HZ, 8), Err(BusFault));
+        assert_eq!(s.read(REG_HARTS, 8), Err(BusFault), "harts and reserved");
+        assert_eq!(s.read(REG_RAM_BASE, 2), Err(BusFault));
         // Read-only, at the widths it takes.
-        assert_eq!(s.write(v2::REG_RAM_SIZE, 8, 0), Ok(()));
-        assert_eq!(s.read(v2::REG_RAM_SIZE, 8), Ok(0x100_0000_0000));
+        assert_eq!(s.write(REG_RAM_SIZE, 8, 0), Ok(()));
+        assert_eq!(s.read(REG_RAM_SIZE, 8), Ok(0x100_0000_0000));
         assert_eq!(s.write(REG_MAGIC, 8, 0), Err(BusFault));
     }
 
@@ -428,8 +322,8 @@ mod tests {
         let mut devs = devices();
         devs[0].base = 0x12_3456_7000;
         devs[0].size = 0x1_0000_0000;
-        let s = Sysinfo::new(&rv64(MachineConfig::default()), devs);
-        let at = |i: u32, field: u32| DEV_TABLE + i * v2::DEV_ENTRY_SIZE + field;
+        let s = Sysinfo::new(&MachineConfig::default(), devs);
+        let at = |i: u32, field: u32| DEV_TABLE + i * DEV_ENTRY_SIZE + field;
         assert_eq!(s.read(at(0, 0x00), 4), Ok(DeviceType::Uart as u64));
         assert_eq!(s.read(at(0, 0x04), 4), Ok(1), "irq");
         assert_eq!(s.read(at(0, 0x08), 8), Ok(0x12_3456_7000));
@@ -445,15 +339,6 @@ mod tests {
         // Past the count: zeros, at either width.
         assert_eq!(s.read(at(2, 0x08), 8), Ok(0));
         assert_eq!(s.read(0xff8, 8), Ok(0));
-        assert_eq!(v2::DEV_MAX, 168);
-    }
-
-    #[test]
-    fn the_layout_follows_the_machines_width() {
-        let mut s = Sysinfo::new(&MachineConfig::default(), devices());
-        assert_eq!(s.version(), 1);
-        s.set_xlen(Xlen::Rv64);
-        assert_eq!(s.read(REG_VERSION, 4), Ok(2));
-        assert_eq!(s.read(v2::REG_RAM_SIZE, 8), Ok(4 * MIB as u64));
+        assert_eq!(DEV_MAX, 168);
     }
 }

@@ -23,10 +23,9 @@
 //! Like the block device, every address is physical, every buffer must lie in RAM, and
 //! a bad descriptor is an error status for the program, never a host panic.
 //!
-//! Two register layouts, as for the block device: **version 2**, which RV64 machines
-//! present, with 64-bit ring bases and 16-byte descriptors holding a 64-bit address
-//! ([`v2`]); and **version 1**, all 32-bit with 8-byte descriptors, which RV32 machines
-//! keep (the constants at the top of this module).
+//! The registers are version 2's: 64-bit ring bases, and 16-byte descriptors holding a
+//! 64-bit address. (Version 1, all 32-bit with 8-byte descriptors, was RV32's, and went
+//! with it.)
 //!
 //! Where frames go is a [`NetBackend`], chosen per card by whoever builds the machine: a
 //! port of an in-process [`Hub`] (tests; two machines on one hub), a NAT
@@ -44,7 +43,6 @@ pub use pcap::{
 
 use crate::bus::{BusFault, RAM_BASE};
 use crate::mmio::{self, Field};
-use excalibur::Xlen;
 use std::fmt;
 use std::io;
 
@@ -56,8 +54,11 @@ pub const MAX_FRAME: usize = 1514;
 
 /// Largest ring, in descriptors.
 pub const MAX_RING: u32 = 1024;
-/// Bytes per version 1 descriptor: address (u32), length (u16), status (u16).
-pub const DESC_SIZE: u32 = 8;
+/// Bytes per descriptor: address (u64), length (u16), status (u16), reserved (u32). A
+/// ring's base is a multiple of it.
+pub const DESC_SIZE: u32 = 16;
+/// Where a descriptor's length field is; the status follows it.
+const DESC_LEN_AT: usize = 8;
 
 /// Steps of the machine between two polls of the backend for received frames.
 pub const POLL_STEPS: u32 = 256;
@@ -65,8 +66,8 @@ pub const POLL_STEPS: u32 = 256;
 /// cannot stall the machine. The rest wait in the backend (which bounds its own queue).
 pub const POLL_BUDGET: usize = 64;
 
-// Register offsets from the start of a card's page: version 1's, all 32-bit. The ones
-// up to `REG_RX_DROPPED` are version 2's too.
+// Register offsets from the start of a card's page (spec section 9.8). The ring bases
+// are 64-bit, the others 32-bit.
 pub const REG_MAC_LO: u32 = 0x00;
 pub const REG_MAC_HI: u32 = 0x04;
 pub const REG_STATUS: u32 = 0x08;
@@ -74,32 +75,16 @@ pub const REG_ERROR: u32 = 0x0c;
 pub const REG_IRQ_ENABLE: u32 = 0x10;
 pub const REG_IRQ_STATUS: u32 = 0x14;
 pub const REG_RX_DROPPED: u32 = 0x18;
+/// 64-bit.
 pub const REG_TX_BASE: u32 = 0x20;
-pub const REG_TX_SIZE: u32 = 0x24;
-pub const REG_TX_HEAD: u32 = 0x28;
-pub const REG_TX_TAIL: u32 = 0x2c;
-pub const REG_RX_BASE: u32 = 0x30;
-pub const REG_RX_SIZE: u32 = 0x34;
-pub const REG_RX_HEAD: u32 = 0x38;
-pub const REG_RX_TAIL: u32 = 0x3c;
-
-/// Version 2 (RV64 machines, spec section 9.8): the ring registers' offsets, and the
-/// 16-byte descriptor.
-pub mod v2 {
-    /// 64-bit.
-    pub const REG_TX_BASE: u32 = 0x20;
-    pub const REG_TX_SIZE: u32 = 0x28;
-    pub const REG_TX_HEAD: u32 = 0x2c;
-    pub const REG_TX_TAIL: u32 = 0x30;
-    /// 64-bit.
-    pub const REG_RX_BASE: u32 = 0x38;
-    pub const REG_RX_SIZE: u32 = 0x40;
-    pub const REG_RX_HEAD: u32 = 0x44;
-    pub const REG_RX_TAIL: u32 = 0x48;
-    /// Bytes per descriptor: address (u64), length (u16), status (u16), reserved (u32).
-    /// A ring's base is a multiple of it.
-    pub const DESC_SIZE: u32 = 16;
-}
+pub const REG_TX_SIZE: u32 = 0x28;
+pub const REG_TX_HEAD: u32 = 0x2c;
+pub const REG_TX_TAIL: u32 = 0x30;
+/// 64-bit.
+pub const REG_RX_BASE: u32 = 0x38;
+pub const REG_RX_SIZE: u32 = 0x40;
+pub const REG_RX_HEAD: u32 = 0x44;
+pub const REG_RX_TAIL: u32 = 0x48;
 
 /// `NET_STATUS` bit 0: the link is up (the backend can carry frames).
 pub const STATUS_LINK_UP: u32 = 1 << 0;
@@ -126,7 +111,7 @@ pub mod error {
     /// A descriptor the card needed is not in RAM (`BASE` is wrong). Transmit stops at
     /// it; a received frame is dropped.
     pub const BAD_RING: u32 = 3;
-    /// Version 2: a `BASE` that is not a multiple of 16 (the descriptor size); the
+    /// A `BASE` that is not a multiple of 16 (the descriptor size); the
     /// ring's size became 0.
     pub const BAD_BASE: u32 = 4;
 }
@@ -240,7 +225,6 @@ pub trait NetBackend: Send {
 /// One descriptor ring's registers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Ring {
-    /// 32 bits in version 1.
     base: u64,
     /// 0 (no ring) or a power of two up to `MAX_RING`.
     size: u32,
@@ -256,10 +240,9 @@ impl Ring {
 
     /// Address of the descriptor for counter `n`, if it is one (a base near 2^64 may
     /// put it past the top of the address space).
-    fn desc(&self, n: u32, layout: Layout) -> Option<u64> {
+    fn desc(&self, n: u32) -> Option<u64> {
         let slot = n & self.size.wrapping_sub(1);
-        self.base
-            .checked_add(u64::from(slot) * u64::from(layout.desc_size))
+        self.base.checked_add(u64::from(slot) * u64::from(DESC_SIZE))
     }
 }
 
@@ -279,45 +262,17 @@ enum Reg {
     Tail(bool),
 }
 
-/// Where a descriptor's fields are: the version's descriptor format.
-#[derive(Debug, Clone, Copy)]
-struct Layout {
-    desc_size: u32,
-    /// Bytes of the address field, at +0.
-    addr_size: usize,
-    /// Offset of the length field; the status follows it.
-    len_at: usize,
+/// A descriptor's address and length fields.
+fn read_desc(d: &[u8]) -> (u64, u16) {
+    let addr = u64::from_le_bytes(d[..8].try_into().unwrap());
+    let len = u16::from_le_bytes([d[DESC_LEN_AT], d[DESC_LEN_AT + 1]]);
+    (addr, len)
 }
 
-impl Layout {
-    fn of(xlen: Xlen) -> Layout {
-        match xlen {
-            Xlen::Rv32 => Layout {
-                desc_size: DESC_SIZE,
-                addr_size: 4,
-                len_at: 4,
-            },
-            Xlen::Rv64 => Layout {
-                desc_size: v2::DESC_SIZE,
-                addr_size: 8,
-                len_at: 8,
-            },
-        }
-    }
-
-    /// A descriptor's address and length fields.
-    fn read(&self, d: &[u8]) -> (u64, u16) {
-        let mut addr = [0; 8];
-        addr[..self.addr_size].copy_from_slice(&d[..self.addr_size]);
-        let len = u16::from_le_bytes([d[self.len_at], d[self.len_at + 1]]);
-        (u64::from_le_bytes(addr), len)
-    }
-
-    /// Writes a descriptor's length and status fields (the rest is left alone).
-    fn write_result(&self, d: &mut [u8], len: u16, st: u16) {
-        d[self.len_at..self.len_at + 2].copy_from_slice(&len.to_le_bytes());
-        d[self.len_at + 2..self.len_at + 4].copy_from_slice(&st.to_le_bytes());
-    }
+/// Writes a descriptor's length and status fields (the rest is left alone).
+fn write_desc_result(d: &mut [u8], len: u16, st: u16) {
+    d[DESC_LEN_AT..DESC_LEN_AT + 2].copy_from_slice(&len.to_le_bytes());
+    d[DESC_LEN_AT + 2..DESC_LEN_AT + 4].copy_from_slice(&st.to_le_bytes());
 }
 
 /// One card: the registers of spec section 9.8 in front of a backend.
@@ -332,8 +287,6 @@ pub struct NetDevice {
     rx: Ring,
     /// Steps until the next poll of the backend.
     countdown: u32,
-    /// Which registers and descriptors the card has: version 2 on RV64, 1 on RV32.
-    xlen: Xlen,
 }
 
 impl NetDevice {
@@ -348,14 +301,7 @@ impl NetDevice {
             tx: Ring::default(),
             rx: Ring::default(),
             countdown: POLL_STEPS,
-            xlen: Xlen::Rv32,
         }
-    }
-
-    /// Presents the registers and descriptors of an `xlen` machine's cards (spec section
-    /// 9.8). The registers keep their values.
-    pub fn set_xlen(&mut self, xlen: Xlen) {
-        self.xlen = xlen;
     }
 
     pub fn mac(&self) -> MacAddr {
@@ -420,16 +366,14 @@ impl NetDevice {
             self.rx_dropped = self.rx_dropped.wrapping_add(1);
             return;
         }
-        let layout = Layout::of(self.xlen);
-        let desc_addr = self.rx.desc(self.rx.head, layout);
-        let Some((desc_addr, desc)) =
-            desc_addr.and_then(|a| Some((a, ram_range(ram, a, layout.desc_size.into())?)))
+        let desc_addr = self.rx.desc(self.rx.head);
+        let Some((desc_addr, desc)) = desc_addr.and_then(|a| Some((a, ram_range(ram, a, DESC_SIZE.into())?)))
         else {
             self.ring_error(error::BAD_RING);
             self.rx_dropped = self.rx_dropped.wrapping_add(1);
             return;
         };
-        let (addr, cap) = layout.read(&ram[desc.clone()]);
+        let (addr, cap) = read_desc(&ram[desc.clone()]);
         let st = match ram_range(ram, addr, cap.into()) {
             None => status::BAD_DMA,
             Some(_) if (cap as usize) < frame.len() => status::TOO_SMALL,
@@ -442,9 +386,9 @@ impl NetDevice {
         if st != status::OK {
             self.rx_dropped = self.rx_dropped.wrapping_add(1);
         }
-        layout.write_result(&mut ram[desc], frame.len() as u16, st as u16);
+        write_desc_result(&mut ram[desc], frame.len() as u16, st as u16);
         // The length and status fields.
-        dma(desc_addr + layout.len_at as u64, 4);
+        dma(desc_addr + DESC_LEN_AT as u64, 4);
         self.rx.head = self.rx.head.wrapping_add(1);
         self.irq_status |= IRQ_RX;
     }
@@ -453,17 +397,16 @@ impl NetDevice {
     /// writes its length and status fields, a RAM write no hart made: `dma` hears of
     /// each one, as in [`NetDevice::poll`].
     fn transmit(&mut self, ram: &mut [u8], dma: &mut dyn FnMut(u64, u32)) {
-        let layout = Layout::of(self.xlen);
         let mut done = false;
         while self.tx.pending() != 0 {
-            let desc_addr = self.tx.desc(self.tx.head, layout);
+            let desc_addr = self.tx.desc(self.tx.head);
             let Some((desc_addr, desc)) =
-                desc_addr.and_then(|a| Some((a, ram_range(ram, a, layout.desc_size.into())?)))
+                desc_addr.and_then(|a| Some((a, ram_range(ram, a, DESC_SIZE.into())?)))
             else {
                 self.ring_error(error::BAD_RING);
                 break;
             };
-            let (addr, len) = layout.read(&ram[desc.clone()]);
+            let (addr, len) = read_desc(&ram[desc.clone()]);
             let st = if !(MIN_FRAME..=MAX_FRAME).contains(&(len as usize)) {
                 status::BAD_LENGTH
             } else {
@@ -481,9 +424,9 @@ impl NetDevice {
                     }
                 }
             };
-            layout.write_result(&mut ram[desc], len, st as u16);
+            write_desc_result(&mut ram[desc], len, st as u16);
             // The length and status fields.
-            dma(desc_addr + layout.len_at as u64, 4);
+            dma(desc_addr + DESC_LEN_AT as u64, 4);
             self.tx.head = self.tx.head.wrapping_add(1);
             done = true;
         }
@@ -498,7 +441,7 @@ impl NetDevice {
     }
 
     /// Writing a ring's `BASE` or `SIZE` starts it over: `HEAD` and `TAIL` go back to 0.
-    /// In version 2 a ring whose `BASE` is not a multiple of 16 has no descriptors.
+    /// A ring whose `BASE` is not a multiple of 16 has no descriptors.
     fn set_ring(&mut self, rx: bool, base: Option<u64>, size: Option<u32>) {
         let mut ring = if rx { self.rx } else { self.tx };
         if let Some(base) = base {
@@ -513,8 +456,7 @@ impl NetDevice {
                 0
             };
         }
-        let desc_size = Layout::of(self.xlen).desc_size;
-        if self.xlen == Xlen::Rv64 && !ring.base.is_multiple_of(desc_size.into()) {
+        if !ring.base.is_multiple_of(DESC_SIZE.into()) {
             // The register keeps what was written. Only the low bits count, so a base
             // written by halves is checked the same whichever half comes first.
             if base.is_some() || ring.size != 0 {
@@ -543,10 +485,10 @@ impl NetDevice {
         true
     }
 
-    /// What `off` holds in this card's layout.
+    /// What `off` holds.
     fn field(&self, off: u32) -> Field<Reg> {
         use Field::{High, Low, Unused, Word};
-        let common = match off {
+        match off {
             REG_MAC_LO => Word(Reg::MacLo),
             REG_MAC_HI => Word(Reg::MacHi),
             REG_STATUS => Word(Reg::Status),
@@ -554,36 +496,17 @@ impl NetDevice {
             REG_IRQ_ENABLE => Word(Reg::IrqEnable),
             REG_IRQ_STATUS => Word(Reg::IrqStatus),
             REG_RX_DROPPED => Word(Reg::RxDropped),
+            REG_TX_BASE => Low(Reg::Base(false)),
+            0x24 => High(Reg::Base(false)),
+            REG_TX_SIZE => Word(Reg::Size(false)),
+            REG_TX_HEAD => Word(Reg::Head(false)),
+            REG_TX_TAIL => Word(Reg::Tail(false)),
+            REG_RX_BASE => Low(Reg::Base(true)),
+            0x3c => High(Reg::Base(true)),
+            REG_RX_SIZE => Word(Reg::Size(true)),
+            REG_RX_HEAD => Word(Reg::Head(true)),
+            REG_RX_TAIL => Word(Reg::Tail(true)),
             _ => Unused,
-        };
-        if common != Unused {
-            return common;
-        }
-        match self.xlen {
-            Xlen::Rv32 => match off {
-                REG_TX_BASE => Word(Reg::Base(false)),
-                REG_TX_SIZE => Word(Reg::Size(false)),
-                REG_TX_HEAD => Word(Reg::Head(false)),
-                REG_TX_TAIL => Word(Reg::Tail(false)),
-                REG_RX_BASE => Word(Reg::Base(true)),
-                REG_RX_SIZE => Word(Reg::Size(true)),
-                REG_RX_HEAD => Word(Reg::Head(true)),
-                REG_RX_TAIL => Word(Reg::Tail(true)),
-                _ => Unused,
-            },
-            Xlen::Rv64 => match off {
-                v2::REG_TX_BASE => Low(Reg::Base(false)),
-                0x24 => High(Reg::Base(false)),
-                v2::REG_TX_SIZE => Word(Reg::Size(false)),
-                v2::REG_TX_HEAD => Word(Reg::Head(false)),
-                v2::REG_TX_TAIL => Word(Reg::Tail(false)),
-                v2::REG_RX_BASE => Low(Reg::Base(true)),
-                0x3c => High(Reg::Base(true)),
-                v2::REG_RX_SIZE => Word(Reg::Size(true)),
-                v2::REG_RX_HEAD => Word(Reg::Head(true)),
-                v2::REG_RX_TAIL => Word(Reg::Tail(true)),
-                _ => Unused,
-            },
         }
     }
 
@@ -616,7 +539,7 @@ impl NetDevice {
     /// Reads a register, at the widths of spec section 9 ([`mmio::access`]). Unknown
     /// offsets read as 0.
     pub fn read(&self, off: u32, size: u32) -> Result<u64, BusFault> {
-        let access = mmio::access(off, size, self.xlen == Xlen::Rv64, |o| self.field(o))?;
+        let access = mmio::access(off, size, |o| self.field(o))?;
         Ok(access.read(|reg| self.value(reg)))
     }
 
@@ -633,7 +556,7 @@ impl NetDevice {
         ram: &mut [u8],
         dma: &mut dyn FnMut(u64, u32),
     ) -> Result<(), BusFault> {
-        let access = mmio::access(off, size, self.xlen == Xlen::Rv64, |o| self.field(o))?;
+        let access = mmio::access(off, size, |o| self.field(o))?;
         let Some(reg) = access.reg() else {
             return Ok(());
         };

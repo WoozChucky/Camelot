@@ -16,13 +16,11 @@
 //!   QEMU says it when it has no kernel. A `fw_jump` firmware ignores it.
 //!
 //! Camelot's own firmware is `firmware/` in the repository, built by `cargo xtask boot`
-//! into the committed `rom/firmware.elf`, which Grail includes ([`FIRMWARE_ELF`]). It is
-//! RV64 only: RV32 machines boot without firmware until #159.
+//! into the committed `rom/firmware.elf`, which Grail includes ([`FIRMWARE_ELF`]).
 
 use crate::bus::RAM_BASE;
 use crate::config::Bios;
 use crate::elf;
-use excalibur::Xlen;
 
 /// Where the firmware is: the start of RAM.
 pub const FW_BASE: u64 = RAM_BASE;
@@ -55,18 +53,18 @@ pub struct Image {
 }
 
 impl Image {
-    /// The firmware `bios` names for an `xlen` machine: `None` for [`Bios::None`]. An
-    /// error if the file cannot be read, is an ELF file of the other width or is not an
-    /// executable, or does not fit in the firmware's 2 MiB.
-    pub fn of(bios: &Bios, xlen: Xlen) -> Result<Option<Image>, String> {
+    /// The firmware `bios` names: `None` for [`Bios::None`]. An error if the file cannot
+    /// be read, is an ELF32 file or is not an executable, or does not fit in the
+    /// firmware's 2 MiB.
+    pub fn of(bios: &Bios) -> Result<Option<Image>, String> {
         let image = match bios {
             Bios::None => return Ok(None),
-            Bios::Default => Image::from_elf(FIRMWARE_ELF, xlen)?,
+            Bios::Default => Image::from_elf(FIRMWARE_ELF)?,
             Bios::File(path) => {
                 let file = std::fs::read(path)
                     .map_err(|e| format!("cannot read the firmware {}: {e}", path.display()))?;
                 let image = if file.starts_with(b"\x7fELF") {
-                    Image::from_elf(&file, xlen)
+                    Image::from_elf(&file)
                 } else {
                     Image::raw(file)
                 };
@@ -78,19 +76,8 @@ impl Image {
 
     /// A firmware ELF executable: its `PT_LOAD` segments at their physical addresses,
     /// entered at the physical address of its entry point.
-    pub fn from_elf(file: &[u8], xlen: Xlen) -> Result<Image, String> {
+    pub fn from_elf(file: &[u8]) -> Result<Image, String> {
         let elf = elf::parse(file).map_err(|e| e.to_string())?;
-        if elf.xlen != xlen {
-            let name = |x: Xlen| match x {
-                Xlen::Rv32 => "RV32 (ELF32)",
-                Xlen::Rv64 => "RV64 (ELF64)",
-            };
-            return Err(format!(
-                "an {} firmware cannot run on an {} machine",
-                name(elf.xlen),
-                &name(xlen)[..4]
-            ));
-        }
         let entry = elf.physical_entry().map_err(|e| e.to_string())?;
         let segments = elf
             .segments
@@ -174,11 +161,18 @@ mod tests {
 
     #[test]
     fn the_built_in_firmware_fits_its_ram() {
-        let image = Image::of(&Bios::Default, Xlen::Rv64).unwrap().unwrap();
+        let image = Image::of(&Bios::Default).unwrap().unwrap();
         assert_eq!(image.entry, FW_BASE, "the firmware starts at its first byte");
         assert_eq!(image.segments[0].0, FW_BASE);
-        assert!(Image::of(&Bios::Default, Xlen::Rv32).is_err(), "RV64 only");
-        assert_eq!(Image::of(&Bios::None, Xlen::Rv64), Ok(None));
+        assert_eq!(Image::of(&Bios::None), Ok(None));
+        // An ELF32 firmware is refused, as an ELF32 program is.
+        let rv32 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../elf/tests/llvm/rv32/prog.elf"
+        ))
+        .unwrap();
+        let e = Image::from_elf(&rv32).unwrap_err();
+        assert!(e.ends_with(elf::NO_ELF32), "{e}");
     }
 
     #[test]
@@ -191,9 +185,7 @@ mod tests {
         let err = Image::raw(vec![0; FW_SIZE as usize + 1]).unwrap_err();
         assert!(err.contains("outside the firmware's RAM"), "{err}");
         let missing = Bios::File("no such firmware.bin".into());
-        assert!(Image::of(&missing, Xlen::Rv64)
-            .unwrap_err()
-            .contains("cannot read"));
+        assert!(Image::of(&missing).unwrap_err().contains("cannot read"));
     }
 
     #[test]

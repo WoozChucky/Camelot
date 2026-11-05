@@ -12,13 +12,11 @@
 //! never seen set. Every check happens before any data moves, and a backend failure is
 //! an error code for the program: nothing a program does can make the host panic.
 //!
-//! Two register layouts: **version 2**, which RV64 machines present, with 64-bit
-//! `BLK_CAPACITY`, `BLK_SECTOR` and `BLK_DMA` ([`v2`]); and **version 1**, all 32-bit,
-//! which RV32 machines keep (the constants at the top of this module).
+//! The registers are version 2's, with 64-bit `BLK_CAPACITY`, `BLK_SECTOR` and
+//! `BLK_DMA`. (Version 1, all 32-bit, was RV32's, and went with it.)
 
 use crate::bus::{BusFault, RAM_BASE};
 use crate::mmio::{self, Field};
-use excalibur::Xlen;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -26,32 +24,19 @@ use std::path::Path;
 /// Bytes per sector.
 pub const SECTOR_SIZE: usize = 512;
 
-// Version 1's register offsets from the start of a disk's page, all 32-bit.
+// Register offsets from the start of a disk's page (spec section 9.6).
+/// 64-bit.
 pub const REG_CAPACITY: u32 = 0x00;
-pub const REG_FLAGS: u32 = 0x04;
+/// 64-bit.
 pub const REG_SECTOR: u32 = 0x08;
-pub const REG_DMA: u32 = 0x0c;
-pub const REG_COUNT: u32 = 0x10;
-pub const REG_CMD: u32 = 0x14;
-pub const REG_STATUS: u32 = 0x18;
-pub const REG_ERROR: u32 = 0x1c;
-pub const REG_CTRL: u32 = 0x20;
-
-/// Version 2's register offsets (RV64 machines, spec section 9.6).
-pub mod v2 {
-    /// 64-bit.
-    pub const REG_CAPACITY: u32 = 0x00;
-    /// 64-bit.
-    pub const REG_SECTOR: u32 = 0x08;
-    /// 64-bit.
-    pub const REG_DMA: u32 = 0x10;
-    pub const REG_COUNT: u32 = 0x18;
-    pub const REG_FLAGS: u32 = 0x1c;
-    pub const REG_CMD: u32 = 0x20;
-    pub const REG_STATUS: u32 = 0x24;
-    pub const REG_ERROR: u32 = 0x28;
-    pub const REG_CTRL: u32 = 0x2c;
-}
+/// 64-bit.
+pub const REG_DMA: u32 = 0x10;
+pub const REG_COUNT: u32 = 0x18;
+pub const REG_FLAGS: u32 = 0x1c;
+pub const REG_CMD: u32 = 0x20;
+pub const REG_STATUS: u32 = 0x24;
+pub const REG_ERROR: u32 = 0x28;
+pub const REG_CTRL: u32 = 0x2c;
 
 /// `BLK_FLAGS` bit 0: the disk is read-only; writes fail with [`error::READ_ONLY`].
 pub const FLAG_READ_ONLY: u32 = 1 << 0;
@@ -283,14 +268,9 @@ fn check_image_size(len: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Largest disk: the most sectors whose bytes a 64-bit offset reaches. Version 2's
-/// `BLK_CAPACITY` is 64 bits, so the limit is the backend's, never the register's.
-/// Version 1's is 32 bits: a bigger disk shows [`V1_MAX_SECTORS`] there.
+/// Largest disk: the most sectors whose bytes a 64-bit offset reaches. `BLK_CAPACITY`
+/// is 64 bits, so the limit is the backend's, never the register's.
 pub const MAX_SECTORS: u64 = u64::MAX / SECTOR_SIZE as u64;
-
-/// The most sectors version 1's 32-bit `BLK_CAPACITY` shows (RV32 machines), just under
-/// 2 TiB: what a 32-bit `BLK_SECTOR` reaches.
-pub const V1_MAX_SECTORS: u64 = u32::MAX as u64;
 
 /// The registers' contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,13 +299,10 @@ pub struct BlockDevice {
     pub ctrl: u32,
     done: bool,
     error: u32,
-    /// Which layout the registers have: version 2 on RV64, 1 on RV32.
-    xlen: Xlen,
 }
 
 impl BlockDevice {
     /// Fails if the backend is bigger than the device can address ([`MAX_SECTORS`]).
-    /// The registers are version 1's until [`BlockDevice::set_xlen`] says otherwise.
     pub fn new(backend: Box<dyn BlockBackend>) -> Result<Self, String> {
         let capacity = backend.capacity();
         if capacity > MAX_SECTORS {
@@ -343,21 +320,14 @@ impl BlockDevice {
             ctrl: 0,
             done: false,
             error: error::NONE,
-            xlen: Xlen::Rv32,
         })
-    }
-
-    /// Presents the registers of an `xlen` machine's disks (spec section 9.6). The
-    /// registers keep their values.
-    pub fn set_xlen(&mut self, xlen: Xlen) {
-        self.xlen = xlen;
     }
 
     pub fn backend(&mut self) -> &mut dyn BlockBackend {
         &mut *self.backend
     }
 
-    /// Size in sectors (version 1's `BLK_CAPACITY` shows at most 2^32 - 1 of them).
+    /// Size in sectors.
     pub fn capacity(&self) -> u64 {
         self.capacity
     }
@@ -378,37 +348,23 @@ impl BlockDevice {
         self.ctrl & CTRL_IRQ_ENABLE != 0 && self.done
     }
 
-    /// What `off` holds in this disk's layout.
+    /// What `off` holds.
     fn field(&self, off: u32) -> Field<Reg> {
         use Field::{High, Low, Unused, Word};
-        match self.xlen {
-            Xlen::Rv32 => match off {
-                REG_CAPACITY => Word(Reg::Capacity),
-                REG_FLAGS => Word(Reg::Flags),
-                REG_SECTOR => Word(Reg::Sector),
-                REG_DMA => Word(Reg::Dma),
-                REG_COUNT => Word(Reg::Count),
-                REG_CMD => Word(Reg::Cmd),
-                REG_STATUS => Word(Reg::Status),
-                REG_ERROR => Word(Reg::Error),
-                REG_CTRL => Word(Reg::Ctrl),
-                _ => Unused,
-            },
-            Xlen::Rv64 => match off {
-                v2::REG_CAPACITY => Low(Reg::Capacity),
-                0x04 => High(Reg::Capacity),
-                v2::REG_SECTOR => Low(Reg::Sector),
-                0x0c => High(Reg::Sector),
-                v2::REG_DMA => Low(Reg::Dma),
-                0x14 => High(Reg::Dma),
-                v2::REG_COUNT => Word(Reg::Count),
-                v2::REG_FLAGS => Word(Reg::Flags),
-                v2::REG_CMD => Word(Reg::Cmd),
-                v2::REG_STATUS => Word(Reg::Status),
-                v2::REG_ERROR => Word(Reg::Error),
-                v2::REG_CTRL => Word(Reg::Ctrl),
-                _ => Unused,
-            },
+        match off {
+            REG_CAPACITY => Low(Reg::Capacity),
+            0x04 => High(Reg::Capacity),
+            REG_SECTOR => Low(Reg::Sector),
+            0x0c => High(Reg::Sector),
+            REG_DMA => Low(Reg::Dma),
+            0x14 => High(Reg::Dma),
+            REG_COUNT => Word(Reg::Count),
+            REG_FLAGS => Word(Reg::Flags),
+            REG_CMD => Word(Reg::Cmd),
+            REG_STATUS => Word(Reg::Status),
+            REG_ERROR => Word(Reg::Error),
+            REG_CTRL => Word(Reg::Ctrl),
+            _ => Unused,
         }
     }
 
@@ -419,10 +375,7 @@ impl BlockDevice {
 
     fn value(&self, reg: Reg) -> u64 {
         match reg {
-            Reg::Capacity => match self.xlen {
-                Xlen::Rv32 => self.capacity.min(V1_MAX_SECTORS),
-                Xlen::Rv64 => self.capacity,
-            },
+            Reg::Capacity => self.capacity,
             Reg::Flags => (self.read_only as u32 * FLAG_READ_ONLY).into(),
             Reg::Sector => self.sector,
             Reg::Dma => self.dma,
@@ -437,7 +390,7 @@ impl BlockDevice {
     /// Reads a register, at the widths of spec section 9 ([`mmio::access`]). Unknown
     /// offsets, and `BLK_CMD`, read as 0.
     pub fn read(&self, off: u32, size: u32) -> Result<u64, BusFault> {
-        let access = mmio::access(off, size, self.xlen == Xlen::Rv64, |o| self.field(o))?;
+        let access = mmio::access(off, size, |o| self.field(o))?;
         Ok(access.read(|reg| self.value(reg)))
     }
 
@@ -445,7 +398,7 @@ impl BlockDevice {
     /// `RAM_BASE`). Writes to read-only registers and unknown offsets are ignored, and
     /// a write of one half of a 64-bit register keeps the other half.
     pub fn write(&mut self, off: u32, size: u32, val: u64, ram: &mut [u8]) -> Result<(), BusFault> {
-        let access = mmio::access(off, size, self.xlen == Xlen::Rv64, |o| self.field(o))?;
+        let access = mmio::access(off, size, |o| self.field(o))?;
         let Some(reg) = access.reg() else {
             return Ok(());
         };
@@ -787,52 +740,48 @@ mod tests {
         assert!(BlockDevice::new(Box::new(Huge(MAX_SECTORS))).is_ok());
     }
 
-    /// Version 1's 32-bit `BLK_CAPACITY` shows a disk of 2^32 sectors or more as the
-    /// 2^32 - 1 its `BLK_SECTOR` reaches; version 2 shows all of it.
+    /// `BLK_CAPACITY` is 64-bit: a disk of 2^32 sectors or more shows whole.
     #[test]
-    fn a_big_disk_is_whole_only_in_version_2() {
-        let mut d = BlockDevice::new(Box::new(Huge(1 << 33))).unwrap();
-        assert_eq!(d.read(REG_CAPACITY, 4), Ok(u32::MAX.into()));
-        d.set_xlen(Xlen::Rv64);
-        assert_eq!(d.read(v2::REG_CAPACITY, 8), Ok(1 << 33));
+    fn a_big_disk_shows_whole() {
+        let d = BlockDevice::new(Box::new(Huge(1 << 33))).unwrap();
+        assert_eq!(d.read(REG_CAPACITY, 8), Ok(1 << 33));
+        assert_eq!(d.read(REG_CAPACITY + 4, 4), Ok(2));
         assert_eq!(d.capacity(), 1 << 33);
     }
 
-    /// An RV64 machine's disk: 64-bit CAPACITY, SECTOR and DMA, whole or by halves.
+    /// 64-bit CAPACITY, SECTOR and DMA, whole or by halves.
     #[test]
     fn version_2_registers() {
         let (mut d, mut ram) = setup();
-        d.set_xlen(Xlen::Rv64);
-        assert_eq!(d.read(v2::REG_CAPACITY, 8), Ok(4));
-        assert_eq!(d.read(v2::REG_CAPACITY, 4), Ok(4));
-        assert_eq!(d.read(v2::REG_CAPACITY + 4, 4), Ok(0));
-        assert_eq!(d.read(v2::REG_FLAGS, 4), Ok(0));
+        assert_eq!(d.read(REG_CAPACITY, 8), Ok(4));
+        assert_eq!(d.read(REG_CAPACITY, 4), Ok(4));
+        assert_eq!(d.read(REG_CAPACITY + 4, 4), Ok(0));
+        assert_eq!(d.read(REG_FLAGS, 4), Ok(0));
         // The halves of a 64-bit register, each keeping the other.
-        d.write(v2::REG_SECTOR, 8, 0x1_0000_0002, &mut ram).unwrap();
+        d.write(REG_SECTOR, 8, 0x1_0000_0002, &mut ram).unwrap();
         assert_eq!(d.sector, 0x1_0000_0002);
-        d.write(v2::REG_SECTOR, 4, 3, &mut ram).unwrap();
-        assert_eq!(d.read(v2::REG_SECTOR, 8), Ok(0x1_0000_0003));
-        d.write(v2::REG_SECTOR + 4, 4, 0, &mut ram).unwrap();
-        assert_eq!(d.read(v2::REG_SECTOR, 8), Ok(3));
-        assert_eq!(d.read(v2::REG_SECTOR + 4, 4), Ok(0));
+        d.write(REG_SECTOR, 4, 3, &mut ram).unwrap();
+        assert_eq!(d.read(REG_SECTOR, 8), Ok(0x1_0000_0003));
+        d.write(REG_SECTOR + 4, 4, 0, &mut ram).unwrap();
+        assert_eq!(d.read(REG_SECTOR, 8), Ok(3));
+        assert_eq!(d.read(REG_SECTOR + 4, 4), Ok(0));
         // A command with 64-bit DMA.
-        d.write(v2::REG_DMA, 8, crate::bus::RAM_BASE + 512, &mut ram)
-            .unwrap();
-        d.write(v2::REG_COUNT, 4, 1, &mut ram).unwrap();
-        d.write(v2::REG_CTRL, 4, 0xff, &mut ram).unwrap();
-        d.write(v2::REG_CMD, 4, CMD_READ.into(), &mut ram).unwrap();
-        assert_eq!(d.read(v2::REG_STATUS, 4), Ok(STATUS_DONE.into()));
-        assert_eq!(d.read(v2::REG_ERROR, 4), Ok(0));
+        d.write(REG_DMA, 8, crate::bus::RAM_BASE + 512, &mut ram).unwrap();
+        d.write(REG_COUNT, 4, 1, &mut ram).unwrap();
+        d.write(REG_CTRL, 4, 0xff, &mut ram).unwrap();
+        d.write(REG_CMD, 4, CMD_READ.into(), &mut ram).unwrap();
+        assert_eq!(d.read(REG_STATUS, 4), Ok(STATUS_DONE.into()));
+        assert_eq!(d.read(REG_ERROR, 4), Ok(0));
         assert!(d.irq(), "BLK_CTRL is at +0x2C");
-        assert_eq!(d.read(v2::REG_CTRL, 4), Ok(CTRL_IRQ_ENABLE.into()));
+        assert_eq!(d.read(REG_CTRL, 4), Ok(CTRL_IRQ_ENABLE.into()));
         assert!(ram[512..1024].iter().all(|&b| b == 4), "sector 3");
-        assert!(d.is_command(v2::REG_CMD) && !d.is_command(REG_CMD));
-        d.write(v2::REG_STATUS, 4, STATUS_DONE.into(), &mut ram).unwrap();
+        assert!(d.is_command(REG_CMD) && !d.is_command(0x14) && !d.is_command(REG_COUNT));
+        d.write(REG_STATUS, 4, STATUS_DONE.into(), &mut ram).unwrap();
         assert!(!d.done());
         // 32-bit registers take no 8-byte access; a faulting write runs nothing.
-        assert_eq!(d.read(v2::REG_COUNT, 8), Err(BusFault));
-        assert_eq!(d.write(v2::REG_CMD, 8, CMD_READ.into(), &mut ram), Err(BusFault));
-        assert_eq!(d.read(v2::REG_SECTOR + 4, 8), Err(BusFault), "misaligned");
+        assert_eq!(d.read(REG_COUNT, 8), Err(BusFault));
+        assert_eq!(d.write(REG_CMD, 8, CMD_READ.into(), &mut ram), Err(BusFault));
+        assert_eq!(d.read(REG_SECTOR + 4, 8), Err(BusFault), "misaligned");
         assert!(!d.done());
         assert_eq!(d.read(0x30, 8), Ok(0), "unused");
     }
@@ -841,13 +790,12 @@ mod tests {
     #[test]
     fn version_2_checks_do_not_wrap() {
         let (mut d, mut ram) = setup();
-        d.set_xlen(Xlen::Rv64);
         let mut run = |sector: u64, count: u32, dma: u64| {
-            d.write(v2::REG_SECTOR, 8, sector, &mut ram).unwrap();
-            d.write(v2::REG_COUNT, 4, count.into(), &mut ram).unwrap();
-            d.write(v2::REG_DMA, 8, dma, &mut ram).unwrap();
-            d.write(v2::REG_CMD, 4, CMD_READ.into(), &mut ram).unwrap();
-            d.read(v2::REG_ERROR, 4).unwrap() as u32
+            d.write(REG_SECTOR, 8, sector, &mut ram).unwrap();
+            d.write(REG_COUNT, 4, count.into(), &mut ram).unwrap();
+            d.write(REG_DMA, 8, dma, &mut ram).unwrap();
+            d.write(REG_CMD, 4, CMD_READ.into(), &mut ram).unwrap();
+            d.read(REG_ERROR, 4).unwrap() as u32
         };
         let base = crate::bus::RAM_BASE;
         assert_eq!(run(1 << 32, 1, base), error::OUT_OF_RANGE);
@@ -901,12 +849,13 @@ mod tests {
         let (mut d, mut ram) = setup();
         w(&mut d, &mut ram, REG_COUNT, 1);
         w(&mut d, &mut ram, REG_DMA, RAM_BASE);
-        // Version 1 takes no 8-byte access either.
-        for size in [1, 2, 8] {
+        // No byte or halfword accesses, and the 32-bit registers take no 8-byte one.
+        for size in [1, 2] {
             assert_eq!(d.read(REG_CAPACITY, size), Err(BusFault));
             assert_eq!(d.write(REG_CMD, size, CMD_READ.into(), &mut ram), Err(BusFault));
             assert_eq!(d.write(REG_SECTOR, size, 3, &mut ram), Err(BusFault));
         }
+        assert_eq!(d.write(REG_CMD, 8, CMD_READ.into(), &mut ram), Err(BusFault));
         assert!(!d.done(), "a faulting write runs nothing");
         assert_eq!(r(&d, REG_SECTOR), 0);
         assert!(ram.iter().all(|&b| b == 0));

@@ -1,5 +1,5 @@
 //! Grail: an emulator for the Excalibur ISA (RV64IMA + Zicsr, M/S/U modes, Sv39 and
-//! Sv48; RV32 with Sv32 while both widths exist).
+//! Sv48).
 //!
 //! A [`Machine`] is built from a [`MachineConfig`] and owns all of its state, I/O
 //! included (UART and debug output go to sinks the host hands it), so a process can run
@@ -40,15 +40,10 @@ pub mod window;
 use block::{BlockBackend, BlockDevice};
 use bus::{Bus, Exit, MAX_DISKS, MAX_NETS};
 pub use config::{
-    max_ram_size, parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_size, parse_xlen,
-    Bios, DiskConfig, MachineConfig, NetConfig, Paging, DEFAULT_RAM_SIZE, MAX_HARTS,
+    parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_size, Bios, DiskConfig,
+    MachineConfig, NetConfig, Paging, DEFAULT_RAM_SIZE, MAX_HARTS, MAX_RAM_SIZE,
 };
-
-/// Why an RV32 machine cannot have firmware.
-const NO_RV32_FIRMWARE: &str = "firmware (--bios default or a file) runs on RV64 machines only: an RV32 \
-                                machine boots its program in M-mode (--bios none)";
 use cpu::Cpu;
-pub use excalibur::Xlen;
 use keyboard::KeyEvent;
 use net::{MacAddr, NetBackend, NetDevice};
 use pointer::PointerInput;
@@ -185,24 +180,18 @@ impl Machine {
     /// anything is allocated for it, so an image from an untrusted source (a remote
     /// client) cannot make the host allocate more than its size.
     ///
-    /// An ELF64 program makes an RV32 machine RV64 (it must not have run yet); an ELF32
-    /// program on an RV64 machine is an error.
+    /// The program must be an ELF64 one: an ELF32 (RV32) program is an error.
     pub fn load_elf(&mut self, file: &[u8]) -> Result<(), String> {
         let elf = elf::parse(file).map_err(|e| e.to_string())?;
-        if elf.xlen == Xlen::Rv32 && self.config.xlen == Xlen::Rv64 {
-            return Err("an RV32 program (ELF32) cannot run on an RV64 machine".into());
-        }
         let entry = elf.physical_entry().map_err(|e| e.to_string())?;
         if self.config.bios.is_some() {
             // The program is the firmware's next stage: it loads after the firmware's
             // RAM, at FW_JUMP_ADDR or above (spec section 7, "Firmware").
-            if elf.xlen != Xlen::Rv64 {
-                return Err(NO_RV32_FIRMWARE.into());
-            }
             if let Some(seg) = elf.segments.iter().find(|s| s.paddr < firmware::FW_JUMP_ADDR) {
                 return Err(format!(
                     "the segment at {:#x} is in the firmware's RAM ({:#x}-{:#x}): with firmware \
-                     (--bios), a program loads at {:#x} or above",
+                     (--bios), a program loads at {:#x} or above (a bare-metal program runs with \
+                     --bios none)",
                     seg.paddr,
                     firmware::FW_BASE,
                     firmware::FW_JUMP_ADDR - 1,
@@ -214,10 +203,6 @@ impl Machine {
         for seg in &elf.segments {
             bus.load_zeroed(seg.paddr, &seg.data, seg.mem_size)
                 .map_err(|_| format!("segment at {:#x} is outside RAM", seg.paddr))?;
-        }
-        if elf.xlen != self.config.xlen {
-            self.config.xlen = elf.xlen;
-            self.cpu.set_xlen(elf.xlen);
         }
         let bus = &mut self.cpu.bus;
         bus.tohost = elf.symbol("tohost");
@@ -242,10 +227,7 @@ impl Machine {
     /// entry is `next_addr` (0 for none: the firmware boots from disk) and whose bytes
     /// end at `next_end`.
     fn install_firmware(&mut self, next_addr: u64, next_end: u64) -> Result<(), String> {
-        if self.config.xlen != Xlen::Rv64 {
-            return Err(NO_RV32_FIRMWARE.into());
-        }
-        let image = firmware::Image::of(&self.config.bios, Xlen::Rv64)?.expect("the machine has firmware");
+        let image = firmware::Image::of(&self.config.bios)?.expect("the machine has firmware");
         let bus = &mut self.cpu.bus;
         for (at, data, size) in &image.segments {
             bus.load_zeroed(*at, data, *size)
@@ -279,9 +261,8 @@ impl Machine {
     /// [`boot`]). The checks happen when the machine runs: a disk with no valid boot
     /// block stops it with [`boot::EXIT_BOOT_FAILED`] and a message on the UART. An
     /// error here only if the machine has no disk, or has less RAM than the boot area
-    /// ([`boot::BOOT_AREA_SIZE`], 64 KiB) the boot block is loaded into. The ROM's
-    /// loader is the one of the machine's width (RV32 or RV64), and so must be the boot
-    /// block's code.
+    /// ([`boot::BOOT_AREA_SIZE`], 64 KiB) the boot block is loaded into. The boot
+    /// block's code runs in M-mode, as the ROM's loader does.
     ///
     /// With firmware ([`MachineConfig::bios`]) the firmware boots from the disk instead,
     /// and the boot block is its next stage: at [`firmware::FW_JUMP_ADDR`], in S-mode
