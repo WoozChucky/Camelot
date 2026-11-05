@@ -60,6 +60,12 @@ pub fn parsed_int(e: &Expr, x: Xlen) -> Option<i128> {
     int_of(value(e, x, true, false)?).map(|(v, _)| v)
 }
 
+/// [`parsed_int`] of an operand that is not evaluated (the one a constant
+/// `?:` does not choose): dividing by zero in it is no error (C99 6.6p3).
+pub fn parsed_unevaluated_int(e: &Expr, x: Xlen) -> Option<i128> {
+    int_of(value(e, x, false, false)?).map(|(v, _)| v)
+}
+
 /// Whether `e` is a null pointer constant: an integer constant expression
 /// equal to 0, or one cast to `void *` (C99 6.3.2.3).
 pub fn is_null_pointer(e: &Expr, xlen: Xlen) -> bool {

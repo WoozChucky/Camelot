@@ -250,7 +250,19 @@ pub fn compile_warned(
 /// errors come with the warnings, in the order of their positions.
 fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec<Error>> {
     let toks = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| vec![e])?;
-    let mut prog = parser::parse(&toks, xlen).map_err(|e| vec![e])?;
+    let mut prog = match parser::parse_salvaging(&toks, xlen) {
+        Ok(prog) => prog,
+        Err(salvaged) => {
+            let (e, mut partial) = *salvaged;
+            // The warnings of what came before a syntax error come with it,
+            // as clang gives them; not the errors of what it cut short.
+            let _ = sema::check(&mut partial);
+            let mut errors = partial.warnings;
+            errors.push(e);
+            errors.sort_by_key(|e| e.pos);
+            return Err(errors);
+        }
+    };
     if let Err(mut errors) = sema::check(&mut prog) {
         errors.extend(prog.warnings);
         errors.sort_by_key(|e| e.pos);

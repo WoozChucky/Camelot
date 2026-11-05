@@ -2016,6 +2016,7 @@ impl<'a> FuncGen<'a, '_> {
                 cond,
                 step,
                 body,
+                ..
             } => {
                 //     <init>
                 //   .L.loop.N:

@@ -52,10 +52,17 @@ pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
     for (i, item) in prog.items.iter_mut().enumerate() {
         next = c.unevaluated(&mut unevaluated, next, i);
         match item {
-            Item::Func(f) => c.function(f),
+            Item::Func(f) => {
+                c.file_unevaluated(&mut f.unevaluated);
+                c.function(f);
+            }
             Item::Decl(decls) => {
                 for (j, d) in decls.iter_mut().enumerate() {
+                    // A declarator's own before it is declared, its
+                    // initializer's after.
+                    c.file_unevaluated(&mut d.sized);
                     c.global_var(d, (i, j));
+                    c.file_unevaluated(&mut d.unevaluated);
                 }
             }
         }
@@ -448,11 +455,18 @@ impl Checker {
         if to > from {
             let mut fc =
                 FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len(), self.xlen);
-            for (_, u) in &mut us[from..to] {
-                fc.unevaluated(u);
-            }
+            fc.unevaluated(us[from..to].iter_mut().map(|(_, u)| u));
         }
         to
+    }
+
+    /// Checks what the parser evaluated away of a declarator or function
+    /// at file scope ([`Unevaluated`]).
+    fn file_unevaluated(&mut self, us: &mut [Unevaluated]) {
+        if !us.is_empty() {
+            FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len(), self.xlen)
+                .unevaluated(us);
+        }
     }
 
     /// Marks the declarator that defines each global variable: the one with an
@@ -611,21 +625,40 @@ impl<'a> FnChecker<'a> {
         Reported
     }
 
-    /// An expression the parser evaluated away ([`Unevaluated`]): checked
-    /// as the operand of `sizeof` is, never evaluated, so a compound literal
-    /// in it is no object. One the parser could not type made its constant
-    /// an error, reported here if the expression has none of its own.
-    fn unevaluated(&mut self, u: &mut Unevaluated) {
-        let mark = self.literals.len();
-        let checked = self.expr(&mut u.expr);
-        self.literals.truncate(mark);
-        if checked.is_ok() {
-            match (&u.untyped, &u.warning) {
-                (Some((pos, msg)), _) => {
-                    self.err(*pos, msg.clone());
+    /// The expressions the parser evaluated away at one place
+    /// ([`Unevaluated`]), in order: each checked as the operand of `sizeof`
+    /// is, never evaluated, so a compound literal in it is no object, with
+    /// the parameters before it in scope if it was in a parameter list. One
+    /// the parser could not type made its constant an error, reported here
+    /// if the expression has none of its own. A declarator's warning is
+    /// given if none of its operands has an error.
+    fn unevaluated<'u>(&mut self, us: impl IntoIterator<Item = &'u mut Unevaluated>) {
+        let mut clean = Vec::new();
+        for u in us {
+            let (literals, locals) = (self.literals.len(), self.locals.len());
+            let params = !u.params.is_empty();
+            if params {
+                // C's prototype scope: what the parameter list declared.
+                self.scopes.push(HashMap::new());
+                for (name, ty, pos) in &u.params {
+                    self.declare(name, ty, *pos, "parameter ");
                 }
-                (None, Some(w)) => self.errors.push(w.clone()),
-                (None, None) => {}
+            }
+            let checked = self.expr(&mut u.expr);
+            if params {
+                self.scopes.pop();
+            }
+            self.literals.truncate(literals);
+            self.locals.truncate(locals);
+            let ok = checked.is_ok() && u.untyped.is_none();
+            if let (Ok(()), Some((pos, msg))) = (checked, &u.untyped) {
+                self.err(*pos, msg.clone());
+            }
+            clean.push(ok);
+            if let Some(w) = &u.warning {
+                if clean[clean.len() - 1 - u.with..].iter().all(|&ok| ok) {
+                    self.errors.push(w.clone());
+                }
             }
         }
     }
@@ -697,7 +730,7 @@ impl<'a> FnChecker<'a> {
             }
             StmtKind::Return(e) => self.ret(e.as_mut(), s.pos),
             StmtKind::Empty => {}
-            StmtKind::Unevaluated(us) => us.iter_mut().for_each(|u| self.unevaluated(u)),
+            StmtKind::Unevaluated(us) => self.unevaluated(us),
             StmtKind::If { cond, then, els } => {
                 let _ = self.condition(cond);
                 self.scoped(|c| c.stmt(then));
@@ -718,10 +751,12 @@ impl<'a> FnChecker<'a> {
                 cond,
                 step,
                 body,
+                unevaluated,
             } => self.scoped(|c| {
                 if let Some(i) = init {
                     c.stmt(i);
                 }
+                c.unevaluated(unevaluated);
                 if let Some(e) = cond {
                     let _ = c.condition(e);
                 }
@@ -870,7 +905,15 @@ impl<'a> FnChecker<'a> {
         Ok(())
     }
 
+    /// A declarator in a block: what the parser evaluated away of it before
+    /// its name is declared, of its initializer after.
     fn local_decl(&mut self, d: &mut Declarator) {
+        self.unevaluated(&mut d.sized);
+        self.local_var(d);
+        self.unevaluated(&mut d.unevaluated);
+    }
+
+    fn local_var(&mut self, d: &mut Declarator) {
         if d.ty.is_void() {
             self.err(d.pos, format!("variable '{}' has incomplete type 'void'", d.name));
             return;
@@ -1679,6 +1722,8 @@ impl<'a> FnChecker<'a> {
             define: true,
             spelled: Default::default(),
             pos,
+            sized: Vec::new(),
+            unevaluated: Vec::new(),
         });
         Ok(name)
     }
@@ -2010,6 +2055,72 @@ mod tests {
         );
     }
 
+    /// What the parser evaluated away is checked with the names in scope
+    /// where it was (clang 23 takes each of these): a parameter list's with
+    /// the parameters before it, a `for` statement's in its scope, a
+    /// declarator's before its name is declared, and before the next
+    /// declarator's, a parameter's at file scope, not in the body.
+    #[test]
+    fn what_was_evaluated_away_is_checked_in_its_scope() {
+        for src in [
+            "int f(int n, char a[sizeof n]);",
+            "void f(int n, char a[sizeof n]) { }",
+            "int g(void) { return sizeof(int (*)(int n, char a[sizeof n])); }",
+            "int f(int n, int (*cb)(int m, char b[sizeof m + sizeof n]));",
+            "int f(void) { int r = 0; for (int i = 0; i < (int)sizeof(char[sizeof i]); i++) r++; return r; }",
+            "struct S { int y; } g;\nint f(void) { char a[sizeof g.y] = {0}, g = 1; return a[0] + g; }",
+            "struct S { int y; } g;\nint f(void) { char g[sizeof g.y] = {0}; return g[0]; }",
+            "struct S { int y; } g;\nint f(char a[sizeof g.y]) { int g = 0; return a[0] + g; }",
+            "struct S { int y; } g;\nint f(int x) { if (sizeof(char[sizeof g.y])) { int g = x; return g; } return 0; }",
+        ] {
+            let p = ok(src);
+            assert!(p.warnings.is_empty(), "{src}");
+        }
+    }
+
+    /// clang gives a declarator no folding warning when one of its sizes
+    /// has an error; and the warnings before a syntax error come with it.
+    #[test]
+    fn folding_warnings_are_clangs() {
+        let all = |src: &str| -> Vec<String> {
+            crate::parse(src)
+                .unwrap_err()
+                .iter()
+                .map(|e| format!("{} {:?}", e, e.severity))
+                .collect()
+        };
+        let folded = "variable length array folded to constant array as an extension \
+                      Warning(\"gnu-folding-constant\")";
+        assert_eq!(
+            all("unsigned u(void); int f(void);\nint b[1 ? 2 : f(1, 2)][1 ? 3 : u()];"),
+            ["2:15: too many arguments to 'f': expected 0, have 2 (declared at 1:23) Error"]
+        );
+        assert_eq!(
+            all("unsigned u(void); int f(void);\nint b[1 ? 3 : u()][sizeof f(1)];"),
+            ["2:27: too many arguments to 'f': expected 0, have 1 (declared at 1:23) Error"]
+        );
+        assert_eq!(
+            all("unsigned u(void);\nint a[1 ? 2 : u()];\nint b = ;"),
+            [
+                format!("2:5: {folded}"),
+                "3:9: expected expression, found ';' Error".into()
+            ]
+        );
+        assert_eq!(
+            all("unsigned u(void);\nint f(void) { if (1) { static int a[1 ? 2 : u()]; { int q = ; } } }"),
+            [
+                format!("2:35: {folded}"),
+                "2:61: expected expression, found ';' Error".into()
+            ]
+        );
+        // A compound literal's at its `(`.
+        let p = ok("unsigned u(void);\nint *q = (int[1 ? 2 : u()]){1, 2};");
+        assert_eq!(
+            p.warnings[0].to_string(),
+            "2:10: variable length array folded to constant array as an extension"
+        );
+    }
+
     /// `name#slot` (or `name@symbol`) for every variable use in the function, in
     /// source order.
     fn uses(f: &Function) -> Vec<String> {
@@ -2085,6 +2196,7 @@ mod tests {
                     cond,
                     step,
                     body,
+                    ..
                 } => {
                     if let Some(i) = init {
                         stmt(i, out);

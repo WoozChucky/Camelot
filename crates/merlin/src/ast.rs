@@ -30,9 +30,11 @@ pub struct Program {
     /// The target the program is for: its types' sizes, and the code
     /// generated for it ([`crate::types`]).
     pub xlen: Xlen,
-    /// The expressions of the file's scope the parser evaluated away, each
-    /// after how many items it comes, for sema to check
-    /// ([`Unevaluated`]); a block's are statements of their own.
+    /// The expressions of the file's scope the parser evaluated away that
+    /// no declarator or function keeps ([`Declarator::sized`],
+    /// [`Function::unevaluated`]), each after how many items it comes, for
+    /// sema to check ([`Unevaluated`]); a block's are statements of their
+    /// own.
     pub unevaluated: Vec<(usize, Unevaluated)>,
     /// The warnings so far (`Error`s of [`crate::Severity::Warning`]):
     /// what is not an error but clang warns of.
@@ -45,6 +47,14 @@ pub struct Program {
 /// the operand of a `sizeof` and the operand a constant `?:` does not
 /// choose. Its type is all that counts there, which the parser works out,
 /// but it must still be valid C (`f(1, 2)` of an `int f(void)` is not).
+///
+/// Sema checks it where it was, with the names declared there: a
+/// declarator's own before the name it declares ([`Declarator::sized`]:
+/// `char g[sizeof g.y]` sizes by an earlier `g`), one in an initializer
+/// after it ([`Declarator::unevaluated`]), a function declarator's at file
+/// scope ([`Function::unevaluated`]), a `for` statement's in its scope, a
+/// parameter list's with the parameters before it ([`Self::params`]), and
+/// the rest after the declaration or statement they are in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unevaluated {
     pub expr: Expr,
@@ -54,9 +64,17 @@ pub struct Unevaluated {
     pub untyped: Option<(Pos, String)>,
     /// The operand of a `?:` the parser folded, not one of `sizeof`.
     pub folded: bool,
-    /// The warning clang gives the array size it folds by this operand,
-    /// which it leaves out if the operand has an error.
+    /// The warning clang gives the array size a declarator folds, kept with
+    /// the last of the declarator's own operands: given unless this one or
+    /// one of the `with` before it in its list (the declarator's others)
+    /// has an error, as clang gives no warning for a declarator whose size
+    /// is in error.
     pub warning: Option<crate::Error>,
+    pub with: usize,
+    /// The parameters in scope where it was (C's prototype scope): those
+    /// declared before it in the parameter lists it is in, outermost first,
+    /// so `char a[sizeof n]` after `int n` sizes by that `n`.
+    pub params: Vec<(String, Type, Pos)>,
 }
 
 impl Program {
@@ -137,6 +155,10 @@ pub struct Function {
     /// The closing brace of a definition's body (the declaration's position
     /// for a prototype): where `-g` says the epilogue comes from.
     pub end: Pos,
+    /// What the parser evaluated away in its declarator (its return type,
+    /// its parameters), checked at file scope before it is declared
+    /// ([`Unevaluated`]).
+    pub unevaluated: Vec<Unevaluated>,
 }
 
 impl Function {
@@ -193,6 +215,12 @@ pub struct Declarator {
     pub pos: Pos,
     /// How its type was spelled (for `-g`).
     pub spelled: Spelled,
+    /// What the parser evaluated away in its declarator (and, for a
+    /// declaration's first, in the specifiers before it), checked before
+    /// its name is declared; and in its initializer, checked after, before
+    /// the next declarator's ([`Unevaluated`]).
+    pub sized: Vec<Unevaluated>,
+    pub unevaluated: Vec<Unevaluated>,
 }
 
 /// An initializer: `= expr` or `= { ... }`.
@@ -278,12 +306,16 @@ pub enum StmtKind {
         cond: Expr,
     },
     /// `for (init; cond; step) body`. `init` is a `Decl` or `Expr` statement whose
-    /// scope is the loop; a missing `cond` means "forever".
+    /// scope is the loop; a missing `cond` means "forever". `unevaluated`:
+    /// what the parser evaluated away in it, but in a declaration of `init`
+    /// or in a block of `body`, checked in its scope after `init`
+    /// ([`Unevaluated`]).
     For {
         init: Option<Box<Stmt>>,
         cond: Option<Expr>,
         step: Option<Expr>,
         body: Box<Stmt>,
+        unevaluated: Vec<Unevaluated>,
     },
     /// `return expr;`, or `return;` in a `void` function.
     Return(Option<Expr>),
@@ -711,6 +743,7 @@ impl Dumper {
                 cond,
                 step,
                 body,
+                ..
             } => {
                 self.line(d, s.pos, "For");
                 match init {

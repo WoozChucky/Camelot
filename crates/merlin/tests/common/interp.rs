@@ -514,6 +514,7 @@ impl<'a> Interp<'a> {
                 cond,
                 step,
                 body,
+                ..
             } => {
                 if let (Some(i), None) = (init, &seek) {
                     self.stmt(i, frame, seek)?;
