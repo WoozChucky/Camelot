@@ -739,7 +739,14 @@ impl ArgLayout {
     fn new(ft: &FuncType, args: &[Expr], x: Xlen) -> ArgLayout {
         let mut types = ft.params.clone();
         types.extend(args[ft.params.len()..].iter().map(|a| a.ty.clone()));
-        let (words, used) = abi::call_arguments(&ft.ret, &types, ft.params.len(), x);
+        // A function without a prototype takes its (promoted) arguments as
+        // named ones: its definition has them as parameters.
+        let named = if ft.unprototyped.0 && ft.params.is_empty() && !ft.variadic {
+            args.len()
+        } else {
+            ft.params.len()
+        };
+        let (words, used) = abi::call_arguments(&ft.ret, &types, named, x);
         ArgLayout { types, words, used }
     }
 }

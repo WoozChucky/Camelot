@@ -1828,6 +1828,12 @@ impl Pp<'_> {
             "pragma" => {
                 if matches!(args, [t] if t.ident() == Some("once")) {
                     let file = self.stack.last().expect("a file").file;
+                    // Of the file being compiled it means nothing: clang
+                    // warns, at `once`.
+                    if self.stack.len() == 1 {
+                        let msg = "#pragma once in main file";
+                        self.report(Error::warning(args[0].pos, msg, "pragma-once-outside-header"));
+                    }
                     self.once.insert(self.files[file as usize].path.clone());
                     return Ok(());
                 }

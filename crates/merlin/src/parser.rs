@@ -171,6 +171,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         brackets_written: RefCell::new(Default::default()),
         bit_patterns: RefCell::new(Default::default()),
         int_literals: RefCell::new(Default::default()),
+        char_literals: RefCell::new(Default::default()),
         trailing_else: Cell::new(None),
         warnings: RefCell::new(Vec::new()),
     };
@@ -214,6 +215,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
                     brackets: p.brackets_written.take(),
                     bit_patterns: p.bit_patterns.take(),
                     int_literals: p.int_literals.take(),
+                    char_literals: p.char_literals.take(),
                     ..Written::default()
                 },
             };
@@ -230,6 +232,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
             brackets: p.brackets_written.take(),
             bit_patterns: p.bit_patterns.take(),
             int_literals: p.int_literals.take(),
+            char_literals: p.char_literals.take(),
             ..Written::default()
         },
     })
@@ -635,6 +638,8 @@ struct Parser<'a> {
     bit_patterns: RefCell<std::collections::HashSet<Pos>>,
     /// Where the integer literals are ([`Written::int_literals`]).
     int_literals: RefCell<std::collections::HashSet<Pos>>,
+    /// Where the character constants are ([`Written::char_literals`]).
+    char_literals: RefCell<std::collections::HashSet<Pos>>,
     /// The `else` of the `if` the statement just parsed ends with, through
     /// loops and labels, not braces: an `if` without one of its own around
     /// it is clang's dangling `else` (its `TrailingElseLoc`).
@@ -1644,7 +1649,7 @@ impl Parser<'_> {
     /// definition is at `at`.
     fn record_body(&mut self, record: &Record, at: Pos) -> Result<(), Error> {
         let open = self.expect_punct("{")?;
-        let mut members: Vec<(String, Type, Spelled, Pos)> = Vec::new();
+        let mut members: Vec<(String, Type, Spelled, Pos, Pos)> = Vec::new();
         let mut seen: HashMap<String, Pos> = HashMap::new();
         // The layout so far, to reject a struct too big before laying it out.
         let mut end = 0u64;
@@ -1704,7 +1709,7 @@ impl Parser<'_> {
                 if end > MAX_OBJECT_SIZE {
                     return Err(Error::new(d.pos, format!("{} is too large", record.keyword())));
                 }
-                members.push((d.name, d.ty, specs.spelled.clone(), d.pos));
+                members.push((d.name, d.ty, specs.spelled.clone(), d.pos, specs.pos));
                 if !self.eat_punct(",") {
                     break;
                 }
@@ -1724,7 +1729,7 @@ impl Parser<'_> {
             end,
             members
                 .iter()
-                .map(|(_, t, _, _)| t.align(self.xlen))
+                .map(|(_, t, _, _, _)| t.align(self.xlen))
                 .max()
                 .unwrap_or(1),
         ) > MAX_OBJECT_SIZE
@@ -2289,6 +2294,7 @@ impl Parser<'_> {
             // C adjusts a parameter declared as an array or a function to a
             // pointer (keeping qualifiers on what it points to).
             let spelled = decayed_spelling(&d.ty, specs.spelled);
+            let array = d.ty.is_array().then(|| d.ty.clone());
             let ty = if d.ty.is_array() || d.ty.is_func() {
                 d.ty.decay()
             } else {
@@ -2310,6 +2316,7 @@ impl Parser<'_> {
                 pos,
                 spelled,
                 register: specs.class == Class::Register,
+                array,
             });
             if self.eat_punct(")") {
                 return Ok((params, false));
@@ -2541,6 +2548,7 @@ impl Parser<'_> {
                 var: None,
                 define: false,
                 pos: d.pos,
+                begin: specs.pos,
                 spelled: specs.spelled.clone(),
                 sized,
                 unevaluated,
@@ -3415,7 +3423,9 @@ impl Parser<'_> {
                 {
                     self.bit_patterns.borrow_mut().insert(pos);
                 }
-                if !t.text.ends_with('\'') {
+                if t.text.ends_with('\'') {
+                    self.char_literals.borrow_mut().insert(pos);
+                } else {
                     self.int_literals.borrow_mut().insert(pos);
                 }
                 return Ok(Expr {
@@ -3769,6 +3779,7 @@ fn declared_function(d: Decl, specs: &Specs, unevaluated: Vec<Unevaluated>) -> F
                         pos: d.pos,
                         spelled: Spelled::default(),
                         register: false,
+                        array: None,
                     })
                     .collect()
             })

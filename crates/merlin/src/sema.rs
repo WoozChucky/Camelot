@@ -34,7 +34,7 @@
 use crate::abi;
 use crate::ast::*;
 use crate::consteval;
-use crate::types::{common, EnumType, FuncType, IntKind, Spelled, Spelling, Type, Xlen};
+use crate::types::{common, ptr_size, EnumType, FuncType, IntKind, Spelled, Spelling, Type, Xlen};
 use crate::{Error, Pos};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -487,6 +487,31 @@ fn compatible(a: &Type, b: &Type) -> bool {
     }
 }
 
+/// A function type declared with `()`, which says nothing of the
+/// parameters (C99 6.7.5.3p14): no prototype.
+fn unprototyped(f: &FuncType) -> bool {
+    f.unprototyped.0 && f.params.is_empty() && !f.variadic
+}
+
+/// Whether two function types are compatible (C99 6.7.5.3p15): the same
+/// (`()` and `(void)` among them), or one without a prototype and the
+/// other with one whose parameters are each what the default argument
+/// promotions make of themselves (no `char`, `short` or `_Bool`), with no
+/// `...`, and the same result.
+fn functions_compatible(a: &FuncType, b: &FuncType) -> bool {
+    if a == b {
+        return true;
+    }
+    let (bare, proto) = if unprototyped(a) {
+        (a, b)
+    } else if unprototyped(b) {
+        (b, a)
+    } else {
+        return false;
+    };
+    bare.ret == proto.ret && !proto.variadic && proto.params.iter().all(|t| promoted(t) == *t.unqual())
+}
+
 static VOID: Type = Type::Void;
 
 /// An error has been reported; the caller should not add more about the same
@@ -521,6 +546,8 @@ struct GlobalVar {
     /// Where the latest declaration is, and whether it is a definition
     /// (not `extern`: a tentative definition is one), for clang's notes.
     pos: Pos,
+    /// Where the latest declaration begins.
+    begin: Pos,
     defines: bool,
     spelled: Spelled,
     /// The declarator with an initializer, as (item, declarator) indices,
@@ -560,6 +587,7 @@ impl Global {
                 ty: ty.clone(),
                 is_static: false,
                 pos,
+                begin: pos,
                 defines: false,
                 spelled: Spelled::default(),
                 init: None,
@@ -649,7 +677,24 @@ impl Checker {
                 // clang's note names the latest declaration before this one,
                 // or the definition when this is one more.
                 let note = previous(prev.pos, prev.def == Some(prev.pos));
-                let problem = if prev.ty != sig.ty {
+                // One declaration without a prototype and one with
+                // parameters: what C23 makes a conflict, clang warns of, at
+                // the one without (`int f(); int f(int a, int b) {...}`).
+                let bare = "a function declaration without a prototype is deprecated in all versions of C \
+                            and is treated as a zero-parameter prototype in C23, conflicting with a";
+                if unprototyped(&prev.ty) && !unprototyped(&sig.ty) && !sig.ty.params.is_empty() {
+                    let what = if sig.defined { "definition" } else { "declaration" };
+                    let msg = format!("{bare} subsequent {what}");
+                    let w = Error::warning(prev.pos, msg, "deprecated-non-prototype")
+                        .note(f.pos, "conflicting prototype is here");
+                    self.errors.push(w);
+                } else if unprototyped(&sig.ty) && !unprototyped(&prev.ty) && !prev.ty.params.is_empty() {
+                    let msg = format!("{bare} previous declaration");
+                    let w = Error::warning(f.pos, msg, "deprecated-non-prototype")
+                        .note(prev.pos, "conflicting prototype is here");
+                    self.errors.push(w);
+                }
+                let problem = if !functions_compatible(&prev.ty, &sig.ty) {
                     Some((format!("conflicting types for '{}'", f.name), note))
                 } else if let (Some(def), true) = (prev.def, sig.defined) {
                     Some((format!("redefinition of '{}'", f.name), previous(def, true)))
@@ -665,6 +710,11 @@ impl Checker {
                 match problem {
                     Some((msg, (at, what))) => self.errors.push(Error::new(f.pos, msg).note(at, what)),
                     None => {
+                        // The type the declarations make together: the
+                        // prototype, if one has it.
+                        if unprototyped(&prev.ty) {
+                            prev.ty = sig.ty.clone();
+                        }
                         prev.defined |= sig.defined;
                         prev.def = prev.def.or(sig.def);
                         // Of declarations in blocks only, none said inline.
@@ -703,6 +753,13 @@ impl Checker {
         let body = f.body.as_mut().expect("checked above");
         let mut c = FnChecker {
             globals: &self.globals,
+            array_params: HashMap::new(),
+            subscript: false,
+            subscript_add: false,
+            literal_texts: HashMap::new(),
+            param_pos: HashSet::new(),
+            begins: HashMap::new(),
+            sizeofs: HashMap::new(),
             spellings: f.params.iter().map(|p| (p.pos, p.spelled.clone())).collect(),
             ret_spelled: f.ret_spelled.clone(),
             init_spelled: Spelled::default(),
@@ -735,6 +792,10 @@ impl Checker {
         };
         for p in &f.params {
             let id = c.declare(&p.name, &p.ty, p.pos, "parameter ");
+            if let Some(t) = &p.array {
+                c.array_params.insert(p.pos, t.clone());
+            }
+            c.param_pos.insert(p.pos);
             if p.register {
                 c.registers.insert(id.0);
             }
@@ -866,6 +927,7 @@ impl Checker {
                 prev.defines = d.storage != Storage::Extern;
                 prev.visible = true;
                 prev.spelled = d.spelled.clone();
+                prev.begin = d.begin;
             }
             None => {
                 self.globals.insert(
@@ -875,6 +937,7 @@ impl Checker {
                         is_static,
                         pos: d.pos,
                         defines: d.storage != Storage::Extern,
+                        begin: d.begin,
                         spelled: d.spelled.clone(),
                         init,
                         init_pos: init.map(|_| d.pos),
@@ -1186,6 +1249,22 @@ struct Pending {
 
 struct FnChecker<'a> {
     globals: &'a HashMap<String, Global>,
+    /// The expression about to be checked is a subscript's `+`; and the
+    /// `+` [`Self::binary`] checks is.
+    subscript: bool,
+    subscript_add: bool,
+    /// The lists of the compound literals, as written, by their ids.
+    literal_texts: HashMap<u64, String>,
+    /// Where the parameters are.
+    param_pos: HashSet<Pos>,
+    /// Where the declarations of the locals begin, by where they are.
+    begins: HashMap<Pos, Pos>,
+    /// The `sizeof`s sema made constants, by their expressions' ids: what
+    /// clang's warnings of a division of two of them need.
+    sizeofs: HashMap<u64, SizeofOf>,
+    /// The parameters declared as arrays, by where they are: the array
+    /// types they were declared as.
+    array_params: HashMap<Pos, Type>,
     /// How the type of each local and parameter was spelled, by where it
     /// is declared, for clang's names of types ([`Type::named`]); of the
     /// function's result; and of the object an initializer being checked
@@ -1258,6 +1337,13 @@ impl<'a> FnChecker<'a> {
     ) -> Self {
         FnChecker {
             globals,
+            array_params: HashMap::new(),
+            subscript: false,
+            subscript_add: false,
+            literal_texts: HashMap::new(),
+            param_pos: HashSet::new(),
+            begins: HashMap::new(),
+            sizeofs: HashMap::new(),
             spellings: HashMap::new(),
             ret_spelled: Spelled::default(),
             init_spelled: Spelled::default(),
@@ -1478,6 +1564,7 @@ impl<'a> FnChecker<'a> {
                 if self.expr(e).is_ok() {
                     self.full_expression(e);
                     self.unused(e);
+                    self.bounds(e);
                 }
             }
             StmtKind::Return(e) => self.ret(e.as_mut(), s.pos),
@@ -1520,6 +1607,7 @@ impl<'a> FnChecker<'a> {
                     if c.expr(e).is_ok() {
                         c.full_expression(e);
                         c.unused(e);
+                        c.bounds(e);
                     }
                 }
                 c.in_loop(|c| c.scoped(|c| c.stmt(body)));
@@ -1775,6 +1863,30 @@ impl<'a> FnChecker<'a> {
         }
     }
 
+    /// Where `e` begins inside the parentheses around it, at the outermost
+    /// `(` around what it begins with (clang's `getBeginLoc` of `e`
+    /// without its parentheses, `IgnoreParenCasts`).
+    fn begin_inside(&self, e: &Expr) -> Pos {
+        match &e.kind {
+            ExprKind::Binary(_, l, _) | ExprKind::Comma(l, _) | ExprKind::Cond(l, ..) => {
+                self.begin_written(l)
+            }
+            ExprKind::Assign { target, .. } => self.begin_written(target),
+            ExprKind::IncDec {
+                prefix: false,
+                target,
+                ..
+            } => self.begin_written(target),
+            ExprKind::Member { base, .. } => self.begin_written(base),
+            ExprKind::Call { callee, .. } => self.begin_written(callee),
+            ExprKind::Deref(x) if x.pos == e.pos => self.begin_written(x),
+            ExprKind::Cast {
+                x, implicit: true, ..
+            } => self.begin_inside(x),
+            _ => e.pos,
+        }
+    }
+
     /// Where `e` begins as written: at the outermost `(` around it or
     /// around what it begins with, as clang's `getBeginLoc` has it.
     fn begin_written(&self, e: &Expr) -> Pos {
@@ -1826,7 +1938,18 @@ impl<'a> FnChecker<'a> {
                 {
                     coerce(e, ret);
                 }
+                // The address of an automatic object returned: clang's
+                // warning, at the object (`checkExprLifetime`).
+                if !ret.is_void() {
+                    let mut found = Vec::new();
+                    self.stack_address(e, &mut found);
+                    for (at, what) in found {
+                        let msg = format!("address of stack memory associated with {what} returned");
+                        self.errors.push(Error::warning(at, msg, "return-stack-address"));
+                    }
+                }
                 self.full_expression(e);
+                self.bounds(e);
             }
             None if *ret != Type::Void => {
                 let msg = format!("non-void function '{}' should return a value", self.func);
@@ -1851,6 +1974,7 @@ impl<'a> FnChecker<'a> {
         self.assignment_condition(e);
         self.bool_like(e);
         self.full_expression(e);
+        self.bounds(e);
         Ok(())
     }
 
@@ -2101,6 +2225,7 @@ impl<'a> FnChecker<'a> {
 
     fn local_var(&mut self, d: &mut Declarator) {
         self.spellings.insert(d.pos, d.spelled.clone());
+        self.begins.insert(d.pos, d.begin);
         // A block's `extern` declaration, or a function's: in the block the
         // name is the object or function outside it, which it defines
         // nothing of.
@@ -2836,6 +2961,10 @@ impl<'a> FnChecker<'a> {
                 self.convert(e, ty, &spelled, Conv::Init, at)?;
                 coerce(e, ty);
                 self.full_expression(e);
+                // A declaration's own initializer, not an item of a list.
+                if decl.is_some() {
+                    self.bounds(e);
+                }
                 if constant && consteval::eval(e, self.xlen).is_none() {
                     return Err(self.err(expr_loc(e), "initializer element is not a compile-time constant"));
                 }
@@ -2856,12 +2985,42 @@ impl<'a> FnChecker<'a> {
         let named = from.named(&from_spelled);
         self.convert_value(e, &from, &named, &from_spelled, null, to, to_spelled, how, at)?;
         self.constant_conversion(e, to);
+        // An argument's, after the note on its parameter.
+        if how != Conv::Arg {
+            self.enum_to_enum(e, to, to_spelled);
+        }
         // Converted to `_Bool`, it is taken as true or false (an
         // argument's, after the note on its parameter).
         if *to.unqual() == Type::Int(IntKind::Bool) && how != Conv::Arg {
             self.bool_like(e);
         }
         Ok(())
+    }
+
+    /// One enum's value converted to another enum (`to`, as `to_spelled`
+    /// spells it): clang's warning, of its constants too (they are of their
+    /// enum to it).
+    fn enum_to_enum(&mut self, e: &Expr, to: &Type, to_spelled: &Spelled) {
+        let value = strip_implicit(e);
+        let spelled = self.spelled_of(value);
+        let source = match &value.kind {
+            ExprKind::Enumerator {
+                of: Spelled(Some(Spelling::Enum(en))),
+                ..
+            } => Some(en),
+            _ => enum_of(&spelled, &value.ty),
+        };
+        if let (Some(a), Some(b)) = (source, enum_of(to_spelled, to)) {
+            if !Arc::ptr_eq(a, b) {
+                let msg = format!(
+                    "implicit conversion from enumeration type '{}' to different enumeration type {}",
+                    a.name(),
+                    to.named(to_spelled)
+                );
+                self.errors
+                    .push(Error::warning(expr_loc(value), msg, "implicit-enum-enum-cast"));
+            }
+        }
     }
 
     /// An argument converted to its parameter's type `to`: at the argument,
@@ -2885,8 +3044,11 @@ impl<'a> FnChecker<'a> {
             let e = self.errors.pop().expect("just reported");
             self.errors.push(e.note(*pos, what));
         }
-        if checked.is_ok() && *to.unqual() == Type::Int(IntKind::Bool) {
-            self.bool_like(e);
+        if checked.is_ok() {
+            self.enum_to_enum(e, to, &to_spelled);
+            if *to.unqual() == Type::Int(IntKind::Bool) {
+                self.bool_like(e);
+            }
         }
         checked
     }
@@ -2932,7 +3094,14 @@ impl<'a> FnChecker<'a> {
             (Type::Ptr(_), Type::Ptr(_) | Type::Int(_)) if null => return Ok(()),
             (Type::Ptr(a), Type::Ptr(b)) => {
                 let (au, bu) = (a.unqual(), b.unqual());
-                if au.is_func() && bu.is_func() && au != bu {
+                let funcs = |a: &Type, b: &Type| match (a.func_type(), b.func_type()) {
+                    (Some(f), Some(g)) => functions_compatible(f, g),
+                    _ => a == b,
+                };
+                if au.is_func() && bu.is_func() {
+                    if funcs(au, bu) {
+                        return Ok(());
+                    }
                     (
                         "incompatible function pointer types",
                         Some("incompatible-function-pointer-types"),
@@ -3386,6 +3555,8 @@ impl<'a> FnChecker<'a> {
                         self.bad_shift_or_divisor(*op, pos, id, &t, value);
                     }
                 }
+                self.bounds(target);
+                self.bounds(value);
                 // The value of an assignment is what was stored: no qualifiers.
                 target.ty.unqual().clone()
             }
@@ -3404,26 +3575,40 @@ impl<'a> FnChecker<'a> {
                     }
                 }
                 self.assignable(target, pos)?;
+                self.bounds(target);
                 target.ty.unqual().clone()
             }
             ExprKind::Binary(op, l, r) => {
+                // A subscript's `+` is no operator to clang: its base and
+                // index are not checked as operands are.
+                let subscript = std::mem::take(&mut self.subscript);
                 let (a, b) = (self.expr(l), self.expr(r));
                 a?;
                 b?;
                 self.precedence(*op, pos, l, r);
-                self.binary(*op, l, r, pos, id)?
+                self.subscript_add = subscript;
+                let t = self.binary(*op, l, r, pos, id);
+                self.subscript_add = false;
+                let t = t?;
+                if !subscript {
+                    self.bounds(l);
+                    self.bounds(r);
+                }
+                t
             }
             ExprKind::Unary(op, x) => {
                 self.expr(x)?;
                 let t = x.ty.decay();
-                match (*op, &t) {
+                let t = match (*op, &t) {
                     (UnOp::Not, t) if t.is_scalar() => Type::INT,
                     (UnOp::Neg | UnOp::Plus | UnOp::BitNot, Type::Int(k)) => Type::Int(k.promoted()),
                     _ => {
                         let msg = format!("invalid argument type '{t}' to unary expression");
                         return Err(self.err(pos, msg));
                     }
-                }
+                };
+                self.bounds(x);
+                t
             }
             ExprKind::Addr(x) => {
                 self.address_taken = true;
@@ -3440,6 +3625,7 @@ impl<'a> FnChecker<'a> {
             ExprKind::Deref(x) => {
                 // The parser writes `a[i]` as `*(a + i)`, both at the `[`.
                 let subscript = matches!(&x.kind, ExprKind::Binary(BinOp::Add, ..)) && x.pos == pos;
+                self.subscript = subscript;
                 self.expr(x)?;
                 match x.ty.decay() {
                     // `*p` of a `void *` is an expression of type `void`, which
@@ -3450,7 +3636,24 @@ impl<'a> FnChecker<'a> {
                         self.errors.push(Error::warning(pos, msg, "void-ptr-dereference"));
                         *t
                     }
-                    Type::Ptr(t) => *t,
+                    Type::Ptr(t) => {
+                        // `*(int *)0` read or stored: clang's warning, of
+                        // what it does when it runs, that the optimizer
+                        // deletes it (`CheckForNullPointerDereference`).
+                        if !subscript && !addressed && t.is_scalar() && !t.quals().volatile && {
+                            let mut inner = &**x;
+                            while let ExprKind::Cast { x, .. } = &inner.kind {
+                                inner = x;
+                            }
+                            inner.ty.is_integer() && consteval::int(inner, self.xlen) == Some(0)
+                        } {
+                            let msg = "indirection of non-volatile null pointer will be deleted, not trap";
+                            let note =
+                                "consider using __builtin_trap() or qualifying pointer with 'volatile'";
+                            self.runtime(Error::warning(pos, msg, "null-dereference").note(pos, note), e.id);
+                        }
+                        *t
+                    }
                     t => {
                         let msg = if subscript {
                             "subscripted value is not an array, pointer, or vector".to_string()
@@ -3492,6 +3695,24 @@ impl<'a> FnChecker<'a> {
                         self.errors.push(Error::warning(pos, msg, flag));
                     }
                 }
+                // An integer narrower than a pointer made one, unless it is
+                // a constant, a `_Bool` or an enum (clang's
+                // `checkIntToPointerCast`).
+                if let (Type::Ptr(p), Type::Int(k)) = (to.unqual(), &from) {
+                    let spelled = self.spelled_of(x);
+                    let narrower = k.size(self.xlen) < ptr_size(self.xlen);
+                    let constant = consteval::int(x, self.xlen).is_some();
+                    if narrower && *k != IntKind::Bool && !constant && enum_of(&spelled, &from).is_none() {
+                        let named = from.named(&spelled);
+                        let msg = format!("cast to '{to}' from smaller integer type {named}");
+                        let flag = if p.is_void() {
+                            "int-to-void-pointer-cast"
+                        } else {
+                            "int-to-pointer-cast"
+                        };
+                        self.errors.push(Error::warning(pos, msg, flag));
+                    }
+                }
                 return Ok(());
             }
             ExprKind::SizeofType(t) => {
@@ -3511,6 +3732,20 @@ impl<'a> FnChecker<'a> {
                 self.unevaluated -= 1;
                 self.literals.truncate(mark);
                 r?;
+                // `sizeof a` of a parameter declared `int a[4]` is a
+                // pointer's size.
+                if let ExprKind::Var { name, .. } = &x.kind {
+                    if let Some((_, ty, decl)) = self.lookup(name) {
+                        if let Some(array) = self.array_params.get(decl) {
+                            let msg = format!(
+                                "sizeof on array function parameter will return size of '{ty}' instead of '{array}'"
+                            );
+                            let w = Error::warning(self.loc_written(x), msg, "sizeof-array-argument")
+                                .note(*decl, "declared here");
+                            self.errors.push(w);
+                        }
+                    }
+                }
                 if side_effects(x) {
                     let here = if self.written.parens.contains_key(&x.pos) {
                         at
@@ -3544,6 +3779,8 @@ impl<'a> FnChecker<'a> {
                         Error::warning(at, "left operand of comma operator has no effect", "unused-value");
                     self.runtime(w, anchor);
                 }
+                self.bounds(a);
+                self.bounds(b);
                 let t = b.ty.decay();
                 coerce(b, &t);
                 t
@@ -3639,7 +3876,31 @@ impl<'a> FnChecker<'a> {
                     Some((name, Some(Global::Func(sig)))) => Some((name, sig)),
                     _ => None,
                 };
-                if let Some(e) = arity_error(&ft, args, sig, *close, |e| self.begin_written(e)) {
+                if unprototyped(&ft) {
+                    // No prototype: the arguments are promoted, as `...`'s
+                    // are, and passed as named ones. To a definition with
+                    // `()`, which has none, clang warns of them; and of any
+                    // to what has no prototype, as C23 has none.
+                    if let (Some(first), Some((name, s))) = (args.first(), sig) {
+                        if s.def.is_some() {
+                            let _ = first;
+                            let msg = format!("too many arguments in call to '{name}'");
+                            self.errors.push(Error::warning_unflagged(*close, msg));
+                        }
+                    }
+                    if !args.is_empty() {
+                        let to = match sig {
+                            Some((name, _)) => format!("'{name}'"),
+                            None => "a function".to_string(),
+                        };
+                        let msg = format!(
+                            "passing arguments to {to} without a prototype is deprecated in all versions of \
+                             C and is not supported in C23"
+                        );
+                        self.errors
+                            .push(Error::warning(*open, msg, "deprecated-non-prototype"));
+                    }
+                } else if let Some(e) = arity_error(&ft, args, sig, *close, |e| self.begin_written(e)) {
                     return Err(Reported).inspect_err(|_| self.errors.push(e));
                 }
                 if !ok {
@@ -3660,6 +3921,7 @@ impl<'a> FnChecker<'a> {
                         ok = false;
                         continue;
                     }
+                    self.bounds(a);
                     coerce(a, p);
                     // A struct too big for registers is passed as the address of a copy.
                     if p.is_record() && abi::classify(p, self.xlen) == abi::Pass::Ref {
@@ -3707,6 +3969,11 @@ impl<'a> FnChecker<'a> {
             ExprKind::VaEnd(_) | ExprKind::VaCopy(..) => unreachable!("rewritten above"),
             ExprKind::CompoundLit { init, local } => {
                 let mut ty = e.ty.clone();
+                // Its list as written, before sema braces it fully, for
+                // clang's messages that name it.
+                if let Some(text) = self.printed_init(init) {
+                    self.literal_texts.insert(e.id.0, text);
+                }
                 if self.func.is_empty() {
                     let init = std::mem::replace(init.as_mut(), Init::List(Vec::new(), pos));
                     let name = self.static_literal(&mut ty, init, pos)?;
@@ -3759,6 +4026,7 @@ impl<'a> FnChecker<'a> {
             define: true,
             spelled: Default::default(),
             pos,
+            begin: pos,
             sized: Vec::new(),
             unevaluated: Vec::new(),
         });
@@ -3931,6 +4199,31 @@ impl<'a> FnChecker<'a> {
     /// An incomplete type is reported at `at`: the `sizeof` of a type, the
     /// operand of `sizeof expr`.
     fn sizeof(&mut self, e: &mut Expr, t: &Type, at: Pos) -> Checked {
+        // What it is of, as written, before it becomes its value.
+        let of = match &e.kind {
+            ExprKind::SizeofExpr(x, _) => {
+                // The operand is not converted: a variable is itself.
+                let var = match &x.kind {
+                    ExprKind::Var { name, .. } => self.decl_of(name).map(|at| (name.clone(), at)),
+                    _ => None,
+                };
+                self.printed(x).map(|text| SizeofOf {
+                    ty: x.ty.clone(),
+                    text: format!("sizeof {text}"),
+                    var,
+                    expr: true,
+                })
+            }
+            _ => Some(SizeofOf {
+                ty: t.clone(),
+                text: format!("sizeof({})", t.declare("")),
+                var: None,
+                expr: false,
+            }),
+        };
+        if let Some(of) = of {
+            self.sizeofs.insert(e.id.0, of);
+        }
         let size = if t.is_void() || t.is_func() {
             Some(1)
         } else {
@@ -3972,11 +4265,22 @@ impl<'a> FnChecker<'a> {
             _ if op.is_comparison() => {
                 // clang's warnings come first, of what the operands are,
                 // then whether they can be compared at all.
+                self.logical_not_on_left(op, l, r);
                 // Not of a macro's (`#define SAME(x) (x == x)`).
                 if same_operand(l, r) && !self.written.macros.contains(&pos) {
                     let always = matches!(op, BinOp::Eq | BinOp::Le | BinOp::Ge);
                     let msg = format!("self-comparison always evaluates to {always}");
                     self.errors.push(Error::warning(pos, msg, "tautological-compare"));
+                } else {
+                    // A string literal compared with anything but a null
+                    // pointer constant compares its address.
+                    let literal = |e: &Expr| matches!(strip_implicit(e).kind, ExprKind::Str(_));
+                    let null = |e: &Expr| consteval::is_null_pointer(e, self.xlen);
+                    if (literal(l) && !null(r)) || (literal(r) && !null(l)) {
+                        let msg = "result of comparison against a string literal is unspecified (use an \
+                                   explicit string comparison function instead)";
+                        self.errors.push(Error::warning(pos, msg, "string-compare"));
+                    }
                 }
                 let (lnull, rnull) = (
                     consteval::is_null_pointer(l, self.xlen),
@@ -4036,9 +4340,21 @@ impl<'a> FnChecker<'a> {
             }
             // Named as written, before arrays decay, as clang names them.
             _ => {
+                if op == BinOp::BitAnd {
+                    self.logical_not_on_left(op, l, r);
+                }
+                if op == BinOp::Add && !self.subscript_add {
+                    self.string_plus(pos, l, r);
+                }
+                if op == BinOp::Div {
+                    self.sizeof_division(pos, l, r);
+                }
                 let ty = arith_type(op, &lt, &rt, self.xlen)
                     .ok_or_else(|| self.invalid_operands(op, pos, &l.ty, &r.ty))?;
                 self.bad_shift_or_divisor(op, pos, id, &lt, r);
+                if op == BinOp::Shl {
+                    self.shift_of_constant(pos, id, &lt, l, r);
+                }
                 Ok(ty)
             }
         }
@@ -4102,6 +4418,313 @@ impl<'a> FnChecker<'a> {
                 }
             }
         }
+    }
+
+    /// clang's `-Wlogical-not-parentheses`: `!a == b` (or `!a & b`) is
+    /// `(!a) == b`, likely meant as `!(a == b)`, unless what is compared is
+    /// a truth value already, or the `!` is in parentheses.
+    fn logical_not_on_left(&mut self, op: BinOp, l: &Expr, r: &Expr) {
+        let ExprKind::Unary(UnOp::Not, x) = &strip_implicit(l).kind else {
+            return;
+        };
+        let not = strip_implicit(l).pos;
+        if self.written.parens.contains_key(&not) || known_boolean(r) || known_boolean(strip_implicit(x)) {
+            return;
+        }
+        let what = if op == BinOp::BitAnd {
+            "bitwise operator"
+        } else {
+            "comparison"
+        };
+        let msg = format!("logical not is only applied to the left hand side of this {what}");
+        let w = Error::warning(not, msg, "logical-not-parentheses")
+            .note(
+                not,
+                format!("add parentheses after the '!' to evaluate the {what} first"),
+            )
+            .note(
+                not,
+                "add parentheses around left hand side expression to silence this warning",
+            );
+        self.errors.push(w);
+    }
+
+    /// clang's warnings of `sizeof x / sizeof y` that does not count the
+    /// elements of an array (its `DiagnoseDivisionSizeofPointerOrArray`):
+    /// of a pointer by what it points to (-Wsizeof-pointer-div), and of a
+    /// one-dimensional array by a type its elements are not, unless they
+    /// are characters (-Wsizeof-array-div).
+    fn sizeof_division(&mut self, pos: Pos, l: &Expr, r: &Expr) {
+        let (Some(lo), Some(ro)) = (
+            self.sizeofs.get(&strip_implicit(l).id.0),
+            self.sizeofs.get(&strip_implicit(r).id.0),
+        ) else {
+            return;
+        };
+        if !lo.expr {
+            return;
+        }
+        let (lt, rt) = (lo.ty.unqual(), ro.ty.unqual());
+        let w = match (lt, rt) {
+            (Type::Ptr(p), rt) if !rt.is_ptr() => {
+                if p.unqual() != rt {
+                    return;
+                }
+                let msg = format!(
+                    "'{}' will return the size of the pointer, not the array itself",
+                    lo.text
+                );
+                let mut w = Error::warning(pos, msg, "sizeof-pointer-div");
+                if let Some((name, at)) = &lo.var {
+                    w = w.note(*at, format!("pointer '{name}' declared here"));
+                }
+                w
+            }
+            (Type::Array(elem, _), rt) => {
+                let elem = elem.unqual();
+                let char = elem
+                    .int_kind()
+                    .is_some_and(|k| matches!(k, IntKind::Char | IntKind::SChar | IntKind::UChar));
+                if elem.is_array() || char || elem == rt {
+                    return;
+                }
+                let msg = format!(
+                    "expression does not compute the number of elements in this array; element type is \
+                     '{elem}', not '{rt}'"
+                );
+                let mut w = Error::warning(pos, msg, "sizeof-array-div");
+                if let Some((name, at)) = &lo.var {
+                    w = w.note(*at, format!("array '{name}' declared here"));
+                }
+                w.note(
+                    pos,
+                    format!(
+                        "place parentheses around the '{}' expression to silence this warning",
+                        ro.text
+                    ),
+                )
+            }
+            _ => return,
+        };
+        self.errors.push(w);
+    }
+
+    /// Where the declaration of the variable `name` this checker sees
+    /// begins.
+    fn decl_begin_of(&self, name: &str) -> Option<Pos> {
+        match self.lookup(name) {
+            Some((_, _, at)) => Some(self.begins.get(at).copied().unwrap_or(*at)),
+            None => match self.global(name)? {
+                Global::Var(g) => Some(g.begin),
+                Global::Func(f) => Some(f.pos),
+            },
+        }
+    }
+
+    /// The automatic objects whose addresses the value `e` can be, as
+    /// clang's lifetime analysis follows it: through casts (to integers
+    /// too), both operands of a `?:`, a comma's right one, the pointer of
+    /// pointer arithmetic, `&` of an object, and an array as a pointer:
+    /// where each is named, and what it is.
+    fn stack_address(&self, e: &Expr, out: &mut Vec<(Pos, String)>) {
+        match &e.kind {
+            ExprKind::Cast { x, .. } if x.ty.is_array() => self.stack_object(x, out),
+            ExprKind::Cast { x, .. } => self.stack_address(x, out),
+            ExprKind::Cond(_, a, b) => {
+                self.stack_address(a, out);
+                self.stack_address(b, out);
+            }
+            ExprKind::Comma(_, b) => self.stack_address(b, out),
+            ExprKind::Binary(BinOp::Add | BinOp::Sub, a, b) if e.ty.is_ptr() => {
+                let p = if a.ty.decay().is_ptr() { a } else { b };
+                self.stack_address(p, out);
+            }
+            ExprKind::Addr(x) => self.stack_object(x, out),
+            _ if e.ty.is_array() => self.stack_object(e, out),
+            _ => {}
+        }
+    }
+
+    /// [`Self::stack_address`] of the object `e` designates.
+    fn stack_object(&self, e: &Expr, out: &mut Vec<(Pos, String)>) {
+        match &e.kind {
+            ExprKind::Var {
+                name,
+                var: Some(VarRef::Local(_)),
+            } => {
+                let decl = self.lookup(name).map(|(_, _, at)| *at);
+                let what = if decl.is_some_and(|at| self.param_pos.contains(&at)) {
+                    "parameter"
+                } else {
+                    "local variable"
+                };
+                out.push((e.pos, format!("{what} '{name}'")));
+            }
+            ExprKind::Member {
+                base, arrow: false, ..
+            } => self.stack_object(base, out),
+            ExprKind::Deref(x) if x.pos == e.pos => {
+                if let ExprKind::Binary(_, a, i) = &x.kind {
+                    let base = strip_implicit(if a.ty.decay().is_ptr() { a } else { i });
+                    if base.ty.is_array() {
+                        self.stack_object(base, out);
+                    }
+                }
+            }
+            ExprKind::Deref(x) => self.stack_address(x, out),
+            ExprKind::CompoundLit { local: Some(_), .. } => {
+                if let Some(text) = self.literal_texts.get(&e.id.0) {
+                    out.push((e.pos, format!("compound literal '{text}'")));
+                }
+            }
+            ExprKind::Cast {
+                x, implicit: true, ..
+            } => self.stack_object(x, out),
+            _ => {}
+        }
+    }
+
+    /// An initializer list as clang prints it (`{.x = 1, 2}`), as far as
+    /// [`Self::printed`] prints its expressions.
+    fn printed_init(&self, i: &Init) -> Option<String> {
+        Some(match i {
+            Init::Expr(e) => self.printed(e)?,
+            Init::List(items, _) => {
+                let items: Option<Vec<String>> = items.iter().map(|i| self.printed_init(i)).collect();
+                format!("{{{}}}", items?.join(", "))
+            }
+            Init::Designated(ds, value) => {
+                let mut text = String::new();
+                for d in ds {
+                    match d {
+                        Designator::Member(name, ..) => text.push_str(&format!(".{name}")),
+                        Designator::Index(e, _) => text.push_str(&format!("[{}]", self.printed(e)?)),
+                    }
+                }
+                format!("{text} = {}", self.printed_init(value)?)
+            }
+        })
+    }
+
+    /// Where the variable `name` this checker sees is declared.
+    fn decl_of(&self, name: &str) -> Option<Pos> {
+        match self.lookup(name) {
+            Some((_, _, at)) => Some(*at),
+            None => match self.global(name)? {
+                Global::Var(g) => Some(g.pos),
+                Global::Func(f) => Some(f.pos),
+            },
+        }
+    }
+
+    /// `e` as clang prints an expression in a message, as far as merlin
+    /// can: names, members, `*`, `&`, subscripts, integer literals and the
+    /// binary operators, with the parentheses written.
+    fn printed(&self, e: &Expr) -> Option<String> {
+        let text = match &e.kind {
+            ExprKind::Cast {
+                x, implicit: true, ..
+            } => return self.printed(x),
+            ExprKind::Var { name, .. } => name.clone(),
+            ExprKind::Num(v) if self.written.int_literals.contains(&e.pos) => v.to_string(),
+            ExprKind::Member {
+                base, name, arrow, ..
+            } => {
+                format!("{}{}{name}", self.printed(base)?, if *arrow { "->" } else { "." })
+            }
+            ExprKind::Deref(x) if x.pos == e.pos => match &x.kind {
+                ExprKind::Binary(BinOp::Add, a, i) => format!("{}[{}]", self.printed(a)?, self.printed(i)?),
+                _ => return None,
+            },
+            ExprKind::Deref(x) => format!("*{}", self.printed(x)?),
+            ExprKind::Addr(x) => format!("&{}", self.printed(x)?),
+            ExprKind::Binary(op, a, b) => {
+                format!("{} {} {}", self.printed(a)?, op.symbol(), self.printed(b)?)
+            }
+            _ => return None,
+        };
+        Some(if self.written.parens.contains_key(&e.pos) {
+            format!("({text})")
+        } else {
+            text
+        })
+    }
+
+    /// clang's warnings of a string literal and an integer added (C has no
+    /// strings to append to): `-Wstring-plus-int` of any integer, and
+    /// `-Wstring-plus-char` of a character constant and a pointer to a
+    /// character type.
+    fn string_plus(&mut self, pos: Pos, l: &Expr, r: &Expr) {
+        let (l, r) = (strip_implicit(l), strip_implicit(r));
+        // Not through parentheses: `("abc") + i` is let be.
+        let literal =
+            |e: &Expr| matches!(e.kind, ExprKind::Str(_)) && !self.written.parens.contains_key(&e.pos);
+        let index = if literal(l) {
+            Some(r)
+        } else if literal(r) {
+            Some(l)
+        } else {
+            None
+        };
+        if let Some(i) = index.filter(|i| i.ty.is_integer()) {
+            let msg = format!("adding '{}' to a string does not append to the string", i.ty);
+            let w = Error::warning(pos, msg, "string-plus-int")
+                .note(pos, "use array indexing to silence this warning");
+            self.errors.push(w);
+        }
+        let character =
+            |e: &Expr| matches!(e.kind, ExprKind::Num(_)) && self.written.char_literals.contains(&e.pos);
+        let string = |e: &Expr| {
+            e.ty.decay().pointee().is_some_and(|t| {
+                t.int_kind()
+                    .is_some_and(|k| matches!(k, IntKind::Char | IntKind::SChar | IntKind::UChar))
+            })
+        };
+        if (character(r) && string(l)) || (character(l) && string(r)) {
+            let msg = "adding 'char' to a string pointer does not append to the string";
+            let w = Error::warning(pos, msg, "string-plus-char")
+                .note(pos, "use array indexing to silence this warning");
+            self.errors.push(w);
+        }
+    }
+
+    /// clang's warnings of `l << r` of constants (`DiagnoseBadShiftValues`,
+    /// the count in range): of a negative left operand, of what it does
+    /// when it runs (-Wshift-negative-value); of a signed result that needs
+    /// more bits than its type has, but for its sign bit, as it is built
+    /// (-Wshift-overflow).
+    fn shift_of_constant(&mut self, pos: Pos, of: ExprId, lt: &Type, l: &Expr, r: &Expr) {
+        let Some(k) = lt.int_kind().map(IntKind::promoted).filter(|k| k.signed()) else {
+            return;
+        };
+        let width = i128::from(k.size(self.xlen)) * 8;
+        let (Some(a), Some(n)) = (consteval::int(l, self.xlen), consteval::int(r, self.xlen)) else {
+            return;
+        };
+        if !(0..width).contains(&n) {
+            return;
+        }
+        if a < 0 {
+            let w = Error::warning(
+                pos,
+                "shifting a negative signed value is undefined",
+                "shift-negative-value",
+            );
+            return self.runtime(w, of);
+        }
+        // The bits of the value, its sign bit among them, and of the result.
+        let bits = 128 - i128::from(a.leading_zeros()) + 1;
+        let needed = n + bits;
+        if needed <= width || needed - 1 == width {
+            return;
+        }
+        let result = a << n;
+        let msg = format!(
+            "signed shift result (0x{result:X}) requires {needed} bits to represent, but '{}' only has \
+             {width} bits",
+            Type::Int(k)
+        );
+        self.errors.push(Error::warning(pos, msg, "shift-overflow"));
     }
 
     /// clang's `-Wconstant-logical-operand`: `x && 4`, an integer and a
@@ -4237,7 +4860,113 @@ impl<'a> FnChecker<'a> {
     /// conversions and comparisons ([`Self::full`]), then its overflows.
     fn full_expression(&mut self, e: &Expr) {
         self.full(e);
+        if self.unevaluated == 0 {
+            for f in crate::sequence::check(e, self.xlen) {
+                self.runtime(Error::warning(f.at, f.msg, "unsequenced"), f.of);
+            }
+        }
         self.overflow(e);
+    }
+
+    /// clang's `-Warray-bounds` of `e`, as its `CheckArrayAccess` checks it
+    /// where it is called, after what else is said there: of each operand
+    /// of a binary operator (an assignment, a comma), of a unary one but
+    /// `&` and `*`, of an argument, and of a statement's expression, a
+    /// condition, a returned value and a declaration's initializer; not of
+    /// a cast's operand, a subscript's index nor an item of a list. Each
+    /// subscript of the chain at `e` of an array of known size by a
+    /// constant, its base followed down through members, `&` (an address
+    /// may be just past the end) and `*`, and both operands of a `?:`.
+    fn bounds(&mut self, e: &Expr) {
+        self.bounds_chain(e, 0)
+    }
+
+    fn bounds_chain(&mut self, e: &Expr, mut allow: i32) {
+        let mut e = strip_implicit(e);
+        loop {
+            match &e.kind {
+                ExprKind::Deref(x) if x.pos == e.pos => {
+                    let ExprKind::Binary(_, a, i) = &x.kind else {
+                        return;
+                    };
+                    let (base, index) = if a.ty.decay().is_ptr() { (a, i) } else { (i, a) };
+                    self.bound(base, index, allow > 0);
+                    e = strip_implicit(base);
+                }
+                ExprKind::Member { base, .. } => e = strip_implicit(base),
+                ExprKind::Addr(x) => {
+                    allow += 1;
+                    e = strip_implicit(x);
+                }
+                ExprKind::Deref(x) => {
+                    allow -= 1;
+                    e = strip_implicit(x);
+                }
+                ExprKind::Cond(_, a, b) => {
+                    self.bounds_chain(a, allow);
+                    self.bounds_chain(b, allow);
+                    return;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// The subscript of `base` by `index`: clang's warning if `base` is an
+    /// array of known size and `index` a constant out of it (one just past
+    /// the end may be if `one_past`, its address taken), with where the
+    /// array is declared.
+    fn bound(&mut self, base: &Expr, index: &Expr, one_past: bool) {
+        let array = strip_implicit(base);
+        let Type::Array(_, Some(n)) = array.ty.unqual() else {
+            return;
+        };
+        let n = i128::from(*n);
+        let Some(v) = consteval::int(index, self.xlen) else {
+            return;
+        };
+        let msg = if v < 0 {
+            format!("array index {v} is before the beginning of the array")
+        } else if v > n || (v == n && !one_past) {
+            format!(
+                "array index {v} is past the end of the array (that has type '{}')",
+                array.ty.unqual()
+            )
+        } else {
+            return;
+        };
+        // Where the base begins, inside parentheses around it.
+        let mut w = Error::warning(self.begin_inside(array), msg, "array-bounds");
+        // The array it is, through the subscripts it is of.
+        let mut named = array;
+        while let ExprKind::Deref(x) = &named.kind {
+            let ExprKind::Binary(_, a, i) = &x.kind else { break };
+            if x.pos != named.pos {
+                break;
+            }
+            named = strip_implicit(if a.ty.decay().is_ptr() { a } else { i });
+        }
+        let decl = match &named.kind {
+            ExprKind::Var { name, .. } => self.decl_begin_of(name).map(|at| (name.clone(), at)),
+            ExprKind::Member {
+                base, name, arrow, ..
+            } => {
+                let outer = if *arrow {
+                    base.ty.decay().pointee().cloned()
+                } else {
+                    Some(base.ty.clone())
+                };
+                outer
+                    .as_ref()
+                    .and_then(Type::record)
+                    .and_then(|r| Some((name.clone(), r.body()?.member(name)?.begin)))
+            }
+            _ => None,
+        };
+        if let Some((name, at)) = decl {
+            w = w.note(at, format!("array '{name}' declared here"));
+        }
+        self.runtime(w, index.id);
     }
 
     /// clang's `-Wtautological-constant-out-of-range-compare`: a constant
@@ -4268,12 +4997,36 @@ impl<'a> FnChecker<'a> {
             // Only where every value of `t` is the same in the common type.
             let (min, max) = t.range(x);
             let (cmin, cmax) = common.range(x);
-            if min < cmin || max > cmax || t == IntKind::Bool {
+            if min < cmin || max > cmax {
                 continue;
             }
             let v = common.wrap(v, x);
             let below = v < min;
             if !below && v <= max {
+                // A `_Bool` compared with one of its own two values, where
+                // that decides it (`b > 1`, `b >= 0`): clang's warning of
+                // the limits of a truth value.
+                if t != IntKind::Bool {
+                    continue;
+                }
+                // As `other op v`.
+                let op = match (op, left) {
+                    (BinOp::Lt, true) => BinOp::Gt,
+                    (BinOp::Gt, true) => BinOp::Lt,
+                    (BinOp::Le, true) => BinOp::Ge,
+                    (BinOp::Ge, true) => BinOp::Le,
+                    (op, _) => op,
+                };
+                let always = match (op, v) {
+                    (BinOp::Gt, 1) | (BinOp::Lt, 0) => false,
+                    (BinOp::Le, 1) | (BinOp::Ge, 0) => true,
+                    _ => continue,
+                };
+                let msg = format!(
+                    "result of comparison of constant {v} with expression of type '{}' is always {always}",
+                    inner.ty.unqual()
+                );
+                self.runtime(Error::warning(pos, msg, "tautological-constant-compare"), of);
                 continue;
             }
             // `v op other`, or `other op v`, for every value of `t`.
@@ -4410,6 +5163,29 @@ impl<'a> FnChecker<'a> {
         coerce(b, &ty);
         Ok(ty)
     }
+}
+
+/// What a `sizeof` was of ([`FnChecker::sizeof_division`]): the type (an
+/// expression's not converted), the `sizeof` as clang prints it, and the
+/// variable it was of, if it was one, with where it is declared.
+struct SizeofOf {
+    ty: Type,
+    text: String,
+    var: Option<(String, Pos)>,
+    /// Of an expression, not a type name.
+    expr: bool,
+}
+
+/// `e` without the conversions sema added.
+fn strip_implicit(e: &Expr) -> &Expr {
+    let mut e = e;
+    while let ExprKind::Cast {
+        x, implicit: true, ..
+    } = &e.kind
+    {
+        e = x;
+    }
+    e
 }
 
 /// An integer type as an operand promoted has it; any other type as it is.

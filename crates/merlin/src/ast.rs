@@ -66,6 +66,8 @@ pub struct Written {
     /// warnings of literals (its `IntegerLiteral`) know them from what
     /// sema folds (`sizeof (int)`).
     pub int_literals: std::collections::HashSet<Pos>,
+    /// Where each character constant is (`'a'`, clang's `CharacterLiteral`).
+    pub char_literals: std::collections::HashSet<Pos>,
 }
 
 /// An expression the parser needed no value of, for sema to check without
@@ -242,6 +244,9 @@ pub struct Param {
     pub spelled: Spelled,
     /// Declared `register`: its address cannot be taken.
     pub register: bool,
+    /// The array type it was declared as, before C adjusted it to a
+    /// pointer (clang's `-Wsizeof-array-argument`).
+    pub array: Option<Type>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,6 +277,9 @@ pub struct Declarator {
     /// else the first that is not `extern`).
     pub define: bool,
     pub pos: Pos,
+    /// Where its declaration begins (its specifiers), where clang's notes
+    /// of an array name it.
+    pub begin: Pos,
     /// How its type was spelled (for `-g`).
     pub spelled: Spelled,
     /// What the parser evaluated away in its declarator (and, for a

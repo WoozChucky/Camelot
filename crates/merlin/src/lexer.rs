@@ -485,6 +485,14 @@ impl Lexer {
                                 self.bump();
                                 break;
                             }
+                            // A comment does not nest: clang warns of what
+                            // looks like a second one starting.
+                            (Some('/'), Some('*')) => {
+                                let at = self.pos();
+                                self.lexed
+                                    .push(Error::warning(at, "'/*' within block comment", "comment"));
+                                self.bump();
+                            }
                             (Some(_), _) => {
                                 self.bump();
                             }

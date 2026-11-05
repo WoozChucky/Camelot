@@ -37,6 +37,7 @@ pub mod lexer;
 pub mod parser;
 pub mod preprocess;
 pub mod sema;
+pub mod sequence;
 pub mod types;
 
 pub use debug::DebugInfo;

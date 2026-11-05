@@ -292,8 +292,10 @@ pub struct Member {
     pub offset: u32,
     /// How its declaration spelled its type (for `-g`).
     pub spelled: Spelled,
-    /// Where it is declared.
+    /// Where it is declared, and where its declaration begins (its
+    /// specifiers: clang's notes of an array name it there).
     pub pos: Pos,
+    pub begin: Pos,
 }
 
 impl Record {
@@ -328,19 +330,25 @@ impl Record {
         let pos = self.pos;
         let members = members
             .into_iter()
-            .map(|(n, t)| (n, t, Spelled::default(), pos))
+            .map(|(n, t)| (n, t, Spelled::default(), pos, pos))
             .collect();
         self.complete_spelled(members, pos, x)
     }
 
-    /// [`Record::complete`], with each member's spelling and position, and
-    /// the definition's, which only `-g` reads.
-    pub fn complete_spelled(&self, members: Vec<(String, Type, Spelled, Pos)>, pos: Pos, x: Xlen) -> bool {
+    /// [`Record::complete`], with each member's spelling, position and
+    /// where its declaration begins, and the definition's position, which
+    /// only `-g` reads.
+    pub fn complete_spelled(
+        &self,
+        members: Vec<(String, Type, Spelled, Pos, Pos)>,
+        pos: Pos,
+        x: Xlen,
+    ) -> bool {
         let mut offset = 0u64;
         let mut size = 0u64;
         let mut align = 1;
         let mut laid_out = Vec::with_capacity(members.len());
-        for (name, ty, spelled, pos) in members {
+        for (name, ty, spelled, pos, begin) in members {
             let (msize, malign) = (u64::from(ty.size(x).expect("complete member")), ty.align(x));
             align = align.max(malign);
             let at = if self.union { 0 } else { align_up(offset, malign) };
@@ -352,6 +360,7 @@ impl Record {
                 offset: at as u32,
                 spelled,
                 pos,
+                begin,
             });
         }
         let size = align_up(size, align);
@@ -428,8 +437,10 @@ pub struct FuncType {
     /// describes a function pointer's parameters so (`const pt` of a
     /// typedef `pt`). Never part of comparing types.
     pub spelled: Spellings,
-    /// Declared with `()`, of which C99 says nothing of the parameters
-    /// (merlin takes it as `(void)`): clang names the type `int ()`.
+    /// Declared with `()`, of which C99 says nothing of the parameters: a
+    /// call passes its arguments promoted, as named ones, and a prototype
+    /// whose parameters are what the promotions make of themselves is
+    /// compatible with it (`crate::sema`). clang names the type `int ()`.
     pub unprototyped: Unprototyped,
 }
 
