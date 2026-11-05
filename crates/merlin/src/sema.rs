@@ -120,6 +120,61 @@ pub fn arith_type(op: BinOp, l: &Type, r: &Type, x: Xlen) -> Option<Type> {
     }
 }
 
+/// The type of `e` if it is a compound literal, or a member of one (`.`,
+/// at any depth), before sema has checked it: the literal's, and its
+/// members' as its record has them.
+fn literal_type_of(e: &Expr) -> Option<Type> {
+    match &e.kind {
+        ExprKind::CompoundLit { .. } => Some(e.ty.clone()),
+        ExprKind::Member {
+            base,
+            name,
+            arrow: false,
+            ..
+        } => {
+            let outer = literal_type_of(base)?;
+            let m = outer.record()?.body()?.member(name)?.ty.clone();
+            Some(m.qualified(outer.quals()))
+        }
+        _ => None,
+    }
+}
+
+/// Where an expression begins, as clang points at it: the left operand of
+/// an operator after it, the base of a member, the callee of a call.
+fn begin(e: &Expr) -> Pos {
+    match &e.kind {
+        ExprKind::Binary(_, l, _) | ExprKind::Comma(l, _) | ExprKind::Cond(l, ..) => begin(l),
+        ExprKind::Assign { target, .. } => begin(target),
+        ExprKind::IncDec {
+            prefix: false,
+            target,
+            ..
+        } => begin(target),
+        ExprKind::Member { base, .. } => begin(base),
+        ExprKind::Call { callee, .. } => begin(callee),
+        // `a[i]` is `*(a + i)`, at the `[`.
+        ExprKind::Deref(x) if x.pos == e.pos => begin(x),
+        ExprKind::Cast {
+            x, implicit: true, ..
+        } => begin(x),
+        _ => e.pos,
+    }
+}
+
+/// The initializer of a member a braced list leaves out: zero.
+fn zero(ty: &Type, pos: Pos) -> Init {
+    if ty.is_scalar() {
+        Init::Expr(Expr {
+            kind: ExprKind::Num(0),
+            ty: ty.unqual().clone(),
+            pos,
+        })
+    } else {
+        Init::List(Vec::new(), pos)
+    }
+}
+
 /// Whether `e` designates an object (C's lvalue): a variable, `*p`, a
 /// string literal, `p->m`, or `s.m` of an lvalue `s` (a function's name, which
 /// designates the function, counts too, so that `&f` works).
@@ -333,6 +388,8 @@ impl Checker {
             static_labels: HashSet::new(),
             literals: Vec::new(),
             literal_base: 0,
+            constant: false,
+            address_taken: false,
             errors: &mut self.errors,
             xlen: self.xlen,
         };
@@ -431,7 +488,7 @@ impl Checker {
         }
         let Some(d_init) = &mut d.init else { return };
         let mut fc = FnChecker::file_scope(&self.globals, &mut self.errors, self.literals.len(), self.xlen);
-        let checked = fc.init(&mut d.ty, d_init, true);
+        let checked = fc.init_object(&mut d.ty, d_init, true, d.pos);
         self.literals.extend(fc.literals);
         let Some(Global::Var(g)) = self.globals.get_mut(&d.name) else {
             unreachable!("declared above")
@@ -586,6 +643,14 @@ struct FnChecker<'a> {
     /// from `literal_base` (those of earlier initializers come first).
     literals: Vec<Declarator>,
     literal_base: usize,
+    /// Checking an initializer that must be constant (a global's, a static
+    /// local's): a compound literal there whose value, not its object, is
+    /// what counts is folded into that value (clang's constant evaluator
+    /// reads it), as [`FnChecker::folded_literal`] says.
+    constant: bool,
+    /// The expression being checked is the operand of `&` (or the base of a
+    /// member that is): it is an object, not a value.
+    address_taken: bool,
     errors: &'a mut Vec<Error>,
     /// The target, for sizes and conversions.
     xlen: Xlen,
@@ -615,6 +680,8 @@ impl<'a> FnChecker<'a> {
             static_labels: HashSet::new(),
             literals: Vec::new(),
             literal_base,
+            constant: false,
+            address_taken: false,
             errors,
             xlen,
         }
@@ -655,9 +722,9 @@ impl<'a> FnChecker<'a> {
                 self.err(*pos, msg.clone());
             }
             clean.push(ok);
-            if let Some(w) = &u.warning {
+            if let Some(said) = &u.diagnostic {
                 if clean[clean.len() - 1 - u.with..].iter().all(|&ok| ok) {
-                    self.errors.push(w.clone());
+                    self.errors.push(said.clone());
                 }
             }
         }
@@ -934,7 +1001,7 @@ impl<'a> FnChecker<'a> {
             let var = VarRef::Global(label);
             self.bind(&d.name, var.clone(), &d.ty, d.pos, "");
             if let Some(init) = &mut d.init {
-                if self.init(&mut d.ty, init, true).is_err() {
+                if self.init_object(&mut d.ty, init, true, d.pos).is_err() {
                     return;
                 }
                 // The initializer may have completed an array's size.
@@ -948,7 +1015,7 @@ impl<'a> FnChecker<'a> {
             let id = self.declare(&d.name, &d.ty, d.pos, "");
             d.var = Some(VarRef::Local(id));
             if let Some(init) = &mut d.init {
-                if self.init(&mut d.ty, init, false).is_err() {
+                if self.init_object(&mut d.ty, init, false, d.pos).is_err() {
                     return;
                 }
                 // The initializer may have completed an array's size.
@@ -960,6 +1027,135 @@ impl<'a> FnChecker<'a> {
         if d.ty.size(self.xlen).is_none() {
             let msg = format!("variable '{}' has incomplete type '{}'", d.name, d.ty);
             self.err(d.pos, msg);
+        }
+    }
+
+    /// [`Self::init`] of a declared object (declared at `at`), which a
+    /// compound literal of its type may initialize as its list would (a GNU
+    /// extension clang takes, [`Self::init_by_literal`]).
+    fn init_object(&mut self, ty: &mut Type, init: &mut Init, constant: bool, at: Pos) -> Checked {
+        match self.init_by_literal(ty, init, constant, at) {
+            Some(checked) => checked,
+            None => self.init(ty, init, constant),
+        }
+    }
+
+    /// An array or struct initialized by a compound literal of its type,
+    /// `int a[2] = (int[2]){1, 2};`, or by a member of one: it is
+    /// initialized by the literal's list, as clang has it, which emits no
+    /// object for the literal. An array only by an array of its own type
+    /// (`int a[] = (int[]){1, 2}` takes the literal's size), anywhere; a
+    /// struct where its initializer must be constant (elsewhere it is
+    /// copied as any struct value is). `None` if `init` is no such
+    /// literal; the list replaces it, checked, otherwise.
+    fn init_by_literal(
+        &mut self,
+        ty: &mut Type,
+        init: &mut Init,
+        constant: bool,
+        at: Pos,
+    ) -> Option<Checked> {
+        let Init::Expr(e) = init else { return None };
+        let applies = match ty {
+            Type::Array(..) => matches!(e.kind, ExprKind::CompoundLit { .. }) && e.ty.is_array(),
+            Type::Record(_) => constant && literal_type_of(e).is_some_and(|t| t.is_record()),
+            _ => false,
+        };
+        if !applies {
+            return None;
+        }
+        let (lt, list) = match self.literal_value(e, constant) {
+            Ok(Some(found)) => found,
+            Ok(None) => return None,
+            Err(r) => return Some(Err(r)),
+        };
+        let fits = match (&*ty, &lt) {
+            (Type::Array(elem, n), Type::Array(lelem, ln)) => elem == lelem && (n.is_none() || n == ln),
+            (t, lt) => t.unqual() == lt.unqual(),
+        };
+        if !fits {
+            let msg = if ty.is_array() {
+                format!("cannot initialize array of type '{ty}' with array of type '{lt}'")
+            } else {
+                format!("initializing '{ty}' with an expression of incompatible type '{lt}'")
+            };
+            return Some(Err(self.err(at, msg)));
+        }
+        if ty.is_array() {
+            *ty = lt;
+        }
+        *init = list;
+        Some(Ok(()))
+    }
+
+    /// The type and the checked, fully braced list of a compound literal
+    /// `e`, or of a member of one (`(struct u){{1, 2}, 3}.s`, where a
+    /// constant is needed): what initializes it; or `None` for what is no
+    /// such thing, a member of a union other than the one its list gives,
+    /// which clang does not read either. `e` is left as it is, for what
+    /// takes it as an object then.
+    fn literal_value(&mut self, e: &mut Expr, constant: bool) -> Result<Option<(Type, Init)>, Reported> {
+        match &mut e.kind {
+            ExprKind::CompoundLit { init, .. } => {
+                let mut ty = e.ty.clone();
+                self.literal_type(&ty, e.pos)?;
+                let mut list = (**init).clone();
+                self.init(&mut ty, &mut list, constant)?;
+                Ok(Some((ty, list)))
+            }
+            ExprKind::Member {
+                base,
+                name,
+                arrow: false,
+                ..
+            } if constant => {
+                let Some((bt, list)) = self.literal_value(base, constant)? else {
+                    return Ok(None);
+                };
+                let pos = e.pos;
+                let Some(record) = bt.record().cloned() else {
+                    return Ok(None);
+                };
+                let Some(body) = record.body() else {
+                    let msg = format!("incomplete definition of type '{}'", record.name());
+                    return Err(self.err(pos, msg));
+                };
+                let Some(i) = body.members.iter().position(|m| m.name == *name) else {
+                    let msg = format!("no member named '{name}' in '{}'", record.name());
+                    return Err(self.err(pos, msg));
+                };
+                let mty = body.members[i].ty.clone().qualified(bt.quals());
+                // The fully braced list has an item per member up to the
+                // last one given: the rest are zero.
+                let Init::List(items, at) = list else {
+                    unreachable!("a struct's initializer is a list")
+                };
+                // A union's list ends with the one member it holds.
+                if record.union && i + 1 != items.len().max(1) {
+                    return Ok(None);
+                }
+                let item = items.into_iter().nth(i).unwrap_or_else(|| zero(&mty, at));
+                Ok(Some((mty, item)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// A compound literal's value where a constant is needed and its
+    /// object is not (`(int *){&g}`, `(struct s){1, 2}.b`): the value its
+    /// list gives, which `e` becomes, as clang's constant evaluator reads
+    /// it; `false` if `e` is no such literal of a scalar type.
+    fn folded_literal(&mut self, e: &mut Expr) -> Result<bool, Reported> {
+        if !self.constant || !literal_type_of(e).is_some_and(|t| t.is_scalar()) {
+            return Ok(false);
+        }
+        match self.literal_value(e, true)? {
+            Some((_, Init::Expr(x))) => {
+                *e = x;
+                Ok(true)
+            }
+            Some(_) => unreachable!("a scalar's initializer is an expression"),
+            None => Ok(false),
         }
     }
 
@@ -1236,6 +1432,15 @@ impl<'a> FnChecker<'a> {
         constant: bool,
     ) -> Result<Init, Reported> {
         let front = queue.front_mut().expect("not empty");
+        // A struct initialized by a struct literal's list, where a constant
+        // is needed (`{ (struct s){1, 2}, 3 }`).
+        if !front.checked && ty.is_record() {
+            let at = front.init.pos();
+            if let Some(checked) = self.init_by_literal(ty, &mut front.init, constant, at) {
+                checked?;
+                return Ok(queue.pop_front().expect("not empty").init);
+            }
+        }
         let elide = match &mut front.init {
             Init::List(..) | Init::Designated(..) => false,
             Init::Expr(e) if ty.is_array() => !(is_char_array(ty) && matches!(e.kind, ExprKind::Str(_))),
@@ -1243,7 +1448,7 @@ impl<'a> FnChecker<'a> {
                 // A struct is initialized by a struct of its type, or member by member.
                 if !front.checked {
                     front.checked = true;
-                    self.expr(e)?;
+                    self.value(e, constant)?;
                 }
                 e.ty.unqual() != ty.unqual()
             }
@@ -1290,12 +1495,12 @@ impl<'a> FnChecker<'a> {
             Type::Array(..) => Err(self.err(e.pos, "array initializer must be an initializer list")),
             _ => {
                 if !checked {
-                    self.expr(e)?;
+                    self.value(e, constant)?;
                 }
                 self.convert(e, ty, Conv::Init)?;
                 coerce(e, ty);
                 if constant && consteval::eval(e, self.xlen).is_none() {
-                    return Err(self.err(e.pos, "initializer element is not a compile-time constant"));
+                    return Err(self.err(begin(e), "initializer element is not a compile-time constant"));
                 }
                 Ok(())
             }
@@ -1344,7 +1549,7 @@ impl<'a> FnChecker<'a> {
             (Type::Int(_), Type::Ptr(_)) => "incompatible pointer to integer conversion",
             _ => "incompatible types",
         };
-        let msg = format!("{problem} {}", how.phrase(to, &from));
+        let msg = format!("{problem} {}", how.phrase(to, &e.ty));
         Err(self.err(e.pos, msg))
     }
 
@@ -1386,9 +1591,23 @@ impl<'a> FnChecker<'a> {
         self.err(pos, msg)
     }
 
+    /// [`Self::expr`] of an initializer's expression, constant if `constant`
+    /// ([`Self::constant`]).
+    fn value(&mut self, e: &mut Expr, constant: bool) -> Checked {
+        let outer = std::mem::replace(&mut self.constant, constant);
+        let checked = self.expr(e);
+        self.constant = outer;
+        checked
+    }
+
     /// Types `e` and everything in it.
     fn expr(&mut self, e: &mut Expr) -> Checked {
         let pos = e.pos;
+        // Only `e` itself is the operand of `&`, not what is inside it.
+        let addressed = std::mem::take(&mut self.address_taken);
+        if !addressed && self.folded_literal(e)? {
+            return Ok(());
+        }
         if matches!(e.kind, ExprKind::VaEnd(_) | ExprKind::VaCopy(..)) {
             return self.va_end_or_copy(e);
         }
@@ -1475,6 +1694,7 @@ impl<'a> FnChecker<'a> {
                 }
             }
             ExprKind::Addr(x) => {
+                self.address_taken = true;
                 self.expr(x)?;
                 if !is_lvalue(x) {
                     let msg = format!("cannot take the address of an rvalue of type '{}'", x.ty);
@@ -1552,6 +1772,8 @@ impl<'a> FnChecker<'a> {
                 arrow,
                 offset,
             } => {
+                // `&s.m` takes the address of a part of `s`.
+                self.address_taken = addressed && !*arrow;
                 self.expr(base)?;
                 // `p->m` reaches through a pointer; `s.m` names a part of `s`.
                 let (outer, quals) = if *arrow {
@@ -1903,7 +2125,8 @@ impl<'a> FnChecker<'a> {
                 }
                 Ok(Type::INT)
             }
-            _ => arith_type(op, &lt, &rt, self.xlen).ok_or_else(|| self.invalid_operands(pos, &lt, &rt)),
+            // Named as written, before arrays decay, as clang names them.
+            _ => arith_type(op, &lt, &rt, self.xlen).ok_or_else(|| self.invalid_operands(pos, &l.ty, &r.ty)),
         }
     }
 
@@ -2121,6 +2344,170 @@ mod tests {
         );
     }
 
+    /// A compound literal's value where a constant is needed is the value
+    /// its list gives, and an array or a constant struct is initialized by
+    /// a literal of its type as by its list (GNU extensions clang 23 takes):
+    /// the data are clang's, and no object is emitted but for a literal
+    /// whose address is taken.
+    #[test]
+    fn compound_literals_are_read_as_constants() {
+        let src = "int g = 7;\nstruct S { int a, b; };\nstruct U { struct S s; int z; };\n\
+                   union W { int i; char c; };\n\
+                   void *v = (int *){0};\nint m = (int){5};\nint *p = (int *){&g};\n\
+                   long l = (long){(char)3};\nint m2 = (int){5} + 1;\n\
+                   int *ps[2] = { (int *){0}, (int *){&g} };\nint *pp = (int *){&g} + 1;\n\
+                   int z = !(int *){0};\nint *pz = (int *){0} ? &g : 0;\n\
+                   struct S st = (struct S){8, 9};\nint ia[2] = (int[2]){1, 2};\n\
+                   int ia3[] = (int[]){4, 5, 6};\nchar cs[4] = (char[4]){\"xy\"};\n\
+                   struct U u = { (struct S){1, 2}, 3 };\nint nm = (struct U){{1, 2}, 3}.s.b;\n\
+                   struct S sv = (struct U){{4, 5}, 6}.s;\nint ib[2] = (int[2]){[1] = 4};\n\
+                   int wi = (union W){5}.i;\nunion W w = (union W){6};\n\
+                   int *pm = &(struct S){1, 2}.b;\n\
+                   int f(void) { static int *sp = (int *){&g}; static struct S ss = (struct S){3, 4};\n\
+                       static int s6 = (struct S){1, 2}.b + (int){3}; int la[2] = (int[2]){g, 2};\n\
+                       return *sp + ss.b + s6 + la[0]; }\n";
+        let asm = crate::compile(src).unwrap();
+        // A symbol's directives, up to the blank line after them.
+        let data = |sym: &str| -> Vec<String> {
+            let from = asm
+                .find(&format!("\n{sym}:\n"))
+                .unwrap_or_else(|| panic!("no {sym} in\n{asm}"));
+            asm[from + sym.len() + 3..]
+                .lines()
+                .take_while(|l| !l.is_empty())
+                .map(|l| l.trim().to_string())
+                .collect()
+        };
+        for (sym, want) in [
+            ("v", vec![".word 0"]),
+            ("m", vec![".word 5"]),
+            ("p", vec![".word g"]),
+            ("l", vec![".word 3"]),
+            ("m2", vec![".word 6"]),
+            ("ps", vec![".word 0", ".word g"]),
+            ("pp", vec![".word g+4"]),
+            ("z", vec![".word 1"]),
+            ("pz", vec![".word 0"]),
+            ("st", vec![".word 8", ".word 9"]),
+            ("ia", vec![".word 1", ".word 2"]),
+            ("ia3", vec![".word 4", ".word 5", ".word 6"]),
+            ("cs", vec![".ascii \"xy\"", ".zero 2"]),
+            ("u", vec![".word 1", ".word 2", ".word 3"]),
+            ("nm", vec![".word 2"]),
+            ("sv", vec![".word 4", ".word 5"]),
+            ("ib", vec![".zero 4", ".word 4"]),
+            ("wi", vec![".word 5"]),
+            ("w", vec![".word 6"]),
+            ("pm", vec![".word .compoundliteral.0+4"]),
+            ("f.sp", vec![".word g"]),
+            ("f.ss", vec![".word 3", ".word 4"]),
+            ("f.s6", vec![".word 5"]),
+        ] {
+            assert_eq!(data(sym), want, "{sym}");
+        }
+        // The one literal whose address is taken is the one object.
+        assert_eq!(asm.matches("\n.compoundliteral.").count(), 1, "{asm}");
+        // Not a constant, or of another type, as clang has it.
+        let not_constant = "initializer element is not a compile-time constant";
+        for (src, want) in [
+            ("int g; int c = (int){g};", format!("1:22: {not_constant}")),
+            (
+                "int g; int ic[2] = (int[2]){g, 2};",
+                format!("1:29: {not_constant}"),
+            ),
+            ("int ix = (int[2]){1, 5}[1];", format!("1:10: {not_constant}")),
+            (
+                "union W { int i; char c; }; int wc = (union W){5}.c;",
+                format!("1:38: {not_constant}"),
+            ),
+            (
+                "int f(void) { static int *sp = &(int){5}; return *sp; }",
+                format!("1:32: {not_constant}"),
+            ),
+            (
+                "int a[3] = (int[2]){1, 2};",
+                "1:5: cannot initialize array of type 'int[3]' with array of type 'int[2]'".into(),
+            ),
+            (
+                "int a[3] = (int[]){1, 2};",
+                "1:5: cannot initialize array of type 'int[3]' with array of type 'int[2]'".into(),
+            ),
+            (
+                "long a[2] = (int[2]){1, 2};",
+                "1:6: cannot initialize array of type 'long[2]' with array of type 'int[2]'".into(),
+            ),
+            (
+                "int a[2] = (const int[2]){1, 2};",
+                "1:5: cannot initialize array of type 'int[2]' with array of type 'const int[2]'".into(),
+            ),
+            (
+                "struct T { int x[2]; } t = { (int[2]){1, 2} };",
+                "1:30: incompatible pointer to integer conversion initializing 'int' with an \
+                 expression of type 'int[2]'"
+                    .into(),
+            ),
+        ] {
+            assert_eq!(err(src), want, "{src}");
+        }
+    }
+
+    /// A constant the parser cannot work out (an operand it cannot type, a
+    /// name that is no constant) is sema's to check: its error is clang's,
+    /// where clang reports it, and clang says nothing more of the size
+    /// (clang 23).
+    #[test]
+    fn sizes_the_parser_cannot_work_out_are_checked() {
+        let member = "member reference base type 'int' is not a structure or union";
+        for (src, at) in [
+            ("int f(int n, char a[sizeof n.y]);", "1:29"),
+            ("int f(int n, char a[1 ? 2 : n.y]);", "1:30"),
+            (
+                "struct S { int y; } g;\nint f(void) { int g = 0; { char a[sizeof(g.y)] = {0}; return a[0]; } }",
+                "2:43",
+            ),
+            ("int x; int a[sizeof x.y];", "1:22"),
+            ("int x; int a[x.y];", "1:15"),
+            ("int x; enum { E = sizeof x.y };", "1:27"),
+            ("int x; _Static_assert(sizeof x.y, \"\");", "1:31"),
+            ("int x; struct T { char a[sizeof x.y]; };", "1:34"),
+            ("int f(void) { int n = 1; char a[1 ? 2 : n.y]; return 0; }", "1:42"),
+        ] {
+            assert_eq!(errs(src), [format!("{at}: {member}")], "{src}");
+        }
+        let undeclared = "use of undeclared identifier 'nothing'";
+        assert_eq!(errs("int a[sizeof nothing];"), [format!("1:14: {undeclared}")]);
+        assert_eq!(errs("int a[nothing];"), [format!("1:7: {undeclared}")]);
+        assert_eq!(
+            errs("int x; int a[1 ? 0 : nothing];"),
+            [format!("1:22: {undeclared}")]
+        );
+        assert_eq!(
+            errs("int f(int n, char a[sizeof(n * \"a\")]);"),
+            ["1:30: invalid operands to binary expression ('int' and 'char[2]')"]
+        );
+        // What clang says of a size it cannot fold, it leaves out with an
+        // operand in error; merlin its error for a variable-length array.
+        for src in [
+            "int f(void); int (*a[2])[1 ? 2 : f(1, 2)];",
+            "int f(void); int (*fr(void))[1 ? 2 : f(1, 2)];",
+            "int f(void); struct S { int (*p[2])[1 ? 2 : f(1, 2)]; } s;",
+            "int f(void); int g(void) { static int (*p)[1 ? 2 : f(1, 2)]; return 0; }",
+        ] {
+            let e = errs(src);
+            assert!(
+                e.len() == 1 && e[0].contains("too many arguments to 'f'"),
+                "{src}: {e:?}"
+            );
+        }
+        // A size that is valid but no constant is still merlin's error.
+        let msg = "array size must be an integer constant expression \
+                   (literals, enum constants, operators, casts and sizeof)";
+        assert_eq!(
+            errs("int f(void) { int n = 1; char a[n]; return 0; }"),
+            [format!("1:33: {msg}")]
+        );
+    }
+
     /// `name#slot` (or `name@symbol`) for every variable use in the function, in
     /// source order.
     fn uses(f: &Function) -> Vec<String> {
@@ -2326,7 +2713,7 @@ mod tests {
         // and complete after it.
         assert_eq!(
             err("int f() { static int a[] = {1, 2, sizeof a}; return 0; }"),
-            "1:35: invalid application of 'sizeof' to an incomplete type 'int []'"
+            "1:35: invalid application of 'sizeof' to an incomplete type 'int[]'"
         );
         let p = ok("int f() { static int a[] = {1, 2, 3}; return sizeof a; }");
         let StmtKind::Return(Some(e)) = &func(&p, "f").body.as_ref().unwrap()[1].kind else {
@@ -2429,7 +2816,7 @@ mod tests {
         );
         assert_eq!(
             err("int a[];"),
-            "1:5: definition of 'a' needs the array size ('int []')"
+            "1:5: definition of 'a' needs the array size ('int[]')"
         );
         assert_eq!(
             err("int a; static int a;"),
@@ -2632,7 +3019,7 @@ mod tests {
         );
         assert_eq!(
             err("int a[2] = {.x = 1};"),
-            "1:13: field designator cannot initialize a non-struct, non-union type 'int [2]'"
+            "1:13: field designator cannot initialize a non-struct, non-union type 'int[2]'"
         );
         assert_eq!(
             err("int x = {.x = 1};"),
@@ -2660,10 +3047,10 @@ mod tests {
         );
         assert_eq!(
             err("int f() { int a[]; return 0; }"),
-            "1:15: variable 'a' has incomplete type 'int []'"
+            "1:15: variable 'a' has incomplete type 'int[]'"
         );
         let p = ok("int f() { int a[] = {1, 2, 3}; return sizeof a; }");
-        assert_eq!(func(&p, "f").locals[0].ty.to_string(), "int [3]");
+        assert_eq!(func(&p, "f").locals[0].ty.to_string(), "int[3]");
     }
 
     #[test]
@@ -2688,7 +3075,7 @@ mod tests {
         assert_eq!(ty("int *p", "*p"), "int");
         assert_eq!(ty("int *p", "&p"), "int **");
         assert_eq!(ty("int *p", "p[2]"), "int");
-        assert_eq!(ty("int x", "buf"), "char [8]");
+        assert_eq!(ty("int x", "buf"), "char[8]");
         assert_eq!(ty("int x", "buf + 1"), "char *");
         assert_eq!(ty("int x", "&buf"), "char (*)[8]");
         assert_eq!(ty("int x", "*buf"), "char");
@@ -2701,7 +3088,7 @@ mod tests {
         assert_eq!(ty("int *p, int c", "*(c ? p : (void *)0)"), "int");
         assert_eq!(ty("int *p, void *v, int c", "c ? v : p"), "void *");
         assert_eq!(ty("int c", "c ? (void *)0 : (void *)0"), "void *");
-        assert_eq!(ty("int x", "\"abc\""), "char [4]");
+        assert_eq!(ty("int x", "\"abc\""), "char[4]");
         assert_eq!(ty("int x", "\"abc\"[1]"), "char");
         assert_eq!(ty("char c", "c = 300"), "char");
         assert_eq!(ty("char c", "c += 300"), "char");
@@ -2848,7 +3235,7 @@ mod tests {
         e(
             "int *p",
             "(char)p + @(int[2])p",
-            "cannot cast from 'int *' to 'int [2]'",
+            "cannot cast from 'int *' to 'int[2]'",
         );
         e("int x", "@(int)v()", "cannot cast from 'void' to 'int'");
         e("void *p", "p@++, 0", "cannot increment value of type 'void *'");
@@ -2888,7 +3275,7 @@ mod tests {
         );
         e(
             "int a[2]; int b[2]; @a = b; return 0;",
-            "array type 'int [2]' is not assignable",
+            "array type 'int[2]' is not assignable",
         );
         e("g @+ 1 = 2; return 0;", "expression is not assignable");
         e(
@@ -2986,7 +3373,7 @@ mod tests {
         );
         assert_eq!(
             err("int f() { return 0; } int g() { return f; }"),
-            "1:40: incompatible pointer to integer conversion returning 'int (*)(void)' from a function with result type 'int'"
+            "1:40: incompatible pointer to integer conversion returning 'int (void)' from a function with result type 'int'"
         );
     }
 
@@ -3298,7 +3685,7 @@ mod tests {
             .filter(|l| l.temp)
             .map(|l| l.ty.to_string())
             .collect();
-        assert_eq!(temps, ["int [3]", "struct p", "char [4]"]);
+        assert_eq!(temps, ["int[3]", "struct p", "char[4]"]);
         // An lvalue.
         ok("int f() { int *p = &(int){5}; (int){1} = 2; return *p; }");
         assert_eq!(
@@ -3323,9 +3710,9 @@ mod tests {
         assert_eq!(
             got,
             [
-                ".compoundliteral.0: int [3]",
+                ".compoundliteral.0: int[3]",
                 ".compoundliteral.1: struct p",
-                ".compoundliteral.2: const char *const [2]",
+                ".compoundliteral.2: const char *const[2]",
                 ".compoundliteral.3: struct p",
                 ".compoundliteral.4: struct p *[2]",
             ]
@@ -3367,13 +3754,11 @@ mod tests {
             panic!("no literals")
         };
         let got: Vec<String> = literals.iter().map(|d| format!("{}: {}", d.name, d.ty)).collect();
-        assert_eq!(got, [".compoundliteral.0: int [1]"]);
-        // Only its address is constant: using its value to initialize a
-        // global (a GNU extension clang accepts) is not supported.
-        assert_eq!(
-            err("int m = (int){5};"),
-            "1:9: initializer element is not a compile-time constant"
-        );
+        assert_eq!(got, [".compoundliteral.0: int[1]"]);
+        // Its value, where it is read (a GNU extension clang takes), is
+        // folded: no object is made for it.
+        let p = ok("int m = (int){5};");
+        assert!(!format!("{:?}", p.items).contains(".compoundliteral"));
     }
 
     #[test]
@@ -3428,7 +3813,7 @@ mod tests {
         );
         assert_eq!(
             err("int f(int n, ...) { __builtin_va_list ap; return __builtin_va_arg(ap, int[2])[0]; }"),
-            "1:50: second argument to 'va_arg' is of array type 'int [2]'"
+            "1:50: second argument to 'va_arg' is of array type 'int[2]'"
         );
     }
 
@@ -3476,7 +3861,7 @@ mod tests {
         assert_eq!(ty("int (*p)(int)", "&*p"), "int (*)(int)");
         assert_eq!(
             err("void g(void); int f() { void *p = g; return 0; }"),
-            "1:35: incompatible pointer types initializing 'void *' with an expression of type 'void (*)(void)'"
+            "1:35: incompatible pointer types initializing 'void *' with an expression of type 'void (void)'"
         );
         // `NULL`, `((void *)0)`, is a function pointer's too, initialized,
         // assigned or passed; another `void *` is not.
@@ -3494,7 +3879,7 @@ int (*h)(void) = ((void *)0);
         );
         assert_eq!(
             err("int g(int); int f() { int (*q)(char) = g; return 0; }"),
-            "1:40: incompatible pointer types initializing 'int (*)(char)' with an expression of type 'int (*)(int)'"
+            "1:40: incompatible pointer types initializing 'int (*)(char)' with an expression of type 'int (int)'"
         );
         assert_eq!(
             err("int f(int x) { int (*p)(int) = 0; return p(1, 2); }"),

@@ -633,11 +633,29 @@ impl Parser<'_> {
     /// [`Self::resolve_sizeof`]). Those operands are not evaluated, but sema
     /// still checks them ([`Unevaluated`]). The flag says whether the value
     /// is sure: false if the parser could not type an operand `?:` does not
-    /// choose, whose error sema will report (`msg` if it finds none).
+    /// choose, or found no constant, whose error sema will report (`msg` if
+    /// it finds none); the value is then 1, which nothing uses.
     fn const_int(&self, e: &mut Expr, at: Pos, msg: &str) -> Result<(i128, bool), Error> {
         let mark = self.unevaluated.borrow().len();
+        let original = e.clone();
         self.resolve_sizeof(e);
-        let v = consteval::parsed_int(e, self.xlen).ok_or_else(|| Error::new(at, msg))?;
+        let Some(v) = consteval::parsed_int(e, self.xlen) else {
+            // No constant the parser can work out: sema checks the whole
+            // expression, and reports its error if it has one, as clang
+            // does (`sizeof n.y` of an `int n` is no member), else `msg`.
+            // Nothing in it was folded.
+            self.unevaluated.borrow_mut().truncate(mark);
+            self.folding.set(false);
+            self.unevaluated.borrow_mut().push(Unevaluated {
+                expr: original,
+                untyped: Some((at, msg.to_string())),
+                folded: false,
+                diagnostic: None,
+                with: 0,
+                params: self.prototype.borrow().clone(),
+            });
+            return Ok((1, false));
+        };
         let mut sure = true;
         for u in &mut self.unevaluated.borrow_mut()[mark..] {
             if let Some(error) = &mut u.untyped {
@@ -660,7 +678,7 @@ impl Parser<'_> {
                         expr: (**x).clone(),
                         untyped: None,
                         folded: false,
-                        warning: None,
+                        diagnostic: None,
                         with: 0,
                         params: self.prototype.borrow().clone(),
                     });
@@ -752,7 +770,7 @@ impl Parser<'_> {
             expr: original,
             untyped,
             folded: true,
-            warning: None,
+            diagnostic: None,
             with: 0,
             params: self.prototype.borrow().clone(),
         });
@@ -780,29 +798,27 @@ impl Parser<'_> {
     /// variable-length array, or a type made of one, which merlin does not
     /// have: the size is an error, as `int a[n]` is. `d` is declared in
     /// `ctx` with storage class `class`, and an initializer if `init`.
-    fn folded(&self, d: &Decl, ctx: Ctx, class: Class, init: bool) -> Result<(), Error> {
-        let Some(at) = d.folded else { return Ok(()) };
+    ///
+    /// Whatever is said of it, sema says, unless an operand of the
+    /// declarator's sizes has an error, which clang reports alone
+    /// ([`Self::fold_diagnostic`]).
+    fn folded(&self, d: &Decl, ctx: Ctx, class: Class, init: bool) {
+        let Some(at) = d.folded else { return };
         if d.ty.is_func() && class != Class::Typedef && d.reach == Reach::Function {
-            return Err(Error::new(
-                d.pos,
-                "function declaration cannot have variably modified type",
-            ));
+            let msg = "function declaration cannot have variably modified type";
+            return self.fold_diagnostic(d, Error::new(d.pos, msg));
         }
         // What clang can make a constant array of.
         let fixable = d.reach <= Reach::Pointers;
         let folds = match ctx {
             Ctx::File if !fixable => {
-                return Err(Error::new(
-                    d.pos,
-                    "variably modified type declaration not allowed at file scope",
-                ));
+                let msg = "variably modified type declaration not allowed at file scope";
+                return self.fold_diagnostic(d, Error::new(d.pos, msg));
             }
             Ctx::Member if !fixable => {
-                return Err(Error::new(
-                    d.pos,
-                    "fields must have a constant size: 'variable length array in structure' \
-                     extension will never be supported",
-                ));
+                let msg = "fields must have a constant size: 'variable length array in structure' \
+                           extension will never be supported";
+                return self.fold_diagnostic(d, Error::new(d.pos, msg));
             }
             Ctx::File | Ctx::Member => true,
             Ctx::Block | Ctx::ForInit => match class {
@@ -813,11 +829,13 @@ impl Parser<'_> {
             },
             Ctx::Param | Ctx::TypeName => false,
         };
-        if !folds {
-            return Err(Error::new(at, NOT_CONSTANT_SIZE));
-        }
-        self.fold_warning(d, d.pos);
-        Ok(())
+        let (msg, flag) = FOLDED;
+        let said = if folds {
+            Error::warning(d.pos, msg, flag)
+        } else {
+            Error::new(at, NOT_CONSTANT_SIZE)
+        };
+        self.fold_diagnostic(d, said);
     }
 
     /// A type name's folded size. A compound literal's array (`(int[F]){1,
@@ -828,28 +846,27 @@ impl Parser<'_> {
     /// as the array of the folded size, which the size is at run time too
     /// (the operand not chosen is never evaluated). Anything else is a
     /// variable-length array, an error ([`Self::folded`]).
-    fn type_name_folded(&self, d: &Decl, literal: Option<Pos>) -> Result<(), Error> {
-        let Some(at) = d.folded else { return Ok(()) };
+    fn type_name_folded(&self, d: &Decl, literal: Option<Pos>) {
+        let Some(at) = d.folded else { return };
         match literal {
             Some(paren) if d.reach == Reach::Arrays => {
-                self.fold_warning(d, paren);
-                Ok(())
+                let (msg, flag) = FOLDED;
+                self.fold_diagnostic(d, Error::warning(paren, msg, flag));
             }
-            _ if self.scopes.len() == 1 && d.reach > Reach::Arrays => Ok(()),
-            _ => Err(Error::new(at, NOT_CONSTANT_SIZE)),
+            _ if self.scopes.len() == 1 && d.reach > Reach::Arrays => {}
+            _ => self.fold_diagnostic(d, Error::new(at, NOT_CONSTANT_SIZE)),
         }
     }
 
-    /// clang's warning of a folded size, at `at`: with the last of the
-    /// declarator's own operands, for sema to give if none of them has an
-    /// error, as clang does.
-    fn fold_warning(&self, d: &Decl, at: Pos) {
-        let (msg, flag) = FOLDED;
+    /// What is said of a declarator's folded size: kept with the last of
+    /// its own operands, for sema to give if none of them has an error, as
+    /// clang does ([`Unevaluated::diagnostic`]).
+    fn fold_diagnostic(&self, d: &Decl, said: Error) {
         let mut us = self.unevaluated.borrow_mut();
         let own = &mut us[d.unevaluated.clone()];
         let with = own.len() - 1;
         let u = own.last_mut().expect("a folded size has its operand");
-        u.warning = Some(Error::warning(at, msg, flag));
+        u.diagnostic = Some(said);
         u.with = with;
     }
 
@@ -1271,7 +1288,7 @@ impl Parser<'_> {
             }
             loop {
                 let d = self.declarator(&specs.ty, Ctx::Member)?;
-                self.folded(&d, Ctx::Member, Class::None, false)?;
+                self.folded(&d, Ctx::Member, Class::None, false);
                 if self.is_punct(":") {
                     return Err(Error::new(self.here(), "bit-fields are not supported yet"));
                 }
@@ -1375,7 +1392,11 @@ impl Parser<'_> {
                 let at = self.here();
                 let mut e = self.cond()?;
                 let msg = "enumerator value is not an integer constant expression";
-                self.const_int(&mut e, at, msg)?.0
+                match self.const_int(&mut e, at, msg)? {
+                    (v, true) => v,
+                    // Sema reports the error.
+                    (_, false) => 0,
+                }
             } else {
                 next
             };
@@ -1524,8 +1545,10 @@ impl Parser<'_> {
                 let mut e = self.cond()?;
                 self.expect_punct("]")?;
                 let outer = self.folding.replace(false);
-                let n = self.const_int(&mut e, pos, NOT_CONSTANT_SIZE)?.0;
+                let (n, sure) = self.const_int(&mut e, pos, NOT_CONSTANT_SIZE)?;
                 let folded = self.folding.replace(outer).then_some(pos);
+                // Not sure: sema reports the error, and the size is not used.
+                let n = if sure { n } else { 1 };
                 if n <= 0 {
                     return Err(Error::new(pos, format!("array size must be positive, not {n}")));
                 }
@@ -1643,7 +1666,7 @@ impl Parser<'_> {
         // A parameter is never folded (see `folded`); a type name is as its
         // use says (`type_name_folded`).
         if ctx == Ctx::Param {
-            self.folded(&d, ctx, Class::None, false)?;
+            self.folded(&d, ctx, Class::None, false);
         }
         Ok(d)
     }
@@ -1738,7 +1761,7 @@ impl Parser<'_> {
     /// literal's.
     fn type_name(&mut self) -> Result<Type, Error> {
         let (d, _) = self.type_name_decl()?;
-        self.type_name_folded(&d, None)?;
+        self.type_name_folded(&d, None);
         Ok(d.ty)
     }
 
@@ -1843,7 +1866,7 @@ impl Parser<'_> {
             } else {
                 None
             };
-            self.folded(&d, ctx, specs.class, init.is_some())?;
+            self.folded(&d, ctx, specs.class, init.is_some());
             // What its declarator left, and what its initializer did.
             let (sized, unevaluated) = {
                 let mut us = self.unevaluated.borrow_mut();
@@ -1892,7 +1915,7 @@ impl Parser<'_> {
                     "illegal initializer (only variables can be initialized)",
                 ));
             }
-            self.folded(&d, ctx, Class::Typedef, false)?;
+            self.folded(&d, ctx, Class::Typedef, false);
             let spelling = Spelled(Some(Spelling::Typedef(Arc::new(TypedefName {
                 name: d.name.clone(),
                 ty: d.ty.clone(),
@@ -1952,7 +1975,7 @@ impl Parser<'_> {
                 start,
             )?)));
         }
-        self.folded(&d, Ctx::File, specs.class, false)?;
+        self.folded(&d, Ctx::File, specs.class, false);
         // What the function's declarator left, checked at file scope.
         let unevaluated = self.unevaluated.borrow_mut().split_off(start);
         self.bind_name(&d.name, Name::Object(d.ty.clone()), d.pos)?;
@@ -2429,7 +2452,7 @@ impl Parser<'_> {
                 let (d, spelled) = self.type_name_decl()?;
                 self.expect_punct(")")?;
                 let literal = self.is_punct("{");
-                self.type_name_folded(&d, literal.then_some(pos))?;
+                self.type_name_folded(&d, literal.then_some(pos));
                 let ty = d.ty;
                 if literal {
                     let e = self.compound_literal(ty, pos)?;
@@ -2454,7 +2477,7 @@ impl Parser<'_> {
                     let (d, _) = self.type_name_decl()?;
                     self.expect_punct(")")?;
                     let literal = self.is_punct("{");
-                    self.type_name_folded(&d, literal.then_some(at))?;
+                    self.type_name_folded(&d, literal.then_some(at));
                     let ty = d.ty;
                     if literal {
                         let e = self.compound_literal(ty, at)?;
@@ -2710,9 +2733,15 @@ mod tests {
         parse(&lex(src, Xlen::Rv32).unwrap(), Xlen::Rv32).unwrap_or_else(|e| panic!("{src}: {e}"))
     }
 
+    /// The first error of `src`: the parser's, or sema's, which checks what
+    /// the parser left it (an array size it could not work out is sema's
+    /// to report).
     fn err(src: &str) -> String {
-        parse(&lex(src, Xlen::Rv32).unwrap(), Xlen::Rv32)
-            .unwrap_err()
+        let errors = crate::parse(src).unwrap_err();
+        errors
+            .iter()
+            .find(|e| !e.is_warning())
+            .unwrap_or_else(|| panic!("{src}: no error in {errors:?}"))
             .to_string()
     }
 
@@ -3404,7 +3433,7 @@ mod tests {
         );
         let Item::Decl(q) = &p.items[1] else { panic!() };
         let Some(Init::Expr(e)) = &q[0].init else { panic!() };
-        assert_eq!(format!("{}", e.ty), "int [2]");
+        assert_eq!(format!("{}", e.ty), "int[2]");
         // At file scope, a type name that only points to such an array is
         // clang's variably modified type, which it takes there.
         assert_eq!(
@@ -3504,10 +3533,10 @@ mod tests {
             body,
             [
                 "(decl int x)",
-                "(decl char c[4]={0}, char d=(sizeof char [4]))",
+                "(decl char c[4]={0}, char d=(sizeof char[4]))",
                 "(unevaluated (call f))",
-                "(for (decl int i=0) (< i (sizeof char [4])) (i ++) (x ++);)",
-                "(if (sizeof char [4]) {(decl int g=0) (= x g);})",
+                "(for (decl int i=0) (< i (sizeof char[4])) (i ++) (x ++);)",
+                "(if (sizeof char[4]) {(decl int g=0) (= x g);})",
                 "(unevaluated g)",
                 "(return (* (+ c 0)))"
             ]
@@ -3580,10 +3609,14 @@ mod tests {
             ["char a[4]", "char b[20]"]
         );
 
-        // What the parser can't type stays an error.
+        // What the parser can't type is sema's to check: its error is
+        // clang's, and if it has none, the size is no constant merlin knows.
         let msg = "array size must be an integer constant expression \
                    (literals, enum constants, operators, casts and sizeof)";
-        assert_eq!(err("char a[sizeof nothing];"), format!("1:8: {msg}"));
+        assert_eq!(
+            err("char a[sizeof nothing];"),
+            "1:15: use of undeclared identifier 'nothing'"
+        );
         assert_eq!(
             err("int t[] = {[3] = 1}; char a[sizeof t];"),
             format!("1:29: {msg}")
@@ -3622,7 +3655,7 @@ mod tests {
         );
         assert_eq!(
             err("int f()[2];"),
-            "1:5: function cannot return array type 'int [2]'"
+            "1:5: function cannot return array type 'int[2]'"
         );
         assert_eq!(
             err("int f()(int);"),
@@ -3770,7 +3803,7 @@ mod tests {
         let tys: Vec<String> = args.iter().map(|a| a.ty.to_string()).collect();
         assert_eq!(
             tys,
-            ["int", "unsigned int", "unsigned int", "int", "long", "char [4]"]
+            ["int", "unsigned int", "unsigned int", "int", "long", "char[4]"]
         );
     }
 
@@ -4177,7 +4210,7 @@ mod tests {
         };
         assert_eq!(
             sx(&e),
-            "(= p (+ (* (+ (literal int [] {1 2}) 1)) (sizeof (literal char [3] {0}))))"
+            "(= p (+ (* (+ (literal int[] {1 2}) 1)) (sizeof (literal char[3] {0}))))"
         );
     }
 

@@ -783,9 +783,12 @@ impl Type {
                 inner
             }
         }
+        /// The base and the declarator, apart, but for an array's brackets
+        /// with no name before them, as clang writes them: `int[2]`, `int
+        /// *[2]`, `int (*)[2]`.
         fn join(base: &str, inner: &str) -> String {
-            if inner.is_empty() {
-                base.to_string()
+            if inner.is_empty() || inner.starts_with('[') {
+                format!("{base}{inner}")
             } else {
                 format!("{base} {inner}")
             }
@@ -999,7 +1002,7 @@ mod tests {
     #[test]
     fn names_read_like_c() {
         assert_eq!(Type::ptr(Type::CHAR).to_string(), "char *");
-        assert_eq!(Type::array(Type::INT, Some(3)).to_string(), "int [3]");
+        assert_eq!(Type::array(Type::INT, Some(3)).to_string(), "int[3]");
         assert_eq!(
             Type::ptr(Type::array(Type::INT, Some(3))).to_string(),
             "int (*)[3]"

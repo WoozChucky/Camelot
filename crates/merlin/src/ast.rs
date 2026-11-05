@@ -64,12 +64,13 @@ pub struct Unevaluated {
     pub untyped: Option<(Pos, String)>,
     /// The operand of a `?:` the parser folded, not one of `sizeof`.
     pub folded: bool,
-    /// The warning clang gives the array size a declarator folds, kept with
-    /// the last of the declarator's own operands: given unless this one or
-    /// one of the `with` before it in its list (the declarator's others)
-    /// has an error, as clang gives no warning for a declarator whose size
-    /// is in error.
-    pub warning: Option<crate::Error>,
+    /// What is said of the array size a declarator folds, kept with the
+    /// last of the declarator's own operands: clang's warning that it folds
+    /// it, or the error that it cannot (clang's, or merlin's for a
+    /// variable-length array). Given unless this one or one of the `with`
+    /// before it in its list (the declarator's others) has an error, as
+    /// clang says nothing of a declarator whose size is in error.
+    pub diagnostic: Option<crate::Error>,
     pub with: usize,
     /// The parameters in scope where it was (C's prototype scope): those
     /// declared before it in the parameter lists it is in, outermost first,

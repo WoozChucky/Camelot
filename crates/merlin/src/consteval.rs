@@ -99,6 +99,8 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> 
     match &e.kind {
         ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => Some(Int(*v, e.ty.int_kind()?)),
         ExprKind::SizeofType(t) => Some(Int(t.size(xlen)?.into(), IntKind::size_t(xlen))),
+        // An address is true: an object's is never null.
+        ExprKind::Unary(UnOp::Not, x) => Some(Int((!const_truth(&eval(x, xlen)?)).into(), IntKind::Int)),
         ExprKind::Unary(op, x) => {
             let (v, k) = int_of(eval(x, xlen)?)?;
             let k = k.promoted();
@@ -110,12 +112,12 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> 
             })
         }
         ExprKind::Binary(BinOp::LogAnd, l, r) => {
-            let l = int_of(eval(l, xlen)?)?.0 != 0;
-            Some(Int((l && int_of(eval(r, xlen)?)?.0 != 0).into(), IntKind::Int))
+            let l = const_truth(&eval(l, xlen)?);
+            Some(Int((l && const_truth(&eval(r, xlen)?)).into(), IntKind::Int))
         }
         ExprKind::Binary(BinOp::LogOr, l, r) => {
-            let l = int_of(eval(l, xlen)?)?.0 != 0;
-            Some(Int((l || int_of(eval(r, xlen)?)?.0 != 0).into(), IntKind::Int))
+            let l = const_truth(&eval(l, xlen)?);
+            Some(Int((l || const_truth(&eval(r, xlen)?)).into(), IntKind::Int))
         }
         ExprKind::Binary(op, l, r) => {
             let (lc, rc) = (eval(l, xlen)?, eval(r, xlen)?);
@@ -145,7 +147,7 @@ fn value(e: &Expr, xlen: Xlen, evaluated: bool, checked: bool) -> Option<Const> 
         ExprKind::Cond(c, a, b) => {
             // Only the chosen operand is evaluated; of the other only the
             // type counts: sema's, or before sema what its value has.
-            let (chosen, other) = if int_of(eval(c, xlen)?)?.0 != 0 {
+            let (chosen, other) = if const_truth(&eval(c, xlen)?) {
                 (a, b)
             } else {
                 (b, a)
@@ -250,6 +252,17 @@ fn step(t: &Type, xlen: Xlen) -> Option<i128> {
         return Some(1);
     }
     Some(i128::from(t.pointee()?.size(xlen)?))
+}
+
+/// Whether a constant is true, as a condition tests it: an object's
+/// address always (it is never null), a plain number used as an address
+/// if it is not 0.
+fn const_truth(c: &Const) -> bool {
+    match c {
+        Const::Int(v, _) => *v != 0,
+        Const::Addr { base: Some(_), .. } => true,
+        Const::Addr { base: None, offset } => *offset != 0,
+    }
 }
 
 fn int_of(c: Const) -> Option<(i128, IntKind)> {
