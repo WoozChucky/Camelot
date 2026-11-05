@@ -101,8 +101,8 @@ disk. So the whole system fits in one image (the kernel about 300 blocks,
 the filesystem the rest; its size is in the spec, section 10, "Root image");
 `cargo xtask fs --size N` makes an image of N blocks. The same command
 builds the RV64 system's image too, `target/camelot-fs-rv64.img`: the
-programs built for RV64 in `/bin` (but `as` and `ld`, RV32 tools until
-#157), `boot/boot-rv64.elf` and `kernel-disk-rv64.elf` (about 400 blocks),
+programs built for RV64 in `/bin`, `boot/boot-rv64.elf` and
+`kernel-disk-rv64.elf` (about 380 blocks),
 in an image of the same size, which an RV64 machine of 4 MiB boots;
 `--xlen 32` or `--xlen 64` builds just one of them.
 

@@ -96,8 +96,9 @@ Mnemonics are lower case; registers by ABI name or `xN`; CSRs by name
 The RV64-only mnemonics live in tables of their own (`OP_32_FUNCT`,
 `OP_IMM_32_FUNCT3`, `SHIFT_32_FUNCT`, `LOAD_RV64_FUNCT3`,
 `STORE_RV64_FUNCT3`), looked up only on RV64, so on RV32 each is still
-`unknown instruction 'mulw'`; the RV32 tables are exported to the C
-assembler (`crates/xtask/src/c_tables.rs`), which stays RV32 until #157.
+`unknown instruction 'mulw'`; the C assembler (`kernel/user/as`) gets
+them all from `crates/xtask/src/c_tables.rs`, and looks the RV64 ones up
+only on RV64 as well.
 
 Shift amounts are 6 bits on RV64: `slli`, `srli` and `srai` put the amount in
 bits [25:20] and keep only funct6 in [31:26] (`srai` is `010000`), so
@@ -351,8 +352,9 @@ cargo test -p merlin-as
 ```
 
 The tests cover both widths; the RV64 references live in `rv64/`
-subdirectories, out of the corpus that Camelot's `/bin/as`, which is RV32,
-assembles in `crates/xtask/tests/selfhost.rs`.
+subdirectories. Camelot's `/bin/as` assembles each width's in
+`crates/xtask/tests/selfhost.rs`, on a machine of that width, the values
+of `li.golden` and `rv64/li.golden` too.
 
 - `encode_golden`: lines assembled by LLVM, words and relocations identical.
   RV32: 168 lines (`tests/golden/encode.s` → `encode.golden`: RV32I, M, A

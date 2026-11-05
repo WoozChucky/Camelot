@@ -322,12 +322,8 @@ fn root_image_boots(xlen: Xlen) {
         "{out}"
     );
     assert!(out.contains("\nram: 4 MiB at 0x80000000\n"), "{out}");
-    // On RV64 all but as and ld, which write RV32 code until #157.
-    let programs: Vec<String> = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root))
-        .unwrap()
-        .into_iter()
-        .filter(|p| xlen == Xlen::Rv32 || !xtask::userprogs::RV32_ONLY.contains(&p.as_str()))
-        .collect();
+    // Every program, on both widths.
+    let programs: Vec<String> = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root)).unwrap();
     assert!(
         out.contains(&format!(
             "fs: /bin holds {} programs, the kernel none\n",
