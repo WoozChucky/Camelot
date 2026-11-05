@@ -2,7 +2,7 @@
 
 merlin-dbg is the Camelot debugger. This document covers its four layers:
 
-- **machine-level debugging** of any program running in Grail, RV32 or RV64, with no help from the compiler: breakpoints, watchpoints, single steps, registers, CSRs, memory, disassembly and backtraces by frame pointer, on one hart or several;
+- **machine-level debugging** of any program running in Grail, with no help from the compiler: breakpoints, watchpoints, single steps, registers, CSRs, memory, disassembly and backtraces by frame pointer, on one hart or several;
 - **source-level debugging** of programs built with `merlin -g` (the kernel and its user programs are): breakpoints on a source line, stepping by line, the source shown at every stop, from the programs' DWARF line tables (see "Source lines" below);
 - **variables and types**, from the rest of the programs' DWARF debug information: `print` of C expressions, `info locals` and `info args`, `ptype` and `whatis`, and a backtrace with each frame's arguments, in the frame `frame`, `up` and `down` select (see "Variables and types" below);
 - **the platform**: a VM on an Avalon server (`--vm`, its stub carried over the Avalon connection), and Camelot's processes: `info processes`, breakpoints that stop in one process only, symbol files keyed by the program a process runs, and memory read through a process's page table (see "Processes" below).
@@ -20,30 +20,30 @@ The spec's section 7, "Debugging", says what the machine guarantees under a debu
 Start the program under the debugger and give it commands. merlin-dbg starts Grail itself with whatever follows `--`:
 
 ```
-cargo run --release -p merlin-dbg -- -- examples/hello/hello.elf
+cargo run --release -p merlin-dbg -- -- --bios none examples/hello/hello.elf
 ```
 
 ```
-=> 0x00001000:  auipc t0, 0x0
+=> 0x0000000000001000:  auipc t0, 0x0
 (merlin-dbg) break *puts
 breakpoint 1 at 0x80000020 <puts>
 (merlin-dbg) continue
 breakpoint 1
-=> 0x80000020 <puts>:  lui t0, 0x10000
+=> 0x0000000080000020 <puts>:  lui t0, 0x10000
 (merlin-dbg) x/5b $a0
 0x80000050 <message>:  0x48  0x65  0x6c  0x6c  0x6f
 (merlin-dbg) stepi
-=> 0x80000024 <puts+4>:  mv t1, a0
+=> 0x0000000080000024 <puts+4>:  mv t1, a0
 (merlin-dbg) bt
-#0  0x80000024 in puts ()
-#1  0x80000018 in _start ()
+#0  0x0000000080000024 in puts ()
+#1  0x0000000080000018 in _start ()
 (merlin-dbg) continue
 Hello from Camelot!
-[dbg] pc=80000018 a0 = 0x00000014 (20)
+[dbg] pc=0000000080000018 a0 = 0x0000000000000014 (20)
 program exited with code 0
 ```
 
-An RV64 program (`examples/hello/hello-rv64.elf`) runs on an RV64 machine, and merlin-dbg shows the addresses of its frames and code with 16 digits, as GDB does, and the others without leading zeros:
+merlin-dbg shows the addresses of frames and code with 16 digits, as GDB does, and the others without leading zeros:
 
 ```
 (merlin-dbg) x/2g $a0
@@ -92,7 +92,7 @@ The selected hart (`select_hart`, hart 0 to begin with) is the one these read an
 `read_memory` and `write_memory` access memory, in one of two spaces:
 
 - `Space::Physical`: physical addresses.
-- `Space::Virtual`: translated as the hart's instruction fetches are now. That means physical in M-mode or with `satp` off, through its page table otherwise (Sv39 or Sv48 on an RV64 hart, Sv32 on an RV32 one), with no permission checks, so a debugger can read a user page from S-mode.
+- `Space::Virtual`: translated as the hart's instruction fetches are now. That means physical in M-mode or with `satp` off, through its page table otherwise (Sv39 or Sv48), with no permission checks, so a debugger can read a user page from S-mode.
 
 Memory reads and writes stop at the first byte that is not memory (RAM, VRAM, or the boot ROM for reads). Device registers are never accessed, since reading one can change it. A write breaks the LR/SC reservations on the words it changes, as a store would.
 
@@ -141,15 +141,15 @@ Packets are `$payload#checksum`, with `+`/`-` acks until `QStartNoAckMode`. A 0x
 | `qSupported[:features]` | `PacketSize=4000;qXfer:features:read+;QStartNoAckMode+;swbreak+;vContSupported+`. A client that sends `swbreak+` gets `swbreak:;` in breakpoint stop replies |
 | `QStartNoAckMode` | `OK`, then no more acks either way |
 | `?` | the last stop (see below) |
-| `g` / `G data` | `x0`-`x31` and `pc` of the selected hart, little-endian in hex, as wide as the machine's harts (4 bytes each on RV32, 8 on RV64) / writes as many of them as `data` holds |
+| `g` / `G data` | `x0`-`x31` and `pc` of the selected hart, little-endian in hex, 8 bytes each / writes as many of them as `data` holds |
 | `p n` / `P n=value` | register `n`: 0-31 `x0`-`x31`, 32 `pc`, 65 + `a` CSR `a`, 4161 `priv` (0 U, 1 S, 3 M; writing it changes the mode), as wide as `g`'s (a value of another width is `E01`). GDB's own numbering, so a client agrees with it with or without the target description |
-| `m addr,len` | the bytes that can be read from `addr` on, through the selected hart's translation, at most 4096. Addresses are up to 64 bits; on RV32, one past 4 GiB is unmapped |
+| `m addr,len` | the bytes that can be read from `addr` on, through the selected hart's translation, at most 4096. Addresses are up to 64 bits |
 | `M addr,len:hex`, `X addr,len:binary` | `OK` if all `len` bytes were written |
 | `c [addr]`, `C sig[;addr]`, `s [addr]`, `S sig[;addr]` | resumes (at `addr` if given; signals are ignored). `c` replies when the machine stops, `s` after one instruction of the `Hc` hart |
 | `vCont?` | `vCont;c;C;s;S` |
 | `vCont;action[:thread]...` | a step (`s`/`S`) of its thread if there is one, else continue. Every hart runs either way: a step of one hart is a turn of each hart before it |
-| `Z0`/`z0`, `Z1`/`z1 ,addr,kind` | sets/clears a breakpoint (software and hardware ones are the same thing here). Conditions after `;` are ignored. On RV32, a breakpoint at an address past 4 GiB, which no hart can reach, gets `E16` |
-| `Z2`-`Z4` / `z2`-`z4 ,addr,len` | sets/clears a write, read or access watchpoint on `len` bytes (`E16` for an empty range or one past the end of the address space, 2^64 or, on RV32, 2^32) |
+| `Z0`/`z0`, `Z1`/`z1 ,addr,kind` | sets/clears a breakpoint (software and hardware ones are the same thing here). Conditions after `;` are ignored |
+| `Z2`-`Z4` / `z2`-`z4 ,addr,len` | sets/clears a write, read or access watchpoint on `len` bytes (`E16` for an empty range or one past the end of the address space, 2^64) |
 | `Hg thread`, `Hc thread` | selects the hart for registers and memory / for `c` and `s` |
 | `T thread` | `OK` if the hart exists |
 | `qfThreadInfo`, `qsThreadInfo`, `qC` | `m1,2,...`, `l`, `QC` and the selected thread |
@@ -158,7 +158,7 @@ Packets are `$payload#checksum`, with `+`/`-` acks until `QStartNoAckMode`. A 0x
 | `qqemu.Supported` | `PhyMemMode`: of QEMU's own packets, the one Grail has |
 | `Qqemu.PhyMemMode:1`, `Qqemu.PhyMemMode:0` | `OK`: from now on `m`, `M` and `X` use physical addresses, or again the selected hart's translation (QEMU's, which GDB sends for `maintenance packet Qqemu.PhyMemMode:1`); another value is `E01` |
 | `qqemu.PhyMemMode` | `1` or `0`: which they use |
-| `qXfer:features:read:target.xml:off,len` | the target description: `riscv:rv32` or `riscv:rv64` with every register 32 or 64 bits wide (`bitsize`), the `org.gnu.gdb.riscv.cpu` registers, every CSR Grail implements that has a name for the machine's width (RV64 has no `cycleh`), and `priv` |
+| `qXfer:features:read:target.xml:off,len` | the target description: `riscv:rv64` with every register 64 bits wide (`bitsize`), the `org.gnu.gdb.riscv.cpu` registers, every CSR Grail implements (an RV64 hart has no `cycleh`), and `priv` |
 | `qRegisterInfoN` | LLDB's register description, for `x0`-`x31` and `pc`, as wide as `g`'s and at their offsets in it (LLDB builds without XML support, such as LLVM 21's Windows build, ask for these instead of `target.xml`) |
 | `qHostInfo`, `qProcessInfo` | LLDB's: triple `riscv32-unknown-unknown-elf` and 4-byte pointers, or `riscv64-unknown-unknown-elf` and 8-byte pointers; little endian |
 | `k`, `vKill` | `X09` (ended by SIGKILL), then kills the machine. GDB expects no reply to `k` and ignores it; LLDB waits for one |
@@ -230,14 +230,14 @@ merlin-dbg [-x FILE] -- [grail options] program.elf
 
 Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 
-**The machine's width** (RV32 or RV64) comes from the stub, as GDB takes it: the target description's `<architecture>`, `riscv:rv32` or `riscv:rv64` (`qXfer:features:read:target.xml`). A stub without a description is asked for its registers instead, and the length of the `g` reply, 33 registers of 4 or 8 bytes, gives the width. The width decides how the code decodes and disassembles, how wide registers, addresses and saved frame slots are, and which CSR names exist (RV64 has no `cycleh`). A program must be of the machine's width, an ELF32 one for RV32 and ELF64 for RV64: the symbols of one of the other width would be wrong for the machine. With `--connect`, such a program is left out with a warning, and the session goes on without its symbols, as GDB warns and goes on (`warning: program.elf: an RV32 program (ELF32), but the machine is RV64: going on without its symbols`). Ending the session instead would drop the connection, which the stub takes as a detach, and a machine waiting for its debugger would run off on its own. `add-symbol-file` refuses one with the same error, and the session goes on. (With `--`, Grail makes the machine as wide as the program.) On RV32, address arithmetic wraps at 2^32 and an address past it is refused.
+**The machine** is RV64, and merlin-dbg debugs RV64 machines only: the stub's target description's `<architecture>` must be `riscv:rv64` (`qXfer:features:read:target.xml`), and another one (`riscv:rv32`) ends the session with an error, as does a stub without a description whose `g` reply has 33 registers of 4 bytes. Registers, addresses and saved frame slots are 8 bytes, and the code decodes and disassembles as RV64's. A program must be RV64 code, an ELF64 file: the symbols of an ELF32 one, RV32 code, would be wrong for the machine. With `--connect`, such a program is left out with a warning, and the session goes on without its symbols, as GDB warns and goes on (`warning: program.elf: an RV32 program (ELF32): merlin-dbg debugs RV64 (ELF64) programs only: going on without its symbols`). Ending the session instead would drop the connection, which the stub takes as a detach, and a machine waiting for its debugger would run off on its own. `add-symbol-file` refuses one with the same error, and the session goes on. (With `--`, Grail refuses an ELF32 program, as its command does.)
 
 | Command | What it does |
 |---|---|
 | `break FUNC`, `b` | breakpoint on a function past its prologue, as GDB's `break FUNC`: see "Breakpoints on functions" |
 | `break ADDR`, `break *ADDR` | breakpoint at ADDR exactly (a `*` before a function's name, as in GDB, means its first instruction) |
 | `break FILE:LINE` | breakpoint on a source line (`kernel/main.c:273`, or `main.c:273`): see "Source lines" |
-| `watch [-r\|-a] ADDR [LEN]` | watchpoint on LEN bytes at ADDR: writes, `-r` reads, `-a` either. Without LEN, as GDB watches as many bytes as an expression's type has: the size of the symbol ADDR names in the symbol table (a C variable's, `watch total` on a `long` watches 8 bytes), at most 8, or else a register's worth (4 bytes on RV32, 8 on RV64), for an assembly label or an address |
+| `watch [-r\|-a] ADDR [LEN]` | watchpoint on LEN bytes at ADDR: writes, `-r` reads, `-a` either. Without LEN, as GDB watches as many bytes as an expression's type has: the size of the symbol ADDR names in the symbol table (a C variable's, `watch total` on a `long` watches 8 bytes), at most 8, or else a register's worth (8 bytes), for an assembly label or an address |
 | `delete [N]`, `d` | deletes breakpoint or watchpoint N, or all of them |
 | `info breakpoints`, `i b` | lists them |
 | `continue`, `c` | runs every hart until something stops the machine |
@@ -247,7 +247,7 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 | `nexti [N]`, `ni` | the same, but a call runs until it returns: a `jal`/`jalr` that links, or the `auipc ra` + `jalr ra` of a `call` |
 | `finish` | runs until the current function returns to its caller (the backtrace's frame 1), and shows `a0` |
 | `regs`, `info registers` | the selected hart's registers, pc and privilege mode, in GDB's `info registers` layout (see below) |
-| `x/N[b\|h\|w\|g] ADDR` | N units of memory, in hex: GDB's unit letters, bytes (`b`, 8 to a line), halfwords (`h`, 8), words (`w`, 4, the default) or giants (`g`, 8 bytes, 2 to a line), at either width. An `x` (hex, the only format) may come before or after the letter |
+| `x/N[b\|h\|w\|g] ADDR` | N units of memory, in hex: GDB's unit letters, bytes (`b`, 8 to a line), halfwords (`h`, 8), words (`w`, 4, the default) or giants (`g`, 8 bytes, 2 to a line). An `x` (hex, the only format) may come before or after the letter |
 | `disas [ADDR] [N]` | N instructions (8) from ADDR (the pc), `=>` at the pc |
 | `bt`, `backtrace` | the call stack as GDB shows it: each frame's pc, function, arguments and source line (see "Variables and types") |
 | `frame [N]`, `up [N]`, `down [N]` | selects the frame `print`, `info locals` and `info args` look in |
@@ -261,21 +261,19 @@ Ctrl-C stops a running machine and doesn't quit merlin-dbg. `quit` does.
 | `hart N` | selects hart N |
 | `quit`, `q` | leaves |
 
-**`regs`** shows the registers as GDB's `info registers` does for RISC-V, one to a line, so a line fits 80 columns at either width: the name, padded to 15 columns, the value in hex without leading zeros, a tab, and the value as its type in GDB's target description shows it. `ra` and `pc` are code pointers, shown with their symbol; `sp`, `gp`, `tp` and `fp` (`s0`, as GDB names it) are data pointers, in hex; the others are integers, signed at the register's width. `zero` is left out, as GDB leaves it out. `priv`, the privilege mode, comes last, as GDB's `info registers priv` shows it:
+**`regs`** shows the registers as GDB's `info registers` does for RISC-V, one to a line, so a line fits 80 columns: the name, padded to 15 columns, the value in hex without leading zeros, a tab, and the value as its type in GDB's target description shows it. `ra` and `pc` are code pointers, shown with their symbol; `sp`, `gp`, `tp` and `fp` (`s0`, as GDB names it) are data pointers, in hex; the others are integers, signed at the register's width. `zero` is left out, as GDB leaves it out. `priv`, the privilege mode, comes last, as GDB's `info registers priv` shows it:
 
 ```
 ra             0x80000018	0x80000018 <_start+24>
 sp             0x80010070	0x80010070
 ...
-t0             0x80000000	-2147483648
+t0             0x80000000	2147483648
 ...
-a0             0x80000050	-2147483568
+a0             0x80000050	2147483728
 ...
 pc             0x80000020	0x80000020 <puts>
 priv           0x3	prv:3 [Machine]
 ```
-
-On RV64 the same `t0` is `2147483648`, a positive 64-bit number.
 
 An ADDR is any of these, optionally followed by `+N` or `-N`:
 
@@ -283,7 +281,7 @@ An ADDR is any of these, optionally followed by `+N` or `-N`:
 - a symbol (`main`, `puts+8`);
 - a register (`$sp`, `$a0`, `$x5`, `$pc`, `$mstatus`).
 
-Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one, and within its section when it has none (an assembly label), as GDB's minimal symbols are: the stack past the program's last section has no name. Where GDB pads an address with zeros to the target's width, so does merlin-dbg: in backtraces (`bt`, `frame`, `up` and `down`: a frame's pc), disassembly (`disas` and the `=>` line of each stop), `finish`'s frame, the harts' pcs, and `info breakpoints`' breakpoint addresses (GDB's Address column). That is 8 digits on RV32 and 16 on RV64: `0x0000000080000024 <puts+4>`. Everywhere else, as GDB, an address has no leading zeros: a pointer's value, `x`'s line prefixes, `breakpoint N at ADDR`, watchpoints as they are set, hit and listed (GDB shows a watchpoint's expression), `regs`' code pointers, and a read that fails (`(cannot read past 0x80400000)`). So on RV32 only addresses below 0x10000000 look different between the two, such as a user program's `breakpoint 1 at 0x3bc4 <main>`. A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
+Symbols come from the ELF symbol table (through `elf`). Constants and local labels are left out: absolute symbols such as `.equ` values, and `.L` labels. Addresses are shown as `0x80000024 <puts+4>`: the nearest symbol at or below the address, within the symbol's size when it has one, and within its section when it has none (an assembly label), as GDB's minimal symbols are: the stack past the program's last section has no name. Where GDB pads an address with zeros to the target's width, so does merlin-dbg: in backtraces (`bt`, `frame`, `up` and `down`: a frame's pc), disassembly (`disas` and the `=>` line of each stop), `finish`'s frame, the harts' pcs, and `info breakpoints`' breakpoint addresses (GDB's Address column). That is 16 digits: `0x0000000080000024 <puts+4>`. Everywhere else, as GDB, an address has no leading zeros: a pointer's value, `x`'s line prefixes, `breakpoint N at ADDR`, watchpoints as they are set, hit and listed (GDB shows a watchpoint's expression), `regs`' code pointers, and a read that fails (`(cannot read past 0x80400000)`). A branch's target in an instruction is as merlin-objdump and llvm-objdump write it (`beqz t2, 0x80000048 <puts+40>`).
 
 **Breakpoints on functions.** As in GDB, `break FUNC` stops past the function's prologue, where its frame is built and its arguments are in their places, and `break *FUNC` at its first instruction. FUNC is a symbol in code (a C function, or an assembly label in `.text`); any other ADDR, a data symbol, a number or `FUNC+N`, is an exact address. Past the prologue is where GDB puts it (`skip_prologue_sal`, then `riscv_skip_prologue`):
 
@@ -310,16 +308,7 @@ merlin and clang (unless told to omit frame pointers) give every function that c
 - `s0`, the frame pointer, holds the value `sp` had on entry: the canonical frame address (CFA).
 - The prologue saves `ra` and the caller's `s0` just below the CFA.
 
-merlin's prologue (`crates/merlin/src/codegen.rs`, "Stack frame"):
-
-```
-    addi  sp, sp, -16        sp = CFA - 16
-    sw    ra, 12(sp)         ra        at CFA - 4
-    sw    s0, 8(sp)          caller s0 at CFA - 8
-    addi  s0, sp, 16         s0 = CFA
-```
-
-On RV64 (LP64) the slots are doublewords, saved with `sd` and restored with `ld`, as clang lays them out too:
+merlin's prologue (`crates/merlin/src/codegen.rs`, "Stack frame"), whose slots are doublewords, saved with `sd` and restored with `ld`, as clang lays them out too:
 
 ```
     addi  sp, sp, -16        sp = CFA - 16
@@ -328,11 +317,11 @@ On RV64 (LP64) the slots are doublewords, saved with `sd` and restored with `ld`
     addi  s0, sp, 16         s0 = CFA
 ```
 
-clang's prologue is the same with the frame's whole size in the first `addi`. In a variadic function, the saved argument registers come first. merlin saves the `8 - k` argument registers that the named parameters leave free (they take `k` argument words, at most 8) right below the CFA, and `ra` and `s0` below them. With `W` the bytes of a register (4 on RV32, 8 on RV64), `ra` is at CFA - W·(9 - k) and `s0` at CFA - W·(10 - k): with one named parameter, as kprintf, CFA - 32 and CFA - 36 on RV32, CFA - 64 and CFA - 72 on RV64 (`crates/merlin/src/codegen.rs`, "Variadic functions"). So the unwinder doesn't assume where the slots are. It reads the prologue of the function holding each pc, from its symbol's address, for at most 16 instructions. It follows the `sp` adjustments to find where `ra` and `s0` are stored, by a store as wide as a register (`sw` on RV32, `sd` on RV64: a `sw ra` on RV64 would keep half of it), and what `s0` is set to. Instructions are read a word at a time at both widths; the slots are read at the machine's width.
+clang's prologue is the same with the frame's whole size in the first `addi`. In a variadic function, the saved argument registers come first. merlin saves the `8 - k` argument registers that the named parameters leave free (they take `k` argument words, at most 8) right below the CFA, and `ra` and `s0` below them. With `W` the bytes of a register, 8, `ra` is at CFA - W·(9 - k) and `s0` at CFA - W·(10 - k): with one named parameter, as kprintf, CFA - 64 and CFA - 72 (`crates/merlin/src/codegen.rs`, "Variadic functions"). So the unwinder doesn't assume where the slots are. It reads the prologue of the function holding each pc, from its symbol's address, for at most 16 instructions. It follows the `sp` adjustments to find where `ra` and `s0` are stored, by a store as wide as a register (`sd`: a `sw ra` would keep half of it), and what `s0` is set to. Instructions are read a word at a time; the slots 8 bytes at a time.
 
 From one frame's `s0`, the caller's pc and `s0` are the values in those slots. The walk follows the chain up and stops when any of these happens:
 
-- the frame pointer is 0 (`_start` and the kernel's entry leave `s0` at its reset value 0), not 16-byte aligned (a CFA is the `sp` of a call, which the psABI keeps 16-byte aligned on RV32 and RV64), not above the one before, or unreadable;
+- the frame pointer is 0 (`_start` and the kernel's entry leave `s0` at its reset value 0), not 16-byte aligned (a CFA is the `sp` of a call, which the psABI keeps 16-byte aligned), not above the one before, or unreadable;
 - a pc is 0;
 - a function's prologue sets no `s0`;
 - 64 frames have been shown.
@@ -349,7 +338,7 @@ In each case `ra` holds the return address and `s0` is still the caller's frame 
 
 **Trap handlers** are not calls either. A backtrace from inside one ends at the handler, or carries on with whatever `s0` the interrupted code had.
 
-`crates/merlin-dbg/src/frames.rs` has the unwinder and its unit tests. They read prologues made of merlin's instruction words, and one of them builds `tests/rv64/prog.c` with merlin for RV32 and RV64 and reads the real `sum` (variadic) and `fact`, so that those words are merlin's own.
+`crates/merlin-dbg/src/frames.rs` has the unwinder and its unit tests. They read prologues made of merlin's instruction words, and one of them builds `tests/prog/prog.c` with merlin and reads the real `sum` (variadic) and `fact`, so that those words are merlin's own.
 
 ### Source lines
 
@@ -393,7 +382,7 @@ LLDB reads the same tables: `image lookup -a ADDR` gives the line, `breakpoint s
 | `frame [N]`, `f` | selects frame N of the backtrace (shows the selected one without N), and shows it and its line; past the outermost frame, GDB's `No frame at level N.` |
 | `up [N]`, `down [N]` | selects the frame N (1) further out, or further in, as far as there are frames (`up 9` selects the outermost); alone at the outermost or the innermost frame, GDB's `Initial frame selected; you cannot go up.` or `Bottom (innermost) frame selected; you cannot go down.` |
 
-An expression is C's, the part a debugger needs, with C's precedence: variables, numbers (of C's types: `int`, `long` or `long long` for a decimal number, their unsigned types too for a hex or octal one, only those with a `u`, and from `long` with an `L`, from `long long` with `LL`: `sizeof(1L)` is 8 on RV64) and character constants, registers, members (`s.m`, `p->m`), elements (`a[i]`, `m[i][j]`), `*p`, `&x`, `-`, `!`, `~`, the arithmetic, bitwise, shift and comparison operators with C's integer promotions and usual arithmetic conversions, by rank (`-1 < 0u` is 0; an enum is its integer type, so with `enum sign {NEG = -2, ...}` `sv + 0` is -2; the arithmetic is done wide and cut to the result's type, so `2147483647 + 1` is `-2147483648`, an `int`), `&&` and `||` (the right operand evaluated only when the left one does not decide), pointer arithmetic (an element at a time, and the difference of two pointers) and comparisons, `sizeof x`, `sizeof (TYPE)` and casts to a named type (`(struct node *) $a0`, `(unsigned) x`; to `_Bool`, 0 or 1; to `void`), and GDB's `x@N`, N objects like `x` from where it is, as an array (`*p@3`, `buf[2]@4`), which binds as in GDB's grammar, tighter than the shifts and looser than `+` and `-` (`a@n+1` is `a@(n+1)`, `a@2 == b` is `(a@2) == b`). A cast is of a scalar (an integer, an enum or a pointer) to a scalar or `void`: to or from a struct, a union, an array or a function it is GDB's `Invalid cast.`. A TYPE is `struct TAG`, `union TAG`, `enum TAG`, a typedef name or a base type, with `*`s; an integer type in any of C's spellings (`unsigned`, `long int`, `long unsigned long`), which is C's own type (GDB's) if the program describes none of that name. The types of what an expression makes are GDB's at each width: `int`, `long` (4 bytes on RV32, 8 on RV64) and `long long` (8 on both, so an 8-byte integer is `long long` on RV32 and `long` on RV64); `sizeof` is an `unsigned long` and a difference of pointers a `long`, on both. The registers are of the types GDB gives them on RISC-V: `$pc` and `$ra` are code pointers (`void (*)()`, `$1 = (void (*)()) 0x80000044 <walk+40>`), `$sp`, `$gp` and `$tp` data pointers (`void *`), the others `long`; a caller's `$pc` is its return address, and only its `$sp` and `$fp` are known. A name is looked up as C scopes it, and as GDB looks it up: the blocks of the selected frame's function that hold its pc, the innermost first, then its parameters, then the variables of the file's scope (of the unit holding the pc first, then of any other), then the functions. A symbol without debug information is GDB's error, `'puts' has unknown type; cast it to its declared type`.
+An expression is C's, the part a debugger needs, with C's precedence: variables, numbers (of C's types: `int`, `long` or `long long` for a decimal number, their unsigned types too for a hex or octal one, only those with a `u`, and from `long` with an `L`, from `long long` with `LL`: `sizeof(1L)` is 8) and character constants, registers, members (`s.m`, `p->m`), elements (`a[i]`, `m[i][j]`), `*p`, `&x`, `-`, `!`, `~`, the arithmetic, bitwise, shift and comparison operators with C's integer promotions and usual arithmetic conversions, by rank (`-1 < 0u` is 0; an enum is its integer type, so with `enum sign {NEG = -2, ...}` `sv + 0` is -2; the arithmetic is done wide and cut to the result's type, so `2147483647 + 1` is `-2147483648`, an `int`), `&&` and `||` (the right operand evaluated only when the left one does not decide), pointer arithmetic (an element at a time, and the difference of two pointers) and comparisons, `sizeof x`, `sizeof (TYPE)` and casts to a named type (`(struct node *) $a0`, `(unsigned) x`; to `_Bool`, 0 or 1; to `void`), and GDB's `x@N`, N objects like `x` from where it is, as an array (`*p@3`, `buf[2]@4`), which binds as in GDB's grammar, tighter than the shifts and looser than `+` and `-` (`a@n+1` is `a@(n+1)`, `a@2 == b` is `(a@2) == b`). A cast is of a scalar (an integer, an enum or a pointer) to a scalar or `void`: to or from a struct, a union, an array or a function it is GDB's `Invalid cast.`. A TYPE is `struct TAG`, `union TAG`, `enum TAG`, a typedef name or a base type, with `*`s; an integer type in any of C's spellings (`unsigned`, `long int`, `long unsigned long`), which is C's own type (GDB's) if the program describes none of that name. The types of what an expression makes are GDB's for LP64: `int` (4 bytes), `long` and `long long` (8, so an 8-byte integer is a `long`); `sizeof` is an `unsigned long` and a difference of pointers a `long`. The registers are of the types GDB gives them on RISC-V: `$pc` and `$ra` are code pointers (`void (*)()`, `$1 = (void (*)()) 0x80000044 <walk+40>`), `$sp`, `$gp` and `$tp` data pointers (`void *`), the others `long`; a caller's `$pc` is its return address, and only its `$sp` and `$fp` are known. A name is looked up as C scopes it, and as GDB looks it up: the blocks of the selected frame's function that hold its pc, the innermost first, then its parameters, then the variables of the file's scope (of the unit holding the pc first, then of any other), then the functions. A symbol without debug information is GDB's error, `'puts' has unknown type; cast it to its declared type`.
 
 Where a variable lives is a DWARF expression (`DW_AT_location`), which merlin-dbg evaluates in the selected frame: merlin's `DW_OP_fbreg N` (N bytes from the function's frame base, `DW_OP_reg8`, `s0`) and `DW_OP_addrx` (an address in `.debug_addr`), clang's at -O0, `DW_OP_breg2 N` (from `sp`) and `DW_OP_addrx`, and `DW_OP_addr` (the address in the expression itself). The innermost frame has every register; a caller has what the unwinder found: its frame pointer, and its `sp`, which is the CFA of the frame it called (that frame's `s0`, as merlin and clang lay frames out), or the called frame's own `sp` when that frame is not built (a leaf, or a stop in a prologue). Every stop selects the innermost frame again.
 
@@ -472,7 +461,7 @@ The state numbers are `kernel/include/proc.h`'s `PROC_` constants, which are `#d
 
 **Symbols keyed by address space.** The kernel's symbols, and those of `add-symbol-file FILE`, apply everywhere. Those of `add-symbol-file FILE program NAME` apply only in the address spaces of the processes that run program NAME: at each stop, merlin-dbg uses the symbols of every address space and those of the program the stopping hart's process runs. A breakpoint's location is looked for in every symbol file, as GDB's linespecs look in every objfile: it gets a breakpoint wherever it is found, one in the global symbols that stops everywhere, and one in each program's own files that stops only where that program runs (`program cat`). So `break kernel/user/cat.c:19` never stops in the shell running other code at that address, and with cat's and the shell's symbols keyed, `break main` is two breakpoints, cat's main where cat runs and the shell's where the shell does. Keyed by the program rather than by a pid, the symbols follow the program across processes and `exec`s.
 
-**Another process's memory.** `process PID` makes `print` and `x` read through that process's page table, whichever process the hart runs; registers, frames and the backtrace stay the hart's. The stub translates only through the selected hart's own `satp`, so merlin-dbg walks the other table itself (`crates/merlin-dbg/src/paging.rs`), as OpenOCD's RISC-V target does for `virt2phys`: the process's `pagetable` pointer is a kernel address, translated through the hart's table (every process's table maps the kernel), and from that root the privileged spec's walk (Sv32 on RV32, Sv39 or Sv48 on RV64, in the hart's mode), reading page-table entries and then the data over physical memory, with QEMU's packet for it (`Qqemu.PhyMemMode:1`, which Grail's stub has: "Protocol subset"), sent once for a whole read, the walk of every page it touches and the bytes, and undone after it (`Qqemu.PhyMemMode:0`). No permission is checked, as for the stub's own reads. Every stop selects the hart's own process again.
+**Another process's memory.** `process PID` makes `print` and `x` read through that process's page table, whichever process the hart runs; registers, frames and the backtrace stay the hart's. The stub translates only through the selected hart's own `satp`, so merlin-dbg walks the other table itself (`crates/merlin-dbg/src/paging.rs`), as OpenOCD's RISC-V target does for `virt2phys`: the process's `pagetable` pointer is a kernel address, translated through the hart's table (every process's table maps the kernel), and from that root the privileged spec's walk (Sv39 or Sv48, in the hart's mode), reading page-table entries and then the data over physical memory, with QEMU's packet for it (`Qqemu.PhyMemMode:1`, which Grail's stub has: "Protocol subset"), sent once for a whole read, the walk of every page it touches and the bytes, and undone after it (`Qqemu.PhyMemMode:0`). No permission is checked, as for the stub's own reads. Every stop selects the hart's own process again.
 
 The shell's pipeline `cat /README /README /README | cat` runs two processes of `/bin/cat`, the writer and, reading the pipe, the reader:
 
@@ -510,7 +499,7 @@ $2 = 0xbffffe8 "/README"
 
 The writer passed line 19 first, twice, without stopping: the breakpoint is the reader's.
 
-The same goes for the RV64 kernel's processes (#155), under Sv48 and under Sv39: the table's pointers are 8 bytes, read through the kernel's DWARF as the RV32 kernel's 4-byte ones, the kernel's `pagetable` pointers are high-half addresses translated through the hart's Sv48 or Sv39 table, and `satp` shows MODE 9 or 8 in its top bits (`0x9000...`, `0x8000...`).
+The kernel's processes (#155) are read so under Sv48 and under Sv39: the table's pointers are 8 bytes, read through the kernel's DWARF, the kernel's `pagetable` pointers are high-half addresses translated through the hart's Sv48 or Sv39 table, and `satp` shows MODE 9 or 8 in its top bits (`0x9000...`, `0x8000...`).
 
 ### Tests
 
@@ -524,23 +513,23 @@ The same goes for the RV64 kernel's processes (#155), under Sv48 and under Sv39:
 - interrupting a running machine;
 - source lines: a breakpoint on `kmain`'s line of `kernel/main.c` and on a line with no code, `next` and `step` by line, `list`, the lines in a backtrace, and the same in the shell, a user program added with `add-symbol-file`; LLDB on the kernel's line tables (ignored);
 - variables in the kernel, stopped in the shell's first `write`: the backtrace through `sys_write`, `syscall` and `user_trap` with their arguments, `info args` and `info locals` up the frames, the trap frame's members and its registers (an array), the process reached by a pointer and its name (a char array), `whatis` and `ptype`;
-- `crates/merlin-dbg/tests/vars/vars.c`, built by the test with `merlin -g` for RV32 and for RV64: stopped three calls deep in a recursion, the backtrace with every frame's arguments and line, `info args` and `info locals` in each frame (`up`, `down`, `frame`), the locals of a nested block (and its `static` one, the function's), globals of every kind of type (a struct of an enum, an array of structs and a string, an array of two dimensions, a `long long`, a typedef, an enum with negative constants, members of anonymous struct and union types), members, elements, pointers followed, `&`, `sizeof`, pointer differences, `print/x` (of a char array too), a function (one without a prototype), `ptype` and `whatis` of expressions and of type names, casts (and the invalid ones), the types of numbers, sizes and differences at each width, `@` at its precedence, the registers' types, frames past the outermost, struct arguments (`...` in a backtrace), errors; and, ignored, LLDB, which shows the same variables, types and values for it built by merlin and by clang, and merlin-dbg, which shows the same backtraces, arguments, locals, values and types for the two builds (clang's locations are `DW_OP_breg2` and `DW_OP_addrx`).
+- `crates/merlin-dbg/tests/vars/vars.c`, built by the test with `merlin -g`: stopped three calls deep in a recursion, the backtrace with every frame's arguments and line, `info args` and `info locals` in each frame (`up`, `down`, `frame`), the locals of a nested block (and its `static` one, the function's), globals of every kind of type (a struct of an enum, an array of structs and a string, an array of two dimensions, a `long long`, a typedef, an enum with negative constants, members of anonymous struct and union types), members, elements, pointers followed, `&`, `sizeof`, pointer differences, `print/x` (of a char array too), a function (one without a prototype), `ptype` and `whatis` of expressions and of type names, casts (and the invalid ones), the types of numbers, sizes and differences, `@` at its precedence, the registers' types, frames past the outermost, struct arguments (`...` in a backtrace), errors; and, ignored, LLDB, which shows the same variables, types and values for it built by merlin and by clang, and merlin-dbg, which shows the same backtraces, arguments, locals, values and types for the two builds (clang's locations are `DW_OP_breg2` and `DW_OP_addrx`).
 
-The same on RV64 machines, against the stub's `riscv:rv64` description:
+The machines are described by the stub as `riscv:rv64`; and also:
 
-- `examples/hello/hello-rv64.elf`: frames and code addresses with 16 digits, the other addresses and `regs` in GDB's layout without leading zeros, `x/b`, `x/h`, `x/w` and `x/g`, steps, a backtrace, disassembly and `finish`;
-- `examples/smp/smp-rv64.elf` with 2 harts: harts and watchpoints;
-- `crates/merlin-dbg/tests/rv64/prog.c`, built by the test with `merlin -g` for RV64, merlin-as and merlin-ld: `break FILE:LINE`, `next` and `step` by line, `list`, a backtrace through a variadic function from inside it, past its prologue (its own frame read from memory: its `ra` and `s0` at CFA - 64 and CFA - 72), and five frames of a recursive one, `finish`, and a watchpoint on a 64-bit global;
-- `merlin-dbg -- ...` on an RV64 program, and an RV32 program's symbols left out for an RV64 machine: the session goes on, the machine stopped at its first instruction until it is run to a breakpoint.
+- `examples/hello/hello.elf`: frames and code addresses with 16 digits, the other addresses and `regs` in GDB's layout without leading zeros, `x/b`, `x/h`, `x/w` and `x/g`, steps, a backtrace, disassembly and `finish`;
+- `examples/smp/smp.elf` with 2 harts: harts and watchpoints;
+- `crates/merlin-dbg/tests/prog/prog.c`, built by the test with `merlin -g`, merlin-as and merlin-ld: `break FILE:LINE`, `next` and `step` by line, `list`, a backtrace through a variadic function from inside it, past its prologue (its own frame read from memory: its `ra` and `s0` at CFA - 64 and CFA - 72), and five frames of a recursive one, `finish`, and a watchpoint on a 64-bit global;
+- `merlin-dbg -- ...` on a program, and an RV32 program's symbols (clang's, of `crates/elf/tests/llvm`) left out: the session goes on, the machine stopped at its first instruction until it is run to a breakpoint.
 
-- `kernel/kernel-rv64.elf` (#154), the higher-half kernel: `break kmain` and `break kvminit` at their link addresses (0xffff_ffff_8...), stopped in S-mode with Sv48 on, `regs`, and a backtrace of three frames read through the page table, down to `supervisor_entry`.
+- `kernel/kernel.elf` (#154), the higher-half kernel: `break kmain` and `break kvminit` at their link addresses (0xffff_ffff_8...), stopped in S-mode with Sv48 on, `regs`, `stepi`, `nexti`, `finish`, `next`, `info breakpoints`, and a backtrace of three frames read through the page table, down to `supervisor_entry`.
 
 The platform:
 
 - `crates/merlin-dbg/tests/avalon.rs` runs an Avalon server in the test's process, a VM on it running the kernel to its shell, and Herald attached to its console all along. `merlin-dbg --vm vm001 --server ADDR` attaches (the VM paused for it), breaks in `sys_write` as the shell answers a command typed in Herald, shows the backtrace and the system call's number, continues to the next `write` and quits. The VM runs on, the shell answers the next command, Herald's console is the one an undebugged run gives, and Herald saw nothing but the state changes, few of them (rate-limited, protocol doc section 6.8).
-- `crates/merlin-dbg/tests/processes.rs` boots the root image (built as `cargo xtask fs` builds it) with `cat /README /README /README | cat`, and cat's symbols keyed to the program, at both widths: the RV32 kernel under Sv32, and the RV64 disk kernel from an RV64 image (RV64 programs, the RV64 bootloader) under Sv48 and under Sv39. A breakpoint on cat's `write` line for every process stops in both cats, the writer's three writes first. Limited to the reader by its pid, then by its `satp` (whose mode is Sv32's, 9 or 8), it stops only in the reader, as often as the reader writes; the stops show the reader's arguments (`copy`'s `fd` and `name`, `main`'s `argc` and `argv`) and, through the writer's page table (`process`), the bytes at the writer's `argv[1]`, `"/README"`, where the reader's own memory holds something else, and the writer's `buf` (a static, at the same address in both). With the shell's symbols keyed too, `break main` is a breakpoint in each program, each stopping only in its own. Each debugged run's console is the undebugged one's.
+- `crates/merlin-dbg/tests/processes.rs` boots the root image (built as `cargo xtask fs` builds it) with `cat /README /README /README | cat`, and cat's symbols keyed to the program, under Sv48 and under Sv39. A breakpoint on cat's `write` line for every process stops in both cats, the writer's three writes first. Limited to the reader by its pid, then by its `satp` (whose mode is 9 or 8), it stops only in the reader, as often as the reader writes; the stops show the reader's arguments (`copy`'s `fd` and `name`, `main`'s `argc` and `argv`) and, through the writer's page table (`process`), the bytes at the writer's `argv[1]`, `"/README"`, where the reader's own memory holds something else, and the writer's `buf` (a static, at the same address in both). With the shell's symbols keyed too, `break main` is a breakpoint in each program, each stopping only in its own. Each debugged run's console is the undebugged one's.
 - `crates/avalon/tests/debug.rs` drives a VM's stub over the Avalon protocol with raw GDB packets: QEMU's run states (paused as the debugger attaches, on its Ctrl-C and on `PauseVm`, with the stop reply; debug at a breakpoint and after a step), breakpoints, steps, `ResumeVm` refused while the debugger holds the VM, `D` and `DebugDetach`, a connection that ends without `D` (the VM left as it was, its breakpoints still stopping it, the next debugger's `?` removing them), the state notices of 2000 steps rate-limited, a created VM debugged from its first instruction to its exit, `k`, `StopVm` and `DestroyVm` with a debugger attached, and the errors (`Busy`, `InvalidState`, `NoSuchVm`, input from a client that is not the debugger).
-- `src/paging.rs`'s tests walk random Sv32, Sv39 and Sv48 tables and agree with Grail's own walk on every address; `src/camelot.rs`'s check the state names against `proc.h`; `grail::gdb::commands`'s check `Qqemu.PhyMemMode`.
+- `src/paging.rs`'s tests walk random Sv39 and Sv48 tables and agree with Grail's own walk on every address; `src/camelot.rs`'s check the state names against `proc.h`; `grail::gdb::commands`'s check `Qqemu.PhyMemMode`.
 
 `src/remote.rs`'s unit tests give it a stub with no target description, whose width comes from the `g` reply.
 
