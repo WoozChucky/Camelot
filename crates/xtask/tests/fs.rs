@@ -1755,6 +1755,74 @@ fn a_failed_exec_ends_only_a_shell_that_is_not_interactive() {
 }
 
 #[test]
+fn a_failed_special_builtin_ends_only_a_shell_that_is_not_interactive() {
+    width::on_both(|| {
+        // POSIX's "Consequences of Shell Errors", as dash has them: an error in a
+        // special built-in (export or unset with a bad name, an assignment that can't be
+        // made) ends a shell that is not interactive, with dash's status 2, and nothing
+        // after it runs; a regular built-in's error (cd) gives the status 2 too, but the
+        // shell carries on. kernel.rs checks the interactive shell, which carries on
+        // after either.
+        // /s3's two lines assign 16 variables each: with HOME and TERM, the second line's
+        // B14 is the 33rd, one more than the shell has room for.
+        let input: &[u8] = b"cat > /s1\n\
+        export A=1 1B C=3\n\
+        echo not run > /not-run\n\
+        \x04cat > /s2\n\
+        unset 1A\n\
+        echo not run > /not-run\n\
+        \x04cat > /s3\n\
+        A0=1 A1=1 A2=1 A3=1 A4=1 A5=1 A6=1 A7=1 A8=1 A9=1 A10=1 A11=1 A12=1 A13=1 A14=1 A15=1\n\
+        B0=1 B1=1 B2=1 B3=1 B4=1 B5=1 B6=1 B7=1 B8=1 B9=1 B10=1 B11=1 B12=1 B13=1 B14=1 B15=1\n\
+        echo not run > /not-run\n\
+        \x04cat > /s4\n\
+        cd /nope\n\
+        echo run > /run\n\
+        cd /nope\n\
+        \x04sh < /s1\n\
+        sh < /s2\n\
+        sh < /s3\n\
+        sh < /s4\n\
+        exit 0\n";
+        let run = boot(
+            root_image(),
+            Boot {
+                input,
+                max_steps: SHELL_MAX_STEPS,
+                ..READ
+            },
+        );
+        assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+        let out = &run.out;
+        // What each script printed: the second shell's banner and prompts, its errors,
+        // and the first shell's report of its status.
+        let after = |command: &str| {
+            let typed = format!("{PROMPT}{command}\n");
+            let at = out
+                .find(&typed)
+                .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"));
+            &out[at + typed.len()..]
+        };
+        for (script, printed) in [
+            ("sh < /s1", "$ sh: export: 1B: bad variable name\nsh: exit 2\n"),
+            ("sh < /s2", "$ sh: unset: 1A: bad variable name\nsh: exit 2\n"),
+            ("sh < /s3", "$ $ sh: B14=1: too many variables\nsh: exit 2\n"),
+            (
+                "sh < /s4",
+                "$ sh: cd: /nope: no such file or directory\n$ $ sh: cd: /nope: no such file or directory\n$ sh: exit 2\n",
+            ),
+        ] {
+            let want = format!("{SHELL_BANNER}{printed}{PROMPT}");
+            assert!(after(script).starts_with(&want), "{script}: {out}");
+        }
+        fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+        let fs = Fs::open(&run.disk).unwrap();
+        assert!(fs.lookup("/not-run").is_err());
+        assert_eq!(fs.read_file("/run").unwrap(), b"run\n");
+    });
+}
+
+#[test]
 fn filetest_passes_on_the_root_image_and_leaves_it_as_it_was() {
     width::on_both(|| {
         // Every file system call and its errors (kernel/user/filetest.c), on

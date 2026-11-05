@@ -1473,9 +1473,9 @@ fn devices_may_share_a_page() {
 #[test]
 fn allocator_follows_the_ram_size() {
     // RAM comes from sysinfo: the smallest machine the kernel fits in (its
-    // image, with the user programs it embeds, takes most of a 1 MiB one),
+    // image, with the user programs it embeds, takes a little over 2 MiB),
     // and one whose RAM ends inside a 4 MiB region.
-    for mib in [2, 6] {
+    for mib in [3, 6] {
         check_kernel_memory(mib, &[]);
     }
 }
@@ -1533,10 +1533,13 @@ const UART_RX_SIZE: usize = 128;
 /// What the shell's `help` prints (kernel/user/sh.c).
 const HELP: &str = "\
 help            this list
-exit [N]        leave the shell, with status N or the last program's
+exit [N]        leave the shell, with status N or the last command's
 wait            wait for every background program
-cd [DIR]        change the working directory, to / without DIR
+cd [DIR]        change the working directory, to HOME (or /) without DIR
 exec [PROG ...] replace the shell with PROG; without one, keep its redirections
+export [NAME..] pass variables (NAME or NAME=VALUE) to programs; alone, list them
+unset NAME...   remove variables
+NAME=VALUE      set a variable; before a command, for that command alone
 PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /
 CMD < FILE      read the input from FILE
 CMD > FILE      write the output to FILE
@@ -2401,12 +2404,77 @@ fn booting_drops_into_the_user_shell() {
 }
 
 #[test]
+fn the_shell_passes_its_environment_on() {
+    // Issue #216: the shell starts with the kernel's environment for init,
+    // keeps variables (assignments, export, unset) and gives every program
+    // the exported ones, through spawn and exec (tests/common's
+    // environment session; processes_rv64.rs runs it on RV64).
+    let out = run_processes(common::environment::INPUT);
+    common::environment::check(&out, command_output);
+}
+
+#[test]
+fn a_failed_builtin_gives_dashs_status() {
+    // A built-in's status is the last one, which `exit` gives: 0, or 2 when
+    // it fails, as dash's (kernel/user/sh.c, at the top). The console's
+    // shell is interactive, so it carries on (fs.rs runs the same errors in
+    // shells that are not, which end). export and unset stop at a word that
+    // is no name; a successful built-in's status is 0 again.
+    for (input, line, printed) in [
+        (
+            &b"hello\nexport 1A\nexit\n"[..],
+            "export 1A",
+            "sh: export: 1A: bad variable name",
+        ),
+        (
+            b"hello\nunset 1A\nexit\n",
+            "unset 1A",
+            "sh: unset: 1A: bad variable name",
+        ),
+        (
+            b"cd /nope\nexit\n",
+            "cd /nope",
+            "sh: cd: /nope: no such file or directory",
+        ),
+    ] {
+        let (r, out) = run_shell(input);
+        assert_eq!(command_output(&out, line), [printed], "{out}");
+        assert_eq!(r, RunResult::Exited(2), "{out}");
+    }
+    let (r, out) = run_shell(b"export A=1 1B C=3\nenv\nexport 1A\nexport A\nexit\n");
+    assert_eq!(
+        command_output(&out, "export A=1 1B C=3"),
+        ["sh: export: 1B: bad variable name"],
+        "{out}"
+    );
+    assert_eq!(
+        command_output(&out, "env"),
+        ["HOME=/", "TERM=linux", "A=1"],
+        "{out}"
+    );
+    assert_eq!(r, RunResult::Exited(0), "{out}");
+    // An assignment that can't be made: the shell has room for 32
+    // variables, two of them HOME and TERM, so the 15th of the second line
+    // is one too many, and the line's status is 2.
+    let names = |c: char| (0..16).map(|i| format!("{c}{i}=1")).collect::<Vec<_>>().join(" ");
+    let (a, b) = (names('A'), names('B'));
+    let (r, out) = run_shell(format!("{a}\n{b}\nexit\n").as_bytes());
+    assert_eq!(
+        command_output(&out, &b),
+        ["sh: B14=1: too many variables"],
+        "{out}"
+    );
+    assert_eq!(r, RunResult::Exited(2), "{out}");
+}
+
+#[test]
 fn the_shell_is_the_first_process() {
     // The first instruction in U-mode is sh's entry point, crt0's _start,
     // with the start Linux gives a program (docs/camelot-syscalls.md,
     // "Starting a program"): every register zero but sp, which points at
-    // argc (1), argv { "sh", NULL }, an empty envp and the auxiliary vector,
-    // the strings "sh" and the path, "/bin/sh", at the top of the stack.
+    // argc (1), argv { "sh", NULL }, envp { "HOME=/", "TERM=linux", NULL }
+    // (Linux's environment for init) and the auxiliary vector, the strings
+    // "sh", envp's and the path, "/bin/sh", at the top of the stack.
     let (mut m, elf) = load_committed();
     step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
     let c = &m.cpu;
@@ -2424,6 +2492,7 @@ fn the_shell_is_the_first_process() {
         &user_program("sh").elf,
         "/bin/sh",
         &["sh"],
+        common::start::INIT_ENV,
     );
     // Interrupts on, SUM off.
     assert_ne!(c.csr.mstatus & MSTATUS_SIE, 0);
@@ -3383,7 +3452,7 @@ fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     // sbrk maps the new pages one at a time: when memory runs out partway,
     // it must unmap and free the ones it had mapped and leave the heap as it
     // was. 3 MB fits in user space, and a 16 MiB machine has the pages (the
-    // default 4 MiB, with the kernel's 1.4 MB, has not)...
+    // default 4 MiB, with the kernel's 2.2 MB, has not)...
     const LINE: &str = "systest sbrk 3000000";
     let config = MachineConfig {
         ram_size: 16 << 20,
@@ -3392,8 +3461,8 @@ fn a_heap_that_runs_out_of_memory_gives_back_what_it_took() {
     let out = run_processes_on(config, format!("{LINE}\nexit\n").as_bytes());
     assert_eq!(command_output(&out, LINE), ["systest: sbrk 3000000: 0"]);
 
-    // ...but a 3 MiB one runs out of them after mapping some (2 MiB, most of it
-    // the kernel with its embedded programs, leaves systest too few to start in).
+    // ...but a 3 MiB one runs out of them after mapping some (the kernel with
+    // its embedded programs, a little over 2 MiB, leaves systest too few).
     let config = MachineConfig {
         ram_size: 3 << 20,
         ..MachineConfig::default()
@@ -3508,7 +3577,7 @@ fn the_elf_loader_refuses_bad_images() {
     let loads: Vec<u32> = (0..u32::from(parsed.header.phnum))
         .filter(|&i| parsed.segments[i as usize].ty == elf::PT_LOAD)
         .collect();
-    assert_eq!(loads.len(), 2, "hello: text and rodata");
+    assert_eq!(loads.len(), 3, "hello: text, rodata and data (environ)");
     let ph = |i: u32, field: u32| phoff + elf::PHDR_SIZE as u32 * loads[i as usize] + field;
     struct Load {
         offset: u32,
@@ -3525,25 +3594,32 @@ fn the_elf_loader_refuses_bad_images() {
             memsz: p.memsz as u32,
         }
     };
-    let (text, rodata) = (&load(0), &load(1));
+    let (text, rodata, data) = (&load(0), &load(1), &load(2));
     // The cases rely on this layout: the text from the first page on, then
-    // less than a page of rodata on a page of its own.
+    // less than a page of rodata on a page of its own, then the data, the
+    // C library's environ (crt0 sets it), all .bss, on a page of its own.
     assert_eq!(text.vaddr, USER_TEXT);
     assert!(rodata.vaddr >= text.vaddr + text.memsz && rodata.vaddr.is_multiple_of(PAGE));
     assert!(rodata.memsz < PAGE);
     assert_eq!(rodata.filesz, rodata.memsz);
-    // hello reaches its rodata pc-relatively (-mcmodel=medany), so it still
-    // runs with both segments moved by the same amount: here, so that its
-    // rodata, given a whole page, ends right at USER_LOAD_TOP.
-    let high_rodata = USER_LOAD_TOP - PAGE;
-    let high_text = high_rodata - (rodata.vaddr - text.vaddr);
+    assert!(data.vaddr >= rodata.vaddr + rodata.memsz && data.vaddr.is_multiple_of(PAGE));
+    assert!(data.memsz < PAGE);
+    assert_eq!(data.filesz, 0);
+    // hello reaches its rodata and its data pc-relatively
+    // (-mcmodel=medany), so it still runs with every segment moved by the
+    // same amount: here, so that its data, given a whole page, ends right
+    // at USER_LOAD_TOP.
+    let high_data = USER_LOAD_TOP - PAGE;
+    let high_text = high_data - (data.vaddr - text.vaddr);
+    let high_rodata = high_text + (rodata.vaddr - text.vaddr);
     let entry = parsed.header.entry as u32;
-    let moved_high = |rodata_memsz: u32| -> Vec<(u32, [u8; 4])> {
+    let moved_high = |data_memsz: u32| -> Vec<(u32, [u8; 4])> {
         vec![
             (E_ENTRY, (entry - text.vaddr + high_text).to_le_bytes()),
             (ph(0, P_VADDR), high_text.to_le_bytes()),
             (ph(1, P_VADDR), high_rodata.to_le_bytes()),
-            (ph(1, P_MEMSZ), rodata_memsz.to_le_bytes()),
+            (ph(2, P_VADDR), high_data.to_le_bytes()),
+            (ph(2, P_MEMSZ), data_memsz.to_le_bytes()),
         ]
     };
     let (at_top, past_top) = (moved_high(PAGE), moved_high(PAGE + 1));

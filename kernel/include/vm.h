@@ -494,6 +494,13 @@ int copyout(pagetable_t pt, uintptr va, const void *src, usize len);
  * if a byte up to its NUL is not readable user memory; -2 if it has no NUL in
  * its first `max` bytes. `dst` holds a string (maybe cut short) either way. */
 int copyinstr(pagetable_t pt, char *dst, uintptr va, u32 max);
+
+/* The length of the NUL-terminated string at user address `va` in `pt`,
+ * its NUL included, as Linux's strnlen_user measures one: 0 if a byte up
+ * to its NUL (or up to the `max`th) is not readable user memory, more than
+ * `max` if there is no NUL in its first `max` bytes. Copies nothing: exec
+ * measures a string before it knows where in its buffer it goes. */
+u32 strnlen_user(pagetable_t pt, uintptr va, u32 max);
 #endif
 
 #endif
