@@ -125,8 +125,11 @@ pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<Machi
     config.validate()?;
     if config.bios.is_some() {
         if config.xlen == Xlen::Rv32 {
-            return Err("firmware (bios) is for RV64 VMs only: an RV32 VM, which an RV32 profile is                         unless its program is ELF64, boots its program or disk in M-mode (bios none)"
-                .into());
+            return Err(
+                "firmware (bios) is for RV64 VMs only: an RV32 VM, which an RV32 profile is \
+                        unless its program is ELF64, boots its program or disk in M-mode (bios none)"
+                    .into(),
+            );
         }
         // Loaded and dropped: the machine loads it again when it is built.
         grail::firmware::Image::of(&config.bios, Xlen::Rv64)?;
