@@ -743,22 +743,27 @@ static void write_test(void) {
     if (ip != NULL) {
         ilock(ip);
         check(writei(ip, data, B_LEN + 1, 1) == -EINVAL, "write: no holes");
-        check(writei(ip, data, B_LEN, MAXFILE_BYTES - B_LEN + 1) == -EFBIG, "write: past the largest file");
+        check(readi(ip, data, B_LEN, 1) == 0, "read: nothing at the end");
         check(ip->size == B_LEN, "and the size is unchanged");
         iunlockput(ip);
     }
     end_op();
-    /* Files past what the kernel's offsets reach, which only mkfs could
-     * make: open() refuses them. */
+    /* Files past what the kernel's offsets reach (on RV32, 2^31 - 1 bytes,
+     * which only mkfs or an RV64 kernel could make; on RV64 the format's
+     * limit): open() refuses them, and a write at the largest file's end
+     * goes no further. An inode in memory only: its size is all writei()
+     * looks at before it refuses. */
     struct inode big_one;
     memset(&big_one, 0, sizeof big_one);
     big_one.size = MAXFILE_BYTES;
     bool fits = !inode_too_big(&big_one);
     big_one.size = MAXFILE_BYTES + 1;
     bool past = inode_too_big(&big_one);
-    big_one.size = 0;
-    big_one.size_hi = 1;
-    check(fits && past && inode_too_big(&big_one), "a file past 2^31 - 1 bytes is too big to open");
+    big_one.size = (u64)1 << 32;
+    bool high = inode_too_big(&big_one) == (MAXFILE_BYTES < ((u64)1 << 32));
+    big_one.size = MAXFILE_BYTES - 1;
+    bool efbig = writei(&big_one, data, MAXFILE_BYTES - 1, 2) == -EFBIG;
+    check(fits && past && high && efbig, "a file past MAXFILE_BYTES is too big to open or write");
 
     u32 blocks;
     u32 inodes;

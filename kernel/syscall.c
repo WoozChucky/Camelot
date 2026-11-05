@@ -1,6 +1,10 @@
 /* The system calls (docs/camelot-syscalls.md). syscall() takes the call
  * number from a7 and the arguments from a0-a5 of the trap frame, and leaves
- * the result in its a0. A pointer argument is a user address: the kernel
+ * the result in its a0: a `long`, sign-extended to the register's width, as
+ * Linux's riscv64 syscall handler stores regs->a0. Each call takes its
+ * arguments at their C types (an int is the register's low 32 bits, as the
+ * calling convention passes it; a pointer or a size all of it). A pointer
+ * argument is a user address: the kernel
  * never dereferences it, but checks it against the process's page table and
  * copies through the physical pages (copyin, copyout, copyinstr in vm.c), so
  * a bad pointer is an -EFAULT, never a fault in the kernel. The calls on
@@ -16,13 +20,13 @@
 #include "sysfile.h"
 #include "vm.h"
 
-/* The arguments as the process passed them. */
-static u32 arg(struct trap_frame *f, int n) {
+/* The arguments as the process passed them: a register each. */
+static uintptr arg(struct trap_frame *f, int n) {
     return f->regs[REG_A0 + n];
 }
 
-static int sys_sleep(struct trap_frame *f) {
-    u32 n = arg(f, 0);
+static long sys_sleep(struct trap_frame *f) {
+    u32 n = (u32)arg(f, 0);
     acquire(&tickslock);
     u32 start = ticks;
     /* Unsigned differences, so the count may wrap. Every tick wakes the
@@ -36,7 +40,7 @@ static int sys_sleep(struct trap_frame *f) {
 
 /* Copies spawn's or exec's argv (a user array of string pointers ending
  * with a NULL) into `args`. A NULL argv stands for { path }. */
-static int copy_args(pagetable_t pt, u32 argv, const char *path, struct proc_args *args) {
+static int copy_args(pagetable_t pt, uintptr argv, const char *path, struct proc_args *args) {
     args->argc = 0;
     args->len = 0;
     if (argv == 0) {
@@ -46,8 +50,9 @@ static int copy_args(pagetable_t pt, u32 argv, const char *path, struct proc_arg
         return 0;
     }
     for (;;) {
-        u32 ptr;
-        if (copyin(pt, &ptr, argv + 4 * args->argc, sizeof ptr) != 0) {
+        /* argv[i]: a user pointer, 4 or 8 bytes. */
+        uintptr ptr;
+        if (copyin(pt, &ptr, argv + sizeof ptr * args->argc, sizeof ptr) != 0) {
             return -EFAULT;
         }
         if (ptr == 0) {
@@ -70,7 +75,7 @@ static int copy_args(pagetable_t pt, u32 argv, const char *path, struct proc_arg
 
 /* spawn(path, argv) and exec(path, argv): the path and the arguments are
  * copied in, every pointer checked, before anything is looked up. */
-static int sys_run(struct trap_frame *f, bool replace) {
+static long sys_run(struct trap_frame *f, bool replace) {
     pagetable_t pt = myproc()->pagetable;
     char path[MAXPATH + 1];
     int err = fetch_path(pt, arg(f, 0), path);
@@ -97,10 +102,10 @@ static int sys_run(struct trap_frame *f, bool replace) {
 /* procs(buf, max): all of `buf`, `max` entries, must be writable, however
  * many are filled in. The table is built on the kernel stack (NPROC
  * entries, 256 bytes) and copied out. */
-static int sys_procs(struct trap_frame *f) {
+static long sys_procs(struct trap_frame *f) {
     pagetable_t pt = myproc()->pagetable;
-    u32 buf = arg(f, 0);
-    u32 max = arg(f, 1);
+    uintptr buf = arg(f, 0);
+    u32 max = (u32)arg(f, 1);
     if (max > USER_TOP / sizeof(struct procinfo) || !uvm_range_ok(pt, buf, max * sizeof(struct procinfo), PTE_W)) {
         return -EFAULT;
     }
@@ -115,10 +120,10 @@ static int sys_procs(struct trap_frame *f) {
 }
 
 /* harts(buf, max): as procs, with NCPU entries of 16 bytes. */
-static int sys_harts(struct trap_frame *f) {
+static long sys_harts(struct trap_frame *f) {
     pagetable_t pt = myproc()->pagetable;
-    u32 buf = arg(f, 0);
-    u32 max = arg(f, 1);
+    uintptr buf = arg(f, 0);
+    u32 max = (u32)arg(f, 1);
     if (max > USER_TOP / sizeof(struct hartinfo) || !uvm_range_ok(pt, buf, max * sizeof(struct hartinfo), PTE_W)) {
         return -EFAULT;
     }
@@ -134,14 +139,16 @@ static int sys_harts(struct trap_frame *f) {
 
 /* Whether call `num` goes into the network stack: netinfo to setsockopt,
  * numbered one after another. They run under net_lock (net.h). */
-static bool is_net_call(u32 num) {
+static bool is_net_call(uintptr num) {
     return num >= SYS_netinfo && num <= SYS_setsockopt;
 }
 
 void syscall(struct trap_frame *f) {
     struct proc *p = myproc();
-    int ret;
-    u32 num = f->regs[REG_A7];
+    long ret;
+    /* The number is all of a7, as Linux takes it (a long): on RV64 2^32 + 2
+     * is no call, not write. */
+    uintptr num = f->regs[REG_A7];
     /* Whatever the program has on its stack is at or above sp: map the stack
      * down to it, so that a buffer there the program hasn't touched yet (a
      * big local array passed to read()) is user memory like any other. A
@@ -183,7 +190,7 @@ void syscall(struct trap_frame *f) {
         ret = proc_wait((int)arg(f, 0), arg(f, 1));
         break;
     case SYS_sbrk:
-        ret = proc_sbrk((i32)arg(f, 0));
+        ret = proc_sbrk((long)arg(f, 0));
         break;
     case SYS_uptime:
         ret = (int)ticks;
@@ -233,49 +240,49 @@ void syscall(struct trap_frame *f) {
         ret = net_sys_info(arg(f, 0));
         break;
     case SYS_netconf:
-        ret = net_sys_conf(arg(f, 0), arg(f, 1), arg(f, 2));
+        ret = net_sys_conf((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2));
         break;
     case SYS_ping:
-        ret = net_sys_ping(arg(f, 0), arg(f, 1), arg(f, 2));
+        ret = net_sys_ping((u32)arg(f, 0), (u32)arg(f, 1), arg(f, 2));
         break;
     case SYS_socket:
-        ret = sock_sys_socket(arg(f, 0), arg(f, 1), arg(f, 2));
+        ret = sock_sys_socket((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2));
         break;
     case SYS_bind:
-        ret = sock_sys_bind(arg(f, 0), arg(f, 1));
+        ret = sock_sys_bind((u32)arg(f, 0), arg(f, 1));
         break;
     case SYS_listen:
-        ret = sock_sys_listen(arg(f, 0), arg(f, 1));
+        ret = sock_sys_listen((u32)arg(f, 0), (u32)arg(f, 1));
         break;
     case SYS_accept:
-        ret = sock_sys_accept(arg(f, 0), arg(f, 1));
+        ret = sock_sys_accept((u32)arg(f, 0), arg(f, 1));
         break;
     case SYS_connect:
-        ret = sock_sys_connect(arg(f, 0), arg(f, 1));
+        ret = sock_sys_connect((u32)arg(f, 0), arg(f, 1));
         break;
     case SYS_send:
-        ret = sock_sys_send(arg(f, 0), arg(f, 1), arg(f, 2));
+        ret = sock_sys_send((u32)arg(f, 0), arg(f, 1), arg(f, 2));
         break;
     case SYS_recv:
-        ret = sock_sys_recv(arg(f, 0), arg(f, 1), arg(f, 2));
+        ret = sock_sys_recv((u32)arg(f, 0), arg(f, 1), arg(f, 2));
         break;
     case SYS_sendto:
-        ret = sock_sys_sendto(arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
+        ret = sock_sys_sendto((u32)arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
         break;
     case SYS_recvfrom:
-        ret = sock_sys_recvfrom(arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
+        ret = sock_sys_recvfrom((u32)arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
         break;
     case SYS_shutdown:
-        ret = sock_sys_shutdown(arg(f, 0), arg(f, 1));
+        ret = sock_sys_shutdown((u32)arg(f, 0), (u32)arg(f, 1));
         break;
     case SYS_getsockname:
-        ret = sock_sys_name(arg(f, 0), arg(f, 1), false);
+        ret = sock_sys_name((u32)arg(f, 0), arg(f, 1), false);
         break;
     case SYS_getpeername:
-        ret = sock_sys_name(arg(f, 0), arg(f, 1), true);
+        ret = sock_sys_name((u32)arg(f, 0), arg(f, 1), true);
         break;
     case SYS_setsockopt:
-        ret = sock_sys_setsockopt(arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3), arg(f, 4));
+        ret = sock_sys_setsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), (u32)arg(f, 4));
         break;
     case SYS_harts:
         ret = sys_harts(f);
@@ -294,7 +301,7 @@ void syscall(struct trap_frame *f) {
         ret = (int)mythread()->tid;
         break;
     case SYS_futex_wait:
-        ret = futex_wait(arg(f, 0), arg(f, 1));
+        ret = futex_wait(arg(f, 0), (u32)arg(f, 1));
         break;
     case SYS_futex_wake:
         ret = futex_wake(arg(f, 0), (i32)arg(f, 1));
@@ -317,5 +324,8 @@ void syscall(struct trap_frame *f) {
             fileclose(file);
         }
     }
-    f->regs[REG_A0] = (u32)ret;
+    /* A long is the register's width: a negative error stays negative to
+     * the program (on RV64 bits 63-32 copy bit 31 of -EFAULT, say), and a
+     * pointer (sbrk's) comes back whole. */
+    f->regs[REG_A0] = (uintptr)ret;
 }

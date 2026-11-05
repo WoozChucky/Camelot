@@ -1,8 +1,11 @@
 //! The RV64 kernel's tests (#154): `kernel/kernel-rv64.elf`, a higher-half
 //! kernel in Linux's riscv64 layout, booting on RV64 Grail through its boot
 //! self-tests and its kernel processes, on 1 to 8 harts, and its panic
-//! paths. It has no user space yet (#155), so the boot ends after the
-//! self-tests and the exit code is the number of failed ones.
+//! paths, then running the shell, an RV64 program, as the first process
+//! (#155): the boot ends when it exits (`exit`, typed on the UART), and the
+//! exit code is the number of failed self-tests, else the shell's status.
+//! The tests of RV64 processes, their address space and the LP64 system
+//! call ABI are in `processes_rv64.rs`.
 //!
 //! The image is linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000:
 //! its symbols are link addresses, which [`Kernel::pa`] turns into the
@@ -143,13 +146,29 @@ thread_local! {
     /// The kernel the tests on this thread run: the committed one, or a
     /// reference build (`the_rv64_reference_builds_pass_the_same_tests`).
     static UNDER_TEST: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// A reference build's clang assembly of the user programs, which its
+    /// bootable disk's /bin holds built (`rv64_bootable_image`).
+    static UNDER_TEST_USER_ASM: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
 }
 
-/// The kernel under test. (The RV64 kernel has no user programs, so it is
-/// also the disk kernel.)
+/// The kernel under test.
 fn under_test() -> Vec<u8> {
     UNDER_TEST.with(|u| u.borrow().clone()).unwrap_or_else(committed)
 }
+
+/// The kernel a bootable disk holds: the committed disk kernel, without the
+/// programs (they are in the image's /bin); a reference build's own, which
+/// has them, when one is under test (from a mounted disk it runs /bin's).
+fn disk_kernel_under_test() -> Vec<u8> {
+    UNDER_TEST.with(|u| u.borrow().clone()).unwrap_or_else(|| {
+        let path = repo_root().join("kernel").join(kernel::DISK_KERNEL_RV64);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    })
+}
+
+/// What the shell prints when it starts, and its prompt.
+const SHELL_BANNER: &str = "Type help for the list of commands.\n";
+const PROMPT: &str = "$ ";
 
 /// Replaces the pc of a `[dbg] pc=` line with dots.
 fn mask_dbg_pc(out: &str) -> String {
@@ -169,7 +188,8 @@ struct Kernel {
 
 impl Kernel {
     /// The committed RV64 kernel on a machine of `harts` harts and `ram`
-    /// bytes of RAM, not started yet.
+    /// bytes of RAM, not started yet, with `exit` typed on the UART for the
+    /// shell, so that a run ends.
     fn load(harts: usize, ram: usize) -> Kernel {
         Kernel::load_elf(&under_test(), harts, ram)
     }
@@ -186,6 +206,7 @@ impl Kernel {
         .unwrap();
         m.cpu.bus.uart.capture = true;
         m.load_elf(file).unwrap();
+        m.set_uart_input(kernel::typed(b"exit\n"));
         Kernel { m, elf }
     }
 
@@ -289,8 +310,13 @@ fn the_committed_rv64_kernels_are_what_our_toolchain_builds() {
         "{} is stale: run cargo xtask kernel",
         path.display()
     );
-    // No RV64 user programs yet (#156): the two are the same kernel.
-    assert_eq!(disk, built.elf);
+    // The kernel embeds the RV64 user programs; the disk kernel does not.
+    assert!(
+        disk.len() < built.elf.len() / 2,
+        "{} {}",
+        disk.len(),
+        built.elf.len()
+    );
 }
 
 #[test]
@@ -336,7 +362,9 @@ fn the_rv64_kernel_boots_through_its_self_tests() {
     // pages freed (vm.h, kstack_free()).
     assert_eq!(lines[0], "kstack self-test: 3/3 passed", "{rest}");
     assert!(lines[1].starts_with("kstack: "), "{rest}");
-    assert_eq!(lines[2..], ["user space: not on RV64 yet"], "{rest}");
+    // Then the shell, a 64-bit program, as the first process: it reads
+    // `exit` and the machine stops with its status.
+    assert_eq!(lines[2..], [SHELL_BANNER.trim_end(), "$ exit"], "{rest}");
 
     // The layout's variables: Sv48 on a hart that has it, else Sv39, with
     // Linux's values for the mode.
@@ -506,6 +534,7 @@ fn the_rv64_kernel_configures_its_network_with_dhcp() {
     .unwrap();
     m.cpu.bus.uart.capture = true;
     m.load_elf(&file).unwrap();
+    m.set_uart_input(kernel::typed(b"exit\n"));
     let r = m.run(Some(BOOT_MAX_STEPS), |_| {});
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     assert_eq!(r, RunResult::Exited(0), "{out}");
@@ -518,7 +547,8 @@ fn the_rv64_kernel_configures_its_network_with_dhcp() {
 
 #[test]
 fn the_rv64_kernel_takes_ram_from_sysinfo() {
-    for mib in [2usize, 64] {
+    // 3 MiB at least: the image is 2.1 MiB with the programs it embeds.
+    for mib in [3usize, 64] {
         let mut k = Kernel::load(1, mib << 20);
         let r = k.run();
         let out = k.printed();
@@ -743,24 +773,22 @@ fn a_kernel_stack_overflow_hits_the_guard_page_and_is_reported() {
     );
 }
 
-/// A bootable RV64 disk: the root image's files (kernel/fs, /dev/console) in
-/// the filesystem, the RV64 bootloader in the boot block and the RV64 disk
-/// kernel after the filesystem, as `camelot-fs mkfs --boot` makes one. No
-/// /bin: there are no RV64 programs yet (#156).
+/// A bootable RV64 disk: the root image's files (kernel/fs, /dev/console,
+/// the RV64 programs in /bin, `xtask::fs::build_for`) in the filesystem,
+/// the RV64 bootloader in the boot block and the RV64 disk kernel after the
+/// filesystem, as `camelot-fs mkfs --boot` makes one.
 fn rv64_bootable_image(blocks: u32) -> (Vec<u8>, camelot_fs::boot::BootInfo) {
     let root = repo_root();
-    let kernel = under_test();
+    let kernel = disk_kernel_under_test();
     let opts = xtask::fs::bootable_layout(blocks, &kernel).unwrap();
-    let mut fs = camelot_fs::mkfs::Mkfs::new(&opts).unwrap();
-    fs.add_host_dir(&root.join(xtask::fs::ROOT_DIR), "/").unwrap();
-    fs.mkdir(xtask::fs::DEV).unwrap();
-    fs.add_device(
-        &format!("{}/console", xtask::fs::DEV),
-        xtask::fs::CONSOLE_MAJOR,
-        0,
-    )
-    .unwrap();
-    let mut image = fs.finish();
+    // A reference kernel checks that /bin holds the programs it embeds: its
+    // own, built from clang's assembly.
+    let asm = UNDER_TEST_USER_ASM.with(|a| a.borrow().clone());
+    let cc = match &asm {
+        Some(dir) => xtask::userprogs::CCompiler::Clang(dir),
+        None => xtask::userprogs::CCompiler::Merlin,
+    };
+    let mut image = xtask::fs::build_for_with(&root, &opts, kernel::Xlen::Rv64, cc).unwrap();
     let boot = xtask::boot::bootloader_rv64(&root).unwrap();
     let info = camelot_fs::boot::install(&mut image, &boot, &kernel).unwrap();
     (image, info)
@@ -768,7 +796,8 @@ fn rv64_bootable_image(blocks: u32) -> (Vec<u8>, camelot_fs::boot::BootInfo) {
 
 #[test]
 fn the_rv64_kernel_boots_from_disk() {
-    let (image, info) = rv64_bootable_image(2048);
+    let root = repo_root();
+    let (image, info) = rv64_bootable_image(4096);
     for harts in [1, 4] {
         let mut m = Machine::new(MachineConfig {
             harts,
@@ -780,6 +809,7 @@ fn the_rv64_kernel_boots_from_disk() {
         .unwrap();
         m.boot_from_disk().unwrap();
         m.cpu.bus.uart.capture = true;
+        m.set_uart_input(kernel::typed(b"hello\nls /bin\nexit\n"));
         let r = m.run(Some(2 * BOOT_MAX_STEPS), |_| {});
         let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
         // The bootloader found the kernel, loaded its segments at their
@@ -798,14 +828,31 @@ fn the_rv64_kernel_boots_from_disk() {
             out.contains(&format!("\npaging: on ({})\n", mode().name)),
             "{out}"
         );
-        assert!(out.contains("\ndisk 0: 4096 sectors (2048 KiB), irq "), "{out}");
+        assert!(out.contains("\ndisk 0: 8192 sectors (4096 KiB), irq "), "{out}");
         // The disk driver's DMA (physical addresses of direct-map buffers),
         // the filesystem on it, and their self-tests.
         assert!(out.contains("\nblk self-test: 16/16 passed\n"), "{out}");
         assert!(out.contains("\nfs: disk 0 mounted: "), "{out}");
-        assert!(out.contains("\nfs self-test: 11/11 passed\n"), "{out}");
+        // One more check than without /bin: the programs there ("N
+        // programs, the kernel none" for the disk kernel, "N of the
+        // kernel's N programs" for a reference build, which embeds them).
+        let programs = xtask::userprogs::embedded_names(&xtask::userprogs::user_dir(&root)).unwrap();
+        assert!(
+            out.contains(&format!("\nfs: /bin holds {} ", programs.len())),
+            "{out}"
+        );
+        assert!(out.contains("\nfs self-test: 12/12 passed\n"), "{out}");
         assert!(!out.contains("FAILED"), "{out}");
-        assert!(out.ends_with("user space: not on RV64 yet\n"), "{out}");
+        // Then the shell from /bin/sh on the disk, and the programs it
+        // runs from there: 64-bit ELF files, read through the filesystem.
+        assert!(
+            out.contains(&format!(
+                "{SHELL_BANNER}{PROMPT}hello\nhello from user mode\n{PROMPT}ls /bin\n"
+            )),
+            "{out}"
+        );
+        assert!(out.contains(" sh\n") && out.contains(" systest\n"), "{out}");
+        assert!(out.ends_with(&format!("{PROMPT}exit\n")), "{out}");
         if harts > 1 {
             assert!(out.contains(&format!("\nsmp: {harts} harts running\n")), "{out}");
         }
@@ -818,8 +865,9 @@ fn the_rv64_kernel_boots_from_disk() {
 }
 
 /// The RV64 reference build (`cargo xtask kernel --cc clang --xlen 64`) into
-/// a scratch directory, with `assembler` for the `.S` files.
-fn reference_build(assembler: Assembler, name: &str) -> Vec<u8> {
+/// a scratch directory, with `assembler` for the `.S` files. Returns the
+/// kernel and the directory of clang's assembly of the user programs.
+fn reference_build(assembler: Assembler, name: &str) -> (Vec<u8>, std::path::PathBuf) {
     let clang = tools::find("clang").expect("clang (the official LLVM install, or on PATH)");
     let lld = tools::find_beside("ld.lld", &clang).expect("ld.lld next to clang");
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -838,7 +886,7 @@ fn reference_build(assembler: Assembler, name: &str) -> Vec<u8> {
         kernel::Xlen::Rv64,
     )
     .unwrap();
-    std::fs::read(out).unwrap()
+    (std::fs::read(out).unwrap(), dir.join("user"))
 }
 
 #[test]
@@ -848,8 +896,9 @@ fn the_rv64_reference_builds_pass_the_same_tests() {
     // every test above but the one that compares the committed kernel with
     // merlin's build, on this thread's kernel under test.
     for (assembler, name) in [(Assembler::Clang, "clang"), (Assembler::Merlin, "merlin-as")] {
-        let elf = reference_build(assembler, name);
+        let (elf, user_asm) = reference_build(assembler, name);
         assert_ne!(elf, committed(), "{name}: the reference build is merlin's");
+        UNDER_TEST_USER_ASM.with(|a| *a.borrow_mut() = Some(user_asm));
         UNDER_TEST.with(|u| *u.borrow_mut() = Some(elf));
         MODE.set(SV48);
         the_rv64_kernel_falls_back_to_sv39();

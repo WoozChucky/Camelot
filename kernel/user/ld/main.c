@@ -33,10 +33,14 @@ static uchar *read_file(const char *path, uint *len, int *err) {
         *err = r;
         return NULL;
     }
-    uchar *data = xmalloc(st.size + 1);
+    /* The size, an off_t: the linker's lengths are uints (it works in
+     * 32-bit sizes until #157), so a file is at most 2^31 - 1 bytes here,
+     * as the RV32 kernel's off_t reaches. */
+    uint size = (uint)st.size;
+    uchar *data = xmalloc(size + 1);
     uint done = 0;
-    while (done < st.size) {
-        int n = read(fd, data + done, st.size - done);
+    while (done < size) {
+        int n = (int)read(fd, data + done, size - done);
         if (n < 0) {
             close(fd);
             *err = n;

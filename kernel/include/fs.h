@@ -31,12 +31,25 @@
 #define SUPERBLOCK_NO 1
 #define LOGSTART 2
 
-/* The largest file the kernel reads or writes, in bytes: its file offsets
- * are 32-bit (i32 in lseek) until off_t widens (#155). The format's own
- * limit is 2^32 blocks. A bigger file (only mkfs could make one) fails to
- * open with -EOVERFLOW, as Linux's open does for a large file without
- * O_LARGEFILE. */
-#define MAXFILE_BYTES 0x7fffffffu
+/* The most blocks a file has: its logical block numbers are u32, and the
+ * last one, 2^32 - 1, is never a file's (ext4's EXT_MAX_BLOCKS, which
+ * ext4_max_size() makes s_maxbytes from). So a file's block count fits a
+ * u32. No file comes near it: a filesystem is at most 2^31 blocks. */
+#define EXT_MAX_BLOCKS 0xffffffffu
+
+/* The largest file the kernel reads or writes, in bytes (Linux's
+ * s_maxbytes). On RV64 ext4's: EXT_MAX_BLOCKS blocks, 1 KiB short of
+ * 4 TiB. On RV32 what its 32-bit off_t reaches, 2^31 - 1 bytes: a bigger
+ * file (only mkfs, or an RV64 kernel, could make one) fails to open with
+ * -EOVERFLOW. That off_t is a stopgap until RV32 goes (#159), not riscv32
+ * Linux's, which is 64-bit (types.h). The kernel's offsets and sizes are
+ * u64 on both (the inode's size, readi(), writei(), an open file's
+ * offset), as Linux's loff_t is. */
+#if __riscv_xlen == 64
+#define MAXFILE_BYTES ((u64)EXT_MAX_BLOCKS * BSIZE)
+#else
+#define MAXFILE_BYTES 0x7fffffffull
+#endif
 #define DIRSIZ 14
 
 /* Inode types. */
@@ -119,7 +132,8 @@ struct ext_node {
 #define INODE_TRUNCATING 1
 
 /* An inode on the disk: 128 bytes, 8 per block. The size is a u64, as
- * size and size_hi (Merlin has no long long yet). */
+ * size and size_hi: two u32s, so that it needs no 8-byte alignment in the
+ * format (the in-memory inode holds it whole). */
 struct dinode {
     u16 type;
     u16 major; /* devices only */
@@ -173,8 +187,7 @@ struct inode {
     u16 major;
     u16 minor;
     u16 nlink;
-    u32 size;
-    u32 size_hi; /* not 0: bigger than the kernel handles (MAXFILE_BYTES) */
+    u64 size; /* the dinode's size and size_hi */
     struct ext_node root;
     u32 flags;
 };
@@ -260,20 +273,21 @@ void iupdate(struct inode *ip);
 void itrunc(struct inode *ip);
 
 /* Whether locked inode `ip` is bigger than the kernel handles
- * (MAXFILE_BYTES): open() refuses it with -EOVERFLOW. */
+ * (MAXFILE_BYTES): open() refuses it with -EOVERFLOW (only on RV32 can a
+ * file in the format be). */
 bool inode_too_big(const struct inode *ip);
 
 /* Reads up to `n` bytes at `off` of locked inode `ip` into kernel memory
  * `dst`. Returns the bytes read: fewer at the end of the file, 0 at or past
  * it. */
-int readi(struct inode *ip, void *dst, u32 off, u32 n);
+int readi(struct inode *ip, void *dst, u64 off, u32 n);
 
 /* Writes `n` bytes from kernel memory `src` at `off` of locked inode `ip`,
  * growing it as needed (`off` at most its size: no holes). Returns the bytes
  * written, fewer if the disk filled up; -ENOSPC if none could be, -EINVAL
  * for an `off` past the end, -EFBIG past MAXFILE_BYTES. In a
  * transaction, which must have room for the blocks (see log.h). */
-int writei(struct inode *ip, const void *src, u32 off, u32 n);
+int writei(struct inode *ip, const void *src, u64 off, u32 n);
 
 /* ---- Directories and paths ---- */
 

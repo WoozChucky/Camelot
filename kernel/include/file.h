@@ -57,15 +57,15 @@ struct file {
     struct pipe *pipe;  /* FD_PIPE */
     struct socket *sock; /* FD_SOCKET */
     struct inode *ip;   /* FD_INODE, and FD_DEVICE opened by its path */
-    u32 off;            /* FD_INODE */
+    u64 off;            /* FD_INODE: at most MAXFILE_BYTES (fs.h) */
     u16 major;          /* FD_DEVICE */
 };
 
 /* A device's driver: read and write on user memory, as console_read() and
  * console_write() do. */
 struct devsw {
-    int (*read)(pagetable_t pt, u32 dst, u32 n);
-    int (*write)(pagetable_t pt, u32 src, u32 n);
+    isize (*read)(pagetable_t pt, uintptr dst, usize n);
+    isize (*write)(pagetable_t pt, uintptr src, usize n);
 };
 
 extern const struct devsw devsw[NDEV];
@@ -94,23 +94,30 @@ void fileclose(struct file *f);
  * full. */
 struct file *file_console(bool readable, bool writable);
 
+/* The most one read() or write() moves, as Linux's MAX_RW_COUNT: INT_MAX
+ * rounded down to a page. A bigger count is taken as this, so a result
+ * always fits an int. */
+#define MAX_RW_COUNT (0x7fffffffu & ~(u32)(PGSIZE - 1))
+
 /* read(): up to `n` bytes into user address `dst`. Returns the bytes read
  * (0 at the end of the file or of the input), -EBADF if `f` isn't open for
  * reading, -EFAULT (having read nothing) unless [dst, dst + n) is writable
  * user memory, -ENOMEM if no page is free for copying through. */
-int fileread(struct file *f, pagetable_t pt, u32 dst, u32 n);
+isize fileread(struct file *f, pagetable_t pt, uintptr dst, usize n);
 
 /* write(): the `n` bytes at user address `src`. Returns how many were
  * written: all of them, or fewer if the disk filled up or a pipe's readers
  * went away part way; -EBADF, -EFAULT (nothing written), -ENOMEM, or what
  * writing the first byte failed with (-ENOSPC, -EFBIG, -EPIPE...). */
-int filewrite(struct file *f, pagetable_t pt, u32 src, u32 n);
+isize filewrite(struct file *f, pagetable_t pt, uintptr src, usize n);
 
 /* lseek(): sets an FD_INODE file's offset to `offset` from the start
  * (SEEK_SET), the current offset (SEEK_CUR) or the end (SEEK_END) and
- * returns it. -ESPIPE for a pipe, a socket or a device, -EINVAL for another `whence`
- * or an offset below 0 or past the end of the file (it has no holes). */
-int filelseek(struct file *f, i32 offset, u32 whence);
+ * returns it. -ESPIPE for a pipe, a socket or a device, -EINVAL for another
+ * `whence` or an offset below 0 or past the end of the file (it has no
+ * holes), which an offset past the largest file is too: whatever its
+ * value, never a part of it. */
+off_t filelseek(struct file *f, off_t offset, u32 whence);
 
 /* fstat(): fills *st. */
 void filestat(struct file *f, struct stat *st);
