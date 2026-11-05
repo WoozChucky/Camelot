@@ -4054,6 +4054,22 @@ main:
         assert_eq!(asm.matches(".globl").count(), 1);
     }
 
+    /// `extern` with an initializer after `static` defines the internal
+    /// variable (C99 6.2.2p4), as clang has it.
+    #[test]
+    fn extern_after_static_stays_internal() {
+        let asm = compile("static int s; extern int s = 3; int main() { return s; }");
+        assert!(!asm.contains(".globl s"), "{asm}");
+        assert!(
+            asm.contains(
+                "
+s:
+"
+            ),
+            "{asm}"
+        );
+    }
+
     #[test]
     fn static_functions_are_not_global() {
         let asm = compile("static int f() { return 1; } int main() { return f(); }");

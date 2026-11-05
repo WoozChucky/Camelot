@@ -801,13 +801,16 @@ impl Checker {
         }
         if d.init.is_some() && d.storage == Storage::Extern {
             // clang warns, and the declaration is the variable's definition,
-            // as C99 6.9.2p1 has it.
+            // as C99 6.9.2p1 has it. `extern` takes the linkage a
+            // declaration before gave (6.2.2p4): after `static int s;`,
+            // `extern int s = 3;` defines the internal `s`.
             self.errors.push(Error::warning(
                 d.pos,
                 "'extern' variable has an initializer",
                 "extern-initializer",
             ));
-            d.storage = Storage::None;
+            let internal = matches!(self.globals.get(&d.name), Some(Global::Var(p)) if p.is_static);
+            d.storage = if internal { Storage::Static } else { Storage::None };
         }
         d.var = Some(VarRef::Global(d.name.clone()));
         // As in C, the name is in scope from the end of its declarator, so it
@@ -1027,12 +1030,18 @@ impl Conv {
 /// `e` with type `from` to `to` (its `ConversionFixItGenerator`): `;
 /// dereference with *` when `from` is a pointer to what `to` is, `; take
 /// the address with &` when `e` is an lvalue and `to` points to what
-/// `from` is; in either case, the target at least as qualified.
-fn conversion_hint(e: &Expr, from: &Type, to: &Type) -> &'static str {
+/// `from` is; in either case, the target at least as qualified. Not to
+/// dereference a null pointer: what is 0 under its casts (`(int *)0`).
+fn conversion_hint(e: &Expr, from: &Type, to: &Type, x: Xlen) -> &'static str {
     // `to` is `from` but for qualifiers it has more of.
     let fits = |to: &Type, from: &Type| to.unqual() == from.unqual() && to.quals().contains(from.quals());
+    let mut bare = e;
+    while let ExprKind::Cast { x: inner, .. } = &bare.kind {
+        bare = inner;
+    }
+    let null = bare.ty.is_integer() && consteval::int(bare, x) == Some(0);
     match (from.unqual(), to.unqual()) {
-        (Type::Ptr(p), _) if fits(to, p) => "; dereference with *",
+        (Type::Ptr(p), _) if fits(to, p) && !null => "; dereference with *",
         (_, Type::Ptr(p)) if is_lvalue(e) && fits(p, from) => "; take the address with &",
         _ => "",
     }
@@ -1314,6 +1323,10 @@ impl<'a> FnChecker<'a> {
                 }
             }
             self.unevaluated += 1;
+            // A `sizeof`'s operand (what is neither a constant, an operand
+            // not chosen nor a whole expression the parser could not work
+            // out) is not converted, as in `sizeof` itself.
+            self.address_taken = !u.constant && !u.folded && u.untyped.is_none();
             let checked = self.expr(&mut u.expr);
             self.unevaluated -= 1;
             if u.constant && checked.is_ok() {
@@ -2354,6 +2367,27 @@ impl<'a> FnChecker<'a> {
             let Init::Expr(e) = init else { unreachable!() };
             return self.init_expr(ty, e, constant, false, None);
         }
+        // `{ "ab", 1 }` for a char array: the string initializes it, and
+        // what follows is past it, as clang has it.
+        if is_char_array(ty)
+            && matches!(
+                items.first(),
+                Some(Init::Expr(Expr {
+                    kind: ExprKind::Str(_),
+                    ..
+                }))
+            )
+        {
+            let Init::List(mut items, _) = std::mem::replace(init, Init::List(Vec::new(), pos)) else {
+                unreachable!()
+            };
+            let mut rest = items.split_off(1);
+            *init = items.remove(0);
+            let Init::Expr(e) = init else { unreachable!() };
+            let checked = self.init_expr(ty, e, constant, false, None);
+            self.excess(&mut rest, "char array");
+            return checked;
+        }
         if !ty.is_array() && !ty.is_record() {
             if items.iter().any(|i| matches!(i, Init::Designated(..))) {
                 let msg =
@@ -2950,7 +2984,7 @@ impl<'a> FnChecker<'a> {
             ),
             _ => ("", None),
         };
-        let hint = conversion_hint(e, from, to);
+        let hint = conversion_hint(e, from, to, self.xlen);
         let msg = if problem.is_empty() {
             format!("{}{hint}", how.incompatible(&to_named, named))
         } else {
@@ -3289,10 +3323,7 @@ impl<'a> FnChecker<'a> {
                 // A `register` array used as a value is its first element's
                 // address, which C does not give (6.3.2.1p3).
                 Some((VarRef::Local(id), ty, _))
-                    if ty.is_array()
-                        && self.registers.contains(&id.0)
-                        && !addressed
-                        && self.unevaluated == 0 =>
+                    if ty.is_array() && self.registers.contains(&id.0) && !addressed =>
                 {
                     return Err(self.err(pos, "address of register variable requested"));
                 }
@@ -3473,6 +3504,9 @@ impl<'a> FnChecker<'a> {
                 // drop the static variable checking it made.
                 let (mark, at) = (self.literals.len(), *at);
                 self.unevaluated += 1;
+                // The operand itself is not converted: `sizeof a` of an
+                // array is its size, not a pointer's.
+                self.address_taken = true;
                 let r = self.expr(x);
                 self.unevaluated -= 1;
                 self.literals.truncate(mark);
@@ -4348,9 +4382,12 @@ impl<'a> FnChecker<'a> {
                 Type::ptr(to.qualified(q))
             }
             (Type::Ptr(_), Type::Int(_)) | (Type::Int(_), Type::Ptr(_)) => {
-                let null =
-                    consteval::is_null_pointer(a, self.xlen) || consteval::is_null_pointer(b, self.xlen);
-                if !null {
+                // Only an integer that is a null pointer constant takes the
+                // pointer's type silently (not `5` with `(void *)0`).
+                let int = if at.is_ptr() { &*b } else { &*a };
+                if !consteval::is_null_pointer(int, self.xlen) {
+                    // The operands as clang names them: promoted.
+                    let (at, bt) = (promoted(&at), promoted(&bt));
                     let msg = format!(
                         "pointer/integer type mismatch in conditional expression ('{at}' and '{bt}')"
                     );
@@ -4364,6 +4401,7 @@ impl<'a> FnChecker<'a> {
                 }
             }
             _ => {
+                let (at, bt) = (promoted(&at), promoted(&bt));
                 let msg = format!("incompatible operand types ('{at}' and '{bt}')");
                 return Err(self.err(pos, msg));
             }
@@ -4371,6 +4409,14 @@ impl<'a> FnChecker<'a> {
         coerce(a, &ty);
         coerce(b, &ty);
         Ok(ty)
+    }
+}
+
+/// An integer type as an operand promoted has it; any other type as it is.
+fn promoted(t: &Type) -> Type {
+    match t.unqual() {
+        Type::Int(k) => Type::Int(k.promoted()),
+        _ => t.clone(),
     }
 }
 

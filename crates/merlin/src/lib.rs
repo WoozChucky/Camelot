@@ -342,6 +342,9 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
         Ok(mut prog) => {
             prog.written.macros = pp.macros.clone();
             let parsed = std::mem::take(&mut prog.warnings);
+            // The parser's errors it goes on after count too.
+            let mut earlier = earlier;
+            earlier.extend(parsed.iter().filter(|e| !e.is_warning()).map(|e| e.pos));
             let checked = match sema::check_after(&mut prog, &earlier) {
                 Ok(()) => std::mem::take(&mut prog.warnings),
                 Err(all) => all,
@@ -352,6 +355,8 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
             let (e, mut partial) = *salvaged;
             partial.written.macros = pp.macros.clone();
             let parsed = std::mem::take(&mut partial.warnings);
+            let mut earlier = earlier;
+            earlier.extend(parsed.iter().filter(|w| !w.is_warning()).map(|w| w.pos));
             // What came before a syntax error is checked as clang checks it
             // as it parses, errors too; the end of the function it is in,
             // and of the file, come after it.

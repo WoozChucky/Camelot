@@ -2662,6 +2662,11 @@ impl Parser<'_> {
         if !self.is_punct("{") {
             return Err(self.expected("function body after function declarator"));
         }
+        // `register` and `auto` are for objects in a block (C99 6.9p2):
+        // clang's error, after which it goes on with the function.
+        if matches!(specs.class, Class::Register | Class::Auto) {
+            self.warn(Error::new(specs.class_pos, "illegal storage class on function"));
+        }
         self.folded(&d, Ctx::File, specs.class, false);
         // What the function's declarator left, checked at file scope.
         let unevaluated = self.unevaluated.borrow_mut().split_off(start);
