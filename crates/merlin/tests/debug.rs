@@ -256,6 +256,14 @@ fn headers_get_their_own_file_numbers() {
         asm.contains("    .file 1 \"src\" \"./inc/h.h\"\n    .loc 1 1 0\n"),
         "{asm}"
     );
+    // Nor when the only cast is to a type a function defines, which the
+    // function retains, not the unit.
+    let src = "int g(int a) { return a; }\nint f(long v) { typedef short LT; return (LT)v; }\n";
+    let local = merlin::compile_with("l.c", src, &debug_opts("src"), &merlin::no_files).unwrap();
+    assert!(
+        local.contains("g:\n    .file 0 \"src\" \"l.c\"\n    .loc 0 1 0\n"),
+        "{local}"
+    );
     let obj = merlin_as::assemble_to_elf(&asm).unwrap();
     let tables = elf::Elf::parse(&obj).unwrap().line_tables().unwrap();
     // Named as clang names it: next to a main file given without a
@@ -1225,6 +1233,22 @@ fn the_entries_are_clangs_in_clangs_order() {
             )
             .unwrap(),
         ),
+        // A cast to a function's own type, which the function retains, not
+        // the unit; casts to pointers to a function's types, in a block or
+        // through a local typedef, which make the function's entry as the
+        // module begins, those types its first children.
+        (
+            "local_casts.c".into(),
+            "int g(int a) { return a; }\nint f(long v) { typedef short LT; return (LT)v; }\n".into(),
+        ),
+        (
+            "local_pointers.c".into(),
+            "typedef unsigned char u8;\ntypedef long R;\nint g(int a) { return a; }\n\
+             R f(void *v) {\n    int k = 1;\n    { struct N { u8 y; int z; }; k += ((struct N *)v)->z; }\n    \
+             typedef struct M { short s; } MT;\n    MT *mp = (MT *)v;\n    return k + mp->s;\n}\n\
+             int h(void *v) { typedef short LT; struct P { char c; }; return (LT)((struct P *)v)->c; }\n"
+                .into(),
+        ),
     ];
     for p in cases() {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
@@ -1380,6 +1404,27 @@ fn the_files_are_numbered_as_clangs() {
                  int f(void) { return vp.n + (vq != 0); }\n",
             ),
             ("d.h", "struct p;\nstruct q;\ntypedef struct q Q;\n"),
+        ],
+        // A cast to a pointer to a type a function defines: its members'
+        // headers as the module begins. A cast to the function's own type,
+        // its header with the function's.
+        &[
+            (
+                "lc.c",
+                "#include \"t1.h\"\n#include \"t2.h\"\nint g(int a) { return a; }\n\
+                 int f(void *v) {\n    struct N { u8 y; s16 z; };\n    return ((struct N *)v)->z;\n}\n\
+                 int h(long v) { typedef s16 LT; return (LT)v; }\n",
+            ),
+            ("t1.h", "typedef unsigned char u8;\n"),
+            ("t2.h", "typedef short s16;\n"),
+        ],
+        &[
+            (
+                "ll.c",
+                "#include \"t2.h\"\nint g(int a) { return a; }\n\
+                 int h(long v) { typedef s16 LT; return (LT)v; }\n",
+            ),
+            ("t2.h", "typedef short s16;\n"),
         ],
     ];
     let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel");

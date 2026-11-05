@@ -1011,8 +1011,15 @@ impl Lines {
     }
 
     /// The entry of function `i`, with its static locals and the types it
-    /// defines in the order `local` has them.
-    fn function_die(&self, i: usize, local: &[order::Local], nested: &[(usize, (usize, usize))]) -> Die {
+    /// defines in the order `local` has them, after the types it defines
+    /// that LLVM makes as the module begins (`first`).
+    fn function_die(
+        &self,
+        i: usize,
+        first: &[usize],
+        local: &[order::Local],
+        nested: &[(usize, (usize, usize))],
+    ) -> Die {
         let f = &self.functions[i];
         let mut d = Die::new(TAG_SUBPROGRAM, &f.name);
         d.attr(AT_LOW_PC, Val::Addr(f.name.clone()));
@@ -1030,6 +1037,9 @@ impl Lines {
         }
         if f.external {
             d.attr(AT_EXTERNAL, Val::Flag);
+        }
+        for &t in first {
+            d.children.push(self.type_die(t, nested));
         }
         for p in &f.params {
             d.children.push(self.var_die(TAG_FORMAL_PARAMETER, p));
@@ -1331,7 +1341,7 @@ impl Lines {
         // The entries in clang's order (see [`order`]).
         for child in &order.unit {
             let die = match *child {
-                order::Child::Function(i) => self.function_die(i, &order.locals[i], &nested),
+                order::Child::Function(i) => self.function_die(i, &order.first[i], &order.locals[i], &nested),
                 order::Child::Global(i) => self.global_die(&self.globals[i]),
                 order::Child::Literal(i) => self.literal_die(&self.literals[i]),
                 order::Child::Type(t) => self.type_die(t, &nested),

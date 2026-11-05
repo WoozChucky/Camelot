@@ -5,9 +5,19 @@
 //!
 //! 1. as the module begins, the enums (the unit's `enums` list) and then the
 //!    retained types (the types of explicit casts, which clang keeps:
-//!    `CGDebugInfo::EmitExplicitCastType`);
-//! 2. as each function's code is done, its `DW_TAG_subprogram`, in the order
-//!    of the code, with its variables and blocks but none of their types;
+//!    `CGDebugInfo::EmitExplicitCastType`), `DwarfDebug::beginModule`;
+//!    but not a type a function defines (`(LT)v` of a local typedef `LT`),
+//!    which clang's `DIBuilder` keeps in the function's `retainedNodes`
+//!    instead, made in phase 4. A retained type of the unit that refers
+//!    to a function's type (`(struct N *)v` of a local `struct N`) makes
+//!    that type here, and with it, in its place among the unit's
+//!    children, the function's `DW_TAG_subprogram`, which is the type's
+//!    context (`getOrCreateContextDIE`): an entry without attributes yet,
+//!    as LLVM fills a definition's in later, whose first children are the
+//!    types made so;
+//! 2. as each function's code is done, its `DW_TAG_subprogram` (unless
+//!    phase 1 made it), in the order of the code, with its variables and
+//!    blocks but none of their types;
 //! 3. as the module ends, the unit's globals (its `globals` list, string
 //!    literals among them);
 //! 4. then each function's static locals and the types it defines, inside its
@@ -87,6 +97,9 @@ pub(super) struct Order {
     pub unit: Vec<Child>,
     /// Each function's types and static locals, after its blocks.
     pub locals: Vec<Vec<Local>>,
+    /// Each function's types made as the module begins (phase 1), its
+    /// first children, before its parameters.
+    pub first: Vec<Vec<usize>>,
     /// Whether the module begins by describing something (phase 1 has
     /// entries): LLVM makes the unit then.
     pub begins: bool,
@@ -178,7 +191,9 @@ impl Lines {
                         }
                         Event::Cast(t) => {
                             make(*t, &mut locals);
-                            retained.extend(t.filter(|t| !retained.contains(t)));
+                            // The unit retains it, unless it is a type the
+                            // function defines, which the function does.
+                            retained.extend(t.filter(|t| !retained.contains(t) && !local_of.contains_key(t)));
                         }
                         Event::Literal(l) => {
                             make(self.literals[*l].ty, &mut locals);
@@ -231,6 +246,12 @@ impl Lines {
             local_of: HashMap<usize, usize>,
             /// The files the entries made so far name, in order.
             files: Vec<u32>,
+            /// Whether phase 1 is over.
+            begun: bool,
+            /// Which functions' entries are in `unit`.
+            opened: Vec<bool>,
+            /// Each function's types made in phase 1 ([`Order::first`]).
+            first: Vec<Vec<usize>>,
         }
         impl Maker<'_> {
             /// Makes type `t`'s entry if it is not made yet: the types it
@@ -252,6 +273,15 @@ impl Lines {
                 self.made[t] = true;
                 if !self.record_of.contains_key(&t) && !self.local_of.contains_key(&t) {
                     self.unit.push(Child::Type(t));
+                }
+                // A function's type made as the module begins makes the
+                // function's entry, its context, where it is.
+                if let (Some(&f), false) = (self.local_of.get(&t), self.begun) {
+                    if !self.opened[f] {
+                        self.opened[f] = true;
+                        self.unit.push(Child::Function(f));
+                    }
+                    self.first[f].push(t);
                 }
                 match &self.lines.types[t] {
                     // Each member's type, then its file; the record's own
@@ -288,6 +318,9 @@ impl Lines {
             record_of,
             local_of,
             files: Vec::new(),
+            begun: false,
+            opened: vec![false; self.functions.len()],
+            first: vec![Vec::new(); self.functions.len()],
         };
         // 1. The enums, then the kept types.
         for &t in enums.iter().chain(&retained) {
@@ -295,8 +328,19 @@ impl Lines {
         }
         let begins = !enums.is_empty() || !retained.is_empty();
         let begin_files = std::mem::take(&mut m.files);
-        // 2. The functions, in the order of their code.
-        m.unit.extend(self.code.iter().copied().map(Child::Function));
+        m.begun = true;
+        // 2. The functions, in the order of their code, but those phase 1
+        // made already.
+        for &i in &self.code {
+            if !m.opened[i] {
+                m.opened[i] = true;
+                m.unit.push(Child::Function(i));
+            }
+        }
+        // The types phase 1 made are no longer the function's to make.
+        for (l, first) in locals.iter_mut().zip(&m.first) {
+            l.retain(|x| !matches!(x, Local::Type(t) if first.contains(t)));
+        }
         // 3. The globals: each one's type, then its file.
         for g in globals {
             m.unit.push(g);
@@ -356,6 +400,7 @@ impl Lines {
         Order {
             unit: m.unit,
             locals,
+            first: m.first,
             begins,
             begin_files,
             end_files: m.files,
