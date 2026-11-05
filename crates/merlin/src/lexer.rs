@@ -59,6 +59,8 @@ pub enum Kw {
     Static,
     Extern,
     Typedef,
+    Register,
+    Auto,
     Inline,
     Sizeof,
     Return,
@@ -95,6 +97,8 @@ pub const KEYWORDS: &[(Kw, &str)] = &[
     (Kw::Static, "static"),
     (Kw::Extern, "extern"),
     (Kw::Typedef, "typedef"),
+    (Kw::Register, "register"),
+    (Kw::Auto, "auto"),
     (Kw::Inline, "inline"),
     (Kw::Sizeof, "sizeof"),
     (Kw::Return, "return"),
@@ -149,6 +153,8 @@ impl Kw {
                 | Kw::Static
                 | Kw::Extern
                 | Kw::Typedef
+                | Kw::Register
+                | Kw::Auto
                 | Kw::Inline
         )
     }
@@ -156,7 +162,7 @@ impl Kw {
 
 /// C keywords that merlin doesn't handle yet. Using one is a clear error rather
 /// than a confusing parse error further on.
-const UNSUPPORTED_KEYWORDS: &[&str] = &["auto", "double", "float", "register", "_Complex", "_Imaginary"];
+const UNSUPPORTED_KEYWORDS: &[&str] = &["double", "float", "_Complex", "_Imaginary"];
 
 /// Punctuators, longest first so `<<=` wins over `<<` and `<`, `->` over `-`
 /// (`a->b` is never `a - > b`), `...` over `.` and `##` over `#`. `#` and

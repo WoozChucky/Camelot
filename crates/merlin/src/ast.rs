@@ -116,6 +116,8 @@ pub enum Storage {
     None,
     Static,
     Extern,
+    /// `register`, of an object in a block: its address cannot be taken.
+    Register,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +186,8 @@ pub struct Param {
     pub pos: Pos,
     /// How its type was spelled (for `-g`).
     pub spelled: Spelled,
+    /// Declared `register`: its address cannot be taken.
+    pub register: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -667,6 +671,7 @@ impl Dumper {
             Storage::None => "",
             Storage::Static => "static ",
             Storage::Extern => "extern ",
+            Storage::Register => "register ",
         };
         let define = if decl.define { " (definition)" } else { "" };
         self.line(

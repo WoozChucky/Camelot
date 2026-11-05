@@ -475,10 +475,14 @@ impl Checker {
             errors: &mut self.errors,
             pending: Vec::new(),
             unevaluated: 0,
+            registers: HashSet::new(),
             xlen: self.xlen,
         };
         for p in &f.params {
-            c.declare(&p.name, &p.ty, p.pos, "parameter ");
+            let id = c.declare(&p.name, &p.ty, p.pos, "parameter ");
+            if p.register {
+                c.registers.insert(id.0);
+            }
         }
         // A big struct result goes where the caller says: keep that address.
         f.ret_ptr = (ret_complete && abi::returns_in_memory(&f.ret, self.xlen))
@@ -837,6 +841,8 @@ struct FnChecker<'a> {
     /// How many operands deep in what is never evaluated (`sizeof`'s,
     /// what the parser evaluated away) the checker is.
     unevaluated: usize,
+    /// The locals declared `register` (by [`LocalId`]).
+    registers: HashSet<usize>,
     /// The target, for sizes and conversions.
     xlen: Xlen,
 }
@@ -870,6 +876,7 @@ impl<'a> FnChecker<'a> {
             errors,
             pending: Vec::new(),
             unevaluated: 0,
+            registers: HashSet::new(),
             xlen,
         }
     }
@@ -1294,6 +1301,9 @@ impl<'a> FnChecker<'a> {
         } else {
             // As in C, the name is in scope inside its own initializer.
             let id = self.declare(&d.name, &d.ty, d.pos, "");
+            if d.storage == Storage::Register {
+                self.registers.insert(id.0);
+            }
             d.var = Some(VarRef::Local(id));
             if let Some(init) = &mut d.init {
                 if self.init_object(&mut d.ty, init, false, d.pos).is_err() {
@@ -2062,6 +2072,20 @@ impl<'a> FnChecker<'a> {
         }
     }
 
+    /// Whether the lvalue `e` is (a member of) a `register` object.
+    fn in_register(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Var {
+                var: Some(VarRef::Local(id)),
+                ..
+            } => self.registers.contains(&id.0),
+            ExprKind::Member {
+                base, arrow: false, ..
+            } => self.in_register(base),
+            _ => false,
+        }
+    }
+
     /// The type and the position of the declaration a name in scope refers
     /// to: a local's, or a global's latest.
     fn declared(&self, name: &str) -> Option<(Type, Pos)> {
@@ -2161,6 +2185,16 @@ impl<'a> FnChecker<'a> {
         let ty = match &mut e.kind {
             ExprKind::Num(_) | ExprKind::Enumerator { .. } | ExprKind::Str(_) => return Ok(()),
             ExprKind::Var { name, var } => match self.lookup(name) {
+                // A `register` array used as a value is its first element's
+                // address, which C does not give (6.3.2.1p3).
+                Some((VarRef::Local(id), ty, _))
+                    if ty.is_array()
+                        && self.registers.contains(&id.0)
+                        && !addressed
+                        && self.unevaluated == 0 =>
+                {
+                    return Err(self.err(pos, "address of register variable requested"));
+                }
                 Some((v, ty, _)) => {
                     *var = Some(v.clone());
                     ty.clone()
@@ -2251,6 +2285,9 @@ impl<'a> FnChecker<'a> {
                 if !is_lvalue(x) {
                     let msg = format!("cannot take the address of an rvalue of type '{}'", x.ty);
                     return Err(self.err(pos, msg));
+                }
+                if self.in_register(x) {
+                    return Err(self.err(pos, "address of register variable requested"));
                 }
                 Type::ptr(x.ty.clone())
             }
@@ -3375,6 +3412,7 @@ mod tests {
                         Storage::None => "",
                         Storage::Static => "static ",
                         Storage::Extern => "extern ",
+                        Storage::Register => "register ",
                     };
                     let def = if d.define { " (def)" } else { "" };
                     format!("{storage}{}{def}", d.ty.declare(&d.name))

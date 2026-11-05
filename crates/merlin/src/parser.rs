@@ -331,6 +331,9 @@ enum Class {
     Static,
     Extern,
     Typedef,
+    /// `register`, and C99's `auto`, which says what no storage class does.
+    Register,
+    Auto,
 }
 
 /// What a list of declaration specifiers says.
@@ -951,7 +954,7 @@ impl Parser<'_> {
                 Class::Static => d.reach == Reach::Arrays,
                 Class::Extern => fixable,
                 Class::Typedef => false,
-                Class::None => init && d.reach == Reach::Arrays,
+                Class::None | Class::Register | Class::Auto => init && d.reach == Reach::Arrays,
             },
             Ctx::Param | Ctx::TypeName => false,
         };
@@ -1132,7 +1135,7 @@ impl Parser<'_> {
     fn type_name_at(&self, t: &Tok) -> bool {
         match t {
             // Not a storage class or `inline`: `(static int)1` is no cast.
-            Tok::Kw(Kw::Static | Kw::Extern | Kw::Typedef | Kw::Inline) => false,
+            Tok::Kw(Kw::Static | Kw::Extern | Kw::Typedef | Kw::Register | Kw::Auto | Kw::Inline) => false,
             Tok::Kw(k) => k.starts_decl(),
             t => self.is_typedef(t),
         }
@@ -1259,21 +1262,24 @@ impl Parser<'_> {
                 ))
             };
             match k {
-                Kw::Static | Kw::Extern | Kw::Typedef => {
+                Kw::Static | Kw::Extern | Kw::Typedef | Kw::Register | Kw::Auto => {
                     match ctx {
                         Ctx::Member | Ctx::TypeName => {
                             let msg = "type name does not allow storage class to be specified";
                             return Err(Error::new(pos, msg));
                         }
-                        Ctx::Param => {
+                        // A parameter may be `register`, and nothing else.
+                        Ctx::Param if k != Kw::Register => {
                             let msg = "invalid storage class specifier in function declarator";
                             return Err(Error::new(pos, msg));
                         }
-                        Ctx::File | Ctx::Block | Ctx::ForInit => {}
+                        Ctx::Param | Ctx::File | Ctx::Block | Ctx::ForInit => {}
                     }
                     let c = match k {
                         Kw::Static => Class::Static,
                         Kw::Extern => Class::Extern,
+                        Kw::Register => Class::Register,
+                        Kw::Auto => Class::Auto,
                         _ => Class::Typedef,
                     };
                     match class {
@@ -2096,6 +2102,7 @@ impl Parser<'_> {
                 ty,
                 pos,
                 spelled,
+                register: specs.class == Class::Register,
             });
             if self.eat_punct(")") {
                 return Ok((params, false));
@@ -2247,7 +2254,8 @@ impl Parser<'_> {
         let storage = match specs.class {
             Class::Static => Storage::Static,
             Class::Extern => Storage::Extern,
-            Class::None | Class::Typedef => Storage::None,
+            Class::Register => Storage::Register,
+            Class::None | Class::Typedef | Class::Auto => Storage::None,
         };
         let mut first = first;
         let mut items = Vec::new();
@@ -2262,6 +2270,15 @@ impl Parser<'_> {
                     d.pos,
                     "illegal initializer (only variables can be initialized)",
                 ));
+            }
+            // `register` and `auto` are for objects in a block (C99 6.9p2).
+            if matches!(specs.class, Class::Register | Class::Auto) {
+                if d.ty.is_func() {
+                    return Err(Error::new(specs.class_pos, "illegal storage class on function"));
+                }
+                if ctx == Ctx::File {
+                    return Err(Error::new(d.pos, "illegal storage class on file-scoped variable"));
+                }
             }
             if d.ty.is_func() && ctx == Ctx::File {
                 self.folded(&d, ctx, specs.class, false);
@@ -2375,14 +2392,23 @@ impl Parser<'_> {
     fn not_a_declaration(&self) -> Error {
         match self.peek() {
             Tok::Punct("}") => Error::new(self.here(), "extraneous closing brace ('}')"),
-            Tok::Ident(name) if matches!(self.peek_at(1), Tok::Ident(_)) => {
-                Error::new(self.here(), format!("unknown type name '{name}'"))
-            }
-            // C89's implicit `int` (`f() {}`, `x;`).
-            Tok::Ident(_) => {
+            // What would start an Objective-C method, which clang tells
+            // apart at file scope.
+            Tok::Punct("+" | "-") => Error::new(self.here(), "expected external declaration"),
+            // C89's implicit `int` (`f() {}`, `x;`), where what follows the
+            // name can follow a declarator's name, as clang's
+            // `isValidAfterIdentifierInDeclarator` has it; otherwise the
+            // name was meant as a type (`x y;`, `x` at the end).
+            Tok::Ident(_)
+                if matches!(
+                    self.peek_at(1),
+                    Tok::Punct("[" | "(" | ")" | ";" | "," | "=" | "{" | ":")
+                ) =>
+            {
                 let msg = "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int";
                 Error::new(self.here(), msg).flagged("implicit-int")
             }
+            Tok::Ident(name) => Error::new(self.here(), format!("unknown type name '{name}'")),
             _ => self.expected("identifier or '('"),
         }
     }
@@ -3431,6 +3457,7 @@ fn declared_function(d: Decl, specs: &Specs, unevaluated: Vec<Unevaluated>) -> F
                         ty: t.clone(),
                         pos: d.pos,
                         spelled: Spelled::default(),
+                        register: false,
                     })
                     .collect()
             })
@@ -3580,6 +3607,7 @@ mod tests {
             Storage::None => "",
             Storage::Static => "static ",
             Storage::Extern => "extern ",
+            Storage::Register => "register ",
         };
         match &d.init {
             Some(i) => format!("{storage}{}={}", d.ty.declare(&d.name), si(i)),

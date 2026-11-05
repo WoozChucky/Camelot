@@ -66,5 +66,16 @@ pub fn cases() -> Vec<Case> {
         case("register int x;", &["1:14: error: illegal storage class on file-scoped variable"]),
         case("int f(void) { register int x = 1; return *&x; }", &["1:43: error: address of register variable requested"]),
         case("int f(register int x) { int *p = &x; return *p; }", &["1:34: error: address of register variable requested"]),
+        case("auto int y;", &["1:10: error: illegal storage class on file-scoped variable"]),
+        case("register int f(void);", &["1:1: error: illegal storage class on function"]),
+        case("int f(auto int x);", &["1:7: error: invalid storage class specifier in function declarator"]),
+        case("int g(register int x) { return x; }", &[]),
+        case("int f(void) { auto int a = 1; register int b = 2; register int c[2]; register struct { int m; } s; int *p = &a; s.m = b; return *&b + s.m + c[1] + sizeof c; }", &["1:130: error: address of register variable requested", "1:141: error: address of register variable requested"]),
+        case("int f(void) { register struct { int m; } s; return (&s)->m; }", &["1:53: error: address of register variable requested"]),
+        case("int f(void) { register struct { int m; } s; int *p = &s.m; return *p; }", &["1:54: error: address of register variable requested"]),
+        case("int f(void) { register int g(void); return 0; }", &["1:15: error: illegal storage class on function"]),
+        case("struct s { register int x; };", &["1:12: error: type name does not allow storage class to be specified"]),
+        case("int f(void) { static register int x; return 0; }", &["1:22: error: cannot combine with previous 'static' declaration specifier"]),
+        case("typedef register int R;", &["1:9: error: cannot combine with previous 'typedef' declaration specifier"]),
     ]
 }
