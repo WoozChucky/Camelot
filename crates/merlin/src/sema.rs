@@ -2273,8 +2273,8 @@ mod tests {
             ["1:23: variable length array folded to constant array as an extension"]
         );
         assert_eq!(
-            p.warnings[0].severity,
-            crate::Severity::Warning("gnu-folding-constant")
+            (p.warnings[0].severity, p.warnings[0].flag),
+            (crate::Severity::Warning, Some("gnu-folding-constant"))
         );
     }
 
@@ -2309,7 +2309,14 @@ mod tests {
             crate::parse(src)
                 .unwrap_err()
                 .iter()
-                .map(|e| format!("{} {:?}", e, e.severity))
+                .map(|e| {
+                    format!(
+                        "{} {:?}{}",
+                        e,
+                        e.severity,
+                        e.flag.map(|f| format!("({f:?})")).unwrap_or_default()
+                    )
+                })
                 .collect()
         };
         let folded = "variable length array folded to constant array as an extension \

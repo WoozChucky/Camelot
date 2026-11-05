@@ -681,6 +681,7 @@ fn name_files(files: &[String], errors: &mut [Error]) {
         if e.pos.file != 0 && e.file.is_none() {
             e.file = files.get(e.pos.file as usize).cloned();
         }
+        name_files(files, &mut e.notes);
     }
 }
 

@@ -71,8 +71,10 @@ impl fmt::Display for Pos {
     }
 }
 
-/// A diagnostic: an error, which stops the compilation, or a warning, which
-/// does not (what clang warns of by default, as it says it).
+/// A diagnostic, as clang gives it: an error, which stops the compilation,
+/// or a warning, which does not (what clang warns of by default, in its
+/// words), each with the notes that follow it (where what it is about was
+/// declared, say). [`Error::render`] prints it as clang does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     /// Where the problem is, or line 0 when it isn't tied to a place in the source.
@@ -83,15 +85,22 @@ pub struct Error {
     /// friends, which know the names.
     pub file: Option<String>,
     pub severity: Severity,
+    /// The name of clang's `-W` flag for it, which clang prints after the
+    /// message (`[-Wgnu-folding-constant]`): every warning has one, and so
+    /// has an error clang makes of a warning by default
+    /// (`implicit-function-declaration`).
+    pub flag: Option<&'static str>,
+    /// The notes clang gives with it, in order (`'f' declared here`).
+    pub notes: Vec<Error>,
 }
 
 /// How bad a diagnostic is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Error,
-    /// A warning, with the name of clang's flag for it
-    /// (`gnu-folding-constant` for `-Wgnu-folding-constant`).
-    Warning(&'static str),
+    Warning,
+    /// What follows an error or a warning, to explain it.
+    Note,
 }
 
 impl Error {
@@ -101,31 +110,62 @@ impl Error {
             msg: msg.into(),
             file: None,
             severity: Severity::Error,
+            flag: None,
+            notes: Vec::new(),
         }
     }
 
     /// A warning, of clang's warning flag `flag`.
     pub fn warning(pos: Pos, msg: impl Into<String>, flag: &'static str) -> Self {
         Error {
-            severity: Severity::Warning(flag),
+            severity: Severity::Warning,
+            flag: Some(flag),
             ..Error::new(pos, msg)
         }
     }
 
+    /// The error, with clang's flag `flag`: one of the warnings clang makes
+    /// an error by default.
+    pub fn flagged(self, flag: &'static str) -> Self {
+        Error {
+            flag: Some(flag),
+            ..self
+        }
+    }
+
+    /// The diagnostic, with a note at `pos` after the ones it has.
+    pub fn note(mut self, pos: Pos, msg: impl Into<String>) -> Self {
+        self.notes.push(Error {
+            severity: Severity::Note,
+            ..Error::new(pos, msg)
+        });
+        self
+    }
+
     pub fn is_warning(&self) -> bool {
-        matches!(self.severity, Severity::Warning(_))
+        self.severity == Severity::Warning
     }
 
     /// Formats the diagnostic the way compilers and editors expect, as
     /// clang does: `file.c:line:col: error: message`, or
     /// `file.c:line:col: warning: message [-Wflag]`, where `file` names the
-    /// file being compiled (one in a header names the header instead).
+    /// file being compiled (one in a header names the header instead), then
+    /// a line `file.c:line:col: note: message` for each note.
     pub fn render(&self, file: &str) -> String {
+        let mut lines = vec![self.first_line(file)];
+        lines.extend(self.notes.iter().map(|n| n.first_line(file)));
+        lines.join("\n")
+    }
+
+    /// The diagnostic's own line, without its notes.
+    pub fn first_line(&self, file: &str) -> String {
         let file = self.file.as_deref().unwrap_or(file);
-        let (what, flag) = match self.severity {
-            Severity::Error => ("error", String::new()),
-            Severity::Warning(flag) => ("warning", format!(" [-W{flag}]")),
+        let what = match self.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Note => "note",
         };
+        let flag = self.flag.map(|f| format!(" [-W{f}]")).unwrap_or_default();
         if self.pos.line > 0 {
             format!("{file}:{}: {what}: {}{flag}", self.pos, self.msg)
         } else {
@@ -135,6 +175,8 @@ impl Error {
 }
 
 impl fmt::Display for Error {
+    /// `line:col: message`, after the file's name when it is a header's:
+    /// the message alone, without its notes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(file) = &self.file {
             write!(f, "{file}:")?;
