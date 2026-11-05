@@ -263,6 +263,7 @@ impl ServerThread {
             bells: vm.bells(),
             consoles: vm.console_count(),
             viewers: vm.viewer_count(),
+            debugged: vm.debugged(),
             behind: vm.behind_count(),
             keys,
             pointer,
@@ -304,6 +305,8 @@ pub struct VmDebug {
     pub consoles: usize,
     /// Clients attached to the screen.
     pub viewers: usize,
+    /// It has a debugger.
+    pub debugged: bool,
     /// Viewers held back for being over their backlog (`screen_backlog`), owed a full
     /// frame and the cursor once they catch up.
     pub behind: usize,
@@ -1032,6 +1035,20 @@ impl Session<'_> {
                 }
                 Message::Ok
             }
+            Message::DebugAttach { vm } => {
+                let vm = server.find(&vm)?;
+                vm.attach_debugger(self.outbox)?;
+                Message::DebugAttached { vm: vm.id }
+            }
+            Message::DebugDetach { vm } => {
+                if !server.find(&VmRef::Id(vm))?.detach_debugger(self.outbox.id) {
+                    return Err(Fail::new(
+                        ErrorCode::InvalidState,
+                        format!("not the debugger of VM {vm}"),
+                    ));
+                }
+                Message::Ok
+            }
             Message::CreateSwitch { name, nat } => {
                 server.create_switch(name, nat)?;
                 Message::Ok
@@ -1065,7 +1082,8 @@ impl Session<'_> {
     }
 
     /// Serves one event: console input for a VM whose console this client is attached
-    /// to, keys and pointer changes for a VM whose screen it is attached to. Every other
+    /// to, keys and pointer changes for a VM whose screen it is attached to, the GDB
+    /// remote protocol's bytes for a VM whose debugger it is. Every other
     /// event is dropped: input for a VM it is not attached to (or that does not exist),
     /// and events only servers send.
     fn event(&self, msg: Message) {
@@ -1087,16 +1105,23 @@ impl Session<'_> {
                     vm.pointer_input(id, pointer);
                 }
             }
+            Message::DebugInput { vm, data } => {
+                if let Some(vm) = find(vm) {
+                    vm.debug_input(id, &data);
+                }
+            }
             _ => {}
         }
     }
 
-    /// The connection is ending: detach it from every console and screen.
+    /// The connection is ending: detach it from every console and screen, and from the
+    /// VMs it debugs (which run on without its breakpoints).
     fn detach_everywhere(&self) {
         let vms: Vec<Arc<Vm>> = lock(&self.server.table).vms.values().cloned().collect();
         for vm in vms {
             vm.detach_console(self.outbox.id);
             vm.detach_screen(self.outbox.id);
+            vm.detach_debugger(self.outbox.id);
         }
     }
 }

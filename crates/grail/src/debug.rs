@@ -138,6 +138,8 @@ pub struct Debug {
     /// is not stopped by a breakpoint at its hart's pc, so resuming from a breakpoint
     /// executes that instruction instead of stopping on it again.
     resuming: bool,
+    /// Steps run by [`Machine::debug_continue`] and [`Machine::debug_step`].
+    steps: u64,
 }
 
 impl Default for Debug {
@@ -146,6 +148,7 @@ impl Default for Debug {
             breakpoints: BTreeSet::new(),
             hart: 0,
             resuming: true,
+            steps: 0,
         }
     }
 }
@@ -200,6 +203,13 @@ impl Machine {
     /// The watchpoints, in the order they were set.
     pub fn watchpoints(&self) -> &[Watchpoint] {
         &self.cpu.bus.watches.list
+    }
+
+    /// The steps [`Machine::debug_continue`] and [`Machine::debug_step`] have run, as
+    /// [`Machine::run_for`] counts them (idle ticks of a real-time machine waiting in
+    /// `wfi` included): a host that runs the machine both ways adds them up.
+    pub fn debug_steps(&self) -> u64 {
+        self.debug.steps
     }
 
     /// Removes every breakpoint and watchpoint (a debugger detaching).
@@ -365,6 +375,7 @@ impl Machine {
         if let Some(p) = &mut self.pacer {
             p.ticks += n;
         }
+        self.debug.steps += n;
         if stop.is_some() {
             self.debug.resuming = true;
         }
@@ -395,6 +406,7 @@ impl Machine {
             if let Some(p) = &mut self.pacer {
                 p.ticks += ended_step as u64;
             }
+            self.debug.steps += ended_step as u64;
             if let Some(hit) = self.cpu.bus.watches.hit.take() {
                 return Stop::Watchpoint(hit);
             }
