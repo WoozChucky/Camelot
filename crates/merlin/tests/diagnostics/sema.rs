@@ -539,5 +539,14 @@ pub fn cases() -> Vec<Case> {
         case("int a[]; extern int a[3]; int t(void){return sizeof a;}", &["1:5: warning: tentative array definition assumed to have one element [-Wtentative-definition-array]"]),
         case("int a[]; int a[3]; int t(void){return sizeof a;}", &[]),
         case("int a[3]; int a[]; extern int a[];", &[]),
+        // Too many arguments only to a definition without a prototype.
+        case("long long ll(long long x){ return x; } int main(void){ int r=0; { int ll=3; r+=ll; { long long ll(); r+=(int)ll(1LL); } } return r; }", &["1:96: warning: a function declaration without a prototype is deprecated in all versions of C and is treated as a zero-parameter prototype in C23, conflicting with a previous declaration [-Wdeprecated-non-prototype]", "1:11: note: conflicting prototype is here", "1:112: warning: passing arguments to 'll' without a prototype is deprecated in all versions of C and is not supported in C23 [-Wdeprecated-non-prototype]"]),
+        case("int f() { return 0; } int f(int);", &["1:5: warning: a function declaration without a prototype is deprecated in all versions of C and is treated as a zero-parameter prototype in C23, conflicting with a subsequent declaration [-Wdeprecated-non-prototype]", "1:27: note: conflicting prototype is here"]),
+        case("int f() { return 0; } int g(void) { return f(1); }", &["1:47: warning: too many arguments in call to 'f'", "1:45: warning: passing arguments to 'f' without a prototype is deprecated in all versions of C and is not supported in C23 [-Wdeprecated-non-prototype]"]),
+        case("int f(); int f() { return 0; } int f(int);", &["1:14: warning: a function declaration without a prototype is deprecated in all versions of C and is treated as a zero-parameter prototype in C23, conflicting with a subsequent declaration [-Wdeprecated-non-prototype]", "1:36: note: conflicting prototype is here"]),
+        case("int f(); int f() { return 0; } int g(void) { return f(1); }", &["1:56: warning: too many arguments in call to 'f'", "1:54: warning: passing arguments to 'f' without a prototype is deprecated in all versions of C and is not supported in C23 [-Wdeprecated-non-prototype]"]),
+        case("int f(int); int f() { return 0; } int g(void) { return f(1); }", &["1:17: error: conflicting types for 'f'", "1:5: note: previous declaration is here"]),
+        case("int f() { return 0; } int g(void) { int f(); return f(1); }", &["1:56: warning: too many arguments in call to 'f'", "1:54: warning: passing arguments to 'f' without a prototype is deprecated in all versions of C and is not supported in C23 [-Wdeprecated-non-prototype]"]),
+        case("int f() { return 0; } int g(void) { int f = 1; { int f(); return f(1); } }", &["1:69: warning: too many arguments in call to 'f'", "1:67: warning: passing arguments to 'f' without a prototype is deprecated in all versions of C and is not supported in C23 [-Wdeprecated-non-prototype]"]),
     ]
 }

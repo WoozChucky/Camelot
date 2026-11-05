@@ -680,6 +680,8 @@ impl Checker {
             unreachable!("a function's type")
         };
         ty.unprototyped = crate::types::Unprototyped(!f.prototyped);
+        // A definition with `()`, which takes no arguments.
+        let bare_def = (f.body.is_some() && !f.prototyped).then(|| (*ty).clone());
         let sig = FuncSig {
             ty: *ty,
             is_static: f.is_static,
@@ -693,7 +695,7 @@ impl Checker {
                 .map(|p| (p.name.clone(), p.pos, p.spelled.clone()))
                 .collect(),
             spelled: f.ret_spelled.clone(),
-            bare_def: None,
+            bare_def,
             visible: true,
         };
         // Functions are visible from their declaration onwards, so a function can
@@ -719,11 +721,12 @@ impl Checker {
                     self.errors.extend(w);
                 }
                 // A definition with `()` has no parameters, and a prototype
-                // must agree in their number (C99 6.7.5.3p15).
+                // before it must agree in their number (C99 6.7.5.3p15); one
+                // after it is compatible with its type, `int ()`, as clang
+                // has it, if its parameters promote to themselves.
                 let takes = |t: &FuncType| t.has_prototype() && (!t.params.is_empty() || t.variadic);
                 let problem = if !functions_compatible(&prev.ty, &prev.spelled, &sig.ty, &sig.spelled)
                     || (sig.defined && unprototyped(&sig.ty) && takes(&prev.ty))
-                    || (prev.bare_def.is_some() && takes(&sig.ty))
                 {
                     Some((format!("conflicting types for '{}'", f.name), note))
                 } else if let (Some(def), true) = (prev.def, sig.defined) {
@@ -747,9 +750,7 @@ impl Checker {
                         {
                             prev.ty = *c;
                         }
-                        if sig.defined && unprototyped(&sig.ty) {
-                            prev.bare_def = Some(sig.ty.clone());
-                        }
+                        prev.bare_def = prev.bare_def.take().or(sig.bare_def.clone());
                         prev.defined |= sig.defined;
                         prev.def = prev.def.or(sig.def);
                         // Of declarations in blocks only, none said inline.
@@ -4147,10 +4148,12 @@ impl<'a> FnChecker<'a> {
                 if unprototyped(&ft) {
                     // No prototype: the arguments are promoted, as `...`'s
                     // are, and passed as named ones. To a definition with
-                    // `()`, which has none, clang warns of them; and of any
-                    // to what has no prototype, as C23 has none.
+                    // `()`, which takes none, clang warns of them (not to
+                    // one with a prototype, which a local can keep from
+                    // making the type, C99 6.2.7p4); and of any to what has
+                    // no prototype, as C23 has none.
                     if let (false, Some((name, s))) = (args.is_empty(), sig) {
-                        if s.def.is_some() {
+                        if s.bare_def.is_some() {
                             let msg = format!("too many arguments in call to '{name}'");
                             self.errors.push(Error::warning_unflagged(*close, msg));
                         }
