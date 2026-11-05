@@ -26,6 +26,10 @@ pub const VERSION: u32 = 17;
 pub const LAST_COMP_VERSION: u32 = 16;
 /// The header's size in bytes.
 pub const HEADER_SIZE: usize = 40;
+/// The oldest version [`parse`] reads: 16, whose nodes are named by their unit names
+/// alone (earlier versions give each node its full path) and whose header lacks only
+/// version 17's last word, `size_dt_struct`.
+pub const OLDEST_VERSION: u32 = 16;
 
 /// The structure block's tokens.
 const FDT_BEGIN_NODE: u32 = 1;
@@ -302,7 +306,13 @@ pub struct Tree {
     pub boot_cpuid: u32,
 }
 
-/// Reads a flattened device tree: an error if the header, a block or a token is wrong.
+/// Reads a flattened device tree, version 16 or 17: an error if the header, a block or a
+/// token is wrong.
+///
+/// As libfdt's `fdt_check_header()` and `fdt_offset_ptr()`: a version 17 header is ten
+/// words, and its structure block is `size_dt_struct` bytes from `off_dt_struct`; a
+/// version 16 header is nine, without `size_dt_struct`, and its structure block runs
+/// from `off_dt_struct` to wherever `FDT_END` is, inside the tree's `totalsize`.
 pub fn parse(blob: &[u8]) -> Result<Tree, String> {
     let word = |at: usize| -> Result<u32, String> {
         blob.get(at..at + 4)
@@ -318,16 +328,39 @@ pub fn parse(blob: &[u8]) -> Result<Tree, String> {
     }
     let blob = &blob[..total];
     let (off_struct, off_strings, off_rsvmap) = (word(8)? as usize, word(12)? as usize, word(16)? as usize);
+    let version = word(20)?;
+    if version < OLDEST_VERSION {
+        return Err(format!("version {version} is older than {OLDEST_VERSION}"));
+    }
     if word(24)? > VERSION {
         return Err(format!("last_comp_version {} is newer than {VERSION}", word(24)?));
     }
+    // The header's size: the blocks start after it.
+    let header = if version >= 17 {
+        HEADER_SIZE
+    } else {
+        HEADER_SIZE - 4
+    };
+    if [off_struct, off_strings, off_rsvmap]
+        .iter()
+        .any(|&off| off < header)
+    {
+        return Err("a block starts inside the header".into());
+    }
     let boot_cpuid = word(28)?;
-    let (size_strings, size_struct) = (word(32)? as usize, word(36)? as usize);
+    let size_strings = word(32)? as usize;
+    // Version 16's structure block has no size: the tokens end at FDT_END, which
+    // must come before the end of the tree.
+    let struct_end = if version >= 17 {
+        off_struct + word(36)? as usize
+    } else {
+        total
+    };
     let strings = blob
         .get(off_strings..off_strings + size_strings)
         .ok_or("the strings block is past the end of the tree")?;
     let structure = blob
-        .get(off_struct..off_struct + size_struct)
+        .get(off_struct..struct_end)
         .ok_or("the structure block is past the end of the tree")?;
 
     let mut reservations = Vec::new();
@@ -506,5 +539,52 @@ mod tests {
         blob[n - 4..].copy_from_slice(&0x77u32.to_be_bytes());
         assert!(parse(&blob).unwrap_err().contains("unknown token"));
         assert!(parse(&blob[..20]).is_err());
+    }
+
+    /// `blob`'s header word `n` set to `value`.
+    fn set_word(blob: &mut [u8], n: usize, value: u32) {
+        blob[n * 4..n * 4 + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    #[test]
+    fn version_16_trees_are_read_as_libfdt_reads_them() {
+        // A version 16 tree, as an older dtc writes it: a nine-word header, then the
+        // padding to the 8-aligned reservation map where version 17 has
+        // size_dt_struct. The structure block is everything to FDT_END.
+        let mut w = Writer::new();
+        w.reserve(0x8000_0000, 0x20_0000);
+        w.begin_node("");
+        w.prop_str("compatible", "riscv-virtio");
+        w.begin_node("chosen");
+        w.prop_str("stdout-path", "/soc/serial@10000000");
+        w.end_node();
+        w.end_node();
+        let v17 = w.finish();
+        let mut v16 = v17.clone();
+        set_word(&mut v16, 5, 16);
+        set_word(&mut v16, 9, 0);
+        assert_eq!(parse(&v16).unwrap(), parse(&v17).unwrap());
+        // FDT_END must still come before totalsize: an empty root (no strings)
+        // whose last token, FDT_END, is cut off.
+        let mut w = Writer::new();
+        w.begin_node("");
+        w.end_node();
+        let mut cut = w.finish();
+        set_word(&mut cut, 5, 16);
+        set_word(&mut cut, 9, 0);
+        assert!(parse(&cut).is_ok());
+        cut.truncate(cut.len() - 4);
+        let len = cut.len() as u32;
+        set_word(&mut cut, 1, len);
+        set_word(&mut cut, 3, len);
+        assert!(parse(&cut).unwrap_err().contains("ends inside a token"));
+        // Older versions name nodes by their paths, and are refused.
+        let mut v15 = v16.clone();
+        set_word(&mut v15, 5, 15);
+        assert!(parse(&v15).unwrap_err().contains("older than 16"));
+        // A version 16 block may start at byte 36, not inside the header.
+        let mut inside = v16;
+        set_word(&mut inside, 4, 32);
+        assert!(parse(&inside).unwrap_err().contains("inside the header"));
     }
 }
