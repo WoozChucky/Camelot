@@ -33,13 +33,12 @@ const SLICE: u64 = 500_000;
 /// slower than clang's; the slowest command here takes about 20 million.
 const COMMAND_MAX_STEPS: u64 = 200_000_000;
 /// The ticks that `ticks`, the shell and `sleep` itself may take besides
-/// the ones `sleep` waits for.
+/// the ones `sleep` waits for, on both widths. RV64's 4-level page tables
+/// are seven pages a process where RV32's are three: zeroed four bytes at a
+/// time, the 36 pages of `ticks`, `sleep` and `ticks` (24 on RV32) took
+/// RV64 a million steps, a tick, more; kzalloc() zeroes with memset's
+/// register-wide stores now, as Linux's clear_page() does.
 const SLEEP_SLACK: u32 = 3;
-/// The same on RV64, where merlin's code for the kernel and the programs is
-/// slower (64-bit constants it does not fold yet take several instructions
-/// each, #209): starting `ticks`, `sleep` and `ticks` again from the disk
-/// takes up to four ticks.
-const SLEEP_SLACK_RV64: u32 = 5;
 
 /// Camelot running on Grail, with its shell waiting for a command.
 struct Session {
@@ -425,15 +424,11 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool, xlen: Xlen) {
 
     // sleep, for as many ticks as it was asked (10 a second), and not many
     // more: the commands around it take a tick or two of their own.
-    let slack = match xlen {
-        Xlen::Rv32 => SLEEP_SLACK,
-        Xlen::Rv64 => SLEEP_SLACK_RV64,
-    };
     for (time, want) in [("0.3", 3), ("1", 10)] {
         let (printed, slept) = s.ticks_around(&format!("sleep {time}"));
         assert_eq!(printed, "");
         assert!(
-            (want..want + slack).contains(&slept),
+            (want..want + SLEEP_SLACK).contains(&slept),
             "sleep {time}: {slept} ticks"
         );
     }
