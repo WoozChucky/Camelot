@@ -24,15 +24,22 @@ fn boot_image(image: Vec<u8>, input: &[u8]) -> (RunResult, String, Vec<u8>, Mach
     boot_image_on(Xlen::Rv32, image, input)
 }
 
-/// [`boot_image`] on an `xlen` machine.
+/// [`boot_image`] on an `xlen` machine: an RV64 one on Camelot's firmware,
+/// which boots the disk, with its 2 MiB on top of the 4 MiB an RV32 one
+/// has.
 fn boot_image_on(xlen: Xlen, image: Vec<u8>, input: &[u8]) -> (RunResult, String, Vec<u8>, Machine) {
-    let config = MachineConfig {
-        xlen: match xlen {
-            Xlen::Rv32 => grail::Xlen::Rv32,
-            Xlen::Rv64 => grail::Xlen::Rv64,
+    let config = match xlen {
+        Xlen::Rv32 => MachineConfig {
+            disks: vec![DiskConfig::memory(image)],
+            ..MachineConfig::default()
         },
-        disks: vec![DiskConfig::memory(image)],
-        ..MachineConfig::default()
+        Xlen::Rv64 => MachineConfig {
+            xlen: grail::Xlen::Rv64,
+            bios: grail::Bios::Default,
+            ram_size: 6 << 20,
+            disks: vec![DiskConfig::memory(image)],
+            ..MachineConfig::default()
+        },
     };
     let mut m = Machine::new(config).unwrap();
     m.boot_from_disk().unwrap();
@@ -265,7 +272,8 @@ fn the_rv64_root_image_boots_from_disk_and_runs_programs_from_bin() {
 }
 
 /// The `xlen` root image, `cargo xtask fs`'s: its layout, the room left in
-/// its filesystem, and a boot on an `xlen` machine of the default 4 MiB,
+/// its filesystem, and a boot on an `xlen` machine of the default 4 MiB (RV64:
+/// 6 MiB, on Camelot's firmware, which keeps 2 MiB),
 /// whose shell runs programs from `/bin` and writes to the disk.
 fn root_image_boots(xlen: Xlen) {
     let root = repo_root();
@@ -325,7 +333,15 @@ fn root_image_boots(xlen: Xlen) {
         )),
         "{out}"
     );
-    assert!(out.contains("\nram: 4 MiB at 0x80000000\n"), "{out}");
+    // RV64: the firmware's 2 MiB on top.
+    let mib = match xlen {
+        Xlen::Rv32 => 4,
+        Xlen::Rv64 => 6,
+    };
+    assert!(
+        out.contains(&format!("\nram: {mib} MiB at 0x80000000\n")),
+        "{out}"
+    );
     // On RV64 all but as and ld, which write RV32 code until #157.
     let programs: Vec<String> = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root))
         .unwrap()
@@ -354,10 +370,13 @@ fn root_image_boots(xlen: Xlen) {
         )),
         "{out}"
     );
-    // The bootloader pointed the ROM's entry word (a doubleword on RV64) at the
-    // kernel's physical entry point, so harts the kernel wakes with an IPI go
-    // there from the park loop, as after an ELF boot. The RV64 kernel is
-    // linked high and loaded low: its entry's load address.
+    // RV32: the bootloader pointed the ROM's entry word at the kernel's
+    // physical entry point, so harts the kernel wakes with an IPI go there
+    // from the park loop, as after an ELF boot. RV64: the bootloader ran in
+    // S-mode, the firmware's next stage, and left the ROM alone (its entry
+    // doubleword is the hand-off to the firmware, where the kernel's harts
+    // wait for hart_start); the kernel is linked high and loaded at
+    // 0x8020_0000.
     let k = elf::Elf::parse(&kernel).unwrap();
     let entry = k.header.entry;
     let entry = k
@@ -371,8 +390,8 @@ fn root_image_boots(xlen: Xlen) {
         Xlen::Rv32 => assert_eq!(lo, entry),
         Xlen::Rv64 => {
             let hi = u64::from(m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR + 4).unwrap());
-            assert_eq!(lo | hi << 32, entry);
-            assert_eq!(entry, 0x8000_0000);
+            assert_eq!(lo | hi << 32, grail::boot::FW_HANDOFF_PC);
+            assert_eq!(entry, grail::firmware::FW_JUMP_ADDR);
         }
     }
 }

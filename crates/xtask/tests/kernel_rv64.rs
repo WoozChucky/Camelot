@@ -7,8 +7,9 @@
 //! The tests of RV64 processes, their address space and the LP64 system
 //! call ABI are in `processes_rv64.rs`.
 //!
-//! The image is linked at 0xffff_ffff_8000_0000 and loaded at 0x8000_0000:
-//! its symbols are link addresses, which [`Kernel::pa`] turns into the
+//! The image is linked at 0xffff_ffff_8000_0000 and loaded at 0x8020_0000,
+//! and runs in S-mode on Camelot's firmware (`--bios default`): its symbols
+//! are link addresses, which [`Kernel::pa`] turns into the
 //! physical addresses the bus takes, and a pointer into the direct map
 //! goes back through `va_pa_offset`, the kernel's own variable.
 //!
@@ -28,7 +29,12 @@ use xtask::{repo_root, tools};
 
 /// Where the image is linked (kernel/kernel.lds.S) and loaded.
 const KERNEL_LINK_ADDR: u64 = 0xffff_ffff_8000_0000;
-const LOAD_ADDR: u64 = 0x8000_0000;
+const LOAD_ADDR: u64 = 0x8020_0000;
+/// Where RAM starts: the direct map maps it at PAGE_OFFSET.
+const RAM_BASE: u64 = 0x8000_0000;
+/// The RAM of the tests' machines: the firmware's 2 MiB, the image's 2.1 MiB from
+/// 0x8020_0000, and the device tree at the last 2 MiB boundary below the end.
+const RAM: usize = 8 << 20;
 /// What depends on the paging mode the kernel chose (vm.h, Linux's
 /// vm-layout.rst): Sv48 on a hart that has it, Sv39 on one without.
 #[derive(Clone, Copy, Debug)]
@@ -44,7 +50,7 @@ struct Mode {
     vmalloc_start: u64,
     /// The kernel's root entries in use at the end of the boot: the fixmap,
     /// the vmalloc area (the kernel stacks and the devices), the direct map
-    /// of 4 MiB of RAM, the image.
+    /// of 8 MiB of RAM, the image.
     root_entries: &'static [usize],
 }
 
@@ -116,7 +122,7 @@ sbi: extensions TIME IPI HSM SRST DBCN
 kprintf: d=-42 u=4294967295 x=cafef00d p=0x0000000080000000 s=excalibur c=K %=%
 kprintf self-test: 33/33 passed
 [dbg] pc=................ a0 = 0x0000000000000000 (0)
-ram: 4 MiB at 0x80000000
+ram: 8 MiB at 0x80000000
 paging: on (MODE)
 vm self-test: 26/26 passed
 timer: 10 Hz tick, 10000000 Hz timebase
@@ -203,6 +209,7 @@ impl Kernel {
             ram_size: ram,
             xlen: grail::Xlen::Rv64,
             paging: mode().paging,
+            bios: grail::Bios::Default,
             ..MachineConfig::default()
         })
         .unwrap();
@@ -260,7 +267,7 @@ impl Kernel {
 /// Boots the committed RV64 kernel with `boot_fault` set to `fault`, on one
 /// hart. Returns the kernel afterwards, how the run ended and what it printed.
 fn run_with_fault(fault: u32) -> (Kernel, RunResult, String) {
-    let mut k = Kernel::load(1, grail::DEFAULT_RAM_SIZE);
+    let mut k = Kernel::load(1, RAM);
     let at = k.sym("boot_fault");
     k.write32(at, fault);
     let r = k.run();
@@ -340,7 +347,7 @@ fn the_rv64_kernel_is_linked_high_and_loaded_low() {
         );
     }
     // The boot stack is 16 KiB, aligned to twice that (kernel_vec's check).
-    let k = Kernel::load(1, grail::DEFAULT_RAM_SIZE);
+    let k = Kernel::load(1, RAM);
     let (bottom, top) = (k.sym("__stack_bottom"), k.sym("__stack_top"));
     assert_eq!(top - bottom, KSTACK_SIZE);
     assert_eq!(bottom % KSTACK_SLOT, 0);
@@ -351,7 +358,7 @@ fn the_rv64_kernel_is_linked_high_and_loaded_low() {
 
 #[test]
 fn the_rv64_kernel_boots_through_its_self_tests() {
-    let mut k = Kernel::load(1, grail::DEFAULT_RAM_SIZE);
+    let mut k = Kernel::load(1, RAM);
     let r = k.run();
     let out = k.printed();
     assert_eq!(r, RunResult::Exited(0), "output:\n{out}");
@@ -375,7 +382,7 @@ fn the_rv64_kernel_boots_through_its_self_tests() {
     assert_eq!(k.read64(k.sym("satp_mode")), mode.satp_mode);
     assert_eq!(k.read64(k.sym("page_offset")), mode.page_offset);
     assert_eq!(k.read64(k.sym("vmalloc_start")), mode.vmalloc_start);
-    assert_eq!(k.read64(k.sym("va_pa_offset")), mode.page_offset - LOAD_ADDR);
+    assert_eq!(k.read64(k.sym("va_pa_offset")), mode.page_offset - RAM_BASE);
     assert_eq!(
         k.read64(k.sym("va_kernel_pa_offset")),
         KERNEL_LINK_ADDR - LOAD_ADDR
@@ -384,7 +391,7 @@ fn the_rv64_kernel_boots_through_its_self_tests() {
     // kernel_satp, and hart 0's struct cpu has it.
     let kpt = k.read64(k.sym("kernel_pagetable"));
     assert!(
-        kpt >= mode.page_offset && kpt < mode.page_offset + (4 << 20),
+        kpt >= mode.page_offset && kpt < mode.page_offset + RAM as u64,
         "{kpt:#x}"
     );
     assert_eq!(k.read64(k.sym("kernel_satp")), mode.satp_mode | k.pa(kpt) >> 12);
@@ -401,7 +408,7 @@ fn the_rv64_kernel_boots_through_its_self_tests() {
 
 #[test]
 fn the_page_table_maps_the_kernel_half_only() {
-    let mut k = Kernel::load(1, grail::DEFAULT_RAM_SIZE);
+    let mut k = Kernel::load(1, RAM);
     assert_eq!(k.run(), RunResult::Exited(0));
     let kpt = k.pa(k.read64(k.sym("kernel_pagetable")));
     let root: Vec<u64> = (0..512).map(|i| k.read64_pa(kpt + 8 * i)).collect();
@@ -454,7 +461,7 @@ fn the_page_table_maps_the_kernel_half_only() {
 
     // The early page table maps RAM exactly, and no devices but the
     // fixmap's: its direct map ends with RAM.
-    let ram_end = mode().page_offset + grail::DEFAULT_RAM_SIZE as u64;
+    let ram_end = mode().page_offset + RAM as u64;
     assert!(k.translate(early, ram_end - 4096).is_some());
     assert!(k.translate(early, ram_end).is_none());
     assert!(k.translate(early, mode().vmalloc_start).is_none());
@@ -492,7 +499,7 @@ impl Kernel {
 #[test]
 fn the_rv64_kernel_runs_on_up_to_eight_harts() {
     for harts in [2, 3, 8] {
-        let mut k = Kernel::load(harts, grail::DEFAULT_RAM_SIZE);
+        let mut k = Kernel::load(harts, RAM);
         let r = k.run();
         let out = k.printed();
         assert_eq!(r, RunResult::Exited(0), "{harts} harts:\n{out}");
@@ -529,6 +536,8 @@ fn the_rv64_kernel_configures_its_network_with_dhcp() {
     let mut m = Machine::new(MachineConfig {
         xlen: grail::Xlen::Rv64,
         paging: mode().paging,
+        bios: grail::Bios::Default,
+        ram_size: RAM,
         nets: vec![grail::NetConfig::user(Vec::new())],
         ..MachineConfig::default()
     })
@@ -548,8 +557,10 @@ fn the_rv64_kernel_configures_its_network_with_dhcp() {
 
 #[test]
 fn the_rv64_kernel_takes_ram_from_sysinfo() {
-    // 3 MiB at least: the image is 2.1 MiB with the programs it embeds.
-    for mib in [3usize, 64] {
+    // 8 MiB at least: the image is 2.1 MiB with the programs it embeds, from
+    // 0x8020_0000, after the firmware's 2 MiB, and the device tree goes at
+    // the last 2 MiB boundary below the end of RAM, above it.
+    for mib in [8usize, 10, 64] {
         let mut k = Kernel::load(1, mib << 20);
         let r = k.run();
         let out = k.printed();
@@ -564,7 +575,7 @@ fn the_rv64_kernel_takes_ram_from_sysinfo() {
 
 #[test]
 fn kernel_stacks_keep_a_margin() {
-    let mut k = Kernel::load(2, grail::DEFAULT_RAM_SIZE);
+    let mut k = Kernel::load(2, RAM);
     assert_eq!(k.run(), RunResult::Exited(0));
     let out = k.printed();
     let line = out.lines().find(|l| l.starts_with("kstack: ")).unwrap();
@@ -804,6 +815,9 @@ fn the_rv64_kernel_boots_from_disk() {
             harts,
             xlen: grail::Xlen::Rv64,
             paging: mode().paging,
+            bios: grail::Bios::Default,
+            // The firmware's 2 MiB on top of the 4 MiB an RV32 kernel boots on.
+            ram_size: 6 << 20,
             disks: vec![grail::DiskConfig::memory(image.clone())],
             ..MachineConfig::default()
         })
@@ -857,11 +871,12 @@ fn the_rv64_kernel_boots_from_disk() {
         if harts > 1 {
             assert!(out.contains(&format!("\nsmp: {harts} harts running\n")), "{out}");
         }
-        // The ROM's entry doubleword is the kernel's physical entry point, so
-        // the harts it woke came in at 0x8000_0000, with paging off.
+        // The bootloader ran in S-mode and wrote nothing to the ROM: its
+        // entry doubleword is still the hand-off to the firmware, which
+        // started the other harts for the kernel (HSM hart_start).
         let lo = m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR).unwrap() as u64;
         let hi = m.cpu.bus.peek(grail::boot::BOOT_ENTRY_ADDR + 4).unwrap() as u64;
-        assert_eq!(lo | hi << 32, LOAD_ADDR);
+        assert_eq!(lo | hi << 32, grail::boot::FW_HANDOFF_PC);
     }
 }
 

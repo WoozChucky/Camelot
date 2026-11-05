@@ -50,13 +50,19 @@ impl Session {
     /// Boots the committed `xlen` kernel with `image` as disk 0 and waits
     /// for the shell's first prompt.
     fn boot(image: Vec<u8>, xlen: Xlen) -> Session {
-        let (machine_xlen, kernel) = match xlen {
-            Xlen::Rv32 => (grail::Xlen::Rv32, "kernel.elf"),
-            Xlen::Rv64 => (grail::Xlen::Rv64, xtask::kernel::KERNEL_ELF_RV64),
+        // The RV64 kernel runs in S-mode, on Camelot's firmware.
+        let (machine_xlen, bios, kernel) = match xlen {
+            Xlen::Rv32 => (grail::Xlen::Rv32, grail::Bios::None, "kernel.elf"),
+            Xlen::Rv64 => (
+                grail::Xlen::Rv64,
+                grail::Bios::Default,
+                xtask::kernel::KERNEL_ELF_RV64,
+            ),
         };
         let config = MachineConfig {
             ram_size: RAM,
             xlen: machine_xlen,
+            bios,
             disks: vec![DiskConfig::memory(image)],
             ..MachineConfig::default()
         };

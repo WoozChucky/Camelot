@@ -16,9 +16,10 @@
 
 use grail::Machine;
 
-/// Where the RV64 kernel image is linked, and where it is loaded.
+/// Where the RV64 kernel image is linked, and where it is loaded: after the
+/// firmware's 2 MiB.
 const KERNEL_LINK_ADDR: u64 = 0xffff_ffff_8000_0000;
-const LOAD_ADDR: u64 = 0x8000_0000;
+const LOAD_ADDR: u64 = 0x8020_0000;
 const PGSIZE: u64 = 4096;
 /// A kernel stack's size (vm.h's KSTACK_SIZE): 4 pages.
 const KSTACK_SIZE: u64 = 4 * PGSIZE;

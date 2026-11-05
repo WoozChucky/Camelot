@@ -343,9 +343,19 @@ pub mod width {
         }
     }
 
-    /// Where the RV64 kernel image is linked, and where it is loaded.
+    /// The firmware a kernel of the width under test boots on: none for
+    /// RV32, whose kernel has its own M-mode layer, Camelot's for RV64.
+    pub fn bios() -> grail::Bios {
+        match get() {
+            Xlen::Rv32 => grail::Bios::None,
+            Xlen::Rv64 => grail::Bios::Default,
+        }
+    }
+
+    /// Where the RV64 kernel image is linked, and where it is loaded: after
+    /// the firmware's 2 MiB.
     const KERNEL_LINK_ADDR_RV64: u64 = 0xffff_ffff_8000_0000;
-    const LOAD_ADDR: u64 = 0x8000_0000;
+    const LOAD_ADDR: u64 = 0x8020_0000;
 
     /// The physical address of `va`, an address in the kernel image: the
     /// same on RV32; on RV64, linked in the upper half, its load address.
