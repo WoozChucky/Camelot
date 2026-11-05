@@ -34,10 +34,7 @@ main:
     sb    a0, -19(s0)
     li    a0, -25536
     sh    a0, -22(s0)
-    li    a0, 1
-    negw  a0, a0
-    slli  a0, a0, 48
-    srli  a0, a0, 48
+    li    a0, 65535
     sh    a0, -24(s0)
     li    a0, 0
     sw    a0, -28(s0)
@@ -83,8 +80,7 @@ main:
     lh    a0, -22(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 25536
-    negw  a0, a0
+    li    a0, -25536
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0
@@ -177,8 +173,7 @@ main:
     lb    a0, -34(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 56
-    negw  a0, a0
+    li    a0, -56
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0
@@ -194,8 +189,7 @@ main:
     negw  a0, a0
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 200
-    negw  a0, a0
+    li    a0, -200
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0
@@ -300,8 +294,7 @@ main:
     lw    a0, -28(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 1
-    negw  a0, a0
+    li    a0, -1
     addi  sp, sp, -8
     sd    a0, 0(sp)
     lhu   a0, -50(s0)
@@ -314,10 +307,7 @@ main:
     sw    a0, -28(s0)
     li    a0, 200
     sb    a0, -51(s0)
-    li    a0, 2
-    negw  a0, a0
-    slli  a0, a0, 56
-    srai  a0, a0, 56
+    li    a0, -2
     sb    a0, -52(s0)
     lw    a0, -28(s0)
     addi  sp, sp, -8
@@ -331,8 +321,7 @@ main:
     divw  a0, a1, a0
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 100
-    negw  a0, a0
+    li    a0, -100
     ld    a1, 0(sp)
     addi  sp, sp, 8
     xor   a0, a1, a0

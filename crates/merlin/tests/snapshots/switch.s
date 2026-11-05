@@ -45,8 +45,7 @@ classify:
     lw    a0, -16(s0)
     j     .L.return.classify
 .L.case.classify.5:
-    li    a0, 1
-    neg   a0, a0
+    li    a0, -1
     j     .L.return.classify
 .L.break.1:
     li    a0, 0
@@ -522,8 +521,7 @@ main:
 .L.and.19:
     snez  a0, a0
     beqz  a0, .L.and.18
-    li    a0, 5
-    neg   a0, a0
+    li    a0, -5
     addi  sp, sp, -12
     call  classify
     addi  sp, sp, 12
@@ -561,8 +559,7 @@ main:
     addi  sp, sp, 12
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 1
-    neg   a0, a0
+    li    a0, -1
     lw    a1, 0(sp)
     addi  sp, sp, 4
     xor   a0, a1, a0
@@ -887,8 +884,7 @@ main:
     lw    a0, -12(s0)
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 1
-    neg   a0, a0
+    li    a0, -1
     addi  sp, sp, -12
     call  kind
     addi  sp, sp, 12

@@ -736,10 +736,7 @@ main:
     sw    a0, -24(s0)
     li    a0, 40
     sw    a0, -20(s0)
-    li    a0, 2
-    neg   a0, a0
-    slli  a0, a0, 24
-    srai  a0, a0, 24
+    li    a0, -2
     sb    a0, -33(s0)
     li    a0, 65535
     sh    a0, -36(s0)
@@ -932,32 +929,7 @@ main:
     call  mix
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 2
-    neg   a0, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 5
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 0
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 6
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 50
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    li    a0, 59
     lw    a1, 0(sp)
     addi  sp, sp, 4
     xor   a0, a1, a0
@@ -981,19 +953,7 @@ main:
     call  mix
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 7
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 65
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 7000
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    li    a0, 7072
     lw    a1, 0(sp)
     addi  sp, sp, 4
     xor   a0, a1, a0
@@ -1094,19 +1054,7 @@ main:
     addi  sp, sp, 48
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 28
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 6
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 100
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    li    a0, 134
     lw    a1, 0(sp)
     addi  sp, sp, 4
     xor   a0, a1, a0
@@ -1168,13 +1116,7 @@ main:
     addi  sp, sp, 64
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 73
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 45
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    sub   a0, a1, a0
+    li    a0, 28
     lw    a1, 0(sp)
     addi  sp, sp, 4
     xor   a0, a1, a0
