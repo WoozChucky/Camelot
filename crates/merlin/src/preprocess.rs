@@ -2,15 +2,28 @@
 //!
 //! Works on the lexer's preprocessing tokens ([`PpToken`]) and hands the
 //! parser the tokens of the whole translation unit, every directive carried
-//! out and every macro replaced. It does what C99 asks, with two limits
-//! (both errors, never a different meaning): a directive may not appear
-//! inside the arguments of a macro call (C leaves that undefined; GCC and
-//! clang accept some), and `defined` may not come out of a macro expansion
-//! in `#if` (also undefined).
+//! out and every macro replaced. It does what C99 asks, and what clang does
+//! where C leaves the behavior undefined: a directive inside the arguments
+//! of a macro call is carried out (but `#include` and `#pragma`, an error
+//! there), and a `defined` that a macro's expansion produces in `#if` is
+//! evaluated, with clang's warning.
+//!
+//! ## Diagnostics
+//!
+//! They are clang's, in its words, at its positions, and clang goes on
+//! after most of them, so merlin does too: a directive with an error is
+//! dropped (a macro is not defined, an `#include` not read, a `#line` not
+//! applied; an `#if` whose condition has one is false), and a macro call
+//! with the wrong number of arguments leaves the macro's name as it is.
+//! Only a header that is not found stops it (clang's fatal error).
+//! [`preprocess_recovering`] hands on the tokens with the diagnostics so
+//! that the parser goes on too; [`Output::merge`] puts its diagnostics and
+//! the parser's in clang's order.
 //!
 //! * `#include "file"` looks in the including file's directory, then in
 //!   each `-I` directory in order; `#include <file>` only in the `-I`
-//!   directories (merlin has no system headers). The name may also come
+//!   directories (merlin has no system headers; one found as `"file"` would
+//!   be is an error, and included, as clang does). The name may also come
 //!   from a macro (`#include HEADER`). Includes nest up to 200 deep.
 //!   `#pragma once` makes a file include only once; include guards
 //!   (`#ifndef X` / `#define X` ... `#endif`) work like in any compiler.
@@ -22,17 +35,20 @@
 //!   line of its own ([`PpKind::Directive`], which the parser skips), and
 //!   so is `#ident "string"` (`#sccs`), macros replaced.
 //! * `#define NAME tokens` and `#define F(a, b) tokens` (with `...` and
-//!   `__VA_ARGS__`), `#undef`. Defining a macro again is an error unless the
-//!   definitions are the same (C99 6.10.3p2), except from the command line
-//!   (`-D`), where the last one wins.
+//!   `__VA_ARGS__`, or GNU's `args...`), `#undef`. Defining a macro again
+//!   differently (C99 6.10.3p2 asks for the same definition) is clang's
+//!   warning, and the new definition holds; so is defining or undefining
+//!   `__FILE__`, `__LINE__` or a predefined `__STDC...` macro.
 //! * `#if`, `#elif` with `defined NAME` / `defined(NAME)` and integer
 //!   constant expressions in 64 bits (C's `intmax_t`, `uintmax_t`), where any
-//!   identifier left after macro replacement is 0; `#ifdef`, `#ifndef`,
-//!   `#else`, `#endif`. Groups that are skipped are only scanned for the
-//!   directives that nest, so they may hold anything that lexes (an
-//!   apostrophe in a sentence too).
-//! * `#error` stops with its text; `#line N "name"` renumbers the lines
-//!   that follow; `#` alone does nothing. Any other directive is an error.
+//!   identifier left after macro replacement is 0, evaluated as clang
+//!   evaluates them ([`Eval`]); `#ifdef`, `#ifndef`, `#else`, `#endif`.
+//!   Groups that are skipped are only scanned for the directives that nest,
+//!   so they may hold anything that lexes (an apostrophe in a sentence too).
+//! * `#error` is an error with the rest of its line as written, `#warning`
+//!   a warning; `#line N "name"` and GNU's line marker `# N "name" flags`
+//!   renumber the lines that follow; `#` alone does nothing. Any other
+//!   directive is an error.
 //! * `__FILE__` and `__LINE__`, and a few predefined macros ([`predefined`]).
 //!
 //! ## Macro replacement
@@ -84,7 +100,8 @@
 //! * Pasting two tokens that do not form one (`. ## name`) is no error: they
 //!   stay two, written with nothing between them, unless the second is a
 //!   token of the macro's body with a space before it (`call f ## @plt`
-//!   is `call foo @plt`, as in clang).
+//!   is `call foo @plt`, as in clang). And `#` in a function-like macro's
+//!   body may stand before anything (`# y` is two tokens of the expansion).
 //! * Trigraphs are characters, and what is no C token (`$`, `@`, `\`)
 //!   passes through ([`lexer::lex_pp_asm`]).
 //!
@@ -99,7 +116,7 @@
 
 use crate::lexer::{self, PpKind, PpToken};
 use crate::types::Xlen;
-use crate::{Error, Pos};
+use crate::{Error, Pos, Severity};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -352,9 +369,12 @@ pub struct Output {
     layout: Vec<Layout>,
     /// Where files start and end and `#line` renumbers, after how many tokens.
     marks: Vec<(usize, Mark)>,
-    /// The warnings clang gives while preprocessing (`'N' macro
-    /// redefined`), in order.
-    pub warnings: Vec<Error>,
+    /// The diagnostics of preprocessing (`'N' macro redefined`), in order:
+    /// warnings, and from [`preprocess_recovering`] errors too.
+    pub diagnostics: Vec<Error>,
+    /// For each diagnostic, where the last token that came out before it
+    /// is ([`Pos::default`] for none): see [`Output::merge`].
+    after: Vec<Pos>,
 }
 
 /// Where a token of the output goes, for [`Output::print_asm`].
@@ -388,6 +408,30 @@ impl Output {
     pub fn name_files(&self, mut errors: Vec<Error>) -> Vec<Error> {
         name_files(&self.files, &mut errors);
         errors
+    }
+
+    /// The preprocessor's diagnostics and those of what reads its tokens
+    /// (`later`: the lexer's, the parser's, the checker's, in any order),
+    /// in the order clang gives them. clang preprocesses as its parser asks
+    /// for tokens, so a diagnostic of the preprocessor comes when the
+    /// parser reads the token after it; and its parser reports an error at
+    /// a token once it has read the next one too. So each of the
+    /// preprocessor's comes before what is reported at or after the last
+    /// token that came out before it, the others in the order of their
+    /// positions: `F(1)` with too few arguments is an error at the `)`,
+    /// then one at `F`, which the parser takes for a type's name.
+    pub fn merge(&self, mut later: Vec<Error>) -> Vec<Error> {
+        later.sort_by_key(|e| e.pos);
+        let mut later = later.into_iter().peekable();
+        let mut out = Vec::new();
+        for (d, after) in self.diagnostics.iter().zip(&self.after) {
+            while let Some(e) = later.next_if(|e| e.pos < *after) {
+                out.push(e);
+            }
+            out.push(d.clone());
+        }
+        out.extend(later);
+        out
     }
 
     /// The text of preprocessed assembly, for the assembler, as clang's
@@ -689,10 +733,30 @@ fn name_files(files: &[String], errors: &mut [Error]) {
 }
 
 /// Preprocesses the source `src` of the file `name` (its name for
-/// `__FILE__` and errors; `#include "..."` looks next to it). An error in a
-/// header has its [`Error::file`] set. An error stops it: `Err` has the
-/// warnings before it, then the error.
+/// `__FILE__` and errors; `#include "..."` looks next to it), for what
+/// wants no tokens if there is an error (`merlin -E`, assembly): `Err` has
+/// every diagnostic, in order, if one is an error; [`Output::diagnostics`]
+/// has the warnings. A diagnostic in a header has its [`Error::file`] set.
 pub fn preprocess(name: &str, src: &str, opts: &Options, load: Loader) -> Result<Output, Vec<Error>> {
+    let out = preprocess_recovering(name, src, opts, load)?;
+    if out.diagnostics.iter().any(|d| !d.is_warning()) {
+        return Err(out.diagnostics);
+    }
+    Ok(out)
+}
+
+/// Preprocesses as [`preprocess`] does, going on after an error as clang
+/// does (see the module's documentation), for the parser to go on too: the
+/// tokens come with the errors and warnings in [`Output::diagnostics`].
+/// Only what stops clang stops it (a header not found, and in merlin a
+/// lexical error in the file being compiled): `Err` has the diagnostics
+/// before it, then that one.
+pub fn preprocess_recovering(
+    name: &str,
+    src: &str,
+    opts: &Options,
+    load: Loader,
+) -> Result<Output, Vec<Error>> {
     let mut pp = Pp {
         opts,
         load,
@@ -706,18 +770,20 @@ pub fn preprocess(name: &str, src: &str, opts: &Options, load: Loader) -> Result
         pending: VecDeque::new(),
         isolated: false,
         conds: Vec::new(),
-        command_line: true,
+        builtin_file: 0,
         asm: opts.lang == Lang::AssemblerWithCpp,
         guards: HashMap::new(),
         emitted: 0,
+        last_out: Pos::default(),
         marks: Vec::new(),
         carry: (false, false, false),
-        warnings: Vec::new(),
+        diagnostics: Vec::new(),
+        after: Vec::new(),
     };
     let result = pp.run(src);
-    let mut warnings = std::mem::take(&mut pp.warnings);
+    let mut diagnostics = std::mem::take(&mut pp.diagnostics);
     let files: Vec<String> = pp.files.into_iter().map(|f| f.name).collect();
-    name_files(&files, &mut warnings);
+    name_files(&files, &mut diagnostics);
     match result {
         Ok((toks, end)) => {
             let layout = toks
@@ -735,13 +801,14 @@ pub fn preprocess(name: &str, src: &str, opts: &Options, load: Loader) -> Result
                 files,
                 layout,
                 marks: pp.marks,
-                warnings,
+                diagnostics,
+                after: pp.after,
             })
         }
         Err(mut e) => {
             name_files(&files, std::slice::from_mut(&mut e));
-            warnings.push(e);
-            Err(warnings)
+            diagnostics.push(e);
+            Err(diagnostics)
         }
     }
 }
@@ -845,6 +912,9 @@ struct PTok {
     /// own line, which [`PpToken::space`] also says for a newline. Macro
     /// expansion moves it about as it moves `space`.
     lead: bool,
+    /// It is a token of a function-like macro's body (where clang does not
+    /// warn of a `defined` in `#if`, see [`Eval::defined`]).
+    function_body: bool,
 }
 
 impl PTok {
@@ -860,6 +930,7 @@ impl PTok {
             site: None,
             spelled,
             lead,
+            function_body: false,
         }
     }
 }
@@ -867,8 +938,8 @@ impl PTok {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MacroKind {
     Object,
-    /// The parameter names, and whether `...` ends the list (its argument
-    /// is `__VA_ARGS__`, after the named ones).
+    /// The parameter names, and whether the last one takes the variadic
+    /// arguments: `__VA_ARGS__` for `...` (C99), `args` for GNU's `args...`.
     Function {
         params: Vec<String>,
         variadic: bool,
@@ -902,16 +973,12 @@ impl Macro {
                 .all(|(i, (a, b))| a.kind == b.kind && a.text == b.text && (i == 0 || a.space == b.space))
     }
 
-    /// The index of the parameter a body token names, if it names one
-    /// (`__VA_ARGS__` is the one after the named parameters).
+    /// The index of the parameter a body token names, if it names one.
     fn param(&self, t: &PpToken) -> Option<usize> {
-        let MacroKind::Function { params, variadic } = &self.kind else {
+        let MacroKind::Function { params, .. } = &self.kind else {
             return None;
         };
         let name = t.ident()?;
-        if *variadic && name == "__VA_ARGS__" {
-            return Some(params.len());
-        }
         params.iter().position(|p| p == name)
     }
 }
@@ -927,6 +994,8 @@ struct File {
 struct Cursor {
     toks: Vec<PpToken>,
     i: usize,
+    /// Its text, for the lines `#error` and `#warning` print as written.
+    text: Rc<str>,
     /// Its entry in [`Pp::files`] (`#line "name"` makes another).
     file: u32,
     /// Added to every line number (`#line`).
@@ -937,6 +1006,20 @@ struct Cursor {
     /// For an `#include`d file: the line the file that includes it goes on
     /// at, after the directive.
     back: Option<u32>,
+    /// How many line markers say a file was entered (flag 1) and not left
+    /// yet (flag 2): what flag 2 may leave.
+    entered_by_markers: u32,
+}
+
+/// What reading the arguments of a macro call gives ([`Pp::arguments`]).
+enum Call {
+    /// The arguments, and the `)` that ends them.
+    Args(Vec<Vec<PTok>>, PTok),
+    /// Too many or too few: the macro's name stands for itself, as in
+    /// clang, and what was read is gone.
+    Wrong,
+    /// The input ended before the `)`: the call is gone.
+    Unterminated,
 }
 
 /// An open `#if` (or `#ifdef`, `#ifndef`).
@@ -965,17 +1048,20 @@ struct Pp<'a> {
     /// line): nothing past `pending` is read.
     isolated: bool,
     conds: Vec<Cond>,
-    /// Reading the predefined and command-line macros, which may be defined
-    /// again.
-    command_line: bool,
+    /// The file of the predefined macros, `<built-in>`.
+    builtin_file: u32,
     /// Preprocessing assembly ([`Lang::AssemblerWithCpp`]).
     asm: bool,
     /// The include guard of each file read that has one (see [`guard`]).
     guards: HashMap<PathBuf, String>,
     /// How many tokens have come out so far, where [`Pp::marks`] are.
     emitted: usize,
-    /// The warnings so far.
-    warnings: Vec<Error>,
+    /// Where the last token that came out is.
+    last_out: Pos,
+    /// The diagnostics so far, and where the last token out was when each
+    /// came ([`Output::merge`]).
+    diagnostics: Vec<Error>,
+    after: Vec<Pos>,
     /// Where files start and end, after how many tokens.
     marks: Vec<(usize, Mark)>,
     /// A macro that expanded to nothing started a line, or had a space
@@ -999,7 +1085,7 @@ impl Pp<'_> {
             .map(|(name, value)| format!("#define {name} {value}\n"))
             .collect();
         builtin.push_str("#define __FILE__\n#define __LINE__\n");
-        self.read_directives("<built-in>", &builtin)?;
+        self.builtin_file = self.read_directives("<built-in>", &builtin)?;
         self.macros.get_mut("__FILE__").expect("defined above").kind = MacroKind::File;
         self.macros.get_mut("__LINE__").expect("defined above").kind = MacroKind::Line;
         let cmd: String = self
@@ -1017,26 +1103,26 @@ impl Pp<'_> {
         if !cmd.is_empty() {
             self.read_directives("<command line>", &cmd)?;
         }
-        self.command_line = false;
 
         let (toks, end) = self.lex(src, 0)?;
-        self.enter(toks, 0);
+        self.enter(toks, src, 0);
         let mut out = Vec::new();
         while let Some(t) = self.next()? {
+            self.last_out = t.t.pos;
             out.push(t);
             self.emitted += 1;
         }
         Ok((out, end))
     }
 
-    /// Reads a made-up file holding only directives.
-    fn read_directives(&mut self, name: &str, text: &str) -> Result<(), Error> {
+    /// Reads a made-up file holding only directives; its number.
+    fn read_directives(&mut self, name: &str, text: &str) -> Result<u32, Error> {
         let id = self.new_file(name.to_string(), PathBuf::from(name));
         let (toks, _) = lexer::lex_pp(text, id)?;
-        self.enter(toks, id);
+        self.enter(toks, text, id);
         match self.next()? {
             Some(t) => Err(Error::new(t.t.pos, "expected a directive")),
-            None => Ok(()),
+            None => Ok(id),
         }
     }
 
@@ -1045,15 +1131,30 @@ impl Pp<'_> {
         (self.files.len() - 1) as u32
     }
 
-    fn enter(&mut self, toks: Vec<PpToken>, file: u32) {
+    fn enter(&mut self, toks: Vec<PpToken>, text: &str, file: u32) {
         self.stack.push(Cursor {
             toks,
             i: 0,
+            text: text.into(),
             file,
             line_delta: 0,
             conds: self.conds.len(),
             back: None,
+            entered_by_markers: 0,
         });
+    }
+
+    /// Records a diagnostic and goes on.
+    fn report(&mut self, e: Error) {
+        self.diagnostics.push(e);
+        self.after.push(self.last_out);
+    }
+
+    /// Records the diagnostics a function of the lexer collected.
+    fn report_all(&mut self, diagnostics: Vec<Error>) {
+        for d in diagnostics {
+            self.report(d);
+        }
     }
 
     // ---- reading tokens ----
@@ -1104,27 +1205,58 @@ impl Pp<'_> {
         line
     }
 
-    /// Leaves the innermost file, which must have closed its conditionals.
-    fn leave(&mut self) -> Result<(), Error> {
+    /// The rest of the line after the token `name` (a directive's name in
+    /// the innermost file), as written: what clang's `#error` and
+    /// `#warning` print. Spaces after the name are left out; comments stay,
+    /// and a backslash at the end of a line joins the next one to it.
+    fn raw_rest(&self, name: &PpToken) -> String {
+        let cur = self.stack.last().expect("a file");
+        // The line as the lexer numbered it, before `#line`.
+        let line = (i64::from(name.end.line) - cur.line_delta) as usize;
+        let mut lines = cur.text.split('\n').skip(line - 1);
+        let first = lines.next().unwrap_or("");
+        let start = first
+            .char_indices()
+            .nth(name.end.col as usize - 1)
+            .map_or(first.len(), |(i, _)| i);
+        let mut text = String::new();
+        let mut part = &first[start..];
+        loop {
+            let part_line = part.strip_suffix('\r').unwrap_or(part);
+            match (part_line.strip_suffix('\\'), lines.next()) {
+                (Some(joined), Some(next)) => {
+                    text.push_str(joined);
+                    part = next;
+                }
+                _ => {
+                    text.push_str(part_line);
+                    break;
+                }
+            }
+        }
+        text.trim_start_matches(' ').to_string()
+    }
+
+    /// Leaves the innermost file. clang reports every conditional it left
+    /// open, the innermost first, and closes them.
+    fn leave(&mut self) {
         let cur = self.stack.pop().expect("a file");
-        if self.conds.len() > cur.conds {
-            return Err(Error::new(
-                self.conds.last().expect("checked").pos,
-                "unterminated conditional directive",
-            ));
+        while self.conds.len() > cur.conds {
+            let pos = self.conds.pop().expect("checked").pos;
+            self.report(Error::new(pos, "unterminated conditional directive"));
         }
         if let (Some(line), Some(parent)) = (cur.back, self.stack.last()) {
             let file = parent.file;
             self.marks.push((self.emitted, Mark::Exit { line, file }));
         }
-        Ok(())
     }
 
     /// The next token before macro replacement: from an expansion waiting
     /// to be rescanned, or else from the files, carrying out directives on
-    /// the way. Inside a macro call's arguments (`in_args`) a directive is
-    /// an error and the end of a file ends the input.
-    fn next_raw(&mut self, in_args: bool) -> Result<Option<PTok>, Error> {
+    /// the way. Inside the arguments of a call of the macro `call`, the
+    /// arguments go on past the end of a header, but not past the end of
+    /// the file being compiled.
+    fn next_raw(&mut self, call: Option<&PpToken>) -> Result<Option<PTok>, Error> {
         loop {
             if let Some(t) = self.pending.pop_front() {
                 return Ok(Some(t));
@@ -1133,21 +1265,26 @@ impl Pp<'_> {
                 return Ok(None);
             }
             if self.peek_file().is_none() {
-                if in_args {
+                if call.is_some() && self.stack.len() == 1 {
                     return Ok(None);
                 }
-                self.leave()?;
+                self.leave();
                 continue;
             }
             if self.at_directive() {
-                if in_args {
-                    let pos = self.take_file().pos;
-                    return Err(Error::new(
-                        pos,
-                        "directives inside the arguments of a macro call are not supported",
-                    ));
+                if let Some(name) = call {
+                    if self.embedded_include(name) {
+                        continue;
+                    }
                 }
-                self.directive()?;
+                // An error drops the directive, and preprocessing goes on;
+                // only a fatal one stops it.
+                if let Err(e) = self.directive() {
+                    if e.severity == Severity::Fatal {
+                        return Err(e);
+                    }
+                    self.report(e);
+                }
                 continue;
             }
             let mut t = PTok::read(self.take_file());
@@ -1159,6 +1296,37 @@ impl Pp<'_> {
             }
             return Ok(Some(t));
         }
+    }
+
+    /// Inside the arguments of a call of the macro `name`, a directive that
+    /// would bring in other text (`#include`, `#pragma`...) is an error, and
+    /// dropped, as clang has it (C leaves any directive there undefined;
+    /// clang carries out the others). Whether the next line was one.
+    fn embedded_include(&mut self, name: &PpToken) -> bool {
+        let cur = self.stack.last().expect("a file");
+        let directive = match cur.toks.get(cur.i + 1) {
+            Some(t) if !t.bol => t.ident().unwrap_or("").to_string(),
+            _ => String::new(),
+        };
+        if !matches!(
+            directive.as_str(),
+            "include" | "include_next" | "import" | "__include_macros" | "pragma" | "embed"
+        ) {
+            return false;
+        }
+        self.take_file(); // #
+        let line = self.rest_of_line();
+        self.report(
+            Error::new(
+                line[0].pos,
+                format!("embedding a #{directive} directive within macro arguments is not supported"),
+            )
+            .note(
+                name.pos,
+                format!("expansion of macro '{}' requested here", name.text),
+            ),
+        );
+        true
     }
 
     /// Whether the next token is `(`, without reading past the innermost file.
@@ -1175,7 +1343,7 @@ impl Pp<'_> {
     /// The next token after macro replacement, or `None` at the end.
     fn next(&mut self) -> Result<Option<PTok>, Error> {
         loop {
-            let Some(mut t) = self.next_raw(false)? else {
+            let Some(mut t) = self.next_raw(None)? else {
                 return Ok(None);
             };
             if t.t.kind == PpKind::Directive {
@@ -1207,15 +1375,19 @@ impl Pp<'_> {
                 MacroKind::Line => vec![self.made(&t, PpKind::Number, t.t.pos.line.to_string())],
                 MacroKind::Object => {
                     let hide = hide_union(&t.hide, &Rc::new(vec![name]));
-                    self.substitute(&m, &[], &hide, &t, t.t.end)?
+                    self.substitute(&m, &[], &hide, &t, t.t.end)
                 }
-                MacroKind::Function { params, variadic } => {
+                MacroKind::Function { .. } => {
                     if !self.lparen_follows() {
                         return Ok(Some(t));
                     }
-                    let (args, rparen) = self.arguments(&t.t, params.len(), *variadic)?;
+                    let (args, rparen) = match self.arguments(&t.t, &m)? {
+                        Call::Args(args, rparen) => (args, rparen),
+                        Call::Wrong => return Ok(Some(t)),
+                        Call::Unterminated => continue,
+                    };
                     let hide = hide_union(&hide_intersection(&t.hide, &rparen.hide), &Rc::new(vec![name]));
-                    self.substitute(&m, &args, &hide, &t, rparen.t.end)?
+                    self.substitute(&m, &args, &hide, &t, rparen.t.end)
                 }
             };
             if expansion.is_empty() {
@@ -1242,86 +1414,102 @@ impl Pp<'_> {
             site: Some(at.site.unwrap_or(at.t.pos)),
             spelled: None,
             lead: at.lead,
+            function_body: false,
         }
     }
 
     /// Replaces a list of tokens on its own, as if it were the rest of the
-    /// file: a macro argument, or an `#if` line.
-    fn expand_alone(&mut self, toks: Vec<PTok>) -> Result<Vec<PTok>, Error> {
+    /// file: a macro argument, or a directive's line. Nothing stops it: no
+    /// directive is read, and the diagnostics of the expansion are reported.
+    fn expand_alone(&mut self, toks: Vec<PTok>) -> Vec<PTok> {
         let saved = std::mem::replace(&mut self.pending, toks.into());
         let was_isolated = std::mem::replace(&mut self.isolated, true);
         let carry = std::mem::take(&mut self.carry);
         let mut out = Vec::new();
-        let result = loop {
-            match self.next() {
-                Ok(Some(t)) => out.push(t),
-                Ok(None) => break Ok(out),
-                Err(e) => break Err(e),
-            }
-        };
+        while let Some(t) = self.next().expect("only a directive can stop the preprocessor") {
+            out.push(t);
+        }
         self.pending = saved;
         self.isolated = was_isolated;
         self.carry = carry;
-        result
+        out
     }
 
-    /// After a function-like macro's name, reads `( arguments )`: each
-    /// argument's tokens (split at commas outside parentheses; the commas of
-    /// the variadic part stay in `__VA_ARGS__`) and the `)`.
-    fn arguments(
-        &mut self,
-        name: &PpToken,
-        nparams: usize,
-        variadic: bool,
-    ) -> Result<(Vec<Vec<PTok>>, PTok), Error> {
-        let unterminated = || {
-            Error::new(
-                name.pos,
-                format!("unterminated call of the function-like macro '{}'", name.text),
-            )
+    /// After the name of the function-like macro `m`, reads `( arguments )`
+    /// as clang's `ReadMacroCallArgumentList` does: each argument's tokens
+    /// (split at commas outside parentheses; the commas of the variadic
+    /// part stay in it) and the `)`. A wrong number of arguments is an
+    /// error at the first extra one, or at the `)` for too few; the end of
+    /// the input before the `)` is one at the name.
+    fn arguments(&mut self, name: &PpToken, m: &Macro) -> Result<Call, Error> {
+        let MacroKind::Function { params, variadic } = &m.kind else {
+            unreachable!("a function-like macro");
         };
-        self.next_raw(true)?.ok_or_else(unterminated)?; // (
+        let defined_here = |e: Error| e.note(m.pos, format!("macro '{}' defined here", name.text));
+        let open = self.next_raw(Some(name))?.expect("lparen_follows saw the '('");
         let mut args: Vec<Vec<PTok>> = vec![Vec::new()];
+        // Where each argument starts: its first token, or the `(` or `,`
+        // before it if it has none.
+        let mut starts: Vec<Pos> = Vec::new();
+        let mut separator = open.t.pos;
         let mut depth = 0;
         let rparen = loop {
-            let t = self.next_raw(true)?.ok_or_else(unterminated)?;
+            let Some(t) = self.next_raw(Some(name))? else {
+                let e = Error::new(name.pos, "unterminated function-like macro invocation");
+                self.report(defined_here(e));
+                return Ok(Call::Unterminated);
+            };
+            let arg = args.len() - 1;
             if t.t.is_punct("(") {
                 depth += 1;
             } else if t.t.is_punct(")") {
                 if depth == 0 {
+                    if starts.len() == arg {
+                        starts.push(separator);
+                    }
                     break t;
                 }
                 depth -= 1;
-            } else if t.t.is_punct(",") && depth == 0 && !(variadic && args.len() == nparams + 1) {
+            } else if t.t.is_punct(",") && depth == 0 && !(*variadic && args.len() == params.len()) {
+                if starts.len() == arg {
+                    starts.push(separator);
+                }
+                separator = t.t.pos;
                 args.push(Vec::new());
                 continue;
             }
-            args.last_mut().expect("one at least").push(t);
+            if starts.len() == arg {
+                starts.push(t.t.pos);
+            }
+            args[arg].push(t);
         };
-        // `F()` passes one empty argument, which is no argument for a macro
-        // without parameters.
-        if nparams == 0 && !variadic && args.len() == 1 && args[0].is_empty() {
+        // `F()` passes no argument; one empty argument where one is wanted.
+        if args.len() == 1 && args[0].is_empty() {
             args.clear();
         }
-        // The variadic part may be left out entirely.
-        if variadic && args.len() == nparams {
-            args.push(Vec::new());
+        let wanted = params.len();
+        if !variadic && args.len() > wanted {
+            let e = Error::new(
+                starts[wanted],
+                "too many arguments provided to function-like macro invocation",
+            );
+            self.report(defined_here(e));
+            return Ok(Call::Wrong);
         }
-        let want = nparams + usize::from(variadic);
-        if args.len() != want {
-            let which = if args.len() > want { "many" } else { "few" };
-            return Err(Error::new(
-                name.pos,
-                format!(
-                    "too {which} arguments provided to function-like macro invocation of '{}' \
-                     (expected {nparams}{}, have {})",
-                    name.text,
-                    if variadic { " or more" } else { "" },
-                    args.len()
-                ),
-            ));
+        // Too few is fine for `F()` where one argument is wanted, and where
+        // only the variadic one is missing (`F(x)` for `F(x, ...)`).
+        let fine = args.len() + 1 == wanted && (args.is_empty() || *variadic)
+            || (*variadic && args.is_empty() && wanted == 2);
+        if args.len() < wanted && !fine {
+            let e = Error::new(
+                rparen.t.pos,
+                "too few arguments provided to function-like macro invocation",
+            );
+            self.report(defined_here(e));
+            return Ok(Call::Wrong);
         }
-        Ok((args, rparen))
+        args.resize(wanted, Vec::new());
+        Ok(Call::Args(args, rparen))
     }
 
     /// The expansion of macro `m` used at `at` (ending at `end`), with these
@@ -1341,9 +1529,10 @@ impl Pp<'_> {
         hide: &HideSet,
         at_tok: &PTok,
         end: Pos,
-    ) -> Result<Vec<PTok>, Error> {
+    ) -> Vec<PTok> {
         let site = Some(at_tok.site.unwrap_or(at_tok.t.pos));
         let at = &at_tok.t;
+        let function_body = matches!(m.kind, MacroKind::Function { .. });
         // A body token, where the macro was used.
         let here = |t: &PpToken| PTok {
             t: PpToken {
@@ -1356,6 +1545,7 @@ impl Pp<'_> {
             site,
             spelled: Some((t.pos, t.end)),
             lead: t.space,
+            function_body,
         };
         let placemarker = || PTok {
             t: PpToken {
@@ -1370,6 +1560,7 @@ impl Pp<'_> {
             site,
             spelled: None,
             lead: false,
+            function_body,
         };
         let (at_lead, at_bol) = (at_tok.lead, at_tok.t.bol);
         let mut out: Vec<PTok> = Vec::new();
@@ -1390,8 +1581,8 @@ impl Pp<'_> {
             // `call foo @plt`, as in clang); an argument's first token has
             // none (`f ## g` with `@plt` is `foo@plt`).
             let own_space = t.space && m.param(t).is_none();
-            // In a function-like macro, `#` is always before a parameter
-            // (`define` checks).
+            // In a function-like macro of C, `#` is always before a
+            // parameter (`define` checks); in assembly it may be a token.
             let stringized = body
                 .get(i + 1)
                 .and_then(|n| m.param(n))
@@ -1408,12 +1599,15 @@ impl Pp<'_> {
                 let mut s = here(t);
                 s.t.kind = PpKind::Str;
                 s.spelled = None;
-                s.t.text = stringize(arg).ok_or_else(|| {
-                    Error::new(
-                        at.pos,
-                        "'#' produced an invalid string literal: it ends in a lone '\\'",
-                    )
-                })?;
+                let (text, lone_backslash) = stringize(arg);
+                if lone_backslash {
+                    let last = arg.last().expect("a backslash is a token").t.pos;
+                    self.report(Error::warning_unflagged(
+                        last,
+                        "invalid string literal, ignoring final '\\'",
+                    ));
+                }
+                s.t.text = text;
                 vec![s]
             } else if let Some(p) = m.param(t) {
                 let arg = &args[p];
@@ -1425,7 +1619,7 @@ impl Pp<'_> {
                         arg.clone()
                     }
                 } else {
-                    self.expand_alone(arg.clone())?
+                    self.expand_alone(arg.clone())
                 }
             } else {
                 vec![here(t)]
@@ -1444,7 +1638,7 @@ impl Pp<'_> {
                 paste = false;
                 let left = out.pop().expect("'##' is never first in a body");
                 match piece.next() {
-                    Some(right) => out.extend(glue(left, right, self.asm, own_space)?),
+                    Some(right) => out.extend(self.paste(left, right, own_space, at.pos)),
                     None => out.push(left), // an argument that expanded to nothing
                 }
             }
@@ -1462,13 +1656,61 @@ impl Pp<'_> {
             first.lead = at_lead;
             first.t.bol = at_bol;
         }
-        Ok(out)
+        out
+    }
+
+    /// `left ## right` in the expansion of a macro used at `at`: the two
+    /// spellings joined, which must read as one token. When they do not, C
+    /// has an error and clang goes on with the two tokens, the left one
+    /// where the macro was used (where clang reports what the parser says
+    /// of it), the right one where it was. In assembly that is no error:
+    /// `right` has a space before it if it is a token of the macro's body
+    /// written with one (`space`: `call f ## @plt` is `call foo @plt`), else
+    /// none (`. ## name` is `.name`), as clang leaves them.
+    fn paste(&mut self, mut left: PTok, mut right: PTok, space: bool, at: Pos) -> Vec<PTok> {
+        if left.t.kind == PpKind::Placemarker {
+            return vec![right];
+        }
+        if right.t.kind == PpKind::Placemarker {
+            return vec![left];
+        }
+        let text = format!("{}{}", left.t.text, right.t.text);
+        let one = match lexer::lex_pp_in(&text, left.t.pos.file, self.asm) {
+            Ok((toks, _))
+                if toks.len() == 1 && toks[0].text == text && !matches!(toks[0].kind, PpKind::Invalid(_)) =>
+            {
+                Some(toks[0].kind.clone())
+            }
+            _ => None,
+        };
+        let Some(kind) = one else {
+            if self.asm {
+                right.t.space = space;
+                right.lead = space;
+            } else {
+                self.report(Error::new(
+                    at,
+                    format!("pasting formed '{text}', an invalid preprocessing token"),
+                ));
+                left.t.pos = at;
+            }
+            return vec![left, right];
+        };
+        vec![PTok {
+            t: PpToken { kind, text, ..left.t },
+            hide: left.hide,
+            site: left.site,
+            spelled: None,
+            lead: left.lead,
+            function_body: left.function_body,
+        }]
     }
 
     // ---- directives ----
 
     /// Carries out the directive starting at the innermost file's next
-    /// token, a `#` at the start of a line.
+    /// token, a `#` at the start of a line. An error drops what is left of
+    /// it ([`Pp::next_raw`] reports it).
     fn directive(&mut self) -> Result<(), Error> {
         let hash = self.take_file();
         let line = self.rest_of_line();
@@ -1476,54 +1718,60 @@ impl Pp<'_> {
             return Ok(()); // `#` alone: the null directive
         };
         let args = &line[1..];
-        let name = first.ident().unwrap_or("");
-        match name {
+        match first.ident().unwrap_or("") {
             "define" => self.define(first, args),
-            "undef" => {
-                let name = self.macro_name(first, args)?;
-                no_more(&args[1..], "#undef")?;
-                if matches!(
-                    self.macros.get(&name).map(|m| &m.kind),
-                    Some(MacroKind::File | MacroKind::Line)
-                ) {
-                    return Err(Error::new(
-                        args[0].pos,
-                        format!("cannot undefine the builtin macro '{name}'"),
-                    ));
-                }
-                self.macros.remove(&name);
-                Ok(())
-            }
+            "undef" => self.undef(first, args),
             "include" => self.include(first, args),
             "if" => {
-                let value = self.condition(first, args)?;
-                self.open_cond(first.pos, value)
+                let value = self.condition(first, args);
+                self.open_cond(first.pos, value);
+                Ok(())
             }
             "ifdef" | "ifndef" => {
-                let name = self.macro_name(first, args)?;
-                no_more(&args[1..], &format!("#{}", first.text))?;
-                let defined = self.macros.contains_key(&name);
-                self.open_cond(first.pos, defined == (first.text == "ifdef"))
+                // Without a name the group is skipped (an `#else` may follow).
+                let value = match self.macro_name(first, args, false) {
+                    Ok(name) => {
+                        self.extra_tokens(&args[1..], &first.text, false);
+                        self.macros.contains_key(&name) == (first.text == "ifdef")
+                    }
+                    Err(e) => {
+                        self.report(e);
+                        false
+                    }
+                };
+                self.open_cond(first.pos, value);
+                Ok(())
             }
-            "elif" | "else" => {
+            "elif" => {
+                // The group that ends here was taken: the others are skipped,
+                // this condition not even evaluated.
+                if self.innermost_cond(first)?.seen_else {
+                    self.report(Error::new(first.pos, "#elif after #else"));
+                }
+                self.skip_group();
+                Ok(())
+            }
+            "else" => {
+                self.extra_tokens(args, "else", false);
                 let cond = self.innermost_cond(first)?;
-                if cond.seen_else {
-                    return Err(Error::new(first.pos, format!("#{} after #else", first.text)));
+                if std::mem::replace(&mut cond.seen_else, true) {
+                    self.report(Error::new(first.pos, "#else after #else"));
                 }
-                if first.text == "else" {
-                    no_more(args, "#else")?;
-                    cond.seen_else = true;
-                }
-                // The group that ends here was taken: skip the others.
-                self.skip_group()
+                self.skip_group();
+                Ok(())
             }
             "endif" => {
-                no_more(args, "#endif")?;
+                self.extra_tokens(args, "endif", false);
                 self.innermost_cond(first)?;
                 self.conds.pop();
                 Ok(())
             }
-            "error" => Err(Error::new(first.pos, format!("#error {}", spelling(args)))),
+            "error" => Err(Error::new(first.pos, self.raw_rest(first))),
+            "warning" => {
+                let msg = self.raw_rest(first);
+                self.report(Error::warning(first.pos, msg, "#warnings"));
+                Ok(())
+            }
             "pragma" => {
                 if matches!(args, [t] if t.ident() == Some("once")) {
                     let file = self.stack.last().expect("a file").file;
@@ -1547,8 +1795,7 @@ impl Pp<'_> {
                 // `#ident "string"` (macros replaced; anything after the
                 // string is ignored, clang warns of it), passed on as
                 // `#ident` in both spellings, as clang does.
-                let toks = args.iter().cloned().map(PTok::read).collect();
-                let expanded = self.expand_alone(toks)?;
+                let expanded = self.expand_alone(read(args));
                 match expanded.first() {
                     Some(s) if s.t.kind == PpKind::Str => {
                         let text = format!("#ident {}", s.t.text);
@@ -1562,13 +1809,10 @@ impl Pp<'_> {
                 }
             }
             "line" => self.line(first, args),
-            _ => {
-                let what = if name.is_empty() { &first.text } else { name };
-                Err(Error::new(
-                    if name.is_empty() { hash.pos } else { first.pos },
-                    format!("invalid preprocessing directive '#{what}'"),
-                ))
-            }
+            // `# 33 "file"`: GNU's line marker, what `-E` writes (no
+            // directive in assembly, see `at_directive`).
+            _ if first.kind == PpKind::Number => self.line_marker(first, args),
+            _ => Err(Error::new(first.pos, "invalid preprocessing directive")),
         }
     }
 
@@ -1589,136 +1833,215 @@ impl Pp<'_> {
             site: None,
             spelled: None,
             lead: false,
+            function_body: false,
         });
     }
 
-    /// The name a `#define`, `#undef`, `#ifdef` or `#ifndef` is about.
-    fn macro_name(&self, directive: &PpToken, args: &[PpToken]) -> Result<String, Error> {
+    /// clang's warning for tokens after what a directive takes, macros
+    /// replaced first for `expand` (`#include "a.h" EMPTY` has none).
+    fn extra_tokens(&mut self, rest: &[PpToken], directive: &str, expand: bool) {
+        let first = if expand {
+            self.expand_alone(read(rest)).first().map(|t| t.t.pos)
+        } else {
+            rest.first().map(|t| t.pos)
+        };
+        if let Some(pos) = first {
+            self.report(Error::warning(
+                pos,
+                format!("extra tokens at end of #{directive} directive"),
+                "extra-tokens",
+            ));
+        }
+    }
+
+    /// The name a `#define`, `#undef`, `#ifdef` or `#ifndef` is about; one
+    /// may not define or undefine (`define_undef`) `defined`.
+    fn macro_name(&self, directive: &PpToken, args: &[PpToken], define_undef: bool) -> Result<String, Error> {
         let Some(t) = args.first() else {
             return Err(Error::new(directive.end, "macro name missing"));
         };
         match t.ident() {
-            Some("defined") => Err(Error::new(t.pos, "'defined' cannot be used as a macro name")),
+            Some("defined") if define_undef => {
+                Err(Error::new(t.pos, "'defined' cannot be used as a macro name"))
+            }
             Some(name) => Ok(name.to_string()),
             None => Err(Error::new(t.pos, "macro name must be an identifier")),
         }
     }
 
+    /// Whether a macro is one C itself defines: `__FILE__`, `__LINE__`, or
+    /// a predefined one whose name starts with `__STDC`. C99 6.10.8p4 says
+    /// not to define them again or undefine them; clang warns, and lets it
+    /// be done.
+    fn language_builtin(&self, m: &Macro, name: &str) -> bool {
+        matches!(m.kind, MacroKind::File | MacroKind::Line)
+            || (m.pos.file == self.builtin_file && name.starts_with("__STDC"))
+    }
+
+    fn undef(&mut self, directive: &PpToken, args: &[PpToken]) -> Result<(), Error> {
+        let name = self.macro_name(directive, args, true)?;
+        self.extra_tokens(&args[1..], "undef", false);
+        if self
+            .macros
+            .get(&name)
+            .is_some_and(|m| self.language_builtin(m, &name))
+        {
+            self.report(Error::warning(
+                args[0].pos,
+                "undefining builtin macro",
+                "builtin-macro-redefined",
+            ));
+        }
+        self.macros.remove(&name);
+        Ok(())
+    }
+
     fn define(&mut self, directive: &PpToken, args: &[PpToken]) -> Result<(), Error> {
-        let name = self.macro_name(directive, args)?;
+        let name = self.macro_name(directive, args, true)?;
         let name_pos = args[0].pos;
         let rest = &args[1..];
+        // Where the line ends, for what is missing at its end.
+        let eod = args[args.len() - 1].end;
         // `F(` with no space before the `(` makes a function-like macro.
         let (kind, body) = if rest.first().is_some_and(|t| t.is_punct("(") && !t.space) {
-            let mut params: Vec<String> = Vec::new();
-            let mut variadic = false;
-            let mut i = 1;
-            let close = loop {
-                let Some(t) = rest.get(i) else {
-                    return Err(Error::new(directive.pos, "missing ')' in macro parameter list"));
-                };
-                i += 1;
-                if t.is_punct(")") && params.is_empty() && !variadic {
-                    break i;
-                }
-                if t.is_punct("...") {
-                    variadic = true;
-                } else if let Some(p) = t.ident() {
-                    if p == "__VA_ARGS__" {
-                        return Err(Error::new(
-                            t.pos,
-                            "'__VA_ARGS__' cannot be a macro parameter name",
-                        ));
-                    }
-                    if params.iter().any(|q| q == p) {
-                        return Err(Error::new(t.pos, format!("duplicate macro parameter name '{p}'")));
-                    }
-                    params.push(p.to_string());
-                } else {
-                    return Err(Error::new(t.pos, "invalid token in macro parameter list"));
-                }
-                match rest.get(i) {
-                    Some(t) if t.is_punct(")") => break i + 1,
-                    Some(t) if t.is_punct(",") && !variadic => i += 1,
-                    Some(t) => return Err(Error::new(t.pos, "expected ',' or ')' in macro parameter list")),
-                    None => return Err(Error::new(directive.pos, "missing ')' in macro parameter list")),
-                }
-            };
+            let (params, variadic, close) = parameters(rest, eod)?;
             (MacroKind::Function { params, variadic }, rest[close..].to_vec())
         } else {
             (MacroKind::Object, rest.to_vec())
         };
-        let m = Macro {
+        let mut m = Macro {
             kind,
             body,
             pos: name_pos,
         };
-        // What the body may hold: `##` between two tokens, `#` before a
-        // parameter, `__VA_ARGS__` only in a variadic macro.
-        if let Some(t) = m
-            .body
-            .first()
-            .filter(|t| t.is_punct("##"))
-            .or(m.body.last().filter(|t| t.is_punct("##")))
-        {
+        // What the body may hold, checked in clang's order: in a
+        // function-like macro `#` before a parameter (in assembly before
+        // anything but the end of the line: then it is no operator, a token
+        // of no kind, as clang makes it), then `##` between two tokens.
+        if matches!(m.kind, MacroKind::Function { .. }) {
+            for i in 0..m.body.len() {
+                let next = m.body.get(i + 1);
+                if m.body[i].is_punct("#") && !next.is_some_and(|n| m.param(n).is_some()) {
+                    if !self.asm || next.is_none() {
+                        let at = next.map_or(eod, |n| n.pos);
+                        return Err(Error::new(at, "'#' is not followed by a macro parameter"));
+                    }
+                    m.body[i].kind = PpKind::Invalid(None);
+                }
+            }
+        }
+        if let Some(t) = m.body.first().filter(|t| t.is_punct("##")) {
             return Err(Error::new(
                 t.pos,
-                "'##' cannot appear at either end of a macro expansion",
+                "'##' cannot appear at start of macro expansion",
             ));
         }
-        for (i, t) in m.body.iter().enumerate() {
-            let function = matches!(m.kind, MacroKind::Function { .. });
-            if function && t.is_punct("#") && !m.body.get(i + 1).is_some_and(|n| m.param(n).is_some()) {
-                return Err(Error::new(t.pos, "'#' is not followed by a macro parameter"));
-            }
-            if t.ident() == Some("__VA_ARGS__") && m.param(t).is_none() {
-                return Err(Error::new(
-                    t.pos,
-                    "__VA_ARGS__ can only appear in the expansion of a variadic macro",
-                ));
-            }
+        if let Some(t) = m.body.last().filter(|t| t.is_punct("##")) {
+            return Err(Error::new(t.pos, "'##' cannot appear at end of macro expansion"));
         }
-        if let Some(prev) = self.macros.get(&name) {
-            if matches!(prev.kind, MacroKind::File | MacroKind::Line) {
-                return Err(Error::new(
+        // Defining a macro again: the same definition is fine (C99
+        // 6.10.3p2), another one clang's warning; the new one holds.
+        let again = self.macros.get(&name).and_then(|prev| {
+            if self.language_builtin(prev, &name) {
+                Some(Error::warning(
                     name_pos,
-                    format!("cannot redefine the builtin macro '{name}'"),
-                ));
+                    "redefining builtin macro",
+                    "builtin-macro-redefined",
+                ))
+            } else if !prev.same(&m) {
+                Some(
+                    Error::warning(name_pos, format!("'{name}' macro redefined"), "macro-redefined")
+                        .note(prev.pos, "previous definition is here"),
+                )
+            } else {
+                None
             }
-            if !self.command_line && !prev.same(&m) {
-                let at = match self.files.get(prev.pos.file as usize) {
-                    Some(f) if prev.pos.file != name_pos.file => format!("{}:{}", f.name, prev.pos),
-                    _ => prev.pos.to_string(),
-                };
-                return Err(Error::new(
-                    name_pos,
-                    format!("'{name}' macro redefined (previous definition at {at})"),
-                ));
-            }
+        });
+        if let Some(e) = again {
+            self.report(e);
         }
         self.macros.insert(name, m);
         Ok(())
     }
 
     fn include(&mut self, directive: &PpToken, args: &[PpToken]) -> Result<(), Error> {
-        let (header, angled, pos) = match header_name(args)? {
-            Some(h) => h,
+        let eod = args.last().map_or(directive.end, |t| t.end);
+        let (header, angled, pos) = match header_name(args, eod)? {
+            Some((header, angled, pos, used)) => {
+                self.extra_tokens(&args[used..], "include", true);
+                (header, angled, pos)
+            }
             None => {
                 // `#include MACRO`: replace, then it must be one of the two forms.
-                let toks = args.iter().cloned().map(PTok::read).collect();
-                let expanded: Vec<PpToken> = self.expand_alone(toks)?.into_iter().map(|t| t.t).collect();
-                header_name(&expanded)?.ok_or_else(|| {
-                    Error::new(
+                let expanded: Vec<PpToken> = self.expand_alone(read(args)).into_iter().map(|t| t.t).collect();
+                let Some((header, angled, pos, used)) = header_name(&expanded, eod)? else {
+                    return Err(Error::new(
                         args.first().map_or(directive.end, |t| t.pos),
                         "expected \"FILENAME\" or <FILENAME>",
-                    )
-                })?
+                    ));
+                };
+                self.extra_tokens(&expanded[used..], "include", false);
+                (header, angled, pos)
             }
         };
         if header.is_empty() {
             return Err(Error::new(pos, "empty filename"));
         }
-        // `"file"`: next to the including file first, then the -I directories.
+        let not_found = || Error::fatal(pos, format!("'{header}' file not found"));
+        let (name, path, text) = match self.find(&header, angled) {
+            Some(found) => found,
+            // clang looks for an `<a.h>` it does not find as `"a.h"` too,
+            // and includes what it finds, with an error.
+            None if angled => {
+                let found = self.find(&header, false).ok_or_else(not_found)?;
+                self.report(Error::new(
+                    pos,
+                    format!("'{header}' file not found with <angled> include; use \"quotes\" instead"),
+                ));
+                found
+            }
+            None => return Err(not_found()),
+        };
+        if self.once.contains(&path) {
+            return Ok(());
+        }
+        // A file wholly inside `#ifndef X` ... `#endif` is not read again
+        // once X is defined (clang's and GCC's multiple-include
+        // optimization): nothing of it would come out, and no line marker
+        // says it was entered.
+        if self
+            .guards
+            .get(&path)
+            .is_some_and(|g| self.macros.contains_key(g))
+        {
+            return Ok(());
+        }
+        if self.stack.len() >= MAX_INCLUDE_DEPTH {
+            return Err(Error::new(pos, "#include nested too deeply"));
+        }
+        let id = self.new_file(name, path.clone());
+        let (toks, _) = self.lex(&text, id)?;
+        if let Some(g) = guard(&toks) {
+            self.guards.insert(path, g);
+        }
+        // The file that includes it goes on after the directive's line.
+        let back = args.last().map_or(directive.end.line, |t| t.end.line) + 1;
+        self.marks.push((
+            self.emitted,
+            Mark::Enter {
+                line: directive.pos.line,
+                file: id,
+            },
+        ));
+        self.enter(toks, &text, id);
+        self.stack.last_mut().expect("entered").back = Some(back);
+        Ok(())
+    }
+
+    /// The file an `#include` names: `"file"` next to the including file
+    /// first, then in each `-I` directory in order; `<file>` only in those.
+    /// Its name (by the directory it was found in), path and text.
+    fn find(&self, header: &str, angled: bool) -> Option<(String, PathBuf, String)> {
         let cur = self.stack.last().expect("a file").file as usize;
         let mut dirs: Vec<(String, PathBuf)> = Vec::new();
         if !angled {
@@ -1740,84 +2063,161 @@ impl Pp<'_> {
         for d in &self.opts.include_dirs {
             dirs.push((d.to_string_lossy().into_owned(), d.clone()));
         }
-        for (shown, dir) in dirs {
-            let path = normalize(&dir.join(&header));
-            let Some(text) = (self.load)(&path) else {
-                continue;
-            };
-            if self.once.contains(&path) {
-                return Ok(());
-            }
-            // A file wholly inside `#ifndef X` ... `#endif` is not read again
-            // once X is defined (clang's and GCC's multiple-include
-            // optimization): nothing of it would come out, and no line
-            // marker says it was entered.
-            if self
-                .guards
-                .get(&path)
-                .is_some_and(|g| self.macros.contains_key(g))
-            {
-                return Ok(());
-            }
-            if self.stack.len() >= MAX_INCLUDE_DEPTH {
-                return Err(Error::new(pos, "#include nested too deeply"));
-            }
+        dirs.into_iter().find_map(|(shown, dir)| {
+            let path = normalize(&dir.join(header));
+            let text = (self.load)(&path)?;
             let name = if shown.is_empty() {
-                header.clone()
+                header.to_string()
             } else {
                 format!("{}/{header}", shown.trim_end_matches(['/', '\\']))
             };
-            let id = self.new_file(name, path.clone());
-            let (toks, _) = self.lex(&text, id)?;
-            if let Some(g) = guard(&toks) {
-                self.guards.insert(path, g);
-            }
-            // The file that includes it goes on after the directive's line.
-            let back = args.last().map_or(directive.end.line, |t| t.end.line) + 1;
-            self.marks.push((
-                self.emitted,
-                Mark::Enter {
-                    line: directive.pos.line,
-                    file: id,
-                },
-            ));
-            self.enter(toks, id);
-            self.stack.last_mut().expect("entered").back = Some(back);
-            return Ok(());
-        }
-        Err(Error::new(pos, format!("'{header}' file not found")))
+            Some((name, path, text))
+        })
     }
 
     /// `#line N` or `#line N "name"` (after macro replacement): the next
     /// line is line N (of a file called `name`).
     fn line(&mut self, directive: &PpToken, args: &[PpToken]) -> Result<(), Error> {
-        let toks = args.iter().cloned().map(PTok::read).collect();
-        let toks: Vec<PpToken> = self.expand_alone(toks)?.into_iter().map(|t| t.t).collect();
-        let bad = || {
-            Error::new(
-                directive.pos,
-                "#line takes a line number and an optional file name",
-            )
-        };
-        let n: u32 = match toks.first() {
-            Some(t) if t.kind == PpKind::Number && t.text.bytes().all(|b| b.is_ascii_digit()) => {
-                t.text.parse().map_err(|_| bad())?
+        let eod = args.last().map_or(directive.end, |t| t.end);
+        let toks: Vec<PpToken> = self.expand_alone(read(args)).into_iter().map(|t| t.t).collect();
+        let missing = "#line directive requires a positive integer argument";
+        let n = self.line_value(toks.first(), eod, missing, "#line")?;
+        let rename = match toks.get(1) {
+            None => None,
+            Some(t) if t.kind == PpKind::Str && t.text.starts_with('"') => {
+                let name = self.file_name(t)?;
+                self.extra_tokens(&toks[2..], "line", false);
+                Some(name)
             }
-            _ => return Err(bad()),
+            Some(t) => return Err(Error::new(t.pos, "invalid filename for #line directive")),
         };
-        if n == 0 || n > 2_147_483_647 {
-            return Err(Error::new(toks[0].pos, "#line number out of range"));
+        self.renumber(directive, n, rename);
+        Ok(())
+    }
+
+    /// `# N "name" flags`, GNU's line marker, which `-E` writes: what
+    /// `#line N "name"` does. Its flags say that a file starts there (1) or
+    /// ends (2), and that it is a system header (3, 4); merlin checks them
+    /// as clang does, and does nothing else with them.
+    fn line_marker(&mut self, digits: &PpToken, args: &[PpToken]) -> Result<(), Error> {
+        let eod = args.last().map_or(digits.end, |t| t.end);
+        let missing = "line marker directive requires a positive integer argument";
+        let n = self.line_value(Some(digits), eod, missing, "GNU line marker")?;
+        let toks: Vec<PpToken> = self.expand_alone(read(args)).into_iter().map(|t| t.t).collect();
+        let rename = match toks.first() {
+            None => None,
+            Some(t) if t.kind == PpKind::Str && t.text.starts_with('"') => {
+                let name = self.file_name(t)?;
+                let entered = self.marker_flags(&toks[1..], eod)?;
+                self.stack.last_mut().expect("a file").entered_by_markers = entered;
+                Some(name)
+            }
+            Some(t) => return Err(Error::new(t.pos, "invalid filename for line marker directive")),
+        };
+        self.renumber(digits, n, rename);
+        Ok(())
+    }
+
+    /// The flags of a line marker, after its file name, checked as clang's
+    /// `ReadLineMarkerFlags` does: 1 (a file starts) or 2 (one that a
+    /// marker started ends), then 3, then 4, each at most once and in that
+    /// order. How many files markers have started and not ended after them.
+    fn marker_flags(&mut self, flags: &[PpToken], eod: Pos) -> Result<u32, Error> {
+        let invalid = "invalid flag line marker directive";
+        let mut entered = self.stack.last().expect("a file").entered_by_markers;
+        let Some(first) = flags.first() else {
+            return Ok(entered);
+        };
+        let mut i = 0;
+        let mut value = self.line_value(Some(first), eod, invalid, "#line")?;
+        if value == 1 || value == 2 {
+            if value == 1 {
+                entered += 1;
+            } else if entered == 0 {
+                return Err(Error::new(
+                    first.pos,
+                    "invalid line marker flag '2': cannot pop empty include stack",
+                ));
+            } else {
+                entered -= 1;
+            }
+            i += 1;
+            let Some(t) = flags.get(i) else {
+                return Ok(entered);
+            };
+            value = self.line_value(Some(t), eod, invalid, "#line")?;
         }
-        let rename = match &toks[1..] {
-            [] => None,
-            [t] if t.kind == PpKind::Str => Some(lexer::decode(&t.text, t.pos, &mut self.warnings)?),
-            _ => return Err(bad()),
+        // Then 3, then 4, and nothing after.
+        for want in [3, 4] {
+            if value != want {
+                return Err(Error::new(flags[i].pos, invalid));
+            }
+            i += 1;
+            match flags.get(i) {
+                None => return Ok(entered),
+                Some(t) if want == 3 => value = self.line_value(Some(t), eod, invalid, "#line")?,
+                Some(t) => return Err(Error::new(t.pos, invalid)),
+            }
+        }
+        unreachable!("4 is the last flag")
+    }
+
+    /// The number of a `#line` or a line marker, or of a flag, as clang's
+    /// `GetLineValue` reads it: digits, in decimal even with a leading 0
+    /// (which clang warns of), that fit in 32 bits; `missing` is the error
+    /// for anything else, `what` names the directive in the other messages.
+    fn line_value(
+        &mut self,
+        tok: Option<&PpToken>,
+        eod: Pos,
+        missing: &str,
+        what: &str,
+    ) -> Result<u32, Error> {
+        let Some(t) = tok.filter(|t| t.kind == PpKind::Number) else {
+            return Err(Error::new(tok.map_or(eod, |t| t.pos), missing));
         };
+        let mut value: u32 = 0;
+        for (k, c) in t.text.chars().enumerate() {
+            let Some(d) = c.to_digit(10) else {
+                let at = Pos {
+                    col: t.pos.col + k as u32,
+                    ..t.pos
+                };
+                return Err(Error::new(
+                    at,
+                    format!("{what} directive requires a simple digit sequence"),
+                ));
+            };
+            value = value
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(d))
+                .ok_or_else(|| Error::new(t.pos, missing))?;
+        }
+        if t.text.starts_with('0') && value != 0 {
+            self.report(Error::warning_unflagged(
+                t.pos,
+                format!("{what} directive interprets number as decimal, not octal"),
+            ));
+        }
+        Ok(value)
+    }
+
+    /// The file name a `#line` or a line marker gives, a string literal.
+    fn file_name(&mut self, t: &PpToken) -> Result<String, Error> {
+        let mut warnings = Vec::new();
+        let bytes = lexer::decode(&t.text, t.pos, &mut warnings)?;
+        self.report_all(warnings);
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// After the directive at `directive`, the next line is line `n` (of a
+    /// file called `rename`).
+    fn renumber(&mut self, directive: &PpToken, n: u32, rename: Option<String>) {
         // The directive's own line, as the lexer numbered it.
         let cur = self.stack.last().expect("a file");
         let written = i64::from(directive.pos.line) - cur.line_delta;
         let path = self.files[cur.file as usize].path.clone();
-        let renamed = rename.map(|bytes| self.new_file(String::from_utf8_lossy(&bytes).into_owned(), path));
+        let renamed = rename.map(|name| self.new_file(name, path));
         let cur = self.stack.last_mut().expect("a file");
         cur.line_delta = i64::from(n) - (written + 1);
         if let Some(id) = renamed {
@@ -1825,7 +2225,6 @@ impl Pp<'_> {
         }
         let file = cur.file;
         self.marks.push((self.emitted, Mark::Rename { line: n, file }));
-        Ok(())
     }
 
     // ---- conditionals ----
@@ -1842,16 +2241,14 @@ impl Pp<'_> {
         Ok(self.conds.last_mut().expect("checked"))
     }
 
-    fn open_cond(&mut self, pos: Pos, value: bool) -> Result<(), Error> {
+    fn open_cond(&mut self, pos: Pos, value: bool) {
         self.conds.push(Cond {
             pos,
             taken: value,
             seen_else: false,
         });
-        if value {
-            Ok(())
-        } else {
-            self.skip_group()
+        if !value {
+            self.skip_group();
         }
     }
 
@@ -1859,15 +2256,19 @@ impl Pp<'_> {
     /// until one is taken (an `#elif` whose condition holds, or `#else`, if
     /// none was taken before) or its `#endif` closes it. Only directives
     /// are looked at, to follow the nesting of conditionals.
-    fn skip_group(&mut self) -> Result<(), Error> {
-        let mut depth = 0;
+    fn skip_group(&mut self) {
+        // Where the conditionals that open in the skipped lines are.
+        let mut nested: Vec<Pos> = Vec::new();
         loop {
             match self.peek_file() {
                 None => {
-                    return Err(Error::new(
-                        self.conds.last().expect("open").pos,
-                        "unterminated conditional directive",
-                    ))
+                    // clang reports every conditional left open at the end
+                    // of the file, the innermost first ([`Pp::leave`] those
+                    // being skipped).
+                    for pos in nested.into_iter().rev() {
+                        self.report(Error::new(pos, "unterminated conditional directive"));
+                    }
+                    return;
                 }
                 Some(t) if !(t.bol && t.is_punct("#")) => {
                     self.take_file();
@@ -1880,28 +2281,31 @@ impl Pp<'_> {
             let Some(first) = line.first() else { continue };
             let args = &line[1..];
             match first.ident() {
-                Some("if" | "ifdef" | "ifndef") => depth += 1,
-                Some("endif") if depth > 0 => depth -= 1,
-                Some("endif") => {
-                    no_more(args, "#endif")?;
-                    self.conds.pop();
-                    return Ok(());
+                Some("if" | "ifdef" | "ifndef") => nested.push(first.pos),
+                Some("endif") if !nested.is_empty() => {
+                    nested.pop();
                 }
-                Some(d @ ("elif" | "else")) if depth == 0 => {
-                    let cond = self.conds.last_mut().expect("open");
-                    if cond.seen_else {
-                        return Err(Error::new(first.pos, format!("#{d} after #else")));
+                Some("endif") => {
+                    self.extra_tokens(args, "endif", false);
+                    self.conds.pop();
+                    return;
+                }
+                Some(d @ ("elif" | "else")) if nested.is_empty() => {
+                    let Cond { taken, seen_else, .. } = *self.conds.last().expect("open");
+                    if seen_else {
+                        self.report(Error::new(first.pos, format!("#{d} after #else")));
                     }
                     if d == "else" {
-                        no_more(args, "#else")?;
+                        let cond = self.conds.last_mut().expect("open");
                         cond.seen_else = true;
-                        if !cond.taken {
+                        if !taken {
                             cond.taken = true;
-                            return Ok(());
+                            self.extra_tokens(args, "else", false);
+                            return;
                         }
-                    } else if !cond.taken && self.condition(first, args)? {
+                    } else if !taken && self.condition(first, args) {
                         self.conds.last_mut().expect("open").taken = true;
-                        return Ok(());
+                        return;
                     }
                 }
                 _ => {}
@@ -1909,79 +2313,83 @@ impl Pp<'_> {
         }
     }
 
-    /// The value of an `#if` or `#elif` condition.
-    fn condition(&mut self, directive: &PpToken, args: &[PpToken]) -> Result<bool, Error> {
-        // `defined NAME` and `defined(NAME)` first, before macros are replaced.
-        let mut toks = Vec::new();
-        let mut i = 0;
-        while i < args.len() {
-            let t = &args[i];
-            i += 1;
-            if t.ident() != Some("defined") {
-                toks.push(PTok::read(t.clone()));
-                continue;
-            }
-            let paren = args.get(i).is_some_and(|t| t.is_punct("("));
-            if paren {
-                i += 1;
-            }
-            let Some(name) = args.get(i).and_then(PpToken::ident) else {
-                return Err(Error::new(
-                    args.get(i).map_or(t.end, |t| t.pos),
-                    "'defined' needs a macro name",
-                ));
-            };
-            i += 1;
-            if paren {
-                if !args.get(i).is_some_and(|t| t.is_punct(")")) {
-                    return Err(Error::new(
-                        args.get(i).map_or(args[i - 1].end, |t| t.pos),
-                        "expected ')' after the macro name",
-                    ));
-                }
-                i += 1;
-            }
-            let value = if self.macros.contains_key(name) { "1" } else { "0" };
-            toks.push(PTok::read(PpToken {
-                kind: PpKind::Number,
-                text: value.to_string(),
-                ..t.clone()
-            }));
+    /// The value of an `#if` or `#elif` condition, which [`Eval`] reads as
+    /// the rest of the line is replaced: false if it has an error, as in
+    /// clang.
+    fn condition(&mut self, directive: &PpToken, args: &[PpToken]) -> bool {
+        let saved = std::mem::replace(&mut self.pending, read(args).into());
+        let was_isolated = std::mem::replace(&mut self.isolated, true);
+        let carry = std::mem::take(&mut self.carry);
+        let end = args.last().map_or(directive.end, |t| t.end);
+        let value = Eval {
+            pp: self,
+            tok: None,
+            end,
         }
-        let toks: Vec<PpToken> = self.expand_alone(toks)?.into_iter().map(|t| t.t).collect();
-        let mut e = Eval {
-            toks: &toks,
-            i: 0,
-            end: args.last().map_or(directive.end, |t| t.end),
-            warnings: Vec::new(),
-        };
-        if toks.is_empty() {
-            return Err(Error::new(
-                directive.end,
-                format!("#{} with no expression", directive.text),
-            ));
-        }
-        let v = e.cond(true);
-        self.warnings.append(&mut e.warnings);
-        let v = v?;
-        if let Some(t) = toks.get(e.i) {
-            return Err(Error::new(
-                t.pos,
-                format!("unexpected '{}' in preprocessor expression", t.text),
-            ));
-        }
-        Ok(v.bits != 0)
+        .directive_expression();
+        self.pending = saved;
+        self.isolated = was_isolated;
+        self.carry = carry;
+        value.unwrap_or_else(|e| {
+            self.report(e);
+            false
+        })
     }
 }
 
-/// Errors if a directive has tokens past what it takes.
-fn no_more(rest: &[PpToken], directive: &str) -> Result<(), Error> {
-    match rest.first() {
-        Some(t) => Err(Error::new(
-            t.pos,
-            format!("extra tokens at end of {directive} directive"),
-        )),
-        None => Ok(()),
+/// Tokens of a directive's line, to be replaced on their own.
+fn read(toks: &[PpToken]) -> Vec<PTok> {
+    toks.iter().cloned().map(PTok::read).collect()
+}
+
+/// The parameters of a function-like macro, as clang's
+/// `ReadMacroParameterList` reads them, from `rest`, which starts at the
+/// `(`, on a line that ends at `eod`: their names, whether the last one is
+/// variadic, and where the body starts. C99's `...` is the parameter
+/// `__VA_ARGS__`; GNU's `args...` makes `args` the variadic one.
+fn parameters(rest: &[PpToken], eod: Pos) -> Result<(Vec<String>, bool, usize), Error> {
+    let at = |i: usize| rest.get(i).map_or(eod, |t| t.pos);
+    let rparen_after = |i: usize| {
+        if rest.get(i).is_some_and(|t| t.is_punct(")")) {
+            Ok(())
+        } else {
+            Err(Error::new(at(i), "missing ')' in macro parameter list"))
+        }
+    };
+    let mut params: Vec<String> = Vec::new();
+    let mut i = 1;
+    loop {
+        let Some(t) = rest.get(i) else {
+            return Err(Error::new(eod, "missing ')' in macro parameter list"));
+        };
+        i += 1;
+        if t.is_punct(")") {
+            if params.is_empty() {
+                return Ok((params, false, i));
+            }
+            return Err(Error::new(t.pos, "expected identifier in macro parameter list"));
+        }
+        if t.is_punct("...") {
+            rparen_after(i)?;
+            params.push("__VA_ARGS__".to_string());
+            return Ok((params, true, i + 1));
+        }
+        let Some(p) = t.ident() else {
+            return Err(Error::new(t.pos, "invalid token in macro parameter list"));
+        };
+        if params.iter().any(|q| q == p) {
+            return Err(Error::new(t.pos, format!("duplicate macro parameter name '{p}'")));
+        }
+        params.push(p.to_string());
+        match rest.get(i) {
+            Some(t) if t.is_punct(")") => return Ok((params, false, i + 1)),
+            Some(t) if t.is_punct(",") => i += 1,
+            Some(t) if t.is_punct("...") => {
+                rparen_after(i + 1)?;
+                return Ok((params, true, i + 2));
+            }
+            _ => return Err(Error::new(at(i), "expected comma in macro parameter list")),
+        }
     }
 }
 
@@ -2031,45 +2439,32 @@ fn guard(toks: &[PpToken]) -> Option<String> {
     None
 }
 
-/// `"file"` or `<file>` at the start of an `#include`'s tokens, with
-/// whether it was `<file>` and where it is; `None` if neither form is there.
-fn header_name(toks: &[PpToken]) -> Result<Option<(String, bool, Pos)>, Error> {
+/// `"file"` or `<file>` at the start of an `#include`'s tokens, on a line
+/// that ends at `eod`: the name, whether it was `<file>`, where it is and
+/// how many tokens it took; `None` if neither form is there.
+fn header_name(toks: &[PpToken], eod: Pos) -> Result<Option<(String, bool, Pos, usize)>, Error> {
     let Some(first) = toks.first() else {
         return Ok(None);
     };
-    let (name, angled, used) = if first.kind == PpKind::Str {
+    if first.kind == PpKind::Str {
         // Not a string literal: the characters between the quotes, as they are.
-        (first.text[1..first.text.len() - 1].to_string(), false, 1)
-    } else if first.is_punct("<") {
-        let Some(close) = toks.iter().position(|t| t.is_punct(">")) else {
-            return Err(Error::new(first.pos, "expected '>' after the file name"));
-        };
-        let mut name = String::new();
-        for (k, t) in toks[1..close].iter().enumerate() {
-            if k > 0 && t.space {
-                name.push(' ');
-            }
-            name.push_str(&t.text);
-        }
-        (name, true, close + 1)
-    } else {
-        return Ok(None);
-    };
-    no_more(&toks[used..], "#include")?;
-    Ok(Some((name, angled, first.pos)))
-}
-
-/// Tokens as written, a space where there was whitespace between them:
-/// what `#error` prints.
-fn spelling(toks: &[PpToken]) -> String {
-    let mut s = String::new();
-    for (k, t) in toks.iter().enumerate() {
-        if k > 0 && t.space {
-            s.push(' ');
-        }
-        s.push_str(&t.text);
+        let name = first.text[1..first.text.len() - 1].to_string();
+        return Ok(Some((name, false, first.pos, 1)));
     }
-    s
+    if !first.is_punct("<") {
+        return Ok(None);
+    }
+    let Some(close) = toks.iter().position(|t| t.is_punct(">")) else {
+        return Err(Error::new(eod, "expected '>'").note(first.pos, "to match this '<'"));
+    };
+    let mut name = String::new();
+    for (k, t) in toks[1..close].iter().enumerate() {
+        if k > 0 && t.space {
+            name.push(' ');
+        }
+        name.push_str(&t.text);
+    }
+    Ok(Some((name, true, first.pos, close + 1)))
 }
 
 /// `\` and `"` escaped, to go between double quotes.
@@ -2080,8 +2475,9 @@ fn escape(s: &str) -> String {
 /// `#arg`: the argument's spelling as a string literal, with the `\` and
 /// `"` of string literals and character constants in it escaped. Other
 /// backslashes stay as they are, so an argument that ends in one (`s(\)`)
-/// has no valid literal (C leaves it undefined): `None`.
-fn stringize(arg: &[PTok]) -> Option<String> {
+/// would have no valid literal (C leaves it undefined): clang leaves that
+/// backslash out, and warns. Whether it did.
+fn stringize(arg: &[PTok]) -> (String, bool) {
     let mut s = String::from("\"");
     for (k, t) in arg.iter().enumerate() {
         if k > 0 && t.t.space {
@@ -2095,272 +2491,478 @@ fn stringize(arg: &[PTok]) -> Option<String> {
     }
     // An odd number of backslashes at the end would escape the closing quote.
     let trailing = s.len() - s.trim_end_matches('\\').len();
-    if trailing % 2 == 1 {
-        return None;
+    let lone = trailing % 2 == 1;
+    if lone {
+        s.pop();
     }
     s.push('"');
-    Some(s)
-}
-
-/// `left ## right`: the two spellings joined, which must read as one token.
-/// In assembly (`asm`) two that do not stay two, as clang leaves them:
-/// `right` with a space before it if it is a token of the macro's body
-/// written with one (`space`: `call f ## @plt` is `call foo @plt`), else
-/// with none (`. ## name` is `.name`).
-fn glue(left: PTok, right: PTok, asm: bool, space: bool) -> Result<Vec<PTok>, Error> {
-    if left.t.kind == PpKind::Placemarker {
-        return Ok(vec![right]);
-    }
-    if right.t.kind == PpKind::Placemarker {
-        return Ok(vec![left]);
-    }
-    let text = format!("{}{}", left.t.text, right.t.text);
-    let one = match lexer::lex_pp_in(&text, left.t.pos.file, asm) {
-        Ok((toks, _))
-            if toks.len() == 1 && toks[0].text == text && !matches!(toks[0].kind, PpKind::Invalid(_)) =>
-        {
-            Some(toks[0].kind.clone())
-        }
-        _ => None,
-    };
-    let Some(kind) = one else {
-        if asm {
-            let mut right = right;
-            right.t.space = space;
-            right.lead = space;
-            return Ok(vec![left, right]);
-        }
-        return Err(Error::new(
-            left.t.pos,
-            format!("pasting formed '{text}', an invalid preprocessing token"),
-        ));
-    };
-    Ok(vec![PTok {
-        t: PpToken { kind, text, ..left.t },
-        hide: left.hide,
-        site: left.site,
-        spelled: None,
-        lead: left.lead,
-    }])
+    (s, lone)
 }
 
 /// A value in `#if` arithmetic: 64 bits, signed (`intmax_t`) or not
 /// (`uintmax_t`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Val {
     bits: u64,
     unsigned: bool,
+    /// The identifier it is, if it is one alone: one followed by `(` is no
+    /// macro (`function-like macro 'f' is not defined`).
+    ident: Option<(Pos, String)>,
 }
 
 impl Val {
-    fn signed(v: i64) -> Val {
+    fn new(bits: u64, unsigned: bool) -> Val {
         Val {
-            bits: v as u64,
-            unsigned: false,
+            bits,
+            unsigned,
+            ident: None,
         }
     }
 
     fn truth(b: bool) -> Val {
-        Val::signed(i64::from(b))
+        Val::new(u64::from(b), false)
+    }
+
+    fn negative(&self) -> bool {
+        !self.unsigned && (self.bits as i64) < 0
     }
 }
 
-/// Evaluates an `#if` expression (C99 6.10.1): an integer constant
+/// The precedence of `?`, where the top of a condition starts, and of `,`,
+/// which only parentheses or the middle of `?:` may hold (clang's).
+const QUESTION: u8 = 4;
+const COMMA: u8 = 3;
+
+/// The precedence of the binary operator `tok` in `#if`, as clang has them:
+/// the higher binds tighter; `)`, `:` and the end of the line (`None`) end
+/// what is being read. `None` for a token that is no binary operator.
+fn precedence(tok: Option<&PTok>) -> Option<u8> {
+    let Some(t) = tok else {
+        return Some(0);
+    };
+    let PpKind::Punct(op) = t.t.kind else {
+        return None;
+    };
+    Some(match op {
+        "*" | "/" | "%" => 14,
+        "+" | "-" => 13,
+        "<<" | ">>" => 12,
+        "<" | "<=" | ">" | ">=" => 11,
+        "==" | "!=" => 10,
+        "&" => 9,
+        "^" => 8,
+        "|" => 7,
+        "&&" => 6,
+        "||" => 5,
+        "?" => QUESTION,
+        "," => COMMA,
+        ":" => 2,
+        ")" => 0,
+        _ => return None,
+    })
+}
+
+/// Evaluates an `#if` expression (C99 6.10.1) as clang's
+/// `PPExpressions.cpp` does, with its diagnostics: an integer constant
 /// expression over 64-bit values, every operator but assignments, `++`,
-/// `--`, `,` and `sizeof`. `&&`, `||` and `?:` evaluate only what they
-/// need (`eval` false below them): division by zero there is no error.
-struct Eval<'t> {
-    toks: &'t [PpToken],
-    i: usize,
-    /// Where the expression ends, for "expected value" at the end.
+/// `--` and `sizeof`, read by precedence climbing ([`precedence`]). The
+/// tokens come one at a time from the line, macros replaced as they come
+/// ([`Pp::next`]), but the name after `defined`. `&&`, `||` and `?:`
+/// evaluate only what they need (`live` false below them): division by
+/// zero there is no error, an overflow no warning.
+struct Eval<'p, 'a> {
+    pp: &'p mut Pp<'a>,
+    /// The next token, `None` at the end of the line.
+    tok: Option<PTok>,
+    /// Where the line ends, for what is missing there.
     end: Pos,
-    /// The warnings of its literals.
-    warnings: Vec<Error>,
 }
 
-impl Eval<'_> {
-    fn peek(&self) -> Option<&PpToken> {
-        self.toks.get(self.i)
-    }
-
-    fn eat(&mut self, p: &str) -> bool {
-        let yes = self.peek().is_some_and(|t| t.is_punct(p));
-        if yes {
-            self.i += 1;
-        }
-        yes
+impl Eval<'_, '_> {
+    /// Reads the next token, macros replaced.
+    fn advance(&mut self) -> Result<(), Error> {
+        self.tok = self.pp.next()?;
+        Ok(())
     }
 
     fn here(&self) -> Pos {
-        self.peek().map_or(self.end, |t| t.pos)
+        self.tok.as_ref().map_or(self.end, |t| t.t.pos)
     }
 
-    fn cond(&mut self, eval: bool) -> Result<Val, Error> {
-        let c = self.binary(1, eval)?;
-        if !self.eat("?") {
-            return Ok(c);
-        }
-        let yes = c.bits != 0;
-        let a = self.cond(eval && yes)?;
-        if !self.eat(":") {
-            return Err(Error::new(self.here(), "expected ':' in preprocessor expression"));
-        }
-        let b = self.cond(eval && !yes)?;
-        let unsigned = a.unsigned || b.unsigned;
-        let v = if yes { a } else { b };
-        Ok(Val {
-            bits: v.bits,
-            unsigned,
-        })
+    fn at(&self, p: &str) -> bool {
+        self.tok.as_ref().is_some_and(|t| t.t.is_punct(p))
     }
 
-    fn binary(&mut self, min: u8, eval: bool) -> Result<Val, Error> {
-        let mut l = self.unary(eval)?;
-        loop {
-            let Some(PpKind::Punct(op)) = self.peek().map(|t| t.kind.clone()) else {
-                return Ok(l);
-            };
-            let prec = match op {
-                "||" => 1,
-                "&&" => 2,
-                "|" => 3,
-                "^" => 4,
-                "&" => 5,
-                "==" | "!=" => 6,
-                "<" | ">" | "<=" | ">=" => 7,
-                "<<" | ">>" => 8,
-                "+" | "-" => 9,
-                "*" | "/" | "%" => 10,
-                _ => return Ok(l),
-            };
-            if prec < min {
-                return Ok(l);
+    /// The whole line (clang's `EvaluateDirectiveExpression`): an
+    /// expression, then the end of the line. Anything else there is an
+    /// error, but the value stands (`#if 1 )` is true).
+    fn directive_expression(&mut self) -> Result<bool, Error> {
+        self.advance()?;
+        let mut v = self.value(true)?;
+        if self.tok.is_some() {
+            self.binary(&mut v, QUESTION, true)?;
+            if let Some(t) = &self.tok {
+                let e = Error::new(t.t.pos, "expected end of line in preprocessor expression");
+                self.pp.report(e);
             }
-            let pos = self.here();
-            self.i += 1;
-            // The right side of `&&` and `||` is evaluated only if it matters.
-            let eval_r = match op {
-                "&&" => eval && l.bits != 0,
-                "||" => eval && l.bits == 0,
-                _ => eval,
-            };
-            let r = self.binary(prec + 1, eval_r)?;
-            l = apply(op, l, r, eval, pos)?;
         }
+        Ok(v.bits != 0)
     }
 
-    fn unary(&mut self, eval: bool) -> Result<Val, Error> {
-        let pos = self.here();
-        let Some(t) = self.peek().cloned() else {
-            return Err(Error::new(pos, "expected value in preprocessor expression"));
+    /// A value (clang's `EvaluateValue`): a number, a character constant,
+    /// an identifier (0), `defined`, a unary operator and its operand, or
+    /// an expression in parentheses.
+    fn value(&mut self, live: bool) -> Result<Val, Error> {
+        let Some(t) = self.tok.clone() else {
+            return Err(Error::new(self.end, "expected value in expression"));
         };
-        self.i += 1;
-        match &t.kind {
-            PpKind::Punct("(") => {
-                let v = self.cond(eval)?;
-                if !self.eat(")") {
-                    return Err(Error::new(self.here(), "expected ')' in preprocessor expression"));
-                }
-                Ok(v)
-            }
-            PpKind::Punct(op @ ("+" | "-" | "~" | "!")) => {
-                let v = self.unary(eval)?;
-                Ok(match *op {
-                    "+" => v,
-                    "-" => Val {
-                        bits: v.bits.wrapping_neg(),
-                        unsigned: v.unsigned,
-                    },
-                    "~" => Val {
-                        bits: !v.bits,
-                        unsigned: v.unsigned,
-                    },
-                    _ => Val::truth(v.bits == 0),
+        let pos = t.t.pos;
+        match t.t.kind {
+            PpKind::Ident if t.t.text == "defined" => self.defined(&t),
+            PpKind::Ident => {
+                self.advance()?;
+                Ok(Val {
+                    ident: Some((pos, t.t.text)),
+                    ..Val::new(0, false)
                 })
             }
             PpKind::Number => {
-                let lit = lexer::integer(&t.text, t.pos)?;
-                let Some(bits) = lit.value else {
-                    return Err(Error::new(
-                        t.pos,
-                        "integer literal is too large to be represented in any integer type",
-                    ));
+                let v = self.number(&t.t, live)?;
+                self.advance()?;
+                Ok(v)
+            }
+            PpKind::Char => {
+                let mut warnings = Vec::new();
+                let c = lexer::char_constant(&t.t.text, pos, &mut warnings)?;
+                self.pp.report_all(warnings);
+                let lexer::Tok::Num(v, _) = c else {
+                    unreachable!("a character constant is a number")
                 };
-                Ok(Val {
-                    bits,
-                    unsigned: lit.unsigned || bits > i64::MAX as u64,
+                self.advance()?;
+                Ok(Val::new(v as i64 as u64, false))
+            }
+            PpKind::Punct("(") => {
+                self.advance()?;
+                let mut v = self.value(live)?;
+                if !self.at(")") {
+                    self.binary(&mut v, 1, live)?;
+                    if !self.at(")") {
+                        return Err(Error::new(self.here(), "expected ')' in preprocessor expression")
+                            .note(pos, "to match this '('"));
+                    }
+                }
+                self.advance()?;
+                v.ident = None;
+                Ok(v)
+            }
+            PpKind::Punct(op @ ("+" | "-" | "~" | "!")) => {
+                self.advance()?;
+                let v = self.value(live)?;
+                Ok(match op {
+                    "+" => Val::new(v.bits, v.unsigned),
+                    "-" => {
+                        // Only the most negative value overflows.
+                        if live && !v.unsigned && v.bits == i64::MIN as u64 {
+                            self.overflow(pos);
+                        }
+                        Val::new(v.bits.wrapping_neg(), v.unsigned)
+                    }
+                    "~" => Val::new(!v.bits, v.unsigned),
+                    _ => Val::truth(v.bits == 0),
                 })
             }
-            PpKind::Char => match lexer::char_constant(&t.text, t.pos, &mut self.warnings)? {
-                lexer::Tok::Num(v, _) => Ok(Val::signed(v as i64)),
-                _ => unreachable!("a character constant is a number"),
-            },
-            PpKind::Ident if t.text == "defined" => Err(Error::new(
-                t.pos,
-                "'defined' produced by macro expansion is not supported",
-            )),
-            // An identifier that is no macro: 0.
-            PpKind::Ident => Ok(Val::signed(0)),
+            PpKind::Punct(")") => Err(Error::new(pos, "expected value in expression")),
             _ => Err(Error::new(
-                t.pos,
-                format!("unexpected '{}' in preprocessor expression", t.text),
+                pos,
+                "invalid token at start of a preprocessor expression",
             )),
         }
     }
+
+    /// An integer literal: clang's errors for a floating one and for wrong
+    /// digits or suffixes. One too large for 64 bits is an error too, and
+    /// its low 64 bits, unsigned, go on; one too large for a signed value
+    /// is unsigned, which clang warns of in decimal.
+    fn number(&mut self, t: &PpToken, live: bool) -> Result<Val, Error> {
+        if floating(&t.text) {
+            return Err(Error::new(
+                t.pos,
+                "floating point literal in preprocessor expression",
+            ));
+        }
+        let lit = lexer::integer(&t.text, t.pos)?;
+        Ok(match lit.value {
+            None => {
+                self.pp.report(Error::new(
+                    t.pos,
+                    "integer literal is too large to be represented in any integer type",
+                ));
+                Val::new(wrapped(&t.text), true)
+            }
+            Some(bits) if !lit.unsigned && bits > i64::MAX as u64 => {
+                if live && lit.decimal {
+                    self.pp.report(Error::warning(
+                        t.pos,
+                        "integer literal is too large to be represented in a signed integer type, \
+                         interpreting as unsigned",
+                        "implicitly-unsigned-literal",
+                    ));
+                }
+                Val::new(bits, true)
+            }
+            Some(bits) => Val::new(bits, lit.unsigned),
+        })
+    }
+
+    /// `defined NAME` or `defined ( NAME )`, the name not replaced (clang's
+    /// `EvaluateDefined`): 1 if it is a macro. A `defined` that a macro's
+    /// expansion produced is undefined behavior (C99 6.10.1p4), which clang
+    /// evaluates all the same, and warns of, but in a function-like macro's
+    /// body (the only way to write some tests).
+    fn defined(&mut self, defined: &PTok) -> Result<Val, Error> {
+        let mut next = self.pp.next_raw(None)?;
+        let open = match &next {
+            Some(p) if p.t.is_punct("(") => {
+                let open = p.t.pos;
+                next = self.pp.next_raw(None)?;
+                Some(open)
+            }
+            _ => None,
+        };
+        let name = match &next {
+            None => return Err(Error::new(self.end, "macro name missing")),
+            Some(n) => match n.t.ident() {
+                Some(name) => name.to_string(),
+                None => return Err(Error::new(n.t.pos, "macro name must be an identifier")),
+            },
+        };
+        if let Some(open) = open {
+            match self.pp.next_raw(None)? {
+                Some(close) if close.t.is_punct(")") => {}
+                other => {
+                    let at = other.map_or(self.end, |t| t.t.pos);
+                    return Err(Error::new(at, "missing ')' after 'defined'").note(open, "to match this '('"));
+                }
+            }
+        }
+        let value = self.pp.macros.contains_key(&name);
+        self.advance()?;
+        if defined.site.is_some() && !defined.function_body {
+            self.pp.report(Error::warning(
+                defined.t.pos,
+                "macro expansion producing 'defined' has undefined behavior",
+                "expansion-to-defined",
+            ));
+        }
+        Ok(Val::truth(value))
+    }
+
+    /// The precedence of the operator after the value `v`; an error if the
+    /// token there is none.
+    fn precedence_after(&self, v: &Val) -> Result<u8, Error> {
+        if let Some(p) = precedence(self.tok.as_ref()) {
+            return Ok(p);
+        }
+        let t = self.tok.as_ref().expect("the end of the line has a precedence");
+        if let (true, Some((pos, name))) = (t.t.is_punct("("), &v.ident) {
+            return Err(Error::new(
+                *pos,
+                format!("function-like macro '{name}' is not defined"),
+            ));
+        }
+        Err(Error::new(
+            t.t.pos,
+            "token is not a valid binary operator in a preprocessor subexpression",
+        ))
+    }
+
+    /// The binary operators after `lhs` whose precedence is at least `min`
+    /// (clang's `EvaluateDirectiveSubExpr`), applied to it: each takes as
+    /// its right side a value and the operators after it that bind tighter,
+    /// but `?`, whose middle runs to its `:` and whose end groups to the
+    /// right.
+    fn binary(&mut self, lhs: &mut Val, min: u8, live: bool) -> Result<(), Error> {
+        let mut prec = self.precedence_after(lhs)?;
+        while prec >= min {
+            let Some(PpKind::Punct(op)) = self.tok.as_ref().map(|t| t.t.kind.clone()) else {
+                unreachable!("only operators bind")
+            };
+            let at = self.here();
+            // The right side of `0 && x`, `1 || x` and `0 ? x : y` is not
+            // evaluated.
+            let rhs_live = match op {
+                "&&" | "?" => live && lhs.bits != 0,
+                "||" => live && lhs.bits == 0,
+                _ => live,
+            };
+            self.advance()?;
+            let mut rhs = self.value(rhs_live)?;
+            let this = prec;
+            prec = self.precedence_after(&rhs)?;
+            let rhs_min = if op == "?" { COMMA } else { this + 1 };
+            if prec >= rhs_min {
+                self.binary(&mut rhs, rhs_min, rhs_live)?;
+                prec = self.precedence_after(&rhs)?;
+            }
+            *lhs = match op {
+                "?" => {
+                    if !self.at(":") {
+                        return Err(Error::new(self.here(), "expected ':'").note(at, "to match this '?'"));
+                    }
+                    self.advance()?;
+                    let after_live = live && lhs.bits == 0;
+                    let mut after = self.value(after_live)?;
+                    self.binary(&mut after, this, after_live)?;
+                    prec = self.precedence_after(&after)?;
+                    let unsigned = rhs.unsigned || after.unsigned;
+                    let v = if lhs.bits != 0 { rhs } else { after };
+                    Val::new(v.bits, unsigned)
+                }
+                ":" => return Err(Error::new(at, "':' without preceding '?'")),
+                _ => self.apply(op, lhs, &rhs, live, at)?,
+            };
+        }
+        Ok(())
+    }
+
+    /// clang's warning for a signed result that does not fit.
+    fn overflow(&mut self, at: Pos) {
+        self.pp.report(Error::warning_unflagged(
+            at,
+            "integer overflow in preprocessor expression",
+        ));
+    }
+
+    /// `l op r`, the operator at `at`, with C's usual arithmetic
+    /// conversions (unsigned if either side is; not for shifts, which take
+    /// the left side's type, nor for `&&`, `||` and `,`), wrapping, with
+    /// clang's warnings where it is evaluated (`live`): for a negative
+    /// value made unsigned, and for a signed result that overflows.
+    fn apply(&mut self, op: &str, l: &Val, r: &Val, live: bool, at: Pos) -> Result<Val, Error> {
+        let unsigned = !matches!(op, "<<" | ">>" | "&&" | "||" | ",") && (l.unsigned || r.unsigned);
+        if live && unsigned {
+            for (side, v) in [("left", l), ("right", r)] {
+                if v.negative() {
+                    self.pp.report(Error::warning_unflagged(
+                        at,
+                        format!(
+                            "{side} side of operator converted from negative value to unsigned: {} to {}",
+                            v.bits as i64, v.bits
+                        ),
+                    ));
+                }
+            }
+        }
+        let (a, b) = (l.bits, r.bits);
+        let (sa, sb) = (a as i64, b as i64);
+        let arith = |bits: u64| Val::new(bits, unsigned);
+        // Whether a signed `+`, `-` or `*` overflows.
+        let signed_overflow = |checked: Option<i64>| !unsigned && checked.is_none();
+        let mut overflow = false;
+        let v = match op {
+            "||" => Val::truth(a != 0 || b != 0),
+            "&&" => Val::truth(a != 0 && b != 0),
+            "," => Val::new(b, r.unsigned),
+            "|" => arith(a | b),
+            "^" => arith(a ^ b),
+            "&" => arith(a & b),
+            "==" => Val::truth(a == b),
+            "!=" => Val::truth(a != b),
+            "<" => Val::truth(if unsigned { a < b } else { sa < sb }),
+            ">" => Val::truth(if unsigned { a > b } else { sa > sb }),
+            "<=" => Val::truth(if unsigned { a <= b } else { sa <= sb }),
+            ">=" => Val::truth(if unsigned { a >= b } else { sa >= sb }),
+            "<<" => {
+                let (bits, ov) = shift_left(a, b, l.unsigned);
+                overflow = ov;
+                Val::new(bits, l.unsigned)
+            }
+            ">>" => {
+                // A shift by the width or more shifts by one less.
+                overflow = b >= 64;
+                let n = b.min(63) as u32;
+                let bits = if l.unsigned { a >> n } else { (sa >> n) as u64 };
+                Val::new(bits, l.unsigned)
+            }
+            "+" => {
+                overflow = signed_overflow(sa.checked_add(sb));
+                arith(a.wrapping_add(b))
+            }
+            "-" => {
+                overflow = signed_overflow(sa.checked_sub(sb));
+                arith(a.wrapping_sub(b))
+            }
+            "*" => {
+                overflow = signed_overflow(sa.checked_mul(sb));
+                arith(a.wrapping_mul(b))
+            }
+            "/" | "%" if b == 0 => {
+                if live {
+                    let what = if op == "/" { "division" } else { "remainder" };
+                    return Err(Error::new(
+                        at,
+                        format!("{what} by zero in preprocessor expression"),
+                    ));
+                }
+                arith(0)
+            }
+            "/" if unsigned => arith(a / b),
+            "%" if unsigned => arith(a % b),
+            "/" => {
+                overflow = sa == i64::MIN && sb == -1;
+                arith(sa.wrapping_div(sb) as u64)
+            }
+            "%" => arith(sa.wrapping_rem(sb) as u64),
+            _ => unreachable!("binary() only passes the operators above"),
+        };
+        if overflow && live {
+            self.overflow(at);
+        }
+        Ok(v)
+    }
 }
 
-/// `l op r` in `#if` arithmetic: unsigned if either side is (except for
-/// shifts, which take the left side's type), wrapping.
-fn apply(op: &str, l: Val, r: Val, eval: bool, pos: Pos) -> Result<Val, Error> {
-    let unsigned = l.unsigned || r.unsigned;
-    let (a, b) = (l.bits, r.bits);
-    let (sa, sb) = (a as i64, b as i64);
-    let arith = |bits: u64| Val { bits, unsigned };
-    let cmp = |lt: bool| Val::truth(lt);
-    Ok(match op {
-        "||" => Val::truth(a != 0 || b != 0),
-        "&&" => Val::truth(a != 0 && b != 0),
-        "|" => arith(a | b),
-        "^" => arith(a ^ b),
-        "&" => arith(a & b),
-        "==" => Val::truth(a == b),
-        "!=" => Val::truth(a != b),
-        "<" => cmp(if unsigned { a < b } else { sa < sb }),
-        ">" => cmp(if unsigned { a > b } else { sa > sb }),
-        "<=" => cmp(if unsigned { a <= b } else { sa <= sb }),
-        ">=" => cmp(if unsigned { a >= b } else { sa >= sb }),
-        "<<" => Val {
-            bits: a.wrapping_shl(b as u32),
-            unsigned: l.unsigned,
-        },
-        ">>" => Val {
-            bits: if l.unsigned {
-                a.wrapping_shr(b as u32)
-            } else {
-                sa.wrapping_shr(b as u32) as u64
-            },
-            unsigned: l.unsigned,
-        },
-        "+" => arith(a.wrapping_add(b)),
-        "-" => arith(a.wrapping_sub(b)),
-        "*" => arith(a.wrapping_mul(b)),
-        "/" | "%" => {
-            if b == 0 {
-                if !eval {
-                    return Ok(arith(0));
-                }
-                return Err(Error::new(pos, "division by zero in preprocessor expression"));
-            }
-            let v = match (op, unsigned) {
-                ("/", true) => a / b,
-                ("/", false) => sa.wrapping_div(sb) as u64,
-                (_, true) => a % b,
-                (_, false) => sa.wrapping_rem(sb) as u64,
-            };
-            arith(v)
-        }
-        _ => unreachable!("binary() only passes the operators above"),
-    })
+/// `a << b` in 64 bits, as clang's `APInt::ushl_ov` and `sshl_ov` do it: a
+/// shift by 64 or more is 0, and overflows; a shift that drops a set bit
+/// overflows (for a signed value, one that changes its sign too).
+fn shift_left(a: u64, b: u64, unsigned: bool) -> (u64, bool) {
+    if b >= 64 {
+        return (0, true);
+    }
+    let n = b as u32;
+    let overflow = if unsigned {
+        n > a.leading_zeros()
+    } else if (a as i64) >= 0 {
+        n >= a.leading_zeros()
+    } else {
+        n >= a.leading_ones()
+    };
+    (a << n, overflow)
+}
+
+/// Whether a preprocessing number is a floating constant: it has a `.` or
+/// an exponent (`e` in decimal, `p` in hex).
+fn floating(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let hex = lower.starts_with("0x");
+    lower.contains('.') || (!hex && lower.contains('e')) || (hex && lower.contains('p'))
+}
+
+/// The low 64 bits of an integer literal too large for them, whose digits
+/// [`lexer::integer`] has checked.
+fn wrapped(text: &str) -> u64 {
+    let lower = text.to_ascii_lowercase();
+    let (radix, digits) = match lower.strip_prefix("0x") {
+        Some(hex) => (16, hex),
+        None if lower.starts_with('0') => (8, lower.as_str()),
+        None => (10, lower.as_str()),
+    };
+    digits
+        .chars()
+        .map_while(|c| c.to_digit(radix))
+        .fold(0u64, |v, d| {
+            v.wrapping_mul(u64::from(radix)).wrapping_add(u64::from(d))
+        })
 }
 
 #[cfg(test)]
@@ -2410,6 +3012,18 @@ mod tests {
 
     fn err_with(files: &[(&str, &str)], src: &str) -> String {
         run(files, src, &Options::default()).unwrap_err().render("main.c")
+    }
+
+    /// `main.c` preprocessed going on after errors, as for the parser: its
+    /// tokens and diagnostics (the messages are the table's, in
+    /// `tests/diagnostics/preprocessor.rs`).
+    fn recovered(src: &str) -> Output {
+        preprocess_recovering("main.c", src, &Options::default(), &|_| None).unwrap()
+    }
+
+    /// The tokens that come out after errors, as [`words`] has them.
+    fn pp_recovered(src: &str) -> String {
+        words(&recovered(src).tokens)
     }
 
     #[test]
@@ -2552,12 +3166,9 @@ puts( "The first, second, and third items." );
         );
         assert_eq!(pp("#define s(x) #x\n#define N 1\ns(N)"), same(r#""N""#));
         // A backslash outside a literal stays as it is: one at the end would
-        // escape the closing quote, which C leaves undefined. Two are fine.
-        assert_eq!(
-            err("#define s(x) #x\nconst char *p = s(\\);"),
-            "main.c:2:17: error: '#' produced an invalid string literal: it ends in a lone '\\'"
-        );
-        assert!(err("#define s(x) #x\ns(a \\)").contains("lone '\\'"));
+        // escape the closing quote, which C leaves undefined, and clang
+        // leaves out (with a warning). Two are fine.
+        assert_eq!(pp("#define s(x) #x\ns(\\) s(a \\)"), same(r#""" "a ""#));
         assert_eq!(pp("#define s(x) #x\ns(\\\\)"), same(r#""\\""#));
     }
 
@@ -2572,14 +3183,11 @@ puts( "The first, second, and third items." );
             pp("#define cat(a, b) a ## b\n#define xy 42\ncat(x, y)"),
             same("42")
         );
-        assert_eq!(
-            err("#define cat(a, b) a ## b\ncat(+, -)"),
-            "main.c:2:5: error: pasting formed '+-', an invalid preprocessing token"
-        );
-        assert_eq!(
-            err("#define cat(a, b) a ## b\ncat(/, /)"),
-            "main.c:2:5: error: pasting formed '//', an invalid preprocessing token"
-        );
+        // Two tokens that make none are an error, and stay two, the left
+        // one where the macro was used, as in clang.
+        let out = recovered("#define cat(a, b) a ## b\nint x = 1 cat(+, -) 1;");
+        let at: Vec<(&str, Pos)> = out.tokens.iter().map(|t| (t.text.as_str(), t.pos)).collect();
+        assert_eq!(at[4..6], [("+", Pos::new(2, 11)), ("-", Pos::new(2, 18))]);
         // Object-like macros paste too.
         assert_eq!(pp("#define X a ## b\nX"), same("ab"));
     }
@@ -2629,21 +3237,33 @@ puts( "The first, second, and third items." );
             pp("#line 100\n__LINE__\n#line 7 \"x.c\"\n__LINE__ __FILE__"),
             same(r#"100 7 "x.c""#)
         );
-        assert_eq!(err("#line 0"), "main.c:1:7: error: #line number out of range");
+        // As clang takes them: line 0, past 2^31 - 1, a leading 0 (decimal);
+        // a bad one is dropped.
         assert_eq!(
-            err("#line x"),
-            "main.c:1:2: error: #line takes a line number and an optional file name"
+            pp("#line 0\n__LINE__\n#line 2147483648\n__LINE__\n#line 010\n__LINE__"),
+            same("0 2147483648 10")
+        );
+        assert_eq!(
+            pp_recovered("#line x\n__LINE__\n#line 4294967296\n__LINE__"),
+            same("2 4")
+        );
+        // GNU's line markers, which `-E` writes, with their flags.
+        assert_eq!(
+            pp("# 33 \"x.c\"\n__LINE__ __FILE__\n# 7 \"h.h\" 1 3 4\n# 9 \"x.c\" 2\n__LINE__ __FILE__"),
+            same(r#"33 "x.c" 9 "x.c""#)
+        );
+        assert_eq!(
+            pp_recovered("# 5 \"x.c\" 2\n__LINE__ __FILE__"),
+            same(r#"2 "main.c""#)
         );
         // A backslash in a file name is escaped.
         let out = preprocess("dir\\a.c", "__FILE__", &Options::default(), &|_| None).unwrap();
         assert_eq!(out.tokens[0].text, r#""dir\\a.c""#);
+        // `__LINE__` and `__FILE__` may be defined again or undefined (a
+        // warning), and the new definition holds.
         assert_eq!(
-            err("#define __LINE__ 1"),
-            "main.c:1:9: error: cannot redefine the builtin macro '__LINE__'"
-        );
-        assert_eq!(
-            err("#undef __FILE__"),
-            "main.c:1:8: error: cannot undefine the builtin macro '__FILE__'"
+            pp("#define __LINE__ 1\n#undef __FILE__\n\n__LINE__ __FILE__"),
+            same("1 __FILE__")
         );
     }
 
@@ -2678,27 +3298,19 @@ puts( "The first, second, and third items." );
             out.files[2..],
             ["inc/d.h", "inc/d.h", "inc/c.h", "sub/b.h", "sub/c.h"]
         );
-        // `<...>` does not look next to the including file.
-        assert_eq!(
-            err_with(&files, "#include <a.h>"),
-            "main.c:1:10: error: 'a.h' file not found"
-        );
-        assert_eq!(
-            err_with(&files, "#include \"nope.h\""),
-            "main.c:1:10: error: 'nope.h' file not found"
-        );
-        assert_eq!(
-            err("#include"),
-            "main.c:1:9: error: expected \"FILENAME\" or <FILENAME>"
-        );
-        assert_eq!(
-            err("#include \"a.h\" x"),
-            "main.c:1:16: error: extra tokens at end of #include directive"
-        );
-        assert_eq!(
-            err("#include <a.h"),
-            "main.c:1:10: error: expected '>' after the file name"
-        );
+        // `<...>` does not look next to the including file: what it finds
+        // there it includes, with an error, as clang does.
+        let files: HashMap<PathBuf, String> = [(PathBuf::from("sub/c.h"), "int c;".to_string())].into();
+        let load = move |p: &Path| files.get(p).cloned();
+        let out = preprocess_recovering("main.c", "#include <sub/c.h>", &Options::default(), &load).unwrap();
+        assert_eq!(words(&out.tokens), same("int c;"));
+        assert_eq!(out.diagnostics.len(), 1);
+        // A file not found stops everything (clang's fatal error).
+        let stopped =
+            preprocess_recovering("main.c", "#include \"x.h\"\n#bogus", &Options::default(), &|_| {
+                None
+            });
+        assert_eq!(stopped.unwrap_err().len(), 1);
     }
 
     #[test]
@@ -2712,28 +3324,14 @@ puts( "The first, second, and third items." );
         let src = "#include \"guard.h\"\n#include \"guard.h\"\n#include \"once.h\"\n#include \"./once.h\"\n\
                    #include \"twice.h\"\n#include \"twice.h\"\n";
         assert_eq!(pp_with(&files, src), same("int g; int o; int t; int t;"));
-        assert_eq!(
-            err_with(&files, "#include \"self.h\""),
-            "./self.h:1:10: error: #include nested too deeply"
-        );
     }
 
     #[test]
     fn errors_in_headers_name_the_header() {
-        let files = [("bad.h", "\n#if 1\n"), ("worse.h", "#error stop  here")];
-        assert_eq!(
-            err_with(&files, "#include \"bad.h\""),
-            "./bad.h:2:2: error: unterminated conditional directive"
-        );
+        let files = [("worse.h", "#error stop  here")];
         assert_eq!(
             err_with(&files, "#include \"worse.h\""),
-            "./worse.h:1:2: error: #error stop here"
-        );
-        // A conditional must end in the file that opened it.
-        let files = [("end.h", "#endif\n")];
-        assert_eq!(
-            err_with(&files, "#if 1\n#include \"end.h\"\n#endif"),
-            "./end.h:1:2: error: #endif without #if"
+            "./worse.h:1:2: error: stop  here"
         );
     }
 
@@ -2775,87 +3373,74 @@ puts( "The first, second, and third items." );
         assert!(truth("1 || 1 / 0"));
         assert!(!truth("0 && 1 / 0"));
         assert!(truth("1 ? 1 : 1 / 0"));
-        assert_eq!(
-            err("#if 1 / 0\n#endif"),
-            "main.c:1:7: error: division by zero in preprocessor expression"
-        );
-        assert_eq!(err("#if\n#endif"), "main.c:1:4: error: #if with no expression");
-        assert_eq!(
-            err("#if 1 +\n#endif"),
-            "main.c:1:8: error: expected value in preprocessor expression"
-        );
-        assert_eq!(
-            err("#if (1\n#endif"),
-            "main.c:1:7: error: expected ')' in preprocessor expression"
-        );
-        assert_eq!(
-            err("#if 1 2\n#endif"),
-            "main.c:1:7: error: unexpected '2' in preprocessor expression"
-        );
-        assert_eq!(
-            err("#if 1 = 2\n#endif"),
-            "main.c:1:7: error: unexpected '=' in preprocessor expression"
-        );
-        // Past 64 bits a literal has no type at all: an error, not u64::MAX.
+        assert!(truth("0 ? 1 / 0 : 1"));
+        // `?:` groups to the right; `,` is an operator inside parentheses.
+        assert!(truth("0 ? 1 : 0 ? 0 : 2"));
+        assert!(truth("(0, 2) == 2"));
+        // Shifts by the width or more, as clang's: `<<` gives 0, `>>`
+        // shifts by 63 (warnings both).
+        assert!(!truth("1 << 64") && truth("-1 >> 64 == -1"));
         assert!(truth("18446744073709551615 == 0xffffffffffffffff"));
-        for big in [
-            "18446744073709551616",
-            "0x1ffffffffffffffff",
-            "99999999999999999999999",
+        // An error makes the condition false, as in clang; but a literal
+        // too large for 64 bits, an error too, goes on with its low bits,
+        // and so does a line with something after a whole expression.
+        let value = |e: &str| pp_recovered(&format!("#if {e}\n1\n#else\n0\n#endif"));
+        for wrong in [
+            "1 / 0",
+            "",
+            "1 +",
+            "(1",
+            "1 2",
+            "1 = 2",
+            "1.0",
+            "defined",
+            "defined(X",
+            "f(1)",
         ] {
-            assert_eq!(
-                err(&format!("#if {big} == 0\n#endif")),
-                "main.c:1:5: error: integer literal is too large to be represented in any integer type"
-            );
+            assert_eq!(value(wrong), same("0"), "#if {wrong}");
         }
+        assert_eq!(value("18446744073709551617 == 1"), same("1"));
+        assert_eq!(value("1 )"), same("1"));
+        // `defined` that a macro produces is evaluated, as clang does it.
         assert_eq!(
-            err("#if 1.0\n#endif"),
-            "main.c:1:5: error: floating-point literals are not supported"
+            pp("#define D defined(X)\n#define X\n#if D\nyes\n#endif"),
+            same("yes")
         );
         assert_eq!(
-            err("#if defined\n#endif"),
-            "main.c:1:12: error: 'defined' needs a macro name"
-        );
-        assert_eq!(
-            err("#if defined(X\n#endif"),
-            "main.c:1:14: error: expected ')' after the macro name"
-        );
-        assert_eq!(
-            err("#define D defined(X)\n#if D\n#endif"),
-            "main.c:2:5: error: 'defined' produced by macro expansion is not supported"
+            pp("#define F(m) defined(m)\n#if F(F) && !F(G)\nyes\n#endif"),
+            same("yes")
         );
     }
 
     #[test]
     fn conditional_errors() {
+        // What comes out after the errors, as clang has it: an unterminated
+        // group as if it ended with the file, each one reported; a stray
+        // `#else` or `#endif` ignored; after a second `#else` nothing is
+        // taken; `#ifdef` without a name skipped.
+        let errors = |src: &str| {
+            let out = recovered(src);
+            let lines: Vec<String> = out.diagnostics.iter().map(|d| d.render("main.c")).collect();
+            (words(&out.tokens), lines)
+        };
+        let (toks, lines) = errors("#if 1\n#if 0\nx\n#endif\ny");
+        assert_eq!(toks, same("y"));
+        assert_eq!(lines, ["main.c:1:2: error: unterminated conditional directive"]);
+        let (toks, lines) = errors("#if 0\n#if 1\nx");
+        assert_eq!(toks, "");
         assert_eq!(
-            err("#if 1\nx"),
-            "main.c:1:2: error: unterminated conditional directive"
+            lines,
+            [
+                "main.c:2:2: error: unterminated conditional directive",
+                "main.c:1:2: error: unterminated conditional directive"
+            ]
         );
-        assert_eq!(
-            err("#if 0\nx"),
-            "main.c:1:2: error: unterminated conditional directive"
-        );
-        assert_eq!(err("#else"), "main.c:1:2: error: #else without #if");
-        assert_eq!(err("#elif 1"), "main.c:1:2: error: #elif without #if");
-        assert_eq!(err("#endif"), "main.c:1:2: error: #endif without #if");
-        assert_eq!(
-            err("#if 1\n#else\n#else\n#endif"),
-            "main.c:3:2: error: #else after #else"
-        );
-        assert_eq!(
-            err("#if 0\n#else\n#elif 1\n#endif"),
-            "main.c:3:2: error: #elif after #else"
-        );
-        assert_eq!(
-            err("#if 1\n#endif X"),
-            "main.c:2:8: error: extra tokens at end of #endif directive"
-        );
-        assert_eq!(err("#ifdef\n#endif"), "main.c:1:7: error: macro name missing");
-        assert_eq!(
-            err("#ifdef 1\n#endif"),
-            "main.c:1:8: error: macro name must be an identifier"
-        );
+        assert_eq!(errors("#else\na\n#endif\nb").0, same("a b"));
+        assert_eq!(errors("#if 1\na\n#else\nb\n#else\nc\n#endif").0, same("a"));
+        assert_eq!(errors("#if 0\na\n#else\nb\n#elif 1\nc\n#endif").0, same("b"));
+        assert_eq!(errors("#ifdef\na\n#else\nb\n#endif").0, same("b"));
+        // Extra tokens are a warning.
+        assert_eq!(pp("#ifdef X Y\n#else Z\nb\n#endif W"), same("b"));
     }
 
     #[test]
@@ -2872,117 +3457,71 @@ puts( "The first, second, and third items." );
             pp("#define S \"s\"\n#ident S\n#sccs \"t\" junk\nx"),
             "#ident \"s\" #ident \"t\" x "
         );
-        assert_eq!(err("#ident x"), "main.c:1:8: error: invalid #ident directive");
-        assert_eq!(err("#sccs"), "main.c:1:6: error: invalid #ident directive");
         let src = "#pragma weird\n#ident \"v1\"\nint main(void) { return 0; }\n";
         assert!(crate::compile_with("main.c", src, &Options::default(), &|_| None).is_ok());
+        // `#error` and `#warning` say the rest of the line as written,
+        // comments and all, a backslash-newline taken out; clang goes on.
+        let out = recovered("#error a /* c */  b  \n#warning x \\\n y\n#line 9\n#error z\nok");
+        let lines: Vec<String> = out.diagnostics.iter().map(|d| d.render("main.c")).collect();
         assert_eq!(
-            err("#error \"stop\" now"),
-            "main.c:1:2: error: #error \"stop\" now"
+            lines,
+            [
+                "main.c:1:2: error: a /* c */  b  ",
+                "main.c:2:2: warning: x  y [-W#warnings]",
+                "main.c:9:2: error: z"
+            ]
         );
-        assert_eq!(
-            err("#bogus"),
-            "main.c:1:2: error: invalid preprocessing directive '#bogus'"
-        );
-        assert_eq!(
-            err("# 33 \"x.c\""),
-            "main.c:1:1: error: invalid preprocessing directive '#33'"
-        );
+        assert_eq!(words(&out.tokens), same("ok"));
         // `#` starts a directive only at the start of a line.
         assert_eq!(pp("x # define"), same("x # define"));
     }
 
     #[test]
     fn definition_errors() {
-        assert_eq!(err("#define"), "main.c:1:8: error: macro name missing");
+        // A definition with an error is dropped.
         assert_eq!(
-            err("#define 1 2"),
-            "main.c:1:9: error: macro name must be an identifier"
+            pp_recovered("#define F(a b) a\n#define G(x) #y\n#define H ## x\nF(1) G(1) H"),
+            same("F(1) G(1) H")
         );
-        assert_eq!(
-            err("#define defined"),
-            "main.c:1:9: error: 'defined' cannot be used as a macro name"
-        );
-        assert_eq!(
-            err("#define N 1\n#define N 2"),
-            "main.c:2:9: error: 'N' macro redefined (previous definition at 1:9)"
-        );
-        assert_eq!(
-            err("#define F(a) a\n#define F(b) b"),
-            "main.c:2:9: error: 'F' macro redefined (previous definition at 1:9)"
-        );
-        assert_eq!(
-            err("#define N 1+1\n#define N 1 + 1"),
-            "main.c:2:9: error: 'N' macro redefined (previous definition at 1:9)"
-        );
-        assert_eq!(
-            err("#define F(a"),
-            "main.c:1:2: error: missing ')' in macro parameter list"
-        );
-        assert_eq!(
-            err("#define F(a,)"),
-            "main.c:1:13: error: invalid token in macro parameter list"
-        );
-        assert_eq!(
-            err("#define F(a b)"),
-            "main.c:1:13: error: expected ',' or ')' in macro parameter list"
-        );
-        assert_eq!(
-            err("#define F(a, a)"),
-            "main.c:1:14: error: duplicate macro parameter name 'a'"
-        );
-        assert_eq!(
-            err("#define F(..., a)"),
-            "main.c:1:14: error: expected ',' or ')' in macro parameter list"
-        );
-        assert_eq!(
-            err("#define F(x) #y"),
-            "main.c:1:14: error: '#' is not followed by a macro parameter"
-        );
-        assert_eq!(
-            err("#define F(x) ## x"),
-            "main.c:1:14: error: '##' cannot appear at either end of a macro expansion"
-        );
-        assert_eq!(
-            err("#define F x ##"),
-            "main.c:1:13: error: '##' cannot appear at either end of a macro expansion"
-        );
-        assert_eq!(
-            err("#define F(x) __VA_ARGS__"),
-            "main.c:1:14: error: __VA_ARGS__ can only appear in the expansion of a variadic macro"
-        );
+        // Defining a macro again differently is a warning, and the new
+        // definition holds.
+        assert_eq!(pp("#define N 1\n#define N 2\nN"), same("2"));
+        // GNU's named variadic parameter, and `__VA_ARGS__` where C99 gives
+        // it no meaning (a name like any other, to clang).
+        assert_eq!(pp("#define F(a, rest...) a: rest\nF(1, 2, 3)"), same("1: 2, 3"));
+        assert_eq!(pp("#define F(x) __VA_ARGS__ x\nF(1)"), same("__VA_ARGS__ 1"));
         // `#` in an object-like macro is just a token.
         assert_eq!(pp("#define H # x\nH"), same("# x"));
     }
 
     #[test]
     fn call_errors() {
+        // With the wrong number of arguments the name stays, the arguments
+        // go; an unterminated call goes entirely.
         assert_eq!(
-            err("#define F(a, b) a\nF(1)"),
-            "main.c:2:1: error: too few arguments provided to function-like macro invocation of 'F' (expected 2, have 1)"
+            pp_recovered("#define F(a, b) a\nF(1) x F(1, 2, 3) y F()"),
+            same("F x F y F")
+        );
+        assert_eq!(pp_recovered("#define F(a) a\nx F(1"), same("x"));
+        // `F()` is one empty argument where one is wanted; the variadic
+        // part may be left out.
+        assert_eq!(
+            pp("#define F(a) [a]\n#define G(a, ...) a\nF() G(1) G()"),
+            same("[] 1")
+        );
+        // Directives in the arguments are carried out, as clang does, but
+        // `#include` and `#pragma`, an error there.
+        assert_eq!(
+            pp("#define F(a) a\nF(1\n#define X 2\n#if 0\n3\n#endif\n) X"),
+            same("1 2")
         );
         assert_eq!(
-            err("#define F(a) a\nF(1, 2)"),
-            "main.c:2:1: error: too many arguments provided to function-like macro invocation of 'F' (expected 1, have 2)"
+            pp_recovered("#define F(a) #a\nF(1\n#pragma once\n)"),
+            same(r#""1""#)
         );
-        assert_eq!(
-            err("#define F() 1\nF(x)"),
-            "main.c:2:1: error: too many arguments provided to function-like macro invocation of 'F' (expected 0, have 1)"
-        );
-        assert_eq!(
-            err("#define F(a) a\nF(1"),
-            "main.c:2:1: error: unterminated call of the function-like macro 'F'"
-        );
-        assert_eq!(
-            err("#define F(a) a\nF(1\n#define X\n)"),
-            "main.c:3:1: error: directives inside the arguments of a macro call are not supported"
-        );
-        // A call may not run past the end of a header.
-        let files = [("open.h", "#define F(a) a\nF(1")];
-        assert_eq!(
-            err_with(&files, "#include \"open.h\"\n)"),
-            "./open.h:2:1: error: unterminated call of the function-like macro 'F'"
-        );
+        // A call goes on past the end of a header, not of the file compiled.
+        let files = [("open.h", "#define F(a, b) a b\nF(1")];
+        assert_eq!(pp_with(&files, "#include \"open.h\"\n, 2) x"), same("1 2 x"));
     }
 
     #[test]
@@ -3005,6 +3544,15 @@ puts( "The first, second, and third items." );
         };
         let out = run(&[], "ONE TWO F(3) GONE __merlin__ __STDC_VERSION__", &opts).unwrap();
         assert_eq!(words(&out.tokens), same("1 22 (3+1) GONE __merlin__ 199901L"));
+        // Defining `TWO` again is clang's warning, there too.
+        let warned: Vec<String> = out.diagnostics.iter().map(|d| d.render("main.c")).collect();
+        assert_eq!(
+            warned,
+            [
+                "<command line>:6:9: warning: 'TWO' macro redefined [-Wmacro-redefined]\n\
+                 <command line>:2:9: note: previous definition is here"
+            ]
+        );
         let opts = Options {
             xlen: Xlen::Rv32,
             include_dirs: Vec::new(),
@@ -3269,13 +3817,17 @@ puts( "The first, second, and third items." );
         };
         let e = preprocess("main.S", "# if the disk is there\n", &opts, &crate::no_files).unwrap_err();
         assert_eq!(
-            e.last().unwrap().render("main.S"),
-            "main.S:1:10: error: unexpected 'disk' in preprocessor expression"
+            e[0].render("main.S"),
+            "main.S:1:10: error: token is not a valid binary operator in a preprocessor subexpression"
         );
-        // C keeps its errors: an unknown directive, a bad paste, a trigraph.
+        // `#` in a function-like macro may stand before anything.
+        assert_eq!(
+            asm(&[], "#define F(x) # y x\nF(1)\n"),
+            "# 1 \"main.S\"\n\n# y 1\n"
+        );
+        // C keeps its errors: an unknown directive, a bad paste.
         assert!(err("#warn\n").contains("invalid preprocessing directive"));
         assert!(err("#define P(a, b) a ## b\nP(., x)").contains("pasting formed '.x'"));
-        assert!(err("??=").contains("trigraphs"));
         // The guard of a file is its first `#ifndef` only if it closes last.
         let toks = |s: &str| lexer::lex_pp(s, 0).unwrap().0;
         assert_eq!(guard(&toks("#ifndef A\n#endif\n")), Some("A".into()));

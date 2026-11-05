@@ -277,10 +277,11 @@ pub fn preprocess_asm(name: &str, src: &str, opts: &Options, load: Loader) -> Re
 }
 
 /// Preprocesses, lexes, parses and checks one translation unit. The
-/// preprocessor and the parser stop at the first error; the checker reports
-/// every error it finds. Errors in headers have their [`Error::file`] set.
+/// preprocessor goes on after an error where clang does, the parser stops
+/// at the first; the checker reports every error it finds. Errors in
+/// headers have their [`Error::file`] set.
 pub fn parse_with(name: &str, src: &str, opts: &Options, load: Loader) -> Result<ast::Program, Vec<Error>> {
-    let pp = preprocess(name, src, opts, load)?;
+    let pp = preprocess::preprocess_recovering(name, src, opts, load)?;
     let mut prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
     prog.warnings = pp.name_files(prog.warnings);
     Ok(prog)
@@ -299,7 +300,7 @@ pub fn compile_warned(
     opts: &Options,
     load: Loader,
 ) -> Result<(String, Vec<Error>), Vec<Error>> {
-    let pp = preprocess(name, src, opts, load)?;
+    let pp = preprocess::preprocess_recovering(name, src, opts, load)?;
     let debug = opts.debug.as_ref().map(|d| (d, pp.files.as_slice()));
     let prog = check(&pp, opts.xlen).map_err(|errors| pp.name_files(errors))?;
     let warnings = pp.name_files(prog.warnings.clone());
@@ -310,15 +311,13 @@ pub fn compile_warned(
 }
 
 /// The front end after the preprocessor: tokens, syntax tree, checks. The
-/// errors come with the warnings, in the order of their positions.
+/// errors come with the warnings, the preprocessor's among them, in
+/// clang's order ([`preprocess::Output::merge`]).
 fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec<Error>> {
     // The lexer's diagnostics, then everything after: clang goes on after
     // an error in a literal, or a token that is none, and so does merlin.
-    let mut diagnostics = pp.warnings.clone();
-    let (toks, lexed) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|mut e| {
-        diagnostics.append(&mut e);
-        diagnostics.clone()
-    })?;
+    let mut diagnostics = Vec::new();
+    let (toks, lexed) = lexer::finish(pp.tokens.clone(), pp.end, xlen).map_err(|e| pp.merge(e))?;
     diagnostics.extend(lexed);
     let mut prog = match parser::parse_salvaging(&toks, xlen) {
         Ok(prog) => prog,
@@ -329,8 +328,7 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
             let _ = sema::check(&mut partial);
             diagnostics.extend(partial.warnings);
             diagnostics.push(e);
-            diagnostics.sort_by_key(|e| e.pos);
-            return Err(diagnostics);
+            return Err(pp.merge(diagnostics));
         }
     };
     let checked = sema::check(&mut prog);
@@ -338,7 +336,7 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
     if let Err(errors) = checked {
         diagnostics.extend(errors);
     }
-    diagnostics.sort_by_key(|e| e.pos);
+    let diagnostics = pp.merge(diagnostics);
     if diagnostics.iter().any(|d| !d.is_warning()) {
         return Err(diagnostics);
     }
