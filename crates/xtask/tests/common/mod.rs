@@ -528,7 +528,8 @@ pub mod start {
 /// The shell's environment (issue #216; kernel/user/sh.c, "Variables and
 /// the environment"): a session typed at either width, without a disk, and
 /// what each command must print. `env` (kernel/user/env.c) prints the
-/// environment the shell gave it, after its own changes.
+/// environment the shell gave it, after its own changes, and
+/// `printenv` (kernel/user/printenv.c) the values getenv finds in it.
 pub mod environment {
     use super::PROMPT;
 
@@ -536,6 +537,8 @@ pub mod environment {
     /// the first process, so the machine stops when it ends.
     pub const INPUT: &[u8] = b"env\n\
         X=1 env -u TERM\n\
+        X=1 printenv X HOME\n\
+        printenv X\n\
         export Y=2\n\
         Z=3\n\
         env -u HOME\n\
@@ -558,6 +561,9 @@ pub mod environment {
         assert_eq!(output(out, "env"), ["HOME=/", "TERM=linux"], "{out}");
         // An assignment before a program is in its environment alone.
         assert_eq!(output(out, "X=1 env -u TERM"), ["HOME=/", "X=1"], "{out}");
+        // printenv: getenv of each name.
+        assert_eq!(output(out, "X=1 printenv X HOME"), ["1", "/"], "{out}");
+        assert_eq!(output(out, "printenv X"), ["printenv: exit 1"], "{out}");
         // export: in every program's from then on; a plain assignment is
         // the shell's own.
         assert_eq!(output(out, "env -u HOME"), ["TERM=linux", "Y=2"], "{out}");

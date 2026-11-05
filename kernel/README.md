@@ -278,6 +278,7 @@ parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
 | `ps` | lists the processes |
 | `kill` | kills processes by pid |
 | `env` | runs a program with the environment changed, or prints it |
+| `printenv` | prints variables' values, or the whole environment |
 | `sleep` | waits for some seconds (`0.5` for half a second) |
 | `ticks` | prints the timer ticks since boot |
 | `ifconfig`, `ping` | show and set the network interface; ICMP echo to a host (an address or a name) |

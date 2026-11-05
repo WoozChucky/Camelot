@@ -170,7 +170,7 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
-               Linux's start",
+               Linux's start, the environment (#216)",
         args: &[
             "-p",
             "xtask",
@@ -181,6 +181,19 @@ const STEPS: &[Step] = &[
             "pointers_into_the_kernel_half_are_refused",
             "the_calls_take_and_return_64_bit_values",
             "a_program_starts_as_linux_starts_one",
+            "the_shell_passes_its_environment_on",
+        ],
+    },
+    Step {
+        what: "RV32 processes: Linux's start with the environment, and the shell's environment (#216)",
+        args: &[
+            "-p",
+            "xtask",
+            "--test",
+            "kernel",
+            "--",
+            "the_shell_is_the_first_process",
+            "the_shell_passes_its_environment_on",
         ],
     },
     Step {

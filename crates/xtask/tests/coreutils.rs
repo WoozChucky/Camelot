@@ -566,6 +566,9 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool, xlen: Xlen) {
         s.run("env /bin"),
         format!("env: /bin: not a regular file\n{}", exit_line("env", 126))
     );
+    assert_eq!(s.run("printenv TERM HOME"), "linux\n/\n");
+    assert_eq!(s.run("printenv"), "HOME=/\nTERM=linux\n");
+    assert_eq!(s.run("printenv HOME=/"), exit_line("printenv", 1));
     assert_eq!(s.run("HOME=/t cd"), "");
     assert_eq!(s.run("ls u"), listing);
     assert_eq!(s.run("cd"), "");

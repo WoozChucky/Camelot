@@ -44,6 +44,7 @@ for `grep`, whose 1 means "no line matched".
 | `ps` | `ps` | lists the processes (`procs`): pid, parent, state, size, name |
 | `harts` | `harts` | lists the harts (`harts`): id, the process running on it (`-` while idle), the ticks it has taken and the processes it has switched to |
 | `env` | `env [-i] [-u NAME]... [NAME=VALUE]... [PROG [ARG...]]` | runs PROG with its environment emptied (`-i`), without NAME (`-u`) or with NAME set, or without PROG prints the environment; 125 if env fails, 127 if there is no PROG, 126 if it can't be run |
+| `printenv` | `printenv [NAME...]` | prints the value of each NAME (`getenv`), a line each, or the whole environment without a NAME; exits 1 if a NAME has no value |
 | `kill` | `kill PID...` | ends processes (`kill`): they exit with status -1; not the shell, whose end is Camelot's |
 | `sleep` | `sleep SECONDS` | waits, `0.5` for half a second (the clock ticks 10 times a second) |
 

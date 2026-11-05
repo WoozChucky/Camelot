@@ -30,10 +30,10 @@
  *
  * Built-ins: help, exit [N], wait, cd [DIR], export, unset and exec [PROG
  * [ARG...]] (see below). All but exec run in the shell itself, with its
- * redirections, but can't be part of a pipeline. The shell ends with `exit`, or at the end
- * of the input (Ctrl-D on an empty line), with the status N or else the last
- * foreground program's; when it is the first process, the kernel then stops
- * the machine with it.
+ * redirections, but can't be part of a pipeline. The shell ends with
+ * `exit`, or at the end of the input (Ctrl-D on an empty line), with the
+ * status N or else the last foreground program's; when it is the first
+ * process, the kernel then stops the machine with it.
  *
  * `exec PROG [ARG...]` is POSIX's: the program replaces the shell in its
  * process (the kernel's exec), with the same pid, parent, descriptors and
@@ -63,7 +63,8 @@
  * word are assignments:
  *   NAME=value ...        alone, they set shell variables, which stay
  *                         exported if they were (else they are the
- *                         shell's own, until `export NAME`);
+ *                         shell's own, until `export NAME`), and the
+ *                         status is 0, as POSIX has it;
  *   NAME=value PROG ...   before a program, they are in its environment
  *                         only (and the shell's stays as it was);
  *   NAME=value exec PROG  before `exec`, `exit`, `export` or `unset` (POSIX's
