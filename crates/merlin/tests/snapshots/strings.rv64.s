@@ -106,7 +106,7 @@ main:
     sd    s0, 0(sp)
     addi  s0, sp, 16
     addi  sp, sp, -16
-    la    a0, .L.str.0
+    la    a0, .L.str
     sd    a0, -24(s0)
     ld    a0, -24(s0)
     call  length
@@ -275,7 +275,7 @@ main:
 
     .section .rodata
 
-.L.str.0:
+.L.str:
     .asciz "hello, world\n"
 
 .L.str.1:

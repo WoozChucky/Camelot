@@ -410,8 +410,38 @@
 //! `.ascii` and `.zero` (struct padding too), after a `.balign` for the
 //! type. A `static` local's symbol is
 //! `function.name`, a local symbol (no `.globl`). Each string literal gets a
-//! label `.L.str.<n>` in `.rodata`, one for literals of the same bytes, as
+//! label `.L.str` in `.rodata`, one for literals of the same bytes, as
 //! clang merges them.
+//!
+//! ## Symbol names
+//!
+//! The names merlin makes are clang's: `.str` for a string literal (written
+//! `.L.str`, a private label), `.compoundliteral` for the object of a
+//! compound literal at file scope, `function.name` for a `static` local.
+//! Several of one name are told apart as LLVM tells apart any two globals
+//! of the same name (`ValueSymbolTable::makeUniqueName`): the first keeps
+//! the name, and each one after gets `.N`, N the next value of one counter
+//! for the whole module (`LastUnique`), shared by every name. So the numbers
+//! skip:
+//!
+//! ```text
+//!   const char *a = "x";         .L.str
+//!   int *b = (int[]){1};         .compoundliteral
+//!   const char *c = "y";         .L.str.1
+//!   int *d = (int[]){2};         .compoundliteral.2
+//!   int f(void) {
+//!       static int x;            f.x
+//!       { static int x; }        f.x.3
+//!   }
+//! ```
+//!
+//! A symbol takes its name when clang makes its global ([`FileGen::create`]
+//! for a variable, [`FileGen::string`] for a string literal): in the order
+//! the output is generated (see "Order"), not the order of the source. A
+//! `static` global emitted at the end, where it is used, names its compound
+//! literals there. Sema gives each such variable a key, which tells apart
+//! those of one name ([`crate::sema::symbol_key`]); [`FileGen::name`] is the
+//! symbol a key was given.
 //!
 //! ## Control flow
 //!
@@ -465,7 +495,7 @@ use crate::ast::*;
 use crate::consteval::{self, Base, Const};
 use crate::debug::{DebugInfo, Lines, Location, Scope, Var};
 use crate::elide;
-use crate::sema::arith_type;
+use crate::sema::{arith_type, symbol_base, LITERAL};
 use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
 use crate::{Error, Pos};
 use std::cell::Cell;
@@ -518,6 +548,8 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
         pieces: Vec::new(),
         labels: 0,
         strings: Vec::new(),
+        symbols: SymbolTable::default(),
+        names: HashMap::new(),
         debug: debug.map(|(info, names)| Lines::new(info, names, xlen)),
         by_symbol: defs
             .iter()
@@ -642,7 +674,7 @@ impl<'a> Def<'a> {
     /// A compound literal of the file's scope, which the initializer that
     /// names it emits (`GetAddrOfConstantCompoundLiteral`).
     fn hidden(&self) -> bool {
-        matches!(self, Def::Var(d) if d.name.starts_with(".compoundliteral."))
+        matches!(self, Def::Var(d) if d.name == LITERAL)
     }
 }
 
@@ -805,6 +837,36 @@ fn log2(n: u32) -> Option<u32> {
     n.is_power_of_two().then(|| n.trailing_zeros())
 }
 
+/// The names of the module's symbols (its functions and globals), as LLVM's
+/// `ValueSymbolTable` keeps them: a name asked for that is taken already is
+/// made unique with `.N`, N from a counter of the whole table (see "Symbol
+/// names" above).
+#[derive(Default)]
+struct SymbolTable {
+    taken: HashSet<String>,
+    /// The last number appended (`LastUnique`): the next one is one more,
+    /// whichever name it is for.
+    last_unique: u32,
+}
+
+impl SymbolTable {
+    /// Takes the name `base`, or, if it is taken, `base.N` for the first N
+    /// after the last one given that makes a name not taken
+    /// (`makeUniqueName`).
+    fn insert(&mut self, base: &str) -> String {
+        if self.taken.insert(base.to_string()) {
+            return base.to_string();
+        }
+        loop {
+            self.last_unique += 1;
+            let name = format!("{base}.{}", self.last_unique);
+            if self.taken.insert(name.clone()) {
+                return name;
+            }
+        }
+    }
+}
+
 /// What is shared by the whole file: the output, the label counter and the
 /// string literals seen so far.
 struct FileGen<'a> {
@@ -819,8 +881,12 @@ struct FileGen<'a> {
     pieces: Vec<(&'static str, String)>,
     /// Label counter shared by every function in the file, so labels are unique.
     labels: usize,
-    /// String literals, emitted at the end; literal `i` is `.L.str.<i>`.
-    strings: Vec<Vec<u8>>,
+    /// String literals, emitted at the end: each one's bytes and label.
+    strings: Vec<(Vec<u8>, String)>,
+    /// The names of the module's symbols, and the symbol each key sema
+    /// gave a variable is written as ("Symbol names" above).
+    symbols: SymbolTable,
+    names: HashMap<String, String>,
     /// With `-g`, the debug information ([`crate::debug`]).
     debug: Option<Lines>,
     /// The file's definitions, in the order they come, and by symbol.
@@ -863,15 +929,19 @@ impl<'a> FileGen<'a> {
 
     // ---- the order of the output ----
 
-    /// Makes symbol `sym`, as clang makes a function or global the first
-    /// time it is defined or referred to (`GetOrCreateLLVMFunction`,
-    /// `GetOrCreateLLVMGlobal`): the output has the symbols in this order. A
-    /// deferred definition waiting for its first use is to be emitted now.
+    /// Makes symbol `sym` (a key sema gave it), as clang makes a function or
+    /// global the first time it is defined or referred to
+    /// (`GetOrCreateLLVMFunction`, `GetOrCreateLLVMGlobal`): the output has
+    /// the symbols in this order, and the symbol takes its name now ("Symbol
+    /// names" above). A deferred definition waiting for its first use is to
+    /// be emitted now.
     fn create(&mut self, sym: &str) {
         if self.dry {
             return;
         }
         if self.created_set.insert(sym.to_string()) {
+            let name = self.symbols.insert(symbol_base(sym));
+            self.names.insert(sym.to_string(), name);
             self.created.push(sym.to_string());
             if let Some(&k) = self.by_symbol.get(sym) {
                 if self.waiting[k] {
@@ -880,6 +950,17 @@ impl<'a> FileGen<'a> {
                 }
             }
         }
+    }
+
+    /// The symbol made for key `sym` ([`Self::create`]). A function's first
+    /// pass, which makes nothing, writes the key, and its output is thrown
+    /// away.
+    fn name<'s>(&'s self, sym: &'s str) -> &'s str {
+        debug_assert!(
+            self.dry || self.names.contains_key(sym),
+            "'{sym}' is used before it is made"
+        );
+        self.names.get(sym).map_or(sym, String::as_str)
     }
 
     /// A reference to symbol `sym` in the code or the data generated. A
@@ -910,9 +991,12 @@ impl<'a> FileGen<'a> {
                 if self.defs[k].hidden() {
                     return Ok(());
                 }
-                if let (Some(dbg), Some(VarRef::Global(sym))) = (self.debug.as_mut(), &d.var) {
-                    let external = d.storage != Storage::Static;
-                    dbg.global(&d.name, sym, (&d.ty, &d.spelled), d.pos, external);
+                if let Some(VarRef::Global(sym)) = &d.var {
+                    let sym = self.name(sym).to_string();
+                    if let Some(dbg) = self.debug.as_mut() {
+                        let external = d.storage != Storage::Static;
+                        dbg.global(&d.name, &sym, (&d.ty, &d.spelled), d.pos, external);
+                    }
                 }
                 Ok(())
             }
@@ -1035,14 +1119,22 @@ impl<'a> FileGen<'a> {
     }
 
     /// The label of a string literal, at `pos`: the same bytes are one
-    /// literal, as clang merges them (C99 6.4.5p6 leaves it open).
+    /// literal, as clang merges them (C99 6.4.5p6 leaves it open). A new
+    /// one is named `.str` now, as clang names its private global
+    /// (`GetAddrOfConstantStringFromLiteral`), `.L.str` in the assembly
+    /// (`.L`: a private symbol, which the object leaves out).
     fn string(&mut self, bytes: &[u8], pos: Pos) -> String {
-        if let Some(i) = self.strings.iter().position(|s| s == bytes) {
-            return format!(".L.str.{i}");
+        if let Some((_, label)) = self.strings.iter().find(|(s, _)| s == bytes) {
+            return label.clone();
         }
-        self.strings.push(bytes.to_vec());
-        // (A first pass's literals are taken back: see [`Self::function`].)
-        let label = format!(".L.str.{}", self.strings.len() - 1);
+        // A first pass's literals are taken back ([`Self::function`]): they
+        // take no name.
+        let label = if self.dry {
+            String::from(".L.str")
+        } else {
+            format!(".L{}", self.symbols.insert(".str"))
+        };
+        self.strings.push((bytes.to_vec(), label.clone()));
         if let Some(d) = self.debug.as_mut() {
             d.literal(&label, bytes.len(), pos);
         }
@@ -1070,6 +1162,7 @@ impl<'a> FileGen<'a> {
             self.data(&d.ty, init, &mut data);
         }
         self.create(sym);
+        let name = self.name(sym).to_string();
         self.begin();
         // A `const` object never changes: read-only data, as clang does (a
         // `const volatile` one may be changed from outside, so it stays
@@ -1091,22 +1184,24 @@ impl<'a> FileGen<'a> {
             ""
         };
         let bytes = if size == 1 { "byte" } else { "bytes" };
+        // A compound literal has no name in C: its symbol's.
+        let shown = if d.name == LITERAL { &name } else { &d.name };
         let _ = writeln!(
             self.out,
             "\n    # {storage}{}: {size} {bytes}",
-            d.ty.declare(&d.name)
+            d.ty.declare(shown)
         );
-        if d.storage != Storage::Static && !sym.contains('.') {
-            let _ = writeln!(self.out, "    .globl {sym}");
+        if d.storage != Storage::Static {
+            let _ = writeln!(self.out, "    .globl {name}");
         }
         if d.ty.align(self.xlen) > 1 {
             let _ = writeln!(self.out, "    .balign {}", d.ty.align(self.xlen));
         }
         // An object symbol with its size, as for functions: debuggers and
         // tests find what an address belongs to from the symbol table.
-        let _ = writeln!(self.out, "    .type {sym}, @object");
-        let _ = writeln!(self.out, "    .size {sym}, {size}");
-        let _ = writeln!(self.out, "{sym}:");
+        let _ = writeln!(self.out, "    .type {name}, @object");
+        let _ = writeln!(self.out, "    .size {name}, {size}");
+        let _ = writeln!(self.out, "{name}:");
         if d.init.is_none() {
             data.push(format!(".zero {size}"));
         }
@@ -1197,7 +1292,7 @@ impl<'a> FileGen<'a> {
                         let sym = match base {
                             Base::Sym(s) => {
                                 self.reference(&s);
-                                s
+                                self.name(&s).to_string()
                             }
                             Base::Str(bytes) => self.string(&bytes, e.pos),
                         };
@@ -1255,8 +1350,8 @@ impl<'a> FileGen<'a> {
             return;
         }
         self.switch(".rodata");
-        for (i, bytes) in std::mem::take(&mut self.strings).iter().enumerate() {
-            let _ = writeln!(self.out, "\n.L.str.{i}:");
+        for (bytes, label) in std::mem::take(&mut self.strings) {
+            let _ = writeln!(self.out, "\n{label}:");
             let mut with_nul = bytes.clone();
             with_nul.push(0);
             for line in byte_directives(&with_nul) {
@@ -1407,10 +1502,18 @@ impl<'a> FuncGen<'a, '_> {
         self.ins_sized(size, "li", format!("{reg}, {value}"));
     }
 
-    /// `la reg, symbol`: `auipc` + `addi`.
+    /// `la reg, symbol`: `auipc` + `addi`, for the symbol of key `symbol`
+    /// (a function or variable).
     fn la(&mut self, reg: &str, symbol: &str) {
         self.file.reference(symbol);
-        self.ins_sized(8, "la", format!("{reg}, {symbol}"));
+        let name = self.file.name(symbol).to_string();
+        self.la_label(reg, &name);
+    }
+
+    /// `la reg, label`, of a label that is no symbol of the module's (a
+    /// string literal's).
+    fn la_label(&mut self, reg: &str, label: &str) {
+        self.ins_sized(8, "la", format!("{reg}, {label}"));
     }
 
     fn comment(&mut self, text: impl AsRef<str>) {
@@ -1833,14 +1936,17 @@ impl<'a> FuncGen<'a, '_> {
     /// its slot, a `static` local at its symbol. (A block's `extern`
     /// declaration defines nothing.)
     fn debug_decl(&mut self, decl: &Declarator) {
-        let Some(d) = self.file.debug.as_mut() else {
+        if self.file.debug.is_none() {
             return;
-        };
+        }
         let at = match &decl.var {
             Some(VarRef::Local(id)) => Location::Frame(self.offsets[id.0]),
-            Some(VarRef::Global(sym)) if decl.storage == Storage::Static => Location::Symbol(sym.clone()),
+            Some(VarRef::Global(sym)) if decl.storage == Storage::Static => {
+                Location::Symbol(self.file.name(sym).to_string())
+            }
             _ => return,
         };
+        let d = self.file.debug.as_mut().expect("-g");
         let v = d.var(&decl.name, &decl.ty, &decl.spelled, decl.pos, at);
         d.declared(&v);
         self.scopes.last_mut().expect("a scope").push(v);
@@ -2517,7 +2623,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             ExprKind::Str(bytes) => {
                 let label = self.file.string(bytes, e.pos);
-                self.la("a0", &label);
+                self.la_label("a0", &label);
             }
             ExprKind::Var { var, .. } => match var {
                 Some(VarRef::Local(id)) => {
@@ -4263,11 +4369,11 @@ main:
             "p:\n    .word g+4\n",
             "s:\n    .ascii \"hi\\n\"\n    .zero 1\n",
             "    .bss\n\n    # static unsigned int u: 4 bytes\n    .balign 4\n    .type u, @object\n    .size u, 4\nu:\n    .zero 4\n",
-            "str:\n    .word .L.str.0\n",
+            "str:\n    .word .L.str\n",
             "raw:\n    .byte 1\n    .byte 2\n    .byte 255\n",
             "zeros:\n    .word 0\n    .zero 4\n",
             "\n    # static int n: 4 bytes\n    .balign 4\n    .type main.n, @object\n    .size main.n, 4\nmain.n:\n    .word 3\n",
-            "    .section .rodata\n\n.L.str.0:\n    .asciz \"a\\\"b\\\\\"\n",
+            "    .section .rodata\n\n.L.str:\n    .asciz \"a\\\"b\\\\\"\n",
         ] {
             assert!(data.contains(want), "missing {want:?} in\n{data}");
         }
@@ -4285,7 +4391,7 @@ main:
             "a:\n    .word i\n",
             "b:\n    .word i+2\n",
             "c:\n    .word i+8\n",
-            "d:\n    .word .L.str.0+1\n",
+            "d:\n    .word .L.str+1\n",
         ] {
             assert!(asm.contains(want), "missing {want:?} in\n{asm}");
         }
@@ -4294,9 +4400,9 @@ main:
     #[test]
     fn string_literals() {
         let asm = compile("char *f() { return \"one\"; } int main() { return f()[0] + \"\\x01\\x02z\"[1]; }");
-        assert!(asm.contains("la    a0, .L.str.0\n"), "{asm}");
+        assert!(asm.contains("la    a0, .L.str\n"), "{asm}");
         assert!(asm.ends_with(
-            "    .section .rodata\n\n.L.str.0:\n    .asciz \"one\"\n\n.L.str.1:\n    .byte 1, 2\n    .asciz \"z\"\n"
+            "    .section .rodata\n\n.L.str:\n    .asciz \"one\"\n\n.L.str.1:\n    .byte 1, 2\n    .asciz \"z\"\n"
         ), "{asm}");
     }
 
@@ -5287,7 +5393,7 @@ main:
                 "    # long g: 8 bytes\n    .globl g\n    .balign 8\n    .type g, @object\n    .size g, 8\ng:\n    .quad -2\n",
                 "i:\n    .word 5\n",
                 "    .balign 8\n    .type p, @object\n    .size p, 8\np:\n    .quad i+4\n",
-                "s:\n    .quad .L.str.0\n",
+                "s:\n    .quad .L.str\n",
                 "u:\n    .quad 1\n",
             ] {
                 assert!(asm.contains(want), "missing {want:?} in\n{asm}");

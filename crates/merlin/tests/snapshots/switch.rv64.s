@@ -784,7 +784,7 @@ main:
     addi  a0, s0, -32
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    la    a0, .L.str.0
+    la    a0, .L.str
     addi  sp, sp, -8
     sd    a0, 0(sp)
     li    a0, 7
@@ -998,7 +998,7 @@ main:
 
     .section .rodata
 
-.L.str.0:
+.L.str:
     .asciz "abcdefg"
 
 .L.str.1:
