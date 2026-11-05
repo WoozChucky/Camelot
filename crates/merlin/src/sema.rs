@@ -1279,6 +1279,10 @@ impl<'a> FnChecker<'a> {
                 }
                 return Ok(());
             }
+            // `(void *)0`, and so `NULL`, is a null pointer constant, which
+            // converts to any pointer, a function's too (C11 6.5.16.1p1),
+            // where any other `void *` converts only to an object's.
+            (Type::Ptr(_), Type::Ptr(_)) if consteval::is_null_pointer(e, self.xlen) => return Ok(()),
             (Type::Ptr(a), Type::Ptr(b)) => {
                 let (au, bu) = (a.unqual(), b.unqual());
                 let compatible =
@@ -3361,6 +3365,20 @@ mod tests {
         assert_eq!(
             err("void g(void); int f() { void *p = g; return 0; }"),
             "1:35: incompatible pointer types initializing 'void *' with an expression of type 'void (*)(void)'"
+        );
+        // `NULL`, `((void *)0)`, is a function pointer's too, initialized,
+        // assigned or passed; another `void *` is not.
+        ok("struct S { int (*f)(void); } g = { ((void *)0) };
+int (*h)(void) = ((void *)0);
+            void take(void (*cb)(int));
+            int f(void) { int (*l)(void) = ((void *)0); l = ((void *)0); take(((void *)0)); return 0; }");
+        assert_eq!(
+            err("void *v; int f() { int (*l)(void) = v; return 0; }"),
+            "1:37: incompatible pointer types initializing 'int (*)(void)' with an expression of type 'void *'"
+        );
+        assert_eq!(
+            err("int f() { int (*l)(void) = (void *)1; return 0; }"),
+            "1:28: incompatible pointer types initializing 'int (*)(void)' with an expression of type 'void *'"
         );
         assert_eq!(
             err("int g(int); int f() { int (*q)(char) = g; return 0; }"),

@@ -1229,8 +1229,11 @@ impl Lines {
             }
             TypeNode::Func(ret, params, variadic) => {
                 let mut d = Die::new(TAG_SUBROUTINE_TYPE, "a function type");
-                d.attr(AT_PROTOTYPED, Val::Flag);
+                // The return type first, then the flag, as LLVM's
+                // `constructTypeDIE` adds them: the abbreviation lists the
+                // attributes in this order.
                 typed(&mut d, *ret);
+                d.attr(AT_PROTOTYPED, Val::Flag);
                 for p in params {
                     let mut pd = Die::new(TAG_FORMAL_PARAMETER, "a parameter");
                     typed(&mut pd, *p);

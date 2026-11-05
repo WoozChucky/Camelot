@@ -657,12 +657,14 @@ fn llvm_dwarfdump_verifies_every_case() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Every attribute merlin writes for [`VARS`] has the form clang gives it, at
-/// both widths: the `DW_AT_* [DW_FORM_*]` pairs llvm-dwarfdump -v shows for
-/// merlin's object are those it shows for clang's (clang -O0 -g; its own, such as
-/// the producer's, are the same forms). Ignored: it needs clang and
-/// llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP` name them if they are not on the
-/// PATH).
+/// Every attribute merlin writes for [`VARS`] has the form clang gives it, in
+/// the order clang writes it, at both widths: entry by entry, the tag and its
+/// `DW_AT_* [DW_FORM_*]` pairs, in order, that llvm-dwarfdump -v shows for
+/// merlin's object are those it shows for clang's (clang -O0 -g; its own, such
+/// as the producer's, are the same forms). The order is the abbreviation's,
+/// which LLVM decides by the order it adds the attributes in. Ignored: it
+/// needs clang and llvm-dwarfdump (`CLANG` and `LLVM_DWARFDUMP` name them if
+/// they are not on the PATH).
 #[test]
 #[ignore]
 fn the_forms_are_clangs() {
@@ -672,20 +674,27 @@ fn the_forms_are_clangs() {
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("v.c");
     std::fs::write(&source, VARS).unwrap();
-    let forms = |obj: &Path| -> std::collections::BTreeSet<String> {
+    // Each entry as a line: its tag, then its attributes and their forms.
+    let forms = |obj: &Path| -> Vec<String> {
         let out = std::process::Command::new(&tool)
             .args(["--debug-info", "-v"])
             .arg(obj)
             .output()
             .unwrap_or_else(|e| panic!("cannot run {tool}: {e}"));
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.lines()
-            .filter_map(|l| {
-                let l = l.trim();
-                let end = l.find(']')?;
-                (l.starts_with("DW_AT_") && l.contains("[DW_FORM_")).then(|| l[..=end].to_string())
-            })
-            .collect()
+        let mut entries: Vec<String> = Vec::new();
+        for l in text.lines() {
+            let l = l.trim();
+            if let Some(tag) = l.split_whitespace().nth(1).filter(|t| t.starts_with("DW_TAG_")) {
+                entries.push(tag.to_string());
+            } else if let (Some(e), Some(end)) = (entries.last_mut(), l.find(']')) {
+                if l.starts_with("DW_AT_") && l.contains("[DW_FORM_") {
+                    e.push(' ');
+                    e.push_str(&l[..=end]);
+                }
+            }
+        }
+        entries
     };
     for x in [Xlen::Rv32, Xlen::Rv64] {
         let bits = x.bits();
@@ -715,7 +724,10 @@ fn the_forms_are_clangs() {
             .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let (ours, theirs) = (forms(&ours), forms(&theirs));
-        assert!(ours.contains("DW_AT_name [DW_FORM_strx1]"), "{ours:#?}");
+        assert!(
+            ours.iter().any(|e| e.contains("DW_AT_name [DW_FORM_strx1]")),
+            "{ours:#?}"
+        );
         assert_eq!(ours, theirs, "merlin's (left) and clang's (right), {x:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -947,6 +959,21 @@ fn null_pointer_constants_keep_casts_as_clangs() {
     let src = "typedef long L;\ntypedef int I;\nint *p = (void *)0;\nint *q = (I)0;\nint *r = (int *)(L)0;\n\
                int main(void) { return 0; }\n";
     assert_eq!(named(src, dw::TAG_TYPEDEF), ["I", "L"]);
+    // A function pointer's `NULL` too.
+    let src = "typedef void *K1;
+typedef void *K2;
+typedef void *K3;
+typedef void *K4;
+               int (*gfp)(void) = (K4)0;
+void take(void (*cb)(int));
+               int (*f(int x))(void) {
+                   int (*fp)(void) = (K1)0;
+                   take((K2)0);
+                   if (x) return (K3)0;
+                   return fp;
+               }
+";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["K4"]);
 }
 
 /// A function pointer's parameters are described as declared, by their
