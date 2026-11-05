@@ -76,8 +76,6 @@ main:
     li    a0, 0
     sw    a0, -20(s0)
 .L.continue.6:
-    li    a0, 1
-    beqz  a0, .L.break.7
     lw    a0, -20(s0)
     addi  sp, sp, -4
     sw    a0, 0(sp)

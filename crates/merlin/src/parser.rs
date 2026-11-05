@@ -489,7 +489,7 @@ impl Parser<'_> {
     /// `int b[sizeof a / sizeof a[0]]` work before sema has typed anything.
     fn const_int(&self, e: &mut Expr) -> Option<i128> {
         self.resolve_sizeof(e);
-        consteval::int(e, self.xlen)
+        consteval::parsed_int(e, self.xlen)
     }
 
     /// Rewrites `sizeof expr` into `sizeof (type)` throughout the operators

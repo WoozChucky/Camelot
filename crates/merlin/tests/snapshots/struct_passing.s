@@ -810,10 +810,7 @@ main:
     bltu  t1, t3, 2b
     # struct word w = ...
     sw    zero, -228(s0)
-    li    a0, 3
-    neg   a0, a0
-    slli  a0, a0, 16
-    srai  a0, a0, 16
+    li    a0, -3
     sh    a0, -228(s0)
     li    a0, 4
     sh    a0, -226(s0)
@@ -1314,8 +1311,7 @@ main:
     lh    a0, 0(a0)
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 3
-    neg   a0, a0
+    li    a0, -3
     lw    a1, 0(sp)
     addi  sp, sp, 4
     xor   a0, a1, a0
@@ -1405,25 +1401,7 @@ main:
     addi  sp, sp, 12
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 30
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 3
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 15
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    add   a0, a1, a0
+    li    a0, 49
     lw    a1, 0(sp)
     addi  sp, sp, 4
     xor   a0, a1, a0
@@ -1702,25 +1680,7 @@ main:
     lw    a0, -12(s0)
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 6
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 6
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    xor   a0, a1, a0
-    seqz  a0, a0
-    beqz  a0, .L.and.15
     li    a0, 1
-    addi  sp, sp, -4
-    sw    a0, 0(sp)
-    li    a0, 1
-    lw    a1, 0(sp)
-    addi  sp, sp, 4
-    xor   a0, a1, a0
-    seqz  a0, a0
-.L.and.15:
-    snez  a0, a0
     lw    a1, 0(sp)
     addi  sp, sp, 4
     add   a0, a1, a0
