@@ -23,7 +23,7 @@ fn samples_cover_the_whole_catalogue() {
 fn catalogue_is_in_code_order_and_grouped() {
     let codes: Vec<u16> = CATALOGUE.iter().map(|(code, _, _)| *code).collect();
     assert!(codes.windows(2).all(|w| w[0] < w[1]), "{codes:x?}");
-    assert!(codes.iter().all(|c| c >> 8 <= 6));
+    assert!(codes.iter().all(|c| c >> 8 <= 7));
 }
 
 #[test]
@@ -92,6 +92,8 @@ fn field_layouts_match_the_protocol_doc() {
             clock_hz: Some(5),
             nominal_hz: 7,
             harts: 2,
+            xlen: Xlen::Rv64,
+            paging: Paging::Sv39,
             devices: vec![DeviceSpec::Disk(DiskSpec {
                 source: DiskSource::File("d".into()),
                 read_only: true,
@@ -102,12 +104,14 @@ fn field_layouts_match_the_protocol_doc() {
     .unwrap();
     #[rustfmt::skip]
     let want = [
-        45, 0, 0, 0, 0x01, 0x01,
+        47, 0, 0, 0, 0x01, 0x01,
         1, 0, 0, 0, b'a',                       // name
         0, 0x10, 0, 0, 0, 0, 0, 0,              // ram_size u64
         1, 5, 0, 0, 0,                          // clock_hz Some(5)
         7, 0, 0, 0,                             // nominal_hz
         2, 0, 0, 0,                             // harts
+        64,                                     // xlen: RV64
+        8,                                      // paging: satp.MODE 8, Sv39 alone
         1, 0, 0, 0,                             // 1 device
         1, 1, 1, 0, 0, 0, b'd', 1,              // disk, file "d", read-only
         1, 0, 0, 0, 0xee,                       // program
@@ -567,6 +571,7 @@ fn vm_ref_parses_ids_and_names() {
     }
     assert_eq!(VmRef::Id(3).to_string(), "3");
     assert_eq!(VmState::Exited(2).to_string(), "exited(2)");
+    assert_eq!(VmState::Debug.to_string(), "debug");
 }
 
 #[test]

@@ -15,10 +15,12 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         char *end;
         long pid = strtol(argv[i], &end, 10);
-        /* strtol gives LONG_MAX for a number past it, so that one is
-         * refused too: no pid gets that high, and a number too big for an
-         * int must not end up naming some other process. */
-        if (end == argv[i] || *end != 0 || pid <= 0 || pid == LONG_MAX) {
+        /* A pid is an int: a number too big for one is not a pid, and
+         * must not end up naming some other process by its low 32 bits.
+         * On RV64, where a long has 64 bits, that is one past INT_MAX; on
+         * RV32 strtol gives LONG_MAX (INT_MAX there) for any number past
+         * it, so that one is refused too (no pid gets that high). */
+        if (end == argv[i] || *end != 0 || pid <= 0 || pid > INT_MAX || pid == LONG_MAX) {
             fprintf(STDERR, "kill: %s: not a process id\n", argv[i]);
             status = 1;
             continue;

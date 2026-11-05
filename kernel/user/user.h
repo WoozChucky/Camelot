@@ -18,6 +18,44 @@ typedef long time_t;
 typedef long intptr_t;
 typedef unsigned long uintptr_t;
 
+/* Integers of a given width, as <stdint.h> has them: the same on both
+ * widths. The 64-bit ones are long long, which merlin and clang make a
+ * register on RV64 and a pair of them on RV32 (lib/libgcc.c has the
+ * routines RV32 calls to divide them). */
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef short int16_t;
+typedef unsigned short uint16_t;
+typedef int int32_t;
+typedef unsigned int uint32_t;
+typedef long long int64_t;
+typedef unsigned long long uint64_t;
+
+/* The limits of the integer types, as <limits.h> and <stdint.h> give
+ * them. A long is a register: 64 bits on RV64 (_LP64), 32 on RV32. */
+#define INT_MAX 2147483647
+#define INT_MIN (-INT_MAX - 1)
+#define UINT_MAX 4294967295u
+#ifdef _LP64
+#define LONG_MAX 0x7fffffffffffffffL
+#define ULONG_MAX 0xffffffffffffffffUL
+#else
+#define LONG_MAX 2147483647L
+#define ULONG_MAX 4294967295UL
+#endif
+#define LONG_MIN (-LONG_MAX - 1)
+#define LLONG_MAX 0x7fffffffffffffffLL
+#define LLONG_MIN (-LLONG_MAX - 1)
+#define ULLONG_MAX 0xffffffffffffffffULL
+#define INT32_MAX INT_MAX
+#define INT32_MIN INT_MIN
+#define UINT32_MAX UINT_MAX
+#define INT64_MAX LLONG_MAX
+#define INT64_MIN LLONG_MIN
+#define UINT64_MAX ULLONG_MAX
+#define SIZE_MAX ULONG_MAX
+#define SSIZE_MAX LONG_MAX
+
 #define NULL ((void *)0)
 
 /* Error numbers: a system call that fails returns minus one of them. They
@@ -78,6 +116,29 @@ typedef unsigned long uintptr_t;
  * their strings take with their NULs. */
 #define MAXARG 16
 #define ARG_MAX 512
+
+/* A program starts as Linux starts one (docs/camelot-syscalls.md,
+ * "Starting a program"): crt0 calls main(argc, argv, envp), and after
+ * envp's NULL comes the auxiliary vector, pairs of a type and a value (a
+ * long each), ending with AT_NULL. Its types, Linux's values
+ * (kernel/include/syscall.h's: a test checks they agree). */
+#define AT_NULL 0    /* the end of the vector */
+#define AT_PHDR 3    /* where the program headers are, 0 if not loaded */
+#define AT_PHENT 4   /* a program header's size */
+#define AT_PHNUM 5   /* how many there are */
+#define AT_PAGESZ 6  /* the page size: 4096 */
+#define AT_BASE 7    /* the interpreter's base: 0, there is none */
+#define AT_FLAGS 8   /* flags: 0 */
+#define AT_ENTRY 9   /* the program's entry point, crt0's _start */
+#define AT_UID 11    /* the user and group ids: 0, Camelot has one user */
+#define AT_EUID 12
+#define AT_GID 13
+#define AT_EGID 14
+#define AT_HWCAP 16  /* the ISA's letters, bit 'X' - 'A' for each: I, M and A */
+#define AT_CLKTCK 17 /* how often uptime() ticks a second */
+#define AT_SECURE 23 /* 0: not a setuid program */
+#define AT_RANDOM 25 /* the address of 16 random bytes */
+#define AT_EXECFN 31 /* the path the program was started with */
 
 /* open's flags: one access mode, plus O_CREAT (make the file if it is
  * missing), O_TRUNC (empty it, when opened for writing) and O_CLOEXEC (the
@@ -298,46 +359,6 @@ long syscall(long number, long a0, long a1, long a2);
 
 /* ---- The C library (lib/, see lib/README.md) ---- */
 
-/* 64-bit integers (lib/i64.c): merlin has no long long, so a value is
- * two words, in two's complement. The assembler and the linker compute with
- * them as merlin-as and merlin-ld do with Rust's i64. */
-typedef struct {
-    uint lo;
-    uint hi;
-} i64;
-
-i64 i64_of(int v);
-i64 i64_u(uint v);
-i64 i64_add(i64 a, i64 b);
-i64 i64_sub(i64 a, i64 b);
-i64 i64_neg(i64 a);
-i64 i64_not(i64 a);
-i64 i64_mul(i64 a, i64 b);
-/* a / b and a % b truncated toward zero, as Rust's checked_div/checked_rem:
- * 0 when there is no result (b is 0, or i64::MIN / -1). */
-int i64_div(i64 a, i64 b, i64 *q);
-int i64_rem(i64 a, i64 b, i64 *r);
-/* The shifts take the low 6 bits of n, as Rust's wrapping shifts do. */
-/* a << n: i64::wrapping_shl. */
-i64 i64_shl(i64 a, uint n);
-/* a >> n, logical (zeros shifted in): (a as u64).wrapping_shr. */
-i64 i64_shr(i64 a, uint n);
-/* a >> n, arithmetic (the sign shifted in): i64::wrapping_shr. */
-i64 i64_sar(i64 a, uint n);
-i64 i64_and(i64 a, i64 b);
-i64 i64_or(i64 a, i64 b);
-i64 i64_xor(i64 a, i64 b);
-/* -1, 0 or 1, comparing as signed. */
-int i64_cmp(i64 a, i64 b);
-int i64_eq(i64 a, i64 b);
-int i64_is_neg(i64 a);
-/* Whether lo <= v < hi (signed). */
-int i64_in(i64 v, i64 lo, i64 hi);
-/* Decimal (signed), and 0x-prefixed hexadecimal of the unsigned value, as
- * Rust's {} and {:#x}: each call returns one of a few rotating buffers. */
-const char *i64_dec(i64 v);
-const char *i64_hex(i64 v);
-
 /* Strings and memory (lib/string.c). */
 size_t strlen(const char *s);
 int strcmp(const char *a, const char *b);
@@ -358,19 +379,13 @@ int memcmp(const void *a, const void *b, size_t n);
  * after "0"); *end (if `end` isn't NULL) is where it stopped, `s` itself
  * when there were no digits. A number out of range gives LONG_MAX, or
  * LONG_MIN with a '-', as in C (*end is still past all its digits). */
-#ifdef _LP64
-#define LONG_MAX 0x7fffffffffffffffL
-#else
-#define LONG_MAX 2147483647L
-#endif
-#define LONG_MIN (-LONG_MAX - 1)
-#define INT_MAX 2147483647
-#define INT_MIN (-INT_MAX - 1)
 int atoi(const char *s);
 long strtol(const char *s, char **end, int base);
 
-/* The heap (lib/malloc.c), on top of sbrk: blocks aligned to 8 bytes,
- * a free list with neighbours merged. malloc(0) and a failure return NULL.
+/* The heap (lib/malloc.c), on top of sbrk: blocks aligned to the size of
+ * malloc's header, two pointers' worth (8 bytes on RV32, 16 on RV64: the
+ * ABI's largest alignment, as glibc's malloc gives), a free list with
+ * neighbours merged. malloc(0) and a failure return NULL.
  * calloc zeroes; realloc keeps the old bytes (up to the smaller size), and
  * realloc(NULL, n) is malloc(n). */
 void *malloc(size_t n);
@@ -418,8 +433,10 @@ void mutex_unlock(struct mutex *m);
 int thread_start(int (*fn)(void *), void *arg, void *stack, uint size);
 
 /* Formatted output (lib/printf.c): %d %u %x %p %s %c %%, with an optional
- * '-' (left align), '0' (zero padding) and width; an 'l' before d/u/x is
- * accepted and ignored (long is int's size). printf and fprintf return the
+ * '-' (left align), '0' (zero padding) and width. d, u and x take an int
+ * (or unsigned int), or with a length before them a wider one: 'l' a long,
+ * 'll' a long long (int64_t), 'z' a size_t (or ssize_t, with d). %p prints
+ * every digit of a pointer, 8 on RV32 and 16 on RV64. printf and fprintf return the
  * bytes written, or a negative error number; snprintf writes at most
  * `size` bytes into `buf`, the last one a NUL, and returns the length the
  * whole text has (longer than `size` - 1 if it was cut). */

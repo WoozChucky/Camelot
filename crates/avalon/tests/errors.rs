@@ -33,265 +33,289 @@ fn create_error(
 
 #[test]
 fn unknown_vms() {
-    let server = server(None);
-    let mut rt = connect(&server);
-    create(&mut rt, "real", profile(1, None), spinner());
-    for vm in [
-        VmRef::Id(0),
-        VmRef::Id(2),
-        VmRef::Id(u32::MAX),
-        VmRef::Name("ghost".into()),
-    ] {
-        for msg in [
-            Message::GetVmInfo { vm: vm.clone() },
-            Message::StartVm { vm: vm.clone() },
-            Message::PauseVm { vm: vm.clone() },
-            Message::ResumeVm { vm: vm.clone() },
-            Message::StopVm { vm: vm.clone() },
-            Message::DestroyVm { vm: vm.clone() },
-            Message::ConsoleAttach { vm: vm.clone() },
-            Message::ScreenAttach { vm: vm.clone() },
+    on_both_widths(|| {
+        let server = server(None);
+        let mut rt = connect(&server);
+        create(&mut rt, "real", profile(1, None), spinner());
+        for vm in [
+            VmRef::Id(0),
+            VmRef::Id(2),
+            VmRef::Id(u32::MAX),
+            VmRef::Name("ghost".into()),
         ] {
+            for msg in [
+                Message::GetVmInfo { vm: vm.clone() },
+                Message::StartVm { vm: vm.clone() },
+                Message::PauseVm { vm: vm.clone() },
+                Message::ResumeVm { vm: vm.clone() },
+                Message::StopVm { vm: vm.clone() },
+                Message::DestroyVm { vm: vm.clone() },
+                Message::ConsoleAttach { vm: vm.clone() },
+                Message::ScreenAttach { vm: vm.clone() },
+            ] {
+                assert_eq!(error_of(&mut rt, &msg), ErrorCode::NoSuchVm, "{msg:?}");
+            }
+        }
+        for msg in [Message::ConsoleDetach { vm: 9 }, Message::ScreenDetach { vm: 9 }] {
             assert_eq!(error_of(&mut rt, &msg), ErrorCode::NoSuchVm, "{msg:?}");
         }
-    }
-    for msg in [Message::ConsoleDetach { vm: 9 }, Message::ScreenDetach { vm: 9 }] {
-        assert_eq!(error_of(&mut rt, &msg), ErrorCode::NoSuchVm, "{msg:?}");
-    }
-    // Attached nowhere.
-    for msg in [Message::ConsoleDetach { vm: 1 }, Message::ScreenDetach { vm: 1 }] {
-        assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState, "{msg:?}");
-    }
-    server.stop().unwrap();
+        // Attached nowhere.
+        for msg in [Message::ConsoleDetach { vm: 1 }, Message::ScreenDetach { vm: 1 }] {
+            assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState, "{msg:?}");
+        }
+        server.stop().unwrap();
+    });
 }
 
 #[test]
 fn invalid_names() {
-    let server = server(None);
-    let mut rt = connect(&server);
-    for name in [
-        "",
-        "Upper",
-        "123",
-        "con",
-        "com1.img",
-        "a/b",
-        "-x",
-        ".x",
-        "x.",
-        "a b",
-        &"x".repeat(65),
-    ] {
+    on_both_widths(|| {
+        let server = server(None);
+        let mut rt = connect(&server);
+        for name in [
+            "",
+            "Upper",
+            "123",
+            "con",
+            "com1.img",
+            "a/b",
+            "-x",
+            ".x",
+            "x.",
+            "a b",
+            &"x".repeat(65),
+        ] {
+            assert_eq!(
+                create_error(&mut rt, name, profile(1, None), spinner()),
+                ErrorCode::InvalidName,
+                "{name:?}"
+            );
+        }
+        create(&mut rt, &"x".repeat(64), profile(1, None), spinner());
+        create(&mut rt, "web-1.prod_a", profile(1, None), spinner());
         assert_eq!(
-            create_error(&mut rt, name, profile(1, None), spinner()),
-            ErrorCode::InvalidName,
-            "{name:?}"
+            create_error(&mut rt, "web-1.prod_a", profile(1, None), spinner()),
+            ErrorCode::AlreadyExists
         );
-    }
-    create(&mut rt, &"x".repeat(64), profile(1, None), spinner());
-    create(&mut rt, "web-1.prod_a", profile(1, None), spinner());
-    assert_eq!(
-        create_error(&mut rt, "web-1.prod_a", profile(1, None), spinner()),
-        ErrorCode::AlreadyExists
-    );
-    server.stop().unwrap();
+        server.stop().unwrap();
+    });
 }
 
 #[test]
 fn invalid_profiles() {
-    let server = server(None);
-    let mut rt = connect(&server);
-    let disk = |source| {
-        DeviceSpec::Disk(DiskSpec {
-            source,
-            read_only: false,
-        })
-    };
-    let missing = examples_dir().join("disk/no-such-image.img");
-    // A port nobody listens on: a Lake disk there cannot be attached.
-    let no_lake = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().to_string()
-    };
-    let bad = [
-        HardwareProfile::with_ram(0),
-        HardwareProfile::with_ram(4095),
-        HardwareProfile::with_ram(4 << 30),
-        HardwareProfile::with_ram(u64::MAX),
-        HardwareProfile {
-            clock_hz: Some(0),
-            ..HardwareProfile::with_ram(MIB)
-        },
-        HardwareProfile {
-            nominal_hz: 0,
-            ..HardwareProfile::with_ram(MIB)
-        },
-        HardwareProfile {
-            devices: vec![disk(DiskSource::File(missing.to_string_lossy().into_owned())); 9],
-            ..HardwareProfile::with_ram(MIB)
-        },
-        HardwareProfile {
-            devices: vec![disk(DiskSource::File(missing.to_string_lossy().into_owned()))],
-            ..HardwareProfile::with_ram(MIB)
-        },
-        HardwareProfile {
-            devices: vec![disk(DiskSource::Lake {
-                addr: no_lake.clone(),
-                name: "root".into(),
-            })],
-            ..HardwareProfile::with_ram(MIB)
-        },
-        HardwareProfile {
-            devices: vec![disk(DiskSource::Lake {
-                addr: no_lake,
-                name: "not/a/name".into(),
-            })],
-            ..HardwareProfile::with_ram(MIB)
-        },
-    ];
-    for profile in bad {
+    on_both_widths(|| {
+        let server = server(None);
+        let mut rt = connect(&server);
+        let disk = |source| {
+            DeviceSpec::Disk(DiskSpec {
+                source,
+                read_only: false,
+            })
+        };
+        let missing = examples_dir().join("disk/no-such-image.img");
+        // A port nobody listens on: a Lake disk there cannot be attached.
+        let no_lake = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().to_string()
+        };
+        let bad = [
+            hardware(0),
+            hardware(4095),
+            // Past the width's limit: 2 GiB on RV32, 1 TiB on RV64.
+            hardware(match xlen() {
+                avalon_proto::Xlen::Rv32 => 4 << 30,
+                avalon_proto::Xlen::Rv64 => (1 << 40) + (4 << 30),
+            }),
+            hardware(u64::MAX),
+            HardwareProfile {
+                clock_hz: Some(0),
+                ..hardware(MIB)
+            },
+            HardwareProfile {
+                nominal_hz: 0,
+                ..hardware(MIB)
+            },
+            HardwareProfile {
+                devices: vec![disk(DiskSource::File(missing.to_string_lossy().into_owned())); 9],
+                ..hardware(MIB)
+            },
+            HardwareProfile {
+                devices: vec![disk(DiskSource::File(missing.to_string_lossy().into_owned()))],
+                ..hardware(MIB)
+            },
+            HardwareProfile {
+                devices: vec![disk(DiskSource::Lake {
+                    addr: no_lake.clone(),
+                    name: "root".into(),
+                })],
+                ..hardware(MIB)
+            },
+            HardwareProfile {
+                devices: vec![disk(DiskSource::Lake {
+                    addr: no_lake,
+                    name: "not/a/name".into(),
+                })],
+                ..hardware(MIB)
+            },
+        ];
+        for profile in bad {
+            assert_eq!(
+                create_error(&mut rt, "vm", profile.clone(), spinner()),
+                ErrorCode::InvalidProfile,
+                "{profile:?}"
+            );
+        }
         assert_eq!(
-            create_error(&mut rt, "vm", profile.clone(), spinner()),
-            ErrorCode::InvalidProfile,
-            "{profile:?}"
+            rt.request(&Message::ListVms).unwrap(),
+            Message::VmList { vms: vec![] }
         );
-    }
-    assert_eq!(
-        rt.request(&Message::ListVms).unwrap(),
-        Message::VmList { vms: vec![] }
-    );
-    server.stop().unwrap();
+        server.stop().unwrap();
+    });
 }
 
-/// Sets the memory size of an ELF's first program header.
+/// Sets the memory size of an ELF's first program header, ELF32 (`e_phoff` at 0x1c,
+/// `p_memsz` at 0x14, 4 bytes each) or ELF64 (at 0x20 and 0x28, 8 bytes each).
 fn with_memsz(mut elf: Vec<u8>, memsz: u32) -> Vec<u8> {
-    let phoff = u32::from_le_bytes(elf[0x1c..0x20].try_into().unwrap()) as usize;
-    elf[phoff + 0x14..phoff + 0x18].copy_from_slice(&memsz.to_le_bytes());
+    if elf[4] == 2 {
+        let phoff = u64::from_le_bytes(elf[0x20..0x28].try_into().unwrap()) as usize;
+        elf[phoff + 0x28..phoff + 0x30].copy_from_slice(&u64::from(memsz).to_le_bytes());
+    } else {
+        let phoff = u32::from_le_bytes(elf[0x1c..0x20].try_into().unwrap()) as usize;
+        elf[phoff + 0x14..phoff + 0x18].copy_from_slice(&memsz.to_le_bytes());
+    }
     elf
 }
 
 #[test]
 fn invalid_programs() {
-    let server = server(None);
-    let mut rt = connect(&server);
-    let mut truncated = spinner();
-    truncated.truncate(40);
-    let mut not_riscv = spinner();
-    not_riscv[0x12] = 0x3e; // e_machine = x86-64
-    for program in [
-        Vec::new(),
-        b"not an ELF file".to_vec(),
-        truncated,
-        not_riscv,
-        // A segment far larger than RAM: refused before anything is allocated for it.
-        with_memsz(spinner(), 0xffff_f000),
-        with_memsz(spinner(), 2 * MIB as u32),
-    ] {
-        assert_eq!(
-            create_error(&mut rt, "vm", profile(1, None), program),
-            ErrorCode::InvalidProgram
+    on_both_widths(|| {
+        let server = server(None);
+        let mut rt = connect(&server);
+        let mut truncated = spinner();
+        truncated.truncate(40);
+        let mut not_riscv = spinner();
+        not_riscv[0x12] = 0x3e; // e_machine = x86-64
+        for program in [
+            Vec::new(),
+            b"not an ELF file".to_vec(),
+            truncated,
+            not_riscv,
+            // A segment far larger than RAM: refused before anything is allocated for it.
+            with_memsz(spinner(), 0xffff_f000),
+            with_memsz(spinner(), 2 * MIB as u32),
+        ] {
+            assert_eq!(
+                create_error(&mut rt, "vm", profile(1, None), program),
+                ErrorCode::InvalidProgram
+            );
+        }
+        // The same segment fits in a bigger machine.
+        create(
+            &mut rt,
+            "vm",
+            profile(4, None),
+            with_memsz(spinner(), 2 * MIB as u32),
         );
-    }
-    // The same segment fits in a bigger machine.
-    create(
-        &mut rt,
-        "vm",
-        profile(4, None),
-        with_memsz(spinner(), 2 * MIB as u32),
-    );
-    server.stop().unwrap();
+        server.stop().unwrap();
+    });
 }
 
 #[test]
 fn the_ram_budget() {
-    let server = server(Some(100 * MIB));
-    let mut rt = connect(&server);
-    assert_eq!(
-        create_error(&mut rt, "huge", profile(101, None), spinner()),
-        ErrorCode::OverBudget
-    );
-    let a = create(&mut rt, "a", profile(60, None), spinner());
-    create(&mut rt, "b", profile(40, None), spinner());
-    assert_eq!(
-        create_error(&mut rt, "c", profile(1, None), spinner()),
-        ErrorCode::OverBudget
-    );
-    // Stopping keeps the RAM; destroying frees it.
-    rt.request_ok(&Message::StopVm { vm: VmRef::Id(a) }).unwrap();
-    assert_eq!(
-        create_error(&mut rt, "c", profile(1, None), spinner()),
-        ErrorCode::OverBudget
-    );
-    rt.request_ok(&Message::DestroyVm { vm: VmRef::Id(a) }).unwrap();
-    create(&mut rt, "c", profile(60, None), spinner());
-    server.stop().unwrap();
+    on_both_widths(|| {
+        let server = server(Some(100 * MIB));
+        let mut rt = connect(&server);
+        assert_eq!(
+            create_error(&mut rt, "huge", profile(101, None), spinner()),
+            ErrorCode::OverBudget
+        );
+        let a = create(&mut rt, "a", profile(60, None), spinner());
+        create(&mut rt, "b", profile(40, None), spinner());
+        assert_eq!(
+            create_error(&mut rt, "c", profile(1, None), spinner()),
+            ErrorCode::OverBudget
+        );
+        // Stopping keeps the RAM; destroying frees it.
+        rt.request_ok(&Message::StopVm { vm: VmRef::Id(a) }).unwrap();
+        assert_eq!(
+            create_error(&mut rt, "c", profile(1, None), spinner()),
+            ErrorCode::OverBudget
+        );
+        rt.request_ok(&Message::DestroyVm { vm: VmRef::Id(a) }).unwrap();
+        create(&mut rt, "c", profile(60, None), spinner());
+        server.stop().unwrap();
+    });
 }
 
 #[test]
 fn state_errors() {
-    let server = server(None);
-    let mut rt = connect(&server);
-    let id = create(&mut rt, "vm", profile(1, None), spinner());
-    for msg in [
-        Message::PauseVm { vm: VmRef::Id(id) },
-        Message::ResumeVm { vm: VmRef::Id(id) },
-    ] {
-        assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState);
-    }
-    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-    for msg in [
-        Message::StartVm { vm: VmRef::Id(id) },
-        Message::ResumeVm { vm: VmRef::Id(id) },
-    ] {
-        assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState);
-    }
-    server.stop().unwrap();
+    on_both_widths(|| {
+        let server = server(None);
+        let mut rt = connect(&server);
+        let id = create(&mut rt, "vm", profile(1, None), spinner());
+        for msg in [
+            Message::PauseVm { vm: VmRef::Id(id) },
+            Message::ResumeVm { vm: VmRef::Id(id) },
+        ] {
+            assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState);
+        }
+        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+        for msg in [
+            Message::StartVm { vm: VmRef::Id(id) },
+            Message::ResumeVm { vm: VmRef::Id(id) },
+        ] {
+            assert_eq!(error_of(&mut rt, &msg), ErrorCode::InvalidState);
+        }
+        server.stop().unwrap();
+    });
 }
 
 #[test]
 fn groups_avalon_does_not_serve() {
-    let server = server(None);
-    let mut rt = connect(&server);
-    create(&mut rt, "vm", profile(1, None), spinner());
-    for msg in [
-        Message::BlockOpen {
-            name: "disk".into(),
-            read_only: true,
-        },
-        Message::BlockRead {
-            handle: 1,
-            sector: 0,
-            count: 1,
-        },
-        Message::BlockWrite {
-            handle: 1,
-            sector: 0,
-            data: vec![0; 512],
-        },
-        Message::BlockFlush { handle: 1 },
-        Message::BlockSize { handle: 1 },
-        Message::BlockClose { handle: 1 },
-        Message::DiskCreate {
-            name: "disk".into(),
-            sectors: 8,
-            source: None,
-        },
-        Message::ListDisks,
-        Message::DiskDelete { name: "disk".into() },
-    ] {
-        assert_eq!(error_of(&mut rt, &msg), ErrorCode::Unsupported, "{msg:?}");
-    }
-    assert_eq!(
-        error_of(
-            &mut rt,
-            &Message::Hello {
-                version: 1,
-                agent: "again".into()
-            }
-        ),
-        ErrorCode::Unexpected
-    );
-    server.stop().unwrap();
+    on_both_widths(|| {
+        let server = server(None);
+        let mut rt = connect(&server);
+        create(&mut rt, "vm", profile(1, None), spinner());
+        for msg in [
+            Message::BlockOpen {
+                name: "disk".into(),
+                read_only: true,
+            },
+            Message::BlockRead {
+                handle: 1,
+                sector: 0,
+                count: 1,
+            },
+            Message::BlockWrite {
+                handle: 1,
+                sector: 0,
+                data: vec![0; 512],
+            },
+            Message::BlockFlush { handle: 1 },
+            Message::BlockSize { handle: 1 },
+            Message::BlockClose { handle: 1 },
+            Message::DiskCreate {
+                name: "disk".into(),
+                sectors: 8,
+                source: None,
+            },
+            Message::ListDisks,
+            Message::DiskDelete { name: "disk".into() },
+        ] {
+            assert_eq!(error_of(&mut rt, &msg), ErrorCode::Unsupported, "{msg:?}");
+        }
+        assert_eq!(
+            error_of(
+                &mut rt,
+                &Message::Hello {
+                    version: 1,
+                    agent: "again".into()
+                }
+            ),
+            ErrorCode::Unexpected
+        );
+        server.stop().unwrap();
+    });
 }
 
 /// Raw frames, each answered (or not) as section 4 of the protocol doc says: the next
@@ -540,29 +564,31 @@ fn the_last_frame_survives_unread_input() {
 
 #[test]
 fn a_client_that_leaves_is_detached() {
-    let server = server(None);
-    let mut rt = connect(&server);
-    let id = create(&mut rt, "echo", profile(1, None), example("uart-echo"));
-    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-    for _ in 0..3 {
-        let mut console = Console::attach(&server, VmRef::Id(id));
-        console.send(b"x");
-        console.wait_for("x");
-        drop(console);
-    }
-    for _ in 0..2 {
-        drop(Viewer::attach(&server, VmRef::Id(id)));
-    }
-    // Detached as they left, not only once the VM next writes to them.
-    wait_until("the clients to be detached", SLOW, || {
-        let vm = server.debug_vm(id).unwrap();
-        vm.consoles == 0 && vm.viewers == 0
+    on_both_widths(|| {
+        let server = server(None);
+        let mut rt = connect(&server);
+        let id = create(&mut rt, "echo", profile(1, None), example("uart-echo"));
+        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+        for _ in 0..3 {
+            let mut console = Console::attach(&server, VmRef::Id(id));
+            console.send(b"x");
+            console.wait_for("x");
+            drop(console);
+        }
+        for _ in 0..2 {
+            drop(Viewer::attach(&server, VmRef::Id(id)));
+        }
+        // Detached as they left, not only once the VM next writes to them.
+        wait_until("the clients to be detached", SLOW, || {
+            let vm = server.debug_vm(id).unwrap();
+            vm.consoles == 0 && vm.viewers == 0
+        });
+        let mut last = Console::attach(&server, VmRef::Id(id));
+        assert_eq!(last.scrollback, b"xxx");
+        last.send(b"y");
+        last.wait_for("y");
+        server.stop().unwrap();
     });
-    let mut last = Console::attach(&server, VmRef::Id(id));
-    assert_eq!(last.scrollback, b"xxx");
-    last.send(b"y");
-    last.wait_for("y");
-    server.stop().unwrap();
 }
 
 /// Reads what the server sends on `s` until it closes the connection; panics if it
@@ -647,11 +673,12 @@ fn a_client_gets_a_limited_time_to_say_hello() {
 /// [`avalon::MAX_QUEUED`] bytes wait for it; the VM and the other clients carry on.
 #[test]
 fn a_client_that_stops_reading_is_cut_off() {
-    let server = server(None);
-    let mut rt = connect(&server);
-    // Prints `x` forever, a few instructions apart.
-    let chatty = guest(
-        "
+    on_both_widths(|| {
+        let server = server(None);
+        let mut rt = connect(&server);
+        // Prints `x` forever, a few instructions apart.
+        let chatty = guest(
+            "
     .globl _start
 _start:
     li    t0, 0x10000000
@@ -662,59 +689,60 @@ _start:
     bnez  t2, 2b
     j     1b
 ",
-    );
-    let id = create(&mut rt, "chatty", profile(1, None), chatty);
+        );
+        let id = create(&mut rt, "chatty", profile(1, None), chatty);
 
-    // A client that reads everything, counting the console's bytes.
-    let received = Arc::new(AtomicU64::new(0));
-    let mut reader = connect(&server);
-    reader.get_ref().set_read_timeout(None).unwrap();
-    reader
-        .request(&Message::ConsoleAttach { vm: VmRef::Id(id) })
-        .unwrap();
-    let reading = {
-        let received = Arc::clone(&received);
-        std::thread::spawn(move || {
-            while let Ok(msg) = reader.recv() {
-                if let Message::ConsoleOutput { data, .. } = msg {
-                    received.fetch_add(data.len() as u64, Ordering::SeqCst);
+        // A client that reads everything, counting the console's bytes.
+        let received = Arc::new(AtomicU64::new(0));
+        let mut reader = connect(&server);
+        reader.get_ref().set_read_timeout(None).unwrap();
+        reader
+            .request(&Message::ConsoleAttach { vm: VmRef::Id(id) })
+            .unwrap();
+        let reading = {
+            let received = Arc::clone(&received);
+            std::thread::spawn(move || {
+                while let Ok(msg) = reader.recv() {
+                    if let Message::ConsoleOutput { data, .. } = msg {
+                        received.fetch_add(data.len() as u64, Ordering::SeqCst);
+                    }
                 }
-            }
-        })
-    };
-    // And one that attaches, then reads nothing more.
-    let mut stuck = connect(&server);
-    stuck
-        .request(&Message::ConsoleAttach { vm: VmRef::Id(id) })
-        .unwrap();
-    assert_eq!(server.debug_connections(), 3);
-    assert_eq!(server.debug_vm(id).unwrap().consoles, 2);
+            })
+        };
+        // And one that attaches, then reads nothing more.
+        let mut stuck = connect(&server);
+        stuck
+            .request(&Message::ConsoleAttach { vm: VmRef::Id(id) })
+            .unwrap();
+        assert_eq!(server.debug_connections(), 3);
+        assert_eq!(server.debug_vm(id).unwrap().consoles, 2);
 
-    rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
-    let limit = Duration::from_secs(60);
-    wait_until("the stuck client to be cut off", limit, || {
-        server.debug_vm(id).unwrap().consoles == 1
-    });
-    // Its connection ends: the server's threads for it are gone, and what reaches it is
-    // what was in flight, then the end.
-    wait_until("its connection to end", SLOW, || server.debug_connections() == 2);
-    let rest = read_until_closed(stuck.get_mut(), SLOW);
-    assert!(rest.len() < 2 * avalon::MAX_QUEUED, "{} bytes", rest.len());
+        rt.request_ok(&Message::StartVm { vm: VmRef::Id(id) }).unwrap();
+        let limit = Duration::from_secs(60);
+        wait_until("the stuck client to be cut off", limit, || {
+            server.debug_vm(id).unwrap().consoles == 1
+        });
+        // Its connection ends: the server's threads for it are gone, and what reaches it is
+        // what was in flight, then the end.
+        wait_until("its connection to end", SLOW, || server.debug_connections() == 2);
+        let rest = read_until_closed(stuck.get_mut(), SLOW);
+        assert!(rest.len() < 2 * avalon::MAX_QUEUED, "{} bytes", rest.len());
 
-    // The VM runs on, the reading client still gets its output, requests are answered.
-    let at = received.load(Ordering::SeqCst);
-    let steps = info(&mut rt, id).steps;
-    wait_until("more output", SLOW, || {
-        received.load(Ordering::SeqCst) > at + 100_000
+        // The VM runs on, the reading client still gets its output, requests are answered.
+        let at = received.load(Ordering::SeqCst);
+        let steps = info(&mut rt, id).steps;
+        wait_until("more output", SLOW, || {
+            received.load(Ordering::SeqCst) > at + 100_000
+        });
+        assert!(info(&mut rt, id).steps > steps);
+        assert_eq!(state(&mut rt, id), VmState::Running);
+        assert_eq!(
+            rt.request(&Message::Ping { token: 8 }).unwrap(),
+            Message::Pong { token: 8 }
+        );
+        server.stop().unwrap();
+        reading.join().unwrap();
     });
-    assert!(info(&mut rt, id).steps > steps);
-    assert_eq!(state(&mut rt, id), VmState::Running);
-    assert_eq!(
-        rt.request(&Message::Ping { token: 8 }).unwrap(),
-        Message::Pong { token: 8 }
-    );
-    server.stop().unwrap();
-    reading.join().unwrap();
 }
 
 /// A create whose disk image takes a long time to open holds up no other request:
@@ -722,81 +750,86 @@ _start:
 #[cfg(target_os = "linux")]
 #[test]
 fn a_slow_create_holds_up_no_one_else() {
-    use std::os::unix::ffi::OsStrExt;
+    on_both_widths(|| {
+        use std::os::unix::ffi::OsStrExt;
 
-    extern "C" {
-        fn mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
-    }
-    let dir = std::env::temp_dir().join(format!("avalon-fifo-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let fifo = dir.join("disk.img");
-    let _ = std::fs::remove_file(&fifo);
-    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-    // SAFETY: a NUL-terminated path and a mode.
-    assert_eq!(unsafe { mkfifo(path.as_ptr(), 0o600) }, 0);
-
-    let server = server(Some(64 * MIB));
-    let profile_with_fifo = HardwareProfile {
-        devices: vec![DeviceSpec::Disk(DiskSpec {
-            source: DiskSource::File(fifo.to_string_lossy().into_owned()),
-            read_only: true,
-        })],
-        ..HardwareProfile::with_ram(40 * MIB)
-    };
-    let slow = {
-        let mut conn = connect(&server);
-        conn.get_ref().set_read_timeout(None).unwrap();
-        std::thread::spawn(move || {
-            conn.request(&Message::CreateVm {
-                name: "slow".into(),
-                profile: profile_with_fifo,
-                program: spinner(),
-            })
-        })
-    };
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(!slow.is_finished(), "the open of a FIFO blocks");
-
-    // Everyone else is served meanwhile; the slow VM's name and RAM are taken.
-    let mut rt = connect(&server);
-    let start = Instant::now();
-    assert_eq!(
-        rt.request(&Message::ListVms).unwrap(),
-        Message::VmList { vms: vec![] }
-    );
-    assert_eq!(
-        create_error(&mut rt, "slow", profile(1, None), spinner()),
-        ErrorCode::AlreadyExists
-    );
-    assert_eq!(
-        create_error(&mut rt, "big", profile(30, None), spinner()),
-        ErrorCode::OverBudget
-    );
-    let other = create(&mut rt, "other", profile(20, None), spinner());
-    rt.request_ok(&Message::StartVm { vm: VmRef::Id(other) }).unwrap();
-    assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
-    assert!(!slow.is_finished());
-
-    // A writer lets the open finish. A FIFO reads as an empty image: a disk of no
-    // sectors, or one Grail refuses; either way the create ends.
-    let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-    match slow.join().unwrap() {
-        Ok(Message::VmCreated { id }) => {
-            assert_ne!(id, other);
-            rt.request_ok(&Message::DestroyVm {
-                vm: VmRef::Name("slow".into()),
-            })
-            .unwrap();
+        extern "C" {
+            fn mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
         }
-        Err(avalon_proto::Error::Remote {
-            code: ErrorCode::InvalidProfile,
-            ..
-        }) => {}
-        other => panic!("{other:?}"),
-    }
-    drop(writer);
-    // Its name and RAM are free again.
-    create(&mut rt, "slow", profile(40, None), spinner());
-    server.stop().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+        let dir = std::env::temp_dir().join(format!("avalon-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("disk.img");
+        let _ = std::fs::remove_file(&fifo);
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path and a mode.
+        assert_eq!(unsafe { mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let server = server(Some(64 * MIB));
+        let profile_with_fifo = HardwareProfile {
+            devices: vec![DeviceSpec::Disk(DiskSpec {
+                source: DiskSource::File(fifo.to_string_lossy().into_owned()),
+                read_only: true,
+            })],
+            ..hardware(40 * MIB)
+        };
+        let slow = {
+            let mut conn = connect(&server);
+            conn.get_ref().set_read_timeout(None).unwrap();
+            // A thread of the test's width: the spinner it sends is of that width.
+            spawn(move || {
+                conn.request(&Message::CreateVm {
+                    name: "slow".into(),
+                    profile: profile_with_fifo,
+                    program: spinner(),
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!slow.is_finished(), "the open of a FIFO blocks");
+
+        // Everyone else is served meanwhile; the slow VM's name and RAM are taken.
+        let mut rt = connect(&server);
+        let start = Instant::now();
+        assert_eq!(
+            rt.request(&Message::ListVms).unwrap(),
+            Message::VmList { vms: vec![] }
+        );
+        assert_eq!(
+            create_error(&mut rt, "slow", profile(1, None), spinner()),
+            ErrorCode::AlreadyExists
+        );
+        assert_eq!(
+            create_error(&mut rt, "big", profile(30, None), spinner()),
+            ErrorCode::OverBudget
+        );
+        let other = create(&mut rt, "other", profile(20, None), spinner());
+        assert_eq!(info(&mut rt, other).vm.profile.xlen, xlen());
+        rt.request_ok(&Message::StartVm { vm: VmRef::Id(other) }).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+        assert!(!slow.is_finished());
+
+        // A writer lets the open finish. A FIFO reads as an empty image: a disk of no
+        // sectors, or one Grail refuses; either way the create ends.
+        let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        match slow.join().unwrap() {
+            Ok(Message::VmCreated { id }) => {
+                assert_ne!(id, other);
+                assert_eq!(info(&mut rt, id).vm.profile.xlen, xlen());
+                rt.request_ok(&Message::DestroyVm {
+                    vm: VmRef::Name("slow".into()),
+                })
+                .unwrap();
+            }
+            Err(avalon_proto::Error::Remote {
+                code: ErrorCode::InvalidProfile,
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        }
+        drop(writer);
+        // Its name and RAM are free again.
+        create(&mut rt, "slow", profile(40, None), spinner());
+        server.stop().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }

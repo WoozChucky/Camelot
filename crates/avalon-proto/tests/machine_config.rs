@@ -67,10 +67,8 @@ fn profile_from(config: &MachineConfig, switches: Switches) -> Result<HardwarePr
         harts,
         disks,
         nets,
-        // The protocol carries no width until #158: every VM is RV32 (an ELF64 program
-        // makes it RV64 when loaded).
-        xlen: _,
-        paging: _,
+        xlen,
+        paging,
     } = config.clone();
     let mut devices: Vec<DeviceSpec> = disks.iter().map(disk_spec_from).collect::<Result<_, _>>()?;
     for net in &nets {
@@ -81,8 +79,42 @@ fn profile_from(config: &MachineConfig, switches: Switches) -> Result<HardwarePr
         clock_hz,
         nominal_hz,
         harts: harts as u32,
+        xlen: xlen_from(xlen),
+        paging: paging_from(paging),
         devices,
     })
+}
+
+/// Grail's width as the protocol's, every one of them (the match has no `_`).
+fn xlen_from(xlen: grail::Xlen) -> avalon_proto::Xlen {
+    match xlen {
+        grail::Xlen::Rv32 => avalon_proto::Xlen::Rv32,
+        grail::Xlen::Rv64 => avalon_proto::Xlen::Rv64,
+    }
+}
+
+/// Grail's paging modes as the protocol's, every one of them.
+fn paging_from(paging: grail::Paging) -> avalon_proto::Paging {
+    match paging {
+        grail::Paging::Sv48 => avalon_proto::Paging::Sv48,
+        grail::Paging::Sv39 => avalon_proto::Paging::Sv39,
+    }
+}
+
+/// The protocol's width as Grail's.
+fn xlen_to(xlen: avalon_proto::Xlen) -> grail::Xlen {
+    match xlen {
+        avalon_proto::Xlen::Rv32 => grail::Xlen::Rv32,
+        avalon_proto::Xlen::Rv64 => grail::Xlen::Rv64,
+    }
+}
+
+/// The protocol's paging modes as Grail's.
+fn paging_to(paging: avalon_proto::Paging) -> grail::Paging {
+    match paging {
+        avalon_proto::Paging::Sv48 => grail::Paging::Sv48,
+        avalon_proto::Paging::Sv39 => grail::Paging::Sv39,
+    }
 }
 
 /// What Avalon does with a profile from the wire: every disk, an image file or an image
@@ -123,8 +155,8 @@ fn config_from(profile: &HardwareProfile, switches: Switches) -> Result<MachineC
         harts: usize::try_from(profile.harts).map_err(|_| "too many harts".to_string())?,
         disks,
         nets,
-        xlen: grail::Xlen::Rv32,
-        paging: grail::Paging::Sv48,
+        xlen: xlen_to(profile.xlen),
+        paging: paging_to(profile.paging),
     };
     config.validate()?;
     Ok(config)
@@ -161,6 +193,22 @@ fn defaults_match_grail() {
         HardwareProfile::with_ram(4096),
         profile_from(&MachineConfig::with_ram(4096), &[]).unwrap()
     );
+    // The wire's width is Grail's in bits.
+    for xlen in [grail::Xlen::Rv32, grail::Xlen::Rv64] {
+        assert_eq!(u32::from(xlen_from(xlen).bits()), xlen.bits());
+        assert_eq!(
+            avalon_proto::Xlen::from_bits(xlen_from(xlen).bits()),
+            Some(xlen_from(xlen))
+        );
+    }
+    // And its paging modes the widest one's `satp.MODE` (Sv48 9, Sv39 8).
+    for (paging, mode) in [(grail::Paging::Sv48, 9), (grail::Paging::Sv39, 8)] {
+        assert_eq!(paging_from(paging).satp_mode(), mode);
+        assert_eq!(
+            avalon_proto::Paging::from_satp_mode(mode),
+            Some(paging_from(paging))
+        );
+    }
 }
 
 #[test]
@@ -170,9 +218,24 @@ fn configs_survive_the_wire() {
     let configs = [
         MachineConfig::default(),
         MachineConfig::with_ram(MIB),
-        // The protocol has no width (#158): its VMs are RV32 unless their program is
-        // ELF64, so the most a profile on its own takes is RV32's.
         MachineConfig::with_ram(MAX_RAM_SIZE_RV32),
+        // Each width with the most RAM it takes, and each paging mode.
+        MachineConfig {
+            xlen: grail::Xlen::Rv64,
+            ..MachineConfig::with_ram(MAX_RAM_SIZE)
+        },
+        MachineConfig {
+            xlen: grail::Xlen::Rv64,
+            paging: grail::Paging::Sv39,
+            harts: 2,
+            disks: vec![DiskConfig::lake("127.0.0.1:7401", "os-base-rv64")],
+            ..MachineConfig::with_ram(64 * MIB)
+        },
+        // An RV32 machine keeps the paging it is given, though its harts have Sv32.
+        MachineConfig {
+            paging: grail::Paging::Sv39,
+            ..MachineConfig::with_ram(MIB)
+        },
         MachineConfig {
             ram_size: 64 * MIB,
             clock_hz: Some(2_000_000),
@@ -249,6 +312,10 @@ fn invalid_profiles_decode_and_are_left_to_the_server() {
         HardwareProfile::with_ram(4095),
         HardwareProfile::with_ram(MAX_RAM_SIZE_RV32 as u64 + 4096),
         HardwareProfile::with_ram(MAX_RAM_SIZE as u64 + 4096),
+        HardwareProfile {
+            xlen: avalon_proto::Xlen::Rv64,
+            ..HardwareProfile::with_ram(MAX_RAM_SIZE as u64 + 4096)
+        },
         HardwareProfile::with_ram(u64::MAX),
         HardwareProfile {
             clock_hz: Some(0),

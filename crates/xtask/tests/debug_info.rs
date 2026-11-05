@@ -2,7 +2,8 @@
 //! and that changes nothing the machine loads: the committed kernels' segments
 //! are byte for byte those of a build without debug information, the programs
 //! the kernel embeds and `/bin` holds have none (merlin-ld strips it), and so the
-//! root image is the same either way.
+//! root image is the same either way. For both widths: the RV64 kernels, the
+//! programs built for RV64 and the RV64 root image too.
 
 use std::path::{Path, PathBuf};
 use xtask::{fs, kernel, toolchain, userprogs};
@@ -46,15 +47,24 @@ fn committed(name: &str) -> Vec<u8> {
 
 #[test]
 fn debug_information_changes_no_loaded_byte() {
+    for xlen in kernel::XLENS {
+        no_loaded_byte_changes(xlen);
+    }
+}
+
+/// [`debug_information_changes_no_loaded_byte`] for the `xlen` kernels,
+/// programs and root image.
+fn no_loaded_byte_changes(xlen: kernel::Xlen) {
     let kernel_dir = repo_root().join("kernel");
-    let plain = toolchain::without_debug_info(|| kernel::build_merlin(&kernel_dir, None).unwrap());
+    let plain = toolchain::without_debug_info(|| kernel::build_merlin_for(&kernel_dir, None, xlen).unwrap());
     let plain_disk = toolchain::without_debug_info(|| kernel::disk_kernel(&kernel_dir, &plain).unwrap());
     assert!(!has_line_table(&plain.elf));
     // The committed kernels (what `cargo xtask kernel` builds, with -g: the
-    // test in kernel.rs checks that) carry line tables, and load the same.
+    // tests in kernel.rs and kernel_rv64.rs check that) carry line tables,
+    // and load the same.
     for (name, plain) in [
-        (kernel::KERNEL_ELF, &plain.elf),
-        (kernel::DISK_KERNEL, &plain_disk),
+        (kernel::kernel_elf(xlen), &plain.elf),
+        (kernel::disk_kernel_elf(xlen), &plain_disk),
     ] {
         let with = committed(name);
         assert!(has_line_table(&with), "{name} has no line table");
@@ -67,23 +77,32 @@ fn debug_information_changes_no_loaded_byte() {
     // A program: its debug ELF has the line tables, the one it is installed
     // as does not, and both load the same; without -g it is the installed one.
     let user = userprogs::user_dir(&repo_root());
-    let prog = userprogs::build_named(&user, "echo").unwrap();
-    let plain_prog = toolchain::without_debug_info(|| userprogs::build_named(&user, "echo").unwrap());
+    let prog = userprogs::build_named_for(&user, "echo", xlen).unwrap();
+    let plain_prog =
+        toolchain::without_debug_info(|| userprogs::build_named_for(&user, "echo", xlen).unwrap());
     assert!(has_line_table(&prog.debug) && !has_line_table(&prog.elf));
     assert!(loaded(&prog.debug) == loaded(&prog.elf));
     assert!(plain_prog.elf == prog.elf && plain_prog.debug == prog.elf);
 
     // The root image, programs and kernel together.
-    let image = fs::build_bootable(&repo_root(), fs::IMAGE_SIZE).unwrap();
+    let image = fs::build_bootable_for(&repo_root(), fs::IMAGE_SIZE, xlen).unwrap();
     let plain_image =
-        toolchain::without_debug_info(|| fs::build_bootable(&repo_root(), fs::IMAGE_SIZE).unwrap());
-    assert!(image == plain_image, "the root image differs without -g");
+        toolchain::without_debug_info(|| fs::build_bootable_for(&repo_root(), fs::IMAGE_SIZE, xlen).unwrap());
+    assert!(image == plain_image, "the {xlen:?} root image differs without -g");
 }
 
 #[test]
 fn the_kernel_line_table_names_its_sources() {
+    for xlen in kernel::XLENS {
+        line_table_names_sources(kernel::kernel_elf(xlen));
+    }
+}
+
+/// [`the_kernel_line_table_names_its_sources`] for the committed kernel
+/// `name`.
+fn line_table_names_sources(name: &str) {
     // Paths relative to the repository root: a debugger run there finds them.
-    let elf = committed(kernel::KERNEL_ELF);
+    let elf = committed(name);
     let e = elf::Elf::parse(&elf).unwrap();
     let tables = e.line_tables().unwrap();
     let files: Vec<&str> = tables

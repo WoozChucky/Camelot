@@ -107,7 +107,7 @@ static int load_and_run(struct elf_file *f, const char *path, const char *name, 
     if (err < 0) {
         return err;
     }
-    return proc_exec_commit(&img, name, args);
+    return proc_exec_commit(&img, name);
 }
 
 int exec_replace(const char *path, const struct proc_args *args) {

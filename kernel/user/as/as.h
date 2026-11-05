@@ -6,7 +6,7 @@
  * merlin-as, whose comments explain the rules in more depth:
  *
  *   main.c    the command line, reading the file, the passes (main.rs, lib.rs)
- *   util.c    memory, byte buffers, errors (64-bit numbers: lib/i64.c)
+ *   util.c    memory, byte buffers, errors
  *   lexer.c   text to tokens, one statement at a time (lexer.rs)
  *   parser.c  tokens to statements (parser.rs)
  *   encode.c  one instruction to machine words (encode.rs)
@@ -19,6 +19,12 @@
  *             declares the tables and defines the numbers, tables.c holds
  *             the tables, once for the program
  *
+ * It assembles for either width, as merlin-as does: RV32 (ELF32 objects)
+ * or RV64 (ELF64), chosen by `-march=` (`xlen`), RV32 the default until
+ * #159. The program itself runs on both: its numbers are merlin-as's types,
+ * int64_t for Rust's i64 and uint64_t for its u64, the same on both widths
+ * (on RV32 merlin makes a long long a pair of registers).
+ *
  * Unlike merlin-as, which holds every token of the file at once, this one
  * reads a statement, assembles it and forgets it: a machine has 4 MiB of RAM
  * by default, and the kernel's biggest assembly file has 200 KB of text. */
@@ -26,6 +32,18 @@
 #define AS_H
 
 #include "../user.h"
+
+/* The width being assembled for, 32 or 64 (merlin-as's Options::xlen, from
+ * `-march=`), for the whole file: main.c sets it before the first line. */
+extern uint xlen;
+
+/* Rust's wrapping arithmetic on i64 (wrapping_add...), which merlin-as's
+ * expressions and addends use: through uint64_t, whose arithmetic wraps
+ * around in C, where a signed overflow is undefined. */
+#define WRAP_ADD(a, b) ((int64_t)((uint64_t)(a) + (uint64_t)(b)))
+#define WRAP_SUB(a, b) ((int64_t)((uint64_t)(a) - (uint64_t)(b)))
+#define WRAP_MUL(a, b) ((int64_t)((uint64_t)(a) * (uint64_t)(b)))
+#define WRAP_NEG(a) ((int64_t)(0 - (uint64_t)(a)))
 
 /* ---- Memory ----
  * Two bump allocators: perm_alloc's memory lasts the whole run (symbols,
@@ -40,8 +58,8 @@ char *tmp_strndup(const char *s, uint n);
 void *grow(void *p, uint *cap, uint need, uint size);
 void die(const char *msg);
 /* A formatted message in tmp memory, as long as it needs to be (merlin-as's
- * messages hold whole names): %s %d %u %x %X (upper case) %c %%, and a
- * width with 0 for %x (%08x). */
+ * messages hold whole names): %s %d %u %x %X (upper case) %c %%, %lld %llu
+ * %llx for 64-bit numbers, and a width with 0 for %x (%08x). */
 char *fmt(const char *f, ...);
 
 /* A byte buffer. */
@@ -103,7 +121,7 @@ enum {
 struct token {
     int kind;
     uint line;
-    i64 num;
+    int64_t num; /* T_INT: the bits of a u64, as merlin-as's `u64 as i64` */
     char *text;
     uint len;
     int punct;
@@ -132,7 +150,7 @@ enum { M_HI, M_LO, M_PCREL_HI, M_PCREL_LO };
 
 struct expr {
     int kind;
-    i64 num;
+    int64_t num;
     char *sym;
     int op; /* E_BIN: B_...; E_MOD: M_... */
     struct expr *a;
@@ -193,19 +211,24 @@ struct emit {
     int has_fixup;
     int kind;
     char *name;
-    i64 addend;
+    int64_t addend;
     int auipc;
 };
 
-/* Encodes one instruction into words (at most 2). Returns how many, or 0
- * with the message in *err. */
+/* The most words one instruction takes: RV64's longest `li`. */
+#define MAX_EMITS 8
+
+/* Encodes one instruction into words (at most MAX_EMITS) for the width
+ * `xlen`. Returns how many, or 0 with the message in *err. */
 int encode(const char *m, struct operand *ops, uint nops, struct emit *out, char **err);
 
 /* What the encoder asks the assembler (asm.c), merlin-as's Ctx. */
-int ctx_constant(struct expr *e, i64 *v);
-int ctx_symbol(struct expr *e, char **name, i64 *addend);
+int ctx_constant(struct expr *e, int64_t *v);
+int ctx_symbol(struct expr *e, char **name, int64_t *addend);
 int ctx_undefined(const char *name);
 int ctx_csr(struct expr *e, uint *addr);
+/* A CSR's number from its name, as the width `xlen` has it: on RV64 the
+ * RV32-only CSRs (CSR_RV32_ONLY: cycleh, mstatush...) are no name. */
 int csr_parse(const char *name, uint *addr);
 
 /* The immediate scramblers, which asm.c also uses to patch resolved labels. */
@@ -216,6 +239,9 @@ uint u_imm(uint imm20);
 uint j_imm(int imm);
 /* value = (hi << 12) + lo, lo the sign-extended low 12 bits. */
 void hi_lo(int value, uint *hi, int *lo);
+/* The same split of a 64-bit value, as LLVM computes %hi and %lo of a
+ * constant on both widths: the bits above 31 are dropped. */
+void hi_lo64(int64_t value, uint *hi, int *lo);
 
 /* ---- Sections' ELF attributes (section.c) ---- */
 /* A section's sh_type, sh_flags and sh_entsize (SHT_* and SHF_* are in
@@ -253,7 +279,7 @@ struct reloc {
     uint offset;
     int kind;
     char *symbol;
-    i64 addend;
+    int64_t addend;
     uint line;
     /* After asm_finish: the index in the object's symbols of the first one
      * named `symbol`. */
@@ -281,9 +307,10 @@ struct symbol {
     int global;
     int defined;
     int has_constant;
-    i64 constant;
+    int64_t constant;
     int ty;
-    uint size;
+    /* st_size, as .size gave it: 64 bits, which an ELF32 object cuts to 32. */
+    uint64_t size;
     int keep; /* written to the symbol table (see asm_finish) */
     int local; /* named by .local: local even if undefined */
 };
@@ -334,9 +361,10 @@ struct row {
     struct loc loc;
 };
 
-/* A 4-byte field of `.debug_line` (at `at`, from the section's start) for
- * the linker to fill in: offset `off` of `.debug_line_str` (section -1) or
- * of a code section. */
+/* A field of `.debug_line` (at `at`, from the section's start) for the
+ * linker to fill in: offset `off` of `.debug_line_str` (section -1, a 4-byte
+ * DWARF32 offset on both widths) or of a code section (an address: 4 bytes
+ * on RV32, 8 on RV64). */
 struct dfixup {
     uint at;
     int section;
@@ -356,14 +384,20 @@ struct line_table {
 /* Encodes the rows (file 0 is `root`, files 1.. are `files`) as LLVM does,
  * one sequence per section in the order their first rows came, each ending
  * at the section's size. `base` is where the table goes in `.debug_line`
- * and `str_base` where its strings go in `.debug_line_str`. */
+ * and `str_base` where its strings go in `.debug_line_str`; an address is
+ * `address_size` bytes, the width of a register (DWARF's address_size). */
 void dwarf_encode(struct dfile *root, struct dfile *files, uint nfiles, struct row *rows, uint nrows,
-                  struct section *sections, uint nsections, uint base, uint str_base, struct line_table *t);
+                  struct section *sections, uint nsections, uint base, uint str_base, uint address_size,
+                  struct line_table *t);
 
 /* ---- The ELF file (elf.c) ---- */
+/* The object, ELF32 for RV32 and ELF64 for RV64 (the width `xlen`). */
 void elf_write(struct object *obj, struct buf *out);
+/* The width's Tag_RISCV_arch: RISCV_ARCH or RISCV_ARCH_RV64 (merlin-as's
+ * elf::arch). */
+const char *riscv_arch(void);
 /* The contents of `.riscv.attributes` (merlin-as's elf::riscv_attributes):
- * Tag_RISCV_arch = RISCV_ARCH. */
+ * Tag_RISCV_arch = riscv_arch(). */
 void riscv_attributes(struct buf *out);
 
 #endif

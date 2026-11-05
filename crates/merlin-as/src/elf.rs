@@ -44,7 +44,6 @@ use crate::Xlen;
 /// spelling: exactly what clang writes for `-march=rv32ima_zicsr_zifencei`
 /// (M implies Zmmul, A implies Zaamo and Zalrsc). Without it llvm-objdump
 /// assumes plain RV32I and prints the M and A instructions as `<unknown>`.
-/// The C assembler, which writes RV32 until #157, takes this one.
 pub const ARCH: &str = "rv32i2p1_m2p0_a2p1_zicsr2p0_zifencei2p0_zmmul1p0_zaamo1p0_zalrsc1p0";
 
 /// The same for RV64: what clang writes for `-march=rv64ima_zicsr_zifencei`.

@@ -75,13 +75,11 @@ static void uleb(struct buf *out, uint v) {
 
 /* A signed LEB128 of a 64-bit value: a line delta is the difference of two
  * 32-bit line numbers. */
-static void sleb(struct buf *out, i64 v) {
+static void sleb(struct buf *out, int64_t v) {
     for (;;) {
-        uint byte = v.lo & 0x7f;
-        v = i64_sar(v, 7);
-        int zero = v.lo == 0 && v.hi == 0;
-        int minus_one = v.lo == 0xffffffffu && v.hi == 0xffffffffu;
-        if ((zero && (byte & 0x40) == 0) || (minus_one && (byte & 0x40) != 0)) {
+        uint byte = (uint)v & 0x7f;
+        v >>= 7; /* arithmetic: the sign comes in */
+        if ((v == 0 && (byte & 0x40) == 0) || (v == -1 && (byte & 0x40) != 0)) {
             buf_byte(out, byte);
             return;
         }
@@ -162,15 +160,16 @@ static uint string_add(struct strings *s, char *text) {
     return off;
 }
 
-/* A 4-byte field to relocate at `out`'s end (plus base): against the
- * `.debug_line_str` offset `off` (section -1), or offset `off` of a section. */
-static void fixup(struct line_table *t, uint base, int section, uint off) {
+/* A field of `size` bytes to relocate at `out`'s end (plus base): a 4-byte
+ * offset `off` of `.debug_line_str` (section -1), or an address, offset
+ * `off` of a section, as wide as an address (4 or 8 bytes). */
+static void fixup(struct line_table *t, uint base, int section, uint off, uint size) {
     t->fixups = grow(t->fixups, &t->cap, t->nfixups + 1, sizeof(struct dfixup));
     struct dfixup *f = &t->fixups[t->nfixups++];
     f->at = base + t->line.len;
     f->section = section;
     f->off = off;
-    buf_zeros(&t->line, 4);
+    buf_zeros(&t->line, size);
 }
 
 /* ---- The line number program ---- */
@@ -181,19 +180,19 @@ static void fixup(struct line_table *t, uint base, int section, uint off) {
  * row; a line delta out of its range goes first with DW_LNS_advance_line,
  * an address delta up to 17 bytes too big with DW_LNS_const_add_pc (special
  * opcode 255's advance), a bigger one with DW_LNS_advance_pc. */
-static void advance(struct buf *out, i64 line_delta, uint addr_delta) {
+static void advance(struct buf *out, int64_t line_delta, uint addr_delta) {
     int temp;
     int need_copy = 0;
-    if (i64_in(line_delta, i64_of(LINE_BASE), i64_of(LINE_BASE + LINE_RANGE))) {
-        temp = (int)line_delta.lo - LINE_BASE;
+    if (line_delta >= LINE_BASE && line_delta < LINE_BASE + LINE_RANGE) {
+        temp = (int)line_delta - LINE_BASE;
     } else {
         buf_byte(out, ADVANCE_LINE);
         sleb(out, line_delta);
-        line_delta = i64_u(0);
+        line_delta = 0;
         temp = -LINE_BASE;
         need_copy = 1;
     }
-    if (line_delta.lo == 0 && line_delta.hi == 0 && addr_delta == 0) {
+    if (line_delta == 0 && addr_delta == 0) {
         buf_byte(out, COPY);
         return;
     }
@@ -218,8 +217,10 @@ static void advance(struct buf *out, i64 line_delta, uint addr_delta) {
     buf_byte(out, need_copy ? COPY : (uint)temp);
 }
 
-/* One sequence: the rows of section `sec`, which ends at `end`. */
-static void program(struct line_table *t, uint base, int sec, uint end, struct row *rows, uint nrows) {
+/* One sequence: the rows of section `sec`, which ends at `end`. Its
+ * addresses are `address_size` bytes. */
+static void program(struct line_table *t, uint base, int sec, uint end, struct row *rows, uint nrows,
+                    uint address_size) {
     struct buf *out = &t->line;
     uint file = 1, line = 1, column = 0, flags = LOC_IS_STMT, isa = 0;
     int have_last = 0;
@@ -268,12 +269,14 @@ static void program(struct line_table *t, uint base, int sec, uint end, struct r
         if (loc->flags & LOC_EPILOGUE_BEGIN) {
             buf_byte(out, SET_EPILOGUE_BEGIN);
         }
-        i64 line_delta = i64_sub(i64_u(loc->line), i64_u(line));
+        int64_t line_delta = (int64_t)loc->line - (int64_t)line;
         if (!have_last) {
+            /* An extended opcode: 0, its length (the opcode and the
+             * address), DW_LNE_set_address, then the address itself. */
             buf_byte(out, 0);
-            buf_byte(out, 5);
+            buf_byte(out, 1 + address_size);
             buf_byte(out, SET_ADDRESS);
-            fixup(t, base, sec, offset);
+            fixup(t, base, sec, offset, address_size);
             advance(out, line_delta, 0);
         } else {
             advance(out, line_delta, offset - last);
@@ -298,7 +301,8 @@ static void program(struct line_table *t, uint base, int sec, uint end, struct r
 /* ---- The table ---- */
 
 void dwarf_encode(struct dfile *root, struct dfile *files, uint nfiles, struct row *rows, uint nrows,
-                  struct section *sections, uint nsections, uint base, uint str_base, struct line_table *t) {
+                  struct section *sections, uint nsections, uint base, uint str_base, uint address_size,
+                  struct line_table *t) {
     memset(t, 0, sizeof *t);
     uint nentries = nfiles + 1;
     char **dirs = tmp_alloc(nentries * sizeof(char *));
@@ -319,7 +323,7 @@ void dwarf_encode(struct dfile *root, struct dfile *files, uint nfiles, struct r
     struct buf *out = &t->line;
     buf_u32(out, 0); /* unit_length, filled in last */
     buf_u16(out, 5); /* version */
-    buf_byte(out, 4); /* address_size */
+    buf_byte(out, address_size);
     buf_byte(out, 0); /* segment_selector_size */
     uint header_length_at = out->len;
     buf_u32(out, 0);
@@ -337,7 +341,7 @@ void dwarf_encode(struct dfile *root, struct dfile *files, uint nfiles, struct r
     buf_byte(out, FORM_LINE_STRP);
     uleb(out, ndirs);
     for (uint d = 0; d < ndirs; d++) {
-        fixup(t, base, -1, string_add(&strings, dirs[d]));
+        fixup(t, base, -1, string_add(&strings, dirs[d]), 4);
     }
     buf_byte(out, md5 ? 3 : 2);
     buf_byte(out, LNCT_PATH);
@@ -350,7 +354,7 @@ void dwarf_encode(struct dfile *root, struct dfile *files, uint nfiles, struct r
     }
     uleb(out, nentries);
     for (uint i = 0; i < nentries; i++) {
-        fixup(t, base, -1, string_add(&strings, names[i]));
+        fixup(t, base, -1, string_add(&strings, names[i]), 4);
         uleb(out, dir_of[i]);
         if (md5) {
             buf_put(out, i == 0 ? root->md5 : files[i - 1].md5, 16);
@@ -374,7 +378,7 @@ void dwarf_encode(struct dfile *root, struct dfile *files, uint nfiles, struct r
         }
     }
     for (uint j = 0; j < nseq; j++) {
-        program(t, base, order[j], sections[order[j]].size, rows, nrows);
+        program(t, base, order[j], sections[order[j]].size, rows, nrows, address_size);
     }
     uint unit_length = out->len - 4;
     for (uint b = 0; b < 4; b++) {

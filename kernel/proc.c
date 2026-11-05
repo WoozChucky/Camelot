@@ -63,12 +63,14 @@
 #include "kalloc.h"
 #include "kprintf.h"
 #include "log.h"
-#include "machine.h"
 #include "memlayout.h"
 #include "riscv.h"
+#include "sbi.h"
 #include "smp.h"
 #include "spinlock.h"
 #include "string.h"
+#include "syscall.h"
+#include "timer.h"
 
 static struct proc procs[NPROC];
 static struct thread threads[NTHREAD];
@@ -178,30 +180,131 @@ static void set_name(struct proc *p, const char *name) {
     p->name[i] = 0;
 }
 
-/* Puts `args` at the top of the stack page `stack` (mapped at USER_STACK) and
- * points frame `f`'s sp, a0 and a1 at them:
+/* ---- The program's start ----
  *
- *   USER_TOP    the strings, argv[0]'s first, NUL-terminated
- *               padding to a pointer's size (4 bytes on RV32, 8 on RV64)
- *   argv        argv[0] ... argv[argc - 1], then a NULL: a pointer each
- *               padding to a multiple of 16
- *   sp          the program's first stack frame grows down from here
+ * What a new program finds at the top of its stack page, as Linux's
+ * create_elf_tables (fs/binfmt_elf.c) puts it there for an ELF program and
+ * the RISC-V psABI describes it ("Process Initialization"); from USER_TOP
+ * down:
  *
- * ARG_MAX and MAXARG keep all of it well inside the page. */
-static void push_args(struct trap_frame *f, u8 *stack, const struct proc_args *args) {
-    uintptr strings = USER_TOP - args->len;
-    uintptr argv = (strings & ~(uintptr)(sizeof(uintptr) - 1)) - sizeof(uintptr) * (args->argc + 1);
-    memcpy(stack + (strings - USER_STACK), args->strings, args->len);
-    uintptr *slots = (uintptr *)(stack + (argv - USER_STACK));
-    uintptr at = strings;
-    for (u32 i = 0; i < args->argc; i++) {
-        slots[i] = at;
-        at += strlen(args->strings + (at - strings)) + 1;
+ *   USER_TOP     a pointer-sized zero, Linux's end marker
+ *                the path the program was started with (AT_EXECFN)
+ *                the argument strings, argv[0]'s first (lowest), each
+ *                NUL-terminated (the environment's would go between the two
+ *                and the path: spawn and exec pass none)
+ *                padding to a multiple of 16
+ *                16 random bytes (AT_RANDOM)
+ *                padding
+ *                the auxiliary vector: AUXV_ENTRIES pairs of a type and a
+ *                value, a pointer's size each, the last one AT_NULL
+ *                envp: NULL, an empty environment
+ *                argv[0] ... argv[argc - 1], NULL
+ *   sp           argc, a long
+ *
+ * sp, the lowest of it, is 16-byte aligned. a0 holds 0: the psABI's
+ * address of a function for the program to register with atexit, the
+ * dynamic linker's (ELF_PLAT_INIT on Linux), and there is none. Every other
+ * register is zero too. crt0 finds argc, argv and envp from sp. */
+
+/* The ISA the kernel runs programs on, as AT_HWCAP gives it, Linux's way: a
+ * bit for each single-letter extension, 'X' - 'A' (Zicsr and Zifencei have
+ * no letter). RV32IMA and RV64IMA: the base, M and A. */
+#define HWCAP_ISA(letter) (1ul << ((letter) - 'A'))
+#define HWCAP (HWCAP_ISA('I') | HWCAP_ISA('M') | HWCAP_ISA('A'))
+
+/* The auxiliary vector's entries push_start writes, AT_NULL's included. */
+#define AUXV_ENTRIES 17
+/* The pointer-sized words below the random bytes: argc, argv's MAXARG + 1,
+ * envp's NULL and the vector. */
+#define START_WORDS (1 + (MAXARG + 1) + 1 + 2 * AUXV_ENTRIES)
+/* All of it fits in the stack's first page, with room to spare for the
+ * program's first frames: the marker, the path, the strings, the padding
+ * and the random bytes, then the words and their padding. */
+_Static_assert(sizeof(uintptr) + MAXPATH + 1 + ARG_MAX + 15 + 16 + sizeof(uintptr) * START_WORDS + 15 <= PGSIZE / 2,
+               "a program's start fills more than half its stack page");
+
+/* MurmurHash3's finalizer, which TCP's initial sequence numbers are mixed
+ * with too (net/tcp.c): every bit of the result depends on every bit of h. */
+static u32 mix32(u32 h) {
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+/* AT_RANDOM's 16 bytes, into `buf`. Linux takes them from its entropy pool
+ * (get_random_bytes); Camelot has no source of entropy (no RNG device, and
+ * Grail without --clock runs the same way every time), so these are the
+ * time and `salt` (the new stack page's address, which no other running
+ * program has), mixed: different for every program started, well spread,
+ * not secret. */
+static void random_bytes(u8 *buf, uintptr salt) {
+    u64 now = r_time();
+    u32 h = mix32((u32)now ^ (u32)salt);
+    for (u32 i = 0; i < 4; i++) {
+        h = mix32(h + 0x9e3779b9u * (i + 1) + (u32)(now >> 32) + (u32)((u64)salt >> 32));
+        memcpy(buf + 4 * i, &h, 4);
     }
-    slots[args->argc] = 0;
-    f->regs[REG_SP] = argv & ~(uintptr)15;
-    f->regs[REG_A0] = args->argc;
-    f->regs[REG_A1] = argv;
+}
+
+/* Puts `args`, `path` and `prog`'s auxiliary vector at the top of the stack
+ * page `stack` (mapped at USER_STACK), as above, and sets frame `f`'s sp. */
+static void push_start(struct trap_frame *f, u8 *stack, const struct proc_args *args, const char *path,
+                       const struct elf_loaded *prog) {
+    /* The page holds the user addresses [USER_STACK, USER_TOP). It is
+     * zeroed: the end marker, the padding and a0 are zero already. */
+    uintptr at = USER_TOP - sizeof(uintptr);
+    usize path_len = strlen(path) + 1;
+    at -= path_len;
+    uintptr execfn = at;
+    memcpy(stack + (at - USER_STACK), path, path_len);
+    at -= args->len;
+    uintptr strings = at;
+    memcpy(stack + (at - USER_STACK), args->strings, args->len);
+    at = (at & ~(uintptr)15) - 16;
+    uintptr random = at;
+    random_bytes(stack + (at - USER_STACK), pa(stack));
+
+    u32 words = 1 + (args->argc + 1) + 1 + 2 * AUXV_ENTRIES;
+    uintptr sp = (random - sizeof(uintptr) * words) & ~(uintptr)15;
+    uintptr *w = (uintptr *)(stack + (sp - USER_STACK));
+    u32 n = 0;
+    w[n++] = args->argc;
+    uintptr s = strings;
+    for (u32 i = 0; i < args->argc; i++) {
+        w[n++] = s;
+        s += strlen(args->strings + (s - strings)) + 1;
+    }
+    w[n++] = 0; /* argv's NULL */
+    w[n++] = 0; /* envp's */
+    /* The vector, in Linux's order (the RISC-V entries it puts first,
+     * AT_SYSINFO_EHDR for the vDSO, the caches' sizes and AT_MINSIGSTKSZ,
+     * have nothing to say here: no vDSO, no cache information, no signals). */
+    uintptr auxv[2 * AUXV_ENTRIES] = {
+        AT_HWCAP,  HWCAP,
+        AT_PAGESZ, PGSIZE,
+        AT_CLKTCK, TICK_HZ,
+        AT_PHDR,   prog->phdr,
+        AT_PHENT,  sizeof(elf_phdr),
+        AT_PHNUM,  prog->phnum,
+        AT_BASE,   0, /* no interpreter: a static program */
+        AT_FLAGS,  0,
+        AT_ENTRY,  prog->entry,
+        AT_UID,    0,
+        AT_EUID,   0,
+        AT_GID,    0,
+        AT_EGID,   0,
+        AT_SECURE, 0,
+        AT_RANDOM, random,
+        AT_EXECFN, execfn,
+        AT_NULL,   0,
+    };
+    for (u32 i = 0; i < 2 * AUXV_ENTRIES; i++) {
+        w[n++] = auxv[i];
+    }
+    f->regs[REG_SP] = sp;
 }
 
 /* A free thread slot, cleared and THREAD_NEW, with a kernel stack, for
@@ -302,7 +405,7 @@ static void kick_idle(u32 n) {
         }
     }
     if (kick != 0) {
-        machine_ipi(kick);
+        sbi_send_ipi(kick, 0);
     }
 }
 
@@ -331,9 +434,10 @@ static struct trap_frame *frame_of(struct thread *t) {
 }
 
 /* A new user address space for `prog`: its segments and a zeroed stack
- * page with `args` at the top. Returns its page table and sets *heap (the
- * page after the last segment) and frame `f`: all zero but sepc (the entry
- * point), sp, a0 and a1. Or returns NULL with *err = -ENOMEM, or -ENOEXEC
+ * page with its start at the top (push_start: `args`, `path` and the
+ * auxiliary vector). Returns its page table and sets *heap (the page after
+ * the last segment) and frame `f`: all zero but sepc (the entry point) and
+ * sp. Or returns NULL with *err = -ENOMEM, or -ENOEXEC
  * with "WHO: PATH: REASON" printed, leaving `f` alone and nothing
  * allocated. */
 static pagetable_t build_space(const struct elf_file *prog, const char *who, const char *path,
@@ -343,8 +447,8 @@ static pagetable_t build_space(const struct elf_file *prog, const char *who, con
         *err = -ENOMEM;
         return NULL;
     }
-    uintptr entry, end;
-    const char *load_err = elf_load(pt, prog, &entry, &end);
+    struct elf_loaded loaded;
+    const char *load_err = elf_load(pt, prog, &loaded);
     if (load_err != NULL) {
         if (strcmp(load_err, ELF_OUT_OF_MEMORY) == 0) {
             *err = -ENOMEM;
@@ -365,11 +469,11 @@ static pagetable_t build_space(const struct elf_file *prog, const char *who, con
         uvm_free(pt);
         return NULL;
     }
-    *heap = end;
-    /* The user registers: all zero but pc, sp and the arguments. */
+    *heap = loaded.end;
+    /* The user registers: all zero but pc and sp. */
     memset(f, 0, sizeof *f);
-    f->sepc = entry;
-    push_args(f, stack, args);
+    f->sepc = loaded.entry;
+    push_start(f, stack, args, path, &loaded);
     return pt;
 }
 
@@ -488,7 +592,7 @@ void proc_exec_abandon(struct exec_image *img) {
     img->pagetable = NULL;
 }
 
-int proc_exec_commit(struct exec_image *img, const char *name, const struct proc_args *args) {
+int proc_exec_commit(struct exec_image *img, const char *name) {
     struct proc *p = myproc();
     /* No other thread runs the new program, and none may be using the old
      * address space when it goes. The others end on their way back to
@@ -527,7 +631,7 @@ int proc_exec_commit(struct exec_image *img, const char *name, const struct proc
      * with it, as on Linux once exec is past its point of no return. The
      * caller holds no lock, so closing one may free an inode. */
     fd_close_on_exec();
-    return (int)args->argc;
+    return 0;
 }
 
 struct proc *kproc_create(const char *name, void (*fn)(void), const char **err) {
@@ -1096,6 +1200,17 @@ long proc_sbrk(long increment) {
     if (increment > 0) {
         uintptr grow = (uintptr)increment;
         if (grow > USER_LOAD_TOP - old) {
+            releasesleep(&p->heap_lock);
+            return -ENOMEM;
+        }
+        /* More than the whole of RAM can never be had: that fails at once,
+         * as Linux's default overcommit check fails it (mm/util.c,
+         * __vm_enough_memory with OVERCOMMIT_GUESS: more pages than RAM and
+         * swap hold), rather than after taking and zeroing every free
+         * page. The pages counted are those the growth maps, from the old
+         * end's page boundary to the new one's, as Linux's brk counts
+         * PAGE_ALIGN(newbrk) - PAGE_ALIGN(oldbrk) (mm/mmap.c). */
+        if ((PGROUNDUP(old + grow) - PGROUNDUP(old)) / PGSIZE > ram_size / PGSIZE) {
             releasesleep(&p->heap_lock);
             return -ENOMEM;
         }

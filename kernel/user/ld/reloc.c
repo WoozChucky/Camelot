@@ -23,18 +23,30 @@
  *   R_RISCV_32_PCREL         S + A - P            the whole word
  *   R_RISCV_RELAX, NONE      nothing
  *
- * Values are computed exactly (64 bits), then checked against what the
- * field holds. A hi/lo pair builds a full 32-bit value and wraps modulo
- * 2^32 as the hardware does, so only R_RISCV_32, BRANCH, JAL, SET32 and
- * 32_PCREL can be out of range. R_RISCV_ALIGN is refused: ld.lld deletes
- * the padding beyond what the alignment needs, and merlin-ld does not.
+ * S and P are u64 addresses and A an i64 addend, and every value is
+ * computed as the hardware adds: S + A (and S + A - P) modulo 2^64, then
+ * read as signed for the range checks. On RV32 S and P are below 2^32 and
+ * A is a 32-bit addend, so that is the exact value; on RV64 it wraps at
+ * 2^64 as auipc and jal do, which is what ld.lld computes on both widths.
  *
- * R_RISCV_64 is `.dword sym` (`.quad`), which assemblers emit on RV32 too,
- * for a 64-bit datum holding an address: S + A in 64 bits (S zero-extended,
- * A sign-extended), never checked. In a section that is not loaded (debug
- * information, ctx->debug) it is the 32-bit value sign-extended, as ld.lld's
- * relocateNonAlloc does on RV32: `.dword _start` at 0x80000000 is
- * 0xffffffff80000000 there, and 0x80000000 in .data. */
+ *   - A hi/lo pair builds a 32-bit value. On RV32 it wraps modulo 2^32 and
+ *     reaches every address: never out of range. On RV64 lui and auipc
+ *     sign-extend hi << 12, so a pair reaches -2^31 - 0x800 to
+ *     2^31 - 0x801: HI20, PCREL_HI20 and CALL(_PLT) are checked against
+ *     that window (check_hi_window), the LO12 halves never.
+ *   - BRANCH and JAL: +-4 KiB and +-1 MiB on both widths.
+ *   - SET32 and 32_PCREL must fit 32 bits read as signed; the other ADD,
+ *     SUB and SET types keep the low bits of their value.
+ *   - R_RISCV_32 must fit 32 bits read as unsigned (an address) or signed
+ *     (a negative offset; on RV64 also a higher-half address).
+ *   - R_RISCV_64 (`.dword sym`, which assemblers emit on RV32 too) holds any
+ *     value. On RV32, in a section that is not loaded (debug information,
+ *     ctx->debug), it and the other 64-bit data fields get the 32-bit value
+ *     sign-extended, as ld.lld's relocateNonAlloc does: `.dword _start` at
+ *     0x80000000 is 0xffffffff80000000 there, and 0x80000000 in .data.
+ *
+ * R_RISCV_ALIGN is refused: ld.lld deletes the padding beyond what the
+ * alignment needs, and merlin-ld does not. */
 #include "ld.h"
 
 const char *reloc_type_name(uint type) {
@@ -82,13 +94,36 @@ static uint set_j(uint inst, uint imm) {
 }
 
 /* The %hi / %lo split: the low 12 bits are sign-extended by the instruction
- * that adds them, so the high part rounds up when bit 11 is set. */
-static uint hi20(uint value) {
-    return ((value + 0x800) >> 12) & 0xfffff;
+ * that adds them, so the high part rounds up when bit 11 is set. Only the
+ * low 32 bits of `value` reach the fields, on both widths. */
+static uint hi20(uint64_t value) {
+    return (uint)((value + 0x800) >> 12) & 0xfffff;
 }
 
-static uint lo12(uint value) {
-    return value & 0xfff;
+static uint lo12(uint64_t value) {
+    return (uint)value & 0xfff;
+}
+
+/* The range check of a hi/lo pair's value `v` (S + A for HI20, S + A - P for
+ * PCREL_HI20 and CALL(_PLT)): none on RV32, where the pair wraps modulo 2^32
+ * and reaches everything; on RV64, the high part (v + 0x800) >> 12 must be
+ * a signed 20-bit number, or lui/auipc would sign-extend it into another
+ * value (ld.lld's checkInt(hi, 20)), and the error gives that high part. */
+static int check_hi_window(int64_t v, struct reloc_context *ctx, struct reloc_error *e) {
+    if (!ctx->elf64) {
+        return RE_OK;
+    }
+    /* Arithmetic shift: the sign of v + 0x800 stays. The addition wraps as
+     * ld.lld's does on its uint64_t. */
+    int64_t hi = (int64_t)((uint64_t)v + 0x800) >> 12;
+    int64_t min = -((int64_t)1 << 19), max = ((int64_t)1 << 19) - 1;
+    if (hi < min || hi > max) {
+        e->value = hi;
+        e->min = min;
+        e->max = max;
+        return RE_OUT_OF_RANGE;
+    }
+    return RE_OK;
 }
 
 static uint read32(uchar *b) {
@@ -105,21 +140,21 @@ static void write32(uchar *b, uint v) {
 /* Whether `value` is a signed `bits`-bit even number: a branch's (13) or a
  * jump's (21) offset. ld.lld's range, that of a `bits`-bit number; out of
  * range and odd is two errors (RE_RANGE_AND_ALIGN, the range first). */
-static int check_offset(i64 value, uint bits, uint *out, struct reloc_error *e) {
-    i64 min = i64_neg(i64_shl(i64_u(1), bits - 1));
-    i64 max = i64_sub(i64_shl(i64_u(1), bits - 1), i64_u(1));
-    if (i64_cmp(value, min) < 0 || i64_cmp(value, max) > 0) {
+static int check_offset(int64_t value, uint bits, uint *out, struct reloc_error *e) {
+    int64_t min = -((int64_t)1 << (bits - 1));
+    int64_t max = ((int64_t)1 << (bits - 1)) - 1;
+    if (value < min || value > max) {
         e->value = value;
         e->min = min;
         e->max = max;
-        return value.lo & 1 ? RE_RANGE_AND_ALIGN : RE_OUT_OF_RANGE;
+        return value & 1 ? RE_RANGE_AND_ALIGN : RE_OUT_OF_RANGE;
     }
-    if (value.lo & 1) {
+    if (value & 1) {
         e->value = value;
-        e->min = i64_u(2);
+        e->min = 2;
         return RE_MISALIGNED;
     }
-    *out = value.lo;
+    *out = (uint)value;
     return RE_OK;
 }
 
@@ -146,46 +181,42 @@ static uint data_field(uint type) {
  * `v`, S + A (S + A - P for 32_PCREL): ADD adds, SUB subtracts, SUB6 and
  * SET6 change the low 6 bits of the byte, the SETs write. Only SET32 and
  * 32_PCREL are checked, as signed 32-bit numbers. */
-static int apply_data(uint type, uint n, i64 v, uchar *bytes, struct reloc_error *e) {
-    i64 old = i64_u(0);
+static int apply_data(uint type, uint n, uint64_t v, uchar *bytes, struct reloc_error *e) {
+    uint64_t old = 0;
     for (uint k = 0; k < n; k++) {
-        if (k < 4) {
-            old.lo |= (uint)bytes[k] << (8 * k);
-        } else {
-            old.hi |= (uint)bytes[k] << (8 * (k - 4));
-        }
+        old |= (uint64_t)bytes[k] << (8 * k);
     }
-    i64 out = v;
+    uint64_t out = v;
     if (type == R_RISCV_ADD8 || type == R_RISCV_ADD16 || type == R_RISCV_ADD32 || type == R_RISCV_ADD64) {
-        out = i64_add(old, v);
+        out = old + v;
     } else if (type == R_RISCV_SUB8 || type == R_RISCV_SUB16 || type == R_RISCV_SUB32 || type == R_RISCV_SUB64) {
-        out = i64_sub(old, v);
+        out = old - v;
     } else if (type == R_RISCV_SUB6) {
-        out.lo = (old.lo & 0xc0) | ((old.lo - v.lo) & 0x3f);
+        out = (old & 0xc0) | ((old - v) & 0x3f);
     } else if (type == R_RISCV_SET6) {
-        out.lo = (old.lo & 0xc0) | (v.lo & 0x3f);
+        out = (old & 0xc0) | (v & 0x3f);
     } else if (type == R_RISCV_SET32 || type == R_RISCV_32_PCREL) {
-        i64 min = i64_of((int)0x80000000u), max = i64_u(0x7fffffffu);
-        if (i64_cmp(v, min) < 0 || i64_cmp(v, max) > 0) {
-            e->value = v;
-            e->min = min;
-            e->max = max;
+        int64_t sv = (int64_t)v;
+        if (sv < INT32_MIN || sv > INT32_MAX) {
+            e->value = sv;
+            e->min = INT32_MIN;
+            e->max = INT32_MAX;
             return RE_OUT_OF_RANGE;
         }
     }
     for (uint k = 0; k < n; k++) {
-        bytes[k] = (uchar)(k < 4 ? out.lo >> (8 * k) : out.hi >> (8 * (k - 4)));
+        bytes[k] = (uchar)(out >> (8 * k));
     }
     return RE_OK;
 }
 
-int reloc_apply(uint type, uint place, i64 sym, int addend, uchar *bytes, uint have, struct reloc_context *ctx,
-                struct reloc_error *e) {
-    /* S is 64 bits: a debug relocation against discarded code has S = -A
-     * modulo 2^64 (relocate.c), so that S + A is 0. The fields take the low
-     * 32 bits, `sl`. */
-    i64 s = sym, a = i64_of(addend), p = i64_u(place);
-    uint sl = sym.lo;
+int reloc_apply(uint type, uint64_t place, uint64_t sym, int64_t addend, uchar *bytes, uint64_t have,
+                struct reloc_context *ctx, struct reloc_error *e) {
+    /* The two values of every formula, S + A and S + A - P, modulo 2^64 as
+     * the hardware adds, read as signed for the range checks. On RV32 they
+     * are exact (S and P below 2^32, A a 32-bit addend). */
+    uint64_t abs = sym + (uint64_t)addend;
+    uint64_t pcrel = abs - place;
     uint need;
     if (type == R_RISCV_NONE || type == R_RISCV_RELAX) {
         return RE_OK;
@@ -210,19 +241,22 @@ int reloc_apply(uint type, uint place, i64 sym, int addend, uchar *bytes, uint h
         e->have = have;
         return RE_TRUNCATED;
     }
-    /* S + A; in a section that is not loaded, the 32-bit value sign-extended,
-     * as ld.lld's relocateNonAlloc gives every value there on RV32. */
-    i64 value = ctx->debug ? i64_of((int)(sl + (uint)addend)) : i64_add(s, a);
+    /* On RV32, in a section that is not loaded, ld.lld's relocateNonAlloc
+     * sign-extends the 32-bit value of every relocation it applies there:
+     * it shows in the 64-bit fields, R_RISCV_64 and ADD64/SUB64. */
+    int nonalloc = !ctx->elf64 && ctx->debug;
     if (data_field(type)) {
-        if (type == R_RISCV_32_PCREL) {
-            value = ctx->debug ? i64_of((int)(sl + (uint)addend - place)) : i64_sub(value, p);
+        uint64_t v = type == R_RISCV_32_PCREL ? pcrel : abs;
+        if (nonalloc) {
+            v = (uint64_t)(int64_t)(int)(uint)v;
         }
-        return apply_data(type, need, value, bytes, e);
+        return apply_data(type, need, v, bytes, e);
     }
     if (type == R_RISCV_64) {
         /* A doubleword holding an address, never out of range. */
-        write32(bytes, value.lo);
-        write32(bytes + 4, value.hi);
+        uint64_t v = nonalloc ? (uint64_t)(int64_t)(int)(uint)abs : abs;
+        write32(bytes, (uint)v);
+        write32(bytes + 4, (uint)(v >> 32));
         return RE_OK;
     }
     uint inst = read32(bytes);
@@ -230,19 +264,19 @@ int reloc_apply(uint type, uint place, i64 sym, int addend, uchar *bytes, uint h
     int r;
     if (type == R_RISCV_32) {
         /* A data word holding an address: it must fit 32 bits, read as
-         * unsigned (an address) or signed (a negative offset). */
-        i64 value = i64_add(s, a);
-        i64 min = i64_of((int)0x80000000u), max = i64_u(0xffffffffu);
-        if (i64_cmp(value, min) < 0 || i64_cmp(value, max) > 0) {
-            e->value = value;
-            e->min = min;
-            e->max = max;
+         * unsigned (an address) or signed (a negative offset, and on RV64 a
+         * higher-half address 0xffff_ffff_8xxx_xxxx). */
+        int64_t v = (int64_t)abs;
+        if (v < INT32_MIN || v > (int64_t)UINT32_MAX) {
+            e->value = v;
+            e->min = INT32_MIN;
+            e->max = UINT32_MAX;
             return RE_OUT_OF_RANGE;
         }
-        patched = value.lo;
+        patched = (uint)abs;
     } else if (type == R_RISCV_BRANCH || type == R_RISCV_JAL) {
         int branch = type == R_RISCV_BRANCH;
-        r = check_offset(i64_sub(i64_add(s, a), p), branch ? 13 : 21, &imm, e);
+        r = check_offset((int64_t)pcrel, branch ? 13 : 21, &imm, e);
         if (r != RE_OK) {
             return r;
         }
@@ -250,30 +284,44 @@ int reloc_apply(uint type, uint place, i64 sym, int addend, uchar *bytes, uint h
     } else if (type == R_RISCV_CALL || type == R_RISCV_CALL_PLT) {
         /* auipc ra, %hi(off) + jalr ra, %lo(off)(ra), off = S + A - P with P
          * the auipc's address: the jalr adds to ra (P + hi), so both halves
-         * use the same off. */
-        uint off = sl + (uint)addend - place;
-        write32(bytes + 4, set_i(read32(bytes + 4), lo12(off)));
-        patched = set_u(inst, hi20(off));
+         * use the same off. The range is checked before the jalr is
+         * written, so that on error neither word changes. */
+        r = check_hi_window((int64_t)pcrel, ctx, e);
+        if (r != RE_OK) {
+            return r;
+        }
+        write32(bytes + 4, set_i(read32(bytes + 4), lo12(pcrel)));
+        patched = set_u(inst, hi20(pcrel));
     } else if (type == R_RISCV_PCREL_HI20) {
-        patched = set_u(inst, hi20(sl + (uint)addend - place));
+        r = check_hi_window((int64_t)pcrel, ctx, e);
+        if (r != RE_OK) {
+            return r;
+        }
+        patched = set_u(inst, hi20(pcrel));
     } else if (type == R_RISCV_PCREL_LO12_I || type == R_RISCV_PCREL_LO12_S) {
         /* The low part of the same value as the HI20 at the auipc this
-         * relocation's symbol labels: that HI20's S + A - P, P = S here. */
+         * relocation's symbol labels: that HI20's S + A - P, P = S here.
+         * Not range-checked: the HI20 is. */
         if (addend != 0) {
             return RE_LO12_ADDEND;
         }
         int k;
-        if (!umap_get(&ctx->by_place, sl, &k)) {
+        if (!umap_get(&ctx->by_place, sym, &k)) {
             return RE_MISSING_HI20;
         }
-        uint value = ctx->sites[k].sym + (uint)ctx->sites[k].addend - sl;
+        uint64_t value = ctx->sites[k].sym + (uint64_t)ctx->sites[k].addend - sym;
         patched = type == R_RISCV_PCREL_LO12_I ? set_i(inst, lo12(value)) : set_s(inst, lo12(value));
     } else if (type == R_RISCV_HI20) {
-        patched = set_u(inst, hi20(sl + (uint)addend));
+        /* The HI20 carries the range check of the absolute pair. */
+        r = check_hi_window((int64_t)abs, ctx, e);
+        if (r != RE_OK) {
+            return r;
+        }
+        patched = set_u(inst, hi20(abs));
     } else if (type == R_RISCV_LO12_I) {
-        patched = set_i(inst, lo12(sl + (uint)addend));
+        patched = set_i(inst, lo12(abs));
     } else {
-        patched = set_s(inst, lo12(sl + (uint)addend));
+        patched = set_s(inst, lo12(abs));
     }
     write32(bytes, patched);
     return RE_OK;

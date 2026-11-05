@@ -213,7 +213,7 @@ function serverCard(avalon, vms, ram) {
         "p",
         {},
         el("a", { href: "#/vms" }, vms.total + " VMs"),
-        ": " + vms.running + " running, " + vms.paused + " paused, " + vms.created + " created, " + vms.ended + " ended",
+        ": " + vms.running + " running, " + vms.paused + " paused, " + vms.debug + " debug, " + vms.created + " created, " + vms.ended + " ended",
       ),
     );
   }
@@ -289,7 +289,7 @@ function vmsPage(main, ctx) {
         el(
           "table",
           {},
-          el("tr", {}, ["ID", "Name", "State", "RAM", "Clock", "Disks", ""].map((h) => el("th", {}, h))),
+          el("tr", {}, ["ID", "Name", "State", "Arch", "RAM", "Clock", "Disks", ""].map((h) => el("th", {}, h))),
           list.vms.map((vm) =>
             el(
               "tr",
@@ -297,6 +297,7 @@ function vmsPage(main, ctx) {
               el("td", { class: "num" }, vm.id),
               el("td", {}, vmLink(vm.id, vm.name)),
               el("td", {}, stateCell(vm)),
+              el("td", {}, vm.arch),
               el("td", { class: "num" }, vm.ram_text),
               el("td", {}, vm.clock_text),
               el("td", {}, diskList(vm)),
@@ -350,6 +351,11 @@ function newVmPage(main, ctx, disk) {
 
   const field = (label, input, hint) => el("label", {}, el("span", {}, label), input, hint ? el("span", { class: "muted" }, " " + hint) : null);
   const name = el("input", { type: "text", required: true, placeholder: "web", autocomplete: "off" });
+  // The width, as QEMU's binary picks it (qemu-system-riscv32 or -riscv64), and an
+  // RV64 VM's paging modes; the values are what Round Table's --xlen and --paging take.
+  const option = (value, text, selected) => el("option", { value, selected: selected || undefined }, text);
+  const xlen = el("select", { class: "xlen" }, option("32", "RV32", true), option("64", "RV64"));
+  const paging = el("select", { class: "paging" }, option("sv48", "Sv48 and Sv39", true), option("sv39", "Sv39 alone"));
   const ram = el("input", { type: "text", value: "4" });
   const clock = el("input", { type: "text", placeholder: "full speed" });
   const harts = el("input", { type: "text", value: "1" });
@@ -364,11 +370,22 @@ function newVmPage(main, ctx, disk) {
   const bootProgram = el("input", { type: "radio", name: "boot", value: "program", checked: true });
   const camelotHint = el("span", { class: "muted" }, " Lake's image is copied to a disk of the VM's own, NAME-disk0");
   const programField = field("Program", program, "an Excalibur ELF executable; without one the VM boots from its first disk");
+  const pagingField = field("Paging", paging, "an RV64 VM's; an RV32 VM has Sv32");
+  // Lake's images, and the Camelot image of each width (from the disks list).
+  let images = null;
   const showBoot = () => {
     programField.hidden = bootCamelot.checked;
+    pagingField.hidden = xlen.value !== "64";
+    if (images) {
+      const image = xlen.value === "64" ? images.camelot_image_rv64 : images.camelot_image;
+      camelotHint.textContent = images.disks.some((d) => d.name === image)
+        ? " Lake's image " + image + " is copied to a disk of the VM's own, NAME-disk0"
+        : " Lake has no image named " + image + " to copy: start the platform with cargo xtask up";
+    }
   };
   bootCamelot.addEventListener("change", showBoot);
   bootProgram.addEventListener("change", showBoot);
+  xlen.addEventListener("change", showBoot);
   const boot = el(
     "fieldset",
     { class: "boot" },
@@ -382,7 +399,9 @@ function newVmPage(main, ctx, disk) {
     "form",
     { class: "panel" },
     field("Name", name, "lowercase letters, digits, '.', '_' and '-'"),
-    field("RAM", ram, "MiB, or 512M, 16G; 1 MiB to 1 TiB, an RV32 program's VM at most 2 GiB"),
+    field("Width", xlen, "an ELF64 program makes the VM RV64; a Camelot VM boots its width's image"),
+    pagingField,
+    field("RAM", ram, "MiB, or 512M, 16G, 1T; 1 MiB to 1 TiB, an RV32 VM at most 2 GiB"),
     field("Clock", clock, "e.g. 10MHz, 500kHz, 5Hz; empty runs at full speed"),
     field("Harts", harts, "cores, 1 to 8; each runs at the clock"),
     boot,
@@ -404,6 +423,8 @@ function newVmPage(main, ctx, disk) {
     try {
       const request = {
         name: name.value.trim(),
+        xlen: xlen.value,
+        paging: paging.value,
         ram: ram.value,
         clock: clock.value,
         harts: harts.value,
@@ -444,11 +465,11 @@ function newVmPage(main, ctx, disk) {
       lake = list.lake;
       for (const d of list.disks) lakeImages.append(el("option", { value: "lake://" + lake + "/" + d.name }));
       if (disk) addDisk("lake://" + lake + "/" + disk);
+      images = list;
+      // The form's width at first, RV32: its image decides.
       const hasImage = list.disks.some((d) => d.name === list.camelot_image);
       if (hasImage && !disk) {
         bootCamelot.checked = true;
-      } else if (!hasImage) {
-        camelotHint.textContent = " Lake has no image named " + list.camelot_image + " to copy: start the platform with cargo xtask up";
       }
       showBoot();
     })
@@ -509,6 +530,7 @@ function vmPage(main, ctx, id) {
 function vmFacts(vm) {
   const rows = [
     ["State", stateCell(vm)],
+    ["Arch", vm.arch_text],
     ["RAM", vm.ram_text],
     ["Clock", vm.clock_hz === null ? "full speed (reports " + vm.nominal_text + " to the guest)" : vm.clock_text + " (real time)"],
     ["Harts", String(vm.harts)],

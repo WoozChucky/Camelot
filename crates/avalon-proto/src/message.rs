@@ -3,7 +3,8 @@
 //!
 //! Type codes are grouped by their high byte: `0x00` session, `0x01` VM control, `0x02`
 //! console, `0x03` screen and input (keyboard and pointer), `0x04` block I/O, `0x05`
-//! disk management, `0x06` virtual network (Avalon's switches). Every message is a
+//! disk management, `0x06` virtual network (Avalon's switches), `0x07` debugging (a VM's
+//! GDB stub, tunnelled). Every message is a
 //! request (answered by exactly one reply), a reply, or an event (never answered); see
 //! [`MessageKind`].
 
@@ -75,6 +76,12 @@ pub mod ty {
     pub const DETACH_CARD: u16 = 0x0606;
     pub const CAPTURE_SWITCH: u16 = 0x0607;
     pub const SET_SWITCH_NAT: u16 = 0x0608;
+    // Debugging.
+    pub const DEBUG_ATTACH: u16 = 0x0701;
+    pub const DEBUG_ATTACHED: u16 = 0x0702;
+    pub const DEBUG_INPUT: u16 = 0x0703;
+    pub const DEBUG_OUTPUT: u16 = 0x0704;
+    pub const DEBUG_DETACH: u16 = 0x0705;
 }
 
 /// Every message type, with its name and kind, in code order. The protocol doc's
@@ -136,6 +143,11 @@ pub const CATALOGUE: &[(u16, &str, MessageKind)] = {
         (ty::DETACH_CARD, "DetachCard", Request),
         (ty::CAPTURE_SWITCH, "CaptureSwitch", Request),
         (ty::SET_SWITCH_NAT, "SetSwitchNat", Request),
+        (ty::DEBUG_ATTACH, "DebugAttach", Request),
+        (ty::DEBUG_ATTACHED, "DebugAttached", Reply),
+        (ty::DEBUG_INPUT, "DebugInput", Event),
+        (ty::DEBUG_OUTPUT, "DebugOutput", Event),
+        (ty::DEBUG_DETACH, "DebugDetach", Request),
     ]
 };
 
@@ -193,13 +205,95 @@ pub const DEFAULT_NOMINAL_HZ: u32 = 10_000_000;
 /// Harts of [`HardwareProfile::default`], as for Grail's default.
 pub const DEFAULT_HARTS: u32 = 1;
 
+/// A VM's register width, as `grail::Xlen`: what QEMU picks with its binary,
+/// `qemu-system-riscv32` or `qemu-system-riscv64`. On the wire a `u8`, the width in
+/// bits: 32 or 64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Xlen {
+    /// RV32: Sv32 paging, at most 2 GiB of RAM. The default while both widths exist
+    /// (#159 removes it).
+    #[default]
+    Rv32,
+    /// RV64: Sv48 and Sv39 paging (or Sv39 alone, [`Paging`]), up to 1 TiB of RAM.
+    Rv64,
+}
+
+impl Xlen {
+    /// The width in bits, 32 or 64: what the wire carries.
+    pub fn bits(self) -> u8 {
+        match self {
+            Xlen::Rv32 => 32,
+            Xlen::Rv64 => 64,
+        }
+    }
+
+    /// The width of `bits`, if it is 32 or 64.
+    pub fn from_bits(bits: u8) -> Option<Xlen> {
+        match bits {
+            32 => Some(Xlen::Rv32),
+            64 => Some(Xlen::Rv64),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Xlen {
+    /// `RV32` or `RV64`.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "RV{}", self.bits())
+    }
+}
+
+/// The paging modes an RV64 VM's harts implement, as `grail::Paging`: QEMU's
+/// `-cpu rv64` (Sv48 too, the default) or `-cpu rv64,sv48=off`. On the wire a `u8`,
+/// the widest mode as `satp.MODE` numbers it (privileged spec, "satp"): 9 for Sv48
+/// (and Sv39), 8 for Sv39 alone. An RV32 VM has Sv32 whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Paging {
+    /// Sv48 and Sv39 (and Bare): `satp.MODE` 9 is the widest.
+    #[default]
+    Sv48,
+    /// Sv39 (and Bare) only, as on most RV64 boards: a write of MODE 9 to `satp` is
+    /// refused (WARL), which is how the guest finds out.
+    Sv39,
+}
+
+impl Paging {
+    /// The widest mode's `satp.MODE` value, 9 or 8: what the wire carries.
+    pub fn satp_mode(self) -> u8 {
+        match self {
+            Paging::Sv48 => 9,
+            Paging::Sv39 => 8,
+        }
+    }
+
+    /// The paging of `mode`, if it is 9 (Sv48) or 8 (Sv39).
+    pub fn from_satp_mode(mode: u8) -> Option<Paging> {
+        match mode {
+            9 => Some(Paging::Sv48),
+            8 => Some(Paging::Sv39),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Paging {
+    /// `sv48` or `sv39`, as Grail's `--paging` takes it.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Paging::Sv48 => "sv48",
+            Paging::Sv39 => "sv39",
+        })
+    }
+}
+
 /// A VM's hardware, mirroring `grail::MachineConfig` field for field (a test in this
 /// crate fails to compile when `MachineConfig` gains a field this does not have).
 /// The server validates it as Grail does and answers `InvalidProfile` if it is wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareProfile {
     /// RAM size in bytes: a non-zero multiple of 4 KiB, at most 1 TiB (2 GiB for an RV32
-    /// VM, which a VM is unless its program is ELF64).
+    /// VM).
     pub ram_size: u64,
     /// Real-time clock in instructions per second, or `None` to run at full speed.
     pub clock_hz: Option<u32>,
@@ -207,6 +301,14 @@ pub struct HardwareProfile {
     pub nominal_hz: u32,
     /// Harts (cores), each running at the clock: 1 to `grail::MAX_HARTS` (8).
     pub harts: u32,
+    /// The harts' width, chosen as QEMU's binary chooses it. An ELF64 program makes
+    /// an RV32 VM RV64 when it is loaded, as Grail's `Machine::load_elf` does, and the
+    /// VM's profile says RV64 from then on (`VmList`, `VmInfo`); an ELF32 program
+    /// cannot run on an RV64 VM. A VM that boots from disk is as wide as this says:
+    /// so are its boot ROM and the boot block it runs.
+    pub xlen: Xlen,
+    /// The paging modes an RV64 VM's harts implement; an RV32 VM has Sv32.
+    pub paging: Paging,
     /// Optional hardware beyond the fixed machine (spec section 7), in the order the
     /// guest should see it.
     pub devices: Vec<DeviceSpec>,
@@ -219,6 +321,8 @@ impl Default for HardwareProfile {
             clock_hz: None,
             nominal_hz: DEFAULT_NOMINAL_HZ,
             harts: DEFAULT_HARTS,
+            xlen: Xlen::default(),
+            paging: Paging::default(),
             devices: Vec::new(),
         }
     }
@@ -310,7 +414,8 @@ impl fmt::Display for VmRef {
 }
 
 /// A VM's life cycle: created, then running, paused and resumed any number of times,
-/// until it is stopped or its program exits.
+/// and stopped by its debugger and resumed by it, until it is stopped or its program
+/// exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmState {
     Created,
@@ -320,6 +425,9 @@ pub enum VmState {
     Stopped,
     /// The program stopped the machine with this exit code.
     Exited(u32),
+    /// Held by its debugger: stopped at a breakpoint, a watchpoint, a step or an
+    /// interrupt, until the debugger resumes it (QEMU's run state `debug`).
+    Debug,
 }
 
 impl fmt::Display for VmState {
@@ -330,6 +438,7 @@ impl fmt::Display for VmState {
             VmState::Paused => write!(f, "paused"),
             VmState::Stopped => write!(f, "stopped"),
             VmState::Exited(code) => write!(f, "exited({code})"),
+            VmState::Debug => write!(f, "debug"),
         }
     }
 }
@@ -369,6 +478,7 @@ pub struct DeviceEntry {
 pub enum AttachKind {
     Console,
     Screen,
+    Debug,
 }
 
 /// A key press or release for the guest's keyboard device (Excalibur spec section
@@ -725,7 +835,8 @@ pub enum Message {
         vm: u32,
         state: VmState,
     },
-    /// Server: it ended an attachment (the VM was destroyed).
+    /// Server: it ended an attachment (the VM was destroyed; a debugger's also when the
+    /// VM's machine ended).
     Detached {
         vm: u32,
         kind: AttachKind,
@@ -928,6 +1039,31 @@ pub enum Message {
         switch: String,
         nat: Option<NatConfig>,
     },
+
+    // ---- Debugging (Avalon) ----
+    /// Attach a debugger to a VM's GDB stub: the VM stops for it (state debug).
+    /// Answered by `DebugAttached`; the GDB remote serial protocol then travels in
+    /// `DebugInput` and `DebugOutput`.
+    DebugAttach {
+        vm: VmRef,
+    },
+    DebugAttached {
+        vm: u32,
+    },
+    /// Client: bytes of the GDB remote serial protocol for the VM's stub.
+    DebugInput {
+        vm: u32,
+        data: Vec<u8>,
+    },
+    /// Server: bytes of the GDB remote serial protocol from the VM's stub.
+    DebugOutput {
+        vm: u32,
+        data: Vec<u8>,
+    },
+    /// Answered by `Ok`; the VM runs on without breakpoints, as after GDB's `D`.
+    DebugDetach {
+        vm: u32,
+    },
 }
 
 impl Message {
@@ -989,6 +1125,11 @@ impl Message {
             DetachCard { .. } => ty::DETACH_CARD,
             CaptureSwitch { .. } => ty::CAPTURE_SWITCH,
             SetSwitchNat { .. } => ty::SET_SWITCH_NAT,
+            DebugAttach { .. } => ty::DEBUG_ATTACH,
+            DebugAttached { .. } => ty::DEBUG_ATTACHED,
+            DebugInput { .. } => ty::DEBUG_INPUT,
+            DebugOutput { .. } => ty::DEBUG_OUTPUT,
+            DebugDetach { .. } => ty::DEBUG_DETACH,
         }
     }
 
@@ -1141,7 +1282,8 @@ impl Message {
             | StopVm { vm }
             | DestroyVm { vm }
             | ConsoleAttach { vm }
-            | ScreenAttach { vm } => put_vm_ref(w, vm),
+            | ScreenAttach { vm }
+            | DebugAttach { vm } => put_vm_ref(w, vm),
             VmInfo(d) => {
                 put_summary(w, &d.vm);
                 w.list(&d.devices, |w, e| {
@@ -1161,15 +1303,20 @@ impl Message {
                 w.u8(match kind {
                     AttachKind::Console => 1,
                     AttachKind::Screen => 2,
+                    AttachKind::Debug => 3,
                 });
             }
             ConsoleAttached { vm, scrollback: data }
             | ConsoleInput { vm, data }
-            | ConsoleOutput { vm, data } => {
+            | ConsoleOutput { vm, data }
+            | DebugInput { vm, data }
+            | DebugOutput { vm, data } => {
                 w.u32(*vm);
                 w.bytes(data);
             }
-            ConsoleDetach { vm } | ScreenDetach { vm } => w.u32(*vm),
+            ConsoleDetach { vm } | ScreenDetach { vm } | DebugAttached { vm } | DebugDetach { vm } => {
+                w.u32(*vm)
+            }
             ScreenAttached {
                 vm,
                 width,
@@ -1401,6 +1548,7 @@ impl Message {
                 kind: match r.u8()? {
                     1 => AttachKind::Console,
                     2 => AttachKind::Screen,
+                    3 => AttachKind::Debug,
                     t => return Err(bad_tag("attachment kind", t)),
                 },
             },
@@ -1418,6 +1566,17 @@ impl Message {
                 data: r.bytes()?,
             },
             ty::CONSOLE_DETACH => ConsoleDetach { vm: r.u32()? },
+            ty::DEBUG_ATTACH => DebugAttach { vm: get_vm_ref(r)? },
+            ty::DEBUG_ATTACHED => DebugAttached { vm: r.u32()? },
+            ty::DEBUG_INPUT => DebugInput {
+                vm: r.u32()?,
+                data: r.bytes()?,
+            },
+            ty::DEBUG_OUTPUT => DebugOutput {
+                vm: r.u32()?,
+                data: r.bytes()?,
+            },
+            ty::DEBUG_DETACH => DebugDetach { vm: r.u32()? },
             ty::SCREEN_ATTACH => ScreenAttach { vm: get_vm_ref(r)? },
             ty::SCREEN_ATTACHED => ScreenAttached {
                 vm: r.u32()?,
@@ -1616,6 +1775,7 @@ fn put_state(w: &mut Writer, state: &VmState) {
             w.u8(4);
             w.u32(*code);
         }
+        VmState::Debug => w.u8(5),
     }
 }
 
@@ -1626,6 +1786,7 @@ fn get_state(r: &mut Reader) -> Result<VmState> {
         2 => VmState::Paused,
         3 => VmState::Stopped,
         4 => VmState::Exited(r.u32()?),
+        5 => VmState::Debug,
         t => return Err(bad_tag("VM state", t)),
     })
 }
@@ -1635,6 +1796,8 @@ fn put_profile(w: &mut Writer, p: &HardwareProfile) {
     w.option(&p.clock_hz, |w, hz| w.u32(*hz));
     w.u32(p.nominal_hz);
     w.u32(p.harts);
+    w.u8(p.xlen.bits());
+    w.u8(p.paging.satp_mode());
     w.list(&p.devices, |w, d| match d {
         DeviceSpec::Disk(disk) => {
             w.u8(1);
@@ -1665,6 +1828,16 @@ fn get_profile(r: &mut Reader) -> Result<HardwareProfile> {
         clock_hz: r.option(|r| r.u32())?,
         nominal_hz: r.u32()?,
         harts: r.u32()?,
+        xlen: {
+            let bits = r.u8()?;
+            Xlen::from_bits(bits)
+                .ok_or_else(|| Error::Invalid(format!("register width {bits}, not 32 or 64")))?
+        },
+        paging: {
+            let mode = r.u8()?;
+            Paging::from_satp_mode(mode)
+                .ok_or_else(|| Error::Invalid(format!("paging mode {mode}, not 9 (Sv48) or 8 (Sv39)")))?
+        },
         devices: r.list(|r| match r.u8()? {
             1 => {
                 let source = match r.u8()? {

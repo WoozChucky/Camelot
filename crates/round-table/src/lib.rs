@@ -6,9 +6,9 @@
 //! tests call [`run`] the same way against servers running in process.
 
 use avalon_client::{
-    create_camelot_vm, device_name, disk_source_text, format_hz, format_size, mac_text, parse_addr,
-    parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_ram,
-    vm_disk, Client, VmAction, BASE_IMAGE,
+    arch_text, base_image, create_camelot_vm, device_name, disk_source_text, format_hz, format_size,
+    mac_text, parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd,
+    parse_net, parse_paging, parse_ram, parse_xlen, vm_disk, Client, VmAction,
 };
 use avalon_proto::{
     validate_name, DeviceSpec, DiskInfo, DiskSpec, HardwareProfile, NatConfig, NetSpec, PortOwner,
@@ -37,9 +37,11 @@ VM commands, sent to Avalon:
                   grail --disk IMG does
   create --name NAME --camelot [--lake ADDR] [options]
                   create a VM that boots Camelot from a disk of its own:
-                  Lake's image os-base (cargo xtask up puts it there) is
-                  copied to NAME-disk0, which becomes the VM's first disk
-  list            every VM: id, name, state, RAM, clock, disks and cards
+                  Lake's image os-base, or os-base-rv64 for an RV64 VM
+                  (cargo xtask up puts both there), is copied to
+                  NAME-disk0, which becomes the VM's first disk
+  list            every VM: id, name, state, width, RAM, clock, disks and
+                  cards
   info VM         one VM in detail: hardware, disks, network cards, steps
                   run, devices
   start VM        start a created VM
@@ -55,9 +57,16 @@ VM commands, sent to Avalon:
 create options:
   --name NAME     the VM's name (required): 1 to 64 lowercase letters,
                   digits, '.', '_' and '-', not all digits
-  --ram SIZE      RAM size: MiB, or a number with a unit, M/MiB or G/GiB
-                  (--ram 64, --ram 16G); 1 MiB to 1 TiB, an RV32 VM at most
-                  2 GiB (default 4 MiB)
+  --xlen 32|64    the VM's register width: RV32 (the default) or RV64, as
+                  QEMU's qemu-system-riscv32 and qemu-system-riscv64. An
+                  ELF64 program makes the VM RV64 anyway; an ELF32 one does
+                  not run on an RV64 VM. A VM that boots from disk is of
+                  this width, and so must be its disk's boot block
+  --paging MODE   an RV64 VM's paging: sv48 (Sv48 and Sv39, the default) or
+                  sv39 (Sv39 alone, as most RV64 boards); an RV32 VM has Sv32
+  --ram SIZE      RAM size: MiB, or a number with a unit, M/MiB, G/GiB or
+                  T/TiB (--ram 64, --ram 16G); 1 MiB to 1 TiB, an RV32 VM at
+                  most 2 GiB (default 4 MiB)
   --clock FREQ    real time: run FREQ instructions per second. FREQ is a
                   number with an optional unit, Hz, kHz or MHz: 10MHz, 500kHz,
                   1.5MHz, 5Hz. Without it the VM runs at full speed and
@@ -75,8 +84,9 @@ create options:
                   one up from the VM's name). Repeat for more cards, up to 4
   --start         start the VM as soon as it is created
   --camelot       boot Camelot from NAME-disk0, a copy of Lake's image os-base
-                  made on the Lake at --lake ADDR (no program); Avalon reaches
-                  the disk at that address too
+                  (os-base-rv64 with --xlen 64) made on the Lake at --lake
+                  ADDR (no program); Avalon reaches the disk at that address
+                  too
 
 Switch commands, sent to Avalon:
   switch create NAME [--nat [--hostfwd RULE]...]
@@ -252,10 +262,12 @@ pub fn run(args: &[String], out: &mut dyn Write) -> Result<(), Failure> {
 // ---- Parsing ----
 
 /// Every option, and whether it takes a value.
-const OPTIONS: [(&str, bool); 18] = [
+const OPTIONS: [(&str, bool); 20] = [
     ("--server", true),
     ("--lake", true),
     ("--name", true),
+    ("--xlen", true),
+    ("--paging", true),
     ("--ram", true),
     ("--clock", true),
     ("--harts", true),
@@ -344,6 +356,8 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             &[
                 "--server",
                 "--name",
+                "--xlen",
+                "--paging",
                 "--ram",
                 "--clock",
                 "--harts",
@@ -456,6 +470,8 @@ fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Cre
                 validate_name(value).map_err(with)?;
                 name = Some(value.clone());
             }
+            "--xlen" => profile.xlen = parse_xlen(value).map_err(with)?,
+            "--paging" => profile.paging = parse_paging(value).map_err(with)?,
             "--ram" => profile.ram_size = parse_ram(value).map_err(with)?,
             "--clock" => profile.clock_hz = Some(parse_clock(value).map_err(with)?),
             "--harts" => profile.harts = parse_harts(value).map_err(with)?,
@@ -704,7 +720,8 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
                     create.profile.clone(),
                 )
                 .map_err(|e| Failure::Failed(e.to_string()))?;
-                (id, format!("created disk {disk} (a copy of {BASE_IMAGE})\n"))
+                let image = base_image(create.profile.xlen);
+                (id, format!("created disk {disk} (a copy of {image})\n"))
             } else {
                 let id = avalon
                     .create_vm(&create.name, create.profile.clone(), program)
@@ -932,6 +949,7 @@ pub fn vm_table(vms: &[VmSummary]) -> String {
                 vm.id.to_string(),
                 vm.name.clone(),
                 vm.state.to_string(),
+                vm.profile.xlen.to_string(),
                 format_size(vm.profile.ram_size),
                 clock_text(&vm.profile),
                 disks(&vm.profile).count().to_string(),
@@ -939,7 +957,10 @@ pub fn vm_table(vms: &[VmSummary]) -> String {
             ]
         })
         .collect();
-    table(&["ID", "NAME", "STATE", "RAM", "CLOCK", "DISKS", "NETS"], &rows)
+    table(
+        &["ID", "NAME", "STATE", "ARCH", "RAM", "CLOCK", "DISKS", "NETS"],
+        &rows,
+    )
 }
 
 /// A field of `info` that lists several values: one per line, the label on the first,
@@ -966,10 +987,12 @@ pub fn vm_details(details: &VmDetails) -> String {
         ),
     };
     let mut text = format!(
-        "id       {}\nname     {}\nstate    {}\nRAM      {}\nclock    {clock}\nharts    {}\nsteps    {steps}\n",
+        "id       {}\nname     {}\nstate    {}\narch     {}\nRAM      {}\nclock    {clock}\nharts    {}\n\
+         steps    {steps}\n",
         vm.id,
         vm.name,
         vm.state,
+        arch_text(vm.profile.xlen, vm.profile.paging),
         format_size(vm.profile.ram_size),
         vm.profile.harts,
     );
@@ -1123,7 +1146,7 @@ pub fn switch_details(switch: &SwitchInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use avalon_proto::{DeviceEntry, DiskSource, SwitchPort, VmState};
+    use avalon_proto::{DeviceEntry, DiskSource, Paging, SwitchPort, VmState, Xlen};
 
     fn parse(args: &str) -> Result<Invocation, String> {
         let args: Vec<String> = args.split_whitespace().map(str::to_string).collect();
@@ -1195,6 +1218,7 @@ mod tests {
         assert_eq!(c.profile.clock_hz, Some(10_000_000));
         assert_eq!(c.profile.nominal_hz, avalon_proto::DEFAULT_NOMINAL_HZ);
         assert_eq!(c.profile.harts, 4);
+        assert_eq!(c.profile.xlen, Xlen::Rv32);
         assert_eq!(
             c.profile.devices,
             vec![
@@ -1220,7 +1244,7 @@ mod tests {
         assert_eq!(c.profile.ram_size, 4 << 20);
         assert_eq!(avalon_proto::DEFAULT_RAM_SIZE, 4 << 20);
         let mib = avalon_proto::DEFAULT_RAM_SIZE >> 20;
-        assert!(USAGE.contains(&format!("2 GiB (default {mib} MiB)\n")));
+        assert!(USAGE.contains(&format!("most 2 GiB (default {mib} MiB)\n")));
         assert!(!c.start);
         // No program: the VM boots from its disk.
         let Command::Create(c) = command("create --name os --disk root.img") else {
@@ -1247,6 +1271,19 @@ mod tests {
         };
         assert!(c.camelot);
         assert_eq!(c.profile.devices.len(), 1);
+        // An RV64 VM, with Sv39 alone; up to RV64's 1 TiB of RAM.
+        let Command::Create(c) = command("create --name os --camelot --xlen 64 --paging sv39 --ram 1T")
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (c.profile.xlen, c.profile.paging, c.profile.ram_size),
+            (Xlen::Rv64, Paging::Sv39, 1 << 40)
+        );
+        let Command::Create(c) = command("create --name os --xlen=32 --paging=sv48 --disk a.img") else {
+            panic!()
+        };
+        assert_eq!((c.profile.xlen, c.profile.paging), (Xlen::Rv32, Paging::Sv48));
     }
 
     #[test]
@@ -1455,6 +1492,8 @@ mod tests {
             clock_hz: Some(1_500_000),
             nominal_hz: 10_000_000,
             harts: 2,
+            xlen: Xlen::Rv64,
+            paging: Paging::Sv48,
             devices: vec![
                 disk("lake://10.0.0.9:7401/data", false),
                 DeviceSpec::Net(parse_net("lan,mac=02:ca:00:00:00:01").unwrap()),
@@ -1469,9 +1508,9 @@ mod tests {
         assert_eq!(
             vm_table(&vms),
             "\
-ID  NAME       STATE      RAM     CLOCK       DISKS  NETS
-1   web        running    64 MiB  1.5 MHz     2      2
-12  batch-job  exited(3)  4 MiB   full speed  0      0
+ID  NAME       STATE      ARCH  RAM     CLOCK       DISKS  NETS
+1   web        running    RV64  64 MiB  1.5 MHz     2      2
+12  batch-job  exited(3)  RV32  4 MiB   full speed  0      0
 "
         );
         let details = VmDetails {
@@ -1498,6 +1537,7 @@ ID  NAME       STATE      RAM     CLOCK       DISKS  NETS
 id       1
 name     web
 state    running
+arch     RV64 (Sv48 and Sv39 paging)
 RAM      64 MiB
 clock    1.5 MHz (real time)
 harts    2
@@ -1521,6 +1561,7 @@ devices  2
             text.contains("\nclock    full speed (reports 10 MHz to the guest)\n"),
             "{text}"
         );
+        assert!(text.contains("\narch     RV32 (Sv32 paging)\n"), "{text}");
         assert!(
             text.contains("\ndisks    none\nnets     none\ndevices  0\n"),
             "{text}"

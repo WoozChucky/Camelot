@@ -1,10 +1,12 @@
 //! `disk create --from` and `create --camelot` against the real Lake and Avalon, in
-//! process: copies of an image, and VMs that boot from copies of Lake's `camelot`
-//! image of their own, two of them running at once.
+//! process: copies of an image, and VMs that boot from copies of Lake's base image of
+//! their width (`os-base`, `os-base-rv64`) of their own, two of them running at once,
+//! RV32 VMs and then RV64 ones.
 //!
-//! The `camelot` image here is a small bootable disk whose boot block spins forever,
-//! so a VM booted from it stays running and holds its disk; the real Camelot image is
-//! booted by `cargo xtask up --demo`'s test (crates/xtask/tests/up.rs).
+//! The base images here are small bootable disks whose boot block spins forever
+//! (`j .` is the same instruction on both widths), so a VM booted from one stays
+//! running and holds its disk; the real Camelot images are booted by `cargo xtask
+//! up`'s tests (crates/xtask/tests/up.rs).
 
 mod common;
 
@@ -104,145 +106,173 @@ os-base  8 KiB   16       no
 
 #[test]
 fn camelot_vms_boot_from_copies_of_their_own() {
-    let dir = TempDir::new("vms");
-    std::fs::write(dir.0.join("os-base"), spinning_image(16)).unwrap();
-    let lake = lake(&dir);
-    let lake_addr = lake.addr().to_string();
-    let avalon = avalon(256);
-    let server = avalon.addr().to_string();
-    let run = |args: &[&str]| {
-        let mut full = vec!["--server", &server, "--lake", &lake_addr];
-        full.extend_from_slice(args);
-        rt(&full)
-    };
-    let refused = |args: &[&str]| match run(args) {
-        Err(round_table::Failure::Failed(why)) => why,
-        other => panic!("{args:?} should be refused, got {other:?}"),
-    };
-
-    // Two VMs, each on a copy of its own, running at the same time.
-    assert_eq!(
-        run(&["create", "--name", "one", "--camelot", "--ram", "16", "--start"]).unwrap(),
-        "created disk one-disk0 (a copy of os-base)\ncreated VM 1 (one)\nstarted VM 1 (one)\n"
-    );
-    assert_eq!(
-        run(&["create", "--camelot", "--name", "two", "--ram", "16"]).unwrap(),
-        "created disk two-disk0 (a copy of os-base)\ncreated VM 2 (two)\n"
-    );
-    ok(avalon.addr(), &["start", "two"]);
-    let addr = avalon.addr();
-    let running = |s| s == avalon_proto::VmState::Running;
-    wait_for_state(addr, "one", running);
-    wait_for_state(addr, "two", running);
-    // Both run on: their steps go up.
-    for vm in ["one", "two"] {
-        let before = steps(addr, vm);
-        let start = std::time::Instant::now();
-        while steps(addr, vm) == before {
-            assert!(start.elapsed() < SLOW, "VM {vm} does not run");
+    on_both_widths(|| {
+        let arch = arch();
+        // The base image of this width, and the width as --xlen takes it.
+        let base = avalon_client::base_image(xlen());
+        let x = xlen_arg();
+        let dir = TempDir::new("vms");
+        for image in ["os-base", "os-base-rv64"] {
+            std::fs::write(dir.0.join(image), spinning_image(16)).unwrap();
         }
-    }
-    assert_eq!(
-        ok(addr, &["list"]),
-        "\
-ID  NAME  STATE    RAM     CLOCK       DISKS  NETS
-1   one   running  16 MiB  full speed  1      0
-2   two   running  16 MiB  full speed  1      0
-"
-    );
-    let info = ok(addr, &["info", "one"]);
-    assert!(
-        info.contains(&format!("disks    lake://{lake_addr}/one-disk0 (read-write)\n")),
-        "{info}"
-    );
-    // Each holds its own copy; the image they were copied from stays free.
-    let disks = |lake_addr: &str| rt(&["--lake", lake_addr, "disk", "list"]).unwrap();
-    assert_eq!(
-        disks(&lake_addr),
-        "\
-NAME       SIZE   SECTORS  ATTACHED
-one-disk0  8 KiB  16       read-write
-os-base    8 KiB  16       no
-two-disk0  8 KiB  16       read-write
-"
-    );
+        let lake = lake(&dir);
+        let lake_addr = lake.addr().to_string();
+        let avalon = avalon(256);
+        let server = avalon.addr().to_string();
+        let run = |args: &[&str]| {
+            let mut full = vec!["--server", &server, "--lake", &lake_addr];
+            full.extend_from_slice(args);
+            rt(&full)
+        };
+        let refused = |args: &[&str]| match run(args) {
+            Err(round_table::Failure::Failed(why)) => why,
+            other => panic!("{args:?} should be refused, got {other:?}"),
+        };
 
-    // A copy whose name is taken.
-    assert_eq!(
-        refused(&["create", "--name", "one", "--camelot"]),
-        "cannot create disk one-disk0: already exists: a disk named 'one-disk0' already exists"
-    );
-    // A VM name Avalon has, but Lake not its disk: the copy is made, Avalon refuses
-    // the VM, and the copy is deleted again. (Readers of the base image do not stop
-    // a copy.)
-    ok(
-        addr,
-        &[
-            "create",
-            "--name",
-            "three",
-            "--disk-ro",
-            &format!("lake://{lake_addr}/os-base"),
-        ],
-    );
-    let why = refused(&["create", "--name", "three", "--camelot"]);
-    assert!(why.starts_with("already exists: "), "{why}");
-    assert!(!dir.0.join("three-disk0").exists());
-    // The base image with a writer cannot be copied.
-    ok(addr, &["destroy", "three"]);
-    ok(
-        addr,
-        &[
-            "create",
-            "--name",
-            "w",
-            "--disk",
-            &format!("lake://{lake_addr}/os-base"),
-        ],
-    );
-    assert_eq!(
-        refused(&["create", "--name", "four", "--camelot"]),
-        "cannot create disk four-disk0: busy: disk 'os-base' is attached read-write"
-    );
-    ok(addr, &["destroy", "w"]);
-
-    // A Lake without the base image says what to do.
-    let empty = TempDir::new("empty");
-    let bare = self::lake(&empty);
-    let bare_addr = bare.addr().to_string();
-    let args = [
-        "--server",
-        &server,
-        "--lake",
-        &bare_addr,
-        "create",
-        "--name",
-        "five",
-        "--camelot",
-    ];
-    match rt(&args) {
-        Err(round_table::Failure::Failed(why)) => assert_eq!(
-            why,
+        // Two VMs, each on a copy of its own, running at the same time.
+        assert_eq!(
+            run(&[
+                "create",
+                "--name",
+                "one",
+                "--camelot",
+                "--xlen",
+                x,
+                "--ram",
+                "16",
+                "--start"
+            ])
+            .unwrap(),
+            format!("created disk one-disk0 (a copy of {base})\ncreated VM 1 (one)\nstarted VM 1 (one)\n")
+        );
+        assert_eq!(
+            run(&["create", "--camelot", "--name", "two", "--ram", "16", "--xlen", x]).unwrap(),
+            format!("created disk two-disk0 (a copy of {base})\ncreated VM 2 (two)\n")
+        );
+        ok(avalon.addr(), &["start", "two"]);
+        let addr = avalon.addr();
+        let running = |s| s == avalon_proto::VmState::Running;
+        wait_for_state(addr, "one", running);
+        wait_for_state(addr, "two", running);
+        // Both run on: their steps go up.
+        for vm in ["one", "two"] {
+            let before = steps(addr, vm);
+            let start = std::time::Instant::now();
+            while steps(addr, vm) == before {
+                assert!(start.elapsed() < SLOW, "VM {vm} does not run");
+            }
+        }
+        assert_eq!(
+            ok(addr, &["list"]),
             format!(
-                "the Lake at {bare_addr} has no 'os-base' image to copy (start the platform with \
-                 'cargo xtask up', which puts it in Lake's images directory)"
+                "\
+ID  NAME  STATE    ARCH  RAM     CLOCK       DISKS  NETS
+1   one   running  {arch}  16 MiB  full speed  1      0
+2   two   running  {arch}  16 MiB  full speed  1      0
+"
             )
-        ),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(disks(&bare_addr), "no disks\n");
-    // A name too long for its disk is a mistake on the command line.
-    let long = "a".repeat(60);
-    match rt(&["create", "--name", &long, "--camelot"]) {
-        Err(round_table::Failure::Usage(why)) => assert!(why.contains("too long"), "{why}"),
-        other => panic!("{other:?}"),
-    }
+        );
+        let info = ok(addr, &["info", "one"]);
+        assert!(
+            info.contains(&format!("disks    lake://{lake_addr}/one-disk0 (read-write)\n")),
+            "{info}"
+        );
+        // Each holds its own copy; the images they were copied from stay free.
+        let disks = |lake_addr: &str| rt(&["--lake", lake_addr, "disk", "list"]).unwrap();
+        assert_eq!(
+            disks(&lake_addr),
+            "\
+NAME          SIZE   SECTORS  ATTACHED
+one-disk0     8 KiB  16       read-write
+os-base       8 KiB  16       no
+os-base-rv64  8 KiB  16       no
+two-disk0     8 KiB  16       read-write
+"
+        );
 
-    // Destroying the VMs frees their copies.
-    ok(addr, &["destroy", "one"]);
-    ok(addr, &["destroy", "two"]);
-    assert!(disks(&lake_addr).contains("one-disk0  8 KiB  16       no\n"));
-    avalon.stop().unwrap();
-    bare.stop().unwrap();
-    lake.stop().unwrap();
+        // A copy whose name is taken.
+        assert_eq!(
+            refused(&["create", "--name", "one", "--camelot", "--xlen", x]),
+            "cannot create disk one-disk0: already exists: a disk named 'one-disk0' already exists"
+        );
+        // A VM name Avalon has, but Lake not its disk: the copy is made, Avalon refuses
+        // the VM, and the copy is deleted again. (Readers of the base image do not stop
+        // a copy.)
+        ok(
+            addr,
+            &[
+                "create",
+                "--name",
+                "three",
+                "--xlen",
+                x,
+                "--disk-ro",
+                &format!("lake://{lake_addr}/{base}"),
+            ],
+        );
+        let why = refused(&["create", "--name", "three", "--camelot", "--xlen", x]);
+        assert!(why.starts_with("already exists: "), "{why}");
+        assert!(!dir.0.join("three-disk0").exists());
+        // The base image with a writer cannot be copied.
+        ok(addr, &["destroy", "three"]);
+        ok(
+            addr,
+            &[
+                "create",
+                "--name",
+                "w",
+                "--xlen",
+                x,
+                "--disk",
+                &format!("lake://{lake_addr}/{base}"),
+            ],
+        );
+        assert_eq!(
+            refused(&["create", "--name", "four", "--camelot", "--xlen", x]),
+            format!("cannot create disk four-disk0: busy: disk '{base}' is attached read-write")
+        );
+        ok(addr, &["destroy", "w"]);
+
+        // A Lake without the base image of the width says what to do.
+        let empty = TempDir::new("empty");
+        let bare = self::lake(&empty);
+        let bare_addr = bare.addr().to_string();
+        let args = [
+            "--server",
+            &server,
+            "--lake",
+            &bare_addr,
+            "create",
+            "--name",
+            "five",
+            "--camelot",
+            "--xlen",
+            x,
+        ];
+        match rt(&args) {
+            Err(round_table::Failure::Failed(why)) => assert_eq!(
+                why,
+                format!(
+                    "the Lake at {bare_addr} has no '{base}' image to copy (start the platform with \
+                 'cargo xtask up', which puts it in Lake's images directory)"
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(disks(&bare_addr), "no disks\n");
+        // A name too long for its disk is a mistake on the command line.
+        let long = "a".repeat(60);
+        match rt(&["create", "--name", &long, "--camelot"]) {
+            Err(round_table::Failure::Usage(why)) => assert!(why.contains("too long"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+
+        // Destroying the VMs frees their copies.
+        ok(addr, &["destroy", "one"]);
+        ok(addr, &["destroy", "two"]);
+        assert!(disks(&lake_addr).contains("one-disk0     8 KiB  16       no\n"));
+        avalon.stop().unwrap();
+        bare.stop().unwrap();
+        lake.stop().unwrap();
+    });
 }

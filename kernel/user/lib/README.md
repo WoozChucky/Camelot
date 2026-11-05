@@ -11,7 +11,6 @@ together.
 |---|---|
 | `string.c` | `strlen`, `strcmp`, `strncmp`, `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`, `memmove`, `memcmp` |
 | `stdlib.c` | `atoi`, `strtol` (bases 2 to 36, or 0 for C's prefixes; out of range gives `LONG_MAX` or `LONG_MIN`) |
-| `i64.c` | `i64`, 64-bit integers as two words (written before merlin had `long long`; #157 moves the tools to it): arithmetic, shifts, comparisons, checked division, and `i64_dec`/`i64_hex` to print them; the assembler and the linker compute with them |
 | `libgcc.c` | `__divdi3`, `__udivdi3`, `__moddi3`, `__umoddi3`, `__muldi3`: the routines merlin and clang call for `long long` division on RV32 (libgcc's names), with RISC-V's results for division by zero and `LLONG_MIN / -1`; the kernel has the same ones (`kernel/libgcc.c`) |
 | `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk`, under a mutex |
 | `printf.c` | `printf`, `fprintf` (to a descriptor), `snprintf`, `puts` |
@@ -29,7 +28,7 @@ together.
 ## How programs get it
 
 Every `kernel/user/X.c` (or `X.s`) is a program, linked with the runtime
-(`crt0.s`, which calls `main` and then `exit`, and `usys.s`, the system call
+(`crt0.S`, which calls `main` and then `exit`, and `usys.s`, the system call
 stubs) and with the library (`crates/xtask/src/userprogs.rs`). The library
 is linked the way a C library is linked from an archive (`libc.a`): each
 file here is a *member*, compiled and assembled once for all the programs,
@@ -48,7 +47,7 @@ program's objects, in file name order. On its command line the members go
 between `--start-lib` and `--end-lib`, as with ld.lld:
 
 ```
-merlin-ld -T user.ld -o cat cat.c.o crt0.s.o usys.s.o \
+merlin-ld -T user.ld -o cat cat.c.o crt0.S.o usys.s.o \
           --start-lib lib/getline.c.o lib/malloc.c.o lib/printf.c.o lib/spin.c.o \
           lib/stat.c.o lib/stdlib.c.o lib/strerror.c.o lib/string.c.o --end-lib
 ```
@@ -79,10 +78,20 @@ where its characters go: to a descriptor, through the buffer, for `printf`
 and `fprintf`; into the caller's string for `snprintf`, which keeps
 counting past the end so that it can return the length the whole text
 needs. The conversions are `%d %u %x %p %s %c %%`, with the flags `-` (pad
-on the right) and `0` (pad with zeros, after a minus sign) and a width; an
-`l` before `d`, `u` or `x` is accepted and ignored, since `long` is `int`'s
-size. An unknown conversion is printed as written. It is the kernel's
-`kprintf` (`kernel/kprintf.c`) with the same formats.
+on the right) and `0` (pad with zeros, after a minus sign) and a width.
+`d`, `u` and `x` take an `int` (or `unsigned int`), or with a length before
+them a wider integer, as C's `printf` does: `l` a `long`, as wide as a
+register (64 bits on RV64, 32 on RV32), `ll` a `long long` (`int64_t`, 64
+bits on both), `z` a `size_t` (`ssize_t` with `d`). `%p` prints every
+digit of a pointer, 8 on RV32 and 16 on RV64. An unknown conversion is
+printed as written. The digits are divided off a 64-bit value with
+`do_div`, as Linux's `vsprintf.c` does: on RV32 three 32-bit divisions, so
+a program that prints numbers needs no `__udivdi3`. It is the kernel's
+`kprintf` (`kernel/kprintf.c`) with what programs need added: `kprintf`
+has no `-` flag and no `z` length, takes `0` only right after the `%`,
+and divides a value past 32 bits with C's `/`, which on RV32 is a call to
+`__udivdi3` (`kernel/libgcc.c`); and a conversion cut off by the end of
+the format it prints as written, where `printf` prints a lone `%`.
 
 ## Line input
 
@@ -104,8 +113,16 @@ Two ways, for two kinds of input:
 ## The heap
 
 `malloc.c` is the allocator of K&R's *The C Programming Language*, section
-8.7. Each block starts with an 8-byte header (its size in 8-byte units and,
-while free, the next free block), so every block is 8-byte aligned. The
+8.7. Each block starts with a header of two words, a pointer's size each
+(8 bytes on RV32, 16 on RV64): its size in header-sized units, a `size_t`,
+and, while it is free, the next free block. So every block is aligned to
+the header's size, which on RV64 is the ABI's largest alignment, 16 bytes,
+as glibc's `malloc` gives. When a program has moved the end of the heap
+with `sbrk` itself, by a number of bytes that is not a multiple of the
+header's size, `malloc` skips to the next multiple before it puts a block
+there, and takes the bytes it skipped from `sbrk` too, as glibc corrects a
+misaligned break. A request of more than `LONG_MAX` bytes (what
+`sbrk` takes) fails with `NULL` at once. The
 free blocks form a ring in address order, through a dummy block of size 0;
 `malloc` walks it from where the last search stopped and takes the first
 block big enough, cutting the request off its end. The threads of a

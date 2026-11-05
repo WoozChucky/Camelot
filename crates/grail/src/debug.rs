@@ -138,6 +138,8 @@ pub struct Debug {
     /// is not stopped by a breakpoint at its hart's pc, so resuming from a breakpoint
     /// executes that instruction instead of stopping on it again.
     resuming: bool,
+    /// Steps run by [`Machine::debug_continue`] and [`Machine::debug_step`].
+    steps: u64,
 }
 
 impl Default for Debug {
@@ -146,6 +148,7 @@ impl Default for Debug {
             breakpoints: BTreeSet::new(),
             hart: 0,
             resuming: true,
+            steps: 0,
         }
     }
 }
@@ -202,7 +205,22 @@ impl Machine {
         &self.cpu.bus.watches.list
     }
 
-    /// Removes every breakpoint and watchpoint (a debugger detaching).
+    /// The steps [`Machine::debug_continue`] and [`Machine::debug_step`] have run, as
+    /// [`Machine::run_for`] counts them (idle ticks of a real-time machine waiting in
+    /// `wfi` included): a host that runs the machine both ways adds them up.
+    pub fn debug_steps(&self) -> u64 {
+        self.debug.steps
+    }
+
+    /// Whether the machine has a breakpoint or a watchpoint: a host runs it with
+    /// [`Machine::debug_continue`] then, debugger or not, so that they stop it (QEMU
+    /// keeps a debugger's breakpoints when its connection ends without `D`).
+    pub fn has_debug_points(&self) -> bool {
+        !self.debug.breakpoints.is_empty() || !self.cpu.bus.watches.list.is_empty()
+    }
+
+    /// Removes every breakpoint and watchpoint (a debugger detaching, or a new one
+    /// asking why the machine stopped, `?`).
     pub fn clear_debug_points(&mut self) {
         self.debug.breakpoints.clear();
         self.cpu.bus.watches.list.clear();
@@ -365,6 +383,7 @@ impl Machine {
         if let Some(p) = &mut self.pacer {
             p.ticks += n;
         }
+        self.debug.steps += n;
         if stop.is_some() {
             self.debug.resuming = true;
         }
@@ -395,6 +414,7 @@ impl Machine {
             if let Some(p) = &mut self.pacer {
                 p.ticks += ended_step as u64;
             }
+            self.debug.steps += ended_step as u64;
             if let Some(hit) = self.cpu.bus.watches.hit.take() {
                 return Stop::Watchpoint(hit);
             }

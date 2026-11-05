@@ -40,7 +40,7 @@ struct report {
 static long parse_num(const char *s) {
     char *end;
     long n = strtol(s, &end, 10);
-    if (end == s || *end != 0 || n < 0 || n == LONG_MAX) {
+    if (end == s || *end != 0 || n < 0 || n > INT_MAX || n == LONG_MAX) {
         return -1;
     }
     return n;

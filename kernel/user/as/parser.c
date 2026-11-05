@@ -134,7 +134,7 @@ static struct expr *primary(void) {
     if (t->kind == T_LOCALREF) {
         struct expr *e = new_expr(E_SYM);
         char name[16];
-        snprintf(name, sizeof name, "%u%c", t->num.lo, t->fwd ? 'f' : 'b');
+        snprintf(name, sizeof name, "%u%c", (uint)t->num, t->fwd ? 'f' : 'b');
         e->sym = tmp_strndup(name, (uint)strlen(name));
         return e;
     }
@@ -418,7 +418,7 @@ static int option_args(struct stmt *s) {
         } else if (t->kind == T_PUNCT) {
             buf_byte(&item, (uint)t->punct);
         } else if (t->kind == T_INT) {
-            const char *d = i64_dec(t->num);
+            const char *d = fmt("%lld", t->num);
             buf_put(&item, d, (uint)strlen(d));
         } else {
             buf_byte(&item, '?');
@@ -457,8 +457,8 @@ static int section_args(struct stmt *s) {
         } else if (s->nargs == 3 && is_punct(t, '%') && next->kind == T_INT) {
             /* The number in decimal, as the type name's digits. */
             pos += 2;
-            const char *d = i64_dec(next->num);
-            str_arg(a, tmp_strndup(d, (uint)strlen(d)), (uint)strlen(d));
+            const char *d = fmt("%lld", next->num);
+            str_arg(a, d, (uint)strlen(d));
         } else if (t->kind == T_STR) {
             pos++;
             str_arg(a, t->text, t->len);
@@ -539,10 +539,10 @@ int parse_statement(struct token *t, int n, struct stmt **out) {
             stmts[count].name = a->text;
             count++;
             pos += 2;
-        } else if (a->kind == T_INT && !i64_is_neg(a->num)) {
+        } else if (a->kind == T_INT && a->num >= 0) {
             stmts[count].kind = S_LABEL;
             stmts[count].line = line;
-            stmts[count].name = tmp_strndup(i64_dec(a->num), (uint)strlen(i64_dec(a->num)));
+            stmts[count].name = fmt("%lld", a->num);
             count++;
             pos += 2;
         } else {

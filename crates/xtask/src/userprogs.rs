@@ -2,7 +2,7 @@
 //! "Kernel processes").
 //!
 //! Every `kernel/user/*.c`, `*.s` and `*.S` is one program, but for the runtime
-//! linked into each of them ([`RUNTIME`]: `crt0.s` and the system call stubs
+//! linked into each of them ([`RUNTIME`]: `crt0.S` and the system call stubs
 //! `usys.s`), and so is every subdirectory but `lib/`: a program of several
 //! files (`kernel/user/as/*.c` is `as`), each compiled and assembled on its
 //! own and linked together, in name order. The C library, `kernel/user/lib/` ([`LIB_DIR`]), is linked as
@@ -42,7 +42,7 @@ use std::process::Command;
 /// The user programs' directory, relative to the repository root.
 pub const USER_DIR: &str = "kernel/user";
 /// The runtime linked into every program (none of them is a program).
-pub const RUNTIME: &[&str] = &["crt0.s", "usys.s"];
+pub const RUNTIME: &[&str] = &["crt0.S", "usys.s"];
 /// The C library's directory, under [`USER_DIR`]: every `.c` and `.s` file
 /// in it is a library member.
 pub const LIB_DIR: &str = "lib";
@@ -51,12 +51,6 @@ pub const SCRIPT: &str = "user.ld";
 /// Where a `.S` file finds `<asm.h>` (the repository's `include/`, as the
 /// kernel's and the examples' do), relative to [`USER_DIR`].
 pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
-/// Programs built for RV32 only: `/bin/as` and `/bin/ld` write RV32
-/// objects and executables until #157, so an RV64 kernel neither embeds them
-/// (nor would it, [`DISK_ONLY`]) nor finds them in an RV64 root
-/// filesystem's `/bin` ([`build_all_for`]). #157 empties it.
-pub const RV32_ONLY: &[&str] = &["as", "ld"];
-
 /// Programs the root image's `/bin` holds but the kernel does not build in:
 /// they read and write files, which a machine without a disk has none of,
 /// and their copies would not fit in the 2 MiB the kernel boots in (`as` is
@@ -453,13 +447,10 @@ pub fn build_all_with(dir: &Path, cc: CCompiler) -> Result<Vec<Program>, String>
     build_all_for(dir, cc, Xlen::Rv32)
 }
 
-/// [`build_all_with`] for `xlen`: on RV64 every program but the
-/// [`RV32_ONLY`] ones. What a root filesystem's `/bin` holds.
+/// [`build_all_with`] for `xlen`: every program, built for that width.
+/// What a root filesystem's `/bin` holds.
 pub fn build_all_for(dir: &Path, cc: CCompiler, xlen: Xlen) -> Result<Vec<Program>, String> {
-    let progs: Vec<Source> = programs(dir)?
-        .into_iter()
-        .filter(|p| xlen == Xlen::Rv32 || !RV32_ONLY.contains(&p.stem.as_str()))
-        .collect();
+    let progs = programs(dir)?;
     let rt = build_runtime_for(dir, cc, xlen)?;
     progs
         .iter()
@@ -467,13 +458,12 @@ pub fn build_all_for(dir: &Path, cc: CCompiler, xlen: Xlen) -> Result<Vec<Progra
         .collect()
 }
 
-/// The programs of `dir` the `xlen` kernel embeds ([`embedded`]: all but
-/// [`DISK_ONLY`]), by name. On RV64 also not [`RV32_ONLY`].
-pub fn embedded_for(dir: &Path, xlen: Xlen) -> Result<Vec<Source>, String> {
+/// The programs of `dir` the kernel embeds ([`embedded`]: all but
+/// [`DISK_ONLY`]), by name: the same on both widths.
+pub fn embedded_for(dir: &Path) -> Result<Vec<Source>, String> {
     Ok(programs(dir)?
         .into_iter()
         .filter(|p| !DISK_ONLY.contains(&p.stem.as_str()))
-        .filter(|p| xlen == Xlen::Rv32 || !RV32_ONLY.contains(&p.stem.as_str()))
         .collect())
 }
 
@@ -485,7 +475,7 @@ pub fn build_embedded_for(dir: &Path, xlen: Xlen) -> Result<Vec<Program>, String
 
 /// [`build_embedded_for`], their C compiled by `cc`.
 pub fn build_embedded_with(dir: &Path, cc: CCompiler, xlen: Xlen) -> Result<Vec<Program>, String> {
-    let progs = embedded_for(dir, xlen)?;
+    let progs = embedded_for(dir)?;
     let rt = build_runtime_for(dir, cc, xlen)?;
     progs
         .iter()
@@ -548,9 +538,7 @@ pub fn compile_clang(clang: &Path, dir: &Path, out: &Path, verbose: bool) -> Res
     compile_clang_for(clang, dir, out, verbose, Xlen::Rv32)
 }
 
-/// [`compile_clang`] for `xlen`. On RV64 only for the programs the RV64
-/// kernel embeds ([`embedded_for`]): /bin/as and /bin/ld are RV32 programs
-/// until #157.
+/// [`compile_clang`] for `xlen`.
 pub fn compile_clang_for(
     clang: &Path,
     dir: &Path,
@@ -562,11 +550,7 @@ pub fn compile_clang_for(
         .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
     let out = std::path::absolute(out).map_err(|e| format!("bad path {}: {e}", out.display()))?;
     let mut all: Vec<Source> = sources(dir)?.into_iter().chain(library(dir)?).collect();
-    let dirs: Vec<Source> = match xlen {
-        Xlen::Rv32 => programs(dir)?,
-        Xlen::Rv64 => embedded_for(dir, xlen)?,
-    };
-    for prog in dirs.iter().filter(|p| p.lang == Lang::Dir) {
+    for prog in programs(dir)?.iter().filter(|p| p.lang == Lang::Dir) {
         std::fs::create_dir_all(out.join(&prog.stem))
             .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
         all.extend(prog.parts(dir)?);
@@ -656,7 +640,7 @@ pub fn generate_for<P: std::borrow::Borrow<Program>>(programs: &[P], cc: CCompil
          #\n\
          # The user programs as ELF images for the kernel's loader: each one's C\n\
          # compiled by {cc}, assembled by merlin-as and linked by merlin-ld with\n\
-         # the runtime (crt0.s, usys.s), the members of the C library (lib/) it\n\
+         # the runtime (crt0.S, usys.s), the members of the C library (lib/) it\n\
          # needs and kernel/user/user.ld (crates/xtask/src/userprogs.rs). The\n\
          # table is the array\n\
          # kernel/include/proc.h declares:\n\
@@ -755,7 +739,7 @@ mod tests {
     /// an ecall, and the library has one function.
     fn write_runtime(dir: &Path) {
         std::fs::write(
-            dir.join("crt0.s"),
+            dir.join("crt0.S"),
             "    .section .text.start\n    .globl _start\n_start:\n    call main\n    call exit\n",
         )
         .unwrap();

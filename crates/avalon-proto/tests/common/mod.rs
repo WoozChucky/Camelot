@@ -12,6 +12,8 @@ pub fn profile() -> HardwareProfile {
         clock_hz: Some(2_000_000),
         nominal_hz: 10_000_000,
         harts: 4,
+        xlen: Xlen::Rv64,
+        paging: Paging::Sv39,
         devices: vec![
             DeviceSpec::Disk(DiskSpec {
                 source: DiskSource::File("C:\\vms\\root.img".into()),
@@ -57,6 +59,7 @@ pub fn samples() -> Vec<Message> {
         VmState::Stopped,
         VmState::Exited(0),
         VmState::Exited(u32::MAX),
+        VmState::Debug,
     ];
     let mut v = vec![
         Hello {
@@ -135,6 +138,34 @@ pub fn samples() -> Vec<Message> {
             vm: 2,
             kind: AttachKind::Screen,
         },
+        Detached {
+            vm: 3,
+            kind: AttachKind::Debug,
+        },
+        DebugAttach { vm: VmRef::Id(4) },
+        DebugAttach {
+            vm: VmRef::Name("kernel".into()),
+        },
+        DebugAttached { vm: 4 },
+        DebugInput {
+            vm: 4,
+            data: Vec::new(),
+        },
+        // A packet, an ack and a Ctrl-C: the stream's bytes as they are.
+        DebugInput {
+            vm: 4,
+            data: b"+$vCont;c#a8\x03".to_vec(),
+        },
+        DebugOutput {
+            vm: 4,
+            data: b"$T05thread:1;#40".to_vec(),
+        },
+        // Binary data (an `X` packet's) travels unchanged too.
+        DebugOutput {
+            vm: u32::MAX,
+            data: (0..=255).collect(),
+        },
+        DebugDetach { vm: 4 },
         ConsoleAttach { vm: VmRef::Id(1) },
         ConsoleAttached {
             vm: 1,

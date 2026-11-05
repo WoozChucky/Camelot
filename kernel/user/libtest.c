@@ -37,6 +37,31 @@ static void check_str(const char *got, const char *want, const char *what) {
     }
 }
 
+/* user.h's types: the fixed-width ones are as wide as their names say on
+ * both widths, and the ABI's (size_t, ssize_t, off_t, time_t, intptr_t) a
+ * long's width, a register's. */
+static void test_types(void) {
+    check(sizeof(int8_t) == 1 && sizeof(uint8_t) == 1, "int8_t and uint8_t are a byte");
+    check(sizeof(int16_t) == 2 && sizeof(uint16_t) == 2, "int16_t and uint16_t are 2 bytes");
+    check(sizeof(int32_t) == 4 && sizeof(uint32_t) == 4, "int32_t and uint32_t are 4 bytes");
+    check(sizeof(int64_t) == 8 && sizeof(uint64_t) == 8, "int64_t and uint64_t are 8 bytes");
+    check((int8_t)0xff < 0 && (uint8_t)0xff > 0 && (int16_t)0xffff < 0, "int8_t and int16_t are signed");
+    check(sizeof(size_t) == sizeof(long) && sizeof(ssize_t) == sizeof(long), "size_t is a long's width");
+    check(sizeof(off_t) == sizeof(long) && sizeof(time_t) == sizeof(long), "off_t and time_t too");
+    check(sizeof(intptr_t) == sizeof(void *) && sizeof(uintptr_t) == sizeof(void *), "intptr_t holds a pointer");
+    check(sizeof(long) == sizeof(void *), "a long is a pointer's width");
+#ifdef _LP64
+    check(sizeof(long) == 8, "LP64: a long is 8 bytes");
+#else
+    check(sizeof(long) == 4, "ILP32: a long is 4 bytes");
+#endif
+    check(LONG_MAX == (long)(ULONG_MAX >> 1) && LONG_MIN == -LONG_MAX - 1, "LONG_MAX and LONG_MIN");
+    check(INT64_MAX == 0x7fffffffffffffffll && INT64_MIN + INT64_MAX == -1 && UINT64_MAX + 1 == 0,
+          "the 64-bit limits");
+    check(SIZE_MAX == (size_t)-1 && UINT_MAX == (uint)-1 && UINT32_MAX == 0xffffffffu, "the unsigned limits");
+    check(INT_MAX == 2147483647 && INT_MIN == (int)0x80000000u, "INT_MAX and INT_MIN");
+}
+
 static void test_strings(void) {
     char buf[32];
     check_eq((int)strlen(""), 0, "strlen of nothing");
@@ -106,29 +131,48 @@ static void test_numbers(void) {
 #endif
 }
 
-/* lib/i64.c: 64-bit integers as two words. */
-static void test_i64(void) {
-    i64 big = i64_add(i64_u(0xffffffffu), i64_u(1));
-    check(big.lo == 0 && big.hi == 1, "i64_add carries into the high word");
-    check_str(i64_dec(i64_sub(i64_u(5), i64_u(7))), "-2", "i64_sub below zero");
-    check_str(i64_hex(i64_of(-16)), "0xfffffffffffffff0", "i64_hex of a negative number");
-    check_str(i64_dec(i64_mul(i64_u(0x80000000u), i64_u(6))), "12884901888", "i64_mul past 32 bits");
-    i64 q, r;
-    check(i64_div(i64_of(-7), i64_of(2), &q) && i64_eq(q, i64_of(-3)), "i64_div truncates toward zero");
-    check(i64_rem(i64_of(-7), i64_of(2), &r) && i64_eq(r, i64_of(-1)), "i64_rem has the dividend's sign");
-    check(!i64_div(i64_u(1), i64_u(0), &q), "i64_div by zero has no result");
-    check_str(i64_hex(i64_shl(i64_u(1), 40)), "0x10000000000", "i64_shl");
-    check_str(i64_dec(i64_sar(i64_of(-64), 3)), "-8", "i64_sar keeps the sign");
-    check_str(i64_hex(i64_shr(i64_of(-64), 3)), "0x1ffffffffffffff8", "i64_shr shifts zeros in");
-    check_str(i64_hex(i64_shr(i64_of(-1), 40)), "0xffffff", "i64_shr past 32 bits");
-    /* The edges: no shift, the high word alone, the top bit alone, and a
-     * count of 64, whose low 6 bits are 0 (Rust's wrapping_shr). */
-    check_str(i64_hex(i64_shr(i64_of(-1), 0)), "0xffffffffffffffff", "i64_shr by 0");
-    check_str(i64_hex(i64_shr(i64_of(-1), 32)), "0xffffffff", "i64_shr by 32");
-    check_str(i64_hex(i64_shr(i64_of(-1), 63)), "0x1", "i64_shr by 63");
-    check_str(i64_hex(i64_shr(i64_of(-16), 64)), "0xfffffffffffffff0", "i64_shr by 64 is by 0");
-    check(i64_cmp(i64_of(-1), i64_u(1)) < 0, "i64_cmp is signed");
-    check(i64_in(i64_u(4), i64_u(4), i64_u(5)) && !i64_in(i64_u(5), i64_u(4), i64_u(5)), "i64_in is half open");
+/* A shift count the compiler cannot fold: the shifts below are the
+ * register pair's code on RV32 (and lib/libgcc.c's division routines the
+ * quotients'), the arithmetic /bin/as and /bin/ld compute with. */
+static int shift_counts[] = {0, 3, 32, 40, 63};
+
+/* The value in hexadecimal, as merlin-as prints a u64 with {:#x}. */
+static const char *hex64(uint64_t v) {
+    static char buf[24];
+    snprintf(buf, sizeof buf, "0x%llx", v);
+    return buf;
+}
+
+/* int64_t and uint64_t, `long long`: 64 bits on both widths. */
+static void test_long_long(void) {
+    uint64_t big = (uint64_t)0xffffffffu + 1;
+    check(big == (uint64_t)1 << 32, "uint64_t addition carries into the high word");
+    int64_t five = 5, seven = 7;
+    check(five - seven == -2, "int64_t subtraction below zero");
+    check_str(hex64((uint64_t)(int64_t)-16), "0xfffffffffffffff0", "a negative int64_t as a uint64_t");
+    check(((uint64_t)0x80000000u * 6) == 12884901888ull, "a product past 32 bits");
+    int64_t m7 = -7, two = 2;
+    check(m7 / two == -3, "int64_t division truncates toward zero");
+    check(m7 % two == -1, "int64_t remainder has the dividend's sign");
+    uint64_t n = 0xfffffffffffffff0ull, three = 3, thousand = 1000;
+    check(n / three == 0x5555555555555550ull, "uint64_t division past 32 bits");
+    check(n / thousand == 18446744073709551ull && n % thousand == 600, "uint64_t division and remainder");
+    check_str(hex64((uint64_t)1 << shift_counts[3]), "0x10000000000", "a left shift past 32 bits");
+    int64_t m64 = -64;
+    check(m64 >> shift_counts[1] == -8, "an int64_t right shift keeps the sign");
+    check_str(hex64((uint64_t)m64 >> shift_counts[1]), "0x1ffffffffffffff8",
+              "a uint64_t right shift shifts zeros in");
+    uint64_t ones = ~(uint64_t)0;
+    check_str(hex64(ones >> shift_counts[3]), "0xffffff", "a right shift past 32 bits");
+    /* The edges of a register pair: no shift, the high word alone, the
+     * top bit alone. */
+    check_str(hex64(ones >> shift_counts[0]), "0xffffffffffffffff", "a right shift by 0");
+    check_str(hex64(ones >> shift_counts[2]), "0xffffffff", "a right shift by 32");
+    check_str(hex64(ones >> shift_counts[4]), "0x1", "a right shift by 63");
+    check(ones << shift_counts[4] == (uint64_t)1 << 63, "a left shift by 63");
+    int64_t m1 = -1, one = 1;
+    check(m1 < one && (uint64_t)m1 > (uint64_t)one, "int64_t compares signed, uint64_t unsigned");
+    check(INT64_MIN < INT64_MAX && (int64_t)0x80000000u > 0, "the 64-bit comparisons see the high word");
 }
 
 static void test_snprintf(void) {
@@ -149,6 +193,32 @@ static void test_snprintf(void) {
     check_str(buf, "-9223372036854775808 18446744073709551615 123456789abcdef", "64-bit longs");
 #else
     check_str(buf, "0x00001000 (null)", "%p and a null string");
+    /* A long is 32 bits: %ld and %lu of its limits. */
+    snprintf(buf, sizeof buf, "%ld %lu %lx", LONG_MIN, ~0ul, 0x89abcdeful);
+    check_str(buf, "-2147483648 4294967295 89abcdef", "32-bit longs");
+#endif
+    /* A long long is 64 bits on both widths (on RV32 a register pair,
+     * which a variadic call passes in an even register and the next). */
+    snprintf(buf, sizeof buf, "%lld %llu %llx", LLONG_MIN, ULLONG_MAX, 0x123456789abcdefll);
+    check_str(buf, "-9223372036854775808 18446744073709551615 123456789abcdef", "%ll: 64-bit long longs");
+    snprintf(buf, sizeof buf, "%d|%lld|%d", 1, -2ll, 3);
+    check_str(buf, "1|-2|3", "%lld between ints");
+    snprintf(buf, sizeof buf, "[%20llu|%-5lld|%05llx]", 4294967296ull, -1ll, 0xabcull);
+    check_str(buf, "[          4294967296|-1   |00abc]", "%ll with widths and flags");
+    int64_t i64max = INT64_MAX;
+    uint64_t u64 = (uint64_t)1 << 40;
+    snprintf(buf, sizeof buf, "%lld %llx", i64max, u64);
+    check_str(buf, "9223372036854775807 10000000000", "int64_t and uint64_t");
+    /* z: a size_t (or ssize_t), a long's width. */
+    snprintf(buf, sizeof buf, "%zu %zd %zx", sizeof(struct stat), (ssize_t)-5, (size_t)0xff);
+#ifdef _LP64
+    check_str(buf, "24 -5 ff", "%z: size_t and ssize_t");
+    snprintf(buf, sizeof buf, "%zu", SIZE_MAX);
+    check_str(buf, "18446744073709551615", "%zu of SIZE_MAX");
+#else
+    check_str(buf, "16 -5 ff", "%z: size_t and ssize_t");
+    snprintf(buf, sizeof buf, "%zu", SIZE_MAX);
+    check_str(buf, "4294967295", "%zu of SIZE_MAX");
 #endif
     snprintf(buf, sizeof buf, "%q %");
     check_str(buf, "%q %", "unknown conversions are printed as written");
@@ -256,8 +326,13 @@ static void test_malloc(void) {
     z = realloc(z, 4000);
     check(z != NULL && z[0] == 0 && z[49] == 49, "realloc keeps the bytes");
     free(z);
-    check(calloc(0x10000, 0x10000) == NULL, "calloc overflow");
+    check(calloc(SIZE_MAX / 2, 3) == NULL && calloc(3, SIZE_MAX / 2) == NULL, "calloc overflow");
     check(malloc(0x7fffffff) == NULL, "malloc of more than there is");
+    check(malloc(SIZE_MAX) == NULL && malloc(SIZE_MAX - 8) == NULL, "malloc of SIZE_MAX does not wrap around");
+#ifdef _LP64
+    /* A size_t of 64 bits, whole: 2^32 + 16 is not 16. */
+    check(malloc(0x100000010ul) == NULL, "malloc of 4 GiB and 16 bytes is more than there is");
+#endif
     /* Many small blocks, freed in an odd order, then one big one. */
     char *many[40];
     for (int i = 0; i < 40; i++) {
@@ -277,6 +352,22 @@ static void test_malloc(void) {
     char *all = malloc(3000);
     check(all != NULL && sbrk(0) == top, "and their room is used again");
     free(all);
+}
+
+/* A program that moves the end of the heap itself, by an odd number of
+ * bytes: the blocks malloc then takes from fresh heap are still aligned to
+ * its header's size, and so is the end of the heap after them. Runs after
+ * test_malloc, whose biggest free block is smaller than the request. */
+static void test_odd_break(void) {
+    uintptr_t align = (uintptr_t)HDR - 1;
+    char *top = sbrk(3);
+    check((long)top >= 0 && ((uintptr_t)sbrk(0) & align) != 0, "sbrk by 3 bytes leaves the end unaligned");
+    char *p = malloc(200000);
+    check(p != NULL && p > top, "a block from above the odd end");
+    check(((uintptr_t)p & align) == 0 && ((uintptr_t)sbrk(0) & align) == 0,
+          "is aligned to the header's size, and so is the new end");
+    p[199999] = 1;
+    free(p);
 }
 
 /* libtest feed N: N lines "line K", written in pieces of 7 bytes. */
@@ -466,13 +557,15 @@ int main(int argc, char **argv) {
         return family();
     }
     test_inet();
+    test_types();
     test_strings();
     test_numbers();
-    test_i64();
+    test_long_long();
     test_snprintf();
     /* First, while the heap is still empty. */
     test_merge();
     test_malloc();
+    test_odd_break();
     test_reader();
     test_kill_descendants();
     printf("libtest: %d checks, %d failed\n", checks, failures);

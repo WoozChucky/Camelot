@@ -111,6 +111,8 @@ const BOOT_OUTPUT_TEMPLATE: &str = concat!(
     xtask::banner!(),
     "\
 Camelot v0.1.0 booting...
+sbi: v2.0, implementation 0x434d4c54 version 0x1
+sbi: extensions TIME IPI HSM SRST DBCN
 kprintf: d=-42 u=4294967295 x=cafef00d p=0x0000000080000000 s=excalibur c=K %=%
 kprintf self-test: 33/33 passed
 [dbg] pc=................ a0 = 0x0000000000000000 (0)
@@ -504,14 +506,13 @@ fn the_rv64_kernel_runs_on_up_to_eight_harts() {
             assert_eq!(k.read32(cpu + CPU_HARTID), h as u32);
             assert_eq!(k.read64(cpu + CPU_PAGETABLE), kpt, "hart {h}");
         }
-        // The other harts' stacks: a page each at its physical address for
-        // M-mode, freed (and its hart_boot_sp 0) once the hart runs on its
-        // kernel stack, in the vmalloc area, KSTACK_SLOT aligned, for the
-        // scheduler.
+        // The other harts run on the kernel stack smp_boot() gave each with
+        // hart_start: in the vmalloc area, in the lower half of a
+        // KSTACK_SLOT aligned slot, as every kernel stack is (vm.h).
         for h in 1..harts as u64 {
-            assert_eq!(k.read64(k.sym("hart_boot_sp") + 8 * h), 0, "hart {h}");
-            let sp = k.read64(k.sym("hart_sp") + 8 * h);
-            assert_eq!((sp - KSTACK_SIZE) % KSTACK_SLOT, 0, "{sp:#x}");
+            let sp = k.m.cpu.hart(h as usize).x[2];
+            let slot = sp & !(KSTACK_SLOT - 1);
+            assert!(sp > slot && sp <= slot + KSTACK_SIZE, "{sp:#x}");
             let area = mode().vmalloc_start..=mode().vmalloc_start + KSTACK_SLOTS * KSTACK_SLOT;
             assert!(area.contains(&sp), "{sp:#x}");
             // The scheduler isn't running a thread of a process at the end.
@@ -835,12 +836,18 @@ fn the_rv64_kernel_boots_from_disk() {
         assert!(out.contains("\nfs: disk 0 mounted: "), "{out}");
         // One more check than without /bin: the programs there ("N
         // programs, the kernel none" for the disk kernel, "N of the
-        // kernel's N programs" for a reference build, which embeds them).
-        let programs = xtask::userprogs::embedded_names(&xtask::userprogs::user_dir(&root)).unwrap();
-        assert!(
-            out.contains(&format!("\nfs: /bin holds {} ", programs.len())),
-            "{out}"
-        );
+        // kernel's N programs" for a reference build, which embeds them):
+        // every program on the disk, as and ld too, which the kernel never
+        // embeds.
+        let user = xtask::userprogs::user_dir(&root);
+        let holds = if UNDER_TEST_USER_ASM.with(|a| a.borrow().is_some()) {
+            let n = xtask::userprogs::embedded_names(&user).unwrap().len();
+            format!("\nfs: /bin holds {n} of the kernel's {n} programs\n")
+        } else {
+            let n = xtask::userprogs::program_names(&user).unwrap().len();
+            format!("\nfs: /bin holds {n} programs, the kernel none\n")
+        };
+        assert!(out.contains(&holds), "{out}");
         assert!(out.contains("\nfs self-test: 12/12 passed\n"), "{out}");
         assert!(!out.contains("FAILED"), "{out}");
         // Then the shell from /bin/sh on the disk, and the programs it

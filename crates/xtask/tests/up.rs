@@ -58,26 +58,36 @@ impl Output {
     }
 }
 
-/// The root image `up` builds, built once (with the binaries) for every test.
-fn root_image() -> &'static [u8] {
-    static IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
-    IMAGE.get_or_init(|| {
+/// The root images `up` builds, RV32's and RV64's, built once (with the binaries) for
+/// every test.
+fn root_images() -> &'static up::RootImages {
+    static IMAGES: OnceLock<up::RootImages> = OnceLock::new();
+    IMAGES.get_or_init(|| {
         let dir = TempDir::new("build");
         let mut options = Options::new(&xtask::repo_root());
         options.image = dir.0.join("camelot-fs.img");
-        let image = up::build(&options, &mut |line| eprintln!("{line}")).unwrap();
-        assert_eq!(std::fs::read(&options.image).unwrap(), image);
-        image
+        options.image_rv64 = dir.0.join("camelot-fs-rv64.img");
+        let images = up::build(&options, &mut |line| eprintln!("{line}")).unwrap();
+        assert_eq!(std::fs::read(&options.image).unwrap(), images.rv32);
+        assert_eq!(std::fs::read(&options.image_rv64).unwrap(), images.rv64);
+        images
     })
 }
 
+/// The RV32 root image `up` builds.
+fn root_image() -> &'static [u8] {
+    &root_images().rv32
+}
+
 /// `up`'s options for a test: ephemeral ports, everything under `dir`, nothing to
-/// build (the image is [`root_image`]).
+/// build (the images are [`root_images`]).
 fn options(dir: &TempDir) -> Options {
     let mut o = Options::new(&xtask::repo_root());
     o.images = dir.0.join("images");
     o.image = dir.0.join("camelot-fs.img");
-    std::fs::write(&o.image, root_image()).unwrap();
+    o.image_rv64 = dir.0.join("camelot-fs-rv64.img");
+    std::fs::write(&o.image, &root_images().rv32).unwrap();
+    std::fs::write(&o.image_rv64, &root_images().rv64).unwrap();
     o.build = false;
     let any = "127.0.0.1:0".parse().unwrap();
     (o.lake, o.avalon, o.pendragon) = (any, any, any);
@@ -92,11 +102,25 @@ fn token(url: &str) -> &str {
 
 /// One HTTP request to Pendragon; the status and the body.
 fn http(addr: SocketAddr, path: &str, token: &str) -> (u16, String) {
+    http_request(addr, "GET", path, token, "")
+}
+
+/// One HTTP request to Pendragon with a JSON body (none if empty), as the page sends
+/// it; the status and the body.
+fn http_request(addr: SocketAddr, method: &str, path: &str, token: &str, body: &str) -> (u16, String) {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(SLOW)).unwrap();
+    let json = if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
     write!(
         s,
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nX-Pendragon-Token: {token}\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nX-Pendragon-Token: {token}\r\n{json}Connection: close\r\n\r\n{body}"
     )
     .unwrap();
     let mut reply = String::new();
@@ -112,7 +136,9 @@ fn all_answer(platform: &Platform) {
     let mut lake = Client::connect(&platform.lake.to_string(), "test").unwrap();
     assert!(lake.server().starts_with("lake "), "{}", lake.server());
     let disks = lake.list_disks().unwrap();
-    assert!(disks.iter().any(|d| d.name == "os-base"), "{disks:?}");
+    for image in ["os-base", "os-base-rv64"] {
+        assert!(disks.iter().any(|d| d.name == image), "{disks:?}");
+    }
     let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
     assert!(avalon.server().starts_with("avalon "), "{}", avalon.server());
     avalon.list_vms().unwrap();
@@ -281,6 +307,10 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         std::fs::read(options.images.join("os-base")).unwrap(),
         root_image()
     );
+    assert_eq!(
+        std::fs::read(options.images.join("os-base-rv64")).unwrap(),
+        root_images().rv64
+    );
     let mut platform = Platform::start(&options, &RUNNING, log).unwrap();
     for addr in [platform.lake, platform.avalon, platform.pendragon] {
         assert!(addr.ip().is_loopback() && addr.port() != 0, "{addr}");
@@ -367,7 +397,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     // Nothing is named after the OS.
     let mut names: Vec<&str> = disks.iter().map(|d| d.name.as_str()).collect();
     names.sort();
-    assert_eq!(names, ["os-base", "second-disk0", "vm001-disk0"]);
+    assert_eq!(names, ["os-base", "os-base-rv64", "second-disk0", "vm001-disk0"]);
     let mut names: Vec<String> = vms.iter().map(|vm| vm.name.clone()).collect();
     names.sort();
     assert_eq!(names, ["second", "vm001"]);
@@ -380,7 +410,11 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         platform.avalon
     )));
     assert!(summary.contains(&format!("cargo run --release -p herald -- --tcp {shd}")));
-    check_summary(&summary, 4);
+    assert!(
+        summary.contains("create --name web64 --camelot --xlen 64 --start\n"),
+        "{summary}"
+    );
+    check_summary(&summary, 5);
 
     // Ctrl-C: the flag `up`'s handler sets.
     let stop = AtomicBool::new(true);
@@ -436,8 +470,235 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     one.type_line("cat /kept");
     one.wait_for_end("kept\n$ ");
     drop(one);
-    check_summary(&platform.summary(true), 4);
-    check_summary(&platform.summary(false), 3);
+    check_summary(&platform.summary(true), 5);
+    check_summary(&platform.summary(false), 4);
+    platform.stop(log);
+}
+
+/// What Round Table says to `args` on the platform: the disk commands to its Lake,
+/// the others to its Avalon (and `create --camelot` to both).
+fn round_table(platform: &Platform, args: &[&str]) -> String {
+    let (avalon, lake) = (platform.avalon.to_string(), platform.lake.to_string());
+    let mut full: Vec<String> = match args.first() {
+        Some(&"disk") => vec!["--lake".into(), lake],
+        _ if args.contains(&"--camelot") => vec!["--server".into(), avalon, "--lake".into(), lake],
+        _ => vec!["--server".into(), avalon],
+    };
+    full.extend(args.iter().map(|a| a.to_string()));
+    let mut out = Vec::new();
+    round_table::run(&full, &mut out).unwrap_or_else(|e| panic!("round-table {args:?}: {e}"));
+    String::from_utf8(out).unwrap()
+}
+
+/// Attaches to VM `vm`'s screen and returns the size it says and the first frame,
+/// which is the whole screen.
+fn first_frame(avalon: SocketAddr, vm: u32) -> (u32, u32, Vec<u8>) {
+    let mut conn = Connection::connect(avalon, "test").unwrap();
+    conn.get_ref().set_read_timeout(Some(SLOW)).unwrap();
+    let reply = conn
+        .request(&Message::ScreenAttach { vm: VmRef::Id(vm) })
+        .unwrap();
+    let Message::ScreenAttached {
+        width,
+        height,
+        format,
+        ..
+    } = reply
+    else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(format, avalon_proto::PIXEL_FORMAT_XRGB8888);
+    loop {
+        match conn.recv().unwrap() {
+            Message::ScreenFrame {
+                x,
+                y,
+                width: w,
+                height: h,
+                pixels,
+                ..
+            } => {
+                assert_eq!((x, y, w, h), (0, 0, width, height), "the first frame is whole");
+                return (width, height, pixels);
+            }
+            // The cursor, state changes: not the frame.
+            _ => continue,
+        }
+    }
+}
+
+/// RV64 VMs on the platform `up` brings up, made the two ways a person makes one:
+/// Round Table's `create --camelot --xlen 64` (Sv48 and Sv39, the default) and
+/// Pendragon's form, through its API (`"xlen": "64"`, here with Sv39 alone). Each
+/// boots RV64 Camelot from its own copy of Lake's `os-base-rv64`, which `up` seeded
+/// beside the RV32 `os-base`, with the default 4 MiB of RAM, as the demo VM boots RV32
+/// Camelot (the test above), and works as that one does: its console runs the shell,
+/// its screen is served, its card on a switch with a NAT gateway reaches its `shd`
+/// through a forwarded port, and what it writes to its disk is in Lake's image once
+/// it is stopped.
+#[test]
+fn rv64_vms_from_round_table_and_pendragon_boot_camelot() {
+    let dir = TempDir::new("rv64");
+    let out = Output::default();
+    let log = &mut |line: &str| out.push(line);
+    let options = options(&dir);
+    up::prepare(&options, log).unwrap();
+    assert!(
+        out.lines()
+            .iter()
+            .any(|l| l.starts_with("up: image os-base-rv64 in ") && l.ends_with(": created")),
+        "{:#?}",
+        out.lines()
+    );
+    let platform = Platform::start(&options, &RUNNING, log).unwrap();
+    let rt = |args: &[&str]| round_table(&platform, args);
+
+    // A switch with a NAT gateway for each VM, each forwarding a port of the host to
+    // its VM's shd: 10.0.2.15, the first address its DHCP server gives, port 23.
+    for switch in ["rt", "pd"] {
+        rt(&[
+            "switch",
+            "create",
+            switch,
+            "--nat",
+            "--hostfwd",
+            "tcp:127.0.0.1:0-10.0.2.15:23",
+        ]);
+    }
+    // Round Table's VM, with Sv48 and Sv39 (the default).
+    assert_eq!(
+        rt(&[
+            "create",
+            "--name",
+            "rt64",
+            "--camelot",
+            "--xlen",
+            "64",
+            "--net",
+            "rt",
+            "--start"
+        ]),
+        "created disk rt64-disk0 (a copy of os-base-rv64)\ncreated VM 1 (rt64)\nstarted VM 1 (rt64)\n"
+    );
+    // Pendragon's, with Sv39 alone.
+    let token = token(&platform.url);
+    let (status, body) = http_request(
+        platform.pendragon,
+        "POST",
+        "/api/vms",
+        token,
+        r#"{"name": "pd64", "camelot": true, "xlen": "64", "paging": "sv39", "nets": [{"switch": "pd"}], "start": true}"#,
+    );
+    assert_eq!(status, 201, "{body}");
+    assert!(
+        body.contains(r#""id":2"#) && body.contains(r#""disk":"pd64-disk0""#),
+        "{body}"
+    );
+    let vms = [("rt64", 1, "rt", "Sv48"), ("pd64", 2, "pd", "Sv39")];
+
+    // What the clients show of them: RV64, and each one's paging.
+    assert_eq!(
+        rt(&["list"]),
+        "\
+ID  NAME  STATE    ARCH  RAM    CLOCK       DISKS  NETS
+1   rt64  running  RV64  4 MiB  full speed  1      1
+2   pd64  running  RV64  4 MiB  full speed  1      1
+"
+    );
+    let info = rt(&["info", "rt64"]);
+    assert!(
+        info.contains("\narch     RV64 (Sv48 and Sv39 paging)\nRAM      4 MiB\n"),
+        "{info}"
+    );
+    let (status, pd) = http(platform.pendragon, "/api/vms/pd64", token);
+    assert_eq!(status, 200, "{pd}");
+    assert!(
+        pd.contains(r#""xlen":64,"paging":"sv39","arch":"RV64","arch_text":"RV64 (Sv39 paging)""#),
+        "{pd}"
+    );
+    let (status, disks) = http(platform.pendragon, "/api/disks", token);
+    assert_eq!(status, 200, "{disks}");
+    assert!(
+        disks.contains(r#""camelot_image":"os-base","camelot_image_rv64":"os-base-rv64""#),
+        "{disks}"
+    );
+    let lake_disks = rt(&["disk", "list"]);
+    for line in [
+        "os-base-rv64  4 MiB  8192     no\n",
+        "pd64-disk0    4 MiB  8192     read-write\n",
+        "rt64-disk0    4 MiB  8192     read-write\n",
+    ] {
+        assert!(lake_disks.contains(line), "{line:?} in {lake_disks}");
+    }
+
+    // The console: RV64 Camelot booted to its shell, with the paging the VM has (and
+    // 64-bit pointers in the kernel's self-test).
+    let mut avalon = Client::connect(&platform.avalon.to_string(), "test").unwrap();
+    let switches = avalon.list_switches().unwrap();
+    for (name, id, switch, paging) in vms {
+        let mut console = Console::attach(platform.avalon, id);
+        console.wait_for_end(PROMPT);
+        for line in [
+            "Camelot v",
+            "p=0x0000000080000000 ",
+            "\nram: 4 MiB at 0x80000000\n",
+            &format!("\npaging: on ({paging})\n"),
+            ", the kernel none\n",
+        ] {
+            assert!(
+                console.output.contains(line),
+                "{name}: {line:?} in\n{}",
+                console.output
+            );
+        }
+        console.type_line(&format!("echo kept by {name} > /kept"));
+        console.wait_for_end(PROMPT);
+        console.type_line("cat /kept");
+        console.wait_for_end(&format!("kept by {name}\n$ "));
+        drop(console);
+
+        // The screen: served from the first frame, the whole screen in the mode a
+        // machine starts in, black with the display off (Camelot draws nothing).
+        let (width, height, pixels) = first_frame(platform.avalon, id);
+        assert_eq!((width, height), (640, 480), "{name}");
+        assert_eq!(pixels.len(), 640 * 480 * 4);
+        assert!(pixels.iter().all(|&b| b == 0), "{name}: the screen is black");
+
+        // The network: shd answers through the port the VM's switch forwards.
+        let forward = switches
+            .iter()
+            .find(|s| s.name == switch)
+            .and_then(|s| s.nat.as_ref())
+            .map(|nat| nat.hostfwd[0].host)
+            .unwrap_or_else(|| panic!("switch {switch} forwards nothing: {switches:?}"));
+        let shd = SocketAddr::V4(forward);
+        up::start_shd(platform.avalon, id, shd, SLOW).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut shell = Shell::connect(shd);
+        shell.command("echo through shd", "through shd\n");
+        shell.command("cat /kept", &format!("kept by {name}\n"));
+        shell.leave();
+    }
+
+    // The disks: stopped, each VM lets go of its copy, which holds what it wrote.
+    assert_eq!(rt(&["stop", "rt64"]), "stopped VM rt64\n");
+    let (status, body) = http_request(platform.pendragon, "POST", "/api/vms/pd64/stop", token, "");
+    assert_eq!(status, 200, "{body}");
+    let start = Instant::now();
+    while !rt(&["disk", "list"]).contains("pd64-disk0    4 MiB  8192     no\n")
+        || !rt(&["disk", "list"]).contains("rt64-disk0    4 MiB  8192     no\n")
+    {
+        assert!(start.elapsed() < SLOW, "the disks are still attached");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for (name, ..) in vms {
+        let image = std::fs::read(options.images.join(format!("{name}-disk0"))).unwrap();
+        let fs = camelot_fs::read::Fs::open(&image).unwrap();
+        assert_eq!(
+            fs.read_file("/kept").unwrap(),
+            format!("kept by {name}\n").into_bytes()
+        );
+    }
+    drop(avalon);
     platform.stop(log);
 }
 
@@ -499,7 +760,7 @@ fn a_taken_shd_address_leaves_the_demo_without_shd() {
     all_answer(&platform);
     let summary = platform.summary(true);
     assert!(!tells_of_shd(&summary), "{summary}");
-    check_summary(&summary, 3);
+    check_summary(&summary, 4);
 
     // start_shd with nobody's shell at the address it is given (the listener, which
     // accepts and says nothing): it types `shd &`, which starts, and gives up when its
@@ -567,7 +828,7 @@ fn a_disk_without_shd_leaves_the_demo_without_shd() {
     assert!(platform.shd.is_some());
     let summary = platform.summary(true);
     assert!(!tells_of_shd(&summary), "{summary}");
-    check_summary(&summary, 3);
+    check_summary(&summary, 4);
     // The platform carries on.
     let mut console = Console::attach(platform.avalon, id);
     console.type_line("echo still up");
@@ -707,9 +968,10 @@ fn ctrl_c_while_starting_stops_what_started() {
 fn ending_xtask_up_ends_the_servers() {
     let dir = TempDir::new("process");
     let options = options(&dir);
-    // `--no-build` seeds target/camelot-fs.img when there is one; without it, an image
-    // already in the directory does.
-    up::seed(&options.images, root_image()).unwrap();
+    // `--no-build` seeds target/camelot-fs.img and target/camelot-fs-rv64.img when they
+    // are there; without them, the images already in the directory do.
+    up::seed(&options.images, "os-base", root_image()).unwrap();
+    up::seed(&options.images, "os-base-rv64", &root_images().rv64).unwrap();
     let any = "127.0.0.1:0";
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_xtask"))
         .args([
@@ -798,20 +1060,42 @@ fn a_new_image_says_the_demo_disk_is_older() {
             .any(|l| l.starts_with("up: note: the demo VM's disk"))
     };
     // The image changed, but there is no demo disk yet: nothing to say.
-    up::seed(&options.images, &[0; 512]).unwrap();
+    up::seed(&options.images, "os-base", &[0; 512]).unwrap();
     up::prepare(&options, log).unwrap();
     assert!(!note(&out));
     // Unchanged image, old demo disk: nothing to say either.
     std::fs::write(options.images.join("vm001-disk0"), [0; 512]).unwrap();
     up::prepare(&options, log).unwrap();
     assert!(!note(&out));
+    // A new RV64 image says nothing of the demo disk, which is RV32's copy.
+    up::seed(&options.images, "os-base-rv64", &[0; 512]).unwrap();
+    up::prepare(&options, log).unwrap();
+    assert!(!note(&out));
+    assert!(
+        out.lines()
+            .iter()
+            .any(|l| l.starts_with("up: image os-base-rv64 in ")
+                && l.ends_with(": replaced with the new build")),
+        "{:#?}",
+        out.lines()
+    );
     // A new image and the old demo disk.
-    up::seed(&options.images, &[0; 512]).unwrap();
+    up::seed(&options.images, "os-base", &[0; 512]).unwrap();
     up::prepare(&options, log).unwrap();
     assert!(note(&out), "{:#?}", out.lines());
-    let last = out.lines().last().unwrap().clone();
+    // Said after the RV32 image's line, before the RV64 one's.
+    let lines = out.lines();
+    let at = lines
+        .iter()
+        .rposition(|l| l.starts_with("up: note: the demo VM's disk"))
+        .unwrap();
+    assert!(lines[at - 1].starts_with("up: image os-base in "), "{lines:#?}");
+    assert!(
+        lines[at + 1].starts_with("up: image os-base-rv64 in "),
+        "{lines:#?}"
+    );
     assert_eq!(
-        last,
+        lines[at],
         format!(
             "up: note: the demo VM's disk vm001-disk0 is a copy of the image os-base from before this \
              build, and the demo boots it as it is; to boot the new build, delete {} while up is not \
@@ -830,8 +1114,24 @@ fn no_build_needs_what_a_build_makes() {
     options.image = dir.0.join("missing.img");
     let e = up::prepare(&options, log).unwrap_err();
     assert!(e.starts_with("there is no "), "{e}");
+    assert!(e.contains("as the image os-base: "), "{e}");
     // A base image already in the directory is enough.
-    up::seed(&options.images, &[0; 512]).unwrap();
+    up::seed(&options.images, "os-base", &[0; 512]).unwrap();
+    up::prepare(&options, log).unwrap();
+    // So it is for RV64's.
+    options.image_rv64 = dir.0.join("missing-rv64.img");
+    std::fs::remove_file(options.images.join("os-base-rv64")).unwrap();
+    let e = up::prepare(&options, log).unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "there is no {} to put in {} as the image os-base-rv64: run cargo xtask up without \
+             --no-build",
+            options.image_rv64.display(),
+            options.images.display()
+        )
+    );
+    up::seed(&options.images, "os-base-rv64", &[0; 512]).unwrap();
     up::prepare(&options, log).unwrap();
     options.bin_dir = dir.0.join("nowhere");
     let e = up::prepare(&options, log).unwrap_err();

@@ -321,6 +321,111 @@ static int child(int argc, char **argv) {
     return 100;
 }
 
+/* crt0's entry point (crt0.S): the auxiliary vector's AT_ENTRY. */
+void _start(void);
+
+/* The program's start (docs/camelot-syscalls.md, "Starting a program"),
+ * as main finds it, for a program started with `path`: argc, a long, at
+ * sp, 16-byte aligned, right below argv; argv's NULL, then an empty envp
+ * and the auxiliary vector, every entry Linux gives that Camelot has, once;
+ * the argument strings, the path and an end marker, in that order, up to
+ * the top of the stack. Returns 0 if all of that holds, else the number of
+ * the first check that fails. */
+static int start_fault(int argc, char **argv, char **envp, const char *path) {
+    long *sp = (long *)argv - 1;
+    if (*sp != argc || ((uintptr_t)sp & 15) != 0) {
+        return 1;
+    }
+    if (argv[argc] != NULL || envp != argv + argc + 1 || envp[0] != NULL) {
+        return 2;
+    }
+    /* The vector: each type at most once, up to AT_NULL. */
+    unsigned long value[32];
+    int seen[32];
+    for (int i = 0; i < 32; i++) {
+        seen[i] = 0;
+    }
+    unsigned long *aux = (unsigned long *)(envp + 1);
+    int n = 0;
+    while (aux[0] != AT_NULL) {
+        if (aux[0] >= 32 || seen[aux[0]] || ++n > 31) {
+            return 3;
+        }
+        seen[aux[0]] = 1;
+        value[aux[0]] = aux[1];
+        aux += 2;
+    }
+    if (aux[1] != 0) {
+        return 3;
+    }
+    /* Exactly these, with these values. */
+    int types[] = {AT_HWCAP, AT_PAGESZ, AT_CLKTCK, AT_PHDR,   AT_PHENT,  AT_PHNUM,  AT_BASE,   AT_FLAGS,
+                   AT_ENTRY, AT_UID,    AT_EUID,   AT_GID,    AT_EGID,   AT_SECURE, AT_RANDOM, AT_EXECFN};
+    int count = (int)(sizeof types / sizeof types[0]);
+    for (int i = 0; i < count; i++) {
+        if (!seen[types[i]]) {
+            return 4;
+        }
+    }
+    if (n != count) {
+        return 4;
+    }
+    unsigned long hwcap = 1ul << ('I' - 'A') | 1ul << ('M' - 'A') | 1ul << ('A' - 'A');
+    if (value[AT_HWCAP] != hwcap || value[AT_PAGESZ] != PAGE || value[AT_CLKTCK] != 10) {
+        return 5;
+    }
+    /* An ELF32 program header is 32 bytes, an ELF64 one 56. */
+    if (value[AT_PHENT] != (sizeof(void *) == 8 ? 56 : 32) || value[AT_PHNUM] < 1 || value[AT_PHNUM] > 16) {
+        return 6;
+    }
+    /* user.ld starts the first segment at 0x1000, after the headers, so no
+     * segment loads them and AT_PHDR is 0; a linker that does load them
+     * makes it their address, where the first is a PT_LOAD (1) or a
+     * PT_PHDR (6). */
+    if (value[AT_PHDR] != 0 && *(uint *)value[AT_PHDR] != 1 && *(uint *)value[AT_PHDR] != 6) {
+        return 7;
+    }
+    if (value[AT_ENTRY] != (uintptr_t)_start || value[AT_BASE] != 0 || value[AT_FLAGS] != 0) {
+        return 8;
+    }
+    if (value[AT_UID] != 0 || value[AT_EUID] != 0 || value[AT_GID] != 0 || value[AT_EGID] != 0 ||
+        value[AT_SECURE] != 0) {
+        return 9;
+    }
+    /* The strings: argv's in order, each right after the one before, then
+     * the path, then a long of zeros at the very top. */
+    char *at = argv[0];
+    for (int i = 0; i < argc; i++) {
+        if (argv[i] != at) {
+            return 10;
+        }
+        at += strlen(at) + 1;
+    }
+    char *execfn = (char *)value[AT_EXECFN];
+    if (execfn != at || strcmp(execfn, path) != 0) {
+        return 11;
+    }
+    at += strlen(at) + 1;
+    if ((uintptr_t)at + sizeof(long) != user_top || *(long *)at != 0) {
+        return 12;
+    }
+    /* The 16 random bytes: below the strings, above the vector, 16-byte
+     * aligned, and not all zero (as good as certain). */
+    uchar *random = (uchar *)value[AT_RANDOM];
+    if ((uintptr_t)random % 16 != 0 || (uintptr_t)(random + 16) > (uintptr_t)argv[0] ||
+        (uintptr_t)random < (uintptr_t)(aux + 2)) {
+        return 13;
+    }
+    int nonzero = 0;
+    for (int i = 0; i < 16; i++) {
+        nonzero |= random[i];
+    }
+    if (!nonzero) {
+        return 13;
+    }
+    return 0;
+}
+
 /* Spawns systest with the arguments `a` and `b` and waits for it; returns
  * its exit status, or the error. */
 static int run_child(char *a, char *b) {
@@ -987,11 +1092,16 @@ static void test_network_without_a_card(void) {
     check_eq(bind(NOFILE, &a), -EBADF, "bind on a bad descriptor");
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv, char **envp) {
     user_top = ((uintptr_t)argv[0] + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
+    /* The shell, spawn and exec all start it as /bin/systest. A child
+     * with a bad start exits with 100 and the check that failed, which
+     * no test of a child's status wants. */
+    int fault = start_fault(argc, argv, envp, "/bin/systest");
     if (argc > 1) {
-        return child(argc, argv);
+        return fault != 0 ? 100 + fault : child(argc, argv);
     }
+    check_eq(fault, 0, "the program's start: argc, argv, envp and the auxiliary vector on the stack");
     test_simple_calls();
     test_files();
     test_spawn_and_wait();

@@ -20,6 +20,7 @@
 #define CAMELOT_FS_H
 
 #include "bio.h"
+#include "errno.h"
 #include "sleeplock.h"
 #include "syscall.h"
 #include "types.h"
@@ -64,10 +65,10 @@
 #define INODES_MIN 2
 #define INODES_MAX 65536
 
-/* The filesystem's failures are minus the error numbers of syscall.h
- * (ENOENT, EEXIST, ENOTDIR, ENOSPC, ...), which the file system calls pass
- * on. EIO is only fs_mount()'s: once mounted, a disk error panics. */
-#define EIO 5 /* the disk failed */
+/* The filesystem's failures are minus the error numbers of errno.h:
+ * syscall.h's (ENOENT, EEXIST, ENOTDIR, ENOSPC, ...), which the file system
+ * calls pass on, and EIO, which is only fs_mount()'s: once mounted, a disk
+ * error panics. */
 
 /* Block 1. */
 struct superblock {

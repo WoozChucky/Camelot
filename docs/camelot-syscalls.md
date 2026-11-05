@@ -9,7 +9,7 @@ in `kernel/net/net.c` and the sockets' in `kernel/net/socket.c`,
 `docs/camelot-net.md`), the numbers are in
 `kernel/include/syscall.h`; the user side is `kernel/user/usys.s` (one stub
 per call), `kernel/user/user.h` (their C declarations, the error numbers,
-`open`'s flags and `struct stat`) and `kernel/user/crt0.s` (the start-up
+`open`'s flags and `struct stat`) and `kernel/user/crt0.S` (the start-up
 code). How processes, address spaces, the scheduler and open files work
 inside the kernel is in `docs/excalibur-spec.md`, section 10, "Kernel
 processes" and "Kernel files"; the filesystem's format is in
@@ -170,7 +170,7 @@ blocked reading the console, which keeps the machine running until it gets a
 line or the end of the input (`sh &`, then `exit` in the first shell, leaves
 the second one reading). Note that 0xFE is also the code of a kernel panic:
 the exit code alone can't tell `exit -2` from a panic, the console output
-can. Returning from `main` calls `exit` with the return value (`crt0.s`).
+can. Returning from `main` calls `exit` with the return value (`crt0.S`).
 
 A process that faults in U-mode (any exception but `ecall`: a page fault, an
 illegal instruction such as `xcal.halt`, a misaligned access) is killed
@@ -261,8 +261,11 @@ towards the stack: new pages are mapped R+W and read zero, including bytes
 given back by an earlier shrink and grown again. A negative `increment`
 shrinks it, unmapping and freeing the pages no longer used. Errors:
 `-ENOMEM` when the heap would reach the guard page under the stack's limit
-(`USER_LOAD_TOP`: 0x0B7F_F000 on RV32, 0x7FFF_FF7F_F000 in Sv48) or memory
-runs out (nothing changes), `-EINVAL` when it would shrink below its start.
+(`USER_LOAD_TOP`: 0x0B7F_F000 on RV32, 0x7FFF_FF7F_F000 in Sv48), when it
+would map more new pages than the whole of RAM has (those from the old
+end's page boundary to the new end's: refused at once, as Linux's default
+overcommit check refuses it), or when memory runs out
+(nothing changes), `-EINVAL` when it would shrink below its start.
 A program whose segments end above 4 GiB has its heap there, and `sbrk`
 returns those addresses whole.
 
@@ -886,27 +889,64 @@ caller's `sp`, so a buffer in a stack frame the program hasn't touched yet
 is good for `read`. Past 8 MiB is the guard page: a fault, which kills the
 process. So is running out of RAM while it grows; the kernel says so first.
 
-Whether from `spawn` or `exec`, the kernel enters the program at its ELF
-entry point, crt0's `_start`, with every register zero except:
-
-- `a0` = `argc`, the number of arguments;
-- `a1` = `argv`, the address of the argument array;
-- `sp`, 16-byte aligned, just below the arguments.
-
-The arguments sit at the top of the stack's first page:
+Whether from `spawn` or `exec`, the kernel starts the program as Linux
+starts an ELF program (`create_elf_tables` in `fs/binfmt_elf.c`) and the
+RISC-V psABI describes it ("Process Initialization"), at both widths: at
+its ELF entry point, crt0's `_start`, with every register zero except
+`sp`, which is 16-byte aligned and points at `argc`. `a0` is zero too: the
+psABI's address of a function for the program to register with `atexit`
+(a dynamic linker's), and there is none. Everything is at the top of the
+stack's first page, each word a `long`, a pointer's size (4 bytes on RV32,
+8 on RV64):
 
 ```
-USER_TOP     the strings, argv[0]'s first, each NUL-terminated
-             padding to a pointer's size: a multiple of 4 on RV32, 8 on RV64
-argv         argv[0] ... argv[argc - 1], then a null pointer, a pointer
-             each (4 or 8 bytes)
+USER_TOP     a word of zeros, the end marker
+             the path the program was started with (AT_EXECFN),
+             NUL-terminated
+             the argument strings, argv[0]'s first, each NUL-terminated
+             (an environment's strings would go between the two: spawn
+             and exec pass none)
              padding to a multiple of 16
-sp           the program's first stack frame grows down from here
+             16 random bytes (AT_RANDOM)
+             padding
+             the auxiliary vector: pairs of words, a type and a value,
+             the last pair AT_NULL
+envp         a null pointer: the environment, empty
+argv         argv[0] ... argv[argc - 1], then a null pointer
+sp           argc
 ```
 
-Every page the program gets (its segments beyond their file bytes, `.bss`,
-the stack, the heap) reads zero. `_start` calls `main(argc, argv)` and passes
-its return value to `exit`.
+The auxiliary vector has Linux's entries, in Linux's order, with Linux's
+type numbers (`AT_*` in `user.h` and `kernel/include/syscall.h`), but for
+those Camelot has nothing to say with (no vDSO, no cache information, no
+signals, no platform string):
+
+| Number | Type | Value |
+|---|---|---|
+| 16 | `AT_HWCAP` | the ISA's single-letter extensions, bit `X - 'A'` for each: I, M and A (0x1101) |
+| 6 | `AT_PAGESZ` | 4096 |
+| 17 | `AT_CLKTCK` | how often `uptime` ticks a second: 10 |
+| 3 | `AT_PHDR` | the address of the program headers, in the `PT_LOAD` segment whose file bytes hold them, as Linux finds them; 0 if none does (`user.ld` starts the first segment at 0x1000, past them) |
+| 4 | `AT_PHENT` | a program header's size: 32 (ELF32) or 56 (ELF64) |
+| 5 | `AT_PHNUM` | how many there are |
+| 7 | `AT_BASE` | 0: no interpreter, the programs are static |
+| 8 | `AT_FLAGS` | 0 |
+| 9 | `AT_ENTRY` | the program's entry point |
+| 11 | `AT_UID` | 0, as are the next three: Camelot has one user |
+| 12 | `AT_EUID` | 0 |
+| 13 | `AT_GID` | 0 |
+| 14 | `AT_EGID` | 0 |
+| 23 | `AT_SECURE` | 0 |
+| 25 | `AT_RANDOM` | the address of the 16 random bytes: different for every program started, but not secret (Camelot has no source of entropy; they mix the time and the stack page's address) |
+| 31 | `AT_EXECFN` | the address of the path |
+| 0 | `AT_NULL` | 0, the end |
+
+`MAXARG`, `ARG_MAX` and `MAXPATH` keep all of it in the first half of the
+page. Every page the program gets (its segments beyond their file bytes,
+`.bss`, the stack, the heap) reads zero. `_start` loads `argc` from `sp`,
+finds `argv` right above it and `envp` past `argv`'s null pointer, calls
+`main(argc, argv, envp)` and passes its return value to `exit`. A program
+that wants the auxiliary vector walks past `envp`'s null pointer to it.
 
 ## Console input
 
@@ -938,13 +978,18 @@ error number included), their constants and structures (`O_*`, `F_*`,
 `struct netinfo`, `struct net_stats`, `NETINFO_*`, `struct ping_reply`,
 `AF_INET`, `SOCK_*`, `IPPROTO_*`, `INADDR_*`, `SHUT_*`, `SOL_SOCKET`,
 `SO_RCVTIMEO`, `struct in_addr`, `struct sockaddr_in`, `struct timeval`,
-`MAXPATH`, `DIRSIZ`) and the C library in `kernel/user/lib/`, described in
+`MAXPATH`, `DIRSIZ`, `AT_*`), the integer types of `<stdint.h>` and
+`<sys/types.h>` (`int8_t` to `int64_t`, `uint8_t` to `uint64_t`, the 64-bit
+ones `long long`; `intptr_t`, `uintptr_t`, `size_t`, `ssize_t`, `off_t`,
+`time_t`, a `long` wide) and their limits (`INT_MAX`, `UINT_MAX`,
+`LONG_MAX`, `ULONG_MAX`, `LLONG_MAX`, `SIZE_MAX`, `INT64_MAX`, ...), and the C library in `kernel/user/lib/`, described in
 its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`,
 `memmove`, `memcmp`), numbers (`atoi`, `strtol`), the heap (`malloc`,
 `free`, `calloc`, `realloc`, on top of `sbrk`), formatted output (`printf`,
 `fprintf` to a descriptor, `snprintf`; `%d %u %x %p %s %c %%` with `-`, `0`
-and a width, `l` for a `long`), `puts`, line input (`getline`, one read of the console
+and a width, and `l` for a `long`, `ll` for a `long long`, `z` for a
+`size_t`), `puts`, line input (`getline`, one read of the console
 without the newline; readers, `reader_getline`, for files and pipes),
 `strerror`, `stat` (`open`, `fstat`, `close`), `spin` (a busy loop),
 addresses and names (`htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`,
@@ -964,7 +1009,7 @@ returns its `long` result.
 
 Each `kernel/user/X.c`, `X.s` or `X.S` (assembly that goes through the C
 preprocessor first, for each width: `#if __riscv_xlen == 64`) is a program called `X`, linked with the
-runtime, `crt0.s` and `usys.s`, and with the members of the library
+runtime, `crt0.S` and `usys.s`, and with the members of the library
 (`kernel/user/lib/*.c`) it needs: like an archive's, a member goes in only
 if it defines something the program (or another member that went in)
 refers to and nothing else defines (`crates/merlin-ld/src/library.rs`,

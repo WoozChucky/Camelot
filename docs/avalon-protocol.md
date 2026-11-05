@@ -1,13 +1,14 @@
-# Avalon Protocol v10
+# Avalon Protocol v12
 
 The wire protocol of the Avalon platform. Every program in it speaks this protocol:
 
 | Program | Role | Serves / uses |
 |---|---|---|
-| **Avalon** | hypervisor server: runs N Grail VMs | serves session, VM control, console, screen and input, virtual network |
+| **Avalon** | hypervisor server: runs N Grail VMs | serves session, VM control, console, screen and input, virtual network, debugging |
 | **Round Table** | control CLI | uses VM control and virtual network (and disk management against Lake) |
 | **Pendragon** | web console ([`pendragon.md`](pendragon.md)) | uses VM control, console and virtual network (Avalon), disk management (Lake) |
 | **Herald** | attaches to one VM | uses console, screen and input |
+| **merlin-dbg** | the debugger ([`merlin-dbg.md`](merlin-dbg.md)), `--vm NAME` | uses debugging |
 | **Lake** | storage server: serves disk images | serves session, block I/O, disk management |
 
 The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the messages as Rust types, `encode`/`decode`, and a blocking `Connection` over any `Read + Write`. This document and the crate must agree; `crates/avalon-proto/tests/spec.rs` checks the type codes, the error codes and one layout of every message byte for byte against the tables below.
@@ -16,7 +17,7 @@ The implementation is the `avalon-proto` crate (`crates/avalon-proto`): the mess
 
 - TCP, through `std::net`. One connection is one session; either side ends it by closing the socket.
 - Servers listen on loopback by default: Avalon on `127.0.0.1:7400`, Lake on `127.0.0.1:7401`. Listening on any other interface takes an explicit command-line flag.
-- **No authentication and no encryption** (versions 1 to 10). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
+- **No authentication and no encryption** (versions 1 to 12). Anyone who can reach the port can create, control and read VMs and disks. That is why servers bind to loopback unless told otherwise. Authentication and TLS will be a later protocol version (and std-only, like everything else).
 - A client and a server are both just byte streams to the protocol; tests run it over in-memory buffers as well as sockets.
 
 ## 2. Framing
@@ -109,18 +110,23 @@ Round Table and Herald take a VM argument that is all digits as an id, anything 
 | 2 | paused | |
 | 3 | stopped (by a client) | |
 | 4 | exited (the program stopped the machine) | `code: u32` |
+| 5 | debug (stopped by a breakpoint, a watchpoint or a debugger's step, section 6.8) | |
 
 **HardwareProfile**, the hardware of one VM. It mirrors Grail's `MachineConfig` field for field (`crates/avalon-proto/tests/machine_config.rs` stops compiling if `MachineConfig` gains a field the profile lacks):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `ram_size` | `u64` | RAM in bytes: a non-zero multiple of 4 KiB, at most 1 TiB, or 2 GiB for an RV32 VM (Excalibur spec section 7, "RAM"). Until the protocol carries a width (#158), a VM is RV64 if its program is ELF64 and RV32 otherwise, booting from disk included. Avalon's RAM budget counts the whole size, lazily backed or not. The protocol has no default; `HardwareProfile::default()` and the clients have Grail's, 4 MiB (`DEFAULT_RAM_SIZE`) |
+| `ram_size` | `u64` | RAM in bytes: a non-zero multiple of 4 KiB, at most 1 TiB, or 2 GiB for an RV32 VM (Excalibur spec section 7, "RAM"), the width being `xlen`'s (or the program's, below). Avalon's RAM budget counts the whole size, lazily backed or not: what the VM may use, which the budget guarantees, while the host commits only what the guest touches. The protocol has no default; `HardwareProfile::default()` and the clients have Grail's, 4 MiB (`DEFAULT_RAM_SIZE`) |
 | `clock_hz` | `option<u32>` | real-time clock in instructions per second; none = run at full speed |
 | `nominal_hz` | `u32` | clock reported to the guest when `clock_hz` is none (Grail's default: 10 000 000) |
 | `harts` | `u32` | number of harts, 1 to 8 (Excalibur spec section 7, "Harts"; Grail's default: 1). The clock is per hart |
+| `xlen` | `u8` | the harts' register width in bits: 32 (RV32) or 64 (RV64); other values are invalid. `HardwareProfile::default()` and the clients have 32 while both widths exist (#159). See **The width**, below |
+| `paging` | `u8` | the paging modes an RV64 VM's harts implement, as the widest one's `satp.MODE`: 9 for Sv48 and Sv39 (the default), 8 for Sv39 alone (Excalibur spec section 5; Grail's `--paging`); other values are invalid. An RV32 VM has Sv32 whatever this says |
 | `devices` | `list<DeviceSpec>` | optional hardware beyond the fixed machine, in the order the guest should see it |
 
-The guest reads these values from its sysinfo block (Excalibur spec section 9.5). The wire accepts any values; the server validates them as Grail does and answers `InvalidProfile`.
+The guest reads these values from its sysinfo block (Excalibur spec section 9.5) and its `misa` and `satp` CSRs. The wire accepts any values of the numeric fields but `xlen` and `paging`; the server validates them as Grail does and answers `InvalidProfile`.
+
+**The width.** A VM's width is part of its hardware, chosen when it is created, as QEMU chooses it with its binary (`qemu-system-riscv32` or `qemu-system-riscv64`) and Grail with `--xlen`: the profile says it, rather than the server guessing it from what the VM runs, since a VM that boots from disk has nothing to guess from until its boot ROM, which is already of one width, has run the disk's boot block. A program decides it as it does for Grail (`Machine::load_elf`): an ELF64 program on a profile that says 32 makes the VM RV64 (its RAM checked against RV64's limit), and an ELF32 program on a profile that says 64 is `InvalidProgram`, as `qemu-system-riscv64` refuses an ELF32 kernel. The VM's profile in `VmList` and `VmInfo` gives the width it has, so an RV32 profile with an ELF64 program reads back as RV64. A VM that boots from disk is as wide as `xlen` says: its boot ROM is of that width, and so must be the code in the disk's boot block (an RV64 Camelot image boots on an RV64 VM; Lake's images have no width of their own). The device table (`DeviceEntry`) keeps 32-bit addresses on both widths: every device is below 4 GiB.
 
 **DeviceSpec**:
 
@@ -317,6 +323,12 @@ Codes are grouped by their high byte. Req = request, Rep = reply, Ev = event; C�
 | 0x0606 | `DetachCard` | Req | C→S | `Ok` |
 | 0x0607 | `CaptureSwitch` | Req | C→S | `Ok` |
 | 0x0608 | `SetSwitchNat` | Req | C→S | `Ok` |
+| **0x07xx** | **debugging** (Avalon) | | | |
+| 0x0701 | `DebugAttach` | Req | C→S | `DebugAttached` |
+| 0x0702 | `DebugAttached` | Rep | S→C | |
+| 0x0703 | `DebugInput` | Ev | C→S | |
+| 0x0704 | `DebugOutput` | Ev | S→C | |
+| 0x0705 | `DebugDetach` | Req | C→S | `Ok` |
 
 Any request can also be answered by `Error`. A server answers requests from a group it does not serve with `Error(Unsupported)`.
 
@@ -331,30 +343,30 @@ Any request can also be answered by `Error`. A server answers requests from a gr
 | `Ping` | `token: u32` |
 | `Pong` | `token: u32` (the `Ping`'s) |
 
-Example, `Hello` version 10 from agent `"rt"`:
+Example, `Hello` version 12 from agent `"rt"`:
 
 ```
-0e 00 00 00  01 00  41 56 4c 4e  0a 00  02 00 00 00  72 74
-length 14    Hello  "AVLN"       v10    agent "rt"
+0e 00 00 00  01 00  41 56 4c 4e  0c 00  02 00 00 00  72 74
+length 14    Hello  "AVLN"       v12    agent "rt"
 ```
 
 ### 6.2 VM control
 
 | Message | Payload | Notes |
 |---|---|---|
-| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable, or empty: the VM then boots from its disk 0, as `grail --disk IMG` does (spec section 7, "Boot from disk"), and a profile without a disk is `InvalidProgram`. The VM is loaded and left in state created, its network cards plugged into the switches the profile names. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below, and a bad network card), `NoSuchSwitch` (a card names a switch that does not exist), `AlreadyExists` (a card's address is on its switch already), `InvalidProgram`, `OverBudget`. A create that fails plugs in nothing |
+| `CreateVm` | `name: string`, `profile: HardwareProfile`, `program: bytes` | `program` is an Excalibur ELF executable, ELF32 or ELF64 (an ELF64 one makes the VM RV64, an ELF32 one cannot run on an RV64 VM: section 3, **The width**), or empty: the VM then boots from its disk 0, as `grail --disk IMG` does (spec section 7, "Boot from disk"), through the boot ROM of the profile's width, and a profile without a disk is `InvalidProgram`. The VM is loaded and left in state created, its network cards plugged into the switches the profile names. Errors: `InvalidName`, `AlreadyExists`, `InvalidProfile` (also a disk that cannot be opened or attached, see below, and a bad network card), `NoSuchSwitch` (a card names a switch that does not exist), `AlreadyExists` (a card's address is on its switch already), `InvalidProgram`, `OverBudget`. A create that fails plugs in nothing |
 | `VmCreated` | `id: u32` | ids are never reused while the server runs |
 | `ListVms` | empty | |
 | `VmList` | `vms: list<VmSummary>` | in id order |
 | `GetVmInfo` | `vm: VmRef` | |
 | `VmInfo` | `vm: VmSummary`, `devices: list<DeviceEntry>`, `steps: u64` | `devices` is the guest's sysinfo device table; `steps` the instructions executed so far |
 | `StartVm` | `vm: VmRef` | created → running |
-| `PauseVm` | `vm: VmRef` | running → paused |
-| `ResumeVm` | `vm: VmRef` | paused → running |
-| `StopVm` | `vm: VmRef` | created, running or paused → stopped. A stopped or exited VM cannot be restarted; destroy it and create a new one |
+| `PauseVm` | `vm: VmRef` | running → paused (also one its debugger resumed, which gets its stop reply, section 6.8) |
+| `ResumeVm` | `vm: VmRef` | paused or debug → running. A VM with a debugger is resumed by its debugger, not by `ResumeVm` (`InvalidState`, section 6.8) |
+| `StopVm` | `vm: VmRef` | created, running, paused or debug → stopped. A stopped or exited VM cannot be restarted; destroy it and create a new one |
 | `DestroyVm` | `vm: VmRef` | any state; frees the VM, unplugs its network cards, detaches its clients (`Detached`), and its name can be reused |
-| `VmStateChanged` | `vm: u32`, `state: VmState` | sent to every client attached to the VM (console or screen; once to a client attached to both) when its state changes, including when its program exits |
-| `Detached` | `vm: u32`, `kind: u8` (1 console, 2 screen) | the server ended an attachment, because the VM was destroyed. Not sent in answer to `ConsoleDetach`/`ScreenDetach` |
+| `VmStateChanged` | `vm: u32`, `state: VmState` | sent to every client attached to the VM (console, screen or debugger; once to a client attached more than one way) when its state changes, including when its program exits |
+| `Detached` | `vm: u32`, `kind: u8` (1 console, 2 screen, 3 debugger) | the server ended an attachment, because the VM was destroyed, or for a debugger also because the VM's machine ended (section 6.8). Not sent in answer to `ConsoleDetach`/`ScreenDetach`/`DebugDetach` |
 
 A request for a transition from the wrong state gets `InvalidState`.
 
@@ -442,7 +454,7 @@ Concurrency: an image has at most one writer at a time, and a writer excludes re
 
 Lake keeps each disk as a raw image file named after the disk, in the directory it serves (`lake --dir`): sector `n` is bytes 512·`n` to 512·`n` + 511, as in Grail's image files, so an image can be copied in and out of Lake's directory. A file there whose name is not a valid disk name, or whose size is not a whole number of sectors, is not a disk: it is not listed and cannot be attached or deleted, and its name cannot be used for a new disk (`AlreadyExists`). Disks are matched by their exact file name: where the filesystem ignores case (Windows, macOS), a file `ROOT` is not disk `root` (`NoSuchDisk`), though it still keeps the name `root` from being used for a new disk. Images never change size through the protocol (a clone may be bigger than its source, but that is a new image).
 
-**Cloning.** A `DiskCreate` with a `source` copies an existing image into a new one, so that every VM can boot from its own copy of a base image (Round Table's `disk create NAME --from SRC`; `create --camelot` and Pendragon's Camelot VMs clone the image `os-base` to `NAME-disk0`, and `cargo xtask up` puts the image in Lake's directory). The source must not have a writer, since a copy of a disk being written is not a disk; it may have readers, and Lake attaches it read-only itself for the copy, so no writer can attach it until the copy is done. Checks come in the order names, source, size, destination: an invalid name is `InvalidName`, a missing source `NoSuchDisk`, a source with a writer `Busy`, a size below the source's `OutOfRange` (above the maximum `OverBudget`), a destination that exists `AlreadyExists`. The copy is made under a name that is not a disk name (`.NAME.clone` for the destination `NAME`: it starts with a `.`, so it is never listed or attached) and renamed into place when it is complete: until `Ok`, the new image does not exist for anyone, and a failed copy leaves nothing behind. A copy that a Lake ending mid-way left in the directory is removed when Lake next starts on it. While a copy is in progress its name is taken (a second `DiskCreate` of it gets `AlreadyExists`). Runs of zeros are not written, so a clone of a sparse image is sparse too. The reply comes when the copy is complete, so a large image takes as long as copying it on the server's host.
+**Cloning.** A `DiskCreate` with a `source` copies an existing image into a new one, so that every VM can boot from its own copy of a base image (Round Table's `disk create NAME --from SRC`; `create --camelot` and Pendragon's Camelot VMs clone the image of the VM's width to `NAME-disk0`, `os-base` for an RV32 VM and `os-base-rv64` for an RV64 one, and `cargo xtask up` puts both images in Lake's directory). The source must not have a writer, since a copy of a disk being written is not a disk; it may have readers, and Lake attaches it read-only itself for the copy, so no writer can attach it until the copy is done. Checks come in the order names, source, size, destination: an invalid name is `InvalidName`, a missing source `NoSuchDisk`, a source with a writer `Busy`, a size below the source's `OutOfRange` (above the maximum `OverBudget`), a destination that exists `AlreadyExists`. The copy is made under a name that is not a disk name (`.NAME.clone` for the destination `NAME`: it starts with a `.`, so it is never listed or attached) and renamed into place when it is complete: until `Ok`, the new image does not exist for anyone, and a failed copy leaves nothing behind. A copy that a Lake ending mid-way left in the directory is removed when Lake next starts on it. While a copy is in progress its name is taken (a second `DiskCreate` of it gets `AlreadyExists`). Runs of zeros are not written, so a clone of a sparse image is sparse too. The reply comes when the copy is complete, so a large image takes as long as copying it on the server's host.
 
 A new image is a sparse file: it takes no space on the host until it is written. On Windows Lake marks it sparse explicitly (NTFS does not otherwise, and the first write near the end of a large non-sparse file would make the filesystem write zeros over everything before it, inside that one write, for longer than a Grail disk waits for an answer). On a filesystem without sparse files (FAT, exFAT), `DiskCreate` writes the zeros itself, so creating a large image there takes a while, but no later write does.
 
@@ -480,13 +492,43 @@ Avalon's VMs talk to each other over virtual Ethernet switches, kept by the serv
 
 **Captures.** A capture writes the classic libpcap format that Wireshark and tcpdump read, exactly as Grail's `--pcap FILE` does (Excalibur spec section 9.8): one record per frame that enters the switch, from any port, before it is forwarded. Frames are written by a thread of the server's own; if it falls more than 1024 frames behind (a slow disk), the frames past that are left out of the capture, but still forwarded. If writing the file fails (a full disk, say), the capture ends there: the file keeps the frames written before the failure, and later frames are not captured. Such a capture is still listed in `SwitchInfo` until it is stopped, and stopping it gets `Io` with the error (it is stopped all the same, so a new one can be started). Deleting the switch ends its capture.
 
+### 6.8 Debugging
+
+A VM has a GDB stub: Grail's (`grail --gdb`, [`merlin-dbg.md`](merlin-dbg.md), "The GDB stub"), which a debugger attaches to over the Avalon connection instead of a TCP port of its own. The GDB remote serial protocol travels inside `DebugInput` and `DebugOutput` events exactly as it would over a socket: packets (`$payload#checksum`), acknowledgements, a Ctrl-C (0x03), cut wherever the sender likes. merlin-dbg is such a debugger (`merlin-dbg --vm NAME`); any GDB client can be bridged to one. Everything the stub does is what `grail --gdb` does, packet for packet; this section says only how it fits in a VM's life.
+
+| Message | Payload | Notes |
+|---|---|---|
+| `DebugAttach` | `vm: VmRef` | the client becomes the VM's debugger, and the VM stops for it between two steps, as a new GDB client stops `grail --gdb`: a running VM is paused. A created VM starts paused, before its first instruction, as `grail --gdb-wait` waits; a paused one, or one in state debug, stays as it is. Answered once the VM has stopped. Errors: `NoSuchVm`, `Busy` (it has a debugger already: one at a time, as Grail's stub serves one client), `InvalidState` (stopped or exited: there is no machine to debug) |
+| `DebugAttached` | `vm: u32` | the VM's id. The stub waits for the debugger's first packet |
+| `DebugInput` | `vm: u32`, `data: bytes` | the debugger's bytes for the stub. Dropped unless this client is the VM's debugger |
+| `DebugOutput` | `vm: u32`, `data: bytes` | the stub's bytes for the debugger |
+| `DebugDetach` | `vm: u32` | the client stops being the debugger, as if it had sent GDB's `D`: the breakpoints and watchpoints go, and a stopped VM (paused or debug) runs again (running). Errors: `NoSuchVm`, `InvalidState` (this connection is not its debugger) |
+
+**State.** The run states are QEMU's, as its stub moves a VM through them (`gdbstub/system.c`), and every change is a `VmStateChanged`, to the debugger too:
+
+- **paused** (SIGINT): the debugger's arrival stops the VM as QEMU stops one for a GDB connection (`vm_stop(RUN_STATE_PAUSED)`), and so do the debugger's Ctrl-C and a `PauseVm` while the VM runs for it. A debugger waiting for a stop reply gets one, `T02`: QEMU sends one for any stop of the VM.
+- **debug** (SIGTRAP): a breakpoint, a watchpoint or the end of a step stops the VM in QEMU's run state `debug` (which its `info status` shows as "paused (debug)"); Round Table and Pendragon show it as `debug`. The debugger gets `T05`.
+- **running**: the debugger's continue (`c`, `vCont;c`, QEMU's `vm_start`) and its step (`s`, `vCont;s`, `vm_prepare_start`) run the VM. A step is a running, then a debug: one instruction runs between them.
+
+A stopped VM with a debugger is the debugger's to resume: `ResumeVm` is `InvalidState` (paused or debug), where QEMU's `cont` would run it under a debugger that waits for no stop reply and would not hear when it stops again. `PauseVm` applies to a VM running for its debugger, as above. A VM in state debug without a debugger (its debugger's connection ended at a stop, below) is resumed by `ResumeVm`, as QEMU's `cont` resumes one.
+
+**Rate limit.** While a VM has a debugger, its `VmStateChanged` notices are rate-limited as QEMU's monitor rate-limits its noisy events (`monitor_qapi_event_queue`, once a second): the first change goes out at once, the ones in the second after it are held, only the last of them kept, and that one goes out when the second is over, unless the VM is back in the state the last notice gave. merlin-dbg's `next` may step a million times, each step two changes; without the limit every client attached to the VM would hear of each. The end of the machine (stopped, exited) is never held, and `GetVmInfo` always gives the state as it is.
+
+The console, screen and input of a VM being debugged are as they always are, for every client attached to them: the machine runs the same instructions with or without a debugger (merlin-dbg.md, "Determinism"), and its output goes out while it runs. Input waits while it is stopped, as it does while it is paused.
+
+- **Detaching**: GDB's `D` or `DebugDetach`: the breakpoints and watchpoints are removed, and a stopped VM (paused or debug) runs on (running), as QEMU's `D` does (`gdb_continue`) and as a machine does after its debugger detaches from `grail --gdb`. The VM can have a new debugger at once.
+- **A connection that ends** without `D` leaves the VM as it was, as QEMU does when a GDB connection closes. What the debugger sent before the end still reaches the stub first, as QEMU's stub reads a connection's last bytes before it sees the close: a `c`, or a Ctrl-C, sent just before the connection ends still runs, or stops, the VM. Then: stopped, it stays stopped (`ResumeVm` resumes it, or the next debugger); running, it runs on, and the breakpoints and watchpoints the debugger set still stop it, in state debug, with no debugger to tell. The next debugger's `?`, which a GDB client asks as it connects, removes them, as QEMU's stub does. The VM can have a new debugger at once.
+- **The end of the machine**: when the program exits, the debugger gets the stub's stop reply (`W` and the exit code) if it was waiting for one; when the VM is stopped (`StopVm`, or GDB's `k`, which stops it as `StopVm` does and is answered `X09`) a debugger that was waiting for a stop reply gets `X09`, ended by SIGKILL. Then, as for a destroyed VM, the server ends the attachment with `Detached` (kind 3): there is nothing left to debug.
+
+The stub sees the machine and nothing else of the VM: the guest's memory, its registers and CSRs, through the selected hart's translation or (QEMU's `Qqemu.PhyMemMode:1`) physical.
+
 ## 7. Versioning
 
-- The protocol version is a `u16`, currently **10** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
+- The protocol version is a `u16`, currently **12** (`PROTOCOL_VERSION`). Both sides must speak the same version; there is no negotiation.
 - Any change to the catalogue bumps the version: a new message type, a new field, a new enum variant or tag, a changed layout or a changed rule. (Unknown codes and tags are errors in the decoder, so an old peer could not read them anyway.)
 - Three things never change, in any version, so that peers of different versions can always tell each other so: the frame header (`u32` length, `u16` type), the `Hello` and `Welcome` messages (codes 0x0001 and 0x0002 and their layouts) and the `Error` message (code 0x0003 and its layout). Error codes are never reused or renumbered; new ones may be added with a version bump.
 - Things that are deliberately open-ended and need no new version: `DeviceEntry.kind` (sysinfo device type codes come from the Excalibur spec), `ScreenAttached.format` values a server chooses to send, free-text fields.
-- This document describes version 10. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
+- This document describes version 12. When the version changes, the change is described here and the crate's round-trip, layout and fuzz tests are updated with it.
 
 History:
 
@@ -502,6 +544,8 @@ History:
 | 8 | `ScreenResized` (0x0307): a VM's screen changes size when its guest changes the framebuffer's mode (section 6.4, **Modes**), followed by a full frame; screens up to 1920 × 1080, with Avalon's viewer backlog following the screen's size (`screen_backlog`, a little over one full frame: 2 MiB at 640 × 480, as before, up to 8.4 MiB at 1920 × 1080) and its limit on a client's queued output 32 MiB (section 8), which was 8 MiB for 640 × 480 screens |
 | 9 | `KeyEvent` carries the physical key for the keyboard's raw mode (Excalibur spec section 9.4): the `usage` field (`u16`, after `flags`) and the repeat flag (bit 3); `code` may be 0 when `usage` is not; the repeat flag only on a press; a viewer that goes (`ScreenDetach`, or its connection ends) has the keys and buttons it held released (section 6.4, **Input**) |
 | 10 | `CursorShape` (0x0308) and `CursorPosition` (0x0309): the framebuffer's cursor plane (Excalibur spec section 9.3) goes to the viewers apart from the frames, its image when it changes and its place when it moves (section 6.4, **Cursor**), up to `MAX_CURSOR_SIZE` (256) pixels each way |
+| 11 | the debugging group 0x07xx (section 6.8: `DebugAttach`, `DebugAttached`, `DebugInput`, `DebugOutput`, `DebugDetach`), a VM's GDB stub over the connection; `VmState` tag 5, debug (stopped by a breakpoint, a watchpoint or a step); `Detached` kind 3, a debugger; `StopVm` of a VM in state debug |
+| 12 | `HardwareProfile.xlen` and `HardwareProfile.paging` (a `u8` each, after `harts`): a VM's register width, RV32 or RV64, and an RV64 VM's paging modes, Sv48 and Sv39 or Sv39 alone (section 3, **The width**). Version 11 servers made a VM RV64 only for an ELF64 program, and RV32 otherwise, booting from disk included |
 
 ## 8. Limits
 

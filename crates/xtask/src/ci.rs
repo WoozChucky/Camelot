@@ -22,6 +22,8 @@
 //! - how Avalon and Lake end connections: bad handshakes, and a server's last
 //!   frame arriving whole though the client sent more (Linux's TCP stack is not
 //!   Windows's here);
+//! - a VM's debugger over Avalon: the stub and its run states, and merlin-dbg
+//!   breaking in the kernel of a VM with Herald attached;
 //! - the tests that check the documents against the code (instant).
 //!
 //! Left to the local run: the kernel's filesystem integration tests and their
@@ -89,6 +91,26 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
+        what: "Avalon: a VM's GDB stub over the connection, its run states",
+        args: &["-p", "avalon", "--test", "debug"],
+    },
+    Step {
+        what: "Avalon: a VM's width, its profile's or its program's, and RV64's RAM",
+        args: &[
+            "-p",
+            "avalon",
+            "--test",
+            "server",
+            "--",
+            "a_vm_is_as_wide_as_its_profile_or_its_program",
+            "an_rv64_vm_has_more_ram_than_the_host",
+        ],
+    },
+    Step {
+        what: "merlin-dbg on an Avalon VM: the kernel's write system call, Herald attached",
+        args: &["-p", "merlin-dbg", "--test", "avalon"],
+    },
+    Step {
         what: "Lake: bad handshakes, and the last frame before a close arrives whole",
         args: &[
             "-p",
@@ -143,7 +165,12 @@ const STEPS: &[Step] = &[
         args: &["-p", "xtask", "--test", "kernel_rv64"],
     },
     Step {
-        what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused",
+        what: "the kernels' SBI: every call and error on both widths, a fence before every IPI (#170)",
+        args: &["-p", "xtask", "--test", "sbi"],
+    },
+    Step {
+        what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
+               Linux's start",
         args: &[
             "-p",
             "xtask",
@@ -153,10 +180,12 @@ const STEPS: &[Step] = &[
             "negative_results_arrive_sign_extended",
             "pointers_into_the_kernel_half_are_refused",
             "the_calls_take_and_return_64_bit_values",
+            "a_program_starts_as_linux_starts_one",
         ],
     },
     Step {
-        what: "the committed examples, boot programs and hello are current; an RV64 boot block boots",
+        what: "the committed examples, boot programs and hello are current; an RV64 boot block and the \
+               RV64 root image boot",
         args: &[
             "-p",
             "xtask",
@@ -170,6 +199,7 @@ const STEPS: &[Step] = &[
             "committed_examples_are_current",
             "committed_boot_programs_are_up_to_date",
             "an_rv64_boot_block_boots_through_the_rv64_rom",
+            "the_rv64_root_image_boots_from_disk_and_runs_programs_from_bin",
             "hello",
         ],
     },

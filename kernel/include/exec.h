@@ -22,13 +22,13 @@
 int exec_spawn(const char *path, const struct proc_args *args);
 
 /* exec(): replaces the current process's program with the one at `path`.
- * Returns argc for the new program's a0, or an error as exec_spawn() (but
+ * Returns 0 for the new program's a0, or an error as exec_spawn() (but
  * -EAGAIN), the old program still running. */
 int exec_replace(const char *path, const struct proc_args *args);
 
 /* The first process's program: the one at `path`, with argv = { name }.
  * From the root filesystem if there is one, falling back to the embedded
- * programs if it has no such file. Returns argc or an error. */
+ * programs if it has no such file. Returns 0 or an error. */
 int exec_init(const char *path, const char *name);
 
 #endif

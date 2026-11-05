@@ -8,6 +8,17 @@ and merlin-ld (`cargo xtask kernel`, which embeds them in the kernel for
 when there is no disk; `cargo xtask fs`, which installs them in `/bin` of
 the root image). The shell runs `NAME` as `/bin/NAME`.
 
+Every program builds for both widths from the same source, and runs the
+same on each: for the RV32 kernel as ELF32 (ILP32: `int`, `long` and
+pointers 4 bytes), for the RV64 kernel as ELF64 (LP64: `long`, `size_t`
+and pointers 8 bytes), and the RV64 kernel's `/bin` (`cargo xtask fs`'s
+`target/camelot-fs-rv64.img`) holds them all, `as` and `ld` writing RV64
+objects and executables there. Assembly that differs between the widths is a
+`.S` file, preprocessed for each with `include/asm.h` (`REG_L`, `SZREG`).
+A program starts as Linux starts one: `main(argc, argv, envp)`, with the
+auxiliary vector after `envp` (docs/camelot-syscalls.md, "Starting a
+program").
+
 ## The basic programs
 
 Each one reports a problem as `NAME: WHAT: REASON` on stderr (the shell
@@ -55,8 +66,8 @@ $ wait
 
 | Program | Usage | What it does |
 |---|---|---|
-| `as` | `as [-o OUT.o] FILE.s` | the assembler, merlin-as rewritten in C (`as/`): the same language, the same object byte for byte (RV32, merlin-as's default, until #157 brings RV64), the same error messages (`FILE:LINE: error: ...`), and the same line tables from `.file`/`.loc` (merlin `-g` output). The first step of self-hosting: section 10, "Self-hosting", of the spec. Only in `/bin` of the root image: the kernel does not build it in (it needs files) |
-| `ld` | `ld [-T SCRIPT] [-e ENTRY] [-o OUT] [-S] FILE.o ... [--start-lib LIB.o ... --end-lib] [@ARGS]` | the linker, merlin-ld rewritten in C (`ld/`): the same scripts (`AT` load addresses and `ADDR` included), libraries and messages, the same executable byte for byte (RV32, ELF32 objects only, until #157 brings RV64); `@ARGS` reads more arguments from a file, for link lines longer than the shell takes. `as` then `ld` builds a program on Camelot itself. Only in `/bin` of the root image, as `as` |
+| `as` | `as [-march=ISA] [-o OUT.o] FILE.s` | the assembler, merlin-as rewritten in C (`as/`): the same language, the same object byte for byte (RV32, merlin-as's default until #159, or RV64 with `-march=rv64ima_zicsr_zifencei`), the same error messages (`FILE:LINE: error: ...`), and the same line tables from `.file`/`.loc` (merlin `-g` output). The first step of self-hosting: section 10, "Self-hosting", of the spec. Only in `/bin` of the root image: the kernel does not build it in (it needs files) |
+| `ld` | `ld [-T SCRIPT] [-e ENTRY] [-o OUT] [-S] FILE.o ... [--start-lib LIB.o ... --end-lib] [@ARGS]` | the linker, merlin-ld rewritten in C (`ld/`): the same scripts (`AT` load addresses and `ADDR` included), libraries and messages, the same executable byte for byte (ELF32 or ELF64, the class of its objects); `@ARGS` reads more arguments from a file, for link lines longer than the shell takes. `as` then `ld` builds a program on Camelot itself. Only in `/bin` of the root image, as `as` |
 
 ## Network programs
 

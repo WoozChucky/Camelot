@@ -24,10 +24,11 @@
  * section's address, as in Linux's `AT(ADDR(.text) - LOAD_OFFSET)`. layout.c
  * explains what they mean.
  *
- * The objects are RV32 here (object.c reads ELF32 only, until #157), so a
- * script's values are merlin-ld's ELF32 ones: exact 64-bit numbers up to
- * 2^63 - 1, an overflow an error, the 4 GiB address space checked where a
- * value is used. */
+ * A script is read for the class of the objects (script_parse's elf64), as
+ * merlin-ld reads it: for ELF64 its values are any u64 and its arithmetic
+ * wraps modulo 2^64, as ld.lld's; for ELF32 (RV32, until #159) they are
+ * exact 64-bit numbers up to 2^63 - 1, an overflow an error, and the 4 GiB
+ * address space is checked where a value is used (layout.c). */
 #include "ld.h"
 
 const char DEFAULT_SCRIPT[] = "\n"
@@ -215,14 +216,9 @@ static int format_class(const char *name) {
 
 /* ---- Numbers and globs ---- */
 
-/* a > b, as unsigned 64-bit numbers. */
-static int ugt(i64 a, i64 b) {
-    return a.hi != b.hi ? a.hi > b.hi : a.lo > b.lo;
-}
-
-/* parse_number, for an ELF64 script (wide) or an ELF32 one: up to 2^64 - 1,
- * or up to i64::MAX. */
-static int number(const char *w, i64 *out, int wide) {
+/* parse_number, for an ELF64 script (wide) or an ELF32 one: any u64, or
+ * up to i64::MAX, the type ELF32 scripts are evaluated in. */
+static int number(const char *w, uint64_t *out, int wide) {
     uint n = (uint)strlen(w);
     if (n == 0) {
         return 0;
@@ -236,12 +232,9 @@ static int number(const char *w, i64 *out, int wide) {
         n--;
     }
     /* The most either form may be before the multiplier, and a tenth of it. */
-    i64 max, tenth;
-    max.lo = 0xffffffffu;
-    max.hi = wide ? 0xffffffffu : 0x7fffffffu;
-    tenth.lo = wide ? 0x99999999u : 0xccccccccu;
-    tenth.hi = wide ? 0x19999999u : 0x0cccccccu;
-    i64 v = i64_u(0);
+    uint64_t max = wide ? UINT64_MAX : (uint64_t)INT64_MAX;
+    uint64_t tenth = wide ? 0x1999999999999999ULL : 0x0cccccccccccccccULL;
+    uint64_t v = 0;
     if (n >= 2 && w[0] == '0' && (w[1] == 'x' || w[1] == 'X')) {
         if (n == 2) {
             return 0;
@@ -252,10 +245,10 @@ static int number(const char *w, i64 *out, int wide) {
                      : c >= 'a' && c <= 'f' ? (uint)(c - 'a' + 10)
                      : c >= 'A' && c <= 'F' ? (uint)(c - 'A' + 10)
                                             : 16;
-            if (d >= 16 || ugt(v, i64_shr(max, 4))) {
+            if (d >= 16 || v > max >> 4) {
                 return 0;
             }
-            v = i64_add(i64_shl(v, 4), i64_u(d));
+            v = v << 4 | d;
         }
     } else {
         if (n == 0) {
@@ -265,29 +258,29 @@ static int number(const char *w, i64 *out, int wide) {
             if (w[i] < '0' || w[i] > '9') {
                 return 0;
             }
-            if (ugt(v, tenth)) {
+            if (v > tenth) {
                 return 0;
             }
-            i64 ten = i64_mul(v, i64_u(10));
-            v = i64_add(ten, i64_u((uint)(w[i] - '0')));
+            uint64_t ten = v * 10;
+            v = ten + (uint)(w[i] - '0');
             /* Past max, or round 2^64. */
-            if (ugt(v, max) || ugt(ten, v)) {
+            if (v > max || ten > v) {
                 return 0;
             }
         }
     }
     if (mult != 1) {
-        if (ugt(v, i64_shr(max, mult == 1024 ? 10 : 20))) {
+        if (v > max >> (mult == 1024 ? 10 : 20)) {
             return 0;
         }
-        v = i64_mul(v, i64_u(mult));
+        v *= mult;
     }
     *out = v;
     return 1;
 }
 
-int parse_number(const char *w, i64 *out) {
-    return number(w, out, 0);
+int parse_number(const char *w, uint64_t *out, int wide) {
+    return number(w, out, wide);
 }
 
 int glob_match(const char *p, const char *n) {
@@ -575,8 +568,29 @@ static int expr(struct expr **out) {
     }
 }
 
+/* a + b (sub: a - b) in a script's arithmetic: ELF64 modulo 2^64; ELF32
+ * exact, as i64s, Rust's checked_add and checked_sub (0 on an overflow). */
+int script_add(uint64_t a, uint64_t b, int sub, int wide, uint64_t *out) {
+    uint64_t r = sub ? a - b : a + b;
+    if (!wide) {
+        /* A signed overflow: the operands' signs agree (for a - b, a's and
+         * the opposite of b's) and the result's does not. */
+        int na = (int64_t)a < 0, nb = ((int64_t)b < 0) ^ sub, nr = (int64_t)r < 0;
+        if (sub && b == (uint64_t)INT64_MIN) {
+            /* -i64::MIN does not exist: a - MIN overflows unless a < 0. */
+            if (!na) {
+                return 0;
+            }
+        } else if (na == nb && nr != na) {
+            return 0;
+        }
+    }
+    *out = r;
+    return 1;
+}
+
 /* Evaluates an expression made only of numbers. */
-static int const_eval(struct expr *e, i64 *out) {
+static int const_eval(struct expr *e, uint64_t *out) {
     if (e->kind == X_NUM) {
         *out = e->num;
         return 1;
@@ -584,32 +598,15 @@ static int const_eval(struct expr *e, i64 *out) {
     if (e->kind != X_ADD && e->kind != X_SUB) {
         return 0;
     }
-    i64 a, b;
+    uint64_t a, b;
     if (!const_eval(e->a, &a) || !const_eval(e->b, &b)) {
         return 0;
     }
-    i64 r = e->kind == X_ADD ? i64_add(a, b) : i64_sub(a, b);
-    /* ELF64: modulo 2^64. ELF32: checked_add / checked_sub, no signed
-     * overflow. */
-    if (elf64) {
-        *out = r;
-        return 1;
-    }
-    int na = i64_is_neg(a), nb = i64_is_neg(b) ^ (e->kind == X_SUB), nr = i64_is_neg(r);
-    if (e->kind == X_SUB && b.hi == 0x80000000u && b.lo == 0) {
-        /* -i64::MIN does not exist: a - MIN overflows unless a < 0. */
-        if (!na) {
-            return 0;
-        }
-    } else if (na == nb && nr != na) {
-        return 0;
-    }
-    *out = r;
-    return 1;
+    return script_add(a, b, e->kind == X_SUB, elf64, out);
 }
 
 /* `ORIGIN = constant-expr` (or one of the other names). */
-static int region_field(const char *const *names, i64 *out) {
+static int region_field(const char *const *names, uint64_t *out) {
     uint line = cur_line();
     char *w;
     if (!word(names[0], &w)) {
@@ -635,8 +632,9 @@ static int region_field(const char *const *names, i64 *out) {
 static const char *const ORIGIN_NAMES[] = {"ORIGIN", "org", "o", NULL};
 static const char *const LENGTH_NAMES[] = {"LENGTH", "len", "l", NULL};
 
-static int fits_u32(i64 v) {
-    return v.hi == 0;
+/* An ELF32 script's value, read as an i64, fits in 32 bits unsigned. */
+static int fits_u32(uint64_t v) {
+    return v <= UINT32_MAX;
 }
 
 static int memory(struct script *s) {
@@ -667,34 +665,35 @@ static int memory(struct script *s) {
                 return 0;
             }
         }
-        i64 origin, length;
+        uint64_t origin, length;
         if (!expect(":") || !region_field(ORIGIN_NAMES, &origin) || !expect(",") ||
             !region_field(LENGTH_NAMES, &length)) {
             return 0;
         }
         if (elf64) {
-            /* ELF64: the region ends below 2^64. */
-            if (ugt(origin, i64_add(origin, length))) {
+            /* ELF64: the region ends below 2^64. ld.lld computes its end
+             * modulo 2^64, so one that reaches 2^64 ends at 0 and no
+             * section fits in it; an error here says why. */
+            if (origin + length < origin) {
                 return fail(line, fmt("MEMORY region %s extends past the 64-bit address space", name));
             }
         } else {
+            /* ELF32: within 4 GiB, which it may end at exactly. */
             if (!fits_u32(origin)) {
-                return fail(line, fmt("MEMORY ORIGIN %s does not fit in 32 bits", i64_hex(origin)));
+                return fail(line, fmt("MEMORY ORIGIN 0x%llx does not fit in 32 bits", origin));
             }
             if (!fits_u32(length)) {
-                return fail(line, fmt("MEMORY LENGTH %s does not fit in 32 bits", i64_hex(length)));
+                return fail(line, fmt("MEMORY LENGTH 0x%llx does not fit in 32 bits", length));
             }
-            /* origin + length > 2^32: the region may end exactly at 4 GiB. */
-            i64 end = i64_add(origin, length);
-            if (end.hi > 1 || (end.hi == 1 && end.lo != 0)) {
+            if (origin + length > (uint64_t)1 << 32) {
                 return fail(line, fmt("MEMORY region %s extends past 4 GiB", name));
             }
         }
         have = 1;
         s->has_memory = 1;
         s->region_name = name;
-        s->origin = origin.lo;
-        s->length = length.lo;
+        s->origin = origin;
+        s->length = length;
     }
     return 1;
 }

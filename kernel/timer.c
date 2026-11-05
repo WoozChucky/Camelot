@@ -1,16 +1,20 @@
-/* The timer tick: the timebase, the tick interval and arming the CLINT. */
+/* The timer tick: the timebase, the tick interval, and each hart's next
+ * deadline, which the SBI's set_timer programs (include/sbi.h). */
 #include "timer.h"
-#include "clint.h"
-#include "machine.h"
-#include "mmio.h"
+#include "riscv.h"
+#include "sbi.h"
 #include "spinlock.h"
 #include "sysinfo.h"
 
-/* The timebase, read once from sysinfo (0 until then): by hart 0's
- * timer_init(), in M-mode before kmain, where sysinfo is at its physical
- * address. The other harts' timer_init() find it here, so M-mode reads
- * sysinfo only that once (sysinfo.c). */
+/* The timebase, read once from sysinfo (0 until then), by hart 0's first
+ * timer_start() in trap_init(). The other harts find it here. */
 static u32 timebase;
+
+/* Each hart's next tick, in `time` units: one interval after the one
+ * before, rather than after whenever the tick was handled, so that the
+ * ticks don't drift however long the handler takes to get there. Only the
+ * hart itself touches its own. */
+static u64 next_tick[NCPU];
 
 u32 timebase_hz(void) {
     if (timebase == 0) {
@@ -26,36 +30,30 @@ u32 timebase_hz(void) {
 u32 timer_interval(void) {
     u32 interval = timebase_hz() / TICK_HZ;
     /* A timebase below TICK_HZ: tick as often as the timer can rather than
-     * rearming with 0, which would fire continuously. */
+     * set the next deadline to now, which would fire continuously. */
     return interval != 0 ? interval : 1;
 }
 
-void timer_init(void) {
-    u32 hart = r_tp();
+void timer_start(void) {
+    u32 hart = cpuid();
+    next_tick[hart] = r_time() + timer_interval();
+    sbi_set_timer(next_tick[hart]);
+}
+
+u32 timer_next(void) {
+    u32 hart = cpuid();
     u32 interval = timer_interval();
-    uintptr *scratch = &machine_scratch[hart * MSCRATCH_WORDS];
-    scratch[MSCRATCH_INTERVAL] = interval;
-    scratch[MSCRATCH_MTIMECMP] = CLINT_MTIMECMP(hart);
-
-#if __riscv_xlen == 64
-    /* mtimecmp = mtime + interval, each one access. */
-    mmio_write64(CLINT_MTIMECMP(hart), mmio_read64(CLINT_MTIME) + interval);
-#else
-    /* Read the 64-bit mtime as two halves: retry if the low word wrapped
-     * between the reads. */
-    u32 hi;
-    u32 lo;
+    u64 now = r_time();
+    /* Past every deadline that has gone by: those ticks were missed (the
+     * hart had interrupts off that long, or a debugger stopped it), and
+     * are counted, as Linux's periodic tick counts them; a deadline left
+     * in the past would fire again at once, and never let the hart do
+     * anything else. */
+    u32 ticks = 0;
     do {
-        hi = mmio_read32(CLINT_MTIME_HI);
-        lo = mmio_read32(CLINT_MTIME_LO);
-    } while (mmio_read32(CLINT_MTIME_HI) != hi);
-
-    /* mtimecmp = mtime + interval. Park the high word at its maximum while
-     * the low one changes, so no intermediate value can be in the past. */
-    u32 cmp_lo = lo + interval;
-    u32 cmp_hi = hi + (cmp_lo < lo ? 1 : 0);
-    mmio_write32(CLINT_MTIMECMP_HI(hart), 0xffffffffu);
-    mmio_write32(CLINT_MTIMECMP_LO(hart), cmp_lo);
-    mmio_write32(CLINT_MTIMECMP_HI(hart), cmp_hi);
-#endif
+        next_tick[hart] += interval;
+        ticks++;
+    } while (next_tick[hart] <= now);
+    sbi_set_timer(next_tick[hart]);
+    return ticks;
 }
