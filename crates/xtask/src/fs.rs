@@ -72,10 +72,10 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
 
 /// The root filesystem of the `xlen` kernel, `opts`' shape: on RV32
 /// [`build`]'s; on RV64 the same files with the programs built for RV64 in
-/// `/bin`, those the RV64 kernel embeds ([`userprogs::build_embedded_for`]:
-/// not `as` and `ld`, which write RV32 code until #157). What the RV64
-/// kernel's tests boot from disk; the RV64 root image `cargo xtask fs`
-/// makes is #156's.
+/// `/bin` ([`userprogs::build_all_for`]: not the
+/// [`userprogs::RV32_ONLY`] ones, `as` and `ld`, which write RV32 code until
+/// #157). What the RV64 kernel's tests boot from disk; the RV64 root image
+/// `cargo xtask fs` makes is #156's.
 pub fn build_for(root: &Path, opts: &Options, xlen: Xlen) -> Result<Vec<u8>, String> {
     build_for_with(root, opts, xlen, CCompiler::Merlin)
 }
@@ -91,7 +91,7 @@ pub fn build_for_with(root: &Path, opts: &Options, xlen: Xlen, cc: CCompiler) ->
     fs.mkdir(DEV)?;
     fs.add_device(&format!("{DEV}/console"), CONSOLE_MAJOR, 0)?;
     fs.mkdir(BIN)?;
-    for prog in userprogs::build_embedded_with(&userprogs::user_dir(root), cc, xlen)? {
+    for prog in userprogs::build_all_for(&userprogs::user_dir(root), cc, xlen)? {
         fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
     }
     Ok(fs.finish())

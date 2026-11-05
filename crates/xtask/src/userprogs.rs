@@ -51,9 +51,11 @@ pub const SCRIPT: &str = "user.ld";
 /// Where a `.S` file finds `<asm.h>` (the repository's `include/`, as the
 /// kernel's and the examples' do), relative to [`USER_DIR`].
 pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
-/// Programs written in RV32 assembly that only the RV32 kernel builds in
-/// (#156 ports them, or #159 drops them with RV32).
-pub const RV32_ONLY: &[&str] = &[];
+/// Programs built for RV32 only: `/bin/as` and `/bin/ld` write RV32
+/// objects and executables until #157, so an RV64 kernel neither embeds them
+/// (nor would it, [`DISK_ONLY`]) nor finds them in an RV64 root
+/// filesystem's `/bin` ([`build_all_for`]). #157 empties it.
+pub const RV32_ONLY: &[&str] = &["as", "ld"];
 
 /// Programs the root image's `/bin` holds but the kernel does not build in:
 /// they read and write files, which a machine without a disk has none of,
@@ -448,8 +450,17 @@ pub fn build_named(dir: &Path, name: &str) -> Result<Program, String> {
 /// Builds every program in `dir`, by name, its C compiled by `cc`; the
 /// runtime and the library once for all of them.
 pub fn build_all_with(dir: &Path, cc: CCompiler) -> Result<Vec<Program>, String> {
-    let progs = programs(dir)?;
-    let rt = build_runtime(dir, cc)?;
+    build_all_for(dir, cc, Xlen::Rv32)
+}
+
+/// [`build_all_with`] for `xlen`: on RV64 every program but the
+/// [`RV32_ONLY`] ones. What a root filesystem's `/bin` holds.
+pub fn build_all_for(dir: &Path, cc: CCompiler, xlen: Xlen) -> Result<Vec<Program>, String> {
+    let progs: Vec<Source> = programs(dir)?
+        .into_iter()
+        .filter(|p| xlen == Xlen::Rv32 || !RV32_ONLY.contains(&p.stem.as_str()))
+        .collect();
+    let rt = build_runtime_for(dir, cc, xlen)?;
     progs
         .iter()
         .map(|prog| link_program(dir, prog, cc, &rt))
@@ -457,8 +468,7 @@ pub fn build_all_with(dir: &Path, cc: CCompiler) -> Result<Vec<Program>, String>
 }
 
 /// The programs of `dir` the `xlen` kernel embeds ([`embedded`]: all but
-/// [`DISK_ONLY`]), by name. On RV64 also not [`RV32_ONLY`], which are RV32
-/// assembly.
+/// [`DISK_ONLY`]), by name. On RV64 also not [`RV32_ONLY`].
 pub fn embedded_for(dir: &Path, xlen: Xlen) -> Result<Vec<Source>, String> {
     Ok(programs(dir)?
         .into_iter()
