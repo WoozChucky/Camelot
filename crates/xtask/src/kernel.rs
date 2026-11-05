@@ -19,8 +19,8 @@
 //! and RV64 exist side by side (#141): the RV32 kernel (`kernel.elf`:
 //! everything at 0x8000_0000, identity mapped) and the RV64 one
 //! (`kernel-rv64.elf`: a higher-half kernel linked at 0xffff_ffff_8000_0000
-//! and loaded at 0x8000_0000, #154). The RV64 kernel has no user programs of its
-//! own yet (#156): its `userprogs.s` is [`crate::userprogs::empty`].
+//! and loaded at 0x8000_0000, #154), which embeds the user programs built for
+//! RV64 (#155, [`crate::userprogs::generated_for`]).
 //!
 //! The reference build ([`Toolchain::Clang`], `cargo xtask kernel --cc
 //! clang`) compiles the C with clang `-O2`, assembles with clang (or
@@ -815,7 +815,8 @@ pub fn build_reference(
 }
 
 /// [`build_reference`] for `xlen`: the RV64 kernel is built with
-/// [`TARGET_FLAGS_RV64`], and has no user programs (#156).
+/// [`TARGET_FLAGS_RV64`], its user programs' C compiled by clang for RV64
+/// too.
 #[allow(clippy::too_many_arguments)]
 pub fn build_reference_for(
     root: &Path,
@@ -838,8 +839,13 @@ pub fn build_reference_for(
             let programs = userprogs::build_all_with(&user, CCompiler::Clang(&asm))?;
             userprogs::generate(&userprogs::embedded(&programs), CCompiler::Clang(&asm))
         }
-        // No RV64 user programs yet (#156).
-        Xlen::Rv64 => userprogs::empty(),
+        Xlen::Rv64 => {
+            let user = userprogs::user_dir(root);
+            let asm = work.join("user");
+            userprogs::compile_clang_for(clang, &user, &asm, verbose, xlen)?;
+            let programs = userprogs::build_embedded_with(&user, CCompiler::Clang(&asm), xlen)?;
+            userprogs::generate_for(&programs, CCompiler::Clang(&asm), xlen)
+        }
     };
     std::fs::write(&progs, text).map_err(|e| format!("cannot write {}: {e}", progs.display()))?;
     Build {

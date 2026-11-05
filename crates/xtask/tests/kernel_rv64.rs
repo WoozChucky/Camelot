@@ -146,6 +146,9 @@ thread_local! {
     /// The kernel the tests on this thread run: the committed one, or a
     /// reference build (`the_rv64_reference_builds_pass_the_same_tests`).
     static UNDER_TEST: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    /// A reference build's clang assembly of the user programs, which its
+    /// bootable disk's /bin holds built (`rv64_bootable_image`).
+    static UNDER_TEST_USER_ASM: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
 }
 
 /// The kernel under test.
@@ -778,7 +781,14 @@ fn rv64_bootable_image(blocks: u32) -> (Vec<u8>, camelot_fs::boot::BootInfo) {
     let root = repo_root();
     let kernel = disk_kernel_under_test();
     let opts = xtask::fs::bootable_layout(blocks, &kernel).unwrap();
-    let mut image = xtask::fs::build_for(&root, &opts, kernel::Xlen::Rv64).unwrap();
+    // A reference kernel checks that /bin holds the programs it embeds: its
+    // own, built from clang's assembly.
+    let asm = UNDER_TEST_USER_ASM.with(|a| a.borrow().clone());
+    let cc = match &asm {
+        Some(dir) => xtask::userprogs::CCompiler::Clang(dir),
+        None => xtask::userprogs::CCompiler::Merlin,
+    };
+    let mut image = xtask::fs::build_for_with(&root, &opts, kernel::Xlen::Rv64, cc).unwrap();
     let boot = xtask::boot::bootloader_rv64(&root).unwrap();
     let info = camelot_fs::boot::install(&mut image, &boot, &kernel).unwrap();
     (image, info)
@@ -823,13 +833,12 @@ fn the_rv64_kernel_boots_from_disk() {
         // the filesystem on it, and their self-tests.
         assert!(out.contains("\nblk self-test: 16/16 passed\n"), "{out}");
         assert!(out.contains("\nfs: disk 0 mounted: "), "{out}");
-        // One more check than without /bin: the programs there.
+        // One more check than without /bin: the programs there ("N
+        // programs, the kernel none" for the disk kernel, "N of the
+        // kernel's N programs" for a reference build, which embeds them).
         let programs = xtask::userprogs::embedded_names(&xtask::userprogs::user_dir(&root)).unwrap();
         assert!(
-            out.contains(&format!(
-                "\nfs: /bin holds {} programs, the kernel ",
-                programs.len()
-            )),
+            out.contains(&format!("\nfs: /bin holds {} ", programs.len())),
             "{out}"
         );
         assert!(out.contains("\nfs self-test: 12/12 passed\n"), "{out}");
@@ -856,8 +865,9 @@ fn the_rv64_kernel_boots_from_disk() {
 }
 
 /// The RV64 reference build (`cargo xtask kernel --cc clang --xlen 64`) into
-/// a scratch directory, with `assembler` for the `.S` files.
-fn reference_build(assembler: Assembler, name: &str) -> Vec<u8> {
+/// a scratch directory, with `assembler` for the `.S` files. Returns the
+/// kernel and the directory of clang's assembly of the user programs.
+fn reference_build(assembler: Assembler, name: &str) -> (Vec<u8>, std::path::PathBuf) {
     let clang = tools::find("clang").expect("clang (the official LLVM install, or on PATH)");
     let lld = tools::find_beside("ld.lld", &clang).expect("ld.lld next to clang");
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -876,7 +886,7 @@ fn reference_build(assembler: Assembler, name: &str) -> Vec<u8> {
         kernel::Xlen::Rv64,
     )
     .unwrap();
-    std::fs::read(out).unwrap()
+    (std::fs::read(out).unwrap(), dir.join("user"))
 }
 
 #[test]
@@ -886,8 +896,9 @@ fn the_rv64_reference_builds_pass_the_same_tests() {
     // every test above but the one that compares the committed kernel with
     // merlin's build, on this thread's kernel under test.
     for (assembler, name) in [(Assembler::Clang, "clang"), (Assembler::Merlin, "merlin-as")] {
-        let elf = reference_build(assembler, name);
+        let (elf, user_asm) = reference_build(assembler, name);
         assert_ne!(elf, committed(), "{name}: the reference build is merlin's");
+        UNDER_TEST_USER_ASM.with(|a| *a.borrow_mut() = Some(user_asm));
         UNDER_TEST.with(|u| *u.borrow_mut() = Some(elf));
         MODE.set(SV48);
         the_rv64_kernel_falls_back_to_sv39();

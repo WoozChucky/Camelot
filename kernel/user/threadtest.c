@@ -92,7 +92,7 @@ static int joined(int tid) {
 /* ---- Creating, ending and joining ---- */
 
 static int returns_arg(void *arg) {
-    return (int)(uint)arg;
+    return (int)(uintptr_t)arg;
 }
 
 /* thread_exit from a few calls down: the innermost call ends the thread. */
@@ -132,7 +132,7 @@ static int raw_sp_ok;
 
 static void raw_entry(void *arg) {
     char here;
-    raw_arg = (int)(uint)arg;
+    raw_arg = (int)(uintptr_t)arg;
     /* Its frame is just below the stack it was given. */
     uintptr_t sp = (uintptr_t)&here;
     raw_sp_ok = sp < (uintptr_t)(stacks[1] + STACK_SIZE) && sp > (uintptr_t)stacks[1];
@@ -327,7 +327,7 @@ static int counter;
 static int spun;
 
 static int adds(void *arg) {
-    int n = (int)(uint)arg;
+    int n = (int)(uintptr_t)arg;
     for (int i = 0; i < n; i++) {
         mutex_lock(&lock);
         counter = counter + 1;
@@ -354,7 +354,7 @@ static int waits_at_gate(void *arg) {
  * keeps the threads out of each other's way. 0 if every block held its
  * bytes. */
 static int mallocs(void *arg) {
-    int me = (int)(uint)arg;
+    int me = (int)(uintptr_t)arg;
     for (int round = 0; round < 20; round++) {
         uchar *blocks[4];
         for (int i = 0; i < 4; i++) {
@@ -423,7 +423,7 @@ static void test_locks(void) {
     check_eq(spun, 600, "the spinlock keeps every addition");
 
     for (int i = 0; i < 3; i++) {
-        tids[i] = start(mallocs, (void *)(uint)i, i);
+        tids[i] = start(mallocs, (void *)(uintptr_t)i, i);
     }
     for (int i = 0; i < 3; i++) {
         check_eq(joined(tids[i]), 0, "malloc from three threads at once");
@@ -483,7 +483,7 @@ static int waits_forever(void *arg) {
 }
 
 static int joins(void *arg) {
-    return joined((int)(uint)arg);
+    return joined((int)(uintptr_t)arg);
 }
 
 static int spins(void *arg) {
@@ -502,7 +502,7 @@ static int faults(void *arg) {
 }
 
 static int ends_last(void *arg) {
-    int main_tid = (int)(uint)arg;
+    int main_tid = (int)(uintptr_t)arg;
     /* The main thread has ended (or will): joining it gets its status. */
     int status = joined(main_tid);
     return status == 0 ? 9 : 100;
@@ -795,7 +795,7 @@ static int child(int argc, char **argv) {
     if (strcmp(mode, "live") == 0) {
         int a = start(waits_forever, NULL, 0);
         start(sleeps, NULL, 1);
-        start(joins, (void *)(uint)a, 2);
+        start(joins, (void *)(uintptr_t)a, 2);
         start(spins, NULL, 3);
         sleep(2);
         exit(7);
@@ -804,13 +804,13 @@ static int child(int argc, char **argv) {
         /* No thread in sleep(), which wakes on every tick and would see the
          * kill by itself: kill must wake the futex and join waiters. */
         int a = start(waits_forever, NULL, 0);
-        start(joins, (void *)(uint)a, 1);
+        start(joins, (void *)(uintptr_t)a, 1);
         for (;;) {
             futex_wait(&forever, 0);
         }
     }
     if (strcmp(mode, "last") == 0) {
-        start(ends_last, (void *)(uint)gettid(), 0);
+        start(ends_last, (void *)(uintptr_t)gettid(), 0);
         thread_exit(0);
     }
     if (strcmp(mode, "exec") == 0) {

@@ -127,8 +127,8 @@ extern uintptr satp_mode;
  *
  * RV64: the upper half of the address space is the kernel's, laid out as
  * Linux's riscv64 kernel lays it out (Documentation/arch/riscv/vm-layout.rst;
- * root entries 256-511 in Sv48, which every process's root table copies,
- * #155). From the top:
+ * root entries 256-511, which every process's root table copies,
+ * uvm_create()). From the top:
  *
  *   KERNEL_LINK_ADDR  0xffff_ffff_8000_0000  the kernel image (kernel.lds.S),
  *                                            the top 2 GiB, in both modes

@@ -3846,6 +3846,54 @@ fn the_system_call_document_matches_the_code() {
             "{name}: {returns}"
         );
     }
+    // The structures' sizes on each width (## Structures): what user.h and
+    // the kernel's headers make of them, compiled by merlin for RV32 (ILP32)
+    // and RV64 (LP64), each size a _Static_assert.
+    let at = doc.find("\n## Structures\n").expect("no ## Structures");
+    let section = &doc[at + 1..];
+    let section = &section[..section[3..].find("\n## ").unwrap() + 3];
+    let sizes: Vec<(&str, u32, u32)> = section
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let name = cells.get(1)?.strip_prefix('`')?.strip_suffix('`')?;
+            Some((name, cells.get(2)?.parse().ok()?, cells.get(3)?.parse().ok()?))
+        })
+        .collect();
+    assert_eq!(sizes.len(), 9, "{sizes:?}");
+    for (xlen, wide) in [
+        (merlin::types::Xlen::Rv32, false),
+        (merlin::types::Xlen::Rv64, true),
+    ] {
+        for (dir, include, headers) in [
+            ("kernel/user", None, "#include \"user.h\"\n"),
+            (
+                "kernel",
+                Some("include"),
+                "#include \"syscall.h\"\n#include \"fs.h\"\n",
+            ),
+        ] {
+            let mut src = headers.to_string();
+            for (name, rv32, rv64) in &sizes {
+                let size = if wide { rv64 } else { rv32 };
+                src.push_str(&format!(
+                    "_Static_assert(sizeof({name}) == {size}, \"{name} is {size} bytes\");\n"
+                ));
+            }
+            let opts = merlin::Options {
+                include_dirs: include.into_iter().map(PathBuf::from).collect(),
+                xlen,
+                ..merlin::Options::default()
+            };
+            let base = repo_root().join(dir);
+            let load = |p: &std::path::Path| std::fs::read_to_string(base.join(p)).ok();
+            if let Err(errors) = merlin::compile_with("sizes.c", &src, &opts, &load) {
+                let errors: Vec<String> = errors.iter().map(|e| e.render("sizes.c")).collect();
+                panic!("{dir} on {xlen:?}: {}", errors.join("\n"));
+            }
+        }
+    }
+
     // And the limits.
     for limit in ["MAXARG", "ARG_MAX", "MAXPATH"] {
         let want = defines(&header, limit);

@@ -356,11 +356,11 @@ turns interrupts on under a `push_off()` before its `pop_off()`.
 
 ## RV64: a higher-half kernel (#154)
 
-The same sources build an RV64 kernel too, `kernel-rv64.elf` (and
-`kernel-disk-rv64.elf`, the same kernel for now: there are no RV64 user
-programs to build in until #156), with merlin's LP64 code and the same
+The same sources build an RV64 kernel too, `kernel-rv64.elf` (with the user
+programs built for RV64 in it) and `kernel-disk-rv64.elf` (without them, for
+a bootable disk), with merlin's LP64 code and the same
 linker script, `kernel.lds.S`, preprocessed for RV64. It runs as Linux's riscv64 kernel does (spec section 10,
-"The RV64 kernel"):
+"The RV64 kernel" and "RV64 processes"):
 
 ```
 grail kernel/kernel-rv64.elf                     # Sv48, the default hart
@@ -386,8 +386,15 @@ grail --paging sv39 --harts 4 kernel/kernel-rv64.elf
   `NR_CACHED_STACKS`); the others are unmapped and their pages freed where
   no lock is held (`kstack_reclaim()`).
 - The boot runs every self-test, on 1 to 8 harts, from the ROM or from a
-  disk (`boot/boot.S` builds `boot-rv64.elf` too), and ends with `user
-  space: not on RV64 yet` and the failure count as the exit code.
+  disk (`boot/boot.S` builds `boot-rv64.elf` too), then the shell, a 64-bit
+  program, as the first process.
+- User space is the lower half (#155): below `USER_TOP`, 2^47 in Sv48 and
+  2^38 in Sv39, Linux's `TASK_SIZE`, with the stack under it and the
+  program at 0x1000. Every process's root table copies the kernel's
+  entries 256-511; user leaves have A, and D if writable, from the start.
+  The programs are ELF64; the system calls the LP64 ABI at Linux's widths
+  (`docs/camelot-syscalls.md`): 64-bit user addresses, `size_t`, `ssize_t`
+  and `off_t`, a `long` result sign-extended in `a0`.
 
 ```
 ...
@@ -397,14 +404,19 @@ vm self-test: 26/26 passed
 kstack self-test: 3/3 passed
 smp: 4 harts running
 kstack: 880 of 16384 bytes used at most
-user space: not on RV64 yet
+Type help for the list of commands.
+$ ps
+  PID  PPID STATE      SIZE NAME
+   33     0 sleep     40960 sh
+   36    33 run       20480 ps
 ```
 
 `cargo xtask kernel` builds both widths; `--xlen 64` builds the RV64 one
 alone, and `--cc clang --xlen 64` its reference build (clang
 `--target=riscv64-unknown-elf -march=rv64ima_zicsr -mabi=lp64
 -mcmodel=medany`, in `target/kernel/clang/rv64`). Its tests are
-`crates/xtask/tests/kernel_rv64.rs`.
+`crates/xtask/tests/kernel_rv64.rs`, and its processes'
+`crates/xtask/tests/processes_rv64.rs`.
 
 ## Locking
 

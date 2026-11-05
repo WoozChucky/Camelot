@@ -34,7 +34,6 @@
 //! width, and a `.S` file is preprocessed for it first (`#if __riscv_xlen`),
 //! as the kernel's are; a `.s` file is the same text for both.
 
-use crate::kernel::TARGET_FLAGS;
 use crate::toolchain::{self, Xlen};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -80,7 +79,7 @@ pub fn embedded_names(dir: &Path) -> Result<Vec<String>, String> {
 pub const MAX_NAME: usize = 15;
 
 /// clang's flags for the user C files in the reference build, after
-/// [`TARGET_FLAGS`]: like the kernel's (freestanding, no libc headers, no
+/// the target's (`crate::kernel::target_flags`): like the kernel's (freestanding, no libc headers, no
 /// hidden runtime, nothing that records the clang version), with `user.h`
 /// from the same directory. `-S`: the output is assembly, for merlin-as.
 pub const C_FLAGS: &[&str] = &[
@@ -454,19 +453,30 @@ pub fn build_all_with(dir: &Path, cc: CCompiler) -> Result<Vec<Program>, String>
         .collect()
 }
 
-/// Builds the programs of `dir` the `xlen` kernel embeds ([`embedded`]: all
-/// but [`DISK_ONLY`]), by name, with our own tools. On RV64 also not
-/// [`RV32_ONLY`], which are RV32 assembly.
-pub fn build_embedded_for(dir: &Path, xlen: Xlen) -> Result<Vec<Program>, String> {
-    let progs: Vec<Source> = programs(dir)?
+/// The programs of `dir` the `xlen` kernel embeds ([`embedded`]: all but
+/// [`DISK_ONLY`]), by name. On RV64 also not [`RV32_ONLY`], which are RV32
+/// assembly.
+pub fn embedded_for(dir: &Path, xlen: Xlen) -> Result<Vec<Source>, String> {
+    Ok(programs(dir)?
         .into_iter()
         .filter(|p| !DISK_ONLY.contains(&p.stem.as_str()))
         .filter(|p| xlen == Xlen::Rv32 || !RV32_ONLY.contains(&p.stem.as_str()))
-        .collect();
-    let rt = build_runtime_for(dir, CCompiler::Merlin, xlen)?;
+        .collect())
+}
+
+/// Builds the programs the `xlen` kernel embeds ([`embedded_for`]) with our
+/// own tools.
+pub fn build_embedded_for(dir: &Path, xlen: Xlen) -> Result<Vec<Program>, String> {
+    build_embedded_with(dir, CCompiler::Merlin, xlen)
+}
+
+/// [`build_embedded_for`], their C compiled by `cc`.
+pub fn build_embedded_with(dir: &Path, cc: CCompiler, xlen: Xlen) -> Result<Vec<Program>, String> {
+    let progs = embedded_for(dir, xlen)?;
+    let rt = build_runtime_for(dir, cc, xlen)?;
     progs
         .iter()
-        .map(|prog| link_program(dir, prog, CCompiler::Merlin, &rt))
+        .map(|prog| link_program(dir, prog, cc, &rt))
         .collect()
 }
 
@@ -489,16 +499,24 @@ pub fn build_all(dir: &Path) -> Result<Vec<Program>, String> {
     build_all_with(dir, CCompiler::Merlin)
 }
 
-/// clang's arguments for `src` (run in [`USER_DIR`]), writing to `out`.
+/// clang's arguments for `src` (run in [`USER_DIR`]), writing to `out`, for
+/// RV32.
 pub fn clang_args(src: &Source, out: &Path) -> Vec<String> {
+    clang_args_for(src, out, Xlen::Rv32)
+}
+
+/// [`clang_args`] for `xlen`: `--target=riscv64-unknown-elf -mabi=lp64` on
+/// RV64 (`crate::kernel::target_flags`).
+pub fn clang_args_for(src: &Source, out: &Path, xlen: Xlen) -> Vec<String> {
     // merlin-as assembles what clang writes, and its .attribute arch must
     // name merlin-as's ISA, which has Zifencei: the kernel's flags leave it
     // out (clang compiles the kernel's C to objects itself), these name it.
-    let mut args: Vec<String> = TARGET_FLAGS
+    let mut args: Vec<String> = crate::kernel::target_flags(xlen)
         .iter()
         .chain(C_FLAGS)
         .map(|s| match *s {
             "-march=rv32ima_zicsr" => "-march=rv32ima_zicsr_zifencei".to_string(),
+            "-march=rv64ima_zicsr" => "-march=rv64ima_zicsr_zifencei".to_string(),
             s => s.to_string(),
         })
         .collect();
@@ -514,18 +532,35 @@ pub fn clang_args(src: &Source, out: &Path) -> Vec<String> {
 /// relative names, so the output doesn't depend on where the repository
 /// is.
 pub fn compile_clang(clang: &Path, dir: &Path, out: &Path, verbose: bool) -> Result<(), String> {
+    compile_clang_for(clang, dir, out, verbose, Xlen::Rv32)
+}
+
+/// [`compile_clang`] for `xlen`. On RV64 only for the programs the RV64
+/// kernel embeds ([`embedded_for`]): /bin/as and /bin/ld are RV32 programs
+/// until #157.
+pub fn compile_clang_for(
+    clang: &Path,
+    dir: &Path,
+    out: &Path,
+    verbose: bool,
+    xlen: Xlen,
+) -> Result<(), String> {
     std::fs::create_dir_all(out.join(LIB_DIR))
         .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
     let out = std::path::absolute(out).map_err(|e| format!("bad path {}: {e}", out.display()))?;
     let mut all: Vec<Source> = sources(dir)?.into_iter().chain(library(dir)?).collect();
-    for prog in programs(dir)?.iter().filter(|p| p.lang == Lang::Dir) {
+    let dirs: Vec<Source> = match xlen {
+        Xlen::Rv32 => programs(dir)?,
+        Xlen::Rv64 => embedded_for(dir, xlen)?,
+    };
+    for prog in dirs.iter().filter(|p| p.lang == Lang::Dir) {
         std::fs::create_dir_all(out.join(&prog.stem))
             .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
         all.extend(prog.parts(dir)?);
     }
     for src in all.iter().filter(|s| s.lang == Lang::C) {
         let src = src.clone();
-        let args = clang_args(&src, &out.join(format!("{}.s", src.stem)));
+        let args = clang_args_for(&src, &out.join(format!("{}.s", src.stem)), xlen);
         if verbose {
             eprintln!("{} {}", clang.display(), args.join(" "));
         }

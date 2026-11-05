@@ -77,15 +77,21 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
 /// kernel's tests boot from disk; the RV64 root image `cargo xtask fs`
 /// makes is #156's.
 pub fn build_for(root: &Path, opts: &Options, xlen: Xlen) -> Result<Vec<u8>, String> {
+    build_for_with(root, opts, xlen, CCompiler::Merlin)
+}
+
+/// [`build_for`], with the programs' C compiled by `cc`: for a reference
+/// kernel, which checks that `/bin` holds the programs it embeds.
+pub fn build_for_with(root: &Path, opts: &Options, xlen: Xlen, cc: CCompiler) -> Result<Vec<u8>, String> {
     if xlen == Xlen::Rv32 {
-        return build(root, opts);
+        return build_with(root, opts, cc);
     }
     let mut fs = Mkfs::new(opts)?;
     fs.add_host_dir(&root.join(ROOT_DIR), "/")?;
     fs.mkdir(DEV)?;
     fs.add_device(&format!("{DEV}/console"), CONSOLE_MAJOR, 0)?;
     fs.mkdir(BIN)?;
-    for prog in userprogs::build_embedded_for(&userprogs::user_dir(root), xlen)? {
+    for prog in userprogs::build_embedded_with(&userprogs::user_dir(root), cc, xlen)? {
         fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
     }
     Ok(fs.finish())
