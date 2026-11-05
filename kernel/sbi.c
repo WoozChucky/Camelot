@@ -64,7 +64,15 @@ void sbi_set_timer(u64 stime) {
 }
 
 long sbi_send_ipi(uintptr mask, uintptr base) {
-    return sbi_ecall(SBI_EXT_IPI, SBI_IPI_SEND_IPI, mask, base, 0, 0, 0, 0).error;
+    struct sbiret r = sbi_ecall(SBI_EXT_IPI, SBI_IPI_SEND_IPI, mask, base, 0, 0, 0, 0);
+    if (r.error != SBI_SUCCESS) {
+        /* Linux's __sbi_send_ipi_v02() message, pr_err("%s: hbase = [%lu]
+         * hmask = [0x%lx] failed (error [%d])\n", __func__, ...). Linux
+         * prints the errno it maps the error to; Camelot's kernel has no
+         * errno for most SBI errors, so here it is the SBI error itself. */
+        kprintf("sbi_send_ipi: hbase = [%lu] hmask = [0x%lx] failed (error [%ld])\n", base, mask, r.error);
+    }
+    return r.error;
 }
 
 long sbi_hart_start(uintptr hartid, phys_addr_t start, uintptr opaque) {
@@ -105,11 +113,12 @@ long sbi_system_reset(u32 type, u32 reason) {
     return sbi_ecall(SBI_EXT_SRST, SBI_SRST_RESET, type, reason, 0, 0, 0, 0).error;
 }
 
-/* A reset that, if it returns at all, failed: said so, as Linux's
- * sbi_srst_reset() does. */
+/* A reset that, if it returns at all, failed: said so in the words of
+ * Linux's sbi_srst_reset(), pr_warn("%s: type=0x%lx reason=0x%lx failed\n",
+ * __func__, type, reason). */
 static void sbi_srst_reset(u32 type, u32 reason) {
-    long err = sbi_system_reset(type, reason);
-    kprintf("sbi: system_reset type 0x%x reason 0x%x failed (%s)\n", type, reason, sbi_strerror(err));
+    sbi_system_reset(type, reason);
+    kprintf("sbi_srst_reset: type=0x%x reason=0x%x failed\n", type, reason);
 }
 
 void machine_power_off(u32 code) {

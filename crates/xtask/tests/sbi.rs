@@ -4,14 +4,16 @@
 //! (kernel/kernel.elf, RV32, and kernel/kernel-rv64.elf, RV64), with each
 //! call's results and errors, and every register but a0 and a1 kept. Then
 //! the kernel's own side: the exit codes machine_power_off() gives, and its
-//! warning and fallback when a reason is refused; a hart that hart_start
-//! can't start and one that never comes online, both reported and left
-//! out, one that comes online too late, which stops itself, and a trap on a
-//! hart that is starting, which stops the machine (on RV64 through a trap
-//! vector that needs no stack until the hart's stack is mapped); and, over
-//! whole boots, that every IPI store comes after a fence that orders the stores before it (#170), that every msip
-//! clear comes before a fence that orders it before the loads after it, and
-//! that S-mode never touches the CLINT or the SBI's scratch blocks.
+//! warning and fallback when a reason is refused; sbi_send_ipi()'s report
+//! of a failed call; a hart that hart_start can't start and one that never
+//! comes online, both reported and left out, one that comes online too
+//! late, which stops itself, and a trap on a hart that is starting, which
+//! stops the machine (on RV64 through a trap vector that needs no stack
+//! until the hart's stack is mapped); and, over whole boots, that every IPI
+//! store comes after a fence that orders the stores before it (#170), that
+//! every msip clear comes before a fence that orders it before the loads
+//! after it, and that S-mode never touches the CLINT or the SBI's scratch
+//! blocks.
 
 mod common;
 
@@ -632,9 +634,39 @@ fn machine_power_off_says_so_and_falls_back_when_the_reason_is_refused() {
         );
         assert_eq!(reasons, [0xe000_0007, 1], "{xlen:?}");
         assert!(
-            out.ends_with("\nsbi: system_reset type 0x0 reason 0xe0000007 failed (SBI_ERR_INVALID_PARAM)\n"),
+            out.ends_with("\nsbi_srst_reset: type=0x0 reason=0xe0000007 failed\n"),
             "{xlen:?}:\n{out}"
         );
+    }
+}
+
+#[test]
+fn sbi_send_ipi_says_when_the_call_fails() {
+    // The kernel's sbi_send_ipi(), called from kmain: to hart 0 it succeeds
+    // and says nothing; to hart 4, which the machine doesn't have, it
+    // returns SBI_ERR_INVALID_PARAM and says so in the words of Linux's
+    // __sbi_send_ipi_v02().
+    for xlen in WIDTHS {
+        let mut s = Sbi::at_kmain(xlen, 4);
+        let (send_ipi, kmain) = (s.sym("sbi_send_ipi"), s.kmain);
+        for (mask, error, said) in [
+            (1, 0, ""),
+            (
+                0x10,
+                ERR_INVALID_PARAM,
+                "sbi_send_ipi: hbase = [0] hmask = [0x10] failed (error [-3])\n",
+            ),
+        ] {
+            let printed = s.printed().len();
+            let h = s.m.cpu.hart_mut(0);
+            h.set_reg(1, kmain);
+            h.set_reg(10, mask);
+            h.set_reg(11, 0);
+            h.pc = send_ipi;
+            s.step_until(|m| m.cpu.hart(0).pc == kmain);
+            assert_eq!(s.m.cpu.hart(0).x[10] as i64, error, "{xlen:?} {mask:#x}");
+            assert_eq!(&s.printed()[printed..], said, "{xlen:?} {mask:#x}");
+        }
     }
 }
 

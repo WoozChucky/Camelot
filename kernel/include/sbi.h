@@ -141,7 +141,9 @@ void sbi_init(void);
 void sbi_set_timer(u64 stime);
 
 /* IPI: a supervisor software interrupt to hart `base` + i for every bit i
- * set in `mask`. Returns the SBI error. */
+ * set in `mask`. Returns the SBI error, and says a failure on the console
+ * as Linux's __sbi_send_ipi_v02() does (`sbi_send_ipi: hbase = [0] hmask =
+ * [0x10] failed (error [-3])`, the error the SBI's), so callers needn't. */
 long sbi_send_ipi(uintptr mask, uintptr base);
 
 /* HSM: starts hart `hartid` in S-mode at physical address `start` with
@@ -170,9 +172,9 @@ long sbi_system_reset(u32 type, u32 reason);
  * for PANIC_EXIT_CODE, and Camelot's SBI's own 0xE000_0000 | code for any
  * other code (its low 28 bits). An SBI that refuses that reason (OpenSBI
  * takes only the standard two) gets "system failure" instead, as any code
- * but 0 is one; each refusal is said on the console first (`sbi:
- * system_reset type 0x0 reason 0xe0000007 failed (SBI_ERR_INVALID_PARAM)`),
- * as Linux's sbi_srst_reset() warns. Never returns: if the SBI cannot shut
+ * but 0 is one; each refusal is said on the console first in the
+ * words of Linux's sbi_srst_reset() warning (`sbi_srst_reset: type=0x0
+ * reason=0xe0000007 failed`). Never returns: if the SBI cannot shut
  * down, the hart waits for good. */
 void machine_power_off(u32 code);
 
