@@ -196,6 +196,13 @@ fn plain(path: &str) -> String {
 /// A diagnostic's line as the table writes it: without `t.c:`, a header's
 /// path plain.
 fn table_line(line: &str) -> String {
+    // A line of no place (`fatal error: too many errors emitted...`).
+    if ["error: ", "fatal error: ", "warning: ", "note: "]
+        .iter()
+        .any(|k| line.starts_with(k))
+    {
+        return line.to_string();
+    }
     match line.strip_prefix("t.c:") {
         Some(rest) => rest.to_string(),
         None => match line.split_once(':') {
@@ -299,7 +306,7 @@ fn diagnostics(stderr: &str) -> Vec<(String, Vec<String>)> {
         let line = table_line(line.trim_end_matches('\r'));
         let Some(kind) = ["error", "fatal error", "warning", "note"]
             .into_iter()
-            .find(|k| line.contains(&format!(": {k}: ")))
+            .find(|k| line.contains(&format!(": {k}: ")) || line.starts_with(&format!("{k}: ")))
         else {
             continue;
         };

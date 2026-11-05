@@ -68,6 +68,20 @@ pub struct Written {
     pub int_literals: std::collections::HashSet<Pos>,
     /// Where each character constant is (`'a'`, clang's `CharacterLiteral`).
     pub char_literals: std::collections::HashSet<Pos>,
+    /// Of each name read as an expression that nothing declares, the one
+    /// clang's typo correction takes it for, if there is one
+    /// (`crate::parser::correction`): where the name is, by where the
+    /// typo is.
+    pub corrections: std::collections::HashMap<Pos, Correction>,
+}
+
+/// What clang takes a misspelt name for: a name in scope, where it is
+/// declared, and its value if it is an enumeration constant.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Correction {
+    pub name: String,
+    pub pos: Pos,
+    pub enumerator: Option<(i128, crate::types::Spelled)>,
 }
 
 /// An expression the parser needed no value of, for sema to check without

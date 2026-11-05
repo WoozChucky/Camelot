@@ -158,6 +158,16 @@ impl Error {
         }
     }
 
+    /// A diagnostic of no place, which clang prints with no file name
+    /// (`fatal error: too many errors emitted, stopping now`).
+    pub fn unplaced(self) -> Self {
+        Error {
+            pos: Pos::default(),
+            file: Some(String::new()),
+            ..self
+        }
+    }
+
     /// The error, with clang's flag `flag`: one of the warnings clang makes
     /// an error by default.
     pub fn flagged(self, flag: &'static str) -> Self {
@@ -203,6 +213,9 @@ impl Error {
         let flag = self.flag.map(|f| format!(" [-W{f}]")).unwrap_or_default();
         if self.pos.line > 0 {
             format!("{file}:{}: {what}: {}{flag}", self.pos, self.msg)
+        } else if file.is_empty() {
+            // Of no file at all ([`Error::unplaced`]).
+            format!("{what}: {}{flag}", self.msg)
         } else {
             format!("{file}: {what}: {}{flag}", self.msg)
         }
@@ -368,7 +381,7 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
         }
     };
     let read = in_clangs_order(lexed, parsed);
-    let diagnostics = pp.merge(in_clangs_order(read, checked));
+    let diagnostics = error_limit(pp.merge(in_clangs_order(read, checked)));
     match prog {
         Some(mut prog) if diagnostics.iter().all(Error::is_warning) => {
             prog.warnings = diagnostics;
@@ -376,6 +389,29 @@ fn check(pp: &preprocess::Output, xlen: types::Xlen) -> Result<ast::Program, Vec
         }
         _ => Err(diagnostics),
     }
+}
+
+/// How many errors clang gives before it stops (`-ferror-limit=20`): the
+/// one that would be the 20th is its fatal error instead.
+const ERROR_LIMIT: usize = 20;
+
+/// The diagnostics up to clang's error limit ([`ERROR_LIMIT`]), and its
+/// fatal error there if they reach it.
+fn error_limit(diagnostics: Vec<Error>) -> Vec<Error> {
+    let mut errors = 0;
+    let mut out = Vec::with_capacity(diagnostics.len());
+    for d in diagnostics {
+        if !d.is_warning() {
+            errors += 1;
+            if errors == ERROR_LIMIT {
+                let msg = "too many errors emitted, stopping now [-ferror-limit=]";
+                out.push(Error::fatal(Pos::default(), msg).unplaced());
+                break;
+            }
+        }
+        out.push(d);
+    }
+    out
 }
 
 /// The diagnostics of the lexer and those of the parser and sema, in the

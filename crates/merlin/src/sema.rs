@@ -3518,7 +3518,32 @@ impl<'a> FnChecker<'a> {
                         *var = Some(VarRef::Global(name.clone()));
                         Type::Func(Box::new(sig.ty.clone()))
                     }
-                    None => return Err(self.err(pos, format!("use of undeclared identifier '{name}'"))),
+                    None => match self.written.corrections.get(&pos).cloned() {
+                        // clang's typo correction: the name taken for one in
+                        // scope, which the expression then is.
+                        Some(c) => {
+                            let msg = format!(
+                                "use of undeclared identifier '{name}'; did you mean '{}'?",
+                                c.name
+                            );
+                            let note = format!("'{}' declared here", c.name);
+                            self.errors.push(Error::new(pos, msg).note(c.pos, note));
+                            e.kind = match c.enumerator {
+                                Some((value, of)) => ExprKind::Enumerator {
+                                    name: c.name,
+                                    value,
+                                    of,
+                                },
+                                None => ExprKind::Var {
+                                    name: c.name,
+                                    var: None,
+                                },
+                            };
+                            e.ty = Type::INT;
+                            return self.expr(e);
+                        }
+                        None => return Err(self.err(pos, format!("use of undeclared identifier '{name}'"))),
+                    },
                 },
             },
             // clang reports what is wrong with an assignment at its operator.
@@ -3858,8 +3883,14 @@ impl<'a> FnChecker<'a> {
                             "call to undeclared function '{name}'; ISO C99 and later do not support \
                              implicit function declarations"
                         );
-                        self.errors
-                            .push(Error::new(pos, msg).flagged("implicit-function-declaration"));
+                        let mut e = Error::new(pos, msg).flagged("implicit-function-declaration");
+                        // clang's typo correction, in notes.
+                        if let Some(c) = self.written.corrections.get(&callee.pos) {
+                            e = e
+                                .note(callee.pos, format!("did you mean '{}'?", c.name))
+                                .note(c.pos, format!("'{}' declared here", c.name));
+                        }
+                        self.errors.push(e);
                         return Err(Reported);
                     }
                 }

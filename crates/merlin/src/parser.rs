@@ -173,6 +173,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         bit_patterns: RefCell::new(Default::default()),
         int_literals: RefCell::new(Default::default()),
         char_literals: RefCell::new(Default::default()),
+        corrections: RefCell::new(Default::default()),
         trailing_else: Cell::new(None),
         warnings: RefCell::new(Vec::new()),
     };
@@ -217,6 +218,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
                     bit_patterns: p.bit_patterns.take(),
                     int_literals: p.int_literals.take(),
                     char_literals: p.char_literals.take(),
+                    corrections: p.corrections.take(),
                     ..Written::default()
                 },
             };
@@ -234,9 +236,63 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
             bit_patterns: p.bit_patterns.take(),
             int_literals: p.int_literals.take(),
             char_literals: p.char_literals.take(),
+            corrections: p.corrections.take(),
             ..Written::default()
         },
     })
+}
+
+/// clang's typo correction (`Sema::CorrectTypo`) of `typo` among the
+/// `candidates` (names, and what goes with each): the one closest to it by
+/// edit distance (Levenshtein's: insertions, deletions, replacements),
+/// none if two are as close. A name is a candidate only if the lengths
+/// differ by less than a third of the typo's (`typo.len() / diff >= 3`)
+/// and the distance is at most a third of it, rounded up; and the best is
+/// taken only if the typo is three times as long as the distance or more.
+pub fn correction<'n, T>(
+    typo: &str,
+    candidates: impl IntoIterator<Item = (&'n str, T)>,
+) -> Option<(&'n str, T)> {
+    let len = typo.chars().count();
+    let bound = len.div_ceil(3);
+    let mut best: Option<(usize, &'n str, T)> = None;
+    let mut tied = false;
+    for (name, what) in candidates {
+        let diff = len.abs_diff(name.chars().count());
+        if diff > 0 && len / diff < 3 {
+            continue;
+        }
+        let d = edit_distance(typo, name);
+        if d > bound || d == 0 {
+            continue;
+        }
+        match &best {
+            Some((b, ..)) if d > *b => {}
+            Some((b, ..)) if d == *b => tied = true,
+            _ => {
+                best = Some((d, name, what));
+                tied = false;
+            }
+        }
+    }
+    let (d, name, what) = best?;
+    (!tied && len / d >= 3).then_some((name, what))
+}
+
+/// Levenshtein's distance of `a` and `b`, in characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for j in 0..b.len() {
+            let here = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != b[j])).min(row[j] + 1).min(here + 1);
+            prev = here;
+        }
+    }
+    row[b.len()]
 }
 
 fn binop(t: &Tok) -> Option<(BinOp, u8)> {
@@ -643,6 +699,8 @@ struct Parser<'a> {
     int_literals: RefCell<std::collections::HashSet<Pos>>,
     /// Where the character constants are ([`Written::char_literals`]).
     char_literals: RefCell<std::collections::HashSet<Pos>>,
+    /// Typo corrections ([`Written::corrections`]).
+    corrections: RefCell<HashMap<Pos, Correction>>,
     /// The `else` of the `if` the statement just parsed ends with, through
     /// loops and labels, not braces: an `if` without one of its own around
     /// it is clang's dangling `else` (its `TrailingElseLoc`).
@@ -732,6 +790,73 @@ impl Parser<'_> {
     }
 
     // ---- scopes ----
+
+    /// What clang's typo correction takes the undeclared `typo`, read as
+    /// an expression, for: a variable, function or enumeration constant in
+    /// scope ([`correction`]).
+    fn correct_expr(&self, typo: &str) -> Option<Correction> {
+        let mut seen = std::collections::HashSet::new();
+        let candidates = self
+            .scopes
+            .iter()
+            .rev()
+            .flat_map(|s| &s.names)
+            .filter_map(|(n, (what, at))| {
+                if !seen.insert(n.as_str()) {
+                    return None;
+                }
+                match what {
+                    Name::Typedef(..) => None,
+                    Name::EnumConst(v, of) => Some((n.as_str(), (*at, Some((*v, of.clone()))))),
+                    Name::Object(_) => Some((n.as_str(), (*at, None))),
+                }
+            });
+        let (name, (pos, enumerator)) = correction(typo, candidates)?;
+        Some(Correction {
+            name: name.to_string(),
+            pos,
+            enumerator,
+        })
+    }
+
+    /// What clang's typo correction takes the unknown type name `typo` for:
+    /// a typedef name in scope (where it is declared), or a keyword of a
+    /// type specifier or qualifier ([`correction`]).
+    fn correct_type(&self, typo: &str) -> Option<(String, Option<Pos>)> {
+        const KEYWORDS: [&str; 18] = [
+            "char",
+            "const",
+            "double",
+            "enum",
+            "float",
+            "int",
+            "long",
+            "short",
+            "signed",
+            "struct",
+            "union",
+            "unsigned",
+            "void",
+            "volatile",
+            "_Complex",
+            "_Imaginary",
+            "_Bool",
+            "restrict",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        let typedefs = self
+            .scopes
+            .iter()
+            .rev()
+            .flat_map(|s| &s.names)
+            .filter_map(|(n, (what, at))| {
+                (seen.insert(n.as_str()) && matches!(what, Name::Typedef(..)))
+                    .then_some((n.as_str(), Some(*at)))
+            });
+        let keywords = KEYWORDS.iter().map(|k| (*k, None));
+        let (name, decl) = correction(typo, typedefs.chain(keywords))?;
+        Some((name.to_string(), decl))
+    }
 
     fn lookup_name(&self, name: &str) -> Option<&Name> {
         self.scopes
@@ -2641,7 +2766,19 @@ impl Parser<'_> {
                 let msg = "type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int";
                 Error::new(self.here(), msg).flagged("implicit-int")
             }
-            Tok::Ident(name) => Error::new(self.here(), format!("unknown type name '{name}'")),
+            Tok::Ident(name) => {
+                let (at, name) = (self.here(), name.clone());
+                match self.correct_type(&name) {
+                    Some((to, decl)) => {
+                        let e = Error::new(at, format!("unknown type name '{name}'; did you mean '{to}'?"));
+                        match decl {
+                            Some(decl) => e.note(decl, format!("'{to}' declared here")),
+                            None => e,
+                        }
+                    }
+                    None => Error::new(at, format!("unknown type name '{name}'")),
+                }
+            }
             _ => self.expected("identifier or '('"),
         }
     }
@@ -3527,6 +3664,9 @@ impl Parser<'_> {
                     }
                     Some(_) => {}
                     None => {
+                        if let Some(c) = self.correct_expr(&name) {
+                            self.corrections.borrow_mut().insert(pos, c);
+                        }
                         let var = Expr::new(
                             ExprKind::Var {
                                 name: name.clone(),
