@@ -18,7 +18,14 @@
 //!   closes the WebSocket (the VM stopped, exited or was destroyed, Avalon went away);
 //! - binary messages, one per `ScreenFrame`: the rectangle's `x`, `y`, `width` and
 //!   `height` (u32, little-endian), then its pixels as a canvas takes them
-//!   (`ImageData`: R, G, B, A bytes, A 255), rows top to bottom.
+//!   (`ImageData`: R, G, B, A bytes, A 255), rows top to bottom;
+//! - the cursor, which Avalon sends apart from the frames (protocol doc, section 6.4,
+//!   **Cursor**), in text messages too: `{"type": "cursor_shape", "width", "height",
+//!   "hot_x", "hot_y", "pixels"}` once per `CursorShape`, its image in base64 as
+//!   `ImageData` takes it (straight RGBA: [`straight_rgba`] divides the guest's
+//!   premultiplied colours by their alpha), and `{"type": "cursor_position",
+//!   "visible", "x", "y"}` once per `CursorPosition`. The page draws the cursor on a
+//!   canvas of its own over the screen's, so moving it redraws no frame.
 //!
 //! What comes from the page, text messages in JSON ([`PageInput`]): keys as the
 //! browser reports them (`KeyboardEvent.code` and `.key`), pointer changes in screen
@@ -515,6 +522,57 @@ pub fn frame_message(x: u32, y: u32, width: u32, height: u32, pixels: &[u8]) -> 
         out.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
     }
     out
+}
+
+/// A cursor's image in the canvas's straight RGBA, from Avalon's premultiplied
+/// ARGB8888 (bytes B, G, R, A, each colour already multiplied by A: protocol doc,
+/// `CursorShape`). `ImageData` is straight, and the browser multiplies each colour by
+/// its alpha as it draws, so each colour here is the guest's divided by its alpha:
+/// `c × 255 / A`, rounded to the nearest. A canvas that keeps its pixels
+/// premultiplied, as browsers' do, and multiplies by `A / 255` rounding to the
+/// nearest gets the guest's colour back exactly (the division's error is under half,
+/// times `A / 255`), and the page then shows the spec's
+/// `cursor + screen × (255 − A) / 255` (Excalibur spec section 9.3). Two kinds of pixel straight alpha cannot hold: a
+/// colour above its alpha, which the spec's sum saturates, is full (255); and a
+/// colour with A = 0, which the spec adds to the screen, is left out (transparent).
+pub fn straight_rgba(pixels: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pixels.len());
+    for px in pixels.as_chunks::<4>().0 {
+        let a = px[3] as u32;
+        if a == 0 {
+            out.extend_from_slice(&[0; 4]);
+            continue;
+        }
+        let straight = |c: u8| (((c as u32 * 255) + a / 2) / a).min(255) as u8;
+        out.extend_from_slice(&[straight(px[2]), straight(px[1]), straight(px[0]), a as u8]);
+    }
+    out
+}
+
+/// `{"type": "cursor_shape", ...}`: the cursor's image from now on, `pixels` its
+/// premultiplied ARGB8888 as `CursorShape` carries it, sent as straight RGBA in base64.
+fn cursor_shape_json(width: u32, height: u32, hot_x: u32, hot_y: u32, pixels: &[u8]) -> String {
+    Json::object([
+        ("type", "cursor_shape".into()),
+        ("width", width.into()),
+        ("height", height.into()),
+        ("hot_x", hot_x.into()),
+        ("hot_y", hot_y.into()),
+        ("pixels", crate::base64::encode(&straight_rgba(pixels)).into()),
+    ])
+    .encode()
+}
+
+/// `{"type": "cursor_position", ...}`: whether the cursor shows, and its image's top
+/// left pixel at (`x`, `y`) of the screen (off its edges, maybe).
+fn cursor_position_json(visible: bool, x: i32, y: i32) -> String {
+    Json::object([
+        ("type", "cursor_position".into()),
+        ("visible", visible.into()),
+        ("x", i64::from(x).into()),
+        ("y", i64::from(y).into()),
+    ])
+    .encode()
 }
 
 /// Whether Pendragon can relay a `width` × `height` screen in `format`: XRGB8888, not
@@ -1041,6 +1099,26 @@ fn on_server(shared: &Shared, ty: u16, msg: Result<Message, Error>) -> Step {
             *crate::console::lock(&shared.size) = (width, height);
             to_page(shared.page.text(&screen_json(vm, width, height)))
         }
+        // The cursor, apart from the frames: relayed as it comes, the page keeping it
+        // (the image across a hide and a mode change, as a viewer does).
+        (
+            Some(MessageKind::Event),
+            Ok(Message::CursorShape {
+                vm: v,
+                width,
+                height,
+                hot_x,
+                hot_y,
+                pixels,
+            }),
+        ) if v == vm => to_page(
+            shared
+                .page
+                .text(&cursor_shape_json(width, height, hot_x, hot_y, &pixels)),
+        ),
+        (Some(MessageKind::Event), Ok(Message::CursorPosition { vm: v, visible, x, y })) if v == vm => {
+            to_page(shared.page.text(&cursor_position_json(visible, x, y)))
+        }
         (Some(MessageKind::Event), Ok(Message::VmStateChanged { vm: v, state })) if v == vm => {
             if let Step::End(end) = to_page(shared.page.text(&state_json(state))) {
                 return Step::End(end);
@@ -1455,6 +1533,50 @@ mod tests {
         assert_eq!(msg[..2], [0x82, 24]);
         assert_eq!(msg[2..18], [3, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(msg[18..], [0x11, 0x22, 0x33, 0xff, 0xff, 0xee, 0xdd, 0xff]);
+    }
+
+    /// The cursor's image goes to the page straight: each colour divided by its alpha,
+    /// rounded to the nearest, so a canvas that multiplies it back, rounding to the
+    /// nearest, has the guest's premultiplied colour again, for every colour and alpha
+    /// a premultiplied pixel can have. A colour above its alpha saturates, and an
+    /// image with no alpha is transparent.
+    #[test]
+    fn the_cursor_goes_to_the_canvas_straight() {
+        for a in 1..=255u32 {
+            for c in 0..=a {
+                let px = straight_rgba(&[c as u8, 0, 0, a as u8]);
+                assert_eq!((px[0], px[1], px[3]), (0, 0, a as u8));
+                // The canvas's premultiplied store: c × a / 255, to the nearest.
+                let back = (px[2] as u32 * a + 127) / 255;
+                assert_eq!(back, c, "colour {c}, alpha {a}: straight {}", px[2]);
+            }
+        }
+        // B, G, R, A to R, G, B, A: opaque colours unchanged, half-covered blue full.
+        assert_eq!(
+            straight_rgba(&[0x33, 0x22, 0x11, 0xff, 0x80, 0, 0, 0x80]),
+            [0x11, 0x22, 0x33, 0xff, 0, 0, 0xff, 0x80]
+        );
+        assert_eq!(
+            straight_rgba(&[0x90, 0x10, 0, 0x80]),
+            [0, 0x20, 0xff, 0x80],
+            "saturated"
+        );
+        assert_eq!(straight_rgba(&[0x40, 0x40, 0x40, 0]), [0; 4], "no alpha, nothing");
+    }
+
+    #[test]
+    fn cursor_messages_for_the_page() {
+        assert_eq!(
+            cursor_shape_json(2, 1, 1, 0, &[0x33, 0x22, 0x11, 0xff, 0, 0, 0, 0]),
+            format!(
+                r#"{{"type":"cursor_shape","width":2,"height":1,"hot_x":1,"hot_y":0,"pixels":"{}"}}"#,
+                crate::base64::encode(&[0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0])
+            )
+        );
+        assert_eq!(
+            cursor_position_json(true, -4, 12),
+            r#"{"type":"cursor_position","visible":true,"x":-4,"y":12}"#
+        );
     }
 
     /// After a write that failed, which may have left part of a frame on the wire,

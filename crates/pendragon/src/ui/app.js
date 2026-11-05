@@ -618,7 +618,8 @@ function terminal(text, output) {
 
 // The VM's screen in a canvas, with its keyboard and mouse, over a WebSocket on which
 // Pendragon is the VM's viewer (docs/pendragon.md, "Screens"). Pendragon sends the
-// screen's size (again on every mode change) and rectangles of RGBA pixels; the page
+// screen's size (again on every mode change), rectangles of RGBA pixels and the
+// guest's cursor, its image and its place apart from the frames; the page
 // sends what the browser reports, as it reports it: keys by KeyboardEvent.code and
 // .key (Pendragon has the key table, Grail's HID usages), Pointer Events in screen
 // pixels, wheel deltas. A browser lets a page set no header on a WebSocket, so the
@@ -627,6 +628,25 @@ function screenView(ctx, id) {
   const canvas = el("canvas", { class: "screen", width: 640, height: 480, tabindex: 0 });
   const status = el("p", { class: "muted" }, "screen: connecting");
   const draw = canvas.getContext("2d", { alpha: false });
+  // The guest's cursor, on a transparent canvas of the screen's size laid over it (the
+  // browser blends the two): moving the cursor redraws two small rectangles of this
+  // one and no frame. Its image is straight RGBA, as ImageData takes it (Pendragon
+  // divided the guest's premultiplied colours by their alpha). The pointer's events
+  // go through it to the screen.
+  const overlay = el("canvas", { class: "cursor", width: 640, height: 480 });
+  const pen = overlay.getContext("2d");
+  const cursor = { image: null, visible: false, x: 0, y: 0 };
+  // Puts the cursor where it is now: clears the rectangle it was drawn in, draws it
+  // anew if it shows. putImageData replaces pixels and clips at the canvas's edges.
+  let drawn = null;
+  const drawCursor = () => {
+    if (drawn) pen.clearRect(drawn.x, drawn.y, drawn.width, drawn.height);
+    drawn = null;
+    if (cursor.image && cursor.visible) {
+      pen.putImageData(cursor.image, cursor.x, cursor.y);
+      drawn = { x: cursor.x, y: cursor.y, width: cursor.image.width, height: cursor.image.height };
+    }
+  };
   let ws = null;
   let ended = false;
   let retry = null;
@@ -669,6 +689,23 @@ function screenView(ctx, id) {
         draw.fillStyle = "#000";
         draw.fillRect(0, 0, msg.width, msg.height);
         size = msg.width + " × " + msg.height;
+        // The cursor stays where it was, on the new screen.
+        overlay.width = msg.width;
+        overlay.height = msg.height;
+        drawn = null;
+        drawCursor();
+      } else if (msg.type === "cursor_shape") {
+        // The cursor's image from now on, also while it is hidden.
+        const pixels = new Uint8ClampedArray(fromBase64(msg.pixels).buffer);
+        cursor.image = new ImageData(pixels, msg.width, msg.height);
+        drawCursor();
+        return;
+      } else if (msg.type === "cursor_position") {
+        cursor.visible = msg.visible;
+        cursor.x = msg.x;
+        cursor.y = msg.y;
+        drawCursor();
+        return;
       } else if (msg.type === "state") {
         state = msg.state_text;
       } else if (msg.type === "end") {
@@ -682,6 +719,10 @@ function screenView(ctx, id) {
       if (!ctx.alive || ended) return;
       // Pendragon restarted, Avalon away, no such VM: the facts above say which.
       status.textContent = "screen: not connected; trying again";
+      // The next connection starts with no cursor: Avalon sends it again on attaching.
+      cursor.image = null;
+      cursor.visible = false;
+      drawCursor();
       retry = setTimeout(open, 3000);
     });
   };
@@ -760,7 +801,7 @@ function screenView(ctx, id) {
     if (ws) ws.close(1000, "the page left");
   });
   open();
-  return [el("div", { class: "screen-box" }, canvas), status];
+  return [el("div", { class: "screen-box" }, canvas, overlay), status];
 }
 
 // Windows reports AltGr as two keys pressed together: a Left Ctrl that is not there,

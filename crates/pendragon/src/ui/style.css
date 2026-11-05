@@ -182,6 +182,7 @@ dl.facts dd { margin: 0; }
 /* The VM's screen: its own size, smaller when the page is narrower, pixels kept
    sharp. No border or padding on the canvas itself, so its box is the screen's. */
 .screen-box {
+  position: relative;
   display: inline-block;
   max-width: 100%;
   border: 1px solid var(--line);
@@ -196,6 +197,18 @@ canvas.screen {
   image-rendering: pixelated;
   touch-action: none;
   outline: none;
+}
+
+/* The guest's cursor, on a canvas of the screen's size over the screen's own, drawn
+   at the same scale; the pointer's events go through it to the screen. */
+canvas.cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+  pointer-events: none;
 }
 
 .screen-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
