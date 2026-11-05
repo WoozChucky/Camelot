@@ -10,7 +10,9 @@
 //! - a pointer into the kernel's half of the address space, or between the
 //!   halves, is refused with -EFAULT (`pointers_into_the_kernel_half_are_refused`);
 //! - the widths are LP64's: `lseek`'s 64-bit `off_t`, `stat`'s 24 bytes,
-//!   `sbrk`'s pointers above 4 GiB (`the_calls_take_and_return_64_bit_values`).
+//!   `sbrk`'s pointers above 4 GiB (`the_calls_take_and_return_64_bit_values`);
+//! - a 32-bit program is refused, with no compat mode
+//!   (`an_elf32_program_is_refused`).
 
 use grail::{DiskConfig, Machine, MachineConfig, NetConfig, RunResult};
 use xtask::kernel::{self, BOOT_MAX_STEPS};
@@ -104,8 +106,8 @@ fn all_checks_pass(out: &str, command: &str, program: &str) -> u32 {
 }
 
 /// A disk with the root filesystem the RV64 kernel's tests use
-/// (`xtask::fs::build_for`: the RV64 programs in /bin), `blocks` blocks,
-/// and `extra` files besides.
+/// (`xtask::fs::build_for`: the programs built for RV64 in /bin), `blocks`
+/// blocks, and `extra` files besides.
 fn rv64_root_disk(blocks: u32, extra: &[(&str, &[u8])]) -> DiskConfig {
     let root = repo_root();
     let opts = camelot_fs::mkfs::Options {
@@ -127,7 +129,8 @@ fn rv64_root_disk(blocks: u32, extra: &[(&str, &[u8])]) -> DiskConfig {
         .unwrap();
         fs.mkdir(xtask::fs::BIN).unwrap();
         let user = xtask::userprogs::user_dir(&root);
-        for p in xtask::userprogs::build_embedded_for(&user, kernel::Xlen::Rv64).unwrap() {
+        let merlin = xtask::userprogs::CCompiler::Merlin;
+        for p in xtask::userprogs::build_all_for(&user, merlin, kernel::Xlen::Rv64).unwrap() {
             fs.add_file(&format!("{}/{}", xtask::fs::BIN, p.name), &p.elf)
                 .unwrap();
         }
@@ -422,6 +425,33 @@ SECTIONS
     .bss : { *(.bss*) }
 }
 ";
+
+#[test]
+fn an_elf32_program_is_refused() {
+    // The RV64 kernel loads ELF64 executables only, with no compat mode for
+    // RV32 ones (spec, "RV64 processes", "Loading"): hello built for RV32,
+    // an ELF32 file in /bin, does not start, for the reason the RV32
+    // kernel gives an image of another class (kernel.rs's
+    // the_elf_loader_refuses_bad_images), and the RV64 one runs.
+    let user = xtask::userprogs::user_dir(&repo_root());
+    let hello32 = xtask::userprogs::build_named_for(&user, "hello", kernel::Xlen::Rv32).unwrap();
+    assert_eq!(hello32.elf[4], 1, "not ELFCLASS32");
+    let out = run(
+        Setup {
+            disks: vec![rv64_root_disk(4096, &[("/bin/hello32", &hello32.elf)])],
+            ..Setup::default()
+        },
+        b"hello32\nhello\nexit 0\n",
+    );
+    assert_eq!(
+        command_output(&out, "hello32"),
+        [
+            "spawn: /bin/hello32: not a 64-bit little-endian RISC-V file",
+            "sh: hello32: not an executable"
+        ]
+    );
+    assert_eq!(command_output(&out, "hello"), ["hello from user mode"]);
+}
 
 #[test]
 fn the_calls_take_and_return_64_bit_values() {
