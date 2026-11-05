@@ -27,5 +27,4 @@ merlin-ld = { path = "../merlin-ld" }
 # tests/avalon.rs debugs a VM on an Avalon server in process, with Herald attached.
 avalon = { path = "../avalon" }
 herald = { path = "../herald" }
-# tests/processes.rs boots the root image, built as `cargo xtask fs` builds it.
-camelot-fs = { path = "../camelot-fs" }
+# (tests/processes.rs builds the root image with xtask, as `cargo xtask fs` does.)

@@ -108,7 +108,6 @@ dependencies = [
  "avalon",
  "avalon-client",
  "avalon-proto",
- "camelot-fs",
  "elf",
  "excalibur",
  "grail",

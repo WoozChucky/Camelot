@@ -10,7 +10,9 @@
 //! - [`run`]: the command line, which connects to a stub (`grail --gdb`'s, or a VM's on
 //!   an Avalon server) or starts a machine in this process.
 
+pub mod camelot;
 pub mod frames;
+pub mod paging;
 pub mod remote;
 pub mod session;
 pub mod source;
@@ -200,17 +202,20 @@ fn start(
     // warns and goes on: ending it would drop the connection, which the stub takes
     // as a detach, and a machine waiting for its debugger would run off on its own.
     // (Started with `--`, the machine is the program's width.)
-    let (symbols, lines, debug) = match &file {
-        Some((path, file)) => match symbols::check_xlen(file, remote.xlen) {
-            Ok(()) => (symbols, lines, debug),
+    let (symbols, lines, debug, file) = match file {
+        Some((path, file)) => match symbols::check_xlen(&file, remote.xlen) {
+            Ok(()) => (symbols, lines, debug, Some(file)),
             Err(e) => {
                 let _ = writeln!(out, "warning: {path}: {e}: going on without its symbols");
-                (Symbols::default(), Lines::default(), vars::Debug::default())
+                (Symbols::default(), Lines::default(), vars::Debug::default(), None)
             }
         },
-        None => (symbols, lines, debug),
+        None => (symbols, lines, debug, None),
     };
     let mut session = Session::new(remote, symbols, lines, debug, &mut *out, on_quit, interrupt);
+    if let Some(file) = file {
+        session.set_program(file);
+    }
     session.start()?;
 
     // The script, then stdin. Commands that do not come from a terminal are echoed, so

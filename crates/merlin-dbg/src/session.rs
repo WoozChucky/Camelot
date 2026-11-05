@@ -7,15 +7,115 @@
 //! knows the variables and types: `print`, `info locals`, `info args`, `ptype`,
 //! `whatis`, the arguments of each frame in a backtrace, and `frame`, `up` and
 //! `down` to choose the frame those look in.
+//!
+//! On the Camelot kernel it knows the processes too ([`crate::camelot`]): `info
+//! processes`; breakpoints that stop only in one process (`break LOC process PID`, or
+//! `satp VALUE`, its address space), and symbol files that apply only where one
+//! program runs (`add-symbol-file FILE program NAME`), whose breakpoints stop only
+//! there; and `process PID`, which reads memory through that process's page table.
 
+use crate::camelot;
 use crate::frames::{self, Regs};
+use crate::paging;
 use crate::remote::{self, hex_value, wrap, Remote, StopEvent, Watch};
 use crate::source::{Lines, Place};
 use crate::symbols::{self, Symbols};
-use crate::vars::{self, Debug, Eval};
+use crate::vars::{self, Debug, Eval, Target};
 use excalibur::{Inst, Syntax, Xlen};
+use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+
+/// What limits where a breakpoint stops: in one process (`break LOC process PID`: the
+/// one running on the hart that hit it, `cpus[hart].proc`, has that pid), in one
+/// address space (`break LOC satp VALUE`: the hart's `satp` is VALUE), or in the
+/// processes running one program (a breakpoint set from a program's own symbols,
+/// `add-symbol-file FILE program NAME`). A hit anywhere else is not a stop: the
+/// machine runs on, as GDB's breakpoints with a condition that does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Filter {
+    Process(u64),
+    Satp(u64),
+    Program(String),
+}
+
+impl std::fmt::Display for Filter {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Filter::Process(pid) => write!(f, "process {pid}"),
+            Filter::Satp(v) => write!(f, "satp {v:#x}"),
+            Filter::Program(name) => write!(f, "program {name}"),
+        }
+    }
+}
+
+/// The symbols, line tables and debugging information of one address space: those
+/// of every space (the program, the kernel), and those of the program it runs.
+#[derive(Default)]
+struct Syms {
+    symbols: Symbols,
+    lines: Lines,
+    debug: Debug,
+}
+
+/// Memory as `print` and `x` read it: through the selected hart's translation, or
+/// through the page table of the process `process PID` selected, which merlin-dbg
+/// walks itself over physical memory ([`paging`]).
+pub struct Memory<'a> {
+    remote: &'a mut Remote,
+    space: Option<paging::Space>,
+}
+
+impl Memory<'_> {
+    /// Up to `len` bytes at `addr`: fewer where the memory (or the mapping) ends, an
+    /// error when not even the first byte can be read.
+    fn read_upto(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        let Some(space) = self.space else {
+            return self.remote.read_memory(addr, len);
+        };
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let va = addr.wrapping_add(out.len() as u64);
+            let remote = &mut *self.remote;
+            let pa = paging::translate(space, va, &mut |a, size| {
+                let b = remote.read_physical(a, size).ok().filter(|b| b.len() == size)?;
+                Some(b.iter().rev().fold(0u64, |v, &x| v << 8 | u64::from(x)))
+            });
+            let Some(pa) = pa else {
+                if out.is_empty() {
+                    return Err(format!("cannot access memory at address {va:#x}"));
+                }
+                break;
+            };
+            let chunk = ((paging::PAGE_SIZE - va % paging::PAGE_SIZE) as usize).min(len - out.len());
+            let bytes = match self.remote.read_physical(pa, chunk) {
+                Ok(b) => b,
+                Err(e) if out.is_empty() => return Err(e),
+                Err(_) => break,
+            };
+            let short = bytes.len() < chunk;
+            out.extend(bytes);
+            if short {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Target for Memory<'_> {
+    fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        let b = self.read_upto(addr, len)?;
+        if b.len() < len {
+            return Err(format!(
+                "cannot access memory at address {:#x}",
+                addr + b.len() as u64
+            ));
+        }
+        Ok(b)
+    }
+}
 
 /// A breakpoint or a watchpoint, numbered from 1 as they are set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +165,24 @@ pub struct Session<'a, W: Write> {
     exited: bool,
     on_quit: OnQuit,
     interrupt: &'a AtomicBool,
+    /// What limits each breakpoint (by its number), all of them at once.
+    filters: HashMap<usize, Vec<Filter>>,
+    /// The ELF files whose symbols apply in every address space (the program, and
+    /// `add-symbol-file FILE` without a program), and those that apply where one
+    /// program runs (`add-symbol-file FILE program NAME`): what the sets are built of.
+    global_files: Vec<Vec<u8>>,
+    keyed_files: Vec<(String, Vec<u8>)>,
+    /// The program whose keyed files are in `symbols`, `lines` and `debug` now (with
+    /// the global ones), and the sets not in use, by the program they are for.
+    active: Option<String>,
+    sets: HashMap<Option<String>, Syms>,
+    /// `directory` arguments, for every set.
+    dirs: Vec<PathBuf>,
+    /// The process whose page table `print` and `x` read through (`process PID`),
+    /// until the next stop; none: the selected hart's own translation.
+    process: Option<(u64, paging::Space)>,
+    /// Where `run_to` runs to: a stop there is its own, never a filtered breakpoint's.
+    running_to: Option<u64>,
 }
 
 type Result<T> = std::result::Result<T, String>;
@@ -88,7 +206,11 @@ nexti|ni [N]            the same, but run a call to its return
 finish                  run until the current function returns
 list|l [FILE:]LINE|FUNC show ten source lines around LINE; list alone goes on
 directory DIR           look for source files in DIR first
-add-symbol-file FILE    add the symbols and lines of another program (a user one)
+add-symbol-file FILE [program NAME]  add the symbols and lines of another program
+                        (a user one), for every address space or where NAME runs
+info processes          the kernel's processes: pid, state, program, satp, harts
+process [PID]           print and x read process PID's memory, through its page table
+break LOC process PID   stop at LOC only in process PID (or: satp VALUE)
 regs|info registers     the selected hart's registers, as GDB shows them
 x/N[b|h|w|g] ADDR       N bytes (b), halfwords (h), words (w) or giants (g, 8) at ADDR
 disas [ADDR] [N]        disassemble N instructions (8) from ADDR (the pc)
@@ -126,7 +248,21 @@ impl<'a, W: Write> Session<'a, W> {
             exited: false,
             on_quit,
             interrupt,
+            filters: HashMap::new(),
+            global_files: Vec::new(),
+            keyed_files: Vec::new(),
+            active: None,
+            sets: HashMap::new(),
+            dirs: Vec::new(),
+            process: None,
+            running_to: None,
         }
+    }
+
+    /// The ELF file of the program the session was given symbols of, for building the
+    /// symbols of each address space ([`Session::activate`]).
+    pub fn set_program(&mut self, file: Vec<u8>) {
+        self.global_files.insert(0, file);
     }
 
     /// Says where the machine is stopped, as the session starts.
@@ -205,7 +341,8 @@ impl<'a, W: Write> Session<'a, W> {
                 Some("harts" | "threads") => self.harts()?,
                 Some("locals") => self.info_locals()?,
                 Some("args") => self.info_args()?,
-                _ => return Err("info breakpoints, registers, harts, locals or args".into()),
+                Some("processes" | "proc" | "procs") => self.info_processes()?,
+                _ => return Err("info breakpoints, registers, harts, locals, args or processes".into()),
             },
             "continue" | "c" => self.continue_()?,
             "stepi" | "si" => {
@@ -236,6 +373,10 @@ impl<'a, W: Write> Session<'a, W> {
                     return Err("directory needs a directory".into());
                 }
                 self.lines.add_dir(rest.into());
+                for set in self.sets.values_mut() {
+                    set.lines.add_dir(rest.into());
+                }
+                self.dirs.push(rest.into());
                 self.say(format!("source files are looked for in {rest} first"));
             }
             "add-symbol-file" => self.add_symbol_file(rest)?,
@@ -295,6 +436,7 @@ impl<'a, W: Write> Session<'a, W> {
                 None => self.harts()?,
                 Some(n) => self.select_hart(n)?,
             },
+            "process" => self.select_process(&args)?,
             _ if cmd.starts_with("x/") || cmd == "x" => self.examine(&cmd[1..], rest)?,
             _ => return Err(format!("unknown command '{cmd}' (try help)")),
         }
@@ -343,11 +485,72 @@ impl<'a, W: Write> Session<'a, W> {
         n
     }
 
+    /// `break LOC [process PID | satp VALUE]`. LOC is looked for in the symbols of every
+    /// address space first, then in each program's own (`add-symbol-file FILE program
+    /// NAME`), whose breakpoints then stop only where that program runs.
     fn break_(&mut self, expr: &str) -> Result<()> {
         if expr.is_empty() {
             return Err("break needs an address or a symbol".into());
         }
-        let addrs = match source_line(expr) {
+        let words: Vec<&str> = expr.split_whitespace().collect();
+        let (loc, mut filters) = match words.as_slice() {
+            [loc @ .., "process", pid] if !loc.is_empty() => {
+                let pid = parse_number(pid).ok_or_else(|| format!("'{pid}' is not a process id"))?;
+                if !self.processes()?.iter().any(|p| p.pid == pid) {
+                    return Err(format!("no process {pid}"));
+                }
+                (loc.join(" "), vec![Filter::Process(pid)])
+            }
+            [loc @ .., "satp", v] if !loc.is_empty() => {
+                let v = self.eval(v)?;
+                (loc.join(" "), vec![Filter::Satp(v)])
+            }
+            _ => (expr.to_string(), Vec::new()),
+        };
+        let original = self.active.clone();
+        let mut programs: Vec<String> = self.keyed_files.iter().map(|(p, _)| p.clone()).collect();
+        programs.dedup();
+        let mut failed = None;
+        for set in std::iter::once(None).chain(programs.into_iter().map(Some)) {
+            self.activate(set.clone());
+            let addrs = match self.locate(&loc) {
+                Ok(addrs) => addrs,
+                Err(e) => {
+                    failed.get_or_insert(e);
+                    continue;
+                }
+            };
+            if let Some(program) = set {
+                filters.push(Filter::Program(program));
+            }
+            let set = self.set_breakpoints(addrs, &filters);
+            self.activate(original);
+            return set;
+        }
+        self.activate(original);
+        Err(failed.unwrap_or_else(|| format!("no symbol '{loc}'")))
+    }
+
+    /// Sets a breakpoint at each of `addrs`, limited by `filters`.
+    fn set_breakpoints(&mut self, addrs: Vec<u64>, filters: &[Filter]) -> Result<()> {
+        for addr in addrs {
+            if !self.has_breakpoint(addr) {
+                self.remote.set_breakpoint(addr)?;
+            }
+            let n = self.add_point(Point::Break(addr));
+            if !filters.is_empty() {
+                self.filters.insert(n, filters.to_vec());
+            }
+            let at = self.where_(addr);
+            let only = filters.iter().map(|f| format!(", {f}")).collect::<String>();
+            self.say(format!("breakpoint {n} at {at}{only}"));
+        }
+        Ok(())
+    }
+
+    /// The addresses a breakpoint's location means, in the symbols in use.
+    fn locate(&mut self, expr: &str) -> Result<Vec<u64>> {
+        Ok(match source_line(expr) {
             Some((file, line)) => {
                 let symbols = &self.symbols;
                 let (addrs, place) = self
@@ -375,16 +578,7 @@ impl<'a, W: Write> Session<'a, W> {
                 Some(entry) => vec![self.skip_prologue(entry)],
                 None => vec![self.eval(expr)?],
             },
-        };
-        for addr in addrs {
-            if !self.has_breakpoint(addr) {
-                self.remote.set_breakpoint(addr)?;
-            }
-            let n = self.add_point(Point::Break(addr));
-            let at = self.where_(addr);
-            self.say(format!("breakpoint {n} at {at}"));
-        }
-        Ok(())
+        })
     }
 
     /// Where `break` puts a breakpoint on the function at `entry`: past its
@@ -429,18 +623,111 @@ impl<'a, W: Write> Session<'a, W> {
         hex_value(v, self.xlen)
     }
 
-    /// `add-symbol-file FILE`.
-    fn add_symbol_file(&mut self, path: &str) -> Result<()> {
-        if path.is_empty() {
-            return Err("add-symbol-file needs a file".into());
-        }
+    /// `add-symbol-file FILE [program NAME]`: FILE's symbols, in every address space,
+    /// or (with a program) only in those of the processes that run program NAME (their
+    /// name in the process table, the last name of the path they were run from).
+    fn add_symbol_file(&mut self, args: &str) -> Result<()> {
+        let words: Vec<&str> = args.split_whitespace().collect();
+        let (path, program) = match words.as_slice() {
+            [] => return Err("add-symbol-file needs a file".into()),
+            [path] => (*path, None),
+            [path, "program", name] => (*path, Some(name.to_string())),
+            _ => return Err("add-symbol-file FILE [program NAME]".into()),
+        };
         let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         symbols::check_xlen(&file, self.xlen).map_err(|e| format!("{path}: {e}"))?;
-        self.symbols.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-        self.lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-        self.debug.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-        self.say(format!("added the symbols of {path}"));
+        // Each of them parses it, so that a broken file is refused here.
+        let mut set = Syms::default();
+        set.symbols.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
+        set.lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
+        set.debug.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
+        match program {
+            None => {
+                self.symbols.add_elf(&file)?;
+                self.lines.add_elf(&file)?;
+                self.debug.add_elf(&file)?;
+                self.global_files.push(file);
+                // The other sets are made again with it when they are next used.
+                self.sets.clear();
+                self.say(format!("added the symbols of {path}"));
+            }
+            Some(name) => {
+                self.keyed_files.push((name.clone(), file));
+                self.keyed_files.sort_by(|a, b| a.0.cmp(&b.0));
+                self.sets.remove(&Some(name.clone()));
+                if self.active.as_ref() == Some(&name) {
+                    // In use: made again now, with the new file.
+                    self.active = None;
+                    let set = self.build(&Some(name.clone()));
+                    self.install(set);
+                    self.active = Some(name.clone());
+                }
+                self.say(format!("added the symbols of {path}, for program {name}"));
+                // The program may be running now.
+                if !self.exited {
+                    self.follow_process();
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The symbols of the address spaces where `program` runs: the global files'
+    /// and its own, in the order they were added.
+    fn build(&self, program: &Option<String>) -> Syms {
+        let mut set = Syms::default();
+        let keyed = self
+            .keyed_files
+            .iter()
+            .filter(|(p, _)| Some(p) == program.as_ref())
+            .map(|(_, f)| f);
+        for file in self.global_files.iter().chain(keyed) {
+            // Every file was read once already, when it was added.
+            let _ = set.symbols.add_elf(file);
+            let _ = set.lines.add_elf(file);
+            let _ = set.debug.add_elf(file);
+        }
+        for dir in &self.dirs {
+            set.lines.add_dir(dir.clone());
+        }
+        set
+    }
+
+    /// Puts `set` in use, and returns the one that was.
+    fn install(&mut self, set: Syms) -> Syms {
+        Syms {
+            symbols: std::mem::replace(&mut self.symbols, set.symbols),
+            lines: std::mem::replace(&mut self.lines, set.lines),
+            debug: std::mem::replace(&mut self.debug, set.debug),
+        }
+    }
+
+    /// Uses the symbols of the address spaces where `program` runs (`None`: the global
+    /// ones alone), made the first time they are used and kept.
+    fn activate(&mut self, program: Option<String>) {
+        if self.active == program {
+            return;
+        }
+        let set = match self.sets.remove(&program) {
+            Some(set) => set,
+            None => self.build(&program),
+        };
+        let old = self.install(set);
+        let was = std::mem::replace(&mut self.active, program);
+        self.sets.insert(was, old);
+    }
+
+    /// Uses the symbols of the program the selected hart's process runs, if it has
+    /// symbols of its own (and the global ones otherwise).
+    fn follow_process(&mut self) {
+        if self.keyed_files.is_empty() {
+            return;
+        }
+        let program = match self.current_process() {
+            Ok(Some((_, name))) if self.keyed_files.iter().any(|(p, _)| *p == name) => Some(name),
+            _ => None,
+        };
+        self.activate(program);
     }
 
     fn has_breakpoint(&self, addr: u64) -> bool {
@@ -497,6 +784,7 @@ impl<'a, W: Write> Session<'a, W> {
         };
         for (n, p) in doomed {
             self.points.retain(|(m, _)| *m != n);
+            self.filters.remove(&n);
             match p {
                 Point::Break(addr) if !self.has_breakpoint(addr) => self.remote.clear_breakpoint(addr)?,
                 Point::Break(_) => {}
@@ -515,8 +803,15 @@ impl<'a, W: Write> Session<'a, W> {
         // A breakpoint's address with all its digits, as GDB's Address column has
         // it; a watchpoint's as it would be typed, GDB's What column (its expression).
         for (n, p) in &self.points {
+            let only: String = self
+                .filters
+                .get(n)
+                .into_iter()
+                .flatten()
+                .map(|f| format!(", {f}"))
+                .collect();
             lines.push(match *p {
-                Point::Break(addr) => format!("{n:<4} breakpoint  {}", self.show(addr)),
+                Point::Break(addr) => format!("{n:<4} breakpoint  {}{only}", self.show(addr)),
                 Point::Watch(kind, addr, len) => format!(
                     "{n:<4} watchpoint  {}, {len} bytes, {}",
                     self.show_plain(addr),
@@ -538,13 +833,190 @@ impl<'a, W: Write> Session<'a, W> {
             // After a run, the stop shows its source line whatever it is.
             self.shown = None;
         }
-        match self.remote.resume(step, self.interrupt)? {
-            StopEvent::Exited(code) => {
-                self.exited = true;
-                self.say(format!("program exited with code {code}"));
-                Ok(None)
+        loop {
+            match self.remote.resume(step, self.interrupt)? {
+                StopEvent::Exited(code) => {
+                    self.exited = true;
+                    self.say(format!("program exited with code {code}"));
+                    return Ok(None);
+                }
+                StopEvent::Stopped { signal, hart, watch } => {
+                    // Every stop reads memory as the hart that stopped sees it, with
+                    // the symbols of the program it runs.
+                    self.process = None;
+                    if step.is_none() && watch.is_none() && signal == 5 {
+                        let pc = self.remote.register(remote::PC)?;
+                        // A breakpoint that does not stop here (another process's
+                        // hit): on with the run, as GDB with a condition that fails.
+                        if Some(pc) != self.running_to && self.has_breakpoint(pc) {
+                            match self.stops_here(pc) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                // As GDB when a condition cannot be evaluated: it stops.
+                                Err(e) => self.say(format!("error in testing the breakpoint's process: {e}")),
+                            }
+                        }
+                    }
+                    self.follow_process();
+                    return Ok(Some((hart, watch, signal)));
+                }
             }
-            StopEvent::Stopped { signal, hart, watch } => Ok(Some((hart, watch, signal))),
+        }
+    }
+
+    /// Whether a breakpoint at `pc` stops the selected hart: one of them there has no
+    /// filter, or the hart is where all of its filters say.
+    fn stops_here(&mut self, pc: u64) -> Result<bool> {
+        let at: Vec<usize> = self
+            .points
+            .iter()
+            .filter(|(_, p)| *p == Point::Break(pc))
+            .map(|(n, _)| *n)
+            .collect();
+        for n in at {
+            let filters = self.filters.get(&n).cloned().unwrap_or_default();
+            let mut stops = true;
+            for f in &filters {
+                stops &= self.passes(f)?;
+            }
+            if stops {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn passes(&mut self, filter: &Filter) -> Result<bool> {
+        Ok(match filter {
+            Filter::Satp(v) => self.remote.register(remote::csr(SATP))? == *v,
+            Filter::Process(pid) => self.current_process()?.is_some_and(|(p, _)| p == *pid),
+            Filter::Program(name) => self.current_process()?.is_some_and(|(_, n)| n == *name),
+        })
+    }
+
+    // ---- Processes (the Camelot kernel) ----
+
+    /// An evaluator of the kernel's variables, outside any frame.
+    fn eval_globals(&mut self) -> Eval<'_, &mut Remote> {
+        Eval {
+            debug: &self.debug,
+            symbols: &self.symbols,
+            target: &mut self.remote,
+            frame: None,
+            xlen: self.xlen,
+        }
+    }
+
+    /// The pid and program of the process on the selected hart, if one is.
+    fn current_process(&mut self) -> Result<Option<(u64, String)>> {
+        let hart = self.remote.selected()?;
+        camelot::current(&mut self.eval_globals(), hart)
+    }
+
+    fn processes(&mut self) -> Result<Vec<camelot::Process>> {
+        camelot::processes(&mut self.eval_globals())
+    }
+
+    /// The address space of a process whose root table is at the kernel's virtual
+    /// address `pagetable`: found through the hart's own table (which maps the kernel,
+    /// in every process's table), and in the hart's paging mode.
+    fn space_of(&mut self, pagetable: u64) -> Result<(u64, paging::Space)> {
+        let satp = self.remote.register(remote::csr(SATP))?;
+        let hart = paging::space(satp, self.xlen)?;
+        let remote = &mut self.remote;
+        let root = paging::translate(hart, pagetable, &mut |a, size| {
+            let b = remote.read_physical(a, size).ok().filter(|b| b.len() == size)?;
+            Some(b.iter().rev().fold(0u64, |v, &x| v << 8 | u64::from(x)))
+        })
+        .ok_or_else(|| format!("the page table at {pagetable:#x} is not mapped"))?;
+        let value = paging::satp_for(satp, root, self.xlen);
+        Ok((value, paging::space(value, self.xlen)?))
+    }
+
+    /// `info processes`: the process table, as `lx-ps` lists Linux's tasks: each
+    /// process's pid, state, program and `satp` (what the hart's `satp` holds while it
+    /// runs); `*` marks the one `print` and `x` read the memory of (the hart's own, or
+    /// the one `process` selected), and each hart running it is named.
+    fn info_processes(&mut self) -> Result<()> {
+        let procs = self.processes()?;
+        let mut running = Vec::new();
+        let selected = self.remote.selected()?;
+        for hart in 0..self.remote.harts {
+            self.remote.select(hart)?;
+            let current = camelot::current(&mut self.eval_globals(), hart);
+            if let Ok(Some((pid, _))) = current {
+                running.push((pid, hart));
+            }
+        }
+        self.remote.select(selected)?;
+        let marked = match self.process {
+            Some((pid, _)) => Some(pid),
+            None => running.iter().find(|(_, h)| *h == selected).map(|(pid, _)| *pid),
+        };
+        let mut lines = vec!["  PID  State     Name             satp".to_string()];
+        for p in procs {
+            let satp = match p.pagetable {
+                0 => "(the kernel's)".to_string(),
+                pt => match self.space_of(pt) {
+                    Ok((v, _)) => format!("{v:#x}"),
+                    Err(_) => "?".to_string(),
+                },
+            };
+            let star = if marked == Some(p.pid) { '*' } else { ' ' };
+            let harts: String = running
+                .iter()
+                .filter(|(pid, _)| *pid == p.pid)
+                .map(|(_, h)| format!("  hart {h}"))
+                .collect();
+            let state = camelot::state_name(p.state);
+            lines.push(
+                format!("{star} {:<4} {state:<9} {:<16} {satp}{harts}", p.pid, p.name)
+                    .trim_end()
+                    .to_string(),
+            );
+        }
+        self.say(lines.join("\n"));
+        Ok(())
+    }
+
+    /// `process PID`: `print` and `x` read memory through that process's page table
+    /// until the next stop; `process` alone says whose memory they read.
+    fn select_process(&mut self, args: &[&str]) -> Result<()> {
+        let Some(arg) = args.first() else {
+            let hart = self.remote.selected()?;
+            let whose = match (self.process, self.current_process()?) {
+                (Some((pid, _)), _) => format!("process {pid}'s memory, through its page table"),
+                (None, Some((pid, name))) => {
+                    format!("process {pid} ({name})'s memory, as hart {hart} sees it")
+                }
+                (None, None) => format!("memory as hart {hart} sees it, which runs no process"),
+            };
+            self.say(format!("print and x read {whose}"));
+            return Ok(());
+        };
+        let pid = parse_number(arg).ok_or_else(|| format!("'{arg}' is not a process id"))?;
+        let p = self
+            .processes()?
+            .into_iter()
+            .find(|p| p.pid == pid)
+            .ok_or_else(|| format!("no process {pid}"))?;
+        if p.pagetable == 0 {
+            return Err(format!(
+                "process {pid} ({}) is the kernel's: it has no page table of its own",
+                p.name
+            ));
+        }
+        let (satp, space) = self.space_of(p.pagetable)?;
+        self.process = Some((pid, space));
+        self.say(format!("process {pid} ({}), satp {satp:#x}", p.name));
+        Ok(())
+    }
+
+    /// Memory as `print` and `x` read it.
+    fn memory(&mut self) -> Memory<'_> {
+        Memory {
+            remote: &mut self.remote,
+            space: self.process.map(|(_, s)| s),
         }
     }
 
@@ -562,14 +1034,31 @@ impl<'a, W: Write> Session<'a, W> {
             self.say(format!("{who}watchpoint{n} ({}) hit at {at}", kind.name()));
         } else if signal == 2 {
             self.say(format!("{who}interrupted"));
-        } else if let Some(n) = self
-            .points
-            .iter()
-            .find_map(|(n, p)| (*p == Point::Break(pc)).then_some(*n))
-        {
+        } else if let Some(n) = self.stopping_breakpoint(pc)? {
             self.say(format!("{who}breakpoint {n}"));
         }
         self.show_pc()
+    }
+
+    /// The breakpoint at `pc` that stops the selected hart (the first of them).
+    fn stopping_breakpoint(&mut self, pc: u64) -> Result<Option<usize>> {
+        let at: Vec<usize> = self
+            .points
+            .iter()
+            .filter(|(_, p)| *p == Point::Break(pc))
+            .map(|(n, _)| *n)
+            .collect();
+        for n in at {
+            let filters = self.filters.get(&n).cloned().unwrap_or_default();
+            let mut stops = true;
+            for f in &filters {
+                stops &= self.passes(f)?;
+            }
+            if stops {
+                return Ok(Some(n));
+            }
+        }
+        Ok(None)
     }
 
     fn hart_prefix(&self, hart: usize) -> String {
@@ -625,7 +1114,11 @@ impl<'a, W: Write> Session<'a, W> {
             return Ok(None);
         };
         let pc = self.remote.register(remote::PC)?;
-        if stopped != hart || watch.is_some() || signal != 5 || self.has_breakpoint(pc) {
+        if stopped != hart
+            || watch.is_some()
+            || signal != 5
+            || self.has_breakpoint(pc) && self.stops_here(pc)?
+        {
             self.report(stopped, watch, signal)?;
             return Ok(None);
         }
@@ -766,6 +1259,7 @@ impl<'a, W: Write> Session<'a, W> {
         if temporary {
             self.remote.set_breakpoint(target)?;
         }
+        self.running_to = Some(target);
         let result = loop {
             let stop = match self.resume(None) {
                 Ok(Some(stop)) => stop,
@@ -775,6 +1269,9 @@ impl<'a, W: Write> Session<'a, W> {
             let (stopped, watch, signal) = stop;
             let pc = self.remote.register(remote::PC)?;
             let ours = stopped == hart && watch.is_none() && signal == 5 && pc == target;
+            // A breakpoint of the user's at the target that does not stop here is as
+            // good as a temporary one.
+            let temporary = temporary || ours && !self.stops_here(pc)?;
             if ours && stack_ok(self.remote.register(2)?, sp0) {
                 if !temporary {
                     self.report(stopped, watch, signal)?;
@@ -790,6 +1287,7 @@ impl<'a, W: Write> Session<'a, W> {
             // Our breakpoint, but another call deeper down: on with the run. The stop
             // selected the hart that hit it, ours.
         };
+        self.running_to = None;
         if temporary && !self.exited {
             self.remote.clear_breakpoint(target)?;
         }
@@ -870,7 +1368,7 @@ impl<'a, W: Write> Session<'a, W> {
             'w' => (4, 4),
             _ => (8, 2),
         };
-        let bytes = self.remote.read_memory(addr, count * size)?;
+        let bytes = self.memory().read_upto(addr, count * size)?;
         let mut lines = Vec::new();
         for (i, chunk) in bytes.chunks(per_line * size).enumerate() {
             let at = self.advance(addr, (i * per_line * size) as u64);
@@ -1031,13 +1529,16 @@ impl<'a, W: Write> Session<'a, W> {
         Ok(())
     }
 
-    /// An evaluator in the selected frame.
-    fn eval_in_frame(&mut self) -> Result<Eval<'_, crate::remote::Remote>> {
+    /// An evaluator in the selected frame, reading memory as `print` does.
+    fn eval_in_frame(&mut self) -> Result<Eval<'_, Memory<'_>>> {
         let frame = self.frame_context()?;
         Ok(Eval {
             debug: &self.debug,
             symbols: &self.symbols,
-            target: &mut self.remote,
+            target: Memory {
+                remote: &mut self.remote,
+                space: self.process.map(|(_, s)| s),
+            },
             frame,
             xlen: self.xlen,
         })
@@ -1208,6 +1709,9 @@ impl<'a, W: Write> Session<'a, W> {
 
 /// How many instructions `step` and `next` run at most looking for another line.
 const STEP_LIMIT: u32 = 1_000_000;
+
+/// The `satp` CSR's number.
+const SATP: u16 = 0x180;
 
 /// The registers each frame has, as far as they are known: all of them in the
 /// innermost; in a caller its frame pointer, and its `sp`, which is where the frame

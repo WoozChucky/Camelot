@@ -38,6 +38,12 @@ pub trait Target {
     fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>>;
 }
 
+impl<T: Target + ?Sized> Target for &mut T {
+    fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        (**self).read(addr, len)
+    }
+}
+
 impl Target for crate::remote::Remote {
     fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
         let b = self.read_memory(addr, len)?;
@@ -316,7 +322,7 @@ impl Debug {
 
     // ---- types ----
 
-    /// Through typedefs, `const` and `volatile`.
+    /// Through typedefs, `const` and `volatile`, to a complete type.
     /// (A chain longer than any real one is a loop in broken information: it
     /// ends as `void`.)
     fn strip(&self, mut t: Option<DieRef>) -> Option<DieRef> {
@@ -326,10 +332,30 @@ impl Debug {
                 dw::TAG_TYPEDEF | dw::TAG_CONST_TYPE | dw::TAG_VOLATILE_TYPE | dw::TAG_RESTRICT_TYPE => {
                     t = self.type_of(r)
                 }
-                _ => return Some(r),
+                _ => return Some(self.complete(r)),
             }
         }
         None
+    }
+
+    /// The definition of an incomplete struct, union or enum (a declaration, as a
+    /// unit has `struct proc` that only points to one): the type of that tag and name
+    /// another unit defines, as GDB resolves an opaque type (`check_typedef`). The
+    /// type itself when it is complete, or no unit defines it.
+    fn complete(&self, r: DieRef) -> DieRef {
+        let d = self.die(r);
+        let opaque = matches!(
+            d.tag,
+            dw::TAG_STRUCTURE_TYPE | dw::TAG_UNION_TYPE | dw::TAG_ENUMERATION_TYPE
+        ) && d.flag(dw::AT_DECLARATION);
+        match d
+            .name()
+            .filter(|_| opaque)
+            .and_then(|name| self.described(&[d.tag], name))
+        {
+            Some(Ty::Die(Some(def))) if !self.die(def).flag(dw::AT_DECLARATION) => def,
+            _ => r,
+        }
     }
 
     /// An array type's element type and dimensions.
@@ -1070,7 +1096,9 @@ impl Parser<'_> {
 pub struct Eval<'a, T: Target> {
     pub debug: &'a Debug,
     pub symbols: &'a Symbols,
-    pub target: &'a mut T,
+    /// Where values are read from: the machine as a hart sees it (`&mut Remote`), or
+    /// through a process's page table (the session's `Memory`).
+    pub target: T,
     /// The selected frame, if the machine has one with debugging information.
     pub frame: Option<Frame>,
     pub xlen: Xlen,
@@ -1181,6 +1209,19 @@ impl<T: Target> Eval<'_, T> {
     pub fn value(&mut self, text: &str) -> Result<Value> {
         let e = self.parse(text)?;
         self.eval(&e)
+    }
+
+    /// The value of the expression `text` as a number: an integer's, an enum's or a
+    /// pointer's (what the kernel's process table is read with, [`crate::camelot`]).
+    pub fn integer(&mut self, text: &str) -> Result<i128> {
+        let v = self.value(text)?;
+        self.number(&v)
+    }
+
+    /// The bytes of the object the expression `text` names (a character array's).
+    pub fn object(&mut self, text: &str) -> Result<Vec<u8>> {
+        let v = self.value(text)?;
+        self.bytes(&v)
     }
 
     /// `text` as a type name (`struct node`, `Node *`), if it is one.
