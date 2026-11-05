@@ -224,8 +224,13 @@ mod tests {
         let asm = compile_c(&dir, "a.c", &["include"], "x").unwrap();
         assert!(asm.contains("f:"), "{asm}");
         assert!(asm.contains("42"), "{asm}");
-        // With debug information, which can be turned off.
-        assert!(asm.starts_with("    .file 0 \"x\" \"a.c\"\n"), "{asm}");
+        // With debug information, which can be turned off. A unit with no
+        // globals, strings, enums or casts has its `.file 0` just before the
+        // first `.loc`, where clang puts it.
+        assert!(
+            asm.contains("    .file 0 \"x\" \"a.c\"\n    .loc 0 3 0\n"),
+            "{asm}"
+        );
         let plain = without_debug_info(|| compile_c(&dir, "a.c", &["include"], "x").unwrap());
         assert!(!plain.contains(".file") && !plain.contains(".loc"), "{plain}");
         assert!(compile_c(&dir, "a.c", &["include"], "x")
