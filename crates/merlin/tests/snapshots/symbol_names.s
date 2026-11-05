@@ -192,7 +192,7 @@ other.n.5:
     .type late, @object
     .size late, 4
 late:
-    .word .compoundliteral.10
+    .word .compoundliteral.13
 
     .text
 
@@ -424,6 +424,120 @@ copies:
     ret
     .size copies, . - copies
 
+    # int dead(int k): frame 16 bytes
+    #     -12(s0)  param int k
+    #     -16(s0)  local int m
+    .globl dead
+    .type dead, @function
+dead:
+    addi  sp, sp, -16
+    sw    ra, 12(sp)
+    sw    s0, 8(sp)
+    addi  s0, sp, 16
+    sw    a0, -12(s0)
+    lw    a0, -12(s0)
+    li    t0, 1
+    beq   a0, t0, .L.case.dead.0
+    j     .L.case.dead.1
+.L.case.dead.0:
+    la    a0, .L.str.9
+    lbu   a0, 0(a0)
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    li    a0, 111
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    sub   a0, a1, a0
+    j     .L.return.dead
+.L.case.dead.1:
+    j     .L.break.1
+.L.break.1:
+    lw    a0, -12(s0)
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    li    a0, 2
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    xor   a0, a1, a0
+    seqz  a0, a0
+    beqz  a0, .L.else.2
+    li    a0, 2
+    j     .L.return.dead
+.L.else.2:
+    j     .L.label.dead.out
+.L.label.dead.out:
+.L.loop.4:
+    lw    a0, -12(s0)
+    addi  a0, a0, 1
+    sw    a0, -12(s0)
+    addi  a0, a0, -1
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    li    a0, 3
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    slt   a0, a0, a1
+    beqz  a0, .L.end.7
+    j     .L.break.6
+.L.end.7:
+    j     .L.continue.5
+.L.continue.5:
+    j     .L.loop.4
+.L.break.6:
+.L.continue.8:
+    lw    a0, -12(s0)
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    la    a0, .L.str.11
+    lbu   a0, 0(a0)
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    add   a0, a1, a0
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    li    a0, 108
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    sub   a0, a1, a0
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    la    a0, dead.n.10
+    lw    a0, 0(a0)
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    add   a0, a1, a0
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    li    a0, 4
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    sub   a0, a1, a0
+.L.return.dead:
+    addi  sp, s0, -16
+    lw    ra, 12(sp)
+    lw    s0, 8(sp)
+    addi  sp, sp, 16
+    ret
+    .size dead, . - dead
+
+    .data
+
+    # static int n: 4 bytes
+    .balign 4
+    .type dead.n, @object
+    .size dead.n, 4
+dead.n:
+    .word 3
+
+    # static int n: 4 bytes
+    .balign 4
+    .type dead.n.10, @object
+    .size dead.n.10, 4
+dead.n.10:
+    .word 4
+
+    .text
+
     # int main(void): frame 16 bytes
     #     -12(s0)  local int sum
     .globl main
@@ -570,6 +684,26 @@ main:
     lw    a0, -12(s0)
     addi  sp, sp, -4
     sw    a0, 0(sp)
+    li    a0, 1
+    addi  sp, sp, -12
+    call  dead
+    addi  sp, sp, 12
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
+    li    a0, 5
+    addi  sp, sp, -8
+    call  dead
+    addi  sp, sp, 8
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    add   a0, a1, a0
+    lw    a1, 0(sp)
+    addi  sp, sp, 4
+    add   a0, a1, a0
+    sw    a0, -12(s0)
+    lw    a0, -12(s0)
+    addi  sp, sp, -4
+    sw    a0, 0(sp)
     la    a0, late
     lw    a0, 0(a0)
     addi  a0, a0, 4
@@ -579,7 +713,7 @@ main:
     add   a0, a1, a0
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    la    a0, .L.str.9
+    la    a0, .L.str.12
     lbu   a0, 0(a0)
     addi  sp, sp, -4
     sw    a0, 0(sp)
@@ -601,11 +735,11 @@ main:
 
     .data
 
-    # static struct pair .compoundliteral.10: 8 bytes
+    # static struct pair .compoundliteral.13: 8 bytes
     .balign 4
-    .type .compoundliteral.10, @object
-    .size .compoundliteral.10, 8
-.compoundliteral.10:
+    .type .compoundliteral.13, @object
+    .size .compoundliteral.13, 8
+.compoundliteral.13:
     .word 3
     .word 4
 
@@ -625,4 +759,10 @@ main:
     .byte 0, 0, 0, 0, 0, 0
 
 .L.str.9:
+    .asciz "one"
+
+.L.str.11:
+    .asciz "loop"
+
+.L.str.12:
     .asciz "x"

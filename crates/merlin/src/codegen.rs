@@ -470,6 +470,46 @@
 //! variables of an arm left out are not described, and the types of its
 //! casts are not kept.
 //!
+//! ## Unreachable code
+//!
+//! Nor is code control cannot reach generated, as clang's `EmitStmt` leaves
+//! it out at `-O0` (`CGStmt.cpp`). clang generates into an insertion point,
+//! the block it is filling; a jump (`return`, `break`, `continue`, `goto`)
+//! takes it away, and a statement with no insertion point is skipped, so
+//! its string literals take no names, its casts and enums are not
+//! described. [`FuncGen::reachable`] is that insertion point:
+//!
+//! ```text
+//!   return 0;
+//!   puts("dead");        no code, no .str
+//!   int n = f();         a slot for n, but no call and no -g description
+//!   static int s;        emitted all the same (a declaration is visited)
+//! again:
+//!   puts("live");        a label: reachable again
+//! ```
+//!
+//! A label or a `case` gives the insertion point back ([`FuncGen::block`]),
+//! and a statement with a label in it is generated from its start, as
+//! clang's `EnsureInsertPoint` makes a new block for it. Where the paths
+//! of a statement meet ([`FuncGen::join`]: after an `if`, a loop, a
+//! `switch`), control is there if it falls in or a jump generated so far
+//! goes there, as clang deletes a block that has no uses. So after `if (c)
+//! return 1; else return 2;` nothing is reached; nor after a `while (1)`
+//! or `for (;;)` without a `break` control reaches, nor after a `switch`
+//! with a `default` whose cases all return; and the statements of a
+//! `switch` body before its first `case`. Some blocks are emitted whatever
+//! reaches them: a `do`'s condition and a `for`'s step, so what follows a
+//! `do` loop is always reached. A static local's declaration, a block, a
+//! label and a jump are visited even where control cannot reach them
+//! (clang's `EmitSimpleStmt`): a local declared there still gets its slot,
+//! as clang allocates it, but no initialization and no `-g` description.
+//!
+//! (LLVM then deletes, as it generates the machine code, every block no
+//! path from the function's entry reaches, such as that of a label after a
+//! `return` that no `goto` control reaches jumps to; merlin keeps that
+//! code. Its globals are made all the same, so that changes no name, only
+//! what `-g` describes of the label's code.)
+//!
 //! A conditional branch reaches only ±4 KiB, and merlin-as reports a branch
 //! that cannot reach its label as an error rather than rewriting it. So once a
 //! function is generated, [`relax_branches`] estimates every instruction's
@@ -1142,6 +1182,8 @@ impl<'a> FileGen<'a> {
                 scopes: Vec::new(),
                 used: (0..n).map(|i| Cell::new(i < f.params.len())).collect(),
                 slots,
+                reachable: true,
+                reached: HashSet::new(),
             };
             g.function(body);
             let used: Vec<bool> = g.used.iter().map(Cell::get).collect();
@@ -1508,6 +1550,28 @@ enum Place {
     Pushed,
 }
 
+/// Whether `s` is visited even where control cannot reach it: clang's
+/// `EmitSimpleStmt` statements, which `EmitStmt` handles before it asks
+/// whether there is an insertion point. A block's statements are each
+/// asked in turn; a declaration still gives its locals their slots and
+/// emits its static locals; a label or `case` makes the code after it
+/// reachable; a jump does nothing there.
+fn always_visited(s: &Stmt) -> bool {
+    matches!(
+        s.kind,
+        StmtKind::Block(_)
+            | StmtKind::Decl(_)
+            | StmtKind::Empty
+            | StmtKind::Unevaluated(_)
+            | StmtKind::Label { .. }
+            | StmtKind::Goto(_)
+            | StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Case { .. }
+            | StmtKind::Default { .. }
+    )
+}
+
 /// Per-function code generator state. `'a` is the tree's lifetime, `'f` the
 /// (shorter) borrow of the file's state.
 struct FuncGen<'a, 'f> {
@@ -1551,6 +1615,14 @@ struct FuncGen<'a, 'f> {
     used: Vec<Cell<bool>>,
     /// The locals the frame has slots for: those the code uses.
     slots: Vec<bool>,
+    /// Whether control can reach the code being generated: clang's
+    /// insertion point (`HaveInsertPoint`), which a jump takes away and a
+    /// label gives back ("Unreachable code" above).
+    reachable: bool,
+    /// The labels the jumps and branches generated so far go to: those
+    /// control reaches other than by falling into them (clang's blocks
+    /// that have uses).
+    reached: HashSet<String>,
 }
 
 impl<'a> FuncGen<'a, '_> {
@@ -1604,6 +1676,7 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     fn branch(&mut self, op: &'static str, regs: &'static str, target: &str) {
+        self.reached.insert(target.to_string());
         self.lines.push(Line::Branch {
             op,
             regs,
@@ -1617,6 +1690,38 @@ impl<'a> FuncGen<'a, '_> {
 
     fn branch_if_nonzero(&mut self, target: &str) {
         self.branch("bnez", "a0", target);
+    }
+
+    /// A statement's jump to `target` (`return`, `break`, `continue`,
+    /// `goto`, the end of an `if`'s arm, a loop's way back), as clang's
+    /// `EmitBranch`: generated only from code control reaches, and nothing
+    /// after it is reached until a label is.
+    fn jump(&mut self, target: &str) {
+        if self.reachable {
+            self.reached.insert(target.to_string());
+            self.ins("j", target);
+        }
+        self.reachable = false;
+    }
+
+    /// A label code is generated after whether or not anything reaches it
+    /// (a `goto` label, a `case`, a loop's top): clang's
+    /// `EmitBlock(block)`, which makes the block the insertion point.
+    fn block(&mut self, name: &str) {
+        self.label(name);
+        self.reachable = true;
+    }
+
+    /// The label where the paths of a statement meet (after an `if`, a
+    /// loop, a `switch`): clang's `EmitBlock(block, IsFinished = true)`,
+    /// which deletes a block nothing falls or jumps into, so the code after
+    /// it is reached only if control falls in or a jump generated so far
+    /// goes there.
+    fn join(&mut self, name: &str) {
+        self.reachable |= self.reached.contains(name);
+        if self.reachable {
+            self.label(name);
+        }
     }
 
     /// A fresh label name, `.L.<what>.<n>`.
@@ -1921,7 +2026,9 @@ impl<'a> FuncGen<'a, '_> {
             self.lines.remove(i);
         }
         self.loc(f.end);
-        if !returned {
+        // (Only if control reaches the end: not after a `return`, nor
+        // after a loop no `break` leaves.)
+        if self.reachable {
             self.li("a0", 0);
             if self.is_pair(&f.ret) {
                 self.li("a1", 0);
@@ -2036,6 +2143,17 @@ impl<'a> FuncGen<'a, '_> {
     /// A statement. With `-g`, a block, and a `for` that declares its
     /// variable, is a scope of its own, with labels around its code.
     fn stmt(&mut self, s: &'a Stmt) {
+        // Code control cannot reach is not generated, as clang's `EmitStmt`
+        // leaves it out ("Unreachable code" above): a statement but those
+        // it always visits (a block, a declaration, a label, a jump, a
+        // `case`), unless a label in it can be jumped to, which makes it
+        // reachable from its start (`EnsureInsertPoint`).
+        if !self.reachable && !always_visited(s) {
+            if !elide::contains_label(s, false) {
+                return;
+            }
+            self.reachable = true;
+        }
         let scoped = match &s.kind {
             StmtKind::Block(_) => true,
             StmtKind::For { init: Some(init), .. } => matches!(init.kind, StmtKind::Decl(_)),
@@ -2074,7 +2192,10 @@ impl<'a> FuncGen<'a, '_> {
             | StmtKind::Case { .. }
             | StmtKind::Default { .. }
             | StmtKind::Label { .. } => {}
-            _ => self.loc(s.pos),
+            // (A jump control cannot reach is no code: clang's `EmitBreakStmt`,
+            // `EmitGotoStmt` give a location only with an insertion point.)
+            _ if self.reachable => self.loc(s.pos),
+            _ => {}
         }
         match &s.kind {
             StmtKind::Block(body) => {
@@ -2094,6 +2215,13 @@ impl<'a> FuncGen<'a, '_> {
                     if matches!(d.var, Some(VarRef::Global(_))) {
                         self.local_decl(d);
                         self.debug_decl(d);
+                        continue;
+                    }
+                    // A local declared where control cannot reach has its
+                    // slot, but no initialization and no description: clang
+                    // allocates it (`EmitAutoVarAlloca`), but describes it and
+                    // emits its initializer only at an insertion point.
+                    if !self.reachable {
                         continue;
                     }
                     self.debug_decl(d);
@@ -2129,6 +2257,8 @@ impl<'a> FuncGen<'a, '_> {
                 //                             .L.else.N:
                 //                               <els>
                 //                             .L.end.N:
+                // (Control reaches the end if an arm falls off its end, or,
+                // with no `else`, when the test fails.)
                 self.loc(s.pos);
                 self.test(cond);
                 match els {
@@ -2136,17 +2266,17 @@ impl<'a> FuncGen<'a, '_> {
                         let end = self.new_label("end");
                         self.branch_if_zero(&end);
                         self.stmt(then);
-                        self.label(&end);
+                        self.join(&end);
                     }
                     Some(els) => {
                         let else_ = self.new_label("else");
                         let end = self.new_label("end");
                         self.branch_if_zero(&else_);
                         self.stmt(then);
-                        self.ins("j", &end);
-                        self.label(&else_);
+                        self.jump(&end);
+                        self.block(&else_);
                         self.stmt(els);
-                        self.label(&end);
+                        self.join(&end);
                     }
                 }
             }
@@ -2157,9 +2287,12 @@ impl<'a> FuncGen<'a, '_> {
                 //     <body>
                 //     j    .L.continue.N
                 //   .L.break.N:
+                // (The code after the loop is reached when the test fails or
+                // a `break` control reaches leaves: not after a `while (1)`
+                // without one.)
                 let cont = self.new_label("continue");
                 let brk = self.new_label("break");
-                self.label(&cont);
+                self.block(&cont);
                 if self.constant_condition(cond) == Some(true) {
                     // `while (1)`: nothing to test, as clang has it. Its
                     // code generator still visits the condition (`-g`).
@@ -2170,8 +2303,8 @@ impl<'a> FuncGen<'a, '_> {
                     self.branch_if_zero(&brk);
                 }
                 self.loop_body(body, &cont, &brk);
-                self.ins("j", &cont);
-                self.label(&brk);
+                self.jump(&cont);
+                self.join(&brk);
             }
             StmtKind::DoWhile { body, cond } => {
                 //   .L.do.N:
@@ -2180,12 +2313,16 @@ impl<'a> FuncGen<'a, '_> {
                 //     <cond>
                 //     bnez a0, .L.do.N
                 //   .L.break.N:
+                //
+                // The condition is generated even when neither the body's end
+                // nor a `continue` reaches it, as clang emits its block
+                // (`EmitDoStmt`), so the code after the loop is too.
                 let top = self.new_label("do");
                 let cont = self.new_label("continue");
                 let brk = self.new_label("break");
-                self.label(&top);
+                self.block(&top);
                 self.loop_body(body, &cont, &brk);
-                self.label(&cont);
+                self.block(&cont);
                 if self.constant_condition(cond) == Some(false) {
                     // `do ... while (0)`: nothing to test, as clang has it.
                     self.kept_casts(cond);
@@ -2194,7 +2331,7 @@ impl<'a> FuncGen<'a, '_> {
                     self.test(cond);
                     self.branch_if_nonzero(&top);
                 }
-                self.label(&brk);
+                self.join(&brk);
             }
             StmtKind::For {
                 init,
@@ -2215,23 +2352,30 @@ impl<'a> FuncGen<'a, '_> {
                 if let Some(init) = init {
                     self.stmt(init);
                 }
+                //
+                // The step is generated even when neither the body's end nor
+                // a `continue` reaches it, as clang emits its block
+                // (`EmitForStmt`); the code after the loop is reached when the
+                // test fails or a `break` control reaches leaves.
                 let top = self.new_label("loop");
                 let cont = self.new_label("continue");
                 let brk = self.new_label("break");
-                self.label(&top);
+                self.block(&top);
                 if let Some(cond) = cond {
                     self.loc(cond.pos);
                     self.test(cond);
                     self.branch_if_zero(&brk);
                 }
                 self.loop_body(body, &cont, &brk);
-                self.label(&cont);
                 if let Some(step) = step {
+                    self.block(&cont);
                     self.loc(step.pos);
                     self.expr(step);
+                } else {
+                    self.join(&cont);
                 }
-                self.ins("j", &top);
-                self.label(&brk);
+                self.jump(&top);
+                self.join(&brk);
             }
             StmtKind::Return(e) => {
                 if let Some(e) = e {
@@ -2241,7 +2385,7 @@ impl<'a> FuncGen<'a, '_> {
                     }
                 }
                 let ret = self.ret_label.clone();
-                self.ins("j", ret);
+                self.jump(&ret);
             }
             StmtKind::Break => {
                 let brk = self
@@ -2249,11 +2393,11 @@ impl<'a> FuncGen<'a, '_> {
                     .last()
                     .expect("sema: break in a loop or switch")
                     .clone();
-                self.ins("j", brk);
+                self.jump(&brk);
             }
             StmtKind::Continue => {
                 let cont = self.continues.last().expect("sema: continue in a loop").clone();
-                self.ins("j", cont);
+                self.jump(&cont);
             }
             StmtKind::Switch {
                 cond,
@@ -2316,17 +2460,22 @@ impl<'a> FuncGen<'a, '_> {
                     Some(id) => self.case_label(*id),
                     None => brk.clone(),
                 };
-                self.ins("j", otherwise);
+                // Control enters the body only at its labels (clang clears
+                // the insertion point before it): a statement before the
+                // first `case` is not generated. The code after it is
+                // reached without a `default`, by a `break` control reaches,
+                // or falling off the body's end.
+                self.jump(&otherwise);
                 self.breaks.push(brk.clone());
                 self.stmt(body);
                 self.breaks.pop();
-                self.label(&brk);
+                self.join(&brk);
             }
             StmtKind::Case { id, body, .. } | StmtKind::Default { id, body } => {
                 // (Nothing jumps to the label of a switch on a constant.)
                 if !self.elided_cases.contains(id) {
                     let label = self.case_label(*id);
-                    self.label(&label);
+                    self.block(&label);
                     // `-g`: a case value that is an enumeration constant
                     // describes its enum, as clang's `EmitCaseStmt` does
                     // (`case RED:`, not `case RED + 1:` or `case (RED):`).
@@ -2349,7 +2498,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             StmtKind::Label { name, body } => {
                 let label = self.goto_label(name);
-                self.label(&label);
+                self.block(&label);
                 // `-g`: clang describes the label, in its block.
                 if let Some(d) = self.file.debug.as_mut() {
                     let l = d.label(name, s.pos, &label);
@@ -2359,7 +2508,7 @@ impl<'a> FuncGen<'a, '_> {
             }
             StmtKind::Goto(name) => {
                 let label = self.goto_label(name);
-                self.ins("j", label);
+                self.jump(&label);
             }
         }
     }

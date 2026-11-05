@@ -46,9 +46,6 @@ classify:
     j     .L.return.classify
 .L.case.classify.5:
     li    a0, -1
-    j     .L.return.classify
-.L.break.1:
-    li    a0, 0
 .L.return.classify:
     addi  sp, s0, -16
     lw    ra, 12(sp)
