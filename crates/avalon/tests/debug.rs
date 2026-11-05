@@ -105,6 +105,14 @@ impl Gdb {
         }
     }
 
+    /// Ends the connection as GDB does when it quits without `D`: the server reads all
+    /// that was sent, then the end. Only the sending half is shut, so that what the
+    /// server sends meanwhile, unread, does not turn the close into a reset (which can
+    /// take with it what the server has not read yet).
+    fn hang_up(&self) {
+        self.conn.get_ref().shutdown(std::net::Shutdown::Write).unwrap();
+    }
+
     fn acks(&self) -> usize {
         self.events.iter().filter(|e| **e == Event::Ack).count()
     }
@@ -258,8 +266,9 @@ fn a_debugger_that_goes_without_detaching_leaves_the_vm_as_it_was() {
     let mut gdb = Gdb::attach(&server, VmRef::Id(id));
     assert_eq!(gdb.ask(&format!("Z0,{at:x},4")), "OK");
     gdb.send("c");
-    drop(gdb);
+    gdb.hang_up();
     wait_for_state(&mut control, id, |s| s == VmState::Debug);
+    drop(gdb);
     wait_until("the debugger to go", SLOW, || {
         !server.debug_vm(id).unwrap().debugged
     });
@@ -289,6 +298,36 @@ fn a_debugger_that_goes_without_detaching_leaves_the_vm_as_it_was() {
     assert!(interrupted.starts_with("T02"), "{interrupted}");
     assert_eq!(gdb.ask("D"), "OK");
     wait_for_state(&mut control, id, |s| s == VmState::Running);
+    server.stop().unwrap();
+}
+
+/// What a debugger sent just before its connection ended still reaches the stub, as
+/// QEMU's stub reads a connection's last bytes before it sees the close: an interrupt
+/// sent while the VM ran for the debugger, the thread in a slice, and then the end,
+/// still stops the VM (paused, as the debugger's Ctrl-C stops it), and it stays stopped
+/// with nobody to debug it.
+#[test]
+fn a_debuggers_last_bytes_reach_the_stub() {
+    let server = server(None);
+    let mut control = connect(&server);
+    let id = create(&mut control, "spin", profile(4, None), spinner());
+    control
+        .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
+        .unwrap();
+    let mut gdb = Gdb::attach(&server, VmRef::Id(id));
+    assert_eq!(state(&mut control, id), VmState::Paused);
+    gdb.send("c");
+    wait_for_state(&mut control, id, |s| s == VmState::Running);
+    gdb.raw(&[0x03]);
+    gdb.hang_up();
+    wait_until("the debugger to go", SLOW, || {
+        !server.debug_vm(id).unwrap().debugged
+    });
+    wait_for_state(&mut control, id, |s| s == VmState::Paused);
+    let steps = info(&mut control, id).steps;
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(info(&mut control, id).steps, steps);
+    drop(gdb);
     server.stop().unwrap();
 }
 

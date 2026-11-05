@@ -228,10 +228,10 @@ struct Inner {
     /// machine for it): what `attach_debugger` and `detach_debugger` wait for.
     linked: Option<u64>,
     /// A debugger that went without `D` (its connection ended, or it could no longer be
-    /// written to): the thread lets go of its session and leaves the machine as it is,
-    /// stopped or running, its breakpoints and watchpoints kept, as QEMU does when a
-    /// GDB connection closes.
-    dropped: Option<u64>,
+    /// written to): the thread hands the stub what it sent before it went, then lets go
+    /// of its session and leaves the machine as it is, stopped or running, its
+    /// breakpoints and watchpoints kept, as QEMU does when a GDB connection closes.
+    dropped: Option<Dropped>,
     /// The state notices held back by [`NOTICE_RATE`].
     notices: Notices,
 }
@@ -252,6 +252,26 @@ struct Debugger {
     outbox: Arc<Outbox>,
     /// Bytes of the GDB remote serial protocol for the stub.
     input: Vec<u8>,
+}
+
+/// A debugger gone without `D`, and the bytes it sent that the thread had not taken
+/// yet. QEMU's stub reads a connection's bytes in order and sees its end after the
+/// last of them (`gdb_chr_receive`, then `CHR_EVENT_CLOSED`), so a `c` sent just before
+/// the connection closed still runs the VM: these still go to the stub, before the
+/// thread lets go of the session.
+struct Dropped {
+    client: u64,
+    input: Vec<u8>,
+}
+
+impl Dropped {
+    /// `debugger` is gone without `D`.
+    fn from(debugger: Debugger) -> Dropped {
+        Dropped {
+            client: debugger.outbox.id,
+            input: debugger.input,
+        }
+    }
 }
 
 /// What the thread does once it has looked at the VM.
@@ -724,8 +744,7 @@ impl Vm {
                 || viewers.iter().any(|v| v.outbox.id == d.outbox.id);
             if !told && !d.outbox.event(&event) {
                 // Gone without `D`.
-                *dropped = Some(d.outbox.id);
-                *debugger = None;
+                *dropped = debugger.take().map(Dropped::from);
             }
         }
         self.wake.notify_all();
@@ -1025,9 +1044,9 @@ impl Vm {
         if inner.debugger.as_ref().map(|d| d.outbox.id) != Some(id) {
             return false;
         }
-        inner.debugger = None;
+        let debugger = inner.debugger.take();
         if dropped {
-            inner.dropped = Some(id);
+            inner.dropped = debugger.map(Dropped::from);
         }
         self.wake.notify_all();
         while inner.linked == Some(id) && !inner.gone {
@@ -1175,6 +1194,11 @@ impl Vm {
                         return;
                     }
                     self.send_due_notice(&mut inner);
+                    // What a debugger gone without `D` sent before it went reaches the
+                    // stub before its session ends.
+                    if let Some(input) = Vm::dropped_input(&mut inner, &link) {
+                        break Work::Debug(input);
+                    }
                     self.link_debugger(&mut inner, &mut link, &mut machine);
                     if let Some(l) = link.as_mut().filter(|l| l.waiting) {
                         if inner.state == VmState::Paused {
@@ -1367,7 +1391,8 @@ impl Vm {
                 {
                     nap = nap.min(due.saturating_duration_since(Instant::now()));
                 }
-                let debug_input = inner.debugger.as_ref().is_some_and(|d| !d.input.is_empty());
+                let debug_input = inner.debugger.as_ref().is_some_and(|d| !d.input.is_empty())
+                    || inner.dropped.as_ref().is_some_and(|d| !d.input.is_empty());
                 if !inner.kick && !inner.gone && !inner.stopping && !debug_input {
                     drop(self.wake.wait_timeout(inner, nap));
                 }
@@ -1388,7 +1413,7 @@ impl Vm {
             return;
         }
         if let Some(old) = link.take() {
-            if inner.dropped.take() != Some(old.client) {
+            if inner.dropped.take().map(|d| d.client) != Some(old.client) {
                 machine.clear_debug_points();
                 if matches!(inner.state, VmState::Paused | VmState::Debug) {
                     self.set_state(inner, VmState::Running);
@@ -1421,9 +1446,18 @@ impl Vm {
         let event = event_frame(&Message::DebugOutput { vm: self.id, data });
         if !debugger.outbox.event(&event) {
             // Gone, as if its connection had ended.
-            inner.dropped = Some(debugger.outbox.id);
-            inner.debugger = None;
+            inner.dropped = inner.debugger.take().map(Dropped::from);
         }
+    }
+
+    /// The bytes a debugger gone without `D` sent that the stub has not had, while the
+    /// thread still has its session (`link`).
+    fn dropped_input(inner: &mut Inner, link: &Option<DebugLink>) -> Option<Vec<u8>> {
+        let dropped = inner.dropped.as_mut()?;
+        if link.as_ref().map(|l| l.client) != Some(dropped.client) || dropped.input.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut dropped.input))
     }
 
     /// The machine has ended (stopped, exited, destroyed): a debugger waiting for a stop
