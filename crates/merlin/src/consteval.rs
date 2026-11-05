@@ -316,14 +316,21 @@ fn binary(
 /// as clang 23 folds it.
 ///
 /// * An object's address is not null: a global's, a local's (a
-///   parameter's too), a string literal's, a function's. So `&g != 0` is 1,
-///   `!&g` is 0 and `&g && x` is `x`'s truth.
+///   parameter's too), a string literal's, a compound literal's, a
+///   function's. So `&g != 0` is 1, `!&g` is 0 and `&g && x` is `x`'s
+///   truth.
 /// * Two objects' addresses differ (`&g == &h` is 0), unless one points
-///   just past its object, where the other may start (`&g + 1 == &h`), or
-///   both are string literals whose bytes could be shared (`"a" == "a"`,
-///   not `&"ab"[1] == "ab"`).
-/// * Addresses in one object compare and subtract by their offsets
-///   (`&a[1] < &a[2]` is 1, `&a[2] - &a[0]` is 2).
+///   just past its object and the other at its start, where the two may
+///   meet (`&g + 1 == &h`, but `&a[4] == &s.n` is 0), or one is an array
+///   of unknown size, which may hold nothing (`extern int ea[];`: `ea ==
+///   &g`), or both are string literals whose bytes could be shared (`"a"
+///   == "a"`, not `&"ab"[1] == "ab"`). An address knows it is just past
+///   its object only while it designates something ([`Designator`]): not
+///   once cast to a pointer to another type, so `(char *)&g + 4 == (char
+///   *)&h` is 0.
+/// * Addresses in one object are equal and subtract by their offsets
+///   (`&a[2] - &a[0]` is 2), and are ordered by them inside the object or
+///   just past its end (`&a[1] < &a[2]` is 1, `&a[1] < &a[5]` not known).
 ///
 /// What is not known stays code: a pointer variable's value (`p != 0`), an
 /// address converted to an integer (`(long)&g`), two objects' order
@@ -340,37 +347,59 @@ pub fn condition(e: &Expr, x: Xlen) -> Option<i128> {
 }
 
 /// A value [`condition`] works out: an integer, or an address in an object
-/// (none: a plain number used as an address, `(char *)16`, or null).
+/// (none: a plain number used as an address, `(char *)16`, or null), at an
+/// offset in bytes, with what the address designates ([`Designator`]).
 #[derive(Clone, Debug)]
 enum Folded {
     Int(i128, IntKind),
-    Addr(Option<Object>, i128),
+    Addr(Option<Object>, i128, Designator),
 }
 
+/// What an address designates, as clang's evaluator tracks it
+/// (`SubobjectDesignator`): the bytes of the object or subobject it is in,
+/// from the start of its object, which arithmetic may move it across up to
+/// just past the end (`&a[4]` of an `int a[4]`, `&s.m + 1`); or `None`
+/// once it no longer designates one (`Invalid`): moved out of them
+/// (`&a[5]`), or cast to a pointer to another type (`(char *)&g`) but
+/// `void *`. Two objects' addresses are equal only where one is just past
+/// the end of its object, and clang knows that only of an address that
+/// still designates something (or one into an object of incomplete type).
+type Designator = Option<(i128, i128)>;
+
 /// An object whose address [`condition`] knows: what it is, and its size in
-/// bytes (none for a function).
+/// bytes (none for a function or an object of incomplete type).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Object {
     what: Place,
     size: Option<i128>,
+    /// An object of incomplete type (`extern struct s es;`).
+    incomplete: bool,
+    /// An array of unknown size (`extern int ea[];`), which may hold no
+    /// element at all: clang's `isZeroSized`, whose address it never
+    /// compares with another object's, since the two could be one.
+    zero_sized: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Place {
     /// A global symbol: a global variable, a `static` local, a function.
     Sym(String),
-    /// A local of the function (a parameter too).
+    /// A local of the function (a parameter too, a compound literal in a
+    /// function).
     Local(LocalId),
     /// A string literal.
     Str(Vec<u8>),
+    /// A compound literal of the file's scope, by the address of its
+    /// expression: each is an object of its own.
+    Literal(usize),
 }
 
 /// Whether a value is true, as a condition tests it.
 fn truth(v: &Folded) -> bool {
     match v {
         Folded::Int(v, _) => *v != 0,
-        Folded::Addr(Some(_), _) => true,
-        Folded::Addr(None, offset) => *offset != 0,
+        Folded::Addr(Some(_), ..) => true,
+        Folded::Addr(None, offset, _) => *offset != 0,
     }
 }
 
@@ -383,6 +412,12 @@ fn fold(e: &Expr, x: Xlen) -> Option<Folded> {
     let as_int = |v: Folded| match v {
         Int(v, k) => Some((v, k)),
         Addr(..) => None,
+    };
+    // An address moved by `by` bytes: it designates what it did while it
+    // stays in it, up to just past its end.
+    let moved = |o: Option<Object>, at: i128, d: Designator, by: i128| {
+        let to = at + by;
+        Addr(o, to, d.filter(|&(lo, hi)| (lo..=hi).contains(&to)))
     };
     match &e.kind {
         ExprKind::Unary(UnOp::Not, a) => Some(Int((!truth(&fold(a, x)?)).into(), IntKind::Int)),
@@ -414,15 +449,15 @@ fn fold(e: &Expr, x: Xlen) -> Option<Folded> {
                 Const::Addr { .. } => None,
             },
             // A pointer moved by whole elements.
-            (Addr(o, at), Int(n, _)) if matches!(op, BinOp::Add | BinOp::Sub) => {
+            (Addr(o, at, d), Int(n, _)) if matches!(op, BinOp::Add | BinOp::Sub) => {
                 let n = if *op == BinOp::Sub { -n } else { n };
-                Some(Addr(o, at + n * step(&l.ty, x)?))
+                Some(moved(o, at, d, n * step(&l.ty, x)?))
             }
-            (Int(n, _), Addr(o, at)) if *op == BinOp::Add => Some(Addr(o, at + n * step(&r.ty, x)?)),
-            (Addr(a, at), Addr(b, bt)) => compare(*op, (a, at), (b, bt), &l.ty, x),
+            (Int(n, _), Addr(o, at, d)) if *op == BinOp::Add => Some(moved(o, at, d, n * step(&r.ty, x)?)),
+            (Addr(a, at, ad), Addr(b, bt, bd)) => compare(*op, (a, at, ad), (b, bt, bd), &l.ty, x),
             // An address compared with a null pointer constant, `&g != 0`.
-            (Addr(a, at), Int(n, _)) => compare(*op, (a, at), (None, n), &l.ty, x),
-            (Int(n, _), Addr(b, bt)) => compare(*op, (None, n), (b, bt), &r.ty, x),
+            (Addr(a, at, ad), Int(n, _)) => compare(*op, (a, at, ad), (None, n, None), &l.ty, x),
+            (Int(n, _), Addr(b, bt, bd)) => compare(*op, (None, n, None), (b, bt, bd), &r.ty, x),
         },
         ExprKind::Cond(c, a, b) => {
             let v = fold(if truth(&fold(c, x)?) { a } else { b }, x)?;
@@ -436,13 +471,30 @@ fn fold(e: &Expr, x: Xlen) -> Option<Folded> {
             (Type::Int(k), Int(v, _)) => Some(Int(k.wrap(v, x), *k)),
             // A plain number used as an address is that number again; an
             // object's address as a number is not known.
-            (Type::Int(k), Addr(None, at)) => Some(Int(k.wrap(at, x), *k)),
-            (Type::Ptr(_), Int(v, _)) => Some(Addr(None, IntKind::ULong.wrap(v, x))),
-            (Type::Ptr(_), a @ Addr(..)) => Some(a),
+            (Type::Int(k), Addr(None, at, _)) => Some(Int(k.wrap(at, x), *k)),
+            (Type::Ptr(_), Int(v, _)) => Some(Addr(None, IntKind::ULong.wrap(v, x), None)),
+            // A pointer cast to another pointer type designates nothing any
+            // more (clang's `CK_BitCast`), but to `void *` or to a pointer
+            // to a similar type (`CK_NoOp`: qualifiers added); an array or
+            // a function decays to a pointer to its elements or to itself
+            // first.
+            (Type::Ptr(to), Addr(o, at, d)) => {
+                let keeps = to.is_void()
+                    || match a.ty.unqual() {
+                        Type::Ptr(from) | Type::Array(from, _) => from.similar(to),
+                        f @ Type::Func(_) => f.similar(to),
+                        _ => true,
+                    };
+                Some(Addr(o, at, d.filter(|_| keeps)))
+            }
             _ => None,
         },
         // An array or a function stands for its address.
-        ExprKind::Str(_) | ExprKind::Var { .. } | ExprKind::Deref(_) | ExprKind::Member { .. }
+        ExprKind::Str(_)
+        | ExprKind::Var { .. }
+        | ExprKind::Deref(_)
+        | ExprKind::Member { .. }
+        | ExprKind::CompoundLit { .. }
             if e.ty.is_array() || e.ty.is_func() =>
         {
             place(e, x)
@@ -454,13 +506,19 @@ fn fold(e: &Expr, x: Xlen) -> Option<Folded> {
 
 /// The address of an lvalue, if [`condition`] knows it.
 fn place(e: &Expr, x: Xlen) -> Option<Folded> {
+    let size = e.ty.size(x).map(i128::from);
     let object = |what: Place| {
+        // An incomplete type has no size; a function has none either.
+        let incomplete = size.is_none() && !e.ty.is_func();
         Some(Folded::Addr(
             Some(Object {
                 what,
-                size: e.ty.size(x).map(i128::from),
+                size,
+                incomplete,
+                zero_sized: incomplete && e.ty.is_array(),
             }),
             0,
+            Some((0, size.unwrap_or(0))),
         ))
     };
     match &e.kind {
@@ -473,17 +531,30 @@ fn place(e: &Expr, x: Xlen) -> Option<Folded> {
             ..
         } => object(Place::Local(*id)),
         ExprKind::Str(bytes) => object(Place::Str(bytes.clone())),
+        // A compound literal is an object, never null (sema gives one in
+        // a function a local).
+        ExprKind::CompoundLit { local: Some(id), .. } => object(Place::Local(*id)),
+        ExprKind::CompoundLit { local: None, .. } => object(Place::Literal(e as *const Expr as usize)),
         ExprKind::Deref(p) => match fold(p, x)? {
+            // An array element that is an array itself (`m[1]` of an
+            // `int m[2][4]`) is the subobject designated.
+            Folded::Addr(o, at, d) if e.ty.is_array() => {
+                Some(Folded::Addr(o, at, d.and(size.map(|s| (at, at + s)))))
+            }
             a @ Folded::Addr(..) => Some(a),
             Folded::Int(..) => None,
         },
+        // A member is the subobject designated.
         ExprKind::Member {
             base,
             arrow,
             offset: member,
             ..
         } => match if *arrow { fold(base, x)? } else { place(base, x)? } {
-            Folded::Addr(o, at) => Some(Folded::Addr(o, at + i128::from(*member))),
+            Folded::Addr(o, at, d) => {
+                let at = at + i128::from(*member);
+                Some(Folded::Addr(o, at, d.and(size.map(|s| (at, at + s)))))
+            }
             Folded::Int(..) => None,
         },
         _ => None,
@@ -491,11 +562,12 @@ fn place(e: &Expr, x: Xlen) -> Option<Folded> {
 }
 
 /// `a op b` of two addresses, `l` the type of the left one: a comparison
-/// or a difference, where what is known of the objects decides it.
+/// or a difference, where what is known of the objects decides it, as
+/// clang's `EvaluateComparisonBinaryOperator` decides it.
 fn compare(
     op: BinOp,
-    (a, at): (Option<Object>, i128),
-    (b, bt): (Option<Object>, i128),
+    (a, at, ad): (Option<Object>, i128, Designator),
+    (b, bt, bd): (Option<Object>, i128, Designator),
     l: &Type,
     x: Xlen,
 ) -> Option<Folded> {
@@ -536,22 +608,40 @@ fn compare(
         }
     };
     if same {
+        // Ordered only inside the object, or just past its end, whose size
+        // must be known: `&a[1] < &a[5]` of an `int a[4]` is not folded, nor
+        // any order in an array of unknown size.
+        let inside = |at: i128| {
+            a.as_ref()
+                .is_none_or(|o| o.size.is_some_and(|size| (0..=size).contains(&at)))
+        };
+        let ordered = inside(at) && inside(bt);
         return match op {
             BinOp::Eq => int(at == bt),
             BinOp::Ne => int(at != bt),
-            BinOp::Lt => int(at < bt),
-            BinOp::Le => int(at <= bt),
-            BinOp::Gt => int(at > bt),
-            BinOp::Ge => int(at >= bt),
+            BinOp::Lt if ordered => int(at < bt),
+            BinOp::Le if ordered => int(at <= bt),
+            BinOp::Gt if ordered => int(at > bt),
+            BinOp::Ge if ordered => int(at >= bt),
             BinOp::Sub => Some(Folded::Int((at - bt) / step(l, x)?, IntKind::ptrdiff_t(x))),
             _ => None,
         };
     }
-    // Two objects: never at one address, unless one points just past its
-    // end, where the other may start.
+    // Two objects: never at one address, unless one may hold nothing at
+    // all, or one points just past its end and the other at its start,
+    // where the two could meet (C++ DR1652, which clang applies to C).
     let (a, b) = (a?, b?);
-    let past = |o: &Object, at: i128| o.size == Some(at);
-    if past(&a, at) || past(&b, bt) {
+    if a.zero_sized || b.zero_sized {
+        return None;
+    }
+    // Just past the end: what is known of an address that designates
+    // something, by its offset; of one that does not, only that it may be
+    // if its object's size is unknown (`isOnePastTheEndOfCompleteObject`).
+    let past = |o: &Object, at: i128, d: Designator| match d {
+        Some(_) => o.size == Some(at),
+        None => o.incomplete,
+    };
+    if (bt == 0 && past(&a, at, ad)) || (at == 0 && past(&b, bt, bd)) {
         return None;
     }
     match op {
@@ -705,11 +795,12 @@ mod tests {
     }
 
     /// What [`condition`] folds of `cond`, the condition of an `if` in a
-    /// checked program with globals `g`, `h`, `a[4]`, `s`, a function `fn`,
-    /// a parameter `x` and locals `l` and `p` (pointing to `l`).
+    /// checked program with globals `g`, `h`, `a[4]`, `s`, arrays of
+    /// unknown size `ea` and `eb`, a function `fn`, a parameter `x` and
+    /// locals `l` and `p` (pointing to `l`).
     fn cond(src: &str) -> Option<i128> {
         let prog = crate::parse(&format!(
-            "int g, h, a[4]; struct {{ int m, n; }} s; int fn(void);\n\
+            "int g, h, a[4]; struct {{ int m, n; }} s; int fn(void); extern int ea[], eb[];\n\
              int f(int x) {{ int l = x; int *p = &l; if ({src}) return 1; return 0; }}"
         ))
         .unwrap_or_else(|e| panic!("{src}: {e:?}"));
@@ -758,6 +849,35 @@ mod tests {
             ("&\"ab\"[1] == \"ab\"", 0),
             ("(char *)0 == 0", 1),
             ("(char *)16 != 0", 1),
+            // Just past the end of one object, the start of no other.
+            ("&a[4] == &s.n", 0),
+            ("&s.m + 1 == &g", 0),
+            // Out of what it designates (`&s.m + 2`), or cast to a pointer
+            // to another type, an address designates nothing, and is just
+            // past the end of nothing.
+            ("&s.m + 2 == &g", 0),
+            ("(char *)&g + 4 == (char *)&h", 0),
+            ("(int *)((char *)&a + 16) == &h", 0),
+            ("(char *)a + 16 == (char *)&g", 0),
+            ("(unsigned *)&a[4] == (unsigned *)&g", 0),
+            ("(int *)(void *)&a[4] == &g", 0),
+            // In one object, equal and subtracted by the offsets, out of it
+            // too; ordered inside it or just past its end.
+            ("&a[5] == &a[5]", 1),
+            ("&a[6] - &a[0]", 6),
+            ("&a[0] <= &a[4]", 1),
+            ("(char *)&a + 1 < (char *)&a + 2", 1),
+            ("&s.m + 2 > &s.m", 1),
+            // An array of unknown size: not null, and equal and subtracted
+            // in itself.
+            ("ea != 0", 1),
+            ("&ea[1] == &ea[1]", 1),
+            ("&ea[2] == &ea[3]", 0),
+            ("&ea[5] - &ea[1]", 4),
+            // A compound literal is an object.
+            ("&(int){1} != 0", 1),
+            ("&(int){1} == &g", 0),
+            ("&(int){1} == &(int){1}", 0),
         ] {
             assert_eq!(cond(src), Some(v), "{src}");
         }
@@ -774,6 +894,27 @@ mod tests {
             "&g == (int *)16",
             "&g",
             "x",
+            // Just past the end of one object, where another starts: also
+            // through `void *`, a cast that keeps what it designates, or
+            // one just past a member that ends its struct.
+            "&a[1] + 3 == &h",
+            "(void *)&a[4] == (void *)&g",
+            "(const int *)&a[4] == &g",
+            "&s.n + 1 == &g",
+            // Ordered out of the object.
+            "&a[1] < &a[5]",
+            "&a[-1] < &a[1]",
+            "(char *)&a + 1 < (char *)&a + 20",
+            // An array of unknown size may hold nothing, and so be at
+            // another object's address (clang's `isZeroSized`), whatever
+            // the offsets; and its addresses are not ordered.
+            "ea == &g",
+            "&ea[3] == &g",
+            "&ea[1] == &s.n",
+            "ea == eb",
+            "(char *)&ea[3] == (char *)&g",
+            "&ea[2] < &ea[3]",
+            "(char *)&ea[1] < (char *)&ea[2]",
         ] {
             assert_eq!(cond(src), None, "{src}");
         }
