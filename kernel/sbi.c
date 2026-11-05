@@ -2,6 +2,7 @@
  * makes, over sbi_ecall() (sbi_ecall.S), as Linux's arch/riscv/kernel/sbi.c
  * has them, and the boot-time check that the calls are there. */
 #include "sbi.h"
+#include "errno.h"
 #include "kprintf.h"
 #include "riscv.h"
 #include "trap.h"
@@ -67,10 +68,11 @@ long sbi_send_ipi(uintptr mask, uintptr base) {
     struct sbiret r = sbi_ecall(SBI_EXT_IPI, SBI_IPI_SEND_IPI, mask, base, 0, 0, 0, 0);
     if (r.error != SBI_SUCCESS) {
         /* Linux's __sbi_send_ipi_v02() message, pr_err("%s: hbase = [%lu]
-         * hmask = [0x%lx] failed (error [%d])\n", __func__, ...). Linux
-         * prints the errno it maps the error to; Camelot's kernel has no
-         * errno for most SBI errors, so here it is the SBI error itself. */
-        kprintf("sbi_send_ipi: hbase = [%lu] hmask = [0x%lx] failed (error [%ld])\n", base, mask, r.error);
+         * hmask = [0x%lx] failed (error [%d])\n", __func__, hbase, hmask,
+         * sbi_err_map_linux_errno(ret.error)): the error as minus an errno,
+         * -22 (-EINVAL) for SBI_ERR_INVALID_PARAM. */
+        kprintf("sbi_send_ipi: hbase = [%lu] hmask = [0x%lx] failed (error [%d])\n", base, mask,
+                sbi_err_map_linux_errno(r.error));
     }
     return r.error;
 }
@@ -168,6 +170,45 @@ const char *sbi_strerror(long error) {
         return "SBI_ERR_ALREADY_STOPPED";
     case SBI_ERR_NO_SHMEM:
         return "SBI_ERR_NO_SHMEM";
+    case SBI_ERR_INVALID_STATE:
+        return "SBI_ERR_INVALID_STATE";
+    case SBI_ERR_BAD_RANGE:
+        return "SBI_ERR_BAD_RANGE";
+    case SBI_ERR_TIMEOUT:
+        return "SBI_ERR_TIMEOUT";
+    case SBI_ERR_IO:
+        return "SBI_ERR_IO";
+    case SBI_ERR_DENIED_LOCKED:
+        return "SBI_ERR_DENIED_LOCKED";
     }
     return "an unknown SBI error";
+}
+
+/* Linux's sbi_err_map_linux_errno() (arch/riscv/include/asm/sbi.h), case
+ * for case. */
+int sbi_err_map_linux_errno(long err) {
+    switch (err) {
+    case SBI_SUCCESS:
+        return 0;
+    case SBI_ERR_DENIED:
+    case SBI_ERR_DENIED_LOCKED:
+        return -EPERM;
+    case SBI_ERR_INVALID_PARAM:
+    case SBI_ERR_INVALID_STATE:
+        return -EINVAL;
+    case SBI_ERR_BAD_RANGE:
+        return -ERANGE;
+    case SBI_ERR_INVALID_ADDRESS:
+        return -EFAULT;
+    case SBI_ERR_NO_SHMEM:
+        return -ENOMEM;
+    case SBI_ERR_TIMEOUT:
+        return -ETIMEDOUT;
+    case SBI_ERR_IO:
+        return -EIO;
+    case SBI_ERR_NOT_SUPPORTED:
+    case SBI_ERR_FAILED:
+    default:
+        return -ENOTSUPP;
+    }
 }

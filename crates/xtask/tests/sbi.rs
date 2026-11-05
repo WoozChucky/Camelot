@@ -654,7 +654,7 @@ fn sbi_send_ipi_says_when_the_call_fails() {
             (
                 0x10,
                 ERR_INVALID_PARAM,
-                "sbi_send_ipi: hbase = [0] hmask = [0x10] failed (error [-3])\n",
+                "sbi_send_ipi: hbase = [0] hmask = [0x10] failed (error [-22])\n",
             ),
         ] {
             let printed = s.printed().len();

@@ -95,7 +95,9 @@
 #define SBI_DBCN_CONSOLE_READ 1       /* (num_bytes, base_addr_lo, base_addr_hi) */
 #define SBI_DBCN_CONSOLE_WRITE_BYTE 2 /* (byte) */
 
-/* Error codes, in a0. */
+/* Error codes, in a0: the SBI spec's names (Linux calls SBI_ERR_FAILED
+ * SBI_ERR_FAILURE), -1 to -9 v0.2's, -10 and -11 v2.0's, -12 to -14
+ * v3.0's. */
 #define SBI_SUCCESS 0
 #define SBI_ERR_FAILED (-1)
 #define SBI_ERR_NOT_SUPPORTED (-2)
@@ -106,6 +108,11 @@
 #define SBI_ERR_ALREADY_STARTED (-7)
 #define SBI_ERR_ALREADY_STOPPED (-8)
 #define SBI_ERR_NO_SHMEM (-9)
+#define SBI_ERR_INVALID_STATE (-10)
+#define SBI_ERR_BAD_RANGE (-11)
+#define SBI_ERR_TIMEOUT (-12)
+#define SBI_ERR_IO (-13)
+#define SBI_ERR_DENIED_LOCKED (-14)
 
 /* Camelot's SBI implementation (machine.S): its ID, which no registry has
  * given it (the SBI spec lists BBL as 0, OpenSBI as 1, and so on up from
@@ -143,7 +150,8 @@ void sbi_set_timer(u64 stime);
 /* IPI: a supervisor software interrupt to hart `base` + i for every bit i
  * set in `mask`. Returns the SBI error, and says a failure on the console
  * as Linux's __sbi_send_ipi_v02() does (`sbi_send_ipi: hbase = [0] hmask =
- * [0x10] failed (error [-3])`, the error the SBI's), so callers needn't. */
+ * [0x10] failed (error [-22])`, the error sbi_err_map_linux_errno()'s), so
+ * callers needn't. */
 long sbi_send_ipi(uintptr mask, uintptr base);
 
 /* HSM: starts hart `hartid` in S-mode at physical address `start` with
@@ -180,6 +188,18 @@ void machine_power_off(u32 code);
 
 /* A short name for an SBI error ("SBI_ERR_INVALID_PARAM"), for messages. */
 const char *sbi_strerror(long error);
+
+/* An SBI error as minus an errno (errno.h), Linux's sbi_err_map_linux_errno()
+ * (arch/riscv/include/asm/sbi.h): 0 for SBI_SUCCESS, -EPERM for
+ * SBI_ERR_DENIED and SBI_ERR_DENIED_LOCKED, -EINVAL for
+ * SBI_ERR_INVALID_PARAM and SBI_ERR_INVALID_STATE, -ERANGE for
+ * SBI_ERR_BAD_RANGE, -EFAULT for SBI_ERR_INVALID_ADDRESS, -ENOMEM for
+ * SBI_ERR_NO_SHMEM, -ETIMEDOUT for SBI_ERR_TIMEOUT, -EIO for SBI_ERR_IO, and
+ * -ENOTSUPP for SBI_ERR_NOT_SUPPORTED, SBI_ERR_FAILED and every other error
+ * (SBI_ERR_ALREADY_AVAILABLE, SBI_ERR_ALREADY_STARTED and
+ * SBI_ERR_ALREADY_STOPPED among them). Linux has it inline in the header;
+ * here it is sbi.c's, so that each file including this one has no copy. */
+int sbi_err_map_linux_errno(long err);
 #endif
 
 #endif
