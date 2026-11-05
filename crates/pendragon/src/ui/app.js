@@ -213,7 +213,7 @@ function serverCard(avalon, vms, ram) {
         "p",
         {},
         el("a", { href: "#/vms" }, vms.total + " VMs"),
-        ": " + vms.running + " running, " + vms.paused + " paused, " + vms.created + " created, " + vms.ended + " ended",
+        ": " + vms.running + " running, " + vms.paused + " paused, " + vms.debug + " debug, " + vms.created + " created, " + vms.ended + " ended",
       ),
     );
   }

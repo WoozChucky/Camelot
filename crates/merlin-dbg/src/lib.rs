@@ -7,10 +7,12 @@
 //! - [`vars`]: variables and types, from the program's DWARF debugging information;
 //! - [`frames`]: backtraces by frame pointer (the frame layout is explained there);
 //! - [`session`]: the commands;
-//! - [`run`]: the command line, which connects to a stub or starts a machine in this
-//!   process.
+//! - [`run`]: the command line, which connects to a stub (`grail --gdb`'s, or a VM's on
+//!   an Avalon server) or starts a machine in this process.
 
+pub mod camelot;
 pub mod frames;
+pub mod paging;
 pub mod remote;
 pub mod session;
 pub mod source;
@@ -18,14 +20,13 @@ pub mod symbols;
 pub mod vars;
 
 use remote::Remote;
-use session::{Flow, OnQuit, Session};
-use source::Lines;
+use session::{Flow, OnQuit, ProgramFile, Session};
 use std::io::{BufRead, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::AtomicBool;
-use symbols::Symbols;
 
 pub const USAGE: &str = "usage: merlin-dbg [--connect ADDR] [-x FILE] [program.elf]
+       merlin-dbg --vm VM [--server ADDR] [-x FILE] [program.elf]
        merlin-dbg [-x FILE] -- [grail options] program.elf
 
 Debugs a program running in Grail, at the machine level: breakpoints,
@@ -38,6 +39,10 @@ relative to the current directory (directory DIR adds others).
   --connect ADDR  the GDB stub of a running grail --gdb (default 127.0.0.1:1234):
                   HOST:PORT or a port on 127.0.0.1. program.elf gives the symbols.
                   quit leaves the machine running
+  --vm VM         the GDB stub of a VM on an Avalon server (its name or id), which
+                  stops for the debugger; quit leaves it running
+  --server ADDR   with --vm, the Avalon server: host:port, or a host or IP address
+                  for port 7400 (default 127.0.0.1:7400)
   -- ARGS         start Grail in this process with ARGS, its options and program
                   (as for the grail command), stopped at its first instruction.
                   The program's console output comes here; it gets no input.
@@ -49,6 +54,20 @@ running machine.";
 
 /// The default stub address, `grail --gdb-wait`'s.
 const DEFAULT_ADDR: &str = "127.0.0.1:1234";
+
+/// Avalon's default port, for a `--server` without one.
+const AVALON_PORT: u16 = 7400;
+
+/// The name merlin-dbg gives an Avalon server.
+const AGENT: &str = "merlin-dbg";
+
+/// Where the stub is.
+enum Stub {
+    /// `grail --gdb`'s, at this address.
+    Tcp(SocketAddr),
+    /// The stub of this VM on the Avalon server at this address.
+    Vm(String, avalon_proto::VmRef),
+}
 
 /// Runs merlin-dbg with `args` (without the program name), reading commands from
 /// `input` and writing to `out`. `interrupt` is set on Ctrl-C. Returns the exit code.
@@ -74,6 +93,8 @@ fn start(
     interrupt: &AtomicBool,
 ) -> Result<(), Option<String>> {
     let mut connect = None;
+    let mut vm = None;
+    let mut server = None;
     let mut script = None;
     let mut program = None;
     let mut grail_args = None;
@@ -86,6 +107,17 @@ fn start(
                     .next()
                     .ok_or_else(|| Some("--connect needs an address".to_string()))?;
                 connect = Some(parse_addr(v).map_err(|e| format!("--connect: {e}"))?);
+            }
+            "--vm" => {
+                let v = it.next().ok_or_else(|| Some("--vm needs a VM".to_string()))?;
+                vm = Some(avalon_proto::VmRef::parse(v));
+            }
+            "--server" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Some("--server needs an address".to_string()))?;
+                server =
+                    Some(avalon_client::parse_addr(v, AVALON_PORT).map_err(|e| format!("--server: {e}"))?);
             }
             "-x" => {
                 script = Some(
@@ -107,8 +139,16 @@ fn start(
         None => String::new(),
     };
 
+    if server.is_some() && vm.is_none() {
+        return Err(Some(format!("--server goes with --vm\n{USAGE}")));
+    }
+    if vm.is_some() && (connect.is_some() || grail_args.is_some()) {
+        return Err(Some(format!(
+            "--vm, --connect and -- are three ways to reach a machine: one at a time\n{USAGE}"
+        )));
+    }
     // Where the stub is, and the machine's thread when it is ours.
-    let (addr, machine, on_quit) = match grail_args {
+    let (stub, machine, on_quit) = match grail_args {
         Some(_) if connect.is_some() || program.is_some() => {
             return Err(Some(format!(
                 "--connect and a program go before --, not with it\n{USAGE}"
@@ -117,44 +157,56 @@ fn start(
         Some(args) => {
             let (addr, thread, prog) = start_grail(args)?;
             program = prog;
-            (addr, Some(thread), OnQuit::Kill)
+            (Stub::Tcp(addr), Some(thread), OnQuit::Kill)
         }
-        None => (
-            connect.unwrap_or_else(|| DEFAULT_ADDR.parse().expect("the default address parses")),
-            None,
-            OnQuit::Detach,
-        ),
+        None => match vm {
+            Some(vm) => {
+                let server = server.unwrap_or_else(|| avalon_proto::DEFAULT_AVALON_ADDR.to_string());
+                (Stub::Vm(server, vm), None, OnQuit::Detach)
+            }
+            None => (
+                Stub::Tcp(
+                    connect.unwrap_or_else(|| DEFAULT_ADDR.parse().expect("the default address parses")),
+                ),
+                None,
+                OnQuit::Detach,
+            ),
+        },
     };
-    let mut lines = Lines::default();
-    let mut debug = vars::Debug::default();
-    let (symbols, file) = match &program {
+    let program = match &program {
         Some(path) => {
             let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-            lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-            debug.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-            let symbols = Symbols::from_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-            (symbols, Some((path, file)))
+            let program = ProgramFile::from_elf(file).map_err(|e| format!("{path}: {e}"))?;
+            Some((path, program))
         }
-        None => (Symbols::default(), None),
+        None => None,
     };
-    let remote = Remote::connect(addr)?;
+    let remote = match stub {
+        Stub::Tcp(addr) => Remote::connect(addr)?,
+        Stub::Vm(server, vm) => {
+            let client = avalon_client::Client::connect(&server, AGENT).map_err(|e| e.to_string())?;
+            let tunnel =
+                avalon_client::DebugTunnel::open(client, &vm).map_err(|e| format!("VM {vm}: {e}"))?;
+            Remote::over(Box::new(tunnel))?
+        }
+    };
     // The machine's width, from the stub, must be the program's: an ELF32 program's
     // symbols would be wrong for an RV64 machine. A program of the other width is
     // left out with a warning and the session goes on without its symbols, as GDB
-    // warns and goes on: ending it would drop the connection, which the stub takes
-    // as a detach, and a machine waiting for its debugger would run off on its own.
+    // warns and goes on: ending it would drop the connection without `D`, which
+    // leaves the machine stopped for a debugger that has gone (as QEMU's stub does).
     // (Started with `--`, the machine is the program's width.)
-    let (symbols, lines, debug) = match &file {
-        Some((path, file)) => match symbols::check_xlen(file, remote.xlen) {
-            Ok(()) => (symbols, lines, debug),
+    let program = match program {
+        Some((path, program)) => match symbols::check_xlen(program.file(), remote.xlen) {
+            Ok(()) => Some(program),
             Err(e) => {
                 let _ = writeln!(out, "warning: {path}: {e}: going on without its symbols");
-                (Symbols::default(), Lines::default(), vars::Debug::default())
+                None
             }
         },
-        None => (symbols, lines, debug),
+        None => None,
     };
-    let mut session = Session::new(remote, symbols, lines, debug, &mut *out, on_quit, interrupt);
+    let mut session = Session::new(remote, program, &mut *out, on_quit, interrupt);
     session.start()?;
 
     // The script, then stdin. Commands that do not come from a terminal are echoed, so

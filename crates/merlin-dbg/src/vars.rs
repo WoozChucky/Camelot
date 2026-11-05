@@ -29,6 +29,8 @@
 use crate::symbols::Symbols;
 use elf::dies::{dw, Attr, Die, InfoUnit};
 use excalibur::Xlen;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -36,6 +38,12 @@ type Result<T> = std::result::Result<T, String>;
 pub trait Target {
     /// `len` bytes at `addr`, or an error if they cannot all be read.
     fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>>;
+}
+
+impl<T: Target + ?Sized> Target for &mut T {
+    fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        (**self).read(addr, len)
+    }
 }
 
 impl Target for crate::remote::Remote {
@@ -53,7 +61,7 @@ impl Target for crate::remote::Remote {
 
 /// An entry of a loaded program's debugging information: the program (in the order
 /// they were added), its unit and the entry's index there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DieRef {
     file: usize,
     unit: usize,
@@ -64,6 +72,11 @@ pub struct DieRef {
 #[derive(Default)]
 pub struct Debug {
     files: Vec<Vec<InfoUnit>>,
+    /// The definitions found for incomplete types ([`Debug::complete`]), by their
+    /// declaration: a filtered breakpoint's test goes through `struct proc` at every
+    /// hit, and finding a definition looks at every entry. Emptied when a program is
+    /// added, which may define a type none did.
+    completed: RefCell<HashMap<DieRef, DieRef>>,
 }
 
 /// A frame's registers, as far as they are known, and the pc its scopes are looked
@@ -159,6 +172,7 @@ impl Debug {
         let elf = elf::Elf::parse(file).map_err(|e| e.to_string())?;
         let units = elf.debug_entries().map_err(|e| e.to_string())?;
         self.files.push(units);
+        self.completed.get_mut().clear();
         Ok(())
     }
 
@@ -190,12 +204,15 @@ impl Debug {
 
     /// Every entry of every program, as a reference.
     fn all(&self) -> impl Iterator<Item = DieRef> + '_ {
-        self.files.iter().enumerate().flat_map(|(file, units)| {
-            units
-                .iter()
-                .enumerate()
-                .flat_map(move |(unit, u)| (0..u.dies.len()).map(move |die| DieRef { file, unit, die }))
-        })
+        (0..self.files.len()).flat_map(|file| self.entries_of(file))
+    }
+
+    /// Every entry of program `file`, as a reference.
+    fn entries_of(&self, file: usize) -> impl Iterator<Item = DieRef> + '_ {
+        self.files[file]
+            .iter()
+            .enumerate()
+            .flat_map(move |(unit, u)| (0..u.dies.len()).map(move |die| DieRef { file, unit, die }))
     }
 
     /// The function whose code holds `pc`.
@@ -316,7 +333,7 @@ impl Debug {
 
     // ---- types ----
 
-    /// Through typedefs, `const` and `volatile`.
+    /// Through typedefs, `const` and `volatile`, to a complete type.
     /// (A chain longer than any real one is a loop in broken information: it
     /// ends as `void`.)
     fn strip(&self, mut t: Option<DieRef>) -> Option<DieRef> {
@@ -326,10 +343,41 @@ impl Debug {
                 dw::TAG_TYPEDEF | dw::TAG_CONST_TYPE | dw::TAG_VOLATILE_TYPE | dw::TAG_RESTRICT_TYPE => {
                     t = self.type_of(r)
                 }
-                _ => return Some(r),
+                _ => return Some(self.complete(r)),
             }
         }
         None
+    }
+
+    /// The definition of an incomplete struct, union or enum (a declaration, as a
+    /// unit has `struct proc` that only points to one): the type of that tag and name
+    /// another unit defines, as GDB resolves an opaque type (`check_typedef`). As GDB
+    /// does, the program the declaration is in is looked in first, then the others.
+    /// The type itself when it is complete, or no unit defines it. Found once per
+    /// declaration, then remembered.
+    fn complete(&self, r: DieRef) -> DieRef {
+        let d = self.die(r);
+        let opaque = matches!(
+            d.tag,
+            dw::TAG_STRUCTURE_TYPE | dw::TAG_UNION_TYPE | dw::TAG_ENUMERATION_TYPE
+        ) && d.flag(dw::AT_DECLARATION);
+        let Some(name) = d.name().filter(|_| opaque) else {
+            return r;
+        };
+        if let Some(&def) = self.completed.borrow().get(&r) {
+            return def;
+        }
+        let defines = |e: &DieRef| {
+            let e = self.die(*e);
+            e.tag == d.tag && e.name() == Some(name) && !e.flag(dw::AT_DECLARATION)
+        };
+        let def = self
+            .entries_of(r.file)
+            .find(defines)
+            .or_else(|| self.all().filter(|e| e.file != r.file).find(defines))
+            .unwrap_or(r);
+        self.completed.borrow_mut().insert(r, def);
+        def
     }
 
     /// An array type's element type and dimensions.
@@ -1070,7 +1118,9 @@ impl Parser<'_> {
 pub struct Eval<'a, T: Target> {
     pub debug: &'a Debug,
     pub symbols: &'a Symbols,
-    pub target: &'a mut T,
+    /// Where values are read from: the machine as a hart sees it (`&mut Remote`), or
+    /// through a process's page table (the session's `Memory`).
+    pub target: T,
     /// The selected frame, if the machine has one with debugging information.
     pub frame: Option<Frame>,
     pub xlen: Xlen,
@@ -1181,6 +1231,19 @@ impl<T: Target> Eval<'_, T> {
     pub fn value(&mut self, text: &str) -> Result<Value> {
         let e = self.parse(text)?;
         self.eval(&e)
+    }
+
+    /// The value of the expression `text` as a number: an integer's, an enum's or a
+    /// pointer's (what the kernel's process table is read with, [`crate::camelot`]).
+    pub fn integer(&mut self, text: &str) -> Result<i128> {
+        let v = self.value(text)?;
+        self.number(&v)
+    }
+
+    /// The bytes of the object the expression `text` names (a character array's).
+    pub fn object(&mut self, text: &str) -> Result<Vec<u8>> {
+        let v = self.value(text)?;
+        self.bytes(&v)
     }
 
     /// `text` as a type name (`struct node`, `Node *`), if it is one.
@@ -2392,5 +2455,51 @@ mod tests {
         let shown = eval.show(&v, true, false).unwrap();
         assert!(shown.starts_with("{self = {self = "), "{shown}");
         assert!(shown.contains("..."), "{shown}");
+    }
+    /// An incomplete `struct s` resolves to a definition of the same name: the one of
+    /// its own program before another program's, as GDB looks in the declaration's
+    /// objfile first; found once and remembered, until a program is added.
+    #[test]
+    fn an_incomplete_type_is_its_own_programs_definition() {
+        let abbrevs = "
+    .section .debug_abbrev,\"\",@progbits
+    .byte 1, 0x11, 1, 0, 0                          # 1: compile unit, with children
+    .byte 2, 0x13, 0, 0x03, 0x08, 0x3c, 0x19, 0, 0  # 2: struct declaration: name
+    .byte 3, 0x13, 0, 0x03, 0x08, 0x0b, 0x0b, 0, 0  # 3: struct: name, byte size
+    .byte 0
+    .section .debug_info,\"\",@progbits
+";
+        // A unit holding one entry of `len` bytes, `body`. Its length counts the header
+        // after the length (8 bytes), the unit's own entry (1), the body and the end
+        // of the unit's children (1).
+        let unit = |len: usize, body: &str| {
+            let length = 8 + 1 + len + 1;
+            format!("    .word {length}\n    .half 5\n    .byte 1, 4\n    .word 0\n    .byte 1\n{body}    .byte 0\n")
+        };
+        let declared = unit(3, "    .byte 2\n    .asciz \"s\"\n");
+        let defined = |size: u8| unit(4, &format!("    .byte 3\n    .asciz \"s\"\n    .byte {size}\n"));
+        let options = merlin_as::Options { xlen: Xlen::Rv32 };
+        let other = format!("{abbrevs}{}", defined(8));
+        let own = format!("{abbrevs}{declared}{}", defined(4));
+        let mut debug = Debug::default();
+        debug
+            .add_elf(&merlin_as::assemble_to_elf_with(&other, &options).unwrap())
+            .unwrap();
+        debug
+            .add_elf(&merlin_as::assemble_to_elf_with(&own, &options).unwrap())
+            .unwrap();
+        let decl = debug
+            .all()
+            .find(|&r| debug.die(r).flag(dw::AT_DECLARATION))
+            .unwrap();
+        assert_eq!(decl.file, 1);
+        let def = debug.complete(decl);
+        assert_eq!((def.file, def.unit), (1, 1), "its own program's");
+        assert_eq!(debug.size(&Ty::Die(Some(decl)), Xlen::Rv32), Some(4));
+        assert_eq!(debug.completed.borrow().get(&decl), Some(&def));
+        debug
+            .add_elf(&merlin_as::assemble_to_elf_with(&other, &options).unwrap())
+            .unwrap();
+        assert!(debug.completed.borrow().is_empty());
     }
 }

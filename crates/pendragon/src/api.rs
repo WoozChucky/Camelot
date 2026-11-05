@@ -390,6 +390,7 @@ impl App {
                 ("created", count(|s| s == VmState::Created).into()),
                 ("running", count(|s| s == VmState::Running).into()),
                 ("paused", count(|s| s == VmState::Paused).into()),
+                ("debug", count(|s| s == VmState::Debug).into()),
                 (
                     "ended",
                     count(|s| matches!(s, VmState::Stopped | VmState::Exited(_))).into(),
@@ -1042,6 +1043,7 @@ pub(crate) fn state_word(state: VmState) -> &'static str {
         VmState::Paused => "paused",
         VmState::Stopped => "stopped",
         VmState::Exited(_) => "exited",
+        VmState::Debug => "debug",
     }
 }
 
