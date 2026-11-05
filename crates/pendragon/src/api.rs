@@ -591,6 +591,11 @@ impl App {
                     "camelot_ram_rv64",
                     (avalon_client::camelot_ram(Xlen::Rv64) >> 20).into(),
                 ),
+                // And its firmware of each width, as `bios` takes it (none on RV32,
+                // Camelot's own on RV64): the form's until it is typed in, as the
+                // server's choice when `bios` is left empty.
+                ("camelot_bios", camelot_bios(Xlen::Rv32).to_string().into()),
+                ("camelot_bios_rv64", camelot_bios(Xlen::Rv64).to_string().into()),
                 ("disks", Json::Array(disks)),
                 ("vms_error", vms.err().map(|f| f.message).into()),
             ]),

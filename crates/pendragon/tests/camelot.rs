@@ -47,6 +47,9 @@ fn camelot_vms_need_no_program() {
         let disks = api.expect(200, api.get("disks"));
         assert_eq!(s(&disks, "camelot_image"), "os-base");
         assert_eq!(s(&disks, "camelot_image_rv64"), "os-base-rv64");
+        // And their firmware, as `bios` takes it, for the form to start with.
+        assert_eq!(s(&disks, "camelot_bios"), "none");
+        assert_eq!(s(&disks, "camelot_bios_rv64"), "default");
         let r = create(vec![("name", "early".into()), ("camelot", true.into())]);
         assert_eq!(r.status, 404, "{}", r.text());
         assert_eq!(
@@ -204,6 +207,15 @@ fn the_new_vm_form_offers_camelot() {
         "option(\"sv48\", \"Sv48 and Sv39\", true), option(\"sv39\", \"Sv39 alone\")",
         "xlen.value === \"64\" ? images.camelot_image_rv64 : images.camelot_image",
         "xlen.addEventListener(\"change\", showBoot);",
+        // The firmware, an RV64 VM's, as Round Table's --bios takes it: a Camelot
+        // VM's own (the server's) until it is typed in, else none.
+        "const biosField = field(",
+        "\"Firmware\",",
+        "el(\"option\", { value: \"none\" }), el(\"option\", { value: \"default\" })",
+        "biosField.hidden = xlen.value !== \"64\";",
+        "xlen.value === \"64\" ? images.camelot_bios_rv64 : images.camelot_bios",
+        "bios.value = bootCamelot.checked ? camelotBios : \"none\";",
+        "bios: xlen.value === \"64\" ? bios.value.trim() : \"\",",
         "[\"Arch\", vm.arch_text]",
     ] {
         assert!(js.contains(needed), "app.js lacks {needed:?}");
