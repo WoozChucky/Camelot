@@ -1808,13 +1808,16 @@ impl Parser<'_> {
             }
             Tok::Kw(Kw::Case) => {
                 self.advance();
+                let start = self.pos;
                 let expr = self.cond()?;
+                let bare = self.pos == start + 1;
                 self.expect_punct(":")?;
                 StmtKind::Case {
                     expr,
                     value: 0,
                     id: 0,
                     body: Box::new(self.stmt()?),
+                    bare,
                 }
             }
             Tok::Kw(Kw::Default) => {

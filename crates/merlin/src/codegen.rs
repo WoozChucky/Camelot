@@ -2123,8 +2123,10 @@ impl<'a> FuncGen<'a, '_> {
                     self.label(&label);
                     // `-g`: a case value that is an enumeration constant
                     // describes its enum, as clang's `EmitCaseStmt` does
-                    // (`case RED:`, not `case RED + 1:`).
-                    if let (Some(d), StmtKind::Case { expr, .. }) = (self.file.debug.as_mut(), &s.kind) {
+                    // (`case RED:`, not `case RED + 1:` or `case (RED):`).
+                    if let (Some(d), StmtKind::Case { expr, bare: true, .. }) =
+                        (self.file.debug.as_mut(), &s.kind)
+                    {
                         let mut e = expr;
                         while let ExprKind::Cast {
                             x, implicit: true, ..

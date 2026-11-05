@@ -268,12 +268,15 @@ pub enum StmtKind {
         default: Option<usize>,
     },
     /// `case expr: body`. Sema sets the value and an id, unique in the
-    /// function, that its switch refers to.
+    /// function, that its switch refers to. `bare`: the expression is one
+    /// token (an enumeration constant alone, not in parentheses), whose
+    /// enum `-g` describes, as clang's `EmitCaseStmt` does.
     Case {
         expr: Expr,
         value: i128,
         id: usize,
         body: Box<Stmt>,
+        bare: bool,
     },
     /// `default: body`, with an id like a case's.
     Default {

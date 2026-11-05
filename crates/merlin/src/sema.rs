@@ -732,6 +732,7 @@ impl<'a> FnChecker<'a> {
                 value,
                 id,
                 body,
+                ..
             } => {
                 let pos = s.pos;
                 let checked = self.expr(expr);

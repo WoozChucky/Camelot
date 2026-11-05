@@ -859,13 +859,14 @@ fn initializer_casts_are_kept_as_clang_keeps_them() {
 
 /// clang describes the enum of an enumeration constant its code uses, even
 /// with no variable of it (clang 23): where the code evaluates the constant,
-/// and in a `case` label that is the constant alone; not in a static
-/// initializer, a constant condition, `sizeof`, an operand left out or a
-/// constant `switch`'s labels. An enum a function defines is its own.
+/// and in a `case` label that is the constant alone (not in parentheses,
+/// `case (Z):`); not in a static initializer, a constant condition,
+/// `sizeof`, an operand left out or a constant `switch`'s labels. An enum
+/// a function defines is its own.
 #[test]
 fn enums_are_described_for_the_constants_the_code_uses() {
     let names = [
-        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "Z",
     ];
     let mut src: String = names.iter().map(|n| format!("enum {{ {n} = 1 }};\n")).collect();
     src.push_str(
@@ -875,6 +876,7 @@ fn enums_are_described_for_the_constants_the_code_uses() {
              x = C ? 1 : 2;\n\
              x = sizeof(D);\n\
              switch (x) { case E: break; case F + 1: break; }\n\
+             switch (x) { case (Z): break; }\n\
              x = 0 && G;\n\
              arr[H] = 1;\n\
              x = (long)I;\n\
