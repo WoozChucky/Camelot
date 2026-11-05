@@ -88,7 +88,11 @@ digit of a pointer, 8 on RV32 and 16 on RV64. An unknown conversion is
 printed as written. The digits are divided off a 64-bit value with
 `do_div`, as Linux's `vsprintf.c` does: on RV32 three 32-bit divisions, so
 a program that prints numbers needs no `__udivdi3`. It is the kernel's
-`kprintf` (`kernel/kprintf.c`) with the same formats.
+`kprintf` (`kernel/kprintf.c`) with what programs need added: `kprintf`
+has no `-` flag and no `z` length, takes `0` only right after the `%`,
+and divides a value past 32 bits with C's `/`, which on RV32 is a call to
+`__udivdi3` (`kernel/libgcc.c`); and a conversion cut off by the end of
+the format it prints as written, where `printf` prints a lone `%`.
 
 ## Line input
 
