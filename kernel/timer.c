@@ -40,8 +40,20 @@ void timer_start(void) {
     sbi_set_timer(next_tick[hart]);
 }
 
-void timer_next(void) {
+u32 timer_next(void) {
     u32 hart = cpuid();
-    next_tick[hart] += timer_interval();
+    u32 interval = timer_interval();
+    u64 now = r_time();
+    /* Past every deadline that has gone by: those ticks were missed (the
+     * hart had interrupts off that long, or a debugger stopped it), and
+     * are counted, as Linux's periodic tick counts them; a deadline left
+     * in the past would fire again at once, and never let the hart do
+     * anything else. */
+    u32 ticks = 0;
+    do {
+        next_tick[hart] += interval;
+        ticks++;
+    } while (next_tick[hart] <= now);
     sbi_set_timer(next_tick[hart]);
+    return ticks;
 }

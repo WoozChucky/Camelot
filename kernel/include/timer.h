@@ -29,8 +29,10 @@ u32 timer_interval(void);
 void timer_start(void);
 
 /* At a tick: this hart's next one, one interval after the deadline of the
- * one being handled. set_timer also clears the pending supervisor timer
- * interrupt, which S-mode cannot clear itself. */
-void timer_next(void);
+ * one being handled, or after the last deadline that has gone by if the
+ * hart took the tick that late. set_timer also clears the pending
+ * supervisor timer interrupt, which S-mode cannot clear itself. Returns how
+ * many ticks have come: 1, plus any missed. */
+u32 timer_next(void);
 
 #endif

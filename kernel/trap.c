@@ -219,18 +219,19 @@ static bool probe_fixup(struct trap_frame *f) {
     return true;
 }
 
-/* A timer tick on this hart. Every hart counts its own (for the harts
- * system call); hart 0's are the clock: `ticks`, on which processes in the
- * sleep system call wait (with tickslock), and the network's timer, which
- * comes after, without tickslock: it takes the network's lock. */
-static void clock_tick(void) {
+/* `n` timer ticks on this hart (more than 1 if some were missed). Every
+ * hart counts its own (for the harts system call); hart 0's are the clock:
+ * `ticks`, on which processes in the sleep system call wait (with
+ * tickslock), and the network's timer, which comes after, without
+ * tickslock: it takes the network's lock. */
+static void clock_tick(u32 n) {
     struct cpu *c = mycpu();
-    c->ticks = c->ticks + 1;
+    c->ticks = c->ticks + n;
     if (c->hartid != 0) {
         return;
     }
     acquire(&tickslock);
-    ticks = ticks + 1;
+    ticks = ticks + n;
     wakeup((const void *)&ticks);
     release(&tickslock);
     net_timer();
@@ -238,10 +239,13 @@ static void clock_tick(void) {
 
 /* The supervisor timer interrupt: this hart's tick. The next one first,
  * which also clears this one (S-mode can't clear STIP itself: set_timer
- * does, timer.c), then the tick counted. */
+ * does, timer.c), then the tick counted. A tick also serves any TLB flush
+ * another hart asked for (smp.c): a hart that was slow to take its IPI, or
+ * took it with the request not yet in sight, still flushes within a tick,
+ * and the hart waiting for it isn't left waiting for good. */
 static void timer_interrupt(void) {
-    timer_next();
-    clock_tick();
+    clock_tick(timer_next());
+    tlb_serve();
 }
 
 /* The supervisor software interrupt: an IPI from another hart. Clear SSIP
