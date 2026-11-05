@@ -89,11 +89,77 @@ static void sleb(struct buf *out, int64_t v) {
 
 /* ---- The directory and file tables ---- */
 
+/* Where LLVM's sys::path functions see the root directory of `path`
+ * (root_dir_start, POSIX style): the `/` of `/x`, the separator after a
+ * network name (`//net/x`), or none (-1). */
+static int root_dir_start(const char *path) {
+    uint len = (uint)strlen(path);
+    if (len > 3 && path[0] == '/' && path[1] == '/' && path[2] != '/') {
+        char *sep = strchr(path + 2, '/');
+        return sep == NULL ? -1 : (int)(sep - path);
+    }
+    return path[0] == '/' ? 0 : -1;
+}
+
+/* Where the last component of the first `len` bytes of `path` starts
+ * (LLVM's filename_pos): at a trailing `/` itself, else after the last `/`
+ * (0 if there is none, or if it is the second of a leading `//`). */
+static uint filename_pos(const char *path, uint len) {
+    if (len > 0 && path[len - 1] == '/') {
+        return len - 1;
+    }
+    uint i = len;
+    while (i > 0 && path[i - 1] != '/') {
+        i--;
+    }
+    if (i == 0 || (i == 2 && path[0] == '/')) {
+        return 0;
+    }
+    return i;
+}
+
+/* LLVM's sys::path::filename (POSIX style): the last component of `path`.
+ * A trailing `/` is the component `.` (`a/` is `.` in `a`), except a root
+ * directory alone, which is `/`. */
+static char *file_name(const char *path) {
+    uint len = (uint)strlen(path);
+    int root = root_dir_start(path);
+    /* Skip the trailing separators, unless one is the root directory. */
+    uint end = len;
+    while (end > 0 && (int)(end - 1) != root && path[end - 1] == '/') {
+        end--;
+    }
+    if (len > 0 && path[len - 1] == '/' && (root < 0 || (int)end > root + 1)) {
+        return ".";
+    }
+    uint start = filename_pos(path, end);
+    return tmp_strndup(path + start, end - start);
+}
+
+/* LLVM's sys::path::parent_path (POSIX style): `path` without its last
+ * component and the separators before it, keeping a root directory (`/q.h`
+ * is in `/`); empty if there is nothing before the last component. */
+static char *parent_path(const char *path) {
+    uint end = filename_pos(path, (uint)strlen(path));
+    int filename_was_sep = path[end] == '/';
+    int root = root_dir_start(path);
+    while (end > 0 && (root < 0 || (int)end > root) && path[end - 1] == '/') {
+        end--;
+    }
+    if (root >= 0 && (int)end == root && !filename_was_sep) {
+        return tmp_strndup(path, (uint)root + 1);
+    }
+    return tmp_strndup(path, end);
+}
+
 /* The directory and file tables as LLVM builds them from the `.file`s:
  * directory 0 is the compilation directory and file 0 the main file, as
- * written in `.file 0`. Another file whose directory is the compilation
- * directory, or that has none, is split at its last `/` (`include/types.h`
- * is `types.h` in directory `include`); then its directory is 0 if empty,
+ * written in `.file 0` (the name not split). Every other file is filed as
+ * MCDwarfLineTableHeader::tryGetFile files it: a directory that is the
+ * compilation directory is none; a file with no directory then has its
+ * name split into parent_path and file_name (`include/types.h` is
+ * `types.h` in `include`, `/q.h` is `q.h` in `/`), unless the name has no
+ * parent; an empty name is `<stdin>`. Then its directory is 0 if empty,
  * else found or added in the order the files name them. Fills dirs (the
  * directories), names and dir_of (per file, its name and directory). */
 static uint file_tables(struct dfile *root, struct dfile *files, uint nfiles, char **dirs, char **names,
@@ -106,14 +172,19 @@ static uint file_tables(struct dfile *root, struct dfile *files, uint nfiles, ch
     for (uint i = 0; i < nfiles; i++) {
         char *dir = files[i].dir;
         char *name = files[i].name;
-        if (strcmp(dir, comp_dir) == 0) {
+        if (name[0] == 0) {
             dir = "";
-        }
-        if (dir[0] == 0) {
-            char *slash = strrchr(name, '/');
-            if (slash != NULL && slash > name && slash[1] != 0) {
-                dir = tmp_strndup(name, (uint)(slash - name));
-                name = slash + 1;
+            name = "<stdin>";
+        } else {
+            if (strcmp(dir, comp_dir) == 0) {
+                dir = "";
+            }
+            if (dir[0] == 0) {
+                char *parent = parent_path(name);
+                if (parent[0] != 0) {
+                    dir = parent;
+                    name = file_name(name);
+                }
             }
         }
         uint index = 0;

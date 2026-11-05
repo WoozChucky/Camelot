@@ -751,13 +751,23 @@ fn multi_file_clang_reference() {
 /// `proc.h` (#154, #155) and `fs.h`'s on-disk layouts.
 #[test]
 fn kernel_sources_compile() {
+    kernel_sources();
+}
+
+/// Every C file of the kernel and its user programs (`kernel/*.c`,
+/// `kernel/net/*.c`, `kernel/user/*.c` and the library, `/bin/as`'s and
+/// `/bin/ld`'s), each with the directories it includes from.
+fn kernel_c_files() -> Vec<(PathBuf, Vec<PathBuf>)> {
     let kernel = tests_dir().join("../../../kernel");
-    let mut failures = Vec::new();
-    let mut count = 0;
+    let user = kernel.join("user");
+    let mut all = Vec::new();
     for (dir, includes) in [
         (kernel.clone(), vec![kernel.join("include")]),
         (kernel.join("net"), vec![kernel.join("include")]),
-        (kernel.join("user"), vec![kernel.join("user")]),
+        (user.clone(), vec![user.clone()]),
+        (user.join("lib"), vec![user.clone()]),
+        (user.join("as"), vec![user.clone()]),
+        (user.join("ld"), vec![user.clone()]),
     ] {
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
@@ -765,21 +775,28 @@ fn kernel_sources_compile() {
             .filter(|p| p.extension().is_some_and(|x| x == "c"))
             .collect();
         files.sort();
+        all.extend(files.into_iter().map(|f| (f, includes.clone())));
+    }
+    all
+}
+
+fn kernel_sources() {
+    let mut failures = Vec::new();
+    let mut count = 0;
+    for (f, includes) in kernel_c_files() {
         let opts = merlin::Options {
             include_dirs: includes,
             ..merlin::Options::default()
         };
-        for f in files {
-            count += 1;
-            let name = f.file_name().unwrap().to_string_lossy().into_owned();
-            match merlin::compile_file(&f, &opts) {
-                Ok(asm) => {
-                    if let Err(errs) = merlin_as::assemble_to_elf(&asm) {
-                        failures.push(format!("  {name}: merlin-as: {:?}", errs.first()));
-                    }
+        count += 1;
+        let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        match merlin::compile_file(&f, &opts) {
+            Ok(asm) => {
+                if let Err(errs) = merlin_as::assemble_to_elf(&asm) {
+                    failures.push(format!("  {name}: merlin-as: {:?}", errs.first()));
                 }
-                Err(errs) => failures.push(format!("  {name}: {}", errs[0].render(&name))),
             }
+            Err(errs) => failures.push(format!("  {name}: {}", errs[0].render(&name))),
         }
     }
     assert!(count >= 20, "only {count} kernel C files");
@@ -953,4 +970,258 @@ fn clang_reference() {
         let elf = ld_lld(&objs, &scratch.path(&format!("{}.elf", c.name)))?;
         run_in_grail(&elf)
     });
+}
+
+/// One unit of an object's contents: a byte, or an address of `size`
+/// bytes, `sym+off`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Unit {
+    Byte(u8),
+    Addr { sym: String, off: i64, size: u8 },
+}
+
+/// An object an assembly file defines: its name, its size and what its data
+/// directives put in it.
+#[derive(Debug, PartialEq, Eq)]
+struct Object {
+    name: String,
+    size: u64,
+    data: Vec<Unit>,
+}
+
+/// The objects an assembly file defines, sorted by name: those with a
+/// `.type NAME, @object` and a `.size NAME, N` (or `.comm NAME, N`), as both
+/// compilers write them, and merlin's string literals (`.L.str`,
+/// `.L.str.N`), whose size is that of the data after their label (clang
+/// gives them a `.size`). An object's data is what the data directives
+/// right after its label give, up to the first line that is not one
+/// ([`data_units`]): its bytes, and each address as the symbol and offset
+/// it names, so two objects of one size whose names are swapped differ. An
+/// object with none (clang's `.comm`) is zeros.
+fn objects(asm: &str) -> Vec<Object> {
+    // A directive's operands (`.word NAME` gives `NAME`), without the
+    // comment clang writes after them (`.type .L.str,@object # @.str`).
+    fn operands<'l>(l: &'l str, name: &str) -> Option<&'l str> {
+        let r = l.strip_prefix(name).filter(|r| r.starts_with([' ', '\t']))?;
+        Some(r.split('#').next().unwrap_or(r).trim())
+    }
+    let mut typed = std::collections::HashSet::new();
+    let mut sizes = std::collections::HashMap::new();
+    let mut data = std::collections::HashMap::new();
+    let mut lines = asm.lines().peekable();
+    while let Some(line) = lines.next() {
+        let l = line.trim();
+        if let Some(rest) = operands(l, ".type") {
+            if let Some((sym, kind)) = rest.split_once(',') {
+                if kind.trim() == "@object" {
+                    typed.insert(sym.trim().to_string());
+                }
+            }
+        } else if let Some(rest) = operands(l, ".size").or_else(|| operands(l, ".comm")) {
+            // `.size NAME, N`, or `.comm NAME, N, ALIGN` (clang's for a
+            // zero `static`, after a `.local NAME`).
+            let mut ops = rest.split(',').map(str::trim);
+            if let (Some(sym), Some(Ok(n))) = (ops.next(), ops.next().map(str::parse::<u64>)) {
+                sizes.insert(sym.to_string(), n);
+            }
+        } else if let Some(label) = line.strip_suffix(':') {
+            let mut units = Vec::new();
+            while let Some(d) = lines.next_if(|d| data_units(d.trim()).is_some()) {
+                units.extend(data_units(d.trim()).unwrap());
+            }
+            // merlin's literal (clang's has its `.type` and `.size`).
+            let numbered = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+            let literal = label == ".L.str" || label.strip_prefix(".L.str.").is_some_and(numbered);
+            if literal && !typed.contains(label) {
+                let size = units
+                    .iter()
+                    .map(|u| match u {
+                        Unit::Byte(_) => 1,
+                        Unit::Addr { size, .. } => u64::from(*size),
+                    })
+                    .sum();
+                typed.insert(label.to_string());
+                sizes.insert(label.to_string(), size);
+            }
+            data.insert(label.to_string(), units);
+        }
+    }
+    let mut objects: Vec<Object> = typed
+        .into_iter()
+        .map(|name| {
+            let size = *sizes.get(&name).unwrap_or_else(|| panic!("{name} has no .size"));
+            let mut data = data.remove(&name).unwrap_or_default();
+            if data.is_empty() {
+                data = vec![Unit::Byte(0); size as usize];
+            }
+            Object { name, size, data }
+        })
+        .collect();
+    objects.sort_by(|a, b| a.name.cmp(&b.name));
+    objects
+}
+
+/// The units of data directive `d`, if it is one: `.byte`, `.half`,
+/// `.word`, `.quad` (numbers, little-endian, or addresses `sym`, `sym+N`,
+/// `sym-N`), `.zero N` (`.zero N, B`: N bytes B), `.ascii "..."` and
+/// `.asciz "..."` (one more, the NUL), with the escapes either compiler
+/// writes (`\n \t \b \" \\`..., octal).
+fn data_units(d: &str) -> Option<Vec<Unit>> {
+    let (dir, rest) = d.split_once([' ', '\t'])?;
+    let rest = rest.trim();
+    let mut out = Vec::new();
+    let size = match dir {
+        ".byte" => 1,
+        ".half" => 2,
+        ".word" => 4,
+        ".quad" => 8,
+        ".zero" => {
+            // `.zero N` or `.zero N, BYTE` (clang's for bytes all one value).
+            let mut ops = rest.split('#').next().unwrap().split(',').map(str::trim);
+            let n: usize = ops.next()?.parse().ok()?;
+            let fill = ops.next().map_or(Some(0), |b| b.parse::<i16>().ok())? as u8;
+            return Some(vec![Unit::Byte(fill); n]);
+        }
+        ".ascii" | ".asciz" => {
+            let mut chars = rest.strip_prefix('"')?.chars().peekable();
+            while let Some(c) = chars.next() {
+                let byte = match c {
+                    '"' => break,
+                    '\\' => match chars.next()? {
+                        'n' => b'\n',
+                        't' => b'\t',
+                        'r' => b'\r',
+                        'b' => 8,
+                        'f' => 12,
+                        'v' => 11,
+                        'a' => 7,
+                        d @ '0'..='7' => {
+                            let mut v = d.to_digit(8).unwrap();
+                            for _ in 0..2 {
+                                let Some(n) = chars.peek().and_then(|c| c.to_digit(8)) else {
+                                    break;
+                                };
+                                v = v * 8 + n;
+                                chars.next();
+                            }
+                            v as u8
+                        }
+                        c => u8::try_from(c).ok()?,
+                    },
+                    c => u8::try_from(c).ok()?,
+                };
+                out.push(Unit::Byte(byte));
+            }
+            if dir == ".asciz" {
+                out.push(Unit::Byte(0));
+            }
+            return Some(out);
+        }
+        _ => return None,
+    };
+    for op in rest.split('#').next().unwrap().split(',').map(str::trim) {
+        if let Ok(v) = op.parse::<i128>() {
+            out.extend(v.to_le_bytes()[..size].iter().map(|&b| Unit::Byte(b)));
+            continue;
+        }
+        let (sym, off) = match op.find(['+', '-']) {
+            Some(i) => (&op[..i], op[i..].trim_start_matches('+').parse().ok()?),
+            None => (op, 0),
+        };
+        out.push(Unit::Addr {
+            sym: sym.to_string(),
+            off,
+            size: size as u8,
+        });
+    }
+    Some(out)
+}
+
+/// merlin names the symbols it makes as clang does (the spec's "Symbol
+/// names"): for every case, every C file of the multi-file programs and
+/// every C file of the kernel and its user programs, at both widths, the
+/// objects merlin's assembly defines are clang's (`-O0 -S`), by name, size
+/// and contents (each byte, and the symbol each address is of, so that two
+/// names swapped show): the string literals (`.L.str`, `.L.str.N`), the
+/// compound literals at file scope (`.compoundliteral`,
+/// `.compoundliteral.N`), the `static` locals (`f.x`, `f.x.N`) and the
+/// globals, which keep their own names (`clang_name_var`, `clang_name_func`:
+/// a C name a constant had before). The numbers come from one counter, in the order the symbols are
+/// emitted, so a difference in that order, or a name clang takes that merlin
+/// does not count, changes them. Left out of clang's are the constants it
+/// copies a local's initializer from, `__const.f.a` or an array's
+/// `constinit`, which merlin does not make: it counts their names all the
+/// same. Needs clang.
+///
+///     cargo test -p merlin --test harness -- --ignored symbol_names
+#[test]
+#[ignore = "needs clang on PATH"]
+fn symbol_names_are_clangs() {
+    let mut sources: Vec<(PathBuf, Vec<PathBuf>)> = cases(ALL_CASES)
+        .into_iter()
+        .map(|c| (c.path, Vec::new()))
+        .collect();
+    for m in multi_cases() {
+        let includes: Vec<PathBuf> = m.include.into_iter().collect();
+        sources.extend(m.c_files.into_iter().map(|c| (c, includes.clone())));
+    }
+    sources.extend(kernel_c_files());
+    let mut failures = Vec::new();
+    let scratch = Scratch::new("symbol-names");
+    for (path, includes) in &sources {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let what = name.clone();
+        let opts = merlin::Options {
+            include_dirs: includes.clone(),
+            ..merlin::Options::default()
+        };
+        let ours = match merlin::compile_file(path, &opts) {
+            Ok(asm) => objects(&asm),
+            Err(errs) => {
+                failures.push(format!("  {what}: {}", errs[0].render(&name)));
+                continue;
+            }
+        };
+        let s = scratch.path(&format!("{name}.s"));
+        let mut cmd = clang();
+        cmd.args(["-S", "-O0", "-ffreestanding", "-fno-builtin", "-nostdinc", "-w"]);
+        for dir in includes {
+            cmd.arg("-I").arg(dir);
+        }
+        if let Err(e) = tool(cmd.arg(path).arg("-o").arg(&s)) {
+            failures.push(format!("  {what}: {e}"));
+            continue;
+        }
+        let theirs: Vec<Object> = objects(&std::fs::read_to_string(&s).unwrap())
+            .into_iter()
+            .filter(|o| {
+                let constinit = o.name == ".Lconstinit" || o.name.starts_with(".Lconstinit.");
+                !o.name.starts_with(".L__const.") && !constinit
+            })
+            .collect();
+        if ours != theirs {
+            let same_size = |o: &Object, p: &Object| p.name == o.name && p.size == o.size;
+            let only = |a: &[Object], b: &[Object]| -> Vec<String> {
+                a.iter()
+                    .filter(|o| !b.iter().any(|p| same_size(o, p)))
+                    .map(|o| format!("{} ({})", o.name, o.size))
+                    .collect()
+            };
+            let (o, t) = (only(&ours, &theirs), only(&theirs, &ours));
+            let contents: Vec<&str> = ours
+                .iter()
+                .filter(|o| theirs.iter().any(|p| same_size(o, p) && p != *o))
+                .map(|o| o.name.as_str())
+                .collect();
+            failures.push(format!(
+                "  {what}: merlin's only {o:?}, clang's only {t:?}, other contents {contents:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} files whose symbols are not clang's:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

@@ -1,3 +1,4 @@
+    .file "func_ptrs.c"
     .text
 
     # int add(int a, int b): frame 32 bytes

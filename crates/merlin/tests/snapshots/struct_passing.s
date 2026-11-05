@@ -1,3 +1,4 @@
+    .file "struct_passing.c"
     .text
 
     # struct one mk_one(char c): frame 32 bytes

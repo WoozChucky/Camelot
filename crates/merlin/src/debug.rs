@@ -6,11 +6,14 @@
 //! merlin writes it as assembly, the way clang does, and leaves the encoding of
 //! the line table to the assembler:
 //!
-//! * `.file N "dir" "name"` numbers the source files: 0 is the file being
-//!   compiled, with the *compilation directory* (`-fdebug-compilation-dir`, the
-//!   directory the names are relative to); then each header that has code or
-//!   declares a described entry, numbered as LLVM numbers them (see
-//!   [`Lines::renumber`]).
+//! * `.file N "dir" "name" md5 0x...` numbers the source files: 0 is the
+//!   file being compiled, with the *compilation directory*
+//!   (`-fdebug-compilation-dir`, the directory the names are relative to);
+//!   then each header that has code or declares a described entry, numbered
+//!   as LLVM numbers them (see [`Lines::renumber`]). Each names its file as
+//!   clang does, split into a directory and a name (`.file 1 "./inc" "h.h"`
+//!   for `./inc/h.h`; see "File names" below), with the MD5 checksum of its
+//!   contents ([`crate::md5`]), which merlin-as puts in the line table.
 //! * `.loc FILE LINE COLUMN` goes before the code of every statement (see
 //!   [`crate::codegen`]): a function's first line (column 0) before its
 //!   prologue, each statement's start, a loop's condition and step each time
@@ -72,13 +75,45 @@
 //!
 //! None of it changes the code: labels and directives assemble to no bytes
 //! in `.text`, and the debug sections are not loaded.
+//!
+//! ## File names
+//!
+//! A `.file` names its file the way clang 23's `-S` does, which takes two
+//! steps:
+//!
+//! 1. clang makes the file's `DIFile` (`CGDebugInfo::createFile`, see
+//!    [`clang_file`]): a relative name (as the preprocessor gives it,
+//!    `./inc/h.h`) goes with the compilation directory; an absolute one is
+//!    split where it leaves the compilation directory (`/src/inc/h.h` with
+//!    `/src` is `inc/h.h` in `/src`), unless they share only the root.
+//! 2. LLVM's assembler files it (`MCDwarfLineTableHeader::tryGetFile`): the
+//!    compilation directory is no directory; a file named as the main file
+//!    (`.file 0`'s name, see [`root_name`]) with the same checksum is file 0
+//!    itself; and a file with no directory left has its name split at its
+//!    last `/` ([`merlin_as::dwarf::file_entry`]). clang's assembly printer
+//!    writes the directory and name that leaves: `./inc/h.h` is
+//!    `.file 1 "./inc" "h.h"`, `./h2.h` is `.file 2 "." "h2.h"`, and a name
+//!    with nothing to split off has no directory (`.file 3 "x.h"`).
+//!
+//! merlin names files with `/` on every host (the preprocessor writes `/`,
+//! and here the compilation directory's `\` count as `/` too), so its
+//! `.file`s are those of clang on Linux. clang on Windows joins the pieces
+//! with `\` (`.\inc/h.h` is `.file 1 ".\\inc" "h.h"`).
+//!
+//! Every file has the MD5 checksum of its bytes as the preprocessor read
+//! them ([`crate::preprocess::Output::checksums`]), as clang's
+//! `CGDebugInfo::computeChecksum` takes them from its source manager: the
+//! `md5 0x...` operand, which merlin-as writes in the line table's
+//! `DW_LNCT_MD5` column.
 
 mod order;
 
 use crate::types::{IntKind, Quals, Record, Spelled, Spelling, Type, PTR_SIZE};
 use crate::Pos;
+use merlin_as::dwarf::{file_entry, file_name, parent_path};
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 /// `-g`: emit debug information.
@@ -87,6 +122,176 @@ pub struct DebugInfo {
     /// The directory the file names are relative to, as clang's
     /// `-fdebug-compilation-dir` (by default the directory merlin runs in).
     pub comp_dir: String,
+}
+
+/// The files the preprocessor read, by [`Pos::file`]
+/// ([`crate::preprocess::Output`]): what the `.file` directives say of them.
+#[derive(Clone, Copy, Debug)]
+pub struct Sources<'a> {
+    /// Each file's name, as `__FILE__` has it.
+    pub names: &'a [String],
+    /// Each file's MD5 checksum.
+    pub md5: &'a [Option<[u8; 16]>],
+}
+
+/// A path separator: merlin's names use `/` ([`Lines::name`]).
+fn is_sep(c: u8) -> bool {
+    c == b'/'
+}
+
+/// Whether `component` is a root name: a drive (`C:`, on Windows, as LLVM's
+/// native style has it) or a network name (`//net`).
+fn is_root_name(component: &str) -> bool {
+    let b = component.as_bytes();
+    (cfg!(windows) && b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+        || (b.len() > 2 && is_sep(b[0]) && b[1] == b[0] && !is_sep(b[2]))
+}
+
+/// The components of `path` as LLVM's `sys::path::begin` iterates them: a
+/// root name ([`is_root_name`]), a root directory `/`, then the names
+/// between separators (several in a row are one), and `.` for a trailing
+/// separator.
+fn components(path: &str) -> Vec<&str> {
+    let b = path.as_bytes();
+    let next_sep = |from: usize| {
+        b[from..]
+            .iter()
+            .position(|&c| is_sep(c))
+            .map_or(b.len(), |i| from + i)
+    };
+    let mut out = Vec::new();
+    if b.is_empty() {
+        return out;
+    }
+    let first = if cfg!(windows) && b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        2
+    } else if b.len() > 2 && is_sep(b[0]) && b[1] == b[0] && !is_sep(b[2]) {
+        next_sep(2)
+    } else if is_sep(b[0]) {
+        1
+    } else {
+        next_sep(0)
+    };
+    let mut at = 0;
+    let mut component = &path[..first];
+    loop {
+        out.push(component);
+        at += component.len();
+        if at == b.len() {
+            return out;
+        }
+        if is_sep(b[at]) {
+            // The root directory after a root name.
+            if is_root_name(component) {
+                component = &path[at..at + 1];
+                continue;
+            }
+            while at < b.len() && is_sep(b[at]) {
+                at += 1;
+            }
+            if at == b.len() && component != "/" {
+                at -= 1;
+                component = ".";
+                continue;
+            }
+        }
+        component = &path[at..next_sep(at)];
+    }
+}
+
+/// LLVM's `sys::path::append` of one component, joining with `/`: after a
+/// path that ends with a separator, the component without its leading ones;
+/// else a separator first, unless the path is empty or the component
+/// starts with a separator or is a root name.
+fn append(path: &mut String, component: &str) {
+    if path.bytes().last().is_some_and(is_sep) {
+        path.push_str(component.trim_start_matches('/'));
+        return;
+    }
+    if !(path.is_empty() || component.bytes().next().is_some_and(is_sep) || is_root_name(component)) {
+        path.push('/');
+    }
+    path.push_str(component);
+}
+
+/// The directory and the name of the `DIFile` clang makes for a file named
+/// `name` (`CGDebugInfo::createFile`), `comp_dir` the compilation
+/// directory: a relative name is in `comp_dir`. An absolute one loses the
+/// components it has in common with `comp_dir`, which are its directory
+/// (`/src/inc/h.h` with `/src` is `inc/h.h` in `/src`), unless they are
+/// only a root (`/`, `C:/`): then it keeps them, and has no directory.
+/// Whether a name is absolute is the host's rule, as LLVM's native one.
+fn clang_file(comp_dir: &str, name: &str) -> (String, String) {
+    if !Path::new(name).is_absolute() {
+        return (comp_dir.to_string(), name.to_string());
+    }
+    let file = components(name);
+    let cur = components(comp_dir);
+    let common = file.iter().zip(&cur).take_while(|(f, c)| f == c).count();
+    // The root's components: a root name, a root directory, or both.
+    let root = match file.first() {
+        Some(&c) if is_root_name(c) => 1 + usize::from(file.get(1).is_some_and(|d| d.bytes().all(is_sep))),
+        Some(&c) if c.bytes().all(is_sep) => 1,
+        _ => 0,
+    };
+    if common <= root {
+        return (String::new(), name.to_string());
+    }
+    let (mut dir, mut rest) = (String::new(), String::new());
+    for c in &file[..common] {
+        append(&mut dir, c);
+    }
+    for c in &file[common..] {
+        append(&mut rest, c);
+    }
+    (dir, rest)
+}
+
+/// The name of the main file as clang gives it to the compile unit and to
+/// `.file 0` (`CGDebugInfo::CreateCompileUnit`): its directory (`.` if it
+/// has none) and its base name joined, without the `./`s that start it.
+/// `m.c` and `./m.c` are `m.c`, `sub/../m.c` stays itself.
+fn root_name(name: &str) -> String {
+    let dir = match parent_path(name) {
+        "" => ".",
+        d => d,
+    };
+    let mut path = dir.to_string();
+    append(&mut path, file_name(name));
+    // `sys::path::remove_leading_dotslash`.
+    let mut p = path.as_str();
+    while p.len() > 2 && p.starts_with("./") {
+        p = p[2..].trim_start_matches('/');
+    }
+    p.to_string()
+}
+
+/// A file of the line table as its `.file` names it: the directory (none
+/// if empty) and the name LLVM's assembler files it under, and its MD5.
+#[derive(Clone, Debug)]
+struct FileEntry {
+    dir: String,
+    name: String,
+    md5: Option<[u8; 16]>,
+    /// The directory and name `tryGetFile` looks the file up by (its
+    /// `SourceIdMap`): files with the same are one file of the table.
+    key: (String, String),
+}
+
+/// `.file N "dir" "name" md5 0x...`, as clang's assembly printer writes it
+/// (`printDwarfFileDirective`): no directory if it is empty, no checksum
+/// if there is none.
+fn file_line(n: u32, dir: &str, name: &str, md5: Option<[u8; 16]>) -> String {
+    let mut s = format!(".file {n} ");
+    if !dir.is_empty() {
+        s.push_str(&quoted(dir));
+        s.push(' ');
+    }
+    s.push_str(&quoted(name));
+    if let Some(sum) = md5 {
+        let _ = write!(s, " md5 0x{}", crate::md5::hex(&sum));
+    }
+    s
 }
 
 /// `DW_TAG_*`, `DW_AT_*`, `DW_FORM_*`, `DW_ATE_*`, `DW_OP_*` (DWARF 5, section 7).
@@ -396,14 +601,26 @@ pub(crate) enum Event {
 /// The debug information of one translation unit as it is generated.
 pub(crate) struct Lines {
     info: DebugInfo,
+    /// The compilation directory with `/` separators, for working out the
+    /// files' directories (`info.comp_dir` is what `.file 0` writes).
+    comp_dir: String,
     /// The preprocessor's file names, by [`Pos::file`].
     names: Vec<String>,
+    /// Their MD5 checksums, by [`Pos::file`].
+    md5: Vec<Option<[u8; 16]>>,
+    /// The main file's name as `.file 0` gives it ([`root_name`]).
+    root: String,
     /// [`Pos::file`] → `.file` number, for the files given one so far.
     numbers: HashMap<u32, u32>,
-    /// A name already numbered (a header read twice is one file).
-    by_name: HashMap<String, u32>,
-    /// The names of the files numbered so far, file `n` at `n - 1`.
-    file_names: Vec<String>,
+    /// A file already numbered, by its directory and name as LLVM's
+    /// assembler looks them up (`tryGetFile`'s `SourceIdMap`, before the
+    /// name is split) and its checksum: clang's `DIFile`, of which a
+    /// header read twice has one. Two that differ only in their checksums
+    /// (a header, and a `#line` naming it, which has none) have numbers of
+    /// their own here, made one by [`Lines::renumber`].
+    by_name: HashMap<(String, String, Option<[u8; 16]>), u32>,
+    /// The files numbered so far, file `n` at `n - 1`.
+    file_entries: Vec<FileEntry>,
     /// The final `.file` numbers of the numbers given as the code was
     /// generated ([`Lines::renumber`]).
     renumbered: HashMap<u32, u32>,
@@ -450,14 +667,27 @@ fn renumbered_line(line: &str, from: u32, to: u32) -> String {
     format!("{head}{name} {to}{rest}")
 }
 
-/// `s` as an assembly string literal.
-fn quoted(s: &str) -> String {
+/// `s` as an assembly string literal, byte by byte as LLVM's assembly
+/// printer quotes one (`PrintQuotedString`, the `.file` names and the
+/// `.asciz` strings clang writes): `"` and `\` escaped, a printable ASCII
+/// byte (0x20 to 0x7e) as it is, `\b`, `\f`, `\n`, `\r` and `\t` by name,
+/// and any other byte, control or not ASCII, as three octal digits: `é`,
+/// UTF-8 `c3 a9`, is `\303\251` (clang's `.file "caf\303\251.c"`).
+pub(crate) fn quoted(s: &str) -> String {
     let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            _ => out.push(c),
+    for b in s.bytes() {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(char::from(b)),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            _ => {
+                let _ = write!(out, "\\{:03o}", b);
+            }
         }
     }
     out.push('"');
@@ -465,13 +695,16 @@ fn quoted(s: &str) -> String {
 }
 
 impl Lines {
-    pub fn new(info: &DebugInfo, names: &[String]) -> Self {
-        Lines {
+    pub fn new(info: &DebugInfo, sources: Sources) -> Self {
+        let mut lines = Lines {
             info: info.clone(),
-            names: names.to_vec(),
+            comp_dir: info.comp_dir.replace('\\', "/"),
+            names: sources.names.to_vec(),
+            md5: sources.md5.to_vec(),
+            root: String::new(),
             numbers: HashMap::new(),
             by_name: HashMap::new(),
-            file_names: Vec::new(),
+            file_entries: Vec::new(),
             renumbered: HashMap::new(),
             late_files: Vec::new(),
             order: None,
@@ -485,7 +718,9 @@ impl Lines {
             types: Vec::new(),
             type_ids: HashMap::new(),
             keep: Vec::new(),
-        }
+        };
+        lines.root = root_name(&lines.name(0));
+        lines
     }
 
     /// The file's name with `/` separators.
@@ -495,33 +730,79 @@ impl Lines {
             .map_or_else(|| "<unknown>".to_string(), |n| n.replace('\\', "/"))
     }
 
+    /// The file's MD5 checksum.
+    fn checksum(&self, file: u32) -> Option<[u8; 16]> {
+        self.md5.get(file as usize).copied().flatten()
+    }
+
     /// `.file 0`, the first line of the output until [`Lines::renumber`]
-    /// puts it where clang has it.
+    /// puts it where clang has it: the compilation directory as given, and
+    /// the main file's name and checksum. Not split, as LLVM never splits
+    /// the root file's name.
     pub fn file0(&self) -> String {
-        format!(
-            ".file 0 {} {}",
-            quoted(&self.info.comp_dir),
-            quoted(&self.name(0))
-        )
+        file_line(0, &self.info.comp_dir, &self.root, self.checksum(0))
     }
 
     /// The `.file` number of `file` as the code is generated, given the
     /// first time it is asked for: [`Lines::renumber`] gives the final ones.
+    /// 0 for the main file: one named as `.file 0` names it, with its
+    /// checksum (LLVM's `isRootFile`), which the file being compiled is
+    /// unless its name starts with `./` or otherwise differs from
+    /// [`root_name`]'s (clang then gives its code a file of its own: `m.c`
+    /// in `.` for `./m.c`).
     fn number(&mut self, file: u32) -> u32 {
-        if file == 0 {
-            return 0;
-        }
         if let Some(&n) = self.numbers.get(&file) {
             return n;
         }
-        let name = self.name(file);
-        if let Some(&n) = self.by_name.get(&name) {
+        // The `DIFile`'s directory and name, then the ones `tryGetFile`
+        // looks up: the compilation directory is no directory, and a file
+        // with no name is `<stdin>`.
+        let (di_dir, di_name) = clang_file(&self.comp_dir, &self.name(file));
+        let (dir, name) = match (di_dir.as_str(), di_name.as_str()) {
+            (_, "") => ("", "<stdin>"),
+            (d, n) if d == self.comp_dir => ("", n),
+            (d, n) => (d, n),
+        };
+        let md5 = self.checksum(file);
+        let is_root = |name: &str| name == self.root && md5 == self.checksum(0);
+        if is_root(name) {
+            self.numbers.insert(file, 0);
+            return 0;
+        }
+        let key = (dir.to_string(), name.to_string());
+        let difile = (key.0.clone(), key.1.clone(), md5);
+        if let Some(&n) = self.by_name.get(&difile) {
             self.numbers.insert(file, n);
             return n;
         }
-        let n = self.by_name.len() as u32 + 1;
-        self.by_name.insert(name.clone(), n);
-        self.file_names.push(name);
+        // The directory and name `tryGetFile` files it under, which clang's
+        // `.file` writes. Unless the assembler, reading them, would file
+        // them differently: the split lost something (clang's own `-S`
+        // output is wrong there), and the `.file` names the file as its
+        // `DIFile` does, which the assembler files as clang `-c` files it.
+        // `./m.c` is `m.c` in `.`, which an assembler would take for the
+        // main file `m.c` (clang's `.loc 1` is then `unassigned file
+        // number`); with the compilation directory `.`, `./h.h` is `h.h`
+        // in `.`, which an assembler would file in the compilation
+        // directory itself.
+        let (mut d, mut f) = file_entry(&self.comp_dir, dir, name);
+        if is_root(f) || file_entry(&self.comp_dir, d, f) != (d, f) {
+            d = if di_dir == self.comp_dir {
+                &self.info.comp_dir
+            } else {
+                &di_dir
+            };
+            f = &di_name;
+        }
+        let n = self.file_entries.len() as u32 + 1;
+        let entry = FileEntry {
+            dir: d.to_string(),
+            name: f.to_string(),
+            md5,
+            key,
+        };
+        self.file_entries.push(entry);
+        self.by_name.insert(difile, n);
         self.numbers.insert(file, n);
         n
     }
@@ -534,8 +815,8 @@ impl Lines {
     /// The `.file` directive of file `n` (as the code was generated) under
     /// its final number `to`.
     fn file_directive(&self, n: u32, to: u32) -> String {
-        let name = &self.file_names[n as usize - 1];
-        format!(".file {to} {} {}", quoted(&self.info.comp_dir), quoted(name))
+        let f = &self.file_entries[n as usize - 1];
+        file_line(to, &f.dir, &f.name, f.md5)
     }
 
     /// Numbers the files as LLVM does, and returns the output `text` with
@@ -579,13 +860,26 @@ impl Lines {
             .collect();
         let order = self.order(&nested, &local);
 
-        // The final numbers, from 1 as LLVM needs them.
+        // The final numbers, from 1 as LLVM needs them. Files that LLVM's
+        // assembler looks up under the same directory and name (two
+        // `DIFile`s that differ in their checksums) are one: the first one
+        // LLVM needs makes the file, with its checksum and its `.file`
+        // (`tryGetFile` finds the other in its `SourceIdMap`), whatever
+        // one merlin's code generation numbered first.
+        let keys: Vec<(String, String)> = self.file_entries.iter().map(|f| f.key.clone()).collect();
         let mut map: HashMap<u32, u32> = HashMap::from([(0, 0)]);
-        let give = |map: &mut HashMap<u32, u32>, n: u32| -> Option<u32> {
+        let mut by_key: HashMap<&(String, String), u32> = HashMap::new();
+        let mut give = |map: &mut HashMap<u32, u32>, n: u32| -> Option<u32> {
             if map.contains_key(&n) {
                 return None;
             }
-            let next = map.len() as u32;
+            let key = &keys[n as usize - 1];
+            if let Some(&to) = by_key.get(key) {
+                map.insert(n, to);
+                return None;
+            }
+            let next = by_key.len() as u32 + 1;
+            by_key.insert(key, next);
             map.insert(n, next);
             Some(next)
         };
@@ -887,9 +1181,10 @@ impl Lines {
         }
     }
 
-    /// String literal `label`, of `len` bytes without its NUL, at `pos`.
+    /// String literal `label`, a `char` array of `len` bytes (its NUL
+    /// included, if it has one), at `pos`.
     pub fn literal(&mut self, label: &str, len: usize, pos: Pos) {
-        let array = Type::Array(Box::new(Type::Int(IntKind::Char)), Some(len as u32 + 1));
+        let array = Type::Array(Box::new(Type::Int(IntKind::Char)), Some(len as u32));
         let ty = self.type_of(&array, &Spelled::default());
         let file = self.decl_file(pos);
         self.events.push(Event::Literal(self.literals.len()));
@@ -1327,7 +1622,7 @@ impl Lines {
         let mut cu = Die::new(TAG_COMPILE_UNIT, "the compile unit");
         cu.attr(AT_PRODUCER, Val::Str("merlin".into()));
         cu.attr(AT_LANGUAGE, Val::Data2(LANG_C99));
-        cu.attr(AT_NAME, Val::Str(self.name(0)));
+        cu.attr(AT_NAME, Val::Str(self.root.clone()));
         cu.attr(AT_STR_OFFSETS_BASE, Val::SecOffset(".Lstr_offsets_base0".into()));
         cu.attr(AT_STMT_LIST, Val::SecOffset(".Lline_table_start0".into()));
         cu.attr(AT_COMP_DIR, Val::Str(self.info.comp_dir.clone()));

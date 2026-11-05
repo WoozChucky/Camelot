@@ -157,8 +157,8 @@ impl Vm {
     /// The pages the kernel has not lost ([`kstacks::pages`]): the free ones
     /// (`nfree`, kernel/kalloc.c), the pages of every mapped kernel stack, and
     /// the stacks in use.
-    pub fn pages(&self) -> kstacks::Pages {
-        kstacks::pages(&self.m, &kernel_elf())
+    pub fn pages(&mut self) -> kstacks::Pages {
+        kstacks::pages(&mut self.m, &kernel_elf())
     }
 }
 

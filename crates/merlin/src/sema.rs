@@ -25,8 +25,10 @@
 //! * `sizeof` is replaced by its value.
 //! * A compound literal at file scope (in a global's initializer) is an
 //!   object with static storage, as C99 says: it becomes a hidden `static`
-//!   variable, `.compoundliteral.<n>`, which the expression then names. Those
-//!   variables are added to the program as a last declaration.
+//!   variable, named `.compoundliteral` as clang names it, which the
+//!   expression then names by its key (`.compoundliteral#<n>`, see
+//!   [`symbol_key`]). Those variables are added to the program as a last
+//!   declaration.
 //!
 //! Reports all errors, in source order. An expression with an error doesn't
 //! produce more errors about the expressions around it.
@@ -37,6 +39,30 @@ use crate::consteval;
 use crate::types::{common, FuncType, IntKind, Spelled, Type};
 use crate::{Error, Pos};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+/// The name of the hidden variable of a file-scope compound literal, as
+/// clang names it.
+pub const LITERAL: &str = ".compoundliteral";
+
+/// The key of the `n`th symbol sema makes under the name `base`, the name
+/// clang gives it: `base` itself for the first, `base#n` after (no C
+/// identifier, nor any symbol, has a `#`). Several compound literals are all
+/// `.compoundliteral`, and two `static int x` in `f` both `f.x`; the key,
+/// which [`VarRef::Global`] holds, tells them apart. The symbol each is
+/// written as is codegen's: LLVM's uniquing of clashing names, which numbers
+/// them in the order they are emitted (`crate::codegen`, "Symbol names").
+pub fn symbol_key(base: &str, n: usize) -> String {
+    if n == 0 {
+        base.to_string()
+    } else {
+        format!("{base}#{n}")
+    }
+}
+
+/// The name `key` stands for: what comes before its `#` ([`symbol_key`]).
+pub fn symbol_base(key: &str) -> &str {
+    key.split_once('#').map_or(key, |(base, _)| base)
+}
 
 pub fn check(prog: &mut Program) -> Result<(), Vec<Error>> {
     let mut c = Checker {
@@ -630,7 +656,7 @@ struct FnChecker<'a> {
     /// `goto` may jump forward).
     labels: HashMap<String, Pos>,
     gotos: Vec<(String, Pos)>,
-    /// Symbols given to `static` locals so far.
+    /// The keys given to `static` locals so far (see [`symbol_key`]).
     static_labels: HashSet<String>,
     /// At file scope: the objects of the compound literals checked, numbered
     /// from `literal_base` (those of earlier initializers come first).
@@ -975,14 +1001,16 @@ impl<'a> FnChecker<'a> {
             return;
         }
         if d.storage == Storage::Static {
-            // A static local is a global under a name of its own, visible only
-            // in this block: `function.name`, numbered if the function has
-            // several of the same name.
-            let mut label = format!("{}.{}", self.func, d.name);
+            // A static local is a global of its own, visible only in this
+            // block, named `function.name` as clang names it; the key sets
+            // apart several of the same name in one function (codegen gives
+            // each its symbol, [`symbol_key`]).
+            let base = format!("{}.{}", self.func, d.name);
+            let mut label = base.clone();
             let mut n = 0;
             while self.static_labels.contains(&label) {
                 n += 1;
-                label = format!("{}.{}.{n}", self.func, d.name);
+                label = symbol_key(&base, n);
             }
             self.static_labels.insert(label.clone());
             // As in C, the name is in scope inside its own initializer, so
@@ -1915,25 +1943,25 @@ impl<'a> FnChecker<'a> {
 
     /// `(type){ ... }` at file scope: an object with static storage, so its
     /// list must be constant, like a global's. It becomes a `static`
-    /// variable of its own, whose name this returns.
+    /// variable of its own, whose key this returns ([`symbol_key`]).
     fn static_literal(&mut self, ty: &mut Type, mut init: Init, pos: Pos) -> Result<String, Reported> {
         self.literal_type(ty, pos)?;
         self.init(ty, &mut init, true)?;
         // Numbered after any literal nested in this one's list.
-        let name = format!(".compoundliteral.{}", self.literal_base + self.literals.len());
+        let key = symbol_key(LITERAL, self.literal_base + self.literals.len());
         self.literals.push(Declarator {
-            name: name.clone(),
+            name: LITERAL.to_string(),
             ty: ty.clone(),
             storage: Storage::Static,
             init: Some(init),
-            var: Some(VarRef::Global(name.clone())),
+            var: Some(VarRef::Global(key.clone())),
             define: true,
             spelled: Default::default(),
             pos,
             sized: Vec::new(),
             unevaluated: Vec::new(),
         });
-        Ok(name)
+        Ok(key)
     }
 
     // The varargs checks live in functions of their own: `expr` recurses
@@ -2167,6 +2195,7 @@ fn is_char_array(t: &Type) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{symbol_key, LITERAL};
     use crate::ast::*;
 
     fn ok(src: &str) -> Program {
@@ -2380,7 +2409,7 @@ mod tests {
             ("ib", vec![".zero 4", ".word 4"]),
             ("wi", vec![".word 5"]),
             ("w", vec![".word 6"]),
-            ("pm", vec![".quad .compoundliteral.0+4"]),
+            ("pm", vec![".quad .compoundliteral+4"]),
             ("f.sp", vec![".quad g"]),
             ("f.ss", vec![".word 3", ".word 4"]),
             ("f.s6", vec![".word 5"]),
@@ -2388,7 +2417,7 @@ mod tests {
             assert_eq!(data(sym), want, "{sym}");
         }
         // The one literal whose address is taken is the one object.
-        assert_eq!(asm.matches("\n.compoundliteral.").count(), 1, "{asm}");
+        assert_eq!(asm.matches("\n.compoundliteral").count(), 1, "{asm}");
         // Not a constant, or of another type, as clang has it.
         let not_constant = "initializer element is not a compile-time constant";
         for (src, want) in [
@@ -2718,8 +2747,8 @@ mod tests {
             [
                 "decl n@f.n",
                 "decl m@f.m",
-                "decl n@f.n.1",
-                "n@f.n.1",
+                "decl n@f.n#1",
+                "n@f.n#1",
                 "g@g",
                 "n@f.n",
                 "m@f.m",
@@ -3672,23 +3701,30 @@ mod tests {
                     const char *const *names = (const char *const[]){\"a\", \"b\"};
                     struct p **pp = (struct p *[]){&(struct p){5, 6}, 0};",
         );
-        // Each became a static variable the initializer names, numbered in
-        // order (a nested literal before the list it is in), declared last.
+        // Each became a static variable the initializer names by its key,
+        // numbered in order (a nested literal before the list it is in),
+        // declared last.
+        let key = |d: &Declarator| match &d.var {
+            Some(VarRef::Global(key)) => key.clone(),
+            _ => panic!("a literal's variable is a global"),
+        };
         let Some(Item::Decl(literals)) = p.items.last() else {
             panic!("no literals")
         };
-        let got: Vec<String> = literals.iter().map(|d| format!("{}: {}", d.name, d.ty)).collect();
+        let got: Vec<String> = literals.iter().map(|d| format!("{}: {}", key(d), d.ty)).collect();
         assert_eq!(
             got,
             [
-                ".compoundliteral.0: int[3]",
-                ".compoundliteral.1: struct p",
-                ".compoundliteral.2: const char *const[2]",
-                ".compoundliteral.3: struct p",
-                ".compoundliteral.4: struct p *[2]",
+                ".compoundliteral: int[3]",
+                ".compoundliteral#1: struct p",
+                ".compoundliteral#2: const char *const[2]",
+                ".compoundliteral#3: struct p",
+                ".compoundliteral#4: struct p *[2]",
             ]
         );
-        assert!(literals.iter().all(|d| d.define && d.storage == Storage::Static));
+        assert!(literals
+            .iter()
+            .all(|d| d.define && d.storage == Storage::Static && d.name == LITERAL));
         // `a` and `q` hold their addresses: constants.
         for (i, name) in ["a", "q"].iter().enumerate() {
             let d = p
@@ -3703,7 +3739,7 @@ mod tests {
             assert_eq!(
                 crate::consteval::eval(e),
                 Some(crate::consteval::Const::Addr {
-                    base: Some(crate::consteval::Base::Sym(format!(".compoundliteral.{i}"))),
+                    base: Some(crate::consteval::Base::Sym(symbol_key(LITERAL, i))),
                     offset: 0
                 })
             );
@@ -3724,8 +3760,8 @@ mod tests {
         let Some(Item::Decl(literals)) = p.items.last() else {
             panic!("no literals")
         };
-        let got: Vec<String> = literals.iter().map(|d| format!("{}: {}", d.name, d.ty)).collect();
-        assert_eq!(got, [".compoundliteral.0: int[1]"]);
+        let got: Vec<String> = literals.iter().map(|d| format!("{}: {}", key(d), d.ty)).collect();
+        assert_eq!(got, [".compoundliteral: int[1]"]);
         // Its value, where it is read (a GNU extension clang takes), is
         // folded: no object is made for it.
         let p = ok("int m = (int){5};");

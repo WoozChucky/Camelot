@@ -1,3 +1,4 @@
+    .file "break_continue.c"
     .text
 
     # int main(void): frame 48 bytes
@@ -95,7 +96,6 @@ main:
     j     .L.continue.6
 .L.end.8:
     j     .L.break.7
-    j     .L.continue.6
 .L.break.7:
     li    a0, 0
     sw    a0, -32(s0)

@@ -157,26 +157,101 @@ pub fn sleb(out: &mut Vec<u8>, mut v: i64) {
     }
 }
 
+/// Where LLVM's `sys::path` functions see the root directory of `path`
+/// (`root_dir_start`, POSIX style): the `/` of `/x`, the separator after a
+/// network name (`//net/x`), or none.
+fn root_dir_start(path: &str) -> Option<usize> {
+    let b = path.as_bytes();
+    if b.len() > 3 && b[0] == b'/' && b[1] == b'/' && b[2] != b'/' {
+        return path[2..].find('/').map(|i| i + 2);
+    }
+    (b.first() == Some(&b'/')).then_some(0)
+}
+
+/// Where the last component of `path` starts (LLVM's `filename_pos`): at a
+/// trailing `/` itself, else after the last `/` (0 if there is none, or if
+/// it is the second of a leading `//`).
+fn filename_pos(path: &str) -> usize {
+    let b = path.as_bytes();
+    if b.last() == Some(&b'/') {
+        return b.len() - 1;
+    }
+    match path.rfind('/') {
+        None => 0,
+        Some(1) if b[0] == b'/' => 0,
+        Some(i) => i + 1,
+    }
+}
+
+/// LLVM's `sys::path::filename` (POSIX style, `/` the only separator): the
+/// last component of `path`. A trailing `/` is the component `.` (`a/` is
+/// `.` in `a`), except a root directory alone, which is `/`.
+pub fn file_name(path: &str) -> &str {
+    let b = path.as_bytes();
+    let root = root_dir_start(path);
+    // Skip the trailing separators, unless one is the root directory.
+    let mut end = b.len();
+    while end > 0 && Some(end - 1) != root && b[end - 1] == b'/' {
+        end -= 1;
+    }
+    if b.last() == Some(&b'/') && root.is_none_or(|r| end > r + 1) {
+        return ".";
+    }
+    &path[filename_pos(&path[..end])..end]
+}
+
+/// LLVM's `sys::path::parent_path` (POSIX style): `path` without its last
+/// component and the separators before it, keeping a root directory
+/// (`/q.h` is in `/`); empty if there is nothing before the last component.
+pub fn parent_path(path: &str) -> &str {
+    let b = path.as_bytes();
+    let mut end = filename_pos(path);
+    let filename_was_sep = b.get(end) == Some(&b'/');
+    let root = root_dir_start(path);
+    while end > 0 && root.is_none_or(|r| end > r) && b[end - 1] == b'/' {
+        end -= 1;
+    }
+    match root {
+        Some(r) if end == r && !filename_was_sep => &path[..r + 1],
+        _ => &path[..end],
+    }
+}
+
+/// The directory and the name LLVM files a `.file N "dir" "name"` under
+/// (`MCDwarfLineTableHeader::tryGetFile`): a directory that is the
+/// compilation directory is none; a file with no directory then has its
+/// name split into [`parent_path`] and [`file_name`] (`include/types.h` is
+/// `types.h` in `include`, `/q.h` is `q.h` in `/`), unless the name has no
+/// parent. An empty name is `<stdin>`, in no directory.
+///
+/// merlin, like clang, writes its `.file`s already split this way
+/// (`.file 1 "./inc" "h.h"` for `./inc/h.h`): clang's assembly printer
+/// writes the directory and the name `tryGetFile` leaves.
+pub fn file_entry<'a>(comp_dir: &str, dir: &'a str, name: &'a str) -> (&'a str, &'a str) {
+    if name.is_empty() {
+        return ("", "<stdin>");
+    }
+    let dir = if dir == comp_dir { "" } else { dir };
+    if dir.is_empty() {
+        let parent = parent_path(name);
+        if !parent.is_empty() {
+            return (parent, file_name(name));
+        }
+    }
+    (dir, name)
+}
+
 /// The directory and file tables as LLVM builds them from the `.file`s:
 /// directory 0 is the compilation directory and file 0 the main file, as
-/// written in `.file 0`. Another file whose directory is the compilation
-/// directory, or that has none, is split at its last `/` (`include/types.h`
-/// is `types.h` in directory `include`); then its directory is 0 if empty,
-/// else found or added in the order the files name them. Returns the
-/// directories and, per file, its name and directory index.
+/// written in `.file 0` (the name not split). Every other file is filed
+/// under the directory and name [`file_entry`] gives; then its directory
+/// is 0 if empty, else found or added in the order the files name them.
+/// Returns the directories and, per file, its name and directory index.
 pub fn file_tables(comp_dir: &str, root: &File, files: &[File]) -> (Vec<String>, Vec<(String, u64)>) {
     let mut dirs = vec![comp_dir.to_string()];
     let mut entries = vec![(root.name.clone(), 0)];
     for f in files {
-        let (mut dir, mut name) = (f.dir.as_str(), f.name.as_str());
-        if dir == comp_dir {
-            dir = "";
-        }
-        if dir.is_empty() {
-            if let Some(i) = name.rfind('/').filter(|&i| i > 0 && i + 1 < name.len()) {
-                (dir, name) = (&name[..i], &name[i + 1..]);
-            }
-        }
+        let (dir, name) = file_entry(comp_dir, &f.dir, &f.name);
         let index = if dir.is_empty() {
             0
         } else {
@@ -459,6 +534,28 @@ mod tests {
                 ("b.h", 1)
             ]
         );
+    }
+
+    /// LLVM's `sys::path::parent_path` and `filename` (POSIX style) on the
+    /// names of tests/debug_line/paths.s, whose table llvm-mc made.
+    #[test]
+    fn paths_split_like_llvm() {
+        for (path, parent, name) in [
+            ("/q.h", "/", "q.h"),
+            ("a/", "a", "."),
+            ("./x.h", ".", "x.h"),
+            ("//net/x.h", "//net/", "x.h"),
+            ("a//b.h", "a", "b.h"),
+            ("/", "", "/"),
+            ("a/b/", "a/b", "."),
+            ("x.h", "", "x.h"),
+            ("", "", ""),
+        ] {
+            assert_eq!((parent_path(path), file_name(path)), (parent, name), "{path:?}");
+        }
+        assert_eq!(file_entry("/src", "/src", "./z.h"), (".", "z.h"));
+        assert_eq!(file_entry("/src", "/other", "./z.h"), ("/other", "./z.h"));
+        assert_eq!(file_entry("/src", "/src", ""), ("", "<stdin>"));
     }
 
     #[test]

@@ -6,6 +6,11 @@
 use merlin::{DebugInfo, Options};
 use std::path::{Path, PathBuf};
 
+/// The MD5 of `text` as `.file` writes it, 32 hex digits.
+fn md5(text: &str) -> String {
+    merlin::md5::hex(&merlin::md5::md5(text.as_bytes()))
+}
+
 fn debug_opts(comp_dir: &str) -> Options {
     Options {
         debug: Some(DebugInfo {
@@ -223,28 +228,29 @@ void empty(void) {
 #[test]
 fn headers_get_their_own_file_numbers() {
     let src = "#include \"inc/h.h\"\nint main(void) {\n    return twice(2);\n}\n";
-    let load = |p: &Path| {
-        (p == Path::new("inc/h.h")).then(|| "static int twice(int x) {\n    return 2 * x;\n}\n".to_string())
-    };
+    let header = "static int twice(int x) {\n    return 2 * x;\n}\n";
+    let load = |p: &Path| (p == Path::new("inc/h.h")).then(|| header.to_string());
     let asm = merlin::compile_with("m.c", src, &debug_opts("src"), &load).unwrap();
     // No globals, enums or casts: LLVM makes the unit for the first
     // function's code, and `.file 0` comes with its first `.loc`, as clang
-    // writes it.
+    // writes it, with the file's MD5.
+    let file0 = format!(".file 0 \"src\" \"m.c\" md5 0x{}", md5(src));
     assert!(
-        asm.contains("main:\n    .file 0 \"src\" \"m.c\"\n    .loc 0 2 0\n"),
+        asm.contains(&format!("main:\n    {file0}\n    .loc 0 2 0\n")),
         "{asm}"
     );
     assert_eq!(asm.matches(".file 0 ").count(), 1, "{asm}");
-    assert!(
-        asm.contains("    .file 1 \"src\" \"./inc/h.h\"\n    .loc 1 1 0\n"),
-        "{asm}"
-    );
+    // The header's name split as clang splits it: `./inc/h.h` is `h.h` in
+    // `./inc`.
+    let file1 = format!(".file 1 \"./inc\" \"h.h\" md5 0x{}", md5(header));
+    assert!(asm.contains(&format!("    {file1}\n    .loc 1 1 0\n")), "{asm}");
     // Nor when the only cast is to a type a function defines, which the
     // function retains, not the unit.
     let src = "int g(int a) { return a; }\nint f(long v) { typedef short LT; return (LT)v; }\n";
     let local = merlin::compile_with("l.c", src, &debug_opts("src"), &merlin::no_files).unwrap();
+    let file0 = format!(".file 0 \"src\" \"l.c\" md5 0x{}", md5(src));
     assert!(
-        local.contains("g:\n    .file 0 \"src\" \"l.c\"\n    .loc 0 1 0\n"),
+        local.contains(&format!("g:\n    {file0}\n    .loc 0 1 0\n")),
         "{local}"
     );
     let obj = merlin_as::assemble_to_elf(&asm).unwrap();
@@ -277,8 +283,12 @@ fn file_numbers_follow_the_output() {
         .collect();
     assert_eq!(labels, ["f:", "sa:", "ea:"], "{asm}");
     let sa = asm.find("sa:").unwrap();
+    let file1 = format!(
+        ".file 1 \".\" \"a.h\" md5 0x{}",
+        md5(&load(Path::new("a.h")).unwrap())
+    );
     assert!(
-        asm[sa..].starts_with("sa:\n    .file 1 \"src\" \"./a.h\"\n    .loc 1 4 0\n"),
+        asm[sa..].starts_with(&format!("sa:\n    {file1}\n    .loc 1 4 0\n")),
         "{asm}"
     );
     assert_eq!(asm.matches(".file 1 ").count(), 1, "{asm}");
@@ -287,12 +297,163 @@ fn file_numbers_follow_the_output() {
     assert_eq!(tables[0].files, ["src/m.c", "src/./a.h"]);
 }
 
+/// The `.file` lines name the files as clang 23's do (clang on Linux; on
+/// Windows it joins with `\`): a header next to a main file named without
+/// a directory is in `.`, one found in a `-I` directory in that directory;
+/// the main file named `./m.c` is `m.c` to `.file 0` and the compile unit,
+/// so its code gets a file of its own, as clang's does; a name `#line`
+/// gives has no checksum. Where clang's `.file` would not assemble to what
+/// clang -c makes, merlin's names the file as clang's `DIFile` does
+/// (`the_file_directives_are_clangs` compares them with clang's).
+#[test]
+fn files_are_named_as_clang_names_them() {
+    let header = "static int twice(int x) {\n    return 2 * x;\n}\n";
+    let other = "static int thrice(int x) {\n    return 3 * x;\n}\n";
+    let load = |p: &Path| {
+        if p == Path::new("h.h") {
+            Some(header.to_string())
+        } else if p == Path::new("inc/o.h") {
+            Some(other.to_string())
+        } else {
+            None
+        }
+    };
+    let src = "#include \"h.h\"\n#include <o.h>\nint main(void) {\n    return twice(2) + thrice(1);\n}\n";
+    let opts = Options {
+        include_dirs: vec!["inc".into()],
+        ..debug_opts("src")
+    };
+    // The line table's `.file`s, the numbered ones (not `.file "m.c"`).
+    let files = |asm: &str| -> Vec<String> {
+        asm.lines()
+            .map(str::trim)
+            .filter(|l| {
+                l.strip_prefix(".file ")
+                    .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let (m, h, o) = (md5(src), md5(header), md5(other));
+    let asm = merlin::compile_with("m.c", src, &opts, &load).unwrap();
+    assert_eq!(
+        files(&asm),
+        [
+            format!(".file 0 \"src\" \"m.c\" md5 0x{m}"),
+            format!(".file 1 \".\" \"h.h\" md5 0x{h}"),
+            format!(".file 2 \"inc\" \"o.h\" md5 0x{o}"),
+        ]
+    );
+    // With `./m.c`, the code's file is `./m.c`, which is not the root's
+    // name: it is `m.c` in `.`. clang writes `.file 1 "." "m.c"`, which an
+    // assembler reads as the main file, `m.c` (llvm-mc then rejects the
+    // `.loc 1`s); merlin names it as clang's `DIFile` does, and so its
+    // object has clang -c's file 1, `m.c` in `.`.
+    let asm = merlin::compile_with("./m.c", src, &opts, &load).unwrap();
+    assert_eq!(
+        files(&asm),
+        [
+            format!(".file 0 \"src\" \"m.c\" md5 0x{m}"),
+            format!(".file 1 \"src\" \"./m.c\" md5 0x{m}"),
+            format!(".file 2 \".\" \"h.h\" md5 0x{h}"),
+            format!(".file 3 \"inc\" \"o.h\" md5 0x{o}"),
+        ]
+    );
+    assert!(asm.contains("    .loc 1 3 0\n"), "{asm}");
+    assert!(!asm.contains(".loc 0 "), "{asm}");
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let elf = elf::Elf::parse(&obj).unwrap();
+    let table = &elf.line_tables().unwrap()[0];
+    assert_eq!(table.dirs, ["src", ".", "inc"]);
+    assert_eq!(
+        table.entries[..2],
+        [("m.c".to_string(), 0), ("m.c".to_string(), 1)]
+    );
+    let units = elf.debug_entries().unwrap();
+    assert_eq!(units[0].dies[0].name(), Some("m.c"));
+    // A `-I` directory named as the compilation directory: `src/h.h` with
+    // the compilation directory `src` is `h.h` in `src` to LLVM, which
+    // clang writes `.file 1 "src" "h.h"`, `h.h` in the compilation
+    // directory (directory 0) to an assembler; merlin names it as clang's
+    // `DIFile` does, which the assembler files as clang -c does.
+    let opts = Options {
+        include_dirs: vec!["src".into()],
+        ..debug_opts("src")
+    };
+    let src = "#include <h.h>\nint main(void) {\n    return twice(2);\n}\n";
+    let load = |p: &Path| (p == Path::new("src/h.h")).then(|| header.to_string());
+    let asm = merlin::compile_with("m.c", src, &opts, &load).unwrap();
+    assert_eq!(
+        files(&asm)[1..],
+        [format!(".file 1 \"src\" \"src/h.h\" md5 0x{h}")][..],
+        "{asm}"
+    );
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let table = &elf::Elf::parse(&obj).unwrap().line_tables().unwrap()[0];
+    assert_eq!(table.dirs, ["src", "src"]);
+    assert_eq!(table.entries[1], ("h.h".to_string(), 1));
+    // A name `#line` gives has no checksum, as in clang (and so the line
+    // table has no MD5 column).
+    let src = "int f(void) {\n#line 7 \"gen/y.c\"\n    return 1;\n}\n";
+    let asm = merlin::compile_with("m.c", src, &debug_opts("src"), &merlin::no_files).unwrap();
+    let m = md5(src);
+    assert_eq!(
+        files(&asm),
+        [
+            format!(".file 0 \"src\" \"m.c\" md5 0x{m}"),
+            ".file 1 \"gen\" \"y.c\"".to_string(),
+        ]
+    );
+    // A `#line` naming a header as the preprocessor names it: two `DIFile`s
+    // (the header's with its checksum, the `#line`'s with none) that LLVM's
+    // assembler files under one name, the one it needs first deciding the
+    // file. That is the header, whose `hq` comes first in the output,
+    // though merlin generates `g` first: the header's MD5 stays, and with
+    // it the line table's MD5 column.
+    let q = "static int hq(int a) { return a + 1; }\n";
+    let load = |p: &Path| (p == Path::new("inc/q.h")).then(|| q.to_string());
+    let src = "#include \"inc/q.h\"\nint f(int a) { return hq(a); }\n#line 1 \"./inc/q.h\"\nint g(int a) { return a; }\n";
+    let asm = merlin::compile_with("k1.c", src, &debug_opts("src"), &load).unwrap();
+    assert_eq!(
+        files(&asm),
+        [
+            format!(".file 0 \"src\" \"k1.c\" md5 0x{}", md5(src)),
+            format!(".file 1 \"./inc\" \"q.h\" md5 0x{}", md5(q)),
+        ],
+        "{asm}"
+    );
+    let g = asm.find("\ng:\n").unwrap();
+    assert!(asm[g..].contains("    .loc 1 1 0\n"), "{asm}");
+}
+
+/// Names are quoted as clang quotes them, byte by byte: the octal escapes
+/// of a name that is not ASCII (`café.c`) and of control characters, in
+/// the file symbol and the line table's `.file`s alike.
+#[test]
+fn names_are_quoted_as_clang_quotes_them() {
+    let src = "int g;\n";
+    let asm = merlin::compile_with("caf\u{e9}.c", src, &debug_opts("src"), &merlin::no_files).unwrap();
+    assert!(asm.starts_with("    .file \"caf\\303\\251.c\"\n"), "{asm}");
+    let file0 = format!("    .file 0 \"src\" \"caf\\303\\251.c\" md5 0x{}\n", md5(src));
+    assert!(asm.contains(&file0), "{asm}");
+    // The object names the file as clang's does.
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let elf = elf::Elf::parse(&obj).unwrap();
+    assert_eq!(elf.symbols().unwrap()[1].name, "caf\u{e9}.c");
+    assert_eq!(elf.line_tables().unwrap()[0].entries[0].0, "caf\u{e9}.c");
+    let src = "int f(void) {\n#line 7 \"a\\tb\\bc\\fd\\re\\\"f\\vg\\ah\\ni~\u{e9}.c\"\n    return 1;\n}\n";
+    let asm = merlin::compile_with("m.c", src, &debug_opts("src"), &merlin::no_files).unwrap();
+    let want = "    .file 1 \"a\\tb\\bc\\fd\\re\\\"f\\013g\\007h\\ni~\\303\\251.c\"\n";
+    assert!(asm.contains(want), "{asm}");
+}
+
 #[test]
 fn the_command_line_takes_g() {
     let dir = std::env::temp_dir().join(format!("merlin-debug-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // With a global, `.file 0` is the first line.
-    std::fs::write(dir.join("a.c"), "int g;\nint f(void) { return g; }\n").unwrap();
+    // With a global, `.file 0` comes first, after clang's `.file "a.c"`.
+    let src = "int g;\nint f(void) { return g; }\n";
+    std::fs::write(dir.join("a.c"), src).unwrap();
     let run = |args: &[&str]| {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_merlin"))
             .args(args)
@@ -305,16 +466,32 @@ fn the_command_line_takes_g() {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         std::fs::read_to_string(dir.join("-")).unwrap()
     };
-    assert!(run(&["-g", "-fdebug-compilation-dir=here"]).starts_with("    .file 0 \"here\" \"a.c\"\n"));
-    assert!(run(&["-g", "-fdebug-compilation-dir", "there"]).starts_with("    .file 0 \"there\" \"a.c\"\n"));
+    let sum = md5(src);
+    let here = run(&["-g", "-fdebug-compilation-dir=here"]);
+    assert!(
+        here.starts_with(&format!(
+            "    .file \"a.c\"\n    .file 0 \"here\" \"a.c\" md5 0x{sum}\n"
+        )),
+        "{here}"
+    );
+    let there = run(&["-g", "-fdebug-compilation-dir", "there"]);
+    assert!(
+        there.starts_with(&format!(
+            "    .file \"a.c\"\n    .file 0 \"there\" \"a.c\" md5 0x{sum}\n"
+        )),
+        "{there}"
+    );
     // By default the directory merlin runs in.
     let cwd = dir.canonicalize().unwrap();
     let asm = run(&["-g"]);
-    let first = asm.lines().next().unwrap();
+    let first = asm.lines().nth(1).unwrap();
     assert!(first.starts_with("    .file 0 \""), "{first}");
     let named = first.split('"').nth(1).unwrap().replace("\\\\", "\\");
     assert_eq!(Path::new(&named).canonicalize().unwrap(), cwd);
-    assert!(!run(&[]).contains(".file"));
+    // Without -g, only the file's name, which is no line table's.
+    let plain = run(&[]);
+    assert!(plain.starts_with("    .file \"a.c\"\n"), "{plain}");
+    assert!(!plain.contains(".file 0") && !plain.contains(".loc"), "{plain}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -679,18 +856,17 @@ fn the_forms_are_clangs() {
         }
         entries
     };
-    let bits = 64;
     let opts = Options { ..debug_opts("dir") };
     let asm = merlin::compile_with("v.c", VARS, &opts, &merlin::no_files).unwrap();
     let obj = merlin_as::assemble_to_elf(&asm).unwrap();
-    let ours = dir.join(format!("merlin-{bits}.o"));
+    let ours = dir.join("merlin.o");
     std::fs::write(&ours, obj).unwrap();
-    let theirs = dir.join(format!("clang-{bits}.o"));
-    let abi = if bits == 64 { "lp64" } else { "ilp32" };
+    let theirs = dir.join("clang.o");
+    let abi = "lp64";
     let out = std::process::Command::new(&clang)
         .args([
-            &format!("--target=riscv{bits}"),
-            &format!("-march=rv{bits}ima_zicsr_zifencei"),
+            "--target=riscv64",
+            "-march=rv64ima_zicsr_zifencei",
             &format!("-mabi={abi}"),
             "-O0",
             "-g",
@@ -1217,21 +1393,20 @@ fn the_entries_are_clangs_in_clangs_order() {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         sources.push((name, std::fs::read_to_string(&p).unwrap()));
     }
-    let bits = 64;
-    let abi = if bits == 64 { "lp64" } else { "ilp32" };
+    let abi = "lp64";
     let opts = Options { ..debug_opts("dir") };
     for (name, src) in &sources {
         let source = dir.join(name);
         std::fs::write(&source, src).unwrap();
         let asm = merlin::compile_with(name, src, &opts, &merlin::no_files).unwrap();
         let obj = merlin_as::assemble_to_elf(&asm).unwrap();
-        let ours = dir.join(format!("{name}-merlin-{bits}.o"));
+        let ours = dir.join(format!("{name}-merlin.o"));
         std::fs::write(&ours, obj).unwrap();
-        let theirs = dir.join(format!("{name}-clang-{bits}.o"));
+        let theirs = dir.join(format!("{name}-clang.o"));
         let out = std::process::Command::new(&clang)
             .args([
-                &format!("--target=riscv{bits}"),
-                &format!("-march=rv{bits}ima_zicsr_zifencei"),
+                "--target=riscv64",
+                "-march=rv64ima_zicsr_zifencei",
                 &format!("-mabi={abi}"),
                 "-O0",
                 "-g",
@@ -1401,8 +1576,7 @@ fn the_files_are_numbered_as_clangs() {
     for f in ["fs.c", "pipe.c", "proc.c", "bio.c", "file.c"] {
         units.push((kernel.clone(), f, true));
     }
-    let bits = 64;
-    let abi = if bits == 64 { "lp64" } else { "ilp32" };
+    let abi = "lp64";
     for (k, (at, name, kernel)) in units.iter().enumerate() {
         let includes: Vec<&str> = if *kernel { vec!["include"] } else { Vec::new() };
         let opts = Options {
@@ -1413,11 +1587,11 @@ fn the_files_are_numbered_as_clangs() {
         let src = load(Path::new(name)).unwrap();
         let asm = merlin::compile_with(name, &src, &opts, &load).unwrap();
         let ours = merlin_as::assemble_to_elf(&asm).unwrap();
-        let theirs = dir.join(format!("{k}-clang-{bits}.o"));
+        let theirs = dir.join(format!("{k}-clang.o"));
         let out = std::process::Command::new(&clang)
             .args([
-                &format!("--target=riscv{bits}"),
-                &format!("-march=rv{bits}ima_zicsr_zifencei"),
+                "--target=riscv64",
+                "-march=rv64ima_zicsr_zifencei",
                 &format!("-mabi={abi}"),
                 "-mno-relax",
                 "-O0",
@@ -1450,6 +1624,282 @@ fn the_files_are_numbered_as_clangs() {
             ours.1, theirs.1,
             "{name}: merlin's entries (left) and clang's (right)"
         );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The numbered `.file` lines of `asm`, `.file 0` first wherever it is, with
+/// single spaces, and with `/` for `\` (clang on Windows joins the pieces of a
+/// path with `\`, which its assembly writes `\\`; merlin writes `/`).
+fn file_lines(asm: &str) -> Vec<String> {
+    let mut lines: Vec<String> = asm
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| {
+            l.strip_prefix(".file ")
+                .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .map(|l| l.replace("\\\\", "/"))
+        .collect();
+    lines.sort_by_key(|l| !l.starts_with(".file 0 "));
+    lines
+}
+
+/// The directories and the files (name, directory) of an object's line
+/// table, with `/` for `\`.
+fn file_table(obj: &[u8]) -> (Vec<String>, Vec<(String, u64)>) {
+    let elf = elf::Elf::parse(obj).unwrap();
+    let t = &elf.line_tables().unwrap()[0];
+    let slash = |s: &String| s.replace('\\', "/");
+    let entries = t.entries.iter().map(|(n, d)| (slash(n), *d)).collect();
+    (t.dirs.iter().map(slash).collect(), entries)
+}
+
+/// merlin's `.file` lines are clang 23's `-S -g` ones (the names, split into
+/// directory and name as clang splits them, and the MD5s), for a unit of
+/// several headers named as the preprocessor finds them (next to the file
+/// that includes them, in `-I` directories, relative and absolute), its main
+/// file named `m.c`, `./m.c` or `sub/../m.c` or by an absolute path in and
+/// out of the compilation directory, `#line` names (one quoted with
+/// escapes, and one naming a header as clang names it, which makes one file
+/// with the header's MD5), and the compilation directory `.`; and
+/// merlin-as makes of them the line table's directories
+/// and files clang `-c` makes.
+///
+/// Two `.file`s differ, where clang's `-S` is not what its `-c` makes:
+/// `./m.c`'s code, which clang writes `.file 1 "." "m.c"` (the main file to
+/// an assembler, which then rejects the `.loc 1`s) and merlin as its
+/// `DIFile`, `"src" "./m.c"`; and `./h2.h` in the compilation directory
+/// `.`, `"." "h2.h"` to clang (`h2.h` in directory 0 to an assembler), `"."
+/// "./h2.h"` to merlin. `sub/../m.c` is left out on Windows, where clang
+/// names the main file `sub/..\m.c`, which its code's `sub/../m.c` is not.
+///
+/// Ignored: it needs clang (`CLANG` names it if it is not on the PATH).
+#[test]
+#[ignore]
+fn the_file_directives_are_clangs() {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let dir = std::env::temp_dir().join(format!("merlin-file-lines-{}", std::process::id()));
+    for (name, text) in [
+        (
+            "m.c",
+            "#include \"inc/h.h\"\n#include \"h2.h\"\n#include \"sub/s.h\"\n\
+             int f(int a) { return twice(a) + thrice(a) + four(a) + five(a); }\n",
+        ),
+        ("inc/h.h", "static int twice(int x) { return x * 2; }\n"),
+        ("h2.h", "static int thrice(int x) { return x * 3; }\n"),
+        (
+            "sub/s.h",
+            "static int four(int x) { return x * 4; }\n#include \"t.h\"\n",
+        ),
+        ("sub/t.h", "static int five(int x) { return x * 5; }\n"),
+        ("a.c", "#include \"q.h\"\nint f(void) { return g(); }\n"),
+        ("q/q.h", "static int g(void) { return 1; }\n"),
+        ("l.c", "int f(void) {\n#line 7 \"gen/y.c\"\n    return 1;\n}\n"),
+        // Names quoted with escapes, octal ones among them.
+        (
+            "e.c",
+            "int f(void) {\n#line 7 \"a\\tb\\bc\\fd\\re\\\"f\\vg\\ah\\ni~\u{e9}.c\"\n    return 1;\n}\n",
+        ),
+        // A `#line` naming a header as clang names it (on Windows with
+        // `\`, as clang joins the pieces there): one file to LLVM's
+        // assembler, which keeps the header's MD5, the file it needs first.
+        ("inc/q.h", "static int hq(int a) { return a + 1; }\n"),
+        (
+            "k.c",
+            if cfg!(windows) {
+                "#include \"inc/q.h\"\nint f(int a) { return hq(a); }\n#line 1 \".\\\\inc/q.h\"\nint g(int a) { return a; }\n"
+            } else {
+                "#include \"inc/q.h\"\nint f(int a) { return hq(a); }\n#line 1 \"./inc/q.h\"\nint g(int a) { return a; }\n"
+            },
+        ),
+    ] {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let abs = dir.to_string_lossy().into_owned();
+    let q = dir.join("q").to_string_lossy().into_owned();
+    let a = dir.join("a.c").to_string_lossy().into_owned();
+    let other = if cfg!(windows) { "C:\\other" } else { "/other" };
+    let md5_of = |name: &str| md5(&std::fs::read_to_string(dir.join(name)).unwrap());
+    let main_code = format!(".file 1 \"src\" \"./m.c\" md5 0x{}", md5_of("m.c"));
+    let h2 = format!(".file 2 \".\" \"./h2.h\" md5 0x{}", md5_of("h2.h"));
+    // Each case: the compilation directory, the -I directories, the file,
+    // and merlin's `.file` where it is not clang's (by number).
+    type Case<'a> = (&'a str, &'a [&'a str], &'a str, Option<(usize, &'a str)>);
+    let q_dir = [q.as_str()];
+    let mut cases: Vec<Case> = vec![
+        ("src", &[], "m.c", None),
+        ("src", &[], "./m.c", Some((1, &main_code))),
+        (".", &[], "m.c", Some((2, &h2))),
+        (&abs, &[], "m.c", None),
+        ("src", &["q"], "a.c", None),
+        (&abs, &q_dir, "a.c", None),
+        (&abs, &q_dir, &a, None),
+        (other, &q_dir, &a, None),
+        (&q, &q_dir, &a, None),
+        ("src", &[], "l.c", None),
+        ("src", &[], "e.c", None),
+        ("src", &[], "k.c", None),
+    ];
+    if !cfg!(windows) {
+        cases.push(("src", &[], "sub/../m.c", None));
+    }
+    for (comp_dir, includes, name, differs) in cases {
+        let opts = Options {
+            include_dirs: includes.iter().map(PathBuf::from).collect(),
+            ..debug_opts(comp_dir)
+        };
+        let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
+        let src = load(Path::new(name)).unwrap();
+        let ours = merlin::compile_with(name, &src, &opts, &load).unwrap();
+        let clang_run = |out: &str| {
+            let out = std::process::Command::new(&clang)
+                .args([
+                    "--target=riscv64",
+                    "-march=rv64ima_zicsr_zifencei",
+                    "-mabi=lp64",
+                    "-mno-relax",
+                    "-O0",
+                    "-g",
+                    out,
+                    "-o",
+                    "-",
+                ])
+                .arg(format!("-fdebug-compilation-dir={comp_dir}"))
+                .args(includes.iter().map(|i| format!("-I{i}")))
+                .arg(name)
+                .current_dir(&dir)
+                .output()
+                .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        let what = format!("{name} in {comp_dir} with {includes:?}: merlin's (left) and clang's (right)");
+        let mut theirs = file_lines(&String::from_utf8(clang_run("-S")).unwrap());
+        if let Some((n, line)) = differs {
+            theirs[n] = line.to_string();
+        }
+        assert_eq!(file_lines(&ours), theirs, "{what}");
+        let obj = merlin_as::assemble_to_elf(&ours).unwrap();
+        assert_eq!(file_table(&obj), file_table(&clang_run("-c")), "{what}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `.file "NAME"` lines of `asm` (the one without a number), with
+/// single spaces.
+fn file_symbol_lines(asm: &str) -> Vec<String> {
+    asm.lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| l.starts_with(".file \""))
+        .collect()
+}
+
+/// The `STT_FILE` symbols of an object, each with its index in the symbol
+/// table and every field.
+fn file_symbols(obj: &[u8]) -> Vec<(usize, elf::Symbol)> {
+    let elf = elf::Elf::parse(obj).unwrap();
+    let syms = elf.symbols().unwrap();
+    syms.into_iter()
+        .enumerate()
+        .filter(|(_, s)| s.ty() == elf::STT_FILE)
+        .collect()
+}
+
+/// merlin's first line is clang 23's `.file "NAME"`, with and without
+/// `-g`, the base name of the file it was given (`m.c`, `./m.c`,
+/// `sub/n.c`, `sub/../m.c`, an absolute name, `café.c`, quoted in octal,
+/// and on Windows `sub\n.c`),
+/// whatever `#line` says; and merlin-as makes of it clang -c's `STT_FILE`
+/// symbol, the object's first, local and absolute, the only one, on both
+/// widths.
+///
+/// Ignored: it needs clang (`CLANG` names it if it is not on the PATH).
+#[test]
+#[ignore]
+fn the_file_symbol_is_clangs() {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let dir = std::env::temp_dir().join(format!("merlin-file-symbol-{}", std::process::id()));
+    for (name, text) in [
+        ("m.c", "int g;\nint f(void) { return g; }\n"),
+        ("sub/n.c", "#line 9 \"other/y.c\"\nint f(void) { return 1; }\n"),
+        ("caf\u{e9}.c", "int f(void) { return 1; }\n"),
+    ] {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let abs = dir.join("m.c").to_string_lossy().into_owned();
+    let mut names = vec![
+        "m.c",
+        "./m.c",
+        "sub/n.c",
+        "sub/../m.c",
+        abs.as_str(),
+        "caf\u{e9}.c",
+    ];
+    if cfg!(windows) {
+        names.push("sub\\n.c");
+    }
+    for name in names {
+        for g in [false, true] {
+            let opts = if g { debug_opts("src") } else { Options::default() };
+            let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
+            let src = load(Path::new(name)).unwrap();
+            let ours = merlin::compile_with(name, &src, &opts, &load).unwrap();
+            let clang_run = |out: &str| {
+                let mut cmd = std::process::Command::new(&clang);
+                cmd.args([
+                    "--target=riscv64",
+                    "-march=rv64ima_zicsr_zifencei",
+                    "-mabi=lp64",
+                    "-mno-relax",
+                    "-O0",
+                    "-fdebug-compilation-dir=src",
+                    out,
+                    "-o",
+                    "-",
+                ]);
+                if g {
+                    cmd.arg("-g");
+                }
+                let out = cmd
+                    .arg(name)
+                    .current_dir(&dir)
+                    .output()
+                    .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+                assert!(
+                    out.status.success(),
+                    "{name}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                out.stdout
+            };
+            let what = format!("{name}, -g {g}: merlin's (left) and clang's (right)");
+            let theirs = String::from_utf8(clang_run("-S")).unwrap();
+            assert_eq!(file_symbol_lines(&ours), file_symbol_lines(&theirs), "{what}");
+            // It is the first line, as clang's is after its
+            // `.attribute`s, which merlin leaves to the assembler.
+            let words = |l: &str| l.split_whitespace().collect::<Vec<_>>().join(" ");
+            let first = theirs
+                .lines()
+                .find(|l| !l.trim_start().starts_with(".attribute"))
+                .map(words);
+            assert_eq!(ours.lines().next().map(words), first, "{what}");
+            let obj = merlin_as::assemble_to_elf(&ours).unwrap();
+            let syms = file_symbols(&obj);
+            assert_eq!(syms, file_symbols(&clang_run("-c")), "{what}");
+            assert_eq!(syms.len(), 1, "{what}");
+            assert_eq!(syms[0].0, 1, "{what}");
+            assert_eq!(syms[0].1.shndx, elf::SHN_ABS, "{what}");
+            assert_eq!(syms[0].1.bind(), elf::STB_LOCAL, "{what}");
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
