@@ -421,6 +421,26 @@ fn files_are_named_as_clang_names_them() {
             ".file 1 \"gen\" \"y.c\"".to_string(),
         ]
     );
+    // A `#line` naming a header as the preprocessor names it: two `DIFile`s
+    // (the header's with its checksum, the `#line`'s with none) that LLVM's
+    // assembler files under one name, the one it needs first deciding the
+    // file. That is the header, whose `hq` comes first in the output,
+    // though merlin generates `g` first: the header's MD5 stays, and with
+    // it the line table's MD5 column.
+    let q = "static int hq(int a) { return a + 1; }\n";
+    let load = |p: &Path| (p == Path::new("inc/q.h")).then(|| q.to_string());
+    let src = "#include \"inc/q.h\"\nint f(int a) { return hq(a); }\n#line 1 \"./inc/q.h\"\nint g(int a) { return a; }\n";
+    let asm = merlin::compile_with("k1.c", src, &debug_opts("src"), &load).unwrap();
+    assert_eq!(
+        files(&asm),
+        [
+            format!(".file 0 \"src\" \"k1.c\" md5 0x{}", md5(src)),
+            format!(".file 1 \"./inc\" \"q.h\" md5 0x{}", md5(q)),
+        ],
+        "{asm}"
+    );
+    let g = asm.find("\ng:\n").unwrap();
+    assert!(asm[g..].contains("    .loc 1 1 0\n"), "{asm}");
 }
 
 #[test]
@@ -1667,8 +1687,10 @@ fn file_table(obj: &[u8]) -> (Vec<String>, Vec<(String, u64)>) {
 /// several headers named as the preprocessor finds them (next to the file
 /// that includes them, in `-I` directories, relative and absolute), its main
 /// file named `m.c`, `./m.c` or `sub/../m.c` or by an absolute path in and
-/// out of the compilation directory, a `#line` name, and the compilation
-/// directory `.`; and merlin-as makes of them the line table's directories
+/// out of the compilation directory, `#line` names (one naming a header
+/// as clang names it, which makes one file with the header's MD5), and the
+/// compilation directory `.`; and
+/// merlin-as makes of them the line table's directories
 /// and files clang `-c` makes.
 ///
 /// Two `.file`s differ, where clang's `-S` is not what its `-c` makes:
@@ -1701,6 +1723,18 @@ fn the_file_directives_are_clangs() {
         ("a.c", "#include \"q.h\"\nint f(void) { return g(); }\n"),
         ("q/q.h", "static int g(void) { return 1; }\n"),
         ("l.c", "int f(void) {\n#line 7 \"gen/y.c\"\n    return 1;\n}\n"),
+        // A `#line` naming a header as clang names it (on Windows with
+        // `\`, as clang joins the pieces there): one file to LLVM's
+        // assembler, which keeps the header's MD5, the file it needs first.
+        ("inc/q.h", "static int hq(int a) { return a + 1; }\n"),
+        (
+            "k.c",
+            if cfg!(windows) {
+                "#include \"inc/q.h\"\nint f(int a) { return hq(a); }\n#line 1 \".\\\\inc/q.h\"\nint g(int a) { return a; }\n"
+            } else {
+                "#include \"inc/q.h\"\nint f(int a) { return hq(a); }\n#line 1 \"./inc/q.h\"\nint g(int a) { return a; }\n"
+            },
+        ),
     ] {
         let path = dir.join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1728,6 +1762,7 @@ fn the_file_directives_are_clangs() {
         (other, &q_dir, &a, None),
         (&q, &q_dir, &a, None),
         ("src", &[], "l.c", None),
+        ("src", &[], "k.c", None),
     ];
     if !cfg!(windows) {
         cases.push(("src", &[], "sub/../m.c", None));

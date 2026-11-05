@@ -274,6 +274,9 @@ struct FileEntry {
     dir: String,
     name: String,
     md5: Option<[u8; 16]>,
+    /// The directory and name `tryGetFile` looks the file up by (its
+    /// `SourceIdMap`): files with the same are one file of the table.
+    key: (String, String),
 }
 
 /// `.file N "dir" "name" md5 0x...`, as clang's assembly printer writes it
@@ -612,8 +615,11 @@ pub(crate) struct Lines {
     numbers: HashMap<u32, u32>,
     /// A file already numbered, by its directory and name as LLVM's
     /// assembler looks them up (`tryGetFile`'s `SourceIdMap`, before the
-    /// name is split): a header read twice is one file.
-    by_name: HashMap<(String, String), u32>,
+    /// name is split) and its checksum: clang's `DIFile`, of which a
+    /// header read twice has one. Two that differ only in their checksums
+    /// (a header, and a `#line` naming it, which has none) have numbers of
+    /// their own here, made one by [`Lines::renumber`].
+    by_name: HashMap<(String, String, Option<[u8; 16]>), u32>,
     /// The files numbered so far, file `n` at `n - 1`.
     file_entries: Vec<FileEntry>,
     /// The final `.file` numbers of the numbers given as the code was
@@ -755,7 +761,8 @@ impl Lines {
             return 0;
         }
         let key = (dir.to_string(), name.to_string());
-        if let Some(&n) = self.by_name.get(&key) {
+        let difile = (key.0.clone(), key.1.clone(), md5);
+        if let Some(&n) = self.by_name.get(&difile) {
             self.numbers.insert(file, n);
             return n;
         }
@@ -783,9 +790,10 @@ impl Lines {
             dir: d.to_string(),
             name: f.to_string(),
             md5,
+            key,
         };
         self.file_entries.push(entry);
-        self.by_name.insert(key, n);
+        self.by_name.insert(difile, n);
         self.numbers.insert(file, n);
         n
     }
@@ -843,13 +851,26 @@ impl Lines {
             .collect();
         let order = self.order(&nested, &local);
 
-        // The final numbers, from 1 as LLVM needs them.
+        // The final numbers, from 1 as LLVM needs them. Files that LLVM's
+        // assembler looks up under the same directory and name (two
+        // `DIFile`s that differ in their checksums) are one: the first one
+        // LLVM needs makes the file, with its checksum and its `.file`
+        // (`tryGetFile` finds the other in its `SourceIdMap`), whatever
+        // one merlin's code generation numbered first.
+        let keys: Vec<(String, String)> = self.file_entries.iter().map(|f| f.key.clone()).collect();
         let mut map: HashMap<u32, u32> = HashMap::from([(0, 0)]);
-        let give = |map: &mut HashMap<u32, u32>, n: u32| -> Option<u32> {
+        let mut by_key: HashMap<&(String, String), u32> = HashMap::new();
+        let mut give = |map: &mut HashMap<u32, u32>, n: u32| -> Option<u32> {
             if map.contains_key(&n) {
                 return None;
             }
-            let next = map.len() as u32;
+            let key = &keys[n as usize - 1];
+            if let Some(&to) = by_key.get(key) {
+                map.insert(n, to);
+                return None;
+            }
+            let next = by_key.len() as u32 + 1;
+            by_key.insert(key, next);
             map.insert(n, next);
             Some(next)
         };
