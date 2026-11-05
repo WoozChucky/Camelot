@@ -340,10 +340,15 @@ fn files_are_named_as_clang_names_them() {
         include_dirs: vec!["inc".into()],
         ..debug_opts("src")
     };
+    // The line table's `.file`s, the numbered ones (not `.file "m.c"`).
     let files = |asm: &str| -> Vec<String> {
         asm.lines()
-            .filter(|l| l.trim_start().starts_with(".file "))
-            .map(|l| l.trim().to_string())
+            .map(str::trim)
+            .filter(|l| {
+                l.strip_prefix(".file ")
+                    .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+            })
+            .map(str::to_string)
             .collect()
     };
     let (m, h, o) = (md5(src), md5(header), md5(other));
@@ -422,7 +427,7 @@ fn files_are_named_as_clang_names_them() {
 fn the_command_line_takes_g() {
     let dir = std::env::temp_dir().join(format!("merlin-debug-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // With a global, `.file 0` is the first line.
+    // With a global, `.file 0` comes first, after clang's `.file "a.c"`.
     let src = "int g;\nint f(void) { return g; }\n";
     std::fs::write(dir.join("a.c"), src).unwrap();
     let run = |args: &[&str]| {
@@ -440,22 +445,29 @@ fn the_command_line_takes_g() {
     let sum = md5(src);
     let here = run(&["-g", "-fdebug-compilation-dir=here"]);
     assert!(
-        here.starts_with(&format!("    .file 0 \"here\" \"a.c\" md5 0x{sum}\n")),
+        here.starts_with(&format!(
+            "    .file \"a.c\"\n    .file 0 \"here\" \"a.c\" md5 0x{sum}\n"
+        )),
         "{here}"
     );
     let there = run(&["-g", "-fdebug-compilation-dir", "there"]);
     assert!(
-        there.starts_with(&format!("    .file 0 \"there\" \"a.c\" md5 0x{sum}\n")),
+        there.starts_with(&format!(
+            "    .file \"a.c\"\n    .file 0 \"there\" \"a.c\" md5 0x{sum}\n"
+        )),
         "{there}"
     );
     // By default the directory merlin runs in.
     let cwd = dir.canonicalize().unwrap();
     let asm = run(&["-g"]);
-    let first = asm.lines().next().unwrap();
+    let first = asm.lines().nth(1).unwrap();
     assert!(first.starts_with("    .file 0 \""), "{first}");
     let named = first.split('"').nth(1).unwrap().replace("\\\\", "\\");
     assert_eq!(Path::new(&named).canonicalize().unwrap(), cwd);
-    assert!(!run(&[]).contains(".file"));
+    // Without -g, only the file's name, which is no line table's.
+    let plain = run(&[]);
+    assert!(plain.starts_with("    .file \"a.c\"\n"), "{plain}");
+    assert!(!plain.contains(".file 0") && !plain.contains(".loc"), "{plain}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1761,6 +1773,111 @@ fn the_file_directives_are_clangs() {
         assert_eq!(file_lines(&ours), theirs, "{what}");
         let obj = merlin_as::assemble_to_elf(&ours).unwrap();
         assert_eq!(file_table(&obj), file_table(&clang_run("-c")), "{what}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `.file "NAME"` lines of `asm` (the one without a number), with
+/// single spaces.
+fn file_symbol_lines(asm: &str) -> Vec<String> {
+    asm.lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| l.starts_with(".file \""))
+        .collect()
+}
+
+/// The `STT_FILE` symbols of an object, each with its index in the symbol
+/// table and every field.
+fn file_symbols(obj: &[u8]) -> Vec<(usize, elf::Symbol)> {
+    let elf = elf::Elf::parse(obj).unwrap();
+    let syms = elf.symbols().unwrap();
+    syms.into_iter()
+        .enumerate()
+        .filter(|(_, s)| s.ty() == elf::STT_FILE)
+        .collect()
+}
+
+/// merlin's first line is clang 23's `.file "NAME"`, with and without
+/// `-g`, the base name of the file it was given (`m.c`, `./m.c`,
+/// `sub/n.c`, `sub/../m.c`, an absolute name, and on Windows `sub\n.c`),
+/// whatever `#line` says; and merlin-as makes of it clang -c's `STT_FILE`
+/// symbol, the object's first, local and absolute, the only one, on both
+/// widths.
+///
+/// Ignored: it needs clang (`CLANG` names it if it is not on the PATH).
+#[test]
+#[ignore]
+fn the_file_symbol_is_clangs() {
+    let clang = std::env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let dir = std::env::temp_dir().join(format!("merlin-file-symbol-{}", std::process::id()));
+    for (name, text) in [
+        ("m.c", "int g;\nint f(void) { return g; }\n"),
+        ("sub/n.c", "#line 9 \"other/y.c\"\nint f(void) { return 1; }\n"),
+    ] {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let abs = dir.join("m.c").to_string_lossy().into_owned();
+    let mut names = vec!["m.c", "./m.c", "sub/n.c", "sub/../m.c", abs.as_str()];
+    if cfg!(windows) {
+        names.push("sub\\n.c");
+    }
+    for name in names {
+        for xlen in [Xlen::Rv32, Xlen::Rv64] {
+            for g in [false, true] {
+                let opts = Options {
+                    xlen,
+                    ..if g { debug_opts("src") } else { Options::default() }
+                };
+                let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
+                let src = load(Path::new(name)).unwrap();
+                let ours = merlin::compile_with(name, &src, &opts, &load).unwrap();
+                let (target, march, abi) = match xlen {
+                    Xlen::Rv32 => ("riscv32", "rv32ima_zicsr_zifencei", "ilp32"),
+                    Xlen::Rv64 => ("riscv64", "rv64ima_zicsr_zifencei", "lp64"),
+                };
+                let clang_run = |out: &str| {
+                    let mut cmd = std::process::Command::new(&clang);
+                    cmd.arg(format!("--target={target}"))
+                        .arg(format!("-march={march}"))
+                        .arg(format!("-mabi={abi}"))
+                        .args(["-mno-relax", "-O0", "-fdebug-compilation-dir=src", out, "-o", "-"]);
+                    if g {
+                        cmd.arg("-g");
+                    }
+                    let out = cmd
+                        .arg(name)
+                        .current_dir(&dir)
+                        .output()
+                        .unwrap_or_else(|e| panic!("cannot run {clang}: {e}"));
+                    assert!(
+                        out.status.success(),
+                        "{name}: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    out.stdout
+                };
+                let what = format!("{name}, {xlen:?}, -g {g}: merlin's (left) and clang's (right)");
+                let theirs = String::from_utf8(clang_run("-S")).unwrap();
+                assert_eq!(file_symbol_lines(&ours), file_symbol_lines(&theirs), "{what}");
+                // It is the first line, as clang's is after its
+                // `.attribute`s, which merlin leaves to the assembler.
+                let words = |l: &str| l.split_whitespace().collect::<Vec<_>>().join(" ");
+                let first = theirs
+                    .lines()
+                    .find(|l| !l.trim_start().starts_with(".attribute"))
+                    .map(words);
+                assert_eq!(ours.lines().next().map(words), first, "{what}");
+                let obj = merlin_as::assemble_to_elf_with(&ours, &merlin_as::Options { xlen }).unwrap();
+                let syms = file_symbols(&obj);
+                assert_eq!(syms, file_symbols(&clang_run("-c")), "{what}");
+                assert_eq!(syms.len(), 1, "{what}");
+                assert_eq!(syms[0].0, 1, "{what}");
+                assert_eq!(syms[0].1.shndx, elf::SHN_ABS, "{what}");
+                assert_eq!(syms[0].1.bind(), elf::STB_LOCAL, "{what}");
+            }
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

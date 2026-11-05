@@ -232,7 +232,9 @@ mod tests {
             "{asm}"
         );
         let plain = without_debug_info(|| compile_c(&dir, "a.c", &["include"], "x").unwrap());
-        assert!(!plain.contains(".file") && !plain.contains(".loc"), "{plain}");
+        // Without, only clang's `.file "a.c"` (the object's file symbol).
+        assert!(plain.starts_with("    .file \"a.c\"\n"), "{plain}");
+        assert!(!plain.contains(".file 0") && !plain.contains(".loc"), "{plain}");
         assert!(compile_c(&dir, "a.c", &["include"], "x")
             .unwrap()
             .contains(".loc"));

@@ -665,7 +665,7 @@ fn renumbered_line(line: &str, from: u32, to: u32) -> String {
 }
 
 /// `s` as an assembly string literal.
-fn quoted(s: &str) -> String {
+pub(crate) fn quoted(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {

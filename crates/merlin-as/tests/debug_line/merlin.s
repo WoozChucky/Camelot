@@ -14,6 +14,7 @@
 #   }
 #   void nothing(void) {
 #   }
+    .file "m.c"
     .file 0 "src" "m.c" md5 0x54ec47e7dca72bbb5aa63c2a481fb712
 
     .text

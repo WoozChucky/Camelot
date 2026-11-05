@@ -3911,7 +3911,8 @@ mod tests {
         let asm = compile("int main() { return 42; }");
         assert_eq!(
             asm,
-            "    .text
+            "    .file \"<input>\"
+    .text
 
     # int main(void): frame 16 bytes
     .globl main
@@ -4271,7 +4272,8 @@ main:
         ] {
             assert!(data.contains(want), "missing {want:?} in\n{data}");
         }
-        assert!(data.starts_with("    .data\n"), "{data}");
+        // After the file's name, clang's first line.
+        assert!(data.starts_with("    .file \"<input>\"\n    .data\n"), "{data}");
         assert!(!data.contains(".globl u"), "static");
         assert!(!data.contains(".globl main.n"), "static local");
         assert!(asm.contains("la    a0, main.n\n"), "{asm}");

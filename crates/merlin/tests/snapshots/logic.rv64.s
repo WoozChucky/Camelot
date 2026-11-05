@@ -1,3 +1,4 @@
+    .file "logic.c"
     .text
 
     # int bump(int v): frame 32 bytes
