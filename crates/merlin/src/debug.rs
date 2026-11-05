@@ -670,14 +670,27 @@ fn renumbered_line(line: &str, from: u32, to: u32) -> String {
     format!("{head}{name} {to}{rest}")
 }
 
-/// `s` as an assembly string literal.
+/// `s` as an assembly string literal, byte by byte as LLVM's assembly
+/// printer quotes one (`PrintQuotedString`, the `.file` names and the
+/// `.asciz` strings clang writes): `"` and `\` escaped, a printable ASCII
+/// byte (0x20 to 0x7e) as it is, `\b`, `\f`, `\n`, `\r` and `\t` by name,
+/// and any other byte, control or not ASCII, as three octal digits: `é`,
+/// UTF-8 `c3 a9`, is `\303\251` (clang's `.file "caf\303\251.c"`).
 pub(crate) fn quoted(s: &str) -> String {
     let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            _ => out.push(c),
+    for b in s.bytes() {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(char::from(b)),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            _ => {
+                let _ = write!(out, "\\{:03o}", b);
+            }
         }
     }
     out.push('"');

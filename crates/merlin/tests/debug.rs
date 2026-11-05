@@ -443,6 +443,27 @@ fn files_are_named_as_clang_names_them() {
     assert!(asm[g..].contains("    .loc 1 1 0\n"), "{asm}");
 }
 
+/// Names are quoted as clang quotes them, byte by byte: the octal escapes
+/// of a name that is not ASCII (`café.c`) and of control characters, in
+/// the file symbol and the line table's `.file`s alike.
+#[test]
+fn names_are_quoted_as_clang_quotes_them() {
+    let src = "int g;\n";
+    let asm = merlin::compile_with("caf\u{e9}.c", src, &debug_opts("src"), &merlin::no_files).unwrap();
+    assert!(asm.starts_with("    .file \"caf\\303\\251.c\"\n"), "{asm}");
+    let file0 = format!("    .file 0 \"src\" \"caf\\303\\251.c\" md5 0x{}\n", md5(src));
+    assert!(asm.contains(&file0), "{asm}");
+    // The object names the file as clang's does.
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let elf = elf::Elf::parse(&obj).unwrap();
+    assert_eq!(elf.symbols().unwrap()[1].name, "caf\u{e9}.c");
+    assert_eq!(elf.line_tables().unwrap()[0].entries[0].0, "caf\u{e9}.c");
+    let src = "int f(void) {\n#line 7 \"a\\tb\\bc\\fd\\re\\\"f\\vg\\ah\\ni~\u{e9}.c\"\n    return 1;\n}\n";
+    let asm = merlin::compile_with("m.c", src, &debug_opts("src"), &merlin::no_files).unwrap();
+    let want = "    .file 1 \"a\\tb\\bc\\fd\\re\\\"f\\013g\\007h\\ni~\\303\\251.c\"\n";
+    assert!(asm.contains(want), "{asm}");
+}
+
 #[test]
 fn the_command_line_takes_g() {
     let dir = std::env::temp_dir().join(format!("merlin-debug-{}", std::process::id()));
@@ -1687,9 +1708,9 @@ fn file_table(obj: &[u8]) -> (Vec<String>, Vec<(String, u64)>) {
 /// several headers named as the preprocessor finds them (next to the file
 /// that includes them, in `-I` directories, relative and absolute), its main
 /// file named `m.c`, `./m.c` or `sub/../m.c` or by an absolute path in and
-/// out of the compilation directory, `#line` names (one naming a header
-/// as clang names it, which makes one file with the header's MD5), and the
-/// compilation directory `.`; and
+/// out of the compilation directory, `#line` names (one quoted with
+/// escapes, and one naming a header as clang names it, which makes one file
+/// with the header's MD5), and the compilation directory `.`; and
 /// merlin-as makes of them the line table's directories
 /// and files clang `-c` makes.
 ///
@@ -1723,6 +1744,11 @@ fn the_file_directives_are_clangs() {
         ("a.c", "#include \"q.h\"\nint f(void) { return g(); }\n"),
         ("q/q.h", "static int g(void) { return 1; }\n"),
         ("l.c", "int f(void) {\n#line 7 \"gen/y.c\"\n    return 1;\n}\n"),
+        // Names quoted with escapes, octal ones among them.
+        (
+            "e.c",
+            "int f(void) {\n#line 7 \"a\\tb\\bc\\fd\\re\\\"f\\vg\\ah\\ni~\u{e9}.c\"\n    return 1;\n}\n",
+        ),
         // A `#line` naming a header as clang names it (on Windows with
         // `\`, as clang joins the pieces there): one file to LLVM's
         // assembler, which keeps the header's MD5, the file it needs first.
@@ -1762,6 +1788,7 @@ fn the_file_directives_are_clangs() {
         (other, &q_dir, &a, None),
         (&q, &q_dir, &a, None),
         ("src", &[], "l.c", None),
+        ("src", &[], "e.c", None),
         ("src", &[], "k.c", None),
     ];
     if !cfg!(windows) {
@@ -1834,7 +1861,8 @@ fn file_symbols(obj: &[u8]) -> Vec<(usize, elf::Symbol)> {
 
 /// merlin's first line is clang 23's `.file "NAME"`, with and without
 /// `-g`, the base name of the file it was given (`m.c`, `./m.c`,
-/// `sub/n.c`, `sub/../m.c`, an absolute name, and on Windows `sub\n.c`),
+/// `sub/n.c`, `sub/../m.c`, an absolute name, `café.c`, quoted in octal,
+/// and on Windows `sub\n.c`),
 /// whatever `#line` says; and merlin-as makes of it clang -c's `STT_FILE`
 /// symbol, the object's first, local and absolute, the only one, on both
 /// widths.
@@ -1848,13 +1876,21 @@ fn the_file_symbol_is_clangs() {
     for (name, text) in [
         ("m.c", "int g;\nint f(void) { return g; }\n"),
         ("sub/n.c", "#line 9 \"other/y.c\"\nint f(void) { return 1; }\n"),
+        ("caf\u{e9}.c", "int f(void) { return 1; }\n"),
     ] {
         let path = dir.join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     }
     let abs = dir.join("m.c").to_string_lossy().into_owned();
-    let mut names = vec!["m.c", "./m.c", "sub/n.c", "sub/../m.c", abs.as_str()];
+    let mut names = vec![
+        "m.c",
+        "./m.c",
+        "sub/n.c",
+        "sub/../m.c",
+        abs.as_str(),
+        "caf\u{e9}.c",
+    ];
     if cfg!(windows) {
         names.push("sub\\n.c");
     }
