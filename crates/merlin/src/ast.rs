@@ -19,7 +19,7 @@
 //! Typedefs, struct tags and enum constants are gone even earlier: the parser
 //! resolves them, so the tree only has types and numbers.
 
-use crate::types::{Type, Xlen};
+use crate::types::{Spelled, Type, Xlen};
 use crate::Pos;
 use std::fmt::Write;
 
@@ -76,6 +76,8 @@ pub enum Storage {
 pub struct Function {
     pub name: String,
     pub ret: Type,
+    /// How the return type was spelled (for `-g`).
+    pub ret_spelled: Spelled,
     pub params: Vec<Param>,
     /// `...` ends the parameter list.
     pub variadic: bool,
@@ -89,6 +91,10 @@ pub struct Function {
     /// (every file-scope declaration says `inline` and none `extern`): it
     /// provides no external definition, so it is emitted without `.globl`.
     pub inline_only: bool,
+    /// Declared with a prototype: a parameter list that is not `()`, which
+    /// merlin takes as `(void)` but C as saying nothing of the parameters
+    /// (`DW_AT_prototyped` under `-g`, as clang has it).
+    pub prototyped: bool,
     /// `None` for a prototype (`int f(int a);`): declared here, defined elsewhere.
     pub body: Option<Vec<Stmt>>,
     /// Filled in by sema: parameters first (in order), then every local declared in
@@ -126,6 +132,8 @@ pub struct Param {
     /// parameters.
     pub ty: Type,
     pub pos: Pos,
+    /// How its type was spelled (for `-g`).
+    pub spelled: Spelled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +164,8 @@ pub struct Declarator {
     /// else the first that is not `extern`).
     pub define: bool,
     pub pos: Pos,
+    /// How its type was spelled (for `-g`).
+    pub spelled: Spelled,
 }
 
 /// An initializer: `= expr` or `= { ... }`.
@@ -407,10 +417,12 @@ pub enum ExprKind {
     Addr(Box<Expr>),
     /// `*p` (and `a[i]`, which the parser writes as `*(a + i)`).
     Deref(Box<Expr>),
-    /// `(type) x`, converting to `ty`. Sema adds implicit ones.
+    /// `(type) x`, converting to `ty`. Sema adds implicit ones. `spelled`:
+    /// how an explicit one spelled its type (for `-g`).
     Cast {
         x: Box<Expr>,
         implicit: bool,
+        spelled: Spelled,
     },
     /// `sizeof (type)`; sema replaces it with its value.
     SizeofType(Type),
@@ -732,7 +744,7 @@ impl Dumper {
                 node(self, "Deref".to_string());
                 self.expr(d + 1, x);
             }
-            ExprKind::Cast { x, implicit } => {
+            ExprKind::Cast { x, implicit, .. } => {
                 node(self, if *implicit { "ImplicitCast" } else { "Cast" }.to_string());
                 self.expr(d + 1, x);
             }

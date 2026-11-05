@@ -5,10 +5,11 @@
 //! object (`prog.o`), the same with linker relaxation (`prog-relax.o`, whose
 //! debug sections hold R_RISCV_ADD/SUB pairs) and a linked program
 //! (`prog.elf`). Next to each are `FILE.readelf`, what `llvm-readelf -h -S -l
-//! -s -r` printed, and `FILE.lines`, what `llvm-dwarfdump --debug-line`
-//! printed (regenerate them all with scripts/gen-elf-golden.sh). The test
-//! parses that text and checks the elf crate reads the same header, sections,
-//! segments, symbols, relocations and line table rows.
+//! -s -r` printed, `FILE.lines`, what `llvm-dwarfdump --debug-line` printed,
+//! and `FILE.info`, what `llvm-dwarfdump --debug-info` printed (regenerate
+//! them all with scripts/gen-elf-golden.sh). The test parses that text and
+//! checks the elf crate reads the same header, sections, segments, symbols,
+//! relocations, line table rows and debugging information entries.
 
 use elf::{Class, Elf, Rela, Section, Symbol, STT_FUNC, STT_SECTION};
 use std::path::{Path, PathBuf};
@@ -505,4 +506,184 @@ fn header_numbers_stop_at_a_comma() {
     assert_eq!(header_num(text, "Flags"), 5);
     let text = "  Start of program headers:          64 (bytes into file)\n";
     assert_eq!(header_num(text, "Start of program headers"), 64);
+}
+
+/// A DWARF tag or encoding as llvm-dwarfdump names it.
+fn dw_name(name: &str) -> u64 {
+    use elf::dies::dw::*;
+    match name {
+        "DW_TAG_compile_unit" => TAG_COMPILE_UNIT,
+        "DW_TAG_subprogram" => TAG_SUBPROGRAM,
+        "DW_TAG_formal_parameter" => TAG_FORMAL_PARAMETER,
+        "DW_TAG_variable" => TAG_VARIABLE,
+        "DW_TAG_lexical_block" => TAG_LEXICAL_BLOCK,
+        "DW_TAG_array_type" => TAG_ARRAY_TYPE,
+        "DW_TAG_subrange_type" => TAG_SUBRANGE_TYPE,
+        "DW_TAG_base_type" => TAG_BASE_TYPE,
+        "DW_TAG_const_type" => TAG_CONST_TYPE,
+        "DW_TAG_pointer_type" => TAG_POINTER_TYPE,
+        "DW_ATE_signed" => ATE_SIGNED,
+        "DW_ATE_unsigned" => ATE_UNSIGNED,
+        "DW_ATE_unsigned_char" => ATE_UNSIGNED_CHAR,
+        _ => panic!("no {name} in the table"),
+    }
+}
+
+/// `v` in LEB128, signed or not.
+fn leb(mut v: i64, signed: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        let done = if signed {
+            (v == 0 && b & 0x40 == 0) || (v == -1 && b & 0x40 != 0)
+        } else {
+            v == 0
+        };
+        out.push(if done { b } else { b | 0x80 });
+        if done {
+            return out;
+        }
+    }
+}
+
+/// A location expression as llvm-dwarfdump prints it, encoded again: the
+/// operations clang's -O0 code uses.
+fn expression(text: &str) -> Vec<u8> {
+    let (op, arg) = text.split_once(' ').unwrap_or((text, ""));
+    if let Some(n) = op.strip_prefix("DW_OP_breg") {
+        // DW_OP_breg2 X2+24
+        let (_, off) = arg.split_once(['+', '-']).unwrap();
+        let off = if arg.contains('-') {
+            -(dec(off) as i64)
+        } else {
+            dec(off) as i64
+        };
+        let mut b = vec![0x70 + dec(n) as u8];
+        b.extend(leb(off, true));
+        b
+    } else if let Some(n) = op.strip_prefix("DW_OP_reg") {
+        vec![0x50 + dec(n) as u8]
+    } else if op == "DW_OP_addrx" {
+        let mut b = vec![0xa1];
+        b.extend(leb(hex(arg) as i64, false));
+        b
+    } else {
+        panic!("no {op} in the table")
+    }
+}
+
+/// An entry of `.debug_info` as llvm-dwarfdump `--debug-info` prints it: its
+/// offset, its depth (from its indentation), its tag and its attributes (the
+/// name, and the text in the parentheses).
+type DumpedDie = (u64, usize, u64, Vec<(String, String)>);
+
+fn dwarfdump_entries(text: &str) -> Vec<DumpedDie> {
+    let mut out: Vec<DumpedDie> = Vec::new();
+    for line in text.lines() {
+        if let Some((off, rest)) = line.split_once(':').filter(|(o, _)| o.starts_with("0x")) {
+            let tag = rest.trim_start();
+            if tag.starts_with("DW_TAG_") {
+                let depth = (rest.len() - tag.len() - 1) / 2;
+                out.push((hex(off), depth, dw_name(tag), Vec::new()));
+            }
+        } else if let Some((at, value)) = line.trim_start().split_once('\t') {
+            if at.starts_with("DW_AT_") {
+                let value = value.strip_prefix('(').unwrap_or(value);
+                let value = value.strip_suffix(')').unwrap_or(value);
+                out.last_mut()
+                    .unwrap()
+                    .3
+                    .push((at.to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// `elf::dies` reads every entry llvm-dwarfdump prints, at its offset and
+/// depth, with its tag, and the attributes a debugger reads: names, types,
+/// lines, sizes, encodings, flags, locations, frame bases and code ranges.
+/// The `.debug_addr` pool gives `table`'s address in the linked program.
+#[test]
+fn reads_the_entries_llvm_dwarfdump_prints() {
+    use elf::dies::{dw, Die};
+    for xlen in [32, 64] {
+        for file in FILES {
+            let bytes = std::fs::read(dir(xlen).join(file)).unwrap();
+            let text = std::fs::read_to_string(dir(xlen).join(format!("{file}.info"))).unwrap();
+            let elf = Elf::parse(&bytes).unwrap();
+            let units = elf.debug_entries().unwrap();
+            assert_eq!(units.len(), 1, "rv{xlen} {file}");
+            let unit = &units[0];
+            assert_eq!((unit.version, unit.addr_size), (5, xlen as u8 / 8));
+            let want = dwarfdump_entries(&text);
+            assert_eq!(unit.dies.len(), want.len(), "rv{xlen} {file}");
+            let depth = |d: &Die| {
+                let mut n = 0;
+                let mut p = d.parent;
+                while let Some(i) = p {
+                    n += 1;
+                    p = unit.dies[i].parent;
+                }
+                n
+            };
+            for (d, (off, dep, tag, attrs)) in unit.dies.iter().zip(&want) {
+                let at = format!("rv{xlen} {file} {off:#x}");
+                assert_eq!((d.offset, depth(d), d.tag), (*off, *dep, *tag), "{at}");
+                for (name, value) in attrs {
+                    let number = || {
+                        if value.starts_with("0x") {
+                            hex(value)
+                        } else {
+                            dec(value)
+                        }
+                    };
+                    let flag = |a| assert!(d.flag(a), "{at} {name}");
+                    match name.as_str() {
+                        "DW_AT_name" => {
+                            assert_eq!(d.name(), value.split('"').nth(1), "{at}");
+                        }
+                        "DW_AT_type" => {
+                            let target = hex(value.split(' ').next().unwrap());
+                            assert_eq!(d.reference(dw::AT_TYPE), Some(target), "{at}");
+                        }
+                        "DW_AT_decl_line" => assert_eq!(d.unsigned(dw::AT_DECL_LINE), Some(number()), "{at}"),
+                        "DW_AT_byte_size" => assert_eq!(d.unsigned(dw::AT_BYTE_SIZE), Some(number()), "{at}"),
+                        "DW_AT_count" => assert_eq!(d.unsigned(dw::AT_COUNT), Some(number()), "{at}"),
+                        "DW_AT_encoding" => {
+                            assert_eq!(d.unsigned(dw::AT_ENCODING), Some(dw_name(value)), "{at}");
+                        }
+                        "DW_AT_external" => flag(dw::AT_EXTERNAL),
+                        "DW_AT_prototyped" => flag(dw::AT_PROTOTYPED),
+                        "DW_AT_location" => {
+                            assert_eq!(d.block(dw::AT_LOCATION), Some(&expression(value)[..]), "{at}");
+                        }
+                        "DW_AT_frame_base" => {
+                            assert_eq!(d.block(dw::AT_FRAME_BASE), Some(&expression(value)[..]), "{at}");
+                        }
+                        // A function's or a block's low and high pc: its range.
+                        "DW_AT_low_pc" if d.tag != dw::TAG_COMPILE_UNIT => {
+                            assert_eq!(d.ranges.first().map(|r| r.0), Some(number()), "{at}");
+                        }
+                        "DW_AT_high_pc" => assert_eq!(d.ranges.first().map(|r| r.1), Some(number()), "{at}"),
+                        _ => {}
+                    }
+                }
+            }
+            // The unit's ranges come from its range list; `table`'s address
+            // from the address pool its DW_OP_addrx indexes.
+            assert_eq!(unit.dies[0].ranges.len(), 3, "rv{xlen} {file}");
+            let table = unit.dies.iter().find(|d| d.name() == Some("table")).unwrap();
+            let index = table.block(dw::AT_LOCATION).unwrap()[1] as usize;
+            assert!(index < unit.addr_pool.len(), "rv{xlen} {file}");
+            if file == "prog.elf" {
+                assert_eq!(
+                    unit.addr_pool.get(index).copied(),
+                    elf.symbol("table"),
+                    "rv{xlen}"
+                );
+            }
+        }
+    }
 }
