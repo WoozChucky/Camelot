@@ -166,7 +166,7 @@ static pagetable_t user_pt(void) {
     return myproc()->pagetable;
 }
 
-int net_sys_info(u32 uinfo) {
+int net_sys_info(uintptr uinfo) {
     if (!uvm_range_ok(user_pt(), uinfo, sizeof(struct netinfo), PTE_W)) {
         return -EFAULT;
     }
@@ -221,7 +221,7 @@ int net_sys_conf(u32 addr, u32 mask, u32 gateway) {
     return 0;
 }
 
-int net_sys_ping(u32 addr, u32 seq, u32 ureply) {
+int net_sys_ping(u32 addr, u32 seq, uintptr ureply) {
     if (!uvm_range_ok(user_pt(), ureply, sizeof(struct ping_reply), PTE_W)) {
         return -EFAULT;
     }

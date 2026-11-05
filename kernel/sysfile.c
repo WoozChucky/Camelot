@@ -23,14 +23,15 @@
 #include "string.h"
 #include "syscall.h"
 
-/* The arguments as the process passed them. */
-static u32 arg(struct trap_frame *f, int n) {
+/* The arguments as the process passed them: a register each (syscall.c).
+ * A descriptor or flags are an int, the register's low 32 bits. */
+static uintptr arg(struct trap_frame *f, int n) {
     return f->regs[REG_A0 + n];
 }
 
 /* Reads the rest of a user string, from `va` to its NUL, without keeping
  * it. Returns 0, or -1 if it runs into memory the process can't read. */
-static int skip_string(pagetable_t pt, u32 va) {
+static int skip_string(pagetable_t pt, uintptr va) {
     char chunk[64];
     int n;
     /* -2: `sizeof chunk` bytes read, none of them a NUL. */
@@ -40,7 +41,7 @@ static int skip_string(pagetable_t pt, u32 va) {
     return n == -1 ? -1 : 0;
 }
 
-int fetch_path(pagetable_t pt, u32 va, char *buf) {
+int fetch_path(pagetable_t pt, uintptr va, char *buf) {
     int n = copyinstr(pt, buf, va, MAXPATH + 1);
     if (n == -2) {
         return skip_string(pt, va + MAXPATH + 1) != 0 ? -EFAULT : -ENAMETOOLONG;
@@ -51,28 +52,28 @@ int fetch_path(pagetable_t pt, u32 va, char *buf) {
     return n == 0 ? -ENOENT : 0;
 }
 
-int sys_read(struct trap_frame *f) {
-    struct file *file = fd_get(arg(f, 0));
+long sys_read(struct trap_frame *f) {
+    struct file *file = fd_get((u32)arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
-    int r = fileread(file, myproc()->pagetable, arg(f, 1), arg(f, 2));
+    isize r = fileread(file, myproc()->pagetable, arg(f, 1), arg(f, 2));
     fileclose(file);
     return r;
 }
 
-int sys_write(struct trap_frame *f) {
-    struct file *file = fd_get(arg(f, 0));
+long sys_write(struct trap_frame *f) {
+    struct file *file = fd_get((u32)arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
-    int r = filewrite(file, myproc()->pagetable, arg(f, 1), arg(f, 2));
+    isize r = filewrite(file, myproc()->pagetable, arg(f, 1), arg(f, 2));
     fileclose(file);
     return r;
 }
 
-int sys_close(struct trap_frame *f) {
-    struct file *file = fd_take(arg(f, 0));
+long sys_close(struct trap_frame *f) {
+    struct file *file = fd_take((u32)arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
@@ -80,8 +81,8 @@ int sys_close(struct trap_frame *f) {
     return 0;
 }
 
-int sys_dup(struct trap_frame *f) {
-    struct file *file = fd_get(arg(f, 0));
+long sys_dup(struct trap_frame *f) {
+    struct file *file = fd_get((u32)arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
@@ -95,10 +96,10 @@ int sys_dup(struct trap_frame *f) {
 
 /* fcntl(fd, cmd, arg), Linux's for the descriptor's flags and copies: the
  * descriptor is checked first, as Linux does, then the command. */
-int sys_fcntl(struct trap_frame *f) {
-    u32 fd = arg(f, 0);
-    u32 cmd = arg(f, 1);
-    u32 a = arg(f, 2);
+long sys_fcntl(struct trap_frame *f) {
+    u32 fd = (u32)arg(f, 0);
+    u32 cmd = (u32)arg(f, 1);
+    u32 a = (u32)arg(f, 2);
     struct file *file = fd_get(fd);
     if (file == NULL) {
         return -EBADF;
@@ -132,18 +133,18 @@ int sys_fcntl(struct trap_frame *f) {
     return r;
 }
 
-int sys_lseek(struct trap_frame *f) {
-    struct file *file = fd_get(arg(f, 0));
+long sys_lseek(struct trap_frame *f) {
+    struct file *file = fd_get((u32)arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
-    int r = filelseek(file, (i32)arg(f, 1), arg(f, 2));
+    off_t r = filelseek(file, (off_t)arg(f, 1), (u32)arg(f, 2));
     fileclose(file);
     return r;
 }
 
-int sys_fstat(struct trap_frame *f) {
-    struct file *file = fd_get(arg(f, 0));
+long sys_fstat(struct trap_frame *f) {
+    struct file *file = fd_get((u32)arg(f, 0));
     if (file == NULL) {
         return -EBADF;
     }
@@ -159,9 +160,9 @@ int sys_fstat(struct trap_frame *f) {
     return copyout(pt, arg(f, 1), &st, sizeof st) == 0 ? 0 : -EFAULT;
 }
 
-int sys_pipe(struct trap_frame *f) {
+long sys_pipe(struct trap_frame *f) {
     pagetable_t pt = myproc()->pagetable;
-    u32 va = arg(f, 0);
+    uintptr va = arg(f, 0);
     int fds[2];
     if (!uvm_range_ok(pt, va, sizeof fds, PTE_W)) {
         return -EFAULT;
@@ -220,13 +221,13 @@ static struct inode *open_inode(const char *path, u32 flags, int *err) {
     }
 }
 
-int sys_open(struct trap_frame *f) {
+long sys_open(struct trap_frame *f) {
     char path[MAXPATH + 1];
     int err = fetch_path(myproc()->pagetable, arg(f, 0), path);
     if (err < 0) {
         return err;
     }
-    u32 flags = arg(f, 1);
+    u32 flags = (u32)arg(f, 1);
     u32 mode = flags & O_ACCMODE;
     if ((flags & ~(O_ACCMODE | O_CREAT | O_TRUNC | O_CLOEXEC)) != 0 || mode == O_ACCMODE) {
         return -EINVAL;
@@ -297,7 +298,7 @@ int sys_open(struct trap_frame *f) {
     return fd;
 }
 
-int sys_mkdir(struct trap_frame *f) {
+long sys_mkdir(struct trap_frame *f) {
     char path[MAXPATH + 1];
     int err = fetch_path(myproc()->pagetable, arg(f, 0), path);
     if (err < 0) {
@@ -315,7 +316,7 @@ int sys_mkdir(struct trap_frame *f) {
     return ip != NULL ? 0 : err;
 }
 
-int sys_unlink(struct trap_frame *f) {
+long sys_unlink(struct trap_frame *f) {
     char path[MAXPATH + 1];
     int err = fetch_path(myproc()->pagetable, arg(f, 0), path);
     if (err < 0) {
@@ -330,7 +331,7 @@ int sys_unlink(struct trap_frame *f) {
     return err;
 }
 
-int sys_link(struct trap_frame *f) {
+long sys_link(struct trap_frame *f) {
     char old[MAXPATH + 1];
     char new[MAXPATH + 1];
     pagetable_t pt = myproc()->pagetable;
@@ -356,7 +357,7 @@ int sys_link(struct trap_frame *f) {
     return err;
 }
 
-int sys_chdir(struct trap_frame *f) {
+long sys_chdir(struct trap_frame *f) {
     char path[MAXPATH + 1];
     int err = fetch_path(myproc()->pagetable, arg(f, 0), path);
     if (err < 0) {

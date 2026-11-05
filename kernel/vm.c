@@ -168,6 +168,10 @@ int map_pages(pagetable_t pt, uintptr va, phys_addr_t pa, usize size, u32 perm) 
         (perm & (PTE_R | PTE_W)) == PTE_W || ((perm & PTE_U) != 0 && (perm & PTE_KERNEL) != 0)) {
         panic("map_pages: bad permissions");
     }
+    /* A user leaf's A and D, up front (vm.h). */
+    if (perm & PTE_U) {
+        perm |= PTE_USER_AD(perm);
+    }
     /* The last page, computed so that a range ending at the top of the
      * address space doesn't wrap. */
     uintptr last = va + (size - PGSIZE);

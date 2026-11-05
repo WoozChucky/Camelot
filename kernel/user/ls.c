@@ -10,7 +10,7 @@ static char type_letter(int type) {
 }
 
 static void line(const struct stat *st, const char *name) {
-    printf("%c %4u %2u %7u %s\n", type_letter(st->type), st->ino, st->nlink, st->size, name);
+    printf("%c %4u %2u %7ld %s\n", type_letter(st->type), st->ino, st->nlink, st->size, name);
 }
 
 /* Lists `path`. Returns 0, or 1 if it can't. */

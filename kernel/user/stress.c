@@ -51,8 +51,8 @@ static uchar pipe_byte(uint id, uint n) {
 
 /* The heap round: 1 if the pages kept what was written. */
 static int heap_round(uint id, uint round) {
-    int old = sbrk(PAGES * PAGE);
-    if (old < 0) {
+    char *old = sbrk(PAGES * PAGE);
+    if ((long)old < 0) {
         return 0;
     }
     uint *words = (uint *)old;
@@ -68,7 +68,7 @@ static int heap_round(uint id, uint round) {
             break;
         }
     }
-    if (sbrk(-(PAGES * PAGE)) != old + PAGES * PAGE) {
+    if ((char *)sbrk(-(PAGES * PAGE)) != old + PAGES * PAGE) {
         ok = 0;
     }
     return ok;

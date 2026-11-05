@@ -668,7 +668,6 @@ static void trunc_restart(struct inode *ip) {
  * inode freed is iput()'s to finish first (see there). */
 static bool truncate(struct inode *ip, bool free_inode) {
     ip->size = 0;
-    ip->size_hi = 0;
     if (ip->type == T_DEVICE || (ip->root.h.depth == 0 && ip->root.h.entries == 0)) {
         /* No blocks (a device's root is all zero): only the inode changes,
          * a block the caller's operation counts already. */
@@ -716,7 +715,7 @@ void itrunc(struct inode *ip) {
 }
 
 bool inode_too_big(const struct inode *ip) {
-    return ip->size_hi != 0 || ip->size > MAXFILE_BYTES;
+    return ip->size > MAXFILE_BYTES;
 }
 
 /* ---- Inodes ---- */
@@ -747,8 +746,8 @@ void iupdate(struct inode *ip) {
     dip->major = ip->major;
     dip->minor = ip->minor;
     dip->nlink = ip->nlink;
-    dip->size = ip->size;
-    dip->size_hi = ip->size_hi;
+    dip->size = (u32)ip->size;
+    dip->size_hi = (u32)(ip->size >> 32);
     memmove(&dip->root, &ip->root, sizeof ip->root);
     dip->flags = ip->flags;
     log_write(b);
@@ -801,8 +800,7 @@ void ilock(struct inode *ip) {
         ip->major = dip->major;
         ip->minor = dip->minor;
         ip->nlink = dip->nlink;
-        ip->size = dip->size;
-        ip->size_hi = dip->size_hi;
+        ip->size = (u64)dip->size_hi << 32 | dip->size;
         memmove(&ip->root, &dip->root, sizeof ip->root);
         ip->flags = dip->flags;
         brelse(b);
@@ -860,44 +858,52 @@ void iunlockput(struct inode *ip) {
 
 /* ---- Contents ---- */
 
-int readi(struct inode *ip, void *dst, u32 off, u32 n) {
-    if (off >= ip->size || off + n < off) {
+int readi(struct inode *ip, void *dst, u64 off, u32 n) {
+    if (off >= ip->size) {
         return 0;
     }
     if (n > ip->size - off) {
-        n = ip->size - off;
+        n = (u32)(ip->size - off);
     }
+    /* The block `off` is in, and where in it: `off` is below the size, so
+     * its block number fits the extents' u32. Then block by block, in u32
+     * arithmetic. */
+    u32 bn = (u32)(off >> BSHIFT);
+    u32 at = (u32)off & (BSIZE - 1);
     u8 *d = (u8 *)dst;
-    for (u32 done = 0; done < n;) {
-        u32 addr = ext_lookup(ip, off / BSIZE);
+    for (u32 done = 0; done < n; bn++, at = 0) {
+        u32 addr = ext_lookup(ip, bn);
         if (addr == 0) {
             panic("readi: a hole in a file");
         }
         struct buf *b = fs_bread(ip->dev, addr);
-        u32 m = MIN(n - done, BSIZE - off % BSIZE);
-        memmove(d, b->data + off % BSIZE, m);
+        u32 m = MIN(n - done, BSIZE - at);
+        memmove(d, b->data + at, m);
         brelse(b);
         done += m;
-        off += m;
         d += m;
     }
     return (int)n;
 }
 
-int writei(struct inode *ip, const void *src, u32 off, u32 n) {
-    if (off > ip->size || off + n < off) {
+int writei(struct inode *ip, const void *src, u64 off, u32 n) {
+    if (off > ip->size) {
         return -EINVAL;
     }
-    if (off + n > MAXFILE_BYTES) {
+    /* off + n > MAXFILE_BYTES, without overflowing to find out. */
+    if (off > MAXFILE_BYTES || n > MAXFILE_BYTES - off) {
         return -EFBIG;
     }
     const u8 *s = (const u8 *)src;
     u32 done = 0;
     /* The file's blocks: no holes, so exactly the ones its size needs. A
-     * block at or past them is the next one, added to the tree. */
-    u32 blocks = div_ceil(ip->size, BSIZE);
-    while (done < n) {
-        u32 bn = off / BSIZE;
+     * block at or past them is the next one, added to the tree. The size
+     * is at most MAXFILE_BYTES, at most EXT_MAX_BLOCKS blocks (fs.h), so
+     * the count fits a u32, and so does the block of every byte written. */
+    u32 blocks = (u32)((ip->size + BSIZE - 1) >> BSHIFT);
+    u32 bn = (u32)(off >> BSHIFT);
+    u32 at = (u32)off & (BSIZE - 1);
+    for (; done < n; bn++, at = 0) {
         u32 addr;
         if (bn < blocks) {
             addr = ext_lookup(ip, bn);
@@ -916,16 +922,15 @@ int writei(struct inode *ip, const void *src, u32 off, u32 n) {
             blocks++;
         }
         struct buf *b = fs_bread(ip->dev, addr);
-        u32 m = MIN(n - done, BSIZE - off % BSIZE);
-        memmove(b->data + off % BSIZE, s, m);
+        u32 m = MIN(n - done, BSIZE - at);
+        memmove(b->data + at, s, m);
         log_write(b);
         brelse(b);
         done += m;
-        off += m;
         s += m;
     }
-    if (off > ip->size) {
-        ip->size = off;
+    if (off + done > ip->size) {
+        ip->size = off + done;
     }
     /* The size, and the root of the tree, which may have changed. */
     iupdate(ip);

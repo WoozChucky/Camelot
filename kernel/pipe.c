@@ -74,14 +74,14 @@ void pipeclose(struct pipe *p, bool writable) {
     }
 }
 
-int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n) {
-    u32 done = 0;
+isize pipewrite(struct pipe *p, pagetable_t pt, uintptr src, usize n) {
+    usize done = 0;
     acquire(&p->lock);
     while (done < n) {
         if (!p->readopen) {
             /* Nobody will ever read the rest. */
             release(&p->lock);
-            return done > 0 ? (int)done : -EPIPE;
+            return done > 0 ? (isize)done : -EPIPE;
         }
         u32 used = p->nwrite - p->nread;
         if (used == PIPESIZE) {
@@ -95,32 +95,32 @@ int pipewrite(struct pipe *p, pagetable_t pt, u32 src, u32 n) {
         }
         /* As much as fits before the end of the ring. */
         u32 at = p->nwrite % PIPESIZE;
-        u32 m = MIN(MIN(n - done, PIPESIZE - used), PIPESIZE - at);
+        u32 m = (u32)MIN(MIN(n - done, PIPESIZE - used), PIPESIZE - at);
         /* The caller checked the buffer, but another thread of the process
          * may have unmapped part of it since (sbrk): what is left of the
          * write fails, and the reader never sees what wasn't copied. */
         if (copyin(pt, p->data + at, src + done, m) != 0) {
             wakeup(&p->nread);
             release(&p->lock);
-            return done > 0 ? (int)done : -EFAULT;
+            return done > 0 ? (isize)done : -EFAULT;
         }
         p->nwrite += m;
         done += m;
     }
     wakeup(&p->nread);
     release(&p->lock);
-    return (int)done;
+    return (isize)done;
 }
 
-int piperead(struct pipe *p, pagetable_t pt, u32 dst, u32 n) {
+isize piperead(struct pipe *p, pagetable_t pt, uintptr dst, usize n) {
     acquire(&p->lock);
     while (p->nread == p->nwrite && p->writeopen && !proc_killed()) {
         sleep(&p->nread, &p->lock);
     }
-    u32 count = 0;
+    usize count = 0;
     while (count < n && p->nread != p->nwrite) {
         u32 at = p->nread % PIPESIZE;
-        u32 m = MIN(MIN(n - count, p->nwrite - p->nread), PIPESIZE - at);
+        u32 m = (u32)MIN(MIN(n - count, p->nwrite - p->nread), PIPESIZE - at);
         /* As in pipewrite: bytes that couldn't be copied stay in the pipe. */
         if (copyout(pt, dst + count, p->data + at, m) != 0) {
             if (count == 0) {
@@ -135,7 +135,7 @@ int piperead(struct pipe *p, pagetable_t pt, u32 dst, u32 n) {
     /* Room for the writers. */
     wakeup(&p->nwrite);
     release(&p->lock);
-    return (int)count;
+    return (isize)count;
 }
 
 u32 pipe_bytes(struct pipe *p) {

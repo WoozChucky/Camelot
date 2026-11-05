@@ -19,15 +19,35 @@ The numbers in the tables below are checked against `syscall.h`, `usys.s`
 and `user.h` by `cargo test` (`crates/xtask/tests/kernel.rs`): change all of
 them together.
 
+Camelot runs on RV32 and RV64 while the switch to 64 bits happens (#141):
+the same calls, with Linux's widths for each but for RV32's `off_t` and
+`time_t` (below). An RV32 program is ILP32
+(`int`, `long` and pointers 32 bits), an RV64 one LP64 (`int` 32 bits,
+`long` and pointers 64), and every type below is the C type it says, at
+that width: `size_t`, `ssize_t`, `off_t` and `time_t` are a `long` wide, so
+64-bit on RV64, as on Linux. On RV32 that leaves `off_t` and `time_t` 32-bit,
+which riscv32 Linux's are not (its glibc has only 64-bit ones): a stopgap
+until RV32 goes (#159), which limits RV32's files to 2^31 - 1 bytes
+(`open`). "Structures" gives what the widths make of each structure's
+size.
+
 ## Calling convention
 
 The Linux RISC-V convention, which is also the C calling convention's, so a
 stub is two instructions:
 
 - The program executes `ecall` in U-mode with the call number in `a7` and
-  the arguments in `a0`-`a5` (`setsockopt` takes five, the most).
-- The result comes back in `a0`. A value from -4095 to -1 is an error: minus
-  one of the error numbers below. Every other value is a success.
+  the arguments in `a0`-`a5` (`setsockopt` takes five, the most). An
+  argument is a register, read at its C type: an `int` is the register's
+  low 32 bits (which the calling convention keeps sign-extended on RV64), a
+  pointer, a `size_t` or an `off_t` all of it. The number is all of `a7`, a
+  `long`: on RV64, 2^32 + 4 is no call, not `getpid`.
+- The result comes back in `a0`: a `long`, sign-extended to the register's
+  width, so an error is negative to a 64-bit program too (-14 is
+  0xffff_ffff_ffff_fff2, not 0x0000_0000_ffff_fff2). A value from -4095 to
+  -1 is an error: minus one of the error numbers below. Every other value
+  is a success: a count, a descriptor, or for `sbrk` an address (user
+  addresses are below `USER_TOP`, so never in that range).
 - Every register but `a0` is preserved, `a1`-`a7` and the temporaries
   included, and `pc` continues after the `ecall`.
 
@@ -43,8 +63,12 @@ An unknown call number returns `-ENOSYS` and changes nothing else.
 space. The kernel never dereferences it: it checks every byte of the range
 against the process's page table (each page must be below `USER_TOP`,
 mapped, and mapped with U and the access the call needs: R to read from it,
-W to write to it) and then copies through the physical pages. A range that
-fails the check, such as a null pointer, a kernel address, the guard page
+W to write to it) and then copies through the physical pages, which the
+kernel reaches through its own mapping of them (on RV64 the direct map, as
+Linux's kernel reaches user pages). A range that
+fails the check, such as a null pointer, a kernel address (on RV64 any
+address from `USER_TOP` up: the kernel's half of the address space, and the
+addresses between the halves, which are not canonical), the guard page
 under the stack, the stack below `sp` (not grown to yet: see "Starting a
 program"), memory past the end of the heap, read-only memory for a
 buffer the kernel writes, or a length that runs past `USER_TOP` or wraps
@@ -58,23 +82,44 @@ up to its NUL. The checks come in a fixed order: a bad descriptor
 a call that takes a path fails with `-EFAULT` for a bad one whether or not
 there is a filesystem to look it up in.
 
+## Structures
+
+What the calls store and read, as `user.h` and `kernel/include/syscall.h`
+declare them, in bytes. The ones made of fixed-width fields are the same on
+both widths, as their Linux counterparts are; the three with a `long`, a
+`size_t` or an `off_t` grow on RV64, each such field 8-byte aligned. The
+test that checks the tables compiles both headers for both widths and
+checks each size.
+
+| Structure | RV32 | RV64 | What |
+|-----------|------|------|------|
+| `struct stat` | 16 | 24 | `fstat`'s: `size` is an `off_t` |
+| `struct dirent` | 16 | 16 | a directory's entries, as `read` gives them |
+| `struct procinfo` | 32 | 40 | `procs`': `size` is a `size_t` |
+| `struct hartinfo` | 16 | 16 | `harts`' |
+| `struct net_stats` | 108 | 108 | the network's counters |
+| `struct netinfo` | 132 | 132 | `netinfo`'s |
+| `struct ping_reply` | 16 | 16 | `ping`'s |
+| `struct timeval` | 8 | 16 | `SO_RCVTIMEO`'s: two `long`s, `tv_sec` a `time_t` |
+| `struct sockaddr_in` | 16 | 16 | an IPv4 address and port |
+
 ## Calls
 
 | Number | Name | Arguments | Returns |
 |---|---|---|---|
 | 1 | `exit` | `int status` | does not return |
-| 2 | `write` | `int fd, const void *buf, uint len` | bytes written; `-EBADF`, `-EFAULT`, `-EPIPE`, `-ENOSPC`, `-EFBIG`, `-EINVAL`, `-ENOMEM` |
-| 3 | `read` | `int fd, void *buf, uint len` | bytes read, 0 at the end of the input; `-EBADF`, `-EFAULT`, `-ENOMEM` |
+| 2 | `write` | `int fd, const void *buf, size_t len` | bytes written; `-EBADF`, `-EFAULT`, `-EPIPE`, `-ENOSPC`, `-EFBIG`, `-EINVAL`, `-ENOMEM` |
+| 3 | `read` | `int fd, void *buf, size_t len` | bytes read, 0 at the end of the input; `-EBADF`, `-EFAULT`, `-ENOMEM` |
 | 4 | `getpid` | | the caller's pid |
 | 5 | `yield` | | 0 |
 | 6 | `sleep` | `uint ticks` | 0 |
 | 7 | `spawn` | `const char *path, char *const argv[]` | the child's pid; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-EAGAIN`, `-ENOMEM`, `-EFAULT` |
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
-| 9 | `sbrk` | `int increment` | the old end of the heap; `-ENOMEM`, `-EINVAL` |
+| 9 | `sbrk` | `long increment` | the old end of the heap, a pointer; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
 | 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
 | 12 | `close` | `int fd` | 0; `-EBADF` |
-| 13 | `lseek` | `int fd, int offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
+| 13 | `lseek` | `int fd, off_t offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
 | 14 | `fstat` | `int fd, struct stat *st` | 0; `-EBADF`, `-EFAULT` |
 | 15 | `mkdir` | `const char *path` | 0; `-EEXIST`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOSPC`, `-EROFS`, `-EFAULT` |
 | 16 | `unlink` | `const char *path` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EINVAL`, `-ENOTEMPTY`, `-EROFS`, `-EFAULT` |
@@ -93,10 +138,10 @@ there is a filesystem to look it up in.
 | 29 | `listen` | `int fd, int backlog` | 0; `-EBADF`, `-ENOTSOCK`, `-EOPNOTSUPP`, `-EINVAL` |
 | 30 | `accept` | `int fd, struct sockaddr_in *addr` | a new descriptor; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EOPNOTSUPP`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EAGAIN`, `-EINTR` |
 | 31 | `connect` | `int fd, const struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EINVAL`, `-EISCONN`, `-ENETUNREACH`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`, `-ENOBUFS`, `-EADDRINUSE`, `-EINTR` |
-| 32 | `send` | `int fd, const void *buf, uint len` | bytes sent; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EPIPE`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EDESTADDRREQ`, `-EMSGSIZE`, `-ENETUNREACH`, `-ENOBUFS`, `-EINTR` |
-| 33 | `recv` | `int fd, void *buf, uint len` | bytes received, 0 at the end; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EINVAL`, `-EAGAIN`, `-EINTR` |
-| 34 | `sendto` | `int fd, const void *buf, uint len, const struct sockaddr_in *to` | bytes sent; `send`'s errors, `-EFAULT` also for `to`, `-EAFNOSUPPORT`, `-EINVAL`, `-EADDRINUSE` |
-| 35 | `recvfrom` | `int fd, void *buf, uint len, struct sockaddr_in *from` | bytes received; `recv`'s errors (`-EFAULT` also for `from`) |
+| 32 | `send` | `int fd, const void *buf, size_t len` | bytes sent; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EPIPE`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EDESTADDRREQ`, `-EMSGSIZE`, `-ENETUNREACH`, `-ENOBUFS`, `-EINTR` |
+| 33 | `recv` | `int fd, void *buf, size_t len` | bytes received, 0 at the end; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EINVAL`, `-EAGAIN`, `-EINTR` |
+| 34 | `sendto` | `int fd, const void *buf, size_t len, const struct sockaddr_in *to` | bytes sent; `send`'s errors, `-EFAULT` also for `to`, `-EAFNOSUPPORT`, `-EINVAL`, `-EADDRINUSE` |
+| 35 | `recvfrom` | `int fd, void *buf, size_t len, struct sockaddr_in *from` | bytes received; `recv`'s errors (`-EFAULT` also for `from`) |
 | 36 | `shutdown` | `int fd, int how` | 0; `-EBADF`, `-ENOTSOCK`, `-EINVAL`, `-ENOTCONN`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT` |
 | 37 | `getsockname` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT` |
 | 38 | `getpeername` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN` |
@@ -142,7 +187,8 @@ is `send`: on UDP that is an empty datagram). To a file on the disk, the bytes g
 at the descriptor's offset, which moves past them, and the file grows if they
 run past its end; a write that can write nothing fails with what stopped it:
 `-ENOSPC` (the disk is full), `-EFBIG` (the file would pass the largest the
-kernel writes, 2^31 - 1 bytes), `-EINVAL` (the offset is past the end of the
+kernel writes: on RV64 ext4's, 2^32 - 1 blocks; on RV32 2^31 - 1 bytes,
+what its `off_t` reaches), `-EINVAL` (the offset is past the end of the
 file, which another descriptor has emptied meanwhile), `-ENOMEM` (no page
 free for copying through). To the console, the bytes are printed. To a
 pipe, they wait in it for a reader ("Pipes"); `-EPIPE` if no read end is
@@ -208,14 +254,17 @@ after sleeping; `-EFAULT` when `status` is not writable, checked before
 anything else.
 
 **sbrk(increment)** moves the end of the caller's heap by `increment` bytes
-and returns the old end, so `sbrk(0)` returns the current one. The heap
+(a `long`) and returns the old end, a pointer, so `sbrk(0)` returns the
+current one; an error is minus its number as a pointer (`(long)p < 0`). The heap
 starts empty, on the page after the program's last segment, and grows up
 towards the stack: new pages are mapped R+W and read zero, including bytes
 given back by an earlier shrink and grown again. A negative `increment`
 shrinks it, unmapping and freeing the pages no longer used. Errors:
 `-ENOMEM` when the heap would reach the guard page under the stack's limit
-(`USER_LOAD_TOP`, 0x0B7F_F000) or memory runs out (nothing changes),
-`-EINVAL` when it would shrink below its start.
+(`USER_LOAD_TOP`: 0x0B7F_F000 on RV32, 0x7FFF_FF7F_F000 in Sv48) or memory
+runs out (nothing changes), `-EINVAL` when it would shrink below its start.
+A program whose segments end above 4 GiB has its heap there, and `sbrk`
+returns those addresses whole.
 
 **uptime()** returns the timer ticks since boot (10 a second at the nominal
 clock), as an unsigned number.
@@ -239,11 +288,12 @@ opens:
   read-only filesystem; a node whose major number has no driver is
   `-ENODEV`.
 
-A file bigger than 2^31 - 1 bytes is `-EOVERFLOW`: the kernel's file
-offsets are 32-bit (`lseek` works in an `int`) until they become a 64-bit
-`off_t` (#155), so it could not reach all of it. That is Linux's answer to
-an `open` without `O_LARGEFILE` on such a file. The filesystem allows files
-far bigger (docs/camelot-fs.md, "Inodes"); only mkfs can make one.
+On RV32, a file bigger than 2^31 - 1 bytes is `-EOVERFLOW`: its `off_t` is
+32-bit, so `lseek` could not reach all of it. That `off_t` is this
+kernel's stopgap until RV32 goes (#159), not riscv32 Linux's, which is
+64-bit and so opens such a file. The filesystem allows
+files far bigger (docs/camelot-fs.md, "Inodes"), which an RV64 kernel,
+whose `off_t` is 64-bit, opens, reads and writes (or mkfs makes).
 
 Errors: the path's (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`), those above,
 `-ENOSPC` (no free inode or block to make the file with), `-EMFILE` (all 16
@@ -263,12 +313,15 @@ then ("Pipes"), and a file whose last name was removed meanwhile is freed.
 **lseek(fd, offset, whence)** moves the offset of the file behind `fd` to
 `offset` bytes from the start (`whence` = `SEEK_SET`, 0), from the current
 offset (`SEEK_CUR`, 1) or from the end (`SEEK_END`, 2), and returns it.
-Errors: `-EBADF`; `-ESPIPE` for a pipe or a device, which have no offset;
-`-EINVAL` for another `whence`, or a new offset below 0 or past the end of
-the file (files have no holes: they only grow by writing at their end).
+`offset` and the result are an `off_t`. Errors: `-EBADF`; `-ESPIPE` for a
+pipe or a device, which have no offset; `-EINVAL` for another `whence`, or
+a new offset below 0 or past the end of the file (files have no holes: they
+only grow by writing at their end), which every offset past the largest
+file is too: the whole `off_t` counts, so on RV64 2^32 + 100 is past the
+end of a small file, not 100.
 
 **fstat(fd, st)** stores what the open file behind `fd` is in the `struct
-stat` at `st` (16 bytes, `user.h`): `ino` (its inode, 0 for a pipe and for
+stat` at `st` (16 bytes on RV32, 24 on RV64, `user.h`): `ino` (its inode, 0 for a pipe and for
 the console the kernel gave the shell), `type` (`T_DIR` 1, `T_FILE` 2,
 `T_DEVICE` 3, `T_PIPE` 4), `nlink` (the names it has; 0 for a file whose
 last name was removed while it is open), `size` (bytes; for a pipe, the
@@ -371,7 +424,7 @@ own processes or for the first process, the shell, whose end would be
 Camelot's (it ends only by its own `exit`).
 
 **procs(buf, max)** describes the processes, in pid order, in the array of
-`max` `struct procinfo` (32 bytes each, `user.h`) at `buf`, and returns how
+`max` `struct procinfo` (32 bytes each on RV32, 40 on RV64, `user.h`) at `buf`, and returns how
 many processes there are, which may be more than `max`: only the first
 `max` are stored then, and `procs(NULL, 0)` just counts them. Each entry
 holds `pid`; `ppid`, its parent's pid, or 0 for a process without one (the
@@ -561,8 +614,9 @@ connected.
 **setsockopt(fd, level, option, value, len)** sets an option; the one there
 is is `SO_RCVTIMEO` (20) at level `SOL_SOCKET` (1), how long `recv`,
 `recvfrom` and `accept` wait: `value` is a `struct timeval` (`tv_sec`,
-`tv_usec`; 8 bytes, `len`), rounded up to whole timer ticks, 0 for no limit
-(the default). Errors: `-EINVAL` (`len` is not 8, or a negative time, or
+`tv_usec`, two `long`s: 8 bytes on RV32, 16 on RV64, `len`), rounded up to
+whole timer ticks, 0 for no limit (the default). Errors: `-EINVAL` (`len`
+is not the structure's size, or a negative time, or
 `tv_usec` of a second or more), `-EFAULT` (`value` is not readable),
 `-ENOPROTOOPT` (another level or option).
 
@@ -788,10 +842,13 @@ started as `/bin/sh`, from the filesystem when there is one and it has a
 
 ## Starting a program
 
-A program is an ELF32 executable linked with `kernel/user/user.ld`: code from
+A program is an ELF executable of the kernel's own width, ELF32 for the
+RV32 kernel and ELF64 for the RV64 one (an RV64 kernel runs no RV32
+program: there is no compat mode, #141; anything else is `-ENOEXEC`),
+linked with `kernel/user/user.ld`: code from
 0x1000 (page 0 is never mapped, so a null pointer faults), each output
 section on a page boundary so the kernel can map each with its own
-permissions, and a heap after the last one. User space is the low 192 MiB:
+permissions, and a heap after the last one. On RV32, user space is the low 192 MiB:
 
 ```
 0x0000_0000  unmapped
@@ -804,6 +861,23 @@ permissions, and a heap after the last one. User space is the low 192 MiB:
              the stack (R+W), grown down on demand
 0x0BFF_F000  the stack's first page, mapped from the start
 0x0C00_0000  USER_TOP: nothing above is accessible from U-mode
+```
+
+On RV64, user space is the lower half of the address space, as Linux's
+riscv64 `TASK_SIZE`: 128 TiB in Sv48, 256 GiB in Sv39 (on a hart without
+Sv48), with the same order and the same 8 MiB stack limit. In Sv48:
+
+```
+0x0000_0000_0000_0000  unmapped
+0x0000_0000_0000_1000  .text (R+X), .rodata (R), .data and .bss (R+W)
+                       heap (R+W), grown by sbrk
+                       ...
+0x0000_7FFF_FF7F_F000  guard page, unmapped (USER_LOAD_TOP)
+0x0000_7FFF_FF80_0000  the stack's limit (USER_STACK_LIMIT)
+                       ...
+0x0000_7FFF_FFFF_F000  the stack's first page, mapped from the start
+0x0000_8000_0000_0000  USER_TOP (Sv39: 0x0000_0040_0000_0000); above it
+                       the kernel's half, from 0xFFFF_8000_0000_0000
 ```
 
 The stack is mapped as it grows: a load or store just below it maps the
@@ -823,8 +897,9 @@ The arguments sit at the top of the stack's first page:
 
 ```
 USER_TOP     the strings, argv[0]'s first, each NUL-terminated
-             padding to a multiple of 4
-argv         argv[0] ... argv[argc - 1], then a null pointer
+             padding to a pointer's size: a multiple of 4 on RV32, 8 on RV64
+argv         argv[0] ... argv[argc - 1], then a null pointer, a pointer
+             each (4 or 8 bytes)
              padding to a multiple of 16
 sp           the program's first stack frame grows down from here
 ```
@@ -869,7 +944,7 @@ its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 `memmove`, `memcmp`), numbers (`atoi`, `strtol`), the heap (`malloc`,
 `free`, `calloc`, `realloc`, on top of `sbrk`), formatted output (`printf`,
 `fprintf` to a descriptor, `snprintf`; `%d %u %x %p %s %c %%` with `-`, `0`
-and a width), `puts`, line input (`getline`, one read of the console
+and a width, `l` for a `long`), `puts`, line input (`getline`, one read of the console
 without the newline; readers, `reader_getline`, for files and pipes),
 `strerror`, `stat` (`open`, `fstat`, `close`), `spin` (a busy loop),
 addresses and names (`htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`,
@@ -882,11 +957,13 @@ spinlock` with `spin_lock` and `spin_unlock`; `struct mutex` with
 the rest, but `resolve` (which keeps its DNS messages in static buffers)
 and `inet_ntoa` (which returns one), and a `struct reader` must not be
 shared without a lock.
-`syscall(number, a0, a1, a2)` makes any call by number, for tests.
+`syscall(number, a0, a1, a2)` makes any call by number, for tests, and
+returns its `long` result.
 
 ## Building programs
 
-Each `kernel/user/X.c` or `X.s` is a program called `X`, linked with the
+Each `kernel/user/X.c`, `X.s` or `X.S` (assembly that goes through the C
+preprocessor first, for each width: `#if __riscv_xlen == 64`) is a program called `X`, linked with the
 runtime, `crt0.s` and `usys.s`, and with the members of the library
 (`kernel/user/lib/*.c`) it needs: like an archive's, a member goes in only
 if it defines something the program (or another member that went in)

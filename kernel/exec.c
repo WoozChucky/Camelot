@@ -9,7 +9,7 @@
 #include "string.h"
 
 /* elf_file's read() for a file: the inode is locked for the whole load. */
-static bool read_inode(const struct elf_file *f, void *dst, u32 off, u32 n) {
+static bool read_inode(const struct elf_file *f, void *dst, u64 off, u32 n) {
     return readi(f->inode, dst, off, n) == (int)n;
 }
 

@@ -45,7 +45,7 @@ int main(int argc, char **argv) {
     printf("  PID  PPID STATE      SIZE NAME\n");
     for (int i = 0; i < n && i < MAX_PROCS; i++) {
         struct procinfo *p = &info[i];
-        printf("%5u %5u %-6s %8u %s\n", p->pid, p->ppid, state_name(p->state), p->size, p->name);
+        printf("%5u %5u %-6s %8lu %s\n", p->pid, p->ppid, state_name(p->state), p->size, p->name);
     }
     if (n > MAX_PROCS) {
         printf("(and %d more)\n", n - MAX_PROCS);

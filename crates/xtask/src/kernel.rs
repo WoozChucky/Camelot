@@ -19,8 +19,8 @@
 //! and RV64 exist side by side (#141): the RV32 kernel (`kernel.elf`:
 //! everything at 0x8000_0000, identity mapped) and the RV64 one
 //! (`kernel-rv64.elf`: a higher-half kernel linked at 0xffff_ffff_8000_0000
-//! and loaded at 0x8000_0000, #154). The RV64 kernel has no user programs of its
-//! own yet (#156): its `userprogs.s` is [`crate::userprogs::empty`].
+//! and loaded at 0x8000_0000, #154), which embeds the user programs built for
+//! RV64 (#155, [`crate::userprogs::generated_for`]).
 //!
 //! The reference build ([`Toolchain::Clang`], `cargo xtask kernel --cc
 //! clang`) compiles the C with clang `-O2`, assembles with clang (or
@@ -363,13 +363,12 @@ pub fn userprogs(kernel_dir: &Path) -> Result<String, String> {
     crate::userprogs::generated(&kernel_dir.join(USER_DIR))
 }
 
-/// [`userprogs`] for the `xlen` kernel: the RV64 kernel has no programs of
-/// its own until the user programs are built for RV64 (#156), so its table is
-/// [`crate::userprogs::empty`], as the disk kernel's.
+/// [`userprogs`] for the `xlen` kernel: on RV64 the programs built for RV64
+/// ([`crate::userprogs::generated_for`]).
 pub fn userprogs_for(kernel_dir: &Path, xlen: Xlen) -> Result<String, String> {
     match xlen {
         Xlen::Rv32 => userprogs(kernel_dir),
-        Xlen::Rv64 => Ok(crate::userprogs::empty()),
+        Xlen::Rv64 => crate::userprogs::generated_for(&kernel_dir.join(USER_DIR), xlen),
     }
 }
 
@@ -626,12 +625,6 @@ impl Build {
             return Ok(None);
         }
         let path = self.kernel_dir.join(self.userprogs_path());
-        if self.xlen == Xlen::Rv64 && self.userprogs.is_none() {
-            // No RV64 user programs yet (#156).
-            let text = crate::userprogs::empty();
-            std::fs::write(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-            return Ok(Some(text));
-        }
         if self.userprogs.is_some() {
             let text =
                 std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -643,11 +636,25 @@ impl Build {
                 self.userprogs_path().display()
             );
         }
-        let programs = crate::userprogs::build_all(&self.kernel_dir.join(USER_DIR))?;
-        let text = crate::userprogs::generate(
-            &crate::userprogs::embedded(&programs),
-            crate::userprogs::CCompiler::Merlin,
-        );
+        let user = self.kernel_dir.join(USER_DIR);
+        let (programs, text) = match self.xlen {
+            Xlen::Rv32 => {
+                let programs = crate::userprogs::build_all(&user)?;
+                let text = crate::userprogs::generate(
+                    &crate::userprogs::embedded(&programs),
+                    crate::userprogs::CCompiler::Merlin,
+                );
+                (programs, text)
+            }
+            // The programs the RV64 kernel embeds: /bin/as and /bin/ld are
+            // RV32 programs until #157.
+            Xlen::Rv64 => {
+                let programs = crate::userprogs::build_embedded_for(&user, self.xlen)?;
+                let text =
+                    crate::userprogs::generate_for(&programs, crate::userprogs::CCompiler::Merlin, self.xlen);
+                (programs, text)
+            }
+        };
         std::fs::write(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         // The programs with their debug information, for merlin-dbg's
         // `add-symbol-file` (the kernel embeds them without).
@@ -808,7 +815,8 @@ pub fn build_reference(
 }
 
 /// [`build_reference`] for `xlen`: the RV64 kernel is built with
-/// [`TARGET_FLAGS_RV64`], and has no user programs (#156).
+/// [`TARGET_FLAGS_RV64`], its user programs' C compiled by clang for RV64
+/// too.
 #[allow(clippy::too_many_arguments)]
 pub fn build_reference_for(
     root: &Path,
@@ -831,8 +839,13 @@ pub fn build_reference_for(
             let programs = userprogs::build_all_with(&user, CCompiler::Clang(&asm))?;
             userprogs::generate(&userprogs::embedded(&programs), CCompiler::Clang(&asm))
         }
-        // No RV64 user programs yet (#156).
-        Xlen::Rv64 => userprogs::empty(),
+        Xlen::Rv64 => {
+            let user = userprogs::user_dir(root);
+            let asm = work.join("user");
+            userprogs::compile_clang_for(clang, &user, &asm, verbose, xlen)?;
+            let programs = userprogs::build_embedded_with(&user, CCompiler::Clang(&asm), xlen)?;
+            userprogs::generate_for(&programs, CCompiler::Clang(&asm), xlen)
+        }
     };
     std::fs::write(&progs, text).map_err(|e| format!("cannot write {}: {e}", progs.display()))?;
     Build {

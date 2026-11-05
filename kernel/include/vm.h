@@ -7,7 +7,8 @@
  * sets A and D itself (hardware-managed) and has no TLB; a hart without that
  * (Svade, the privileged spec's other choice) faults on an access whose
  * leaf has A clear, or D for a store, so the kernel's own leaves are made
- * with A and D set (PTE_KERNEL, below), as Linux makes them.
+ * with A and D set (PTE_KERNEL, below), as Linux makes them, and the user
+ * leaves with A, and D if writable (PTE_USER_AD).
  *
  * - RV32, Sv32: two levels of 1024 4-byte PTEs. A virtual address splits
  *   10/10/12: VPN[1] (bits 31:22) indexes the root, VPN[0] (bits 21:12) a
@@ -62,8 +63,19 @@ typedef pte_t *pagetable_t; /* one page: PTES_PER_TABLE PTEs */
  * through it needs the hardware to set them (a hart that doesn't would
  * fault, and kernel_trap would panic), and G, since the kernel's mappings
  * are the same in every address space (processes share them, uvm_create()).
- * User pages get neither: A and D are the hardware's to set (Grail does). */
+ * User pages never get G; they get A, and D if writable, from map_pages()
+ * (PTE_USER_AD, below). */
 #define PTE_KERNEL (PTE_G | PTE_A | PTE_D)
+
+/* What map_pages() adds to a user leaf with permissions `perm`, as Linux's
+ * riscv user protections do on both widths: A always (its _PAGE_BASE has
+ * _PAGE_ACCESSED), and D on a writable page, which Linux maps dirty when it
+ * makes an anonymous page for a write (do_anonymous_page()'s pte_mkdirty()).
+ * Every user page here is anonymous memory, made when it is mapped (the
+ * loader's, the stack's, the heap's), and nothing pages it out, so none is
+ * ever mapped clean: no access through a user leaf needs the hardware to
+ * set A or D, and a hart without that (Svade) never faults on one. */
+#define PTE_USER_AD(perm) (PTE_A | (((perm) & PTE_W) != 0 ? PTE_D : 0))
 /* The kernel's leaves, by Linux's names: data, read-only data, text, and
  * text that is written too (the early page table's image). */
 #define PAGE_KERNEL (PTE_R | PTE_W | PTE_KERNEL)
@@ -110,8 +122,8 @@ extern uintptr satp_mode;
  *
  * RV64: the upper half of the address space is the kernel's, laid out as
  * Linux's riscv64 kernel lays it out (Documentation/arch/riscv/vm-layout.rst;
- * root entries 256-511 in Sv48, which every process's root table copies,
- * #155). From the top:
+ * root entries 256-511, which every process's root table copies,
+ * uvm_create()). From the top:
  *
  *   KERNEL_LINK_ADDR  0xffff_ffff_8000_0000  the kernel image (kernel.lds.S),
  *                                            the top 2 GiB, in both modes
@@ -318,7 +330,8 @@ pte_t *walk(pagetable_t pt, uintptr va, bool alloc);
 
 /* Maps the `size` bytes at `va` to the physical range at `pa`, with
  * permissions `perm` (some of PTE_R/W/X/U, or a PAGE_KERNEL one: with A, D
- * and G, never U). `va`, `pa` and `size` must be page aligned and `size`
+ * and G, never U; a user one gets PTE_USER_AD(perm) besides). `va`, `pa`
+ * and `size` must be page aligned and `size`
  * non-zero; mapping a page that is already mapped panics.
  * Returns 0, or -1 if a page table could not be allocated (the pages mapped
  * before that stay mapped). The range may end at the top of the address
@@ -404,9 +417,22 @@ pagetable_t vm_active_pagetable(void);
  *                     page 0, never mapped, so a null pointer faults
  *
  * RV64: user space is the lower half of the address space, root entries 0
- * to 255 (Linux's TASK_SIZE: 128 TiB in Sv48, 256 GiB in Sv39), with the
- * same order of stack, guard page, heap and program. The process side is
- * #155's.
+ * to 255 in Sv48 (Linux's TASK_SIZE: 128 TiB), 0 to 255 in Sv39 too (256
+ * GiB), with the same order of stack, guard page, heap and program, and the
+ * same 8 MiB stack limit; the numbers for Sv48:
+ *
+ *   USER_TOP          0x0000_8000_0000_0000 (Sv39 0x40_0000_0000)
+ *                     the stack, grown down on demand, at most USER_STACK_MAX
+ *   USER_STACK_LIMIT  0x0000_7fff_ff80_0000
+ *                     an unmapped guard page
+ *   USER_LOAD_TOP     0x0000_7fff_ff7f_f000
+ *                     the heap (sbrk), up from the program
+ *                     the program's segments, from USER_BASE
+ *   USER_BASE         0x0000_0000_0000_1000
+ *                     page 0, never mapped
+ *
+ * Every address above USER_TOP is the kernel's: in Sv48 and Sv39 the ones
+ * between the two halves are not canonical, and an access faults.
  *
  * Every other root entry is a copy of the kernel's, so the kernel's mappings
  * (none with U) are there in every process and a trap from U-mode needs no

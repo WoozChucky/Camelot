@@ -24,7 +24,7 @@ struct out {
 
 static void flush(struct out *o) {
     if (o->len > 0 && o->err == 0) {
-        int n = write(o->fd, o->buf, (uint)o->len);
+        int n = (int)write(o->fd, o->buf, (size_t)o->len);
         if (n < 0) {
             o->err = n;
         }
@@ -75,12 +75,13 @@ static void emit_text(struct out *o, const char *s, int len, const struct spec *
     }
 }
 
-/* `val` in `base` (10 or 16) with an optional minus sign. */
-static void emit_number(struct out *o, uint val, uint base, int negative, const struct spec *sp) {
-    char digits[10]; /* up to 10 digits (4294967295) */
+/* `val` in `base` (10 or 16) with an optional minus sign. An unsigned long:
+ * a long's digits are a register's, 64 bits on RV64. */
+static void emit_number(struct out *o, unsigned long val, uint base, int negative, const struct spec *sp) {
+    char digits[20]; /* up to 20 digits (18446744073709551615) */
     int n = 0;
     do {
-        uint d = val % base;
+        uint d = (uint)(val % base);
         digits[n] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
         n++;
         val /= base;
@@ -134,7 +135,11 @@ static void vformat(struct out *o, const char *fmt, va_list ap) {
             sp.width = sp.width * 10 + (*fmt - '0');
             fmt++;
         }
+        /* 'l': the argument is a long (or unsigned long), as wide as a
+         * register; without it an int, 32 bits on both widths. */
+        int is_long = 0;
         if (*fmt == 'l') {
+            is_long = 1;
             fmt++;
         }
         char conv = *fmt;
@@ -143,19 +148,30 @@ static void vformat(struct out *o, const char *fmt, va_list ap) {
             break;
         }
         fmt++;
-        if (conv == 'd') {
-            int v = va_arg(ap, int);
-            /* Negated as unsigned, so INT_MIN works. */
-            emit_number(o, v < 0 ? 0u - (uint)v : (uint)v, 10, v < 0, &sp);
-        } else if (conv == 'u') {
-            emit_number(o, va_arg(ap, uint), 10, 0, &sp);
-        } else if (conv == 'x') {
-            emit_number(o, va_arg(ap, uint), 16, 0, &sp);
+        if (conv == 'd' || conv == 'u' || conv == 'x') {
+            /* The argument at its type: a long with 'l', else an int (d)
+             * or an unsigned int (u, x), made a long the way C converts
+             * it. */
+            long v;
+            if (is_long) {
+                v = va_arg(ap, long);
+            } else if (conv == 'd') {
+                v = va_arg(ap, int);
+            } else {
+                v = (long)va_arg(ap, uint);
+            }
+            int negative = conv == 'd' && v < 0;
+            /* Negated as unsigned, so INT_MIN and LONG_MIN work; u and x
+             * print the bits as an unsigned long (a uint's on RV32, whose
+             * long is 32 bits, so the conversion above kept them). */
+            emit_number(o, negative ? 0ul - (unsigned long)v : (unsigned long)v, conv == 'x' ? 16 : 10, negative,
+                        &sp);
         } else if (conv == 'p') {
-            struct spec hex = {8, 0, 1};
+            /* Every digit of a pointer: 8 on RV32, 16 on RV64. */
+            struct spec hex = {2 * (int)sizeof(void *), 0, 1};
             emit(o, '0');
             emit(o, 'x');
-            emit_number(o, (uint)va_arg(ap, void *), 16, 0, &hex);
+            emit_number(o, (uintptr_t)va_arg(ap, void *), 16, 0, &hex);
         } else if (conv == 's') {
             const char *s = va_arg(ap, const char *);
             if (s == NULL) {
