@@ -256,8 +256,12 @@ impl Machine {
     /// did it, on a one-hart machine), so the host can show or dump that frame: one that
     /// wrote `FB_PRESENT`, made a modeset that took effect (a write to `FB_MODE` the
     /// display refused shows nothing new), or whose vertical blank made a page flip take
-    /// effect ([`framebuffer::Framebuffer::shown`]). Only a frame shown during
-    /// this call counts: a present the host has not taken yet
+    /// effect ([`framebuffer::Framebuffer::shown`]); and at the end of a step whose
+    /// vertical blank moved, showed or hid the cursor or gave it an image (took a write of
+    /// `FB_CURSOR_ADDR`, even of the address it had: an image redrawn in place), which
+    /// changes the picture without a new frame ([`framebuffer::Framebuffer::changes`]); a
+    /// new hotspot alone does not, since the display does not use it. Only a change during this call
+    /// counts: a present the host has not taken yet
     /// ([`framebuffer::Framebuffer::take_present`]) does not stop the next call.
     ///
     /// With a real-time clock it also stops once the machine is ~1 ms ahead of the wall
@@ -302,7 +306,7 @@ impl Machine {
             Some(p) => steps.min(p.allowance(Instant::now())),
         };
         let paced = self.pacer.is_some();
-        let shown = self.cpu.bus.fb.shown();
+        let shown = self.cpu.bus.fb.changes();
         let mut n = 0;
         while n < budget && self.cpu.bus.exit.is_none() {
             if paced {
@@ -319,7 +323,7 @@ impl Machine {
             }
             self.cpu.step_traced(trace);
             n += 1;
-            if STOP_ON_PRESENT && self.cpu.bus.fb.shown() != shown {
+            if STOP_ON_PRESENT && self.cpu.bus.fb.changes() != shown {
                 break;
             }
         }

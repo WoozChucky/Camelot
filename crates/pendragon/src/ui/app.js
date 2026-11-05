@@ -1,10 +1,11 @@
-// Pendragon's pages: overview, VMs (list, new, one VM with its console), disks and
-// switches (the virtual network, with its NAT gateways).
+// Pendragon's pages: overview, VMs (list, new, one VM with its screen and console),
+// disks and switches (the virtual network, with its NAT gateways).
 //
 // Plain JavaScript, no build step. Every element is made with the DOM and every
 // piece of data goes in as text (textContent), never as markup, so nothing a VM
 // prints or a server says can become script. The pages talk to Pendragon's JSON API
-// (docs/pendragon.md) with this launch's token in the X-Pendragon-Token header.
+// (docs/pendragon.md) with this launch's token in the X-Pendragon-Token header, and
+// to a VM's screen over a WebSocket.
 "use strict";
 
 // ---- Token ----
@@ -469,7 +470,18 @@ function vmPage(main, ctx, id) {
   const actions = el("p");
   const screen = el("pre", { class: "console", tabindex: 0 });
   const status = el("p", { class: "muted" });
-  main.append(title, error, actions, facts, el("h2", {}, "Console"), screen, consoleInput(ctx, id, error), status);
+  main.append(
+    title,
+    error,
+    actions,
+    facts,
+    el("h2", {}, "Screen"),
+    ...screenView(ctx, id),
+    el("h2", {}, "Console"),
+    screen,
+    consoleInput(ctx, id, error),
+    status,
+  );
 
   const refresh = async () => {
     try {
@@ -600,6 +612,237 @@ function terminal(text, output) {
     }
   }
   return out;
+}
+
+// ---- Screen ----
+
+// The VM's screen in a canvas, with its keyboard and mouse, over a WebSocket on which
+// Pendragon is the VM's viewer (docs/pendragon.md, "Screens"). Pendragon sends the
+// screen's size (again on every mode change), rectangles of RGBA pixels and the
+// guest's cursor, its image and its place apart from the frames; the page
+// sends what the browser reports, as it reports it: keys by KeyboardEvent.code and
+// .key (Pendragon has the key table, Grail's HID usages), Pointer Events in screen
+// pixels, wheel deltas. A browser lets a page set no header on a WebSocket, so the
+// token goes in a subprotocol it offers.
+function screenView(ctx, id) {
+  const canvas = el("canvas", { class: "screen", width: 640, height: 480, tabindex: 0 });
+  const status = el("p", { class: "muted" }, "screen: connecting");
+  const draw = canvas.getContext("2d", { alpha: false });
+  // The guest's cursor, on a transparent canvas of the screen's size laid over it (the
+  // browser blends the two): moving the cursor redraws two small rectangles of this
+  // one and no frame. Its image is straight RGBA, as ImageData takes it (Pendragon
+  // divided the guest's premultiplied colours by their alpha). The pointer's events
+  // go through it to the screen.
+  const overlay = el("canvas", { class: "cursor", width: 640, height: 480 });
+  const pen = overlay.getContext("2d");
+  const cursor = { image: null, visible: false, x: 0, y: 0 };
+  // Puts the cursor where it is now: clears the rectangle it was drawn in, draws it
+  // anew if it shows. putImageData replaces pixels and clips at the canvas's edges.
+  let drawn = null;
+  const drawCursor = () => {
+    if (drawn) pen.clearRect(drawn.x, drawn.y, drawn.width, drawn.height);
+    drawn = null;
+    if (cursor.image && cursor.visible) {
+      pen.putImageData(cursor.image, cursor.x, cursor.y);
+      drawn = { x: cursor.x, y: cursor.y, width: cursor.image.width, height: cursor.image.height };
+    }
+  };
+  let ws = null;
+  let ended = false;
+  let retry = null;
+  let size = "";
+  let state = "";
+  const show = () => {
+    const typing = document.activeElement === canvas;
+    status.textContent =
+      "screen: " + size + (state ? ", " + state : "") +
+      (ended ? "" : typing ? ". Keys go to the VM; click outside the screen to stop" : ". Click the screen to type into the VM");
+  };
+  const send = (msg) => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  };
+  const altGr = altGrFilter(send);
+
+  const open = () => {
+    if (!ctx.alive) return;
+    const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+    ws = new WebSocket(scheme + location.host + "/api/vms/" + encodeURIComponent(id) + "/screen", [
+      "pendragon.screen",
+      "pendragon.token." + (token || ""),
+    ]);
+    ws.binaryType = "arraybuffer";
+    ws.addEventListener("message", (event) => {
+      if (typeof event.data !== "string") {
+        // A rectangle: x, y, width, height (u32, little-endian), then RGBA pixels.
+        const head = new DataView(event.data, 0, 16);
+        const w = head.getUint32(8, true);
+        const h = head.getUint32(12, true);
+        const pixels = new Uint8ClampedArray(event.data, 16, w * h * 4);
+        draw.putImageData(new ImageData(pixels, w, h), head.getUint32(0, true), head.getUint32(4, true));
+        return;
+      }
+      const msg = JSON.parse(event.data);
+      if (msg.type === "screen") {
+        // A new screen (the first, or the guest changed modes): black, at its size.
+        canvas.width = msg.width;
+        canvas.height = msg.height;
+        draw.fillStyle = "#000";
+        draw.fillRect(0, 0, msg.width, msg.height);
+        size = msg.width + " × " + msg.height;
+        // The cursor stays where it was, on the new screen.
+        overlay.width = msg.width;
+        overlay.height = msg.height;
+        drawn = null;
+        drawCursor();
+      } else if (msg.type === "cursor_shape") {
+        // The cursor's image from now on, also while it is hidden.
+        const pixels = new Uint8ClampedArray(fromBase64(msg.pixels).buffer);
+        cursor.image = new ImageData(pixels, msg.width, msg.height);
+        drawCursor();
+        return;
+      } else if (msg.type === "cursor_position") {
+        cursor.visible = msg.visible;
+        cursor.x = msg.x;
+        cursor.y = msg.y;
+        drawCursor();
+        return;
+      } else if (msg.type === "state") {
+        state = msg.state_text;
+      } else if (msg.type === "end") {
+        ended = true;
+        state = "ended: " + msg.reason;
+      }
+      show();
+    });
+    ws.addEventListener("close", () => {
+      altGr.drop();
+      if (!ctx.alive || ended) return;
+      // Pendragon restarted, Avalon away, no such VM: the facts above say which.
+      status.textContent = "screen: not connected; trying again";
+      // The next connection starts with no cursor: Avalon sends it again on attaching.
+      cursor.image = null;
+      cursor.visible = false;
+      drawCursor();
+      retry = setTimeout(open, 3000);
+    });
+  };
+
+  // Keys, while the canvas has the focus. Every key's default action is stopped (Tab,
+  // Backspace, F5 and the like are the guest's); the few the browser keeps for itself
+  // (Ctrl+W) never reach the page.
+  const key = (event, down) => {
+    event.preventDefault();
+    altGr.key(event, {
+      type: "key",
+      down,
+      code: event.code,
+      key: event.key,
+      shift: event.shiftKey,
+      ctrl: event.ctrlKey,
+      alt: event.altKey,
+    });
+  };
+  canvas.addEventListener("keydown", (event) => key(event, true));
+  canvas.addEventListener("keyup", (event) => key(event, false));
+  // Key-ups go elsewhere once the canvas loses the focus (to another element, another
+  // window, a hidden tab): Pendragon releases every key and button the page held, as
+  // Grail's window does.
+  const release = () => {
+    altGr.drop();
+    send({ type: "release" });
+    show();
+  };
+  canvas.addEventListener("blur", release);
+  canvas.addEventListener("focus", show);
+  const hidden = () => {
+    if (document.visibilityState === "hidden") release();
+  };
+  document.addEventListener("visibilitychange", hidden);
+
+  // The pointer, in screen pixels: the canvas may be drawn smaller than the screen.
+  // Pointer capture keeps a drag that leaves the canvas going to it, positions past
+  // its edges included (Pendragon clamps them).
+  const pointer = (event) => {
+    const box = canvas.getBoundingClientRect();
+    if (box.width === 0 || box.height === 0) return;
+    send({
+      type: "pointer",
+      x: Math.floor(((event.clientX - box.left) * canvas.width) / box.width),
+      y: Math.floor(((event.clientY - box.top) * canvas.height) / box.height),
+      buttons: event.buttons & 7,
+    });
+  };
+  canvas.addEventListener("pointerdown", (event) => {
+    // No text selection, no middle-button scrolling: the button is the guest's.
+    event.preventDefault();
+    canvas.focus();
+    canvas.setPointerCapture(event.pointerId);
+    pointer(event);
+  });
+  canvas.addEventListener("pointermove", pointer);
+  canvas.addEventListener("pointerup", pointer);
+  // The browser took the pointer away (a touch became a scroll, say): the buttons
+  // are up as far as the guest is concerned.
+  canvas.addEventListener("pointercancel", () => send({ type: "pointer", buttons: 0 }));
+  canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+  canvas.addEventListener(
+    "wheel",
+    (event) => {
+      event.preventDefault();
+      send({ type: "wheel", dy: event.deltaY, mode: event.deltaMode });
+    },
+    { passive: false },
+  );
+
+  ctx.abort.signal.addEventListener("abort", () => {
+    clearTimeout(retry);
+    altGr.drop();
+    document.removeEventListener("visibilitychange", hidden);
+    if (ws) ws.close(1000, "the page left");
+  });
+  open();
+  return [el("div", { class: "screen-box" }, canvas, overlay), status];
+}
+
+// Windows reports AltGr as two keys pressed together: a Left Ctrl that is not there,
+// and Right Alt. As noVNC does (its keyboard.js), a Left Ctrl press on Windows is held
+// back for a moment: a Right Alt press within 50 ms makes it the fake one, which is
+// dropped (its key-up, of a key Pendragon never saw go down, reports nothing);
+// anything else, or 100 ms, sends it.
+function altGrFilter(send) {
+  const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+  const windows = /^Win/.test(platform);
+  let held = null;
+  const flush = () => {
+    if (!held) return;
+    clearTimeout(held.timer);
+    const msg = held.msg;
+    held = null;
+    send(msg);
+  };
+  return {
+    key(event, msg) {
+      if (held) {
+        if (msg.down && event.code === "AltRight" && event.timeStamp - held.time < 50) {
+          clearTimeout(held.timer);
+          held = null;
+        } else {
+          flush();
+        }
+      }
+      if (windows && msg.down && event.code === "ControlLeft") {
+        held = { msg, time: event.timeStamp, timer: setTimeout(flush, 100) };
+        return;
+      }
+      send(msg);
+    },
+    // The focus went, and Pendragon releases what was sent: a Ctrl not yet sent is
+    // not sent.
+    drop() {
+      if (held) clearTimeout(held.timer);
+      held = null;
+    },
+  };
 }
 
 // ---- Disks ----

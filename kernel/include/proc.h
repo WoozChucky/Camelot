@@ -171,10 +171,15 @@ struct proc {
      * looked up from: an inode with a reference, or NULL when there is no
      * filesystem (and for kernel processes, which use the root). */
     struct inode *cwd;
+    /* The descriptors that close on exec (FD_CLOEXEC), bit fd for ofile[fd]:
+     * Linux's close_on_exec bitmap. A free descriptor's bit is clear. */
+    u32 cloexec;
 };
 
+_Static_assert(NOFILE <= 32, "a bit of proc.cloexec for each descriptor");
+
 /* The tests walk procs[] by this size (and read pagetable at 32). */
-#define PROC_SIZE 168
+#define PROC_SIZE 172
 #if __riscv_xlen == 32
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 #endif
@@ -403,12 +408,29 @@ struct file *fd_get(u32 fd);
 
 /* Gives `f` the lowest free descriptor: the descriptor, which now holds the
  * caller's reference to `f`, or -EMFILE when there is none (the caller
- * still holds its reference). */
+ * still holds its reference). The descriptor stays open across exec. */
 int fd_install(struct file *f);
+
+/* fd_install() at the lowest free descriptor from `lowest` up (below
+ * NOFILE), closing on exec if `cloexec`: open with O_CLOEXEC, fcntl's
+ * F_DUPFD and F_DUPFD_CLOEXEC. */
+int fd_install_from(struct file *f, u32 lowest, bool cloexec);
 
 /* fd_install() for two files at once, or neither: the lowest two free
  * descriptors, in fds[0] (for `a`) and fds[1] (for `b`). 0 or -EMFILE. */
 int fd_install2(struct file *a, struct file *b, int *fds);
+
+/* Descriptor `fd`'s flags, FD_CLOEXEC or 0, or -EBADF if it is not open:
+ * fcntl's F_GETFD. */
+int fd_flags(u32 fd);
+
+/* Sets descriptor `fd`'s flags to `flags` (FD_CLOEXEC or 0): 0, or -EBADF
+ * if it is not open. fcntl's F_SETFD. */
+int fd_set_flags(u32 fd, u32 flags);
+
+/* Closes every descriptor that closes on exec: what exec does once the new
+ * program replaces the old one (proc_exec_commit()). */
+void fd_close_on_exec(void);
 
 /* Whether a descriptor is free: the calls that make a file check first, so
  * that nothing is made for want of one. Another thread may take it before

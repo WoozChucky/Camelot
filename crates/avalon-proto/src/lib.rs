@@ -27,6 +27,7 @@ use std::io;
 
 mod addr;
 pub mod conn;
+pub mod cursor;
 pub mod frame;
 mod linger;
 pub mod message;
@@ -35,6 +36,7 @@ mod wire;
 
 pub use addr::{default_port, parse_listen, LAKE_SCHEME};
 pub use conn::Connection;
+pub use cursor::{Cursor, CursorImage, CursorView};
 pub use frame::{decode, encode, read_frame, write_frame, Frame};
 pub use linger::{close_gracefully, LINGER, LINGER_BYTES};
 pub use message::*;
@@ -42,7 +44,7 @@ pub use screen::{Rect, Screen};
 
 /// Protocol version carried by the handshake. Both sides must speak the same one; any
 /// change to the message catalogue (a new message, field or enum value) bumps it.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// First four payload bytes of `Hello`, so a server can tell an Avalon client from a
 /// stray connection.

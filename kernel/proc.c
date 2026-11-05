@@ -398,13 +398,15 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
     /* What the child inherits: the standard descriptors, sharing their open
      * files (and offsets), and the working directory. A descriptor above 2
      * stays the parent's own, so a pipe end the parent keeps for itself
-     * doesn't keep the pipe open in every child. Under the parent's
-     * files_lock, as another of its threads may be closing them. */
+     * doesn't keep the pipe open in every child; so does one that closes on
+     * exec, as spawn is a fork and an exec in one (posix_spawn closes it in
+     * the child). Under the parent's files_lock, as another of its threads
+     * may be closing them. */
     struct proc *parent = myproc();
     if (parent != NULL) {
         acquire(&parent->files_lock);
         for (u32 fd = 0; fd <= FD_STDERR; fd++) {
-            if (parent->ofile[fd] != NULL) {
+            if (parent->ofile[fd] != NULL && (parent->cloexec & (1u << fd)) == 0) {
                 p->ofile[fd] = filedup(parent->ofile[fd]);
             }
         }
@@ -521,6 +523,10 @@ int proc_exec_commit(struct exec_image *img, const char *name, const struct proc
     if (old != NULL) {
         uvm_free(old);
     }
+    /* The old program is gone: the descriptors it marked close-on-exec go
+     * with it, as on Linux once exec is past its point of no return. The
+     * caller holds no lock, so closing one may free an inode. */
+    fd_close_on_exec();
     return (int)args->argc;
 }
 
@@ -1315,18 +1321,77 @@ struct file *fd_get(u32 fd) {
 }
 
 int fd_install(struct file *f) {
+    return fd_install_from(f, 0, false);
+}
+
+int fd_install_from(struct file *f, u32 lowest, bool cloexec) {
     struct proc *p = myproc();
     int r = -EMFILE;
     acquire(&p->files_lock);
-    for (u32 fd = 0; fd < NOFILE; fd++) {
+    for (u32 fd = lowest; fd < NOFILE; fd++) {
         if (p->ofile[fd] == NULL) {
             p->ofile[fd] = f;
+            /* The bit of a free descriptor is clear (fd_take()). */
+            if (cloexec) {
+                p->cloexec |= 1u << fd;
+            }
             r = (int)fd;
             break;
         }
     }
     release(&p->files_lock);
     return r;
+}
+
+int fd_flags(u32 fd) {
+    struct proc *p = myproc();
+    if (fd >= NOFILE) {
+        return -EBADF;
+    }
+    acquire(&p->files_lock);
+    int r = -EBADF;
+    if (p->ofile[fd] != NULL) {
+        r = (p->cloexec & (1u << fd)) != 0 ? FD_CLOEXEC : 0;
+    }
+    release(&p->files_lock);
+    return r;
+}
+
+int fd_set_flags(u32 fd, u32 flags) {
+    struct proc *p = myproc();
+    if (fd >= NOFILE) {
+        return -EBADF;
+    }
+    acquire(&p->files_lock);
+    int r = -EBADF;
+    if (p->ofile[fd] != NULL) {
+        if ((flags & FD_CLOEXEC) != 0) {
+            p->cloexec |= 1u << fd;
+        } else {
+            p->cloexec &= ~(1u << fd);
+        }
+        r = 0;
+    }
+    release(&p->files_lock);
+    return r;
+}
+
+void fd_close_on_exec(void) {
+    struct proc *p = myproc();
+    for (u32 fd = 0; fd < NOFILE; fd++) {
+        struct file *f = NULL;
+        acquire(&p->files_lock);
+        if ((p->cloexec & (1u << fd)) != 0) {
+            f = p->ofile[fd];
+            p->ofile[fd] = NULL;
+            p->cloexec &= ~(1u << fd);
+        }
+        release(&p->files_lock);
+        /* Not under the spinlock: closing may free an inode, which sleeps. */
+        if (f != NULL) {
+            fileclose(f);
+        }
+    }
 }
 
 int fd_install2(struct file *a, struct file *b, int *fds) {
@@ -1369,6 +1434,7 @@ struct file *fd_take(u32 fd) {
     acquire(&p->files_lock);
     struct file *f = p->ofile[fd];
     p->ofile[fd] = NULL;
+    p->cloexec &= ~(1u << fd);
     release(&p->files_lock);
     return f;
 }
@@ -1382,6 +1448,7 @@ bool fd_take_if(u32 fd, struct file *f) {
     bool took = p->ofile[fd] == f;
     if (took) {
         p->ofile[fd] = NULL;
+        p->cloexec &= ~(1u << fd);
     }
     release(&p->files_lock);
     return took;

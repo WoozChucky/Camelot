@@ -13,7 +13,7 @@
 //! host can show several machines' framebuffers at once. The only process-wide thing
 //! is the window class, which Windows registers once per process anyway.
 
-use crate::framebuffer::{Frame, FB_HEIGHT, FB_WIDTH};
+use crate::framebuffer::{Composite, Frame, FB_HEIGHT, FB_WIDTH};
 use crate::keyboard::{code, usage, KeyEvent};
 use crate::pointer::{Motion, PointerInput, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT};
 use crate::win32::*;
@@ -529,6 +529,9 @@ pub struct Window {
     hwnd: HWND,
     /// Boxed so its address, stored in the window, stays put when the `Window` moves.
     state: Box<State>,
+    /// The picture drawn last, the cursor blended over the frame, which a drawing for a
+    /// change of the cursor alone starts from ([`Window::draw_cursor`]).
+    composite: RefCell<Composite>,
 }
 
 impl Window {
@@ -588,7 +591,11 @@ impl Window {
             if hwnd.is_null() {
                 return Err("CreateWindowExW failed".into());
             }
-            Ok(Window { hwnd, state })
+            Ok(Window {
+                hwnd,
+                state,
+                composite: RefCell::new(Composite::new()),
+            })
         }
     }
 
@@ -659,12 +666,27 @@ impl Window {
         self.state.frame.get()
     }
 
-    /// Stretches the frame over the client area; a frame with no pixels (the display
-    /// off) paints it black. A frame of another size than the last one (the guest
+    /// Stretches the frame, its cursor plane blended over it, over the client area; a
+    /// frame with no pixels (the display off) paints it black. A frame of another size
+    /// than the last one (the guest
     /// changed modes) resizes the window to show it pixel for pixel, as QEMU's window
     /// does, unless the user has maximized or minimized it; the mouse is mapped to the
     /// new size from then on.
     pub fn draw(&self, frame: Frame) {
+        self.show(frame, false);
+    }
+
+    /// Draws after a change of the cursor alone (it moved, took another image or went)
+    /// since the last drawing: only the rectangles the cursor covered and covers are
+    /// drawn again from `frame` ([`Composite::draw_cursor`]), and the rest of the
+    /// picture is the last drawing's, until the next [`Window::draw`]. A frame of another
+    /// size is drawn whole.
+    pub fn draw_cursor(&self, frame: Frame) {
+        self.show(frame, true);
+    }
+
+    /// [`Window::draw`], or [`Window::draw_cursor`] when `cursor_only`.
+    fn show(&self, frame: Frame, cursor_only: bool) {
         if !self.is_open() {
             return;
         }
@@ -676,6 +698,19 @@ impl Window {
             // GDI could not read on Windows until it is committed.
             crate::ram::touch(pixels);
         }
+        // The cursor plane blended over the frame, in the window's picture of it: GDI
+        // draws the one picture.
+        let mut composite = self.composite.borrow_mut();
+        let pixels = if cursor_only {
+            composite.draw_cursor(&frame)
+        } else {
+            composite.draw(&frame)
+        };
+        let frame = Frame {
+            pixels,
+            cursor: None,
+            ..frame
+        };
         // SAFETY: a valid window handle; the DC is released before returning.
         unsafe {
             let mut client = RECT::default();
@@ -1362,6 +1397,7 @@ mod tests {
                 width: fw,
                 height: fh,
                 pixels: Some(&pixels),
+                cursor: None,
             };
             stretch_matches(frame);
         }
@@ -1578,6 +1614,7 @@ mod tests {
             width,
             height,
             pixels: None,
+            cursor: None,
         }
     }
 
@@ -1607,6 +1644,7 @@ mod tests {
                 width: FB_WIDTH,
                 height: FB_HEIGHT,
                 pixels: Some(&pixels),
+                cursor: None,
             });
             std::thread::sleep(std::time::Duration::from_millis(16));
         }

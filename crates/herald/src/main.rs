@@ -80,7 +80,7 @@ fn show_screen(server: &str, addrs: &[SocketAddr], vm: &VmRef) -> Result<(), Str
                 End::VmEnded(state) => state.to_string(),
                 End::Destroyed => "destroyed".to_string(),
             };
-            view.hold(&session.screen, &status);
+            view.hold(&session.screen, &session.cursor, &status);
             Ok(())
         }
         Err(e) => Err(format!("lost the connection to {server}: {e}")),

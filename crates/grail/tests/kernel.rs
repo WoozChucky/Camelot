@@ -179,6 +179,7 @@ fn shell_accepts_windows_line_ends() {
          exit [N]        leave the shell, with status N or the last program's\n\
          wait            wait for every background program\n\
          cd [DIR]        change the working directory, to / without DIR\n\
+         exec [PROG ...] replace the shell with PROG; without one, keep its redirections\n\
          PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /\n\
          CMD < FILE      read the input from FILE\n\
          CMD > FILE      write the output to FILE\n\
@@ -191,6 +192,62 @@ fn shell_accepts_windows_line_ends() {
          {PROMPT}exit\n"
     );
     assert_eq!(shell_output(&out), want);
+}
+
+#[test]
+fn exec_replaces_the_shell() {
+    // POSIX's `exec`: alone, it does nothing (no redirections to keep); a program that
+    // can't be started is reported and the shell carries on, as is a redirection
+    // that can't be opened (there are no files without a disk). Its NAME is always a
+    // program, never a built-in: `exec cd /bin` is /bin/cd, which isn't there. In a
+    // pipeline or a background job, which POSIX runs in a subshell, it replaces the
+    // command's subshell: one `exec` goes and the rest runs the program NAME, still
+    // never a built-in (`exec exit 7 &` doesn't end the shell, `exec exec echo hi &`
+    // is /bin/exec), and `exec` alone only makes its redirections. A shell reading a
+    // pipe is not interactive: a failed `exec` ends it, with 127 for no such program.
+    // Then `exec PROG` replaces the first process, so the machine stops with PROG's
+    // status: `systest fds` exits 0 only with descriptors 0, 1 and 2 and no other (the
+    // shell's copies above 2 are not inherited), `systest exit 3` with 3.
+    let lines = "exec\nexec nosuch\nexec > /f\nexec cd /bin\nexec cd /bin &\nexec exit 7 &\n\
+                 exec exec echo hi &\nexec &\nexec > /f | cat\necho piped | exec cat\n\
+                 echo exec nosuch | sh\nexec echo behind &\nwait\n";
+    let (code, out) = grail(&kernel_elf(), format!("{lines}exec systest fds\n").as_bytes());
+    assert_eq!(code, Some(0), "output:\n{out}");
+    let shell = shell_output(&out);
+    let want_start = format!(
+        "{SHELL_BANNER}{PROMPT}exec\n\
+         {PROMPT}exec nosuch\n\
+         sh: nosuch: no such program\n\
+         {PROMPT}exec > /f\n\
+         sh: /f: no such file or directory\n\
+         {PROMPT}exec cd /bin\n\
+         sh: cd: no such program\n\
+         {PROMPT}exec cd /bin &\n\
+         sh: cd: no such program\n\
+         {PROMPT}exec exit 7 &\n\
+         sh: exit: no such program\n\
+         {PROMPT}exec exec echo hi &\n\
+         sh: exec: no such program\n\
+         {PROMPT}exec &\n\
+         {PROMPT}exec > /f | cat\n\
+         sh: /f: no such file or directory\n\
+         {PROMPT}echo piped | exec cat\n\
+         piped\n\
+         {PROMPT}echo exec nosuch | sh\n\
+         {SHELL_BANNER}{PROMPT}sh: nosuch: no such program\n\
+         sh: exit 127\n\
+         {PROMPT}exec echo behind &\n"
+    );
+    assert!(shell.starts_with(&want_start), "{shell}");
+    // The background echo's [PID], its line and `wait`'s report, in whatever order
+    // its output and the prompt come.
+    let rest = &shell[want_start.len()..];
+    assert!(rest.contains("behind\n"), "{rest}");
+    assert!(rest.contains("] echo: exit 0\n"), "{rest}");
+    assert!(rest.ends_with(&format!("{PROMPT}exec systest fds\n")), "{rest}");
+
+    let (code, out) = grail(&kernel_elf(), b"exec systest exit 3\n");
+    assert_eq!(code, Some(3), "output:\n{out}");
 }
 
 #[test]

@@ -24,7 +24,9 @@
 //!    `up` types `shd &` on its console: the shell server, which gives each connection
 //!    (`herald --tcp 127.0.0.1:2323`) a shell of its own, beside the console's. `up`
 //!    checks that a shell answers through the forward; if none does (an old disk
-//!    without `/bin/shd`, say), it says so and how to start it, and goes on.
+//!    without `/bin/shd`, say, which the console tells at once), it says so and how
+//!    to start it, and goes on. So it does when the forward cannot be set up (its
+//!    address is taken), without shd. Either way its summary leaves `herald --tcp` out.
 //! 5. **Wait** ([`Platform::wait`]) until Ctrl-C, or until one of the servers ends;
 //!    then **stop** ([`Platform::stop`]) the others, Pendragon first and Lake last.
 //!
@@ -71,6 +73,8 @@ pub const DEMO_GUEST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 1
 
 /// The first line of a Camelot shell's greeting.
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
+/// A Camelot shell's prompt.
+const PROMPT: &str = "$ ";
 
 /// The demo's switch and VM.
 pub const DEMO_SWITCH: &str = "nat";
@@ -370,6 +374,9 @@ pub struct Platform {
     /// Where the demo's gateway forwards to its VM's `shd`, as bound and reachable,
     /// once [`Platform::demo`] has set the forward up.
     pub shd: Option<SocketAddr>,
+    /// Whether [`Platform::demo`] started `shd` in its VM: only then does the summary
+    /// say how to reach it.
+    shd_running: bool,
 }
 
 impl Platform {
@@ -397,6 +404,7 @@ impl Platform {
             images,
             shd_listen: options.shd,
             shd: None,
+            shd_running: false,
         };
         let images = platform.images.to_string_lossy().into_owned();
         let lake = platform.spawn(
@@ -684,11 +692,14 @@ impl Platform {
             "up: demo: started VM {id} ({DEMO_VM}) on switch {DEMO_SWITCH}"
         ));
         if let Some(shd) = self.shd {
-            match start_shd(self.avalon, id, shd) {
-                Ok(()) => log(&format!(
-                    "up: demo: started shd, the shell server, in VM {id}: each connection to {shd} \
-                     is a shell of its own"
-                )),
+            match start_shd(self.avalon, id, shd, SHD_TIMEOUT) {
+                Ok(()) => {
+                    self.shd_running = true;
+                    log(&format!(
+                        "up: demo: started shd, the shell server, in VM {id}: each connection to {shd} \
+                         is a shell of its own"
+                    ))
+                }
                 Err(e) => log(&format!(
                     "up: demo: could not start shd in VM {id} ({e}); type shd & on its console"
                 )),
@@ -713,7 +724,7 @@ impl Platform {
         // The VM to attach to: the demo's, or the one the create command makes.
         let vm = if demo { DEMO_VM } else { "web" };
         let shell = match self.shd {
-            Some(shd) if demo => {
+            Some(shd) if demo && self.shd_running => {
                 format!("\x20 cargo run --release -p herald -- --tcp {shd}      (a shell of its own: shd)\n")
             }
             _ => String::new(),
@@ -748,16 +759,18 @@ impl Drop for Platform {
     }
 }
 
-/// How long [`start_shd`] waits for the demo VM's prompt, and then for a shell through
-/// the forward.
+/// How long [`start_shd`] waits, when `up` starts it, for the demo VM's prompt, and
+/// then for a shell through the forward.
 pub const SHD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Starts `shd` in VM `vm` on the Avalon server at `avalon`: waits for the shell's
 /// prompt on its console, types `shd &`, and waits until a shell answers at `shd`,
 /// the forwarded port (then leaves it with `exit`). Fails if any of it does not
-/// happen within [`SHD_TIMEOUT`].
-pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr) -> Result<(), String> {
-    let deadline = Instant::now() + SHD_TIMEOUT;
+/// happen within `timeout` (`up` gives [`SHD_TIMEOUT`]), and as soon as the console
+/// says it went wrong: the shell finding no `/bin/shd` (`sh: shd: no such program`,
+/// an older disk), or `shd` itself giving up (`shd: port 23: address in use`, say).
+pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
     let mut client =
         Client::connect(&avalon.to_string(), "xtask-up").map_err(|e| format!("cannot reach Avalon: {e}"))?;
     let (id, scrollback) = client
@@ -768,34 +781,64 @@ pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr) -> Result<(), Str
         .set_read_timeout(Some(POLL))
         .map_err(|e| e.to_string())?;
     let mut output = String::from_utf8_lossy(&scrollback).into_owned();
-    while !output.ends_with("\n$ ") {
+    while !output.ends_with(&format!("\n{PROMPT}")) {
         if Instant::now() > deadline {
             return Err("its shell never showed a prompt".into());
         }
-        match conn.recv() {
-            Ok(Message::ConsoleOutput { data, .. }) => output += &String::from_utf8_lossy(&data),
-            Ok(_) => {}
-            Err(avalon_proto::Error::Io(e))
-                if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-            Err(e) => return Err(format!("its console: {e}")),
-        }
+        read_console(conn, &mut output)?;
     }
+    let typed = output.len();
     conn.send(&Message::ConsoleInput {
         vm: id,
         data: b"shd &\n".to_vec(),
     })
     .map_err(|e| format!("its console: {e}"))?;
     // Until shd listens, the gateway's connection to the VM is refused, and so the
-    // host's ends at once: try again a little later.
+    // host's ends at once: try again a little later, reading the console meanwhile.
     loop {
+        if let Some(failure) = shd_failure(&output[typed..]) {
+            return Err(failure.to_string());
+        }
         if shell_answers(shd, deadline) {
             return Ok(());
         }
         if Instant::now() > deadline {
             return Err(format!("no shell answered at {shd}"));
         }
-        std::thread::sleep(POLL);
+        read_console(conn, &mut output)?;
     }
+}
+
+/// Adds what the console attached on `conn` prints within [`POLL`] (its read timeout)
+/// to `output`. Fails once the console has stopped working.
+fn read_console(conn: &mut avalon_proto::Connection<TcpStream>, output: &mut String) -> Result<(), String> {
+    match conn.recv() {
+        Ok(Message::ConsoleOutput { data, .. }) => {
+            *output += &String::from_utf8_lossy(&data);
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(avalon_proto::Error::Io(e))
+            if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(format!("its console: {e}")),
+    }
+}
+
+/// The line of a console's output, from where `shd &` was typed, that says `shd` did
+/// not start: the shell's (`sh: shd: REASON`, it could not start the program) or
+/// shd's own (`shd: ...`, an error: without -v shd prints nothing else). None while
+/// the whole lines so far say neither.
+fn shd_failure(output: &str) -> Option<&str> {
+    // Whole lines only: the last one may still be coming.
+    let whole = &output[..output.rfind('\n').map_or(0, |i| i + 1)];
+    whole
+        .lines()
+        // A background shd's error comes after the prompt that followed its line.
+        .map(|l| l.trim_end_matches('\r').trim_start_matches(PROMPT))
+        .find(|l| l.starts_with("sh: shd: ") || l.starts_with("shd: "))
 }
 
 /// Whether a Camelot shell greets a connection to `addr` before `deadline`; if one
@@ -1218,6 +1261,23 @@ mod tests {
         assert_eq!(addr.port(), 55555);
         assert_eq!(url, "http://127.0.0.1:55555/?token=00ff");
         assert_eq!(pendragon_url("pendragon: open the URL above"), None);
+    }
+
+    #[test]
+    fn what_says_shd_did_not_start() {
+        // The console's echo of the line, the job's pid and the prompt: nothing wrong.
+        assert_eq!(shd_failure("shd &\r\n[5]\r\n$ "), None);
+        assert_eq!(
+            shd_failure("shd &\r\nsh: shd: no such program\r\n$ "),
+            Some("sh: shd: no such program")
+        );
+        assert_eq!(
+            shd_failure("shd &\n[5]\n$ shd: port 23: address in use\n"),
+            Some("shd: port 23: address in use")
+        );
+        // Only a whole line counts.
+        assert_eq!(shd_failure("shd &\n[5]\n$ shd: port 23: addr"), None);
+        assert_eq!(shd_failure("shd &\n[5]\n$ shd"), None);
     }
 
     #[test]

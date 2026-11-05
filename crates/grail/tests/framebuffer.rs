@@ -253,6 +253,49 @@ fn run_for_stops_only_at_a_present_of_its_own() {
     assert!(m.cpu.bus.fb.take_present(), "still pending for the host");
 }
 
+/// A cursor image redrawn in place shows when the program writes `FB_CURSOR_ADDR`
+/// again, with the address it holds (spec 9.3, as a write of Intel's CURBASE): the
+/// vertical blank that takes the write ends `run_for`'s slice and tells the host (which
+/// redraws its window and dumps the picture), and a redraw without it does neither. A
+/// new hotspot alone changes no pixel, and is no change either.
+#[test]
+fn run_for_stops_at_a_cursor_image_written_again() {
+    use grail::bus::{FB_CTRL_BASE, RAM_BASE};
+    use grail::framebuffer::{REG_CTRL, REG_CURSOR_ADDR, REG_CURSOR_CTRL, REG_CURSOR_HOT};
+    let mut m = Machine::with_ram(1 << 20);
+    // `j .`: the program does nothing; the test writes the registers, as it would.
+    m.cpu.bus.load(RAM_BASE, &0x0000_006f_u32.to_le_bytes()).unwrap();
+    m.cpu.pc = RAM_BASE;
+    let image = RAM_BASE + 0x4000;
+    let reg = |m: &mut Machine, off: u32, size: u32, val: u64| {
+        m.cpu.bus.write(FB_CTRL_BASE + u64::from(off), size, val).unwrap();
+    };
+    let first_pixel = |m: &Machine| m.cpu.bus.frame().cursor.map(|c| c.pixels[..4].to_vec());
+    reg(&mut m, REG_CTRL, 4, 1);
+    reg(&mut m, REG_CURSOR_ADDR, 8, image);
+    reg(&mut m, REG_CURSOR_CTRL, 4, 1);
+    // Bounded budgets, each several frames long: a regression must fail, not hang.
+    const BUDGET: u64 = 2_000_000;
+    assert!(m.run_for(BUDGET, &mut |_| {}) < BUDGET, "the cursor shows");
+    assert!(m.cpu.bus.fb.take_cursor_update());
+    assert_eq!(first_pixel(&m), Some(vec![0; 4]));
+
+    // Redrawn in place: the host reads the new pixels when it draws, but nothing tells it.
+    m.cpu.bus.load(image, &[0xff; 4]).unwrap();
+    assert_eq!(m.run_for(BUDGET, &mut |_| {}), BUDGET);
+    assert!(!m.cpu.bus.fb.take_cursor_update());
+    reg(&mut m, REG_CURSOR_HOT, 4, 3);
+    assert_eq!(m.run_for(BUDGET, &mut |_| {}), BUDGET, "a hotspot alone");
+    assert!(!m.cpu.bus.fb.take_cursor_update());
+    // Written again, the same address: the next vertical blank takes it as a new image.
+    let updates = m.cpu.bus.fb.cursor_updates;
+    reg(&mut m, REG_CURSOR_ADDR, 8, image);
+    assert!(m.run_for(BUDGET, &mut |_| {}) < BUDGET);
+    assert!(m.cpu.bus.fb.take_cursor_update());
+    assert_eq!(m.cpu.bus.fb.cursor_updates, updates + 1);
+    assert_eq!(first_pixel(&m), Some(vec![0xff; 4]));
+}
+
 /// Runs one load or store with `a0` = `addr` and `a1` = 0x0000_0101 at
 /// RAM_BASE; returns the machine and, if it trapped, (mcause, mtval).
 fn one_access(inst: u32, addr: u64) -> (Machine, Option<(u64, u64)>) {
@@ -570,4 +613,166 @@ fn flip_follows_a_real_time_clock() {
         "one interrupt per vertical blank"
     );
     check_flip_dumps(&dir);
+}
+
+/// `examples/cursor`, for an RV32 or an RV64 machine.
+fn cursor_elf(rv64: bool) -> PathBuf {
+    let name = if rv64 { "cursor-rv64.elf" } else { "cursor.elf" };
+    repo_root().join("examples/cursor").join(name)
+}
+
+/// The places `examples/cursor` puts its cursor's top left corner at, in order.
+const CURSOR_PATH: [(i32, i32); 6] = [(100, 100), (300, 200), (-4, -12), (634, 472), (320, 240), (0, 0)];
+
+/// Pixel (x, y) of `examples/cursor`'s frame, 0x00RRGGBB: eight bars of 80 columns.
+fn cursor_frame_pixel(x: u32, _y: u32) -> u32 {
+    const BARS: [u32; 8] = [
+        0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000,
+    ];
+    BARS[(x / 80) as usize]
+}
+
+/// Pixel (x, y) of `examples/cursor`'s cursor image, 0xAARRGGBB premultiplied: an
+/// arrow of 16 rows, row y covering x 0 to y, black on its edges and white inside, both
+/// opaque; below it 8 rows of 8 pixels of blue half covered; clear elsewhere.
+fn cursor_image_pixel(x: u32, y: u32) -> u32 {
+    if y < 16 && x <= y {
+        if x == 0 || x == y || y == 15 {
+            0xff00_0000
+        } else {
+            0xffff_ffff
+        }
+    } else if (16..24).contains(&y) && x < 8 {
+        0x8000_0080
+    } else {
+        0
+    }
+}
+
+/// The PPM `examples/cursor` shows: its frame, with the cursor at `at` blended over
+/// it, as spec section 9.3 says: each colour `cursor + frame × (255 - A) / 255`,
+/// rounded to the nearest (written here without Grail's blending code).
+fn cursor_ppm(at: Option<(i32, i32)>) -> Vec<u8> {
+    let mut out = format!("P6\n{FB_WIDTH} {FB_HEIGHT}\n255\n").into_bytes();
+    for y in 0..FB_HEIGHT {
+        for x in 0..FB_WIDTH {
+            let frame = cursor_frame_pixel(x, y);
+            let image = at.and_then(|(cx, cy)| {
+                let (ix, iy) = (x as i32 - cx, y as i32 - cy);
+                ((0..64).contains(&ix) && (0..64).contains(&iy))
+                    .then(|| cursor_image_pixel(ix as u32, iy as u32))
+            });
+            for shift in [16, 8, 0] {
+                let d = frame >> shift & 0xff;
+                let px = match image {
+                    None => d,
+                    Some(s) => {
+                        let a = s >> 24;
+                        ((s >> shift & 0xff) + (d * (255 - a) + 127) / 255).min(255)
+                    }
+                };
+                out.push(px as u8);
+            }
+        }
+    }
+    out
+}
+
+/// Acceptance of #203: `examples/cursor` through `grail --fb-dump`, at both widths:
+/// the frame it presents once, then one dump per place the cursor is shown at, each the
+/// frame with the cursor blended over it there (off the corners too), then the last
+/// again at exit.
+#[test]
+fn cursor_dumps_every_place_it_moves_to() {
+    for rv64 in [false, true] {
+        let dir = scratch(&format!("cursor-{}", if rv64 { 64 } else { 32 }));
+        let out = grail(&[
+            "--fb-dump",
+            dir.to_str().unwrap(),
+            cursor_elf(rv64).to_str().unwrap(),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let want: Vec<String> = (0..CURSOR_PATH.len() + 2)
+            .map(|i| format!("frame-{i:04}.ppm"))
+            .collect();
+        assert_eq!(names, want, "{}", if rv64 { "RV64" } else { "RV32" });
+        let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+        assert!(
+            read(&names[0]) == cursor_ppm(None),
+            "the frame, before the cursor"
+        );
+        for (k, &at) in CURSOR_PATH.iter().enumerate() {
+            let name = &names[k + 1];
+            assert!(
+                read(name) == cursor_ppm(Some(at)),
+                "{name} is not the cursor at {at:?}"
+            );
+        }
+        assert!(
+            read(&names[CURSOR_PATH.len() + 1]) == cursor_ppm(Some(CURSOR_PATH[5])),
+            "at exit"
+        );
+    }
+}
+
+/// Acceptance of #203: `examples/cursor` moves its cursor over a still frame, and the
+/// frame is not redrawn. Run in slices, as a host runs it: a slice ends where the
+/// cursor changed, at a vertical blank, and there the cursor is at the next place of
+/// the path; the program presents once, flips and sets no mode, and VRAM is the same
+/// from the present to the end. At both widths, each place shown at the first vertical
+/// blank after its write, woken by its interrupt.
+#[test]
+fn cursor_moves_over_a_frame_that_is_not_redrawn() {
+    for rv64 in [false, true] {
+        let mut m = Machine::with_ram(grail::DEFAULT_RAM_SIZE);
+        m.load_elf(&std::fs::read(cursor_elf(rv64)).unwrap()).unwrap();
+        let mut frame: Option<Vec<u8>> = None;
+        let mut places = Vec::new();
+        let mut slices = 0;
+        while m.exit_code().is_none() {
+            m.run_for(1_000_000, &mut |_| {});
+            slices += 1;
+            assert!(slices < 10_000, "the program does not end");
+            let fb = &mut m.cpu.bus.fb;
+            if fb.take_present() {
+                assert!(frame.is_none(), "presented again");
+                frame = Some(fb.vram.clone());
+            }
+            if fb.take_cursor_update() {
+                let c = fb.cursor();
+                assert!(c.on);
+                assert_eq!((c.hot_x, c.hot_y), (0, 0));
+                assert_eq!(fb.ticks_to_vblank(), fb.frame_ticks(), "at a vertical blank");
+                places.push((c.x, c.y));
+            }
+        }
+        let width = if rv64 { "RV64" } else { "RV32" };
+        assert_eq!(m.exit_code(), Some(0), "{width}");
+        assert_eq!(places, CURSOR_PATH, "{width}");
+        let fb = &m.cpu.bus.fb;
+        assert_eq!((fb.presents, fb.flips, fb.modesets), (1, 0, 0), "one frame");
+        assert_eq!((fb.shown(), fb.cursor_updates), (1, CURSOR_PATH.len() as u64));
+        assert!(
+            frame.as_deref() == Some(&fb.vram[..]),
+            "VRAM changed after the present"
+        );
+        assert_eq!(fb.scanout(), 0);
+        assert!(m.cpu.bus.frame().to_ppm() == cursor_ppm(Some(CURSOR_PATH[5])));
+        assert_eq!(m.cpu.x[9], CURSOR_PATH.len() as u64, "s1: the places shown");
+        assert_eq!(
+            m.cpu.x[24],
+            CURSOR_PATH.len() as u64,
+            "s8: one vertical blank a place"
+        );
+    }
 }
