@@ -199,8 +199,7 @@ main:
     ld    a0, 0(a0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 1
-    negw  a0, a0
+    li    a0, -1
     ld    a1, 0(sp)
     addi  sp, sp, 8
     slli  a0, a0, 2

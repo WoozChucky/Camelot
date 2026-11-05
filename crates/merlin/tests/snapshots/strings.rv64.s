@@ -145,37 +145,7 @@ main:
     lw    a0, -28(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 10
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 9
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 0
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 92
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 39
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    addw  a0, a1, a0
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 160
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    subw  a0, a1, a0
+    li    a0, -10
     ld    a1, 0(sp)
     addi  sp, sp, 8
     addw  a0, a1, a0
@@ -217,13 +187,7 @@ main:
     lw    a0, -28(s0)
     addi  sp, sp, -8
     sd    a0, 0(sp)
-    li    a0, 5
-    addi  sp, sp, -8
-    sd    a0, 0(sp)
-    li    a0, 1
-    ld    a1, 0(sp)
-    addi  sp, sp, 8
-    add   a0, a1, a0
+    li    a0, 6
     ld    a1, 0(sp)
     addi  sp, sp, 8
     add   a0, a1, a0

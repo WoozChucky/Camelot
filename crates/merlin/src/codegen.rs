@@ -274,11 +274,27 @@
 //! swapped (`l > r`), those two followed by `xori 1` (`>=`, `<=`), and `xor`
 //! followed by `seqz`/`snez` (`==`, `!=`). `&&` and `||` branch around their
 //! right side and turn the result into 0 or 1 with `snez`; `?:` branches like
-//! an `if`.
+//! an `if`. A constant condition is decided here, as clang's code generator
+//! decides it at `-O0` (see "Control flow"): `c ? a : b` is the operand `c`
+//! chooses, and `1 && x` and `0 || x` are `x`, as 0 or 1.
 //!
 //! Pointer arithmetic counts elements: `p + i` scales `i` by the size of what
 //! `p` points to (a shift for powers of two), and `p - q` divides the byte
 //! difference by it.
+//!
+//! An integer constant expression (C99 6.6) is one constant, of any integer
+//! type, at both widths: `8 * (1024ul * 1024ul)` is `li a0, 8388608`, and
+//! `3LL << 40` on RV32 is `li a0, 0` and `li a1, 768` (a pair). clang does
+//! the same at `-O0`, since its front end folds them whatever the type.
+//! [`crate::consteval`] works the value out with the semantics above (the
+//! usual arithmetic conversions, wrapping at the type's width, shift amounts
+//! masked as the hardware masks them), so the constant is what the
+//! instructions would have computed. A division by zero is not folded and
+//! stays a `div` at run time (clang warns, then has no value for it); in a
+//! larger expression only the parts around it are folded. Where an operand
+//! is not constant (`x * (2 * 3)`) the constant parts are folded and the
+//! rest is computed as above: nothing is reassociated (`x * 2 * 3` is two
+//! multiplies), as at `-O0`.
 //!
 //! ## Places: where assignments store
 //!
@@ -360,6 +376,18 @@
 //! chain is simpler to read and works for any values. A C label `name` is
 //! `.L.label.<function>.<name>`, and `goto` is a `j` to it.
 //!
+//! A condition that is an integer constant expression is decided at compile
+//! time, as clang's code generator decides it at `-O0` ([`crate::elide`]):
+//! `if (1) a; else b;` is `a` alone, with no test, and a `switch` on a
+//! constant is the statements its case runs, up to the `break`, without
+//! compares or labels. Code a jump can still reach is kept: an arm with a
+//! `goto` label in it, or a `case` of a `switch` around it, and the `if` is
+//! generated as usual. `while (1)` tests nothing, nor does `do ... while
+//! (0)`; `while (0)`, `do ... while (1)` and `for` loops test their
+//! condition, as in clang. `-g` describes only what is generated: the
+//! variables of an arm left out are not described, and the types of its
+//! casts are not kept.
+//!
 //! A conditional branch reaches only ±4 KiB, and merlin-as reports a branch
 //! that cannot reach its label as an error rather than rewriting it. So once a
 //! function is generated, [`relax_branches`] estimates every instruction's
@@ -384,6 +412,7 @@ use crate::abi::{self, Pass};
 use crate::ast::*;
 use crate::consteval::{self, Base, Const};
 use crate::debug::{DebugInfo, Lines, Location, Scope, Var};
+use crate::elide;
 use crate::sema::arith_type;
 use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
 use crate::{Error, Pos};
@@ -464,6 +493,7 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
                     file: &mut file,
                     ret_label: format!(".L.return.{}", f.name),
                     statics: Vec::new(),
+                    elided_cases: Vec::new(),
                     after_prologue: false,
                     scopes: Vec::new(),
                 };
@@ -964,6 +994,9 @@ struct FuncGen<'a, 'f> {
     ret_label: String,
     /// The function's `static` locals, emitted as data after it.
     statics: Vec<&'a Declarator>,
+    /// The ids of the `case`s and `default`s of each `switch` on a constant
+    /// generated so far, whose labels nothing jumps to.
+    elided_cases: Vec<usize>,
     /// With `-g`: a `.loc` has been written since the function's first, so
     /// the next is not the one that ends the prologue.
     after_prologue: bool,
@@ -1466,14 +1499,17 @@ impl<'a> FuncGen<'a, '_> {
     fn unscoped_stmt(&mut self, s: &'a Stmt) {
         debug_assert_eq!(self.depth, 0, "temporaries left on the stack between statements");
         // `-g`: a statement with code of its own starts a line. A loop's parts
-        // and a declaration's initializers get theirs where they are made.
+        // and a declaration's initializers get theirs where they are made, an
+        // `if`'s and a `switch`'s where their condition is tested.
         match &s.kind {
             StmtKind::Block(_)
             | StmtKind::Decl(_)
             | StmtKind::Empty
+            | StmtKind::If { .. }
             | StmtKind::While { .. }
             | StmtKind::DoWhile { .. }
             | StmtKind::For { .. }
+            | StmtKind::Switch { .. }
             | StmtKind::Case { .. }
             | StmtKind::Default { .. }
             | StmtKind::Label { .. } => {}
@@ -1498,6 +1534,21 @@ impl<'a> FuncGen<'a, '_> {
             StmtKind::Expr(e) => self.expr(e),
             StmtKind::Empty => {}
             StmtKind::If { cond, then, els } => {
+                // A constant condition runs one arm: only that one is
+                // generated, unless the other has a label (see [`elide`]).
+                if let Some(c) = self.constant_condition(cond) {
+                    let (run, skipped) = if c {
+                        (Some(&**then), els.as_deref())
+                    } else {
+                        (els.as_deref(), Some(&**then))
+                    };
+                    if !skipped.is_some_and(|s| elide::contains_label(s, false)) {
+                        if let Some(run) = run {
+                            self.stmt(run);
+                        }
+                        return;
+                    }
+                }
                 //     <cond>                    <cond>
                 //     beqz a0, .L.end.N         beqz a0, .L.else.N
                 //     <then>                    <then>
@@ -1505,6 +1556,7 @@ impl<'a> FuncGen<'a, '_> {
                 //                             .L.else.N:
                 //                               <els>
                 //                             .L.end.N:
+                self.loc(s.pos);
                 self.test(cond);
                 match els {
                     None => {
@@ -1535,9 +1587,15 @@ impl<'a> FuncGen<'a, '_> {
                 let cont = self.new_label("continue");
                 let brk = self.new_label("break");
                 self.label(&cont);
-                self.loc(cond.pos);
-                self.test(cond);
-                self.branch_if_zero(&brk);
+                if self.constant_condition(cond) == Some(true) {
+                    // `while (1)`: nothing to test, as clang has it. Its
+                    // code generator still visits the condition (`-g`).
+                    self.kept_casts(cond);
+                } else {
+                    self.loc(cond.pos);
+                    self.test(cond);
+                    self.branch_if_zero(&brk);
+                }
                 self.loop_body(body, &cont, &brk);
                 self.ins("j", &cont);
                 self.label(&brk);
@@ -1555,9 +1613,14 @@ impl<'a> FuncGen<'a, '_> {
                 self.label(&top);
                 self.loop_body(body, &cont, &brk);
                 self.label(&cont);
-                self.loc(cond.pos);
-                self.test(cond);
-                self.branch_if_nonzero(&top);
+                if self.constant_condition(cond) == Some(false) {
+                    // `do ... while (0)`: nothing to test, as clang has it.
+                    self.kept_casts(cond);
+                } else {
+                    self.loc(cond.pos);
+                    self.test(cond);
+                    self.branch_if_nonzero(&top);
+                }
                 self.label(&brk);
             }
             StmtKind::For {
@@ -1638,6 +1701,21 @@ impl<'a> FuncGen<'a, '_> {
                 //     j    .L.case.f.2         (default; or .L.break.N)
                 //     <body>                   (with .L.case.f.<id>: labels)
                 //   .L.break.N:
+                //
+                // On a constant condition, only the statements that run, as
+                // clang has them, when they can be picked out (see [`elide`]):
+                // no compares, no labels, no `break`.
+                if let Some(v) = consteval::int(cond, self.xlen).filter(|_| cond.ty.is_integer()) {
+                    if let Some(run) = elide::case_statements(body, v, cases, *default) {
+                        self.elided_cases
+                            .extend(cases.iter().map(|&(_, id)| id).chain(*default));
+                        for s in run {
+                            self.stmt(s);
+                        }
+                        return;
+                    }
+                }
+                self.loc(s.pos);
                 let brk = self.new_label("break");
                 self.expr(cond);
                 let kind = cond.ty.int_kind().expect("sema: an integer condition");
@@ -1671,8 +1749,11 @@ impl<'a> FuncGen<'a, '_> {
                 self.label(&brk);
             }
             StmtKind::Case { id, body, .. } | StmtKind::Default { id, body } => {
-                let label = self.case_label(*id);
-                self.label(&label);
+                // (Nothing jumps to the label of a switch on a constant.)
+                if !self.elided_cases.contains(id) {
+                    let label = self.case_label(*id);
+                    self.label(&label);
+                }
                 self.stmt(body);
             }
             StmtKind::Label { name, body } => {
@@ -1690,6 +1771,16 @@ impl<'a> FuncGen<'a, '_> {
                 self.ins("j", label);
             }
         }
+    }
+
+    /// The value of a condition clang's code generator decides at compile
+    /// time: an integer constant expression (`ConstantFoldsToSimpleInteger`;
+    /// for loops, the `ConstantInt` the condition's code folds to).
+    fn constant_condition(&self, e: &Expr) -> Option<bool> {
+        if !e.ty.is_integer() {
+            return None;
+        }
+        consteval::int(e, self.xlen).map(|v| v != 0)
     }
 
     fn loop_body(&mut self, body: &'a Stmt, cont: &str, brk: &str) {
@@ -1825,6 +1916,62 @@ impl<'a> FuncGen<'a, '_> {
 
     // ---- expressions: each leaves its value in a0 ----
 
+    /// An integer constant expression other than a literal (`1024ul *
+    /// 1024ul`, `(char)300`, `sizeof(int) * 4`): loads its value, as one
+    /// constant (see "Expressions"), and says so. Any other expression is
+    /// left to [`Self::expr`].
+    fn folded(&mut self, e: &'a Expr) -> bool {
+        if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_)) {
+            return false;
+        }
+        let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
+            return false;
+        };
+        // A disagreement would load the wrong registers (on RV32, a `long`
+        // where sema has a `long long` pair): checked in every build.
+        assert_eq!(e.ty.int_kind(), Some(kind), "consteval types it as sema does");
+        self.kept_casts(e);
+        self.constant(v, kind);
+        true
+    }
+
+    /// `-g`: the explicit casts inside a folded constant, in the order
+    /// clang meets them. Its front end still walks a constant's expression,
+    /// keeping the types of the casts it emits, and its IR builder folds
+    /// what it emits; but it emits only what is evaluated: of `c ? a : b`
+    /// with a constant `c`, the operand chosen (not `c`), and of `l && r`
+    /// or `l || r` with a constant `l`, `r` when it decides the result
+    /// (`1 && r`, `0 || r`) and nothing otherwise (clang's
+    /// `VisitAbstractConditionalOperator`, `VisitBinLAnd`, `VisitBinLOr`).
+    fn kept_casts(&mut self, e: &'a Expr) {
+        if self.file.debug.is_none() {
+            return;
+        }
+        self.kept_cast(e);
+        let decided = |c: &Expr| consteval::int(c, self.xlen).map(|v| v != 0);
+        match &e.kind {
+            ExprKind::Unary(_, x)
+            | ExprKind::Cast { x, .. }
+            | ExprKind::Addr(x)
+            | ExprKind::Deref(x)
+            | ExprKind::Member { base: x, .. } => self.kept_casts(x),
+            ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r) => {
+                if decided(l) == Some(*op == BinOp::LogAnd) {
+                    self.kept_casts(r);
+                }
+            }
+            ExprKind::Binary(_, l, r) => {
+                self.kept_casts(l);
+                self.kept_casts(r);
+            }
+            ExprKind::Cond(c, a, b) => match decided(c) {
+                Some(true) => self.kept_casts(a),
+                _ => self.kept_casts(b),
+            },
+            _ => {}
+        }
+    }
+
     /// `-g`: clang keeps the type of an explicit cast in the unit (and
     /// describes it as it is evaluated).
     fn kept_cast(&mut self, e: &Expr) {
@@ -1842,6 +1989,9 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     fn expr(&mut self, e: &'a Expr) {
+        if self.folded(e) {
+            return;
+        }
         match &e.kind {
             ExprKind::Num(v) => {
                 // The value as the register holds it: an `unsigned int`
@@ -1943,6 +2093,14 @@ impl<'a> FuncGen<'a, '_> {
                     self.step(ty, -delta);
                 }
             }
+            // `1 && r` and `0 || r` are `r` as 0 or 1, as clang has them
+            // (`0 && r` and `1 || r` are constants, folded above).
+            ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r)
+                if self.constant_condition(l) == Some(*op == BinOp::LogAnd) =>
+            {
+                self.test(r);
+                self.ins("snez", "a0, a0");
+            }
             ExprKind::Binary(BinOp::LogAnd, l, r) => {
                 //     <l>
                 //     beqz a0, .L.and.N   # l is 0: so is the result, skip r
@@ -2010,20 +2168,21 @@ impl<'a> FuncGen<'a, '_> {
                 self.expr(p);
                 self.load(&e.ty);
             }
-            // A constant converted (`char c = 1;`): just the converted value.
-            ExprKind::Cast { x, .. } if e.ty.is_integer() && matches!(x.kind, ExprKind::Num(_)) => {
-                self.kept_cast(e);
-                let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
-                    unreachable!("an integer literal cast to an integer type is constant")
-                };
-                self.constant(v, kind);
-            }
             ExprKind::Cast { x, .. } => {
                 self.kept_cast(e);
                 self.expr(x);
                 self.convert(&x.ty, &e.ty);
             }
             ExprKind::SizeofType(_) | ExprKind::SizeofExpr(_) => unreachable!("sema folds sizeof"),
+            // A constant condition: only the operand it chooses, as clang has
+            // it (an expression has no labels to keep).
+            ExprKind::Cond(c, a, b) if self.constant_condition(c).is_some() => {
+                self.expr(if self.constant_condition(c) == Some(true) {
+                    a
+                } else {
+                    b
+                });
+            }
             ExprKind::Cond(c, a, b) => {
                 //     <c>
                 //     beqz a0, .L.else.N
@@ -4033,6 +4192,81 @@ main:
         compile("int main() { int a0 = 1; return a0; }");
     }
 
+    #[test]
+    fn constant_expressions_are_folded() {
+        // Every integer type, as clang's front end folds them at -O0: a
+        // long long is a pair, its low word in a0.
+        let f = |ty: &str, e: &str| {
+            let asm = compile(&format!("{ty} f(void) {{ return {e}; }}"));
+            body_of(&asm, "f")[4..].join("; ")
+        };
+        assert_eq!(f("long", "8 * (1024ul * 1024ul)"), "li a0, 8388608");
+        assert_eq!(f("int", "8 * (1024 * 1024)"), "li a0, 8388608");
+        assert_eq!(f("unsigned long", "0ul - 1"), "li a0, -1");
+        assert_eq!(
+            f("long", "2147483647L + 1"),
+            "li a0, -2147483648",
+            "wraps at 32 bits"
+        );
+        assert_eq!(f("long long", "3LL << 40"), "li a0, 0; li a1, 768");
+        assert_eq!(
+            f("unsigned long long", "(0ull - 1) / 3 + 1"),
+            "li a0, 1431655766; li a1, 1431655765"
+        );
+        assert_eq!(f("long long", "-1LL >> 63"), "li a0, -1; li a1, -1");
+        assert_eq!(
+            f("long long", "1LL << 65"),
+            "li a0, 2; li a1, 0",
+            "the low 6 bits of the amount"
+        );
+        assert_eq!(f("long long", "(long long)-1"), "li a0, -1; li a1, -1");
+        assert_eq!(f("int", "(int)(1LL << 32 | 7)"), "li a0, 7");
+        assert_eq!(f("int", "(0LL - 1) < 0ull"), "li a0, 0", "an unsigned comparison");
+        assert_eq!(f("char", "(char)300 + 1"), "li a0, 45");
+        assert_eq!(f("unsigned", "sizeof(long long) * 3"), "li a0, 24");
+        assert_eq!(f("int", "1 && 2LL || 0"), "li a0, 1");
+        // The operand `?:` does not choose is not evaluated: it need not be
+        // constant (C99 6.6p3), only its type counts, as clang folds it.
+        let g = |src: &str| body_of(&compile(src), "f")[4..].join("; ");
+        assert_eq!(g("int h(void); int f(void) { return 1 ? 2 : h(); }"), "li a0, 2");
+        assert_eq!(
+            g("unsigned h(void); unsigned long long f(void) { return 0 ? h() : -1; }"),
+            "li a0, -1; li a1, 0",
+            "-1 converted to the operands' common type, unsigned int"
+        );
+        assert_eq!(
+            g("long long h(void); long long f(void) { return 1 ? -1 : h(); }"),
+            "li a0, -1; li a1, -1"
+        );
+        let asm = compile("int h(void); int x = 1 ? 2 : h(); int y = 0 && h();");
+        assert!(
+            asm.contains(
+                "x:
+    .word 2
+"
+            ),
+            "{asm}"
+        );
+        assert!(
+            asm.contains(
+                "y:
+    .word 0
+"
+            ),
+            "{asm}"
+        );
+        // Division by zero is left to run time; the rest is folded.
+        assert_eq!(
+            f("int", "(2 * 3) / 0"),
+            "li a0, 6; addi sp, sp, -4; sw a0, 0(sp); li a0, 0; lw a1, 0(sp); addi sp, sp, 4; div a0, a1, a0"
+        );
+        // Only the constant parts of an expression, and nothing reassociated.
+        let asm = compile("int x; int f(void) { return x * (2 * 3) + x * 2 * 3; }");
+        let body = body_of(&asm, "f").join("; ");
+        assert_eq!(body.matches("mul ").count(), 3, "{body}");
+        assert!(body.contains("li a0, 6"), "{body}");
+    }
+
     /// `long long` on RV32: register pairs.
     mod pairs {
         use super::{body_of, compile};
@@ -4360,10 +4594,8 @@ main:
         #[test]
         fn big_constants() {
             // li takes 64-bit values; an unsigned int is held sign-extended.
-            assert_eq!(
-                main_body("", "return 0xffffffffu == 0;").split("; ").next(),
-                Some("li a0, -1")
-            );
+            let body = main_body("", "unsigned u; u = 0xffffffffu; return 0;");
+            assert!(body.contains("; li a0, -1; sw a0"), "{body}");
             let body = main_body("", "long l; l = 0x123456789abcdef0L; return 0;");
             assert!(body.contains("li a0, 1311768467463790320; sd a0"), "{body}");
             let body = main_body("", "unsigned long u; u = 0xffffffffffffffffUL; return 0;");
@@ -4371,6 +4603,55 @@ main:
             // A constant converted is the converted constant.
             let body = main_body("", "unsigned long u; u = 4294967295u; return 0;");
             assert!(body.contains("; li a0, 4294967295; sd a0"), "{body}");
+        }
+
+        #[test]
+        fn constant_expressions_are_folded() {
+            // Every integer type, as clang's front end folds them at -O0.
+            let f = |ty: &str, e: &str| {
+                let asm = compile(&format!("{ty} f(void) {{ return {e}; }}"));
+                body_of(&asm, "f")[4..].join("; ")
+            };
+            assert_eq!(f("long", "8 * (1024ul * 1024ul)"), "li a0, 8388608");
+            assert_eq!(f("int", "8 * (1024 * 1024)"), "li a0, 8388608");
+            assert_eq!(f("long long", "3LL << 40"), "li a0, 3298534883328");
+            assert_eq!(
+                f("unsigned long long", "(0ull - 1) / 3 + 1"),
+                "li a0, 6148914691236517206"
+            );
+            assert_eq!(f("unsigned long", "0ul - 1"), "li a0, -1");
+            assert_eq!(
+                f("long", "-9223372036854775807L - 1"),
+                "li a0, -9223372036854775808"
+            );
+            // The 32-bit invariant: an unsigned int is held sign-extended.
+            assert_eq!(f("unsigned", "0x80000000u | 1"), "li a0, -2147483647");
+            assert_eq!(
+                f("long", "(long)(0xffffffffu + 1)"),
+                "li a0, 0",
+                "unsigned int wraps at 32 bits"
+            );
+            assert_eq!(f("long", "1L << 65"), "li a0, 2", "the low 6 bits of the amount");
+            assert_eq!(
+                f("int", "1 << 33"),
+                "li a0, 2",
+                "the low 5 bits of a 32-bit one's"
+            );
+            assert_eq!(
+                f("long", "(-9223372036854775807L - 1) / -1"),
+                "li a0, -9223372036854775808"
+            );
+            assert_eq!(f("unsigned long", "sizeof(long) * 3"), "li a0, 24");
+            assert_eq!(
+                f("int", "0 ? 1 / 0 : 2L > 1"),
+                "li a0, 1",
+                "the operand not chosen is not divided"
+            );
+            // Division by zero is left to run time; the rest is folded.
+            assert_eq!(
+                f("long", "(2L * 3) / 0"),
+                "li a0, 6; addi sp, sp, -8; sd a0, 0(sp); li a0, 0; ld a1, 0(sp); addi sp, sp, 8; div a0, a1, a0"
+            );
         }
 
         #[test]

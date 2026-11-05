@@ -197,8 +197,7 @@ main:
     lw    a0, 0(a0)
     addi  sp, sp, -4
     sw    a0, 0(sp)
-    li    a0, 1
-    neg   a0, a0
+    li    a0, -1
     lw    a1, 0(sp)
     addi  sp, sp, 4
     slli  a0, a0, 2
