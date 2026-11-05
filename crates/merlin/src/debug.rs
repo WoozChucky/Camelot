@@ -963,7 +963,10 @@ impl Lines {
         };
         let mut d = Die::new(tag, &v.name);
         d.attr(AT_LOCATION, Val::Expr(location));
-        d.attr(AT_NAME, Val::Str(v.name.clone()));
+        // An unnamed parameter (`int f(int) { ... }`) has none.
+        if !v.name.is_empty() {
+            d.attr(AT_NAME, Val::Str(v.name.clone()));
+        }
         d.attr(AT_DECL_FILE, self.file_val(v.file));
         d.attr(AT_DECL_LINE, Val::Const(v.line.into()));
         if let Some(t) = v.ty {

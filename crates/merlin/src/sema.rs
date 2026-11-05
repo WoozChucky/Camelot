@@ -755,6 +755,10 @@ impl<'a> FnChecker<'a> {
     }
 
     fn bind(&mut self, name: &str, var: VarRef, ty: &Type, pos: Pos, what: &str) {
+        // An unnamed parameter (`int f(int) { ... }`) is no name.
+        if name.is_empty() {
+            return;
+        }
         let scope = self.scopes.last_mut().expect("at least one scope");
         if let Some((_, _, prev_pos)) = scope.insert(name.to_string(), (var, ty.clone(), pos)) {
             self.err(
@@ -981,6 +985,20 @@ impl<'a> FnChecker<'a> {
     }
 
     fn local_var(&mut self, d: &mut Declarator) {
+        // A block's `extern` declaration, or a function's: in the block the
+        // name is the object or function outside it, which it defines
+        // nothing of.
+        if d.storage == Storage::Extern || d.ty.is_func() {
+            if d.init.is_some() {
+                let msg = "declaration of block scope identifier with linkage cannot have an initializer";
+                self.err(d.pos, msg);
+                return;
+            }
+            let var = VarRef::Global(d.name.clone());
+            self.bind(&d.name, var.clone(), &d.ty, d.pos, "");
+            d.var = Some(var);
+            return;
+        }
         if d.ty.is_void() {
             self.err(d.pos, format!("variable '{}' has incomplete type 'void'", d.name));
             return;
@@ -1169,6 +1187,16 @@ impl<'a> FnChecker<'a> {
             return self.init_expr(ty, e, constant, false);
         };
         let pos = *pos;
+        // `{}` for a scalar (C23's, which clang takes in C99 too) means 0.
+        if items.is_empty() && !ty.is_array() && !ty.is_record() {
+            *init = Init::Expr(Expr {
+                kind: ExprKind::Num(0),
+                ty: Type::INT,
+                pos,
+            });
+            let Init::Expr(e) = init else { unreachable!() };
+            return self.init_expr(ty, e, constant, false);
+        }
         // `{ x }` for a scalar, or `{ "text" }` for a char array, means `x`.
         let unwrap = match &items[..] {
             [Init::Expr(_)] if !ty.is_array() && !ty.is_record() => true,
