@@ -504,13 +504,10 @@ fn arity_error(
     })
 }
 
-/// Whether two declarations of a variable agree: the same type, except that an
-/// array of unknown size matches one of known size.
+/// Whether two declarations of a variable agree: their types are
+/// compatible ([`Type::compatible`]).
 fn compatible(a: &Type, b: &Type) -> bool {
-    match (a, b) {
-        (Type::Array(x, n), Type::Array(y, m)) => x == y && (n == m || n.is_none() || m.is_none()),
-        _ => a == b,
-    }
+    a.compatible(b)
 }
 
 /// A function type declared with `()`, which says nothing of the
@@ -519,23 +516,32 @@ fn unprototyped(f: &FuncType) -> bool {
     f.unprototyped.0 && f.params.is_empty() && !f.variadic
 }
 
+/// clang's warning of two declarations of a function, one without a
+/// prototype and one with parameters (`earlier`, then `later` and whether
+/// it is a definition): C23 makes the one without a prototype take no
+/// parameters, so they conflict there. At the one without.
+fn deprecated_conflict(earlier: (&FuncType, Pos), later: (&FuncType, Pos, bool)) -> Option<Error> {
+    let bare = "a function declaration without a prototype is deprecated in all versions of C and is \
+                treated as a zero-parameter prototype in C23, conflicting with a";
+    let ((a, at), (b, bt, defined)) = (earlier, later);
+    let (msg, here, there) = if unprototyped(a) && !unprototyped(b) && !b.params.is_empty() {
+        let what = if defined { "definition" } else { "declaration" };
+        (format!("{bare} subsequent {what}"), at, bt)
+    } else if unprototyped(b) && !unprototyped(a) && !a.params.is_empty() {
+        (format!("{bare} previous declaration"), bt, at)
+    } else {
+        return None;
+    };
+    Some(Error::warning(here, msg, "deprecated-non-prototype").note(there, "conflicting prototype is here"))
+}
+
 /// Whether two function types are compatible (C99 6.7.5.3p15): the same
 /// (`()` and `(void)` among them), or one without a prototype and the
 /// other with one whose parameters are each what the default argument
 /// promotions make of themselves (no `char`, `short` or `_Bool`), with no
 /// `...`, and the same result.
 fn functions_compatible(a: &FuncType, b: &FuncType) -> bool {
-    if a == b {
-        return true;
-    }
-    let (bare, proto) = if unprototyped(a) {
-        (a, b)
-    } else if unprototyped(b) {
-        (b, a)
-    } else {
-        return false;
-    };
-    bare.ret == proto.ret && !proto.variadic && proto.params.iter().all(|t| promoted(t) == *t.unqual())
+    a.compatible(b)
 }
 
 static VOID: Type = Type::Void;
@@ -562,6 +568,8 @@ struct FuncSig {
     params: Vec<(String, Pos, Spelled)>,
     /// How the latest declaration spelled the result's type.
     spelled: Spelled,
+    /// The type of the definition, if it is `f()`, of no parameters.
+    bare_def: Option<FuncType>,
     /// Declared at file scope (not only in a block, [`Global::hidden`]).
     visible: bool,
 }
@@ -607,6 +615,7 @@ impl Global {
                 def: None,
                 params: Vec::new(),
                 spelled: Spelled::default(),
+                bare_def: None,
                 visible: false,
             }),
             None => Global::Var(GlobalVar {
@@ -687,6 +696,7 @@ impl Checker {
                 .map(|p| (p.name.clone(), p.pos, p.spelled.clone()))
                 .collect(),
             spelled: f.ret_spelled.clone(),
+            bare_def: None,
             visible: true,
         };
         // Functions are visible from their declaration onwards, so a function can
@@ -706,21 +716,18 @@ impl Checker {
                 // One declaration without a prototype and one with
                 // parameters: what C23 makes a conflict, clang warns of, at
                 // the one without (`int f(); int f(int a, int b) {...}`).
-                let bare = "a function declaration without a prototype is deprecated in all versions of C \
-                            and is treated as a zero-parameter prototype in C23, conflicting with a";
-                if unprototyped(&prev.ty) && !unprototyped(&sig.ty) && !sig.ty.params.is_empty() {
-                    let what = if sig.defined { "definition" } else { "declaration" };
-                    let msg = format!("{bare} subsequent {what}");
-                    let w = Error::warning(prev.pos, msg, "deprecated-non-prototype")
-                        .note(f.pos, "conflicting prototype is here");
-                    self.errors.push(w);
-                } else if unprototyped(&sig.ty) && !unprototyped(&prev.ty) && !prev.ty.params.is_empty() {
-                    let msg = format!("{bare} previous declaration");
-                    let w = Error::warning(f.pos, msg, "deprecated-non-prototype")
-                        .note(prev.pos, "conflicting prototype is here");
-                    self.errors.push(w);
+                // Not of a definition `f()`, which conflicts outright.
+                if !(sig.defined && unprototyped(&sig.ty)) {
+                    let w = deprecated_conflict((&prev.ty, prev.pos), (&sig.ty, f.pos, sig.defined));
+                    self.errors.extend(w);
                 }
-                let problem = if !functions_compatible(&prev.ty, &sig.ty) {
+                // A definition with `()` has no parameters, and a prototype
+                // must agree in their number (C99 6.7.5.3p15).
+                let takes = |t: &FuncType| t.has_prototype() && (!t.params.is_empty() || t.variadic);
+                let problem = if !functions_compatible(&prev.ty, &sig.ty)
+                    || (sig.defined && unprototyped(&sig.ty) && takes(&prev.ty))
+                    || (prev.bare_def.is_some() && takes(&sig.ty))
+                {
                     Some((format!("conflicting types for '{}'", f.name), note))
                 } else if let (Some(def), true) = (prev.def, sig.defined) {
                     Some((format!("redefinition of '{}'", f.name), previous(def, true)))
@@ -737,9 +744,14 @@ impl Checker {
                     Some((msg, (at, what))) => self.errors.push(Error::new(f.pos, msg).note(at, what)),
                     None => {
                         // The type the declarations make together: the
-                        // prototype, if one has it.
-                        if unprototyped(&prev.ty) {
-                            prev.ty = sig.ty.clone();
+                        // prototype, if one has it ([`Type::composite`]).
+                        if let Type::Func(c) = Type::Func(Box::new(prev.ty.clone()))
+                            .composite(&Type::Func(Box::new(sig.ty.clone())))
+                        {
+                            prev.ty = *c;
+                        }
+                        if sig.defined && unprototyped(&sig.ty) {
+                            prev.bare_def = Some(sig.ty.clone());
                         }
                         prev.defined |= sig.defined;
                         prev.def = prev.def.or(sig.def);
@@ -954,7 +966,8 @@ impl Checker {
                     d.ty = prev.ty.clone();
                 }
                 if !d.ty.is_array() || d.ty.size(self.xlen).is_some() {
-                    prev.ty = d.ty.clone();
+                    prev.ty = prev.ty.composite(&d.ty);
+                    d.ty = prev.ty.clone();
                 }
                 prev.init = prev.init.or(init);
                 prev.init_pos = prev.init_pos.or(init.map(|_| d.pos));
@@ -3212,7 +3225,7 @@ impl<'a> FnChecker<'a> {
                     )
                 } else if enums_differ(au, to_spelled, bu, from_spelled) {
                     ("incompatible pointer types", Some("incompatible-pointer-types"))
-                } else if au == bu || au.is_void() || bu.is_void() {
+                } else if au.compatible(bu) || au.is_void() || bu.is_void() {
                     if !a.quals().contains(b.quals()) {
                         let msg = format!("{} discards qualifiers", how.phrase(&to_named, named));
                         let flag = "incompatible-pointer-types-discards-qualifiers";
@@ -3444,7 +3457,7 @@ impl<'a> FnChecker<'a> {
     /// not agree with an earlier one of its name: one of no linkage in the
     /// same block, or one with linkage, in a block of this function or of
     /// an earlier one, or at file scope (shown or not). Whether it had one.
-    fn linkage_redeclared(&mut self, d: &Declarator) -> bool {
+    fn linkage_redeclared(&mut self, d: &mut Declarator) -> bool {
         let name = &d.name;
         // A static local's symbol is its own (`f.x`), a declaration's with
         // linkage the name.
@@ -3471,7 +3484,7 @@ impl<'a> FnChecker<'a> {
             return false;
         };
         let msg = match (ty.is_func(), d.ty.is_func()) {
-            (true, true) if ty != d.ty => format!("conflicting types for '{name}'"),
+            (true, true) if !ty.compatible(&d.ty) => format!("conflicting types for '{name}'"),
             (false, false) if !compatible(&ty, &d.ty) => {
                 format!(
                     "redeclaration of '{name}' with a different type: '{}' vs '{ty}'",
@@ -3487,7 +3500,15 @@ impl<'a> FnChecker<'a> {
                 self.errors.push(e);
                 return true;
             }
-            _ => return false,
+            _ => {
+                if let (Some(a), Some(b)) = (ty.func_type(), d.ty.func_type()) {
+                    let w = deprecated_conflict((a, pos), (b, d.pos, false));
+                    self.errors.extend(w);
+                }
+                // The name has the type the declarations make together.
+                d.ty = ty.composite(&d.ty);
+                return false;
+            }
         };
         let (at, what) = previous(pos, definition);
         self.errors.push(Error::new(d.pos, msg).note(at, what));
@@ -4009,8 +4030,18 @@ impl<'a> FnChecker<'a> {
                 };
                 // The function called by name, whose declaration clang's
                 // notes point at and its messages name the parameters of.
-                let sig = match callee.direct_callee().map(|n| (n, globals.get(n))) {
-                    Some((name, Some(Global::Func(sig)))) => Some((name, sig)),
+                // A function declared in a block is the declaration a call
+                // names, as clang's notes have it.
+                let local = callee.direct_callee().and_then(|n| {
+                    let (_, ty, at) = self.lookup(n)?;
+                    match Global::hidden(*at, ty) {
+                        Global::Func(sig) => Some((n, sig)),
+                        Global::Var(_) => None,
+                    }
+                });
+                let sig = match (&local, callee.direct_callee().map(|n| (n, globals.get(n)))) {
+                    (Some((name, sig)), _) => Some((*name, sig)),
+                    (None, Some((name, Some(Global::Func(sig))))) => Some((name, sig)),
                     _ => None,
                 };
                 if unprototyped(&ft) {
@@ -4018,9 +4049,8 @@ impl<'a> FnChecker<'a> {
                     // are, and passed as named ones. To a definition with
                     // `()`, which has none, clang warns of them; and of any
                     // to what has no prototype, as C23 has none.
-                    if let (Some(first), Some((name, s))) = (args.first(), sig) {
+                    if let (false, Some((name, s))) = (args.is_empty(), sig) {
                         if s.def.is_some() {
-                            let _ = first;
                             let msg = format!("too many arguments in call to '{name}'");
                             self.errors.push(Error::warning_unflagged(*close, msg));
                         }
@@ -4442,7 +4472,7 @@ impl<'a> FnChecker<'a> {
                     (Type::Ptr(a), Type::Ptr(b)) => {
                         let (au, bu) = (a.unqual(), b.unqual());
                         let void = equality && (au.is_void() || bu.is_void());
-                        if (au != bu || enums_differ(au, &ls, bu, &rs)) && !void {
+                        if (!au.compatible(bu) || enums_differ(au, &ls, bu, &rs)) && !void {
                             let msg = format!("comparison of distinct pointer types {pair}");
                             self.errors
                                 .push(Error::warning(pos, msg, "compare-distinct-pointer-types"));
@@ -5259,8 +5289,8 @@ impl<'a> FnChecker<'a> {
             // the result points to it with every qualifier of either side.
             (Type::Ptr(x), Type::Ptr(y)) => {
                 let q = x.quals().union(y.quals());
-                let to = if x.unqual() == y.unqual() {
-                    x.unqual().clone()
+                let to = if x.unqual().compatible(y.unqual()) {
+                    x.unqual().composite(y.unqual())
                 } else {
                     if !x.is_void() && !y.is_void() {
                         let msg = format!("pointer type mismatch ('{at}' and '{bt}')");

@@ -444,21 +444,48 @@ pub struct FuncType {
     pub unprototyped: Unprototyped,
 }
 
-/// Whether a function type was declared with `()` ([`FuncType`]). Any two
-/// compare equal: `int ()` is compatible with `int (void)`.
-#[derive(Clone, Copy, Debug, Default)]
+/// Whether a function type was declared with `()` ([`FuncType`]): part of
+/// the type, so `int ()` is not `int (void)`, though the two are
+/// compatible ([`Type::compatible`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Unprototyped(pub bool);
 
-impl PartialEq for Unprototyped {
-    fn eq(&self, _: &Self) -> bool {
-        true
+impl FuncType {
+    /// Whether the type has a prototype: all but `()`, which says nothing
+    /// of the parameters (C99 6.7.5.3p14).
+    pub fn has_prototype(&self) -> bool {
+        !(self.unprototyped.0 && self.params.is_empty() && !self.variadic)
     }
-}
 
-impl Eq for Unprototyped {}
-
-impl Hash for Unprototyped {
-    fn hash<H: Hasher>(&self, _: &mut H) {}
+    /// Whether two function types are compatible (C99 6.7.5.3p15): their
+    /// results are, and, with prototypes both, so are their parameters in
+    /// number, `...` and each type (unqualified); one without a prototype is
+    /// compatible with a prototype whose parameters are each what the
+    /// default argument promotions make of themselves (no `char`, `short`
+    /// or `_Bool`), with no `...`.
+    pub fn compatible(&self, other: &FuncType) -> bool {
+        if !self.ret.compatible(&other.ret) {
+            return false;
+        }
+        let promotes_to_itself = |t: &Type| match t.unqual() {
+            Type::Int(k) => k.promoted() == *k,
+            _ => true,
+        };
+        match (self.has_prototype(), other.has_prototype()) {
+            (true, true) => {
+                self.variadic == other.variadic
+                    && self.params.len() == other.params.len()
+                    && self
+                        .params
+                        .iter()
+                        .zip(&other.params)
+                        .all(|(a, b)| a.unqual().compatible(b.unqual()))
+            }
+            (false, false) => true,
+            (true, false) => !self.variadic && self.params.iter().all(promotes_to_itself),
+            (false, true) => !other.variadic && other.params.iter().all(promotes_to_itself),
+        }
+    }
 }
 
 /// The declared type and [`Spelled`] of each parameter of a function type,
@@ -806,6 +833,54 @@ impl Type {
             Type::Int(k) => !k.promoted().signed(),
             Type::Ptr(_) | Type::Array(..) | Type::Func(_) => true,
             _ => false,
+        }
+    }
+
+    /// Whether two types are compatible (C99 6.2.7): the same, but that an
+    /// array of unknown size is compatible with one of a size, and function
+    /// types as [`FuncType::compatible`] has them, at any depth (a pointer
+    /// to one, an array of them, a parameter of one).
+    pub fn compatible(&self, other: &Type) -> bool {
+        match (self, other) {
+            (Type::Qual(x, p), Type::Qual(y, q)) => p == q && x.compatible(y),
+            (Type::Qual(..), _) | (_, Type::Qual(..)) => false,
+            (Type::Ptr(x), Type::Ptr(y)) => x.compatible(y),
+            (Type::Array(x, n), Type::Array(y, m)) => {
+                x.compatible(y) && (n == m || n.is_none() || m.is_none())
+            }
+            (Type::Func(f), Type::Func(g)) => f.compatible(g),
+            _ => self == other,
+        }
+    }
+
+    /// The composite type of two compatible types (C99 6.2.7p3): an
+    /// array's size if one has it, a function's prototype if one has it,
+    /// part by part.
+    pub fn composite(&self, other: &Type) -> Type {
+        match (self, other) {
+            (Type::Qual(x, q), Type::Qual(y, _)) => Type::Qual(Box::new(x.composite(y)), *q),
+            (Type::Ptr(x), Type::Ptr(y)) => Type::ptr(x.composite(y)),
+            (Type::Array(x, n), Type::Array(y, m)) => Type::Array(Box::new(x.composite(y)), n.or(*m)),
+            (Type::Func(f), Type::Func(g)) => {
+                let ret = f.ret.composite(&g.ret);
+                let mut c = match (f.has_prototype(), g.has_prototype()) {
+                    (false, true) => (**g).clone(),
+                    (true, true) => {
+                        let mut c = (**f).clone();
+                        c.params = f
+                            .params
+                            .iter()
+                            .zip(&g.params)
+                            .map(|(a, b)| a.composite(b))
+                            .collect();
+                        c
+                    }
+                    _ => (**f).clone(),
+                };
+                c.ret = ret;
+                Type::Func(Box::new(c))
+            }
+            _ => self.clone(),
         }
     }
 

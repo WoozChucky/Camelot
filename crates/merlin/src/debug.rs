@@ -536,9 +536,9 @@ enum TypeNode {
     Record(Arc<Record>, Vec<(String, Option<usize>, u32, u32, u32)>, u32, u32),
     /// `const` (true) or `volatile` (false) of the type (none: `void`).
     Qual(bool, Option<usize>),
-    /// A function type: what it returns, what it takes, and whether `...`
-    /// follows.
-    Func(Option<usize>, Vec<Option<usize>>, bool),
+    /// A function type: what it returns, what it takes, whether `...`
+    /// follows, and whether it has a prototype (`int ()` has none).
+    Func(Option<usize>, Vec<Option<usize>>, bool, bool),
     /// A typedef name: what it stands for, and its `.file` number and
     /// position.
     Typedef(String, Option<usize>, u32, Pos),
@@ -557,7 +557,7 @@ enum TypeKey {
     Array(usize, Vec<Option<u32>>),
     Record(usize),
     Qual(bool, Option<usize>),
-    Func(Option<usize>, Vec<Option<usize>>, bool),
+    Func(Option<usize>, Vec<Option<usize>>, bool, bool),
     Spelling(usize),
 }
 
@@ -1033,8 +1033,11 @@ impl Lines {
                         None => self.type_of(p, &none),
                     })
                     .collect();
-                let key = TypeKey::Func(ret, params.clone(), f.variadic);
-                Some(self.intern(key, || TypeNode::Func(ret, params, f.variadic)))
+                // `int ()` says nothing of its parameters, which clang
+                // describes apart from `int (void)`.
+                let prototyped = !(f.unprototyped.0 && f.params.is_empty() && !f.variadic);
+                let key = TypeKey::Func(ret, params.clone(), f.variadic, prototyped);
+                Some(self.intern(key, || TypeNode::Func(ret, params, f.variadic, prototyped)))
             }
         }
     }
@@ -1556,19 +1559,22 @@ impl Lines {
                 typed(&mut d, *of);
                 d
             }
-            TypeNode::Func(ret, params, variadic) => {
+            TypeNode::Func(ret, params, variadic, prototyped) => {
                 let mut d = Die::new(TAG_SUBROUTINE_TYPE, "a function type");
                 // The return type first, then the flag, as LLVM's
                 // `constructTypeDIE` adds them: the abbreviation lists the
-                // attributes in this order.
+                // attributes in this order. A type without a prototype has
+                // no flag, and its unknown parameters are `...`'s entry.
                 typed(&mut d, *ret);
-                d.attr(AT_PROTOTYPED, Val::Flag);
+                if *prototyped {
+                    d.attr(AT_PROTOTYPED, Val::Flag);
+                }
                 for p in params {
                     let mut pd = Die::new(TAG_FORMAL_PARAMETER, "a parameter");
                     typed(&mut pd, *p);
                     d.children.push(pd);
                 }
-                if *variadic {
+                if *variadic || !*prototyped {
                     d.children
                         .push(Die::new(TAG_UNSPECIFIED_PARAMETERS, "the variadic arguments"));
                 }
