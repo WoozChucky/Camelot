@@ -7,10 +7,10 @@ pub fn cases() -> Vec<Case> {
     vec![
         // stringizing_spaces_and_quotes
         case("#define s(x) #x\nconst char *p = s(\\);", &["2:19: warning: invalid string literal, ignoring final '\\'"]),
-        case("#define s(x) #x\ns(a \\)", &["2:5: warning: invalid string literal, ignoring final '\\'", "2:1: error: expected identifier or '('"]),
+        case("#define s(x) #x\ns(a \\)", &["2:5: warning: invalid string literal, ignoring final '\\'", "2:1: error: expected identifier or '('"]).partial("merlin gives no notes of where a macro was expanded"),
         // pasting
-        case("#define cat(a, b) a ## b\ncat(+, -)", &["2:1: error: pasting formed '+-', an invalid preprocessing token", "2:1: error: expected external declaration"]).then(&["2:8: error: expected external declaration"]),
-        case("#define cat(a, b) a ## b\ncat(/, /)", &["2:1: error: pasting formed '//', an invalid preprocessing token", "2:1: error: expected identifier or '('"]),
+        case("#define cat(a, b) a ## b\ncat(+, -)", &["2:1: error: pasting formed '+-', an invalid preprocessing token", "2:1: error: expected external declaration"]).then(&["2:8: error: expected external declaration"]).partial("merlin gives no notes of where a macro was expanded"),
+        case("#define cat(a, b) a ## b\ncat(/, /)", &["2:1: error: pasting formed '//', an invalid preprocessing token", "2:1: error: expected identifier or '('"]).partial("merlin gives no notes of where a macro was expanded"),
         // file_and_line
         case("#line 0", &[]),
         case("#line x", &["1:7: error: #line directive requires a positive integer argument"]),
@@ -41,7 +41,7 @@ pub fn cases() -> Vec<Case> {
         case("#if 1.0\n#endif", &["1:5: error: floating point literal in preprocessor expression"]),
         case("#if defined\n#endif", &["1:12: error: macro name missing"]),
         case("#if defined(X\n#endif", &["1:14: error: missing ')' after 'defined'", "1:12: note: to match this '('"]),
-        case("#define D defined(X)\n#if D\n#endif", &["2:5: warning: macro expansion producing 'defined' has undefined behavior [-Wexpansion-to-defined]"]),
+        case("#define D defined(X)\n#if D\n#endif", &["2:5: warning: macro expansion producing 'defined' has undefined behavior [-Wexpansion-to-defined]"]).partial("merlin gives no notes of where a macro was expanded"),
         // conditional_errors
         case("#if 1\nx", &["1:2: error: unterminated conditional directive", "2:1: error: unknown type name 'x'"]).then(&["2:2: error: expected identifier or '('"]),
         case("#if 0\nx", &["1:2: error: unterminated conditional directive"]),
@@ -87,7 +87,7 @@ pub fn cases() -> Vec<Case> {
         // assembly_directives
         // Which `#` lines are directives in assembly, and errors.
         case("#warn\n", &["1:2: error: invalid preprocessing directive"]),
-        case("#define P(a, b) a ## b\nP(., x)", &["2:1: error: pasting formed '.x', an invalid preprocessing token", "2:1: error: expected identifier or '('"]),
+        case("#define P(a, b) a ## b\nP(., x)", &["2:1: error: pasting formed '.x', an invalid preprocessing token", "2:1: error: expected identifier or '('"]).partial("merlin gives no notes of where a macro was expanded"),
         case("??=", &["1:1: warning: trigraph converted to '#' character [-Wtrigraphs]"]),
     ]
 }

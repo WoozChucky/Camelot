@@ -245,8 +245,8 @@ pub fn cases() -> Vec<Case> {
         case("struct p { int x; }; int f(void) { struct p a; return a == a; }", &["1:57: warning: self-comparison always evaluates to true [-Wtautological-compare]", "1:57: error: invalid operands to binary expression ('struct p' and 'struct p')"]),
         case("struct p { const int x; int y; }; int f(struct p a, struct p b) { a.y = 1; a = b; return 0; }", &["1:78: error: cannot assign to variable 'a' with const-qualified data member 'x'", "1:22: note: data member 'x' declared const here"]),
         case("struct p; struct p g; int f() { return 0; }", &["1:20: error: tentative definition has type 'struct p' that is never completed", "1:8: note: forward declaration of 'struct p'"]),
-        case("struct p; int f(struct p a) { return 0; }", &["1:26: error: variable has incomplete type 'struct p'"]),
-        case("struct p; struct p f(void) { }", &["1:20: error: incomplete result type 'struct p' in function definition"]),
+        case("struct p; int f(struct p a) { return 0; }", &["1:26: error: variable has incomplete type 'struct p'", "1:8: note: forward declaration of 'struct p'"]),
+        case("struct p; struct p f(void) { }", &["1:20: error: incomplete result type 'struct p' in function definition", "1:8: note: forward declaration of 'struct p'"]),
         case("struct p; struct p f(void); int g() { f(); return 0; }", &["1:39: error: calling 'f' with incomplete return type 'struct p'", "1:20: note: 'f' declared here", "1:8: note: forward declaration of 'struct p'"]),
         // compound_literals
         case("int f() { return (void){0}; }", &["1:18: error: variable has incomplete type 'void'"]),

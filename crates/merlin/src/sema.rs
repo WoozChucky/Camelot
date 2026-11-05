@@ -740,15 +740,23 @@ impl Checker {
         // A definition needs complete parameter and result types.
         for p in &f.params {
             if p.ty.is_record() && p.ty.size(self.xlen).is_none() {
-                self.err(p.pos, format!("variable has incomplete type '{}'", p.ty));
+                let mut e = Error::new(p.pos, format!("variable has incomplete type '{}'", p.ty));
+                if let Some(r) = p.ty.record() {
+                    e = e.note(r.pos, format!("forward declaration of '{}'", r.name()));
+                }
+                self.errors.push(e);
             }
         }
         let ret_complete = !f.ret.is_record() || f.ret.size(self.xlen).is_some();
         if !ret_complete {
-            self.err(
+            let mut e = Error::new(
                 f.pos,
                 format!("incomplete result type '{}' in function definition", f.ret),
             );
+            if let Some(r) = f.ret.record() {
+                e = e.note(r.pos, format!("forward declaration of '{}'", r.name()));
+            }
+            self.errors.push(e);
         }
         let body = f.body.as_mut().expect("checked above");
         let mut c = FnChecker {

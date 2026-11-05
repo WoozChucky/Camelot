@@ -17,13 +17,21 @@
 //!
 //!       cargo test -p merlin --test diagnostics -- --ignored
 //!
+//!   With `MERLIN_BLESS=1`, a row clang disagrees with is rewritten to
+//!   clang's lines, with the notes merlin gives (and so is one where merlin
+//!   gives more of clang's notes than the row has); rows with `.then`,
+//!   `.merlin` or `.partial`, of one width, or that span lines are left to
+//!   edit by hand:
+//!
+//!       MERLIN_BLESS=1 cargo test -p merlin --test diagnostics -- --ignored clang_gives
+//!
 //! * `clang_warns_as_merlin_does_on_the_programs` (ignored: needs clang):
 //!   on every whole program of merlin's tests (`tests/cases`,
 //!   `tests/cases-merlin`, `tests/multi`) and every C file of the Camelot
 //!   kernel and its user programs, merlin and clang give the same
 //!   diagnostics, the default warnings clang gives on them included.
 //!
-//! A row may say three more things (the spec, "Diagnostics", says why each
+//! A row may say four more things (the spec, "Diagnostics", says why each
 //! is so):
 //!
 //! * `.then(...)`: what clang reports after a syntax error, at which
@@ -31,6 +39,9 @@
 //! * `.merlin(why)`: a diagnostic of merlin's own, for what clang takes and
 //!   merlin's language has not (a variable-length array, `float`): clang
 //!   gives no error on the source.
+//! * `.partial(why)`: the row's notes are some of clang's, in order, where
+//!   merlin gives fewer (of where a macro was expanded); otherwise a row's
+//!   notes are exactly clang's.
 //! * `.rv32()`, `.rv64()`: a row of one target, where clang's diagnostics
 //!   differ with the width.
 //!
@@ -67,6 +78,8 @@ pub struct Case {
     then: Vec<String>,
     /// Why the diagnostic is merlin's own: clang takes the source.
     merlin: Option<&'static str>,
+    /// Why the row's notes are only some of clang's (merlin gives fewer).
+    partial: Option<&'static str>,
     /// The one target the row is for, or both.
     xlen: Option<Xlen>,
     /// `-D` and `-U` options, in order (`-DN=1`, `-UN`).
@@ -85,6 +98,7 @@ pub fn case(src: impl Into<String>, want: &[&str]) -> Case {
         want: want.iter().map(|s| s.to_string()).collect(),
         then: Vec::new(),
         merlin: None,
+        partial: None,
         xlen: None,
         args: Vec::new(),
     }
@@ -108,6 +122,13 @@ impl Case {
     pub fn merlin(self, why: &'static str) -> Case {
         Case {
             merlin: Some(why),
+            ..self
+        }
+    }
+
+    pub fn partial(self, why: &'static str) -> Case {
+        Case {
+            partial: Some(why),
             ..self
         }
     }
@@ -337,9 +358,9 @@ fn scratch(name: &str) -> std::path::PathBuf {
 }
 
 /// Whether clang's diagnostics `got` are what the row says: its errors
-/// and warnings, in clang's order (then those merlin stops before), each of
-/// its notes among those clang gives with the diagnostic; for a row of
-/// merlin's own, no error.
+/// and warnings, in clang's order (then those merlin stops before), each
+/// with clang's notes, or with some of them, in order, for a row marked
+/// `.partial`; for a row of merlin's own, no error.
 fn agrees(c: &Case, got: &[(String, Vec<String>)]) -> bool {
     if c.merlin.is_some() {
         return !got
@@ -349,10 +370,14 @@ fn agrees(c: &Case, got: &[(String, Vec<String>)]) -> bool {
     let want = grouped(&[c.want.clone(), c.then.clone()].concat());
     want.len() == got.len()
         && want.iter().zip(got).all(|((w, wn), (g, gn))| {
-            w == g && {
-                let mut gn = gn.iter();
-                wn.iter().all(|n| gn.any(|g| g == n))
-            }
+            w == g
+                && match c.partial {
+                    None => wn == gn,
+                    Some(_) => {
+                        let mut gn = gn.iter();
+                        wn.iter().all(|n| gn.any(|g| g == n))
+                    }
+                }
         })
 }
 

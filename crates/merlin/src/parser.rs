@@ -164,6 +164,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         prototype: RefCell::new(Vec::new()),
         folding: Cell::new(false),
         salvaged: RefCell::new(Vec::new()),
+        type_open: Cell::new(Pos::default()),
         undeclared: RefCell::new(Vec::new()),
         partial: RefCell::new(None),
         parens: RefCell::new(None),
@@ -616,6 +617,8 @@ struct Parser<'a> {
     /// The statements of the blocks a syntax error cut short, the innermost
     /// first, and the function they make up so far ([`parse_salvaging`]).
     salvaged: RefCell<Vec<Vec<Stmt>>>,
+    /// Where the `(` around the type name being read is.
+    type_open: Cell<Pos>,
     /// The names read as expressions that nothing declares (not called:
     /// that is an implicit declaration), in order, kept for a syntax error
     /// in the statement or declaration they are in: clang checks them as
@@ -788,14 +791,15 @@ impl Parser<'_> {
                 )),
             },
             Some((prev, _)) if *prev == what && !matches!(what, Name::EnumConst(..)) => Ok(()),
-            Some((Name::Typedef(prev, _), _)) if matches!(what, Name::Typedef(..)) => {
+            Some((Name::Typedef(prev, _), prev_pos)) if matches!(what, Name::Typedef(..)) => {
                 let Name::Typedef(new, _) = what else {
                     unreachable!()
                 };
                 Err(Error::new(
                     pos,
                     format!("typedef redefinition with different types ('{new}' vs '{prev}')"),
-                ))
+                )
+                .note(*prev_pos, "previous definition is here"))
             }
             Some((Name::EnumConst(..), prev_pos)) if matches!(what, Name::EnumConst(..)) => {
                 Err(redefinition(format!("enumerator '{name}'"), *prev_pos))
@@ -1921,7 +1925,8 @@ impl Parser<'_> {
             (name, pos, inner)
         } else if let Tok::Ident(name) = self.peek().clone() {
             if ctx == Ctx::TypeName {
-                return Err(self.expected("')'"));
+                let open = self.type_open.get();
+                return Err(self.expected("')'").note(open, "to match this '('"));
             }
             self.advance();
             (name, pos, Vec::new())
@@ -2367,15 +2372,17 @@ impl Parser<'_> {
     /// A type name, for casts and `sizeof`: specifiers and a declarator
     /// without a name (`int`, `char *[4]`, `int (*)(void)`), no compound
     /// literal's.
-    fn type_name(&mut self) -> Result<Type, Error> {
-        let (d, _) = self.type_name_decl()?;
+    fn type_name(&mut self, open: Pos) -> Result<Type, Error> {
+        let (d, _) = self.type_name_decl(open)?;
         self.type_name_folded(&d, None);
         Ok(d.ty)
     }
 
-    /// A type name's declarator, and how it spelled its base (for `-g`).
-    /// What it folded is for its use to say ([`Self::type_name_folded`]).
-    fn type_name_decl(&mut self) -> Result<(Decl, Spelled), Error> {
+    /// A type name's declarator, and how it spelled its base (for `-g`),
+    /// in parentheses opened at `open`. What it folded is for its use to
+    /// say ([`Self::type_name_folded`]).
+    fn type_name_decl(&mut self, open: Pos) -> Result<(Decl, Spelled), Error> {
+        self.type_open.set(open);
         let specs = self.specifiers(Ctx::TypeName)?;
         let d = self.declarator(&specs.ty, Ctx::TypeName)?;
         Ok((d, specs.spelled))
@@ -2832,12 +2839,16 @@ impl Parser<'_> {
                 };
                 let msg = msg.map(|m| format!(": {m}")).unwrap_or_default();
                 let failed = match self.failed_requirement(&original, &cond, &printer) {
-                    Some(term) => {
+                    Some((term, value)) => {
                         let what = printer.expr(term, true);
-                        Error::new(
+                        let e = Error::new(
                             printer.begin(term, true),
                             format!("static assertion failed due to requirement '{what}'{msg}"),
-                        )
+                        );
+                        match self.evaluates_to(term, value, &printer) {
+                            Some((at, note)) => e.note(at, note),
+                            None => e,
+                        }
                     }
                     None => Error::new(at, format!("static assertion failed{msg}")),
                 };
@@ -2864,8 +2875,13 @@ impl Parser<'_> {
     /// condition, or `None` if that is an integer literal itself. Each
     /// term of the condition as written (`original`) is evaluated as the
     /// parser has resolved it (`resolved`, of the same shape).
-    fn failed_requirement<'e>(&self, original: &'e Expr, resolved: &Expr, p: &Printer) -> Option<&'e Expr> {
-        fn terms<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    fn failed_requirement<'e, 'r>(
+        &self,
+        original: &'e Expr,
+        resolved: &'r Expr,
+        p: &Printer,
+    ) -> Option<(&'e Expr, &'r Expr)> {
+        fn terms<'x>(e: &'x Expr, out: &mut Vec<&'x Expr>) {
             match &e.kind {
                 ExprKind::Binary(BinOp::LogAnd, l, r) => {
                     terms(l, out);
@@ -2882,10 +2898,42 @@ impl Parser<'_> {
             .zip(&values)
             .find(|(w, v)| !p.is_integer_literal(w) && consteval::parsed_int(v, self.xlen) == Some(0));
         match failed {
-            Some((w, _)) => Some(w),
+            Some((w, v)) => Some((w, v)),
             None if p.is_integer_literal(original) => None,
-            None => Some(original),
+            None => Some((original, resolved)),
         }
+    }
+
+    /// clang's note on a failed `_Static_assert` of a binary operator (not
+    /// `&&` or `||`): what its operands evaluate to (`expression evaluates to '2 ==
+    /// 3'`), at the operator, unless both are plain to see, literals or
+    /// what unary operators make of them. `written` is the term as written,
+    /// `value` as the parser resolved it.
+    fn evaluates_to(&self, written: &Expr, value: &Expr, p: &Printer) -> Option<(Pos, String)> {
+        let (ExprKind::Binary(op, wl, wr), ExprKind::Binary(_, l, r)) = (&written.kind, &value.kind) else {
+            return None;
+        };
+        if matches!(op, BinOp::LogOr | BinOp::LogAnd) {
+            return None;
+        }
+        fn plain(e: &Expr, p: &Printer) -> bool {
+            match &e.kind {
+                ExprKind::Unary(_, x) => plain(x, p),
+                ExprKind::Num(_) => p.token(e.pos).is_some_and(|t| matches!(t.tok, Tok::Num(..))),
+                _ => false,
+            }
+        }
+        if plain(wl, p) && plain(wr, p) {
+            return None;
+        }
+        let (a, b) = (
+            consteval::parsed_int(l, self.xlen)?,
+            consteval::parsed_int(r, self.xlen)?,
+        );
+        Some((
+            value.pos,
+            format!("expression evaluates to '{a} {} {b}'", op.symbol()),
+        ))
     }
 
     /// `int a = 1, *b;`, or `None` for one that only declares types.
@@ -3268,7 +3316,7 @@ impl Parser<'_> {
             }
             Tok::Punct("(") if self.type_name_follows() => {
                 self.advance();
-                let (d, spelled) = self.type_name_decl()?;
+                let (d, spelled) = self.type_name_decl(pos)?;
                 self.expect_close(")", pos)?;
                 let literal = self.is_punct("{");
                 self.type_name_folded(&d, literal.then_some(pos));
@@ -3294,7 +3342,7 @@ impl Parser<'_> {
                 self.advance();
                 if self.is_punct("(") && self.type_name_follows() {
                     let at = self.advance().pos;
-                    let (d, _) = self.type_name_decl()?;
+                    let (d, _) = self.type_name_decl(at)?;
                     self.expect_close(")", at)?;
                     let literal = self.is_punct("{");
                     self.type_name_folded(&d, literal.then_some(at));
@@ -3550,7 +3598,7 @@ impl Parser<'_> {
             "__builtin_va_arg" => {
                 self.expect_punct(",")?;
                 let at = self.here();
-                let ty = self.type_name()?;
+                let ty = self.type_name(open)?;
                 self.expect_close(")", open)?;
                 return Ok(Expr {
                     id: ExprId::new(),

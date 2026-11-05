@@ -8,7 +8,7 @@ pub fn cases() -> Vec<Case> {
         // typedefs
         // The declarators of a `typedef`, each binding a name to its type.
         case("typedef int T; int f() { return T; }", &["1:33: error: unexpected type name 'T': expected expression"]),
-        case("typedef int T; typedef char T;", &["1:29: error: typedef redefinition with different types ('char' vs 'int')"]),
+        case("typedef int T; typedef char T;", &["1:29: error: typedef redefinition with different types ('char' vs 'int')", "1:13: note: previous definition is here"]),
         case("typedef int x = 1;", &["1:13: error: illegal initializer (only variables can be initialized)"]),
         case("int T; typedef int T;", &["1:20: error: redefinition of 'T' as different kind of symbol", "1:5: note: previous definition is here"]),
         // array_parameter_qualifiers
@@ -114,7 +114,7 @@ pub fn cases() -> Vec<Case> {
         case("int f() { do ; while (1) }", &["1:25: error: expected ';' after do/while statement"]),
         case("int f() { for (static int i = 0;;) ; }", &[]),
         // casts_and_sizeof
-        case("int f() { return (int x)1; }", &["1:23: error: expected ')'"]),
+        case("int f() { return (int x)1; }", &["1:23: error: expected ')'", "1:18: note: to match this '('"]),
         case("int f() { return (static int)1; }", &["1:19: error: expected expression"]),
         // missing_semicolon
         case("int x; int f() { x = 1 }", &["1:23: error: expected ';' after expression"]),
@@ -150,10 +150,10 @@ pub fn cases() -> Vec<Case> {
         case("int f(...);", &["1:7: error: ISO C requires a named parameter before '...'"]),
         case("int f(int a, ..., int b);", &["1:17: error: expected ')'", "1:6: note: to match this '('"]),
         // static_assertions
-        case("_Static_assert(1 + 1 == 3, \"math\");", &["1:16: error: static assertion failed due to requirement '1 + 1 == 3': math"]),
+        case("_Static_assert(1 + 1 == 3, \"math\");", &["1:16: error: static assertion failed due to requirement '1 + 1 == 3': math", "1:22: note: expression evaluates to '2 == 3'"]),
         case("int x; _Static_assert(x, \"x\");", &["1:23: error: static assertion expression is not an integral constant expression"]),
         case("_Static_assert(1);", &["1:17: warning: '_Static_assert' with no message is a C23 extension [-Wc23-extensions]"]),
-        case("struct s { char c; int n; }; _Static_assert((unsigned long)&((struct s *)0)->n == 0, \"n\");", &["1:45: error: static assertion failed due to requirement '(unsigned long)&((struct s *)0)->n == 0': n"]),
+        case("struct s { char c; int n; }; _Static_assert((unsigned long)&((struct s *)0)->n == 0, \"n\");", &["1:45: error: static assertion failed due to requirement '(unsigned long)&((struct s *)0)->n == 0': n", "1:80: note: expression evaluates to '4 == 0'"]),
         // variadic_functions
         case("int f() { __builtin_va_list ap; __builtin_va_arg(ap); }", &["1:52: error: expected ','"]).then(&["1:53: error: expected a type", "1:53: error: expected ')'"]),
         case("int f(void) { __builtin_va_list ap; __builtin_va_start(ap); return 0; }", &["1:58: error: too few arguments to function call, expected 2, have 1"]),
@@ -214,8 +214,8 @@ pub fn cases() -> Vec<Case> {
         case("int f(void) { while 1; }", &["1:21: error: expected '(' after 'while'"]),
         case("int f(void) { do ; while 1; }", &["1:26: error: expected '(' after 'do/while'"]),
         case("int f(void) { for ;; }", &["1:19: error: expected '(' after 'for'"]),
-        case("int f(void) { int i; for (i = 0; i < 3 i++) ; return 0; }", &["1:40: error: expected ';' in 'for' statement specifier"]).then(&["1:45: warning: for loop has empty body [-Wempty-body]"]),
-        case("int f(void) { for (int i = 0 i < 2; i++) ; return 0; }", &["1:30: error: expected ';' in 'for' statement specifier"]).then(&["1:42: warning: for loop has empty body [-Wempty-body]"]),
+        case("int f(void) { int i; for (i = 0; i < 3 i++) ; return 0; }", &["1:40: error: expected ';' in 'for' statement specifier"]).then(&["1:45: warning: for loop has empty body [-Wempty-body]", "1:45: note: put the semicolon on a separate line to silence this warning"]),
+        case("int f(void) { for (int i = 0 i < 2; i++) ; return 0; }", &["1:30: error: expected ';' in 'for' statement specifier"]).then(&["1:42: warning: for loop has empty body [-Wempty-body]", "1:42: note: put the semicolon on a separate line to silence this warning"]),
         case("int f(void) { int i; for (i = 0; i < 3; i++ ; return 0; }", &["1:45: error: expected ')'", "1:26: note: to match this '('"]),
         case("int f(void) { if (1) }", &["1:22: error: expected statement"]),
         case("int f(void) { goto x }", &["1:21: error: expected ';' after goto statement"]).then(&["1:20: error: use of undeclared label 'x'"]),
@@ -232,9 +232,10 @@ pub fn cases() -> Vec<Case> {
         case("_Static_assert((1 == 2), \"x\");", &["1:17: error: static assertion failed due to requirement '1 == 2': x"]),
         case("_Static_assert(1 && (0 || 0), \"x\");", &["1:22: error: static assertion failed due to requirement '0 || 0': x"]),
         case("_Static_assert((1 && 0) && 1, \"x\");", &["1:16: error: static assertion failed due to requirement '(1 && 0) && 1': x"]),
-        case("_Static_assert(0x10L - 16LL + 0UL - 0x0ull, \"x\");", &["1:16: error: static assertion failed due to requirement '16L - 16LL + 0UL - 0ULL': x"]),
+        case("_Static_assert(0x10L - 16LL + 0UL - 0x0ull, \"x\");", &["1:16: error: static assertion failed due to requirement '16L - 16LL + 0UL - 0ULL': x", "1:35: note: expression evaluates to '0 - 0'"]),
         case("_Static_assert(0xffffffff == 0 || '\\0' || 'a' == 0, \"x\");", &["1:16: error: static assertion failed due to requirement '4294967295U == 0 || '\\x00' || 'a' == 0': x"]),
-        case("typedef int T; int x; _Static_assert(sizeof(T) + sizeof x + sizeof(int (*)[2]) == 0, \"x\");", &["1:38: error: static assertion failed due to requirement 'sizeof(int) + sizeof x + sizeof(int (*)[2]) == 0': x"]),
+        case("typedef int T; int x; _Static_assert(sizeof(T) + sizeof x + sizeof(int (*)[2]) == 0, \"x\");", &["1:38: error: static assertion failed due to requirement 'sizeof(int) + sizeof x + sizeof(int (*)[2]) == 0': x", "1:80: note: expression evaluates to '12 == 0'"]).rv32(),
+        case("typedef int T; int x; _Static_assert(sizeof(T) + sizeof x + sizeof(int (*)[2]) == 0, \"x\");", &["1:38: error: static assertion failed due to requirement 'sizeof(int) + sizeof x + sizeof(int (*)[2]) == 0': x", "1:80: note: expression evaluates to '16 == 0'"]).rv64(),
         case("_Static_assert(-(1) + 1 ? ~0 + 1 : !!0, \"x\");", &["1:16: error: static assertion failed due to requirement '-(1) + 1 ? ~0 + 1 : !!0': x"]),
         case("_Static_assert(1, 2);", &["1:19: error: expected string literal for diagnostic message in static_assert"]),
         case("_Static_assert(1 \"a\");", &["1:17: error: expected ','"]).then(&["1:21: error: expected identifier or '('"]),
