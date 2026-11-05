@@ -88,8 +88,8 @@ use crate::ast::*;
 use crate::consteval;
 use crate::lexer::{Kw, Tok, Token};
 use crate::types::{
-    align_up, common, ptr_size, EnumType, IntKind, Quals, Record, Spelled, Spelling, Type, TypedefName, Xlen,
-    MAX_OBJECT_SIZE,
+    align_up, common, ptr_size, EnumType, IntKind, Quals, Record, Spelled, Spelling, Spellings, Type,
+    TypedefName, Xlen, MAX_OBJECT_SIZE,
 };
 use crate::{Error, Pos};
 use std::cell::{Cell, RefCell};
@@ -1453,6 +1453,10 @@ impl Parser<'_> {
                     } else {
                         Type::func(ret, types)
                     };
+                    if let Type::Func(f) = &mut ty {
+                        f.spelled =
+                            Spellings(params.iter().map(|p| (p.ty.clone(), p.spelled.clone())).collect());
+                    }
                     size = None;
                     if i + 1 == steps {
                         func = Some((params, scope));

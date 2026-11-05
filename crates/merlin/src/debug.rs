@@ -722,10 +722,17 @@ impl Lines {
             }
             Type::Func(f) => {
                 let ret = self.type_of(&f.ret, spelled);
+                // Each parameter as its declaration has it (`int
+                // (*read)(const pagetable_t)`), as clang describes them.
+                let none = Spelled::default();
                 let params: Vec<Option<usize>> = f
                     .params
                     .iter()
-                    .map(|p| self.type_of(p, &Spelled::default()))
+                    .enumerate()
+                    .map(|(i, p)| match f.spelled.0.get(i) {
+                        Some((declared, spelled)) => self.type_of(declared, spelled),
+                        None => self.type_of(p, &none),
+                    })
                     .collect();
                 let key = TypeKey::Func(ret, params.clone(), f.variadic);
                 Some(self.intern(key, || TypeNode::Func(ret, params, f.variadic)))

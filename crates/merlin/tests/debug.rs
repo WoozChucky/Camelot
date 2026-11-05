@@ -913,6 +913,90 @@ fn enums_are_described_for_the_constants_the_code_uses() {
     assert_eq!(named(&src, elf::dies::dw::TAG_ENUMERATOR), ["U", "W"]);
 }
 
+/// A null pointer constant made a pointer by assignment, passing, return or
+/// `?:`, or an integer one cast to a pointer, is clang's `CK_NullToPointer`,
+/// whose operand its code generator does not visit: `NULL` returned keeps
+/// no `void *`. Compared, or cast to a pointer explicitly, `(void *)0` is a
+/// bit cast and its cast is kept. A static initializer's `ConstExprEmitter`
+/// does visit the operand (clang 23).
+#[test]
+fn null_pointer_constants_keep_casts_as_clangs() {
+    use elf::dies::dw;
+    let names = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+    let mut src = String::new();
+    for (n, t) in names.iter().zip([
+        "void *", "int ", "void *", "int ", "int *", "void *", "void *", "void *", "long ", "int *",
+    ]) {
+        src.push_str(&format!("typedef {t}{n};\n"));
+    }
+    src.push_str(
+        "struct b;\nvoid take(int *);\n\
+         struct b *f(int x, int *p) {\n\
+             take((A)0);\n\
+             p = (B)0;\n\
+             if (p == (C)0) x++;\n\
+             p = (E)(D)0;\n\
+             p = x ? (F)0 : p;\n\
+             if (x) return (G)0;\n\
+             p = (J)(I)0 + 0;\n\
+             return 0;\n\
+         }\n\
+         void *g(void) { return (H)0; }\n",
+    );
+    assert_eq!(named(&src, dw::TAG_TYPEDEF), ["C", "E", "J", "H"]);
+    let src = "typedef long L;\ntypedef int I;\nint *p = (void *)0;\nint *q = (I)0;\nint *r = (int *)(L)0;\n\
+               int main(void) { return 0; }\n";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["I", "L"]);
+}
+
+/// A function pointer's parameters are described as declared, by their
+/// typedefs and with their qualifiers, as clang 23 describes them (the
+/// function's type itself leaves the qualifiers out).
+#[test]
+fn function_pointer_parameters_are_described_as_declared() {
+    use elf::dies::dw;
+    let src = "typedef unsigned long *pt;\ntypedef int cnt;\nstruct d { int (*read)(pt, cnt); } dv;\n\
+               void (*hook)(const pt, cnt *);\nint main(void) { return 0; }\n";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["pt", "cnt"]);
+    let asm = merlin::compile_with("c.c", src, &debug_opts("dir"), &merlin::no_files).unwrap();
+    let obj = merlin_as::assemble_to_elf(&asm).unwrap();
+    let units = elf::Elf::parse(&obj).unwrap().debug_entries().unwrap();
+    let u = &units[0];
+    // `hook`'s function type: its first parameter is `const pt`.
+    let types: Vec<&elf::dies::Die> = u
+        .dies
+        .iter()
+        .filter(|d| d.tag == dw::TAG_SUBROUTINE_TYPE)
+        .collect();
+    assert_eq!(types.len(), 2);
+    let first = &u.dies[types[1].children[0]];
+    let to = u.die_at(first.reference(dw::AT_TYPE).unwrap()).unwrap();
+    assert_eq!(to.tag, dw::TAG_CONST_TYPE);
+    let t = u.die_at(to.reference(dw::AT_TYPE).unwrap()).unwrap();
+    assert_eq!(t.name(), Some("pt"));
+}
+
+/// clang emits an array whose initializers hold more than 16 bytes as a
+/// constant if it can (`EmitArrayInit`'s `ConstantEmitter`), a compound
+/// literal's too: then its casts are kept as a static initializer's and
+/// its enumeration constants describe no enum. A smaller one is code
+/// (clang 23).
+#[test]
+fn big_arrays_are_described_as_constants() {
+    use elf::dies::dw;
+    let src = "enum { A = 1 };\nenum { B = 1 };\nenum { D = 1 };\ntypedef void *V1;\ntypedef void *V2;\n\
+               void take(char **);\nvoid ti(int *);\n\
+               int f(void) {\n\
+                   take((char *[]){\"a\", \"b\", \"c\", \"d\", (V1)0});\n\
+                   take((char *[]){\"a\", \"b\", (V2)0});\n\
+                   ti((int[]){A, B, 1, 2, 3});\n\
+                   ti((int[]){D, 1});\n\
+                   return 0;\n\
+               }\n";
+    assert_eq!(named(src, dw::TAG_TYPEDEF), ["V1"]);
+    assert_eq!(named(src, dw::TAG_ENUMERATOR), ["D"]);
+}
+
 /// The types a function defines (a typedef, a struct, one in an inner block)
 /// are described in its entry, after its variables and blocks, as clang has
 /// them; a file-scope type of the same tag is the unit's.
@@ -1228,7 +1312,7 @@ fn the_files_are_numbered_as_clangs() {
         }
         units.push((d, case[0].0, false));
     }
-    for f in ["fs.c", "pipe.c", "proc.c"] {
+    for f in ["fs.c", "pipe.c", "proc.c", "bio.c", "file.c"] {
         units.push((kernel.clone(), f, true));
     }
     for x in [Xlen::Rv32, Xlen::Rv64] {

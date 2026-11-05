@@ -646,6 +646,22 @@ impl<'a> Def<'a> {
     }
 }
 
+/// Whether cast `e` makes a null pointer constant a pointer as clang's
+/// `CK_NullToPointer` does, whose operand clang neither emits nor visits
+/// (so `-g` keeps no cast's type in it): an integer one (`(int *)0`, `int
+/// *p = 0`, `(int *)(long)0`), or `(void *)0` converted to another pointer
+/// type where C converts as by assignment (assigned, passed, returned, an
+/// operand of `?:`: `struct b *p = NULL;`). Compared with a pointer, or cast
+/// explicitly, `(void *)0` is converted as any pointer is (a bit cast), and
+/// visited. (In a static initializer clang's `ConstExprEmitter` does visit
+/// the operand of such a cast: [`FileGen::initializer_casts`].)
+fn null_to_pointer(e: &Expr, xlen: Xlen) -> bool {
+    let ExprKind::Cast { x, implicit, .. } = &e.kind else {
+        return false;
+    };
+    e.ty.is_ptr() && consteval::is_null_pointer(x, xlen) && (x.ty.is_integer() || *implicit)
+}
+
 /// The bytes of a register, and of an argument word: 4 on RV32, 8 on RV64.
 fn word(x: Xlen) -> i32 {
     ptr_size(x) as i32
@@ -1205,9 +1221,11 @@ impl<'a> FileGen<'a> {
     /// emitter gives up on. The emitter visits casts, and goes on into a
     /// cast's operand when the cast changes nothing (the same type but for
     /// its qualifiers, at any level of a pointer: `CK_NoOp`, as in
-    /// `(const char *)(char *)&x`) or converts an integer to another
-    /// integer type (`CK_IntegralCast`, not to `_Bool`), and into the
-    /// operand of a unary `-`; it gives up on anything else (`+`, `~`, a
+    /// `(const char *)(char *)&x`), converts an integer to another
+    /// integer type (`CK_IntegralCast`, not to `_Bool`) or makes a null
+    /// pointer constant a pointer (`CK_NullToPointer`, [`null_to_pointer`]:
+    /// `int *p = (void *)0;`, `(int *)(long)0`), and into the operand of a
+    /// unary `-`; it gives up on anything else (`+`, `~`, a
     /// binary operator, `?:`, `&`, an address converted to an integer). So
     /// of `long a = (long)&x;` and `long n = -(T)(U)3;` the types are kept,
     /// of `long b = (long)&x + 4;` and `int *p = (int *)(T)&x;`'s `T` not.
@@ -1222,7 +1240,7 @@ impl<'a> FileGen<'a> {
                 }
                 let (from, to) = (x.ty.unqual(), e.ty.unqual());
                 let integral = from.is_integer() && to.is_integer() && *to != Type::Int(IntKind::Bool);
-                if from.similar(to) || integral {
+                if from.similar(to) || integral || null_to_pointer(e, self.xlen) {
                     self.initializer_casts(x);
                 }
             }
@@ -2276,6 +2294,46 @@ impl<'a> FuncGen<'a, '_> {
         }
     }
 
+    /// `-g`: clang's `ConstantEmitter` trying `init`, of an object of type
+    /// `ty`, as a constant: each element in order, its casts kept as a
+    /// static initializer's ([`FileGen::initializer_casts`]), up to the
+    /// first that is not constant. Whether all are.
+    fn constant_visit(&mut self, ty: &Type, init: &'a Init) -> bool {
+        match (ty.unqual(), init) {
+            (Type::Array(elem, _), Init::List(items, _)) => {
+                items.iter().all(|i| self.constant_visit(elem, i))
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().expect("sema: locals have complete types");
+                body.members
+                    .iter()
+                    .zip(items)
+                    .all(|(m, i)| self.constant_visit(&m.ty, i))
+            }
+            (_, Init::List(items, _)) => items.iter().all(|i| self.constant_visit(ty, i)),
+            (
+                Type::Array(..),
+                Init::Expr(Expr {
+                    kind: ExprKind::Str(_),
+                    ..
+                }),
+            ) => true,
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_visit(lit, init),
+            (_, Init::Expr(e)) => {
+                self.file.initializer_casts(e);
+                consteval::eval(e, self.xlen).is_some()
+            }
+            (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
+        }
+    }
+
     /// Stores an initializer into the local object at `off(s0)`; arrays and
     /// structs initialized by a list have been cleared, so what the list
     /// leaves out is zero already.
@@ -2286,9 +2344,18 @@ impl<'a> FuncGen<'a, '_> {
             (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 let size = elem.size(self.xlen).unwrap() as i32;
+                // `-g`: clang emits an array whose initializers hold more
+                // than 16 bytes as a constant if it can (`EmitArrayInit`'s
+                // `ConstantEmitter`), visiting them as a static
+                // initializer's first; else element by element.
+                let was = self.constant_init;
+                if !was && self.file.debug.is_some() && items.len() as i64 * i64::from(size) > 16 {
+                    self.constant_init = items.iter().all(|i| self.constant_visit(elem, i));
+                }
                 for (i, item) in items.iter().enumerate() {
                     self.init_local(elem, item, off + i as i32 * size);
                 }
+                self.constant_init = was;
             }
             (Type::Record(r), Init::List(items, _)) => {
                 // Sema's list is fully braced: one item per member, in order.
@@ -2390,6 +2457,7 @@ impl<'a> FuncGen<'a, '_> {
         self.kept_cast(e);
         let decided = |c: &Expr| consteval::condition(c, self.xlen).map(|v| v != 0);
         match &e.kind {
+            ExprKind::Cast { .. } if null_to_pointer(e, self.xlen) => {}
             ExprKind::Unary(_, x)
             | ExprKind::Cast { x, .. }
             | ExprKind::Addr(x)
@@ -2621,6 +2689,12 @@ impl<'a> FuncGen<'a, '_> {
             ExprKind::Deref(p) => {
                 self.expr(p);
                 self.load(&e.ty);
+            }
+            // A null pointer constant made a pointer: null, its operand
+            // neither generated nor described, as clang has it.
+            ExprKind::Cast { .. } if null_to_pointer(e, self.xlen) => {
+                self.kept_cast(e);
+                self.li("a0", 0);
             }
             ExprKind::Cast { x, .. } => {
                 self.kept_cast(e);

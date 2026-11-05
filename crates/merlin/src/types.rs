@@ -415,6 +415,30 @@ pub struct FuncType {
     pub ret: Type,
     pub params: Vec<Type>,
     pub variadic: bool,
+    /// Each parameter as its declaration has it, for `-g`: its type with
+    /// its qualifiers (which `params` leaves out, as they do not change the
+    /// function's type) and how it spelled it ([`Spelled`]), since clang
+    /// describes a function pointer's parameters so (`const pt` of a
+    /// typedef `pt`). Never part of comparing types.
+    pub spelled: Spellings,
+}
+
+/// The declared type and [`Spelled`] of each parameter of a function type,
+/// or none (a type made without them). Any two compare equal, as spellings
+/// do.
+#[derive(Clone, Debug, Default)]
+pub struct Spellings(pub Vec<(Type, Spelled)>);
+
+impl PartialEq for Spellings {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Spellings {}
+
+impl Hash for Spellings {
+    fn hash<H: Hasher>(&self, _: &mut H) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -527,6 +551,7 @@ impl Type {
             ret,
             params,
             variadic: false,
+            spelled: Spellings::default(),
         }))
     }
 
@@ -536,6 +561,7 @@ impl Type {
             ret,
             params,
             variadic: true,
+            spelled: Spellings::default(),
         }))
     }
 
