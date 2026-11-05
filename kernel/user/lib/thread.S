@@ -8,18 +8,10 @@
 # ends the thread with what it returns.
 #
 # Both widths: the two slots are pointers, a register wide, stored and
-# loaded with REG_S and REG_L (glibc's sys/asm.h names): sw and lw on RV32,
-# sd and ld on RV64.
+# loaded with REG_S and REG_L (asm.h, Linux's names): sw and lw on RV32, sd
+# and ld on RV64.
 
-#if __riscv_xlen == 64
-#define REG_S sd
-#define REG_L ld
-#define SZREG 8
-#else
-#define REG_S sw
-#define REG_L lw
-#define SZREG 4
-#endif
+#include <asm.h>
 
     .text
 

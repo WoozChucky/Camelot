@@ -7,7 +7,8 @@
  * sets A and D itself (hardware-managed) and has no TLB; a hart without that
  * (Svade, the privileged spec's other choice) faults on an access whose
  * leaf has A clear, or D for a store, so the kernel's own leaves are made
- * with A and D set (PTE_KERNEL, below), as Linux makes them.
+ * with A and D set (PTE_KERNEL, below), as Linux makes them, and the user
+ * leaves with A, and D if writable (PTE_USER_AD).
  *
  * - RV32, Sv32: two levels of 1024 4-byte PTEs. A virtual address splits
  *   10/10/12: VPN[1] (bits 31:22) indexes the root, VPN[0] (bits 21:12) a
@@ -62,25 +63,19 @@ typedef pte_t *pagetable_t; /* one page: PTES_PER_TABLE PTEs */
  * through it needs the hardware to set them (a hart that doesn't would
  * fault, and kernel_trap would panic), and G, since the kernel's mappings
  * are the same in every address space (processes share them, uvm_create()).
- * User pages never get G. On RV64 they get A, and D if writable, from
- * map_pages() (PTE_USER_AD, below); on RV32, which runs only on Grail
- * (which sets A and D itself) and goes in #159, A and D stay the
- * hardware's to set. */
+ * User pages never get G; they get A, and D if writable, from map_pages()
+ * (PTE_USER_AD, below). */
 #define PTE_KERNEL (PTE_G | PTE_A | PTE_D)
 
-/* RV64: what map_pages() adds to a user leaf with permissions `perm`, as
- * Linux's riscv user protections do: A always (its _PAGE_BASE has
+/* What map_pages() adds to a user leaf with permissions `perm`, as Linux's
+ * riscv user protections do on both widths: A always (its _PAGE_BASE has
  * _PAGE_ACCESSED), and D on a writable page, which Linux maps dirty when it
  * makes an anonymous page for a write (do_anonymous_page()'s pte_mkdirty()).
  * Every user page here is anonymous memory, made when it is mapped (the
  * loader's, the stack's, the heap's), and nothing pages it out, so none is
  * ever mapped clean: no access through a user leaf needs the hardware to
  * set A or D, and a hart without that (Svade) never faults on one. */
-#if __riscv_xlen == 64
 #define PTE_USER_AD(perm) (PTE_A | (((perm) & PTE_W) != 0 ? PTE_D : 0))
-#else
-#define PTE_USER_AD(perm) 0
-#endif
 /* The kernel's leaves, by Linux's names: data, read-only data, text, and
  * text that is written too (the early page table's image). */
 #define PAGE_KERNEL (PTE_R | PTE_W | PTE_KERNEL)

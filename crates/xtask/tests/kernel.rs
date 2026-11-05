@@ -1234,9 +1234,10 @@ const PTE_D: u32 = 1 << 7;
 /// What the kernel's own leaves have besides their permissions (vm.h's
 /// PTE_KERNEL, Linux's _PAGE_KERNEL): A and D set up front, and G.
 const PTE_KERNEL: u32 = PTE_G | PTE_A | PTE_D;
-/// The bits of a user PTE the kernel chooses; A and D are Grail's there, and
-/// RSW (9:8) is for software, which the kernel doesn't use yet.
-const PTE_KERNEL_BITS: u32 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G;
+/// The bits of a user PTE the kernel chooses, A and D up front with the
+/// others (vm.h's PTE_USER_AD); RSW (9:8) is for software, which the kernel
+/// doesn't use yet.
+const PTE_KERNEL_BITS: u32 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G | PTE_A | PTE_D;
 const PTE_RSW: u32 = 0x300;
 
 /// Boots the committed kernel on a machine with `ram_mib` MiB of RAM and
@@ -1364,7 +1365,7 @@ fn check_kernel_memory(ram_mib: usize, extra_devices: &[DeviceEntry]) {
     for &(va, pte) in &leaves {
         assert_eq!((pte >> 10) * PAGE, va, "{va:#x} not identity mapped");
         assert_eq!(pte & PTE_RSW, 0, "{va:#x}: {pte:#x}");
-        got.insert(va, pte & (PTE_KERNEL_BITS | PTE_A | PTE_D));
+        got.insert(va, pte & PTE_KERNEL_BITS);
     }
     // Compared as a whole only after spotting the first difference, since the
     // maps have tens of thousands of entries.
@@ -2218,9 +2219,10 @@ fn user_sym(elf: &[u8], name: &str) -> u32 {
         .value as u32
 }
 
-/// The user pages a program's ELF image asks for, as (va, PTE permissions),
-/// then its stack page: what the process's page table must map below
-/// USER_TOP.
+/// The user pages a program's ELF image asks for, as (va, PTE bits), then its
+/// stack page: what the process's page table must map below USER_TOP. Each
+/// has A, and D if it is writable, as map_pages() makes a user leaf (vm.h's
+/// PTE_USER_AD, Linux's user protections).
 fn expected_user_pages(elf: &[u8]) -> Vec<(u32, u32)> {
     let parsed = elf::Elf::parse(elf).unwrap();
     let mut pages = Vec::new();
@@ -2229,9 +2231,9 @@ fn expected_user_pages(elf: &[u8]) -> Vec<(u32, u32)> {
         .iter()
         .filter(|s| s.ty == elf::PT_LOAD && s.memsz > 0)
     {
-        let mut perm = PTE_V | PTE_U | PTE_R;
+        let mut perm = PTE_V | PTE_U | PTE_R | PTE_A;
         if seg.flags & elf::PF_W != 0 {
-            perm |= PTE_W;
+            perm |= PTE_W | PTE_D;
         }
         if seg.flags & elf::PF_X != 0 {
             perm |= PTE_X;
@@ -2244,7 +2246,7 @@ fn expected_user_pages(elf: &[u8]) -> Vec<(u32, u32)> {
             va += PAGE;
         }
     }
-    pages.push((USER_STACK, PTE_V | PTE_U | PTE_R | PTE_W));
+    pages.push((USER_STACK, PTE_V | PTE_U | PTE_R | PTE_W | PTE_A | PTE_D));
     pages
 }
 
@@ -2456,7 +2458,7 @@ fn a_process_page_table_maps_its_program_and_the_kernel() {
     // kernel's, none of it with U.
     let ding = user_program("ding");
     let want = expected_user_pages(&ding.elf);
-    assert_eq!(want[0], (USER_TEXT, PTE_V | PTE_U | PTE_R | PTE_X));
+    assert_eq!(want[0], (USER_TEXT, PTE_V | PTE_U | PTE_R | PTE_X | PTE_A));
     assert!(want.iter().all(|&(va, _)| va >= USER_TEXT && va != USER_LOAD_TOP));
     assert_eq!(user_pages(&m, satp), want);
     let (leaves, tables, megapages) = page_table(&m, satp);
@@ -2650,7 +2652,7 @@ fn a_store_to_read_only_data_is_killed() {
             main + 8
         )
     );
-    assert!(lines[2].ends_with(" ---U--RV"), "{out}");
+    assert!(lines[2].ends_with(" -A-U--RV"), "{out}");
     assert_eq!(lines[3], "badstore: exit -1");
 }
 

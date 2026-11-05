@@ -48,6 +48,9 @@ pub const RUNTIME: &[&str] = &["crt0.s", "usys.s"];
 pub const LIB_DIR: &str = "lib";
 /// The linker script every program is linked with.
 pub const SCRIPT: &str = "user.ld";
+/// Where a `.S` file finds `<asm.h>` (the repository's `include/`, as the
+/// kernel's and the examples' do), relative to [`USER_DIR`].
+pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
 /// Programs written in RV32 assembly that only the RV32 kernel builds in
 /// (#156 ports them, or #159 drops them with RV32).
 pub const RV32_ONLY: &[&str] = &[];
@@ -312,7 +315,7 @@ fn asm_text(dir: &Path, src: &Source, cc: CCompiler, xlen: Xlen) -> Result<(Stri
     match (src.lang, cc) {
         (Lang::Asm, _) => Ok((format!("{USER_DIR}/{}", src.file()), read(&dir.join(src.file()))?)),
         (Lang::AsmCpp, _) => {
-            let text = toolchain::preprocess_asm(dir, &src.file(), &[], xlen).map_err(|e| {
+            let text = toolchain::preprocess_asm(dir, &src.file(), ASM_INCLUDE_DIRS, xlen).map_err(|e| {
                 e.lines()
                     .map(|l| format!("{USER_DIR}/{l}"))
                     .collect::<Vec<_>>()
