@@ -59,6 +59,38 @@ struct Syms {
     debug: Debug,
 }
 
+/// The program a session debugs: its ELF file, and the symbols, line tables and
+/// debugging information read from it. They travel together, so that the file is
+/// there whenever a set of symbols is built ([`Session::activate`]).
+pub struct ProgramFile {
+    file: Vec<u8>,
+    symbols: Symbols,
+    lines: Lines,
+    debug: Debug,
+}
+
+impl ProgramFile {
+    /// Reads what a session needs of the ELF file `file`.
+    pub fn from_elf(file: Vec<u8>) -> Result<ProgramFile> {
+        let symbols = Symbols::from_elf(&file)?;
+        let mut lines = Lines::default();
+        lines.add_elf(&file)?;
+        let mut debug = Debug::default();
+        debug.add_elf(&file)?;
+        Ok(ProgramFile {
+            file,
+            symbols,
+            lines,
+            debug,
+        })
+    }
+
+    /// The ELF file.
+    pub fn file(&self) -> &[u8] {
+        &self.file
+    }
+}
+
 /// Memory as `print` and `x` read it: through the selected hart's translation, or
 /// through the page table of the process `process PID` selected, which merlin-dbg
 /// walks itself over physical memory ([`paging`]).
@@ -74,14 +106,12 @@ impl Memory<'_> {
         let Some(space) = self.space else {
             return self.remote.read_memory(addr, len);
         };
+        // Physical memory for the whole read: every page's walk, and its bytes.
+        let mut phys = self.remote.physical()?;
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
             let va = addr.wrapping_add(out.len() as u64);
-            let remote = &mut *self.remote;
-            let pa = paging::translate(space, va, &mut |a, size| {
-                let b = remote.read_physical(a, size).ok().filter(|b| b.len() == size)?;
-                Some(b.iter().rev().fold(0u64, |v, &x| v << 8 | u64::from(x)))
-            });
+            let pa = paging::translate(space, va, &mut |a, size| phys.word(a, size));
             let Some(pa) = pa else {
                 if out.is_empty() {
                     return Err(format!("cannot access memory at address {va:#x}"));
@@ -89,7 +119,7 @@ impl Memory<'_> {
                 break;
             };
             let chunk = ((paging::PAGE_SIZE - va % paging::PAGE_SIZE) as usize).min(len - out.len());
-            let bytes = match self.remote.read_physical(pa, chunk) {
+            let bytes = match phys.read(pa, chunk) {
                 Ok(b) => b,
                 Err(e) if out.is_empty() => return Err(e),
                 Err(_) => break,
@@ -100,6 +130,7 @@ impl Memory<'_> {
                 break;
             }
         }
+        phys.finish()?;
         Ok(out)
     }
 }
@@ -223,15 +254,19 @@ hart [N]                list the harts, or select hart N
 quit|q                  leave (the machine is killed, or left running with --connect)";
 
 impl<'a, W: Write> Session<'a, W> {
+    /// A session with the machine behind `remote`, debugging `program` (none: the
+    /// machine alone, until `add-symbol-file`).
     pub fn new(
         remote: Remote,
-        symbols: Symbols,
-        lines: Lines,
-        debug: Debug,
+        program: Option<ProgramFile>,
         out: W,
         on_quit: OnQuit,
         interrupt: &'a AtomicBool,
     ) -> Self {
+        let (global_files, symbols, lines, debug) = match program {
+            Some(p) => (vec![p.file], p.symbols, p.lines, p.debug),
+            None => (Vec::new(), Symbols::default(), Lines::default(), Debug::default()),
+        };
         Session {
             xlen: remote.xlen,
             remote,
@@ -249,7 +284,7 @@ impl<'a, W: Write> Session<'a, W> {
             on_quit,
             interrupt,
             filters: HashMap::new(),
-            global_files: Vec::new(),
+            global_files,
             keyed_files: Vec::new(),
             active: None,
             sets: HashMap::new(),
@@ -257,12 +292,6 @@ impl<'a, W: Write> Session<'a, W> {
             process: None,
             running_to: None,
         }
-    }
-
-    /// The ELF file of the program the session was given symbols of, for building the
-    /// symbols of each address space ([`Session::activate`]).
-    pub fn set_program(&mut self, file: Vec<u8>) {
-        self.global_files.insert(0, file);
     }
 
     /// Says where the machine is stopped, as the session starts.
@@ -493,7 +522,7 @@ impl<'a, W: Write> Session<'a, W> {
             return Err("break needs an address or a symbol".into());
         }
         let words: Vec<&str> = expr.split_whitespace().collect();
-        let (loc, mut filters) = match words.as_slice() {
+        let (loc, filters) = match words.as_slice() {
             [loc @ .., "process", pid] if !loc.is_empty() => {
                 let pid = parse_number(pid).ok_or_else(|| format!("'{pid}' is not a process id"))?;
                 if !self.processes()?.iter().any(|p| p.pid == pid) {
@@ -507,28 +536,73 @@ impl<'a, W: Write> Session<'a, W> {
             }
             _ => (expr.to_string(), Vec::new()),
         };
+        // As GDB's linespecs, the location is looked for in every symbol file, and a
+        // breakpoint goes wherever it is found: in the files of every address space
+        // (the program, the kernel), and in each program's own (`add-symbol-file FILE
+        // program NAME`), where it stops only in the processes running that program.
         let original = self.active.clone();
-        let mut programs: Vec<String> = self.keyed_files.iter().map(|(p, _)| p.clone()).collect();
-        programs.dedup();
+        self.activate(None);
+        let mut found = false;
         let mut failed = None;
-        for set in std::iter::once(None).chain(programs.into_iter().map(Some)) {
-            self.activate(set.clone());
-            let addrs = match self.locate(&loc) {
-                Ok(addrs) => addrs,
-                Err(e) => {
-                    failed.get_or_insert(e);
-                    continue;
-                }
-            };
-            if let Some(program) = set {
-                filters.push(Filter::Program(program));
+        let mut result = Ok(());
+        match self.locate(&loc) {
+            Ok(addrs) => {
+                found = true;
+                result = self.set_breakpoints(addrs, &filters);
             }
-            let set = self.set_breakpoints(addrs, &filters);
-            self.activate(original);
-            return set;
+            Err(e) => failed = Some(e),
+        }
+        let mut programs: Vec<String> = self.keyed_files.iter().map(|(p, _)| p.clone()).collect();
+        programs.sort();
+        programs.dedup();
+        for program in programs {
+            if result.is_err() {
+                break;
+            }
+            // That program's files alone: a location found only through the files
+            // of every space is not the program's.
+            let own = self.build_own(&program);
+            let saved = self.install(own);
+            if let Some(addrs) = self.locate_own(&loc).filter(|a| !a.is_empty()) {
+                found = true;
+                let mut only = filters.clone();
+                only.push(Filter::Program(program));
+                result = self.set_breakpoints(addrs, &only);
+            }
+            self.install(saved);
         }
         self.activate(original);
-        Err(failed.unwrap_or_else(|| format!("no symbol '{loc}'")))
+        match failed {
+            Some(e) if !found => Err(e),
+            _ => result,
+        }
+    }
+
+    /// The symbols, line tables and debugging information of `program`'s own files
+    /// (`add-symbol-file FILE program NAME`), without those of every space.
+    fn build_own(&self, program: &str) -> Syms {
+        let mut set = Syms::default();
+        for (_, file) in self.keyed_files.iter().filter(|(p, _)| p == program) {
+            let _ = set.symbols.add_elf(file);
+            let _ = set.lines.add_elf(file);
+            let _ = set.debug.add_elf(file);
+        }
+        for dir in &self.dirs {
+            set.lines.add_dir(dir.clone());
+        }
+        set
+    }
+
+    /// The addresses a breakpoint's location means in the symbols in use, if it names
+    /// something there: a source line of theirs or a function of theirs. An address
+    /// (`*ADDR`, a number, an expression) means the same in every file, and is not
+    /// looked for again.
+    fn locate_own(&mut self, expr: &str) -> Option<Vec<u64>> {
+        if source_line(expr).is_some() || self.symbols.code(expr).is_some() {
+            self.locate(expr).ok()
+        } else {
+            None
+        }
     }
 
     /// Sets a breakpoint at each of `addrs`, limited by `filters`.
@@ -923,12 +997,10 @@ impl<'a, W: Write> Session<'a, W> {
     fn space_of(&mut self, pagetable: u64) -> Result<(u64, paging::Space)> {
         let satp = self.remote.register(remote::csr(SATP))?;
         let hart = paging::space(satp, self.xlen)?;
-        let remote = &mut self.remote;
-        let root = paging::translate(hart, pagetable, &mut |a, size| {
-            let b = remote.read_physical(a, size).ok().filter(|b| b.len() == size)?;
-            Some(b.iter().rev().fold(0u64, |v, &x| v << 8 | u64::from(x)))
-        })
-        .ok_or_else(|| format!("the page table at {pagetable:#x} is not mapped"))?;
+        let mut phys = self.remote.physical()?;
+        let root = paging::translate(hart, pagetable, &mut |a, size| phys.word(a, size));
+        phys.finish()?;
+        let root = root.ok_or_else(|| format!("the page table at {pagetable:#x} is not mapped"))?;
         let value = paging::satp_for(satp, root, self.xlen);
         Ok((value, paging::space(value, self.xlen)?))
     }

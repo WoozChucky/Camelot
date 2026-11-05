@@ -376,45 +376,18 @@ impl Remote {
         Ok(out)
     }
 
-    /// Up to `len` bytes at physical address `addr` (QEMU's `Qqemu.PhyMemMode`, which
-    /// Grail's stub has too): fewer when the memory ends, an error when not even the
-    /// first byte can be read, or the stub cannot read physical memory.
-    pub fn read_physical(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
+    /// Physical memory, until the [`Physical`] is finished or dropped: the stub's
+    /// memory packets read physical addresses meanwhile (QEMU's `Qqemu.PhyMemMode`,
+    /// which Grail's stub has too). One switch serves a whole page walk and the reads
+    /// through it: each switch is a round trip (over Avalon, through the VM's thread).
+    /// An error if the stub cannot read physical memory.
+    pub fn physical(&mut self) -> Result<Physical<'_>> {
         self.request("Qqemu.PhyMemMode:1")
             .map_err(|e| format!("cannot read physical memory: {e}"))?;
-        // In u64: a physical address can be past 4 GiB on RV32 (Sv32's 34 bits).
-        let mut out = Vec::with_capacity(len);
-        let mut failed = None;
-        while out.len() < len {
-            let at = addr.wrapping_add(out.len() as u64);
-            let want = (len - out.len()).min(0x800);
-            match self.request(&format!("m{at:x},{want:x}")) {
-                Ok(reply) => match unhex(&reply) {
-                    Some(bytes) => {
-                        let short = bytes.len() < want;
-                        out.extend(bytes);
-                        if short {
-                            break;
-                        }
-                    }
-                    None => {
-                        failed = Some("a malformed memory packet".to_string());
-                        break;
-                    }
-                },
-                Err(e) => {
-                    if out.is_empty() {
-                        failed = Some(format!("cannot read physical memory at {at:#x}: {e}"));
-                    }
-                    break;
-                }
-            }
-        }
-        self.request("Qqemu.PhyMemMode:0")?;
-        match failed {
-            Some(e) => Err(e),
-            None => Ok(out),
-        }
+        Ok(Physical {
+            remote: self,
+            on: true,
+        })
     }
 
     /// A word of memory (an instruction), if it can be read.
@@ -494,6 +467,74 @@ impl Remote {
     /// Leaves the machine running on its own, without breakpoints (`D`).
     pub fn detach(&mut self) -> Result<()> {
         self.request("D").map(drop)
+    }
+}
+
+/// The stub reading physical memory ([`Remote::physical`]), until [`Physical::finish`]
+/// (or the drop) switches it back to the hart's translation.
+pub struct Physical<'a> {
+    remote: &'a mut Remote,
+    on: bool,
+}
+
+impl Physical<'_> {
+    /// Up to `len` bytes at physical address `addr`: fewer when the memory ends, an
+    /// error when not even the first byte can be read.
+    pub fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
+        // In u64: a physical address can be past 4 GiB on RV32 (Sv32's 34 bits).
+        let mut out = Vec::with_capacity(len);
+        let mut failed = None;
+        while out.len() < len {
+            let at = addr.wrapping_add(out.len() as u64);
+            let want = (len - out.len()).min(0x800);
+            match self.remote.request(&format!("m{at:x},{want:x}")) {
+                Ok(reply) => match unhex(&reply) {
+                    Some(bytes) => {
+                        let short = bytes.len() < want;
+                        out.extend(bytes);
+                        if short {
+                            break;
+                        }
+                    }
+                    None => {
+                        failed = Some("a malformed memory packet".to_string());
+                        break;
+                    }
+                },
+                Err(e) => {
+                    if out.is_empty() {
+                        failed = Some(format!("cannot read physical memory at {at:#x}: {e}"));
+                    }
+                    break;
+                }
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
+    /// The little-endian value of the `size` bytes at physical address `addr` (a page
+    /// table entry), if they can all be read.
+    pub fn word(&mut self, addr: u64, size: usize) -> Option<u64> {
+        let b = self.read(addr, size).ok().filter(|b| b.len() == size)?;
+        Some(b.iter().rev().fold(0u64, |v, &x| v << 8 | u64::from(x)))
+    }
+
+    /// Switches the stub back to the hart's translation.
+    pub fn finish(mut self) -> Result<()> {
+        self.on = false;
+        self.remote.request("Qqemu.PhyMemMode:0").map(|_| ())
+    }
+}
+
+impl Drop for Physical<'_> {
+    /// Left early (an error on the way): switched back all the same.
+    fn drop(&mut self) {
+        if self.on {
+            let _ = self.remote.request("Qqemu.PhyMemMode:0");
+        }
     }
 }
 

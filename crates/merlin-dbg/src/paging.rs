@@ -2,7 +2,7 @@
 //! is not the hart's own (another process's) becomes a physical one, as OpenOCD's
 //! RISC-V target walks them for `virt2phys`. The stub translates only through the
 //! selected hart's `satp`; merlin-dbg reads the other tables itself, over physical
-//! memory (QEMU's `Qqemu.PhyMemMode`, [`crate::remote::Remote::read_physical`]).
+//! memory (QEMU's `Qqemu.PhyMemMode`, [`crate::remote::Remote::physical`]).
 //!
 //! The walk is the privileged spec's (section 12.3.2, "Virtual Address Translation
 //! Process"), for the three modes Excalibur has (spec section 7, "Paging"): Sv32 on

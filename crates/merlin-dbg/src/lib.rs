@@ -20,12 +20,10 @@ pub mod symbols;
 pub mod vars;
 
 use remote::Remote;
-use session::{Flow, OnQuit, Session};
-use source::Lines;
+use session::{Flow, OnQuit, ProgramFile, Session};
 use std::io::{BufRead, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::AtomicBool;
-use symbols::Symbols;
 
 pub const USAGE: &str = "usage: merlin-dbg [--connect ADDR] [-x FILE] [program.elf]
        merlin-dbg --vm VM [--server ADDR] [-x FILE] [program.elf]
@@ -175,17 +173,13 @@ fn start(
             ),
         },
     };
-    let mut lines = Lines::default();
-    let mut debug = vars::Debug::default();
-    let (symbols, file) = match &program {
+    let program = match &program {
         Some(path) => {
             let file = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-            lines.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-            debug.add_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-            let symbols = Symbols::from_elf(&file).map_err(|e| format!("{path}: {e}"))?;
-            (symbols, Some((path, file)))
+            let program = ProgramFile::from_elf(file).map_err(|e| format!("{path}: {e}"))?;
+            Some((path, program))
         }
-        None => (Symbols::default(), None),
+        None => None,
     };
     let remote = match stub {
         Stub::Tcp(addr) => Remote::connect(addr)?,
@@ -199,23 +193,20 @@ fn start(
     // The machine's width, from the stub, must be the program's: an ELF32 program's
     // symbols would be wrong for an RV64 machine. A program of the other width is
     // left out with a warning and the session goes on without its symbols, as GDB
-    // warns and goes on: ending it would drop the connection, which the stub takes
-    // as a detach, and a machine waiting for its debugger would run off on its own.
+    // warns and goes on: ending it would drop the connection without `D`, which
+    // leaves the machine stopped for a debugger that has gone (as QEMU's stub does).
     // (Started with `--`, the machine is the program's width.)
-    let (symbols, lines, debug, file) = match file {
-        Some((path, file)) => match symbols::check_xlen(&file, remote.xlen) {
-            Ok(()) => (symbols, lines, debug, Some(file)),
+    let program = match program {
+        Some((path, program)) => match symbols::check_xlen(program.file(), remote.xlen) {
+            Ok(()) => Some(program),
             Err(e) => {
                 let _ = writeln!(out, "warning: {path}: {e}: going on without its symbols");
-                (Symbols::default(), Lines::default(), vars::Debug::default(), None)
+                None
             }
         },
-        None => (symbols, lines, debug, None),
+        None => None,
     };
-    let mut session = Session::new(remote, symbols, lines, debug, &mut *out, on_quit, interrupt);
-    if let Some(file) = file {
-        session.set_program(file);
-    }
+    let mut session = Session::new(remote, program, &mut *out, on_quit, interrupt);
     session.start()?;
 
     // The script, then stdin. Commands that do not come from a terminal are echoed, so
