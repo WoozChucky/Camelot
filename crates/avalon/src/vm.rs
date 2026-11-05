@@ -51,6 +51,21 @@
 //! input core releases the keys of a keyboard that is unplugged
 //! (`input_dev_release_keys`), so a viewer closed with Alt+F4 leaves no Alt held.
 //!
+//! A VM can have a debugger (protocol doc, section 6.8): a client whose bytes are the
+//! GDB remote serial protocol, for the stub `grail --gdb` serves ([`gdb::Session`]).
+//! The thread is the stub's host, as `grail --gdb`'s loop is: between slices it hands
+//! the debugger's bytes to the session, which answers them, runs the debugger's steps,
+//! and while the machine has breakpoints or watchpoints it runs its slices with
+//! [`Machine::debug_continue`], which stops at them, instead of [`Machine::run_for`].
+//! The run states are QEMU's (`gdbstub/system.c`): the debugger's arrival, its Ctrl-C
+//! and a `PauseVm` stop the VM as paused (SIGINT, `T02`, to a debugger waiting for a
+//! stop reply); a breakpoint, a watchpoint or the end of a step stops it as debug
+//! (SIGTRAP); a continue and a step run it (running). The console, the screen and
+//! input go on as for any paused VM. A debugger that detaches (`D`) leaves the machine
+//! without its breakpoints, running; one whose connection ends leaves it as it was.
+//! While a VM has a debugger its state notices are rate-limited ([`NOTICE_RATE`]): a
+//! `next` may step a million times, each step a running and a debug.
+//!
 //! A VM's network cards ([`Card`]) plug into Avalon's switches. A frame queued for
 //! one of them rings the VM's bell ([`Vm::kick`]), so a machine parked in `wfi`
 //! takes it at once instead of after its nap.
@@ -73,6 +88,8 @@ use avalon_proto::{
 };
 use excalibur::csr::IRQ_M_TIMER;
 use grail::framebuffer::{FB_HEIGHT, FB_WIDTH};
+use grail::gdb::packet::Decoder;
+use grail::gdb::{self, StopReason};
 use grail::net::NetBackend;
 use grail::pointer::{Motion, PointerInput};
 use grail::{keyboard, Machine, MachineConfig};
@@ -129,6 +146,16 @@ const _: () = {
     assert!(backlog > grail::framebuffer::MAX_FRAME_SIZE);
     assert!(crate::outbox::MAX_QUEUED as u64 > backlog + 2 * grail::framebuffer::MAX_FRAME_SIZE);
 };
+
+/// The shortest time between two state notices (`VmStateChanged`) of a VM that has a
+/// debugger, as QEMU's monitor rate-limits its noisy events (`monitor_qapi_event_queue`,
+/// once a second): the first change goes out at once; the ones within the next second
+/// are held, only the last kept, and that one goes out when the second ends, unless the
+/// VM is back where the last notice left it. Without the limit a debugger's steps,
+/// each of them two changes (running, then debug), would flood every client attached
+/// to the VM. The end of the machine (stopped, exited) is never held. A state request
+/// (`GetVmInfo`) always has the state as it is.
+pub const NOTICE_RATE: Duration = Duration::from_secs(1);
 
 /// Most keys, and most pointer changes, waiting for the machine. The devices' own
 /// FIFOs hold 64; more than this waiting means the guest is not reading them (or is
@@ -194,6 +221,137 @@ struct Inner {
     /// Viewers' keys and pointer changes, for the thread to hand to the machine.
     keys: VecDeque<keyboard::KeyEvent>,
     pointer: VecDeque<PointerInput>,
+    /// The client attached as the VM's debugger (protocol doc, section 6.8), and what
+    /// it has sent the stub that the thread has not taken yet.
+    debugger: Option<Debugger>,
+    /// The debugger the thread has a session for, once it has made one (and stopped the
+    /// machine for it): what `attach_debugger` and `detach_debugger` wait for.
+    linked: Option<u64>,
+    /// A debugger that went without `D` (its connection ended, or it could no longer be
+    /// written to): the thread hands the stub what it sent before it went, then lets go
+    /// of its session and leaves the machine as it is, stopped or running, its
+    /// breakpoints and watchpoints kept, as QEMU does when a GDB connection closes.
+    dropped: Option<Dropped>,
+    /// The state notices held back by [`NOTICE_RATE`].
+    notices: Notices,
+}
+
+/// The rate limit of a VM's state notices ([`NOTICE_RATE`]).
+struct Notices {
+    /// The state the last notice gave.
+    sent: VmState,
+    /// When the last notice the limit applied to went out: until a [`NOTICE_RATE`]
+    /// later, changes are held.
+    at: Option<Instant>,
+    /// The last change held.
+    pending: Option<VmState>,
+}
+
+/// A client attached as a VM's debugger.
+struct Debugger {
+    outbox: Arc<Outbox>,
+    /// Bytes of the GDB remote serial protocol for the stub.
+    input: Vec<u8>,
+}
+
+/// A debugger gone without `D`, and the bytes it sent that the thread had not taken
+/// yet. QEMU's stub reads a connection's bytes in order and sees its end after the
+/// last of them (`gdb_chr_receive`, then `CHR_EVENT_CLOSED`), so a `c` sent just before
+/// the connection closed still runs the VM: these still go to the stub, before the
+/// thread lets go of the session.
+struct Dropped {
+    client: u64,
+    input: Vec<u8>,
+}
+
+impl Dropped {
+    /// `debugger` is gone without `D`.
+    fn from(debugger: Debugger) -> Dropped {
+        Dropped {
+            client: debugger.outbox.id,
+            input: debugger.input,
+        }
+    }
+}
+
+/// What the thread does once it has looked at the VM.
+enum Work {
+    /// Hand the debugger's bytes to the stub.
+    Debug(Vec<u8>),
+    /// Run a slice, after handing these keys and pointer changes to the machine.
+    Slice(VecDeque<keyboard::KeyEvent>, VecDeque<PointerInput>),
+}
+
+/// The thread's side of a debugger: its session with Grail's stub ([`gdb::Session`],
+/// the stub `grail --gdb` serves), the decoder of its bytes, and whether it waits for a
+/// stop reply. The thread owns the machine, so it is the stub's host, as `grail --gdb`'s
+/// main loop is.
+struct DebugLink {
+    client: u64,
+    session: gdb::Session,
+    decoder: Decoder,
+    /// The debugger resumed the machine (`c`) and waits for its stop reply.
+    waiting: bool,
+}
+
+/// How a batch of the debugger's bytes left the link.
+enum LinkEnd {
+    /// Still the debugger's: stopped, or resumed (`waiting`).
+    Linked,
+    /// `D`: `OK` sent; the debugger has detached.
+    Detach,
+    /// `k`: `X09` sent; the VM stops.
+    Kill,
+    /// A step reached the exit: `W` sent.
+    Exited(u32),
+}
+
+impl DebugLink {
+    /// Hands the debugger's bytes to the stub, as `grail --gdb` does with what its
+    /// client sends: stopped, each packet is answered and a step runs here; resumed,
+    /// only a Ctrl-C counts, which stops the machine (all-stop mode). `state` is told
+    /// each run state the debugger moves the VM to, as QEMU's: running for a continue
+    /// (`vm_start`) and for a step (`vm_prepare_start`), debug at the step's end, paused
+    /// for a Ctrl-C. Returns what to send the debugger, and how the link stands.
+    fn input(
+        &mut self,
+        machine: &mut Machine,
+        bytes: &[u8],
+        state: &mut impl FnMut(VmState),
+    ) -> (Vec<u8>, LinkEnd) {
+        let mut out = Vec::new();
+        for &b in bytes {
+            let Some(event) = self.decoder.push(b) else {
+                continue;
+            };
+            if self.waiting {
+                if gdb::Session::interrupts(&event) {
+                    self.session.stopped(machine, StopReason::Interrupted, &mut out);
+                    self.waiting = false;
+                    state(VmState::Paused);
+                }
+                continue;
+            }
+            match self.session.event(machine, event, &mut out) {
+                gdb::Next::Wait => {}
+                gdb::Next::Continue => {
+                    self.waiting = true;
+                    state(VmState::Running);
+                }
+                gdb::Next::Step => {
+                    state(VmState::Running);
+                    if let Some(code) = self.session.step(machine, &mut |_| {}, &mut out) {
+                        return (out, LinkEnd::Exited(code));
+                    }
+                    state(VmState::Debug);
+                }
+                gdb::Next::Detach => return (out, LinkEnd::Detach),
+                gdb::Next::Kill => return (out, LinkEnd::Kill),
+                gdb::Next::Exited(code) => return (out, LinkEnd::Exited(code)),
+            }
+        }
+        (out, LinkEnd::Linked)
+    }
 }
 
 /// A client attached to the screen.
@@ -369,6 +527,14 @@ impl Vm {
                 screen_looked: None,
                 keys: VecDeque::new(),
                 pointer: VecDeque::new(),
+                debugger: None,
+                linked: None,
+                dropped: None,
+                notices: Notices {
+                    sent: VmState::Created,
+                    at: None,
+                    pending: None,
+                },
             }),
             wake: Condvar::new(),
             thread: Mutex::new(None),
@@ -499,7 +665,8 @@ impl Vm {
         }
     }
 
-    /// Sets the state and tells every attached client.
+    /// Sets the state and tells every attached client, now or, while the VM has a
+    /// debugger, within [`NOTICE_RATE`].
     ///
     /// A machine that has ended (stopped or exited) ends its network cards first: they
     /// are unplugged for good before anyone can hear of the new state, so a client told
@@ -513,6 +680,48 @@ impl Vm {
             }
         }
         inner.state = state;
+        let notices = &mut inner.notices;
+        let ended = matches!(state, VmState::Stopped | VmState::Exited(_));
+        if inner.debugger.is_some() && !ended {
+            let now = Instant::now();
+            if notices.at.is_some_and(|at| now < at + NOTICE_RATE) {
+                // The thread sends it when the second is over.
+                notices.pending = Some(state);
+                self.wake.notify_all();
+                return;
+            }
+            notices.at = Some(now);
+        } else {
+            notices.at = None;
+        }
+        notices.pending = None;
+        self.notify(inner, state);
+    }
+
+    /// When the state notice held back must go out, if one is.
+    fn notice_due(inner: &Inner) -> Option<Instant> {
+        let n = &inner.notices;
+        n.pending.and(n.at).map(|at| at + NOTICE_RATE)
+    }
+
+    /// Sends the held state notice if its time has come (the thread looks between
+    /// slices and while it waits): unless the VM is in the state the last notice gave,
+    /// which starts another second of the limit.
+    fn send_due_notice(&self, inner: &mut Inner) {
+        if Vm::notice_due(inner).is_none_or(|due| Instant::now() < due) {
+            return;
+        }
+        let state = inner.notices.pending.take().expect("a notice is due");
+        if state == inner.notices.sent {
+            return;
+        }
+        inner.notices.at = Some(Instant::now());
+        self.notify(inner, state);
+    }
+
+    /// Tells every attached client the VM is in `state` (`VmStateChanged`).
+    fn notify(&self, inner: &mut Inner, state: VmState) {
+        inner.notices.sent = state;
         if self.log {
             eprintln!("avalon: VM {} ('{}') {state}", self.id, self.name);
         }
@@ -523,6 +732,21 @@ impl Vm {
         inner
             .viewers
             .retain(|v| consoles.iter().any(|c| c.id == v.outbox.id) || v.outbox.event(&event));
+        let Inner {
+            consoles,
+            viewers,
+            debugger,
+            dropped,
+            ..
+        } = inner;
+        if let Some(d) = debugger {
+            let told = consoles.iter().any(|c| c.id == d.outbox.id)
+                || viewers.iter().any(|v| v.outbox.id == d.outbox.id);
+            if !told && !d.outbox.event(&event) {
+                // Gone without `D`.
+                *dropped = debugger.take().map(Dropped::from);
+            }
+        }
         self.wake.notify_all();
     }
 
@@ -540,6 +764,11 @@ impl Vm {
         if inner.state != VmState::Created || inner.gone {
             return Err(wrong_state(self, inner.state, "created"));
         }
+        self.spawn(&mut inner, VmState::Running)
+    }
+
+    /// Moves the machine of a created VM onto a thread of its own, the VM in `state`.
+    fn spawn(self: &Arc<Self>, inner: &mut Inner, state: VmState) -> Result<(), Fail> {
         let machine = inner.machine.take().expect("a created VM has its machine");
         let vm = Arc::clone(self);
         let spawned = std::thread::Builder::new()
@@ -548,12 +777,12 @@ impl Vm {
         match spawned {
             Ok(handle) => {
                 *lock(&self.thread) = Some(handle);
-                self.set_state(&mut inner, VmState::Running);
+                self.set_state(inner, state);
                 Ok(())
             }
             Err(e) => {
                 // The machine went with the closure that could not run.
-                self.set_state(&mut inner, VmState::Stopped);
+                self.set_state(inner, VmState::Stopped);
                 Err(Fail::new(
                     ErrorCode::Internal,
                     format!("cannot start a VM thread: {e}"),
@@ -562,7 +791,8 @@ impl Vm {
         }
     }
 
-    /// running → paused. Once this returns the machine runs no more steps.
+    /// running → paused. Once this returns the machine runs no more steps. A debugger
+    /// waiting for a stop reply gets one (`T02`), as from QEMU's `stop`.
     pub fn pause(&self) -> Result<(), Fail> {
         let mut inner = self.lock();
         if inner.state != VmState::Running {
@@ -573,17 +803,29 @@ impl Vm {
         Ok(())
     }
 
-    /// paused → running.
+    /// paused → running, and debug → running for a VM without a debugger (one whose
+    /// debugger's connection ended at a stop), as QEMU's `cont`. A VM with a debugger,
+    /// stopped, is the debugger's to resume: it is waiting for no stop reply, and would
+    /// not be told when the VM stops again.
     pub fn resume(&self) -> Result<(), Fail> {
         let mut inner = self.lock();
-        if inner.state != VmState::Paused {
+        if !matches!(inner.state, VmState::Paused | VmState::Debug) {
             return Err(wrong_state(self, inner.state, "paused"));
+        }
+        if inner.debugger.is_some() {
+            return Err(Fail::new(
+                ErrorCode::InvalidState,
+                format!(
+                    "VM {} ('{}') is {}, held by its debugger: the debugger resumes it",
+                    self.id, self.name, inner.state
+                ),
+            ));
         }
         self.set_state(&mut inner, VmState::Running);
         Ok(())
     }
 
-    /// created, running or paused → stopped. The machine is dropped (by the thread,
+    /// created, running, paused or debug → stopped. The machine is dropped (by the thread,
     /// which ends); the VM keeps its scrollback, step count and RAM budget until it is
     /// destroyed. A machine that has run is stopped by its thread, between two slices:
     /// it sends the viewers the last frame, then the state change, as an exit does.
@@ -597,25 +839,27 @@ impl Vm {
                 drop(machine);
                 Ok(())
             }
-            VmState::Running | VmState::Paused => {
+            VmState::Running | VmState::Paused | VmState::Debug => {
                 inner.stopping = true;
                 self.wake.notify_all();
                 // Until the thread has stopped the VM (or the VM is being destroyed, or
                 // its thread crashed, which stops it too).
-                while matches!(inner.state, VmState::Running | VmState::Paused) && !inner.gone {
+                while matches!(inner.state, VmState::Running | VmState::Paused | VmState::Debug)
+                    && !inner.gone
+                {
                     inner = self.wait(inner);
                 }
                 drop(self.settle(inner));
                 Ok(())
             }
-            state => Err(wrong_state(self, state, "created, running or paused")),
+            state => Err(wrong_state(self, state, "created, running, paused or debug")),
         }
     }
 
     /// Ends the VM for good: its thread stops and is joined, its machine is dropped,
     /// and attached clients get `Detached`. The caller has taken it out of the table.
     pub fn destroy(&self) {
-        let (consoles, viewers, machine) = {
+        let (consoles, viewers, debugger, machine) = {
             let mut inner = self.lock();
             inner.gone = true;
             // Its machine is ending: its cards go now, not when the thread lets go.
@@ -627,12 +871,18 @@ impl Vm {
             (
                 std::mem::take(&mut inner.consoles),
                 std::mem::take(&mut inner.viewers),
+                inner.debugger.take(),
                 inner.machine.take(),
             )
         };
         drop(machine);
         let viewers = viewers.into_iter().map(|v| v.outbox).collect();
-        for (clients, kind) in [(consoles, AttachKind::Console), (viewers, AttachKind::Screen)] {
+        let debugger = debugger.into_iter().map(|d| d.outbox).collect();
+        for (clients, kind) in [
+            (consoles, AttachKind::Console),
+            (viewers, AttachKind::Screen),
+            (debugger, AttachKind::Debug),
+        ] {
             let detached = event_frame(&Message::Detached { vm: self.id, kind });
             for client in clients {
                 client.event(&detached);
@@ -650,7 +900,10 @@ impl Vm {
         let machine = {
             let mut inner = self.lock();
             let machine = inner.machine.take();
-            if matches!(inner.state, VmState::Created | VmState::Running | VmState::Paused) {
+            if matches!(
+                inner.state,
+                VmState::Created | VmState::Running | VmState::Paused | VmState::Debug
+            ) {
                 self.set_state(&mut inner, VmState::Stopped);
             }
             inner.gone = true;
@@ -713,6 +966,110 @@ impl Vm {
         inner.kick = true;
         self.wake.notify_all();
         true
+    }
+
+    /// Makes `client` the VM's debugger (protocol doc, section 6.8): the VM stops for it
+    /// as QEMU's does for a GDB connection, paused (`vm_stop(RUN_STATE_PAUSED)`). A
+    /// created VM starts paused, before its first instruction (as `grail --gdb-wait`);
+    /// a running one stops between two slices; a paused one, or one in state debug (its
+    /// last debugger's connection ended at a stop), stays as it is. Returns once the
+    /// thread has stopped the machine. Errors: `Busy` (it has a debugger),
+    /// `InvalidState` (its machine has ended).
+    pub fn attach_debugger(self: &Arc<Self>, client: &Arc<Outbox>) -> Result<(), Fail> {
+        let mut inner = self.lock();
+        if inner.gone {
+            return Err(Fail::new(
+                ErrorCode::NoSuchVm,
+                format!("VM {} is being destroyed", self.id),
+            ));
+        }
+        if let Some(d) = &inner.debugger {
+            let who = if d.outbox.id == client.id {
+                "this connection"
+            } else {
+                "another client"
+            };
+            return Err(Fail::new(
+                ErrorCode::Busy,
+                format!("VM {} ('{}') has a debugger already: {who}", self.id, self.name),
+            ));
+        }
+        const LIVE: &str = "created, running, paused or debug";
+        if !matches!(
+            inner.state,
+            VmState::Created | VmState::Running | VmState::Paused | VmState::Debug
+        ) {
+            return Err(wrong_state(self, inner.state, LIVE));
+        }
+        inner.debugger = Some(Debugger {
+            outbox: Arc::clone(client),
+            input: Vec::new(),
+        });
+        if inner.state == VmState::Created {
+            self.spawn(&mut inner, VmState::Paused)?;
+        }
+        self.wake.notify_all();
+        // Until the thread has its session (the machine stopped for the debugger), or the
+        // machine has ended meanwhile.
+        while inner.linked != Some(client.id)
+            && inner.debugger.as_ref().is_some_and(|d| d.outbox.id == client.id)
+            && !inner.gone
+        {
+            inner = self.wait(inner);
+        }
+        if inner.linked == Some(client.id) {
+            Ok(())
+        } else {
+            Err(wrong_state(self, inner.state, LIVE))
+        }
+    }
+
+    /// Client `id` stops being the VM's debugger, as after GDB's `D`: the thread clears
+    /// the breakpoints and watchpoints and runs a VM that is stopped (paused or debug)
+    /// on, as QEMU's `D` does (`gdb_continue`). Returns once it has. False if `id` was
+    /// not its debugger.
+    pub fn detach_debugger(&self, id: u64) -> bool {
+        self.lose_debugger(id, false)
+    }
+
+    /// Client `id`'s connection has ended: if it was the VM's debugger, the VM is left
+    /// as it is, stopped or running, with its breakpoints and watchpoints, as QEMU
+    /// leaves a VM whose GDB connection closes. The next debugger's `?` removes them.
+    pub fn debugger_gone(&self, id: u64) {
+        self.lose_debugger(id, true);
+    }
+
+    fn lose_debugger(&self, id: u64, dropped: bool) -> bool {
+        let mut inner = self.lock();
+        if inner.debugger.as_ref().map(|d| d.outbox.id) != Some(id) {
+            return false;
+        }
+        let debugger = inner.debugger.take();
+        if dropped {
+            inner.dropped = debugger.map(Dropped::from);
+        }
+        self.wake.notify_all();
+        while inner.linked == Some(id) && !inner.gone {
+            inner = self.wait(inner);
+        }
+        true
+    }
+
+    /// Bytes from client `id` for the stub. Dropped (false) unless it is the debugger.
+    pub fn debug_input(&self, id: u64, data: &[u8]) -> bool {
+        let mut inner = self.lock();
+        match &mut inner.debugger {
+            Some(d) if d.outbox.id == id => d.input.extend_from_slice(data),
+            _ => return false,
+        }
+        inner.kick = true;
+        self.wake.notify_all();
+        true
+    }
+
+    /// Whether the VM has a debugger.
+    pub fn debugged(&self) -> bool {
+        self.lock().debugger.is_some()
     }
 
     /// Attaches `client` to the screen: queues `ScreenAttached` and a full frame of the
@@ -798,7 +1155,10 @@ impl Vm {
     /// the viewers, if it is one and the machine can still run.
     fn input_event(&self, id: u64, push: impl FnOnce(&mut Inner, usize) -> bool) -> bool {
         let mut inner = self.lock();
-        let live = matches!(inner.state, VmState::Created | VmState::Running | VmState::Paused);
+        let live = matches!(
+            inner.state,
+            VmState::Created | VmState::Running | VmState::Paused | VmState::Debug
+        );
         let Some(at) = inner.viewers.iter().position(|v| v.outbox.id == id) else {
             return false;
         };
@@ -810,31 +1170,62 @@ impl Vm {
         true
     }
 
-    /// The VM thread: runs the machine in slices while the VM is running.
+    /// The VM thread: runs the machine in slices while the VM is running, and serves its
+    /// debugger, if it has one, between slices.
     fn run(self: Arc<Self>, mut machine: Machine) {
         let _guard = ThreadGuard(&self);
         let paced = machine.config().clock_hz.is_some();
+        // The debugger's session with the machine's stub, while there is a debugger.
+        let mut link: Option<DebugLink> = None;
         loop {
-            let (keys, pointer) = {
+            let work = {
                 let mut inner = self.lock();
-                loop {
+                let work = loop {
                     if inner.gone || matches!(inner.state, VmState::Stopped | VmState::Exited(_)) {
                         self.last_look(&mut inner, &machine);
+                        self.end_debugger(&mut inner, link.take());
                         return;
                     }
                     if inner.stopping {
                         // `stop` waits for this: the last frame, then the state change.
                         self.last_look(&mut inner, &machine);
                         self.set_state(&mut inner, VmState::Stopped);
+                        self.end_debugger(&mut inner, link.take());
                         return;
                     }
-                    if inner.state == VmState::Running {
-                        break;
+                    self.send_due_notice(&mut inner);
+                    // What a debugger gone without `D` sent before it went reaches the
+                    // stub before its session ends.
+                    if let Some(input) = Vm::dropped_input(&mut inner, &link) {
+                        break Work::Debug(input);
                     }
-                    // Paused: the viewers still get what the last slices drew, and a
-                    // viewer that falls behind still catches up.
+                    self.link_debugger(&mut inner, &mut link, &mut machine);
+                    if let Some(l) = link.as_mut().filter(|l| l.waiting) {
+                        if inner.state == VmState::Paused {
+                            // PauseVm while the debugger waited: its stop reply, as QEMU's
+                            // `gdb_vm_state_change` sends one for any stop (SIGINT).
+                            let mut out = Vec::new();
+                            l.session.stopped(&mut machine, StopReason::Interrupted, &mut out);
+                            l.waiting = false;
+                            self.debug_output(&mut inner, out);
+                        }
+                    }
+                    let input = inner.debugger.as_mut().map(|d| std::mem::take(&mut d.input));
+                    if let Some(input) = input.filter(|i| !i.is_empty()) {
+                        break Work::Debug(input);
+                    }
+                    if inner.state == VmState::Running {
+                        break Work::Slice(
+                            std::mem::take(&mut inner.keys),
+                            std::mem::take(&mut inner.pointer),
+                        );
+                    }
+                    // Paused, or stopped for the debugger: the viewers still get what
+                    // the last slices drew, and a viewer that falls behind still
+                    // catches up.
                     self.look(&mut inner, &machine);
-                    inner = match self.screen_due(&inner) {
+                    let due = [self.screen_due(&inner), Vm::notice_due(&inner)];
+                    inner = match due.into_iter().flatten().min() {
                         Some(due) => {
                             let left = due.saturating_duration_since(Instant::now());
                             self.wake
@@ -844,13 +1235,69 @@ impl Vm {
                         }
                         None => self.wait(inner),
                     };
-                }
+                };
                 inner.busy = true;
                 inner.kick = false;
-                (
-                    std::mem::take(&mut inner.keys),
-                    std::mem::take(&mut inner.pointer),
-                )
+                work
+            };
+            let (keys, pointer) = match work {
+                Work::Debug(input) => {
+                    let link = link.as_mut().expect("a debugger's input comes with its link");
+                    let before = machine.debug_steps();
+                    // The run states the debugger moves the VM through. A request that
+                    // came meanwhile wins: a stop, or a pause during a step.
+                    let mut moved = |to: VmState| {
+                        let mut inner = self.lock();
+                        let from = inner.state;
+                        let follows = match to {
+                            VmState::Running => matches!(from, VmState::Paused | VmState::Debug),
+                            _ => from == VmState::Running,
+                        };
+                        if follows && !inner.gone && !inner.stopping {
+                            self.set_state(&mut inner, to);
+                        }
+                    };
+                    let (out, end) = link.input(&mut machine, &input, &mut moved);
+                    self.steps
+                        .fetch_add(machine.debug_steps() - before, Ordering::Relaxed);
+                    let output = self.output.take();
+                    let mut inner = self.lock();
+                    inner.busy = false;
+                    self.wake.notify_all();
+                    if !output.is_empty() {
+                        self.console_output(&mut inner, output);
+                    }
+                    self.debug_output(&mut inner, out);
+                    match end {
+                        LinkEnd::Linked => {}
+                        LinkEnd::Detach => {
+                            if inner.debugger.as_ref().map(|d| d.outbox.id) == Some(link.client) {
+                                inner.debugger = None;
+                            }
+                            // The next look lets go of the link and runs the machine on.
+                        }
+                        LinkEnd::Kill => {
+                            // As StopVm: the last frame, the state change, the debugger
+                            // detached (`X09` has been sent).
+                            link.waiting = false;
+                            self.last_look(&mut inner, &machine);
+                            self.set_state(&mut inner, VmState::Stopped);
+                            self.end_debugger(&mut inner, None);
+                            return;
+                        }
+                        LinkEnd::Exited(code) => {
+                            link.waiting = false;
+                            self.last_look(&mut inner, &machine);
+                            if !inner.gone {
+                                self.set_state(&mut inner, VmState::Exited(code));
+                            }
+                            self.end_debugger(&mut inner, None);
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                Work::Slice(keys, pointer) => (keys, pointer),
             };
 
             // Viewers' input first, as Grail's window hands it over between slices.
@@ -860,7 +1307,17 @@ impl Vm {
             for change in pointer {
                 machine.pointer_event(change);
             }
-            let steps = machine.run_for(SLICE, &mut |_| {});
+            // With breakpoints or watchpoints (its debugger's, or those of one whose
+            // connection ended), the machine runs as Grail's stub runs it, stopping at
+            // them.
+            let debugged = machine.has_debug_points() || link.as_ref().is_some_and(|l| l.waiting);
+            let (steps, stop) = if debugged {
+                let before = machine.debug_steps();
+                let stop = machine.debug_continue(SLICE, &mut |_| {});
+                (machine.debug_steps() - before, stop)
+            } else {
+                (machine.run_for(SLICE, &mut |_| {}), None)
+            };
             // `run_for` ends a slice early once the guest has shown a new frame (written
             // FB_PRESENT, made a modeset that took effect, or a page flip took effect at a
             // vertical blank), and once a vertical blank has changed the cursor (moved,
@@ -883,11 +1340,26 @@ impl Vm {
             if steps > 0 {
                 inner.screen_owed = true;
             }
+            if let Some(stop) = stop {
+                // A breakpoint, a watchpoint or the exit: the stop reply of a debugger
+                // waiting for one. With none (or none waiting), the VM stops all the
+                // same, as QEMU's does in state debug.
+                if let Some(link) = link.as_mut().filter(|l| l.waiting) {
+                    let mut out = Vec::new();
+                    link.session
+                        .stopped(&mut machine, StopReason::Machine(stop), &mut out);
+                    link.waiting = false;
+                    self.debug_output(&mut inner, out);
+                }
+                if machine.exit_code().is_none() && inner.state == VmState::Running {
+                    self.set_state(&mut inner, VmState::Debug);
+                }
+            }
             if let Some(code) = machine.exit_code() {
                 // The last frame before the state change, so that viewers have it by
                 // the time they hear the program has ended.
                 self.last_look(&mut inner, &machine);
-                if !inner.gone && matches!(inner.state, VmState::Running | VmState::Paused) {
+                if !inner.gone && matches!(inner.state, VmState::Running | VmState::Paused | VmState::Debug) {
                     // A stop asked for during the slice wins, as it would have had it
                     // come a step earlier.
                     let end = if inner.stopping {
@@ -897,7 +1369,11 @@ impl Vm {
                     };
                     self.set_state(&mut inner, end);
                 }
+                self.end_debugger(&mut inner, link.take());
                 return;
+            }
+            if inner.state != VmState::Running {
+                continue;
             }
             self.look(&mut inner, &machine);
             // Nothing to run right now: a real-time machine ahead of the wall clock, or
@@ -909,14 +1385,98 @@ impl Vm {
                 parked(&machine).then_some(PARKED_NAP)
             };
             if let Some(mut nap) = nap {
-                if let Some(due) = self.screen_due(&inner) {
+                for due in [self.screen_due(&inner), Vm::notice_due(&inner)]
+                    .into_iter()
+                    .flatten()
+                {
                     nap = nap.min(due.saturating_duration_since(Instant::now()));
                 }
-                if inner.state == VmState::Running && !inner.kick && !inner.gone && !inner.stopping {
+                let debug_input = inner.debugger.as_ref().is_some_and(|d| !d.input.is_empty())
+                    || inner.dropped.as_ref().is_some_and(|d| !d.input.is_empty());
+                if !inner.kick && !inner.gone && !inner.stopping && !debug_input {
                     drop(self.wake.wait_timeout(inner, nap));
                 }
             }
         }
+    }
+
+    /// Makes the thread's link with the debugger follow `inner.debugger`, as QEMU's stub
+    /// follows its GDB connection. A new debugger gets a session with the machine's
+    /// stub, which stops the machine for it: a running VM is paused
+    /// (`vm_stop(RUN_STATE_PAUSED)`), a stopped one stays as it is. A debugger that
+    /// detached (`D`, `DebugDetach`) leaves the machine without its breakpoints and
+    /// watchpoints, and a stopped VM running again (`gdb_continue`). One whose
+    /// connection ended leaves it as it is, breakpoints and all: QEMU does nothing then.
+    fn link_debugger(&self, inner: &mut Inner, link: &mut Option<DebugLink>, machine: &mut Machine) {
+        let client = inner.debugger.as_ref().map(|d| d.outbox.id);
+        if link.as_ref().map(|l| l.client) == client {
+            return;
+        }
+        if let Some(old) = link.take() {
+            if inner.dropped.take().map(|d| d.client) != Some(old.client) {
+                machine.clear_debug_points();
+                if matches!(inner.state, VmState::Paused | VmState::Debug) {
+                    self.set_state(inner, VmState::Running);
+                }
+            }
+        }
+        if let Some(client) = client {
+            *link = Some(DebugLink {
+                client,
+                session: gdb::Session::new(machine),
+                decoder: Decoder::default(),
+                waiting: false,
+            });
+            if inner.state == VmState::Running {
+                self.set_state(inner, VmState::Paused);
+            }
+        }
+        inner.linked = client;
+        self.wake.notify_all();
+    }
+
+    /// The stub's bytes for the debugger.
+    fn debug_output(&self, inner: &mut Inner, data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+        let Some(debugger) = &inner.debugger else {
+            return;
+        };
+        let event = event_frame(&Message::DebugOutput { vm: self.id, data });
+        if !debugger.outbox.event(&event) {
+            // Gone, as if its connection had ended.
+            inner.dropped = inner.debugger.take().map(Dropped::from);
+        }
+    }
+
+    /// The bytes a debugger gone without `D` sent that the stub has not had, while the
+    /// thread still has its session (`link`).
+    fn dropped_input(inner: &mut Inner, link: &Option<DebugLink>) -> Option<Vec<u8>> {
+        let dropped = inner.dropped.as_mut()?;
+        if link.as_ref().map(|l| l.client) != Some(dropped.client) || dropped.input.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut dropped.input))
+    }
+
+    /// The machine has ended (stopped, exited, destroyed): a debugger waiting for a stop
+    /// reply gets `X09` (an exit has sent its `W` already), and the attachment ends
+    /// (`Detached`), since there is nothing left to debug.
+    fn end_debugger(&self, inner: &mut Inner, link: Option<DebugLink>) {
+        if let Some(mut link) = link.filter(|l| l.waiting) {
+            let mut out = Vec::new();
+            link.session.killed(&mut out);
+            self.debug_output(inner, out);
+        }
+        if let Some(debugger) = inner.debugger.take() {
+            debugger.outbox.event(&event_frame(&Message::Detached {
+                vm: self.id,
+                kind: AttachKind::Debug,
+            }));
+        }
+        inner.linked = None;
+        self.wake.notify_all();
     }
 
     /// When the thread should next look at the screen: `None` when nobody is attached
@@ -1125,10 +1685,17 @@ impl Drop for ThreadGuard<'_> {
         inner.busy = false;
         if std::thread::panicking() {
             eprintln!("avalon: VM {} ('{}') crashed; it is stopped", vm.id, vm.name);
-            if !inner.gone && matches!(inner.state, VmState::Running | VmState::Paused) {
+            if !inner.gone && matches!(inner.state, VmState::Running | VmState::Paused | VmState::Debug) {
                 vm.set_state(&mut inner, VmState::Stopped);
             }
+            if let Some(debugger) = inner.debugger.take() {
+                debugger.outbox.event(&event_frame(&Message::Detached {
+                    vm: vm.id,
+                    kind: AttachKind::Debug,
+                }));
+            }
         }
+        inner.linked = None;
         inner.input = None;
         vm.wake.notify_all();
     }

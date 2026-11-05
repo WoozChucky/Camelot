@@ -3,7 +3,8 @@
 //!
 //! Type codes are grouped by their high byte: `0x00` session, `0x01` VM control, `0x02`
 //! console, `0x03` screen and input (keyboard and pointer), `0x04` block I/O, `0x05`
-//! disk management, `0x06` virtual network (Avalon's switches). Every message is a
+//! disk management, `0x06` virtual network (Avalon's switches), `0x07` debugging (a VM's
+//! GDB stub, tunnelled). Every message is a
 //! request (answered by exactly one reply), a reply, or an event (never answered); see
 //! [`MessageKind`].
 
@@ -75,6 +76,12 @@ pub mod ty {
     pub const DETACH_CARD: u16 = 0x0606;
     pub const CAPTURE_SWITCH: u16 = 0x0607;
     pub const SET_SWITCH_NAT: u16 = 0x0608;
+    // Debugging.
+    pub const DEBUG_ATTACH: u16 = 0x0701;
+    pub const DEBUG_ATTACHED: u16 = 0x0702;
+    pub const DEBUG_INPUT: u16 = 0x0703;
+    pub const DEBUG_OUTPUT: u16 = 0x0704;
+    pub const DEBUG_DETACH: u16 = 0x0705;
 }
 
 /// Every message type, with its name and kind, in code order. The protocol doc's
@@ -136,6 +143,11 @@ pub const CATALOGUE: &[(u16, &str, MessageKind)] = {
         (ty::DETACH_CARD, "DetachCard", Request),
         (ty::CAPTURE_SWITCH, "CaptureSwitch", Request),
         (ty::SET_SWITCH_NAT, "SetSwitchNat", Request),
+        (ty::DEBUG_ATTACH, "DebugAttach", Request),
+        (ty::DEBUG_ATTACHED, "DebugAttached", Reply),
+        (ty::DEBUG_INPUT, "DebugInput", Event),
+        (ty::DEBUG_OUTPUT, "DebugOutput", Event),
+        (ty::DEBUG_DETACH, "DebugDetach", Request),
     ]
 };
 
@@ -310,7 +322,8 @@ impl fmt::Display for VmRef {
 }
 
 /// A VM's life cycle: created, then running, paused and resumed any number of times,
-/// until it is stopped or its program exits.
+/// and stopped by its debugger and resumed by it, until it is stopped or its program
+/// exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmState {
     Created,
@@ -320,6 +333,9 @@ pub enum VmState {
     Stopped,
     /// The program stopped the machine with this exit code.
     Exited(u32),
+    /// Held by its debugger: stopped at a breakpoint, a watchpoint, a step or an
+    /// interrupt, until the debugger resumes it (QEMU's run state `debug`).
+    Debug,
 }
 
 impl fmt::Display for VmState {
@@ -330,6 +346,7 @@ impl fmt::Display for VmState {
             VmState::Paused => write!(f, "paused"),
             VmState::Stopped => write!(f, "stopped"),
             VmState::Exited(code) => write!(f, "exited({code})"),
+            VmState::Debug => write!(f, "debug"),
         }
     }
 }
@@ -369,6 +386,7 @@ pub struct DeviceEntry {
 pub enum AttachKind {
     Console,
     Screen,
+    Debug,
 }
 
 /// A key press or release for the guest's keyboard device (Excalibur spec section
@@ -725,7 +743,8 @@ pub enum Message {
         vm: u32,
         state: VmState,
     },
-    /// Server: it ended an attachment (the VM was destroyed).
+    /// Server: it ended an attachment (the VM was destroyed; a debugger's also when the
+    /// VM's machine ended).
     Detached {
         vm: u32,
         kind: AttachKind,
@@ -928,6 +947,31 @@ pub enum Message {
         switch: String,
         nat: Option<NatConfig>,
     },
+
+    // ---- Debugging (Avalon) ----
+    /// Attach a debugger to a VM's GDB stub: the VM stops for it (state debug).
+    /// Answered by `DebugAttached`; the GDB remote serial protocol then travels in
+    /// `DebugInput` and `DebugOutput`.
+    DebugAttach {
+        vm: VmRef,
+    },
+    DebugAttached {
+        vm: u32,
+    },
+    /// Client: bytes of the GDB remote serial protocol for the VM's stub.
+    DebugInput {
+        vm: u32,
+        data: Vec<u8>,
+    },
+    /// Server: bytes of the GDB remote serial protocol from the VM's stub.
+    DebugOutput {
+        vm: u32,
+        data: Vec<u8>,
+    },
+    /// Answered by `Ok`; the VM runs on without breakpoints, as after GDB's `D`.
+    DebugDetach {
+        vm: u32,
+    },
 }
 
 impl Message {
@@ -989,6 +1033,11 @@ impl Message {
             DetachCard { .. } => ty::DETACH_CARD,
             CaptureSwitch { .. } => ty::CAPTURE_SWITCH,
             SetSwitchNat { .. } => ty::SET_SWITCH_NAT,
+            DebugAttach { .. } => ty::DEBUG_ATTACH,
+            DebugAttached { .. } => ty::DEBUG_ATTACHED,
+            DebugInput { .. } => ty::DEBUG_INPUT,
+            DebugOutput { .. } => ty::DEBUG_OUTPUT,
+            DebugDetach { .. } => ty::DEBUG_DETACH,
         }
     }
 
@@ -1141,7 +1190,8 @@ impl Message {
             | StopVm { vm }
             | DestroyVm { vm }
             | ConsoleAttach { vm }
-            | ScreenAttach { vm } => put_vm_ref(w, vm),
+            | ScreenAttach { vm }
+            | DebugAttach { vm } => put_vm_ref(w, vm),
             VmInfo(d) => {
                 put_summary(w, &d.vm);
                 w.list(&d.devices, |w, e| {
@@ -1161,15 +1211,20 @@ impl Message {
                 w.u8(match kind {
                     AttachKind::Console => 1,
                     AttachKind::Screen => 2,
+                    AttachKind::Debug => 3,
                 });
             }
             ConsoleAttached { vm, scrollback: data }
             | ConsoleInput { vm, data }
-            | ConsoleOutput { vm, data } => {
+            | ConsoleOutput { vm, data }
+            | DebugInput { vm, data }
+            | DebugOutput { vm, data } => {
                 w.u32(*vm);
                 w.bytes(data);
             }
-            ConsoleDetach { vm } | ScreenDetach { vm } => w.u32(*vm),
+            ConsoleDetach { vm } | ScreenDetach { vm } | DebugAttached { vm } | DebugDetach { vm } => {
+                w.u32(*vm)
+            }
             ScreenAttached {
                 vm,
                 width,
@@ -1401,6 +1456,7 @@ impl Message {
                 kind: match r.u8()? {
                     1 => AttachKind::Console,
                     2 => AttachKind::Screen,
+                    3 => AttachKind::Debug,
                     t => return Err(bad_tag("attachment kind", t)),
                 },
             },
@@ -1418,6 +1474,17 @@ impl Message {
                 data: r.bytes()?,
             },
             ty::CONSOLE_DETACH => ConsoleDetach { vm: r.u32()? },
+            ty::DEBUG_ATTACH => DebugAttach { vm: get_vm_ref(r)? },
+            ty::DEBUG_ATTACHED => DebugAttached { vm: r.u32()? },
+            ty::DEBUG_INPUT => DebugInput {
+                vm: r.u32()?,
+                data: r.bytes()?,
+            },
+            ty::DEBUG_OUTPUT => DebugOutput {
+                vm: r.u32()?,
+                data: r.bytes()?,
+            },
+            ty::DEBUG_DETACH => DebugDetach { vm: r.u32()? },
             ty::SCREEN_ATTACH => ScreenAttach { vm: get_vm_ref(r)? },
             ty::SCREEN_ATTACHED => ScreenAttached {
                 vm: r.u32()?,
@@ -1616,6 +1683,7 @@ fn put_state(w: &mut Writer, state: &VmState) {
             w.u8(4);
             w.u32(*code);
         }
+        VmState::Debug => w.u8(5),
     }
 }
 
@@ -1626,6 +1694,7 @@ fn get_state(r: &mut Reader) -> Result<VmState> {
         2 => VmState::Paused,
         3 => VmState::Stopped,
         4 => VmState::Exited(r.u32()?),
+        5 => VmState::Debug,
         t => return Err(bad_tag("VM state", t)),
     })
 }

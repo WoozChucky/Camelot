@@ -22,6 +22,8 @@
 //! - how Avalon and Lake end connections: bad handshakes, and a server's last
 //!   frame arriving whole though the client sent more (Linux's TCP stack is not
 //!   Windows's here);
+//! - a VM's debugger over Avalon: the stub and its run states, and merlin-dbg
+//!   breaking in the kernel of a VM with Herald attached;
 //! - the tests that check the documents against the code (instant).
 //!
 //! Left to the local run: the kernel's filesystem integration tests and their
@@ -87,6 +89,14 @@ const STEPS: &[Step] = &[
             "bad_handshakes",
             "the_last_frame_survives_unread_input",
         ],
+    },
+    Step {
+        what: "Avalon: a VM's GDB stub over the connection, its run states",
+        args: &["-p", "avalon", "--test", "debug"],
+    },
+    Step {
+        what: "merlin-dbg on an Avalon VM: the kernel's write system call, Herald attached",
+        args: &["-p", "merlin-dbg", "--test", "avalon"],
     },
     Step {
         what: "Lake: bad handshakes, and the last frame before a close arrives whole",

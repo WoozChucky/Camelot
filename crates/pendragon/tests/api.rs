@@ -433,6 +433,58 @@ fn vms_and_disks_end_to_end() {
     assert_eq!(s(&api.expect(200, api.get("vms/echo")), "state"), "running");
     assert_eq!(api.action(&format!("vms/{echo}/reboot")).status, 404);
 
+    // ---- A debugger holds it (protocol doc, section 6.8): paused as it attaches, debug
+    // once a step has stopped it, as QEMU's run states ----
+    let client = avalon_client::Client::connect(&platform.avalon.addr().to_string(), "test").unwrap();
+    let mut tunnel =
+        avalon_client::DebugTunnel::open(client, &avalon_proto::VmRef::Name("echo".into())).unwrap();
+    let id = tunnel.vm();
+    assert_eq!(id as u64, echo);
+    assert_eq!(s(&api.expect(200, api.get("vms/echo")), "state"), "paused");
+    tunnel.write_all(&grail::gdb::packet::frame(b"s")).unwrap();
+    let mut decoder = grail::gdb::packet::Decoder::default();
+    let mut buf = [0u8; 256];
+    let reply = 'reply: loop {
+        let n = tunnel
+            .read_timeout(&mut buf, Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        for &b in &buf[..n] {
+            if let Some(grail::gdb::packet::Event::Packet(p)) = decoder.push(b) {
+                break 'reply p;
+            }
+        }
+    };
+    assert!(reply.starts_with(b"T05"), "{}", String::from_utf8_lossy(&reply));
+    let vm = api.expect(200, api.get(&format!("vms/{echo}")));
+    assert_eq!(s(&vm, "state"), "debug");
+    // The state allows a resume, but the debugger resumes it, not the page.
+    assert_eq!(actions(&vm), ["resume", "stop", "destroy"]);
+    let r = api.action("vms/echo/resume");
+    assert_eq!(
+        (r.status, r.json().get("code").and_then(Json::as_str)),
+        (409, Some("invalid state"))
+    );
+    assert_eq!(list(&vm, "disks")[0].get("held"), Some(&Json::Bool(true)));
+    let o = api.expect(200, api.get("overview"));
+    assert_eq!(n(o.get("vms").unwrap(), "debug"), 1);
+    assert_eq!(n(o.get("vms").unwrap(), "running"), 0);
+    drop(tunnel);
+    // Its connection ended without `D`: the VM stays as it was, as QEMU's does, and with
+    // no debugger the page resumes it.
+    let start = std::time::Instant::now();
+    while platform.avalon.debug_vm(id).unwrap().debugged {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "the debugger never went"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let vm = api.expect(200, api.get(&format!("vms/{echo}")));
+    assert_eq!(s(&vm, "state"), "debug");
+    assert_eq!(actions(&vm), ["resume", "stop", "destroy"]);
+    api.expect(200, api.action("vms/echo/resume"));
+    assert_eq!(s(&api.expect(200, api.get("vms/echo")), "state"), "running");
+
     // ---- Detach: the VM holding the disk stops and lets go of it ----
     let r = api.expect(200, api.action("disks/data/detach"));
     assert_eq!(n(&list(&r, "stopped")[0], "id"), echo);
