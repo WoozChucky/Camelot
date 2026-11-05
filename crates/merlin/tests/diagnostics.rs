@@ -275,7 +275,7 @@ fn clang(x: Xlen) -> Command {
 fn diagnostics(stderr: &str) -> Vec<(String, Vec<String>)> {
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
     for line in stderr.lines() {
-        let line = table_line(line.trim_end());
+        let line = table_line(line.trim_end_matches('\r'));
         let Some(kind) = ["error", "fatal error", "warning", "note"]
             .into_iter()
             .find(|k| line.contains(&format!(": {k}: ")))
@@ -579,7 +579,7 @@ fn clang_program_lines(p: &Program, x: Xlen) -> Vec<String> {
                 .iter()
                 .any(|k| l.contains(k))
         })
-        .map(|l| plain_line(&table_line(l.trim_end())))
+        .map(|l| plain_line(&table_line(l.trim_end_matches('\r'))))
         .collect()
 }
 

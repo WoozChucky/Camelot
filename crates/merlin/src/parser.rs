@@ -170,6 +170,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
         parens_written: RefCell::new(Default::default()),
         brackets_written: RefCell::new(Default::default()),
         bit_patterns: RefCell::new(Default::default()),
+        int_literals: RefCell::new(Default::default()),
         trailing_else: Cell::new(None),
         warnings: RefCell::new(Vec::new()),
     };
@@ -212,6 +213,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
                     parens: p.parens_written.take(),
                     brackets: p.brackets_written.take(),
                     bit_patterns: p.bit_patterns.take(),
+                    int_literals: p.int_literals.take(),
                     ..Written::default()
                 },
             };
@@ -227,6 +229,7 @@ pub fn parse_salvaging(toks: &[Token], xlen: Xlen) -> Result<Program, Box<(Error
             parens: p.parens_written.take(),
             brackets: p.brackets_written.take(),
             bit_patterns: p.bit_patterns.take(),
+            int_literals: p.int_literals.take(),
             ..Written::default()
         },
     })
@@ -630,6 +633,8 @@ struct Parser<'a> {
     brackets_written: RefCell<std::collections::HashMap<Pos, Pos>>,
     /// Where the literals written in hex or octal are ([`Written::bit_patterns`]).
     bit_patterns: RefCell<std::collections::HashSet<Pos>>,
+    /// Where the integer literals are ([`Written::int_literals`]).
+    int_literals: RefCell<std::collections::HashSet<Pos>>,
     /// The `else` of the `if` the statement just parsed ends with, through
     /// loops and labels, not braces: an `if` without one of its own around
     /// it is clang's dangling `else` (its `TrailingElseLoc`).
@@ -846,6 +851,7 @@ impl Parser<'_> {
                 with: 0,
                 vla: None,
                 params: self.prototype.borrow().clone(),
+                constant: false,
             });
             return Ok((1, false));
         };
@@ -869,8 +875,28 @@ impl Parser<'_> {
                 with: 0,
                 vla: None,
                 params: self.prototype.borrow().clone(),
+                constant: false,
             });
             return Ok((1, false));
+        }
+        // The constant itself, for sema to check as clang does: not a lone
+        // literal, constant or `sizeof`, of which there is nothing to say.
+        let leaf = matches!(
+            e.kind,
+            ExprKind::Num(_) | ExprKind::Enumerator { .. } | ExprKind::SizeofType(_)
+        );
+        if sure && !leaf {
+            self.unevaluated.borrow_mut().push(Unevaluated {
+                expr: e.clone(),
+                untyped: None,
+                non_integer: None,
+                folded: false,
+                diagnostic: None,
+                with: 0,
+                vla: None,
+                params: self.prototype.borrow().clone(),
+                constant: true,
+            });
         }
         Ok((v, sure))
     }
@@ -892,6 +918,7 @@ impl Parser<'_> {
                         with: 0,
                         vla: None,
                         params: self.prototype.borrow().clone(),
+                        constant: false,
                     });
                     e.kind = ExprKind::SizeofType(t);
                 }
@@ -988,6 +1015,7 @@ impl Parser<'_> {
             with: 0,
             vla: None,
             params: self.prototype.borrow().clone(),
+            constant: false,
         });
         self.folding.set(true);
     }
@@ -1123,6 +1151,7 @@ impl Parser<'_> {
                 with: 0,
                 vla: None,
                 params: Vec::new(),
+                constant: false,
             })
             .collect();
         let pos = us.first()?.expr.pos;
@@ -1959,8 +1988,22 @@ impl Parser<'_> {
                     NOT_CONSTANT_SIZE,
                     Some("size of array has non-integer type"),
                 )?;
-                let folded = self.folding.replace(outer).then_some(size);
+                let mut folded = self.folding.replace(outer).then_some(size);
                 let entries = first..self.unevaluated.borrow().len();
+                // A size clang's evaluator notes as no constant expression
+                // (`1 << 40 ? 1 : 2`, `INT_MAX + 1 > 0 ? 1 : 2`) clang folds
+                // wherever it is, with its warning where the size begins,
+                // given unless the size has an error.
+                if let Some((at, note)) = consteval::parsed_note(&e, self.xlen).filter(|_| sure) {
+                    // Not a leaf (one never is noted): the constant is kept.
+                    folded = None;
+                    let mut us = self.unevaluated.borrow_mut();
+                    let with = entries.len() - 1;
+                    let u = us.last_mut().expect("the constant itself");
+                    let (msg, flag) = FOLDED;
+                    u.diagnostic = Some(Error::warning(size, msg, flag).note(at, note));
+                    u.with = with;
+                }
                 // Not sure: sema reports the error, and the size is not used.
                 out.push(Derive::Array(Array {
                     len: Some(if sure { n } else { 1 }),
@@ -2728,9 +2771,12 @@ impl Parser<'_> {
     /// `_Static_assert(constant, "message");` (C11, which clang accepts in
     /// C99 too; without the message C23's, which clang takes with a
     /// warning), at file or block scope. The parser evaluates constants, so
-    /// it checks the assertion here; nothing is left of it. A failed one is
+    /// it checks the assertion here; what is left of it is the condition
+    /// for sema to check ([`Unevaluated::constant`]). A failed one is
     /// clang's error, which says what failed as clang's
-    /// `findFailedBooleanCondition` does ([`Self::failed_requirement`]).
+    /// `findFailedBooleanCondition` does ([`Self::failed_requirement`]):
+    /// sema gives it after the condition's diagnostics, unless it has an
+    /// error, and clang goes on after it, as merlin does.
     fn static_assert(&mut self) -> Result<(), Error> {
         self.advance();
         let open = self.expect_punct("(")?;
@@ -2762,6 +2808,7 @@ impl Parser<'_> {
         self.expect_semi("after '_Static_assert'")?;
         let original = cond.clone();
         let not_constant = "static assertion expression is not an integral constant expression";
+        let mark = self.unevaluated.borrow().len();
         match self.const_int(&mut cond, at, not_constant, None)? {
             // Not sure of the value: sema reports the error.
             (v, sure) if !sure || v != 0 => Ok(()),
@@ -2771,7 +2818,7 @@ impl Parser<'_> {
                     parens: &parens,
                 };
                 let msg = msg.map(|m| format!(": {m}")).unwrap_or_default();
-                Err(match self.failed_requirement(&original, &cond, &printer) {
+                let failed = match self.failed_requirement(&original, &cond, &printer) {
                     Some(term) => {
                         let what = printer.expr(term, true);
                         Error::new(
@@ -2780,7 +2827,20 @@ impl Parser<'_> {
                         )
                     }
                     None => Error::new(at, format!("static assertion failed{msg}")),
-                })
+                };
+                let mut us = self.unevaluated.borrow_mut();
+                if us.len() == mark {
+                    // `_Static_assert(0, "")`: of a lone literal, nothing
+                    // was kept to check.
+                    drop(us);
+                    self.warn(failed);
+                    return Ok(());
+                }
+                let with = us.len() - mark - 1;
+                let u = us.last_mut().expect("the condition itself");
+                u.diagnostic = Some(failed);
+                u.with = with;
+                Ok(())
             }
         }
     }
@@ -3349,6 +3409,9 @@ impl Parser<'_> {
                 if t.text.len() > 1 && t.text.starts_with('0') && t.text.as_bytes()[1].is_ascii_alphanumeric()
                 {
                     self.bit_patterns.borrow_mut().insert(pos);
+                }
+                if !t.text.ends_with('\'') {
+                    self.int_literals.borrow_mut().insert(pos);
                 }
                 return Ok(Expr {
                     id: ExprId::new(),
@@ -4318,9 +4381,15 @@ mod tests {
                  if (sizeof(char[sizeof g])) { int g = 0; x = g; }\n    \
                  return c[0];\n}\n",
         );
-        let list = |us: &[Unevaluated]| -> Vec<String> { us.iter().map(|u| sx(&u.expr)).collect() };
+        // What is evaluated away; the constants kept with it are below.
+        let list = |us: &[Unevaluated]| -> Vec<String> {
+            us.iter().filter(|u| !u.constant).map(|u| sx(&u.expr)).collect()
+        };
         let file: Vec<(usize, String)> = p.unevaluated.iter().map(|(n, u)| (*n, sx(&u.expr))).collect();
-        assert_eq!(file, [(4, "g".to_string())]);
+        // The enumerator's operand not chosen, then the constant as the
+        // parser resolved it, which sema checks as a constant.
+        assert_eq!(file, [(4, "g".to_string()), (4, "(? 0 0 1)".to_string())]);
+        assert!(p.unevaluated[1].1.constant && !p.unevaluated[0].1.constant);
         let Item::Decl(a) = &p.items[2] else { panic!() };
         assert_eq!(list(&a[0].sized), ["(call f)"]);
         let Item::Decl(b) = &p.items[3] else { panic!() };
@@ -4348,7 +4417,8 @@ mod tests {
             [
                 "(decl int x)",
                 "(decl char c[4]={0}, char d=(sizeof char[4]))",
-                "(unevaluated (call f))",
+                // The assertion's operand not chosen, and its condition.
+                "(unevaluated (call f) (? 1 1 0))",
                 "(for (decl int i=0) (< i (sizeof char[4])) (i ++) (x ++);)",
                 "(if (sizeof char[4]) {(decl int g=0) (= x g);})",
                 "(unevaluated g)",

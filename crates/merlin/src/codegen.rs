@@ -2438,7 +2438,7 @@ impl<'a> FuncGen<'a, '_> {
         if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_) | ExprKind::Enumerator { .. }) {
             return false;
         }
-        let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
+        let Some(Const::Int(v, kind)) = consteval::eval_in_code(e, self.xlen) else {
             return false;
         };
         // A disagreement would load the wrong registers (on RV32, a `long`

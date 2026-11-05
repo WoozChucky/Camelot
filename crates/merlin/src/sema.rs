@@ -991,7 +991,7 @@ impl Checker {
 }
 
 /// How a value is being converted to a type, for messages.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Conv {
     Assign,
     Init,
@@ -1316,6 +1316,13 @@ impl<'a> FnChecker<'a> {
             self.unevaluated += 1;
             let checked = self.expr(&mut u.expr);
             self.unevaluated -= 1;
+            if u.constant && checked.is_ok() {
+                // An integer constant expression is evaluated, as clang
+                // evaluates it: its overflows are warned of.
+                let outer = std::mem::replace(&mut self.unevaluated, 0);
+                self.overflow(&u.expr);
+                self.unevaluated = outer;
+            }
             if params {
                 self.scopes.pop();
             }
@@ -1576,7 +1583,15 @@ impl<'a> FnChecker<'a> {
                 ..
             } => {
                 let pos = s.pos;
+                // A case's value is a constant: nothing of what it does when
+                // it runs is warned of, but its overflows, which clang's
+                // evaluator finds.
+                self.unevaluated += 1;
                 let checked = self.expr(expr);
+                self.unevaluated -= 1;
+                if checked.is_ok() {
+                    self.overflow(expr);
+                }
                 if self.switches.is_empty() {
                     self.err(pos, "'case' statement not in switch statement");
                 } else if checked.is_err() {
@@ -1951,6 +1966,56 @@ impl<'a> FnChecker<'a> {
         }
         if let Some(w) = never_null(e, None) {
             self.errors.push(w);
+        }
+        self.int_in_bool(e);
+    }
+
+    /// clang's `DiagnoseIntInBoolContext`, of `e` taken as true or false
+    /// (through its parentheses): a `<<` of an integer literal, always
+    /// false of 0 and, if it is a constant, as its value is; a `?:` of two
+    /// integer literals, neither 0 nor 1 (`c ? 1 : 0` is an idiom), always
+    /// true if neither is 0. Literals as written, not constants folded.
+    fn int_in_bool(&mut self, e: &Expr) {
+        let literal = |e: &Expr| {
+            let mut e = e;
+            while let ExprKind::Cast {
+                x, implicit: true, ..
+            } = &e.kind
+            {
+                e = x;
+            }
+            match e.kind {
+                ExprKind::Num(v) if self.written.int_literals.contains(&e.pos) => Some(v),
+                _ => None,
+            }
+        };
+        match &e.kind {
+            ExprKind::Binary(BinOp::Shl, l, _) => {
+                let always = match literal(l) {
+                    Some(0) => Some(false),
+                    Some(_) => consteval::int(e, self.xlen).map(|v| v != 0),
+                    None => None,
+                };
+                if let Some(always) = always {
+                    let msg =
+                        format!("converting the result of '<<' to a boolean always evaluates to {always}");
+                    self.errors
+                        .push(Error::warning(e.pos, msg, "tautological-constant-compare"));
+                }
+            }
+            ExprKind::Cond(_, a, b) => {
+                let (Some(x), Some(y)) = (literal(a), literal(b)) else {
+                    return;
+                };
+                let idiom = (x == 0 || x == 1) && (y == 0 || y == 1);
+                if !idiom && x != 0 && y != 0 {
+                    let msg = "converting the result of '?:' with integer constants to a boolean always \
+                               evaluates to 'true'";
+                    self.errors
+                        .push(Error::warning(begin(e), msg, "tautological-constant-compare"));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2374,6 +2439,15 @@ impl<'a> FnChecker<'a> {
         };
         // The initializer of each subobject so far (`None`: zero). A
         // designation into a subobject changes what it had.
+        // The characters a string gave, which a designation changes with
+        // clang's warning of the string (below), not of each character.
+        let exploded = matches!(
+            old,
+            Some(Init::Expr(Expr {
+                kind: ExprKind::Str(_),
+                ..
+            }))
+        );
         let mut slots: Vec<Option<Init>> = match old {
             None => Vec::new(),
             Some(Init::List(items, _)) => items.into_iter().map(Some).collect(),
@@ -2454,8 +2528,10 @@ impl<'a> FnChecker<'a> {
                 }
             }
             let designated = !designators.is_empty();
+            let mut named_at = None;
             if designated {
                 let mut first = designators.remove(0);
+                named_at = Some(first.pos());
                 next = self.designator(ty, &mut first)?;
             } else if match (&*ty, &record) {
                 (Type::Array(_, n), _) => n.is_some_and(|n| next >= n as usize),
@@ -2474,13 +2550,34 @@ impl<'a> FnChecker<'a> {
             if slots.len() <= next {
                 slots.resize(next + 1, None);
             }
+            // A subobject initialized again: clang's warning, before what
+            // initializes it now is checked, with where it was before. Of
+            // a union's other member, at the designator naming this one.
+            let is_union = record.as_ref().is_some_and(|r| r.union);
+            if let (true, Some(at)) = (is_union, named_at) {
+                let other = slots
+                    .iter()
+                    .enumerate()
+                    .find_map(|(j, s)| (j != next).then(|| self.initialized(s)).flatten());
+                if let Some(prev) = other {
+                    self.overrides(at, prev);
+                }
+            }
+            if designators.is_empty() && !exploded {
+                if let Some(prev) = self.initialized(&slots[next]) {
+                    let at = self.init_begin(&queue.front().expect("the value").init);
+                    self.overrides(at, prev);
+                }
+            }
             let init = if designators.is_empty() {
                 self.subobject(&mut sub, queue, constant)?
             } else {
-                // `.a.b = 1`: `a` from `.b = 1`, then what follows.
+                // `.a.b = 1`: `a` from `.b = 1`, then what follows. The
+                // list it makes of `a` begins at `.b`, as clang's does, or
+                // where the one it changes began.
                 let rest = std::mem::take(&mut designators);
+                let at = self.initialized(&slots[next]).unwrap_or(rest[0].pos());
                 let old = slots[next].take();
-                let at = queue.front().expect("the designated value").init.pos();
                 self.fill(&mut sub, queue, constant, at, Fill::Designated(rest, old))?
             };
             // A union holds one member: the last one initialized.
@@ -2502,6 +2599,37 @@ impl<'a> FnChecker<'a> {
             .map(|s| s.unwrap_or_else(|| Init::List(Vec::new(), pos)))
             .collect();
         Ok(Init::List(items, pos))
+    }
+
+    /// Where an initializer begins as clang has it: an expression where it
+    /// is written to ([`Self::begin_written`]), a list at its `{` (one brace
+    /// elision makes where its first item is, one a designator makes at
+    /// the designator after the one naming the subobject).
+    fn init_begin(&self, i: &Init) -> Pos {
+        match i {
+            Init::Expr(e) => self.begin_written(e),
+            Init::List(_, pos) => *pos,
+            Init::Designated(d, _) => d[0].pos(),
+        }
+    }
+
+    /// Where what initialized a subobject so far begins, if anything did
+    /// (an empty list, which leaves it zero, is nothing).
+    fn initialized(&self, slot: &Option<Init>) -> Option<Pos> {
+        match slot {
+            None => None,
+            Some(Init::List(items, _)) if items.is_empty() => None,
+            Some(i) => Some(self.init_begin(i)),
+        }
+    }
+
+    /// clang's warning of a subobject initialized again at `at`, which
+    /// `prev` initialized before.
+    fn overrides(&mut self, at: Pos, prev: Pos) {
+        let msg = "initializer overrides prior initialization of this subobject";
+        let w =
+            Error::warning(at, msg, "initializer-overrides").note(prev, "previous initialization is here");
+        self.errors.push(w);
     }
 
     /// Which subobject of `ty` a designator names: an element index, or a
@@ -2598,7 +2726,8 @@ impl<'a> FnChecker<'a> {
             Init::Expr(_) => false,
         };
         if elide {
-            let pos = queue.front().expect("not empty").init.pos();
+            // The list it makes begins where its first item does.
+            let pos = self.init_begin(&queue.front().expect("not empty").init);
             return self.fill(ty, queue, constant, pos, Fill::Elided);
         }
         let Pending { mut init, checked } = queue.pop_front().expect("not empty");
@@ -2693,6 +2822,11 @@ impl<'a> FnChecker<'a> {
         let named = from.named(&from_spelled);
         self.convert_value(e, &from, &named, &from_spelled, null, to, to_spelled, how, at)?;
         self.constant_conversion(e, to);
+        // Converted to `_Bool`, it is taken as true or false (an
+        // argument's, after the note on its parameter).
+        if *to.unqual() == Type::Int(IntKind::Bool) && how != Conv::Arg {
+            self.bool_like(e);
+        }
         Ok(())
     }
 
@@ -2716,6 +2850,9 @@ impl<'a> FnChecker<'a> {
             };
             let e = self.errors.pop().expect("just reported");
             self.errors.push(e.note(*pos, what));
+        }
+        if checked.is_ok() && *to.unqual() == Type::Int(IntKind::Bool) {
+            self.bool_like(e);
         }
         checked
     }
@@ -4035,25 +4172,14 @@ impl<'a> FnChecker<'a> {
                     self.overflow(b);
                 }
             }
-            ExprKind::Binary(op, l, r) => {
+            ExprKind::Binary(_, l, r) => {
                 self.overflow(l);
                 self.overflow(r);
-                let (Some(a), Some(b)) = (int(l), int(r)) else {
-                    return;
-                };
-                let exact = match op {
-                    BinOp::Add => a + b,
-                    BinOp::Sub => a - b,
-                    BinOp::Mul => a * b,
-                    _ => return,
-                };
-                self.overflowed(exact, &e.ty, e.pos);
+                self.overflowed(e);
             }
             ExprKind::Unary(UnOp::Neg, v) => {
                 self.overflow(v);
-                if let Some(a) = int(v) {
-                    self.overflowed(-a, &e.ty, e.pos);
-                }
+                self.overflowed(e);
             }
             ExprKind::SizeofExpr(..) | ExprKind::SizeofType(_) => {}
             _ => {
@@ -4064,16 +4190,12 @@ impl<'a> FnChecker<'a> {
         }
     }
 
-    /// [`Self::overflow`] of a value `exact` of the type `ty`, at `at`.
-    fn overflowed(&mut self, exact: i128, ty: &Type, at: Pos) {
-        let Some(k) = ty.int_kind().filter(|k| k.signed()) else {
-            return;
-        };
-        let (min, max) = k.range(self.xlen);
-        if exact < min || exact > max {
-            let value = digit_groups(k.wrap(exact, self.xlen));
+    /// [`Self::overflow`] of the operator `e` itself, at it.
+    fn overflowed(&mut self, e: &Expr) {
+        if let Some((value, k)) = consteval::overflow_at(e, self.xlen, true, false) {
+            let (value, ty) = (digit_groups(value), Type::Int(k));
             let msg = format!("overflow in expression; result is {value} with type '{ty}'");
-            self.errors.push(Error::warning(at, msg, "integer-overflow"));
+            self.errors.push(Error::warning(e.pos, msg, "integer-overflow"));
         }
     }
 

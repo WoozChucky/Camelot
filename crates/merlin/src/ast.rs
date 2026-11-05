@@ -62,6 +62,10 @@ pub struct Written {
     /// Where an integer literal written in hex or octal is (`0xff`), which
     /// clang takes for a bit pattern.
     pub bit_patterns: std::collections::HashSet<Pos>,
+    /// Where each integer literal is (not a character constant): clang's
+    /// warnings of literals (its `IntegerLiteral`) know them from what
+    /// sema folds (`sizeof (int)`).
+    pub int_literals: std::collections::HashSet<Pos>,
 }
 
 /// An expression the parser needed no value of, for sema to check without
@@ -106,6 +110,13 @@ pub struct Unevaluated {
     /// declared before it in the parameter lists it is in, outermost first,
     /// so `char a[sizeof n]` after `int n` sizes by that `n`.
     pub params: Vec<(String, Type, Pos)>,
+    /// An integer constant expression the parser evaluated (an array's
+    /// size, an enumerator's value, a `_Static_assert`'s condition), as it
+    /// resolved it (its `sizeof`s and the operands a `?:` does not choose
+    /// are theirs): sema checks it as clang checks a constant, with no
+    /// warning of what it does when it runs but of how it overflows
+    /// (-Winteger-overflow).
+    pub constant: bool,
 }
 
 /// The sizes a declarator at file scope folds, as the ranges of their
