@@ -1,6 +1,6 @@
 /* The program of merlin-dbg's variable tests (tests/session.rs), built with
- * merlin -g for RV32 and RV64, assembled with merlin-as and linked with
- * tests/rv64/crt0.s by merlin-ld; and with clang -g for the LLDB test, which
+ * merlin -g, assembled with merlin-as and linked with
+ * tests/prog/crt0.s by merlin-ld; and with clang -g for the LLDB test, which
  * compares what LLDB reads of the two. Every kind of type merlin describes:
  * base types, pointers, arrays of one and two dimensions, structs, a union,
  * enums (one with negative constants) and typedefs, const, members of

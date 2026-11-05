@@ -3,7 +3,7 @@
 // with crt0.s at 0x80000000 with merlin-ld: source lines, stepping into and
 // over calls, every kind of frame (a leaf, a recursive function, a variadic
 // one) in a backtrace, and a watchpoint on a 64-bit global. src/frames.rs's
-// tests build it for RV32 and RV64 too, without -g, and read the prologues of
+// tests build it without -g too, and read the prologues of
 // sum and fact.
 #define va_list __builtin_va_list
 #define va_start(ap, last) __builtin_va_start(ap, last)

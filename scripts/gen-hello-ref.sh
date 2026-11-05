@@ -1,12 +1,9 @@
 #!/bin/bash
 # Regenerates what clang's assembler makes of examples/hello/hello.S, for
-# crates/merlin-as/tests/encode_hello.rs to compare merlin-as with, for both
-# widths (hello.S is the same source on RV32 and RV64):
+# crates/merlin-as/tests/encode_hello.rs to compare merlin-as with:
 #
 #   crates/merlin-as/tests/golden/hello.ref          words and relocations of .text.start
 #   crates/merlin-as/tests/golden/hello.dr.txt       llvm-objdump -dr of the whole object
-#   crates/merlin-as/tests/golden/rv64/hello.ref     the same, for RV64
-#   crates/merlin-as/tests/golden/rv64/hello.dr.txt
 #
 # Needs clang and llvm-objdump from any LLVM install, plus bash (Git Bash on
 # Windows). LLVM 23 made the committed files, and merlin-objdump prints what
@@ -21,18 +18,18 @@
 #   <hex offset> <word> [<R_RISCV_TYPE> <symbol>[+hexaddend]]
 # with <auipc> for the hidden label a %pcrel_lo relocation points at.
 #
-# The linked images of merlin-as's output (crates/merlin-as/tests/golden/hello.elf
-# and golden/rv64/hello.elf) are rebuilt by `cargo xtask hello` instead.
+# The linked image of merlin-as's output (crates/merlin-as/tests/golden/hello.elf)
+# is rebuilt by `cargo xtask hello` instead.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 GOLDEN="$ROOT/crates/merlin-as/tests/golden"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# gen <xlen> <abi> <directory>: writes hello.ref and hello.dr.txt there.
+# gen <directory>: writes hello.ref and hello.dr.txt there.
 gen() {
-  local xlen=$1 abi=$2 out="$3/hello.ref" dr="$3/hello.dr.txt"
-  local flags="--target=riscv$xlen -march=rv${xlen}ima_zicsr_zifencei -mabi=$abi -mno-relax"
+  local out="$1/hello.ref" dr="$1/hello.dr.txt"
+  local flags="--target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mno-relax"
   # $flags is split into its words on purpose.
   # shellcheck disable=SC2086
   clang $flags -include "$ROOT/examples/xcal.inc" -c "$ROOT/examples/hello/hello.S" -o "$TMP/hello.o"
@@ -59,5 +56,4 @@ gen() {
   echo "wrote $dr"
 }
 
-gen 32 ilp32 "$GOLDEN"
-gen 64 lp64 "$GOLDEN/rv64"
+gen "$GOLDEN"

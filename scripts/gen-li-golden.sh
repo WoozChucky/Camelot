@@ -1,14 +1,13 @@
 #!/bin/bash
-# Regenerates merlin-as's `li` corpora with clang's integrated assembler
+# Regenerates merlin-as's `li` corpus with clang's integrated assembler
 # (LLVM 23), for crates/merlin-as/tests/encode_golden.rs:
 #
-#   crates/merlin-as/tests/golden/li.golden       RV32, 425 values
-#   crates/merlin-as/tests/golden/rv64/li.golden  RV64, 2246 values
+#   crates/merlin-as/tests/golden/li.golden  2246 values
 #
 # `li rd, value` expands to the sequence LLVM's RISCVMatInt::generateInstSeq
-# picks, up to 2 instructions on RV32 and 8 on RV64; merlin-as must pick the
-# same one (crates/merlin-as/src/encode.rs, li_steps). encode.golden has a
-# few hand-picked values; these files have many, chosen to reach every rule
+# picks, up to 8 instructions on RV64; merlin-as must pick the same one
+# (crates/merlin-as/src/encode.rs, li_steps). encode.golden has a few
+# hand-picked values; this file has many, chosen to reach every rule
 # of the algorithm: each power of two, its neighbours and negations, masks of
 # runs of ones, and pseudo-random values from a linear congruential generator
 # (Knuth's MMIX constants) that are thinned out, shifted and masked to vary
@@ -17,7 +16,7 @@
 # for the "round the low 12 bits up" rule). The list is the same on every run.
 #
 # Output format, one line per value:
-#   0x<value, two's complement, 16 hex digits on RV64, 8 on RV32> | <word> ...
+#   0x<value, two's complement, 16 hex digits> | <word> ...
 #
 # Bash arithmetic is 64-bit two's complement with wrapping, as the algorithm's
 # is; `>>` is arithmetic, so a logical shift right is written out (lsr).
@@ -94,49 +93,22 @@ values64() {
   done
 }
 
-values32() {
-  local v k i
-  for v in 0 1 -1 2047 2048 -2048 -2049 0x7FF 0x800 0x801 0xFFF 0x1000 0x7FFFFFFF -0x80000000 \
-    0x7FFFF800 0x7FFFF7FF 0x12345678 0x12345FFF 0x80400000 0x1FFFFF 0xFFFFF800; do
-    add "$v"
-  done
-  for ((k = 0; k < 32; k++)); do
-    add "1 << k"; add "(1 << k) - 1"; add "-(1 << k)"; add "(1 << k) + 1"
-  done
-  X=42
-  for ((i = 0; i < 300; i++)); do
-    lcg
-    lsr "$X" 32; v=$R
-    case $((i % 3)) in
-      1) umod "$X" 30; v=$((v >> R)) ;;
-      2) umod "$X" 20; v=$((v & ~((1 << R) - 1))) ;;
-    esac
-    add "$v"
-  done
-  # As 32-bit values, sign-extended.
-  for i in "${!VALUES[@]}"; do
-    VALUES[i]=$(((VALUES[i] & 0xffffffff) ^ 0x80000000))
-    VALUES[i]=$((VALUES[i] - 0x80000000))
-  done
-}
-
-# gen <xlen> <out>: assembles `li a0, value` for every value, each followed by
-# an `ecall` to mark where its sequence ends (li never writes that word: its
-# rd is a0), and writes the values with their words.
+# gen <out>: assembles `li a0, value` for every value, each followed by an
+# `ecall` to mark where its sequence ends (li never writes that word: its rd
+# is a0), and writes the values with their words.
 gen() {
-  local xlen=$1 out=$2 mabi=ilp32 digits=8 mask=0xffffffff v
-  [ "$xlen" = 64 ] && { mabi=lp64; digits=16; mask=-1; }
+  local out=$1 v
   VALUES=()
-  "values$xlen"
+  values64
   # Each value once, in the order first given.
-  for v in "${VALUES[@]}"; do printf '%x\n' $((v & mask)); done | awk '!seen[$0]++' > "$TMP/values"
+  for v in "${VALUES[@]}"; do printf '%x\n' "$v"; done | awk '!seen[$0]++' > "$TMP/values"
   awk '{ printf "li a0, 0x%s\necall\n", $0 }' "$TMP/values" > "$TMP/li.s"
-  clang --target=riscv$xlen -march=rv${xlen}ima_zicsr_zifencei -mabi=$mabi -mno-relax -c "$TMP/li.s" -o "$TMP/li.o"
+  clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mno-relax -c "$TMP/li.s" -o "$TMP/li.o"
   llvm-objcopy -O binary --only-section=.text "$TMP/li.o" "$TMP/li.bin"
   {
-    echo "# clang --target=riscv$xlen -march=rv${xlen}ima_zicsr_zifencei -mabi=$mabi -mno-relax: li a0, VALUE"
+    echo "# clang --target=riscv64 -march=rv64ima_zicsr_zifencei -mabi=lp64 -mno-relax: li a0, VALUE"
     echo "# regenerate with scripts/gen-li-golden.sh"
-    od -An -tx4 -v "$TMP/li.bin" | awk -v d=$digits '
+    od -An -tx4 -v "$TMP/li.bin" | awk -v d=16 '
       NR == FNR { value[n++] = $0; next }
       {
         for (f = 1; f <= NF; f++) {
@@ -151,5 +123,4 @@ gen() {
   echo "wrote $(grep -vc '^#' "$out") values to $out"
 }
 
-gen 32 "$DIR/li.golden"
-gen 64 "$DIR/rv64/li.golden"
+gen "$DIR/li.golden"
