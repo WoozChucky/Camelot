@@ -97,10 +97,14 @@ fn the_commands_match_the_build() {
     // The command lines in the loader's comments are these, for both widths.
     let root = repo_root();
     for p in xtask::boot::PROGRAMS {
-        let source = std::fs::read_to_string(root.join(p.dir).join(p.source)).unwrap();
+        let source = std::fs::read_to_string(root.join(p.dir).join(p.sources[0])).unwrap();
         for cmd in p.commands() {
             let cmd = cmd.replace(&format!("{}/", p.obj_dir()), "");
-            assert!(source.contains(&format!("#   {cmd}\n")), "{}: {cmd}", p.source);
+            assert!(
+                source.contains(&format!("#   {cmd}\n")),
+                "{}: {cmd}",
+                p.sources[0]
+            );
         }
     }
 }

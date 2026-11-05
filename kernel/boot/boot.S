@@ -3,14 +3,28 @@
 # --boot --kernel` stored on the disk right after the filesystem, and starts it
 # as Grail's boot ROM would have started it from an ELF file.
 #
-# Grail's boot ROM reads this block (sectors 0 and 1 of disk 0) into the last
-# 64 KiB of RAM, checks its signature and checksum, and jumps to its first byte
-# in M-mode with (spec section 7, "Boot from disk"):
+# RV32: Grail's boot ROM reads this block (sectors 0 and 1 of disk 0) into the
+# last 64 KiB of RAM, checks its signature and checksum, and jumps to its first
+# byte in M-mode with (spec section 7, "Boot from disk"):
 #
 #   a0 = 0, the hart id
 #   a1 = the sysinfo block (0x3000_2000)
 #   a2 = the registers of the disk it was read from
 #   mtvec = the ROM's trap handler, which reports any trap and stops
+#
+# RV64: the firmware does that (spec section 7, "Firmware"), and this block is
+# its next stage: it runs at 0x8020_0000 in S-mode with paging off, which
+# reaches the disk and the UART at their physical addresses, with
+#
+#   a0 = 0, the hart id
+#   a1 = the device tree's physical address
+#   a2 = the registers of the disk it was read from
+#
+# 0x8020_0000 is where the RV64 kernel loads, so the block first moves itself
+# out of the way, as a PC's boot sector moves itself out of 0x7c00: to the 64
+# KiB below the device tree, which Grail puts near the end of RAM, at the last
+# 2 MiB boundary that leaves it room (QEMU's place), and goes on there. The
+# kernel has the RAM from 0x8020_0000 up to there.
 #
 # The 64 KiB from here on are ours. The block is linked at address 0 but runs
 # at whatever address the RAM size puts it: every address used is relative to
@@ -32,8 +46,10 @@
 #      program headers, and check it is an Excalibur executable of this
 #      bootloader's width (ELF32 on RV32, ELF64 on RV64; little-endian,
 #      RISC-V, ET_EXEC);
-#   2. for each PT_LOAD segment: check it lies in RAM below this block and in
-#      the kernel's sectors, read its whole sectors straight to p_paddr with the
+#   2. for each PT_LOAD segment: check it lies in free RAM (from the start of
+#      RAM on RV32, from 0x8020_0000, after the firmware's 2 MiB, on RV64) below
+#      this block and in the
+#      kernel's sectors, read its whole sectors straight to p_paddr with the
 #      disk's DMA, its last partial sector through a buffer (so nothing past
 #      p_filesz is written), and zero the rest up to p_memsz (.bss). A segment
 #      with file bytes must start at a multiple of 512 in the file, as merlin-ld
@@ -42,24 +58,27 @@
 #   3. find the entry point's load address: e_entry is a link address, in one
 #      of the segments, so its load address is that segment's p_paddr plus
 #      its distance from p_vaddr (the RV64 kernel is linked at
-#      0xffff_ffff_8000_0000 and loaded at 0x8000_0000, and starts with
+#      0xffff_ffff_8000_0000 and loaded at 0x8020_0000, and starts with
 #      paging off; on RV32 the two are the same);
-#   4. write it to the ROM's entry word (0x1010; a doubleword on RV64), so
-#      that harts the kernel wakes later with an IPI jump to it from the park
-#      loop, as after an ELF boot;
-#   5. jump to it with a0 = 0 and a1 = the sysinfo block.
+#   4. RV32: write it to the ROM's entry word (0x1010), so that harts the
+#      kernel wakes later with an IPI jump to it from the park loop, as after
+#      an ELF boot. RV64 has nothing to write: the kernel starts the other
+#      harts through the firmware's SBI (HSM hart_start);
+#   5. jump to it with a0 = 0 and a1 = the sysinfo block (RV32) or the device
+#      tree (RV64, a1 as the firmware gave it), in the mode this block runs in.
 #
 # A failure prints "boot: <why>" on the UART and stops the machine with exit
 # code 0xfc. No stack: the calls are leaf calls, and the steps keep their state
-# in s0-s11.
+# in s0-s11, the disk's registers in a2.
 #
 # One source for both widths (#193): <asm.h> names what differs (REG_L,
 # REG_S, LWU), and #if __riscv_xlen marks the layouts that do (ELF32 and
-# ELF64 headers; version 1 and 2 of the disk's registers, spec section 9.6).
-# The RV64 boot ROM runs the RV64 boot block, so a disk's bootloader is of
-# its machine's width, and so is the kernel it loads. RAM_BASE is loaded
-# with li, which gives 0x8000_0000 itself on RV64 (lui alone would
-# sign-extend it to 0xffff_ffff_8000_0000).
+# ELF64 headers; version 1 and 2 of the disk's registers, spec section 9.6)
+# and the RV64 block's place as the firmware's next stage. The firmware runs
+# the RV64 boot block, so a disk's bootloader is of its machine's width, and
+# so is the kernel it loads. RAM_BASE and FW_JUMP_ADDR are loaded with li,
+# which gives 0x8000_0000 itself on RV64 (lui alone would sign-extend it to
+# 0xffff_ffff_8000_0000).
 #
 # Built with our own tools by `cargo xtask boot`, which does the same as
 #
@@ -81,6 +100,9 @@
     .equ SYSINFO_BASE,     0x30002000
     .equ UART_BASE,        0x10000000
     .equ BOOT_ENTRY,       0x1010       # the boot ROM's entry word
+    .equ FW_JUMP_ADDR,     0x80200000   # RV64: the firmware's next stage, here
+    .equ BOOT_AREA,        0x10000      # the 64 KiB this block may use
+    .equ BOOT_SIZE,        1024         # the block
     .equ EXIT_BOOT_FAILED, 0xfc
 
     # This block, as mkfs fills it in.
@@ -150,7 +172,24 @@
     .globl _start
 _start:
     auipc s0, 0                         # s0 = this block
-    mv    s1, a2                        # s1 = the disk's registers
+#if __riscv_xlen == 64
+    # Out of the kernel's way, to the 64 KiB below the device tree: copy the
+    # whole block there a doubleword at a time, mkfs's words included, and go
+    # on in the copy, at its `moved` (a label's offset in the block is its
+    # %lo, the block being linked at 0).
+    li    t1, -BOOT_AREA
+    add   t1, t1, a1                    # t1 = the new place
+    addi  t3, s0, BOOT_SIZE             # t3 = the end of this block
+1:  ld    t4, 0(s0)
+    sd    t4, 0(t1)
+    addi  s0, s0, 8
+    addi  t1, t1, 8
+    bltu  s0, t3, 1b
+    addi  s0, t1, -BOOT_SIZE            # s0 = the copy
+    fence.i                             # the copy is code now
+    jalr  zero, %lo(moved)(s0)
+moved:
+#endif
     LWU   s2, KERNEL_SECTOR(s0)         # s2 = the kernel's first sector
     LWU   s3, KERNEL_SECTORS(s0)
     addi  a0, s0, %lo(s_none)
@@ -213,9 +252,13 @@ segment:
     bgeu  t1, s10, 5f
     add   t1, t1, s8
     REG_S t1, E_ENTRY(s4)
-5:  addi  a0, s0, %lo(s_place)         # RAM_BASE <= paddr <= paddr + memsz <= s0
+5:  addi  a0, s0, %lo(s_place)         # free RAM <= paddr <= paddr + memsz <= s0
     bltu  s10, s9, fail
+#if __riscv_xlen == 64
+    li    t1, FW_JUMP_ADDR              # the firmware's RAM is below it
+#else
     li    t1, RAM_BASE
+#endif
     bltu  s8, t1, fail
     add   t0, s8, s10
     bltu  t0, s8, fail
@@ -270,27 +313,29 @@ next_segment:
     # 4 and 5.
 start_kernel:
     REG_L t0, E_ENTRY(s4)
+#if __riscv_xlen == 32
     li    t1, BOOT_ENTRY
     REG_S t0, 0(t1)
-    li    a0, 0
     li    a1, SYSINFO_BASE
+#endif
+    li    a0, 0                         # RV64: a1 is still the device tree
     fence.i                             # the segments are code now
     jr    t0
 
 # read(a3 = first sector, a4 = sector count, a5 = RAM address): a read command,
 # waiting for DONE. Returns through ra; on an error prints it and stops.
 read:
-    REG_S a3, BLK_SECTOR(s1)
-    REG_S a5, BLK_DMA(s1)
-    sw    a4, BLK_COUNT(s1)
+    REG_S a3, BLK_SECTOR(a2)
+    REG_S a5, BLK_DMA(a2)
+    sw    a4, BLK_COUNT(a2)
     li    t0, CMD_READ
-    sw    t0, BLK_CMD(s1)
-1:  lw    t0, BLK_STATUS(s1)
+    sw    t0, BLK_CMD(a2)
+1:  lw    t0, BLK_STATUS(a2)
     andi  t0, t0, STATUS_DONE
     beqz  t0, 1b
     li    t0, STATUS_DONE
-    sw    t0, BLK_STATUS(s1)
-    lw    t0, BLK_ERROR(s1)
+    sw    t0, BLK_STATUS(a2)
+    lw    t0, BLK_ERROR(a2)
     bnez  t0, 2f
     ret
 2:  mv    s11, t0                       # "boot: disk read error 0x..."

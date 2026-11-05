@@ -22,14 +22,25 @@ struct run {
 
 phys_addr_t ram_base;
 usize ram_size;
+phys_addr_t reserved_base;
+usize reserved_size;
 
 static struct spinlock kmem_lock;
 static struct run *freelist;
 static u32 nfree;
 
-/* Whether physical address `a` is a page the allocator manages. */
+/* Whether physical address `a` is in the `size` bytes from `base`: compared
+ * as an offset, so that a range ending at 2^32 on RV32 needs no end. */
+static bool in_range(phys_addr_t a, phys_addr_t base, usize size) {
+    return a - base < size;
+}
+
+/* Whether physical address `a` is a page the allocator manages: a page of
+ * RAM that is neither the kernel image's nor the firmware's. */
 static bool is_free_page(phys_addr_t a) {
-    return a % PGSIZE == 0 && a >= pa(__kernel_end) && a - ram_base < ram_size;
+    phys_addr_t start = pa(__text_start);
+    return a % PGSIZE == 0 && in_range(a, ram_base, ram_size) &&
+           !in_range(a, start, pa(__kernel_end) - start) && !in_range(a, reserved_base, reserved_size);
 }
 
 void kinit(void) {
@@ -37,17 +48,26 @@ void kinit(void) {
     sysinfo_check();
     ram_base = sysinfo_read_reg(SYS_RAM_BASE);
     ram_size = sysinfo_read_reg(SYS_RAM_SIZE);
+#if __riscv_xlen == 64
+    /* What the firmware keeps, as Linux leaves a no-map /reserved-memory
+     * region alone: the RV64 kernel loads right after it. */
+    reserved_base = sysinfo_read_reg(SYS_RESERVED_BASE);
+    reserved_size = sysinfo_read_reg(SYS_RESERVED_SIZE);
+#endif
     /* Physical addresses: the image is linked high on RV64. */
     phys_addr_t start = pa(__text_start);
     phys_addr_t end = pa(__kernel_end);
-    if (start != ram_base) {
-        panic("kinit: the kernel is not at the start of RAM");
+    if (!in_range(start, ram_base, ram_size)) {
+        panic("kinit: the kernel is not in RAM");
     }
-    if (ram_size % PGSIZE != 0) {
+    if (ram_size % PGSIZE != 0 || reserved_size % PGSIZE != 0 || reserved_base % PGSIZE != 0) {
         panic("kinit: the RAM size is not a whole number of pages");
     }
     if (end - ram_base > ram_size) {
         panic("kinit: the kernel is larger than RAM");
+    }
+    if (in_range(start, reserved_base, reserved_size) || in_range(reserved_base, start, end - start)) {
+        panic("kinit: the kernel overlaps the firmware's RAM");
     }
 #if __riscv_xlen == 64
     /* The allocator hands out direct-map pointers, so it gets the RAM the
@@ -57,18 +77,24 @@ void kinit(void) {
         ram_size = direct_map_size;
     }
 #endif
-    /* Count pages rather than compare addresses: with 2 GiB of RAM on RV32
-     * the end of RAM is 2^32, which doesn't fit in a u32. */
-    usize pages = (ram_size - (end - ram_base)) / PGSIZE;
-    /* One lock for all of them rather than one per kfree(): tens of
-     * thousands of pages, and nothing else runs yet. */
+    /* Every page of RAM but the image's and the firmware's, from the
+     * bottom up, so the highest is handed out first. Count pages rather
+     * than compare addresses: with 2 GiB of RAM on RV32 the end of RAM is
+     * 2^32, which doesn't fit in a u32. One lock for all of them rather
+     * than one per kfree(): tens of thousands of pages, and nothing else
+     * runs yet. */
+    usize pages = ram_size / PGSIZE;
     acquire(&kmem_lock);
     for (usize i = 0; i < pages; i++) {
-        struct run *r = va(end + i * PGSIZE);
+        phys_addr_t a = ram_base + i * PGSIZE;
+        if (!is_free_page(a)) {
+            continue;
+        }
+        struct run *r = va(a);
         r->next = freelist;
         freelist = r;
+        nfree++;
     }
-    nfree += (u32)pages;
     release(&kmem_lock);
 }
 
