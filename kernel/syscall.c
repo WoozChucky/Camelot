@@ -38,27 +38,26 @@ static long sys_sleep(struct trap_frame *f) {
     return 0;
 }
 
-/* Copies spawn's or exec's argv (a user array of string pointers ending
- * with a NULL) into `args`. A NULL argv stands for { path }. */
-static int copy_args(pagetable_t pt, uintptr argv, const char *path, struct proc_args *args) {
-    args->argc = 0;
-    args->len = 0;
-    if (argv == 0) {
-        args->argc = 1;
-        args->len = strlen(path) + 1;
-        memcpy(args->strings, path, args->len);
-        return 0;
-    }
+/* Copies `array`, a user array of string pointers ending with a NULL (an
+ * argv or an envp), into `args` after the strings it holds already, and
+ * sets *count to how many it had. As Linux's copy_strings copies both of
+ * execve's arrays: each holds at most MAXARG strings (MAX_ARG_STRINGS on
+ * Linux), and every string of both, with its NUL, must fit in what is left
+ * of ARG_MAX (so none is longer than that, Linux's MAX_ARG_STRLEN), or the
+ * call fails with -E2BIG; a pointer or a string that can't be read is
+ * -EFAULT. */
+static int copy_strings(pagetable_t pt, uintptr array, struct proc_args *args, u32 *count) {
+    *count = 0;
     for (;;) {
-        /* argv[i]: a user pointer, 4 or 8 bytes. */
+        /* array[i]: a user pointer, 4 or 8 bytes. */
         uintptr ptr;
-        if (copyin(pt, &ptr, argv + sizeof ptr * args->argc, sizeof ptr) != 0) {
+        if (copyin(pt, &ptr, array + sizeof ptr * *count, sizeof ptr) != 0) {
             return -EFAULT;
         }
         if (ptr == 0) {
             return 0;
         }
-        if (args->argc == MAXARG || args->len == ARG_MAX) {
+        if (*count == MAXARG || args->len == ARG_MAX) {
             return -E2BIG;
         }
         int n = copyinstr(pt, args->strings + args->len, ptr, ARG_MAX - args->len);
@@ -69,12 +68,36 @@ static int copy_args(pagetable_t pt, uintptr argv, const char *path, struct proc
             return -E2BIG;
         }
         args->len += (u32)n + 1;
-        args->argc++;
+        (*count)++;
     }
 }
 
-/* spawn(path, argv) and exec(path, argv): the path and the arguments are
- * copied in, every pointer checked, before anything is looked up. */
+/* Copies spawn's or exec's argv and envp into `args`: argv's strings, then
+ * envp's (copy_strings()). A NULL argv stands for { path }; a NULL envp is
+ * an empty environment, as Linux takes it. An error in argv is the call's,
+ * and envp is not looked at then (Linux counts argv before envp). */
+static int copy_args(pagetable_t pt, uintptr argv, uintptr envp, const char *path, struct proc_args *args) {
+    args->argc = 0;
+    args->envc = 0;
+    args->len = 0;
+    if (argv == 0) {
+        args->argc = 1;
+        args->len = strlen(path) + 1;
+        memcpy(args->strings, path, args->len);
+    } else {
+        int err = copy_strings(pt, argv, args, &args->argc);
+        if (err != 0) {
+            return err;
+        }
+    }
+    return envp == 0 ? 0 : copy_strings(pt, envp, args, &args->envc);
+}
+
+_Static_assert(sizeof(struct proc_args) <= PGSIZE, "spawn's arguments fit a page");
+
+/* spawn(path, argv, envp) and exec(path, argv, envp): the path, the
+ * arguments and the environment are copied in, every pointer checked,
+ * before anything is looked up. */
 static long sys_run(struct trap_frame *f, bool replace) {
     pagetable_t pt = myproc()->pagetable;
     char path[MAXPATH + 1];
@@ -82,10 +105,10 @@ static long sys_run(struct trap_frame *f, bool replace) {
     /* Too big for the kernel stack: a page of its own while it's needed. */
     struct proc_args *args = NULL;
     if (err != -EFAULT) {
-        /* argv is checked even when the path is too long or empty, which
-         * comes after a bad pointer among argv's. */
+        /* argv and envp are checked even when the path is too long or
+         * empty, which comes after a bad pointer among them. */
         args = kalloc();
-        int arg_err = args == NULL ? -ENOMEM : copy_args(pt, arg(f, 1), err == 0 ? path : "", args);
+        int arg_err = args == NULL ? -ENOMEM : copy_args(pt, arg(f, 1), arg(f, 2), err == 0 ? path : "", args);
         if (err == 0 || arg_err == -EFAULT) {
             err = arg_err;
         }

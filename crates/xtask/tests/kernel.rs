@@ -2405,8 +2405,9 @@ fn the_shell_is_the_first_process() {
     // The first instruction in U-mode is sh's entry point, crt0's _start,
     // with the start Linux gives a program (docs/camelot-syscalls.md,
     // "Starting a program"): every register zero but sp, which points at
-    // argc (1), argv { "sh", NULL }, an empty envp and the auxiliary vector,
-    // the strings "sh" and the path, "/bin/sh", at the top of the stack.
+    // argc (1), argv { "sh", NULL }, envp { "HOME=/", "TERM=linux", NULL }
+    // (Linux's environment for init) and the auxiliary vector, the strings
+    // "sh", envp's and the path, "/bin/sh", at the top of the stack.
     let (mut m, elf) = load_committed();
     step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
     let c = &m.cpu;
@@ -2424,6 +2425,7 @@ fn the_shell_is_the_first_process() {
         &user_program("sh").elf,
         "/bin/sh",
         &["sh"],
+        common::start::INIT_ENV,
     );
     // Interrupts on, SUM off.
     assert_ne!(c.csr.mstatus & MSTATUS_SIE, 0);

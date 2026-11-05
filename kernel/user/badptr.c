@@ -69,16 +69,16 @@ int main(int argc, char **args) {
     int status;
     expect(wait(-1, (int *)KERNEL), -EFAULT);                /* 15 */
     expect(wait(-1, (int *)msg), -EFAULT);                   /* 16 */
-    expect(spawn((char *)KERNEL, NULL), -EFAULT);            /* 17 */
+    expect(spawn((char *)KERNEL, NULL, environ), -EFAULT);   /* 17 */
     char *argv[] = {"echo", (char *)KERNEL, NULL};
-    expect(spawn("/bin/echo", argv), -EFAULT);               /* 18 */
-    expect(spawn("/bin/echo", (char **)KERNEL), -EFAULT);    /* 19 */
+    expect(spawn("/bin/echo", argv, environ), -EFAULT);      /* 18 */
+    expect(spawn("/bin/echo", (char **)KERNEL, environ), -EFAULT); /* 19 */
     /* Program names that run into the end of the heap: a short one, and
      * one longer than any program's, which spawn still reads to its end. */
     char *end = (char *)sbrk(PAGE) + PAGE;
     memset(end - 200, 'a', 200);
-    expect(spawn(end - 10, NULL), -EFAULT);                  /* 20 */
-    expect(spawn(end - 30, NULL), -EFAULT);                  /* 21 */
+    expect(spawn(end - 10, NULL, environ), -EFAULT);         /* 20 */
+    expect(spawn(end - 30, NULL, environ), -EFAULT);         /* 21 */
     /* No child was started by any of that. */
     expect(wait(-1, &status), -ECHILD);                      /* 22 */
     /* A call number nobody defined. */
@@ -93,9 +93,9 @@ int main(int argc, char **args) {
     expect(chdir((char *)KERNEL), -EFAULT);                  /* 29 */
     expect(link((char *)KERNEL, "/x"), -EFAULT);             /* 30 */
     expect(link("/x", end - 10), -EFAULT);                   /* 31 */
-    expect(exec((char *)KERNEL, NULL), -EFAULT);             /* 32 */
-    expect(exec("/bin/echo", argv), -EFAULT);                /* 33 */
-    expect(exec("/bin/echo", (char **)KERNEL), -EFAULT);     /* 34 */
+    expect(exec((char *)KERNEL, NULL, environ), -EFAULT);    /* 32 */
+    expect(exec("/bin/echo", argv, environ), -EFAULT);       /* 33 */
+    expect(exec("/bin/echo", (char **)KERNEL, environ), -EFAULT); /* 34 */
     /* Where fstat and pipe store: nowhere, or read-only memory. */
     struct stat st;
     expect(fstat(STDOUT, (struct stat *)KERNEL), -EFAULT);   /* 35 */
@@ -115,10 +115,10 @@ int main(int argc, char **args) {
     char **bad_argv = (char **)4;
     expect(link("", (char *)KERNEL), -EFAULT);               /* 43 */
     expect(link(long_path, (char *)0), -EFAULT);             /* 44 */
-    expect(spawn("", bad_argv), -EFAULT);                    /* 45 */
-    expect(spawn(long_path, argv), -EFAULT);                 /* 46 */
-    expect(exec("", bad_argv), -EFAULT);                     /* 47 */
-    expect(exec(long_path, argv), -EFAULT);                  /* 48 */
+    expect(spawn("", bad_argv, environ), -EFAULT);           /* 45 */
+    expect(spawn(long_path, argv, environ), -EFAULT);        /* 46 */
+    expect(exec("", bad_argv, environ), -EFAULT);            /* 47 */
+    expect(exec(long_path, argv, environ), -EFAULT);         /* 48 */
     expect(wait(-1, &status), -ECHILD);                      /* 49 */
     /* A pipe's buffers: the failed calls move nothing. */
     int p[2];
@@ -132,6 +132,21 @@ int main(int argc, char **args) {
     expect(buf[0] == 'o' && buf[1] == 'k', 1);               /* 57 */
     close(p[0]);
     close(p[1]);
+    /* The environment, which spawn and exec read as they read argv: a
+     * bad array, a bad string in it, an array that runs off the end of
+     * the heap; and a bad one comes before an empty path too. */
+    char *echo[] = {"echo", NULL};
+    char *bad_env[] = {"A=1", (char *)KERNEL, NULL};
+    char **tail = (char **)end - 1;
+    *tail = "A=1";
+    expect(spawn("/bin/echo", echo, (char **)KERNEL), -EFAULT); /* 58 */
+    expect(spawn("/bin/echo", echo, bad_env), -EFAULT);      /* 59 */
+    expect(exec("/bin/echo", echo, (char **)KERNEL), -EFAULT); /* 60 */
+    expect(exec("/bin/echo", echo, bad_env), -EFAULT);       /* 61 */
+    expect(spawn("/bin/echo", echo, tail), -EFAULT);         /* 62 */
+    expect(spawn("", NULL, bad_argv), -EFAULT);              /* 63 */
+    expect(exec("", NULL, bad_argv), -EFAULT);               /* 64 */
+    expect(wait(-1, &status), -ECHILD);                      /* 65 */
 #ifdef _LP64
     /* RV64: every address from USER_TOP up is the kernel's, or not an
      * address at all (between the two halves): the first one past user
@@ -148,19 +163,19 @@ int main(int argc, char **args) {
         (char *)0xfffffffffffff000ul,
     };
     for (int i = 0; i < 6; i++) {
-        expect(write(STDOUT, kernel_half[i], 1), -EFAULT);   /* 58, 61, ... */
-        expect(read(STDIN, kernel_half[i], 1), -EFAULT);     /* 59, 62, ... */
-        expect(fstat(STDOUT, (struct stat *)kernel_half[i]), -EFAULT); /* 60, 63, ... */
+        expect(write(STDOUT, kernel_half[i], 1), -EFAULT);   /* 66, 69, ... */
+        expect(read(STDIN, kernel_half[i], 1), -EFAULT);     /* 67, 70, ... */
+        expect(fstat(STDOUT, (struct stat *)kernel_half[i]), -EFAULT); /* 68, 71, ... */
     }
-    expect(write(STDOUT, (char *)(USER_TOP - 1), 2), -EFAULT); /* 76 */
-    expect(open((char *)KERNEL, O_RDONLY), -EFAULT);         /* 77 */
-    expect(wait(-1, (int *)0xffffffd600000000ul), -EFAULT);  /* 78 */
-    expect(write(STDOUT, (char *)0x100000000ul + 0x1000, 1), -EFAULT); /* 79 */
+    expect(write(STDOUT, (char *)(USER_TOP - 1), 2), -EFAULT); /* 84 */
+    expect(open((char *)KERNEL, O_RDONLY), -EFAULT);         /* 85 */
+    expect(wait(-1, (int *)0xffffffd600000000ul), -EFAULT);  /* 86 */
+    expect(write(STDOUT, (char *)0x100000000ul + 0x1000, 1), -EFAULT); /* 87 */
 #endif
     /* And a good buffer. */
     if (failed_case == 0) {
         size_t len = strlen(msg);
-        expect(write(STDOUT, msg, len), (long)len);          /* 58, or 80 on RV64 */
+        expect(write(STDOUT, msg, len), (long)len);          /* 66, or 88 on RV64 */
     } else {
         printf("badptr: case %d failed\n", failed_case);
     }

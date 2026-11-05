@@ -119,6 +119,14 @@ int exec_replace(const char *path, const struct proc_args *args) {
     return load_and_run(&f, path, last_name(path), args);
 }
 
+/* Appends the string `s`, with its NUL, to `args`'s strings, which have
+ * room for it (exec_init's are short). */
+static void add_string(struct proc_args *args, const char *s) {
+    usize n = strlen(s) + 1;
+    memcpy(args->strings + args->len, s, n);
+    args->len += (u32)n;
+}
+
 int exec_init(const char *path, const char *name) {
     struct elf_file f;
     int err = prog_open(path, !fs_mounted, &f);
@@ -134,9 +142,15 @@ int exec_init(const char *path, const char *name) {
         prog_close(&f);
         return -ENOMEM;
     }
+    /* argv { name }, then the environment Linux gives init (envp_init in
+     * init/main.c): its home, the root, and the terminal it runs on. */
+    static const char *const init_env[] = {"HOME=/", "TERM=linux"};
+    add_string(args, name);
     args->argc = 1;
-    args->len = strlen(name) + 1;
-    memcpy(args->strings, name, args->len);
+    for (u32 i = 0; i < sizeof init_env / sizeof init_env[0]; i++) {
+        add_string(args, init_env[i]);
+    }
+    args->envc = sizeof init_env / sizeof init_env[0];
     err = load_and_run(&f, path, name, args);
     kfree(args);
     return err;

@@ -415,15 +415,28 @@ pub mod start {
         String::from_utf8(s).unwrap()
     }
 
-    /// Checks the start of program `elf`, run as `path` with `argv`, on the
-    /// stack under `user_top` that ends at the current hart's sp, with
-    /// `word_size`-byte pointers: every register zero but sp (a0, the
-    /// psABI's atexit function, is 0 too); at sp, 16-byte aligned, argc,
-    /// then argv, a NULL, an empty envp, and the auxiliary vector in the
-    /// kernel's order; the strings, argv's in order, then the path and a
-    /// zero word at the very top; the 16 random bytes between the two,
-    /// aligned.
-    pub fn check(m: &Machine, word_size: u64, user_top: u64, elf: &[u8], path: &str, argv: &[&str]) {
+    /// The environment the kernel starts the first process with: Linux's
+    /// for init (init/main.c's envp_init), kernel/exec.c's exec_init.
+    pub const INIT_ENV: &[&str] = &["HOME=/", "TERM=linux"];
+
+    /// Checks the start of program `elf`, run as `path` with `argv` and
+    /// the environment `envp`, on the stack under `user_top` that ends at
+    /// the current hart's sp, with `word_size`-byte pointers: every
+    /// register zero but sp (a0, the psABI's atexit function, is 0 too); at
+    /// sp, 16-byte aligned, argc, then argv, a NULL, envp, a NULL, and the
+    /// auxiliary vector in the kernel's order; the strings, argv's in
+    /// order, then envp's, then the path and a zero word at the very top,
+    /// as Linux's create_elf_tables lays them out; the 16 random bytes
+    /// between the strings and the vector, aligned.
+    pub fn check(
+        m: &Machine,
+        word_size: u64,
+        user_top: u64,
+        elf: &[u8],
+        path: &str,
+        argv: &[&str],
+        envp: &[&str],
+    ) {
         let w = |va: u64| word(m, va, word_size);
         let regs = m.cpu.x;
         let sp = regs[2];
@@ -437,16 +450,19 @@ pub mod start {
         let mut at = sp;
         assert_eq!(w(at), argv.len() as u64, "argc");
         at += word_size;
+        // argv's pointers and a NULL, then envp's and a NULL: the strings
+        // they point at, in order.
         let mut ptrs = Vec::new();
-        for want in argv {
-            let p = w(at);
-            assert_eq!(&string(m, p), want);
-            ptrs.push(p);
+        for (strings, what) in [(argv, "argv"), (envp, "envp")] {
+            for want in strings {
+                let p = w(at);
+                assert_eq!(&string(m, p), want, "{what}");
+                ptrs.push(p);
+                at += word_size;
+            }
+            assert_eq!(w(at), 0, "{what}'s NULL");
             at += word_size;
         }
-        assert_eq!(w(at), 0, "argv's NULL");
-        assert_eq!(w(at + word_size), 0, "envp's NULL: no environment");
-        at += 2 * word_size;
         let mut auxv = Vec::new();
         loop {
             let (ty, val) = (w(at), w(at + word_size));
@@ -456,9 +472,10 @@ pub mod start {
                 break;
             }
         }
-        // The strings: contiguous, argv's then the path, then the marker.
+        // The strings: contiguous, argv's then envp's, then the path, then
+        // the marker.
         let mut s = ptrs[0];
-        for (p, want) in ptrs.iter().zip(argv) {
+        for (p, want) in ptrs.iter().zip(argv.iter().chain(envp)) {
             assert_eq!(*p, s);
             s += want.len() as u64 + 1;
         }

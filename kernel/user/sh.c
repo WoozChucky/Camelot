@@ -28,9 +28,9 @@
  *   sh: NAME: REASON     when a program can't be started, a file can't be
  *                        opened, or a line makes no sense
  *
- * Built-ins: help, exit [N], wait, cd [DIR], and exec [PROG [ARG...]] (see
- * below). The first four run in the shell itself, with its redirections,
- * but can't be part of a pipeline. The shell ends with `exit`, or at the end
+ * Built-ins: help, exit [N], wait, cd [DIR], export, unset and exec [PROG
+ * [ARG...]] (see below). All but exec run in the shell itself, with its
+ * redirections, but can't be part of a pipeline. The shell ends with `exit`, or at the end
  * of the input (Ctrl-D on an empty line), with the status N or else the last
  * foreground program's; when it is the first process, the kernel then stops
  * the machine with it.
@@ -54,6 +54,32 @@
  * subshell, which here is the command alone: `exec NAME ...` runs the
  * program NAME, never a built-in, and `exec > FILE` only makes FILE (or
  * empties it), with status 0.
+ *
+ * Variables and the environment, as POSIX's sh has them (there is no
+ * `$NAME` expansion: the variables are for the programs). The shell starts
+ * with a variable for each NAME=value of its own environment (what crt0
+ * put in environ), all of them exported; NAME is a letter or '_', then
+ * letters, digits and '_'. Words NAME=value before a command's first other
+ * word are assignments:
+ *   NAME=value ...        alone, they set shell variables, which stay
+ *                         exported if they were (else they are the
+ *                         shell's own, until `export NAME`);
+ *   NAME=value PROG ...   before a program, they are in its environment
+ *                         only (and the shell's stays as it was);
+ *   NAME=value exec PROG  before `exec`, `exit`, `export` or `unset` (POSIX's
+ *                         special built-ins), they set the shell's
+ *                         variables first, and `exec` exports them, as
+ *                         dash and bash do, so PROG has them;
+ *   NAME=value cd ...     before another built-in, they are for it alone:
+ *                         `HOME=/bin cd` goes to /bin.
+ * `export NAME[=value]...` exports variables (setting them first if given
+ * a value: `export NAME` alone exports one that may get its value later);
+ * `export` or `export -p` lists the exported ones as `export NAME=value`
+ * (or `export NAME`, without a value yet); `unset NAME...` removes them.
+ * `cd` without a directory goes to HOME, as POSIX's does (/ if there is
+ * none). Every program the shell starts, through spawn or `exec`, gets the
+ * exported variables that have a value as its environment, its
+ * assignments added (or put in place of the variable of the same name).
  *
  * Its input is usually the console, whose line discipline edits and echoes
  * a line and hands it over whole, one per read. Any other input (a network
@@ -114,9 +140,12 @@ struct token {
     char *word;
 };
 
-/* A command: its words (NULL-terminated) and where its input comes from
- * and its output goes, if not from the shell or the pipeline. */
+/* A command: its assignments (NAME=value words, see the top), its words
+ * (NULL-terminated) and where its input comes from and its output goes, if
+ * not from the shell or the pipeline. */
 struct cmd {
+    char *assigns[MAXARG];
+    int nassigns;
     char *argv[MAXARG + 1];
     int argc;
     char *in;
@@ -125,6 +154,185 @@ struct cmd {
      * dropped: NAME is a program, never a built-in (see run_job). */
     int program_only;
 };
+
+/* The shell's variables (see the top): NAME=value, or NAME alone for one
+ * exported before it has a value, each string from malloc. */
+#define MAX_VARS 32
+
+struct var {
+    char *entry; /* NULL: a free slot */
+    int exported;
+};
+
+static struct var vars[MAX_VARS];
+
+/* The length of the name NAME=value `s` starts with, if it is an
+ * assignment, else 0. A name is a letter or '_', then letters, digits and
+ * '_' (POSIX's). With `whole`, `s` must be a name and nothing else. */
+static int name_length(const char *s, int whole) {
+    int n = 0;
+    while ((s[n] >= 'a' && s[n] <= 'z') || (s[n] >= 'A' && s[n] <= 'Z') || s[n] == '_' ||
+           (n > 0 && s[n] >= '0' && s[n] <= '9')) {
+        n++;
+    }
+    if (n == 0) {
+        return 0;
+    }
+    return s[n] == (whole ? 0 : '=') ? n : 0;
+}
+
+/* Whether entry `e` (NAME=value or NAME) is the variable `name`, `len`
+ * bytes. */
+static int is_named(const char *e, const char *name, int len) {
+    return strncmp(e, name, (size_t)len) == 0 && (e[len] == '=' || e[len] == 0);
+}
+
+/* The variable `name` (`len` bytes), or NULL. */
+static struct var *find_var(const char *name, int len) {
+    for (int i = 0; i < MAX_VARS; i++) {
+        if (vars[i].entry != NULL && is_named(vars[i].entry, name, len)) {
+            return &vars[i];
+        }
+    }
+    return NULL;
+}
+
+/* Sets the variable `entry` names to it: NAME=value, or NAME alone (which
+ * leaves the value of one that has one). It stays exported if it was, and
+ * is if `export`. Returns 0, or -1 having said why it can't. */
+static int set_var(const char *entry, int len, int export) {
+    struct var *v = find_var(entry, len);
+    if (v != NULL && entry[len] == 0) {
+        v->exported |= export;
+        return 0;
+    }
+    if (v == NULL) {
+        for (int i = 0; i < MAX_VARS && v == NULL; i++) {
+            if (vars[i].entry == NULL) {
+                v = &vars[i];
+                v->exported = 0;
+            }
+        }
+        if (v == NULL) {
+            fprintf(STDERR, "sh: %s: too many variables\n", entry);
+            return -1;
+        }
+    }
+    size_t size = strlen(entry) + 1;
+    char *copy = malloc(size);
+    if (copy == NULL) {
+        fprintf(STDERR, "sh: %s: out of memory\n", entry);
+        return -1;
+    }
+    memcpy(copy, entry, size);
+    free(v->entry);
+    v->entry = copy;
+    v->exported |= export;
+    return 0;
+}
+
+/* Sets the shell's variables to command `c`'s assignments, exporting them
+ * if `export`. */
+static void assign_all(const struct cmd *c, int export) {
+    for (int i = 0; i < c->nassigns; i++) {
+        set_var(c->assigns[i], name_length(c->assigns[i], 0), export);
+    }
+}
+
+/* The value of `name` for command `c`: its own assignment, or the shell's
+ * variable, or NULL if neither has one. */
+static const char *lookup(const struct cmd *c, const char *name) {
+    int len = (int)strlen(name);
+    for (int i = c->nassigns - 1; i >= 0; i--) {
+        if (is_named(c->assigns[i], name, len)) {
+            return c->assigns[i] + len + 1;
+        }
+    }
+    struct var *v = find_var(name, len);
+    return v != NULL && v->entry[len] == '=' ? v->entry + len + 1 : NULL;
+}
+
+/* The environment a program run with the `n` assignments `assigns` gets,
+ * in `envp` (MAX_VARS + MAXARG + 1 entries), NULL-terminated: every
+ * exported variable with a value, in the order of the shell's table, each
+ * one assigned in its place with its new value, then the assigned ones
+ * that are no variable. A name assigned twice takes the last value. */
+static void build_env(char **assigns, int nassigns, char **envp) {
+    int n = 0;
+    for (int i = 0; i < MAX_VARS; i++) {
+        const char *e = vars[i].entry;
+        if (e != NULL && vars[i].exported && strchr(e, '=') != NULL) {
+            envp[n] = vars[i].entry;
+            n++;
+        }
+    }
+    for (int i = 0; i < nassigns; i++) {
+        char *a = assigns[i];
+        int len = name_length(a, 0);
+        int at = 0;
+        while (at < n && !is_named(envp[at], a, len)) {
+            at++;
+        }
+        envp[at] = a;
+        if (at == n) {
+            n++;
+        }
+    }
+    envp[n] = NULL;
+}
+
+/* The shell's first variables: its environment's entries with a good name,
+ * exported. */
+static void import_env(void) {
+    for (char **e = environ; e != NULL && *e != NULL; e++) {
+        int len = name_length(*e, 0);
+        if (len > 0) {
+            set_var(*e, len, 1);
+        }
+    }
+}
+
+/* `export [-p] [NAME[=value]...]` (see the top). */
+static void export_builtin(struct cmd *c) {
+    if (c->argc == 1 || (c->argc == 2 && strcmp(c->argv[1], "-p") == 0)) {
+        for (int i = 0; i < MAX_VARS; i++) {
+            if (vars[i].entry != NULL && vars[i].exported) {
+                printf("export %s\n", vars[i].entry);
+            }
+        }
+        return;
+    }
+    for (int i = 1; i < c->argc; i++) {
+        const char *a = c->argv[i];
+        int len = name_length(a, 0);
+        if (len == 0) {
+            len = name_length(a, 1);
+        }
+        if (len == 0) {
+            fprintf(STDERR, "sh: export: %s: bad variable name\n", a);
+            continue;
+        }
+        set_var(a, len, 1);
+    }
+}
+
+/* `unset NAME...`: the variables go, exported or not. */
+static void unset_builtin(struct cmd *c) {
+    for (int i = 1; i < c->argc; i++) {
+        const char *name = c->argv[i];
+        int len = name_length(name, 1);
+        if (len == 0) {
+            fprintf(STDERR, "sh: unset: %s: bad variable name\n", name);
+            continue;
+        }
+        struct var *v = find_var(name, len);
+        if (v != NULL) {
+            free(v->entry);
+            v->entry = NULL;
+            v->exported = 0;
+        }
+    }
+}
 
 static int is_blank(char c) {
     return c == ' ' || c == '\t';
@@ -213,8 +421,11 @@ static void help(void) {
     printf("help            this list\n");
     printf("exit [N]        leave the shell, with status N or the last program's\n");
     printf("wait            wait for every background program\n");
-    printf("cd [DIR]        change the working directory, to / without DIR\n");
+    printf("cd [DIR]        change the working directory, to HOME (or /) without DIR\n");
     printf("exec [PROG ...] replace the shell with PROG; without one, keep its redirections\n");
+    printf("export [NAME..] pass variables (NAME or NAME=VALUE) to programs; alone, list them\n");
+    printf("unset NAME...   remove variables\n");
+    printf("NAME=VALUE      set a variable; before a command, for that command alone\n");
     printf("PROG [ARG...]   run /bin/PROG (e.g. ls, cat, echo, wc, sh), or the program at PROG if it has a /\n");
     printf("CMD < FILE      read the input from FILE\n");
     printf("CMD > FILE      write the output to FILE\n");
@@ -230,13 +441,18 @@ static int is_builtin(const struct cmd *c) {
     }
     const char *name = c->argv[0];
     return strcmp(name, "exit") == 0 || strcmp(name, "help") == 0 || strcmp(name, "wait") == 0 ||
-           strcmp(name, "cd") == 0;
+           strcmp(name, "cd") == 0 || strcmp(name, "export") == 0 || strcmp(name, "unset") == 0;
 }
 
 /* Runs built-in `c`. Returns 1 if the shell should exit, with the status in
  * *exit_status. */
 static int builtin(struct cmd *c, int *exit_status) {
     const char *name = c->argv[0];
+    /* POSIX's special built-ins keep the assignments before them; the
+     * others see them (lookup()) but leave the shell's variables be. */
+    if (strcmp(name, "exit") == 0 || strcmp(name, "export") == 0 || strcmp(name, "unset") == 0) {
+        assign_all(c, 0);
+    }
     if (strcmp(name, "exit") == 0) {
         *exit_status = c->argv[1] != NULL ? atoi(c->argv[1]) : last_status;
         return 1;
@@ -245,8 +461,14 @@ static int builtin(struct cmd *c, int *exit_status) {
         help();
     } else if (strcmp(name, "wait") == 0) {
         wait_all();
+    } else if (strcmp(name, "export") == 0) {
+        export_builtin(c);
+    } else if (strcmp(name, "unset") == 0) {
+        unset_builtin(c);
     } else if (strcmp(name, "cd") == 0) {
-        const char *dir = c->argv[1] != NULL ? c->argv[1] : "/";
+        /* Without a directory, HOME (POSIX's), or the root if it has none. */
+        const char *home = lookup(c, "HOME");
+        const char *dir = c->argv[1] != NULL ? c->argv[1] : home != NULL && home[0] != 0 ? home : "/";
         int r = chdir(dir);
         if (r < 0) {
             fprintf(STDERR, "sh: cd: %s: %s\n", dir, strerror(-r));
@@ -258,11 +480,22 @@ static int builtin(struct cmd *c, int *exit_status) {
 /* The tokens t[0..n) as a command in *c. Returns 0, or -1 (having said why)
  * if they make no sense. */
 static int parse_cmd(struct token *t, int n, struct cmd *c) {
+    c->nassigns = 0;
     c->argc = 0;
     c->in = NULL;
     c->out = NULL;
     c->program_only = 0;
     for (int i = 0; i < n; i++) {
+        if (t[i].op == 0 && c->argc == 0 && name_length(t[i].word, 0) > 0) {
+            /* An assignment: a NAME=value before the first other word. */
+            if (c->nassigns == MAXARG) {
+                fprintf(STDERR, "sh: too many assignments\n");
+                return -1;
+            }
+            c->assigns[c->nassigns] = t[i].word;
+            c->nassigns++;
+            continue;
+        }
         if (t[i].op == 0) {
             if (c->argc == MAXARG) {
                 fprintf(STDERR, "sh: too many arguments\n");
@@ -285,7 +518,7 @@ static int parse_cmd(struct token *t, int n, struct cmd *c) {
         i++;
     }
     c->argv[c->argc] = NULL;
-    if (c->argc == 0) {
+    if (c->argc == 0 && c->nassigns == 0) {
         fprintf(STDERR, "sh: a command with no program\n");
         return -1;
     }
@@ -417,6 +650,9 @@ static void restore_fd(int fd, int copy) {
  * is not interactive, where PROG could not be started or a redirection
  * could not be made. */
 static int exec_builtin(struct cmd *c, int *exit_status) {
+    /* A special built-in: the assignments are the shell's from now on, and
+     * exported for the program, as dash and bash have them. */
+    assign_all(c, c->argc > 1);
     int in = -1;
     int out = -1;
     if (open_files(c, &in, &out) < 0) {
@@ -454,7 +690,10 @@ static int exec_builtin(struct cmd *c, int *exit_status) {
         close(out);
     }
     char path[MAXPATH + 2];
-    int err = exec(program_path(c->argv[1], path), &c->argv[1]);
+    /* The shell's environment, the assignments in it already. */
+    char *envp[MAX_VARS + MAXARG + 1];
+    build_env(c->assigns, 0, envp);
+    int err = exec(program_path(c->argv[1], path), &c->argv[1], envp);
     /* Still here: the program couldn't start, and the copies are open. */
     restore_fd(STDIN, saved_in);
     restore_fd(STDOUT, saved_out);
@@ -466,7 +705,18 @@ static int exec_builtin(struct cmd *c, int *exit_status) {
  * shell should exit (the `exit` built-in, or a failed `exec`), with the
  * status in *exit_status. */
 static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
-    if (n == 1 && !background && strcmp(cmds[0].argv[0], "exec") == 0) {
+    if (n == 1 && !background && cmds[0].argc == 0) {
+        /* Assignments alone: the shell's variables (see the top), and the
+         * status 0, as POSIX has it. Their redirections are made below, as
+         * for `exec` alone (in a pipeline or in the background, a subshell
+         * would make the assignments, and they go with it). */
+        assign_all(&cmds[0], 0);
+        if (cmds[0].in == NULL && cmds[0].out == NULL) {
+            last_status = 0;
+            return 0;
+        }
+    }
+    if (n == 1 && !background && cmds[0].argc > 0 && strcmp(cmds[0].argv[0], "exec") == 0) {
         return exec_builtin(&cmds[0], exit_status);
     }
     /* In a pipeline or a background job, which POSIX runs in subshells,
@@ -477,7 +727,7 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
      * only makes its redirections and ends with 0, as its subshell would. */
     for (int i = 0; i < n; i++) {
         struct cmd *c = &cmds[i];
-        if (strcmp(c->argv[0], "exec") == 0) {
+        if (c->argc > 0 && strcmp(c->argv[0], "exec") == 0) {
             /* argv[argc] is the NULL, which moves down too. */
             for (int k = 0; k < c->argc; k++) {
                 c->argv[k] = c->argv[k + 1];
@@ -501,8 +751,8 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
     int pids[MAX_PIPE];
     const char *names[MAX_PIPE];
     int started = 0;
-    /* Whether the last command is an `exec` with no program, whose status,
-     * 0, is the pipeline's. */
+    /* Whether the last command is an `exec` with no program, or
+     * assignments alone, whose status, 0, is the pipeline's. */
     int ends_with_exec = 0;
     int quit = 0;
     /* The read end of the pipe from the previous command, for this one. */
@@ -540,8 +790,8 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
             out = file_out;
         }
         if (cmds[i].argc == 0) {
-            /* `exec` alone: its files are made, and that is all. Nothing
-             * reads or writes the pipe ends it had. */
+            /* `exec` alone, or assignments: its files are made, and that
+             * is all. Nothing reads or writes the pipe ends it had. */
             close_if(in);
             close_if(out);
             ends_with_exec = i + 1 == n;
@@ -557,7 +807,9 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
             break;
         }
         char path[MAXPATH + 2];
-        int pid = spawn(program_path(cmds[i].argv[0], path), cmds[i].argv);
+        char *envp[MAX_VARS + MAXARG + 1];
+        build_env(cmds[i].assigns, cmds[i].nassigns, envp);
+        int pid = spawn(program_path(cmds[i].argv[0], path), cmds[i].argv, envp);
         if (pid < 0) {
             cannot_start(cmds[i].argv[0], pid);
             break;
@@ -684,6 +936,7 @@ static int read_line(char *buf) {
 
 int main(void) {
     char line[LINE_SIZE];
+    import_env();
     look_at_input();
     interactive = console_input || connection_input;
     printf("Type help for the list of commands.\n");

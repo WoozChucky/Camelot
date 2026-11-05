@@ -510,7 +510,7 @@ static int ends_last(void *arg) {
 
 static int run(const char *mode) {
     char *args[] = {"threadtest", (char *)mode, NULL};
-    return spawn("/bin/threadtest", args);
+    return spawn("/bin/threadtest", args, environ);
 }
 
 static int status_of(int pid) {
@@ -649,7 +649,7 @@ static int exec_alone(void) {
     char pid[12];
     snprintf(pid, sizeof pid, "%d", getpid());
     char *args[] = {"threadtest", "alone", pid, NULL};
-    return exec(PROGRAM, args);
+    return exec(PROGRAM, args, environ);
 }
 
 /* The filesystem child modes, or -1 for another. */
@@ -821,7 +821,7 @@ static int child(int argc, char **argv) {
         char pid[12];
         snprintf(pid, sizeof pid, "%d", getpid());
         char *args[] = {"threadtest", "alone", pid, tids[0], tids[1], tids[2], NULL};
-        exec("/bin/threadtest", args);
+        exec("/bin/threadtest", args, environ);
         return 50;
     }
     if (strcmp(mode, "alone") == 0) {

@@ -189,17 +189,26 @@ static void set_name(struct proc *p, const char *name) {
  *
  *   USER_TOP     a pointer-sized zero, Linux's end marker
  *                the path the program was started with (AT_EXECFN)
+ *                the environment's strings, envp[0]'s first, each
+ *                NUL-terminated
  *                the argument strings, argv[0]'s first (lowest), each
- *                NUL-terminated (the environment's would go between the two
- *                and the path: spawn and exec pass none)
+ *                NUL-terminated
  *                padding to a multiple of 16
  *                16 random bytes (AT_RANDOM)
  *                padding
  *                the auxiliary vector: AUXV_ENTRIES pairs of a type and a
  *                value, a pointer's size each, the last one AT_NULL
- *                envp: NULL, an empty environment
+ *                envp[0] ... envp[envc - 1], NULL
  *                argv[0] ... argv[argc - 1], NULL
  *   sp           argc, a long
+ *
+ * Linux copies the strings down from the top in that order (the path,
+ * then envp's, then argv's: copy_string_kernel and copy_strings in
+ * fs/exec.c), each array's in its own order, so argv[0]'s string is the
+ * lowest; create_elf_tables then fills the pointers in going up the
+ * strings. Here they are in kernel memory already, one after another as
+ * syscall.c copied them in (`args`: argv's, then envp's), and go up in one
+ * copy.
  *
  * sp, the lowest of it, is 16-byte aligned. a0 holds 0: the psABI's
  * address of a function for the program to register with atexit, the
@@ -214,12 +223,13 @@ static void set_name(struct proc *p, const char *name) {
 
 /* The auxiliary vector's entries push_start writes, AT_NULL's included. */
 #define AUXV_ENTRIES 17
-/* The pointer-sized words below the random bytes: argc, argv's MAXARG + 1,
- * envp's NULL and the vector. */
-#define START_WORDS (1 + (MAXARG + 1) + 1 + 2 * AUXV_ENTRIES)
+/* The most pointer-sized words below the random bytes: argc, argv's MAXARG
+ * pointers and NULL, envp's as many, and the vector. */
+#define START_WORDS (1 + (MAXARG + 1) + (MAXARG + 1) + 2 * AUXV_ENTRIES)
 /* All of it fits in the stack's first page, with room to spare for the
- * program's first frames: the marker, the path, the strings, the padding
- * and the random bytes, then the words and their padding. */
+ * program's first frames: the marker, the path, the strings (argv's and
+ * envp's, ARG_MAX bytes at most together), the padding and the random
+ * bytes, then the words and their padding. */
 _Static_assert(sizeof(uintptr) + MAXPATH + 1 + ARG_MAX + 15 + 16 + sizeof(uintptr) * START_WORDS + 15 <= PGSIZE / 2,
                "a program's start fills more than half its stack page");
 
@@ -267,17 +277,23 @@ static void push_start(struct trap_frame *f, u8 *stack, const struct proc_args *
     uintptr random = at;
     random_bytes(stack + (at - USER_STACK), pa(stack));
 
-    u32 words = 1 + (args->argc + 1) + 1 + 2 * AUXV_ENTRIES;
+    u32 words = 1 + (args->argc + 1) + (args->envc + 1) + 2 * AUXV_ENTRIES;
     uintptr sp = (random - sizeof(uintptr) * words) & ~(uintptr)15;
     uintptr *w = (uintptr *)(stack + (sp - USER_STACK));
     u32 n = 0;
     w[n++] = args->argc;
+    /* argv's pointers, then envp's, up the strings: each string starts
+     * where the one before it ended. */
     uintptr s = strings;
     for (u32 i = 0; i < args->argc; i++) {
         w[n++] = s;
         s += strlen(args->strings + (s - strings)) + 1;
     }
     w[n++] = 0; /* argv's NULL */
+    for (u32 i = 0; i < args->envc; i++) {
+        w[n++] = s;
+        s += strlen(args->strings + (s - strings)) + 1;
+    }
     w[n++] = 0; /* envp's */
     /* The vector, in Linux's order (the RISC-V entries it puts first,
      * AT_SYSINFO_EHDR for the vDSO, the caches' sizes and AT_MINSIGSTKSZ,

@@ -112,10 +112,11 @@ typedef unsigned long long uint64_t;
 #define STDOUT 1
 #define STDERR 2
 
-/* spawn's and exec's limits: arguments, argv[0] included, and the bytes
- * their strings take with their NULs. */
+/* spawn's and exec's limits: at most MAXARG strings in argv (argv[0]
+ * included) and as many in envp, and the bytes the strings of both take
+ * with their NULs together. */
 #define MAXARG 16
-#define ARG_MAX 512
+#define ARG_MAX 1024
 
 /* A program starts as Linux starts one (docs/camelot-syscalls.md,
  * "Starting a program"): crt0 calls main(argc, argv, envp), and after
@@ -312,7 +313,7 @@ ssize_t read(int fd, void *buf, size_t len);
 int getpid(void);
 int yield(void);
 int sleep(uint ticks);
-int spawn(const char *path, char *const argv[]);
+int spawn(const char *path, char *const argv[], char *const envp[]);
 int wait(int pid, int *status);
 void *sbrk(long increment);
 uint uptime(void);
@@ -326,7 +327,7 @@ int link(const char *old, const char *new);
 int chdir(const char *path);
 int dup(int fd);
 int pipe(int *fds);
-int exec(const char *path, char *const argv[]);
+int exec(const char *path, char *const argv[], char *const envp[]);
 int kill(int pid);
 int procs(struct procinfo *buf, uint max);
 int harts(struct hartinfo *buf, uint max);
@@ -421,6 +422,26 @@ int memcmp(const void *a, const void *b, size_t n);
  * LONG_MIN with a '-', as in C (*end is still past all its digits). */
 int atoi(const char *s);
 long strtol(const char *s, char **end, int base);
+
+/* The environment (lib/environ.c, lib/getenv.c), as POSIX has it: environ is
+ * the program's, a NULL-terminated array of NAME=value strings, which
+ * crt0 sets to main's envp before calling it (as glibc's
+ * __libc_start_main does), and which a program passes on to spawn or exec
+ * (or another array of its own making). getenv: the value of the first
+ * entry called `name` (what follows its first '='), or NULL if there is
+ * none or `name` is empty or has a '=' in it. setenv: gives `name` the
+ * value `value`, adding it at the end, or replacing it if it is there and
+ * `overwrite` is not 0 (else it stays); returns 0, -EINVAL for a bad name
+ * (as getenv's) or -ENOMEM. unsetenv: removes every entry called `name`;
+ * 0, or -EINVAL. Errors come back as numbers, as from the kernel: there is
+ * no errno. setenv changes environ (to a new array, from malloc, the first
+ * time it adds a variable), unsetenv the array in place; neither frees a
+ * string it replaces or removes, so that what getenv returned stays good,
+ * as glibc keeps them. */
+extern char **environ;
+char *getenv(const char *name);
+int setenv(const char *name, const char *value, int overwrite);
+int unsetenv(const char *name);
 
 /* The heap (lib/malloc.c), on top of sbrk: blocks aligned to the size of
  * malloc's header, two pointers' worth (8 bytes on RV32, 16 on RV64: the

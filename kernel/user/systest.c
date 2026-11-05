@@ -32,6 +32,12 @@
  *                         aftercloexec PID`, which exits 0 if its pid is
  *                         PID, 3 and 6 are open without the flag and 4 and
  *                         5 are closed
+ *   systest env           exits 0 if its environment is given_env's
+ *                         entries, and getenv finds their values
+ *   systest execenv       execs `systest env` with given_env
+ *   systest envcount N    exits 0 if its environment has N entries
+ *   systest envbytes N    exits 0 if its arguments' and environment's
+ *                         strings take N bytes with their NULs
  *   systest nostderr      exits 0 if it has descriptors 0 and 1 but not 2
  *   systest spin          spins until it is killed
  *   systest waiter        spawns `systest sleep 1000` and waits for it
@@ -185,7 +191,7 @@ static int exec_self(void) {
     }
     char pid[12];
     char *argv[] = {"systest", "afterexec", decimal(getpid(), pid), NULL};
-    exec("/bin/systest", argv);
+    exec("/bin/systest", argv, environ);
     return 2; /* exec returned: it failed */
 }
 
@@ -209,8 +215,8 @@ static int exec_fail(void) {
     if (keep != 3) {
         return 2;
     }
-    if (exec("/bin/nope", NULL) != -ENOENT || exec("", NULL) != -ENOENT ||
-        exec("/bin/systest", many) != -E2BIG || exec("/bin/systest", (char **)KERNEL_ADDR) != -EFAULT) {
+    if (exec("/bin/nope", NULL, environ) != -ENOENT || exec("", NULL, environ) != -ENOENT ||
+        exec("/bin/systest", many, environ) != -E2BIG || exec("/bin/systest", (char **)KERNEL_ADDR, environ) != -EFAULT) {
         return 1;
     }
     return fcntl(keep, F_GETFD, 0) == FD_CLOEXEC ? 0 : 3;
@@ -225,7 +231,7 @@ static int exec_cloexec(void) {
     }
     char pid[12];
     char *argv[] = {"systest", "aftercloexec", decimal(getpid(), pid), NULL};
-    exec("/bin/systest", argv);
+    exec("/bin/systest", argv, environ);
     return 2; /* exec returned: it failed */
 }
 
@@ -249,7 +255,75 @@ static int no_stderr(void) {
 static int kill_reader(void);
 
 /* What a child run of systest does (see the top of the file). */
+/* The environment test_environment gives `systest env`: a name twice (the
+ * first is getenv's), an empty value, a value with a space, an entry with
+ * no '=' (the kernel passes any string; getenv finds no value in it). */
+static char *given_env[] = {"A=1", "EMPTY=", "B=two words", "A=again", "NOEQUALS", NULL};
+
+/* systest env: exits 0 if its environment is given_env, entry for entry,
+ * and getenv finds in it what it should. */
+static int env_is_given(void) {
+    int n = 0;
+    for (; given_env[n] != NULL; n++) {
+        if (environ[n] == NULL || strcmp(environ[n], given_env[n]) != 0) {
+            return 1;
+        }
+    }
+    if (environ[n] != NULL) {
+        return 2;
+    }
+    const char *a = getenv("A");
+    const char *empty = getenv("EMPTY");
+    const char *b = getenv("B");
+    if (a == NULL || strcmp(a, "1") != 0 || empty == NULL || empty[0] != 0 || b == NULL ||
+        strcmp(b, "two words") != 0) {
+        return 3;
+    }
+    return getenv("NOEQUALS") == NULL && getenv("C") == NULL && getenv("") == NULL ? 0 : 4;
+}
+
+/* systest execenv: execs `systest env` with given_env, in place of the
+ * environment it was started with. */
+static int exec_env(void) {
+    exec("/bin/systest", (char *[]){"systest", "env", NULL}, given_env);
+    return 5; /* exec returned: it failed */
+}
+
+/* systest envcount N: exits 0 if its environment has N entries. */
+static int env_count(int want) {
+    int n = 0;
+    while (environ[n] != NULL) {
+        n++;
+    }
+    return n == want ? 0 : 1;
+}
+
+/* systest envbytes N: exits 0 if its arguments' and its environment's
+ * strings take N bytes with their NULs. */
+static int env_bytes(int argc, char **argv, int want) {
+    int n = 0;
+    for (int i = 0; i < argc; i++) {
+        n += (int)strlen(argv[i]) + 1;
+    }
+    for (char **e = environ; *e != NULL; e++) {
+        n += (int)strlen(*e) + 1;
+    }
+    return n == want ? 0 : 1;
+}
+
 static int child(int argc, char **argv) {
+    if (strcmp(argv[1], "env") == 0) {
+        return env_is_given();
+    }
+    if (strcmp(argv[1], "execenv") == 0) {
+        return exec_env();
+    }
+    if (strcmp(argv[1], "envcount") == 0 && argc == 3) {
+        return env_count(atoi(argv[2]));
+    }
+    if (strcmp(argv[1], "envbytes") == 0 && argc == 3) {
+        return env_bytes(argc, argv, atoi(argv[2]));
+    }
     if (strcmp(argv[1], "pipewrite") == 0 && argc == 3) {
         return pipe_write(atoi(argv[2]));
     }
@@ -295,7 +369,7 @@ static int child(int argc, char **argv) {
         }
     }
     if (strcmp(argv[1], "waiter") == 0) {
-        int pid = spawn("/bin/systest", (char *[]){"systest", "sleep", "1000", NULL});
+        int pid = spawn("/bin/systest", (char *[]){"systest", "sleep", "1000", NULL}, environ);
         return pid > 0 && wait(pid, NULL) == pid ? 0 : 1;
     }
     if (strcmp(argv[1], "killreader") == 0) {
@@ -326,18 +400,26 @@ void _start(void);
 
 /* The program's start (docs/camelot-syscalls.md, "Starting a program"),
  * as main finds it, for a program started with `path`: argc, a long, at
- * sp, 16-byte aligned, right below argv; argv's NULL, then an empty envp
+ * sp, 16-byte aligned, right below argv; argv's NULL, then envp, its NULL,
  * and the auxiliary vector, every entry Linux gives that Camelot has, once;
- * the argument strings, the path and an end marker, in that order, up to
- * the top of the stack. Returns 0 if all of that holds, else the number of
- * the first check that fails. */
+ * the argument strings, the environment's, the path and an end marker, in
+ * that order, up to the top of the stack; and crt0 made envp environ.
+ * Returns 0 if all of that holds, else the number of the first check that
+ * fails. */
 static int start_fault(int argc, char **argv, char **envp, const char *path) {
     long *sp = (long *)argv - 1;
     if (*sp != argc || ((uintptr_t)sp & 15) != 0) {
         return 1;
     }
-    if (argv[argc] != NULL || envp != argv + argc + 1 || envp[0] != NULL) {
+    if (argv[argc] != NULL || envp != argv + argc + 1 || environ != envp) {
         return 2;
+    }
+    int envc = 0;
+    while (envp[envc] != NULL) {
+        if (envc == MAXARG) {
+            return 2;
+        }
+        envc++;
     }
     /* The vector: each type at most once, up to AT_NULL. */
     unsigned long value[32];
@@ -345,7 +427,7 @@ static int start_fault(int argc, char **argv, char **envp, const char *path) {
     for (int i = 0; i < 32; i++) {
         seen[i] = 0;
     }
-    unsigned long *aux = (unsigned long *)(envp + 1);
+    unsigned long *aux = (unsigned long *)(envp + envc + 1);
     int n = 0;
     while (aux[0] != AT_NULL) {
         if (aux[0] >= 32 || seen[aux[0]] || ++n > 31) {
@@ -393,10 +475,16 @@ static int start_fault(int argc, char **argv, char **envp, const char *path) {
         return 9;
     }
     /* The strings: argv's in order, each right after the one before, then
-     * the path, then a long of zeros at the very top. */
+     * envp's, then the path, then a long of zeros at the very top. */
     char *at = argv[0];
     for (int i = 0; i < argc; i++) {
         if (argv[i] != at) {
+            return 10;
+        }
+        at += strlen(at) + 1;
+    }
+    for (int i = 0; i < envc; i++) {
+        if (envp[i] != at) {
             return 10;
         }
         at += strlen(at) + 1;
@@ -430,7 +518,7 @@ static int start_fault(int argc, char **argv, char **envp, const char *path) {
  * its exit status, or the error. */
 static int run_child(char *a, char *b) {
     char *argv[] = {"systest", a, b, NULL};
-    int pid = spawn("/bin/systest", argv);
+    int pid = spawn("/bin/systest", argv, environ);
     if (pid < 0) {
         return pid;
     }
@@ -482,22 +570,22 @@ static void test_spawn_and_wait(void) {
     check_eq(wait(-1, &status), -ECHILD, "wait without children");
     check_eq(status, 7, "a failed wait leaves the status alone");
     check_eq(wait(1, &status), -ECHILD, "wait for the shell, not a child");
-    check_eq(spawn("/bin/nope", NULL), -ENOENT, "spawn of an unknown program");
-    check_eq(spawn("", NULL), -ENOENT, "spawn of an empty path");
-    check_eq(spawn("/bin/a-name-far-too-long-for-any-program", NULL), -ENOENT, "spawn of a long name");
+    check_eq(spawn("/bin/nope", NULL, environ), -ENOENT, "spawn of an unknown program");
+    check_eq(spawn("", NULL, environ), -ENOENT, "spawn of an empty path");
+    check_eq(spawn("/bin/a-name-far-too-long-for-any-program", NULL, environ), -ENOENT, "spawn of a long name");
 
     check_eq(run_child("exit", "0"), 0, "exit status 0");
     check_eq(run_child("exit", "42"), 42, "exit status 42");
     check_eq(run_child("exit", "-3"), -3, "exit status -3");
     char *args[] = {"systest", "args", "", "two words", "x", NULL};
-    int pid = spawn("/bin/systest", args);
+    int pid = spawn("/bin/systest", args, environ);
     check(pid > 0, "spawn with arguments");
     check_eq(wait(pid, &status), pid, "wait for it");
     check_eq(status, 0, "the child got its arguments");
 
     /* wait(pid) takes that child only; wait(-1) any; a NULL status is fine. */
-    int a = spawn("/bin/systest", (char *[]){"systest", "exit", "1", NULL});
-    int b = spawn("/bin/systest", (char *[]){"systest", "exit", "2", NULL});
+    int a = spawn("/bin/systest", (char *[]){"systest", "exit", "1", NULL}, environ);
+    int b = spawn("/bin/systest", (char *[]){"systest", "exit", "2", NULL}, environ);
     check(a > 0 && b > a, "two children");
     check_eq(wait(b, &status), b, "wait for the second");
     check_eq(status, 2, "its status");
@@ -509,7 +597,7 @@ static void test_spawn_and_wait(void) {
     int pids[NPROC];
     int n = 0;
     for (;;) {
-        int p = spawn("/bin/systest", (char *[]){"systest", "sleep", "2", NULL});
+        int p = spawn("/bin/systest", (char *[]){"systest", "sleep", "2", NULL}, environ);
         if (p < 0) {
             check_eq(p, -EAGAIN, "spawn with every slot taken");
             break;
@@ -535,7 +623,7 @@ static void test_spawn_and_wait(void) {
         check_eq(status, 0, "a sleeper's status");
     }
     check_eq(wait(-1, &status), -ECHILD, "every sleeper collected");
-    pid = spawn("/bin/systest", (char *[]){"systest", "exit", "5", NULL});
+    pid = spawn("/bin/systest", (char *[]){"systest", "exit", "5", NULL}, environ);
     check(pid > 0, "a slot is free again");
     check_eq(wait(pid, &status), pid, "and its child ends");
 
@@ -545,9 +633,9 @@ static void test_spawn_and_wait(void) {
         many[i] = "x";
     }
     many[MAXARG + 1] = NULL;
-    check_eq(spawn("/bin/echo", many), -E2BIG, "too many arguments");
+    check_eq(spawn("/bin/echo", many, environ), -E2BIG, "too many arguments");
     many[MAXARG] = NULL;
-    pid = spawn("/bin/systest", many);
+    pid = spawn("/bin/systest", many, environ);
     check(pid > 0, "MAXARG arguments");
     check_eq(wait(pid, &status), pid, "wait for it");
     check_eq(status, 100, "and it ran");
@@ -555,13 +643,13 @@ static void test_spawn_and_wait(void) {
     memset(big, 'y', sizeof big - 1);
     big[sizeof big - 1] = 0;
     char *huge[] = {"echo", big, NULL};
-    check_eq(spawn("/bin/echo", huge), -E2BIG, "arguments over ARG_MAX bytes");
+    check_eq(spawn("/bin/echo", huge, environ), -E2BIG, "arguments over ARG_MAX bytes");
     /* A path is at most MAXPATH bytes. */
     char path[MAXPATH + 2];
     memset(path, 'p', sizeof path - 1);
     path[0] = '/';
     path[sizeof path - 1] = 0;
-    check_eq(spawn(path, NULL), -ENAMETOOLONG, "a path over MAXPATH bytes");
+    check_eq(spawn(path, NULL, environ), -ENAMETOOLONG, "a path over MAXPATH bytes");
 }
 
 static void test_sbrk(void) {
@@ -615,7 +703,7 @@ static int spawn_with(int in, int out, char **argv) {
         close(STDOUT);
         dup(out);
     }
-    int pid = spawn("/bin/systest", argv);
+    int pid = spawn("/bin/systest", argv, environ);
     close(STDIN);
     dup(console_in);
     close(STDOUT);
@@ -724,7 +812,7 @@ static void test_fcntl(void) {
     check_eq(fcntl(STDERR, F_SETFD, 0), 0, "and it doesn't any more");
     check_eq(run_child("nostderr", NULL), 1, "the child gets it again");
 
-    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "cloexec", NULL})), 0,
+    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "cloexec", NULL}, environ)), 0,
              "exec closes the descriptors that close on exec, and only them");
 }
 
@@ -837,10 +925,65 @@ static void test_pipes(void) {
 }
 
 static void test_exec(void) {
-    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "exec", NULL})), 0,
+    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "exec", NULL}, environ)), 0,
              "exec keeps the pid and the descriptors");
-    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "execfail", NULL})), 0,
+    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "execfail", NULL}, environ)), 0,
              "a failed exec returns its error");
+}
+
+/* spawn's and exec's envp: what the program finds in its environment, and
+ * the limits, which argv and envp share (docs/camelot-syscalls.md). */
+static void test_environment(void) {
+    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "env", NULL}, given_env)), 0,
+             "a child gets the environment it is given");
+    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "envcount", "0", NULL}, NULL)), 0,
+             "a NULL envp is an empty environment");
+    char *none[] = {NULL};
+    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "envcount", "0", NULL}, none)), 0,
+             "and so is an empty one");
+    check_eq(status_of(spawn("/bin/systest", (char *[]){"systest", "execenv", NULL}, environ)), 0,
+             "exec replaces the environment");
+
+    /* At most MAXARG strings in envp, as in argv. */
+    char *many[MAXARG + 2];
+    for (int i = 0; i <= MAXARG; i++) {
+        many[i] = "V=x";
+    }
+    many[MAXARG + 1] = NULL;
+    char count[12];
+    char *argv[] = {"systest", "envcount", decimal(MAXARG, count), NULL};
+    check_eq(spawn("/bin/systest", argv, many), -E2BIG, "more than MAXARG environment strings");
+    many[MAXARG] = NULL;
+    check_eq(status_of(spawn("/bin/systest", argv, many)), 0, "MAXARG environment strings");
+    /* An error in argv comes first: envp isn't looked at. */
+    char *many_args[MAXARG + 2];
+    for (int i = 0; i <= MAXARG; i++) {
+        many_args[i] = "x";
+    }
+    many_args[MAXARG + 1] = NULL;
+    check_eq(spawn("/bin/echo", many_args, (char **)KERNEL_ADDR), -E2BIG, "argv's error before envp's");
+
+    /* The strings of both, with their NULs, ARG_MAX bytes at most: an
+     * environment string that makes exactly ARG_MAX, then one byte more. */
+    char total[12];
+    char *bytes_argv[] = {"systest", "envbytes", decimal(ARG_MAX, total), NULL};
+    int used = 0;
+    for (int i = 0; bytes_argv[i] != NULL; i++) {
+        used += (int)strlen(bytes_argv[i]) + 1;
+    }
+    static char big[ARG_MAX + 1];
+    int len = ARG_MAX - used - 1;
+    big[0] = 'V';
+    big[1] = '=';
+    memset(big + 2, 'y', (size_t)(len - 2));
+    big[len] = 0;
+    char *big_env[] = {big, NULL};
+    check_eq(status_of(spawn("/bin/systest", bytes_argv, big_env)), 0, "arguments and environment of ARG_MAX bytes");
+    big[len] = 'y';
+    big[len + 1] = 0;
+    check_eq(spawn("/bin/systest", bytes_argv, big_env), -E2BIG, "arguments and environment over ARG_MAX bytes");
+    check_eq(exec("/bin/systest", bytes_argv, big_env), -E2BIG, "exec of them too");
+    check_eq(exec("/bin/systest", argv, (char **)KERNEL_ADDR), -EFAULT, "exec with a bad envp");
 }
 
 /* The entry procs() gives for `pid` in `info` (`n` entries), or NULL. */
@@ -895,7 +1038,7 @@ static void until_asleep(int pid) {
 }
 
 static int kill_reader(void) {
-    int pid = spawn("/bin/systest", (char *[]){"systest", "count", NULL});
+    int pid = spawn("/bin/systest", (char *[]){"systest", "count", NULL}, environ);
     if (pid < 0) {
         return 1;
     }
@@ -916,7 +1059,7 @@ static int kill_reader(void) {
 static void test_procs_and_kill(void) {
     struct procinfo info[NPROC];
     int me = getpid();
-    int child = spawn("/bin/systest", (char *[]){"systest", "sleep", "1000", NULL});
+    int child = spawn("/bin/systest", (char *[]){"systest", "sleep", "1000", NULL}, environ);
     check(child > me, "a sleeper to look at");
     /* Its turn comes and it goes to sleep. */
     while (state_of(child) != PROC_SLEEPING) {
@@ -951,7 +1094,7 @@ static void test_procs_and_kill(void) {
     check_eq(kill(child), -ESRCH, "kill a process that is gone");
 
     /* A zombie has already ended: killing it changes nothing. */
-    child = spawn("/bin/systest", (char *[]){"systest", "exit", "3", NULL});
+    child = spawn("/bin/systest", (char *[]){"systest", "exit", "3", NULL}, environ);
     while (state_of(child) != PROC_ZOMBIE) {
         yield();
     }
@@ -971,7 +1114,7 @@ static void test_procs_and_kill(void) {
     close(pfd[1]);
 
     /* A runnable one, spinning in U-mode. */
-    child = spawn("/bin/systest", (char *[]){"systest", "spin", NULL});
+    child = spawn("/bin/systest", (char *[]){"systest", "spin", NULL}, environ);
     yield();
     check_eq(kill(child), 0, "kill a spinner");
     check_eq(status_of(child), -1, "the spinner ends");
@@ -990,7 +1133,7 @@ static void test_procs_and_kill(void) {
     int console_out = dup(STDOUT);
     close(STDOUT);
     dup(pfd[1]);
-    child = spawn("/bin/echo", (char *[]){"echo", "ran", NULL});
+    child = spawn("/bin/echo", (char *[]){"echo", "ran", NULL}, environ);
     int killed = kill(child);
     close(STDOUT);
     dup(console_out);
@@ -1024,7 +1167,7 @@ static void test_procs_and_kill(void) {
     check_eq(status_of(child), -1, "the writer's status");
 
     /* A process asleep in wait, for a child of its own that sleeps. */
-    child = spawn("/bin/systest", (char *[]){"systest", "waiter", NULL});
+    child = spawn("/bin/systest", (char *[]){"systest", "waiter", NULL}, environ);
     int grandchild = 0;
     while (grandchild == 0) {
         yield();
@@ -1110,6 +1253,7 @@ int main(int argc, char **argv, char **envp) {
     test_fcntl();
     test_pipes();
     test_exec();
+    test_environment();
     test_procs_and_kill();
     test_harts();
     test_network_without_a_card();

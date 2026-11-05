@@ -222,11 +222,14 @@ extern const u32 user_program_count;
 /* The embedded program called `name`, or NULL. */
 const struct user_program *user_program_find(const char *name);
 
-/* A new program's arguments, in kernel memory: `argc` NUL-terminated strings
- * one after another in `strings`, `len` bytes in all. proc_create() and
+/* A new program's arguments and environment, in kernel memory, as Linux's
+ * struct linux_binprm gathers them for execve: `argc` NUL-terminated
+ * argument strings one after another in `strings`, then `envc` environment
+ * strings (`NAME=value`), `len` bytes in all. proc_create() and
  * proc_exec_load() copy them to the top of the program's stack. */
 struct proc_args {
     u32 argc;
+    u32 envc;
     u32 len;
     char strings[ARG_MAX];
 };
@@ -244,11 +247,12 @@ struct thread *mythread(void);
 
 /* Makes a runnable process called `name` from the executable `prog`, a
  * child of the current process, with one thread: a page table with the
- * program loaded, a stack holding `args` with sp below them, a kernel
- * stack, a pid, copies of the parent's descriptors 0, 1 and 2 (the others
- * are not passed on) and its working directory. It starts at the program's
- * entry point, sp pointing at argc, argv, envp and the auxiliary vector
- * (proc.c, "The program's start"), `path` the vector's AT_EXECFN. Returns its pid, or -EAGAIN (no
+ * program loaded, a stack holding `args` (its arguments and environment)
+ * with sp below them, a kernel stack, a pid, copies of the parent's
+ * descriptors 0, 1 and 2 (the others are not passed on) and its working
+ * directory. It starts at the program's entry point, sp pointing at argc,
+ * argv, envp and the auxiliary vector (proc.c, "The program's start"),
+ * `path` the vector's AT_EXECFN. Returns its pid, or -EAGAIN (no
  * free process or thread slot), -ENOMEM or -ENOEXEC (a bad ELF image: the
  * loader's reason is printed as "spawn: PATH: REASON", `path` being what
  * the caller asked for) when it can't; nothing is left allocated then.
