@@ -18,11 +18,11 @@ Var int *third @third (definition) <11:6>
   Addr : int * <11:14>
     Deref : int <11:20>
       Binary + : int * <11:20>
-        Var table @table : int [4] <11:15>
+        Var table @table : int[4] <11:15>
         Num 2 : int <11:21>
 Var int *past @past (definition) <12:6>
   Binary + : int * <12:19>
-    Var table @table : int [4] <12:13>
+    Var table @table : int[4] <12:13>
     Num 4 : int <12:21>
 Function void bump(void) <14:6>
   ExprStmt <15:5>

@@ -514,6 +514,7 @@ impl<'a> Interp<'a> {
                 cond,
                 step,
                 body,
+                ..
             } => {
                 if let (Some(i), None) = (init, &seek) {
                     self.stmt(i, frame, seek)?;
@@ -577,7 +578,7 @@ impl<'a> Interp<'a> {
                 self.expr(e, frame)?;
                 Flow::Next
             }
-            StmtKind::Empty => Flow::Next,
+            StmtKind::Empty | StmtKind::Unevaluated(_) => Flow::Next,
             StmtKind::Return(e) => Flow::Return(match e {
                 Some(e) => self.expr(e, frame)?,
                 None => 0,
@@ -665,7 +666,7 @@ impl<'a> Interp<'a> {
         self.tick()?;
         let x = self.x;
         Ok(match &e.kind {
-            ExprKind::Num(v) => *v,
+            ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => *v,
             ExprKind::Var { .. }
             | ExprKind::Str(_)
             | ExprKind::Deref(_)

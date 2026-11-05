@@ -63,7 +63,7 @@ Function int main(void) <27:5>
   Decl <31:5>
     Var struct point *p #3 <31:19>
       ImplicitCast : struct point * <31:23>
-        Var pts #2 : struct point [3] <31:23>
+        Var pts #2 : struct point[3] <31:23>
   Decl <32:5>
     Var int i #4 <32:9>
   ExprStmt <33:5>
@@ -140,7 +140,7 @@ Function int main(void) <27:5>
           Member .x (offset 0) : int <43:15>
             Deref : struct point <43:12>
               Binary + : struct point * <43:12>
-                Var pts #2 : struct point [3] <43:9>
+                Var pts #2 : struct point[3] <43:9>
                 Var i #4 : int <43:13>
           Var i #4 : int <43:20>
       ExprStmt <44:9>
@@ -148,7 +148,7 @@ Function int main(void) <27:5>
           Member .y (offset 4) : int <44:15>
             Deref : struct point <44:12>
               Binary + : struct point * <44:12>
-                Var pts #2 : struct point [3] <44:9>
+                Var pts #2 : struct point[3] <44:9>
                 Var i #4 : int <44:13>
           Binary * : int <44:22>
             Var i #4 : int <44:20>
@@ -160,7 +160,7 @@ Function int main(void) <27:5>
         Member .y (offset 4) : int <46:17>
           Deref : struct point <46:14>
             Binary + : struct point * <46:14>
-              Var pts #2 : struct point [3] <46:11>
+              Var pts #2 : struct point[3] <46:11>
               Num 2 : int <46:15>
         Num 4 : int <46:23>
   ExprStmt <47:5>
@@ -196,7 +196,7 @@ Function int main(void) <27:5>
         Var r #1 : struct rect <51:5>
       Deref : struct point <51:16>
         Binary + : struct point * <51:16>
-          Var pts #2 : struct point [3] <51:13>
+          Var pts #2 : struct point[3] <51:13>
           Num 2 : int <51:17>
   ExprStmt <52:5>
     Assign += : int <52:8>
@@ -297,12 +297,12 @@ Function int main(void) <27:5>
             Assign : struct point <66:19>
               Deref : struct point <66:15>
                 Binary + : struct point * <66:15>
-                  Var pts #2 : struct point [3] <66:12>
+                  Var pts #2 : struct point[3] <66:12>
                   Num 0 : int <66:16>
               Assign : struct point <66:28>
                 Deref : struct point <66:24>
                   Binary + : struct point * <66:24>
-                    Var pts #2 : struct point [3] <66:21>
+                    Var pts #2 : struct point[3] <66:21>
                     Num 1 : int <66:25>
                 Member .max (offset 8) : struct point <66:31>
                   Var r #1 : struct rect <66:30>
@@ -311,7 +311,7 @@ Function int main(void) <27:5>
           Member .x (offset 0) : int <66:53>
             Deref : struct point <66:50>
               Binary + : struct point * <66:50>
-                Var pts #2 : struct point [3] <66:47>
+                Var pts #2 : struct point[3] <66:47>
                 Num 0 : int <66:51>
           Num 6 : int <66:59>
   Return <67:5>

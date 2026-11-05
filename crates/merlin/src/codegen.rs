@@ -31,7 +31,9 @@
 //!   definition, kept local); declarations without a definition emit nothing
 //!   (the linker finds them). Like clang, every function and variable gets
 //!   `.type` (`@function` or `@object`) and `.size`, so the symbol table says
-//!   what each address belongs to.
+//!   what each address belongs to. A `static` function or variable (or an
+//!   inline definition) that nothing emitted uses is not emitted, as clang
+//!   leaves it out ("Order" below).
 //! * Semantics: arithmetic wraps at the width of its type (32 bits for `int`,
 //!   and for `long` on RV32; 64 for `long` on RV64), `/` and `%` truncate
 //!   toward zero (`div`/`rem`, or `divu`/`remu` when unsigned), shifts use the
@@ -42,6 +44,41 @@
 //!   order, and nothing is kept in a register across statements. So
 //!   `volatile` needs nothing special: the code generator never caches,
 //!   removes, merges or reorders memory accesses.
+//!
+//! ## Order
+//!
+//! Functions and variables are generated in the order clang's front end
+//! emits them (`CodeGenModule`), and written in the order clang's module has
+//! them, so that `.text`, `.data`, `.bss` and `.rodata` hold them as clang's
+//! output does at `-O0`:
+//!
+//! * *Emitted*: the file is read as it comes. An external function, and an
+//!   external variable with an initializer, is generated where it stands. A
+//!   `static` function or variable (and an inline definition) is deferred:
+//!   generated once something emitted refers to it, or not at all. The
+//!   variables without an initializer (tentative definitions) are generated
+//!   at the end of the file. Then what was used and is still waiting, each
+//!   one's own uses right after it, depth first (`EmitDeferred`).
+//! * *Written*: each symbol where it was first made: a function as its
+//!   generation starts, or the first time code refers to it; a variable when
+//!   its initializer has been generated (a `static` local before it), or the
+//!   first time code or data refers to it ([`FileGen::create`]). So in
+//!
+//!   ```text
+//!   int f(void) { return g() + sh(1); }   int h(void) { ... }
+//!   static int sh(int x) { return x + h(); }   int g(void) { ... }
+//!   ```
+//!
+//!   `sh` is generated last, but its code comes right after `g`'s, before
+//!   `h`'s: `f`, `g`, `sh`, `h`. A `static` local is data made where its
+//!   declaration is generated; a compound literal of the file's scope is
+//!   generated as the initializer that names it is.
+//!
+//! With `-g` the `.file` numbers of the code's files go by the order of
+//! the output too ([`Lines::renumber`]), and the debug information by both
+//! orders, as LLVM's does ([`crate::debug`]). A function call refers to the
+//! function before its arguments are generated, as clang's `EmitCallee`
+//! comes before `EmitCallArgs`: in `f(g())` `f` is made first.
 //!
 //! ## Values and types
 //!
@@ -208,6 +245,15 @@
 //! declaration in the function its own local (shadowed names included), so a
 //! slot never has to be reused and scopes cost nothing here.
 //!
+//! Only the locals of the code generated get a slot, as clang's frame at
+//! `-O0` has room only for the code it emits: a local declared in an arm a
+//! constant condition leaves out, or a temporary of an operand left out (the
+//! result of a call in `1 ? 2 : h().a[0]`), has none. A local declared in
+//! code that is generated has one, used or not. Since what is generated is
+//! known only once it is, a function is generated twice: a first pass, with
+//! a slot for every local, notes the ones the code declares or uses and is
+//! thrown away; the second lays out those alone.
+//!
 //! The prologue saves `ra` and `s0` in a fixed 16 bytes, points `s0` at the top
 //! of the frame and then makes room for the rest; the epilogue undoes it from
 //! `s0`, so it never needs to know the frame size:
@@ -351,6 +397,12 @@
 //! way each time the expression is evaluated; its value is the local's
 //! address (loaded for a scalar `T`).
 //!
+//! clang emits a local array, struct or union whose initializer is constant
+//! (what a static initializer could be) as a constant it copies, not as
+//! code; merlin stores it element by element all the same, but with `-g`
+//! describes what clang's would: the casts a static initializer keeps, and
+//! no enum of its constants ([`FuncGen::constant_initializer`]).
+//!
 //! Globals and `static` locals are data: the initializer, a constant
 //! expression, is written out with `.byte`, `.half`, `.word`, `.quad` (8
 //! bytes, as clang writes them: a `long` or a pointer on RV64; `.word
@@ -416,7 +468,8 @@ use crate::elide;
 use crate::sema::arith_type;
 use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
 use crate::{Error, Pos};
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 /// Generates assembly for a whole translation unit.
@@ -447,102 +500,166 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
     }
 
     let xlen = prog.xlen;
+    // The definitions, in the order they come; a compound literal of the
+    // file's scope is emitted by the initializer that names it.
+    let mut defs = Vec::new();
+    for item in &prog.items {
+        match item {
+            Item::Func(f) if f.body.is_some() => defs.push(Def::Func(f)),
+            Item::Func(_) => {} // a prototype: the definition is elsewhere
+            Item::Decl(decls) => defs.extend(decls.iter().filter(|d| d.define).map(Def::Var)),
+        }
+    }
+    let n = defs.len();
     let mut file = FileGen {
         xlen,
         out: String::new(),
         section: "",
+        pieces: Vec::new(),
         labels: 0,
         strings: Vec::new(),
         debug: debug.map(|(info, names)| Lines::new(info, names, xlen)),
+        by_symbol: defs
+            .iter()
+            .enumerate()
+            .map(|(k, d)| (d.symbol().to_string(), k))
+            .collect(),
+        defs,
+        emitted: vec![false; n],
+        waiting: vec![false; n],
+        queue: Vec::new(),
+        created: Vec::new(),
+        created_set: HashSet::new(),
+        chunks: HashMap::new(),
+        dry: false,
     };
+
+    // clang's front end (CodeGenModule): the file, as it comes, emits what
+    // must be emitted and keeps the rest for when it is used; then the
+    // tentative definitions; then, what was used, each one's uses right
+    // after it.
+    for k in 0..n {
+        let def = file.defs[k];
+        if def.hidden() || def.tentative() {
+            continue;
+        }
+        if !def.deferrable() {
+            file.emit(k)?;
+        } else if file.created_set.contains(def.symbol()) {
+            file.queue.push(k);
+        } else {
+            file.waiting[k] = true;
+        }
+    }
+    for k in 0..n {
+        let def = file.defs[k];
+        if !def.tentative() || def.hidden() {
+            continue;
+        }
+        if def.deferrable() && !file.created_set.contains(def.symbol()) {
+            file.waiting[k] = true;
+        } else {
+            file.emit(k)?;
+        }
+    }
+    file.deferred()?;
+
+    // The output: each symbol's code or data in the order the symbols were
+    // made (the module's order, which LLVM writes them in), then the string
+    // literals and the debug sections.
+    file.out.clear();
+    file.section = "";
     if let Some(d) = &file.debug {
         let _ = writeln!(file.out, "    {}", d.file0());
     }
-    for item in &prog.items {
-        match item {
-            Item::Func(f) => {
-                let Some(body) = &f.body else {
-                    continue; // a prototype: the definition is elsewhere
-                };
-                // A variadic function keeps the argument registers its named
-                // parameters leave free at the top of its frame.
-                let Type::Func(ft) = f.ty() else {
-                    unreachable!("a function's type")
-                };
-                let (_, named_words) = abi::arguments(&ft, xlen);
-                let va_save = if f.variadic {
-                    word(xlen) * (abi::ARG_REGS - named_words.min(abi::ARG_REGS)) as i32
-                } else {
-                    0
-                };
-                let Some((offsets, frame)) = layout(&f.locals, saved_regs(xlen) + va_save, xlen) else {
-                    let msg = format!("the locals of '{}' need a stack frame larger than 2 GiB", f.name);
-                    return Err(Error::new(f.pos, msg));
-                };
-                let mut g = FuncGen {
-                    xlen,
-                    func: f,
-                    offsets,
-                    frame,
-                    named_words,
-                    va_save,
-                    lines: Vec::new(),
-                    depth: 0,
-                    breaks: Vec::new(),
-                    continues: Vec::new(),
-                    file: &mut file,
-                    ret_label: format!(".L.return.{}", f.name),
-                    statics: Vec::new(),
-                    elided_cases: Vec::new(),
-                    after_prologue: false,
-                    scopes: Vec::new(),
-                };
-                g.function(body);
-                let (lines, statics) = (g.lines, g.statics);
-                file.switch(".text");
-                file.out.push('\n');
-                let long = relax_branches(&lines);
-                check_size(f, &lines, &long)?;
-                render(&lines, &long, &mut file.out);
-                for d in statics {
-                    file.variable(d);
-                }
-                if let Some(d) = file.debug.as_mut() {
-                    d.statics_done();
-                }
+    let created = std::mem::take(&mut file.created);
+    for sym in &created {
+        for (section, text) in file.chunks.remove(sym).unwrap_or_default() {
+            if !section.is_empty() {
+                file.switch(section);
             }
-            Item::Decl(decls) => {
-                for d in decls.iter().filter(|d| d.define) {
-                    file.variable(d);
-                    // A compound literal's hidden variable is not described, as
-                    // clang has it: its string literals go with the global that
-                    // names it.
-                    if d.name.starts_with(".compoundliteral.") {
-                        if let (Some(dbg), Some(VarRef::Global(sym))) = (file.debug.as_mut(), &d.var) {
-                            dbg.hidden(sym);
-                        }
-                        continue;
-                    }
-                    if let (Some(dbg), Some(VarRef::Global(sym))) = (file.debug.as_mut(), &d.var) {
-                        let external = d.storage != Storage::Static;
-                        dbg.global(
-                            &d.name,
-                            sym,
-                            (&d.ty, &d.spelled),
-                            d.pos,
-                            external,
-                            d.init.is_some(),
-                        );
-                    }
-                }
-            }
+            file.out.push_str(&text);
         }
+    }
+    // `-g`: the functions in the order of their code, which the files are
+    // numbered by, and the entries made in.
+    if let Some(d) = &mut file.debug {
+        let functions: Vec<&str> = created
+            .iter()
+            .filter(|s| {
+                file.by_symbol
+                    .get(*s)
+                    .is_some_and(|&k| matches!(file.defs[k], Def::Func(_)))
+            })
+            .map(String::as_str)
+            .collect();
+        d.code_order(&functions);
+        file.out = d.renumber(&file.out);
     }
     file.strings();
     if let Some(d) = &mut file.debug {
         file.out.push_str(&d.sections());
     }
     Ok(file.out)
+}
+
+/// A definition of the file: a function, or a global variable (a compound
+/// literal of the file's scope among them). The order they are emitted in
+/// is clang's (see "Order" in the module's documentation).
+#[derive(Clone, Copy)]
+enum Def<'a> {
+    Func(&'a Function),
+    Var(&'a Declarator),
+}
+
+impl<'a> Def<'a> {
+    fn symbol(&self) -> &'a str {
+        match self {
+            Def::Func(f) => &f.name,
+            Def::Var(d) => match &d.var {
+                Some(VarRef::Global(sym)) => sym,
+                _ => unreachable!("sema gives globals a symbol"),
+            },
+        }
+    }
+
+    /// Emitted only once used: a `static` function or global (and a C99
+    /// inline definition, which merlin keeps local), as clang's
+    /// `MustBeEmitted` says of internal linkage.
+    fn deferrable(&self) -> bool {
+        match self {
+            Def::Func(f) => f.is_static || f.inline_only,
+            Def::Var(d) => d.storage == Storage::Static,
+        }
+    }
+
+    /// A global without an initializer: clang emits it at the end of the
+    /// file (`CompleteTentativeDefinition`).
+    fn tentative(&self) -> bool {
+        matches!(self, Def::Var(d) if d.init.is_none())
+    }
+
+    /// A compound literal of the file's scope, which the initializer that
+    /// names it emits (`GetAddrOfConstantCompoundLiteral`).
+    fn hidden(&self) -> bool {
+        matches!(self, Def::Var(d) if d.name.starts_with(".compoundliteral."))
+    }
+}
+
+/// Whether cast `e` makes a null pointer constant a pointer as clang's
+/// `CK_NullToPointer` does, whose operand clang neither emits nor visits
+/// (so `-g` keeps no cast's type in it): an integer one (`(int *)0`, `int
+/// *p = 0`, `(int *)(long)0`), or `(void *)0` converted to another pointer
+/// type where C converts as by assignment (assigned, passed, returned, an
+/// operand of `?:`: `struct b *p = NULL;`). Compared with a pointer, or cast
+/// explicitly, `(void *)0` is converted as any pointer is (a bit cast), and
+/// visited. (In a static initializer clang's `ConstExprEmitter` does visit
+/// the operand of such a cast: [`FileGen::initializer_casts`].)
+fn null_to_pointer(e: &Expr, xlen: Xlen) -> bool {
+    let ExprKind::Cast { x, implicit, .. } = &e.kind else {
+        return false;
+    };
+    e.ty.is_ptr() && consteval::is_null_pointer(x, xlen) && (x.ty.is_integer() || *implicit)
 }
 
 /// The bytes of a register, and of an argument word: 4 on RV32, 8 on RV64.
@@ -569,15 +686,20 @@ fn word_ops(x: Xlen) -> (&'static str, &'static str) {
 /// The largest frame: offsets from `s0` and the frame size must stay `i32`s.
 const MAX_FRAME: i64 = i32::MAX as i64 & !15;
 
-/// Places every local in the frame, below the `header` bytes at its top
-/// (`ra`, `s0` and a variadic function's saved registers): its offset from
-/// `s0`, and the frame size (a multiple of 16, the convention's stack
+/// Places every local the code uses (`used`) in the frame, below the
+/// `header` bytes at its top (`ra`, `s0` and a variadic function's saved
+/// registers): its offset from `s0` (0 for one not used, which has no
+/// slot), and the frame size (a multiple of 16, the convention's stack
 /// alignment). `None` if the frame would be larger than [`MAX_FRAME`].
-fn layout(locals: &[Local], header: i32, x: Xlen) -> Option<(Vec<i32>, i32)> {
+fn layout(locals: &[Local], used: &[bool], header: i32, x: Xlen) -> Option<(Vec<i32>, i32)> {
     // In i64: each local is at most `i32::MAX` bytes, but their sum need not be.
     let mut off = -i64::from(header);
     let mut offsets = Vec::with_capacity(locals.len());
-    for l in locals {
+    for (l, &used) in locals.iter().zip(used) {
+        if !used {
+            offsets.push(0);
+            continue;
+        }
         let mut size = l.ty.size(x).expect("sema: locals have complete types");
         // Arrays and structs are aligned to a register so that clearing them
         // can use `sw` (`sd` on RV64), and a struct's slot is a whole number
@@ -685,21 +807,44 @@ fn log2(n: u32) -> Option<u32> {
 
 /// What is shared by the whole file: the output, the label counter and the
 /// string literals seen so far.
-struct FileGen {
+struct FileGen<'a> {
     /// The target.
     xlen: Xlen,
+    /// The text being written: the piece of a symbol's output in
+    /// `section` (or the whole file, at the end).
     out: String,
     /// The section the output is in.
     section: &'static str,
+    /// The pieces of the symbol being written so far, each in its section.
+    pieces: Vec<(&'static str, String)>,
     /// Label counter shared by every function in the file, so labels are unique.
     labels: usize,
     /// String literals, emitted at the end; literal `i` is `.L.str.<i>`.
     strings: Vec<Vec<u8>>,
     /// With `-g`, the debug information ([`crate::debug`]).
     debug: Option<Lines>,
+    /// The file's definitions, in the order they come, and by symbol.
+    defs: Vec<Def<'a>>,
+    by_symbol: HashMap<String, usize>,
+    /// The definitions emitted so far.
+    emitted: Vec<bool>,
+    /// Deferred definitions waiting for a use (clang's `DeferredDecls`).
+    waiting: Vec<bool>,
+    /// Used, to be emitted (clang's `DeferredDeclsToEmit`).
+    queue: Vec<usize>,
+    /// Every symbol made so far, defined or referred to, in the order it was
+    /// made: the order of the module's functions and globals, in which the
+    /// output has them.
+    created: Vec<String>,
+    created_set: HashSet<String>,
+    /// The output of each symbol emitted, in pieces by section.
+    chunks: HashMap<String, Vec<(&'static str, String)>>,
+    /// A function's first pass is being generated, which makes nothing
+    /// ([`FileGen::function`]).
+    dry: bool,
 }
 
-impl FileGen {
+impl<'a> FileGen<'a> {
     fn switch(&mut self, section: &'static str) {
         if self.section != section {
             let directive = if section == ".rodata" {
@@ -716,6 +861,179 @@ impl FileGen {
         }
     }
 
+    // ---- the order of the output ----
+
+    /// Makes symbol `sym`, as clang makes a function or global the first
+    /// time it is defined or referred to (`GetOrCreateLLVMFunction`,
+    /// `GetOrCreateLLVMGlobal`): the output has the symbols in this order. A
+    /// deferred definition waiting for its first use is to be emitted now.
+    fn create(&mut self, sym: &str) {
+        if self.dry {
+            return;
+        }
+        if self.created_set.insert(sym.to_string()) {
+            self.created.push(sym.to_string());
+            if let Some(&k) = self.by_symbol.get(sym) {
+                if self.waiting[k] {
+                    self.waiting[k] = false;
+                    self.queue.push(k);
+                }
+            }
+        }
+    }
+
+    /// A reference to symbol `sym` in the code or the data generated. A
+    /// compound literal it names is emitted first, as clang emits one where
+    /// an initializer names it.
+    fn reference(&mut self, sym: &str) {
+        if self.dry {
+            return;
+        }
+        if let Some(&k) = self.by_symbol.get(sym) {
+            if self.defs[k].hidden() && !self.emitted[k] {
+                self.emit(k).expect("a variable is emitted without errors");
+            }
+        }
+        self.create(sym);
+    }
+
+    /// Emits definition `k`: its code or its data, and with `-g` its entry.
+    fn emit(&mut self, k: usize) -> Result<(), Error> {
+        self.emitted[k] = true;
+        match self.defs[k] {
+            Def::Func(f) => self.function(f),
+            Def::Var(d) => {
+                self.variable(d, false);
+                // A compound literal's hidden variable is not described, as
+                // clang has it: its string literals go with the global that
+                // names it, which is being emitted.
+                if self.defs[k].hidden() {
+                    return Ok(());
+                }
+                if let (Some(dbg), Some(VarRef::Global(sym))) = (self.debug.as_mut(), &d.var) {
+                    let external = d.storage != Storage::Static;
+                    dbg.global(&d.name, sym, (&d.ty, &d.spelled), d.pos, external);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Emits what was used and not emitted yet, each one's uses right after
+    /// it, depth first (clang's `EmitDeferred`).
+    fn deferred(&mut self) -> Result<(), Error> {
+        let now = std::mem::take(&mut self.queue);
+        for k in now {
+            if !self.emitted[k] {
+                self.emit(k)?;
+                if !self.queue.is_empty() {
+                    self.deferred()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the output of a symbol.
+    fn begin(&mut self) {
+        self.out.clear();
+        self.section = "";
+        self.pieces.clear();
+    }
+
+    /// Goes on in `section`.
+    fn piece(&mut self, section: &'static str) {
+        if self.section != section {
+            if !self.out.is_empty() {
+                let text = std::mem::take(&mut self.out);
+                self.pieces.push((self.section, text));
+            }
+            self.section = section;
+        }
+    }
+
+    /// Ends the output of symbol `sym`.
+    fn finish(&mut self, sym: &str) {
+        let text = std::mem::take(&mut self.out);
+        self.pieces.push((self.section, text));
+        let pieces = std::mem::take(&mut self.pieces);
+        self.chunks.insert(sym.to_string(), pieces);
+    }
+
+    /// Generates function `f`.
+    fn function(&mut self, f: &'a Function) -> Result<(), Error> {
+        let xlen = self.xlen;
+        let body = f.body.as_ref().expect("a definition has a body");
+        self.create(&f.name);
+        // A variadic function keeps the argument registers its named
+        // parameters leave free at the top of its frame.
+        let Type::Func(ft) = f.ty() else {
+            unreachable!("a function's type")
+        };
+        let (_, named_words) = abi::arguments(&ft, xlen);
+        let va_save = if f.variadic {
+            word(xlen) * (abi::ARG_REGS - named_words.min(abi::ARG_REGS)) as i32
+        } else {
+            0
+        };
+        let header = saved_regs(xlen) + va_save;
+        let n = f.locals.len();
+        let gen = |file: &mut FileGen<'a>, slots: Vec<bool>, (offsets, frame): (Vec<i32>, i32)| {
+            let mut g = FuncGen {
+                xlen,
+                func: f,
+                offsets,
+                frame,
+                named_words,
+                va_save,
+                lines: Vec::new(),
+                depth: 0,
+                breaks: Vec::new(),
+                continues: Vec::new(),
+                file,
+                ret_label: format!(".L.return.{}", f.name),
+                elided_cases: Vec::new(),
+                after_prologue: false,
+                constant_init: false,
+                scopes: Vec::new(),
+                used: (0..n).map(|i| Cell::new(i < f.params.len())).collect(),
+                slots,
+            };
+            g.function(body);
+            let used: Vec<bool> = g.used.iter().map(Cell::get).collect();
+            (g.lines, used)
+        };
+        // The frame holds only the locals the code generated uses, as clang's
+        // at `-O0` allocates only for the code it emits: not those of an arm
+        // a constant condition leaves out, nor the temporaries of an operand
+        // left out. A first pass finds them, generating into nothing (no
+        // `-g`, no symbols made, no data, its labels and string literals
+        // taken back); the second is the function.
+        let debug = self.debug.take();
+        let (labels, strings) = (self.labels, self.strings.len());
+        self.dry = true;
+        let all = layout(&f.locals, &vec![true; n], header, xlen).unwrap_or((vec![0; n], 0));
+        let (_, used) = gen(self, vec![true; n], all);
+        self.dry = false;
+        self.debug = debug;
+        self.labels = labels;
+        self.strings.truncate(strings);
+        let Some(frame) = layout(&f.locals, &used, header, xlen) else {
+            let msg = format!("the locals of '{}' need a stack frame larger than 2 GiB", f.name);
+            return Err(Error::new(f.pos, msg));
+        };
+        let (lines, again) = gen(self, used.clone(), frame);
+        debug_assert_eq!(used, again, "both passes generate the same code");
+        self.begin();
+        self.piece(".text");
+        self.out.push('\n');
+        let long = relax_branches(&lines);
+        check_size(f, &lines, &long)?;
+        render(&lines, &long, &mut self.out);
+        self.finish(&f.name);
+        Ok(())
+    }
+
     /// The label of a string literal, at `pos`: the same bytes are one
     /// literal, as clang merges them (C99 6.4.5p6 leaves it open).
     fn string(&mut self, bytes: &[u8], pos: Pos) -> String {
@@ -723,6 +1041,7 @@ impl FileGen {
             return format!(".L.str.{i}");
         }
         self.strings.push(bytes.to_vec());
+        // (A first pass's literals are taken back: see [`Self::function`].)
         let label = format!(".L.str.{}", self.strings.len() - 1);
         if let Some(d) = self.debug.as_mut() {
             d.literal(&label, bytes.len(), pos);
@@ -730,25 +1049,38 @@ impl FileGen {
         label
     }
 
-    /// Emits a global variable or `static` local: its symbol and its data.
-    fn variable(&mut self, d: &Declarator) {
+    /// Emits a global variable or, when `local`, a `static` local: its
+    /// symbol and its data. clang makes a global's symbol after its
+    /// initializer (`EmitGlobalVarDefinition`), unless something referred
+    /// to it before, and a static local's before
+    /// (`getOrCreateStaticVarDecl`), so the symbols its initializer refers
+    /// to come before a global's and after a static local's.
+    fn variable(&mut self, d: &Declarator, local: bool) {
         let Some(VarRef::Global(sym)) = &d.var else {
             unreachable!("sema gives globals and statics a symbol")
         };
+        if local {
+            if self.dry {
+                return;
+            }
+            self.create(sym);
+        }
         let mut data = Vec::new();
         if let Some(init) = &d.init {
             self.data(&d.ty, init, &mut data);
         }
+        self.create(sym);
+        self.begin();
         // A `const` object never changes: read-only data, as clang does (a
         // `const volatile` one may be changed from outside, so it stays
         // writable).
         let quals = d.ty.quals();
         if quals.konst && !quals.volatile {
-            self.switch(".rodata");
+            self.piece(".rodata");
         } else if d.init.is_some() {
-            self.switch(".data");
+            self.piece(".data");
         } else {
-            self.switch(".bss");
+            self.piece(".bss");
         }
         let size =
             d.ty.size(self.xlen)
@@ -781,6 +1113,7 @@ impl FileGen {
         for line in data {
             let _ = writeln!(self.out, "    {line}");
         }
+        self.finish(sym);
     }
 
     /// The directives for an object of type `ty` initialized by `init`.
@@ -842,6 +1175,7 @@ impl FileGen {
                 }
             }
             (_, Init::Expr(e)) => {
+                self.initializer_casts(e);
                 let value = consteval::eval(e, self.xlen).expect("sema: static initializers are constant");
                 // `.quad` for 8 bytes, as clang writes it (merlin-as also
                 // reads `.dword` and `.8byte`).
@@ -862,9 +1196,7 @@ impl FileGen {
                     } => {
                         let sym = match base {
                             Base::Sym(s) => {
-                                if let Some(d) = self.debug.as_mut() {
-                                    d.reference(&s);
-                                }
+                                self.reference(&s);
                                 s
                             }
                             Base::Str(bytes) => self.string(&bytes, e.pos),
@@ -879,6 +1211,41 @@ impl FileGen {
                 out.push(format!("{directive} {operand}"));
             }
             _ => unreachable!("sema checked initializer shapes"),
+        }
+    }
+
+    /// `-g`: the explicit casts of a static initializer's element whose
+    /// types clang keeps. Its front end emits an initializer with its
+    /// `ConstExprEmitter` first, which keeps the type of each explicit cast
+    /// it visits (`EmitExplicitCastExprType`), and evaluates what that
+    /// emitter gives up on. The emitter visits casts, and goes on into a
+    /// cast's operand when the cast changes nothing (the same type but for
+    /// its qualifiers, at any level of a pointer: `CK_NoOp`, as in
+    /// `(const char *)(char *)&x`), converts an integer to another
+    /// integer type (`CK_IntegralCast`, not to `_Bool`) or makes a null
+    /// pointer constant a pointer (`CK_NullToPointer`, [`null_to_pointer`]:
+    /// `int *p = (void *)0;`, `(int *)(long)0`), and into the operand of a
+    /// unary `-`; it gives up on anything else (`+`, `~`, a
+    /// binary operator, `?:`, `&`, an address converted to an integer). So
+    /// of `long a = (long)&x;` and `long n = -(T)(U)3;` the types are kept,
+    /// of `long b = (long)&x + 4;` and `int *p = (int *)(T)&x;`'s `T` not.
+    fn initializer_casts(&mut self, e: &Expr) {
+        if self.debug.is_none() {
+            return;
+        }
+        match &e.kind {
+            ExprKind::Cast { x, implicit, spelled } => {
+                if !implicit {
+                    self.debug.as_mut().expect("-g").cast(&e.ty, spelled);
+                }
+                let (from, to) = (x.ty.unqual(), e.ty.unqual());
+                let integral = from.is_integer() && to.is_integer() && *to != Type::Int(IntKind::Bool);
+                if from.similar(to) || integral || null_to_pointer(e, self.xlen) {
+                    self.initializer_casts(x);
+                }
+            }
+            ExprKind::Unary(UnOp::Neg, x) => self.initializer_casts(x),
+            _ => {}
         }
     }
 
@@ -989,11 +1356,9 @@ struct FuncGen<'a, 'f> {
     /// `continue` goes for each enclosing loop, innermost last.
     breaks: Vec<String>,
     continues: Vec<String>,
-    file: &'f mut FileGen,
+    file: &'f mut FileGen<'a>,
     /// Every `return` jumps here, to the epilogue.
     ret_label: String,
-    /// The function's `static` locals, emitted as data after it.
-    statics: Vec<&'a Declarator>,
     /// The ids of the `case`s and `default`s of each `switch` on a constant
     /// generated so far, whose labels nothing jumps to.
     elided_cases: Vec<usize>,
@@ -1003,6 +1368,15 @@ struct FuncGen<'a, 'f> {
     /// With `-g`: the scopes being generated, the function's body first and
     /// the innermost block last, with the variables declared in each.
     scopes: Vec<Scope>,
+    /// With `-g`: a local's constant initializer is being generated, which
+    /// clang emits as a constant ([`FuncGen::constant_initializer`]): its
+    /// code keeps no casts' types and describes no enums.
+    constant_init: bool,
+    /// The locals the code generated so far declares or uses (the
+    /// parameters from the start).
+    used: Vec<Cell<bool>>,
+    /// The locals the frame has slots for: those the code uses.
+    slots: Vec<bool>,
 }
 
 impl<'a> FuncGen<'a, '_> {
@@ -1035,9 +1409,7 @@ impl<'a> FuncGen<'a, '_> {
 
     /// `la reg, symbol`: `auipc` + `addi`.
     fn la(&mut self, reg: &str, symbol: &str) {
-        if let Some(d) = self.file.debug.as_mut() {
-            d.reference(symbol);
-        }
+        self.file.reference(symbol);
         self.ins_sized(8, "la", format!("{reg}, {symbol}"));
     }
 
@@ -1093,6 +1465,7 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     fn offset(&self, id: LocalId) -> i32 {
+        self.used[id.0].set(true);
         self.offsets[id.0]
     }
 
@@ -1247,6 +1620,10 @@ impl<'a> FuncGen<'a, '_> {
             self.comment(format!("    {}(s0)  {regs}, saved for va_arg", -self.va_save));
         }
         for (i, l) in f.locals.iter().enumerate() {
+            // (The frame has no slot for a local the code does not use.)
+            if !self.slots[i] {
+                continue;
+            }
             let off = self.offsets[i];
             let what = if i < f.params.len() {
                 format!("param {}", l.ty.declare(&l.name))
@@ -1273,8 +1650,7 @@ impl<'a> FuncGen<'a, '_> {
         // `-g`: the prologue comes from the function's first line (column 0, as
         // clang has it).
         if let Some(d) = self.file.debug.as_mut() {
-            let lines = d.loc(f.pos, Some(0), false);
-            self.lines.extend(lines.into_iter().map(Line::Text));
+            self.lines.push(Line::Text(d.loc(f.pos, Some(0), false)));
             self.scopes.push(Scope::default());
         }
 
@@ -1415,8 +1791,7 @@ impl<'a> FuncGen<'a, '_> {
         }
         let first = !self.after_prologue;
         self.after_prologue = true;
-        let lines = d.loc(pos, None, first);
-        self.lines.extend(lines.into_iter().map(Line::Text));
+        self.lines.push(Line::Text(d.loc(pos, None, first)));
     }
 
     /// The top of the frame, which the prologue sets up first: `ra`, `s0`
@@ -1505,6 +1880,7 @@ impl<'a> FuncGen<'a, '_> {
             StmtKind::Block(_)
             | StmtKind::Decl(_)
             | StmtKind::Empty
+            | StmtKind::Unevaluated(_)
             | StmtKind::If { .. }
             | StmtKind::While { .. }
             | StmtKind::DoWhile { .. }
@@ -1522,8 +1898,19 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             StmtKind::Decl(decls) => {
-                // Each declarator described, then initialized, as clang does.
+                // Each declarator described, then initialized, as clang does;
+                // a static local's data first, then its entry
+                // (`EmitStaticVarDecl`).
                 for d in decls {
+                    // A local the code declares has a slot, used or not.
+                    if let Some(VarRef::Local(id)) = d.var {
+                        self.used[id.0].set(true);
+                    }
+                    if matches!(d.var, Some(VarRef::Global(_))) {
+                        self.local_decl(d);
+                        self.debug_decl(d);
+                        continue;
+                    }
                     self.debug_decl(d);
                     if d.init.is_some() && matches!(d.var, Some(VarRef::Local(_))) {
                         self.loc(d.pos);
@@ -1532,7 +1919,8 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             StmtKind::Expr(e) => self.expr(e),
-            StmtKind::Empty => {}
+            // Only checked: nothing is evaluated.
+            StmtKind::Empty | StmtKind::Unevaluated(_) => {}
             StmtKind::If { cond, then, els } => {
                 // A constant condition runs one arm: only that one is
                 // generated, unless the other has a label (see [`elide`]).
@@ -1628,6 +2016,7 @@ impl<'a> FuncGen<'a, '_> {
                 cond,
                 step,
                 body,
+                ..
             } => {
                 //     <init>
                 //   .L.loop.N:
@@ -1705,7 +2094,7 @@ impl<'a> FuncGen<'a, '_> {
                 // On a constant condition, only the statements that run, as
                 // clang has them, when they can be picked out (see [`elide`]):
                 // no compares, no labels, no `break`.
-                if let Some(v) = consteval::int(cond, self.xlen).filter(|_| cond.ty.is_integer()) {
+                if let Some(v) = consteval::condition(cond, self.xlen) {
                     if let Some(run) = elide::case_statements(body, v, cases, *default) {
                         self.elided_cases
                             .extend(cases.iter().map(|&(_, id)| id).chain(*default));
@@ -1753,6 +2142,23 @@ impl<'a> FuncGen<'a, '_> {
                 if !self.elided_cases.contains(id) {
                     let label = self.case_label(*id);
                     self.label(&label);
+                    // `-g`: a case value that is an enumeration constant
+                    // describes its enum, as clang's `EmitCaseStmt` does
+                    // (`case RED:`, not `case RED + 1:` or `case (RED):`).
+                    if let (Some(d), StmtKind::Case { expr, bare: true, .. }) =
+                        (self.file.debug.as_mut(), &s.kind)
+                    {
+                        let mut e = expr;
+                        while let ExprKind::Cast {
+                            x, implicit: true, ..
+                        } = &e.kind
+                        {
+                            e = x;
+                        }
+                        if let ExprKind::Enumerator { of, .. } = &e.kind {
+                            d.enumerator(of);
+                        }
+                    }
                 }
                 self.stmt(body);
             }
@@ -1774,13 +2180,12 @@ impl<'a> FuncGen<'a, '_> {
     }
 
     /// The value of a condition clang's code generator decides at compile
-    /// time: an integer constant expression (`ConstantFoldsToSimpleInteger`;
-    /// for loops, the `ConstantInt` the condition's code folds to).
+    /// time (`ConstantFoldsToSimpleInteger`; for loops, the `ConstantInt`
+    /// the condition's code folds to): an integer constant expression, or
+    /// one of addresses known not to be null or one another (`&g != 0`,
+    /// [`consteval::condition`]).
     fn constant_condition(&self, e: &Expr) -> Option<bool> {
-        if !e.ty.is_integer() {
-            return None;
-        }
-        consteval::int(e, self.xlen).map(|v| v != 0)
+        consteval::condition(e, self.xlen).map(|v| v != 0)
     }
 
     fn loop_body(&mut self, body: &'a Stmt, cont: &str, brk: &str) {
@@ -1824,8 +2229,9 @@ impl<'a> FuncGen<'a, '_> {
 
     fn local_decl(&mut self, d: &'a Declarator) {
         let id = match &d.var {
-            // A static local is data, emitted after the function.
-            Some(VarRef::Global(_)) => return self.statics.push(d),
+            // A static local is data, emitted where it is declared, as clang
+            // emits it.
+            Some(VarRef::Global(_)) => return self.file.variable(d, true),
             Some(VarRef::Local(id)) => *id,
             None => unreachable!("sema resolves every declarator"),
         };
@@ -1838,7 +2244,95 @@ impl<'a> FuncGen<'a, '_> {
             self.comment(format!("{} = ...", d.ty.declare(&d.name)));
             self.clear_local(off, d.ty.size(self.xlen).unwrap() as i32);
         }
+        // `-g`: clang emits an array, struct or union with a constant
+        // initializer as a static's (`EmitAutoVarInit`, its
+        // `IsConstantAggregate`: `ConstantEmitter`), not as code: what
+        // its debug information keeps of it is a static initializer's.
+        let constant = self.file.debug.is_some()
+            && (d.ty.is_array() || d.ty.is_record())
+            && self.constant_initializer(&d.ty, init);
+        self.constant_init = constant;
         self.init_local(&d.ty, init, off);
+        self.constant_init = false;
+    }
+
+    /// Whether `init` is a constant initializer of an object of type `ty`,
+    /// as clang's `Expr::isConstantInitializer` has it: what a static
+    /// initializer could be (numbers, addresses of globals and string
+    /// literals, strings for a `char` array), every element of a list.
+    fn constant_initializer(&self, ty: &Type, init: &Init) -> bool {
+        match (ty.unqual(), init) {
+            (Type::Array(elem, _), Init::List(items, _)) => {
+                items.iter().all(|i| self.constant_initializer(elem, i))
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().expect("sema: locals have complete types");
+                body.members
+                    .iter()
+                    .zip(items)
+                    .all(|(m, i)| self.constant_initializer(&m.ty, i))
+            }
+            (_, Init::List(items, _)) => items.iter().all(|i| self.constant_initializer(ty, i)),
+            (
+                Type::Array(..),
+                Init::Expr(Expr {
+                    kind: ExprKind::Str(_),
+                    ..
+                }),
+            ) => true,
+            // A struct initialized by a compound literal, as GCC allows
+            // even at file scope: constant if its list is.
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_initializer(lit, init),
+            (_, Init::Expr(e)) => consteval::eval(e, self.xlen).is_some(),
+            (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
+        }
+    }
+
+    /// `-g`: clang's `ConstantEmitter` trying `init`, of an object of type
+    /// `ty`, as a constant: each element in order, its casts kept as a
+    /// static initializer's ([`FileGen::initializer_casts`]), up to the
+    /// first that is not constant. Whether all are.
+    fn constant_visit(&mut self, ty: &Type, init: &'a Init) -> bool {
+        match (ty.unqual(), init) {
+            (Type::Array(elem, _), Init::List(items, _)) => {
+                items.iter().all(|i| self.constant_visit(elem, i))
+            }
+            (Type::Record(r), Init::List(items, _)) => {
+                let body = r.body().expect("sema: locals have complete types");
+                body.members
+                    .iter()
+                    .zip(items)
+                    .all(|(m, i)| self.constant_visit(&m.ty, i))
+            }
+            (_, Init::List(items, _)) => items.iter().all(|i| self.constant_visit(ty, i)),
+            (
+                Type::Array(..),
+                Init::Expr(Expr {
+                    kind: ExprKind::Str(_),
+                    ..
+                }),
+            ) => true,
+            (
+                _,
+                Init::Expr(Expr {
+                    kind: ExprKind::CompoundLit { init, .. },
+                    ty: lit,
+                    ..
+                }),
+            ) => self.constant_visit(lit, init),
+            (_, Init::Expr(e)) => {
+                self.file.initializer_casts(e);
+                consteval::eval(e, self.xlen).is_some()
+            }
+            (_, Init::Designated(..)) => unreachable!("sema resolves designators"),
+        }
     }
 
     /// Stores an initializer into the local object at `off(s0)`; arrays and
@@ -1851,9 +2345,18 @@ impl<'a> FuncGen<'a, '_> {
             (_, Init::List(items, _)) if items.is_empty() => {}
             (Type::Array(elem, _), Init::List(items, _)) => {
                 let size = elem.size(self.xlen).unwrap() as i32;
+                // `-g`: clang emits an array whose initializers hold more
+                // than 16 bytes as a constant if it can (`EmitArrayInit`'s
+                // `ConstantEmitter`), visiting them as a static
+                // initializer's first; else element by element.
+                let was = self.constant_init;
+                if !was && self.file.debug.is_some() && items.len() as i64 * i64::from(size) > 16 {
+                    self.constant_init = items.iter().all(|i| self.constant_visit(elem, i));
+                }
                 for (i, item) in items.iter().enumerate() {
                     self.init_local(elem, item, off + i as i32 * size);
                 }
+                self.constant_init = was;
             }
             (Type::Record(r), Init::List(items, _)) => {
                 // Sema's list is fully braced: one item per member, in order.
@@ -1883,6 +2386,11 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             (_, Init::Expr(e)) => {
+                // A constant initializer's element keeps what a static
+                // initializer's does.
+                if self.constant_init {
+                    self.file.initializer_casts(e);
+                }
                 self.expr(e);
                 self.store_local(ty, off);
             }
@@ -1921,7 +2429,7 @@ impl<'a> FuncGen<'a, '_> {
     /// constant (see "Expressions"), and says so. Any other expression is
     /// left to [`Self::expr`].
     fn folded(&mut self, e: &'a Expr) -> bool {
-        if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_)) {
+        if !e.ty.is_integer() || matches!(e.kind, ExprKind::Num(_) | ExprKind::Enumerator { .. }) {
             return false;
         }
         let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
@@ -1944,12 +2452,13 @@ impl<'a> FuncGen<'a, '_> {
     /// (`1 && r`, `0 || r`) and nothing otherwise (clang's
     /// `VisitAbstractConditionalOperator`, `VisitBinLAnd`, `VisitBinLOr`).
     fn kept_casts(&mut self, e: &'a Expr) {
-        if self.file.debug.is_none() {
+        if self.file.debug.is_none() || self.constant_init {
             return;
         }
         self.kept_cast(e);
-        let decided = |c: &Expr| consteval::int(c, self.xlen).map(|v| v != 0);
+        let decided = |c: &Expr| consteval::condition(c, self.xlen).map(|v| v != 0);
         match &e.kind {
+            ExprKind::Cast { .. } if null_to_pointer(e, self.xlen) => {}
             ExprKind::Unary(_, x)
             | ExprKind::Cast { x, .. }
             | ExprKind::Addr(x)
@@ -1968,6 +2477,9 @@ impl<'a> FuncGen<'a, '_> {
                 Some(true) => self.kept_casts(a),
                 _ => self.kept_casts(b),
             },
+            // clang describes the enum of a constant its code uses
+            // (`CGDebugInfo::EmitGlobalVariable` of the `EnumConstantDecl`).
+            ExprKind::Enumerator { of, .. } => self.file.debug.as_mut().expect("-g").enumerator(of),
             _ => {}
         }
     }
@@ -1975,6 +2487,9 @@ impl<'a> FuncGen<'a, '_> {
     /// `-g`: clang keeps the type of an explicit cast in the unit (and
     /// describes it as it is evaluated).
     fn kept_cast(&mut self, e: &Expr) {
+        if self.constant_init {
+            return;
+        }
         if let (
             Some(d),
             ExprKind::Cast {
@@ -1993,7 +2508,8 @@ impl<'a> FuncGen<'a, '_> {
             return;
         }
         match &e.kind {
-            ExprKind::Num(v) => {
+            ExprKind::Num(v) | ExprKind::Enumerator { value: v, .. } => {
+                self.kept_casts(e);
                 // The value as the register holds it: an `unsigned int`
                 // 0xffffffff is `li a0, -1`.
                 let kind = e.ty.int_kind().expect("an integer constant");
@@ -2093,8 +2609,15 @@ impl<'a> FuncGen<'a, '_> {
                     self.step(ty, -delta);
                 }
             }
-            // `1 && r` and `0 || r` are `r` as 0 or 1, as clang has them
-            // (`0 && r` and `1 || r` are constants, folded above).
+            // `0 && r` and `1 || r` are constants, folded above, and so are
+            // they with a left operand only clang's folding of conditions
+            // decides (`&g != 0 || r`): r is left out, as clang leaves it.
+            ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, _)
+                if self.constant_condition(l) == Some(*op == BinOp::LogOr) =>
+            {
+                self.li("a0", i64::from(*op == BinOp::LogOr));
+            }
+            // `1 && r` and `0 || r` are `r` as 0 or 1, as clang has them.
             ExprKind::Binary(op @ (BinOp::LogAnd | BinOp::LogOr), l, r)
                 if self.constant_condition(l) == Some(*op == BinOp::LogAnd) =>
             {
@@ -2167,6 +2690,12 @@ impl<'a> FuncGen<'a, '_> {
             ExprKind::Deref(p) => {
                 self.expr(p);
                 self.load(&e.ty);
+            }
+            // A null pointer constant made a pointer: null, its operand
+            // neither generated nor described, as clang has it.
+            ExprKind::Cast { .. } if null_to_pointer(e, self.xlen) => {
+                self.kept_cast(e);
+                self.li("a0", 0);
             }
             ExprKind::Cast { x, .. } => {
                 self.kept_cast(e);
@@ -2849,6 +3378,12 @@ impl<'a> FuncGen<'a, '_> {
         let layout = ArgLayout::new(&ft, args, self.xlen);
         let (types, regs, used) = (&layout.types, &layout.words, layout.used);
         let direct = callee.direct_callee();
+        // clang refers to the function it calls before the arguments
+        // (`EmitCallee`, then `EmitCallArgs`): in `f(g())`, `f`'s symbol is
+        // made first ("Order" above).
+        if let Some(name) = direct {
+            self.file.reference(name);
+        }
         if used > abi::ARG_REGS {
             let hidden = if abi::returns_in_memory(&ft.ret, self.xlen) {
                 result
@@ -2931,9 +3466,7 @@ impl<'a> FuncGen<'a, '_> {
         match direct {
             // `call` is `auipc ra` + `jalr ra`: two words.
             Some(name) => {
-                if let Some(d) = self.file.debug.as_mut() {
-                    d.reference(name);
-                }
+                self.file.reference(name);
                 self.ins_sized(8, "call", name)
             }
             None => self.ins("jalr", "t1"),
@@ -3318,7 +3851,13 @@ mod tests {
     fn locals(decls: &str) -> (Vec<i32>, i32) {
         let p = crate::parse(&format!("int f() {{ {decls} }}")).unwrap();
         let f = p.funcs().next().unwrap();
-        layout(&f.locals, saved_regs(Xlen::Rv32), Xlen::Rv32).unwrap()
+        layout(
+            &f.locals,
+            &vec![true; f.locals.len()],
+            saved_regs(Xlen::Rv32),
+            Xlen::Rv32,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3335,6 +3874,14 @@ mod tests {
         // Arrays are word-aligned.
         assert_eq!(locals("char c; char buf[5]; char d;"), (vec![-9, -16, -17], 32));
         assert_eq!(locals("int a[10];"), (vec![-48], 48));
+        // A local the code does not use has no slot.
+        let p = crate::parse("int f() { int a, b, c; }").unwrap();
+        let f = p.funcs().next().unwrap();
+        let used = [true, false, true];
+        assert_eq!(
+            layout(&f.locals, &used, saved_regs(Xlen::Rv32), Xlen::Rv32),
+            Some((vec![-12, 0, -16], 16))
+        );
     }
 
     #[test]
@@ -3349,6 +3896,7 @@ mod tests {
         assert_eq!(
             layout(
                 &p.funcs().next().unwrap().locals,
+                &[true],
                 saved_regs(Xlen::Rv32),
                 Xlen::Rv32
             )
@@ -3386,13 +3934,88 @@ main:
         // Each function symbol carries its type and size, as clang's do: ten
         // instructions here, and the static one's too.
         let obj = merlin_as::assemble(&compile(
-            "int main(void) { return 42; } static int f(void) { return 1; }",
+            "int main(void) { return 42; } static int f(void) { return 1; } int (*use)(void) = f;",
         ))
         .unwrap();
         for name in ["main", "f"] {
             let s = obj.symbols.iter().find(|s| s.name == name).unwrap();
             assert_eq!((s.size, s.ty), (40, merlin_as::asm::SymType::Func), "{name}");
         }
+    }
+
+    /// Functions and globals come in clang's order (checked against clang
+    /// 23's): each where it was first defined or referred to, a `static`
+    /// one emitted only once used, after the others, and a tentative
+    /// definition at the end; an unused `static` one not at all.
+    #[test]
+    fn definitions_are_in_clangs_order() {
+        let asm = compile(
+            "extern int vb; static int sh(int); int g(void);\n\
+             static int unused_s(void) { return 7; }\n\
+             static int sv = 5; static int sv_unused = 6; int ta;\n\
+             int f(void) { return g() + sh(1) + vb + sv; }\n\
+             int h(void) { return 3; }\n\
+             static int sh(int x) { return x + h(); }\n\
+             static int sd(void) { return 4; }\n\
+             int g(void) { return sd() + ta; }\n\
+             int vb = 2; int vc = 3;\n\
+             int main(void) { static int n = 1; return f() + vc + n; }\n",
+        );
+        let symbols: Vec<&str> = asm
+            .lines()
+            .filter_map(|l| l.strip_suffix(':'))
+            .filter(|l| !l.starts_with('.'))
+            .collect();
+        assert_eq!(
+            symbols,
+            ["f", "g", "sh", "vb", "sv", "h", "sd", "ta", "vc", "main", "main.n"],
+            "{asm}"
+        );
+        // A call refers to the function it calls before its arguments are
+        // generated (clang's `EmitCallee`, then `EmitCallArgs`).
+        let asm = compile(
+            "static int sa(int); static int sb(void); int (*pf)(int);\n\
+             int f(void) { return sa(sb()) + pf(sb()); }\n\
+             static int sa(int x) { return x; }\nstatic int sb(void) { return 2; }\n",
+        );
+        let symbols: Vec<&str> = asm
+            .lines()
+            .filter_map(|l| l.strip_suffix(':'))
+            .filter(|l| !l.starts_with('.'))
+            .collect();
+        assert_eq!(symbols, ["f", "sa", "sb", "pf"], "{asm}");
+    }
+
+    /// The frame has slots only for the locals of the code generated, as
+    /// clang's at `-O0` allocates only for the code it emits: none for an
+    /// arm a constant condition leaves out, nor for the temporaries of an
+    /// operand left out; a local declared in code that runs has one, used
+    /// or not, and so do those of an arm kept for its label.
+    #[test]
+    fn frames_hold_only_what_is_emitted() {
+        let frame = |src: &str| {
+            let asm = compile(src);
+            let line = asm.lines().find(|l| l.contains(": frame ")).unwrap().to_string();
+            let slots: Vec<String> = asm
+                .lines()
+                .filter(|l| l.contains("(s0)  "))
+                .map(|l| l.trim_start_matches([' ', '#']).to_string())
+                .collect();
+            (line[line.find("frame").unwrap()..].to_string(), slots)
+        };
+        let (f, slots) = frame("int f(int c) { if (0) { int big[100]; big[0] = c; } return c; }");
+        assert_eq!(f, "frame 16 bytes");
+        assert_eq!(slots, ["-12(s0)  param int c"]);
+        let (f, slots) = frame(
+            "struct big { int a[10]; }; struct big h(void);\n\
+             int g(void) { return 1 ? 2 : h().a[0]; }",
+        );
+        assert_eq!((f.as_str(), slots.len()), ("frame 16 bytes", 0));
+        let (f, slots) = frame("int f(void) { int unused; return 0; }");
+        assert_eq!(f, "frame 16 bytes");
+        assert_eq!(slots, ["-12(s0)  local int unused"]);
+        let (f, _) = frame("int f(int c) { if (0) { int k[8]; l: k[0] = c; return k[0]; } goto l; }");
+        assert_eq!(f, "frame 48 bytes", "kept for its label");
     }
 
     #[test]
@@ -3629,7 +4252,7 @@ main:
         let asm = compile(
             "int g = 5; char c = 'x'; short h[3] = {1, -1}; int *p = &g + 1; char s[] = \"hi\\n\";
              static unsigned u; char *str = \"a\\\"b\\\\\"; char raw[3] = {1, 2, 255}; int zeros[2] = {0};
-             int main() { static int n = 3; return n; }",
+             int main() { static int n = 3; return n + u; }",
         );
         let data = &asm;
         for want in [
@@ -4085,8 +4708,10 @@ main:
         ] {
             assert!(asm.contains(want), "missing {want:?} in\n{asm}");
         }
+        // `cv` is in `.data`, after `v`; the tentative `z` comes last.
+        let before = &asm[..asm.find("cv:").unwrap()];
         assert!(
-            !asm[asm.find("cv:").unwrap() - 200..].contains(".rodata"),
+            before.rfind("    .data\n") > before.rfind(".section .rodata"),
             "{asm}"
         );
     }
@@ -4458,7 +5083,7 @@ main:
                 let src = format!("int f() {{ {decls} }}");
                 let p = crate::parse_with(crate::INPUT_NAME, &src, &opts, &crate::no_files).unwrap();
                 let f = p.funcs().next().unwrap();
-                super::super::layout(&f.locals, 16, Xlen::Rv64).unwrap()
+                super::super::layout(&f.locals, &vec![true; f.locals.len()], 16, Xlen::Rv64).unwrap()
             };
             // Locals start below the 16 bytes of ra and s0.
             assert_eq!(locals("int a, b; long c;"), (vec![-20, -24, -32], 32));

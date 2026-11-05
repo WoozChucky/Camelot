@@ -275,6 +275,9 @@ pub struct RecordBody {
     pub members: Vec<Member>,
     pub size: u32,
     pub align: u32,
+    /// Where the definition is (its tag, or `struct` without one), which
+    /// may be after where the type was first declared (for `-g`).
+    pub pos: Pos,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -322,12 +325,12 @@ impl Record {
             .into_iter()
             .map(|(n, t)| (n, t, Spelled::default(), pos))
             .collect();
-        self.complete_spelled(members, x)
+        self.complete_spelled(members, pos, x)
     }
 
-    /// [`Record::complete`], with each member's spelling and position, which
-    /// only `-g` reads.
-    pub fn complete_spelled(&self, members: Vec<(String, Type, Spelled, Pos)>, x: Xlen) -> bool {
+    /// [`Record::complete`], with each member's spelling and position, and
+    /// the definition's, which only `-g` reads.
+    pub fn complete_spelled(&self, members: Vec<(String, Type, Spelled, Pos)>, pos: Pos, x: Xlen) -> bool {
         let mut offset = 0u64;
         let mut size = 0u64;
         let mut align = 1;
@@ -353,6 +356,7 @@ impl Record {
                 members: laid_out,
                 size: size as u32,
                 align,
+                pos,
             })
             .is_ok()
     }
@@ -411,6 +415,30 @@ pub struct FuncType {
     pub ret: Type,
     pub params: Vec<Type>,
     pub variadic: bool,
+    /// Each parameter as its declaration has it, for `-g`: its type with
+    /// its qualifiers (which `params` leaves out, as they do not change the
+    /// function's type) and how it spelled it ([`Spelled`]), since clang
+    /// describes a function pointer's parameters so (`const pt` of a
+    /// typedef `pt`). Never part of comparing types.
+    pub spelled: Spellings,
+}
+
+/// The declared type and [`Spelled`] of each parameter of a function type,
+/// or none (a type made without them). Any two compare equal, as spellings
+/// do.
+#[derive(Clone, Debug, Default)]
+pub struct Spellings(pub Vec<(Type, Spelled)>);
+
+impl PartialEq for Spellings {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Spellings {}
+
+impl Hash for Spellings {
+    fn hash<H: Hasher>(&self, _: &mut H) {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -523,6 +551,7 @@ impl Type {
             ret,
             params,
             variadic: false,
+            spelled: Spellings::default(),
         }))
     }
 
@@ -532,6 +561,7 @@ impl Type {
             ret,
             params,
             variadic: true,
+            spelled: Spellings::default(),
         }))
     }
 
@@ -558,6 +588,19 @@ impl Type {
         }
     }
 
+    /// Whether `self` and `other` are the same type but for their
+    /// qualifiers, at any level of their pointers and arrays (`int **` and
+    /// `const int *const *`): C's similar types, as clang's
+    /// `hasCvrSimilarType` compares them. A cast between two such pointer
+    /// types changes nothing (clang's `CK_NoOp`).
+    pub fn similar(&self, other: &Type) -> bool {
+        match (self.unqual(), other.unqual()) {
+            (Type::Ptr(a), Type::Ptr(b)) => a.similar(b),
+            (Type::Array(a, n), Type::Array(b, m)) => n == m && a.similar(b),
+            (a, b) => a == b,
+        }
+    }
+
     /// The qualifiers of an object of this type: its own, or for an array
     /// its elements' (an array of `const int` is itself const).
     pub fn quals(&self) -> Quals {
@@ -566,6 +609,20 @@ impl Type {
             Type::Array(elem, _) => elem.quals(),
             _ => Quals::NONE,
         }
+    }
+
+    /// The qualifiers `self` adds to `of`, if it is `of` with qualifiers
+    /// added: on an array they go to its elements, so `const row`, of a
+    /// typedef `row` of `u32[4]`, is `const u32[4]`, and adds `const` to
+    /// `row` (as clang describes it: a const typedef). `None` if `self` is
+    /// not `of` so qualified.
+    pub fn quals_added_to(&self, of: &Type) -> Option<Quals> {
+        let (mine, its) = (self.quals(), of.quals());
+        let added = Quals {
+            konst: mine.konst && !its.konst,
+            volatile: mine.volatile && !its.volatile,
+        };
+        (of.clone().qualified(added) == *self).then_some(added)
     }
 
     /// `sizeof`: `None` for `void`, functions, arrays of unknown size and
@@ -726,9 +783,12 @@ impl Type {
                 inner
             }
         }
+        /// The base and the declarator, apart, but for an array's brackets
+        /// with no name before them, as clang writes them: `int[2]`, `int
+        /// *[2]`, `int (*)[2]`.
         fn join(base: &str, inner: &str) -> String {
-            if inner.is_empty() {
-                base.to_string()
+            if inner.is_empty() || inner.starts_with('[') {
+                format!("{base}{inner}")
             } else {
                 format!("{base} {inner}")
             }
@@ -942,7 +1002,7 @@ mod tests {
     #[test]
     fn names_read_like_c() {
         assert_eq!(Type::ptr(Type::CHAR).to_string(), "char *");
-        assert_eq!(Type::array(Type::INT, Some(3)).to_string(), "int [3]");
+        assert_eq!(Type::array(Type::INT, Some(3)).to_string(), "int[3]");
         assert_eq!(
             Type::ptr(Type::array(Type::INT, Some(3))).to_string(),
             "int (*)[3]"

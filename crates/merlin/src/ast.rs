@@ -30,6 +30,52 @@ pub struct Program {
     /// The target the program is for: its types' sizes, and the code
     /// generated for it ([`crate::types`]).
     pub xlen: Xlen,
+    /// The expressions of the file's scope the parser evaluated away that
+    /// no declarator or function keeps ([`Declarator::sized`],
+    /// [`Function::unevaluated`]), each after how many items it comes, for
+    /// sema to check ([`Unevaluated`]); a block's are statements of their
+    /// own.
+    pub unevaluated: Vec<(usize, Unevaluated)>,
+    /// The warnings so far (`Error`s of [`crate::Severity::Warning`]):
+    /// what is not an error but clang warns of.
+    pub warnings: Vec<crate::Error>,
+}
+
+/// An expression the parser needed no value of, for sema to check without
+/// evaluating it, as clang's checks it: in an array size, an enumerator or
+/// a `_Static_assert`, whose values the parser works out before sema runs,
+/// the operand of a `sizeof` and the operand a constant `?:` does not
+/// choose. Its type is all that counts there, which the parser works out,
+/// but it must still be valid C (`f(1, 2)` of an `int f(void)` is not).
+///
+/// Sema checks it where it was, with the names declared there: a
+/// declarator's own before the name it declares ([`Declarator::sized`]:
+/// `char g[sizeof g.y]` sizes by an earlier `g`), one in an initializer
+/// after it ([`Declarator::unevaluated`]), a function declarator's at file
+/// scope ([`Function::unevaluated`]), a `for` statement's in its scope, a
+/// parameter list's with the parameters before it ([`Self::params`]), and
+/// the rest after the declaration or statement they are in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unevaluated {
+    pub expr: Expr,
+    /// The parser could not work out its type (or it is no integer type),
+    /// and took the constant to be this error (where, what) unless sema
+    /// finds one in the expression.
+    pub untyped: Option<(Pos, String)>,
+    /// The operand of a `?:` the parser folded, not one of `sizeof`.
+    pub folded: bool,
+    /// What is said of the array size a declarator folds, kept with the
+    /// last of the declarator's own operands: clang's warning that it folds
+    /// it, or the error that it cannot (clang's, or merlin's for a
+    /// variable-length array). Given unless this one or one of the `with`
+    /// before it in its list (the declarator's others) has an error, as
+    /// clang says nothing of a declarator whose size is in error.
+    pub diagnostic: Option<crate::Error>,
+    pub with: usize,
+    /// The parameters in scope where it was (C's prototype scope): those
+    /// declared before it in the parameter lists it is in, outermost first,
+    /// so `char a[sizeof n]` after `int n` sizes by that `n`.
+    pub params: Vec<(String, Type, Pos)>,
 }
 
 impl Program {
@@ -110,6 +156,10 @@ pub struct Function {
     /// The closing brace of a definition's body (the declaration's position
     /// for a prototype): where `-g` says the epilogue comes from.
     pub end: Pos,
+    /// What the parser evaluated away in its declarator (its return type,
+    /// its parameters), checked at file scope before it is declared
+    /// ([`Unevaluated`]).
+    pub unevaluated: Vec<Unevaluated>,
 }
 
 impl Function {
@@ -166,6 +216,12 @@ pub struct Declarator {
     pub pos: Pos,
     /// How its type was spelled (for `-g`).
     pub spelled: Spelled,
+    /// What the parser evaluated away in its declarator (and, for a
+    /// declaration's first, in the specifiers before it), checked before
+    /// its name is declared; and in its initializer, checked after, before
+    /// the next declarator's ([`Unevaluated`]).
+    pub sized: Vec<Unevaluated>,
+    pub unevaluated: Vec<Unevaluated>,
 }
 
 /// An initializer: `= expr` or `= { ... }`.
@@ -226,6 +282,10 @@ pub struct Stmt {
 pub enum StmtKind {
     /// `{ ... }`, a new scope.
     Block(Vec<Stmt>),
+    /// No statement: what the declaration or statement before it in its
+    /// block had that the parser evaluated away, for sema to check
+    /// ([`Unevaluated`]). It generates nothing.
+    Unevaluated(Vec<Unevaluated>),
     /// `int a = 1, *b;`
     Decl(Vec<Declarator>),
     /// `expr;`
@@ -247,12 +307,16 @@ pub enum StmtKind {
         cond: Expr,
     },
     /// `for (init; cond; step) body`. `init` is a `Decl` or `Expr` statement whose
-    /// scope is the loop; a missing `cond` means "forever".
+    /// scope is the loop; a missing `cond` means "forever". `unevaluated`:
+    /// what the parser evaluated away in it, but in a declaration of `init`
+    /// or in a block of `body`, checked in its scope after `init`
+    /// ([`Unevaluated`]).
     For {
         init: Option<Box<Stmt>>,
         cond: Option<Expr>,
         step: Option<Expr>,
         body: Box<Stmt>,
+        unevaluated: Vec<Unevaluated>,
     },
     /// `return expr;`, or `return;` in a `void` function.
     Return(Option<Expr>),
@@ -268,12 +332,15 @@ pub enum StmtKind {
         default: Option<usize>,
     },
     /// `case expr: body`. Sema sets the value and an id, unique in the
-    /// function, that its switch refers to.
+    /// function, that its switch refers to. `bare`: the expression is one
+    /// token (an enumeration constant alone, not in parentheses), whose
+    /// enum `-g` describes, as clang's `EmitCaseStmt` does.
     Case {
         expr: Expr,
         value: i128,
         id: usize,
         body: Box<Stmt>,
+        bare: bool,
     },
     /// `default: body`, with an id like a case's.
     Default {
@@ -391,6 +458,14 @@ impl Expr {
 pub enum ExprKind {
     /// An integer or character constant, in range for its type (`ty`).
     Num(i128),
+    /// An enumeration constant `name`, an `int` of value `value`, as a
+    /// number is. `of` is its enum, which `-g` describes when the code
+    /// uses the constant, as clang does.
+    Enumerator {
+        name: String,
+        value: i128,
+        of: Spelled,
+    },
     /// A string literal's bytes, without the terminating NUL; its type is
     /// `char[len + 1]`.
     Str(Vec<u8>),
@@ -639,6 +714,12 @@ impl Dumper {
                 self.expr(d + 1, e);
             }
             StmtKind::Empty => self.line(d, s.pos, "Empty"),
+            StmtKind::Unevaluated(us) => {
+                self.line(d, s.pos, "Unevaluated");
+                for u in us {
+                    self.expr(d + 1, &u.expr);
+                }
+            }
             StmtKind::If { cond, then, els } => {
                 self.line(d, s.pos, "If");
                 self.expr(d + 1, cond);
@@ -663,6 +744,7 @@ impl Dumper {
                 cond,
                 step,
                 body,
+                ..
             } => {
                 self.line(d, s.pos, "For");
                 match init {
@@ -713,6 +795,7 @@ impl Dumper {
         let node = |this: &mut Self, text: String| this.line(d, e.pos, &format!("{text} : {ty}"));
         match &e.kind {
             ExprKind::Num(v) => node(self, format!("Num {v}")),
+            ExprKind::Enumerator { name, value, .. } => node(self, format!("Enumerator {name} = {value}")),
             ExprKind::Str(bytes) => node(self, format!("Str {}", quote(bytes))),
             ExprKind::Var { name, var } => node(self, format!("Var {name}{}", where_(var))),
             ExprKind::Assign { op, target, value } => {

@@ -237,6 +237,7 @@ mod tests {
             ret: Type::INT,
             params: vec![Type::INT, record(6), record(16), record(2)],
             variadic: false,
+            spelled: Default::default(),
         };
         let (regs, total) = arguments(&f, Xlen::Rv32);
         assert_eq!(
@@ -254,6 +255,7 @@ mod tests {
             ret: record(12),
             params: vec![Type::INT],
             variadic: false,
+            spelled: Default::default(),
         };
         assert_eq!(arguments(&f, Xlen::Rv32), (vec![(1, Pass::Scalar)], 2));
         // Past a7, words go on the stack; a pair may straddle a7 and the stack.
