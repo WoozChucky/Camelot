@@ -249,20 +249,26 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
             ty::CREATE_VM,
             cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[64, 1], &le(0), &le(0)]),
         ),
+        // A firmware is none (0), default (1) or a file (2).
+        (
+            "firmware tag 3",
+            ty::CREATE_VM,
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[64, 9, 3], &le(0), &le(0)]),
+        ),
         (
             "device tag",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[32, 9], &le(1), &[9]]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[32, 9, 0], &le(1), &[9]]),
         ),
         (
             "disk source tag",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[32, 9], &le(1), &[1, 7]]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[32, 9, 0], &le(1), &[1, 7]]),
         ),
         (
             "card switch option tag",
             ty::CREATE_VM,
-            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[32, 9], &le(1), &[2, 7]]),
+            cat(&[&le(0), &[0; 8], &[0], &le(1), &le(1), &[32, 9, 0], &le(1), &[2, 7]]),
         ),
         (
             "card MAC option tag",
@@ -273,7 +279,7 @@ fn invalid_payloads() -> Vec<(&'static str, u16, Vec<u8>)> {
                 &[0],
                 &le(1),
                 &le(1),
-                &[32, 9],
+                &[32, 9, 0],
                 &le(1),
                 &[2, 0, 3],
             ]),

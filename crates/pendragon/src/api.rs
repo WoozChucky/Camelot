@@ -13,12 +13,12 @@ use crate::json::Json;
 use crate::screen::{OpenError, Screens, Viewer, SUBPROTOCOL};
 use crate::websocket::{accept_response, Handshake};
 use avalon_client::{
-    arch_text, base_image, create_camelot_vm, format_hz, format_size, holds_disks, lake_disks, mac_text,
-    parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_paging,
-    parse_ram, parse_xlen, CamelotError, Client, Timeouts, VmAction,
+    arch_text, base_image, camelot_bios, create_camelot_vm, format_hz, format_size, holds_disks, lake_disks,
+    mac_text, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net,
+    parse_paging, parse_ram, parse_xlen, CamelotError, Client, Timeouts, VmAction,
 };
 use avalon_proto::{
-    validate_name, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, NatConfig, PortOwner,
+    validate_name, Bios, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, NatConfig, PortOwner,
     SwitchInfo, VmDetails, VmRef, VmState, VmSummary, Xlen, SECTOR_SIZE,
 };
 use std::collections::HashMap;
@@ -582,6 +582,15 @@ impl App {
                 // width chosen.
                 ("camelot_image", base_image(Xlen::Rv32).into()),
                 ("camelot_image_rv64", base_image(Xlen::Rv64).into()),
+                // A Camelot VM's RAM of each width in MiB, for the new-VM form.
+                (
+                    "camelot_ram",
+                    (avalon_client::camelot_ram(Xlen::Rv32) >> 20).into(),
+                ),
+                (
+                    "camelot_ram_rv64",
+                    (avalon_client::camelot_ram(Xlen::Rv64) >> 20).into(),
+                ),
                 ("disks", Json::Array(disks)),
                 ("vms_error", vms.err().map(|f| f.message).into()),
             ]),
@@ -941,7 +950,8 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
     only_keys(
         body,
         &[
-            "name", "xlen", "paging", "ram", "clock", "harts", "disks", "nets", "camelot", "program", "start",
+            "name", "xlen", "paging", "bios", "ram", "clock", "harts", "disks", "nets", "camelot", "program",
+            "start",
         ],
     )?;
     let name = string(body, "name")?.ok_or_else(|| Fail::bad("name: a VM needs a name"))?;
@@ -1010,6 +1020,18 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
         Some(_) => return Err(Fail::bad("nets: not a list")),
     }
     let camelot = flag(body, "camelot")?;
+    // A Camelot VM's RAM, left empty, is its width's (6 MiB on RV64: its firmware
+    // keeps 2 MiB), as Round Table's create --camelot without --ram.
+    if camelot && string(body, "ram")?.is_none_or(|s| s.trim().is_empty()) {
+        profile.ram_size = avalon_client::camelot_ram(profile.xlen);
+    }
+    // The firmware as Round Table's --bios takes it; empty or left out, a Camelot VM
+    // has its width's (Camelot's own on RV64), any other VM none.
+    profile.bios = match string(body, "bios")?.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(bios) => Bios::parse(bios).map_err(|e| Fail::bad(format!("bios: {e}")))?,
+        None if camelot => camelot_bios(profile.xlen),
+        None => Bios::None,
+    };
     let program = match (string(body, "program")?, camelot) {
         (Some(_), true) => {
             return Err(Fail::bad(
@@ -1123,6 +1145,8 @@ fn vm_json(vm: &VmSummary) -> Json {
         ("paging", profile.paging.to_string().into()),
         ("arch", profile.xlen.to_string().into()),
         ("arch_text", arch_text(profile.xlen, profile.paging).into()),
+        // The firmware as `bios` takes it: none, default or the file's path.
+        ("bios", profile.bios.to_string().into()),
         ("ram", profile.ram_size.into()),
         ("ram_text", format_size(profile.ram_size).into()),
         ("clock_hz", profile.clock_hz.into()),

@@ -373,9 +373,17 @@ function newVmPage(main, ctx, disk) {
   const pagingField = field("Paging", paging, "an RV64 VM's; an RV32 VM has Sv32");
   // Lake's images, and the Camelot image of each width (from the disks list).
   let images = null;
+  // The RAM follows the choice until it is typed in: a Camelot VM's of its width
+  // (an RV64 one's firmware keeps 2 MiB on top), else the platform's 4 MiB.
+  let ramTyped = false;
+  ram.addEventListener("input", () => { ramTyped = true; });
   const showBoot = () => {
     programField.hidden = bootCamelot.checked;
     pagingField.hidden = xlen.value !== "64";
+    if (images && !ramTyped) {
+      const camelotRam = xlen.value === "64" ? images.camelot_ram_rv64 : images.camelot_ram;
+      ram.value = String(bootCamelot.checked ? camelotRam : 4);
+    }
     if (images) {
       const image = xlen.value === "64" ? images.camelot_image_rv64 : images.camelot_image;
       camelotHint.textContent = images.disks.some((d) => d.name === image)

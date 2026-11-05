@@ -172,13 +172,14 @@ fn simple_profile() -> HardwareProfile {
         harts: 1,
         xlen: Xlen::Rv32,
         paging: Paging::Sv48,
+        bios: Bios::None,
         devices: Vec::new(),
     }
 }
 
 /// `simple_profile` per the HardwareProfile table.
 fn simple_profile_bytes(p: P) -> P {
-    p.u64(0x1000).u8(0).u32(10).u32(1).u8(32).u8(9).u32(0)
+    p.u64(0x1000).u8(0).u32(10).u32(1).u8(32).u8(9).u8(0).u32(0)
 }
 
 /// One message of every type, each field a different value, with its layout per the
@@ -232,6 +233,7 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                     harts: 3,
                     xlen: Xlen::Rv64,
                     paging: Paging::Sv39,
+                    bios: Bios::File("b".into()),
                     devices: vec![
                         DeviceSpec::Disk(DiskSpec {
                             source: DiskSource::File("f".into()),
@@ -265,6 +267,8 @@ fn layouts() -> Vec<(Message, Vec<u8>)> {
                 .u32(3)
                 .u8(64)
                 .u8(8)
+                .u8(2)
+                .str("b")
                 .u32(4)
                 .u8(1)
                 .u8(1)

@@ -76,6 +76,7 @@ pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<Machi
         harts,
         xlen,
         paging,
+        bios,
         devices,
     } = profile;
     let ram_size = usize::try_from(*ram_size)
@@ -112,9 +113,20 @@ pub fn machine_config(profile: &HardwareProfile, program: &[u8]) -> Result<Machi
             avalon_proto::Paging::Sv48 => grail::Paging::Sv48,
             avalon_proto::Paging::Sv39 => grail::Paging::Sv39,
         },
+        bios: machine_bios(bios),
     };
     config.validate()?;
     Ok(config)
+}
+
+/// Grail's firmware for a profile's `bios`: a file on Avalon's host, relative to its
+/// working directory, as a disk image's.
+pub fn machine_bios(bios: &avalon_proto::Bios) -> grail::Bios {
+    match bios {
+        avalon_proto::Bios::None => grail::Bios::None,
+        avalon_proto::Bios::Default => grail::Bios::Default,
+        avalon_proto::Bios::File(path) => grail::Bios::File(path.into()),
+    }
 }
 
 /// The protocol's name for Grail's width `xlen`: what a VM's profile says once its
@@ -140,6 +152,7 @@ mod tests {
             harts: 4,
             xlen: avalon_proto::Xlen::Rv64,
             paging: avalon_proto::Paging::Sv39,
+            bios: avalon_proto::Bios::Default,
             devices: vec![
                 DeviceSpec::Disk(DiskSpec {
                     source: DiskSource::File("a.img".into()),
@@ -173,6 +186,7 @@ mod tests {
                 nets: Vec::new(),
                 xlen: Xlen::Rv64,
                 paging: grail::Paging::Sv39,
+                bios: grail::Bios::Default,
             }
         );
         assert_eq!(

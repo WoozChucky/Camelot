@@ -22,7 +22,7 @@
 //! Pendragon, the web console: the two cannot drift apart.
 
 use avalon_proto::{
-    validate_name, Connection, DeviceSpec, DiskInfo, DiskSource, DiskSpec, ErrorCode, HardwareProfile,
+    validate_name, Bios, Connection, DeviceSpec, DiskInfo, DiskSource, DiskSpec, ErrorCode, HardwareProfile,
     Message, NatConfig, SwitchInfo, VmDetails, VmRef, VmState, VmSummary, Xlen,
 };
 use std::collections::VecDeque;
@@ -236,6 +236,34 @@ pub fn base_image(xlen: Xlen) -> &'static str {
         Xlen::Rv64 => BASE_IMAGE_RV64,
     }
 }
+
+/// The firmware a Camelot VM of width `xlen` boots unless its creator says otherwise:
+/// on RV64 Camelot's own (`Bios::Default`, as QEMU's `virt` runs OpenSBI by
+/// default), since the RV64 root image's bootloader and kernel run in S-mode on an
+/// SBI; on RV32 none, as the RV32 kernel carries its own M-mode layer (until #159).
+pub fn camelot_bios(xlen: Xlen) -> Bios {
+    match xlen {
+        Xlen::Rv32 => Bios::None,
+        Xlen::Rv64 => Bios::Default,
+    }
+}
+
+/// The RAM a Camelot VM of width `xlen` has unless its creator says otherwise: the
+/// platform's default, 4 MiB ([`avalon_proto::DEFAULT_RAM_SIZE`]), and on RV64 the
+/// 2 MiB its firmware keeps at the start of RAM on top (Excalibur spec section 7,
+/// "Firmware"), so that the kernel has the RAM an RV32 VM's kernel has. Less does
+/// not boot: Grail puts the device tree at the last 2 MiB boundary below the end of
+/// RAM, as QEMU does, which must be above the kernel's boot block at 0x8020_0000.
+pub fn camelot_ram(xlen: Xlen) -> u64 {
+    match xlen {
+        Xlen::Rv32 => avalon_proto::DEFAULT_RAM_SIZE,
+        Xlen::Rv64 => avalon_proto::DEFAULT_RAM_SIZE + CAMELOT_FIRMWARE_RAM,
+    }
+}
+
+/// The RAM Camelot's firmware keeps for itself: 0x8000_0000 to 0x801f_ffff
+/// (`grail::firmware::FW_SIZE`).
+pub const CAMELOT_FIRMWARE_RAM: u64 = 2 << 20;
 
 /// The disk a Camelot VM named `vm` boots from: its own copy of its width's
 /// [`base_image`], `<vm>-disk0` (its disk 0).

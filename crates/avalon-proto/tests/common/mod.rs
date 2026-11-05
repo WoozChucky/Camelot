@@ -14,6 +14,7 @@ pub fn profile() -> HardwareProfile {
         harts: 4,
         xlen: Xlen::Rv64,
         paging: Paging::Sv39,
+        bios: Bios::File("C:\\fw\\fw_jump.bin".into()),
         devices: vec![
             DeviceSpec::Disk(DiskSpec {
                 source: DiskSource::File("C:\\vms\\root.img".into()),
