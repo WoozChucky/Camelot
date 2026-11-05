@@ -246,6 +246,53 @@ impl LockWatch {
     }
 }
 
+/// The width of the kernel a test runs, for the tests that run on both
+/// ([`width::on_both`]): the RV32 kernel and then the RV64 one (#156).
+pub mod width {
+    use std::cell::Cell;
+    use xtask::kernel::Xlen;
+
+    thread_local! {
+        static XLEN: Cell<Xlen> = const { Cell::new(Xlen::Rv32) };
+    }
+
+    /// Runs `test` for RV32, then for RV64: [`get`] says which.
+    pub fn on_both(test: impl Fn()) {
+        for xlen in xtask::kernel::XLENS {
+            XLEN.with(|x| x.set(xlen));
+            test();
+        }
+        XLEN.with(|x| x.set(Xlen::Rv32));
+    }
+
+    /// The width under test.
+    pub fn get() -> Xlen {
+        XLEN.with(|x| x.get())
+    }
+
+    /// The same, as Grail names it.
+    pub fn machine() -> grail::Xlen {
+        match get() {
+            Xlen::Rv32 => grail::Xlen::Rv32,
+            Xlen::Rv64 => grail::Xlen::Rv64,
+        }
+    }
+
+    /// Where the RV64 kernel image is linked, and where it is loaded.
+    const KERNEL_LINK_ADDR_RV64: u64 = 0xffff_ffff_8000_0000;
+    const LOAD_ADDR: u64 = 0x8000_0000;
+
+    /// The physical address of `va`, an address in the kernel image: the
+    /// same on RV32; on RV64, linked in the upper half, its load address.
+    pub fn image_pa(va: u64) -> u64 {
+        if va >= KERNEL_LINK_ADDR_RV64 {
+            va - KERNEL_LINK_ADDR_RV64 + LOAD_ADDR
+        } else {
+            va
+        }
+    }
+}
+
 /// A program's start, as the kernel puts it on the stack of a program it
 /// starts (docs/camelot-syscalls.md, "Starting a program"; kernel/proc.c,
 /// push_start), Linux's layout: read through the current hart's
