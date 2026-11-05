@@ -283,6 +283,10 @@ pub struct Member {
     pub ty: Type,
     /// Bytes from the start of the struct (always 0 in a union).
     pub offset: u32,
+    /// How its declaration spelled its type (for `-g`).
+    pub spelled: Spelled,
+    /// Where it is declared.
+    pub pos: Pos,
 }
 
 impl Record {
@@ -313,11 +317,22 @@ impl Record {
     /// the target and completes the type. Every member type must be complete.
     /// Returns `false` if the type was already complete.
     pub fn complete(&self, members: Vec<(String, Type)>, x: Xlen) -> bool {
+        let pos = self.pos;
+        let members = members
+            .into_iter()
+            .map(|(n, t)| (n, t, Spelled::default(), pos))
+            .collect();
+        self.complete_spelled(members, x)
+    }
+
+    /// [`Record::complete`], with each member's spelling and position, which
+    /// only `-g` reads.
+    pub fn complete_spelled(&self, members: Vec<(String, Type, Spelled, Pos)>, x: Xlen) -> bool {
         let mut offset = 0u64;
         let mut size = 0u64;
         let mut align = 1;
         let mut laid_out = Vec::with_capacity(members.len());
-        for (name, ty) in members {
+        for (name, ty, spelled, pos) in members {
             let (msize, malign) = (u64::from(ty.size(x).expect("complete member")), ty.align(x));
             align = align.max(malign);
             let at = if self.union { 0 } else { align_up(offset, malign) };
@@ -327,6 +342,8 @@ impl Record {
                 name,
                 ty,
                 offset: at as u32,
+                spelled,
+                pos,
             });
         }
         let size = align_up(size, align);
@@ -415,6 +432,77 @@ pub enum Type {
 
 /// The largest object merlin lays out: sizes must fit a signed 32-bit offset.
 pub const MAX_OBJECT_SIZE: u64 = i32::MAX as u64;
+
+/// How a declaration spelled the base of its type, where that says more
+/// than the type itself: through a typedef name, or as an enum. C's typedef
+/// names are only names, and merlin's enum types are integer types, so
+/// neither changes what the type is; but a debugger shows them as written
+/// (`Node *`, `enum color`), and `-g` describes them ([`crate::debug`]).
+///
+/// It is the spelling of the declaration's specifiers. The declarator builds
+/// the declared type from the spelled one (`Node *p` points to it), and `-g`
+/// finds the spelled type again inside the declared one.
+#[derive(Clone)]
+pub enum Spelling {
+    Typedef(Arc<TypedefName>),
+    Enum(Arc<EnumType>),
+}
+
+/// A typedef name: what it stands for, and how its own declaration spelled
+/// that.
+#[derive(Debug)]
+pub struct TypedefName {
+    pub name: String,
+    pub ty: Type,
+    pub spelled: Spelled,
+    pub pos: Pos,
+}
+
+/// An enum: its tag, the integer type it is, and its constants.
+#[derive(Debug)]
+pub struct EnumType {
+    pub tag: Option<String>,
+    pub ty: Type,
+    pub constants: Vec<(String, i128)>,
+    pub pos: Pos,
+}
+
+impl Spelling {
+    /// The type the spelling stands for.
+    pub fn ty(&self) -> &Type {
+        match self {
+            Spelling::Typedef(t) => &t.ty,
+            Spelling::Enum(e) => &e.ty,
+        }
+    }
+}
+
+impl fmt::Debug for Spelling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Spelling::Typedef(t) => f.write_str(&t.name),
+            Spelling::Enum(e) => write!(f, "enum {}", e.tag.as_deref().unwrap_or("(anonymous)")),
+        }
+    }
+}
+
+/// A declaration's [`Spelling`], if it has one. A spelling never changes a
+/// type, so any two compare equal: comparing declarations compares what
+/// they declare.
+#[derive(Clone, Debug, Default)]
+pub struct Spelled(pub Option<Spelling>);
+
+impl PartialEq for Spelled {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Spelled {}
+
+impl Hash for Spelled {
+    fn hash<H: Hasher>(&self, _: &mut H) {}
+}
 
 impl Type {
     pub const INT: Type = Type::Int(IntKind::Int);

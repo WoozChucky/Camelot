@@ -231,10 +231,10 @@ fn truncated<T>(what: &str) -> Result<T, Error> {
 }
 
 /// A little-endian reader over one section.
-struct Reader<'a> {
-    data: &'a [u8],
-    at: usize,
-    what: &'static str,
+pub(crate) struct Reader<'a> {
+    pub(crate) data: &'a [u8],
+    pub(crate) at: usize,
+    pub(crate) what: &'static str,
 }
 
 impl<'a> Reader<'a> {
@@ -308,7 +308,7 @@ impl<'a> Reader<'a> {
 
 /// An attribute's value, by the class of its form.
 #[derive(Clone, Debug)]
-enum Value {
+pub(crate) enum Value {
     /// `addr`: an address.
     Addr(u64),
     /// `addrx*`: an index into `.debug_addr`.
@@ -317,7 +317,7 @@ enum Value {
     /// `data8` may also be section offsets, as in DWARF 3).
     Const { value: u64, form: u64 },
     /// `sdata`: a signed constant, never an offset or an unsigned value.
-    Signed,
+    Signed(i64),
     /// `sec_offset`, `strp`, `line_strp`: an offset into another section.
     Offset { value: u64, form: u64 },
     /// `string`: the string itself.
@@ -331,7 +331,9 @@ enum Value {
     UnitRef(u64),
     /// `ref_addr`: an entry anywhere in `.debug_info`, by its offset there.
     InfoRef(u64),
-    /// Anything else (blocks, expressions, other files' references, ...).
+    /// `block*`, `exprloc`: the block's bytes (a location expression, say).
+    Block(Vec<u8>),
+    /// Anything else (other files' references, `data16`, ...).
     Other,
 }
 
@@ -374,10 +376,7 @@ fn read_value(
         FORM_UDATA => constant(r.uleb()?, form),
         FORM_FLAG_PRESENT => constant(1, form),
         FORM_IMPLICIT_CONST => constant(implicit as u64, form),
-        FORM_SDATA => {
-            r.sleb()?;
-            Value::Signed
-        }
+        FORM_SDATA => Value::Signed(r.sleb()?),
         FORM_SEC_OFFSET | FORM_STRP | FORM_LINE_STRP => Value::Offset {
             value: r.uint(4)?,
             form,
@@ -402,19 +401,19 @@ fn read_value(
         FORM_REF_ADDR => Value::InfoRef(r.uint(if version == 2 { addr_size } else { 4 })?),
         FORM_BLOCK1 => {
             let n = r.uint(1)?;
-            skip(r, n)?
+            Value::Block(r.bytes(n)?.to_vec())
         }
         FORM_BLOCK2 => {
             let n = r.uint(2)?;
-            skip(r, n)?
+            Value::Block(r.bytes(n)?.to_vec())
         }
         FORM_BLOCK4 => {
             let n = r.uint(4)?;
-            skip(r, n)?
+            Value::Block(r.bytes(n)?.to_vec())
         }
         FORM_BLOCK | FORM_EXPRLOC => {
             let n = r.uleb()?;
-            skip(r, n)?
+            Value::Block(r.bytes(n)?.to_vec())
         }
         FORM_INDIRECT => {
             let form = r.uleb()?;
@@ -435,7 +434,7 @@ fn skip(r: &mut Reader, n: u64) -> Result<Value, Error> {
 
 /// One abbreviation: the entry's tag, whether it has children, and its
 /// attributes (attribute, form, implicit constant).
-struct Abbrev {
+pub(crate) struct Abbrev {
     tag: u64,
     children: bool,
     attrs: Vec<(u64, u64, i64)>,
@@ -467,15 +466,66 @@ fn abbreviations(abbrev: &[u8], offset: u64) -> Result<HashMap<u64, Abbrev>, Err
 }
 
 /// The sections a unit's values point into.
-struct Sections {
-    info: Relocated,
-    abbrev: Vec<u8>,
-    addr: Option<Relocated>,
-    str: Vec<u8>,
-    line_str: Vec<u8>,
-    str_offsets: Option<Relocated>,
-    rnglists: Option<Relocated>,
-    ranges: Option<Relocated>,
+pub(crate) struct Sections {
+    pub(crate) info: Relocated,
+    pub(crate) abbrev: Vec<u8>,
+    pub(crate) addr: Option<Relocated>,
+    pub(crate) str: Vec<u8>,
+    pub(crate) line_str: Vec<u8>,
+    pub(crate) str_offsets: Option<Relocated>,
+    pub(crate) rnglists: Option<Relocated>,
+    pub(crate) ranges: Option<Relocated>,
+}
+
+impl Sections {
+    /// The offset of the unit after the one at `at` of `.debug_info`.
+    pub(crate) fn next_unit(&self, at: u64) -> Result<u64, Error> {
+        let mut r = Reader::new(&self.info.data, at, ".debug_info")?;
+        let length = r.uint(4)?;
+        if length >= 0xffff_fff0 {
+            return err("debug info: 64-bit DWARF is not supported");
+        }
+        let next = at + 4 + length;
+        if next > self.info.data.len() as u64 {
+            return err("debug info: unit runs past the end of .debug_info");
+        }
+        Ok(next)
+    }
+}
+
+/// A unit's header as read: where the next unit starts, the unit's DWARF
+/// version, address size and abbreviations, and a reader at its next entry.
+pub(crate) struct UnitHeader<'a> {
+    pub next: u64,
+    pub version: u16,
+    pub addr_size: u64,
+    abbrevs: HashMap<u64, Abbrev>,
+    pub r: Reader<'a>,
+}
+
+impl UnitHeader<'_> {
+    /// The next entry, or none at the end of a list of children.
+    pub(crate) fn entry(&mut self) -> Result<Option<Entry>, Error> {
+        let r = &mut self.r;
+        let offset = r.at as u64;
+        let code = r.uleb()?;
+        if code == 0 {
+            return Ok(None);
+        }
+        let Some(a) = self.abbrevs.get(&code) else {
+            return err(format!("debug info: no abbreviation {code}"));
+        };
+        let mut attrs = Vec::new();
+        for &(attr, form, implicit) in &a.attrs {
+            attrs.push((attr, read_value(r, form, implicit, self.version, self.addr_size)?));
+        }
+        Ok(Some(Entry {
+            offset,
+            tag: a.tag,
+            children: a.children,
+            attrs,
+        }))
+    }
 }
 
 /// A string at `off` of a string section.
@@ -487,7 +537,7 @@ fn string_at(sec: &[u8], off: u64) -> Option<String> {
 
 /// What a unit needs to resolve its values: the address size and the bases
 /// of its indexed sections.
-struct Unit<'a> {
+pub(crate) struct Unit<'a> {
     s: &'a Sections,
     version: u16,
     addr_size: u64,
@@ -501,15 +551,15 @@ struct Unit<'a> {
 
 /// One entry (DIE) as read: its offset in `.debug_info`, its tag, whether
 /// children follow it, and its attributes.
-struct Entry {
-    offset: u64,
-    tag: u64,
-    children: bool,
-    attrs: Vec<(u64, Value)>,
+pub(crate) struct Entry {
+    pub(crate) offset: u64,
+    pub(crate) tag: u64,
+    pub(crate) children: bool,
+    pub(crate) attrs: Vec<(u64, Value)>,
 }
 
 /// The value of attribute `a` (its first, as LLVM's `find` takes it).
-fn find(attrs: &[(u64, Value)], a: u64) -> Option<&Value> {
+pub(crate) fn find(attrs: &[(u64, Value)], a: u64) -> Option<&Value> {
     attrs.iter().find(|(at, _)| *at == a).map(|(_, v)| v)
 }
 
@@ -541,12 +591,34 @@ impl CompileUnit {
     }
 }
 
-impl Unit<'_> {
+impl<'a> Unit<'a> {
+    /// What a unit with unit DIE attributes `attrs` resolves its values with.
+    pub(crate) fn new(s: &'a Sections, version: u16, addr_size: u64, attrs: &[(u64, Value)]) -> Unit<'a> {
+        let unit = Unit {
+            s,
+            version,
+            addr_size,
+            addr_base: find(attrs, AT_ADDR_BASE).and_then(Value::section_offset),
+            str_offsets_base: find(attrs, AT_STR_OFFSETS_BASE).and_then(Value::section_offset),
+            rnglists_base: find(attrs, AT_RNGLISTS_BASE)
+                .and_then(Value::section_offset)
+                .unwrap_or(0),
+            base: None,
+        };
+        // A range list's offsets are from the unit's base address.
+        Unit {
+            base: find(attrs, AT_LOW_PC)
+                .or(find(attrs, AT_ENTRY_PC))
+                .and_then(|v| unit.address(v)),
+            ..unit
+        }
+    }
+
     /// An entry's code ranges, as LLVM's `DWARFDie::getAddressRanges` reads
     /// them: low and high pc (an address, or a constant added to the low
     /// one), else the range list `DW_AT_ranges`, its offsets from the unit's
     /// base address.
-    fn ranges(&self, attrs: &[(u64, Value)]) -> Result<Vec<(u64, u64)>, Error> {
+    pub(crate) fn ranges(&self, attrs: &[(u64, Value)]) -> Result<Vec<(u64, u64)>, Error> {
         let low = find(attrs, AT_LOW_PC).and_then(|v| self.address(v));
         let high = |low: u64| {
             let v = find(attrs, AT_HIGH_PC)?;
@@ -587,15 +659,40 @@ impl Unit<'_> {
             .uint(self.addr_size)
             .ok()
     }
+    /// The unit's addresses in `.debug_addr`: those of its contribution, from
+    /// `DW_AT_addr_base` to the end its header (just before it) gives.
+    pub(crate) fn address_pool(&self) -> Vec<u64> {
+        let (Some(addr), Some(base)) = (self.s.addr.as_ref(), self.addr_base) else {
+            return Vec::new();
+        };
+        let Some(end) = base
+            .checked_sub(8)
+            .and_then(|h| Reader::new(&addr.data, h, ".debug_addr").ok())
+            .and_then(|mut r| r.uint(4).ok())
+            .and_then(|len| (base - 4).checked_add(len))
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut at = base;
+        while at + self.addr_size <= end {
+            match self.pooled((at - base) / self.addr_size) {
+                Some(a) => out.push(a),
+                None => break,
+            }
+            at += self.addr_size;
+        }
+        out
+    }
     /// LLVM's `getAsAddress`.
-    fn address(&self, v: &Value) -> Option<u64> {
+    pub(crate) fn address(&self, v: &Value) -> Option<u64> {
         match *v {
             Value::Addr(a) => Some(a),
             Value::AddrIndex(i) => self.pooled(i),
             _ => None,
         }
     }
-    fn string(&self, v: &Value) -> Option<String> {
+    pub(crate) fn string(&self, v: &Value) -> Option<String> {
         match *v {
             Value::Str(ref s) => Some(s.clone()),
             Value::Offset { value, form } if form == FORM_STRP => string_at(&self.s.str, value),
@@ -715,111 +812,24 @@ impl Elf<'_> {
     /// section): for each, what its unit DIE says, and what its other entries
     /// say of its functions. Type units are left out, as they have no code.
     pub fn compile_units(&self) -> Result<Vec<CompileUnit>, Error> {
-        let Some(info) = self.relocated(".debug_info")? else {
+        let Some(s) = self.debug_sections()? else {
             return Ok(Vec::new());
-        };
-        let s = Sections {
-            info,
-            abbrev: self.data_of(".debug_abbrev")?.to_vec(),
-            addr: self.relocated(".debug_addr")?,
-            str: self.data_of(".debug_str")?.to_vec(),
-            line_str: self.data_of(".debug_line_str")?.to_vec(),
-            str_offsets: self.relocated(".debug_str_offsets")?,
-            rnglists: self.relocated(".debug_rnglists")?,
-            ranges: self.relocated(".debug_ranges")?,
         };
         let mut units = Vec::new();
         let mut at = 0u64;
         while at < s.info.data.len() as u64 {
-            let mut r = Reader::new(&s.info.data, at, ".debug_info")?;
-            let length = r.uint(4)?;
-            if length >= 0xffff_fff0 {
-                return err("debug info: 64-bit DWARF is not supported");
-            }
-            let next = at + 4 + length;
-            if next > s.info.data.len() as u64 {
-                return err("debug info: unit runs past the end of .debug_info");
-            }
-            let mut r = Reader {
-                data: &s.info.data[..next as usize],
-                at: r.at,
-                what: ".debug_info",
+            let Some(mut h) = self.unit_header(&s, at)? else {
+                at = s.next_unit(at)?;
+                continue;
             };
-            let version = r.uint(2)? as u16;
-            if !(2..=5).contains(&version) {
-                return err(format!("debug info: DWARF version {version} is not supported"));
-            }
-            let (unit_type, addr_size, abbrev_offset) = if version >= 5 {
-                let ty = r.u8()?;
-                let size = r.u8()?;
-                (ty, size, r.uint(4)?)
-            } else {
-                let offset = r.uint(4)?;
-                (1, r.u8()?, offset)
-            };
-            match unit_type {
-                UT_TYPE | UT_SPLIT_TYPE => {
-                    at = next;
-                    continue;
-                }
-                UT_SKELETON | UT_SPLIT_COMPILE => {
-                    r.bytes(8)?; // dwo_id
-                }
-                _ => {}
-            }
-            if usize::from(addr_size) != self.class.addr_size() {
-                return err(format!(
-                    "debug info: {addr_size}-byte addresses in a file of {}-byte ones",
-                    self.class.addr_size()
-                ));
-            }
-            let addr_size = u64::from(addr_size);
-            let abbrevs = abbreviations(&s.abbrev, abbrev_offset)?;
-            let entry = |r: &mut Reader| -> Result<Option<Entry>, Error> {
-                let offset = r.at as u64;
-                let code = r.uleb()?;
-                if code == 0 {
-                    return Ok(None); // the end of a list of children
-                }
-                let Some(a) = abbrevs.get(&code) else {
-                    return err(format!("debug info: no abbreviation {code}"));
-                };
-                let mut attrs = Vec::new();
-                for &(attr, form, implicit) in &a.attrs {
-                    attrs.push((attr, read_value(r, form, implicit, version, addr_size)?));
-                }
-                Ok(Some(Entry {
-                    offset,
-                    tag: a.tag,
-                    children: a.children,
-                    attrs,
-                }))
-            };
-            let die = entry(&mut r)?;
+            let die = h.entry()?;
             let attrs = die.as_ref().map_or(&[][..], |d| &d.attrs[..]);
-            let unit = Unit {
-                s: &s,
-                version,
-                addr_size,
-                addr_base: find(attrs, AT_ADDR_BASE).and_then(Value::section_offset),
-                str_offsets_base: find(attrs, AT_STR_OFFSETS_BASE).and_then(Value::section_offset),
-                rnglists_base: find(attrs, AT_RNGLISTS_BASE)
-                    .and_then(Value::section_offset)
-                    .unwrap_or(0),
-                base: None,
-            };
-            // A range list's offsets are from the unit's base address.
-            let unit = Unit {
-                base: find(attrs, AT_LOW_PC)
-                    .or(find(attrs, AT_ENTRY_PC))
-                    .and_then(|v| unit.address(v)),
-                ..unit
-            };
+            let unit = Unit::new(&s, h.version, h.addr_size, attrs);
             let ranges = unit.ranges(attrs)?;
             let mut cu = CompileUnit {
                 offset: at,
-                next,
-                version,
+                next: h.next,
+                version: h.version,
                 stmt_list: find(attrs, AT_STMT_LIST).and_then(Value::section_offset),
                 comp_dir: find(attrs, AT_COMP_DIR).and_then(|v| unit.string(v)),
                 ranges,
@@ -832,8 +842,8 @@ impl Elf<'_> {
             if let Some(die) = die {
                 let mut depth = usize::from(die.children);
                 cu.add(&unit, die);
-                while depth > 0 && (r.at as u64) < next {
-                    match entry(&mut r) {
+                while depth > 0 && (h.r.at as u64) < h.next {
+                    match h.entry() {
                         Ok(Some(die)) => {
                             depth += usize::from(die.children);
                             cu.add(&unit, die);
@@ -844,9 +854,70 @@ impl Elf<'_> {
                 }
             }
             units.push(cu);
-            at = next;
+            at = h.next;
         }
         Ok(units)
+    }
+
+    /// `.debug_info` and the sections its values point into, relocated (none
+    /// if there is no `.debug_info`).
+    pub(crate) fn debug_sections(&self) -> Result<Option<Sections>, Error> {
+        let Some(info) = self.relocated(".debug_info")? else {
+            return Ok(None);
+        };
+        Ok(Some(Sections {
+            info,
+            abbrev: self.data_of(".debug_abbrev")?.to_vec(),
+            addr: self.relocated(".debug_addr")?,
+            str: self.data_of(".debug_str")?.to_vec(),
+            line_str: self.data_of(".debug_line_str")?.to_vec(),
+            str_offsets: self.relocated(".debug_str_offsets")?,
+            rnglists: self.relocated(".debug_rnglists")?,
+            ranges: self.relocated(".debug_ranges")?,
+        }))
+    }
+
+    /// The header of the unit at `at` of `.debug_info`, and a reader at its
+    /// first entry; none for a type unit, which has no code.
+    pub(crate) fn unit_header<'s>(&self, s: &'s Sections, at: u64) -> Result<Option<UnitHeader<'s>>, Error> {
+        let next = s.next_unit(at)?;
+        let mut r = Reader {
+            data: &s.info.data[..next as usize],
+            at: at as usize + 4,
+            what: ".debug_info",
+        };
+        let version = r.uint(2)? as u16;
+        if !(2..=5).contains(&version) {
+            return err(format!("debug info: DWARF version {version} is not supported"));
+        }
+        let (unit_type, addr_size, abbrev_offset) = if version >= 5 {
+            let ty = r.u8()?;
+            let size = r.u8()?;
+            (ty, size, r.uint(4)?)
+        } else {
+            let offset = r.uint(4)?;
+            (1, r.u8()?, offset)
+        };
+        match unit_type {
+            UT_TYPE | UT_SPLIT_TYPE => return Ok(None),
+            UT_SKELETON | UT_SPLIT_COMPILE => {
+                r.bytes(8)?; // dwo_id
+            }
+            _ => {}
+        }
+        if usize::from(addr_size) != self.class.addr_size() {
+            return err(format!(
+                "debug info: {addr_size}-byte addresses in a file of {}-byte ones",
+                self.class.addr_size()
+            ));
+        }
+        Ok(Some(UnitHeader {
+            next,
+            version,
+            addr_size: u64::from(addr_size),
+            abbrevs: abbreviations(&s.abbrev, abbrev_offset)?,
+            r,
+        }))
     }
 
     /// Which compile unit each address belongs to, as LLVM's

@@ -13,10 +13,11 @@
 #                 debug sections, R_RISCV_ALIGN and R_RISCV_RELAX in the code
 #   prog.elf      prog.o linked by ld.lld at 0x8000_0000
 #
-# and for each of them FILE.readelf (llvm-readelf -h -S -l -s -r) and
-# FILE.lines (llvm-dwarfdump --debug-line). crates/elf/tests/llvm.rs checks
-# that the elf crate reads the same header, sections, segments, symbols,
-# relocations and line table rows.
+# and for each of them FILE.readelf (llvm-readelf -h -S -l -s -r),
+# FILE.lines (llvm-dwarfdump --debug-line) and FILE.info (llvm-dwarfdump
+# --debug-info). crates/elf/tests/llvm.rs checks that the elf crate reads the
+# same header, sections, segments, symbols, relocations, line table rows and
+# debugging information entries.
 #
 # Made with LLVM 23.
 set -eu
@@ -39,6 +40,7 @@ for xlen in 32 64; do
         # Run in the directory: both tools name the file they read.
         (cd "$out" && llvm-readelf -h -S -l -s -r "$f" > "$f.readelf")
         (cd "$out" && llvm-dwarfdump --debug-line "$f" > "$f.lines")
+        (cd "$out" && llvm-dwarfdump --debug-info "$f" > "$f.info")
     done
 done
 echo "wrote $(ls "$DIR"/rv*/* | wc -l) files"

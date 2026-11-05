@@ -342,7 +342,8 @@
 //! `.ascii` and `.zero` (struct padding too), after a `.balign` for the
 //! type. A `static` local's symbol is
 //! `function.name`, a local symbol (no `.globl`). Each string literal gets a
-//! label `.L.str.<n>` in `.rodata`.
+//! label `.L.str.<n>` in `.rodata`, one for literals of the same bytes, as
+//! clang merges them.
 //!
 //! ## Control flow
 //!
@@ -382,10 +383,10 @@
 use crate::abi::{self, Pass};
 use crate::ast::*;
 use crate::consteval::{self, Base, Const};
-use crate::debug::{DebugInfo, Lines};
+use crate::debug::{DebugInfo, Lines, Location, Scope, Var};
 use crate::sema::arith_type;
 use crate::types::{ptr_size, FuncType, IntKind, Type, Xlen};
-use crate::Error;
+use crate::{Error, Pos};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -464,6 +465,7 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
                     ret_label: format!(".L.return.{}", f.name),
                     statics: Vec::new(),
                     after_prologue: false,
+                    scopes: Vec::new(),
                 };
                 g.function(body);
                 let (lines, statics) = (g.lines, g.statics);
@@ -475,16 +477,39 @@ pub fn generate_with(prog: &Program, debug: Option<(&DebugInfo, &[String])>) -> 
                 for d in statics {
                     file.variable(d);
                 }
+                if let Some(d) = file.debug.as_mut() {
+                    d.statics_done();
+                }
             }
             Item::Decl(decls) => {
                 for d in decls.iter().filter(|d| d.define) {
                     file.variable(d);
+                    // A compound literal's hidden variable is not described, as
+                    // clang has it: its string literals go with the global that
+                    // names it.
+                    if d.name.starts_with(".compoundliteral.") {
+                        if let (Some(dbg), Some(VarRef::Global(sym))) = (file.debug.as_mut(), &d.var) {
+                            dbg.hidden(sym);
+                        }
+                        continue;
+                    }
+                    if let (Some(dbg), Some(VarRef::Global(sym))) = (file.debug.as_mut(), &d.var) {
+                        let external = d.storage != Storage::Static;
+                        dbg.global(
+                            &d.name,
+                            sym,
+                            (&d.ty, &d.spelled),
+                            d.pos,
+                            external,
+                            d.init.is_some(),
+                        );
+                    }
                 }
             }
         }
     }
     file.strings();
-    if let Some(d) = &file.debug {
+    if let Some(d) = &mut file.debug {
         file.out.push_str(&d.sections());
     }
     Ok(file.out)
@@ -661,10 +686,18 @@ impl FileGen {
         }
     }
 
-    /// The label of a new string literal.
-    fn string(&mut self, bytes: &[u8]) -> String {
+    /// The label of a string literal, at `pos`: the same bytes are one
+    /// literal, as clang merges them (C99 6.4.5p6 leaves it open).
+    fn string(&mut self, bytes: &[u8], pos: Pos) -> String {
+        if let Some(i) = self.strings.iter().position(|s| s == bytes) {
+            return format!(".L.str.{i}");
+        }
         self.strings.push(bytes.to_vec());
-        format!(".L.str.{}", self.strings.len() - 1)
+        let label = format!(".L.str.{}", self.strings.len() - 1);
+        if let Some(d) = self.debug.as_mut() {
+            d.literal(&label, bytes.len(), pos);
+        }
+        label
     }
 
     /// Emits a global variable or `static` local: its symbol and its data.
@@ -798,8 +831,13 @@ impl FileGen {
                         offset,
                     } => {
                         let sym = match base {
-                            Base::Sym(s) => s,
-                            Base::Str(bytes) => self.string(&bytes),
+                            Base::Sym(s) => {
+                                if let Some(d) = self.debug.as_mut() {
+                                    d.reference(&s);
+                                }
+                                s
+                            }
+                            Base::Str(bytes) => self.string(&bytes, e.pos),
                         };
                         match offset {
                             0 => sym,
@@ -929,6 +967,9 @@ struct FuncGen<'a, 'f> {
     /// With `-g`: a `.loc` has been written since the function's first, so
     /// the next is not the one that ends the prologue.
     after_prologue: bool,
+    /// With `-g`: the scopes being generated, the function's body first and
+    /// the innermost block last, with the variables declared in each.
+    scopes: Vec<Scope>,
 }
 
 impl<'a> FuncGen<'a, '_> {
@@ -961,6 +1002,9 @@ impl<'a> FuncGen<'a, '_> {
 
     /// `la reg, symbol`: `auipc` + `addi`.
     fn la(&mut self, reg: &str, symbol: &str) {
+        if let Some(d) = self.file.debug.as_mut() {
+            d.reference(symbol);
+        }
         self.ins_sized(8, "la", format!("{reg}, {symbol}"));
     }
 
@@ -1198,6 +1242,7 @@ impl<'a> FuncGen<'a, '_> {
         if let Some(d) = self.file.debug.as_mut() {
             let lines = d.loc(f.pos, Some(0), false);
             self.lines.extend(lines.into_iter().map(Line::Text));
+            self.scopes.push(Scope::default());
         }
 
         // Prologue: save ra and the caller's s0, set up s0, make room for locals.
@@ -1274,9 +1319,15 @@ impl<'a> FuncGen<'a, '_> {
         // Falling off the end returns 0. A final `return` needs no jump to the
         // epilogue, which comes right after it. Either way what follows comes
         // from the closing brace.
-        let returned = self.lines.last() == Some(&Line::Insn(insn_text("j", &self.ret_label), 4));
-        if returned {
-            self.lines.pop();
+        // (`-g`'s labels at the end of a block are not code: the jump may be
+        // just before them.)
+        let last = self
+            .lines
+            .iter()
+            .rposition(|l| !matches!(l, Line::Label(n) if n.starts_with(".Ldbg.")));
+        let returned = last.is_some_and(|i| self.lines[i] == Line::Insn(insn_text("j", &self.ret_label), 4));
+        if let (true, Some(i)) = (returned, last) {
+            self.lines.remove(i);
         }
         self.loc(f.end);
         if !returned {
@@ -1296,9 +1347,24 @@ impl<'a> FuncGen<'a, '_> {
         self.ins(load, format!("s0, {}(sp)", top - va_save - 2 * w));
         self.ins("addi", format!("sp, sp, {top}"));
         self.ins("ret", "");
-        if let Some(d) = self.file.debug.as_mut() {
+        if self.file.debug.is_some() {
             let end = format!(".Lfunc_end.{}", f.name);
-            d.function(&f.name, &end, f.pos, !f.is_static && !f.inline_only);
+            let params = self.debug_params();
+            let body = self.scopes.pop().expect("the function's scope");
+            let d = self.file.debug.as_mut().expect("-g");
+            let ret = (&f.ret, &f.ret_spelled);
+            let external = !f.is_static && !f.inline_only;
+            let flags = (external, f.prototyped);
+            d.function(
+                &f.name,
+                &end,
+                (f.pos, f.end),
+                flags,
+                ret,
+                params,
+                f.variadic,
+                body,
+            );
             self.lines.push(Line::Label(end));
         }
         self.lines.push(Line::Text(format!(".size {0}, . - {0}", f.name)));
@@ -1339,9 +1405,65 @@ impl<'a> FuncGen<'a, '_> {
         }
     }
 
+    /// `-g`: the parameters, each in its slot.
+    fn debug_params(&mut self) -> Vec<Var> {
+        let f = self.func;
+        let Some(d) = self.file.debug.as_mut() else {
+            return Vec::new();
+        };
+        f.params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let at = Location::Frame(self.offsets[i]);
+                d.var(&p.name, &p.ty, &p.spelled, p.pos, at)
+            })
+            .collect()
+    }
+
+    /// `-g`: the variable `decl` declares, in the innermost scope: a local in
+    /// its slot, a `static` local at its symbol. (A block's `extern`
+    /// declaration defines nothing.)
+    fn debug_decl(&mut self, decl: &Declarator) {
+        let Some(d) = self.file.debug.as_mut() else {
+            return;
+        };
+        let at = match &decl.var {
+            Some(VarRef::Local(id)) => Location::Frame(self.offsets[id.0]),
+            Some(VarRef::Global(sym)) if decl.storage == Storage::Static => Location::Symbol(sym.clone()),
+            _ => return,
+        };
+        let v = d.var(&decl.name, &decl.ty, &decl.spelled, decl.pos, at);
+        d.declared(&v);
+        self.scopes.last_mut().expect("a scope").push(v);
+    }
+
     // ---- statements ----
 
+    /// A statement. With `-g`, a block, and a `for` that declares its
+    /// variable, is a scope of its own, with labels around its code.
     fn stmt(&mut self, s: &'a Stmt) {
+        let scoped = match &s.kind {
+            StmtKind::Block(_) => true,
+            StmtKind::For { init: Some(init), .. } => matches!(init.kind, StmtKind::Decl(_)),
+            _ => false,
+        };
+        let Some(d) = self.file.debug.as_mut().filter(|_| scoped) else {
+            return self.unscoped_stmt(s);
+        };
+        let (begin, end) = d.block_labels();
+        self.label(&begin);
+        self.scopes.push(Scope::new(begin, end.clone()));
+        self.unscoped_stmt(s);
+        self.label(&end);
+        let inner = self.scopes.pop().expect("the block's scope");
+        self.scopes
+            .last_mut()
+            .expect("the enclosing scope")
+            .add_block(inner);
+    }
+
+    fn unscoped_stmt(&mut self, s: &'a Stmt) {
         debug_assert_eq!(self.depth, 0, "temporaries left on the stack between statements");
         // `-g`: a statement with code of its own starts a line. A loop's parts
         // and a declaration's initializers get theirs where they are made.
@@ -1364,7 +1486,9 @@ impl<'a> FuncGen<'a, '_> {
                 }
             }
             StmtKind::Decl(decls) => {
+                // Each declarator described, then initialized, as clang does.
                 for d in decls {
+                    self.debug_decl(d);
                     if d.init.is_some() && matches!(d.var, Some(VarRef::Local(_))) {
                         self.loc(d.pos);
                     }
@@ -1554,6 +1678,11 @@ impl<'a> FuncGen<'a, '_> {
             StmtKind::Label { name, body } => {
                 let label = self.goto_label(name);
                 self.label(&label);
+                // `-g`: clang describes the label, in its block.
+                if let Some(d) = self.file.debug.as_mut() {
+                    let l = d.label(name, s.pos, &label);
+                    self.scopes.last_mut().expect("a scope").push_label(l);
+                }
                 self.stmt(body);
             }
             StmtKind::Goto(name) => {
@@ -1696,6 +1825,22 @@ impl<'a> FuncGen<'a, '_> {
 
     // ---- expressions: each leaves its value in a0 ----
 
+    /// `-g`: clang keeps the type of an explicit cast in the unit (and
+    /// describes it as it is evaluated).
+    fn kept_cast(&mut self, e: &Expr) {
+        if let (
+            Some(d),
+            ExprKind::Cast {
+                implicit: false,
+                spelled,
+                ..
+            },
+        ) = (self.file.debug.as_mut(), &e.kind)
+        {
+            d.cast(&e.ty, spelled);
+        }
+    }
+
     fn expr(&mut self, e: &'a Expr) {
         match &e.kind {
             ExprKind::Num(v) => {
@@ -1705,7 +1850,7 @@ impl<'a> FuncGen<'a, '_> {
                 self.constant(*v, kind);
             }
             ExprKind::Str(bytes) => {
-                let label = self.file.string(bytes);
+                let label = self.file.string(bytes, e.pos);
                 self.la("a0", &label);
             }
             ExprKind::Var { var, .. } => match var {
@@ -1867,12 +2012,14 @@ impl<'a> FuncGen<'a, '_> {
             }
             // A constant converted (`char c = 1;`): just the converted value.
             ExprKind::Cast { x, .. } if e.ty.is_integer() && matches!(x.kind, ExprKind::Num(_)) => {
+                self.kept_cast(e);
                 let Some(Const::Int(v, kind)) = consteval::eval(e, self.xlen) else {
                     unreachable!("an integer literal cast to an integer type is constant")
                 };
                 self.constant(v, kind);
             }
             ExprKind::Cast { x, .. } => {
+                self.kept_cast(e);
                 self.expr(x);
                 self.convert(&x.ty, &e.ty);
             }
@@ -2624,7 +2771,12 @@ impl<'a> FuncGen<'a, '_> {
     fn jump_to(&mut self, direct: Option<&str>) {
         match direct {
             // `call` is `auipc ra` + `jalr ra`: two words.
-            Some(name) => self.ins_sized(8, "call", name),
+            Some(name) => {
+                if let Some(d) = self.file.debug.as_mut() {
+                    d.reference(name);
+                }
+                self.ins_sized(8, "call", name)
+            }
             None => self.ins("jalr", "t1"),
         }
     }

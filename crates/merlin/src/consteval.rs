@@ -55,7 +55,9 @@ pub fn int(e: &Expr, x: Xlen) -> Option<i128> {
 /// equal to 0, or one cast to `void *` (C99 6.3.2.3).
 pub fn is_null_pointer(e: &Expr, xlen: Xlen) -> bool {
     match &e.kind {
-        ExprKind::Cast { x, implicit: false } if e.ty == Type::ptr(Type::Void) => is_null_pointer(x, xlen),
+        ExprKind::Cast {
+            x, implicit: false, ..
+        } if e.ty == Type::ptr(Type::Void) => is_null_pointer(x, xlen),
         _ => e.ty.is_integer() && int(e, xlen) == Some(0),
     }
 }
