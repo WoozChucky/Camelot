@@ -141,16 +141,17 @@ void user_return(struct trap_frame *f);
 /* Whether `scause` is a page fault (instruction, load or store). */
 bool is_page_fault(uintptr scause);
 
-/* Sets up the PLIC and enables the interrupts the kernel handles (the
- * forwarded timer tick and external interrupts), then turns interrupts on in
- * S-mode. */
+/* Sets up the PLIC, enables the interrupts the kernel handles (the timer
+ * tick, IPIs and external interrupts), arms hart 0's first tick, then turns
+ * interrupts on in S-mode. */
 void trap_init(void);
 
 /* Name of a trap cause, e.g. "illegal instruction". `cause` is a raw scause
  * value, interrupt bit included. */
 const char *trap_cause_name(uintptr cause);
 
-/* Prints "panic: <msg>" and stops the machine with PANIC_EXIT_CODE. */
+/* Prints "panic: <msg>" and stops the machine with PANIC_EXIT_CODE
+ * (machine_power_off(), include/sbi.h). */
 void panic(const char *msg);
 
 /* Executes an illegal instruction (unimp) after setting every register but sp

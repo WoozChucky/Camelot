@@ -37,7 +37,9 @@ use std::sync::{Arc, Mutex};
 
 /// Largest image Lake creates by default, in sectors: what one Grail disk can address
 /// on an RV32 machine (version 1's `BLK_CAPACITY` register is 32 bits), just under
-/// 2 TiB.
+/// 2 TiB. An image has no width: the same one may be attached to an RV32 VM or an
+/// RV64 one, whose 64-bit `BLK_CAPACITY` would address more (and of which the RV64
+/// kernel uses as much as this), so the default is what both can use whole.
 pub const MAX_IMAGE_SECTORS: u64 = u32::MAX as u64;
 
 const SECTOR: u64 = SECTOR_SIZE as u64;

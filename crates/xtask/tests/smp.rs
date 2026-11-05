@@ -26,6 +26,8 @@ const BOOT_OUTPUT: &str = concat!(
     xtask::banner!(),
     "\
 Camelot v0.1.0 booting...
+sbi: v2.0, implementation 0x434d4c54 version 0x1
+sbi: extensions TIME IPI HSM SRST DBCN
 kprintf: d=-42 u=4294967295 x=cafef00d p=0x80000000 s=excalibur c=K %=%
 kprintf self-test: 26/26 passed
 [dbg] pc=........ a0 = 0x00000000 (0)

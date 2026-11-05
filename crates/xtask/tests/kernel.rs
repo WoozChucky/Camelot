@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{peek_byte, proc_name, LockWatch};
+use common::{peek_byte, proc_name, sbi, LockWatch};
 use excalibur::csr::{
     IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE,
     MSTATUS_SPP,
@@ -19,7 +19,7 @@ use grail::bus::{BLK_BASE, BLK_SIZE, MAX_DISKS, PLIC_BASE, RAM_BASE, SYSINFO_BAS
 use grail::cpu::Mode;
 use grail::devices::{BLK_IRQ, UART_IRQ};
 use grail::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
-use grail::sysinfo::{REG_MAGIC, REG_TIMEBASE_HZ};
+use grail::sysinfo::{REG_HARTS, REG_MAGIC, REG_RAM_BASE, REG_RAM_SIZE, REG_TIMEBASE_HZ};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
 use std::collections::HashMap;
 use std::io::Write;
@@ -39,6 +39,8 @@ const BOOT_OUTPUT: &str = concat!(
     xtask::banner!(),
     "\
 Camelot v0.1.0 booting...
+sbi: v2.0, implementation 0x434d4c54 version 0x1
+sbi: extensions TIME IPI HSM SRST DBCN
 kprintf: d=-42 u=4294967295 x=cafef00d p=0x80000000 s=excalibur c=K %=%
 kprintf self-test: 26/26 passed
 [dbg] pc=........ a0 = 0x00000000 (0)
@@ -92,11 +94,10 @@ const PANIC_EXIT: u32 = 0xfe;
 /// kernel/entry.s).
 const UNEXPECTED_TRAP_EXIT: u32 = 0xff;
 
-/// Byte offsets in hart 0's block of `machine_scratch` (`MSCRATCH_INTERVAL`
-/// and `MSCRATCH_TICK` words, kernel/include/machine.h): the timer interval,
-/// and the word machine_vec sets with each tick it forwards.
-const SCRATCH_INTERVAL: u32 = 12;
-const SCRATCH_TICK: u32 = 20;
+/// Each hart's next tick deadline, a u64 (`next_tick` in kernel/timer.c),
+/// and the timebase the kernel read from sysinfo (`timebase`, a u32).
+const NEXT_TICK: &str = "next_tick";
+const TIMEBASE: &str = "timebase";
 
 /// Values of the kernel's `boot_fault` (kernel/main.c).
 const BOOT_FAULT_NONE: u32 = 1;
@@ -258,10 +259,14 @@ fn committed_kernel_layout() {
     assert_eq!(sym(&elf, "_start"), 0x8000_0000);
     for s in [
         "kmain",
-        "start",
+        "sbi_coldboot",
+        "sbi_hart_init",
+        "sbi_hart_wait",
         "supervisor_entry",
+        "secondary_entry",
         "machine_vec",
-        "machine_halt",
+        "machine_power_off",
+        "sbi_ecall",
         "kernel_vec",
         "kernel_trap",
         "illegal_instruction",
@@ -270,7 +275,6 @@ fn committed_kernel_layout() {
         "kvformat",
         "uart_putc",
         "xcal_dbg",
-        "xcal_halt",
         "kinit",
         "kalloc",
         "kfree",
@@ -340,17 +344,18 @@ fn entry_clears_bss() {
 
 #[test]
 fn early_trap_reports_and_halts() {
-    // Replace start()'s first instruction (M-mode, before machine_vec is
-    // installed) with an illegal one: the early trap handler prints mcause,
-    // mepc, mtval and exits with 0xff. The word is not 0, so the report
-    // shows that mtval is really read (it holds the instruction's bits).
+    // Replace the SBI coldboot's first instruction (M-mode, before
+    // sbi_hart_init installs machine_vec) with an illegal one: the early
+    // trap handler prints mcause, mepc, mtval and exits with 0xff. The word
+    // is not 0, so the report shows that mtval is really read (it holds the
+    // instruction's bits).
     let illegal = 0xffff_ffff;
     assert_eq!(
         excalibur::decode(illegal, excalibur::Xlen::Rv32),
         excalibur::Inst::Illegal(illegal)
     );
     let (mut m, elf) = load_committed();
-    let start = sym(&elf, "start");
+    let start = sym(&elf, "sbi_coldboot");
     m.cpu.bus.load(start.into(), &illegal.to_le_bytes()).unwrap();
     let r = m.run(Some(BOOT_MAX_STEPS), |_| {});
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
@@ -364,11 +369,12 @@ fn early_trap_reports_and_halts() {
 
 #[test]
 fn unexpected_machine_trap_reports_and_halts() {
-    // A trap in M-mode once start() has installed machine_vec, which handles
-    // only the timer and machine calls, falls through to early_trap. timer_init
-    // runs after w_mtvec(machine_vec): make it trap in three ways.
+    // A trap in M-mode once sbi_hart_init has installed machine_vec, which
+    // handles only the timer, IPIs and SBI calls, falls through to
+    // early_trap. The coldboot enters S-mode through sbi_enter_supervisor
+    // after that: make it trap in three ways.
     let (_, elf) = load_committed();
-    let (timer_init, machine_vec) = (sym(&elf, "timer_init"), sym(&elf, "machine_vec"));
+    let (timer_init, machine_vec) = (sym(&elf, "sbi_enter_supervisor"), sym(&elf, "machine_vec"));
     for (word, mcause, mtval) in [
         (0xffff_ffff, ILLEGAL_INSTRUCTION, 0xffff_ffff), // mtval = its bits
         (0x0000_0073, grail::trap::Exception::EcallM as u32, 0),
@@ -425,7 +431,8 @@ fn halt_uses_kmain_return_value() {
     let mut code = li_a0_7.to_le_bytes().to_vec();
     code.extend_from_slice(&ret.to_le_bytes());
     m.cpu.bus.load(kmain.into(), &code).unwrap();
-    // kmain runs in S-mode, so the code reaches xcal.halt via MCALL_HALT.
+    // kmain runs in S-mode, so the code reaches xcal.halt through the SBI's
+    // system_reset (machine_power_off()).
     assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(7));
     assert!(m.cpu.bus.uart.captured.is_empty());
 }
@@ -562,21 +569,25 @@ fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
 }
 
 #[test]
-fn unknown_machine_call_returns_minus_one() {
-    // kmain: li a7, 99; li a1, 40; ecall; add a0, a0, a1; ret. machine_vec
-    // returns -1 in a0 and leaves a1 alone, so kmain returns 39.
+fn unknown_sbi_extension_returns_not_supported() {
+    // kmain: li a7, 99; li a1, 40; li a2, 50; ecall; add a0, a0, a1;
+    // add a0, a0, a2; ret. The SBI returns SBI_ERR_NOT_SUPPORTED (-2) in a0
+    // and 0 in a1 and keeps a2, so kmain returns 48. (tests/sbi.rs drives
+    // every call.)
     let (mut m, elf) = load_committed();
-    let (a0, a1, a7) = (x("a0"), x("a1"), x("a7"));
+    let (a0, a1, a2, a7) = (x("a0"), x("a1"), x("a2"), x("a7"));
     let code = [
         addi(a7, 0, 99),
         addi(a1, 0, 40),
+        addi(a2, 0, 50),
         0x0000_0073,                                // ecall
         (a1 << 20) | (a0 << 15) | (a0 << 7) | 0x33, // add a0, a0, a1
+        (a2 << 20) | (a0 << 15) | (a0 << 7) | 0x33, // add a0, a0, a2
         0x0000_8067,                                // ret
     ];
     let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
     m.cpu.bus.load(sym(&elf, "kmain").into(), &bytes).unwrap();
-    assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(39));
+    assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(48));
 }
 
 #[test]
@@ -591,29 +602,24 @@ fn kmain_runs_in_s_mode_with_traps_delegated() {
     }
     assert_eq!(m.cpu.mode, Mode::S);
     let c = &m.cpu.csr;
-    // Every exception but ecall from S (the machine calls) and from M.
+    // Every exception but ecall from S (the SBI calls) and from M.
     assert_eq!(c.medeleg, 0xb1ff);
     // All S-level interrupts; the machine timer stays in M-mode.
     assert_eq!(
         c.mideleg,
         (1 << IRQ_S_SOFT) | (1 << IRQ_S_TIMER) | (1 << IRQ_S_EXT)
     );
-    // The machine timer and the IPI (on one hart too) stay in M-mode.
-    assert_eq!(c.mie, (1 << IRQ_M_TIMER) | (1 << IRQ_M_SOFT));
+    // Only the IPI (on one hart too): the SBI's set_timer enables the
+    // machine timer, and trap_init the S-level interrupts.
+    assert_eq!(c.mie, 1 << IRQ_M_SOFT);
     assert_eq!(c.mtvec, u64::from(sym(&elf, "machine_vec")));
     assert_eq!(c.stvec, u64::from(sym(&elf, "kernel_vec")));
-    let scratch = sym(&elf, "machine_scratch");
-    assert_eq!(c.mscratch, u64::from(scratch));
-    assert_eq!(
-        m.cpu.bus.peek(u64::from(scratch + SCRATCH_INTERVAL)),
-        Some(TICK_INTERVAL as u32)
-    );
+    assert_eq!(c.mscratch, u64::from(sym(&elf, "machine_scratch")));
     // S-mode interrupts stay off until trap_init.
     assert_eq!(c.mstatus & MSTATUS_SIE, 0);
-    // The first tick is armed one interval after start() ran.
-    let clint = &m.cpu.bus.clint;
-    assert!(clint.mtimecmp[0] > clint.mtime && clint.mtimecmp[0] - clint.mtime < TICK_INTERVAL);
-    assert!(clint.mtimecmp[0] <= TICK_INTERVAL + steps);
+    // No tick armed yet: trap_init arms the first.
+    assert_eq!(m.cpu.bus.clint.mtimecmp[0], u64::MAX);
+    assert!(steps < TO_KMAIN_STEPS);
 }
 
 #[test]
@@ -627,14 +633,18 @@ fn ticks_are_one_interval_apart() {
     let (run_shell, ticks) = (sym(&elf, "proc_run_init"), sym(&elf, "ticks"));
     let mut shell_started = false;
     let mut ticks_at_shell = None;
-    // Machine ticks before trap_init enables the kernel's tick, and after.
+    // Machine timer interrupts before trap_init arms the first tick, and
+    // after.
     let mut early_ticks = 0;
     let mut machine_ticks = Vec::new();
     let mut deadlines = Vec::new();
     let mut kernel_ticks = Vec::new();
+    // The SBI calls before the shell: set_timer, and the others' extensions.
+    let mut set_timers = 0;
+    let mut other_calls = Vec::new();
     let mut external = 0;
     let mut steps_after_trap_init = None;
-    let mut halts = 0;
+    let mut resets = 0;
     let probes = [sym(&elf, "probe_load_insn"), sym(&elf, "probe_store_insn")];
     let mut probe_faults = 0;
     let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
@@ -648,11 +658,11 @@ fn ticks_are_one_interval_apart() {
         if let (Some(steps), false) = (&mut steps_after_trap_init, shell_started) {
             *steps += 1;
         }
+        let ecall = cpu.pc == u64::from(machine_vec) && cpu.csr.mcause == u64::from(ECALL_FROM_S);
+        if ecall && cpu.x[x("a7") as usize] == sbi::EXT_SRST {
+            resets += 1;
+        }
         if shell_started {
-            // Only the final MCALL_HALT may reach M-mode other than a tick.
-            if cpu.pc == u64::from(machine_vec) && cpu.csr.mcause == u64::from(ECALL_FROM_S) {
-                halts += 1;
-            }
             return;
         }
         if cpu.pc == u64::from(machine_vec) {
@@ -664,9 +674,12 @@ fn ticks_are_one_interval_apart() {
                 }
                 deadlines.push(cpu.bus.clint.mtimecmp[0]);
             } else {
-                // The only other trap to M-mode: the final MCALL_HALT.
-                assert_eq!(cpu.csr.mcause, u64::from(ECALL_FROM_S));
-                halts += 1;
+                // The only other trap to M-mode: SBI calls.
+                assert!(ecall, "mcause {:#x}", cpu.csr.mcause);
+                match cpu.x[x("a7") as usize] {
+                    sbi::EXT_TIME => set_timers += 1,
+                    eid => other_calls.push(eid),
+                }
             }
         }
         if cpu.pc == u64::from(kernel_vec) && cpu.csr.scause & INTERRUPT_BIT == 0 {
@@ -682,28 +695,34 @@ fn ticks_are_one_interval_apart() {
             // The UART receiving the shell's `exit`.
             external += 1;
         } else if cpu.pc == u64::from(kernel_vec) {
-            assert_eq!(cpu.csr.scause, INTERRUPT_BIT | u64::from(IRQ_S_SOFT));
+            // A tick: the supervisor timer interrupt, never an IPI on one
+            // hart.
+            assert_eq!(cpu.csr.scause, INTERRUPT_BIT | u64::from(IRQ_S_TIMER));
             // Ticks arrive with paging on.
             assert_ne!(cpu.csr.satp >> 31, 0, "tick before paging");
             kernel_ticks.push(cpu.bus.clint.mtime);
         }
     });
     assert_eq!(r, RunResult::Exited(0));
-    assert_eq!(halts, 1);
+    assert_eq!(resets, 1);
     // All of `exit\n` was waiting before interrupts were on: one interrupt
     // drains it.
     assert_eq!(external, 1);
     // Unmapped load and store, stores to text and rodata.
     assert_eq!(probe_faults, 4);
-    // Setting up memory takes a few intervals, so machine ticks fire before
-    // trap_init. They leave SSIP pending, which trap_init drops: the kernel
-    // then waits ten whole intervals, one machine tick each.
-    assert!(early_ticks > 0, "memory setup took less than one interval");
+    // No tick before trap_init arms the first; then the kernel waits ten
+    // whole intervals, one machine tick each, which the SBI forwards.
+    assert_eq!(early_ticks, 0);
     assert_eq!(machine_ticks.len(), 10, "{machine_ticks:?}");
     assert_eq!(kernel_ticks.len(), 10);
-    // The deadlines are exactly one interval apart (machine_vec adds the
-    // interval to mtimecmp, so ticks don't drift), and after trap_init every
-    // tick lands in wfi, right on its deadline.
+    // One set_timer for the first tick, then one in each tick for the next.
+    assert_eq!(set_timers, 11);
+    // sbi_init's: the version, the implementation and its version, and a
+    // probe for each extension it looks for.
+    assert_eq!(other_calls, [sbi::EXT_BASE; 8]);
+    // The deadlines are exactly one interval apart (the kernel adds the
+    // interval to the last deadline, so ticks don't drift), and every tick
+    // lands in wfi, right on its deadline.
     for w in deadlines.windows(2) {
         assert_eq!(w[1] - w[0], TICK_INTERVAL, "{deadlines:?}");
     }
@@ -764,8 +783,9 @@ fn reg_pattern(tag: u32, sp: u32) -> [u32; 32] {
 
 /// Boots the committed kernel up to kmain, then turns kmain into `j .; j .`
 /// and fills every register but sp and tp with `reg_pattern(0xa5, ..)`: busy code
-/// with every register live. S-mode interrupts are on, as after trap_init.
-/// Returns the machine, the ELF and the registers.
+/// with every register live. S-mode interrupts are on and the timer's
+/// enabled, as after trap_init. Returns the machine, the ELF and the
+/// registers.
 fn busy_kmain() -> (Machine, grail::elf::Elf, [u32; 32]) {
     let (mut m, elf) = load_committed();
     let kmain = sym(&elf, "kmain");
@@ -777,36 +797,53 @@ fn busy_kmain() -> (Machine, grail::elf::Elf, [u32; 32]) {
     // (spec section 10, "Kernel locking"), and the trap handlers take locks.
     regs[x("tp") as usize] = m.cpu.x[x("tp") as usize] as u32;
     set_regs(&mut m, &regs);
-    m.cpu.csr.mie |= 1 << IRQ_S_SOFT;
+    m.cpu.csr.mie |= (1 << IRQ_S_SOFT) | (1 << IRQ_S_TIMER);
     m.cpu.csr.mstatus |= MSTATUS_SIE;
     (m, elf, regs)
 }
 
 #[test]
 fn tick_preserves_every_register() {
-    // A tick goes through both handlers: machine_vec (rearm the timer, raise
-    // SSIP) and kernel_vec (count it). Neither may change a register.
+    // A tick goes through both handlers: machine_vec (raise STIP, mask the
+    // machine timer) and kernel_vec (set the next deadline with an SBI call,
+    // which goes through machine_vec again, and count the tick). None may
+    // change a register.
     let (mut m, elf, regs) = busy_kmain();
     let kmain = sym(&elf, "kmain");
+    // A deadline 20 ticks away, as set_timer would leave it: in mtimecmp,
+    // with the machine timer enabled, and the kernel's record of it.
     let clint = &mut m.cpu.bus.clint;
     clint.mtimecmp[0] = clint.mtime + 20;
     let cmp = clint.mtimecmp[0];
+    m.cpu.csr.mie |= 1 << IRQ_M_TIMER;
+    m.cpu
+        .bus
+        .load(sym(&elf, NEXT_TICK).into(), &cmp.to_le_bytes())
+        .unwrap();
 
     step_to(&mut m, sym(&elf, "machine_vec"));
     assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | u64::from(IRQ_M_TIMER));
     assert_eq!(m.cpu.csr.mepc, u64::from(kmain));
     // machine_vec returns to the loop, which takes the forwarded tick at once.
     step_to(&mut m, sym(&elf, "kernel_vec"));
-    assert_eq!(m.cpu.csr.scause, INTERRUPT_BIT | u64::from(IRQ_S_SOFT));
+    assert_eq!(m.cpu.csr.scause, INTERRUPT_BIT | u64::from(IRQ_S_TIMER));
     assert_eq!(m.cpu.csr.sepc, u64::from(kmain));
     assert_eq!(regs32(&m), regs, "machine_vec changed registers");
-    assert_eq!(m.cpu.bus.clint.mtimecmp[0], cmp + TICK_INTERVAL);
+    assert_eq!(
+        m.cpu.csr.mie & (1 << IRQ_M_TIMER),
+        0,
+        "the machine timer is masked"
+    );
 
     step_to(&mut m, kmain);
     assert_eq!(m.cpu.mode, Mode::S);
     assert_eq!(regs32(&m), regs, "kernel_vec changed registers");
     assert_ne!(m.cpu.csr.mstatus & MSTATUS_SIE, 0);
-    assert_eq!(m.cpu.csr.mip & (1 << IRQ_S_SOFT), 0);
+    // The next deadline one interval after this one, the tick no longer
+    // pending, the machine timer on again for the next.
+    assert_eq!(m.cpu.bus.clint.mtimecmp[0], cmp + TICK_INTERVAL);
+    assert_eq!(m.cpu.csr.mip & (1 << IRQ_S_TIMER), 0);
+    assert_ne!(m.cpu.csr.mie & (1 << IRQ_M_TIMER), 0);
     assert_eq!(m.cpu.bus.peek(sym(&elf, "ticks").into()), Some(1));
 }
 
@@ -816,16 +853,8 @@ fn kernel_vec_resumes_from_the_frame() {
     // it: every register, sepc and sstatus are loaded back from the frame.
     let (mut m, elf, regs) = busy_kmain();
     let kmain = sym(&elf, "kmain");
-    // A tick, as machine_vec raises it: SSIP, and the tick word that tells it
-    // from an IPI.
-    m.cpu.csr.mip |= 1 << IRQ_S_SOFT;
-    m.cpu
-        .bus
-        .load(
-            u64::from(sym(&elf, "machine_scratch") + SCRATCH_TICK),
-            &1u32.to_le_bytes(),
-        )
-        .unwrap();
+    // A tick, as machine_vec raises it: STIP.
+    m.cpu.csr.mip |= 1 << IRQ_S_TIMER;
     step_to(&mut m, sym(&elf, "kernel_trap"));
     let frame = m.cpu.x[x("a0") as usize] as u32;
     let peek = |m: &Machine, off: u32| m.cpu.bus.peek(u64::from(frame + off)).unwrap();
@@ -835,7 +864,7 @@ fn kernel_vec_resumes_from_the_frame() {
     assert_eq!(peek(&m, FRAME_SEPC), kmain);
     assert_eq!(
         u64::from(peek(&m, FRAME_SCAUSE)),
-        INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
+        INTERRUPT_BIT | u64::from(IRQ_S_TIMER)
     );
     let sstatus = u64::from(peek(&m, FRAME_SSTATUS));
     assert_ne!(sstatus & MSTATUS_SPIE, 0);
@@ -860,27 +889,34 @@ fn kernel_vec_resumes_from_the_frame() {
 
 #[test]
 fn ticks_preempting_kernel_code_change_nothing() {
-    // Shorten the tick interval to about a thousand mtime ticks (a prime, so
-    // the ticks don't fall into step with a loop; any shorter and merlin's
-    // tick handler would leave the kernel no time between ticks, where
-    // clang's managed with 211) right after start() armed the
-    // timer. Ticks then land all over kprintf and its self-test instead of
-    // only in wait_ticks' idle loop. A clobbered register would fail the
-    // self-test, garble the output or fault; and every tick still gets its
-    // own line.
-    const SHORT_INTERVAL: u32 = 1009;
+    // Shorten the tick interval to about fifteen hundred mtime ticks (a
+    // prime, so the ticks don't fall into step with a loop; much shorter and
+    // merlin's tick handler, the next deadline and its SBI call included,
+    // would leave the kernel no time between ticks, where clang's managed
+    // with 211) once trap_init has armed the first tick and
+    // kmain has printed the timebase: the kernel's timebase, which the
+    // interval comes from, ten times the interval, and the deadline set to
+    // match. Ticks then land all over the disk, filesystem and network setup
+    // and the self-tests instead of only in wait_ticks' idle loop. A
+    // clobbered register would fail a self-test, garble the output or fault;
+    // and every tick still gets its own line.
+    const SHORT_INTERVAL: u32 = 1499;
     let (mut m, elf) = load_committed();
-    step_to(&mut m, sym(&elf, "supervisor_entry"));
-    let scratch = sym(&elf, "machine_scratch");
+    step_until(
+        &mut m,
+        BOOT_MAX_STEPS,
+        |_| {},
+        |m| printed(m).ends_with("Hz timebase\n"),
+    );
+    let timebase = sym(&elf, TIMEBASE);
+    let set_timebase = |m: &mut Machine, hz: u32| m.cpu.bus.load(timebase.into(), &hz.to_le_bytes()).unwrap();
+    set_timebase(&mut m, SHORT_INTERVAL * 10);
+    let cmp = m.cpu.bus.clint.mtime + u64::from(SHORT_INTERVAL);
+    m.cpu.bus.clint.mtimecmp[0] = cmp;
     m.cpu
         .bus
-        .load(
-            u64::from(scratch + SCRATCH_INTERVAL),
-            &SHORT_INTERVAL.to_le_bytes(),
-        )
+        .load(sym(&elf, NEXT_TICK).into(), &cmp.to_le_bytes())
         .unwrap();
-    let clint = &mut m.cpu.bus.clint;
-    clint.mtimecmp[0] = clint.mtime + u64::from(SHORT_INTERVAL);
 
     // Where a tick interrupts wait_ticks' idle loop: after `wfi` in M-mode,
     // and after intr_on's `csrsi` in S-mode.
@@ -906,19 +942,13 @@ fn ticks_preempting_kernel_code_change_nothing() {
         },
         |m| m.cpu.pc == u64::from(sym(&elf, "proc_run_init")),
     );
-    m.cpu
-        .bus
-        .load(
-            u64::from(scratch + SCRATCH_INTERVAL),
-            &(TICK_INTERVAL as u32).to_le_bytes(),
-        )
-        .unwrap();
+    set_timebase(&mut m, (TICK_INTERVAL * 10) as u32);
     let r = m.run(Some(BOOT_MAX_STEPS), |_| {});
     let out = printed(&m);
     assert_eq!(kernel::mask_dbg_pc(&out), halted_output(), "raw output:\n{out}");
     assert_eq!(r, RunResult::Exited(0));
-    // Fewer kernel ticks: until trap_init, the machine ticks only pile up in
-    // the one SSIP bit, which trap_init then drops.
+    // Each machine tick is one kernel tick: the SBI forwards it as STIP,
+    // which only the kernel's next set_timer clears.
     assert!(
         machine_busy >= 100 && kernel_busy >= 30,
         "only {machine_busy} machine and {kernel_busy} kernel ticks outside the idle loop"
@@ -927,23 +957,27 @@ fn ticks_preempting_kernel_code_change_nothing() {
 
 #[test]
 fn timer_rearm_carries_into_the_high_word() {
-    // machine_vec adds the interval to mtimecmp as two 32-bit halves: a tick
-    // just below 2^32 must carry into the high word.
+    // On RV32 the next deadline goes to set_timer in two registers, the low
+    // half in a0 and the high one in a1, and the SBI writes mtimecmp by
+    // halves: a tick just below 2^32 must carry into the high word.
     const CMP: u64 = 0xffff_ff00;
-    let (mut m, elf) = load_committed();
-    step_to(&mut m, sym(&elf, "kmain"));
+    let (mut m, elf, _) = busy_kmain();
     let clint = &mut m.cpu.bus.clint;
     clint.mtime = CMP - 0x100;
     clint.mtimecmp[0] = CMP;
+    m.cpu.csr.mie |= 1 << IRQ_M_TIMER;
+    m.cpu
+        .bus
+        .load(sym(&elf, NEXT_TICK).into(), &CMP.to_le_bytes())
+        .unwrap();
     step_to(&mut m, sym(&elf, "machine_vec"));
     assert_eq!(m.cpu.csr.mcause, INTERRUPT_BIT | u64::from(IRQ_M_TIMER));
-    for _ in 0..100 {
-        if m.cpu.mode != Mode::M {
-            break;
-        }
-        m.cpu.step();
-    }
-    assert_eq!(m.cpu.mode, Mode::S, "machine_vec never returned");
+    step_to(&mut m, sym(&elf, "sbi_time"));
+    assert_eq!(
+        (m.cpu.x[x("a0") as usize] as u32, m.cpu.x[x("a1") as usize] as u32),
+        ((CMP + TICK_INTERVAL) as u32, 1)
+    );
+    step_to(&mut m, sym(&elf, "kmain"));
     assert_eq!(m.cpu.bus.clint.mtimecmp[0], CMP + TICK_INTERVAL);
     assert!(m.cpu.bus.clint.mtimecmp[0] > 1 << 32);
 }
@@ -1455,7 +1489,7 @@ fn allocator_handles_ram_up_to_the_top_of_the_address_space() {
 #[test]
 fn fault_with_interrupts_off_panics() {
     // An illegal instruction as kmain's first: S-mode traps work before
-    // trap_init, since start() sets stvec before dropping to S-mode.
+    // trap_init, since supervisor_entry sets stvec before it calls kmain.
     let (mut m, elf) = load_committed();
     let kmain = sym(&elf, "kmain");
     m.cpu.bus.load(kmain.into(), &[0, 0, 0, 0]).unwrap();
@@ -1467,9 +1501,9 @@ fn fault_with_interrupts_off_panics() {
     assert_eq!((v["scause"], v["sepc"], v["stval"]), (2, kmain, 0));
     assert_eq!(v["sstatus"] & MSTATUS_SPIE as u32, 0);
     // ra is where kmain would have returned to: supervisor_entry's
-    // instruction after the call (after the branch that sends the other
-    // harts to hart_main, and the call's two instructions).
-    assert_eq!(v["ra"], sym(&elf, "supervisor_entry") + 12);
+    // instruction after the call (after `mv tp, a0`, `la t0, kernel_vec`
+    // and `csrw stvec, t0`, and the call's two instructions).
+    assert_eq!(v["ra"], sym(&elf, "supervisor_entry") + 24);
 }
 
 // ---- The console and the shell ----
@@ -1749,9 +1783,14 @@ fn shell_takes_more_input_than_the_ring_buffer_holds() {
 
 #[test]
 fn plic_routes_the_uart_to_the_kernel() {
-    // No input: the kernel waits at the prompt.
-    let (mut m, _) = load_committed_on(MachineConfig::default(), None);
+    // No input: the kernel waits at the prompt. It is looked at once the
+    // hart first reaches wfi: before, a tick may be on its way (the timing
+    // of boot and of the shell's start decides it), STIP pending with
+    // M-mode's timer off until the handler's set_timer turns it on again.
+    let (mut m, elf) = load_committed_on(MachineConfig::default(), None);
+    let wfi = sym(&elf, "wfi");
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == u64::from(wfi));
     let mut reg = |addr| m.cpu.bus.read(addr, 4).unwrap();
     // Source 1 (the UART) at priority 1, enabled for context 1 (S-mode) only,
     // whose threshold of 0 lets it through.
@@ -1759,12 +1798,13 @@ fn plic_routes_the_uart_to_the_kernel() {
     assert_eq!(reg(plic_enable(1)), 1 << UART_IRQ);
     assert_eq!(reg(plic_threshold(1)), 0);
     assert_eq!(reg(plic_enable(0)), 0);
-    // sie.SEIE on (with the tick's SSIE, and M-mode's timer and IPI); M-mode
+    // sie.SEIE on (with the tick's STIE and the IPI's SSIE, and M-mode's
+    // timer, which the next tick's set_timer has enabled, and IPI); M-mode
     // external interrupts stay off.
     let mie = m.cpu.csr.mie;
     assert_eq!(
         mie,
-        (1 << IRQ_M_TIMER) | (1 << IRQ_M_SOFT) | (1 << IRQ_S_SOFT) | (1 << IRQ_S_EXT),
+        (1 << IRQ_M_TIMER) | (1 << IRQ_M_SOFT) | (1 << IRQ_S_SOFT) | (1 << IRQ_S_TIMER) | (1 << IRQ_S_EXT),
         "mie {mie:#x}"
     );
     assert_eq!(mie & (1 << IRQ_M_EXT), 0);
@@ -1820,8 +1860,10 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     );
     assert_eq!(uart_reads, 0, "the kernel polls the UART while idle");
     assert!((50..=51).contains(&wfis), "{wfis} wfi for 50 ticks");
-    // About a thousand each with merlin's unoptimized code.
-    assert!(steps < 50 * 2000, "{steps} steps for 50 idle ticks");
+    // About two thousand each with merlin's unoptimized code: the
+    // scheduler's look for work, the tick, its next deadline and the SBI
+    // call that sets it.
+    assert!(steps < 50 * 2500, "{steps} steps for 50 idle ticks");
 
     // Type a command: the UART interrupt wakes the hart at once and the
     // console wakes the shell (no tick passes before the ticks program
@@ -1879,14 +1921,7 @@ fn kernel_reads_the_timebase_from_sysinfo() {
         ..MachineConfig::default()
     };
     let (mut m, elf) = load_committed_on(config, Some(kernel::typed(EXIT)));
-    step_to(&mut m, sym(&elf, "kmain"));
     let interval = HZ / 10;
-    assert_eq!(
-        m.cpu
-            .bus
-            .peek(u64::from(sym(&elf, "machine_scratch") + SCRATCH_INTERVAL)),
-        Some(interval)
-    );
     let (kernel_vec, run_shell) = (sym(&elf, "kernel_vec"), sym(&elf, "proc_run_init"));
     let mut kernel_ticks = Vec::new();
     let mut shell_started = false;
@@ -1894,7 +1929,7 @@ fn kernel_reads_the_timebase_from_sysinfo() {
         shell_started |= cpu.pc == u64::from(run_shell);
         if !shell_started
             && cpu.pc == u64::from(kernel_vec)
-            && cpu.csr.scause == INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
+            && cpu.csr.scause == INTERRUPT_BIT | u64::from(IRQ_S_TIMER)
         {
             kernel_ticks.push(cpu.bus.clint.mtime);
         }
@@ -1903,11 +1938,11 @@ fn kernel_reads_the_timebase_from_sysinfo() {
     let want = halted_output().replace("10000000 Hz timebase", "2000000 Hz timebase");
     assert_eq!(kernel::mask_dbg_pc(&printed(&m)), want);
     // Ten ticks before the shell starts, each a 200 000-tick interval.
-    // (Setting up memory takes a few intervals before them, so the total
-    // mtime says little; starting the shell may take more than one.) The
-    // first may come while the kernel is still busy rather than idle in
-    // wfi, which it reaches a few instructions sooner: how long setting up
-    // memory took decides that, so the first interval is only close.
+    // (Setting up memory comes before them, so the total mtime says little;
+    // starting the shell may take more than one.) The first may come while
+    // the kernel is still busy rather than idle in wfi, which it reaches a
+    // few instructions sooner: how long the setup after trap_init took
+    // decides that, so the first interval is only close.
     assert_eq!(kernel_ticks.len(), 10, "{kernel_ticks:?}");
     let first = kernel_ticks[1] - kernel_ticks[0];
     assert!(first.abs_diff(u64::from(interval)) < 100, "{kernel_ticks:?}");
@@ -1919,30 +1954,30 @@ fn kernel_reads_the_timebase_from_sysinfo() {
 #[test]
 fn timer_interval_is_never_zero() {
     // A timebase below the tick rate would give an interval of 0, which
-    // would never move mtimecmp; the kernel uses 1 instead. (A machine that
-    // slow can't run the kernel anyway: the timer fires faster than
-    // machine_vec handles it. So only timer_init is checked.)
-    let config = MachineConfig {
-        nominal_hz: 5,
-        ..MachineConfig::default()
-    };
-    let (mut m, elf) = load_committed_on(config, None);
-    let interval = sym(&elf, "machine_scratch") + SCRATCH_INTERVAL;
-    step_until(
-        &mut m,
-        TO_KMAIN_STEPS,
-        |_| {},
-        |m| m.cpu.bus.peek(interval.into()) != Some(0),
-    );
-    assert_eq!(m.cpu.bus.peek(interval.into()), Some(1));
+    // would set every deadline to now; the kernel uses 1 instead. (A machine
+    // that slow can't run the kernel anyway: the timer fires faster than
+    // the kernel handles it. So timer_interval() is called on its own.)
+    for (hz, interval) in [(5, 1), (10_000_000, TICK_INTERVAL as u32)] {
+        let config = MachineConfig {
+            nominal_hz: hz,
+            ..MachineConfig::default()
+        };
+        let (mut m, elf) = load_committed_on(config, None);
+        assert_eq!(
+            call_kernel(&mut m, &elf, "timer_interval", &[]),
+            interval,
+            "{hz} Hz"
+        );
+    }
 }
 
 #[test]
-fn timebase_is_read_once_in_m_mode() {
-    // timebase_hz() reads sysinfo on its first call, from timer_init in
-    // M-mode, and keeps the value: S-mode code (kmain prints the timebase)
-    // never reads the timebase again. The S-mode reads are kinit's (magic,
-    // version, RAM base and size) and kvminit's (the device table).
+fn timebase_is_read_once() {
+    // timebase_hz() reads sysinfo on its first call, from trap_init's
+    // timer_start, and keeps the value: kmain's print of the timebase, every
+    // tick's next deadline and the other harts' first never read it again.
+    // M-mode reads only what the SBI's coldboot needs: the magic, the harts
+    // and RAM.
     let (mut m, _) = load_committed();
     let mut reads = Vec::new();
     let r = m.run(Some(BOOT_MAX_STEPS), |cpu| {
@@ -1954,29 +1989,28 @@ fn timebase_is_read_once_in_m_mode() {
         }
     });
     assert_eq!(r, RunResult::Exited(0));
-    let m_mode: Vec<_> = reads.iter().filter(|r| r.1 == Mode::M).copied().collect();
-    assert_eq!(m_mode, [(REG_MAGIC, Mode::M), (REG_TIMEBASE_HZ, Mode::M)]);
-    assert!(
-        !reads.contains(&(REG_TIMEBASE_HZ, Mode::S)),
-        "timebase read again in S-mode: {reads:?}"
-    );
+    let m_mode: Vec<_> = reads.iter().filter(|r| r.1 == Mode::M).map(|r| r.0).collect();
+    assert_eq!(m_mode, [REG_MAGIC, REG_HARTS, REG_RAM_BASE, REG_RAM_SIZE]);
+    let timebase = reads.iter().filter(|r| r.0 == REG_TIMEBASE_HZ).count();
+    assert_eq!(timebase, 1, "{reads:?}");
 }
 
 /// Boots the committed kernel on a machine reporting a 2 MHz clock, but with
-/// sysinfo register `reg` reading as 0. Returns the sysinfo registers read
-/// before kmain, the timer interval timer_init stored and the whole output.
-fn boot_with_sysinfo_reg_zero(reg: u32) -> (Vec<u32>, u32, String) {
+/// sysinfo register `reg` reading as 0 to the first timebase_hz(), the one
+/// that reads sysinfo. Returns the sysinfo registers that call read and the
+/// whole output.
+fn boot_with_sysinfo_reg_zero(reg: u32) -> (Vec<u32>, String) {
     let config = MachineConfig {
         nominal_hz: 2_000_000,
         ..MachineConfig::default()
     };
     let (mut m, elf) = load_committed_on(config, Some(kernel::typed(EXIT)));
-    let kmain = sym(&elf, "kmain");
+    step_to_far(&mut m, sym(&elf, "timebase_hz"));
+    // The return address, as the RV32 hart's 32 bits (it keeps registers
+    // sign-extended).
+    let back = u64::from(m.cpu.x[x("ra") as usize] as u32);
     let mut reads = Vec::new();
-    for _ in 0..TO_KMAIN_STEPS {
-        if m.cpu.pc == u64::from(kmain) {
-            break;
-        }
+    while m.cpu.pc != back {
         let read = mem_access(&m.cpu)
             .and_then(|a| Some((device_offset(a.addr, SYSINFO_BASE, SYSINFO_SIZE)?, a.load_rd?)));
         m.cpu.step();
@@ -1987,31 +2021,30 @@ fn boot_with_sysinfo_reg_zero(reg: u32) -> (Vec<u32>, u32, String) {
             }
         }
     }
-    assert_eq!(m.cpu.pc, u64::from(kmain), "never reached kmain");
-    let interval = m
-        .cpu
-        .bus
-        .peek(u64::from(sym(&elf, "machine_scratch") + SCRATCH_INTERVAL))
-        .unwrap();
     assert_eq!(m.run(Some(BOOT_MAX_STEPS), |_| {}), RunResult::Exited(0));
-    (reads, interval, kernel::mask_dbg_pc(&printed(&m)))
+    (reads, kernel::mask_dbg_pc(&printed(&m)))
+}
+
+/// Steps the machine until it is about to execute `pc`, which may be past
+/// the whole early boot (step_to stops at TO_KMAIN_STEPS).
+fn step_to_far(m: &mut Machine, pc: u32) {
+    step_until(m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == u64::from(pc));
+    assert_eq!(m.cpu.pc, u64::from(pc), "never reached {pc:#x}");
 }
 
 #[test]
 fn timebase_falls_back_to_nominal_without_sysinfo() {
     // SYS_MAGIC is wrong: no sysinfo, so SYS_TIMEBASE_HZ is not read and the
     // timebase is the nominal 10 MHz, not the machine's 2 MHz.
-    let (reads, interval, out) = boot_with_sysinfo_reg_zero(REG_MAGIC);
+    let (reads, out) = boot_with_sysinfo_reg_zero(REG_MAGIC);
     assert_eq!(reads, [REG_MAGIC]);
-    assert_eq!(u64::from(interval), TICK_INTERVAL);
     assert_eq!(out, halted_output());
 }
 
 #[test]
 fn timebase_falls_back_to_nominal_when_sysinfo_reports_zero() {
-    let (reads, interval, out) = boot_with_sysinfo_reg_zero(REG_TIMEBASE_HZ);
+    let (reads, out) = boot_with_sysinfo_reg_zero(REG_TIMEBASE_HZ);
     assert_eq!(reads, [REG_MAGIC, REG_TIMEBASE_HZ]);
-    assert_eq!(u64::from(interval), TICK_INTERVAL);
     assert_eq!(out, halted_output());
 }
 
@@ -2492,7 +2525,7 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
                             Some((cause, false)) => {
                                 assert_eq!(
                                     u64::from(cause),
-                                    INTERRUPT_BIT | u64::from(IRQ_S_SOFT),
+                                    INTERRUPT_BIT | u64::from(IRQ_S_TIMER),
                                     "{prev} left after {cause:#x}"
                                 );
                                 timer_switches += 1;
@@ -2657,7 +2690,7 @@ fn a_tick_in_user_mode_saves_every_register_and_switches_back_later() {
         |_| {},
         |m| {
             m.cpu.pc == u64::from(user_vec)
-                && m.cpu.csr.scause == INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
+                && m.cpu.csr.scause == INTERRUPT_BIT | u64::from(IRQ_S_TIMER)
                 && m.cpu.csr.satp == regs_satp
         },
     );
@@ -2683,7 +2716,7 @@ fn a_tick_in_user_mode_saves_every_register_and_switches_back_later() {
     assert_eq!(peek(&m, FRAME_SEPC), sepc);
     assert_eq!(
         u64::from(peek(&m, FRAME_SCAUSE)),
-        INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
+        INTERRUPT_BIT | u64::from(IRQ_S_TIMER)
     );
     assert_eq!(peek(&m, FRAME_SSTATUS) & MSTATUS_SPP as u32, 0);
     // Traps in the kernel go to kernel_vec again.
@@ -3223,7 +3256,7 @@ fn stress_runs_many_processes_through_the_locks() {
                 last = p;
                 if let Some((cause, pc)) = last_trap.take() {
                     if prev != 0
-                        && cause == INTERRUPT_BIT | u64::from(IRQ_S_SOFT)
+                        && cause == INTERRUPT_BIT | u64::from(IRQ_S_TIMER)
                         && proc_name(&m.cpu, prev) == "stress"
                     {
                         preemptions += 1;

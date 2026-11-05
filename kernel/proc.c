@@ -63,9 +63,9 @@
 #include "kalloc.h"
 #include "kprintf.h"
 #include "log.h"
-#include "machine.h"
 #include "memlayout.h"
 #include "riscv.h"
+#include "sbi.h"
 #include "smp.h"
 #include "spinlock.h"
 #include "string.h"
@@ -405,7 +405,7 @@ static void kick_idle(u32 n) {
         }
     }
     if (kick != 0) {
-        machine_ipi(kick);
+        sbi_send_ipi(kick, 0);
     }
 }
 

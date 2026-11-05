@@ -40,11 +40,14 @@
 #define MIE_MSIE (_UL(1) << IRQ_M_SOFT)
 #define MIE_MTIE (_UL(1) << IRQ_M_TIMER)
 #define SIE_SSIE (_UL(1) << IRQ_S_SOFT)
+#define SIE_STIE (_UL(1) << IRQ_S_TIMER)
 #define SIE_SEIE (_UL(1) << IRQ_S_EXT)
 #define SIP_SSIP (_UL(1) << IRQ_S_SOFT)
-/* The same bit in mip, which M-mode sets to raise the S-mode software
- * interrupt (machine.S). */
+/* The same bits in mip, which M-mode sets to raise the S-mode software and
+ * timer interrupts (machine.S). S-mode can clear SSIP itself, but not
+ * STIP: the SBI's set_timer does. */
 #define MIP_SSIP (_UL(1) << IRQ_S_SOFT)
+#define MIP_STIP (_UL(1) << IRQ_S_TIMER)
 
 /* Exception causes (spec section 6). */
 #define CAUSE_INSTR_MISALIGNED 0
@@ -82,24 +85,10 @@
 #define SATP_PPN_MASK _U(0x003fffff)
 #endif
 
-/* Which counters S-mode may read: bit 1 (TM) is `time` (w_mcounteren()). */
+/* Which counters S-mode may read: bit 1 (TM) is `time` (machine.S). */
 #define MCOUNTEREN_TM (_UL(1) << 1)
 
 #ifndef __ASSEMBLER__
-/* M-mode CSRs (only usable before start() drops to S-mode). */
-uintptr r_mstatus(void);
-void w_mstatus(uintptr v);
-void w_mepc(uintptr v);
-void w_mtvec(uintptr v);
-void w_mscratch(uintptr v);
-uintptr r_medeleg(void);
-void w_medeleg(uintptr v);
-uintptr r_mideleg(void);
-void w_mideleg(uintptr v);
-void w_mie(uintptr v);
-/* Which counters S-mode may read (MCOUNTEREN_TM). */
-void w_mcounteren(uintptr v);
-
 /* S-mode CSRs. */
 uintptr r_sstatus(void);
 void w_sstatus(uintptr v);
@@ -114,7 +103,8 @@ void w_satp(uintptr v);
 
 /* `time` (rdtime), the CLINT's mtime, all 64 bits (on RV32 read as two
  * halves, timeh and time, until the high half holds still): how S-mode reads
- * the clock, with no CLINT mapping (start() lets it, through mcounteren). */
+ * the clock, with no CLINT mapping (the SBI lets it, through mcounteren:
+ * machine.S). */
 u64 r_time(void);
 
 /* sfence.vma zero, zero: orders earlier page-table writes before later

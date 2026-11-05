@@ -95,6 +95,18 @@ const STEPS: &[Step] = &[
         args: &["-p", "avalon", "--test", "debug"],
     },
     Step {
+        what: "Avalon: a VM's width, its profile's or its program's, and RV64's RAM",
+        args: &[
+            "-p",
+            "avalon",
+            "--test",
+            "server",
+            "--",
+            "a_vm_is_as_wide_as_its_profile_or_its_program",
+            "an_rv64_vm_has_more_ram_than_the_host",
+        ],
+    },
+    Step {
         what: "merlin-dbg on an Avalon VM: the kernel's write system call, Herald attached",
         args: &["-p", "merlin-dbg", "--test", "avalon"],
     },
@@ -151,6 +163,10 @@ const STEPS: &[Step] = &[
     Step {
         what: "the committed RV64 kernel is current, boots on 1-8 harts and panics as it should",
         args: &["-p", "xtask", "--test", "kernel_rv64"],
+    },
+    Step {
+        what: "the kernels' SBI: every call and error on both widths, a fence before every IPI (#170)",
+        args: &["-p", "xtask", "--test", "sbi"],
     },
     Step {
         what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \

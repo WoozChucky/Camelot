@@ -3,11 +3,14 @@
  * traps from U-mode go to user_vec (uservec.s), which saves them in the
  * process's trap frame and calls user_trap().
  *
- * Two interrupts are handled: the supervisor software interrupt, which
- * machine_vec raises for each timer tick and for each IPI from another hart
- * (a TLB shootdown, smp.c), and the supervisor external interrupt from the
+ * Three interrupts are handled: the supervisor timer interrupt, the hart's
+ * tick, which the SBI raises at the deadline its set_timer was given
+ * (timer.c); the supervisor software interrupt, an IPI from another hart
+ * (a TLB shootdown, smp.c, or a kick for an idle hart, proc.c), which the
+ * SBI's send_ipi raises; and the supervisor external interrupt from the
  * PLIC, which goes to hart 0 only: the UART's receive line, the disks'
- * completions and the network card. Either may wake sleeping processes (wakeup only marks them runnable). In the
+ * completions and the network card. Each may wake sleeping processes
+ * (wakeup only marks them runnable). In the
  * kernel an exception is a bug, so it panics, unless a memory probe (probe.s)
  * caused it. In U-mode, ecall is a call into the kernel (syscall.c) and any
  * other exception kills the process. */
@@ -15,15 +18,16 @@
 #include "blk.h"
 #include "console.h"
 #include "kprintf.h"
-#include "machine.h"
 #include "net.h"
 #include "nic.h"
 #include "plic.h"
 #include "probe.h"
 #include "proc.h"
 #include "riscv.h"
+#include "sbi.h"
 #include "smp.h"
 #include "syscall.h"
+#include "timer.h"
 #include "vm.h"
 
 volatile u32 ticks;
@@ -91,7 +95,7 @@ const char *trap_cause_name(uintptr cause) {
 }
 
 static void halt_after_panic(void) {
-    machine_halt(PANIC_EXIT_CODE);
+    machine_power_off(PANIC_EXIT_CODE);
 }
 
 /* The start of a panic, on whichever hart: the first hart to get here
@@ -215,44 +219,53 @@ static bool probe_fixup(struct trap_frame *f) {
     return true;
 }
 
-/* A timer tick on this hart. Every hart counts its own (for the harts
- * system call); hart 0's are the clock: `ticks`, on which processes in the
- * sleep system call wait (with tickslock), and the network's timer, which
- * comes after, without tickslock: it takes the network's lock. */
-static void clock_tick(void) {
+/* `n` timer ticks on this hart (more than 1 if some were missed). Every
+ * hart counts its own (for the harts system call); hart 0's are the clock:
+ * `ticks`, on which processes in the sleep system call wait (with
+ * tickslock), and the network's timer, which comes after, without
+ * tickslock: it takes the network's lock. */
+static void clock_tick(u32 n) {
     struct cpu *c = mycpu();
-    c->ticks = c->ticks + 1;
+    c->ticks = c->ticks + n;
     if (c->hartid != 0) {
         return;
     }
     acquire(&tickslock);
-    ticks = ticks + 1;
+    ticks = ticks + n;
     wakeup((const void *)&ticks);
     release(&tickslock);
     net_timer();
 }
 
-/* A supervisor software interrupt from machine_vec: a timer tick, an IPI
- * from another hart, or both, which share the one SSIP bit. Clear it first:
- * a tick or an IPI that arrives while this runs sets it again and is taken
- * after sret (and finds nothing to do, if this one did it). Then serve what
- * other harts asked for, and count a tick if machine_vec marked one in
- * this hart's scratch block. Returns whether there was a tick. */
-static bool soft_interrupt(void) {
+/* The supervisor timer interrupt: this hart's tick. The next one first,
+ * which also clears this one (S-mode can't clear STIP itself: set_timer
+ * does, timer.c), then the tick counted. A tick also serves any TLB flush
+ * another hart asked for (smp.c): a hart that was slow to take its IPI, or
+ * took it with the request not yet in sight, still flushes within a tick,
+ * and the hart waiting for it isn't left waiting for good. */
+static void timer_interrupt(void) {
+    clock_tick(timer_next());
+    tlb_serve();
+}
+
+/* The supervisor software interrupt: an IPI from another hart. Clear SSIP
+ * first: one that arrives while this runs sets it again and is taken after
+ * sret (and finds nothing to do, if this one did it). Then serve what other
+ * harts asked for. An IPI that only woke an idle hart (kick_idle(), proc.c)
+ * has nothing more to do: the hart's scheduler looks for work once wfi
+ * returns. */
+static void ipi_interrupt(void) {
     w_sip(r_sip() & ~SIP_SSIP);
     tlb_serve();
-    uintptr *scratch = &machine_scratch[cpuid() * MSCRATCH_WORDS];
-    /* The tick slot's low 32 bits, as machine_vec writes it. */
-    if (atomic_swap((volatile u32 *)&scratch[MSCRATCH_TICK], 0) == 0) {
-        return false;
-    }
-    clock_tick();
-    return true;
 }
 
 void kernel_trap(struct trap_frame *f) {
+    if (f->scause == (CAUSE_INTERRUPT | IRQ_S_TIMER)) {
+        timer_interrupt();
+        return;
+    }
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
-        soft_interrupt();
+        ipi_interrupt();
         return;
     }
     if (f->scause == (CAUSE_INTERRUPT | IRQ_S_EXT)) {
@@ -287,11 +300,12 @@ void user_trap(struct trap_frame *f) {
     /* From here on, a trap is the kernel's own. Interrupts stay off (the trap
      * cleared sstatus.SIE) until the process is back in U-mode. */
     w_stvec((uintptr)kernel_vec);
-    if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
-        /* A tick ends the process's time slice; an IPI alone doesn't. */
-        if (soft_interrupt()) {
-            yield();
-        }
+    if (f->scause == (CAUSE_INTERRUPT | IRQ_S_TIMER)) {
+        /* A tick ends the process's time slice; an IPI doesn't. */
+        timer_interrupt();
+        yield();
+    } else if (f->scause == (CAUSE_INTERRUPT | IRQ_S_SOFT)) {
+        ipi_interrupt();
     } else if (f->scause == (CAUSE_INTERRUPT | IRQ_S_EXT)) {
         external_interrupt();
     } else if (f->scause == CAUSE_ECALL_U) {
@@ -331,10 +345,9 @@ bool is_page_fault(uintptr scause) {
 void trap_init(void) {
     initlock(&tickslock, "ticks");
     plic_init();
-    /* Machine ticks that fired while the kernel set itself up left SSIP
-     * pending: drop that one, so the first tick taken is a whole interval
-     * after it arrives rather than straight away. */
-    w_sip(r_sip() & ~SIP_SSIP);
-    w_sie(r_sie() | SIE_SSIE | SIE_SEIE);
+    /* The timer, IPIs and devices; then the first tick, one interval from
+     * now. */
+    w_sie(r_sie() | SIE_STIE | SIE_SSIE | SIE_SEIE);
+    timer_start();
     w_sstatus(r_sstatus() | SSTATUS_SIE);
 }

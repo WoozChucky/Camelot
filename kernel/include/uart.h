@@ -5,8 +5,12 @@
 #ifndef CAMELOT_UART_H
 #define CAMELOT_UART_H
 
+/* Assembly includes this file too (machine.S, for the debug console's
+ * registers): the C is under #ifndef __ASSEMBLER__ (const.h). */
+#ifndef __ASSEMBLER__
 #include "spinlock.h"
 #include "types.h"
+#endif
 
 #define UART_BASE 0x10000000
 
@@ -25,6 +29,7 @@
 /* Size of the receive ring buffer in bytes, a power of two. */
 #define UART_RX_SIZE 128
 
+#ifndef __ASSEMBLER__
 /* Where the registers are reached: UART_BASE (RV32, and RV64 with paging
  * off), the fixmap's page (RV64, from setup_vm(), vm.h), then the kernel's
  * ioremap() of it (uart_map()). */
@@ -65,5 +70,7 @@ void uart_intr(void);
 /* Takes the oldest received byte out of the ring buffer into `*c`. Returns
  * false if the buffer is empty. Never touches RBR. */
 bool uart_rx_pop(char *c);
+
+#endif
 
 #endif

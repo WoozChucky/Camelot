@@ -3,10 +3,16 @@
 //! and over UDP (issue #85's second criterion, second half). The machines are Grail's,
 //! run in this thread in turns of a few thousand steps, their cards plugged into an
 //! in-process [`Switch`] as an Avalon VM's are; each kernel gets a static address
-//! (10.0.9.1 and 10.0.9.2), patched into its configuration before it boots.
+//! (10.0.9.1 and 10.0.9.2), patched into its configuration before it boots. It runs
+//! twice ([`common::on_both_widths`]): with the RV32 kernel, `kernel/kernel.elf`, and
+//! with the RV64 one, `kernel/kernel-rv64.elf`, whose variables are patched at their
+//! load addresses (it is linked in the upper half and loaded at 0x8000_0000).
+
+mod common;
 
 use avalon::switch::{Card, Switch};
 use avalon_proto::PortOwner;
+use common::{grail_xlen, on_both_widths};
 use grail::net::{MacAddr, NetBackend};
 use grail::{Machine, MachineConfig};
 use std::path::Path;
@@ -40,6 +46,7 @@ impl Vm {
         let backend: Box<dyn NetBackend> = Box::new(card.backend());
         let config = MachineConfig {
             ram_size: 16 << 20,
+            xlen: grail_xlen(),
             ..MachineConfig::default()
         };
         let mut m = Machine::with_devices(config, Vec::new(), vec![(card.mac, backend)]).unwrap();
@@ -49,11 +56,20 @@ impl Vm {
         // one-second timeout, could see its second pass while the other machine is still
         // starting the program that answers.)
         m.cpu.wfi_skips_to_timer = false;
-        let file =
-            std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/kernel.elf")).unwrap();
+        let kernel = match grail_xlen() {
+            grail::Xlen::Rv32 => "kernel.elf",
+            grail::Xlen::Rv64 => "kernel-rv64.elf",
+        };
+        let file = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../kernel")
+                .join(kernel),
+        )
+        .unwrap();
         m.load_elf(&file).unwrap();
         // The kernel's static configuration (kernel/net/net.c): no DHCP, this
-        // address, a /24, no gateway.
+        // address, a /24, no gateway. Each variable is written where it is loaded,
+        // which on RV64 is not where it runs.
         let elf = grail::elf::parse(&file).unwrap();
         for (name, value) in [
             ("net_dhcp", 0),
@@ -61,8 +77,16 @@ impl Vm {
             ("net_static_mask", 0xffff_ff00),
             ("net_static_gateway", 0),
         ] {
-            let addr = elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
-            m.cpu.bus.load(addr, &u32::to_le_bytes(value)).unwrap();
+            let va = elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
+            let segment = elf
+                .segments
+                .iter()
+                .find(|s| (s.vaddr..s.vaddr + s.mem_size).contains(&va))
+                .unwrap_or_else(|| panic!("{name} is in no segment"));
+            m.cpu
+                .bus
+                .load(va - segment.vaddr + segment.paddr, &u32::to_le_bytes(value))
+                .unwrap();
         }
         let (input, rx) = channel();
         m.set_uart_input(rx);
@@ -127,57 +151,59 @@ fn exchange(vms: &mut [&mut Vm], server: &str, ready: &str, client: &str) -> (St
 
 #[test]
 fn nc_talks_between_two_machines_on_a_switch() {
-    let switch = Switch::new("lan");
-    let mut a = Vm::new(1, &switch);
-    let mut b = Vm::new(2, &switch);
-    let vms = &mut [&mut a, &mut b];
-    run_until(vms, |vms| vms.iter().all(|vm| vm.prompts() >= 1));
-    for (vm, addr) in vms.iter().zip(["10.0.9.1", "10.0.9.2"]) {
-        assert!(
-            vm.out().contains(&format!("net: {addr}/24 (static)\n")),
-            "{}",
-            vm.out()
+    on_both_widths(|| {
+        let switch = Switch::new("lan");
+        let mut a = Vm::new(1, &switch);
+        let mut b = Vm::new(2, &switch);
+        let vms = &mut [&mut a, &mut b];
+        run_until(vms, |vms| vms.iter().all(|vm| vm.prompts() >= 1));
+        for (vm, addr) in vms.iter().zip(["10.0.9.1", "10.0.9.2"]) {
+            assert!(
+                vm.out().contains(&format!("net: {addr}/24 (static)\n")),
+                "{}",
+                vm.out()
+            );
+        }
+
+        // TCP: each side sends its input and ends its side; each prints the other's.
+        let (server, client) = exchange(
+            vms,
+            "echo reply | nc -lv 5000",
+            "listening on port 5000\n",
+            "echo hello | nc 10.0.9.1 5000",
         );
-    }
+        let lines: Vec<&str> = server.lines().collect();
+        assert_eq!(lines[0], "listening on port 5000", "{server}");
+        assert!(lines[1].starts_with("connection from 10.0.9.2:"), "{server}");
+        assert_eq!(lines[2..], ["hello"], "{server}");
+        assert_eq!(client, "reply\n");
 
-    // TCP: each side sends its input and ends its side; each prints the other's.
-    let (server, client) = exchange(
-        vms,
-        "echo reply | nc -lv 5000",
-        "listening on port 5000\n",
-        "echo hello | nc 10.0.9.1 5000",
-    );
-    let lines: Vec<&str> = server.lines().collect();
-    assert_eq!(lines[0], "listening on port 5000", "{server}");
-    assert!(lines[1].starts_with("connection from 10.0.9.2:"), "{server}");
-    assert_eq!(lines[2..], ["hello"], "{server}");
-    assert_eq!(client, "reply\n");
-
-    // UDP: the first datagram says who the client is; each side stops once its input
-    // is over and nothing more came for a second.
-    let (server, client) = exchange(
-        vms,
-        "echo pong | nc -luv 5001",
-        "listening on port 5001\n",
-        "echo ping | nc -u 10.0.9.1 5001",
-    );
-    let lines: Vec<&str> = server.lines().collect();
-    assert_eq!(lines[0], "listening on port 5001", "{server}");
-    assert!(lines[1].starts_with("datagram from 10.0.9.2:"), "{server}");
-    assert_eq!(lines[2..], ["ping"], "{server}");
-    assert_eq!(client, "pong\n");
-
-    // Nobody listens: the connection is refused, and nc says so.
-    let (_, client) = exchange(vms, "echo", "", "echo x | nc 10.0.9.1 5002");
-    assert_eq!(client, "nc: 10.0.9.1: connection refused\nnc: exit 1\n");
-
-    for vm in vms.iter_mut() {
-        vm.type_line("exit 0");
-        assert_eq!(
-            vm.m.run(Some(MAX_STEPS), |_| {}),
-            grail::RunResult::Exited(0),
-            "{}",
-            vm.out()
+        // UDP: the first datagram says who the client is; each side stops once its input
+        // is over and nothing more came for a second.
+        let (server, client) = exchange(
+            vms,
+            "echo pong | nc -luv 5001",
+            "listening on port 5001\n",
+            "echo ping | nc -u 10.0.9.1 5001",
         );
-    }
+        let lines: Vec<&str> = server.lines().collect();
+        assert_eq!(lines[0], "listening on port 5001", "{server}");
+        assert!(lines[1].starts_with("datagram from 10.0.9.2:"), "{server}");
+        assert_eq!(lines[2..], ["ping"], "{server}");
+        assert_eq!(client, "pong\n");
+
+        // Nobody listens: the connection is refused, and nc says so.
+        let (_, client) = exchange(vms, "echo", "", "echo x | nc 10.0.9.1 5002");
+        assert_eq!(client, "nc: 10.0.9.1: connection refused\nnc: exit 1\n");
+
+        for vm in vms.iter_mut() {
+            vm.type_line("exit 0");
+            assert_eq!(
+                vm.m.run(Some(MAX_STEPS), |_| {}),
+                grail::RunResult::Exited(0),
+                "{}",
+                vm.out()
+            );
+        }
+    });
 }

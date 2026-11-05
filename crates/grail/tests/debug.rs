@@ -253,7 +253,7 @@ fn a_debugged_run_is_the_undebugged_run() {
 #[test]
 fn a_debugged_kernel_runs_as_it_would() {
     let kernel = read("kernel/kernel.elf");
-    let stops = [symbol(&kernel, "kmain"), symbol(&kernel, "timer_init")];
+    let stops = [symbol(&kernel, "kmain"), symbol(&kernel, "timer_start")];
     same_run_debugged(&kernel, 1, 4, b"hello\nexit\n", &stops, 5);
 }
 

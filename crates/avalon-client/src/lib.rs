@@ -5,15 +5,16 @@
 //!   pause, resume, stop, destroy) and the virtual network (switches, plugging cards
 //!   into them, captures) talk to Avalon; disk management (create, list, delete) talks
 //!   to Lake. Each operation is one request and its typed reply.
-//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, disk sources,
-//!   disk sizes and network cards, so every front end accepts the same syntax (`--ram`
-//!   and `--clock` are Grail's own parsers).
-//! - [`show`]: the same values as text again (sizes, frequencies, device names, MAC
-//!   addresses).
+//! - [`parse`]: the text people type for addresses, RAM sizes, clocks, widths and
+//!   paging modes, disk sources, disk sizes and network cards, so every front end
+//!   accepts the same syntax (`--ram`, `--clock`, `--xlen` and `--paging` are Grail's
+//!   own parsers).
+//! - [`show`]: the same values as text again (sizes, frequencies, widths, device
+//!   names, MAC addresses).
 //! - [`VmAction::allowed_in`], [`holds_disks`] and [`lake_disks`]: what a VM's state
 //!   and profile mean for what a person may do with it and its disks.
 //! - [`create_camelot_vm`]: a VM that boots Camelot from its own copy of Lake's
-//!   [`BASE_IMAGE`], with no program to upload.
+//!   base image of its width ([`base_image`]), with no program to upload.
 //! - [`DebugTunnel`]: a debugger's end of a VM's GDB stub, the GDB remote serial
 //!   protocol's bytes over a session (merlin-dbg's `--vm`).
 //!
@@ -22,7 +23,7 @@
 
 use avalon_proto::{
     validate_name, Connection, DeviceSpec, DiskInfo, DiskSource, DiskSpec, ErrorCode, HardwareProfile,
-    Message, NatConfig, SwitchInfo, VmDetails, VmRef, VmState, VmSummary,
+    Message, NatConfig, SwitchInfo, VmDetails, VmRef, VmState, VmSummary, Xlen,
 };
 use std::collections::VecDeque;
 use std::fmt;
@@ -36,9 +37,9 @@ pub mod show;
 
 pub use parse::{
     parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net,
-    parse_ram,
+    parse_paging, parse_ram, parse_xlen,
 };
-pub use show::{device_name, disk_source_text, format_hz, format_size, mac_text};
+pub use show::{arch_text, device_name, disk_source_text, format_hz, format_size, mac_text};
 
 /// How long [`Client::connect`] tries each address of the server before giving up.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -216,13 +217,28 @@ pub fn lake_disks(profile: &HardwareProfile) -> impl Iterator<Item = (&str, &str
     })
 }
 
-/// The Lake image a Camelot VM's disk is a copy of: a bootable Camelot root
+/// The Lake image an RV32 Camelot VM's disk is a copy of: a bootable Camelot root
 /// filesystem, the one `cargo xtask fs` builds. `cargo xtask up` puts it in Lake's
 /// images directory. A neutral name, not the OS's: it is the base image of the VMs.
 pub const BASE_IMAGE: &str = "os-base";
 
-/// The disk a Camelot VM named `vm` boots from: its own copy of [`BASE_IMAGE`],
-/// `<vm>-disk0` (its disk 0).
+/// The Lake image an RV64 Camelot VM's disk is a copy of: the RV64 root image,
+/// `cargo xtask fs --xlen 64`'s, with its RV64 bootloader, kernel and programs, which
+/// `cargo xtask up` puts beside [`BASE_IMAGE`] (until #159 leaves one width). A boot
+/// block runs on the boot ROM of one width, so each width has an image of its own.
+pub const BASE_IMAGE_RV64: &str = "os-base-rv64";
+
+/// The base image of a Camelot VM of width `xlen`: [`BASE_IMAGE`] or
+/// [`BASE_IMAGE_RV64`].
+pub fn base_image(xlen: Xlen) -> &'static str {
+    match xlen {
+        Xlen::Rv32 => BASE_IMAGE,
+        Xlen::Rv64 => BASE_IMAGE_RV64,
+    }
+}
+
+/// The disk a Camelot VM named `vm` boots from: its own copy of its width's
+/// [`base_image`], `<vm>-disk0` (its disk 0).
 pub fn vm_disk(vm: &str) -> String {
     format!("{vm}-disk0")
 }
@@ -232,8 +248,8 @@ pub fn vm_disk(vm: &str) -> String {
 pub enum CamelotError {
     /// The VM's name is not valid, or leaves no room for `-disk0` in a disk name.
     Name(String),
-    /// The Lake server has no [`BASE_IMAGE`].
-    NoBaseImage { lake: String },
+    /// The Lake server has no base image `image` ([`base_image`]).
+    NoBaseImage { lake: String, image: &'static str },
     /// Lake refused to copy the image (its name is taken, the base image has a
     /// writer), or failed.
     Lake { disk: String, cause: Error },
@@ -257,9 +273,9 @@ impl fmt::Display for CamelotError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             CamelotError::Name(why) => write!(f, "{why}"),
-            CamelotError::NoBaseImage { lake } => write!(
+            CamelotError::NoBaseImage { lake, image } => write!(
                 f,
-                "the Lake at {lake} has no '{BASE_IMAGE}' image to copy (start the platform \
+                "the Lake at {lake} has no '{image}' image to copy (start the platform \
                  with 'cargo xtask up', which puts it in Lake's images directory)"
             ),
             CamelotError::Lake { disk, cause } => write!(f, "cannot create disk {disk}: {cause}"),
@@ -270,12 +286,13 @@ impl fmt::Display for CamelotError {
 
 impl std::error::Error for CamelotError {}
 
-/// Creates a VM that boots Camelot: copies [`BASE_IMAGE`] on the Lake server at
-/// `lake_addr` (the address Avalon will reach it at too) to [`vm_disk`]`(name)`,
-/// puts that disk first in `profile` (disk 0, read-write) and creates the VM with no
-/// program, so it boots from the disk (protocol doc, `CreateVm`). The VM is left in
-/// state created. If Avalon refuses the VM, the copy is deleted again. Returns the VM's
-/// id and the disk's name.
+/// Creates a VM that boots Camelot: copies the base image of `profile`'s width
+/// ([`base_image`]: [`BASE_IMAGE`], or [`BASE_IMAGE_RV64`] for an RV64 VM) on the Lake
+/// server at `lake_addr` (the address Avalon will reach it at too) to
+/// [`vm_disk`]`(name)`, puts that disk first in `profile` (disk 0, read-write) and
+/// creates the VM with no program, so it boots from the disk (protocol doc,
+/// `CreateVm`). The VM is left in state created. If Avalon refuses the VM, the copy is
+/// deleted again. Returns the VM's id and the disk's name.
 pub fn create_camelot_vm(
     avalon: &mut Client,
     lake: &mut Client,
@@ -293,11 +310,13 @@ pub fn create_camelot_vm(
     })?;
     let source = DiskSource::parse(&format!("{}{lake_addr}/{disk}", avalon_proto::LAKE_SCHEME))
         .map_err(CamelotError::Name)?;
-    if let Err(e) = lake.clone_disk(&disk, BASE_IMAGE, None) {
+    let image = base_image(profile.xlen);
+    if let Err(e) = lake.clone_disk(&disk, image, None) {
         // Only the source can be missing in a clone.
         return Err(match e.code() {
             Some(ErrorCode::NoSuchDisk) => CamelotError::NoBaseImage {
                 lake: lake_addr.to_string(),
+                image,
             },
             _ => CamelotError::Lake { disk, cause: e },
         });
