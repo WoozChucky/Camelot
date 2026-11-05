@@ -1221,6 +1221,17 @@ On RV64 (#155) the processes are 64-bit programs, ELF64 executables built from t
 
 **Tests** (`crates/xtask/tests/processes_rv64.rs`; three in `cargo xtask ci`): the RV32 kernel's process tests on the RV64 kernel, with the same programs (systest, libtest, threadtest on 1 and 4 harts, regs beside ding and dong, data, badstore, stress, spacetest's stack and its overflow at the guard page in Sv48 and Sv39, filetest on an RV64 root filesystem, socktest over loopback); `sysregs`, whose failing calls pass only if all 64 bits of `a0` are negative; `badptr` and `badload` on the kernel's half (the image, the direct map in either mode, the vmalloc area, the top page, `USER_TOP` itself, 2^32 + 0x1000) in Sv48 and Sv39; `filetest`'s 64-bit `lseek` (2^32 + 100 is past the end, not 100) and `stat`'s size; and a program whose `.bss` is at 4 GiB, so that `sbrk` hands out addresses above 4 GiB.
 
+### RV64 user space
+
+User space is the same on both widths (#156): every program of `kernel/user` but the self-hosted `as` and `ld` (#157) builds for RV64 from the same source and gives the same results, and the RV64 root image boots as the RV32 one does. What changed for it, at both widths:
+
+- **A program's start is Linux's.** The kernel puts argc, argv, an empty envp and the auxiliary vector at the top of the stack, as Linux's `create_elf_tables` and the RISC-V psABI's "Process Initialization" have them, with `sp` at argc and `a0` zero (the psABI's `atexit` function: no dynamic linker); crt0 (`kernel/user/crt0.S`) calls `main(argc, argv, envp)`. The vector holds Linux's entries that Camelot has, in Linux's order (`AT_HWCAP`, `AT_PAGESZ`, `AT_CLKTCK`, `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_BASE`, `AT_FLAGS`, `AT_ENTRY`, the ids, `AT_SECURE`, `AT_RANDOM`, `AT_EXECFN`), with the program headers' address found as `load_elf_binary` finds it; `docs/camelot-syscalls.md`, "Starting a program", has the layout and the values. `exec` returns 0 into the new program's `a0`.
+- **The C library at Linux's widths.** `user.h` has `<stdint.h>`'s types (the 64-bit ones `long long`, as decided on #141) and the limits; `printf` takes `%l`, `%ll` and `%z`, dividing the digits off with Linux's `do_div` (on RV32 three 32-bit divisions rather than a call to `__udivdi3`); `malloc` takes a `size_t` and aligns to its header, 16 bytes on RV64.
+- **sbrk** refuses at once a growth of more pages than the whole of RAM, as Linux's default overcommit check (`__vm_enough_memory`, `OVERCOMMIT_GUESS`) refuses it, rather than after zeroing every free page.
+- **The root image.** `cargo xtask fs` builds the RV64 one next to the RV32 one ("Root image").
+
+**Tests**: RV64 runs of the user-space tests, each with the programs built for RV64 and the RV64 kernel: the coreutils session (`crates/xtask/tests/coreutils.rs`, and with clang's programs where clang is installed), every filesystem test, crash tests included (`fs.rs`, but the RV32-only `EOVERFLOW` one), the SMP and threads runs (`smp_rv64.rs`: workers side by side on four harts, stress, systest, the disk kernel from `/bin` on four harts, threads and `threadtest fs` on one and four, every page back), every network test of Grail's (`kernel_net.rs`, `kernel_tcp.rs`, `kernel_sockets.rs`, `kernel_shd.rs`), the RV64 root image booting in 4 MiB (`boot.rs`), `-g` changing no loaded byte (`debug_info.rs`), and a program's start checked word by word in Sv48 and Sv39 (`processes_rv64.rs`), as on RV32 (`kernel.rs`, `the_shell_is_the_first_process`).
+
 ### Kernel console
 
 Console input is interrupt-driven; nothing in the kernel waits on RBR.
@@ -1534,7 +1545,7 @@ A process may have several threads, which share its address space, descriptors a
       - merlin-as, merlin-ld and merlin-objdump (#148, #149 and #150, done);
       - RV64 programs end to end (#151, done): the RV64 disk boot ROM, every example built for RV64;
       - merlin (#152, done: LP64, RV64 code and `long long` on both widths), merlin-dbg (#153, done: RV64 machines and programs; its kernel case waits for #154);
-      - the kernel (#154, done: a higher-half kernel in Linux's layout on Sv48, or Sv39 on harts without it, #172; its boot self-tests on 1-8 harts, from the ROM and from disk, "The RV64 kernel"), processes (#155, done: the lower half of Sv48 or Sv39, ELF64, the LP64 system call ABI at Linux's widths, "RV64 processes"), then user space (#156);
+      - the kernel (#154, done: a higher-half kernel in Linux's layout on Sv48, or Sv39 on harts without it, #172; its boot self-tests on 1-8 harts, from the ROM and from disk, "The RV64 kernel"), processes (#155, done: the lower half of Sv48 or Sv39, ELF64, the LP64 system call ABI at Linux's widths, "RV64 processes"), then user space (#156, done: every program but `as` and `ld` on RV64, Linux's process start at both widths, the RV64 root image, "RV64 user space");
       - the self-hosted tools (#157), the platform (#158).
 
       Then RV32 is removed (#159). Paused meanwhile: #115, #116, #120, #121, #133 (#127 done).

@@ -1,10 +1,14 @@
-/* Layout of a user program (spec section 10, "Kernel processes"). User space
- * is the low 4 MiB: page 0 stays unmapped so that a null pointer faults, the
- * code starts at 0x1000 with crt0's _start, and the kernel puts the stack in
- * the last page, below 0x0040_0000. Every output section starts on a page
- * boundary, so each page belongs to one segment and the kernel's ELF loader
- * can give it that segment's permissions. The heap (sbrk) starts on the page
- * after the last one. */
+/* Layout of a user program (spec section 10, "Kernel processes";
+ * docs/camelot-syscalls.md, "Starting a program"), the same for RV32 and
+ * RV64. Page 0 stays unmapped so that a null pointer faults, and the code
+ * starts at 0x1000 with crt0's _start. Every output section starts on a
+ * page boundary, so each page belongs to one segment and the kernel's ELF
+ * loader can give it that segment's permissions. The heap (sbrk) starts on
+ * the page after the last one. The stack is the kernel's to place: at the
+ * top of user space (USER_TOP: 0x0C00_0000 on RV32; on RV64 the top of the
+ * lower half, 2^47 in Sv48 or 2^38 in Sv39), growing down to an 8 MiB
+ * limit. The program headers are in no segment (the first starts past
+ * them), so the auxiliary vector's AT_PHDR is 0. */
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 

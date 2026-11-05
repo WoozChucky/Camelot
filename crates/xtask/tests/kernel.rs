@@ -3884,6 +3884,18 @@ fn the_system_call_document_matches_the_code() {
         }
     }
 
+    // The auxiliary vector's types, in the order the kernel writes them
+    // (proc.c's push_start; tests/common's start::check checks the vector).
+    let mut auxv = doc_table(&doc, "## Starting a program");
+    assert_eq!(auxv.len(), 17, "{auxv:?}");
+    assert_eq!(auxv.last().map(|a| a.0), Some(0), "AT_NULL last");
+    auxv.sort();
+    for (text, what) in [(&header, "syscall.h"), (&user_h, "user.h")] {
+        let mut defined = defines(text, "AT_");
+        defined.sort();
+        assert_eq!(defined, auxv, "{what}");
+    }
+
     // And the limits.
     for limit in ["MAXARG", "ARG_MAX", "MAXPATH"] {
         let want = defines(&header, limit);

@@ -920,22 +920,25 @@ type numbers (`AT_*` in `user.h` and `kernel/include/syscall.h`), but for
 those Camelot has nothing to say with (no vDSO, no cache information, no
 signals, no platform string):
 
-| Type | Number | Value |
+| Number | Type | Value |
 |---|---|---|
-| `AT_HWCAP` | 16 | the ISA's single-letter extensions, bit `X - 'A'` for each: I, M and A (0x1101) |
-| `AT_PAGESZ` | 6 | 4096 |
-| `AT_CLKTCK` | 17 | how often `uptime` ticks a second: 10 |
-| `AT_PHDR` | 3 | the address of the program headers, in the `PT_LOAD` segment whose file bytes hold them, as Linux finds them; 0 if none does (`user.ld` starts the first segment at 0x1000, past them) |
-| `AT_PHENT` | 4 | a program header's size: 32 (ELF32) or 56 (ELF64) |
-| `AT_PHNUM` | 5 | how many there are |
-| `AT_BASE` | 7 | 0: no interpreter, the programs are static |
-| `AT_FLAGS` | 8 | 0 |
-| `AT_ENTRY` | 9 | the program's entry point |
-| `AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID` | 11 to 14 | 0: Camelot has one user |
-| `AT_SECURE` | 23 | 0 |
-| `AT_RANDOM` | 25 | the address of the 16 random bytes: different for every program started, but not secret (Camelot has no source of entropy; they mix the time and the stack page's address) |
-| `AT_EXECFN` | 31 | the address of the path |
-| `AT_NULL` | 0 | 0, the end |
+| 16 | `AT_HWCAP` | the ISA's single-letter extensions, bit `X - 'A'` for each: I, M and A (0x1101) |
+| 6 | `AT_PAGESZ` | 4096 |
+| 17 | `AT_CLKTCK` | how often `uptime` ticks a second: 10 |
+| 3 | `AT_PHDR` | the address of the program headers, in the `PT_LOAD` segment whose file bytes hold them, as Linux finds them; 0 if none does (`user.ld` starts the first segment at 0x1000, past them) |
+| 4 | `AT_PHENT` | a program header's size: 32 (ELF32) or 56 (ELF64) |
+| 5 | `AT_PHNUM` | how many there are |
+| 7 | `AT_BASE` | 0: no interpreter, the programs are static |
+| 8 | `AT_FLAGS` | 0 |
+| 9 | `AT_ENTRY` | the program's entry point |
+| 11 | `AT_UID` | 0, as are the next three: Camelot has one user |
+| 12 | `AT_EUID` | 0 |
+| 13 | `AT_GID` | 0 |
+| 14 | `AT_EGID` | 0 |
+| 23 | `AT_SECURE` | 0 |
+| 25 | `AT_RANDOM` | the address of the 16 random bytes: different for every program started, but not secret (Camelot has no source of entropy; they mix the time and the stack page's address) |
+| 31 | `AT_EXECFN` | the address of the path |
+| 0 | `AT_NULL` | 0, the end |
 
 `MAXARG`, `ARG_MAX` and `MAXPATH` keep all of it in the first half of the
 page. Every page the program gets (its segments beyond their file bytes,
@@ -974,7 +977,11 @@ error number included), their constants and structures (`O_*`, `F_*`,
 `struct netinfo`, `struct net_stats`, `NETINFO_*`, `struct ping_reply`,
 `AF_INET`, `SOCK_*`, `IPPROTO_*`, `INADDR_*`, `SHUT_*`, `SOL_SOCKET`,
 `SO_RCVTIMEO`, `struct in_addr`, `struct sockaddr_in`, `struct timeval`,
-`MAXPATH`, `DIRSIZ`) and the C library in `kernel/user/lib/`, described in
+`MAXPATH`, `DIRSIZ`, `AT_*`), the integer types of `<stdint.h>` and
+`<sys/types.h>` (`int8_t` to `int64_t`, `uint8_t` to `uint64_t`, the 64-bit
+ones `long long`; `intptr_t`, `uintptr_t`, `size_t`, `ssize_t`, `off_t`,
+`time_t`, a `long` wide) and their limits (`INT_MAX`, `UINT_MAX`,
+`LONG_MAX`, `ULONG_MAX`, `LLONG_MAX`, `SIZE_MAX`, `INT64_MAX`, ...), and the C library in `kernel/user/lib/`, described in
 its `README.md`: strings and memory (`strlen`, `strcmp`, `strncmp`,
 `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`,
 `memmove`, `memcmp`), numbers (`atoi`, `strtol`), the heap (`malloc`,

@@ -7,6 +7,13 @@
 # Each read-modify-write is .aqrl: no load or store before it may be seen
 # after it, nor any after it before it, as a fence on each side would
 # order them. Each returns the word as it was before.
+#
+# The same code for both widths: the words are 32-bit ints, and on RV64 the
+# .w instructions (amo*.w, lr.w, sc.w) take the low 32 bits of a register
+# and sign-extend the word they load into all 64, as the LP64 ABI wants an
+# int in a register. atomic_cas compares that with `expect` as 64-bit
+# registers, which is right because the ABI passes an int sign-extended
+# too (merlin and clang both do).
 
     .text
 
