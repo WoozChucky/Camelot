@@ -729,7 +729,11 @@ pub fn finish(toks: Vec<PpToken>, end: Pos, x: Xlen) -> Result<(Vec<Token>, Vec<
 /// each (and one more past four bytes, which do not all fit). `''` is no
 /// token at all to clang ([`lex_pp`] leaves it to the parser).
 pub fn char_constant(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Tok, Error> {
+    let before = diags.len();
     let (bytes, chars) = decode_units(text, pos, diags, true)?;
+    // A character too large for it leaves the constant no value whose
+    // length clang tells of.
+    let too_large = diags[before..].iter().any(|d| !d.is_warning());
     // Four characters are clang's `-Wfour-char-constants` (`'abcd'`, as
     // Mac OS's type codes were written), which is off by default. What
     // counts is characters, each escape one (`'aé'` is two, an error).
@@ -740,7 +744,7 @@ pub fn char_constant(text: &str, pos: Pos, diags: &mut Vec<Error>) -> Result<Tok
             "multichar",
         ));
     }
-    if chars > 4 {
+    if chars > 4 && !too_large {
         diags.push(Error::warning_unflagged(
             pos,
             "character constant too long for its type",

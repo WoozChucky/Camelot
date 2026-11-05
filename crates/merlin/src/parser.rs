@@ -531,6 +531,9 @@ impl Tag {
 struct Scope {
     names: HashMap<String, (Name, Pos)>,
     tags: HashMap<String, Tag>,
+    /// The names a block declares with linkage (`extern int a[];`, a
+    /// function): at file scope every object and function has it.
+    linked: std::collections::HashSet<String>,
 }
 
 /// One step of a declarator, from the base type towards the declared type.
@@ -905,6 +908,25 @@ impl Parser<'_> {
     /// Declares an ordinary identifier in the innermost scope. Declaring a
     /// variable or function again is sema's to judge; any other clash is an
     /// error here, with clang's note where the name was declared before.
+    /// The composite of `ty` and the type of the earlier declaration of
+    /// `name` with linkage this block can see: the innermost around it,
+    /// unless it has no linkage (a local hides the outer ones); `ty` if
+    /// there is none, or it is not compatible (sema's error).
+    fn visible_composite(&self, name: &str, ty: &Type) -> Type {
+        for (depth, scope) in self.scopes.iter().enumerate().rev() {
+            let Some((what, _)) = scope.names.get(name) else {
+                continue;
+            };
+            return match what {
+                Name::Object(t) if (depth == 0 || scope.linked.contains(name)) && t.compatible(ty) => {
+                    t.composite(ty)
+                }
+                _ => ty.clone(),
+            };
+        }
+        ty.clone()
+    }
+
     fn bind_name(&mut self, name: &str, what: Name, pos: Pos) -> Result<(), Error> {
         let scope = self.scopes.last_mut().expect("the file scope");
         let redefinition = |how: String, prev: Pos| {
@@ -2770,7 +2792,20 @@ impl Parser<'_> {
             if let (Some(at), false) = (specs.inline, d.ty.is_func()) {
                 return Err(Error::new(at, "'inline' can only appear on functions"));
             }
-            self.bind_name(&d.name, Name::Object(d.ty.clone()), d.pos)?;
+            // A block's declaration with linkage has the composite type of
+            // it and the earlier one it can see, as sema gives it (C99
+            // 6.2.7p4), for the sizes the parser works out.
+            let linked = ctx != Ctx::File && (specs.class == Class::Extern || d.ty.is_func());
+            let ty = if linked {
+                self.visible_composite(&d.name, &d.ty)
+            } else {
+                d.ty.clone()
+            };
+            self.bind_name(&d.name, Name::Object(ty), d.pos)?;
+            if linked {
+                let scope = self.scopes.last_mut().expect("a scope");
+                scope.linked.insert(d.name.clone());
+            }
             let init = if self.eat_punct("=") {
                 Some(self.initializer()?)
             } else {

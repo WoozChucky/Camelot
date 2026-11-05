@@ -171,9 +171,9 @@ pub fn arith_type(op: BinOp, l: &Type, r: &Type, x: Xlen) -> Option<Type> {
         (BinOp::Add | BinOp::Sub, Type::Ptr(_), Type::Int(_)) if sized(l) => Some(l.clone()),
         (BinOp::Add, Type::Int(_), Type::Ptr(_)) if sized(r) => Some(r.clone()),
         // The difference of two pointers counts elements: `ptrdiff_t`, `int`
-        // on ILP32 and `long` on LP64. What they point to may differ in
-        // qualifiers only.
-        (BinOp::Sub, Type::Ptr(a), Type::Ptr(b)) if a.unqual() == b.unqual() && sized(l) => {
+        // on ILP32 and `long` on LP64. What they point to must be compatible
+        // but for qualifiers.
+        (BinOp::Sub, Type::Ptr(a), Type::Ptr(b)) if a.unqual().compatible(b.unqual()) && sized(l) => {
             Some(Type::Int(IntKind::ptrdiff_t(x)))
         }
         _ => None,
@@ -837,6 +837,7 @@ impl Checker {
             unevaluated: 0,
             registers: HashSet::new(),
             linked: Vec::new(),
+            invalid: HashSet::new(),
             xlen: self.xlen,
         };
         for p in &f.params {
@@ -962,14 +963,11 @@ impl Checker {
                 if let Some((msg, (at, what))) = problem {
                     return self.errors.push(Error::new(d.pos, msg).note(at, what));
                 }
-                // `int a[3]; int a[] = {1};` declares an `int [3]`.
-                if d.ty.is_array() && d.ty.size(self.xlen).is_none() {
-                    d.ty = prev.ty.clone();
-                }
-                if !d.ty.is_array() || d.ty.size(self.xlen).is_some() {
-                    prev.ty = prev.ty.composite(&d.ty);
-                    d.ty = prev.ty.clone();
-                }
+                // The type the declarations make together: `int a[3]; int
+                // a[] = {1};` declares an `int [3]`, and `int (*p[2])();
+                // int (*p[])(int);` an `int (*[2])(int)`.
+                prev.ty = prev.ty.composite(&d.ty);
+                d.ty = prev.ty.clone();
                 prev.init = prev.init.or(init);
                 prev.init_pos = prev.init_pos.or(init.map(|_| d.pos));
                 prev.tentative = prev.tentative.or(tentative);
@@ -1381,6 +1379,10 @@ struct FnChecker<'a> {
     /// What its blocks declared with linkage (`extern int x;`), in order:
     /// [`Global::hidden`].
     linked: Vec<(String, Type, Pos)>,
+    /// Where its blocks' declarations are that conflict with an earlier
+    /// one (`int h(char);`, then `int h();` in a block): clang marks them
+    /// invalid, and says nothing more of what uses them.
+    invalid: HashSet<Pos>,
     /// The target, for sizes and conversions.
     xlen: Xlen,
 }
@@ -1431,6 +1433,7 @@ impl<'a> FnChecker<'a> {
             unevaluated: 0,
             registers: HashSet::new(),
             linked: Vec::new(),
+            invalid: HashSet::new(),
             xlen,
         }
     }
@@ -2306,12 +2309,25 @@ impl<'a> FnChecker<'a> {
     fn local_var(&mut self, d: &mut Declarator) {
         self.spellings.insert(d.pos, d.spelled.clone());
         self.begins.insert(d.pos, d.begin);
+        // A redeclaration the block's earlier declaration of the name does
+        // not allow: the name stays the earlier's.
+        if self.same_scope_conflict(d) {
+            return;
+        }
         // A block's `extern` declaration, or a function's: in the block the
         // name is the object or function outside it, which it defines
         // nothing of.
         if d.storage == Storage::Extern || d.ty.is_func() {
-            // clang declares it all the same.
-            self.linkage_redeclared(d);
+            // clang declares it all the same, invalid if it conflicts with
+            // a declaration around the block; one that conflicts with the
+            // block's own leaves the name that one's.
+            if self.linkage_redeclared(d) {
+                let own = self.scopes.last().is_some_and(|s| s.contains_key(&d.name));
+                if own {
+                    return;
+                }
+                self.invalid.insert(d.pos);
+            }
             let var = VarRef::Global(d.name.clone());
             let binding = (var.clone(), d.ty.clone(), d.pos);
             self.scopes
@@ -2324,24 +2340,6 @@ impl<'a> FnChecker<'a> {
                 let msg = "declaration of block scope identifier with linkage cannot have an initializer";
                 self.err(d.pos, msg);
             }
-            return;
-        }
-        // An object of no linkage where the block declared one with it.
-        if let Some((_, _, prev)) = self
-            .scopes
-            .last()
-            .and_then(|s| s.get(&d.name))
-            .filter(|(v, ..)| matches!(v, VarRef::Global(sym) if *sym == d.name))
-        {
-            let e = Error::new(
-                d.pos,
-                format!(
-                    "non-extern declaration of '{}' follows extern declaration",
-                    d.name
-                ),
-            )
-            .note(*prev, "previous declaration is here");
-            self.errors.push(e);
             return;
         }
         if d.ty.is_void() {
@@ -3483,25 +3481,50 @@ impl<'a> FnChecker<'a> {
     /// not agree with an earlier one of its name: one of no linkage in the
     /// same block, or one with linkage, in a block of this function or of
     /// an earlier one, or at file scope (shown or not). Whether it had one.
+    /// Whether `d` redeclares a name its block declared already in a way
+    /// C does not allow, said as clang's `MergeVarDecl` says it: of a
+    /// function and an object, of objects' types that are not compatible,
+    /// then of their storage. Two of no linkage are [`Self::bind`]'s
+    /// redefinition, two functions [`Self::linkage_redeclared`]'s.
+    fn same_scope_conflict(&mut self, d: &Declarator) -> bool {
+        let name = &d.name;
+        let Some((v, ty, prev)) = self.scopes.last().and_then(|s| s.get(name)).cloned() else {
+            return false;
+        };
+        // A declaration with linkage is bound to the name as its symbol; a
+        // static local's symbol is its own (`f.x`).
+        let linked = matches!(&v, VarRef::Global(sym) if sym == name);
+        let static_local = matches!(&v, VarRef::Global(_)) && !linked;
+        let external = d.storage == Storage::Extern || d.ty.is_func();
+        let (msg, note) = if ty.is_func() != d.ty.is_func() {
+            let msg = format!("redefinition of '{name}' as different kind of symbol");
+            (msg, "previous definition is here")
+        } else if ty.is_func() {
+            return false;
+        } else if !compatible(&ty, &d.ty) {
+            let what = if external { "redeclaration" } else { "redefinition" };
+            let msg = format!("{what} of '{name}' with a different type: '{}' vs '{ty}'", d.ty);
+            (msg, previous(prev, !linked).1)
+        } else if external && linked {
+            return false;
+        } else if static_local && d.storage != Storage::Static {
+            let msg = format!("non-static declaration of '{name}' follows static declaration");
+            (msg, "previous definition is here")
+        } else if external {
+            let msg = format!("extern declaration of '{name}' follows non-extern declaration");
+            (msg, "previous definition is here")
+        } else if linked {
+            let msg = format!("non-extern declaration of '{name}' follows extern declaration");
+            (msg, "previous declaration is here")
+        } else {
+            return false;
+        };
+        self.errors.push(Error::new(d.pos, msg).note(prev, note));
+        true
+    }
+
     fn linkage_redeclared(&mut self, d: &mut Declarator) -> bool {
         let name = &d.name;
-        // A static local's symbol is its own (`f.x`), a declaration's with
-        // linkage the name.
-        let no_linkage = |v: &VarRef| !matches!(v, VarRef::Global(sym) if sym == name);
-        if let Some((v, _, prev)) = self
-            .scopes
-            .last()
-            .and_then(|s| s.get(name))
-            .filter(|(v, ..)| no_linkage(v))
-        {
-            let msg = match v {
-                VarRef::Global(_) => format!("non-static declaration of '{name}' follows static declaration"),
-                _ => format!("extern declaration of '{name}' follows non-extern declaration"),
-            };
-            let e = Error::new(d.pos, msg).note(*prev, "previous definition is here");
-            self.errors.push(e);
-            return true;
-        }
         let earlier = match self.linked.iter().rev().find(|(n, ..)| n == name) {
             Some((_, ty, pos)) => Some((ty.clone(), *pos, false)),
             None => self.globals.get(name).map(Global::declaration),
@@ -3509,6 +3532,12 @@ impl<'a> FnChecker<'a> {
         let Some((ty, pos, definition)) = earlier else {
             return false;
         };
+        // C23's conflict of one without a prototype and one with, before
+        // whatever else is said of them, as clang has it.
+        if let (Some(a), Some(b)) = (ty.func_type(), d.ty.func_type()) {
+            let w = deprecated_conflict((a, pos), (b, d.pos, false));
+            self.errors.extend(w);
+        }
         let msg = match (ty.is_func(), d.ty.is_func()) {
             (true, true) if !ty.compatible(&d.ty) => format!("conflicting types for '{name}'"),
             (false, false) if !compatible(&ty, &d.ty) => {
@@ -3527,12 +3556,20 @@ impl<'a> FnChecker<'a> {
                 return true;
             }
             _ => {
-                if let (Some(a), Some(b)) = (ty.func_type(), d.ty.func_type()) {
-                    let w = deprecated_conflict((a, pos), (b, d.pos, false));
-                    self.errors.extend(w);
+                // The name has the type it makes together with the earlier
+                // declaration that is visible, if one is (C99 6.2.7p4): in
+                // a block around with nothing of the name between, or at
+                // file scope, not hidden. Of one that is not (another
+                // block's, or one a local's name hides), nothing.
+                let name = name.clone();
+                let visible = match self.lookup(&name) {
+                    Some((VarRef::Global(sym), t, _)) if *sym == name => Some(t.clone()),
+                    Some(_) => None,
+                    None => self.global(&name).map(|g| g.declaration().0),
+                };
+                if let Some(t) = visible {
+                    d.ty = t.composite(&d.ty);
                 }
-                // The name has the type the declarations make together.
-                d.ty = ty.composite(&d.ty);
                 return false;
             }
         };
@@ -3647,6 +3684,9 @@ impl<'a> FnChecker<'a> {
                 {
                     return Err(self.err(pos, "address of register variable requested"));
                 }
+                // An invalid declaration's name: what it is in is invalid
+                // too, of nothing more to say.
+                Some((_, _, at)) if self.invalid.contains(at) => return Err(Reported),
                 Some((v, ty, _)) => {
                     *var = Some(v.clone());
                     ty.clone()
@@ -4061,7 +4101,16 @@ impl<'a> FnChecker<'a> {
                 let local = callee.direct_callee().and_then(|n| {
                     let (_, ty, at) = self.lookup(n)?;
                     match Global::hidden(*at, ty) {
-                        Global::Func(sig) => Some((n, sig)),
+                        // Named and placed by the block's declaration,
+                        // defined as the function is.
+                        Global::Func(mut sig) => {
+                            if let Some(Global::Func(f)) = globals.get(n) {
+                                sig.def = f.def;
+                                sig.defined = f.defined;
+                                sig.bare_def = f.bare_def.clone();
+                            }
+                            Some((n, sig))
+                        }
                         Global::Var(_) => None,
                     }
                 });
