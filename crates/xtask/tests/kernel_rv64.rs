@@ -357,6 +357,55 @@ fn the_rv64_kernel_is_linked_high_and_loaded_low() {
 }
 
 #[test]
+fn the_rv64_kernels_have_no_m_mode_code() {
+    // The M-mode layer is the firmware's (#174): no instruction of either RV64
+    // kernel's text is M-mode's, no mret, no access to a CSR that only M-mode
+    // has (bits 9:8 of its number are its lowest privilege, 3), and none of
+    // the SBI's symbols is in it.
+    for file in [under_test(), disk_kernel_under_test()] {
+        let e = grail::elf::parse(&file).unwrap();
+        let sym = |name: &str| e.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"));
+        let (text, end) = (sym("__text_start"), sym("__rodata_start"));
+        let seg = e
+            .segments
+            .iter()
+            .find(|s| (s.vaddr..s.vaddr + s.mem_size).contains(&text))
+            .unwrap();
+        // The text, up to the rodata pages (its last page's padding may not be
+        // in the file).
+        let stop = ((end - seg.vaddr) as usize).min(seg.data.len());
+        let code = &seg.data[(text - seg.vaddr) as usize..stop];
+        let mut csrs = 0;
+        for (i, w) in code.chunks(4).enumerate() {
+            let word = u32::from_le_bytes(w.try_into().unwrap());
+            let at = text + 4 * i as u64;
+            match excalibur::decode(word, excalibur::Xlen::Rv64) {
+                excalibur::Inst::Mret => panic!("mret at {at:#x}"),
+                excalibur::Inst::Csr { csr, .. } => {
+                    assert_ne!(csr >> 8 & 3, 3, "an M-mode CSR ({csr:#x}) at {at:#x}");
+                    csrs += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(csrs > 20, "the S-mode CSRs it uses: {csrs}");
+        for name in [
+            "machine_vec",
+            "machine_scratch",
+            "sbi_coldboot",
+            "sbi_hart_init",
+            "sbi_hart_wait",
+            "early_trap",
+        ] {
+            assert!(e.symbol(name).is_none(), "{name} is in the RV64 kernel");
+        }
+        // It loads after the firmware's 2 MiB, where the firmware starts it.
+        assert_eq!(e.physical_entry().unwrap(), LOAD_ADDR);
+        assert_eq!(LOAD_ADDR, grail::firmware::FW_JUMP_ADDR);
+    }
+}
+
+#[test]
 fn the_rv64_kernel_boots_through_its_self_tests() {
     let mut k = Kernel::load(1, RAM);
     let r = k.run();
@@ -397,6 +446,11 @@ fn the_rv64_kernel_boots_through_its_self_tests() {
     assert_eq!(k.read64(k.sym("kernel_satp")), mode.satp_mode | k.pa(kpt) >> 12);
     let cpus = k.sym("cpus");
     assert_eq!(k.read64(cpus + CPU_PAGETABLE), kpt);
+    // The firmware's a1, the device tree Grail made, kept for the kernel
+    // (Linux's dtb_early_pa).
+    let fdt = k.m.cpu.bus.read_mem(grail::boot::FDT_ADDR_ADDR, 8).unwrap();
+    assert_eq!(fdt, 0x8060_0000);
+    assert_eq!(k.read64(k.sym("dtb_early_pa")), fdt);
     // Every lock let go, hart 0 out of push_off.
     assert_eq!(k.read32(cpus + CPU_NOFF), 0);
     for name in ["kmem_lock", "proc_lock", "uart_tx_lock", "tickslock"] {

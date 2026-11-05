@@ -81,9 +81,14 @@ impl Image {
     pub fn from_elf(file: &[u8], xlen: Xlen) -> Result<Image, String> {
         let elf = elf::parse(file).map_err(|e| e.to_string())?;
         if elf.xlen != xlen {
+            let name = |x: Xlen| match x {
+                Xlen::Rv32 => "RV32 (ELF32)",
+                Xlen::Rv64 => "RV64 (ELF64)",
+            };
             return Err(format!(
-                "an {:?} firmware cannot run on an {xlen:?} machine",
-                elf.xlen
+                "an {} firmware cannot run on an {} machine",
+                name(elf.xlen),
+                &name(xlen)[..4]
             ));
         }
         let entry = elf.physical_entry().map_err(|e| e.to_string())?;

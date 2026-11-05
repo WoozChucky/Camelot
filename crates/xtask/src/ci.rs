@@ -124,8 +124,8 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
-        what: "Grail: riscv-tests, RV64, paging and atomics semantics, disk boot, the committed disk \
-               image, the display controller, the keyboard's two modes",
+        what: "Grail: riscv-tests, RV64, paging and atomics semantics, disk boot, firmware and the \
+               device tree, the committed disk image, the display controller, the keyboard's two modes",
         args: &[
             "-p",
             "grail",
@@ -139,6 +139,8 @@ const STEPS: &[Step] = &[
             "atomics",
             "--test",
             "disk_boot",
+            "--test",
+            "firmware",
             "--test",
             "block",
             "--test",
