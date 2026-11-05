@@ -14,6 +14,8 @@
 //!   and profile mean for what a person may do with it and its disks.
 //! - [`create_camelot_vm`]: a VM that boots Camelot from its own copy of Lake's
 //!   [`BASE_IMAGE`], with no program to upload.
+//! - [`DebugTunnel`]: a debugger's end of a VM's GDB stub, the GDB remote serial
+//!   protocol's bytes over a session (merlin-dbg's `--vm`).
 //!
 //! Round Table, the command-line client, is a thin layer over this crate, and so is
 //! Pendragon, the web console: the two cannot drift apart.
@@ -22,9 +24,11 @@ use avalon_proto::{
     validate_name, Connection, DeviceSpec, DiskInfo, DiskSource, DiskSpec, ErrorCode, HardwareProfile,
     Message, NatConfig, SwitchInfo, VmDetails, VmRef, VmState, VmSummary,
 };
+use std::collections::VecDeque;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 pub mod parse;
@@ -164,14 +168,15 @@ impl VmAction {
     }
 
     /// Whether the server accepts this action on a VM in `state` (protocol doc,
-    /// section 6.2): front ends offer only these.
+    /// section 6.2): front ends offer only these. A VM its debugger holds (paused or
+    /// debug) is the debugger's to resume, and refuses `Resume` all the same.
     pub fn allowed_in(self, state: VmState) -> bool {
         use VmState::*;
         match self {
             VmAction::Start => state == Created,
             VmAction::Pause => state == Running,
-            VmAction::Resume => state == Paused,
-            VmAction::Stop => matches!(state, Created | Running | Paused),
+            VmAction::Resume => matches!(state, Paused | Debug),
+            VmAction::Stop => matches!(state, Created | Running | Paused | Debug),
             VmAction::Destroy => true,
         }
     }
@@ -190,9 +195,13 @@ impl VmAction {
 
 /// Whether a VM in `state` still has its machine, and so holds its disks: a VM's disks
 /// are attached when it is created and released when its machine ends, when it is
-/// stopped or its program exits (protocol doc, section 6.6).
+/// stopped or its program exits (protocol doc, section 6.6). A VM its debugger holds
+/// (state debug) has its machine.
 pub fn holds_disks(state: VmState) -> bool {
-    matches!(state, VmState::Created | VmState::Running | VmState::Paused)
+    matches!(
+        state,
+        VmState::Created | VmState::Running | VmState::Paused | VmState::Debug
+    )
 }
 
 /// The Lake images in a hardware profile, as (server address, image name, read-only),
@@ -465,6 +474,25 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
+    // ---- Debugging (Avalon) ----
+
+    /// Makes this session the debugger of a VM (protocol doc, section 6.8), which stops
+    /// for it: returns the VM's id. `DebugOutput` events follow on the connection, and
+    /// `DebugInput` events sent on it reach the VM's GDB stub; [`DebugTunnel`] makes the
+    /// two a byte stream.
+    pub fn attach_debugger(&mut self, vm: &VmRef) -> Result<u32> {
+        match self.conn.request(&Message::DebugAttach { vm: vm.clone() })? {
+            Message::DebugAttached { vm } => Ok(vm),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Stops being VM `vm`'s debugger, as GDB's `D` does: its breakpoints go, and it
+    /// runs on.
+    pub fn detach_debugger(&mut self, vm: u32) -> Result<()> {
+        Ok(self.conn.request_ok(&Message::DebugDetach { vm })?)
+    }
+
     // ---- Virtual network (Avalon) ----
 
     /// Creates a virtual switch with no cards plugged in.
@@ -572,6 +600,134 @@ fn unexpected(reply: &Message) -> Error {
     Error::Request(avalon_proto::Error::Unexpected(reply.type_code()))
 }
 
+/// A debugger's end of a VM's GDB stub (protocol doc, section 6.8): the GDB remote
+/// serial protocol's bytes, carried in `DebugInput` and `DebugOutput` over a session
+/// attached as the VM's debugger, as a byte stream a GDB client reads and writes as it
+/// would a socket. A thread reads the session; [`DebugTunnel::read_timeout`] takes
+/// what it has read.
+///
+/// The stream ends when the server ends the attachment (`Detached`: the VM's machine
+/// ended) or the session breaks. Dropping the tunnel closes the session: the server
+/// leaves the VM as it is, stopped or running, breakpoints and all, as QEMU leaves a VM
+/// whose GDB connection closes. A debugger detaches with GDB's `D` first.
+pub struct DebugTunnel {
+    conn: Connection<TcpStream>,
+    vm: u32,
+    rx: Receiver<Tunnelled>,
+    /// Bytes read from the session that the reader has not taken yet.
+    pending: VecDeque<u8>,
+    /// Why the stream ended, once it has.
+    ended: Option<String>,
+}
+
+/// What the tunnel's thread reads.
+enum Tunnelled {
+    Bytes(Vec<u8>),
+    End(String),
+}
+
+impl DebugTunnel {
+    /// Attaches `client`'s session to VM `vm` as its debugger (the VM stops) and opens
+    /// the tunnel.
+    pub fn open(mut client: Client<TcpStream>, vm: &VmRef) -> Result<DebugTunnel> {
+        let id = client.attach_debugger(vm)?;
+        let mut conn = client.into_connection();
+        let mut reader = conn.try_clone()?;
+        reader
+            .get_ref()
+            .set_read_timeout(None)
+            .map_err(avalon_proto::Error::from)?;
+        let (tx, rx) = mpsc::channel();
+        // Whatever came with the reply (a state change) is not the stub's.
+        while conn.queued_events() > 0 {
+            if let Ok(Message::DebugOutput { vm, data }) = conn.recv() {
+                if vm == id {
+                    let _ = tx.send(Tunnelled::Bytes(data));
+                }
+            }
+        }
+        std::thread::spawn(move || loop {
+            let sent = match reader.recv() {
+                Ok(Message::DebugOutput { vm, data }) if vm == id => tx.send(Tunnelled::Bytes(data)),
+                Ok(Message::Detached {
+                    vm,
+                    kind: avalon_proto::AttachKind::Debug,
+                }) if vm == id => {
+                    let _ = tx.send(Tunnelled::End(format!("VM {id}'s machine has ended")));
+                    return;
+                }
+                // State changes and the like: the stub says what a debugger needs.
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let _ = tx.send(Tunnelled::End(e.to_string()));
+                    return;
+                }
+            };
+            if sent.is_err() {
+                return;
+            }
+        });
+        Ok(DebugTunnel {
+            conn,
+            vm: id,
+            rx,
+            pending: VecDeque::new(),
+            ended: None,
+        })
+    }
+
+    /// The VM's id.
+    pub fn vm(&self) -> u32 {
+        self.vm
+    }
+
+    /// Reads what the stub has sent into `buf`, waiting at most `timeout` for it
+    /// (forever with none). `ErrorKind::TimedOut` if nothing came in time;
+    /// `UnexpectedEof` once the stream has ended.
+    pub fn read_timeout(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
+        if self.pending.is_empty() && self.ended.is_none() {
+            let got = match timeout {
+                Some(t) => self.rx.recv_timeout(t),
+                None => self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match got {
+                Ok(Tunnelled::Bytes(b)) => self.pending.extend(b),
+                Ok(Tunnelled::End(why)) => self.ended = Some(why),
+                Err(RecvTimeoutError::Timeout) => return Err(io::ErrorKind::TimedOut.into()),
+                Err(RecvTimeoutError::Disconnected) => self.ended = Some("the session ended".into()),
+            }
+        }
+        if self.pending.is_empty() {
+            let why = self.ended.clone().unwrap_or_default();
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, why));
+        }
+        let n = buf.len().min(self.pending.len());
+        for (b, p) in buf.iter_mut().zip(self.pending.drain(..n)) {
+            *b = p;
+        }
+        Ok(n)
+    }
+
+    /// Sends `data` to the stub.
+    pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        let msg = Message::DebugInput {
+            vm: self.vm,
+            data: data.to_vec(),
+        };
+        self.conn.send(&msg).map_err(|e| match e {
+            avalon_proto::Error::Io(e) => e,
+            other => io::Error::other(other.to_string()),
+        })
+    }
+}
+
+impl Drop for DebugTunnel {
+    fn drop(&mut self) {
+        // The reader thread ends with the session.
+        let _ = self.conn.get_ref().shutdown(std::net::Shutdown::Both);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,9 +817,11 @@ mod tests {
         assert_eq!(allowed(Created), ["start", "stop", "destroy"]);
         assert_eq!(allowed(Running), ["pause", "stop", "destroy"]);
         assert_eq!(allowed(Paused), ["resume", "stop", "destroy"]);
+        // Stopped at a breakpoint, once its debugger has gone (QEMU's `cont`).
+        assert_eq!(allowed(Debug), ["resume", "stop", "destroy"]);
         assert_eq!(allowed(Stopped), ["destroy"]);
         assert_eq!(allowed(Exited(3)), ["destroy"]);
-        assert!(holds_disks(Created) && holds_disks(Running) && holds_disks(Paused));
+        assert!(holds_disks(Created) && holds_disks(Running) && holds_disks(Paused) && holds_disks(Debug));
         assert!(!holds_disks(Stopped) && !holds_disks(Exited(0)));
     }
 

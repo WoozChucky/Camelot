@@ -249,6 +249,30 @@ fn detaching_leaves_the_machine_running() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello from Camelot!\n");
 }
 
+/// A client whose connection ends without `D` leaves the machine as it was, as QEMU's
+/// stub does: running, the breakpoints it set still stop it, and it then stays stopped
+/// with nobody to tell until the next client comes; that one's `?` removes them.
+#[test]
+fn a_connection_that_ends_leaves_the_machine_as_it_was() {
+    let hello = "examples/hello/hello.elf";
+    let puts = symbol(hello, "puts");
+    let (child, addr) = grail(&["--gdb-wait"], hello);
+    let mut c = Client::connect(addr);
+    assert_eq!(c.ask(&format!("Z0,{puts:x},4")), "OK");
+    // The loop over the message's bytes, hit once a byte.
+    assert_eq!(c.ask(&format!("Z0,{:x},4", puts + 8)), "OK");
+    c.send("c");
+    drop(c);
+    // Stopped at puts, what puts writes not written yet.
+    let mut c = Client::connect(addr);
+    assert_eq!(c.ask("?"), format!("T02thread:1;20:{};", le(puts)));
+    // The `?` took the breakpoints away: the program runs to its end.
+    assert_eq!(c.ask("c"), "W00");
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Hello from Camelot!\n");
+}
+
 #[test]
 fn gdb_options_are_checked() {
     for args in [

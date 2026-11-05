@@ -23,7 +23,7 @@ fn samples_cover_the_whole_catalogue() {
 fn catalogue_is_in_code_order_and_grouped() {
     let codes: Vec<u16> = CATALOGUE.iter().map(|(code, _, _)| *code).collect();
     assert!(codes.windows(2).all(|w| w[0] < w[1]), "{codes:x?}");
-    assert!(codes.iter().all(|c| c >> 8 <= 6));
+    assert!(codes.iter().all(|c| c >> 8 <= 7));
 }
 
 #[test]
@@ -567,6 +567,7 @@ fn vm_ref_parses_ids_and_names() {
     }
     assert_eq!(VmRef::Id(3).to_string(), "3");
     assert_eq!(VmState::Exited(2).to_string(), "exited(2)");
+    assert_eq!(VmState::Debug.to_string(), "debug");
 }
 
 #[test]

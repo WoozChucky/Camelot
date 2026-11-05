@@ -9,6 +9,11 @@
 //! Registers travel as wide as the machine's harts: 4 bytes on RV32, 8 on RV64, each
 //! little-endian in hex ([`target::reg_bytes`]). Addresses are up to 64 bits.
 //!
+//! Memory packets go through the selected hart's translation, or to physical addresses
+//! once the client has asked for them as QEMU's stub has it (`Qqemu.PhyMemMode:1`,
+//! which GDB sends for `maintenance packet Qqemu.PhyMemMode:1`): a debugger that walks
+//! a page table itself reads it that way.
+//!
 //! A packet the stub does not know gets an empty reply, which tells the client it is
 //! not supported. A known packet with arguments it cannot parse gets `E01`; a memory
 //! access that fails `E14` (EFAULT); a thread or hart that does not exist `E22`
@@ -58,6 +63,8 @@ pub struct Stub {
     /// The hart `c` and `s` act on, from `Hc`; `None` is "any" (the selected hart).
     resume_hart: Option<usize>,
     last_stop: StopReason,
+    /// `m`, `M` and `X` use physical addresses (`Qqemu.PhyMemMode:1`).
+    physical: bool,
 }
 
 impl Default for Stub {
@@ -74,6 +81,7 @@ impl Stub {
             swbreak: false,
             resume_hart: None,
             last_stop: StopReason::Interrupted,
+            physical: false,
         }
     }
 
@@ -130,14 +138,20 @@ impl Stub {
             return reply("");
         };
         let result = match cmd {
-            b'?' => Ok(Action::Reply(self.stop_reply(m))),
+            b'?' => {
+                // A client asks this as it connects, so the breakpoints and watchpoints
+                // an earlier one left (its connection ended without `D`) go, as QEMU's
+                // stub removes them here (`handle_target_halt`).
+                m.clear_debug_points();
+                Ok(Action::Reply(self.stop_reply(m)))
+            }
             b'g' => Ok(read_general(m)),
             b'G' => write_general(m, args),
             b'p' => read_register(m, args),
             b'P' => write_register(m, args),
-            b'm' => read_memory(m, args),
-            b'M' => write_memory(m, args, false),
-            b'X' => write_memory(m, args, true),
+            b'm' => read_memory(m, args, self.space()),
+            b'M' => write_memory(m, args, false, self.space()),
+            b'X' => write_memory(m, args, true, self.space()),
             b'c' | b'C' | b's' | b'S' => self.resume(m, cmd, args),
             b'Z' | b'z' => point(m, cmd == b'Z', args),
             b'H' => self.set_thread(m, args),
@@ -149,6 +163,15 @@ impl Stub {
             _ => Ok(reply("")),
         };
         result.unwrap_or_else(Action::Reply)
+    }
+
+    /// The addresses the memory packets use.
+    fn space(&self) -> Space {
+        if self.physical {
+            Space::Physical
+        } else {
+            Space::Virtual
+        }
     }
 
     /// `c [addr]`, `C sig[;addr]`, `s [addr]`, `S sig[;addr]`: resume at `addr` if given
@@ -256,6 +279,17 @@ impl Stub {
                 reply(&format!("m{}", ids.join(",")))
             }
             "qsThreadInfo" => reply("l"),
+            // QEMU's: what of its `qqemu` packets the stub has, and whether memory packets
+            // use physical addresses (GDB sends these for `maintenance packet`).
+            "qqemu.Supported" => reply("PhyMemMode"),
+            "qqemu.PhyMemMode" => reply(if self.physical { "1" } else { "0" }),
+            "Qqemu.PhyMemMode" => match rest {
+                "0" | "1" => {
+                    self.physical = rest == "1";
+                    reply("OK")
+                }
+                _ => Action::Reply(malformed()),
+            },
             "qC" => reply(&format!("QC{:x}", m.selected_hart() + 1)),
             "qAttached" => reply("1"),
             "qThreadExtraInfo" => match thread(m, rest.as_bytes()) {
@@ -378,12 +412,12 @@ fn addr_len(args: &[u8]) -> Option<(u64, usize)> {
     Some((hex(&args[..i])?, hex(&args[i + 1..])? as usize))
 }
 
-/// `m addr,len`: the bytes that can be read from `addr` on, through the selected hart's
-/// translation; `E14` if not even the first can.
-fn read_memory(m: &Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
+/// `m addr,len`: the bytes that can be read from `addr` on, in `space` (through the
+/// selected hart's translation, or physical); `E14` if not even the first can.
+fn read_memory(m: &Machine, args: &[u8], space: Space) -> Result<Action, Vec<u8>> {
     let (addr, len) = addr_len(args).ok_or_else(malformed)?;
     let mut buf = vec![0; len.min(MAX_READ)];
-    let n = m.read_memory(addr, &mut buf, Space::Virtual);
+    let n = m.read_memory(addr, &mut buf, space);
     if n == 0 && !buf.is_empty() {
         return Err(error(14));
     }
@@ -391,7 +425,7 @@ fn read_memory(m: &Machine, args: &[u8]) -> Result<Action, Vec<u8>> {
 }
 
 /// `M addr,len:hex` and `X addr,len:binary`.
-fn write_memory(m: &mut Machine, args: &[u8], binary: bool) -> Result<Action, Vec<u8>> {
+fn write_memory(m: &mut Machine, args: &[u8], binary: bool, space: Space) -> Result<Action, Vec<u8>> {
     let colon = args.iter().position(|&b| b == b':').ok_or_else(malformed)?;
     let (addr, len) = addr_len(&args[..colon]).ok_or_else(malformed)?;
     let data = &args[colon + 1..];
@@ -404,7 +438,7 @@ fn write_memory(m: &mut Machine, args: &[u8], binary: bool) -> Result<Action, Ve
     if data.len() != len {
         return Err(malformed());
     }
-    if m.write_memory(addr, &data, Space::Virtual) != len {
+    if m.write_memory(addr, &data, space) != len {
         return Err(error(14));
     }
     Ok(reply("OK"))
@@ -765,6 +799,35 @@ mod tests {
     }
 
     #[test]
+    fn qemus_physical_memory_mode() {
+        let (mut m, mut stub) = setup(1);
+        // Virtual 0x4000_0000 is RAM's first page, through a 4 MiB superpage, in S-mode.
+        let root = RAM_BASE + 0x1000;
+        let pte: u32 = (0x80000 << 10) | 0b1111;
+        m.write_memory(
+            root + (0x4000_0000u64 >> 22) * 4,
+            &pte.to_le_bytes(),
+            Space::Physical,
+        );
+        m.write_memory(RAM_BASE, &[0xaa, 0xbb], Space::Physical);
+        assert!(m.set_csr(0x180, (1 << 31) | (root >> 12)));
+        m.set_mode(Mode::S);
+        assert_eq!(ask(&mut m, &mut stub, "qqemu.Supported"), "PhyMemMode");
+        assert_eq!(ask(&mut m, &mut stub, "qqemu.PhyMemMode"), "0");
+        assert_eq!(ask(&mut m, &mut stub, "m80000000,2"), "E0e", "not mapped");
+        assert_eq!(ask(&mut m, &mut stub, "Qqemu.PhyMemMode:1"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "qqemu.PhyMemMode"), "1");
+        // Physical: RAM at its own address, and the virtual one is not RAM.
+        assert_eq!(ask(&mut m, &mut stub, "m80000000,2"), "aabb");
+        assert_eq!(ask(&mut m, &mut stub, "m40000000,2"), "E0e");
+        assert_eq!(ask(&mut m, &mut stub, "M80000000,1:cc"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "X80000001,1:d"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "Qqemu.PhyMemMode:2"), "E01");
+        assert_eq!(ask(&mut m, &mut stub, "Qqemu.PhyMemMode:0"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "m40000000,2"), "cc64");
+    }
+
+    #[test]
     fn breakpoints_and_watchpoints() {
         let (mut m, mut stub) = setup(1);
         assert_eq!(ask(&mut m, &mut stub, "Z0,80000010,4"), "OK");
@@ -982,5 +1045,20 @@ mod tests {
         assert_eq!(r, b"T05thread:2;20:20100000;");
         assert_eq!(stub.stopped(&mut m, StopReason::Machine(Stop::Exited(3))), b"W03");
         assert_eq!(ask(&mut m, &mut stub, "?"), "W03");
+    }
+
+    /// `?` is what a client asks as it connects: the breakpoints and watchpoints a
+    /// client before it left go, as QEMU's stub has it.
+    #[test]
+    fn a_new_clients_question_clears_what_the_last_one_left() {
+        let (mut m, mut stub) = setup(1);
+        assert_eq!(ask(&mut m, &mut stub, "Z0,80000000,4"), "OK");
+        assert_eq!(ask(&mut m, &mut stub, "Z2,80001000,4"), "OK");
+        assert!(m.has_debug_points());
+        let mut next = Stub::new();
+        assert!(ask(&mut m, &mut next, "?").starts_with("T02"));
+        assert!(!m.has_debug_points());
+        assert_eq!(m.breakpoints().count(), 0);
+        assert!(m.watchpoints().is_empty());
     }
 }
