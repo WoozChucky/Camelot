@@ -14,9 +14,10 @@
 //! one of the two firmwares or an assumption in the kernel that no SBI
 //! promises.
 //!
-//! Ignored, as the issue that asked for it has it: a check against
-//! another project's firmware, which `cargo test` does not need. Run it
-//! with `cargo test --release -p xtask --test opensbi -- --ignored`.
+//! Like the riscv-tests, it needs nothing a plain `cargo test` lacks:
+//! the firmware and the kernel are committed, and building the firmware
+//! again is the only step that needs LLVM. So it runs with the suite, and
+//! in CI (`cargo xtask ci`).
 
 use grail::{Bios, Machine, MachineConfig, RunResult};
 use std::sync::mpsc::{self, Sender};
@@ -143,7 +144,6 @@ fn kernel_output(out: &str) -> (String, String) {
 }
 
 #[test]
-#[ignore = "checks the kernel against OpenSBI: cargo test --release -p xtask --test opensbi -- --ignored"]
 fn camelot_boots_under_opensbi() {
     let fw_jump = repo_root().join("tests/opensbi/fw_jump.bin");
     for harts in [1, 4, 8] {

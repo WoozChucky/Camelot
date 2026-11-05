@@ -171,6 +171,10 @@ const STEPS: &[Step] = &[
         args: &["-p", "xtask", "--test", "sbi"],
     },
     Step {
+        what: "the RV64 kernel on OpenSBI v1.9's fw_jump, the reference firmware, on 1, 4 and 8 harts",
+        args: &["-p", "xtask", "--test", "opensbi"],
+    },
+    Step {
         what: "RV64 processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
                Linux's start",
         args: &[
