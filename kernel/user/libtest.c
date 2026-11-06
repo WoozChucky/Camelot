@@ -1,5 +1,6 @@
 /* libtest: checks the C library (lib/, lib/README.md) from a program:
- * strings and memory, numbers, snprintf's formats, malloc and free (and
+ * strings and memory (memset, memcpy, memmove and memcmp at every
+ * alignment), numbers, snprintf's formats, malloc and free (and
  * how free merges neighbours), and the readers on a pipe. Needs no
  * filesystem. Prints a line for each check that fails and, at the end,
  * "libtest: N checks, F failed"; exits with F.
@@ -89,6 +90,171 @@ static void test_strings(void) {
     memmove(buf, buf + 2, 6);
     check(memcmp(buf, "12345656", 8) == 0, "memmove down");
     check(memcmp("a\x80", "a\x01", 2) > 0 && memcmp("ab", "ac", 1) == 0, "memcmp");
+}
+
+/* ---- The memory functions at every alignment ----
+ *
+ * memset, memcpy, memmove and memcmp (lib/mem*.S, the kernel's) work a
+ * register at a time where their pointers are on a register boundary, and
+ * a byte at a time around that: checked at every alignment of each pointer
+ * within a register (0 to 7) and every length to 64, and at a few long
+ * lengths for two alignments, co-aligned and not, with guard bytes either
+ * side that must not change. One check for each function and pair of
+ * alignments; the first wrong case is printed. (kernel.rs's
+ * kernel_memory_functions_at_every_alignment checks the same code, the
+ * kernel's, at more lengths: merlin's C makes the checking slow here.) */
+
+#define MEM_GUARD 8
+#define MEM_LONGEST 4101
+static uchar mem_src[MEM_LONGEST + 8 + 2 * MEM_GUARD];
+static uchar mem_dst[MEM_LONGEST + 8 + 2 * MEM_GUARD];
+
+/* The byte at offset `i` of the patterns: different from its neighbours. */
+#define MEM_BYTE(i) ((uchar)((i) * 7 + 3) | 1)
+
+/* The lengths past 64: around the loops' larger steps (memcpy's 128-byte
+ * rounds, memset's 256) and a page and more. */
+static const size_t mem_long[] = {127, 128, 129, 255, 256, 257, 1024, MEM_LONGEST};
+
+/* Length `i` of the ones checked: 0 to 64, then mem_long's if `longer`;
+ * (size_t)-1 past the last. */
+static size_t mem_length(size_t i, int longer) {
+    if (i <= 64) {
+        return i;
+    }
+    if (!longer || i - 65 >= sizeof mem_long / sizeof mem_long[0]) {
+        return (size_t)-1;
+    }
+    return mem_long[i - 65];
+}
+
+/* Whether the `n` bytes at `at` (in mem_dst) are `want`'s, or all `c` if
+ * `want` is NULL, and the MEM_GUARD bytes either side still 0xee; puts 0xee
+ * back in the n bytes for the next call. */
+static int mem_check(uchar *at, size_t n, const uchar *want, uchar c) {
+    int ok = 1;
+    for (uchar *g = at - MEM_GUARD; g < at; g++) {
+        ok = ok && *g == 0xee;
+    }
+    for (size_t k = 0; k < n; k++) {
+        ok = ok && at[k] == (want ? want[k] : c);
+        at[k] = 0xee;
+    }
+    for (uchar *g = at + n; g < at + n + MEM_GUARD; g++) {
+        ok = ok && *g == 0xee;
+    }
+    return ok;
+}
+
+static void mem_report(const char *f, size_t sa, size_t da, size_t n) {
+    printf("libtest: FAILED: %s from alignment %lu to %lu, %lu bytes\n", f, (unsigned long)sa,
+           (unsigned long)da, (unsigned long)n);
+}
+
+static void test_memory_alignments(void) {
+    for (size_t i = 0; i < sizeof mem_src; i++) {
+        mem_src[i] = MEM_BYTE(i);
+        mem_dst[i] = 0xee;
+    }
+    for (size_t da = 0; da < 8; da++) {
+        int ok = 1;
+        size_t n;
+        for (size_t i = 0; ok && (n = mem_length(i, 1)) != (size_t)-1; i++) {
+            uchar *at = mem_dst + MEM_GUARD + da;
+            ok = memset(at, 0x1ab, n) == at && mem_check(at, n, NULL, 0xab);
+            if (!ok) {
+                mem_report("memset", 0, da, n);
+            }
+        }
+        check(ok, "memset at every alignment");
+    }
+    for (size_t sa = 0; sa < 8; sa++) {
+        for (size_t da = 0; da < 8; da++) {
+            int longer = (sa == 0 || sa == 5) && (da == 0 || da == 5);
+            for (int f = 0; f < 2; f++) {
+                int ok = 1;
+                size_t n;
+                for (size_t i = 0; ok && (n = mem_length(i, longer)) != (size_t)-1; i++) {
+                    uchar *at = mem_dst + MEM_GUARD + da;
+                    const uchar *from = mem_src + MEM_GUARD + sa;
+                    void *r = f == 0 ? memcpy(at, from, n) : memmove(at, from, n);
+                    ok = r == at && mem_check(at, n, from, 0);
+                    if (!ok) {
+                        mem_report(f == 0 ? "memcpy" : "memmove", sa, da, n);
+                    }
+                }
+                check(ok, f == 0 ? "memcpy at every alignment" : "memmove at every alignment");
+            }
+        }
+    }
+}
+
+/* memmove within one buffer, overlapping both ways: from offset s to d,
+ * every pair to 16 apart (every alignment of each, dst below src and
+ * above), at the lengths around a register's and two's. */
+static void test_memmove_overlap(void) {
+    static const size_t lengths[] = {0, 1, 7, 8, 9, 15, 16, 17, 24, 33, 64};
+    int ok = 1;
+    for (size_t s = 0; s < 16 && ok; s++) {
+        for (size_t d = 0; d < 16 && ok; d++) {
+            for (size_t l = 0; l < sizeof lengths / sizeof lengths[0] && ok; l++) {
+                size_t n = lengths[l];
+                for (size_t k = 0; k < n + 16; k++) {
+                    mem_dst[k] = MEM_BYTE(k);
+                }
+                ok = memmove(mem_dst + d, mem_dst + s, n) == mem_dst + d;
+                for (size_t k = 0; k < n + 16 && ok; k++) {
+                    size_t from = k >= d && k < d + n ? k - d + s : k;
+                    ok = mem_dst[k] == MEM_BYTE(from);
+                }
+                if (!ok) {
+                    printf("libtest: FAILED: memmove within a buffer from %lu to %lu, %lu bytes\n",
+                           (unsigned long)s, (unsigned long)d, (unsigned long)n);
+                }
+            }
+        }
+    }
+    check(ok, "memmove overlapping, both ways");
+}
+
+/* memcmp: 0 for equal bytes, whatever follows them; else the sign of the
+ * first byte that differs, as unsigned bytes (0x80 above 0x01), wherever
+ * it is: before a register boundary, at any byte of a whole register, or
+ * after the last one. */
+static void test_memcmp_alignments(void) {
+    for (size_t sa = 0; sa < 8; sa++) {
+        for (size_t da = 0; da < 8; da++) {
+            int ok = 1;
+            for (size_t n = 0; n <= 24 && ok; n++) {
+                uchar *x = mem_src + MEM_GUARD + sa;
+                uchar *y = mem_dst + MEM_GUARD + da;
+                for (size_t k = 0; k < n; k++) {
+                    x[k] = MEM_BYTE(k);
+                    y[k] = MEM_BYTE(k);
+                }
+                x[n] = 1;
+                y[n] = 2;
+                ok = memcmp(x, y, n) == 0;
+                for (size_t p = 0; p < n && ok; p++) {
+                    x[p] = 0x80;
+                    y[p] = 0x01;
+                    ok = memcmp(x, y, n) == 1 && memcmp(y, x, n) == -1;
+                    /* A later difference the other way does not count. */
+                    if (ok && p + 1 < n) {
+                        y[p + 1] = 0xff;
+                        ok = memcmp(x, y, n) == 1;
+                        y[p + 1] = MEM_BYTE(p + 1);
+                    }
+                    x[p] = MEM_BYTE(p);
+                    y[p] = MEM_BYTE(p);
+                }
+                if (!ok) {
+                    mem_report("memcmp", sa, da, n);
+                }
+            }
+            check(ok, "memcmp at every alignment");
+        }
+    }
 }
 
 static void test_numbers(void) {
@@ -633,6 +799,9 @@ int main(int argc, char **argv) {
     test_inet();
     test_types();
     test_strings();
+    test_memory_alignments();
+    test_memmove_overlap();
+    test_memcmp_alignments();
     test_numbers();
     test_long_long();
     test_snprintf();
