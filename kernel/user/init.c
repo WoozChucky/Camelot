@@ -12,9 +12,10 @@
  * and environment, and argv[0] is its program's name, the path's last part.
  *
  * - A respawn service that ends is started again. One that exits with
- *   EX_CONFIG (78, sysexits.h's) can't run with this machine's
- *   configuration (shd with no network card): it said why, and init leaves
- *   it. One that ends less than a second after it started, five times in a
+ *   EX_CONFIG (78, sysexits.h's) less than a second after it started can't
+ *   run with this machine's configuration (shd with no network card): it
+ *   said why, and init leaves it (a longer run that ends with 78, a shell's
+ *   `exit 78`, is any other end). One that ends less than a second after it started, five times in a
  *   row, is left too, with a line that says so, rather than started over
  *   and over, as sysvinit stops a service that respawns too fast; a longer
  *   run starts the count again, so a shell ended at once now and then (by
@@ -252,10 +253,11 @@ int main(void) {
                 last = status;
                 break;
             }
-            if (status == EX_CONFIG) {
+            int quick = uptime() - s->started < RESPAWN_MIN_TICKS;
+            if (quick && status == EX_CONFIG) {
                 break; /* it can't run here, and said why */
             }
-            s->quick = uptime() - s->started < RESPAWN_MIN_TICKS ? s->quick + 1 : 0;
+            s->quick = quick ? s->quick + 1 : 0;
             if (s->quick == RESPAWN_MAX_QUICK) {
                 printf("init: %s ended at once %d times, exit %d: not started again\n", s->path,
                        RESPAWN_MAX_QUICK, status);

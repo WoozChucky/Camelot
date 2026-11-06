@@ -32,7 +32,7 @@ for `grep`, whose 1 means "no line matched".
 
 | Program | Usage | What it does |
 |---|---|---|
-| `init` | `init` (the kernel's, as pid 1) | the first process: starts the services `/etc/rc` lists, `once PATH [ARG...]` or `respawn PATH [ARG...]` a line, restarts the `respawn` ones as they end (but one that exits 78, `EX_CONFIG`, or ends within a second five times in a row), ends the machine once the `once` ones have ended, and collects orphans; without `/etc/rc` it execs `/bin/sh` (excalibur-spec section 10, "Init and the shell") |
+| `init` | `init` (the kernel's, as pid 1) | the first process: starts the services `/etc/rc` lists, `once PATH [ARG...]` or `respawn PATH [ARG...]` a line, restarts the `respawn` ones as they end (but one that exits 78, `EX_CONFIG`, within a second of starting, or ends within a second five times in a row), ends the machine once the `once` ones have ended, and collects orphans; without `/etc/rc` it execs `/bin/sh` (excalibur-spec section 10, "Init and the shell") |
 | `sh` | `sh` | the shell: commands, `<`, `>`, `\|`, `&`, `NAME=VALUE` assignments, and the built-ins `cd`, `wait`, `exit`, `exec`, `export`, `unset`, `help`; it reads the console a line at a time, any other input (a connection from `shd`, a pipe, a file) a byte at a time, up to each newline |
 | `ls` | `ls [PATH...]` | lists directories (the working directory without arguments): type, inode, links, size, name |
 | `cat` | `cat [FILE...]` | copies files, or its input, to its output; refuses a directory |
