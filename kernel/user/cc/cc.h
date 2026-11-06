@@ -426,6 +426,8 @@ struct options {
     int lang;
     /* Preprocessed assembly has line markers: -P turns them off. */
     int line_markers;
+    /* Each file read has its MD5 taken, for -g's line table. */
+    int checksums;
 };
 
 /* Preprocesses the file `name`, whose text is src (n bytes), for -E: the
@@ -451,6 +453,9 @@ struct pp_output {
     const char **files;
     uint *lens;
     uint nfiles;
+    /* Each file's checksum, by number, if options.checksums asked for them
+     * (merlin's Output::checksums): of its bytes as read. */
+    struct checksum *sums;
     /* The diagnostics, in order, and for each where the last token that
      * came out before it is. */
     struct diag **diags;
@@ -1158,11 +1163,118 @@ int might_add_decl(struct stmt *s);
  * picked out. */
 int case_statements(struct stmt *sw, i128 value, struct vec *out);
 
+/* ---- MD5 (md5.c, merlin's md5.rs) ---- */
+
+/* The MD5 digest (RFC 1321) of the n bytes at data, in digest. */
+void md5(const uchar *data, uint n, uchar digest[16]);
+/* The digest as 32 lowercase hex digits, the first byte first, and a NUL:
+ * how clang writes it after `md5 0x`. */
+void md5_hex(const uchar digest[16], char out[33]);
+
+/* A file's MD5 checksum, if it has one (has: a name #line gives has
+ * none). */
+struct checksum {
+    uchar has;
+    uchar sum[16];
+};
+
+/* ---- Debug information (debug.c, merlin's debug.rs) ----
+ * What the code generator tells it as it generates (codegen.c), for the
+ * line table's directives and the DWARF compile unit it writes at the end. */
+
+struct lines;
+struct dvar;
+struct dlabel;
+struct dscope;
+
+/* LLVM's sys::path::filename (POSIX style, merlin-as's dwarf::file_name)
+ * of the n bytes at p: the last component, its length in *len (in p, or
+ * "." for a trailing `/`). */
+const char *path_file_name(const char *p, uint n, uint *len);
+/* Appends the n bytes at s as a string the assembler reads, quoted as
+ * LLVM's assembly printer quotes one (merlin's debug::quoted): `"` and `\`
+ * escaped, printable ASCII as it is, \b \f \n \r \t by name, any other byte
+ * as three octal digits. */
+void quote(struct buf *b, const char *s, uint n);
+
+/* -g's state for one translation unit (merlin's Lines::new): the
+ * compilation directory (-fdebug-compilation-dir), the preprocessor's files
+ * (names[i], lens[i] bytes) and their checksums, by pos.file. */
+struct lines *debug_new(const char *comp_dir, const char **names, const uint *lens, struct checksum *sums,
+                        uint nfiles);
+/* `.file 0 ...`, the first line of the output until debug_renumber puts it
+ * where clang has it. */
+char *debug_file0(struct lines *l);
+/* The labels at the start and the end of a new block's code. */
+void debug_block_labels(struct lines *l, const char **begin, const char **end);
+/* The .loc that says the next instruction comes from pos; column >= 0
+ * overrides the position's (0 for a function's first line). */
+char *debug_loc(struct lines *l, struct pos pos, int column, int prologue_end);
+/* A parameter or a variable named name, of type ty (spelled spelled),
+ * declared at pos, living at symbol sym, or (sym NULL) in the frame at
+ * offset from s0. */
+struct dvar *debug_var(struct lines *l, const char *name, struct type *ty, struct spelling *spelled, struct pos pos,
+                       const char *sym, int offset);
+/* A global variable the file defines, at symbol sym: the events since the
+ * last function or global are its initializer's. */
+void debug_global(struct lines *l, const char *name, const char *sym, struct type *ty, struct spelling *spelled,
+                  struct pos pos, int external);
+/* A variable declared in the function being generated, as clang's front
+ * end describes it there. */
+void debug_declared(struct lines *l, struct dvar *v);
+/* An explicit cast to ty (spelled spelled) in the code generated. */
+void debug_cast(struct lines *l, struct type *ty, struct spelling *spelled);
+/* An enumeration constant of the enum `of` spells, in the code generated. */
+void debug_enumerator(struct lines *l, struct spelling *of);
+/* goto label name, at pos, whose code starts at label sym. */
+struct dlabel *debug_label(struct lines *l, const char *name, struct pos pos, const char *sym);
+/* String literal label, a char array of len bytes (its NUL included, if it
+ * has one), at pos. */
+void debug_literal(struct lines *l, const char *label, uint len, struct pos pos);
+/* The functions, by name, in the order of their code. */
+void debug_code_order(struct lines *l, const char **names, uint n);
+/* A function generated, for its DW_TAG_subprogram (merlin's
+ * Lines::function's arguments). */
+struct debug_function {
+    const char *name;
+    /* The label just past its code. */
+    const char *end;
+    /* Where it starts (its name) and its body ends. */
+    struct pos start;
+    struct pos body_end;
+    int external;
+    int prototyped;
+    struct type *ret;
+    struct spelling *ret_spelled;
+    /* struct dvar *. */
+    struct vec params;
+    int variadic;
+    /* Its body's variables and blocks. */
+    struct dscope *body;
+};
+void debug_function(struct lines *l, struct debug_function *f);
+/* A scope (merlin's Scope): new, with the labels around its code ("" for
+ * a function's body); a goto label in it; a variable it declares; and a
+ * block in it, once its code is generated. */
+struct dscope *debug_scope(const char *begin, const char *end);
+void debug_scope_label(struct dscope *s, struct dlabel *label);
+void debug_scope_var(struct dscope *s, struct dvar *v);
+void debug_scope_block(struct dscope *s, struct dscope *inner);
+/* Numbers the files as LLVM does, and makes text (the output so far) have
+ * its .loc directives renumbered and the .file directives where clang
+ * writes them. Call it once the code is generated and its order known. */
+void debug_renumber(struct lines *l, struct buf *text);
+/* Appends the debug sections (.debug_abbrev, .debug_info, .debug_str and
+ * the others), and the label at the start of .debug_line that the compile
+ * unit points at; nothing if the file has no functions. */
+void debug_sections(struct lines *l, struct buf *out);
+
 /* ---- Code generation (codegen.c, merlin's codegen.rs) ---- */
 
-/* The assembly of a checked program (merlin's generate_with, without -g):
- * 1 and the text appended to out, or 0 and the error. */
-int codegen_generate(struct program *prog, struct buf *out, struct diag **error);
+/* The assembly of a checked program (merlin's generate_with): with -g
+ * (debug not NULL) its debug information too. 1 and the text appended to
+ * out, or 0 and the error. */
+int codegen_generate(struct program *prog, struct lines *debug, struct buf *out, struct diag **error);
 
 /* --dump-ast's text. */
 void ast_dump(struct program *p, struct buf *out);

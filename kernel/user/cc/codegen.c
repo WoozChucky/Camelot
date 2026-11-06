@@ -17,8 +17,12 @@
  * generated uses (as clang's frame at -O0 has room only for those), the
  * second lays out those alone.
  *
- * -g (merlin's debug.rs) is the next stage of cc1: where merlin's code
- * generator writes debug information, this one writes nothing. */
+ * With -g, it tells debug.c (merlin's debug.rs) what it generates as it
+ * goes: a .loc before the code of each statement, each block's scope and
+ * the labels around its code, the variables declared, the string
+ * literals, the explicit casts and enumeration constants clang's code
+ * generator visits (whose types and enums clang describes), the functions
+ * and globals; and writes the debug sections after the code. */
 #include "cc.h"
 
 #define TRY(x)                                                                                               \
@@ -136,6 +140,8 @@ struct filegen {
     struct map chunks;
     /* A function's first pass is being generated: it makes nothing. */
     int dry;
+    /* With -g, the debug information (debug.c); else NULL. */
+    struct lines *debug;
 };
 
 static void out_str(struct filegen *file, const char *s) {
@@ -523,9 +529,10 @@ static void byte_directives(uchar *bytes, uint n, struct vec *out) {
 }
 
 /* The label of a string literal whose array is `array` (its bytes, the NUL
- * included if it has one): the same arrays are one literal, as clang's are
- * the same constant. A new one is named .str now, .L.str in the assembly. */
-static const char *string_array(struct filegen *file, uchar *array, uint n) {
+ * included if it has one), at pos: the same arrays are one literal, as
+ * clang's are the same constant. A new one is named .str now, .L.str in the
+ * assembly. */
+static const char *string_array(struct filegen *file, uchar *array, uint n, struct pos pos) {
     for (uint i = 0; i < file->strings.n; i++) {
         struct strlit *s = file->strings.v[i];
         if (s->len == n && memcmp(s->bytes, array, n) == 0) {
@@ -540,15 +547,18 @@ static const char *string_array(struct filegen *file, uchar *array, uint n) {
     s->len = n;
     s->label = label;
     vec_push(&file->strings, s);
+    if (file->debug != NULL) {
+        debug_literal(file->debug, label, n, pos);
+    }
     return label;
 }
 
-/* The label of a string literal of bytes (without the NUL). */
-static const char *string_label(struct filegen *file, uchar *bytes, uint n) {
+/* The label of a string literal of bytes (without the NUL), at pos. */
+static const char *string_label(struct filegen *file, uchar *bytes, uint n, struct pos pos) {
     uchar *array = arena_alloc(n + 1);
     memcpy(array, bytes, n);
     array[n] = 0;
-    return string_array(file, array, n + 1);
+    return string_array(file, array, n + 1, pos);
 }
 
 /* The type of the first reference to global sym in e, the variable as it was
@@ -579,6 +589,39 @@ static struct type *referred_type(struct expr *e, const char *sym) {
         return t != NULL ? t : referred_type(e->z, sym);
     default:
         return NULL;
+    }
+}
+
+static int null_to_pointer(struct expr *e);
+
+/* -g: the explicit casts of a static initializer's element whose types
+ * clang keeps (merlin's initializer_casts). Its front end emits an
+ * initializer with its ConstExprEmitter first, which keeps the type of each
+ * explicit cast it visits, and evaluates what that emitter gives up on. The
+ * emitter goes on into a cast's operand when the cast changes nothing (the
+ * same type but for its qualifiers, at any level of a pointer: CK_NoOp),
+ * converts an integer to another integer type (not to _Bool) or makes a
+ * null pointer constant a pointer, and into the operand of a unary -; it
+ * gives up on anything else (+, ~, a binary operator, ?:, &, an address
+ * converted to an integer). So of `long a = (long)&x;` and `long n =
+ * -(T)(U)3;` the types are kept, of `long b = (long)&x + 4;` and `int *p =
+ * (int *)(T)&x;`'s T not. */
+static void initializer_casts(struct filegen *file, struct expr *e) {
+    if (file->debug == NULL) {
+        return;
+    }
+    if (e->kind == E_CAST) {
+        if (!e->implicit) {
+            debug_cast(file->debug, e->ty, e->spelled);
+        }
+        struct type *from = ty_unqual(e->x->ty);
+        struct type *to = ty_unqual(e->ty);
+        int integral = ty_is_integer(from) && ty_is_integer(to) && !(to->kind == TY_INT && to->ik == IK_BOOL);
+        if (ty_similar(from, to) || integral || null_to_pointer(e)) {
+            initializer_casts(file, e->x);
+        }
+    } else if (e->kind == E_UNARY && e->op == UOP_NEG) {
+        initializer_casts(file, e->x);
     }
 }
 
@@ -640,6 +683,7 @@ static void data(struct filegen *file, struct type *ty, struct init *init, struc
         }
         return;
     }
+    initializer_casts(file, e);
     struct cval value;
     if (!consteval_eval(e, &value)) {
         die("codegen: a static initializer is not constant");
@@ -660,7 +704,7 @@ static void data(struct filegen *file, struct type *ty, struct init *init, struc
             reference(file, value.sym, referred_type(e, value.sym));
             sym = sym_name(file, value.sym);
         } else {
-            sym = string_label(file, value.bytes, value.len);
+            sym = string_label(file, value.bytes, value.len, e->pos);
         }
         if (i128_is_zero(value.offset)) {
             operand = (char *)sym;
@@ -992,8 +1036,17 @@ struct funcgen {
     /* The ids of the cases and defaults of each switch on a constant
      * generated so far, whose labels nothing jumps to (as id + 1). */
     struct vec elided_cases;
-    /* A local's constant initializer is being generated. */
+    /* A local's constant initializer is being generated, which clang emits
+     * as a constant (constant_initializer): with -g, its code keeps no
+     * casts' types and describes no enums. */
     int constant_init;
+    /* With -g: a .loc has been written since the function's first, so the
+     * next is not the one that ends the prologue. */
+    int after_prologue;
+    /* With -g: the scopes being generated (struct dscope *), the function's
+     * body first and the innermost block last, with the variables declared
+     * in each. */
+    struct vec scopes;
     /* The locals the code generated so far declares or uses. */
     uchar *used;
     /* The locals the frame has slots for. */
@@ -1248,6 +1301,50 @@ static int is_jump_to(struct line *l, const char *target) {
     return l->kind == LINE_INSN && l->size == 4 && strcmp(l->text, insn_text("j", target)) == 0;
 }
 
+/* -g: the next instruction comes from pos (a .loc, see debug.c). The first
+ * one after the function's own says that the prologue ends there. */
+static void loc(struct funcgen *g, struct pos pos) {
+    if (g->file->debug == NULL || pos.line == 0) {
+        return;
+    }
+    int first = !g->after_prologue;
+    g->after_prologue = 1;
+    text_line(g, debug_loc(g->file->debug, pos, -1, first));
+}
+
+/* -g: the parameters, each in its slot. */
+static struct vec debug_params(struct funcgen *g) {
+    struct function *f = g->func;
+    struct vec params;
+    memset(&params, 0, sizeof params);
+    for (uint i = 0; i < f->nparams; i++) {
+        struct param *p = &f->params[i];
+        vec_push(&params, debug_var(g->file->debug, p->name, p->ty, p->spelled, p->pos, NULL, g->offsets[i]));
+    }
+    return params;
+}
+
+/* -g: the variable decl declares, in the innermost scope: a local in its
+ * slot, a static local at its symbol. (A block's extern declaration defines
+ * nothing.) */
+static void debug_decl(struct funcgen *g, struct declarator *decl) {
+    struct lines *d = g->file->debug;
+    if (d == NULL) {
+        return;
+    }
+    struct dvar *v;
+    if (decl->var.kind == VAR_LOCAL) {
+        v = debug_var(d, decl->name, decl->ty, decl->spelled, decl->pos, NULL, g->offsets[decl->var.local]);
+    } else if (decl->var.kind == VAR_GLOBAL && decl->storage == ST_STATIC) {
+        const char *sym = sym_name(g->file, decl->var.sym);
+        v = debug_var(d, decl->name, decl->ty, decl->spelled, decl->pos, sym, 0);
+    } else {
+        return;
+    }
+    debug_declared(d, v);
+    debug_scope_var(vec_last(&g->scopes), v);
+}
+
 static void function_body(struct funcgen *g, struct vec *body) {
     struct function *f = g->func;
     /* A header that maps every local to its slot, for whoever reads the
@@ -1298,6 +1395,12 @@ static void function_body(struct funcgen *g, struct vec *body) {
     /* A function symbol with its size, as clang marks them. */
     text_line(g, fmt(".type %s, @function", f->name));
     label(g, f->name);
+    /* -g: the prologue comes from the function's first line (column 0, as
+     * clang has it). */
+    if (g->file->debug != NULL) {
+        text_line(g, debug_loc(g->file->debug, f->pos, 0, 0));
+        vec_push(&g->scopes, debug_scope("", ""));
+    }
 
     /* Prologue: save ra and the caller's s0, set up s0, make room for
      * locals. */
@@ -1361,10 +1464,18 @@ static void function_body(struct funcgen *g, struct vec *body) {
     }
 
     /* Falling off the end returns 0. A final return needs no jump to the
-     * epilogue, which comes right after it. */
-    if (g->nlines > 0 && is_jump_to(&g->lines[g->nlines - 1], g->ret_label)) {
+     * epilogue, which comes right after it. Either way what follows comes
+     * from the closing brace. (-g's labels at the end of a block are not
+     * code: the jump may be just before them.) */
+    uint last = g->nlines;
+    while (last > 0 && g->lines[last - 1].kind == LINE_LABEL && strncmp(g->lines[last - 1].text, ".Ldbg.", 6) == 0) {
+        last--;
+    }
+    if (last > 0 && is_jump_to(&g->lines[last - 1], g->ret_label)) {
+        memmove(&g->lines[last - 1], &g->lines[last], (g->nlines - last) * sizeof(struct line));
         g->nlines--;
     }
+    loc(g, f->end);
     /* (Only if control reaches the end.) */
     if (g->reachable) {
         li(g, "a0", 0);
@@ -1378,6 +1489,23 @@ static void function_body(struct funcgen *g, struct vec *body) {
     ins(g, "ld", fmt("s0, %d(sp)", top - va_save - 2 * w));
     ins(g, "addi", fmt("sp, sp, %d", top));
     ins(g, "ret", "");
+    if (g->file->debug != NULL) {
+        struct debug_function df;
+        memset(&df, 0, sizeof df);
+        df.name = f->name;
+        df.end = fmt(".Lfunc_end.%s", f->name);
+        df.params = debug_params(g);
+        df.body = vec_pop(&g->scopes);
+        df.start = f->pos;
+        df.body_end = f->end;
+        df.external = !f->is_static && !f->inline_only;
+        df.prototyped = f->prototyped;
+        df.ret = f->ret;
+        df.ret_spelled = f->ret_spelled;
+        df.variadic = f->variadic;
+        debug_function(g->file->debug, &df);
+        label(g, df.end);
+    }
     text_line(g, fmt(".size %s, . - %s", f->name, f->name));
 }
 
@@ -1432,7 +1560,27 @@ static int elided(struct funcgen *g, uint id) {
     return 0;
 }
 
+static void kept_casts(struct funcgen *g, struct expr *e);
+
 static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
+    /* -g: a statement with code of its own starts a line. A loop's parts and
+     * a declaration's initializers get theirs where they are made, an if's
+     * and a switch's where their condition is tested. (A jump control
+     * cannot reach is no code: clang's EmitBreakStmt and EmitGotoStmt give
+     * a location only with an insertion point.) */
+    switch (s->kind) {
+    case S_EXPR:
+    case S_RETURN:
+    case S_BREAK:
+    case S_CONTINUE:
+    case S_GOTO:
+        if (g->reachable) {
+            loc(g, s->pos);
+        }
+        break;
+    default:
+        break;
+    }
     switch (s->kind) {
     case S_BLOCK:
         for (uint i = 0; i < s->list.n; i++) {
@@ -1440,8 +1588,8 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         }
         return;
     case S_DECL:
-        /* Each declarator initialized, as clang does; a static local's data
-         * first. */
+        /* Each declarator described, then initialized, as clang does; a
+         * static local's data first, then its entry (EmitStaticVarDecl). */
         for (uint i = 0; i < s->list.n; i++) {
             struct declarator *d = s->list.v[i];
             /* A block's extern declaration, or a function's, defines
@@ -1455,12 +1603,19 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
             }
             if (d->var.kind == VAR_GLOBAL) {
                 local_decl(g, d);
+                debug_decl(g, d);
                 continue;
             }
             /* A local declared where control cannot reach has its slot, but
-             * no initialization. */
+             * no initialization and no description: clang allocates it, but
+             * describes it and emits its initializer only at an insertion
+             * point. */
             if (!g->reachable) {
                 continue;
+            }
+            debug_decl(g, d);
+            if (d->init != NULL && d->var.kind == VAR_LOCAL) {
+                loc(g, d->pos);
             }
             local_decl(g, d);
         }
@@ -1486,6 +1641,7 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
                 return;
             }
         }
+        loc(g, s->pos);
         expr(g, s->e);
         if (s->els == NULL) {
             const char *end = new_label(g, "end");
@@ -1508,8 +1664,12 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         const char *cont = new_label(g, "continue");
         const char *brk = new_label(g, "break");
         block_label(g, cont);
-        if (constant_condition(s->e) != 1) {
-            /* (`while (1)`: nothing to test, as clang has it.) */
+        if (constant_condition(s->e) == 1) {
+            /* `while (1)`: nothing to test, as clang has it. Its code
+             * generator still visits the condition (-g). */
+            kept_casts(g, s->e);
+        } else {
+            loc(g, s->e->pos);
             expr(g, s->e);
             branch_if_zero(g, brk);
         }
@@ -1527,8 +1687,11 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         block_label(g, top);
         loop_body(g, s->body, cont, brk);
         block_label(g, cont);
-        if (constant_condition(s->e) != 0) {
-            /* (`do ... while (0)`: nothing to test.) */
+        if (constant_condition(s->e) == 0) {
+            /* `do ... while (0)`: nothing to test, as clang has it. */
+            kept_casts(g, s->e);
+        } else {
+            loc(g, s->e->pos);
             expr(g, s->e);
             branch_if_nonzero(g, top);
         }
@@ -1546,12 +1709,14 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         const char *brk = new_label(g, "break");
         block_label(g, top);
         if (s->e != NULL) {
+            loc(g, s->e->pos);
             expr(g, s->e);
             branch_if_zero(g, brk);
         }
         loop_body(g, s->body, cont, brk);
         if (s->step != NULL) {
             block_label(g, cont);
+            loc(g, s->step->pos);
             expr(g, s->step);
         } else {
             join(g, cont);
@@ -1595,6 +1760,7 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
                 return;
             }
         }
+        loc(g, s->pos);
         const char *brk = new_label(g, "break");
         expr(g, s->e);
         int kind = ty_int_kind(s->e->ty);
@@ -1619,13 +1785,31 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         /* (Nothing jumps to the label of a switch on a constant.) */
         if (!elided(g, (uint)s->id)) {
             block_label(g, case_label(g, (uint)s->id));
+            /* -g: a case value that is an enumeration constant describes its
+             * enum, as clang's EmitCaseStmt does (`case RED:`, not `case
+             * RED + 1:` or `case (RED):`). */
+            if (g->file->debug != NULL && s->kind == S_CASE && s->bare) {
+                struct expr *e = s->e;
+                while (e->kind == E_CAST && e->implicit) {
+                    e = e->x;
+                }
+                if (e->kind == E_ENUMERATOR) {
+                    debug_enumerator(g->file->debug, e->spelled);
+                }
+            }
         }
         stmt(g, s->body);
         return;
-    case S_LABEL:
-        block_label(g, goto_label(g, s->name));
+    case S_LABEL: {
+        const char *lbl = goto_label(g, s->name);
+        block_label(g, lbl);
+        /* -g: clang describes the label, in its block. */
+        if (g->file->debug != NULL) {
+            debug_scope_label(vec_last(&g->scopes), debug_label(g->file->debug, s->name, s->pos, lbl));
+        }
         stmt(g, s->body);
         return;
+    }
     default:
         jump(g, goto_label(g, s->name));
         return;
@@ -1642,7 +1826,22 @@ static void stmt(struct funcgen *g, struct stmt *s) {
         }
         g->reachable = 1;
     }
+    /* With -g, a block, and a for that declares its variable, is a scope of
+     * its own, with labels around its code. */
+    int scoped = s->kind == S_BLOCK || (s->kind == S_FOR && s->init != NULL && s->init->kind == S_DECL);
+    if (g->file->debug == NULL || !scoped) {
+        unscoped_stmt(g, s);
+        return;
+    }
+    const char *begin;
+    const char *end;
+    debug_block_labels(g->file->debug, &begin, &end);
+    label(g, begin);
+    vec_push(&g->scopes, debug_scope(begin, end));
     unscoped_stmt(g, s);
+    label(g, end);
+    struct dscope *inner = vec_pop(&g->scopes);
+    debug_scope_block(vec_last(&g->scopes), inner);
 }
 
 /* ---- Initializers ---- */
@@ -1701,9 +1900,9 @@ static void constant_image(struct type *ty, struct init *init, uint at, struct i
 }
 
 /* Whether init is a constant initializer of an object of type ty, as
- * clang's Expr::isConstantInitializer has it. visit: clang's ConstantEmitter
- * trying it (merlin's constant_visit), which stops at the first element
- * that is not constant, keeping casts' types with -g (the next stage). */
+ * clang's Expr::isConstantInitializer has it: what a static initializer
+ * could be (numbers, addresses of globals and string literals, strings for
+ * a char array), every element of a list. */
 static int constant_initializer(struct type *ty, struct init *init) {
     struct type *u = ty_unqual(ty);
     if (u->kind == TY_ARRAY && init->kind == I_LIST) {
@@ -1744,6 +1943,49 @@ static int constant_initializer(struct type *ty, struct init *init) {
     return consteval_eval(e, &c);
 }
 
+/* -g: clang's ConstantEmitter trying init, of an object of type ty, as a
+ * constant (merlin's constant_visit): each element in order, its casts kept
+ * as a static initializer's (initializer_casts), up to the first that is
+ * not constant. Whether all are. */
+static int constant_visit(struct funcgen *g, struct type *ty, struct init *init) {
+    struct type *u = ty_unqual(ty);
+    if (u->kind == TY_ARRAY && init->kind == I_LIST) {
+        for (uint i = 0; i < init->items.n; i++) {
+            if (!constant_visit(g, u->to, init->items.v[i])) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    if (u->kind == TY_RECORD && init->kind == I_LIST) {
+        struct record_body *body = u->rec->body;
+        for (uint i = 0; i < body->nmembers && i < init->items.n; i++) {
+            if (!constant_visit(g, body->members[i].ty, init->items.v[i])) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    if (init->kind == I_LIST) {
+        for (uint i = 0; i < init->items.n; i++) {
+            if (!constant_visit(g, ty, init->items.v[i])) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    struct expr *e = init->e;
+    if (u->kind == TY_ARRAY && e->kind == E_STR) {
+        return 1;
+    }
+    if (e->kind == E_COMPOUND) {
+        return constant_visit(g, e->ty, e->init);
+    }
+    initializer_casts(g->file, e);
+    struct cval c;
+    return consteval_eval(e, &c);
+}
+
 /* Stores an initializer into the local object at off(s0); arrays and
  * structs initialized by a list have been cleared, so what the list leaves
  * out is zero already. */
@@ -1756,14 +1998,16 @@ static void init_local(struct funcgen *g, struct type *ty, struct init *init, in
     if (u->kind == TY_ARRAY && init->kind == I_LIST) {
         int size = (int)ty_size(u->to);
         /* clang emits an array whose initializers hold more than 16 bytes as
-         * a constant if it can, copied from a global it names constinit
-         * after the string literals in it; else element by element. */
+         * a constant if it can (EmitArrayInit's ConstantEmitter, which with
+         * -g visits them as a static initializer's), copied from a global it
+         * names constinit after the string literals in it; else element by
+         * element. */
         int was = g->constant_init;
         int whole = 0;
         if (!was && (int64_t)init->items.n * size > 16) {
             whole = 1;
             for (uint i = 0; i < init->items.n && whole; i++) {
-                whole = constant_initializer(u->to, init->items.v[i]);
+                whole = constant_visit(g, u->to, init->items.v[i]);
             }
         }
         g->constant_init = was || whole;
@@ -1810,12 +2054,17 @@ static void init_local(struct funcgen *g, struct type *ty, struct init *init, in
             for (uint i = e->len + 1; i < u->len; i++) {
                 array[i] = 0;
             }
-            const char *lbl = string_array(g->file, array, u->len);
+            const char *lbl = string_array(g->file, array, u->len, e->pos);
             la_label(g, "a0", lbl);
             add_imm(g, "a1", "s0", off);
             copy(g, "a1", "a0", ty);
         }
         return;
+    }
+    /* A constant initializer's element keeps what a static initializer's
+     * does. */
+    if (g->constant_init) {
+        initializer_casts(g->file, e);
     }
     expr(g, e);
     store_local(g, ty, off);
@@ -1840,7 +2089,9 @@ static void local_decl(struct funcgen *g, struct declarator *d) {
         clear_local(g, off, (int)ty_size(d->ty));
     }
     /* clang emits an array, struct or union with a constant initializer as
-     * a static's. */
+     * a static's (EmitAutoVarInit's IsConstantAggregate: ConstantEmitter),
+     * not as code: with -g, what its debug information keeps of it is a
+     * static initializer's. */
     int cst = (ty_is_array(d->ty) || ty_record(d->ty) != NULL) && constant_initializer(d->ty, d->init);
     g->constant_init = cst;
     init_local(g, d->ty, d->init, off);
@@ -1918,8 +2169,73 @@ static int folded(struct funcgen *g, struct expr *e) {
     if (ty_int_kind(e->ty) != v.ik) {
         die("codegen: consteval types a constant as sema does not");
     }
+    kept_casts(g, e);
     constant(g, v.v, v.ik);
     return 1;
+}
+
+/* -g: clang keeps the type of an explicit cast in the unit (and describes
+ * it as it is evaluated). */
+static void kept_cast(struct funcgen *g, struct expr *e) {
+    if (g->constant_init || g->file->debug == NULL) {
+        return;
+    }
+    if (e->kind == E_CAST && !e->implicit) {
+        debug_cast(g->file->debug, e->ty, e->spelled);
+    }
+}
+
+/* -g: the explicit casts inside a folded constant, in the order clang meets
+ * them. Its front end still walks a constant's expression, keeping the
+ * types of the casts it emits, and its IR builder folds what it emits; but
+ * it emits only what is evaluated: of c ? a : b with a constant c, the
+ * operand chosen (not c), and of l && r or l || r with a constant l, r when
+ * it decides the result (1 && r, 0 || r) and nothing otherwise (clang's
+ * VisitAbstractConditionalOperator, VisitBinLAnd, VisitBinLOr). */
+static void kept_casts(struct funcgen *g, struct expr *e) {
+    if (g->file->debug == NULL || g->constant_init) {
+        return;
+    }
+    kept_cast(g, e);
+    switch (e->kind) {
+    case E_CAST:
+        if (!null_to_pointer(e)) {
+            kept_casts(g, e->x);
+        }
+        return;
+    case E_UNARY:
+    case E_ADDR:
+    case E_DEREF:
+    case E_MEMBER:
+        kept_casts(g, e->x);
+        return;
+    case E_BINARY:
+        if (e->op == OP_LOGAND || e->op == OP_LOGOR) {
+            /* r, when the left operand, as a constant condition, leaves the
+             * result to it. */
+            if (constant_condition(e->x) == (e->op == OP_LOGAND)) {
+                kept_casts(g, e->y);
+            }
+            return;
+        }
+        kept_casts(g, e->x);
+        kept_casts(g, e->y);
+        return;
+    case E_COND:
+        if (constant_condition(e->x) == 1) {
+            kept_casts(g, e->y);
+        } else {
+            kept_casts(g, e->z);
+        }
+        return;
+    case E_ENUMERATOR:
+        /* clang describes the enum of a constant its code uses
+         * (CGDebugInfo::EmitGlobalVariable of the EnumConstantDecl). */
+        debug_enumerator(g->file->debug, e->spelled);
+        return;
+    default:
+        return;
+    }
 }
 
 static void expr(struct funcgen *g, struct expr *e) {
@@ -1929,11 +2245,12 @@ static void expr(struct funcgen *g, struct expr *e) {
     switch (e->kind) {
     case E_NUM:
     case E_ENUMERATOR:
+        kept_casts(g, e);
         /* The value as the register holds it. */
         constant(g, e->value, ty_int_kind(e->ty));
         return;
     case E_STR:
-        la_label(g, "a0", string_label(g->file, e->bytes, e->len));
+        la_label(g, "a0", string_label(g->file, e->bytes, e->len, e->pos));
         return;
     case E_VAR:
         if (e->var.kind == VAR_LOCAL) {
@@ -2062,9 +2379,11 @@ static void expr(struct funcgen *g, struct expr *e) {
         /* A null pointer constant made a pointer: null, its operand neither
          * generated nor described, as clang has it. */
         if (null_to_pointer(e)) {
+            kept_cast(g, e);
             li(g, "a0", 0);
             return;
         }
+        kept_cast(g, e);
         expr(g, e->x);
         convert(g, e->x->ty, e->ty);
         return;
@@ -2903,6 +3222,8 @@ static struct diag *function(struct filegen *file, struct function *f) {
     uint pass;
     uchar *used = NULL;
     struct funcgen *g = NULL;
+    /* The first pass generates into nothing: no -g either. */
+    struct lines *debug = file->debug;
     for (pass = 0; pass < 2; pass++) {
         int *offsets;
         int frame;
@@ -2910,6 +3231,7 @@ static struct diag *function(struct filegen *file, struct function *f) {
         uint strings_n = file->strings.n;
         if (pass == 0) {
             file->dry = 1;
+            file->debug = NULL;
             if (!layout(&f->locals, all, header, &offsets, &frame)) {
                 offsets = arena_alloc(n * sizeof(int) + 1);
                 frame = 0;
@@ -2938,6 +3260,7 @@ static struct diag *function(struct filegen *file, struct function *f) {
             /* What the first pass made is taken back: its labels and string
              * literals. */
             file->dry = 0;
+            file->debug = debug;
             file->labels = labels;
             vec_truncate(&file->strings, strings_n);
             used = g->used;
@@ -2963,7 +3286,7 @@ static struct diag *function(struct filegen *file, struct function *f) {
     return NULL;
 }
 
-/* Emits definition k: its code or its data. */
+/* Emits definition k: its code or its data, and with -g its entry. */
 static struct diag *emit(struct filegen *file, uint k) {
     file->emitted[k] = 1;
     struct def *d = &file->defs[k];
@@ -2971,6 +3294,16 @@ static struct diag *emit(struct filegen *file, uint k) {
         return function(file, d->f);
     }
     variable(file, d->d, 0);
+    /* A compound literal's hidden variable is not described, as clang has
+     * it: its string literals go with the global that names it, which is
+     * being emitted. */
+    if (def_hidden(d)) {
+        return NULL;
+    }
+    if (d->d->var.kind == VAR_GLOBAL && file->debug != NULL) {
+        const char *sym = sym_name(file, d->d->var.sym);
+        debug_global(file->debug, d->d->name, sym, d->d->ty, d->d->spelled, d->d->pos, d->d->storage != ST_STATIC);
+    }
     return NULL;
 }
 
@@ -3024,7 +3357,7 @@ static int register_name(const char *name) {
     return 0;
 }
 
-int codegen_generate(struct program *prog, struct buf *out, struct diag **error) {
+int codegen_generate(struct program *prog, struct lines *debug, struct buf *out, struct diag **error) {
     /* merlin-as reads a register name as a register, never as a symbol, so a
      * function or global called sp or a0 could not be referenced. */
     for (uint i = 0; i < prog->items.n; i++) {
@@ -3050,6 +3383,7 @@ int codegen_generate(struct program *prog, struct buf *out, struct diag **error)
     /* The definitions, in the order they come. */
     struct filegen *file = heap_calloc(1, sizeof(struct filegen));
     file->section = "";
+    file->debug = debug;
     struct vec defs;
     memset(&defs, 0, sizeof defs);
     for (uint i = 0; i < prog->items.n; i++) {
@@ -3113,9 +3447,13 @@ int codegen_generate(struct program *prog, struct buf *out, struct diag **error)
         return 0;
     }
     /* The output: each symbol's code or data in the order the symbols were
-     * made, then the string literals. */
+     * made (the module's order, which LLVM writes them in), then the string
+     * literals and the debug sections. */
     file->out.len = 0;
     file->section = "";
+    if (debug != NULL) {
+        buf_fmt(&file->out, "    %s\n", debug_file0(debug));
+    }
     for (uint i = 0; i < file->created.n; i++) {
         const char *sym = file->created.v[i];
         struct vec *pieces = map_get(&file->chunks, sym);
@@ -3131,7 +3469,26 @@ int codegen_generate(struct program *prog, struct buf *out, struct diag **error)
             buf_put(&file->out, p->text, p->len);
         }
     }
+    /* -g: the functions in the order of their code, which the files are
+     * numbered by, and the entries made in. */
+    if (debug != NULL) {
+        const char **functions = heap_alloc((file->created.n + 1) * sizeof(char *));
+        uint nfunctions = 0;
+        for (uint i = 0; i < file->created.n; i++) {
+            const char *sym = file->created.v[i];
+            void *k = map_get(&file->by_symbol, sym);
+            if (k != NULL && file->defs[(uintptr_t)k - 1].f != NULL) {
+                functions[nfunctions++] = sym;
+            }
+        }
+        debug_code_order(debug, functions, nfunctions);
+        heap_free(functions);
+        debug_renumber(debug, &file->out);
+    }
     strings(file);
+    if (debug != NULL) {
+        debug_sections(debug, &file->out);
+    }
     buf_put(out, file->out.len > 0 ? file->out.data : "", file->out.len);
     return 1;
 }
