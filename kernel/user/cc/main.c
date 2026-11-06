@@ -407,23 +407,19 @@ static int compile_unit(const char *name, const char *src, uint n, struct option
         print_all(&prog.warnings, name);
         return 1;
     }
-    struct diag *error = NULL;
-    struct buf asm_text;
-    memset(&asm_text, 0, sizeof asm_text);
-    if (!codegen_generate(&prog, &asm_text, &error)) {
-        diag_name_files(error, pp.files, pp.lens, pp.nfiles);
-        print_all(&prog.warnings, name);
-        diag_print(error, name);
-        buf_free(&asm_text);
-        return 0;
-    }
     /* `.file "NAME"`, the first line of the assembly, as clang writes it:
-     * the base name of the file being compiled (merlin's file_directive). */
+     * the base name of the file being compiled (merlin's file_directive);
+     * the code generator's text after it. */
     buf_str(text, "    .file ");
     quoted(text, file_name(name));
     buf_byte(text, '\n');
-    buf_put(text, asm_text.data, asm_text.len);
-    buf_free(&asm_text);
+    struct diag *error;
+    if (!codegen_generate(&prog, text, &error)) {
+        diag_name_files(error, pp.files, pp.lens, pp.nfiles);
+        print_all(&prog.warnings, name);
+        diag_print(error, name);
+        return 0;
+    }
     print_all(&prog.warnings, name);
     return 1;
 }

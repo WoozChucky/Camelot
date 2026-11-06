@@ -46,6 +46,17 @@ char *arena_strndup(const char *s, uint n);
 /* Frees the arena and the heap, the interned names with them: nothing
  * allocated in either may be used after. */
 void arena_free(void);
+/* Where the arena is: arena_release gives back everything allocated there
+ * since arena_mark, which nothing may use after (nor may a name have been
+ * interned in between). For work whose results are thrown away: the code
+ * generator's first pass over a function. */
+struct arena_point {
+    void *chunk;
+    uint used;
+    void *big;
+};
+void arena_mark(struct arena_point *m);
+void arena_release(struct arena_point *m);
 /* malloc, calloc, realloc and free on the translation unit's heap. */
 void *heap_alloc(size_t n);
 void *heap_calloc(size_t n, size_t size);
@@ -89,6 +100,8 @@ void *map_get(struct map *m, const char *key);
 void map_put(struct map *m, const char *key, void *value);
 /* Removes the key, if there; whether it was. */
 int map_remove(struct map *m, const char *key);
+/* Frees the map's tables (not its keys or values), leaving it empty. */
+void map_free(struct map *m);
 
 /* The identifier `s` (len bytes), interned: the same text is the same
  * pointer, NUL-terminated, in the arena. */
@@ -670,8 +683,8 @@ struct spelling *spelling_typedef(struct typedef_name *t);
 struct spelling *spelling_enum(struct enum_type *e);
 
 /* clang's place of an unnamed struct, union or enum, `\1FILE\1LINE:COL`,
- * the file's number between two FILE_MARKs, named by name_places. */
-#define FILE_MARK '\1'
+ * the file's number between two FILE_MARKs (above), named by
+ * diag_name_files. */
 char *place(struct pos pos);
 
 /* ---- The syntax tree (ast.c, merlin's ast.rs) ---- */
@@ -1161,7 +1174,8 @@ int case_statements(struct stmt *sw, i128 value, struct vec *out);
 /* ---- Code generation (codegen.c, merlin's codegen.rs) ---- */
 
 /* The assembly of a checked program (merlin's generate_with, without -g):
- * 1 and the text appended to out, or 0 and the error. */
+ * 1 and the text appended to out (written there as it is put together, no
+ * copy made), or 0 and the error. */
 int codegen_generate(struct program *prog, struct buf *out, struct diag **error);
 
 /* --dump-ast's text. */

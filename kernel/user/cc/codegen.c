@@ -1,24 +1,485 @@
-/* cc1: code generation, the checked tree to Excalibur assembly for as
- * (follows merlin's codegen.rs, whose module comment explains it in full:
- * the stack frame, the calling convention, the 32-bit invariant, the order
- * clang emits functions and variables in, the symbol names, control flow,
- * unreachable code and branch relaxation).
+/* cc1: code generation, the checked tree to Excalibur assembly (follows
+ * merlin's codegen.rs). It turns a checked program into `.s` text for as
+ * (merlin-as on the host). It is a *stack
+ * machine* code generator, the approach of Rui Ueyama's chibicc: every
+ * expression leaves its value in `a0`, and a value that must survive while
+ * another expression is evaluated is pushed on the stack. Nothing is kept in
+ * registers across statements and every variable lives in memory, so the
+ * output is long but easy to follow, and easy to check by hand.
  *
- * It is a stack machine: every expression leaves its value in a0, and a
- * value that must survive while another expression is evaluated is pushed
- * on the stack. Every variable lives in memory. An int lives in a 64-bit
- * register sign-extended from bit 31, as the psABI requires; the W
- * instructions keep it so. Structs and arrays leave their address in a0.
+ * The target is Excalibur, RV64 with the LP64 ABI (until #159 merlin
+ * compiled for RV32 and ILP32 too). A register (a *word* here) is 8 bytes,
+ * so pushes, saved registers, argument words and register-wide loads and
+ * stores are `sd`/`ld` of 8 bytes, and `int` arithmetic uses the W
+ * instructions ("The 32-bit invariant" below).
+ *
+ * ---- Contract ----
+ *
+ * - Input: a program that passed sema (sema.c). Every expression has its
+ *   C type, conversions are explicit cast nodes, `sizeof` is folded, every
+ *   member access knows its offset, initializer lists are fully braced, and
+ *   every variable says where it lives: local `#i` of its function
+ *   (parameters first, then the declared locals and the hidden ones calls
+ *   need) or a global symbol. Every call has the right number of arguments
+ *   (those `...` takes promoted), `va_end` and `va_copy` have become plain
+ *   expressions, and every compound literal has its hidden local.
+ * - Output: assembly merlin-as accepts (and so does clang): functions in
+ *   `.text`, initialized variables in `.data`, zero-initialized ones in
+ *   `.bss`, `const` ones and string literals in `.rodata`. Every function and
+ *   variable that is not `static` gets `.globl` (except a C99 inline
+ *   definition, kept local); declarations without a definition emit nothing
+ *   (the linker finds them). Like clang, every function and variable gets
+ *   `.type` (`@function` or `@object`) and `.size`, so the symbol table says
+ *   what each address belongs to. A `static` function or variable (or an
+ *   inline definition) that nothing emitted uses is not emitted, as clang
+ *   leaves it out ("Order" below).
+ * - Semantics: arithmetic wraps at the width of its type (32 bits for `int`,
+ *   64 for `long` and `long long`), `/` and `%` truncate
+ *   toward zero (`div`/`rem`, or `divu`/`remu` when unsigned), shifts use the
+ *   low 5 bits of the amount (6 for a 64-bit type), comparisons and `! &&
+ *   ||` produce 0 or 1, `&&`/`||` short-circuit, an assignment evaluates to
+ *   the stored value. Falling off the end of a function returns 0.
+ * - Memory: every read and write the source asks for is done, once, in
+ *   order, and nothing is kept in a register across statements. So
+ *   `volatile` needs nothing special: the code generator never caches,
+ *   removes, merges or reorders memory accesses.
+ *
+ * ---- Order ----
  *
  * Functions and variables are generated in the order clang's front end
- * emits them and written in the order its module has them, so .text,
- * .data, .bss and .rodata hold them as clang's -O0 output does. Each
- * function is generated twice: a first pass finds the locals the code
- * generated uses (as clang's frame at -O0 has room only for those), the
- * second lays out those alone.
+ * emits them (`CodeGenModule`), and written in the order clang's module has
+ * them, so that `.text`, `.data`, `.bss` and `.rodata` hold them as clang's
+ * output does at `-O0`:
+ *
+ * - *Emitted*: the file is read as it comes. An external function, and an
+ *   external variable with an initializer, is generated where it stands. A
+ *   `static` function or variable (and an inline definition) is deferred:
+ *   generated once something emitted refers to it, or not at all. The
+ *   variables without an initializer (tentative definitions) are generated
+ *   at the end of the file. Then what was used and is still waiting, each
+ *   one's own uses right after it, depth first (`EmitDeferred`).
+ * - *Written*: each symbol where it was first made: a function as its
+ *   generation starts, or the first time code refers to it; a variable when
+ *   its initializer has been generated (a `static` local before it), or the
+ *   first time code or data refers to it (create()). So in
+ *
+ *   int f(void) { return g() + sh(1); }   int h(void) { ... }
+ *   static int sh(int x) { return x + h(); }   int g(void) { ... }
+ *
+ *   `sh` is generated last, but its code comes right after `g`'s, before
+ *   `h`'s: `f`, `g`, `sh`, `h`. A `static` local is data made where its
+ *   declaration is generated; a compound literal of the file's scope is
+ *   generated as the initializer that names it is.
+ *
+ * A function call refers to the function before its arguments are
+ * generated, as clang's `EmitCallee` comes before `EmitCallArgs`: in
+ * `f(g())` `f` is made first.
+ *
+ * ---- Values and types ----
+ *
+ * Every value in a register fills the register: a value of a narrower type
+ * is extended to it. A `char` or `short` is widened when it is loaded
+ * (`lbu`/`lb`, `lhu`/`lh`, by its signedness; plain `char` is unsigned) and
+ * narrowed when it is stored (`sb`, `sh`), so integer promotion costs
+ * nothing. A conversion *to* a narrow type in a register (a cast, or the
+ * value of `c = 300` for a `char c`) is done in place:
+ *
+ *   andi  a0, a0, 255         # to unsigned char (and plain char)
+ *   slli  a0, a0, 56          # to signed char: keep the low byte...
+ *   srai  a0, a0, 56          # ...and copy its top bit up
+ *   slli  a0, a0, 48          # to unsigned short (srai for short)
+ *   srli  a0, a0, 48
+ *
+ * A binary operator's operands are converted to the type the operation is
+ * done in (the usual arithmetic conversions), which changes bits only where
+ * widths differ, and that type decides the instruction: `divu`, `remu`,
+ * `sltu` and `srl` when it is unsigned (`unsigned int`, `unsigned long`, or
+ * a pointer), `div`, `rem`, `slt` and `sra` otherwise.
+ *
+ * ---- The 32-bit invariant ----
+ *
+ * An `int` or `unsigned int` lives in a 64-bit register *sign-
+ * extended* from bit 31, whatever its signedness, as the psABI requires of
+ * arguments and results and as the hand-written assembly expects (so an
+ * `unsigned` 0xffffffff is -1 in its register). `lw` loads it so, and every
+ * operation in a 32-bit type keeps it so: `addw`, `subw`, `mulw`, `divw`,
+ * `divuw`, `remw`, `remuw`, `sllw`, `srlw`, `sraw`, `negw` and `addiw`
+ * compute in 32 bits and sign-extend the result; `and`, `or`, `xor` and
+ * `not` keep it as it is; `slt` and `sltu` compare sign-extended values in
+ * the right order for `int` and for `unsigned int` alike. Conversions
+ * change bits only across that line:
+ *
+ *   sext.w a0, a0             # long or a pointer to int or unsigned int
+ *   slli  a0, a0, 32          # unsigned int to long or unsigned long (and
+ *   srli  a0, a0, 32          # an unsigned index added to a pointer)
+ *
+ * An `int` needs nothing to become a `long` or an index: it is its own
+ * sign extension already.
+ *
+ * A `long long` is 64 bits, a register like a `long`. (On RV32, until #159,
+ * it was a register pair, with libgcc's routines for division.)
+ *
+ * A `_Bool` holds 0 or 1: converting to it is `snez a0, a0` (from a pointer
+ * too), and it is loaded with `lbu`.
+ *
+ * An array is never loaded: an expression of array type leaves its address in
+ * `a0`, which is exactly C's array-to-pointer decay. A function's name
+ * leaves the function's address (`la a0, f`), and so does `*fp`.
+ *
+ * ---- Structs and unions ----
+ *
+ * A struct (or union) is not a value that fits a register, so an expression
+ * of struct type leaves the struct's *address* in `a0`, like an array: a
+ * variable's slot, `*p`'s `p`, a member's address inside its parent. Then
+ *
+ * - `s.m` and `p->m` add the member's offset (sema worked it out) to that
+ *   address, and load the member if it is a scalar;
+ * - `a = b` copies the bytes from `b`'s address to `a`'s, and leaves `a`'s
+ *   address (the assignment's value);
+ * - a struct a call returns is kept in a hidden local of the caller (sema
+ *   adds one per such call), whose address is the call's value: so
+ *   `f().m` is a member access like any other.
+ *
+ * Copies go in units of the struct's alignment, at most a register
+ * (`ld`/`sd`, `lw`/`sw`, `lhu`/`sh`, `lbu`/`sb`), so no access is
+ * misaligned: unrolled for up to 16 units, a loop for more. Struct locals
+ * get slots aligned to a register that are a whole number of registers
+ * long, so that a struct arriving in registers can be stored with `sd`.
+ *
+ * ---- Calling convention (RISC-V LP64) ----
+ *
+ * - Arguments go in `a0-a7`, left to right, and the words past `a7` on the
+ *   stack, from `0(sp)` up at the call; the result comes back in `a0`.
+ *   Arguments and results narrower than 32 bits travel widened by their type
+ *   (sema's casts do that), and 32-bit ones sign-extended (the
+ *   32-bit invariant). The arguments `...` takes travel the same way.
+ * - A struct of up to two words (16 bytes) travels in one
+ *   or two registers, its bytes as they lie in memory: it is loaded from its
+ *   address word by word (put together from smaller aligned pieces, each
+ *   zero-extended, if it is not aligned to a register). A
+ *   bigger one is passed as the address of a copy the caller makes (in a
+ *   hidden local), and returned through memory: the caller passes the
+ *   address of its result local as a hidden first argument in `a0`, and the
+ *   callee copies the result there. abi.c has the rules.
+ * - `ra` holds the return address (`call f` is `auipc ra` + `jalr ra`; a
+ *   call through a pointer loads it into `t1` and does `jalr t1`).
+ * - `sp`, `s0-s11` must look untouched to the caller when we return; the
+ *   `a` and `t` registers may be clobbered by any call. We only ever use
+ *   `s0` (saved in the prologue), the argument registers, and `t0-t4` as
+ *   scratch.
+ * - `sp` is 16-byte aligned at every call.
+ *
+ * ---- Stack frame ----
+ *
+ * `s0` (the frame pointer) holds the value `sp` had on entry, so the caller's
+ * frame starts at `s0` and ours lies below it:
+ *
+ *            caller's frame
+ *   s0 ->  +------------------+  (16-byte aligned: sp before the call)
+ *          | saved ra         |  -8(s0)
+ *          | caller's s0      |  -16(s0)
+ *          | local #0         |           parameters first: a0 is stored here,
+ *          | local #1         |           a1 next, and so on
+ *          | ...              |
+ *          | (padding)        |           frame size rounded up to 16
+ *   sp ->  +------------------+  (16-byte aligned) after the prologue
+ *          | temporaries      |  pushed and popped while evaluating expressions
+ *
+ * The caller's stack arguments, if any, are right above: word 8 of the
+ * arguments at `0(s0)`, word 9 at `8(s0)`, and so on, as clang lays out its
+ * frames.
+ *
+ * Locals are placed downwards from `-16(s0)` in order, each at the next
+ * offset aligned for its type (arrays and structs at least to 8 bytes): an
+ * `int` takes the 4 bytes below the previous local, a `char` 1 byte, an
+ * `int a[3]` 12 bytes. With only `int`s, local `#i` is at
+ * `-(20 + 4*i)(s0)`. Sema gives every
+ * declaration in the function its own local (shadowed names included), so a
+ * slot never has to be reused and scopes cost nothing here.
+ *
+ * Only the locals of the code generated get a slot, as clang's frame at
+ * `-O0` has room only for the code it emits: a local declared in an arm a
+ * constant condition leaves out, or a temporary of an operand left out (the
+ * result of a call in `1 ? 2 : h().a[0]`), has none. A local declared in
+ * code that is generated has one, used or not. Since what is generated is
+ * known only once it is, a function is generated twice: a first pass, with
+ * a slot for every local, notes the ones the code declares or uses and is
+ * thrown away; the second lays out those alone.
+ *
+ * The prologue saves `ra` and `s0` in a fixed 16 bytes, points `s0` at the top
+ * of the frame and then makes room for the rest; the epilogue undoes it from
+ * `s0`, so it never needs to know the frame size:
+ *
+ *   f:  addi  sp, sp, -16          .L.return.f:              # result in a0
+ *       sd    ra, 8(sp)                addi  sp, s0, -16
+ *       sd    s0, 0(sp)                ld    ra, 8(sp)
+ *       addi  s0, sp, 16               ld    s0, 0(sp)
+ *       addi  sp, sp, -(frame - 16)    addi  sp, sp, 16
+ *       sw    a0, -20(s0)  # params    ret
+ *
+ * A struct parameter that came in registers is stored word by word; one
+ * passed by reference is copied from the caller's copy into its slot. A
+ * parameter on the stack is loaded from above `s0` (through `t1`) and
+ * stored into its slot like the others. A function returning a big struct
+ * saves the result address (`a0`) in a hidden local.
+ *
+ * ---- Variadic functions ----
+ *
+ * A variadic function cannot know where its `...` arguments are until it
+ * reads them, so its prologue stores the argument registers its named
+ * parameters leave free (`a<n>` to `a7`) at the very top of its frame, right
+ * below `s0`, where the caller's stack words continue them. Every variadic
+ * argument then lies in one run of words from there up, as if all had been
+ * passed on the stack, and a `va_list` is a plain pointer that walks it (as
+ * clang does). `ra` and `s0` go below the saved registers, and the fixed
+ * part of the frame grows to a multiple of 16 that holds them all:
+ *
+ *   int f(int n, ...)                    s0 ->  +-----------+
+ *     addi  sp, sp, -80                         | a7 .. a1  |  -8(s0) .. -56(s0)
+ *     sd    ra, 16(sp)    # -64(s0)             | saved ra  |  -64(s0)
+ *     sd    s0, 8(sp)     # -72(s0)             | caller s0 |  -72(s0)
+ *     addi  s0, sp, 80                          | n         |  -76(s0), locals...
+ *     sd    a1, -56(s0)   ... sd a7, -8(s0)
+ *
+ * `va_start(ap, n)` points `ap` at the first variadic word (`-56(s0)` here;
+ * `8*k(s0)` when the named parameters take `8 + k` words, all registers and
+ * some stack). `va_arg(ap, T)` takes the words of a `T` at `ap` and moves
+ * `ap` past them: a scalar is loaded, a small struct's value is its address
+ * right there, and a big struct's is the word there (the address of the
+ * caller's copy). `va_end` does nothing and `va_copy` copies the pointer.
+ *
+ * ---- Expressions ----
+ *
+ * `expr(e)` emits code that leaves `e`'s value in `a0`. For `l op r`:
+ *
+ *   <l>                    # a0 = l
+ *   addi  sp, sp, -8       # push a0: <r> may need a0 (and any register)
+ *   sd    a0, 0(sp)
+ *   <r>                    # a0 = r
+ *   ld    a1, 0(sp)        # pop: a1 = l
+ *   addi  sp, sp, 8
+ *   subw  a0, a1, a0       # a0 = l - r, an int
+ *
+ * Comparisons give 0 or 1 with `slt` (`l < r`), `slt` with the operands
+ * swapped (`l > r`), those two followed by `xori 1` (`>=`, `<=`), and `xor`
+ * followed by `seqz`/`snez` (`==`, `!=`). `&&` and `||` branch around their
+ * right side and turn the result into 0 or 1 with `snez`; `?:` branches like
+ * an `if`. A constant condition is decided here, as clang's code generator
+ * decides it at `-O0` (see "Control flow"): `c ? a : b` is the operand `c`
+ * chooses, and `1 && x` and `0 || x` are `x`, as 0 or 1.
+ *
+ * Pointer arithmetic counts elements: `p + i` scales `i` by the size of what
+ * `p` points to (a shift for powers of two), and `p - q` divides the byte
+ * difference by it.
+ *
+ * An integer constant expression (C99 6.6) is one constant, of any integer
+ * type: `8 * (1024ul * 1024ul)` is `li a0, 8388608`, and `3LL << 40` is
+ * `li a0, 3298534883328`. clang does
+ * the same at `-O0`, since its front end folds them whatever the type.
+ * consteval.c works the value out with the semantics above (the
+ * usual arithmetic conversions, wrapping at the type's width, shift amounts
+ * masked as the hardware masks them), so the constant is what the
+ * instructions would have computed. A division by zero is not folded and
+ * stays a `div` at run time (clang warns, then has no value for it); in a
+ * larger expression only the parts around it are folded. Where an operand
+ * is not constant (`x * (2 * 3)`) the constant parts are folded and the
+ * rest is computed as above: nothing is reassociated (`x * 2 * 3` is two
+ * multiplies), as at `-O0`.
+ *
+ * ---- Places: where assignments store ----
+ *
+ * The target of `=`, `op=`, `++` and `--` is a *place*. A scalar local is
+ * reached directly at its offset from `s0`; for anything else (a global,
+ * `*p`, `a[i]`) the address is computed first and pushed, so that the value
+ * can be computed with any registers, then popped into `a1` for the store:
+ *
+ *   x = 5;   (local)          a[i] = 5;
+ *     li    a0, 5               <address of a[i]>
+ *     sw    a0, -24(s0)         addi sp, sp, -8    # push it
+ *                               sd   a0, 0(sp)
+ *                               li   a0, 5
+ *                               ld   a1, 0(sp)     # pop it
+ *                               addi sp, sp, 8
+ *                               sw   a0, 0(a1)
+ *
+ * `x op= v` loads the place's value (peeking at the pushed address, which
+ * stays for the store), pushes it, evaluates `v`, applies the operator,
+ * converts the result to `x`'s type and stores it, so `x` is evaluated once.
+ * `++x` and `x++` add the step (1, or the pointed-to size) in place; `x++`
+ * then subtracts it again to give back the old value.
+ *
+ * Globals are reached through their address: `la a0, g` (`auipc` + `addi`,
+ * PC-relative), then a load or store at `0(a0)`.
+ *
+ * A call evaluates its arguments left to right, pushing all but the last;
+ * the last goes from `a0` to `a(n-1)` with `mv`, then the others are popped
+ * into `a(n-2)` down to `a0` (a small struct's address is popped into `t1`
+ * and its words loaded from there). A call through a pointer evaluates the
+ * pointer first and pops it into `t1` last. If temporaries of an enclosing
+ * expression are still pushed (as in `x + f(y)`), `sp` is lowered to a
+ * multiple of 16 around the `call`, to keep the convention's alignment.
+ *
+ * When the arguments take more than `a0-a7`, every one of them is pushed;
+ * then `sp` goes down far enough for the stack words (keeping it aligned),
+ * each stack word is copied from its pushed argument to its place at
+ * `0(sp)`, `8(sp)`, ..., and the register words are loaded from theirs. One
+ * `addi` after the call frees the words and the pushed arguments together.
+ *
+ * ---- Initializers ----
+ *
+ * A local scalar's initializer is an assignment. A local array or struct
+ * with an initializer list is first cleared (word by word, or with a loop
+ * when it is big), then each element or member given is stored; a struct
+ * initialized by another struct is copied. A local without an initializer is
+ * left as it is (C: indeterminate). Sema has resolved designators already:
+ * a subobject one skips has an empty list, which stores nothing, and a
+ * union's list ends with the member it holds.
+ *
+ * A compound literal `(T){ ... }` is a hidden local initialized the same
+ * way each time the expression is evaluated; its value is the local's
+ * address (loaded for a scalar `T`).
+ *
+ * clang emits a local array, struct or union whose initializer is constant
+ * (what a static initializer could be) as a constant it copies, not as
+ * code; merlin (and cc1) stores it element by element all the same, but
+ * the constant clang would copy from takes a name all the same (`__const`,
+ * "Symbol names" below; `local_decl`).
+ *
+ * Globals and `static` locals are data: the initializer, a constant
+ * expression, is written out with `.byte`, `.half`, `.word`, `.quad` (8
+ * bytes, as clang writes them: a `long` or a pointer; `.quad sym+off` for
+ * an address, which the linker fills in),
+ * `.ascii` and `.zero` (struct padding too), after a `.balign` for the
+ * type. A `static` local's symbol is
+ * `function.name`, a local symbol (no `.globl`). Each string literal gets a
+ * label `.L.str` in `.rodata`, one for literals of the same bytes, as
+ * clang merges them.
+ *
+ * ---- Symbol names ----
+ *
+ * The names merlin makes are clang's: `.str` for a string literal (written
+ * `.L.str`, a private label), `.compoundliteral` for the object of a
+ * compound literal at file scope, `function.name` for a `static` local.
+ * Several of one name are told apart as LLVM tells apart any two globals
+ * of the same name (`ValueSymbolTable::makeUniqueName`): the first keeps
+ * the name, and each one after gets `.N`, N the next value of one counter
+ * for the whole module (`LastUnique`), shared by every name. So the numbers
+ * skip:
+ *
+ *   const char *a = "x";         .L.str
+ *   int *b = (int[]){1};         .compoundliteral
+ *   const char *c = "y";         .L.str.1
+ *   int *d = (int[]){2};         .compoundliteral.2
+ *   int f(void) {
+ *       static int x;            f.x
+ *       { static int x; }        f.x.3
+ *   }
+ *
+ * A symbol takes its name when clang makes its global (create()
+ * for a variable, string_label() for a string literal): in the order
+ * the output is generated (see "Order"), not the order of the source. A
+ * `static` global emitted at the end, where it is used, names its compound
+ * literals there. Sema gives each such variable a key, which tells apart
+ * those of one name (sema's symbol_key); sym_name() is the
+ * symbol a key was given.
+ *
+ * Some globals of clang's take numbers though merlin has no object for
+ * them, so merlin counts them all the same: the constants clang copies a
+ * local's initializer from (`__const.f.a`, an array's `constinit`:
+ * take_name()), and a global clang makes a second time, of its
+ * definition's LLVM type, when a reference made it with another (an
+ * `extern int a[]` used before `int a[3] = {1, 2, 3};`), which takes a
+ * number for a moment before the name moves over to it
+ * (defined()). Code control cannot reach takes no names
+ * ("Unreachable code" below).
+ *
+ * A function or file-scope variable keeps its own name, which other files
+ * link to: LLVM never renames one. When a constant counted has its name
+ * (`int constinit = 3;` after an array copied from clang's `constinit`),
+ * the definition takes the name over, as clang's does, a variable with
+ * one more number, a function with none (take_over()).
+ *
+ * ---- Control flow ----
+ *
+ * Conditions are evaluated into `a0` and tested with `beqz`/`bnez`. Jumps go
+ * to local labels named `.L.<what>.<n>`, numbered across the whole file
+ * (`.L.else.3`, `.L.break.7`); every function returns through
+ * `.L.return.<name>`.
+ *
+ * A `switch` is a chain of compares, one `li t0, value` + `beq a0, t0` per
+ * `case` in source order, then a jump to `default` (or past the body). The
+ * body follows unchanged, its `case` labels (`.L.case.<function>.<n>`) where
+ * they stand, so control falls through from one to the next, and `break`
+ * jumps to the end. A table of addresses would be faster for dense cases; a
+ * chain is simpler to read and works for any values. A C label `name` is
+ * `.L.label.<function>.<name>`, and `goto` is a `j` to it.
+ *
+ * A condition that is an integer constant expression is decided at compile
+ * time, as clang's code generator decides it at `-O0` (elide.c):
+ * `if (1) a; else b;` is `a` alone, with no test, and a `switch` on a
+ * constant is the statements its case runs, up to the `break`, without
+ * compares or labels. Code a jump can still reach is kept: an arm with a
+ * `goto` label in it, or a `case` of a `switch` around it, and the `if` is
+ * generated as usual. `while (1)` tests nothing, nor does `do ... while
+ * (0)`; `while (0)`, `do ... while (1)` and `for` loops test their
+ * condition, as in clang.
+ *
+ * ---- Unreachable code ----
+ *
+ * Nor is code control cannot reach generated, as clang's `EmitStmt` leaves
+ * it out at `-O0` (`CGStmt.cpp`). clang generates into an insertion point,
+ * the block it is filling; a jump (`return`, `break`, `continue`, `goto`)
+ * takes it away, and a statement with no insertion point is skipped, so
+ * its string literals take no names. g->reachable is that insertion point:
+ *
+ *   return 0;
+ *   puts("dead");        no code, no .str
+ *   int n = f();         a slot for n, but no call
+ *   static int s;        emitted all the same (a declaration is visited)
+ * again:
+ *   puts("live");        a label: reachable again
+ *
+ * A label or a `case` gives the insertion point back (block_label()),
+ * and a statement with a label in it is generated from its start, as
+ * clang's `EnsureInsertPoint` makes a new block for it. Where the paths
+ * of a statement meet (join(): after an `if`, a loop, a
+ * `switch`), control is there if it falls in or a jump generated so far
+ * goes there, as clang deletes a block that has no uses. So after `if (c)
+ * return 1; else return 2;` nothing is reached; nor after a `while (1)`
+ * or `for (;;)` without a `break` control reaches, nor after a `switch`
+ * with a `default` whose cases all return; and the statements of a
+ * `switch` body before its first `case`. Some blocks are emitted whatever
+ * reaches them: a `do`'s condition and a `for`'s step, so what follows a
+ * `do` loop is always reached. A static local's declaration, a block, a
+ * label and a jump are visited even where control cannot reach them
+ * (clang's `EmitSimpleStmt`): a local declared there still gets its slot,
+ * as clang allocates it, but no initialization.
+ *
+ * (LLVM then deletes, as it generates the machine code, every block no
+ * path from the function's entry reaches, such as that of a label after a
+ * `return` that no `goto` control reaches jumps to; merlin keeps that
+ * code. Its globals are made all the same, so that changes no name.)
+ *
+ * A conditional branch reaches only +-4 KiB, and merlin-as reports a branch
+ * that cannot reach its label as an error rather than rewriting it. So once a
+ * function is generated, relax_branches() estimates every instruction's
+ * address (never underestimating a distance) and turns a branch that may be
+ * too far into the opposite branch over a `j`, which reaches +-1 MiB:
+ *
+ *   beqz  a0, .L.end.4      becomes      bnez  a0, 1f
+ *                                        j     .L.end.4
+ *                                     1:
+ *
+ * (and `beq a0, t0, ...` becomes `bne a0, t0, 1f` over a `j`).
+ *
+ * Every `j` codegen writes (that long form, loop back-edges, `break`,
+ * `continue`, `goto`, `j .L.return.f`) goes somewhere in the same function,
+ * so they all reach as long as the function's code is under 1 MiB. A bigger
+ * function is an error (check_size()), reported by merlin on the function
+ * rather than by merlin-as on an internal label.
  *
  * -g (merlin's debug.rs) is the next stage of cc1: where merlin's code
- * generator writes debug information, this one writes nothing. */
+ * generator writes debug information, this one writes nothing yet. */
 #include "cc.h"
 
 #define TRY(x)                                                                                               \
@@ -104,6 +565,9 @@ struct filegen {
     /* The text being written: the piece of a symbol's output in section,
      * or the whole file at the end. */
     struct buf out;
+    /* Where the code generator's text starts in out: after what the
+     * caller wrote there before it (the `.file` line), at the end. */
+    uint start;
     const char *section;
     /* struct piece *: the pieces of the symbol being written so far. */
     struct vec pieces;
@@ -149,7 +613,7 @@ static void switch_section(struct filegen *file, const char *section) {
     }
     const char *directive = strcmp(section, ".rodata") == 0 ? ".section .rodata" : section;
     /* A blank line sets the new section apart from what came before. */
-    if (file->out.len > 0) {
+    if (file->out.len > file->start) {
         buf_byte(&file->out, '\n');
     }
     buf_fmt(&file->out, "    %s\n", directive);
@@ -258,8 +722,15 @@ static void made_now(struct filegen *file, const char *sym) {
 }
 
 /* The definition of function or variable sym (a C name), when a constant
- * clang made, counted but not written, has its name: the definition takes
- * it over (merlin's take_over). Whether the name was the constant's. */
+ * clang made, counted but not output (take_name), has its name: constinit,
+ * of an array copied from it, before `int constinit = 3;` (merlin's
+ * take_over). A reference to the symbol finds that constant
+ * (GetGlobalValue), so clang makes the symbol's global only for its
+ * definition, which takes the name over (takeName): a variable is named
+ * constinit.N for a moment (GetOrCreateLLVMGlobal), one more number; a
+ * function is made without a name (GetOrCreateLLVMFunction), none. Either
+ * is made there, after the symbols made so far. Whether the name was the
+ * constant's. */
 static int take_over(struct filegen *file, const char *sym, int variable) {
     if (file->dry || !map_remove(&file->held, sym)) {
         return 0;
@@ -345,8 +816,25 @@ static int padded(struct record_body *body) {
 static int constant_is_null(struct type *ty, struct init *init);
 
 /* Whether the constant clang makes of init, the initializer of an object of
- * type ty, has the LLVM type clang gives such an object in memory (merlin's
- * constant_has_type, whose comment has the rules). */
+ * type ty, has the LLVM type clang gives such an object in memory
+ * (ConvertTypeForMem), as clang's ConstExprEmitter builds it (merlin's
+ * constant_has_type):
+ *
+ * - a scalar's, and a char array's string (the array's size), have it; so
+ *   does a subobject the list leaves out (an empty list here), clang's
+ *   EmitNullConstant;
+ * - an array's (EmitArrayConstant) is an array of its elements' type,
+ *   which is the array's if every element's is, unless 8 zeros or more end
+ *   it (a struct then, the zeros an array of their own); all zeros is the
+ *   array's own zeroinitializer;
+ * - a struct's is the struct's if every member's constant has its type and
+ *   the struct has no padding: C has clang spell the padding out as arrays
+ *   of zeros (DoZeroInitPadding), which the struct's own type leaves to the
+ *   layout;
+ * - a union's has the member it initializes and padding to the union's
+ *   size, the union's own type if that member's constant has the LLVM type
+ *   of the member the union's type holds (the most aligned, then the
+ *   largest, the first of those: lowerUnion). */
 static int constant_has_type(struct type *ty, struct init *init) {
     struct type *u = ty_unqual(ty);
     if (init->kind == I_LIST && init->items.n == 0) {
@@ -444,10 +932,19 @@ static int constant_is_null(struct type *ty, struct init *init) {
     return c.base == BASE_NONE && i128_is_zero(c.offset);
 }
 
-/* The definition of global d (key sym), its initializer's data made: if a
- * reference made its symbol before, with a type whose LLVM type is not the
- * constant's, clang makes a new global of that type and moves the name over
- * to it: the name counter moves on (merlin's defined). */
+/* The definition of global d (key sym), its initializer's data made
+ * (merlin's defined): if a reference made its symbol before, as clang makes
+ * a global of the type the variable was declared with there, and the
+ * constant clang makes of the initializer is of another type, clang makes a
+ * new global of that type, under the name, and moves the name over to it
+ * (GetOrCreateLLVMGlobal): the name counter moves on.
+ *
+ *   extern int a[];          (a [0 x i32] global, where p refers to it)
+ *   int *p = a;
+ *   int a[3] = {1, 2, 3};    ([3 x i32]: a new global, a.1, renamed a)
+ *
+ * The new global is made where the definition is, after the symbols made so
+ * far: the output has the variable there. */
 static void defined(struct filegen *file, struct declarator *d, const char *sym) {
     if (take_over(file, sym, 1)) {
         map_remove(&file->referred_as, sym);
@@ -909,19 +1406,41 @@ static int null_to_pointer(struct expr *e) {
  * of a local array, struct or union (merlin's ConstantImage): each byte (or
  * -1 for an address's), how many scalars are not zero, and whether one is
  * a symbol's own address. */
+/* What clang's emitStoresForConstant looks at in the constant initializer
+ * of a local array, struct or union, to choose how to store it
+ * (local_decl): its bytes and its scalars (merlin's ConstantImage). */
 struct image {
-    int *bytes;
+    /* Each byte of the object. Padding and what the list leaves out are
+     * zero, as C has them and clang's constant spells them out. */
+    uchar *bytes;
+    /* A bit per byte, set for those of an address, which no byte value
+     * stands for (merlin's None): with bytes, 9 bits a byte of the object,
+     * where merlin's Option<u8> takes 16. */
+    uchar *address;
     uint size;
+    /* How many scalars are not zero: a store each, after clearing. */
     uint nonzero;
+    /* One is the address of a symbol itself (no offset, not converted to an
+     * integer), a global in LLVM's constant, which
+     * canEmitInitWithFewStoresAfterBZero gives up on. */
     int symbol;
 };
 
-/* Whether clang copies the object from a constant global at -O0 (merlin's
- * ConstantImage::copied). */
+static int image_is_address(struct image *im, uint i) {
+    return (im->address[i / 8] >> (i % 8)) & 1;
+}
+
+/* Whether clang copies the object from a constant global, at -O0 (merlin's
+ * ConstantImage::copied): not when every byte is zero (a memset of zeros),
+ * and for more than 32 bytes not when at most 6 scalars are not zero and no
+ * one is a symbol's address (zeros, then a store each:
+ * shouldUseBZeroPlusStoresToInitialize), nor when every byte is the same
+ * (a memset: shouldUseMemSetToInitialize). Bytes of an address are equal
+ * to no byte, and to each other. */
 static int image_copied(struct image *im) {
     int all_zero = 1;
-    for (uint i = 0; i < im->size; i++) {
-        if (im->bytes[i] != 0) {
+    for (uint i = 0; i < im->size && all_zero; i++) {
+        if (im->bytes[i] != 0 || image_is_address(im, i)) {
             all_zero = 0;
         }
     }
@@ -932,9 +1451,9 @@ static int image_copied(struct image *im) {
         return 1;
     }
     int few_stores = !im->symbol && im->nonzero <= 6;
-    int one_byte = im->bytes[0] >= 0;
+    int one_byte = !image_is_address(im, 0);
     for (uint i = 0; i < im->size && one_byte; i++) {
-        if (im->bytes[i] != im->bytes[0]) {
+        if (im->bytes[i] != im->bytes[0] || image_is_address(im, i)) {
             one_byte = 0;
         }
     }
@@ -944,7 +1463,9 @@ static int image_copied(struct image *im) {
 /* A scalar's little-endian bytes at byte at. */
 static void image_scalar(struct image *im, uint at, i128 v, uint size, int nonzero) {
     for (uint i = 0; i < size; i++) {
-        im->bytes[at + i] = (int)(i < 8 ? (v.lo >> (8 * i)) & 0xff : (v.hi >> (8 * (i - 8))) & 0xff);
+        uint k = at + i;
+        im->bytes[k] = (uchar)(i < 8 ? v.lo >> (8 * i) : v.hi >> (8 * (i - 8)));
+        im->address[k / 8] &= (uchar) ~(1u << (k % 8));
     }
     im->nonzero += (uint)nonzero;
 }
@@ -952,7 +1473,9 @@ static void image_scalar(struct image *im, uint at, i128 v, uint size, int nonze
 /* An address of size bytes at byte at; symbol: a symbol's own. */
 static void image_address(struct image *im, uint at, uint size, int symbol) {
     for (uint i = 0; i < size; i++) {
-        im->bytes[at + i] = -1;
+        uint k = at + i;
+        im->bytes[k] = 0;
+        im->address[k / 8] |= (uchar)(1u << (k % 8));
     }
     im->nonzero++;
     im->symbol |= symbol;
@@ -1248,6 +1771,21 @@ static int is_jump_to(struct line *l, const char *target) {
     return l->kind == LINE_INSN && l->size == 4 && strcmp(l->text, insn_text("j", target)) == 0;
 }
 
+/* A function: its prologue, which saves ra and s0 in a fixed 16 bytes,
+ * points s0 at the top of the frame and then makes room for the rest; its
+ * parameters stored in their slots; its body; and the epilogue, which
+ * undoes the prologue from s0, so it never needs to know the frame size
+ * ("Stack frame" above):
+ *
+ *   f:  addi  sp, sp, -16          .L.return.f:              # result in a0
+ *       sd    ra, 8(sp)                addi  sp, s0, -16
+ *       sd    s0, 0(sp)                ld    ra, 8(sp)
+ *       addi  s0, sp, 16               ld    s0, 0(sp)
+ *       addi  sp, sp, -(frame - 16)    addi  sp, sp, 16
+ *       sw    a0, -20(s0)  # params    ret
+ *
+ * A variadic function's fixed part is bigger: it holds the argument
+ * registers its named parameters leave free ("Variadic functions"). */
 static void function_body(struct funcgen *g, struct vec *body) {
     struct function *f = g->func;
     /* A header that maps every local to its slot, for whoever reads the
@@ -1486,6 +2024,15 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
                 return;
             }
         }
+        /*     <cond>                    <cond>
+         *     beqz a0, .L.end.N         beqz a0, .L.else.N
+         *     <then>                    <then>
+         *   .L.end.N:                   j    .L.end.N
+         *                             .L.else.N:
+         *                               <els>
+         *                             .L.end.N:
+         * (Control reaches the end if an arm falls off its end, or, with no
+         * else, when the test fails.) */
         expr(g, s->e);
         if (s->els == NULL) {
             const char *end = new_label(g, "end");
@@ -1505,6 +2052,15 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         return;
     }
     case S_WHILE: {
+        /*   .L.continue.N:      (continue re-tests the condition)
+         *     <cond>
+         *     beqz a0, .L.break.N
+         *     <body>
+         *     j    .L.continue.N
+         *   .L.break.N:
+         * (The code after the loop is reached when the test fails or a
+         * break control reaches leaves: not after a `while (1)` without
+         * one.) */
         const char *cont = new_label(g, "continue");
         const char *brk = new_label(g, "break");
         block_label(g, cont);
@@ -1519,8 +2075,16 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         return;
     }
     case S_DOWHILE: {
-        /* The condition is generated even when neither the body's end nor a
-         * continue reaches it, as clang emits its block. */
+        /*   .L.do.N:
+         *     <body>
+         *   .L.continue.N:      (continue tests the condition)
+         *     <cond>
+         *     bnez a0, .L.do.N
+         *   .L.break.N:
+         *
+         * The condition is generated even when neither the body's end nor a
+         * continue reaches it, as clang emits its block (EmitDoStmt), so the
+         * code after the loop is too. */
         const char *top = new_label(g, "do");
         const char *cont = new_label(g, "continue");
         const char *brk = new_label(g, "break");
@@ -1536,6 +2100,15 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         return;
     }
     case S_FOR: {
+        /*     <init>
+         *   .L.loop.N:
+         *     <cond>            (no condition: loop forever)
+         *     beqz a0, .L.break.N
+         *     <body>
+         *   .L.continue.N:      (continue still runs the step)
+         *     <step>
+         *     j    .L.loop.N
+         *   .L.break.N: */
         if (s->init != NULL) {
             stmt(g, s->init);
         }
@@ -1576,8 +2149,23 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         jump(g, vec_last(&g->continues));
         return;
     case S_SWITCH: {
-        /* On a constant condition, only the statements that run, when they
-         * can be picked out: no compares, no labels, no break. */
+        /* A chain of compares, one per case, in source order; then default
+         * (or the end, when there is none). The body is emitted as it is,
+         * its case and default labels where they stand, so control falls
+         * through from one to the next as C says:
+         *
+         *     <cond>                   (promoted: a 32-bit value)
+         *     li   t0, 1
+         *     beq  a0, t0, .L.case.f.0
+         *     li   t0, 7
+         *     beq  a0, t0, .L.case.f.1
+         *     j    .L.case.f.2         (default; or .L.break.N)
+         *     <body>                   (with .L.case.f.<id>: labels)
+         *   .L.break.N:
+         *
+         * On a constant condition, only the statements that run, as clang
+         * has them, when they can be picked out (elide.c's
+         * case_statements): no compares, no labels, no break. */
         i128 v;
         if (consteval_condition(s->e, &v)) {
             struct vec run;
@@ -1626,9 +2214,11 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
         block_label(g, goto_label(g, s->name));
         stmt(g, s->body);
         return;
-    default:
+    case S_GOTO:
         jump(g, goto_label(g, s->name));
         return;
+    default:
+        die("codegen: a statement of no kind");
     }
 }
 
@@ -1851,7 +2441,8 @@ static void local_decl(struct funcgen *g, struct declarator *d) {
     if (cst) {
         struct image im;
         im.size = (uint)ty_size(d->ty);
-        im.bytes = heap_calloc(im.size + 1, sizeof(int));
+        im.bytes = heap_calloc(im.size + 1, 1);
+        im.address = heap_calloc(im.size / 8 + 1, 1);
         im.nonzero = 0;
         im.symbol = 0;
         constant_image(d->ty, d->init, 0, &im);
@@ -1859,6 +2450,7 @@ static void local_decl(struct funcgen *g, struct declarator *d) {
             take_name(g->file, fmt("__const.%s.%s", g->func->name, d->name));
         }
         heap_free(im.bytes);
+        heap_free(im.address);
     }
 }
 
@@ -2020,7 +2612,15 @@ static void expr(struct funcgen *g, struct expr *e) {
                 ins(g, "snez", "a0, a0");
                 return;
             }
-            /* The left operand decides, or the right one does, as 0 or 1. */
+            /* The left operand decides, or the right one does, as 0 or 1:
+             *
+             *     <l>
+             *     beqz a0, .L.and.N   # l is 0: so is the result, skip r
+             *     <r>
+             *   .L.and.N:
+             *     snez a0, a0         # 0 or 1
+             *
+             * and for ||, bnez to .L.or.N: l is not 0, the result is 1. */
             const char *end = new_label(g, e->op == OP_LOGAND ? "and" : "or");
             expr(g, e->x);
             if (e->op == OP_LOGAND) {
@@ -2076,6 +2676,13 @@ static void expr(struct funcgen *g, struct expr *e) {
             expr(g, c ? e->y : e->z);
             return;
         }
+        /*     <c>
+         *     beqz a0, .L.else.N
+         *     <a>
+         *     j    .L.end.N
+         *   .L.else.N:
+         *     <b>
+         *   .L.end.N: */
         const char *els = new_label(g, "else");
         const char *end = new_label(g, "end");
         expr(g, e->x);
@@ -2311,8 +2918,20 @@ static int shape(struct type *t, uint *size, int *is_signed) {
 }
 
 /* Converts the value in reg from type from to type to, keeping every value
- * as a register holds it (merlin's convert_reg, whose comment lists the
- * cases). */
+ * as a register holds it (see "Values and types" above): a type narrower
+ * than the register sign- or zero-extended by its signedness, and a 32-bit
+ * one sign-extended whatever its signedness. So
+ *
+ * - to _Bool, anything but 0 (a pointer too) becomes 1: snez;
+ * - to a register-wide type (long, a pointer), only an unsigned int
+ *   changes, zero-extended (slli and srli by 32); every other value is its
+ *   own extension already;
+ * - to a 32-bit type, a register-wide value is cut to 32 bits and
+ *   sign-extended: sext.w (addiw reg, reg, 0);
+ * - to char or short, a value that may not fit is cut to the type and
+ *   widened back (wrap_reg).
+ *
+ * An array's value is its address, already a pointer. */
 static void convert_reg(struct funcgen *g, const char *reg, struct type *from, struct type *to) {
     from = ty_unqual(from);
     to = ty_unqual(to);
@@ -2624,7 +3243,16 @@ static void call_result(struct funcgen *g, struct functype *ft, int result) {
 /* A call whose arguments take more than a0-a7: every argument is evaluated
  * and pushed, left to right; then room is made below them for the stack
  * words, keeping sp 16-byte aligned at the call, and each word is copied to
- * its place, on the stack or in a register (merlin's call_with_stack). */
+ * its place, on the stack or in a register (merlin's call_with_stack):
+ *
+ *     <arg 0>  push ... <arg n-1>  push
+ *     addi sp, sp, -area           # the outgoing words: 0(sp), 8(sp), ...
+ *     ld   t1, <arg 8>(sp)         # a stack word
+ *     sd   t1, 0(sp)
+ *     ld   a0, <arg 0>(sp)         # a register
+ *     ...
+ *     call f
+ *     addi sp, sp, area + 8n       # the words and the pushed arguments */
 static void call_with_stack(struct funcgen *g, struct expr *e, int hidden, struct arg_layout *l) {
     struct expr *callee = e->x;
     const char *direct = direct_callee(callee);
@@ -2883,6 +3511,18 @@ static void render(struct line *lines, uint n, uchar *lng, struct buf *out) {
 
 /* ---- The file ---- */
 
+/* Frees what a pass over a function kept on the heap: its lines, its lists
+ * and maps, and g itself (not g->used, which the caller may keep). */
+static void funcgen_free(struct funcgen *g) {
+    heap_free(g->lines);
+    heap_free(g->breaks.v);
+    heap_free(g->continues.v);
+    heap_free(g->elided_cases.v);
+    heap_free(g->reached.keys);
+    heap_free(g->reached.values);
+    heap_free(g);
+}
+
 /* Generates function f's code (merlin's FileGen::function): a first pass,
  * generating into nothing, finds the locals the code uses; the second is
  * the function, its frame holding those alone. */
@@ -2903,12 +3543,16 @@ static struct diag *function(struct filegen *file, struct function *f) {
     uint pass;
     uchar *used = NULL;
     struct funcgen *g = NULL;
+    /* Where the arena was before the first pass: what that pass puts there
+     * (its lines' text, its frame, its string literals) goes with it. */
+    struct arena_point before;
     for (pass = 0; pass < 2; pass++) {
         int *offsets;
         int frame;
         uint labels = file->labels;
         uint strings_n = file->strings.n;
         if (pass == 0) {
+            arena_mark(&before);
             file->dry = 1;
             if (!layout(&f->locals, all, header, &offsets, &frame)) {
                 offsets = arena_alloc(n * sizeof(int) + 1);
@@ -2916,6 +3560,7 @@ static struct diag *function(struct filegen *file, struct function *f) {
             }
         } else if (!layout(&f->locals, used, header, &offsets, &frame)) {
             heap_free(all);
+            heap_free(used);
             return diag_error(f->pos,
                               fmt("the locals of '%s' need a stack frame larger than 2 GiB", f->name));
         }
@@ -2936,15 +3581,13 @@ static struct diag *function(struct filegen *file, struct function *f) {
         function_body(g, &f->body);
         if (pass == 0) {
             /* What the first pass made is taken back: its labels and string
-             * literals. */
+             * literals, and its memory. */
             file->dry = 0;
             file->labels = labels;
             vec_truncate(&file->strings, strings_n);
             used = g->used;
-            heap_free(g->lines);
-            heap_free(g->reached.keys);
-            heap_free(g->reached.values);
-            heap_free(g);
+            funcgen_free(g);
+            arena_release(&before);
         }
     }
     begin_symbol(file);
@@ -2952,15 +3595,16 @@ static struct diag *function(struct filegen *file, struct function *f) {
     buf_byte(&file->out, '\n');
     uchar *lng = relax_branches(g->lines, g->nlines);
     struct diag *e = check_size(f, g->lines, g->nlines, lng);
-    if (e != NULL) {
-        return e;
+    if (e == NULL) {
+        render(g->lines, g->nlines, lng, &file->out);
+        finish_symbol(file, f->name);
     }
-    render(g->lines, g->nlines, lng, &file->out);
-    finish_symbol(file, f->name);
     heap_free(lng);
-    heap_free(g->lines);
     heap_free(all);
-    return NULL;
+    heap_free(used);
+    heap_free(g->used);
+    funcgen_free(g);
+    return e;
 }
 
 /* Emits definition k: its code or its data. */
@@ -2978,17 +3622,18 @@ static struct diag *emit(struct filegen *file, uint k) {
  * depth first (clang's EmitDeferred). */
 static struct diag *deferred(struct filegen *file) {
     struct vec now = vec_take(&file->queue);
-    for (uint i = 0; i < now.n; i++) {
+    struct diag *e = NULL;
+    for (uint i = 0; i < now.n && e == NULL; i++) {
         uint k = (uint)((uintptr_t)now.v[i] - 1);
         if (!file->emitted[k]) {
-            TRY(emit(file, k));
-            if (file->queue.n > 0) {
-                TRY(deferred(file));
+            e = emit(file, k);
+            if (e == NULL && file->queue.n > 0) {
+                e = deferred(file);
             }
         }
     }
     heap_free(now.v);
-    return NULL;
+    return e;
 }
 
 /* Whether name is a register's (excalibur's reg::parse): x0 to x31 (u8
@@ -3024,7 +3669,27 @@ static int register_name(const char *name) {
     return 0;
 }
 
+/* Frees what the file's generation kept on the heap. */
+static void filegen_free(struct filegen *file) {
+    buf_free(&file->out);
+    heap_free(file->pieces.v);
+    heap_free(file->strings.v);
+    heap_free(file->queue.v);
+    heap_free(file->created.v);
+    map_free(&file->taken);
+    map_free(&file->names);
+    map_free(&file->by_symbol);
+    map_free(&file->created_set);
+    map_free(&file->referred_as);
+    map_free(&file->held);
+    map_free(&file->chunks);
+    heap_free(file->emitted);
+    heap_free(file->waiting);
+    heap_free(file);
+}
+
 int codegen_generate(struct program *prog, struct buf *out, struct diag **error) {
+    *error = NULL;
     /* merlin-as reads a register name as a register, never as a symbol, so a
      * function or global called sp or a0 could not be referenced. */
     for (uint i = 0; i < prog->items.n; i++) {
@@ -3090,7 +3755,7 @@ int codegen_generate(struct program *prog, struct buf *out, struct diag **error)
         }
         if (!def_deferrable(d)) {
             if ((*error = emit(file, k)) != NULL) {
-                return 0;
+                break;
             }
         } else if (map_get(&file->created_set, def_symbol(d)) != NULL) {
             vec_push(&file->queue, (void *)((uintptr_t)k + 1));
@@ -3098,7 +3763,7 @@ int codegen_generate(struct program *prog, struct buf *out, struct diag **error)
             file->waiting[k] = 1;
         }
     }
-    for (uint k = 0; k < n; k++) {
+    for (uint k = 0; k < n && *error == NULL; k++) {
         struct def *d = &file->defs[k];
         if (!def_tentative(d) || def_hidden(d)) {
             continue;
@@ -3106,15 +3771,19 @@ int codegen_generate(struct program *prog, struct buf *out, struct diag **error)
         if (def_deferrable(d) && map_get(&file->created_set, def_symbol(d)) == NULL) {
             file->waiting[k] = 1;
         } else if ((*error = emit(file, k)) != NULL) {
-            return 0;
+            break;
         }
     }
-    if ((*error = deferred(file)) != NULL) {
+    heap_free(defs.v);
+    if (*error != NULL || (*error = deferred(file)) != NULL) {
+        filegen_free(file);
         return 0;
     }
     /* The output: each symbol's code or data in the order the symbols were
-     * made, then the string literals. */
-    file->out.len = 0;
+     * made, then the string literals, written after what *out holds. */
+    buf_free(&file->out);
+    file->out = *out;
+    file->start = out->len;
     file->section = "";
     for (uint i = 0; i < file->created.n; i++) {
         const char *sym = file->created.v[i];
@@ -3130,8 +3799,11 @@ int codegen_generate(struct program *prog, struct buf *out, struct diag **error)
             }
             buf_put(&file->out, p->text, p->len);
         }
+        heap_free(pieces->v);
     }
     strings(file);
-    buf_put(out, file->out.len > 0 ? file->out.data : "", file->out.len);
+    *out = file->out;
+    memset(&file->out, 0, sizeof file->out);
+    filegen_free(file);
     return 1;
 }

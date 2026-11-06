@@ -82,6 +82,30 @@ static void free_blocks(struct block *b) {
     }
 }
 
+void arena_mark(struct arena_point *m) {
+    m->chunk = chunks;
+    m->used = chunks != NULL ? chunks->used : 0;
+    m->big = bigs;
+}
+
+/* New chunks and blocks go at the head of their lists, so what came after
+ * the mark is what is ahead of the marked ones there. */
+void arena_release(struct arena_point *m) {
+    while (chunks != m->chunk) {
+        struct block *next = chunks->next;
+        free(chunks);
+        chunks = next;
+    }
+    if (chunks != NULL) {
+        chunks->used = m->used;
+    }
+    while (bigs != m->big) {
+        struct block *next = bigs->next;
+        free(bigs);
+        bigs = next;
+    }
+}
+
 /* ---- The translation unit's heap ----
  * What grows or is freed early (an array, a map's table, a buffer) is
  * malloc'd, each block with a header linking it into the list of what the
@@ -389,6 +413,12 @@ void map_put(struct map *m, const char *key, void *value) {
             return;
         }
     }
+}
+
+void map_free(struct map *m) {
+    heap_free(m->keys);
+    heap_free(m->values);
+    memset(m, 0, sizeof *m);
 }
 
 int map_remove(struct map *m, const char *key) {

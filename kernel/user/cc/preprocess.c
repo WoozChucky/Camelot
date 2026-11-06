@@ -3342,11 +3342,6 @@ static struct diag *run(struct pp *pp, const char *src, uint n) {
     return NULL;
 }
 
-static void map_free(struct map *m) {
-    heap_free(m->keys);
-    heap_free(m->values);
-}
-
 /* Frees what the preprocessor malloc'd, but its diagnostics' array, which
  * preprocess_text hands on: the files still open when an error stopped it,
  * their tokens and texts, and its tables. */
