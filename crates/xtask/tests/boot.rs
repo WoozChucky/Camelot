@@ -903,3 +903,107 @@ fn the_spec_gives_the_root_images_size() {
         );
     }
 }
+
+#[test]
+fn the_profiles_images_differ_in_their_etc_rc_and_fonts() {
+    // Issue #182: each profile's directory of kernel/profiles goes over
+    // kernel/fs byte for byte (its /etc/rc); the desktop's has the console's
+    // font and its licence in /usr/share/fonts; both have every program.
+    let root = repo_root();
+    let programs = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root)).unwrap();
+    for profile in xtask::fs::Profile::ALL {
+        let opts = Options {
+            size: profile.image_size(),
+            ..Options::default()
+        };
+        let image = xtask::fs::build_profile(&root, &opts, profile).unwrap();
+        let fs = Fs::open(&image).unwrap();
+        let rc = root
+            .join(xtask::fs::PROFILES_DIR)
+            .join(profile.name())
+            .join("etc/rc");
+        assert_eq!(
+            fs.read_file("/etc/rc").unwrap(),
+            std::fs::read(rc).unwrap(),
+            "{}",
+            profile.name()
+        );
+        let bin: BTreeSet<String> = fs
+            .list("/bin")
+            .unwrap()
+            .into_iter()
+            .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+            .collect();
+        for p in &programs {
+            assert!(bin.contains(p), "{}: no /bin/{p}", profile.name());
+        }
+        let font = fs.read_file("/usr/share/fonts/spleen/8x16.psfu");
+        match profile {
+            xtask::fs::Profile::Server => assert!(font.is_err(), "the server has no fonts"),
+            xtask::fs::Profile::Desktop => {
+                let fonts = root.join("kernel/fonts");
+                assert_eq!(
+                    font.unwrap(),
+                    std::fs::read(fonts.join("spleen-8x16.psfu")).unwrap()
+                );
+                assert_eq!(
+                    fs.read_file("/usr/share/fonts/spleen/LICENSE").unwrap(),
+                    std::fs::read(fonts.join("LICENSE.spleen")).unwrap()
+                );
+            }
+        }
+    }
+    // The tests' image has no profile: no /etc/rc, so the shell is pid 1.
+    let opts = Options {
+        size: xtask::fs::IMAGE_SIZE,
+        ..Options::default()
+    };
+    let plain = Fs::open(&xtask::fs::build(&root, &opts).unwrap()).unwrap();
+    assert!(plain.read_file("/etc/rc").is_err());
+}
+
+#[test]
+fn the_desktop_image_boots_and_init_starts_its_shell_again() {
+    // The desktop's /etc/rc keeps the console's shell running: one that
+    // ends is started again, unless it ended within a second of starting;
+    // with nothing left to run, init ends, and the machine with it (0, no
+    // `once` service). shd ends at once on a machine with no network card.
+    let root = repo_root();
+    let image =
+        xtask::fs::build_bootable(&root, xtask::fs::Profile::Desktop, xtask::fs::DESKTOP_IMAGE_SIZE).unwrap();
+    let mut m = Machine::new(MachineConfig {
+        ram_size: avalon_client::DESKTOP_RAM as usize,
+        ..camelot_vm(vec![DiskConfig::memory(image)])
+    })
+    .unwrap();
+    m.boot_from_disk().unwrap();
+    m.cpu.bus.uart.capture = true;
+    m.set_uart_input(xtask::kernel::typed(b"sleep 1.5\nexit\nps\nexit\n"));
+    let result = m.run(Some(2 * BOOT_MAX_STEPS), |_| {});
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    assert_eq!(result, RunResult::Exited(0), "{out}");
+    assert!(out.contains("\nram: 64 MiB at 0x80000000\n"), "{out}");
+    assert_eq!(
+        out.matches("Type help for the list of commands.\n").count(),
+        2,
+        "{out}"
+    );
+    for line in [
+        "init: /bin/shd ended at once, exit 1: not started again\n",
+        "init: /bin/sh ended at once, exit 0: not started again\n",
+    ] {
+        assert_eq!(out.matches(line).count(), 1, "{line:?} in\n{out}");
+    }
+    // The second shell is init's child too, pid 1's.
+    let ps = &out[out.find("$ ps\n").unwrap_or_else(|| panic!("{out}"))..];
+    let processes: Vec<Vec<&str>> = ps
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .filter(|w| w.len() == 5)
+        .collect();
+    assert!(
+        processes.iter().any(|w| w[..2] == ["1", "0"] && w[4] == "init"),
+        "{out}"
+    );
+    assert!(processes.iter().any(|w| w[1] == "1" && w[4] == "sh"), "{out}");
+}

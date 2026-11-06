@@ -188,7 +188,8 @@ fn all_checks_pass(out: &str, command: &str, program: &str) -> u32 {
 }
 
 /// A disk with the root filesystem (`xtask::fs::build`: the programs in
-/// /bin), `blocks` blocks, and `extra` files besides.
+/// /bin), `blocks` blocks, and `extra` files besides (in `/`, `/bin` or
+/// `/etc`, made for them).
 fn root_disk(blocks: u32, extra: &[(&str, &[u8])]) -> DiskConfig {
     let root = repo_root();
     let opts = camelot_fs::mkfs::Options {
@@ -213,6 +214,9 @@ fn root_disk(blocks: u32, extra: &[(&str, &[u8])]) -> DiskConfig {
         for p in xtask::userprogs::build_all(&user).unwrap() {
             fs.add_file(&format!("{}/{}", xtask::fs::BIN, p.name), &p.elf)
                 .unwrap();
+        }
+        if extra.iter().any(|(path, _)| path.starts_with("/etc/")) {
+            fs.mkdir("/etc").unwrap();
         }
         for (path, bytes) in extra {
             fs.add_file(path, bytes).unwrap();
@@ -469,6 +473,104 @@ fn a_program_starts_as_linux_starts_one() {
         assert_ne!(m.cpu.csr.mstatus & MSTATUS_SIE, 0);
         assert_eq!(m.cpu.csr.mstatus & excalibur::csr::MSTATUS_SUM, 0);
     }
+}
+
+/// Each `ps`'s listing in `out`, in order: a process a line, as (pid, ppid,
+/// state, name). Lines that are not a process's (the header, a line another
+/// process printed meanwhile) are left out.
+fn ps_listings(out: &str) -> Vec<Vec<(u32, u32, String, String)>> {
+    out.split(&format!("{PROMPT}ps\n"))
+        .skip(1)
+        .map(|rest| {
+            rest[..rest.find(PROMPT).unwrap_or(rest.len())]
+                .lines()
+                .filter_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
+                    [pid, ppid, state, _size, name] => Some((
+                        pid.parse().ok()?,
+                        ppid.parse().ok()?,
+                        state.to_string(),
+                        name.to_string(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn init_starts_the_services_of_etc_rc_and_ends_the_machine_with_them() {
+    // Issue #182: /bin/init, pid 1, runs /etc/rc's services: the console's
+    // shell once, a sleep respawned each time it ends, hello (which ends at
+    // once, so it is left), a program that is not there; and says what is
+    // wrong with the lines it leaves out. Orphans become its children, and
+    // it collects them. It can't be killed, nor run again. `exit 3` ends its
+    // one `once` service, so init ends everything and the machine with 3.
+    let rc = b"# the console's shell, and services that end
+once /bin/sh   # the console's
+respawn /bin/sleep 1.5
+respawn\t/bin/hello
+respawn /bin/nothere
+
+once
+bogus /bin/sh
+respawn sh
+once /bin/echo 1 2 3 4 5 6 7 8
+";
+    let input = b"ps\nsleep 2\nps\nsh\nsleep 3 &\nexit\nps\nsleep 4\nps\nkill 1\ninit\nexit 3\n";
+    let setup = Setup {
+        disks: vec![root_disk(4096, &[("/etc/rc", rc)])],
+        ..Setup::default()
+    };
+    let (mut m, _) = load(setup.config(), Some(kernel::typed(input)));
+    let r = m.run(Some(MAX_STEPS), |_| {});
+    let out = printed(&m);
+    assert_eq!(r, RunResult::Exited(3), "{out}");
+    for line in [
+        "init: /etc/rc:7: no program's path\n",
+        "init: /etc/rc:8: bogus: not once or respawn\n",
+        "init: /etc/rc:9: no program's path\n",
+        "init: /etc/rc:10: more than 7 arguments\n",
+        "init: cannot start /bin/nothere: no such file or directory\n",
+        "hello from user mode\n",
+        "init: /bin/hello ended at once, exit 0: not started again\n",
+        "kill: 1: operation not permitted\n",
+        "init: not the first process\n",
+        "init: exit 1\n",
+    ] {
+        assert_eq!(out.matches(line).count(), 1, "{line:?} in\n{out}");
+    }
+    let ps = ps_listings(&out);
+    assert_eq!(ps.len(), 4, "{out}");
+    let named = |listing: &[(u32, u32, String, String)], name: &str, ppid: u32| -> Vec<u32> {
+        listing
+            .iter()
+            .filter(|p| p.3 == name && p.1 == ppid)
+            .map(|p| p.0)
+            .collect()
+    };
+    // Init is pid 1, with no parent; the shell and the sleep are its.
+    assert_eq!(named(&ps[0], "init", 0), [1], "{out}");
+    let sh = named(&ps[0], "sh", 1);
+    assert_eq!(sh.len(), 1, "{out}");
+    let sleep = named(&ps[0], "sleep", 1);
+    assert_eq!(sleep.len(), 1, "{out}");
+    // 2 seconds later, the sleep of 1.5 seconds is another: started again.
+    let again = named(&ps[1], "sleep", 1);
+    assert_eq!(again.len(), 1, "{out}");
+    assert_ne!(again, sleep, "{out}");
+    // The second shell's background sleep, once that shell has ended, is
+    // init's.
+    let at = out.find("sleep 3 &\n[").unwrap_or_else(|| panic!("{out}")) + "sleep 3 &\n[".len();
+    let orphan: u32 = out[at..at + out[at..].find(']').unwrap()].parse().unwrap();
+    assert!(
+        ps[2].iter().any(|p| p.0 == orphan && p.1 == 1 && p.3 == "sleep"),
+        "{out}"
+    );
+    // Once it has ended, init has collected it: no zombie is left.
+    assert!(!ps[3].iter().any(|p| p.0 == orphan), "{out}");
+    assert!(ps.iter().flatten().all(|p| p.2 != "zombie"), "{out}");
+    assert_eq!(named(&ps[3], "sh", 1), sh, "{out}");
 }
 
 #[test]
