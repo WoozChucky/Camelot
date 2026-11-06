@@ -103,7 +103,7 @@ static int expand(int argc, char **argv, char ***out, uint *n) {
         int err;
         char *text = (char *)read_file(file, &len, &err);
         if (text == NULL) {
-            fprintf(2, "ld: cannot read %s: %s\n", file, strerror(err));
+            fprintf(2, "ld: cannot read %s: %s\n", file, strerror(-err));
             return 0;
         }
         char *p = text;
@@ -312,7 +312,7 @@ int main(int argc, char **argv) {
         in.name = names[i].name;
         in.data = read_file(in.name, &in.len, &err);
         if (in.data == NULL) {
-            fprintf(2, "ld: cannot read %s: %s\n", in.name, strerror(err));
+            fprintf(2, "ld: cannot read %s: %s\n", in.name, strerror(-err));
             return 2;
         }
         if (!is_archive(in.data, in.len)) {
@@ -353,7 +353,7 @@ int main(int argc, char **argv) {
         int err;
         script_text = (char *)read_file(script, &len, &err);
         if (script_text == NULL) {
-            fprintf(2, "ld: cannot read %s: %s\n", script, strerror(err));
+            fprintf(2, "ld: cannot read %s: %s\n", script, strerror(-err));
             return 2;
         }
     }
@@ -390,7 +390,7 @@ int main(int argc, char **argv) {
     write_elf(&layout, images, debug, strip, &elf);
     int r = write_file(output, elf.data, elf.len);
     if (r < 0) {
-        fprintf(2, "ld: cannot write %s: %s\n", output, strerror(r));
+        fprintf(2, "ld: cannot write %s: %s\n", output, strerror(-r));
         return 2;
     }
     return 0;

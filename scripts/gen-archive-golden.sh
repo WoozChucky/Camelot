@@ -16,9 +16,12 @@
 #               a_very_long_member_name.o (b.o's bytes) and notes.txt, a
 #               text member of odd size
 #   nosyms.a    nosyms.o alone: a symbol table with no symbols
+#   short.a     a.o, nosyms.o, b.o, c.o and notes.txt: names a Camelot
+#               directory holds (14 bytes at most), for /bin/ar's test
 #   longnames.a names of 15 and 16 bytes, and a long name twice
 #   replaced.a  objs.a after `llvm-ar rcs replaced.a new/a.o c.o`: a.o
 #               replaced in place, c.o added at the end
+#   nosymtab.a  longnames.a's members without a symbol table (rcS)
 #   empty.a     no members
 #
 # Made with LLVM 23.
@@ -34,8 +37,11 @@ cp a.o abcdefghijklmn.o
 rm -f ./*.a
 llvm-ar --format=gnu rcs objs.a a.o nosyms.o b.o a_very_long_member_name.o notes.txt
 llvm-ar --format=gnu rcs nosyms.a nosyms.o
+llvm-ar --format=gnu rcs short.a a.o nosyms.o b.o c.o notes.txt
 llvm-ar --format=gnu rcs longnames.a abcdefghijklm.o abcdefghijklmn.o a_very_long_member_name.o \
     a_very_long_member_name.o
 cp objs.a replaced.a
 llvm-ar --format=gnu rcs replaced.a new/a.o c.o
+llvm-ar --format=gnu rcS nosymtab.a abcdefghijklm.o abcdefghijklmn.o a_very_long_member_name.o \
+    a_very_long_member_name.o
 llvm-ar --format=gnu rcs empty.a

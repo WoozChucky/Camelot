@@ -279,6 +279,13 @@ fn is_long(name: &str) -> bool {
 /// Fails if a member is an ELF file that does not parse, or if the archive
 /// would pass 4 GiB, which a 32-bit symbol table cannot point into.
 pub fn write(members: &[NewMember]) -> Result<Vec<u8>, Error> {
+    write_with(members, true)
+}
+
+/// [`write`], with a symbol table only if `symbol_table`: without one
+/// (`ar rcS`) the members come right after the magic, or after the long
+/// names, as llvm-ar writes them (the members' symbols still must parse).
+pub fn write_with(members: &[NewMember], symbol_table: bool) -> Result<Vec<u8>, Error> {
     let mut out = MAGIC.to_vec();
     if members.is_empty() {
         return Ok(out);
@@ -315,7 +322,7 @@ pub fn write(members: &[NewMember]) -> Result<Vec<u8>, Error> {
         table_size += 1;
     }
     // Where each member's header goes.
-    let mut at = MAGIC.len() + HEADER_SIZE + table_size;
+    let mut at = MAGIC.len() + if symbol_table { HEADER_SIZE + table_size } else { 0 };
     if !long_names.is_empty() {
         at += HEADER_SIZE + long_names.len();
     }
@@ -327,14 +334,16 @@ pub fn write(members: &[NewMember]) -> Result<Vec<u8>, Error> {
     if at > u32::MAX as usize {
         return bad("an archive of more than 4 GiB needs a 64-bit symbol table");
     }
-    header(&mut out, "/", Some(("0", "0")), table_size)?;
-    out.extend_from_slice(&(count as u32).to_be_bytes());
-    for (i, syms) in defined.iter().enumerate() {
-        for _ in syms {
-            out.extend_from_slice(&(offsets[i] as u32).to_be_bytes());
+    if symbol_table {
+        header(&mut out, "/", Some(("0", "0")), table_size)?;
+        out.extend_from_slice(&(count as u32).to_be_bytes());
+        for (i, syms) in defined.iter().enumerate() {
+            for _ in syms {
+                out.extend_from_slice(&(offsets[i] as u32).to_be_bytes());
+            }
         }
+        out.extend_from_slice(&names);
     }
-    out.extend_from_slice(&names);
     if !long_names.is_empty() {
         header(&mut out, "//", None, long_names.len())?;
         out.extend_from_slice(&long_names);

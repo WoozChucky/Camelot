@@ -18,6 +18,11 @@ fn read(name: &str) -> Vec<u8> {
 /// The archive llvm-ar made of `files` (paths under tests/archive), and
 /// the elf crate's of the same: they must be equal.
 fn check(golden: &str, files: &[&str]) {
+    check_with(golden, files, true)
+}
+
+/// [`check`], the archive written with a symbol table if `symbol_table`.
+fn check_with(golden: &str, files: &[&str], symbol_table: bool) {
     let data: Vec<Vec<u8>> = files.iter().map(|f| read(f)).collect();
     let members: Vec<NewMember> = files
         .iter()
@@ -28,7 +33,7 @@ fn check(golden: &str, files: &[&str]) {
         })
         .collect();
     let want = read(golden);
-    let got = archive::write(&members).unwrap();
+    let got = archive::write_with(&members, symbol_table).unwrap();
     assert!(
         got == want,
         "{golden}: {} bytes, llvm-ar's {} (first difference at {:?})",
@@ -52,6 +57,7 @@ fn the_writer_writes_what_llvm_ar_writes() {
         &["a.o", "nosyms.o", "b.o", "a_very_long_member_name.o", "notes.txt"],
     );
     check("nosyms.a", &["nosyms.o"]);
+    check("short.a", &["a.o", "nosyms.o", "b.o", "c.o", "notes.txt"]);
     check(
         "longnames.a",
         &[
@@ -62,6 +68,18 @@ fn the_writer_writes_what_llvm_ar_writes() {
         ],
     );
     check("empty.a", &[]);
+    let no_table = read("nosymtab.a");
+    assert!(!archive::parse(&no_table).unwrap().has_symbol_table);
+    check_with(
+        "nosymtab.a",
+        &[
+            "abcdefghijklm.o",
+            "abcdefghijklmn.o",
+            "a_very_long_member_name.o",
+            "a_very_long_member_name.o",
+        ],
+        false,
+    );
 }
 
 #[test]

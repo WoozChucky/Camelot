@@ -71,8 +71,9 @@ pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
 /// and their copies would cost every machine memory for nothing: `as` is
 /// over 200 KB, `ld` not much less, nearly half together of what the
 /// smallest machine, 3 MiB, has left once the kernel and the programs it
-/// embeds, a little over 2 MiB, are loaded.
-pub const DISK_ONLY: &[&str] = &["as", "ld"];
+/// embeds, a little over 2 MiB, are loaded. `ar` makes and reads archives
+/// for them, files too.
+pub const DISK_ONLY: &[&str] = &["ar", "as", "ld"];
 
 /// The programs the kernel builds in: all but [`DISK_ONLY`], by name.
 pub fn embedded(programs: &[Program]) -> Vec<&Program> {
@@ -472,6 +473,19 @@ pub fn program_objects(dir: &Path, prog: &Source, cc: CCompiler) -> Result<Vec<m
         inputs.push(object(dir, &part, cc)?);
     }
     Ok(inputs)
+}
+
+/// The assembly merlin-as is given for each of `prog`'s parts, in order:
+/// the part's source file and the text ([`program_objects`] assembles
+/// them). What `/bin/as` gets on Camelot to build the same program.
+pub fn program_assembly(dir: &Path, prog: &Source, cc: CCompiler) -> Result<Vec<(Source, String)>, String> {
+    prog.parts(dir)?
+        .into_iter()
+        .map(|part| {
+            let (_, text) = asm_text(dir, &part, cc)?;
+            Ok((part, text))
+        })
+        .collect()
 }
 
 /// Builds program `prog` from `dir`, its C and the runtime's compiled by

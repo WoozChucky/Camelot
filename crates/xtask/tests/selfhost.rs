@@ -701,6 +701,234 @@ fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
     assert!(said.contains("Hello"), "{said:?}");
 }
 
+/// #240's acceptance: inside Camelot, C programs assembled by `/bin/as`
+/// from the assembly the host's merlin wrote (`-g`, as the host builds
+/// them) and linked by `/bin/ld` from the root image's `/usr/lib`,
+///
+/// ```text
+/// as -o /o/PROG.o /src/PROG.s
+/// ld -T /usr/lib/user.ld -o /out/PROG /usr/lib/crt0.o /o/PROG.o -L/usr/lib -lc
+/// ```
+///
+/// are the host's programs byte for byte: with `-S` what `/bin` holds, and
+/// without it the line tables too. Then they run, from `/out`. A program
+/// of several files (`/bin/ar`) is linked from its objects in order.
+#[test]
+fn c_programs_assembled_and_linked_on_camelot_are_the_hosts_and_run() {
+    use userprogs::CCompiler;
+    let dir = userprogs::user_dir(&repo_root());
+    let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
+    let mut files = usr_image_files(&rt);
+    files.push(("/src/words".into(), b"one two\nthree\n".to_vec()));
+    let mut commands: Vec<String> = Vec::new();
+    // (program, output, merlin-ld's executable)
+    let mut checks: Vec<(String, String, Vec<u8>)> = Vec::new();
+    let progs = userprogs::programs(&dir).unwrap();
+    for name in ["hello", "cat", "grep", "printenv", "ar"] {
+        let prog = progs.iter().find(|p| p.stem == name).unwrap();
+        let want = userprogs::link_program(&dir, prog, CCompiler::Merlin, &rt).unwrap();
+        let mut objects = Vec::new();
+        for (j, (_, text)) in userprogs::program_assembly(&dir, prog, CCompiler::Merlin)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+        {
+            let (src, obj) = (format!("/src/{name}{j}.s"), format!("/o/{name}{j}.o"));
+            commands.push(format!("as -o {obj} {src}"));
+            files.push((src, text.into_bytes()));
+            objects.push(obj);
+        }
+        let link = format!(
+            "-T {USR_LIB}/user.ld {USR_LIB}/crt0.o {} -L{USR_LIB} -lc",
+            objects.join(" ")
+        );
+        files.push((format!("/a/{name}"), link.into_bytes()));
+        commands.push(format!("ld @/a/{name} -S -o /out/{name}"));
+        commands.push(format!("ld @/a/{name} -o /out/{name}.g"));
+        checks.push((name.into(), format!("/out/{name}"), want.elf));
+        checks.push((name.into(), format!("/out/{name}.g"), want.debug));
+    }
+    let runs = [
+        ("/out/hello", "hello from user mode\n"),
+        ("/out/cat /src/words", "one two\nthree\n"),
+        ("/out/grep -n three /src/words", "2:three\n"),
+        ("/out/printenv HOME", "/\n"),
+        ("/out/ar t /usr/lib/libc.a environ.o", "environ.o\n"),
+    ];
+    for (run, _) in &runs {
+        commands.push(run.to_string());
+    }
+    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let dirs = [USR_DIRS, &["/src", "/o", "/a"]].concat();
+    let (out, disk) = boot(image_of(&["as", "ld"], &dirs, &files), &input, 20_000_000_000);
+    for c in &commands[..commands.len() - runs.len()] {
+        assert_eq!(shell_output(&out, c), "", "{c}");
+    }
+    let fs = Fs::open(&disk).unwrap();
+    for (name, file, want) in &checks {
+        let got = fs.read_file(file).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert!(
+            got == *want,
+            "{name}: {file} is {} bytes, the host's {} (first difference at {:?})",
+            got.len(),
+            want.len(),
+            got.iter().zip(want).position(|(a, b)| a != b)
+        );
+    }
+    for (run, said) in runs {
+        assert_eq!(shell_output(&out, run).replace('\r', ""), said, "{run}");
+    }
+}
+
+/// #240's acceptance: `/bin/ar` writes, for the same members, the archives
+/// llvm-ar wrote (the elf crate's fixtures, crates/elf/tests/archive, whose
+/// names fit a Camelot directory or are already in an archive), and the
+/// root image's `libc.a` from the library's objects, a response file of
+/// them or batches added with `r`. `t` lists, `x` takes members out, and a
+/// file that is not an archive or a member that is missing is an error.
+#[test]
+fn the_archiver_on_camelot_writes_what_llvm_ar_writes() {
+    let golden = repo_root().join("crates/elf/tests/archive");
+    let read = |f: &str| std::fs::read(golden.join(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+    let rt =
+        userprogs::build_runtime(&userprogs::user_dir(&repo_root()), userprogs::CCompiler::Merlin).unwrap();
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for f in ["a.o", "b.o", "c.o", "nosyms.o", "notes.txt"] {
+        files.push((format!("/src/{f}"), read(f)));
+    }
+    files.push(("/src/new/a.o".into(), read("new/a.o")));
+    for f in ["objs.a", "longnames.a", "nosyms.a", "short.a"] {
+        files.push((format!("/g/{f}"), read(f)));
+    }
+    let members: Vec<String> = rt.library.iter().map(|m| format!("/m/{}", m.name)).collect();
+    for (path, m) in members.iter().zip(&rt.library) {
+        files.push((path.clone(), m.data.clone()));
+    }
+    files.push((
+        "/a/libc".into(),
+        format!("rcs /out/libc.a {}\n", members.join("\n")).into_bytes(),
+    ));
+    // (command, what it prints)
+    let mut commands: Vec<(String, String)> = vec![
+        // Made from files.
+        (
+            "ar rcs /out/short.a /src/a.o /src/nosyms.o /src/b.o /src/c.o /src/notes.txt".into(),
+            "".into(),
+        ),
+        ("ar -rcs /out/nosyms.a /src/nosyms.o".into(), "".into()),
+        ("ar rcs /out/empty.a".into(), "".into()),
+        (
+            "ar r /out/loud.a /src/c.o".into(),
+            "ar: creating /out/loud.a\n".into(),
+        ),
+        // Members replaced in place and added, in an archive with long names.
+        ("cp /g/objs.a /out/replaced.a".into(), "".into()),
+        ("ar rcs /out/replaced.a /src/new/a.o /src/c.o".into(), "".into()),
+        // Archives llvm-ar wrote, written again as they are, and without
+        // their symbol table.
+        ("cp /g/longnames.a /out/longnames.a".into(), "".into()),
+        ("ar rcs /out/longnames.a".into(), "".into()),
+        ("cp /g/longnames.a /out/nosymtab.a".into(), "".into()),
+        ("ar rcS /out/nosymtab.a".into(), "".into()),
+        ("cp /g/objs.a /out/objs.a".into(), "".into()),
+        ("ar rcs /out/objs.a".into(), "".into()),
+        // libc.a: from a response file, and in batches.
+        ("ar @/a/libc".into(), "".into()),
+    ];
+    for batch in members.chunks(6) {
+        commands.push((format!("ar rcs /out/libc2.a {}", batch.join(" ")), "".into()));
+    }
+    let names: String = rt.library.iter().map(|m| format!("{}\n", m.name)).collect();
+    commands.extend([
+        ("ar t /out/libc.a".to_string(), names),
+        (
+            "ar t /g/objs.a b.o a_very_long_member_name.o".into(),
+            "b.o\na_very_long_member_name.o\n".into(),
+        ),
+        ("mkdir /x".into(), "".into()),
+        ("cd /x".into(), "".into()),
+        ("ar x /out/libc.a printf.o usys.o".into(), "".into()),
+        ("cd /".into(), "".into()),
+        ("mkdir /y".into(), "".into()),
+        ("cd /y".into(), "".into()),
+        ("ar x /g/short.a".into(), "".into()),
+        ("cd /".into(), "".into()),
+        (
+            "ar t /src/notes.txt".into(),
+            "ar: error: '/src/notes.txt': not an archive (no !<arch> magic)\nar: exit 1\n".into(),
+        ),
+        (
+            "ar x /out/libc.a nope.o".into(),
+            "ar: error: 'nope.o' was not found\nar: exit 1\n".into(),
+        ),
+        (
+            "ar rcs /out/bad.a /src/none.o".into(),
+            "ar: error: '/src/none.o': no such file or directory\nar: exit 1\n".into(),
+        ),
+        // /bin/ld says why it cannot read a file too.
+        (
+            "ld /src/none.o".into(),
+            "ld: cannot read /src/none.o: no such file or directory\nld: exit 2\n".into(),
+        ),
+    ]);
+    let input = format!(
+        "{}\nexit 0\n",
+        commands
+            .iter()
+            .map(|(c, _)| c.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let dirs = ["/src", "/src/new", "/g", "/m", "/a"];
+    let (out, disk) = boot(
+        image_of(&["ar", "cp", "ld", "mkdir"], &dirs, &files),
+        &input,
+        4_000_000_000,
+    );
+    for (c, said) in &commands {
+        assert_eq!(shell_output(&out, c).replace('\r', ""), *said, "{c}");
+    }
+    let fs = Fs::open(&disk).unwrap();
+    let mut wants: Vec<(&str, Vec<u8>)> = [
+        "short.a",
+        "nosyms.a",
+        "empty.a",
+        "replaced.a",
+        "longnames.a",
+        "nosymtab.a",
+        "objs.a",
+    ]
+    .into_iter()
+    .map(|f| (f, read(f)))
+    .collect();
+    let c_only = [elf::archive::NewMember {
+        name: "c.o",
+        data: &read("c.o"),
+    }];
+    wants.push(("loud.a", elf::archive::write(&c_only).unwrap()));
+    wants.push(("libc.a", rt.archive.clone()));
+    wants.push(("libc2.a", rt.archive.clone()));
+    for (f, want) in &wants {
+        let got = fs
+            .read_file(&format!("/out/{f}"))
+            .unwrap_or_else(|e| panic!("/out/{f}: {e}"));
+        assert!(
+            got == *want,
+            "/out/{f}: {} bytes, llvm-ar's {} (first difference at {:?})",
+            got.len(),
+            want.len(),
+            got.iter().zip(want).position(|(a, b)| a != b)
+        );
+    }
+    let member = |n: &str| &rt.library.iter().find(|m| m.name == n).unwrap().data;
+    assert_eq!(&fs.read_file("/x/printf.o").unwrap(), member("printf.o"));
+    assert_eq!(&fs.read_file("/x/usys.o").unwrap(), member("usys.o"));
+    assert!(fs.read_file("/x/malloc.o").is_err());
+    for f in ["a.o", "nosyms.o", "b.o", "c.o", "notes.txt"] {
+        assert_eq!(fs.read_file(&format!("/y/{f}")).unwrap(), read(f), "/y/{f}");
+    }
+}
+
 /// An object from merlin-as.
 fn object(src: &str) -> Vec<u8> {
     merlin_as::assemble_to_elf(src).unwrap_or_else(|e| panic!("{e:?}\n{src}"))
