@@ -34,8 +34,11 @@ const COMMAND_MAX_STEPS: u64 = 200_000_000;
 /// the ones `sleep` waits for. Sv48's 4-level page tables are seven pages a
 /// process: zeroed four bytes at a time, the 36 pages of `ticks`, `sleep`
 /// and `ticks` took a million steps, a tick, more; kzalloc() zeroes with
-/// memset's register-wide stores, as Linux's clear_page() does.
-const SLEEP_SLACK: u32 = 3;
+/// memset's register-wide stores, as Linux's clear_page() does. The
+/// framebuffer console costs one more: with the screen full, each tick
+/// that shows new lines moves VRAM's text up (some 200,000 steps, a fifth
+/// of a tick), and these commands' lines come at several ticks.
+const SLEEP_SLACK: u32 = 4;
 
 /// Camelot running on Grail, with its shell waiting for a command.
 struct Session {
