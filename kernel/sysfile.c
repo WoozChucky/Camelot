@@ -234,14 +234,15 @@ long sys_getcwd(struct trap_frame *f) {
         at = fs_getcwd(page, PGSIZE);
         end_op();
     }
-    long ret;
-    u64 len = PGSIZE - (u64)at;
-    if (at < 0) {
-        ret = at;
-    } else if (len > size) {
-        ret = -ERANGE;
-    } else {
-        ret = copyout(pt, buf, page + at, len) == 0 ? (long)len : -EFAULT;
+    long ret = at;
+    if (at >= 0) {
+        /* The path's length, its NUL counted. */
+        u64 len = PGSIZE - (u64)at;
+        if (len > size) {
+            ret = -ERANGE;
+        } else {
+            ret = copyout(pt, buf, page + at, len) == 0 ? (long)len : -EFAULT;
+        }
     }
     kfree(page);
     return ret;

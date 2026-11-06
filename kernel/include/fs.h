@@ -311,10 +311,11 @@ struct inode *nameiparent(const char *path, char *name, int *err);
 
 /* The current process's working directory's path (the root's for a kernel
  * process, which has none), as Linux's getcwd() builds it: written at the
- * end of `buf` (`size` bytes, its NUL last), the root alone "/". Returns
- * where in `buf` the path starts; -ENOENT if the directory was removed, or
- * -ENAMETOOLONG if the path doesn't fit. Inside a transaction (it lets go
- * of the inodes it looked at, which may free one removed meanwhile). */
+ * end of `buf` (`size` bytes, at least 2, the root's "/" and its NUL; its
+ * NUL last), the root alone "/". Returns where in `buf` the path starts;
+ * -ENOENT if the directory was removed, or -ENAMETOOLONG if the path and
+ * its NUL don't fit. Inside a transaction (it lets go of the inodes it
+ * looked at, which may free one removed meanwhile). */
 int fs_getcwd(char *buf, u32 size);
 
 /* Makes `path` a new inode of `type` (T_FILE, T_DIR with its `.` and `..`,
