@@ -179,7 +179,13 @@ struct window {
     int cfg_h;
     int pending_w;
     int pending_h;
-    uint configure_serial; /* the last configure sent, 0: none yet */
+    /* The last configure sent and the last the client acked (0: none
+     * yet): serials only grow, so an ack may name any configure after the
+     * last acked, the client not having seen the later ones yet, as
+     * xdg_surface allows. Buffers may come once one is acked; `acked` says
+     * the last one sent is. */
+    uint configure_serial;
+    uint acked_serial;
     int acked;
     int mapped;
     int x; /* the content's top left on the screen */
@@ -317,6 +323,7 @@ void post_error(struct client *c, uint object, uint code, const char *msg);
 void event_begin(struct client *c, uint object, uint opcode);
 void event_end(struct client *c);
 uint next_serial(void);
+int ack_configure(struct window *w, uint serial);
 
 /* ---- core.c and xdg.c: each interface's requests ---- */
 void display_request(struct client *c, struct object *o, uint op, struct args *a);

@@ -302,11 +302,10 @@ void layer_surface_request(struct client *c, struct object *o, uint op, struct a
         post_error(c, 1, WL_DISPLAY_ERROR_IMPLEMENTATION, "popups are not supported");
         break;
     case ZWLR_LAYER_SURFACE_V1_ACK_CONFIGURE:
-        if (w->configure_serial == 0 || a->u[0] != w->configure_serial) {
+        if (ack_configure(w, a->u[0]) < 0) {
             post_error(c, o->id, ZWLR_LAYER_SURFACE_V1_ERROR_INVALID_SURFACE_STATE, "a serial no configure had");
             return;
         }
-        w->acked = 1;
         break;
     }
 }
@@ -322,7 +321,7 @@ int layer_commit(struct window *w, int new_buffer) {
                    "a size of 0 needs the two edges it stretches between");
         return -1;
     }
-    if (new_buffer && (w->configure_serial == 0 || !w->acked)) {
+    if (new_buffer && w->acked_serial == 0) {
         post_error(c, w->layer_id, ZWLR_LAYER_SURFACE_V1_ERROR_INVALID_SURFACE_STATE,
                    "a buffer before the configure was acked");
         return -1;

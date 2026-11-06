@@ -21,8 +21,31 @@ use std::sync::mpsc::{channel, Sender};
 use userprogs::CCompiler;
 use xtask::{kernel, png, repo_root, userprogs};
 
-/// The programs in `/bin`, besides the shell.
-const BINS: &[&str] = &["compositor", "wltest", "guidemo"];
+/// The programs in `/bin`, besides the shell: the server, its clients, and
+/// what the terminal's shell runs.
+const BINS: &[&str] = &[
+    "compositor",
+    "wltest",
+    "guidemo",
+    "term",
+    "ls",
+    "cat",
+    "echo",
+    "wc",
+    "primes",
+    "stty",
+];
+
+/// What `/test/escapes` holds, for the terminal to draw: colours and
+/// attributes, erasing, inserting and deleting, the cursor saved, moved and
+/// restored, and UTF-8.
+const ESCAPES: &[u8] = b"\x1b[1;31mbold red\x1b[0m \x1b[30;42mblack on green\x1b[0m \x1b[7mreverse\x1b[27m \
+\x1b[4munderlined\x1b[24m \x1b[94mbright blue\x1b[0m\n\
+1234567890ABCDEFGHIJ\x1b[10D\x1b[K <- erased to the end\n\
+abcdef\x1b[3D\x1b[2P <- two deleted\n\
+abcdef\x1b[3D\x1b[2@XY <- two inserted\n\
+\x1b7\x1b[12;50H\x1b[46m at 12, 50 \x1b[0m\x1b8saved and restored\n\
+caf\xc3\xa9 \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90 \xc2\xb1\xc2\xb0\n";
 
 /// Steps a frame takes, 60 a second at Grail's clock.
 const FRAME: u64 = 166_667;
@@ -33,11 +56,50 @@ const WAIT_MAX: u64 = 3_000_000_000;
 const KEY_A: u16 = 0x04;
 const KEY_ESCAPE: u16 = 0x29;
 const KEY_TAB: u16 = 0x2b;
+const KEY_PAGE_UP: u16 = 0x4b;
+const KEY_LEFT_CTRL: u16 = 0xe0;
+const KEY_LEFT_SHIFT: u16 = 0xe1;
 const KEY_LEFT_ALT: u16 = 0xe2;
 const KEY_LEFT_GUI: u16 = 0xe3;
 
-/// An image with `/dev`'s console, framebuffer and input devices, the shell
-/// and [`BINS`] in `/bin`, the desktop's `/usr/share`, and an empty `/run`.
+/// The HID usage of the key that types ASCII `c` on a US keyboard, and
+/// whether Shift is held for it.
+fn usage_of(c: char) -> (u16, bool) {
+    const SHIFTED: &str = "!@#$%^&*()";
+    match c {
+        'a'..='z' => (0x04 + (c as u16 - 'a' as u16), false),
+        'A'..='Z' => (0x04 + (c as u16 - 'A' as u16), true),
+        '1'..='9' => (0x1e + (c as u16 - '1' as u16), false),
+        '0' => (0x27, false),
+        '\n' => (0x28, false),
+        ' ' => (0x2c, false),
+        '-' => (0x2d, false),
+        '_' => (0x2d, true),
+        '=' => (0x2e, false),
+        '+' => (0x2e, true),
+        '\\' => (0x31, false),
+        '|' => (0x31, true),
+        ';' => (0x33, false),
+        ':' => (0x33, true),
+        '\'' => (0x34, false),
+        '"' => (0x34, true),
+        ',' => (0x36, false),
+        '<' => (0x36, true),
+        '.' => (0x37, false),
+        '>' => (0x37, true),
+        '/' => (0x38, false),
+        '?' => (0x38, true),
+        _ => match SHIFTED.find(c) {
+            Some(9) => (0x27, true),
+            Some(i) => (0x1e + i as u16, true),
+            None => panic!("no key types {c:?}"),
+        },
+    }
+}
+
+/// An image with `/dev`'s console, framebuffer, input devices and
+/// pseudo-terminals, the shell and [`BINS`] in `/bin`, the terminal's text
+/// in `/test`, the desktop's `/usr/share`, and an empty `/run`.
 fn image() -> Vec<u8> {
     let root = repo_root();
     let share = xtask::fs::share_files(&root).unwrap();
@@ -55,6 +117,12 @@ fn image() -> Vec<u8> {
         .unwrap();
     fs.add_device("/dev/input/event1", xtask::fs::INPUT_MAJOR, 1)
         .unwrap();
+    fs.add_device("/dev/ptmx", xtask::fs::PTMX_MAJOR, 0).unwrap();
+    fs.mkdir("/dev/pts").unwrap();
+    for n in 0..xtask::fs::NPTY {
+        fs.add_device(&format!("/dev/pts/{n}"), xtask::fs::PTS_MAJOR, n)
+            .unwrap();
+    }
     fs.mkdir("/bin").unwrap();
     let user = userprogs::user_dir(&root);
     let rt = userprogs::build_runtime(&user, CCompiler::Merlin).unwrap();
@@ -64,6 +132,10 @@ fn image() -> Vec<u8> {
         let prog = userprogs::link_program(&user, src, CCompiler::Merlin, &rt).unwrap();
         fs.add_file(&format!("/bin/{name}"), &prog.elf).unwrap();
     }
+    fs.mkdir("/test").unwrap();
+    fs.add_file("/test/escapes", ESCAPES).unwrap();
+    let lines: String = (1..=60).map(|n| format!("line {n}\n")).collect();
+    fs.add_file("/test/lines", lines.as_bytes()).unwrap();
     fs.mkdir("/usr").unwrap();
     xtask::fs::add_share(&mut fs, &share).unwrap();
     fs.mkdir("/run").unwrap();
@@ -156,6 +228,37 @@ impl Desk {
     fn tap(&mut self, usage: u16) {
         self.key(usage, true);
         self.key(usage, false);
+    }
+
+    /// Types `text` on the keyboard, a key at a time.
+    fn type_text(&mut self, text: &str) {
+        for c in text.chars() {
+            let (usage, shift) = usage_of(c);
+            if shift {
+                self.key(KEY_LEFT_SHIFT, true);
+            }
+            self.tap(usage);
+            if shift {
+                self.key(KEY_LEFT_SHIFT, false);
+            }
+        }
+    }
+
+    /// Steps until the terminal `title`, started with -v, has committed a
+    /// frame with `line` on the cursor's line up to the cursor: what came
+    /// before it is on the screen once the server is idle after it.
+    fn term_drawn(&mut self, title: &str, line: &str) {
+        self.wait_for(&format!("term \"{title}\": drawn \"{line}\"\n"));
+        self.input = self.seen;
+    }
+
+    /// Types a command line at the terminal `title`'s shell and steps until
+    /// its next prompt is drawn.
+    fn term_command(&mut self, title: &str, command: &str) {
+        self.type_text(command);
+        self.term_drawn(title, &format!("$ {command}"));
+        self.type_text("\n");
+        self.term_drawn(title, "$ ");
     }
 
     /// The pointer at x, y with `buttons` held (no event if neither
@@ -509,4 +612,92 @@ fn frames_flip_at_the_vertical_blank_whole() {
     // The logo key starts the launcher, the GUI library's demo here.
     d.tap(KEY_LEFT_GUI);
     d.wait_for("compositor: focus \"Camelot\"\n");
+}
+
+#[test]
+fn the_terminal_runs_a_shell() {
+    // The terminal emulator (kernel/user/term.c): a window with the shell
+    // on a pseudo-terminal, typed at with the keyboard.
+    let mut d = Desk::boot(4);
+    start_server(&mut d, "");
+    d.run("term -v &");
+    d.wait_for("compositor: focus \"Terminal\"\n");
+    d.term_drawn("Terminal", "$ ");
+    // (`ls /test`, not /bin, whose sizes change with every program.)
+    for command in ["echo hello | wc -c", "ls /test", "primes 4 40000"] {
+        d.term_command("Terminal", command);
+    }
+    d.expect_screen("term-shell");
+}
+
+/// Where the middle of the terminal's cell at `col`, `row` is on the
+/// screen, its window where the server puts the first (its content's top
+/// left at 1, 48, the grid 2 pixels in, cells of 8 x 16).
+fn cell(col: i32, row: i32) -> (i32, i32) {
+    (1 + 2 + col * 8 + 4, 48 + 2 + row * 16 + 8)
+}
+
+#[test]
+fn the_terminal_draws_escapes_and_scrolls_back() {
+    // The VT100's and ANSI's sequences programs write, and the lines that
+    // went off the top, read back with Shift+PageUp; a key brings the view
+    // back down.
+    let mut d = Desk::boot(4);
+    start_server(&mut d, "");
+    d.run("term -v &");
+    d.term_drawn("Terminal", "$ ");
+    d.term_command("Terminal", "cat /test/escapes");
+    d.expect_screen("term-escapes");
+
+    d.term_command("Terminal", "cat /test/lines");
+    d.expect_screen("term-lines");
+    d.key(KEY_LEFT_SHIFT, true);
+    d.tap(KEY_PAGE_UP);
+    d.key(KEY_LEFT_SHIFT, false);
+    d.term_drawn("Terminal", "$ ");
+    d.expect_screen("term-scrolled-back");
+    d.tap(KEY_A);
+    d.term_drawn("Terminal", "$ a");
+    d.expect_screen("term-back-down");
+}
+
+#[test]
+fn terminals_resize_and_share_the_clipboard() {
+    // A window made shorter by its bottom edge: the grid follows it, and
+    // the shell's terminal says its new size (TIOCSWINSZ).
+    let mut d = Desk::boot(4);
+    start_server(&mut d, "");
+    d.run("term -v -T one &");
+    d.term_drawn("one", "$ ");
+    d.term_command("one", "stty size");
+    d.pointer(300, 439, 0);
+    d.pointer(300, 439, BUTTON_LEFT);
+    d.wait_for("compositor: resizing \"one\"\n");
+    d.pointer(300, 359, BUTTON_LEFT);
+    d.pointer(300, 279, BUTTON_LEFT);
+    d.pointer(300, 279, 0);
+    d.term_command("one", "stty size");
+    d.term_command("one", "echo camelot");
+    d.expect_screen("term-resized");
+
+    // Text selected in one terminal with the pointer is pasted in another
+    // with Ctrl+Shift+V.
+    let (x0, y) = cell(0, 6);
+    let (x1, _) = cell(6, 6);
+    d.pointer(x0 - 3, y, 0);
+    d.pointer(x0 - 3, y, BUTTON_LEFT);
+    d.pointer(x1, y, BUTTON_LEFT);
+    d.pointer(x1, y, 0);
+    d.run("term -v -T two &");
+    d.wait_for("compositor: focus \"two\"\n");
+    d.term_drawn("two", "$ ");
+    d.key(KEY_LEFT_CTRL, true);
+    d.key(KEY_LEFT_SHIFT, true);
+    d.tap(0x19); // V
+    d.key(KEY_LEFT_SHIFT, false);
+    d.key(KEY_LEFT_CTRL, false);
+    d.term_drawn("two", "$ camelot");
+    d.type_text("\n");
+    d.term_drawn("two", "$ ");
+    d.expect_screen("term-pasted");
 }

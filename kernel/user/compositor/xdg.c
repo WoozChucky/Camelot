@@ -84,11 +84,10 @@ void xdg_surface_request(struct client *c, struct object *o, uint op, struct arg
     case XDG_SURFACE_SET_WINDOW_GEOMETRY:
         break; /* the window is the whole surface */
     case XDG_SURFACE_ACK_CONFIGURE:
-        if (w->configure_serial == 0 || a->u[0] != w->configure_serial) {
+        if (ack_configure(w, a->u[0]) < 0) {
             post_error(c, o->id, XDG_SURFACE_ERROR_INVALID_SERIAL, "a serial no configure had");
             return;
         }
-        w->acked = 1;
         /* A resize the pointer went on with meanwhile: its size now. */
         if (srv.resizing == w && (w->pending_w != w->cfg_w || w->pending_h != w->cfg_h)) {
             toplevel_configure(w, w->pending_w, w->pending_h, 1);

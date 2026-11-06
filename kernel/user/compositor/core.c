@@ -220,6 +220,17 @@ void toplevel_configure(struct window *w, int width, int height, int resizing) {
     event_end(c);
 }
 
+/* An xdg_surface's or a layer surface's ack_configure of `serial`: 0, or
+ * -1 when no configure the client has yet to ack had it. */
+int ack_configure(struct window *w, uint serial) {
+    if (serial <= w->acked_serial || serial > w->configure_serial) {
+        return -1;
+    }
+    w->acked_serial = serial;
+    w->acked = serial == w->configure_serial;
+    return 0;
+}
+
 static void commit(struct client *c, struct surface *s) {
     struct window *w = s->window;
     int new_buffer = s->attached && s->buffer != NULL;
@@ -233,7 +244,7 @@ static void commit(struct client *c, struct surface *s) {
                        "a commit before the xdg_surface has a role");
             return;
         }
-        if (new_buffer && (w->configure_serial == 0 || !w->acked)) {
+        if (new_buffer && w->acked_serial == 0) {
             post_error(c, w->xdg_id, XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER,
                        "a buffer before the configure was acked");
             return;
