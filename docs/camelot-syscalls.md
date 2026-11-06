@@ -910,13 +910,16 @@ root image, maps the framebuffer's memory, the buffer of its mode ("The
 framebuffer": 640x480 pixels of 32 bits in VRAM at first), from `offset`
 on, its last page whole: a program draws by writing pixels there, and the
 screen shows them.
-The pages are the device's, mapped as they are touched and never freed;
+The pages are the device's, mapped as they are touched, not the
+process's: an unmap leaves them be (VRAM is never freed, a buffer in RAM
+only once no descriptor or mapping of the device is left);
 `MAP_PRIVATE` maps the same pages as `MAP_SHARED` (writes go to the
 device either way, as Linux's framebuffer devices do), so a writable
 mapping of either kind needs the descriptor open for writing. A system
-call's buffer can't be in a device's memory (the kernel copies only to
-and from RAM): `write` from a framebuffer mapping, say, fails with
-`-EFAULT`.
+call's buffer can't be in VRAM (the kernel copies only to and from RAM):
+`write` from a mapping of the 640x480 framebuffer, say, fails with
+`-EFAULT`; from a framebuffer in RAM (another mode, or two frames) it
+works.
 
 ## The framebuffer
 
@@ -969,7 +972,9 @@ row `yres`, but at 800x600, where it is row 608 (`yres_virtual` 1208);
 next vertical blank, so no frame is shown half drawn; with `FB_ACTIVATE_VBL`
 (16) in `activate` it returns once the display shows it. Errors: `-EINVAL`
 for an `xoffset`, a `yoffset` past the last frame or not a multiple of
-`ypanstep`; `-EINTR` if the process is killed while it waits.
+`ypanstep`; `-ENODEV` for `FB_ACTIVATE_VBL` on a display without the
+vertical blank's interrupt (nothing is queued); `-EINTR` if the process is
+killed while it waits.
 `FBIO_WAITFORVSYNC` waits for the next vertical blank (60 a second): its
 argument points to 0, the display (`-ENODEV` for another); `-EINTR` if
 killed.
@@ -1005,7 +1010,7 @@ there, and waits while there are none; a buffer smaller than an event is
 descriptor gets every event from its `open` on, in a queue of its own of
 128; one that falls a whole queue behind loses what it had not read and
 finds `EV_SYN` `SYN_DROPPED` (3) in its place, then the events from there
-on. `write` is `-EINVAL` (`-EBADF` on a descriptor open for reading),
+on, and asks `EVIOCGKEY` which keys are held now. `write` is `-EINVAL` (`-EBADF` on a descriptor open for reading),
 `lseek` `-ESPIPE`.
 
 - **The keyboard** gives `EV_KEY` for each key pressed (1) and released (0),
@@ -1029,6 +1034,7 @@ The requests, at Linux's numbers (`user.h`):
 | `EVIOCGID` | `struct input_id *` | `BUS_HOST` (0x19), vendor 0, product 1 (the keyboard) or 2 (the pointer), version 1 |
 | `EVIOCGNAME(len)` | `char *` | the name, `Grail keyboard` or `Grail pointer`, cut to `len` bytes with its NUL; returns the bytes stored |
 | `EVIOCGBIT(type, len)` | `unsigned char *` | for type 0 the event types the device gives, else the codes of `type` it gives, a bit each, cut to `len` bytes; returns the bytes stored; `-EINVAL` for a type evdev has not |
+| `EVIOCGKEY(len)` | `unsigned char *` | the keys and buttons held, a bit for each key code (`KEY_CNT`, 768 bits, 96 bytes), cut to `len` bytes; returns the bytes stored |
 | `EVIOCGABS(axis)` | `struct input_absinfo *` | the axis's value and range: `ABS_X` from 0 to the width less 1, `ABS_Y` to the height less 1; `-EINVAL` for another axis, or on the keyboard |
 | `EVIOCGRAB` | a number | non-zero: only this descriptor gets the device's events, until it lets go (0) or is closed; `-EBUSY` if a descriptor has the grab already, this one included, `-EINVAL` for letting go of a grab it doesn't have |
 

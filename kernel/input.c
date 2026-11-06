@@ -339,6 +339,15 @@ long input_ioctl(struct file *f, u32 request, uintptr arg) {
     if (nr == EVIOC_NAME_NR) {
         return to_user(pt, arg, d->name, strlen(d->name) + 1, size);
     }
+    if (nr == EVIOC_KEY_NR) {
+        /* The keys held, as the readers were told: what a reader asks for
+         * after a SYN_DROPPED, to learn what it missed (Linux's evdev). */
+        u64 down[WORDS(KEY_CNT)];
+        acquire(&input_lock);
+        memcpy(down, d->down, sizeof down);
+        release(&input_lock);
+        return to_user(pt, arg, down, KEY_CNT / 8, size);
+    }
     if (nr >= EVIOC_BIT_NR && nr < EVIOC_BIT_NR + EV_CNT) {
         return get_bits(d, pt, arg, nr - EVIOC_BIT_NR, size);
     }

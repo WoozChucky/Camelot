@@ -8,12 +8,26 @@
  * (-EBUSY): a program would go on drawing into pages the display no longer
  * shows, or that went back to the free list.
  *
- * Locking: fb_lock, a spinlock, protects the state and the counts; it is
- * taken by mmap's hooks (under a process's vm_lock) and by the vertical
- * blank's interrupt, so nothing under it sleeps, and only the page
- * allocator's lock comes after it. fb_mode_lock, a sleep lock, keeps one
- * request at a time changing the mode or the pan: a new buffer is found and
- * cleared under it, outside fb_lock. */
+ * Locking, in order:
+ *
+ *   fb_mode_lock  a sleep lock: one request at a time changing the mode or
+ *                 the pan; a new buffer is found and cleared under it,
+ *                 outside fb_lock.
+ *   fb_lock       a spinlock: the state and the counts. mmap's hooks take
+ *                 it, under a process's vm_lock or under proc_lock (a
+ *                 process reaped with the device still mapped, proc_free),
+ *                 so nothing under it sleeps or wakes a sleeper, which
+ *                 would take proc_lock; only leaves come after it, the page
+ *                 allocator's lock and uart_tx_lock (fbcon_suspend,
+ *                 fbcon_resume).
+ *   vblank_lock   a spinlock: the vertical blank's count, its waiters and
+ *                 the interrupt's enable; waiters sleep with it, so it
+ *                 comes before proc_lock, and is never taken under fb_lock.
+ *
+ * A buffer in RAM that the last mapping's going lets go of may be let go
+ * of under proc_lock: it is freed later, by fb_reclaim(), where no lock is
+ * held (the scheduler calls it after each switch back, as it does
+ * kstack_reclaim()), rather than with every interrupt off. */
 #include "fb.h"
 #include "fbcon.h"
 #include "file.h"
@@ -61,6 +75,7 @@
 
 static struct spinlock fb_lock;
 static struct sleeplock fb_mode_lock;
+static struct spinlock vblank_lock;
 
 static uintptr regs;   /* the controller's registers (ioremap) */
 static u32 *vram;      /* VRAM, the kernel's pointer */
@@ -84,6 +99,11 @@ static bool blanked;
 
 static u32 opens;      /* open files of the device */
 static u32 maps;       /* areas of processes that map its memory */
+/* A buffer in RAM the display let go of, for fb_reclaim() to free. */
+static void *stale_ram;
+static usize stale_pages;
+
+/* Under vblank_lock. */
 static u32 waiters;    /* threads waiting for a vertical blank */
 static u32 vblank_seq; /* vertical blanks the interrupt has seen */
 
@@ -144,6 +164,7 @@ void fb_present_frame(void) {
 void fb_init(void) {
     initlock(&fb_lock, "fb");
     initsleeplock(&fb_mode_lock, "fbmode");
+    initlock(&vblank_lock, "vblank");
     struct sysinfo_device ctrl;
     struct sysinfo_device mem;
     bool have_ctrl = false;
@@ -213,20 +234,22 @@ bool fb_intr(u32 source) {
     if (irq == 0 || source != irq) {
         return false;
     }
-    acquire(&fb_lock);
+    acquire(&vblank_lock);
     /* Clearing VBLANK lowers the line; the interrupt stays on while
      * someone waits for the next one. */
     wr(FB_IRQ, waiters > 0 ? IRQ_ENABLE | IRQ_VBLANK : IRQ_VBLANK);
     vblank_seq++;
+    release(&vblank_lock);
+    /* A waiter checks the count under vblank_lock and is asleep before it
+     * lets go of it (sleep), so none misses this. */
     wakeup(&vblank_seq);
-    release(&fb_lock);
     return true;
 }
 
-/* Waits for the next vertical blank, holding fb_lock (which sleep lets go
- * of meanwhile): 0, or -EINTR if the process was killed. The interrupt is
- * enabled while anyone waits, from a cleared VBLANK so that only a vertical
- * blank from now on counts. */
+/* Waits for the next vertical blank, holding vblank_lock (which sleep lets
+ * go of meanwhile): 0, -EINTR if the process was killed, or -ENODEV without
+ * the interrupt. It is enabled while anyone waits, from a cleared VBLANK so
+ * that only a vertical blank from now on counts. */
 static int wait_vblank_locked(void) {
     if (irq == 0) {
         return -ENODEV;
@@ -242,7 +265,7 @@ static int wait_vblank_locked(void) {
             r = -EINTR;
             break;
         }
-        sleep(&vblank_seq, &fb_lock);
+        sleep(&vblank_seq, &vblank_lock);
     }
     waiters--;
     if (waiters == 0) {
@@ -251,8 +274,9 @@ static int wait_vblank_locked(void) {
     return r;
 }
 
-/* Back to 640x480 from VRAM, the console's, with any buffer in RAM freed:
- * when the last open file and mapping go. Holding fb_lock. */
+/* Back to 640x480 from VRAM, the console's, with any buffer in RAM left
+ * for fb_reclaim() to free: when the last open file and mapping go. Holding
+ * fb_lock, and maybe proc_lock. */
 static void release_display(void) {
     if (can_flip) {
         /* A modeset: at once, dropping a flip still pending. */
@@ -260,7 +284,9 @@ static void release_display(void) {
         wr(FB_MODE, 0);
     }
     if (smem_ram != NULL) {
-        kfree_contig(smem_ram, smem_pages);
+        /* At most one: a new buffer is made only after fb_reclaim(). */
+        stale_ram = smem_ram;
+        stale_pages = smem_pages;
         smem_ram = NULL;
         smem_pages = 0;
     }
@@ -298,6 +324,24 @@ void fb_close(struct file *f) {
         release_display();
     }
     release(&fb_lock);
+    fb_reclaim();
+}
+
+void fb_reclaim(void) {
+    /* Read without the lock first: the scheduler calls this after every
+     * switch back, and there is seldom anything to free. */
+    if (stale_ram == NULL) {
+        return;
+    }
+    acquire(&fb_lock);
+    void *pages = stale_ram;
+    usize n = stale_pages;
+    stale_ram = NULL;
+    stale_pages = 0;
+    release(&fb_lock);
+    if (pages != NULL) {
+        kfree_contig(pages, n);
+    }
 }
 
 int fb_mmap(struct file *f, u64 offset, usize size, phys_addr_t *pa) {
@@ -435,6 +479,8 @@ static long put_var(pagetable_t pt, uintptr arg) {
         return -EFAULT;
     }
     acquiresleep(&fb_mode_lock);
+    /* A buffer the display let go of goes back before another is made. */
+    fb_reclaim();
     acquire(&fb_lock);
     int mode = check_var(&v);
     release(&fb_lock);
@@ -466,19 +512,39 @@ static long put_var(pagetable_t pt, uintptr arg) {
             if (!same && maps > 0) {
                 r = -EBUSY; /* mapped meanwhile */
             } else {
+                /* The new state, then the display told; if it refuses,
+                 * the old state back, and shown again. */
+                void *was_ram = smem_ram;
+                usize was_pages = smem_pages;
+                phys_addr_t was_pa = smem_pa;
+                u32 was_len = smem_len;
+                u32 was_yv = yres_virtual;
+                u32 was_mode = cur_mode;
+                u32 was_yoff = yoffset;
                 if (!same) {
-                    old = smem_ram;
-                    old_pages = smem_pages;
                     smem_ram = buf;
                     smem_pages = buf != NULL ? pages : 0;
                     smem_pa = buf != NULL ? pa(buf) : vram_pa;
                     smem_len = len;
                     yres_virtual = v.yres_virtual;
-                    buf = NULL;
                 }
                 cur_mode = (u32)mode;
                 yoffset = v.yoffset;
                 r = show(cur_mode, yoffset);
+                if (r != 0) {
+                    smem_ram = was_ram;
+                    smem_pages = was_pages;
+                    smem_pa = was_pa;
+                    smem_len = was_len;
+                    yres_virtual = was_yv;
+                    cur_mode = was_mode;
+                    yoffset = was_yoff;
+                    show(cur_mode, yoffset);
+                } else if (!same) {
+                    old = was_ram;
+                    old_pages = was_pages;
+                    buf = NULL;
+                }
             }
             release(&fb_lock);
             if (old != NULL) {
@@ -503,12 +569,16 @@ static long pan(pagetable_t pt, uintptr arg) {
     if (copyin(pt, &v, arg, sizeof v) != 0) {
         return -EFAULT;
     }
+    bool vbl = (v.activate & FB_ACTIVATE_VBL) != 0;
     acquiresleep(&fb_mode_lock);
     acquire(&fb_lock);
     long r = 0;
+    bool queued = false;
     if (v.xoffset != 0 || v.yoffset > yres_virtual - mode_height[cur_mode] ||
         v.yoffset % panstep(cur_mode) != 0) {
         r = -EINVAL;
+    } else if (vbl && can_flip && irq == 0) {
+        r = -ENODEV; /* no vertical blank to wait for: nothing queued */
     } else if (can_flip) {
         mmio_write64(regs + FB_SCANOUT, scanout(v.yoffset));
         wr(FB_FLIP, 1);
@@ -517,13 +587,19 @@ static long pan(pagetable_t pt, uintptr arg) {
             r = -EINVAL;
         } else {
             yoffset = v.yoffset;
-            while (r == 0 && (v.activate & FB_ACTIVATE_VBL) != 0 &&
-                   (rd(FB_STATUS) & STATUS_FLIP_PENDING) != 0) {
-                r = wait_vblank_locked();
-            }
+            queued = true;
         }
     }
     release(&fb_lock);
+    /* The wait for the flip, outside fb_lock (vblank_lock's sleep takes
+     * proc_lock); fb_mode_lock keeps other pans and mode changes out. */
+    if (queued && vbl) {
+        acquire(&vblank_lock);
+        while (r == 0 && (rd(FB_STATUS) & STATUS_FLIP_PENDING) != 0) {
+            r = wait_vblank_locked();
+        }
+        release(&vblank_lock);
+    }
     releasesleep(&fb_mode_lock);
     return r;
 }
@@ -568,9 +644,9 @@ long fb_ioctl(struct file *f, u32 request, uintptr arg) {
         if (crtc != 0) {
             return -ENODEV; /* one display */
         }
-        acquire(&fb_lock);
+        acquire(&vblank_lock);
         int r = wait_vblank_locked();
-        release(&fb_lock);
+        release(&vblank_lock);
         return r;
     }
     default:

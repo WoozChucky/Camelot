@@ -118,6 +118,7 @@ struct input_absinfo {
 #define EVIOCGID 0x80084502        /* struct input_id */
 #define EVIOCGRAB 0x40044590       /* int, by value: grab (1) or let go (0) */
 #define EVIOC_NAME_NR 0x06         /* EVIOCGNAME(len): the name, len bytes at most */
+#define EVIOC_KEY_NR 0x18          /* EVIOCGKEY(len): the keys held, a bitmap */
 #define EVIOC_BIT_NR 0x20          /* EVIOCGBIT(ev, len): nr 0x20 + ev, a bitmap */
 #define EVIOC_ABS_NR 0x40          /* EVIOCGABS(abs): nr 0x40 + abs, struct input_absinfo */
 #define EV_VERSION 0x010001
@@ -151,7 +152,7 @@ void input_lock_release(void);
  * device `minor` (-ENODEV for a device the machine lacks, -ENOMEM with no
  * page for its ring), read takes whole events, waiting for one (-EINVAL for
  * fewer than 24 bytes), ioctl answers EVIOCGVERSION, EVIOCGID, EVIOCGNAME,
- * EVIOCGBIT, EVIOCGABS and EVIOCGRAB. */
+ * EVIOCGBIT, EVIOCGKEY, EVIOCGABS and EVIOCGRAB. */
 int input_open(struct file *f);
 void input_close(struct file *f);
 isize input_read(struct file *f, pagetable_t pt, uintptr dst, usize n);

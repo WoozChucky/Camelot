@@ -1,7 +1,8 @@
 /* The kernel console: the read and write system calls on the UART, with a
  * line editor in between. Typed bytes wait in the UART driver's ring buffer,
- * or this file's for the keyboard's (console_input), until a process reads; console_read() then edits them into the line
- * buffer here, echoing as it goes, and sleeps while the line is incomplete.
+ * or this file's for the keyboard's (console_input), until a process reads;
+ * console_read() then edits them into the line buffer here, echoing as it
+ * goes, and sleeps while the line is incomplete.
  * Echoing at read time rather than in the interrupt handler means input
  * typed ahead is echoed when a program asks for it, so the echo lands after
  * the prompt and not in the middle of another program's output.

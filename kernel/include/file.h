@@ -99,7 +99,10 @@ struct file {
  *   vm_close  split in two, merged or unmapped (Linux's vm_operations
  *             open and close), so that the driver knows while its memory
  *             is mapped. Called holding spinlocks (a process's vm_lock, or
- *             proc_lock): they may take only a leaf lock of their own */
+ *             proc_lock when a process is reaped): they may take only a
+ *             lock under which nothing sleeps or wakes a sleeper (either
+ *             takes proc_lock), and should leave slow work, such as
+ *             freeing memory, for later (fb.c's fb_reclaim) */
 struct devsw {
     int (*open)(struct file *f);
     void (*close)(struct file *f);

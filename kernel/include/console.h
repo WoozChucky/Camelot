@@ -35,12 +35,12 @@ void console_intr(void);
  *
  * Returns -EFAULT, having taken nothing, if [dst, dst + n) is not writable
  * user memory. */
+isize console_read(struct file *f, pagetable_t pt, uintptr dst, usize n);
+
 /* A character the keyboard typed (keyboard.c, while no process reads the
  * keyboard): it waits, as the UART's bytes do, for console_read(). Any
  * context; takes the console's lock. */
 void console_input(char c);
-
-isize console_read(struct file *f, pagetable_t pt, uintptr dst, usize n);
 
 /* write(1 or 2, src, n): prints the `n` bytes at user address `src` and
  * returns n, or returns -EFAULT, printing nothing, if any of them is not

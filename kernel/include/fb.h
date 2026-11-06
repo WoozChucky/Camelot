@@ -135,6 +135,12 @@ int fb_mmap(struct file *f, u64 offset, usize size, phys_addr_t *pa);
 void fb_vm_open(void);
 void fb_vm_close(void);
 
+/* Frees a buffer in RAM the display let go of, perhaps under proc_lock
+ * when a process was reaped with the device mapped: where no spinlock is
+ * held, as the scheduler calls it after each switch back (proc.c). Cheap
+ * when there is none. */
+void fb_reclaim(void);
+
 /* The current mode's size: 0 by 0 without a display. Any context. */
 void fb_mode_size(u32 *width, u32 *height);
 

@@ -526,11 +526,12 @@ void fbcon_putc(char c) {
     case 0x1b:
         state = ST_ESC;
         break;
-    case '\a':
-    case 0:
-        break;
     default:
-        put_char(ch);
+        /* Any other control character (C0, DEL) does nothing, as on a VT;
+         * a byte past ASCII is drawn as '?'. */
+        if (ch >= 0x20 && ch != 0x7f) {
+            put_char(ch);
+        }
         break;
     }
 }

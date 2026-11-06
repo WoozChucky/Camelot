@@ -299,7 +299,7 @@ parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
 | `threadtest` | checks the thread and futex calls, and processes with threads that exit, exec, fault or are killed (`threadtest: N checks, 0 failed`); `threadtest fs` does the same with threads in file calls, on the root filesystem |
 | `maptest` | checks `mmap`, `munmap`, `mprotect`, `memfd_create` and `ftruncate` (`maptest: N checks, 0 failed`); `maptest threads` maps and unmaps from four threads at once, `maptest fb` draws into `/dev/fb0` through a mapping and waits for a line |
 | `fbtest` | checks `/dev/fb0`'s fbdev requests: modes in VRAM and RAM, `-EBUSY` while mapped, a double-height buffer flipped, the vertical blank, blanking, the errors (`fbtest: N checks, 0 failed`); `fbtest show` shows 800x600 from a flip and waits for a line, `fbtest ansi` writes the framebuffer console's escape sequences |
-| `inputtest` | checks `/dev/input/event0` and `event1`'s evdev requests and `EVIOCGRAB` (`inputtest: N checks, 0 failed`); `inputtest keys N` and `pointer N` print the next N events, `inputtest grab` two readers and a grab |
+| `inputtest` | checks `/dev/input/event0` and `event1`'s evdev requests and `EVIOCGRAB` (`inputtest: N checks, 0 failed`); `inputtest keys N` and `pointer N` print the next N events, `inputtest grab` two readers and a grab, `inputtest overflow` a reader that falls behind (`SYN_DROPPED`, `EVIOCGKEY`) |
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
 | `nettest`, `socktest` | move known bytes through TCP, for the TCP tests; check the socket calls (`socktest: N checks, 0 failed`) |
 | `badload` | reads kernel memory: killed by a load page fault |

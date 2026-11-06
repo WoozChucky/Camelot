@@ -1257,6 +1257,43 @@ fn input_events(
     (m, out)
 }
 
+#[test]
+fn a_reader_that_falls_behind_finds_syn_dropped_and_asks_what_is_held() {
+    // A reader's ring holds 128 events: one that doesn't read while 100
+    // keys are pressed and released (400 events) loses what it had not
+    // read, finds SYN_DROPPED in its place and the packets since, and
+    // learns from EVIOCGKEY that B, pressed last, is held (Linux's evdev).
+    let (mut m, _, tx, _) = root_machine();
+    type_line(&tx, "inputtest overflow\n");
+    step_to_output(&mut m, "inputtest: ready\n");
+    let at = m.cpu.bus.uart.captured.len();
+    let a = key(b'a', 0x04);
+    let mut keys = Vec::new();
+    for _ in 0..100 {
+        keys.push(a);
+        keys.push(release(a));
+    }
+    keys.push(key(b'b', 0x05));
+    for chunk in keys.chunks(32) {
+        for k in chunk {
+            assert!(m.key_event(*k));
+        }
+        step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.bus.kbd.is_empty());
+    }
+    type_line(&tx, "\n");
+    step_to_prompt(&mut m, 2);
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured[at..]).into_owned();
+    // After the echo of the line typed.
+    let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+    let n: usize = lines[0].strip_suffix(" events").unwrap().parse().unwrap();
+    assert!(n <= 128, "{out}");
+    assert_eq!(
+        lines[1..4],
+        ["0 3 0", "1 48 1", "held: KEY_A 0, KEY_B 1"],
+        "{out}"
+    );
+}
+
 /// A key of both forms, as a host sends it: its ASCII-mode code and its
 /// usage.
 fn key(code: u8, usage: u16) -> grail::keyboard::KeyEvent {
@@ -1278,7 +1315,7 @@ fn the_input_devices_answer_evdevs_requests() {
     type_line(&tx, "inputtest\n");
     step_to_prompt(&mut m, 2);
     let out = printed(&m);
-    assert_eq!(all_checks_pass(&out, "inputtest", "inputtest"), 46, "{out}");
+    assert_eq!(all_checks_pass(&out, "inputtest", "inputtest"), 48, "{out}");
     assert!(!m.cpu.bus.kbd.raw());
 }
 

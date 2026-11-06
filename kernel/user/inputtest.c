@@ -9,6 +9,12 @@
  *                           events of the keyboard, a line each:
  *                           "type code value"
  *   inputtest pointer N     the same, of the pointer
+ *   inputtest overflow      prints "inputtest: ready", waits for a line
+ *                           (the UART's: the keyboard is the reader's) while
+ *                           a test types more than a ring holds, then reads
+ *                           what is there and prints "N events", the first
+ *                           and the last but one ("type code value"), and
+ *                           which of KEY_A and KEY_B EVIOCGKEY says are held
  *   inputtest grab          two readers of the keyboard, the first grabbing
  *                           it: prints "inputtest: grabbed" and the key the
  *                           first reads (a press and its SYN_REPORT), lets
@@ -66,6 +72,13 @@ static void keyboard_checks(int kbd) {
     check_eq(ioctl(kbd, EVIOCGBIT(EV_REL, sizeof bits), bits), 8, "EVIOCGBIT(EV_REL)");
     check_eq(ioctl(kbd, EVIOCGBIT(EV_KEY, 4), bits), 4, "EVIOCGBIT cut short");
     check_eq(ioctl(kbd, EVIOCGBIT(7, sizeof bits), bits), -EINVAL, "EVIOCGBIT of a type evdev has not");
+    memset(bits, 0xff, sizeof bits);
+    check_eq(ioctl(kbd, EVIOCGKEY(sizeof bits), bits), 96, "EVIOCGKEY: KEY_CNT bits");
+    int held = 0;
+    for (unsigned i = 0; i < sizeof bits; i++) {
+        held |= bits[i];
+    }
+    check(!held, "no key held");
     struct input_absinfo abs;
     check_eq(ioctl(kbd, EVIOCGABS(ABS_X), &abs), -EINVAL, "EVIOCGABS of a keyboard");
     check_eq(ioctl(kbd, 0x4680, 0), -ENOTTY, "an unknown request");
@@ -148,6 +161,27 @@ int main(int argc, char **argv) {
         }
         printf("inputtest: ready\n");
         print_events(fd, atoi(argv[2]));
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "overflow") == 0) {
+        int fd = open("/dev/input/event0", O_RDONLY);
+        if (fd < 0) {
+            printf("inputtest: open: %d\n", fd);
+            return 1;
+        }
+        printf("inputtest: ready\n");
+        char line[8];
+        read(0, line, sizeof line);
+        static struct input_event ev[256];
+        long n = read(fd, ev, sizeof ev) / (long)sizeof ev[0];
+        printf("%ld events\n", n);
+        printf("%d %d %d\n", ev[0].type, ev[0].code, ev[0].value);
+        if (n >= 2) {
+            printf("%d %d %d\n", ev[n - 2].type, ev[n - 2].code, ev[n - 2].value);
+        }
+        unsigned char keys[96];
+        ioctl(fd, EVIOCGKEY(sizeof keys), keys);
+        printf("held: KEY_A %d, KEY_B %d\n", has_bit(keys, KEY_A), has_bit(keys, KEY_B));
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "grab") == 0) {

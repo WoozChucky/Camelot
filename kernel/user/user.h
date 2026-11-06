@@ -412,6 +412,7 @@ struct input_absinfo {
 #define EVIOCGNAME(len) (0x80004506 | (len) << 16)
 #define EVIOCGBIT(ev, len) (0x80004520 + (ev) | (len) << 16)
 #define EVIOCGABS(abs) (0x80184540 + (abs))
+#define EVIOCGKEY(len) (0x80004518 | (len) << 16)
 
 #define EV_SYN 0x00
 #define EV_KEY 0x01

@@ -154,7 +154,8 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "the committed kernel is current, linked high, boots on 1-8 harts, under Sv39 and from \
-               disk, panics as it should, the shell's built-in statuses are dash's, and the boot and the                shell show on the framebuffer console (#178)",
+               disk, panics as it should, the shell's built-in statuses are dash's, and the boot and the \
+               shell show on the framebuffer console (#178)",
         args: &[
             "-p",
             "xtask",
@@ -187,7 +188,8 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
-               Linux's start as pid 1, the environment (#216), memory mappings (#179), /dev/fb0, the                input devices and the framebuffer console's escape sequences (#178)",
+               Linux's start as pid 1, the environment (#216), memory mappings (#179), /dev/fb0, the \
+               input devices and the framebuffer console's escape sequences (#178)",
         args: &[
             "-p",
             "xtask",
