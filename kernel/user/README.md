@@ -51,7 +51,8 @@ for `grep`, whose 1 means "no line matched".
 | `wc` | `wc [-l] [-w] [-c] [FILE...]` | counts lines, words and bytes, of files or its input; the flags pick the counts; refuses a directory |
 | `grep` | `grep [-v] [-c] [-n] PATTERN [FILE...]` | prints the lines that contain a fixed string; `-v` those that don't, `-c` how many, `-n` with their numbers |
 | `ps` | `ps` | lists the processes (`procs`): pid, parent, state, size, name |
-| `harts` | `harts` | lists the harts (`harts`): id, the process running on it (`-` while idle), the ticks it has taken and the processes it has switched to |
+| `harts` | `harts` | lists the harts (`harts`): id, the process running on it (`-` while idle), the ticks it has taken, how many of them it was idle and the processes it has switched to |
+| `stty` | `stty`, `stty size`, `stty rows N cols N` | a terminal's size, standard input's, as Linux's `stty` shows (`rows R; columns C;`, `size`: `R C`) and sets it (`TIOCGWINSZ`, `TIOCSWINSZ`) |
 | `env` | `env [-i] [-u NAME]... [NAME=VALUE]... [PROG [ARG...]]` | runs PROG with its environment emptied (`-i`), without NAME (`-u`) or with NAME set, or without PROG prints the environment; 125 if env fails, 127 if there is no PROG, 126 if it can't be run |
 | `printenv` | `printenv [NAME...]` | prints the value of each NAME (`getenv`), a line each, or the whole environment without a NAME; exits 1 if a NAME has no value |
 | `kill` | `kill PID...` | ends processes (`kill`): they exit with status -1; not the shell, whose end is Camelot's |
@@ -215,6 +216,11 @@ shd: [7] 10.0.2.2:49152 ended, exit 0
 | `guitest` | `guitest SCENE [DIR]`: draws a scene of the GUI library into memory and writes it to `DIR/SCENE.ppm` (`draw`, `text`, `image`; `widgets` writes `widgets.ppm` and `input.ppm`, after input, and prints the actions), prints what the parts that draw nothing did (`damage`, `keys`, `utf8`, `wire`), or, `wayland`, is a scripted display server on `/run/wayland-0` that runs `guidemo`, prints its requests and writes the frames it commits. Only in `/bin` of the desktop's image |
 | `guidemo` | the GUI library's demonstration, a Wayland client: a window with menus, a text field, a list of knights, a status line and buttons. Only in `/bin` of the desktop's image |
 | `compositor` | `compositor [-v] [-l LAUNCHER] [-s SOCKET]`: the display server (the directory `compositor/`, a program of several files; spec section 10, "The display server"): takes `/dev/fb0` and the input devices, serves Wayland clients at `/run/wayland-0`, composites their windows and manages them; the logo key starts LAUNCHER. The desktop's `/etc/rc` starts it. Only in `/bin` of the desktop's image |
+| `panel` | `panel [-v] [PROGRAM ARGS...]`: the desktop's panel (spec section 10, "The desktop shell"), a bar along the top of the screen: the launcher's menu of `/usr/share/applications`, a button for each window (a click activates it), the harts' load and the clock; starts PROGRAM when no window is shown. The desktop's `/etc/rc` starts it with `/bin/term`. Only in `/bin` of the desktop's image, as the four below |
+| `term` | `term [-v] [-T TITLE] [PROGRAM ARGS...]`: the terminal emulator, a window with PROGRAM (`/bin/sh`) on a pseudo-terminal: the VT100 and ANSI sequences the framebuffer console takes too (`kernel/vt.c`), scrollback, a selection copied to the clipboard and pasted, resizing (`TIOCSWINSZ`) |
+| `files` | `files [DIRECTORY]`: the file browser, a directory's entries in a list, and a file's text |
+| `sysmon` | `sysmon`: the system monitor, the harts' load, the memory and the processes, every second |
+| `gears` | `gears`: three gears turning, glxgears' in fixed point; prints its frame rate every 5 seconds |
 | `wltest` | the display server's test client (`crates/xtask/tests/display.rs`): `wltest window [-n] [-f] [-m] NAME RRGGBB W H` opens a window of one colour and prints every event it gets (`-n` won't close, `-f` flashes every frame, `-m` asks to be moved every frame as a client shouldn't); `wltest probe` prints the globals; `wltest stale` makes a window over the wire itself and asks to be moved with a stale serial, then the right one; `wltest bad KIND` breaks the protocol one way and prints the error it gets. Only in `/bin` of the desktop's image |
 
 `crates/xtask/tests/coreutils.rs` boots Camelot with the root image and

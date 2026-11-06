@@ -25,10 +25,10 @@
  *
  * When the program ends (the slave's last descriptor is closed: the
  * master reads -EIO) the window goes, and term exits 0; 1 if it can't
- * start, 2 on a usage error. -v says on standard error, each time a frame is committed, what
- * the cursor's line holds up to the cursor (`term "Terminal": drawn "$ "`,
- * after the title), which is how a test knows the program's output is on
- * the screen. */
+ * start, 2 on a usage error. -v says on standard error, each time a frame
+ * is committed, what the cursor's line holds up to the cursor
+ * (`term "Terminal": drawn "$ "`, after the title), which is how a test
+ * knows the program's output is on the screen. */
 #include "gui.h"
 #include "../vt.c"
 

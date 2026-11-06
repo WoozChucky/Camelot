@@ -1,7 +1,9 @@
-//! The display server (#184, `kernel/user/compositor`): Grail boots the
-//! disk kernel on an image with the server, its test client `wltest`
-//! (`kernel/user/wltest.c`) and the desktop's `/usr/share`, on several
-//! harts; the shell starts the server and the clients in the background.
+//! The display server (#184, `kernel/user/compositor`) and the desktop
+//! shell (#185: the panel, the terminal and the apps): Grail boots the disk
+//! kernel on an image with the server, its test client `wltest`
+//! (`kernel/user/wltest.c`), the shell's programs and the desktop's
+//! `/usr/share`, on several harts; the shell starts the server and the
+//! clients in the background.
 //! The tests type and click with Grail's keyboard and pointer, read what
 //! the clients say they received, and compare the screen with its expected
 //! image, `tests/display/NAME.png`.
