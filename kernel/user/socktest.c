@@ -616,23 +616,41 @@ static void test_killed_waits(void) {
     close(u);
 }
 
-/* Running out of TCP sockets: this process holds 13 (its descriptors 3 to
- * 15), a child makes the 3 left. */
+/* Running out of TCP sockets: this process takes all but 3, a child makes
+ * the 3 left, then the process the child gave back; and with a socket
+ * free but every descriptor taken, socket() is -EMFILE. */
 static void test_running_out(void) {
     int fds[NOFILE];
     int n = 0;
+    while (n < TCP_SOCKETS - 3) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            break;
+        }
+        fds[n++] = fd;
+    }
+    check_eq(n, TCP_SOCKETS - 3, "TCP sockets but 3");
+    int pid = spawn("/bin/socktest", (char *[]){"socktest", "tcpfill", NULL}, environ);
+    check_eq(status_of(pid), TCP_SOCKETS - n, "the child gets the rest, then -ENOBUFS");
     for (;;) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
-            check_eq(fd, -EMFILE, "descriptors run out first");
+            check_eq(fd, -ENOBUFS, "then the sockets run out, descriptors left");
             break;
         }
-        fds[n] = fd;
-        n++;
+        fds[n++] = fd;
     }
-    check_eq(n, NOFILE - 3, "TCP sockets on every free descriptor");
-    int pid = spawn("/bin/socktest", (char *[]){"socktest", "tcpfill", NULL}, environ);
-    check_eq(status_of(pid), TCP_SOCKETS - n, "the child gets the rest, then -ENOBUFS");
+    check_eq(n, TCP_SOCKETS, "every TCP socket");
+    close(fds[--n]);
+    for (;;) {
+        int fd = dup(fds[0]);
+        if (fd < 0) {
+            break;
+        }
+        fds[n++] = fd;
+    }
+    check_eq(n, NOFILE - 3, "every descriptor taken");
+    check_eq(socket(AF_INET, SOCK_STREAM, 0), -EMFILE, "a socket free, but no descriptor for it");
     for (int i = 0; i < n; i++) {
         close(fds[i]);
     }

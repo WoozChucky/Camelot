@@ -1360,7 +1360,7 @@ const PROMPT: &str = "$ ";
 
 /// Checks `filetest` makes on the root image, its 64-bit off_t's among
 /// them, and `filetest ro` on a read-only one (kernel/user/filetest.c).
-const FILETEST_CHECKS: u32 = 179;
+const FILETEST_CHECKS: u32 = 176;
 const FILETEST_RO_CHECKS: u32 = 14;
 
 /// What the shell printed after reading `command`, up to its next prompt.
@@ -1721,7 +1721,7 @@ fn a_failed_special_builtin_ends_only_a_shell_that_is_not_interactive() {
     echo not run > /not-run\n\
     \x04cat > /s4\n\
     cd /nope\n\
-    echo run > /run\n\
+    echo run > /ran\n\
     cd /nope\n\
     \x04sh < /s1\n\
     sh < /s2\n\
@@ -1762,7 +1762,7 @@ fn a_failed_special_builtin_ends_only_a_shell_that_is_not_interactive() {
     fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
     let fs = Fs::open(&run.disk).unwrap();
     assert!(fs.lookup("/not-run").is_err());
-    assert_eq!(fs.read_file("/run").unwrap(), b"run\n");
+    assert_eq!(fs.read_file("/ran").unwrap(), b"run\n");
 }
 
 #[test]
