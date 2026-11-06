@@ -348,6 +348,19 @@ static void keyboard_event(struct gui_display *d, struct gui_message *m) {
         }
         break;
     }
+    case WL_KEYBOARD_MODIFIERS: {
+        /* The bits are X's, as the GUI_MOD_ ones are (NO_KEYMAP: the
+         * server's own modifier indices are the same). */
+        gui_msg_uint(m);
+        uint depressed = gui_msg_uint(m);
+        uint latched = gui_msg_uint(m);
+        uint locked = gui_msg_uint(m);
+        gui_msg_uint(m);
+        if (!m->bad && w != NULL && w->h->modifiers != NULL) {
+            w->h->modifiers(w, depressed | latched, locked);
+        }
+        break;
+    }
     }
 }
 
@@ -688,15 +701,25 @@ struct gui_buffer *gui_window_buffer(struct gui_window *w) {
         }
         w->drawing = -1; /* configured to another size since */
     }
-    if (w->mem == NULL || width != w->width || height != w->height) {
-        if (make_buffers(w, width, height) < 0) {
-            return NULL;
+    int next;
+    for (;;) {
+        if (w->mem == NULL || width != w->width || height != w->height) {
+            if (make_buffers(w, width, height) < 0) {
+                return NULL;
+            }
         }
-    }
-    int next = w->committed < 0 ? 0 : 1 - w->committed;
-    while (w->bufs[next].busy) {
-        if (gui_dispatch(d, -1) < 0) {
-            return NULL;
+        next = w->committed < 0 ? 0 : 1 - w->committed;
+        while (w->bufs[next].busy) {
+            if (gui_dispatch(d, -1) < 0) {
+                return NULL;
+            }
+        }
+        /* A configure that came while waiting may have changed the size:
+         * the buffer must be the size acknowledged with it. */
+        width = gui_window_width(w);
+        height = gui_window_height(w);
+        if (width == w->width && height == w->height) {
+            break;
         }
     }
     if (w->committed >= 0) {
@@ -804,6 +827,20 @@ static void run_key(struct gui_window *w, uint code, int pressed) {
     gui_ui_key(((struct run *)gui_window_data(w))->ui, code, pressed);
 }
 
+static void run_modifiers(struct gui_window *w, uint held, uint locked) {
+    struct gui_keyboard *k = &((struct run *)gui_window_data(w))->ui->keyboard;
+    gui_keyboard_modifiers(k, held, locked);
+}
+
+/* Keys held when the keyboard leaves are released elsewhere: let go of
+ * them here, or a held Alt would keep every key from typing. */
+static void run_focus(struct gui_window *w, int focused) {
+    if (!focused) {
+        struct gui_keyboard *k = &((struct run *)gui_window_data(w))->ui->keyboard;
+        gui_keyboard_modifiers(k, 0, k->mods);
+    }
+}
+
 static void run_frame(struct gui_window *w) {
     ((struct run *)gui_window_data(w))->frame_ready = 1;
 }
@@ -815,6 +852,8 @@ static const struct gui_window_handlers run_handlers = {
     .button = run_button,
     .scroll = run_scroll,
     .key = run_key,
+    .modifiers = run_modifiers,
+    .focus = run_focus,
     .frame = run_frame,
 };
 
@@ -845,8 +884,16 @@ int gui_run(struct gui_display *d, struct gui_ui *ui, const char *title, int wid
                 r = d->error < 0 ? d->error : -ENOMEM;
                 break;
             }
+            if (b->width != laid_w || b->height != laid_h) {
+                /* Configured to another size while it waited for it. */
+                gui_ui_layout(ui, gui_rect(0, 0, b->width, b->height));
+                laid_w = b->width;
+                laid_h = b->height;
+            }
             gui_ui_draw(ui, b);
-            if (ui->damage.count > 0) {
+            /* A configure is acknowledged with the next commit: one that
+             * changed nothing drawn is committed too, with no damage. */
+            if (ui->damage.count > 0 || !w->acked) {
                 for (int i = 0; i < ui->damage.count; i++) {
                     gui_window_damage(w, ui->damage.rects[i]);
                 }

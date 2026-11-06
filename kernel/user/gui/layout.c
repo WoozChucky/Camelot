@@ -12,7 +12,8 @@
  * asked for, and the room left over is split evenly among the children
  * marked GUI_GROW (the first ones a pixel more when it doesn't divide);
  * across it, every child gets the whole height (or width). When there is
- * less room than asked for, the last children are cut off. */
+ * less room than asked for, the last children are cut off: each child's
+ * rectangle is cut to its box's, and one wholly outside it is empty. */
 #include "theme.h"
 
 static int is_box(const struct gui_widget *w) {
@@ -87,6 +88,8 @@ static void arrange(struct gui_widget *w, struct gui_rect r) {
     w->flags |= GUI_DIRTY;
     if (w->kind == GUI_LIST) {
         widget_list_sync(w);
+    } else if (w->kind == GUI_FIELD) {
+        widget_field_sync(w);
     }
     if (!is_box(w)) {
         return;
@@ -114,11 +117,10 @@ static void arrange(struct gui_widget *w, struct gui_rect r) {
                 extra--;
             }
         }
-        if (row) {
-            arrange(c, gui_rect(at, in.y, size, in.h));
-        } else {
-            arrange(c, gui_rect(in.x, at, in.w, size));
-        }
+        /* Cut to the box: what is cut off isn't drawn over the box's
+         * neighbours, and is hit-tested as it is drawn. */
+        struct gui_rect cr = row ? gui_rect(at, in.y, size, in.h) : gui_rect(in.x, at, in.w, size);
+        arrange(c, gui_rect_intersect(cr, in));
         at += size + w->spacing;
     }
 }

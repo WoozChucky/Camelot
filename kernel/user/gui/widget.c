@@ -70,6 +70,27 @@ static struct gui_widget *add(struct gui_ui *ui, struct gui_widget *parent, int 
     return w;
 }
 
+/* Takes w, the last child added to its parent (or the root), back out of
+ * the tree and frees it with its children: what a constructor that ran
+ * out of memory half-way leaves. */
+static void discard(struct gui_ui *ui, struct gui_widget *w) {
+    struct gui_widget *p = w->parent;
+    if (p == NULL) {
+        ui->root = NULL;
+    } else if (p->first == w) {
+        p->first = NULL;
+        p->last = NULL;
+    } else {
+        struct gui_widget *before = p->first;
+        while (before->next != w) {
+            before = before->next;
+        }
+        before->next = NULL;
+        p->last = before;
+    }
+    free_tree(w);
+}
+
 static struct gui_widget *box(struct gui_ui *ui, struct gui_widget *parent, int kind, int spacing, int padding) {
     struct gui_widget *w = add(ui, parent, kind);
     if (w != NULL) {
@@ -90,7 +111,7 @@ struct gui_widget *gui_column(struct gui_ui *ui, struct gui_widget *parent, int 
 struct gui_widget *gui_label(struct gui_ui *ui, struct gui_widget *parent, const char *text) {
     struct gui_widget *w = add(ui, parent, GUI_LABEL);
     if (w != NULL) {
-        w->text = text;
+        w->text = text != NULL ? text : "";
     }
     return w;
 }
@@ -98,7 +119,7 @@ struct gui_widget *gui_label(struct gui_ui *ui, struct gui_widget *parent, const
 struct gui_widget *gui_button(struct gui_ui *ui, struct gui_widget *parent, const char *text, gui_action action) {
     struct gui_widget *w = add(ui, parent, GUI_BUTTON);
     if (w != NULL) {
-        w->text = text;
+        w->text = text != NULL ? text : "";
         w->action = action;
         w->flags |= GUI_FOCUSABLE;
     }
@@ -115,7 +136,8 @@ struct gui_widget *gui_field(struct gui_ui *ui, struct gui_widget *parent, int c
     }
     w->chars = malloc((size_t)cap + 1);
     if (w->chars == NULL) {
-        return NULL; /* left in the tree, empty; gui_ui_free frees it */
+        discard(ui, w); /* no field without its text */
+        return NULL;
     }
     w->chars[0] = 0;
     w->cap = cap;
@@ -144,6 +166,7 @@ struct gui_widget *gui_list(struct gui_ui *ui, struct gui_widget *parent, const 
     row->flags |= GUI_GROW;
     struct gui_widget *w = add(ui, row, GUI_LIST);
     if (w == NULL) {
+        discard(ui, row);
         return NULL;
     }
     w->items = items;
@@ -152,10 +175,12 @@ struct gui_widget *gui_list(struct gui_ui *ui, struct gui_widget *parent, const 
     w->action = action;
     w->flags |= GUI_FOCUSABLE | GUI_GROW;
     struct gui_widget *bar = gui_scrollbar(ui, row, count, w->rows, NULL);
-    if (bar != NULL) {
-        bar->buddy = w;
-        w->buddy = bar;
+    if (bar == NULL) {
+        discard(ui, row); /* a list and its bar, or neither */
+        return NULL;
     }
+    bar->buddy = w;
+    w->buddy = bar;
     return w;
 }
 
@@ -163,7 +188,7 @@ struct gui_widget *gui_menu(struct gui_ui *ui, struct gui_widget *parent, const 
                             const char *const *items, int count, gui_action action) {
     struct gui_widget *w = add(ui, parent, GUI_MENU);
     if (w != NULL) {
-        w->text = title;
+        w->text = title != NULL ? title : "";
         w->items = items;
         w->count = count;
         w->action = action;
@@ -210,7 +235,7 @@ void gui_widget_dirty(struct gui_widget *w) {
 /* ---- Setting them ---- */
 
 void gui_set_text(struct gui_widget *w, const char *text) {
-    w->text = text;
+    w->text = text != NULL ? text : "";
     gui_widget_dirty(w);
 }
 
@@ -247,6 +272,17 @@ static void field_show_cursor(struct gui_widget *w) {
     } else if (at > w->scroll + shown - 1) {
         w->scroll = at - shown + 1;
     }
+}
+
+void widget_field_sync(struct gui_widget *w) {
+    /* No further than shows the text's end and the cursor after it: a
+     * field set before it was laid out (one column wide, scrolled to the
+     * end), or made wider, shows its text again. */
+    int most = code_points(w->chars, w->len) - field_columns(w) + 1;
+    if (w->scroll > most) {
+        w->scroll = most < 0 ? 0 : most;
+    }
+    field_show_cursor(w);
 }
 
 void gui_field_set(struct gui_widget *w, const char *text) {

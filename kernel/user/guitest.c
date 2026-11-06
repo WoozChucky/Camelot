@@ -16,6 +16,7 @@
  *   guitest damage       the damage lists of a sequence of rectangles
  *   guitest keys         the characters of key sequences
  *   guitest utf8         decoding and encoding
+ *   guitest wire         the wire format reading forged messages
  *
  * Exits 0, or 1 with what went wrong. */
 #include "gui.h"
@@ -75,6 +76,115 @@ static int new_buffer(struct gui_buffer *b, int w, int h) {
 
 /* ---- draw ---- */
 
+/* Bresenham's line as it is usually written, walked a pixel at a time from
+ * one end: what gui_line computes a column or a row at a time. */
+static void walk_line(struct gui_buffer *b, int x0, int y0, int x1, int y1, uint color) {
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y0 - y1 : y1 - y0;
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        gui_plot(b, x0, y0, color);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/* Whether a and b hold the same pixels. */
+static int same_pixels(const struct gui_buffer *a, const struct gui_buffer *b) {
+    return memcmp(a->pixels, b->pixels, (size_t)a->width * (size_t)a->height * sizeof(uint)) == 0;
+}
+
+/* gui_line draws what the walk draws: every line from a buffer's middle to
+ * the points of a square around it, whole and clipped; and lines whose
+ * ends lie near the ends of int's range draw only what lands in the buffer,
+ * without walking there (or wrapping round). */
+static void check_lines(void) {
+    struct gui_buffer a;
+    struct gui_buffer w;
+    if (new_buffer(&a, 40, 40) < 0 || new_buffer(&w, 40, 40) < 0) {
+        return;
+    }
+    for (int clip = 0; clip < 2; clip++) {
+        for (int x = 1; x < 40; x++) {
+            for (int y = 1; y < 40; y++) {
+                gui_fill(&a, gui_rect(0, 0, 40, 40), 0);
+                gui_fill(&w, gui_rect(0, 0, 40, 40), 0);
+                if (clip) {
+                    gui_clip(&a, gui_rect(12, 15, 13, 9));
+                    gui_clip(&w, gui_rect(12, 15, 13, 9));
+                }
+                gui_line(&a, 20, 20, x, y, 0xffffff);
+                walk_line(&w, 20, 20, x, y, 0xffffff);
+                gui_unclip(&a);
+                gui_unclip(&w);
+                if (!same_pixels(&a, &w)) {
+                    printf("guitest: line 20,20 to %d,%d%s is not the walk's\n", x, y, clip ? ", clipped" : "");
+                    failed = 1;
+                    clip = 2;
+                    x = 40;
+                    break;
+                }
+            }
+        }
+    }
+    /* A diagonal from far off to far off: the buffer's diagonal. A steep
+     * line from int's bottom to its top, one column over: x is 0 below y 0
+     * and 1 from y 0 on, so the buffer's column 1. */
+    gui_fill(&a, gui_rect(0, 0, 40, 40), 0);
+    gui_fill(&w, gui_rect(0, 0, 40, 40), 0);
+    gui_line(&a, -1000000000, -1000000000, 1000000000, 1000000000, 0xffffff);
+    gui_line(&a, 0, -2147483647 - 1, 1, 2147483647, 0xff0000);
+    for (int i = 0; i < 40; i++) {
+        gui_plot(&w, i, i, 0xffffff);
+        gui_plot(&w, 1, i, 0xff0000);
+    }
+    if (!same_pixels(&a, &w)) {
+        printf("guitest: lines from far off are not what they should be\n");
+        failed = 1;
+    }
+    gui_buffer_free(&a);
+    gui_buffer_free(&w);
+}
+
+/* gui_blit within one buffer, down and up over rows it is copying: each row
+ * numbered, then scrolled by 3 rows each way. */
+static void check_scroll(void) {
+    struct gui_buffer b;
+    if (new_buffer(&b, 4, 12) < 0) {
+        return;
+    }
+    for (int dir = 0; dir < 2; dir++) {
+        for (int y = 0; y < 12; y++) {
+            gui_fill(&b, gui_rect(0, y, 4, 1), (uint)y);
+        }
+        int down = dir == 0;
+        gui_blit(&b, 1, down ? 3 : 0, &b, gui_rect(0, down ? 0 : 3, 3, 9));
+        for (int y = 0; y < 12; y++) {
+            uint want = down ? (y >= 3 ? (uint)(y - 3) : (uint)y) : (y < 9 ? (uint)(y + 3) : (uint)y);
+            if (b.pixels[y * 4 + 0] != (uint)y || b.pixels[y * 4 + 1] != want ||
+                b.pixels[y * 4 + 3] != want) {
+                printf("guitest: a scroll %s: row %d holds %x, not %x\n", down ? "down" : "up", y,
+                       b.pixels[y * 4 + 1], want);
+                failed = 1;
+                break;
+            }
+        }
+    }
+    gui_buffer_free(&b);
+}
+
 static void scene_draw(const char *dir) {
     struct gui_buffer b;
     if (new_buffer(&b, 160, 120) < 0) {
@@ -124,10 +234,13 @@ static void scene_draw(const char *dir) {
         gui_blit(&b, 150, 110, &g, gui_rect(0, 0, 32, 16));
         gui_buffer_free(&g);
     }
-    /* A copy of part of the buffer itself, overlapping. */
+    /* A copy of part of the buffer itself, its columns overlapping (rows
+     * too: check_scroll). */
     gui_blit(&b, 6, 44, &b, gui_rect(4, 4, 30, 20));
     write_ppm(dir, "draw", &b);
     gui_buffer_free(&b);
+    check_lines();
+    check_scroll();
 }
 
 /* ---- text ---- */
@@ -266,6 +379,34 @@ static void centre(struct gui_widget *w, int *x, int *y) {
     *y = w->rect.y + w->rect.h / 2;
 }
 
+/* A field set before the layout shows its text from the start once laid
+ * out, scrolls when made too narrow for it and back when widened again; a
+ * column too short for its children cuts them to it, the last one off. */
+static void check_layout(struct gui_font *f) {
+    struct gui_ui ui;
+    gui_ui_init(&ui, f);
+    struct gui_widget *root = gui_column(&ui, NULL, 2, 0);
+    struct gui_widget *field = gui_field(&ui, root, 8, 32, NULL);
+    struct gui_widget *a = gui_button(&ui, root, "A", NULL);
+    struct gui_widget *b = gui_button(&ui, root, "B", NULL);
+    if (field == NULL || a == NULL || b == NULL) {
+        fail("check_layout", -ENOMEM);
+        gui_ui_free(&ui);
+        return;
+    }
+    gui_field_set(field, "Excalibur");
+    gui_ui_layout(&ui, gui_rect(0, 0, 120, 200));
+    printf("set before the layout: scroll %d\n", field->scroll);
+    gui_ui_layout(&ui, gui_rect(0, 0, 40, 200));
+    printf("narrow: scroll %d\n", field->scroll);
+    gui_ui_layout(&ui, gui_rect(0, 0, 120, 200));
+    printf("wide again: scroll %d\n", field->scroll);
+    gui_ui_layout(&ui, gui_rect(0, 0, 120, 40));
+    printf("short: A %d,%d %dx%d, B %d,%d %dx%d\n", a->rect.x, a->rect.y, a->rect.w, a->rect.h, b->rect.x,
+           b->rect.y, b->rect.w, b->rect.h);
+    gui_ui_free(&ui);
+}
+
 static void scene_widgets(const char *dir) {
     struct gui_font f;
     int r = gui_font_load(&f, FONT);
@@ -383,6 +524,7 @@ static void scene_widgets(const char *dir) {
 
     gui_buffer_free(&b);
     gui_ui_free(&ui);
+    check_layout(&f);
     gui_font_free(&f);
 }
 
@@ -429,6 +571,18 @@ static void scene_keys(void) {
     static const uint both[] = {KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTSHIFT | UP, KEY_GRAVE,
                                 KEY_RIGHTSHIFT | UP, KEY_GRAVE, KEY_BACKSPACE, KEY_F1, KEY_LEFTMETA};
     type_keys(&k, "two shifts", both, sizeof(both) / sizeof(both[0]));
+    /* The keyboard leaves with Logo and Alt held (their releases go to
+     * another window): both let go of, Caps Lock kept. */
+    gui_keyboard_key(&k, KEY_LEFTALT, 1);
+    gui_keyboard_key(&k, KEY_CAPSLOCK, 1);
+    gui_keyboard_modifiers(&k, 0, k.mods);
+    static const uint after_leave[] = {KEY_Q};
+    type_keys(&k, "after leaving", after_leave, 1);
+    /* The server says Shift is held, pressed before this window had the
+     * keyboard, and nothing locked: a left Shift, which its release ends. */
+    gui_keyboard_modifiers(&k, GUI_MOD_SHIFT, 0);
+    static const uint held[] = {KEY_Q, KEY_LEFTSHIFT | UP, KEY_Q};
+    type_keys(&k, "shift held on entering", held, 3);
 }
 
 /* ---- utf8 ---- */
@@ -459,6 +613,77 @@ static void scene_utf8(void) {
         }
     }
     printf("\n");
+}
+
+/* ---- wire ---- */
+
+/* Messages as a peer could forge them, written raw down a socket pair (the
+ * words little-endian, as the wire is) and read back by gui_wire: each
+ * well-formed argument read, or the message marked broken. Opcode 1 is a
+ * uint, a string and an array; 2 and 3 a string; 4 an array; 5 a
+ * descriptor. */
+static const uint forged[] = {
+    5, 28 << 16 | 1, 7, 3, 'h' | 'i' << 8, 2, 0xbbaa,  /* good: 7 "hi" [aa bb] */
+    5, 16 << 16 | 2, 0xfffffff8, 0,                       /* a string 2^32 - 8 bytes long */
+    5, 16 << 16 | 4, 0xfffffffd, 0,                       /* an array that wraps round */
+    5, 16 << 16 | 3, 4, 'a' | 'b' << 8 | 'c' << 16 | 'd' << 24, /* no NUL */
+    5, 16 << 16 | 3, 4, 'a' | 'b' << 16,                  /* a NUL inside */
+    5, 8 << 16 | 5,                                       /* a descriptor that did not come */
+    5, 12 << 16 | 1, 7,                                   /* the string missing */
+    5, 10 << 16 | 1,                                      /* a size not a multiple of 4 */
+};
+
+static void scene_wire(void) {
+    int fds[2];
+    int r = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    if (r < 0) {
+        fail("socketpair", r);
+        return;
+    }
+    if (write(fds[0], forged, sizeof(forged)) != (ssize_t)sizeof(forged)) {
+        fail("write", -EIO);
+    }
+    close(fds[0]);
+    static struct gui_wire w;
+    gui_wire_init(&w, fds[1]);
+    int n = gui_wire_read(&w, 0);
+    if (n != (int)sizeof(forged)) {
+        fail("gui_wire_read", n);
+    }
+    struct gui_message m;
+    while ((r = gui_wire_next(&w, &m)) == 1) {
+        printf("wire %u.%u:", m.object, m.opcode);
+        if (m.opcode == 1) {
+            uint v = gui_msg_uint(&m);
+            const char *s = gui_msg_string(&m);
+            uint len;
+            const uchar *a = gui_msg_array(&m, &len);
+            if (!m.bad) {
+                printf(" %u \"%s\" [", v, s);
+                for (uint i = 0; i < len; i++) {
+                    printf(i ? " %x" : "%x", a[i]);
+                }
+                printf("]");
+            }
+        } else if (m.opcode == 2 || m.opcode == 3) {
+            const char *s = gui_msg_string(&m);
+            if (!m.bad) {
+                printf(" \"%s\"", s);
+            }
+        } else if (m.opcode == 4) {
+            uint len;
+            gui_msg_array(&m, &len);
+            if (!m.bad) {
+                printf(" [%u bytes]", len);
+            }
+        } else if (m.opcode == 5) {
+            gui_msg_fd(&m);
+        }
+        printf("%s\n", m.bad ? " broken" : "");
+    }
+    printf("wire: %s\n", r == -EPROTO ? "a broken size" : r == 0 ? "the end" : strerror(-r));
+    gui_wire_release(&w);
+    close(fds[1]);
 }
 
 /* ---- wayland ---- */
@@ -592,17 +817,37 @@ static void key_tap(struct fake *s, uint code) {
     key(s, code, 0);
 }
 
+/* The keyboard enters the window, nothing held, or leaves it. */
+static void keyboard_focus(struct fake *s, int enter) {
+    gui_wire_begin(&s->wire, s->keyboard, enter ? WL_KEYBOARD_ENTER : WL_KEYBOARD_LEAVE);
+    gui_wire_uint(&s->wire, ++s->serial);
+    gui_wire_uint(&s->wire, s->surface);
+    if (enter) {
+        gui_wire_array(&s->wire, NULL, 0);
+    }
+    gui_wire_end(&s->wire);
+    if (enter) {
+        gui_wire_begin(&s->wire, s->keyboard, WL_KEYBOARD_MODIFIERS);
+        gui_wire_uint(&s->wire, ++s->serial);
+        for (int i = 0; i < 4; i++) {
+            gui_wire_uint(&s->wire, 0); /* depressed, latched, locked, group */
+        }
+        gui_wire_end(&s->wire);
+    }
+}
+
 /* The input that follows frame n. */
 static void after_frame(struct fake *s, int n) {
     if (n == 1) {
         pointer_at(s, WL_POINTER_ENTER, 120, 38);
         pointer_button(s, 1);
         pointer_button(s, 0);
-        gui_wire_begin(&s->wire, s->keyboard, WL_KEYBOARD_ENTER);
-        gui_wire_uint(&s->wire, ++s->serial);
-        gui_wire_uint(&s->wire, s->surface);
-        gui_wire_array(&s->wire, NULL, 0);
-        gui_wire_end(&s->wire);
+        /* Alt goes down, and the keyboard leaves before it comes up: back
+         * in the window, it types again. */
+        keyboard_focus(s, 1);
+        key(s, KEY_LEFTALT, 1);
+        keyboard_focus(s, 0);
+        keyboard_focus(s, 1);
         key(s, KEY_LEFTSHIFT, 1);
         key_tap(s, KEY_K);
         key(s, KEY_LEFTSHIFT, 0);
@@ -901,7 +1146,7 @@ static void scene_wayland(const char *dir) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("usage: guitest draw|text|image|widgets|wayland DIR, or damage|keys|utf8\n");
+        printf("usage: guitest draw|text|image|widgets|wayland DIR, or damage|keys|utf8|wire\n");
         return 2;
     }
     const char *what = argv[1];
@@ -922,6 +1167,8 @@ int main(int argc, char **argv) {
         scene_keys();
     } else if (strcmp(what, "utf8") == 0) {
         scene_utf8();
+    } else if (strcmp(what, "wire") == 0) {
+        scene_wire();
     } else {
         printf("guitest: no scene %s\n", what);
         return 2;

@@ -43,5 +43,8 @@ int theme_line(const struct gui_ui *ui);
 int widget_list_lines(const struct gui_widget *w);
 /* Keeps a list's first line in range and its scroll bar in step. */
 void widget_list_sync(struct gui_widget *w);
+/* Scrolls a field, once it has its rectangle, to show its cursor and as
+ * much of its text before it as fits. */
+void widget_field_sync(struct gui_widget *w);
 
 #endif

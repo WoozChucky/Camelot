@@ -59,21 +59,29 @@ int main(void) {
     }
     struct gui_ui ui;
     gui_ui_init(&ui, &font);
+    /* The tree in order (a box's children are in the order made); each
+     * constructor returns NULL when out of memory, which skips the rest. */
     struct gui_widget *root = gui_column(&ui, NULL, 4, 4);
-    struct gui_widget *bar = gui_row(&ui, root, 0, 0);
-    gui_menu(&ui, bar, "File", file_items, 2, file_menu);
-    gui_menu(&ui, bar, "Help", help_items, 1, help_menu);
-    struct gui_widget *row = gui_row(&ui, root, 4, 0);
-    gui_label(&ui, row, "Name:");
-    name = gui_field(&ui, row, 12, 32, greet);
+    struct gui_widget *bar = root ? gui_row(&ui, root, 0, 0) : NULL;
+    struct gui_widget *file = bar ? gui_menu(&ui, bar, "File", file_items, 2, file_menu) : NULL;
+    struct gui_widget *help = file ? gui_menu(&ui, bar, "Help", help_items, 1, help_menu) : NULL;
+    struct gui_widget *row = help ? gui_row(&ui, root, 4, 0) : NULL;
+    struct gui_widget *label = row ? gui_label(&ui, row, "Name:") : NULL;
+    name = label ? gui_field(&ui, row, 12, 32, greet) : NULL;
+    struct gui_widget *list = name ? gui_list(&ui, root, knights, 10, 4, pick) : NULL;
+    status = list ? gui_label(&ui, root, "Who goes there?") : NULL;
+    struct gui_widget *buttons = status ? gui_row(&ui, root, 4, 0) : NULL;
+    struct gui_widget *gap = buttons ? gui_label(&ui, buttons, "") : NULL;
+    struct gui_widget *clear_button = gap ? gui_button(&ui, buttons, "Clear", clear) : NULL;
+    if (clear_button == NULL || gui_button(&ui, buttons, "Greet", greet) == NULL) {
+        printf("guidemo: out of memory\n");
+        gui_ui_free(&ui);
+        gui_font_free(&font);
+        return 1;
+    }
     gui_grow(name);
-    struct gui_widget *list = gui_list(&ui, root, knights, 10, 4, pick);
     gui_grow(list->parent);
-    status = gui_label(&ui, root, "Who goes there?");
-    struct gui_widget *buttons = gui_row(&ui, root, 4, 0);
-    gui_grow(gui_label(&ui, buttons, ""));
-    gui_button(&ui, buttons, "Clear", clear);
-    gui_button(&ui, buttons, "Greet", greet);
+    gui_grow(gap);
     gui_ui_focus(&ui, name);
 
     struct gui_display *d = gui_connect(NULL, &r);

@@ -5,7 +5,8 @@
 //! them back from the disk and compares each with its expected image,
 //! `tests/gui/NAME.png`, by encoding it as a PNG ([`xtask::png`]) and
 //! comparing the bytes. The parts that draw nothing (damage lists, the
-//! keyboard, UTF-8) print what they did, which is compared too.
+//! keyboard, UTF-8, the wire format reading forged messages) print what
+//! they did, which is compared too.
 //!
 //! An ignored test, which needs clang, does the same with the programs and
 //! the libraries compiled by clang (the reference build's flags, `-O2
@@ -46,6 +47,7 @@ const COMMANDS: &[&str] = &[
     "guitest damage",
     "guitest keys",
     "guitest utf8",
+    "guitest wire",
 ];
 
 /// The images the scenes write to `/out`.
@@ -295,7 +297,11 @@ fn check_output(run: &Run) {
          menu: 96,144 64x24 164,144 32x24 4,4 180x136 (bounds 4,4 192x164)\n\
          action: menu File 2\n\
          closed: 4,4 180x136 (bounds 4,4 180x136)\n\
-         menu open: 0\n"
+         menu open: 0\n\
+         set before the layout: scroll 0\n\
+         narrow: scroll 6\n\
+         wide again: scroll 0\n\
+         short: A 0,26 120x14, B 0,0 0x0\n"
     );
     assert_eq!(
         output(&run.out, "guitest text /out"),
@@ -316,7 +322,9 @@ fn check_output(run: &Run) {
          caps: \"A1b@C\" mods 2\n\
          caps off: \"d\" mods 0\n\
          ctrl alt: \"z\" mods 0\n\
-         two shifts: \"~`\\b\" mods 40\n"
+         two shifts: \"~`\\b\" mods 40\n\
+         after leaving: \"Q\" mods 2\n\
+         shift held on entering: \"Qq\" mods 0\n"
     );
     assert_eq!(
         output(&run.out, "guitest utf8"),
@@ -324,5 +332,17 @@ fn check_output(run: &Run) {
          utf8 1: fffd fffd fffd fffd fffd fffd fffd fffd\n\
          utf8 2: fffd fffd fffd fffd fffd fffd\n\
          encoded: 41 c3a9 e282ac f09f9880 efbfbd efbfbd\n"
+    );
+    // A length near 2^32 is refused, not wrapped round past the message.
+    assert_eq!(
+        output(&run.out, "guitest wire"),
+        "wire 5.1: 7 \"hi\" [aa bb]\n\
+         wire 5.2: broken\n\
+         wire 5.4: broken\n\
+         wire 5.3: broken\n\
+         wire 5.3: broken\n\
+         wire 5.5: broken\n\
+         wire 5.1: broken\n\
+         wire: a broken size\n"
     );
 }

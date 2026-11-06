@@ -212,7 +212,7 @@ shd: [7] 10.0.2.2:49152 ended, exit 0
 | `badload` | reads kernel memory: killed by a load page fault |
 | `badstore` | writes to its own read-only data: killed by a store page fault |
 | `badhalt` | executes `xcal.halt`, which is M-mode only: killed by an illegal instruction |
-| `guitest` | `guitest SCENE [DIR]`: draws a scene of the GUI library into memory and writes it to `DIR/SCENE.ppm` (`draw`, `text`, `image`; `widgets` writes `widgets.ppm` and `input.ppm`, after input, and prints the actions), prints what the parts that draw nothing did (`damage`, `keys`, `utf8`), or, `wayland`, is a scripted display server on `/run/wayland-0` that runs `guidemo`, prints its requests and writes the frames it commits. Only in `/bin` of the desktop's image |
+| `guitest` | `guitest SCENE [DIR]`: draws a scene of the GUI library into memory and writes it to `DIR/SCENE.ppm` (`draw`, `text`, `image`; `widgets` writes `widgets.ppm` and `input.ppm`, after input, and prints the actions), prints what the parts that draw nothing did (`damage`, `keys`, `utf8`, `wire`), or, `wayland`, is a scripted display server on `/run/wayland-0` that runs `guidemo`, prints its requests and writes the frames it commits. Only in `/bin` of the desktop's image |
 | `guidemo` | the GUI library's demonstration, a Wayland client: a window with menus, a text field, a list of knights, a status line and buttons. Only in `/bin` of the desktop's image |
 
 `crates/xtask/tests/coreutils.rs` boots Camelot with the root image and

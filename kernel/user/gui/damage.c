@@ -8,7 +8,9 @@ void gui_damage_clear(struct gui_damage *d) {
 
 /* Whether a and b overlap, or share an edge or a corner. */
 static int touch(struct gui_rect a, struct gui_rect b) {
-    return a.x <= b.x + b.w && b.x <= a.x + a.w && a.y <= b.y + b.h && b.y <= a.y + a.h;
+    /* The far edges in long, as gui/rect.c computes them. */
+    return a.x <= (long)b.x + b.w && b.x <= (long)a.x + a.w && a.y <= (long)b.y + b.h &&
+           b.y <= (long)a.y + a.h;
 }
 
 static long area(struct gui_rect r) {

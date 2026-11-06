@@ -108,27 +108,61 @@ void gui_outline(struct gui_buffer *b, struct gui_rect r, uint color) {
     gui_fill(b, gui_rect(r.x + r.w - 1, r.y + 1, 1, r.h - 2), color);
 }
 
+/* The steps i, from 0 to n, whose coordinate p0 + s * i lies in [lo, lo +
+ * len): *first to *last (*first > *last when there are none). */
+static void line_steps(long p0, int s, long n, long lo, long len, long *first, long *last) {
+    long hi = lo + len - 1;
+    long from = s > 0 ? lo - p0 : p0 - hi;
+    long to = s > 0 ? hi - p0 : p0 - lo;
+    *first = from < 0 ? 0 : from;
+    *last = to > n ? n : to;
+}
+
+/* floor((2 * i * c + a) / (2 * a)), for 0 <= i, c <= a < 2^32, a > 0:
+ * i * c fits in 64 bits but twice it may not, so the quotient by a is
+ * taken first (i * c = q * a + r, and 2 q a divides by 2 a). */
+static long line_step(unsigned long i, unsigned long c, unsigned long a) {
+    unsigned long ic = i * c;
+    unsigned long q = ic / a;
+    unsigned long r = ic % a;
+    return (long)(q + (2 * r + a) / (2 * a));
+}
+
 void gui_line(struct gui_buffer *b, int x0, int y0, int x1, int y1, uint color) {
-    /* Bresenham's, in all eight octants: err tracks dx * (y - y0) - dy *
-     * (x - x0), the distance from the true line, doubled. */
-    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
-    int dy = y1 > y0 ? y0 - y1 : y1 - y0; /* minus |y1 - y0| */
+    /* Bresenham's line, in all eight octants, but computed a column (or a
+     * row) at a time instead of walked from x0, y0: only the columns the
+     * clip rectangle holds are visited, however far off the ends are.
+     *
+     * The walk it computes: with a = |x1 - x0| and c = |y1 - y0|, err (the
+     * distance from the true line, doubled) starts at a - c; a step in x
+     * adds -c, one in y adds a; x steps when 2 err >= -c, y when
+     * 2 err <= a. When a >= c, x steps every time and err stays in
+     * (a/2 - c, 3a/2 - c], a window a wide: after i steps, m of them in y,
+     * err is a - c - i c + m a, which only one m puts in the window,
+     * m = floor((2 i c + a) / 2a). When c > a, y steps every time, err
+     * stays in [a - 3c/2, a - c/2), and after j steps, k of them in x,
+     * k = floor((2 j a + c) / 2c). */
+    long a = x1 > x0 ? (long)x1 - x0 : (long)x0 - x1;
+    long c = y1 > y0 ? (long)y1 - y0 : (long)y0 - y1;
     int sx = x0 < x1 ? 1 : -1;
     int sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    for (;;) {
-        gui_plot(b, x0, y0, color);
-        if (x0 == x1 && y0 == y1) {
-            break;
+    struct gui_rect clip = b->clip;
+    if (gui_rect_empty(clip)) {
+        return;
+    }
+    long first;
+    long last;
+    if (a >= c) {
+        line_steps(x0, sx, a, clip.x, clip.w, &first, &last);
+        for (long i = first; i <= last; i++) {
+            long m = a == 0 ? 0 : line_step((unsigned long)i, (unsigned long)c, (unsigned long)a);
+            gui_plot(b, (int)(x0 + sx * i), (int)(y0 + sy * m), color);
         }
-        int e2 = 2 * err;
-        if (e2 >= dy) {
-            err += dy;
-            x0 += sx;
-        }
-        if (e2 <= dx) {
-            err += dx;
-            y0 += sy;
+    } else {
+        line_steps(y0, sy, c, clip.y, clip.h, &first, &last);
+        for (long j = first; j <= last; j++) {
+            long k = line_step((unsigned long)j, (unsigned long)a, (unsigned long)c);
+            gui_plot(b, (int)(x0 + sx * k), (int)(y0 + sy * j), color);
         }
     }
 }
@@ -214,7 +248,12 @@ static struct gui_rect blit_area(struct gui_buffer *b, int x, int y, const struc
 void gui_blit(struct gui_buffer *b, int x, int y, const struct gui_buffer *src, struct gui_rect from) {
     struct gui_rect to;
     struct gui_rect s = blit_area(b, x, y, src, from, &to);
-    for (int j = 0; j < to.h; j++) {
+    /* A copy down the same pixels goes from the bottom row up, so that no
+     * row is overwritten before it is copied; memmove handles the overlap
+     * within a row. */
+    int up = src->pixels == b->pixels && to.y > s.y;
+    for (int n = 0; n < to.h; n++) {
+        int j = up ? to.h - 1 - n : n;
         uint *d = &b->pixels[(long)(to.y + j) * b->stride + to.x];
         const uint *p = &src->pixels[(long)(s.y + j) * src->stride + s.x];
         memmove(d, p, (size_t)to.w * sizeof(uint));

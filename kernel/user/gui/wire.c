@@ -195,6 +195,11 @@ int gui_wire_read(struct gui_wire *w, int nowait) {
     if (n < 0) {
         return (int)n;
     }
+    if (m.msg_flags & MSG_CTRUNC) {
+        /* Descriptors were dropped: those that came can't be matched to
+         * their messages any more (libwayland's protocol error too). */
+        w->error = -EPROTO;
+    }
     for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h != NULL; h = CMSG_NXTHDR(&m, h)) {
         if (h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS) {
             continue;
@@ -215,10 +220,13 @@ int gui_wire_read(struct gui_wire *w, int nowait) {
         }
     }
     w->in_len += (int)n;
-    return (int)n;
+    return w->error < 0 ? w->error : (int)n;
 }
 
 int gui_wire_next(struct gui_wire *w, struct gui_message *m) {
+    if (w->error < 0) {
+        return w->error;
+    }
     int avail = w->in_len - w->in_pos;
     if (avail < HEADER) {
         return 0;
@@ -269,7 +277,9 @@ int gui_msg_fixed(struct gui_message *m) {
 /* `len` bytes and their padding: where they start, or NULL and `bad`. */
 static const uchar *take(struct gui_message *m, uint len) {
     uint padded = (len + 3) & ~3u;
-    if (padded < len || m->pos + padded > arg_bytes(m)) {
+    /* Compared with what is left, not pos + padded, which a length near
+     * 2^32 would wrap round (pos never passes the arguments' end). */
+    if (padded < len || padded > arg_bytes(m) - m->pos) {
         m->bad = 1;
         return NULL;
     }

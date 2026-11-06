@@ -80,24 +80,27 @@ void gui_fill(struct gui_buffer *b, struct gui_rect r, uint color);
 void gui_fill_blend(struct gui_buffer *b, struct gui_rect r, uint color);
 /* r's outermost pixels. */
 void gui_outline(struct gui_buffer *b, struct gui_rect r, uint color);
-/* From x0, y0 to x1, y1, both ends drawn (Bresenham's). */
+/* From x0, y0 to x1, y1, both ends drawn (Bresenham's); only the columns
+ * (or rows) inside the clip are computed, however far off the ends are. */
 void gui_line(struct gui_buffer *b, int x0, int y0, int x1, int y1, uint color);
 /* r with its corners rounded to a quarter circle of `radius` pixels (at
  * most half of r's smaller side): filled, or its edge only. */
 void gui_fill_round(struct gui_buffer *b, struct gui_rect r, int radius, uint color);
 void gui_outline_round(struct gui_buffer *b, struct gui_rect r, int radius, uint color);
-/* src's rectangle `from` to x, y in b: copied as it is, or mixed in by
- * each pixel's alpha. */
+/* src's rectangle `from` to x, y in b: copied as it is (b may be src,
+ * the two rectangles overlapping: a scroll), or mixed in by each pixel's
+ * alpha (src another buffer). */
 void gui_blit(struct gui_buffer *b, int x, int y, const struct gui_buffer *src, struct gui_rect from);
 void gui_blend(struct gui_buffer *b, int x, int y, const struct gui_buffer *src, struct gui_rect from);
 
 /* ---- Damage (gui/damage.c) ----
  *
- * What changed since the last frame, as up to GUI_DAMAGE_RECTS rectangles
- * inside one another never, and none touching: one that overlaps or
- * touches another is merged with it into their union, and when there are
- * too many, the new one is merged with the one whose union with it is the
- * smallest. A compositor or a window recomposites or sends only those. */
+ * What changed since the last frame, as up to GUI_DAMAGE_RECTS rectangles,
+ * no two overlapping or touching: one that overlaps or touches another is
+ * merged with it into their union, and when there are too many, the new
+ * one is merged with the one their union grows least (the fewest pixels
+ * added to it). A compositor or a window recomposites or
+ * sends only those. */
 #define GUI_DAMAGE_RECTS 8
 
 struct gui_damage {
@@ -213,6 +216,13 @@ void gui_keyboard_init(struct gui_keyboard *k, const struct gui_keymap *keymap);
  * it; returns the character it types, or 0 (a release, a modifier, a key
  * with none; with Ctrl or Alt held too, as those make shortcuts). */
 uint gui_keyboard_key(struct gui_keyboard *k, uint code, int pressed);
+/* The modifiers the display server says are held (wl_keyboard.modifiers'
+ * depressed | latched) and locked, which it sends when the keyboard enters
+ * a window and as they change: a modifier not held is let go of, one held
+ * that no key here pressed is counted as a left key's; Caps Lock is as
+ * `locked` says. When the keyboard leaves, gui_keyboard_modifiers(k, 0,
+ * k->mods) lets go of every key, whose release goes to another window. */
+void gui_keyboard_modifiers(struct gui_keyboard *k, uint held, uint locked);
 /* The character of `code` with modifiers `mods`, Ctrl and Alt aside. */
 uint gui_keymap_char(const struct gui_keymap *m, uint code, uint mods);
 
@@ -315,7 +325,8 @@ void gui_ui_free(struct gui_ui *ui);
 
 /* Each adds a widget at the end of `parent`'s children (the root when
  * parent is NULL, which must be a row or a column: the first one made);
- * NULL when out of memory. A field holds `cap` bytes of text and asks for
+ * NULL when out of memory, with nothing added. A text or a title that is
+ * NULL is empty. A field holds `cap` bytes of text and asks for
  * room for `columns` characters; a list shows `rows` items with a scroll bar
  * beside it (in a row of their own, which gui_list makes); a menu belongs
  * in a row along the top, its items shown under it when clicked. */
@@ -331,7 +342,7 @@ struct gui_widget *gui_scrollbar(struct gui_ui *ui, struct gui_widget *parent, i
 struct gui_widget *gui_menu(struct gui_ui *ui, struct gui_widget *parent, const char *title,
                             const char *const *items, int count, gui_action action);
 
-/* A label's or a button's new text (kept, not copied); a field's text
+/* A label's or a button's new text (kept, not copied; NULL is empty); a field's text
  * (copied, cut to fit); a list's items; a scroll bar's position. Each
  * marks the widget to be drawn again. */
 void gui_set_text(struct gui_widget *w, const char *text);
@@ -419,10 +430,13 @@ int gui_wire_end(struct gui_wire *w);
 int gui_wire_flush(struct gui_wire *w);
 /* Receives what has come (waiting for it unless `nowait`): the bytes
  * received, 0 when the peer hung up, or a negative error number (-EAGAIN:
- * nothing yet). */
+ * nothing yet; -EPROTO: descriptors were dropped, more than the messages
+ * could take or more than came through; the wire's error once it has
+ * one). */
 int gui_wire_read(struct gui_wire *w, int nowait);
 /* The next whole message received: 1 with *m set, 0 if there is none
- * yet, -EPROTO for a size that can't be (under 8, not a multiple of 4). */
+ * yet, -EPROTO for a size that can't be (under 8, not a multiple of 4,
+ * over GUI_WIRE_MAX), or the wire's error once it has one. */
 int gui_wire_next(struct gui_wire *w, struct gui_message *m);
 uint gui_msg_uint(struct gui_message *m);
 int gui_msg_int(struct gui_message *m);
@@ -455,6 +469,9 @@ struct gui_window_handlers {
     void (*button)(struct gui_window *w, uint button, int pressed);
     void (*scroll)(struct gui_window *w, int amount);
     void (*key)(struct gui_window *w, uint code, int pressed);
+    /* wl_keyboard.modifiers: GUI_MOD_ bits held (depressed | latched) and
+     * locked (gui_keyboard_modifiers). */
+    void (*modifiers)(struct gui_window *w, uint held, uint locked);
     void (*focus)(struct gui_window *w, int focused);
     void (*frame)(struct gui_window *w); /* a good time to draw the next frame */
 };

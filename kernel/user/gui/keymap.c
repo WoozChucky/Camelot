@@ -116,3 +116,11 @@ uint gui_keyboard_key(struct gui_keyboard *k, uint code, int pressed) {
     }
     return gui_keymap_char(k->keymap, code, k->mods);
 }
+
+void gui_keyboard_modifiers(struct gui_keyboard *k, uint held, uint locked) {
+    held &= GUI_MOD_SHIFT | GUI_MOD_CTRL | GUI_MOD_ALT | GUI_MOD_LOGO;
+    k->left &= held;
+    k->right &= held;
+    k->left |= held & ~(k->left | k->right);
+    k->mods = (locked & GUI_MOD_CAPS) | k->left | k->right;
+}
