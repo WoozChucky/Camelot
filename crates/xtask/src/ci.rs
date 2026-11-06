@@ -233,6 +233,12 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
+        what: "the GUI library (#183): drawing, text, images and widgets against their expected \
+               images, the damage lists, the keyboard, UTF-8, and the Wayland client against a \
+               scripted display server",
+        args: &["-p", "xtask", "--test", "gui"],
+    },
+    Step {
         what: "the committed examples, boot programs and hello are current; a boot block and the root \
                images of both profiles boot, its /usr what the programs are linked from",
         args: &[

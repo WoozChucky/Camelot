@@ -3,7 +3,7 @@
 //!
 //! Every `kernel/user/*.c`, `*.s` and `*.S` is one program, but for the start
 //! code linked first into each of them ([`RUNTIME`]: `crt0.S`, which becomes
-//! `crt0.o`), and so is every subdirectory but `lib/`: a program of several
+//! `crt0.o`), and so is every subdirectory but `lib/` and `gui/`: a program of several
 //! files (`kernel/user/as/*.c` is `as`), each compiled and assembled on its
 //! own and linked together, in name order. The C library, `kernel/user/lib/`
 //! ([`LIB_DIR`]), the system call stubs `usys.s` among its files, is an
@@ -11,19 +11,24 @@
 //! member `printf.o`, that goes into a program only if the program needs
 //! something it defines (`merlin_ld::library`, as ld.lld links an
 //! archive), so a program that never calls malloc carries neither its code
-//! nor its data. Our own tools build them, in memory, with no LLVM: merlin
+//! nor its data. The GUI library, `kernel/user/gui/` ([`GUI_DIR`], spec
+//! section 10, "The GUI library"), is a second archive, `libgui.a`
+//! ([`LIBGUI`]), made the same way: a program that draws links its members
+//! too, and one that doesn't is the same program with or without it. Our
+//! own tools build them, in memory, with no LLVM: merlin
 //! compiles each C file to assembly, merlin-as assembles that and the `.s`
 //! files, the elf crate archives the library's objects as llvm-ar would
 //! (`elf::archive`), and merlin-ld links each program as a C program is
-//! linked on Linux, the start code first, the library last:
+//! linked on Linux, the start code first, the libraries last:
 //!
 //! ```text
-//! ld -T user.ld -o PROG crt0.o PROG.o... libc.a
+//! ld -T user.ld -o PROG crt0.o PROG.o... libgui.a libc.a
 //! ```
 //!
-//! The root image's `/usr/lib` holds that `crt0.o` and `libc.a`, and
-//! `/usr/include` the header ([`crate::fs`]), so the same link on Camelot
-//! (`ld -T /usr/lib/user.ld -o PROG /usr/lib/crt0.o PROG.o -L/usr/lib -lc`)
+//! The root image's `/usr/lib` holds that `crt0.o`, `libgui.a` and
+//! `libc.a`, and `/usr/include` the headers ([`crate::fs`]), so the same
+//! link on Camelot (`ld -T /usr/lib/user.ld -o PROG /usr/lib/crt0.o PROG.o
+//! -L/usr/lib -lgui -lc`, or `-lc` alone for a program that doesn't draw)
 //! gives the same bytes. The start code and the library are built once for
 //! all the programs. The
 //! executables then go into the kernel's `userprogs.s` ([`generate`]) as ELF
@@ -58,9 +63,15 @@ pub const RUNTIME: &[&str] = &["crt0.S"];
 pub const LIB_DIR: &str = "lib";
 /// The C library's archive: what `-lc` finds.
 pub const LIBC: &str = "libc.a";
-/// The header the programs and the library include, besides `<asm.h>` for
-/// the assembly: what the root image's `/usr/include` holds.
-pub const HEADERS: &[&str] = &["user.h"];
+/// The GUI library's directory, under [`USER_DIR`]: every `.c`, `.s` and
+/// `.S` file in it is a member of the GUI library (#183).
+pub const GUI_DIR: &str = "gui";
+/// The GUI library's archive: what `-lgui` finds.
+pub const LIBGUI: &str = "libgui.a";
+/// The headers the programs and the libraries include, besides `<asm.h>`
+/// for the assembly: what the root image's `/usr/include` holds. `gui.h`
+/// is the GUI library's, and includes `user.h`.
+pub const HEADERS: &[&str] = &["user.h", "gui.h"];
 /// The linker script every program is linked with.
 pub const SCRIPT: &str = "user.ld";
 /// Where a `.S` file finds `<asm.h>` (the repository's `include/`, as the
@@ -73,7 +84,8 @@ pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
 /// smallest machine, 3 MiB, has left once the kernel and the programs it
 /// embeds, a little over 2 MiB, are loaded. `ar` makes and reads archives
 /// for them, files too, and `cc1`, the C compiler, is bigger than both.
-pub const DISK_ONLY: &[&str] = &["ar", "as", "cc1", "ld"];
+/// `guidemo` and `guitest` read the desktop image's fonts and images.
+pub const DISK_ONLY: &[&str] = &["ar", "as", "cc1", "guidemo", "guitest", "ld"];
 
 /// Programs of several files whose name is not their directory's: (the
 /// directory, the program). `kernel/user/cc` is `/bin/cc1`, the compiler
@@ -281,21 +293,33 @@ pub fn sources(dir: &Path) -> Result<Vec<Source>, String> {
 /// The library's members in `dir` (`dir/lib`), by file name, their stems
 /// starting with `lib/`. There may be none.
 pub fn library(dir: &Path) -> Result<Vec<Source>, String> {
-    let lib = dir.join(LIB_DIR);
+    library_in(dir, LIB_DIR)
+}
+
+/// The GUI library's members in `dir` (`dir/gui`), by file name, their
+/// stems starting with `gui/`. There may be none.
+pub fn gui_library(dir: &Path) -> Result<Vec<Source>, String> {
+    library_in(dir, GUI_DIR)
+}
+
+/// The members of the library in `dir/sub`, by file name, their stems
+/// starting with `sub/`. None if there is no such directory.
+fn library_in(dir: &Path, sub: &str) -> Result<Vec<Source>, String> {
+    let lib = dir.join(sub);
     if !lib.is_dir() {
         return Ok(Vec::new());
     }
     Ok(sources(&lib)?
         .into_iter()
         .map(|s| Source {
-            stem: format!("{LIB_DIR}/{}", s.stem),
+            stem: format!("{sub}/{}", s.stem),
             lang: s.lang,
         })
         .collect())
 }
 
 /// The programs in `dir`: every source but the [`RUNTIME`]'s, and every
-/// subdirectory but [`LIB_DIR`] that holds `.c` or `.s` files, by name. A
+/// subdirectory but [`LIB_DIR`] and [`GUI_DIR`] that holds `.c` or `.s` files, by name. A
 /// name must be [`valid_name`] and belong to one source only.
 pub fn programs(dir: &Path) -> Result<Vec<Source>, String> {
     let mut progs: Vec<Source> = sources(dir)?
@@ -308,7 +332,7 @@ pub fn programs(dir: &Path) -> Result<Vec<Source>, String> {
         let Ok(name) = e.file_name().into_string() else {
             continue;
         };
-        if name == LIB_DIR || !e.file_type().map_err(|e| e.to_string())?.is_dir() {
+        if name == LIB_DIR || name == GUI_DIR || !e.file_type().map_err(|e| e.to_string())?.is_dir() {
             continue;
         }
         if !sources(&e.path())?.is_empty() {
@@ -398,8 +422,8 @@ fn object(dir: &Path, src: &Source, cc: CCompiler) -> Result<merlin_ld::Input, S
     })
 }
 
-/// What every program is linked with: the start code first, the C library
-/// last.
+/// What every program is linked with: the start code first, the GUI
+/// library and the C library last.
 pub struct Runtime {
     /// The start code's objects, `crt0.o`.
     pub objects: Vec<merlin_ld::Input>,
@@ -409,6 +433,11 @@ pub struct Runtime {
     /// `libc.a`: the members in an archive, byte for byte as `llvm-ar rcs`
     /// writes it (`elf::archive::write`).
     pub archive: Vec<u8>,
+    /// The GUI library's members (`draw.o`), by file name; none in a
+    /// directory without `gui/`.
+    pub gui: Vec<merlin_ld::Input>,
+    /// `libgui.a`, as [`Runtime::archive`] is `libc.a`.
+    pub gui_archive: Vec<u8>,
     /// The same, installed ([`Runtime::stripped`]); `None` in a runtime
     /// that is already the installed one.
     installed: Option<Box<Runtime>>,
@@ -416,10 +445,17 @@ pub struct Runtime {
 
 impl Runtime {
     /// What a program made of `own` is linked from, in order: the start
-    /// code, `own`, then the library.
+    /// code, `own`, then the GUI library (if there is one) and the C
+    /// library, as `-lgui -lc`.
     pub fn link_inputs(&self, own: Vec<merlin_ld::Input>) -> Vec<merlin_ld::Input> {
         let mut inputs = self.objects.clone();
         inputs.extend(own);
+        if !self.gui.is_empty() {
+            inputs.push(merlin_ld::Input {
+                name: LIBGUI.into(),
+                data: self.gui_archive.clone(),
+            });
+        }
         inputs.push(merlin_ld::Input {
             name: LIBC.into(),
             data: self.archive.clone(),
@@ -449,11 +485,15 @@ impl Runtime {
         };
         let objects = strip(&self.objects)?;
         let library = strip(&self.library)?;
-        let archive = archive(&library)?;
+        let libc = archive(&library, LIBC)?;
+        let gui = strip(&self.gui)?;
+        let gui_archive = archive(&gui, LIBGUI)?;
         Ok(Runtime {
             objects,
             library,
-            archive,
+            archive: libc,
+            gui,
+            gui_archive,
             installed: None,
         })
     }
@@ -465,9 +505,9 @@ impl Runtime {
     }
 }
 
-/// The library's members in an archive (`libc.a`), as `llvm-ar rcs` writes
-/// it.
-fn archive(library: &[merlin_ld::Input]) -> Result<Vec<u8>, String> {
+/// A library's members in an archive (`libc.a`, called `name`), as `llvm-ar
+/// rcs` writes it.
+fn archive(library: &[merlin_ld::Input], name: &str) -> Result<Vec<u8>, String> {
     let members: Vec<elf::archive::NewMember> = library
         .iter()
         .map(|m| elf::archive::NewMember {
@@ -475,7 +515,7 @@ fn archive(library: &[merlin_ld::Input]) -> Result<Vec<u8>, String> {
             data: &m.data,
         })
         .collect();
-    elf::archive::write(&members).map_err(|e| format!("{LIBC}: {}", e.0))
+    elf::archive::write(&members).map_err(|e| format!("{name}: {}", e.0))
 }
 
 /// The name a source has in the C library's archive: its file name's stem
@@ -486,8 +526,8 @@ pub fn member_name(src: &Source) -> String {
     format!("{stem}.o")
 }
 
-/// Builds the [`RUNTIME`] and the library in `dir`, their C compiled by
-/// `cc`, and archives the library. Two library files with one stem
+/// Builds the [`RUNTIME`] and the libraries in `dir`, their C compiled by
+/// `cc`, and archives the libraries. Two library files with one stem
 /// (`x.c`, `x.s`) are an error: their members would have one name.
 pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
     let objects = runtime()
@@ -500,14 +540,37 @@ pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
             })
         })
         .collect::<Result<_, String>>()?;
-    let sources = library(dir)?;
+    let library = members(dir, LIB_DIR, &library(dir)?, cc)?;
+    let libc = archive(&library, LIBC)?;
+    let gui = members(dir, GUI_DIR, &gui_library(dir)?, cc)?;
+    let gui_archive = archive(&gui, LIBGUI)?;
+    let mut rt = Runtime {
+        objects,
+        library,
+        archive: libc,
+        gui,
+        gui_archive,
+        installed: None,
+    };
+    rt.installed = Some(Box::new(rt.stripped()?));
+    Ok(rt)
+}
+
+/// The objects of a library's `sources` (in `dir/sub`), named as in its
+/// archive ([`member_name`]).
+fn members(
+    dir: &Path,
+    sub: &str,
+    sources: &[Source],
+    cc: CCompiler,
+) -> Result<Vec<merlin_ld::Input>, String> {
     let mut library: Vec<merlin_ld::Input> = Vec::new();
-    for s in &sources {
+    for s in sources {
         let name = member_name(s);
         if library.iter().any(|m| m.name == name) {
             return Err(format!(
                 "{}: two library files make the member {name}",
-                dir.join(LIB_DIR).display()
+                dir.join(sub).display()
             ));
         }
         library.push(merlin_ld::Input {
@@ -515,19 +578,11 @@ pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
             data: object(dir, s, cc)?.data,
         });
     }
-    let archive = archive(&library)?;
-    let mut rt = Runtime {
-        objects,
-        library,
-        archive,
-        installed: None,
-    };
-    rt.installed = Some(Box::new(rt.stripped()?));
-    Ok(rt)
+    Ok(library)
 }
 
 /// Links program `prog` from `dir`: the start code, it compiled by `cc`
-/// (C) and assembled, then `libc.a`, of which merlin-ld takes the members
+/// (C) and assembled, then `libgui.a` and `libc.a`, of which merlin-ld takes the members
 /// it needs, linked with [`SCRIPT`] ([`Runtime::link_inputs`]). merlin-ld's
 /// warnings are errors here, but for clang's duplicate string literals in
 /// the reference build ([`toolchain::link_with`]).
@@ -649,15 +704,21 @@ pub fn clang_args(src: &Source, out: &Path) -> Vec<String> {
 }
 
 /// The reference build's first step: compiles every C file in `dir` and
-/// its library with `clang` to assembly, `X.c` to `out/X.s` and `lib/Y.c`
-/// to `out/lib/Y.s`, for [`CCompiler::Clang`]. clang runs inside `dir` with
+/// its libraries with `clang` to assembly, `X.c` to `out/X.s`, `lib/Y.c`
+/// to `out/lib/Y.s` and `gui/Z.c` to `out/gui/Z.s`, for [`CCompiler::Clang`]. clang runs inside `dir` with
 /// relative names, so the output doesn't depend on where the repository
 /// is.
 pub fn compile_clang(clang: &Path, dir: &Path, out: &Path, verbose: bool) -> Result<(), String> {
-    std::fs::create_dir_all(out.join(LIB_DIR))
-        .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+    for sub in [LIB_DIR, GUI_DIR] {
+        std::fs::create_dir_all(out.join(sub))
+            .map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+    }
     let out = std::path::absolute(out).map_err(|e| format!("bad path {}: {e}", out.display()))?;
-    let mut all: Vec<Source> = sources(dir)?.into_iter().chain(library(dir)?).collect();
+    let mut all: Vec<Source> = sources(dir)?
+        .into_iter()
+        .chain(library(dir)?)
+        .chain(gui_library(dir)?)
+        .collect();
     for prog in programs(dir)?.iter().filter(|p| p.lang == Lang::Dir) {
         std::fs::create_dir_all(out.join(&prog.stem))
             .map_err(|e| format!("cannot create {}: {e}", out.display()))?;

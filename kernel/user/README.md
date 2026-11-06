@@ -1,10 +1,12 @@
 # Camelot's user programs
 
 Every `X.c` or `X.s` here is a program called `X`, and so is every
-subdirectory `X/` other than `lib/` (a program of several files: `as/`),
+subdirectory `X/` other than `lib/` and `gui/` (a program of several files: `as/`),
 except `cc/`, which is `cc1`, the compiler proper (`userprogs::RENAMED`). They run in U-mode on
 the system calls of `docs/camelot-syscalls.md`, declared in `user.h` with
-the C library of `lib/` (see `lib/README.md`). Built by merlin, merlin-as
+the C library of `lib/` (see `lib/README.md`); the programs that draw
+also use the GUI library of `gui/`, declared in `gui.h` (see
+`gui/README.md`). Built by merlin, merlin-as
 and merlin-ld (`cargo xtask kernel`, which embeds them in the kernel for
 when there is no disk; `cargo xtask fs`, which installs them in `/bin` of
 the root image). The shell runs `NAME` as `/bin/NAME`.
@@ -14,8 +16,11 @@ and pointers 8 bytes), and the root image's `/bin` (`cargo xtask fs`'s
 `target/camelot-fs.img`) holds them all, `as` and `ld` writing RV64 objects
 and executables there. Each is linked as a C program is on Linux, the start
 code `crt0.o` first and the C library `libc.a` (`lib/`, an archive) last,
-and the root image's `/usr` holds what they are built from: `user.h` in
-`/usr/include`, and `crt0.o`, `libc.a` and `user.ld` in `/usr/lib`. Assembly that goes through the C preprocessor is a
+after the GUI library `libgui.a` (`gui/`, an archive too: a program takes
+only the members it uses, so one that draws nothing is the same without
+it), and the root image's `/usr` holds what they are built from: `user.h`
+and `gui.h` in `/usr/include`, and `crt0.o`, `libc.a`, `libgui.a` and
+`user.ld` in `/usr/lib`. Assembly that goes through the C preprocessor is a
 `.S` file, with `include/asm.h` for the names Linux's assembly gives a
 register's worth and a pointer (`REG_L`, `SZREG`).
 A program starts as Linux starts one: `main(argc, argv, envp)`, with the
@@ -207,6 +212,8 @@ shd: [7] 10.0.2.2:49152 ended, exit 0
 | `badload` | reads kernel memory: killed by a load page fault |
 | `badstore` | writes to its own read-only data: killed by a store page fault |
 | `badhalt` | executes `xcal.halt`, which is M-mode only: killed by an illegal instruction |
+| `guitest` | `guitest SCENE [DIR]`: draws a scene of the GUI library into memory and writes it to `DIR/SCENE.ppm` (`draw`, `text`, `image`; `widgets` writes `widgets.ppm` and `input.ppm`, after input, and prints the actions), prints what the parts that draw nothing did (`damage`, `keys`, `utf8`, `wire`), or, `wayland`, is a scripted display server on `/run/wayland-0` that runs `guidemo`, prints its requests and writes the frames it commits. Only in `/bin` of the desktop's image |
+| `guidemo` | the GUI library's demonstration, a Wayland client: a window with menus, a text field, a list of knights, a status line and buttons. Only in `/bin` of the desktop's image |
 
 `crates/xtask/tests/coreutils.rs` boots Camelot with the root image and
 runs each basic program, its errors included, from the shell, and checks
