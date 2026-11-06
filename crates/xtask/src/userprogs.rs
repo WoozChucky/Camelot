@@ -81,9 +81,13 @@ pub const DISK_ONLY: &[&str] = &["ar", "as", "cc1", "ld"];
 /// are, which the `cc` driver runs (#242).
 pub const RENAMED: &[(&str, &str)] = &[("cc", "cc1")];
 
-/// The name of the program whose source's stem is `stem`: the stem itself,
-/// but for a directory of [`RENAMED`].
-pub fn program_name(stem: &str) -> &str {
+/// The name of the program whose source's stem is `stem`, of language
+/// `lang`: the stem itself, but for a directory ([`Lang::Dir`]) of
+/// [`RENAMED`] (a file `cc.c` is the program `cc`).
+pub fn program_name(stem: &str, lang: Lang) -> &str {
+    if lang != Lang::Dir {
+        return stem;
+    }
     RENAMED
         .iter()
         .find(|(dir, _)| *dir == stem)
@@ -170,7 +174,7 @@ impl Source {
 
     /// The name of the program it is, as `/bin` has it ([`program_name`]).
     pub fn name(&self) -> &str {
-        program_name(&self.stem)
+        program_name(&self.stem, self.lang)
     }
 
     /// The files a program is built from: itself, or, for a [`Lang::Dir`]
@@ -921,6 +925,27 @@ mod tests {
         std::fs::remove_file(dir.join("a.c")).unwrap();
         std::fs::write(dir.join("Bad-Name.s"), "").unwrap();
         assert!(program_names(&dir).unwrap_err().contains("a program name is"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory of RENAMED is the program it names, and only the
+    /// directory: `cc/` is `cc1`, `cc.c` next to it the program `cc` (the
+    /// driver, #242).
+    #[test]
+    fn only_a_directory_is_renamed() {
+        assert_eq!(program_name("cc", Lang::Dir), "cc1");
+        assert_eq!(program_name("cc", Lang::C), "cc");
+        assert_eq!(program_name("as", Lang::Dir), "as");
+        let dir = scratch("renamed");
+        write_runtime(&dir);
+        std::fs::create_dir_all(dir.join("cc")).unwrap();
+        std::fs::write(dir.join("cc").join("main.c"), "").unwrap();
+        assert_eq!(program_names(&dir).unwrap(), ["cc1"]);
+        std::fs::write(dir.join("cc.c"), "").unwrap();
+        assert_eq!(program_names(&dir).unwrap(), ["cc", "cc1"]);
+        let progs = programs(&dir).unwrap();
+        assert_eq!(progs, [src("cc", Lang::C), src("cc", Lang::Dir)]);
+        assert_eq!(progs[1].parts(&dir).unwrap(), [src("cc/main", Lang::C)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
