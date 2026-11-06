@@ -974,6 +974,48 @@ void vec_truncate(struct vec *l, uint n) {
     }
 }
 
+/* ---- Sorting ---- */
+
+/* Merges the sorted runs v[lo..mid) and v[mid..hi) through tmp, taking
+ * from the left run while the right one's next element is not before it:
+ * equal elements keep their order. */
+static void merge_runs(void **v, void **tmp, uint lo, uint mid, uint hi, int (*before)(void *a, void *b)) {
+    uint i = lo;
+    uint j = mid;
+    uint k = lo;
+    while (i < mid && j < hi) {
+        if (before(v[j], v[i])) {
+            tmp[k++] = v[j++];
+        } else {
+            tmp[k++] = v[i++];
+        }
+    }
+    while (i < mid) {
+        tmp[k++] = v[i++];
+    }
+    while (j < hi) {
+        tmp[k++] = v[j++];
+    }
+    memcpy(v + lo, tmp + lo, (hi - lo) * sizeof(void *));
+}
+
+/* A bottom-up merge sort: runs of 1, 2, 4... elements merged in pairs.
+ * O(n log n), and stable, as Rust's sort is. */
+void sort_stable(void **v, uint n, int (*before)(void *a, void *b)) {
+    if (n < 2) {
+        return;
+    }
+    void **tmp = heap_alloc((size_t)n * sizeof(void *));
+    for (uint width = 1; width < n; width = width > n / 2 ? n : width * 2) {
+        for (uint lo = 0; lo + width < n; lo += 2 * width) {
+            uint mid = lo + width;
+            uint hi = n - mid > width ? mid + width : n;
+            merge_runs(v, tmp, lo, mid, hi, before);
+        }
+    }
+    heap_free(tmp);
+}
+
 /* ---- Position maps ---- */
 
 static uint pos_hash(struct pos p) {

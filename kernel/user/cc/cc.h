@@ -364,6 +364,10 @@ struct vec vec_split_off(struct vec *l, uint at);
 void vec_insert(struct vec *l, uint at, void *p);
 void *vec_remove(struct vec *l, uint at);
 void vec_truncate(struct vec *l, uint n);
+/* Sorts the n pointers at v so that none comes before one it is `before`,
+ * keeping the order of those neither is before (a stable sort, as Rust's
+ * sort and sort_by_key are), in O(n log n). */
+void sort_stable(void **v, uint n, int (*before)(void *a, void *b));
 
 /* A map from positions to pointers, and a set of positions (a map whose
  * values are not looked at): Rust's HashMap<Pos, _> and HashSet<Pos>. */

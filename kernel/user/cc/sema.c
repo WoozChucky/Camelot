@@ -349,25 +349,25 @@ static struct pos expr_loc(struct expr *e) {
     }
 }
 
-/* The operands of e, in order. */
-static uint children(struct expr *e, struct expr ***out) {
-    static struct expr *buf[3];
+/* The operands of e, in order, in a vector of their own (merlin's
+ * children). */
+static struct vec child_vec(struct expr *e) {
+    struct vec v;
+    memset(&v, 0, sizeof v);
     switch (e->kind) {
+    case E_COND:
+        vec_push(&v, e->x);
+        vec_push(&v, e->y);
+        vec_push(&v, e->z);
+        break;
     case E_BINARY:
     case E_COMMA:
     case E_VA_COPY:
     case E_ASSIGN:
     case E_VA_START:
-        buf[0] = e->x;
-        buf[1] = e->y;
-        *out = buf;
-        return 2;
-    case E_COND:
-        buf[0] = e->x;
-        buf[1] = e->y;
-        buf[2] = e->z;
-        *out = buf;
-        return 3;
+        vec_push(&v, e->x);
+        vec_push(&v, e->y);
+        break;
     case E_INCDEC:
     case E_UNARY:
     case E_ADDR:
@@ -376,32 +376,17 @@ static uint children(struct expr *e, struct expr ***out) {
     case E_MEMBER:
     case E_VA_ARG:
     case E_VA_END:
-        buf[0] = e->x;
-        *out = buf;
-        return 1;
-    case E_CALL: {
-        struct expr **all = arena_alloc((e->nargs + 1) * sizeof(struct expr *));
-        all[0] = e->x;
+        vec_push(&v, e->x);
+        break;
+    case E_CALL:
+        vec_push(&v, e->x);
         for (uint i = 0; i < e->nargs; i++) {
-            all[i + 1] = e->args[i];
+            vec_push(&v, e->args[i]);
         }
-        *out = all;
-        return e->nargs + 1;
-    }
+        break;
     default:
-        *out = buf;
-        return 0;
-    }
-}
-
-/* The operands of e, in a vector of their own. */
-static struct vec child_vec(struct expr *e) {
-    struct expr **k;
-    uint n = children(e, &k);
-    struct vec v;
-    memset(&v, 0, sizeof v);
-    for (uint i = 0; i < n; i++) {
-        vec_push(&v, k[i]);
+        /* No operands: a literal, a name, sizeof, a compound literal. */
+        break;
     }
     return v;
 }
@@ -1302,6 +1287,13 @@ struct definition {
     struct type *ty;
 };
 
+/* Whether definition a's declarator comes before b's. */
+static int definition_before(void *a, void *b) {
+    struct definition *x = a;
+    struct definition *y = b;
+    return x->item < y->item || (x->item == y->item && x->decl < y->decl);
+}
+
 /* Marks the declarator that defines each global variable: the one with an
  * initializer, or the first that is not extern (C's tentative definition,
  * which then means zero). */
@@ -1323,21 +1315,17 @@ static void mark_definitions(struct checker *ck, struct program *prog) {
         defs[n].ty = !v->has_init && v->tentative_ty != NULL ? v->tentative_ty : v->ty;
         n++;
     }
-    /* By where the declarator is (each at one place: a stable sort is not
-     * needed). */
-    for (uint i = 1; i < n; i++) {
-        struct definition d = defs[i];
-        uint j = i;
-        while (j > 0 && (defs[j - 1].item > d.item || (defs[j - 1].item == d.item && defs[j - 1].decl > d.decl))) {
-            defs[j] = defs[j - 1];
-            j--;
-        }
-        defs[j] = d;
-    }
+    /* By where the declarator is (each at one place). */
+    struct definition **order = heap_alloc((n + 1) * sizeof(struct definition *));
     for (uint k = 0; k < n; k++) {
-        struct item *it = prog->items.v[defs[k].item];
-        struct declarator *d = it->decls.v[defs[k].decl];
-        struct type *ty = defs[k].init && ty_size(d->ty) >= 0 ? d->ty : defs[k].ty;
+        order[k] = &defs[k];
+    }
+    sort_stable((void **)order, n, definition_before);
+    for (uint k = 0; k < n; k++) {
+        struct definition *def = order[k];
+        struct item *it = prog->items.v[def->item];
+        struct declarator *d = it->decls.v[def->decl];
+        struct type *ty = def->init && ty_size(d->ty) >= 0 ? d->ty : def->ty;
         if (ty->kind == TY_ARRAY && !ty->has_len && ty_size(ty->to) >= 0) {
             /* `int a[];` and nothing more: an array of one element, with
              * clang's warning. */
@@ -1356,6 +1344,7 @@ static void mark_definitions(struct checker *ck, struct program *prog) {
         d->define = 1;
         d->ty = ty;
     }
+    heap_free(order);
     heap_free(defs);
 }
 
@@ -1524,17 +1513,31 @@ static const char *case_name(struct expr *e) {
     return NULL;
 }
 
-/* A stable sort of case labels by value (insertion sort). */
+static int label_before(void *a, void *b) {
+    return i128_lt(((struct case_label *)a)->value, ((struct case_label *)b)->value);
+}
+
+/* Sorts case labels by value, keeping the order of those of one value
+ * (merlin's sort_by_key, a stable sort). */
 static void sort_labels(struct case_label **l, uint n) {
-    for (uint i = 1; i < n; i++) {
-        struct case_label *x = l[i];
-        uint j = i;
-        while (j > 0 && i128_lt(x->value, l[j - 1]->value)) {
-            l[j] = l[j - 1];
-            j--;
-        }
-        l[j] = x;
-    }
+    sort_stable((void **)l, n, label_before);
+}
+
+/* The case values of one switch are of its promoted type, so the low 64
+ * bits tell them apart: a set of them is a map of those (merlin's
+ * HashSet<i128>). */
+static void value_set_add(struct intmap *set, i128 v) {
+    intmap_put(set, v.lo, (void *)1);
+}
+
+static int value_set_has(struct intmap *set, i128 v) {
+    return intmap_has(set, v.lo);
+}
+
+static void value_set_free(struct intmap *set) {
+    heap_free(set->keys);
+    heap_free(set->values);
+    heap_free(set->used);
 }
 
 /* Where clang reports e where it does not look through parentheses: at the
@@ -1590,15 +1593,6 @@ static struct pos begin_inside(struct fnc *c, struct expr *e) {
     default:
         return e->pos;
     }
-}
-
-static int has_value(struct case_label **l, uint n, i128 v) {
-    for (uint i = 0; i < n; i++) {
-        if (i128_eq(l[i]->value, v)) {
-            return 1;
-        }
-    }
-    return 0;
 }
 
 /* clang's checks of a switch's cases, as it ends (ActOnFinishSwitchStmt):
@@ -1675,18 +1669,30 @@ static int finish_switch(struct fnc *c, struct switch_ctx *ctx, struct expr *con
             cs[m++] = cs[i];
         }
     }
+    struct intmap known;
+    memset(&known, 0, sizeof known);
+    for (uint i = 0; i < m; i++) {
+        value_set_add(&known, cs[i]->value);
+    }
     for (uint i = 0; i < n; i++) {
-        if (!has_value(cs, m, sorted[i]->value)) {
+        if (!value_set_has(&known, sorted[i]->value)) {
             push(c, diag_warning(sorted[i]->loc, fmt("case value not in enumerated type %s", named), "switch"));
         }
+    }
+    struct intmap handled;
+    memset(&handled, 0, sizeof handled);
+    for (uint i = 0; i < n; i++) {
+        value_set_add(&handled, sorted[i]->value);
     }
     struct vec unhandled;
     memset(&unhandled, 0, sizeof unhandled);
     for (uint i = 0; i < m; i++) {
-        if (!has_value(sorted, n, cs[i]->value)) {
+        if (!value_set_has(&handled, cs[i]->value)) {
             vec_push(&unhandled, fmt("'%s'", cs[i]->name));
         }
     }
+    value_set_free(&known);
+    value_set_free(&handled);
     if (!ctx->has_default && unhandled.n > 0) {
         char **u = (char **)unhandled.v;
         const char *msg;
@@ -1821,20 +1827,18 @@ static void switch_stmt(struct fnc *c, struct stmt *s) {
     /* The first case of each value is the one taken. */
     s->cases = arena_alloc(ctx->labels.n * sizeof(struct case_ref) + 1);
     s->ncases = 0;
+    struct intmap seen;
+    memset(&seen, 0, sizeof seen);
     for (uint i = 0; i < ctx->labels.n; i++) {
         struct case_label *l = ctx->labels.v[i];
-        int seen = 0;
-        for (uint k = 0; k < s->ncases; k++) {
-            if (i128_eq(s->cases[k].value, l->value)) {
-                seen = 1;
-            }
-        }
-        if (!seen) {
+        if (!value_set_has(&seen, l->value)) {
+            value_set_add(&seen, l->value);
             s->cases[s->ncases].value = l->value;
             s->cases[s->ncases].id = l->id;
             s->ncases++;
         }
     }
+    value_set_free(&seen);
     s->id = ctx->has_default ? (int)ctx->default_id : -1;
 }
 
@@ -1982,13 +1986,15 @@ static void stmt(struct fnc *c, struct stmt *s) {
         }
         break;
     }
-    default: {
+    case S_GOTO: {
         struct goto_ref *g = arena_alloc(sizeof *g);
         g->name = s->name;
         g->pos = s->at;
         vec_push(&c->gotos, g);
         break;
     }
+    default:
+        die("sema: a statement of no kind");
     }
 }
 
@@ -2262,11 +2268,9 @@ static void full(struct fnc *c, struct expr *e) {
         } else if (x->kind == E_SIZEOF_EXPR || x->kind == E_SIZEOF_TYPE) {
             /* Not evaluated. */
         } else {
-            struct expr **k;
-            uint n = children(x, &k);
-            for (uint i = 0; i < n; i++) {
-                vec_push(&work, k[i]);
-            }
+            struct vec k = child_vec(x);
+            vec_extend(&work, &k);
+            heap_free(k.v);
             if (x->kind == E_BINARY && (x->op == OP_LOGAND || x->op == OP_LOGOR)) {
                 /* `p && "message"` is an assertion's idiom. */
                 struct expr *ops[2];
@@ -4337,8 +4341,7 @@ static int check_expr(struct fnc *c, struct expr *e) {
             return 1;
         }
         break;
-    default: {
-        /* A compound literal. */
+    case E_COMPOUND: {
         ty = e->ty;
         /* Its list as written, before sema braces it fully, for clang's
          * messages that name it. */
@@ -4367,6 +4370,8 @@ static int check_expr(struct fnc *c, struct expr *e) {
         }
         break;
     }
+    default:
+        die("sema: an expression of no kind");
     }
     e->ty = ty;
     return 0;
