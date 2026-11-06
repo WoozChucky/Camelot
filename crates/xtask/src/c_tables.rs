@@ -134,6 +134,10 @@ pub fn generate_cc_h() -> String {
     );
     let _ = writeln!(s, "#define MAX_DEPTH {}", merlin::parser::MAX_DEPTH);
     let _ = writeln!(s, "#define MAX_PARAMS {}", merlin::parser::MAX_PARAMS);
+    s.push_str(
+        "\n/* The registers' ABI names, x0 to x31 (excalibur's reg::ABI_NAMES): no symbol may have\n \
+         * one (merlin's codegen). */\nextern const char *const REG_NAMES[32];\n",
+    );
     s.push_str("\n#endif\n");
     s
 }
@@ -202,6 +206,12 @@ pub fn generate_cc_c() -> String {
         }
         s.push_str("};\n");
     }
+    s.push_str("\nconst char *const REG_NAMES[32] = {\n");
+    for chunk in excalibur::reg::ABI_NAMES.chunks(8) {
+        let names: Vec<String> = chunk.iter().map(|n| c_string(n)).collect();
+        let _ = writeln!(s, "    {},", names.join(", "));
+    }
+    s.push_str("};\n");
     s
 }
 

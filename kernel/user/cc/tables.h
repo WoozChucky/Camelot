@@ -81,4 +81,8 @@ extern const char *const STATEMENT_KEYWORDS[NSTATEMENT_KEYWORDS];
 #define MAX_DEPTH 256
 #define MAX_PARAMS 127
 
+/* The registers' ABI names, x0 to x31 (excalibur's reg::ABI_NAMES): no symbol may have
+ * one (merlin's codegen). */
+extern const char *const REG_NAMES[32];
+
 #endif

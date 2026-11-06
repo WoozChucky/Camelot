@@ -1108,6 +1108,17 @@ int abi_returns_in_memory(struct type *ret);
 uint abi_call_arguments(struct type *ret, struct type **args, uint n, uint *words, int *passes);
 uint abi_stack_words(uint total);
 
+/* ---- What a constant condition leaves out (elide.c, merlin's elide.rs) ---- */
+
+/* clang's ContainsLabel, containsBreak and mightAddDeclToScope. */
+int contains_label(struct stmt *s, int ignore_cases);
+int contains_break(struct stmt *s);
+int might_add_decl(struct stmt *s);
+/* The statements switch sw on the constant value runs (clang's
+ * FindCaseStatementsForValue): 1 and them in *out, or 0 if they cannot be
+ * picked out. */
+int case_statements(struct stmt *sw, i128 value, struct vec *out);
+
 /* ---- Code generation (codegen.c, merlin's codegen.rs) ---- */
 
 /* The assembly of a checked program (merlin's generate_with, without -g):
