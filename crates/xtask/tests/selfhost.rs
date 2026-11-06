@@ -2004,8 +2004,9 @@ fn image_path(rel: &str) -> String {
 /// switch, goto, the initializers clang copies from a constant,
 /// designators, strings, static locals, the preprocessor), one of each
 /// other directory of merlin's tests (`cases-merlin`, `multi`, `abi`), a
-/// file of the kernel's and a user program; and, for `-E`, the kernel's
-/// linker script, its entry, the start code and an example's assembly.
+/// file of the kernel's, a user program, the GUI library's drawing and a
+/// program of it; and, for `-E`, the kernel's linker script, its entry,
+/// the start code and an example's assembly.
 const SAMPLED: &[&str] = &[
     "crates/merlin/tests/cases/structs.c",
     "crates/merlin/tests/cases/unions.c",
@@ -2026,6 +2027,8 @@ const SAMPLED: &[&str] = &[
     "crates/merlin/tests/abi/merlin_side.c",
     "kernel/pipe.c",
     "kernel/user/cat.c",
+    "kernel/user/gui/draw.c",
+    "kernel/user/guidemo.c",
     "kernel/kernel.lds.S",
     "kernel/entry.S",
     "kernel/user/crt0.S",
