@@ -379,6 +379,9 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
             "wltest: global 3 wl_seat 1",
             "wltest: global 4 wl_output 2",
             "wltest: global 5 xdg_wm_base 1",
+            "wltest: global 6 wl_data_device_manager 1",
+            "wltest: global 7 zwlr_layer_shell_v1 1",
+            "wltest: global 8 zwlr_foreign_toplevel_manager_v1 1",
         ]
     );
     for (kind, error) in [
@@ -408,14 +411,14 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
     d.run("wltest window fine 808080 100 60 &");
     d.wait_for("wltest fine: shown\n");
 
-    // Four clients at once, and no more: the fifth is refused.
-    for name in ["two", "three", "four"] {
+    // Eight clients at once, and no more: the ninth is refused.
+    for name in ["two", "three", "four", "five", "six", "seven", "eight"] {
         d.run(&format!("wltest window {name} 808080 60 40 &"));
         d.wait_for(&format!("wltest {name}: shown\n"));
     }
-    d.run("wltest window five 808080 60 40");
+    d.run("wltest window nine 808080 60 40");
     d.wait_for("compositor: too many clients: one refused\n");
-    d.wait_for("wltest five: can't connect");
+    d.wait_for("wltest nine: can't connect");
 }
 
 #[test]

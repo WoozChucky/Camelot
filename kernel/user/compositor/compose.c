@@ -8,9 +8,10 @@
  * Only what changed is drawn again: the rectangles damaged since the last
  * frame (gui_damage), and those the last frame drew, which the frame drawn
  * now, two frames old, lacks. Each is drawn from the bottom up: the
- * background, each window in stacking order (its border, title bar and
- * close button, drawn with the GUI library, and its content, copied, or
- * blended for an ARGB8888 surface), the pointer's arrow on top. */
+ * background, the layer surfaces under the windows, each window in
+ * stacking order (its border, title bar and close button, drawn with the
+ * GUI library, and its content, copied, or blended for an ARGB8888
+ * surface), the layer surfaces over them, the pointer's arrow on top. */
 #include "compositor.h"
 
 #define BACKGROUND GUI_RGB(0x2e, 0x4a, 0x62)
@@ -30,16 +31,25 @@ struct gui_rect window_content(const struct window *w) {
 
 struct gui_rect window_title(const struct window *w) {
     struct gui_rect c = window_content(w);
+    if (w->layer >= 0) {
+        return gui_rect(c.x, c.y, 0, 0); /* a layer surface has no decorations */
+    }
     return gui_rect(c.x, c.y - TITLE_H, c.w, TITLE_H);
 }
 
 struct gui_rect window_frame(const struct window *w) {
     struct gui_rect c = window_content(w);
+    if (w->layer >= 0) {
+        return c;
+    }
     return gui_rect(c.x - BORDER, c.y - TITLE_H - BORDER, c.w + 2 * BORDER, c.h + TITLE_H + 2 * BORDER);
 }
 
 struct gui_rect window_close_button(const struct window *w) {
     struct gui_rect t = window_title(w);
+    if (w->layer >= 0) {
+        return t;
+    }
     int margin = (TITLE_H - CLOSE_SIZE) / 2;
     return gui_rect(t.x + t.w - margin - CLOSE_SIZE, t.y + margin, CLOSE_SIZE, CLOSE_SIZE);
 }
@@ -100,6 +110,7 @@ int screen_init(void) {
     srv.have_cursor = gui_image_load(&srv.cursor, CURSOR_PATH) == 0;
     srv.px = srv.width / 2;
     srv.py = srv.height / 2;
+    srv.work = gui_rect(0, 0, srv.width, srv.height);
     /* The second frame drawn whole and flipped to; the first is drawn whole
      * once that flip is done (it is the last frame's damage then). */
     gui_damage_clear(&srv.damage);
@@ -111,11 +122,31 @@ int screen_init(void) {
     return 0;
 }
 
+/* A surface's content, inside the clip. */
+static void draw_content(struct gui_buffer *fb, struct window *w, struct gui_rect clip) {
+    struct gui_rect content = gui_rect_intersect(window_content(w), clip);
+    if (gui_rect_empty(content)) {
+        return;
+    }
+    gui_clip(fb, content);
+    struct gui_buffer *src = &w->surface->content;
+    struct gui_rect from = gui_rect(0, 0, src->width, src->height);
+    if (w->surface->argb) {
+        gui_blend(fb, w->x, w->y, src, from);
+    } else {
+        gui_blit(fb, w->x, w->y, src, from);
+    }
+}
+
 /* A window's decorations and content, inside the frame's clip. */
 static void draw_window(struct gui_buffer *fb, struct window *w, struct gui_rect clip) {
     struct gui_rect frame = window_frame(w);
     struct gui_rect area = gui_rect_intersect(frame, clip);
     if (gui_rect_empty(area)) {
+        return;
+    }
+    if (w->layer >= 0) {
+        draw_content(fb, w, clip);
         return;
     }
     gui_clip(fb, area);
@@ -136,17 +167,7 @@ static void draw_window(struct gui_buffer *fb, struct window *w, struct gui_rect
     gui_fill(fb, button, CLOSE_FILL);
     gui_line(fb, button.x + 3, button.y + 3, button.x + button.w - 4, button.y + button.h - 4, CLOSE_MARK);
     gui_line(fb, button.x + button.w - 4, button.y + 3, button.x + 3, button.y + button.h - 4, CLOSE_MARK);
-    struct gui_rect content = gui_rect_intersect(window_content(w), clip);
-    if (!gui_rect_empty(content)) {
-        gui_clip(fb, content);
-        struct gui_buffer *src = &w->surface->content;
-        struct gui_rect from = gui_rect(0, 0, src->width, src->height);
-        if (w->surface->argb) {
-            gui_blend(fb, w->x, w->y, src, from);
-        } else {
-            gui_blit(fb, w->x, w->y, src, from);
-        }
-    }
+    draw_content(fb, w, clip);
 }
 
 static void draw_cursor(struct gui_buffer *fb, struct gui_rect clip) {
@@ -166,8 +187,16 @@ static void draw_cursor(struct gui_buffer *fb, struct gui_rect clip) {
 static void draw(struct gui_buffer *fb, struct gui_rect r) {
     gui_clip(fb, r);
     gui_fill(fb, r, BACKGROUND);
+    for (int i = 0; i < srv.nlayers && srv.layers[i]->layer < ZWLR_LAYER_SHELL_V1_LAYER_TOP; i++) {
+        draw_window(fb, srv.layers[i], r);
+    }
     for (int i = 0; i < srv.nstack; i++) {
         draw_window(fb, srv.stack[i], r);
+    }
+    for (int i = 0; i < srv.nlayers; i++) {
+        if (srv.layers[i]->layer >= ZWLR_LAYER_SHELL_V1_LAYER_TOP) {
+            draw_window(fb, srv.layers[i], r);
+        }
     }
     draw_cursor(fb, r);
     gui_unclip(fb);

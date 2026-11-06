@@ -516,6 +516,74 @@ int gui_window_commit(struct gui_window *w);
 /* Asks the server to move the window with the pointer (the last button
  * press's serial), as a client-drawn title bar does. */
 void gui_window_move(struct gui_window *w);
+/* A new title for the window (xdg_toplevel.set_title). */
+void gui_window_set_title(struct gui_window *w, const char *title);
+
+/* ---- Layer surfaces: wlroots' layer shell (protocols/wlr-layer-shell-
+ * unstable-v1.xml) ----
+ *
+ * A surface that is part of the desktop rather than a window: no
+ * decorations, on one of four layers (the background, under the windows,
+ * over them, over everything), placed by the server at the screen's edges
+ * it is anchored to. An `exclusive` zone keeps that many pixels at its
+ * edge free of windows (the panel's bar); 0 places it clear of the others'
+ * zones, -1 anywhere. `keyboard` 1 gives it the keyboard while it is shown
+ * (the launcher's menu). A width or height of 0 is the screen's, between
+ * the two edges it is anchored to. The window's handlers are a window's,
+ * `close` when the server takes it away. NULL if the server has no layer
+ * shell (gui_has_layers) or it can't be made. */
+#define GUI_LAYER_BACKGROUND 0
+#define GUI_LAYER_BOTTOM 1
+#define GUI_LAYER_TOP 2
+#define GUI_LAYER_OVERLAY 3
+#define GUI_ANCHOR_TOP 1
+#define GUI_ANCHOR_BOTTOM 2
+#define GUI_ANCHOR_LEFT 4
+#define GUI_ANCHOR_RIGHT 8
+
+int gui_has_layers(struct gui_display *d);
+struct gui_window *gui_layer_open(struct gui_display *d, const char *name, int layer, uint anchor, int exclusive,
+                                  int keyboard, int width, int height, const struct gui_window_handlers *h,
+                                  void *data);
+
+/* ---- Other clients' windows: wlroots' foreign toplevel management
+ * (protocols/wlr-foreign-toplevel-management-unstable-v1.xml) ----
+ *
+ * The windows on the screen, every client's, as the server announces
+ * them: a panel's window list. */
+#define GUI_TOPLEVELS 16
+#define GUI_TOPLEVEL_TITLE 64
+
+struct gui_toplevel {
+    uint handle; /* the server's zwlr_foreign_toplevel_handle_v1 */
+    int activated; /* it has the keyboard */
+    char title[GUI_TOPLEVEL_TITLE];
+};
+
+/* Whether the server announces them (zwlr_foreign_toplevel_manager_v1). */
+int gui_has_toplevels(struct gui_display *d);
+/* The windows, in the order they came: how many, *list pointing at them
+ * (until the next dispatch). */
+int gui_toplevels(struct gui_display *d, const struct gui_toplevel **list);
+/* Whether the list (a window, a title, which is active) changed since the
+ * last call. */
+int gui_toplevels_changed(struct gui_display *d);
+/* Raises the window and gives it the keyboard; asks it to close. */
+void gui_toplevel_activate(struct gui_display *d, uint handle);
+void gui_toplevel_close(struct gui_display *d, uint handle);
+
+/* ---- The clipboard (wl_data_device) ----
+ *
+ * The selection all the clients share: text, as UTF-8
+ * ("text/plain;charset=utf-8", or "text/plain"). Setting it makes this
+ * client its source, which hands it to the others as they ask (while the
+ * client dispatches its events); getting it reads it through a pipe from
+ * its source (or copies it, if it is this client's). */
+/* 0, or a negative error number (-EOPNOTSUPP: the server has no clipboard). */
+int gui_clipboard_set(struct gui_display *d, const char *text, size_t len);
+/* The text, malloc'd and ended by a NUL, in *text, its length in *len: 0,
+ * -ENOENT if the clipboard has no text, or a negative error number. */
+int gui_clipboard_get(struct gui_display *d, char **text, size_t *len);
 
 /* Runs `ui` in a window titled `title` until it is closed or `quit` is
  * set: lays it out to the window's size, draws what changed each frame,

@@ -7,7 +7,8 @@
  * manager (wm.c); its clients connect to /run/wayland-0 and speak the wire
  * format, every message checked against the protocol's tables before it
  * is acted on (client.c), and the requests of each interface are core.c's
- * and xdg.c's.
+ * and xdg.c's, and the desktop shell's, the layer shell, the foreign
+ * toplevel manager and the clipboard, shell.c's.
  *
  * Nothing a client sends is trusted: an id must name one of its own
  * objects of the interface the request says, a new id must be free, a
@@ -22,21 +23,23 @@
 
 /* Descriptors a process has (NOFILE in kernel/include/file.h). */
 #define NOFILE 64
-/* Clients at once: each is a process, and a machine has 8 (NPROC), of
- * which the desktop's services take 4 (init, the server, the console's
- * shell and shd). */
-#define MAX_CLIENTS 4
+/* Clients at once: the panel, terminals and apps (a machine has 32
+ * processes, NPROC). */
+#define MAX_CLIENTS 8
 /* The pools a client has at once (a window's is one), and the descriptors
  * it may send ahead of the messages that take them. */
 #define MAX_POOLS 3
 #define MAX_QUEUED_FDS 2
+/* Descriptors the server holds for a client until they are sent: a pipe's
+ * end a paste passes to the clipboard's source (shell.c). */
+#define MAX_HELD_FDS 1
 /* The server's own descriptors: the keymap's (0), standard output and
  * error, the listening socket, the framebuffer, the keyboard, the
  * pointer. With each client's socket, pools and descriptors sent ahead,
  * they leave one free, for accept and for a descriptor that comes with a
  * message, so the server never runs out. */
 #define SERVER_FDS 7
-_Static_assert(SERVER_FDS + MAX_CLIENTS * (1 + MAX_POOLS + MAX_QUEUED_FDS) <= NOFILE - 1,
+_Static_assert(SERVER_FDS + MAX_CLIENTS * (1 + MAX_POOLS + MAX_QUEUED_FDS + MAX_HELD_FDS) <= NOFILE - 1,
                "the descriptors the server may hold");
 /* Objects a client has at once. */
 #define MAX_OBJECTS 256
@@ -44,10 +47,12 @@ _Static_assert(SERVER_FDS + MAX_CLIENTS * (1 + MAX_POOLS + MAX_QUEUED_FDS) <= NO
 #define MAX_ARGS 8
 /* The ids a client may make: the server's start at 0xff000000. */
 #define CLIENT_ID_MAX 0xfeffffffu
+#define SERVER_ID_START 0xff000000u
 /* Frame callbacks a surface holds at each stage. */
 #define MAX_FRAMES 8
-/* Windows at once, and the biggest buffer and pool. */
+/* Windows at once, layer surfaces, and the biggest buffer and pool. */
 #define MAX_WINDOWS 16
+#define MAX_LAYERS 8
 #define MAX_SIDE 4096
 #define MAX_POOL (64 * 1024 * 1024)
 /* A window that doesn't go this long (ticks, 10 a second) after it was
@@ -57,12 +62,20 @@ _Static_assert(SERVER_FDS + MAX_CLIENTS * (1 + MAX_POOLS + MAX_QUEUED_FDS) <= NO
 #define ACCEPT_RETRY_MS 1000
 /* The longest title kept. */
 #define TITLE_MAX 64
+/* The types a clipboard source offers, at most, and their longest name. */
+#define MAX_MIMES 4
+#define MIME_MAX 64
 
 /* The window decorations: a title bar above the content, a border round
  * both, and a close button at the title bar's right end. */
 #define TITLE_H 20
 #define BORDER 1
 #define CLOSE_SIZE 14
+/* How far outside its border the pointer takes a window's edge, to resize
+ * it, and the smallest a window is made. */
+#define RESIZE_GRIP 6
+#define MIN_WIDTH 64
+#define MIN_HEIGHT 32
 
 #define SOCKET_PATH "/run/wayland-0"
 #define FONT_PATH "/usr/share/fonts/spleen/8x16.psfu"
@@ -143,12 +156,29 @@ struct surface {
 };
 
 /* An xdg_surface, and its toplevel once it has one: a window, shown once a
- * buffer is committed after the client acked the first configure. */
+ * buffer is committed after the client acked the first configure. Or a
+ * layer surface (shell.c): `layer` 0 to 3, no xdg_surface, no toplevel. */
 struct window {
     struct client *c;
     struct surface *surface;
+    int layer; /* -1: a toplevel window */
     uint xdg_id;
     uint toplevel_id;
+    uint layer_id;
+    /* A layer surface's: its anchors, exclusive zone, margins (top, right,
+     * bottom, left), whether it takes the keyboard, the size it asked. */
+    uint anchor;
+    int zone;
+    int margin[4];
+    int keyboard;
+    int req_w;
+    int req_h;
+    /* The size last configured (0: the client's choice), and the one a
+     * resize waits to configure until the last is acked. */
+    int cfg_w;
+    int cfg_h;
+    int pending_w;
+    int pending_h;
     uint configure_serial; /* the last configure sent, 0: none yet */
     int acked;
     int mapped;
@@ -157,6 +187,15 @@ struct window {
     char title[TITLE_MAX];
     int closing;
     uint close_deadline;
+};
+
+/* A wl_data_source: what its client offers to the clipboard. */
+struct source {
+    struct client *c;
+    uint id;
+    int used; /* set as the selection once: it can't be again */
+    int nmimes;
+    char mimes[MAX_MIMES][MIME_MAX];
 };
 
 struct client {
@@ -171,6 +210,9 @@ struct client {
      * every step it took. */
     uint motion_tail;
     struct gui_wire wire;
+    uint next_server_id; /* the next object the server makes for it */
+    int held_fds[MAX_HELD_FDS];
+    int nheld;
     int nobjects;
     struct object objects[MAX_OBJECTS];
 };
@@ -211,6 +253,13 @@ struct server {
     int nstack;
     struct window *focus;
     int placed; /* windows placed so far, for the next one's place */
+    /* The layer surfaces shown, by layer, and the work area they leave
+     * the windows (shell.c). */
+    struct window *layers[MAX_LAYERS];
+    int nlayers;
+    struct gui_rect work;
+    /* The clipboard's selection, or NULL. */
+    struct source *selection;
 
     /* The pointer: where it is, its buttons, the surface it is over (or
      * held on: the implicit grab of a button pressed on it), a window
@@ -225,6 +274,16 @@ struct server {
     struct window *moving;
     int move_dx;
     int move_dy;
+    /* A window being resized: its edges (xdg_toplevel's resize_edge), the
+     * pointer and the content's size where it started, and the content's
+     * right edge then (a resize from the left keeps it). */
+    struct window *resizing;
+    uint resize_edges;
+    int resize_x0;
+    int resize_y0;
+    int resize_w0;
+    int resize_h0;
+    int resize_right;
 
     /* The keyboard: its modifiers, the keys held, and those the window
      * manager took (their releases are its too). */
@@ -277,6 +336,17 @@ void wm_base_request(struct client *c, struct object *o, uint op, struct args *a
 void positioner_request(struct client *c, struct object *o, uint op, struct args *a);
 void xdg_surface_request(struct client *c, struct object *o, uint op, struct args *a);
 void toplevel_request(struct client *c, struct object *o, uint op, struct args *a);
+void layer_shell_request(struct client *c, struct object *o, uint op, struct args *a);
+void layer_surface_request(struct client *c, struct object *o, uint op, struct args *a);
+void toplevel_manager_request(struct client *c, struct object *o, uint op, struct args *a);
+void toplevel_handle_request(struct client *c, struct object *o, uint op, struct args *a);
+void data_manager_request(struct client *c, struct object *o, uint op, struct args *a);
+void data_source_request(struct client *c, struct object *o, uint op, struct args *a);
+void data_device_request(struct client *c, struct object *o, uint op, struct args *a);
+void data_offer_request(struct client *c, struct object *o, uint op, struct args *a);
+/* An xdg_toplevel.configure of width x height (0: the client's choice),
+ * resizing or not, and its xdg_surface.configure. */
+void toplevel_configure(struct window *w, int width, int height, int resizing);
 /* What an object of each kind frees when it goes (object_destroy, and a
  * client's disconnection). */
 void object_free(struct client *c, struct object *o);
@@ -286,6 +356,25 @@ void window_free(struct window *w);
  * frame is drawn: its committed ones become shown. */
 void frames_done(struct client *c, uint time);
 void frames_shown(struct client *c);
+
+/* ---- shell.c ---- */
+/* What a layer surface or a data source frees: 1 if o was one. */
+int shell_object_free(struct client *c, struct object *o);
+/* A layer surface's commit: its checks and configure, 0 or -1 (an error
+ * posted). */
+int layer_commit(struct window *w, int new_buffer);
+void layer_map(struct window *w);
+void layer_unmap(struct window *w);
+/* The work area from the layer surfaces shown, and each placed again. */
+void layers_arrange(void);
+/* The foreign toplevel managers: one bound (each window announced to
+ * it), a window shown, changed (title, activated) or gone. */
+void toplevels_bound(struct client *c, struct object *m);
+void toplevel_announce(struct window *w);
+void toplevel_changed(struct window *w);
+void toplevel_closed(struct window *w);
+/* The clipboard's selection offered to client c (it has the keyboard). */
+void selection_offer(struct client *c);
 
 /* ---- compose.c ---- */
 int screen_init(void);
@@ -314,6 +403,13 @@ void window_map(struct window *w);
 void window_unmap(struct window *w);
 void window_focus(struct window *w);
 void window_move_start(struct window *w);
+/* An interactive resize of `edges` (xdg_toplevel's resize_edge). */
+void window_resize_start(struct window *w, uint edges);
+/* The window's content changed size: a resize from the left keeps its
+ * right edge where it was. */
+void window_resized(struct window *w);
+/* Asks the window's client to close it (killed if it doesn't). */
+void window_close(struct window *w);
 /* A surface or a client is going: the pointer and keyboard forget it. */
 void wm_forget_surface(struct surface *s);
 /* The keyboard's enter for a client's new wl_keyboard, the pointer's for

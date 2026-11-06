@@ -38,6 +38,14 @@ static const struct {
     {&xdg_positioner_interface, positioner_request},
     {&xdg_surface_interface, xdg_surface_request},
     {&xdg_toplevel_interface, toplevel_request},
+    {&zwlr_layer_shell_v1_interface, layer_shell_request},
+    {&zwlr_layer_surface_v1_interface, layer_surface_request},
+    {&zwlr_foreign_toplevel_manager_v1_interface, toplevel_manager_request},
+    {&zwlr_foreign_toplevel_handle_v1_interface, toplevel_handle_request},
+    {&wl_data_device_manager_interface, data_manager_request},
+    {&wl_data_source_interface, data_source_request},
+    {&wl_data_device_interface, data_device_request},
+    {&wl_data_offer_interface, data_offer_request},
 };
 
 #define NHANDLERS ((int)(sizeof(handlers) / sizeof(handlers[0])))
@@ -85,7 +93,8 @@ void client_free(struct client *c) {
     for (int pass = 0; pass < 3; pass++) {
         for (int i = 0; i < c->nobjects; i++) {
             struct object *o = &c->objects[i];
-            int first = o->iface == &xdg_toplevel_interface || o->iface == &xdg_surface_interface;
+            int first = o->iface == &xdg_toplevel_interface || o->iface == &xdg_surface_interface ||
+                        o->iface == &zwlr_layer_surface_v1_interface;
             int second = o->iface == &wl_surface_interface;
             if (o->data != NULL && ((pass == 0 && first) || (pass == 1 && second) || pass == 2)) {
                 object_free(c, o);
@@ -94,6 +103,9 @@ void client_free(struct client *c) {
         }
     }
     gui_wire_release(&c->wire);
+    for (int i = 0; i < c->nheld; i++) {
+        close(c->held_fds[i]);
+    }
     close(c->fd);
     free(c);
 }
@@ -129,9 +141,13 @@ void object_destroy(struct client *c, struct object *o) {
      * until the next one goes. */
     int i = (int)(o - c->objects);
     c->objects[i] = c->objects[--c->nobjects];
-    event_begin(c, 1, WL_DISPLAY_DELETE_ID);
-    gui_wire_uint(&c->wire, id);
-    event_end(c);
+    /* An object the server made goes without delete_id, as libwayland's
+     * server ids do: the client never reuses them. */
+    if (id < SERVER_ID_START) {
+        event_begin(c, 1, WL_DISPLAY_DELETE_ID);
+        gui_wire_uint(&c->wire, id);
+        event_end(c);
+    }
 }
 
 void event_begin(struct client *c, uint object, uint opcode) {
@@ -346,10 +362,17 @@ int client_input(struct client *c) {
 }
 
 int client_flush(struct client *c) {
-    if (c->wire.out_len == 0) {
-        return 0;
+    int r = 0;
+    if (c->wire.out_len > 0 || c->wire.nout_fds > 0) {
+        r = gui_wire_flush(&c->wire);
     }
-    int r = gui_wire_flush(&c->wire);
+    /* Descriptors held for it are its copies now: closed once sent. */
+    if (c->wire.nout_fds == 0) {
+        for (int i = 0; i < c->nheld; i++) {
+            close(c->held_fds[i]);
+        }
+        c->nheld = 0;
+    }
     if (r == -EAGAIN) {
         return 0;
     }
