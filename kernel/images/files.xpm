@@ -1,0 +1,28 @@
+/* XPM */
+/* The file browser's icon (#185): a folder with a sheet in it. */
+static char *files[] = {
+/* width height colours characters-a-pixel */
+"16 16 5 1",
+". c None",
+"y c #E0B040",
+"o c #B08020",
+"w c #F4F4F0",
+"l c #A0A8B0",
+/* the pixels */
+"................",
+"................",
+".ooooo..........",
+"oyyyyyo.........",
+"oyyyyyyoooooooo.",
+"oyyywwwwwwwwyyo.",
+"oyyywllllllwyyo.",
+"oyyywwwwwwwwyyo.",
+"oyyyyyyyyyyyyyyo",
+"oyyyyyyyyyyyyyyo",
+"oyyyyyyyyyyyyyyo",
+"oyyyyyyyyyyyyyyo",
+"oyyyyyyyyyyyyyyo",
+"oyyyyyyyyyyyyyyo",
+".oooooooooooooo.",
+"................"
+};

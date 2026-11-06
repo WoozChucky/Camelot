@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Gears
+Comment=Three gears turning
+Exec=gears
+Icon=gears

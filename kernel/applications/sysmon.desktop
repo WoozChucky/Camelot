@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=System Monitor
+Comment=Processes, harts and memory
+Exec=sysmon
+Icon=sysmon

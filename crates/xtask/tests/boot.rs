@@ -1016,7 +1016,8 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
     // ends is started again, even at once (but not five times in a row), so
     // two Ctrl-Ds or `exit`s don't lose it. shd can't run on a machine with
     // no network card: it says so, and init leaves it. The display server
-    // takes the screen and stays, its socket in /run.
+    // takes the screen and stays, its socket in /run; the panel comes up
+    // on it and starts a terminal, which runs a shell (#185).
     let root = repo_root();
     let image =
         xtask::fs::build_bootable(&root, xtask::fs::Profile::Desktop, xtask::fs::DESKTOP_IMAGE_SIZE).unwrap();
@@ -1027,7 +1028,7 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
     .unwrap();
     m.boot_from_disk().unwrap();
     m.cpu.bus.uart.capture = true;
-    m.set_uart_input(xtask::kernel::typed(b"exit\nexit\nps\n"));
+    m.set_uart_input(xtask::kernel::typed(b"exit\nexit\nsleep 5\nps\n"));
     // The machine runs on: run it until the third shell's ps is done and
     // the display server is ready.
     const READY: &str = "compositor: ready on /run/wayland-0 (640x480)\n";
@@ -1071,4 +1072,11 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
         processes.iter().any(|w| w[1] == "1" && w[4] == "compositor"),
         "{out}"
     );
+    let child_of = |parent: &str, name: &str| -> String {
+        let found = processes.iter().find(|w| w[1] == parent && w[4] == name);
+        found.unwrap_or_else(|| panic!("no {name} of {parent}:\n{out}"))[0].to_string()
+    };
+    let panel = child_of("1", "panel");
+    let term = child_of(&panel, "term");
+    child_of(&term, "sh");
 }

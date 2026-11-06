@@ -42,6 +42,8 @@ crates/elf/tests/llvm/*/*.lines text eol=lf
 kernel/fs/** -text
 # What the root image profiles add, copied into the images byte for byte.
 kernel/profiles/** -text
+# The desktop's application entries, copied into its image byte for byte.
+kernel/applications/** -text
 # The Wayland protocols as their releases ship them (protocols/README.md),
 # byte for byte: their checksums are checked.
 protocols/*.xml -text

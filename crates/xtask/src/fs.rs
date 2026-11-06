@@ -60,11 +60,26 @@ pub const PROFILES_DIR: &str = "kernel/profiles";
 /// The programs of `kernel/user` only the desktop image has: the server
 /// image leaves them out of `/bin`. The desktop's programs join it as they
 /// come (#183-#185).
-pub const DESKTOP_PROGRAMS: &[&str] = &["compositor", "guidemo", "guitest", "term", "wltest"];
+pub const DESKTOP_PROGRAMS: &[&str] = &[
+    "compositor",
+    "files",
+    "gears",
+    "guidemo",
+    "guitest",
+    "panel",
+    "sysmon",
+    "term",
+    "wltest",
+];
 /// Where the desktop image puts the fonts, as Linux distributions do.
 pub const FONTS: &str = "/usr/share/fonts";
 /// Where it puts the images the GUI library reads (QOI files).
 pub const IMAGES: &str = "/usr/share/images";
+/// Where it puts the applications the panel's launcher lists, a
+/// freedesktop.org desktop entry each (`NAME.desktop`), as distributions do.
+pub const APPLICATIONS: &str = "/usr/share/applications";
+/// Their sources (under the repository root), copied byte for byte.
+pub const APPLICATIONS_DIR: &str = "kernel/applications";
 
 /// A root image's profile: one kernel, two images, told apart by their
 /// programs, the files under `/etc` and `/usr/share`, and what init starts
@@ -206,8 +221,10 @@ pub fn usr_files(user_dir: &Path, rt: &userprogs::Runtime) -> Result<Vec<(String
 /// console's font (`kernel/fonts`), for the GUI library to draw text with, in
 /// [`FONTS`], converted to PSF2 as the kernel embeds it
 /// ([`crate::font::psf1_to_psf2`]), a directory a font, as distributions have
-/// them, since a name has 14 bytes at most (docs/camelot-fs.md); and the
-/// images of `kernel/images` in [`IMAGES`] ([`crate::images`]).
+/// them, since a name has 14 bytes at most (docs/camelot-fs.md); the
+/// images of `kernel/images` in [`IMAGES`] ([`crate::images`]); and the
+/// desktop entries of [`APPLICATIONS_DIR`] in [`APPLICATIONS`], in the
+/// order of their names.
 pub fn share_files(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let read =
         |path: PathBuf| std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()));
@@ -225,11 +242,27 @@ pub fn share_files(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     for (name, qoi) in crate::images::build(root)? {
         files.push((format!("{IMAGES}/{name}"), qoi));
     }
+    let apps = root.join(APPLICATIONS_DIR);
+    let mut names: Vec<String> = std::fs::read_dir(&apps)
+        .map_err(|e| format!("cannot read {}: {e}", apps.display()))?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".desktop"))
+        .collect();
+    names.sort();
+    for name in names {
+        files.push((format!("{APPLICATIONS}/{name}"), read(apps.join(&name))?));
+    }
     Ok(files)
 }
 
 /// The directories of `/usr/share`, in the order they are made.
-pub const SHARE_DIRS: &[&str] = &["/usr/share", FONTS, "/usr/share/fonts/spleen", IMAGES];
+pub const SHARE_DIRS: &[&str] = &[
+    "/usr/share",
+    FONTS,
+    "/usr/share/fonts/spleen",
+    IMAGES,
+    APPLICATIONS,
+];
 
 /// Makes [`SHARE_DIRS`] on `fs` (after `/usr`) and writes `files`
 /// ([`share_files`]) there.

@@ -34,6 +34,10 @@ const BINS: &[&str] = &[
     "wc",
     "primes",
     "stty",
+    "panel",
+    "files",
+    "sysmon",
+    "gears",
 ];
 
 /// What `/test/escapes` holds, for the terminal to draw: colours and
@@ -46,6 +50,16 @@ abcdef\x1b[3D\x1b[2P <- two deleted\n\
 abcdef\x1b[3D\x1b[2@XY <- two inserted\n\
 \x1b7\x1b[12;50H\x1b[46m at 12, 50 \x1b[0m\x1b8saved and restored\n\
 caf\xc3\xa9 \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90 \xc2\xb1\xc2\xb0\n";
+
+/// Where the machines' clock starts, the time the panel shows: noon of
+/// Grail's default day (Thursday 1 January 2026), so that it shows "12:00"
+/// for a minute and more of the machine's time.
+const NOON: u64 = grail::rtc::DEFAULT_RTC_TIME + 12 * 3600;
+
+/// Where the panel's hart meters are on a machine of four (x, y, width,
+/// height): how busy the harts were depends on how long everything took,
+/// so screens with the panel leave them out of the comparison.
+const PANEL_METERS: (u32, u32, u32, u32) = (476, 0, 36, 24);
 
 /// Steps a frame takes, 60 a second at Grail's clock.
 const FRAME: u64 = 166_667;
@@ -158,6 +172,7 @@ impl Desk {
             harts,
             bios: grail::Bios::Default,
             ram_size: 32 * 1024 * 1024 + grail::firmware::FW_SIZE as usize,
+            rtc: grail::Rtc::At(NOON),
             ..MachineConfig::default()
         };
         let disk = MemDisk::from_image(image()).unwrap();
@@ -249,6 +264,13 @@ impl Desk {
     /// before it is on the screen once the server is idle after it.
     fn term_drawn(&mut self, title: &str, line: &str) {
         self.wait_for(&format!("term \"{title}\": drawn \"{line}\"\n"));
+        self.since_here();
+    }
+
+    /// The next screen waits for the server to be idle after what was
+    /// printed so far, not just after the last input: a client's line says
+    /// it sent something, which the server may not have drawn yet.
+    fn since_here(&mut self) {
         self.input = self.seen;
     }
 
@@ -312,8 +334,22 @@ impl Desk {
 
     /// The screen is `tests/display/NAME.png`.
     fn expect_screen(&mut self, name: &str) {
+        self.expect_screen_but(name, &[]);
+    }
+
+    /// The screen is `tests/display/NAME.png`, but for the rectangles
+    /// (x, y, width, height) in `masked`, painted magenta in both.
+    fn expect_screen_but(&mut self, name: &str, masked: &[(u32, u32, u32, u32)]) {
         self.wait_idle();
-        let (w, h, rgb) = self.screen();
+        let (w, h, mut rgb) = self.screen();
+        for &(mx, my, mw, mh) in masked {
+            for y in my..(my + mh).min(h) {
+                for x in mx..(mx + mw).min(w) {
+                    let i = ((y * w + x) * 3) as usize;
+                    rgb[i..i + 3].copy_from_slice(&[0xff, 0x00, 0xff]);
+                }
+            }
+        }
         let got = png::encode(w, h, &rgb);
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/display");
         let path = dir.join(format!("{name}.png"));
@@ -700,4 +736,93 @@ fn terminals_resize_and_share_the_clipboard() {
     d.type_text("\n");
     d.term_drawn("two", "$ ");
     d.expect_screen("term-pasted");
+}
+
+/// How many pixels of the screen are mostly `channel` (0 red, 1 green, 2
+/// blue): bright in it and dim in the others.
+fn pixels_of(rgb: &[u8], channel: usize) -> usize {
+    rgb.chunks(3)
+        .filter(|p| p[channel] > 0x60 && (0..3).all(|c| c == channel || p[c] < p[channel] / 2))
+        .count()
+}
+
+#[test]
+fn the_panel_launches_lists_and_focuses_windows() {
+    // The panel (kernel/user/panel.c) along the top: it starts the program
+    // it is given, a terminal, which is placed under it; its launcher's
+    // menu lists /usr/share/applications.
+    let mut d = Desk::boot(4);
+    start_server(&mut d, "");
+    d.run("panel -v term -v &");
+    d.wait_for("panel: ready, 4 applications\n");
+    d.wait_for("panel: started term\n");
+    d.term_drawn("Terminal", "$ ");
+    d.expect_screen_but("panel", &[PANEL_METERS]);
+    // The menu takes the keyboard once it is shown.
+    d.click(40, 12);
+    d.wait_for("panel: menu shown\n");
+    d.wait_for("compositor: focus \"launcher\"\n");
+    d.since_here();
+    d.expect_screen_but("panel-menu", &[PANEL_METERS]);
+
+    // The launcher starts every application, each a window with the
+    // keyboard. The gears turn (glxgears' red, green and blue) until
+    // Escape; the system monitor goes with Escape too.
+    let apps = [
+        ("files", "Files"),
+        ("gears", "Gears"),
+        ("sysmon", "System Monitor"),
+        ("term", "Terminal"),
+    ];
+    for (i, (name, title)) in apps.into_iter().enumerate() {
+        if i > 0 {
+            d.click(40, 12);
+            d.wait_for("panel: menu shown\n");
+            d.wait_for("compositor: focus \"launcher\"\n");
+        }
+        d.click(60, 24 + 2 + 24 * i as i32 + 12);
+        d.wait_for(&format!("panel: started {name}\n"));
+        d.wait_for("panel: menu closed\n");
+        d.wait_for(&format!("compositor: focus \"{title}\"\n"));
+        match name {
+            "gears" => {
+                let fps = d.wait_for(" FPS\n");
+                eprintln!("gears: {}", fps.lines().last().unwrap_or(""));
+                let (w, h, rgb) = d.screen();
+                for channel in 0..3 {
+                    let n = pixels_of(&rgb, channel);
+                    if n <= 1500 {
+                        let actual = repo_root().join("target/display-actual");
+                        std::fs::create_dir_all(&actual).unwrap();
+                        std::fs::write(actual.join("gears.png"), png::encode(w, h, &rgb)).unwrap();
+                        panic!(
+                            "{n} pixels of channel {channel} (drawn in {}):\n{}",
+                            actual.display(),
+                            d.out()
+                        );
+                    }
+                }
+                d.tap(KEY_ESCAPE);
+                d.wait_for(") gone\n");
+            }
+            "sysmon" => {
+                d.settle(30);
+                d.tap(KEY_ESCAPE);
+                d.wait_for(") gone\n");
+            }
+            _ => {}
+        }
+    }
+
+    // A button for each window (the first terminal, the files and the
+    // second terminal, whose prompt a second is plenty for), the one with
+    // the keyboard lit; a click on one raises its window and gives it the
+    // keyboard.
+    d.settle(60);
+    d.since_here();
+    d.expect_screen_but("panel-windows", &[PANEL_METERS]);
+    d.click(120, 12);
+    d.wait_for("compositor: focus \"Terminal\"\n");
+    d.since_here();
+    d.expect_screen_but("panel-focused", &[PANEL_METERS]);
 }
