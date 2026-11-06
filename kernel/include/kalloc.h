@@ -46,6 +46,16 @@ void *kzalloc(void);
  * page-aligned address of free RAM (from __kernel_end to the end of RAM). */
 void kfree(void *page);
 
+/* `n` free pages one after the other in RAM, taken off the free list: the
+ * first one's pointer, or NULL if no such run is free. For memory a device
+ * reads by its physical address, a buffer the framebuffer scans out (fb.c).
+ * Their contents are whatever was there last. Slow: it walks the free list
+ * (kalloc.c). */
+void *kalloc_contig(usize n);
+
+/* Puts back the `n` pages from `pages` that kalloc_contig() gave. */
+void kfree_contig(void *pages, usize n);
+
 /* Number of pages on the free list. */
 u32 kfree_pages(void);
 

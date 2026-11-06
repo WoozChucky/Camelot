@@ -11,7 +11,8 @@
  *   maptest unmapped     touches a page after munmap: killed
  *   maptest readonly     writes a read-only page: killed
  *   maptest past         touches a page past a shared object's end: killed
- *   maptest fb           draws into /dev/fb0's memory (a root image's)
+ *   maptest fb           draws into /dev/fb0's memory (a root image's),
+ *                        prints "maptest: drawn" and waits for a line
  *   maptest threads      threads map and unmap memory at once
  *   maptest child        (shared_checks()'s child) */
 #include "user.h"
@@ -407,11 +408,13 @@ static void fb_checks(void) {
     check_eq(map(0, PAGE, PROT_READ, MAP_SHARED, fd, (off_t)FB_SIZE), -EINVAL, "an offset at its end");
     char buf[4];
     check_eq(read(fd, buf, 4), -EINVAL, "read() of the device");
+    /* Opened before the other goes: the device stays in use, so the
+     * console doesn't take the screen back meanwhile (fb.h). */
+    int ro = open("/dev/fb0", O_RDONLY);
     check_eq(munmap((void *)second, PAGE), 0, "munmap the second");
     check_eq(munmap(px, FB_SIZE), 0, "munmap the first");
     close(fd);
 
-    int ro = open("/dev/fb0", O_RDONLY);
     check_eq(map(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, ro, 0), -EACCES,
              "a writable mapping of a descriptor open for reading");
     check_eq(map(0, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, ro, 0), -EACCES,
@@ -420,6 +423,12 @@ static void fb_checks(void) {
     check(r > 0 && ((uint *)r)[1] == fb_pixel(1, 0), "a read-only one");
     check_eq(mprotect((void *)r, PAGE, PROT_READ | PROT_WRITE), -EACCES, "made writable");
     check_eq(munmap((void *)r, PAGE), 0, "munmap it");
+    /* The pattern stays on the display while the device is open: a test
+     * looks at it, then gives a line, and the console takes the screen
+     * back once it is closed. */
+    printf("maptest: drawn\n");
+    char line[8];
+    read(0, line, sizeof line);
     close(ro);
 }
 
