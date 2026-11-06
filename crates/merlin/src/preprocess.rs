@@ -296,7 +296,7 @@ const MAX_INCLUDE_DEPTH: usize = 200;
 
 /// Every directive's name clang knows. In assembly, `#` and any other word
 /// starts no directive.
-const DIRECTIVES: &[&str] = &[
+pub const DIRECTIVES: &[&str] = &[
     "define",
     "undef",
     "include",

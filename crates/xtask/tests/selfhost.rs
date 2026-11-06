@@ -15,20 +15,86 @@
 //! The machines boot the disk kernel, `kernel/kernel-disk.elf`, on
 //! Camelot's firmware; `/bin/as` writes ELF64 objects, as merlin-as does,
 //! and every object `/bin/ld` links is one.
+//!
+//! The C compiler (#241, `kernel/user/cc`, `/bin/cc1`) comes in stages; its
+//! first is the preprocessor: `cc1 -E` on Camelot writes what the host's
+//! merlin writes, and gives merlin's diagnostics, for every C and `.S` file
+//! of the repository, the diagnostics table's rows of the lexer and the
+//! preprocessor, and inputs of every directive and macro form
+//! (`PP_INPUTS`).
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
 use grail::block::MemDisk;
 use grail::{Machine, MachineConfig, RunResult};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use xtask::{kernel, repo_root, toolchain, userprogs};
+
+// The rows of merlin's diagnostics table that preprocessing gives (the
+// lexer's and the preprocessor's), for `cc1 -E`: their sources, headers and
+// `-D`/`-U` options. The table's builder, for those files: what they say a
+// row's diagnostics are is merlin's compilation's, not `-E`'s, so only the
+// inputs are kept; the host's merlin gives what `-E` says.
+#[path = "../../merlin/tests/diagnostics/lexer.rs"]
+mod lexer_rows;
+#[path = "../../merlin/tests/diagnostics/preprocessor.rs"]
+mod preprocessor_rows;
+
+/// A row of merlin's diagnostics table: a source, the headers it includes
+/// (by name next to it, and text) and its options.
+pub struct Case {
+    src: String,
+    files: Vec<(&'static str, &'static str)>,
+    args: Vec<&'static str>,
+}
+
+/// A row; its diagnostics are merlin's compilation's, which `-E` does not
+/// ask for.
+pub fn case(src: impl Into<String>, _want: &[&str]) -> Case {
+    Case {
+        src: src.into(),
+        files: Vec::new(),
+        args: Vec::new(),
+    }
+}
+
+impl Case {
+    pub fn files(self, files: &[(&'static str, &'static str)]) -> Case {
+        Case {
+            files: files.to_vec(),
+            ..self
+        }
+    }
+
+    pub fn args(self, args: &[&'static str]) -> Case {
+        Case {
+            args: args.to_vec(),
+            ..self
+        }
+    }
+
+    /// What clang says after merlin stops, why a diagnostic is merlin's own,
+    /// why the notes are some of clang's: nothing to `-E`.
+    pub fn then(self, _: &[&str]) -> Case {
+        self
+    }
+
+    pub fn merlin(self, _: &'static str) -> Case {
+        self
+    }
+
+    pub fn partial(self, _: &'static str) -> Case {
+        self
+    }
+}
 
 const PROMPT: &str = "$ ";
 
 /// The corpus: (name on the image, text); `big` adds merlin's assembly for
 /// the shell and the kernel's vm.c. A `.S` source (the examples, the boot
 /// ROM) goes in as merlin's preprocessor makes it, as `cargo xtask
-/// examples` gives it to merlin-as (Camelot has no preprocessor), and is
+/// examples` gives it to merlin-as (what `/bin/cc1 -E` writes too), and is
 /// named `.s` on the image. Every value of merlin-as's `li` golden
 /// (`tests/golden/li.golden`) is one more `li a0, VALUE` line, in files of
 /// [`LI_LINES`]: the values merlin-as's encode_golden.rs holds RISCVMatInt
@@ -227,10 +293,16 @@ fn image(inputs: &[(String, String)]) -> Vec<u8> {
 /// names), the directories `dirs`, `files` (path, contents) and an empty
 /// /out.
 fn image_of(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    image_with_inodes(bins, dirs, files, Options::default().ninodes)
+}
+
+/// [`image_of`], with `ninodes` inodes.
+fn image_with_inodes(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)], ninodes: u32) -> Vec<u8> {
     let bytes: usize = files.iter().map(|(_, t)| t.len()).sum();
     let blocks = 2048 + 3 * bytes / camelot_fs::BSIZE;
     let mut fs = Mkfs::new(&Options {
         size: blocks as u32,
+        ninodes,
         ..Options::default()
     })
     .unwrap();
@@ -504,9 +576,11 @@ nop
 
 #[test]
 fn the_c_tools_tables_are_the_host_tools() {
-    // kernel/user/as/tables.[ch] and kernel/user/ld/tables.[ch] are generated
-    // from merlin-as's, excalibur's and the elf crate's tables
-    // (crates/xtask/src/c_tables.rs) by `cargo xtask kernel`.
+    // kernel/user/as/tables.[ch], kernel/user/ld/tables.[ch] and
+    // kernel/user/cc/tables.[ch] are generated from merlin-as's, excalibur's,
+    // the elf crate's and merlin's tables (crates/xtask/src/c_tables.rs) by
+    // `cargo xtask kernel`. The kernels embed none of cc1, so this is what
+    // tells a stale cc/tables.c.
     for (file, want) in xtask::c_tables::files() {
         let path = repo_root().join(file);
         let committed = std::fs::read_to_string(&path).unwrap().replace('\r', "");
@@ -677,8 +751,8 @@ fn usr_image_files(rt: &userprogs::Runtime) -> Vec<(String, Vec<u8>)> {
 
 /// #23's acceptance: `hello` assembled and linked inside Camelot, by `/bin/as`
 /// and `/bin/ld`, is the host's `examples/hello/hello.elf` byte for byte, and
-/// it runs (on a machine of its own: it is a bare-metal program). Camelot has
-/// no preprocessor: `/bin/as` gets hello.S as merlin's makes it on the host,
+/// it runs (on a machine of its own: it is a bare-metal program).
+/// `/bin/as` gets hello.S as merlin's preprocessor makes it on the host,
 /// the text the host's merlin-as assembles, with `-march` given as clang
 /// takes it.
 #[test]
@@ -1794,4 +1868,642 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
             }
         }
     }
+}
+
+// ---- The C compiler, stage 1: the preprocessor (#241) ----
+
+/// Where the repository's sources are on the image of the preprocessor's
+/// test: under `/r`, each at its path in the repository ([`image_path`]).
+const REPO: &str = "/r";
+
+/// The longest name a Camelot directory entry holds (DIRSIZ,
+/// kernel/include/fs.h).
+const DIRSIZ: usize = 14;
+
+/// A name of a path on the image: the repository's, or for one longer than
+/// [`DIRSIZ`] (merlin's test cases have some) its first 9 bytes, `_` and 4
+/// hex digits of its hash. No file includes one of those by name.
+fn image_name(name: &str) -> String {
+    if name.len() <= DIRSIZ {
+        return name.to_string();
+    }
+    let hash = name
+        .bytes()
+        .fold(2166136261u32, |h, b| (h ^ u32::from(b)).wrapping_mul(16777619));
+    format!("{}_{:04x}", &name[..9], hash & 0xffff)
+}
+
+/// The image path of `rel`, a path relative to the repository's root.
+fn image_path(rel: &str) -> String {
+    let parts: Vec<String> = rel.split('/').map(image_name).collect();
+    format!("{REPO}/{}", parts.join("/"))
+}
+
+/// The repository's C files, headers and `.S` files, by path from the root
+/// with `/`, in order: all but those in `target/` and hidden directories
+/// (`.git`, worktrees), and the firmware's (`firmware/`), whose headers'
+/// names are longer than a Camelot directory entry holds.
+fn repo_sources() -> Vec<String> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            if p.is_dir() {
+                if name != "target" && name != "firmware" && !name.starts_with('.') {
+                    walk(root, &p, found);
+                }
+            } else if p.extension().is_some_and(|x| x == "c" || x == "h" || x == "S") {
+                found.push(p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let root = repo_root();
+    let mut found = Vec::new();
+    walk(&root, &root, &mut found);
+    found.sort();
+    found
+}
+
+/// One `cc1 -E`: the input file (an image path), the options before it, as
+/// cc1 is given them, and as merlin is.
+struct PpJob {
+    input: String,
+    args: Vec<String>,
+    opts: merlin::Options,
+}
+
+impl PpJob {
+    /// `input` of language `lang`, with these `-I` directories, `-D` and
+    /// `-U` options (`-DNAME=VALUE`, `-UNAME`), and `-P` if not
+    /// `line_markers`.
+    fn new(
+        input: String,
+        lang: merlin::Lang,
+        includes: &[String],
+        macros: &[&str],
+        line_markers: bool,
+    ) -> PpJob {
+        let mut args = Vec::new();
+        if !line_markers {
+            args.push("-P".to_string());
+        }
+        for d in includes {
+            args.push(format!("-I{d}"));
+        }
+        let mut cmd = Vec::new();
+        for m in macros {
+            args.push(m.to_string());
+            cmd.push(match (m.strip_prefix("-D"), m.strip_prefix("-U")) {
+                (Some(d), _) => merlin::CmdMacro::Define(d.to_string()),
+                (_, Some(u)) => merlin::CmdMacro::Undef(u.to_string()),
+                _ => panic!("{m}: -D or -U"),
+            });
+        }
+        // A file whose name says no language is given one.
+        if lang != merlin::Lang::of_file(&input) {
+            args.push(match lang {
+                merlin::Lang::C => "-xc".to_string(),
+                merlin::Lang::AssemblerWithCpp => "-xassembler-with-cpp".to_string(),
+            });
+        }
+        let opts = merlin::Options {
+            include_dirs: includes.iter().map(PathBuf::from).collect(),
+            macros: cmd,
+            lang,
+            line_markers,
+            ..merlin::Options::default()
+        };
+        PpJob { input, args, opts }
+    }
+
+    fn command(&self, out: &str) -> String {
+        format!("cc1 -E {} {} -o {out}", self.args.join(" "), self.input).replace("  ", " ")
+    }
+}
+
+/// What `merlin -E` makes of `job` on the host, reading `files` (image path,
+/// contents) for its input and headers: the text it writes, if it
+/// succeeds, and what it prints on stderr.
+fn merlin_e(job: &PpJob, files: &BTreeMap<String, Vec<u8>>) -> (Option<String>, String) {
+    let text = |p: &str| files.get(p).and_then(|b| String::from_utf8(b.clone()).ok());
+    // merlin's paths are the host's (`\` on Windows); the image's are `/`.
+    let load = |p: &std::path::Path| text(&p.to_string_lossy().replace('\\', "/"));
+    let src = text(&job.input).unwrap_or_else(|| panic!("{}: no such file", job.input));
+    let render = |errors: &[merlin::Error]| -> String {
+        errors
+            .iter()
+            .map(|e| format!("{}\n", e.render(&job.input)))
+            .collect()
+    };
+    if job.opts.lang == merlin::Lang::AssemblerWithCpp {
+        match merlin::preprocess_asm(&job.input, &src, &job.opts, &load) {
+            Ok(t) => (Some(t), String::new()),
+            Err(e) => (None, render(&e)),
+        }
+    } else {
+        match merlin::preprocess(&job.input, &src, &job.opts, &load) {
+            Ok(pp) => (
+                Some(merlin::preprocess::spell(&pp.tokens)),
+                render(&pp.diagnostics),
+            ),
+            Err(e) => (None, render(&e)),
+        }
+    }
+}
+
+/// Inputs of every directive and macro form, written for this test, with
+/// their headers (by name next to the input), their `-I`, `-D` and `-U`
+/// options (`{dir}` the input's directory), and whether they are assembly. Those that end in an error are
+/// there for the diagnostics.
+#[allow(clippy::type_complexity)]
+const PP_INPUTS: &[(&str, &[(&str, &str)], &[&str], bool)] = &[
+    // Rescanning, hide sets, recursion, variadic macros, GNU's `args...`.
+    (
+        "#define ID(x) x\n#define TWICE(x) x x\n#define SELF SELF + 1\n#define A B\n#define B A\n\
+         ID(TWICE(1)) SELF A B ID(ID)(2) ID\n(3) ID (4)\n#define CALL(f, ...) f(__VA_ARGS__)\n\
+         CALL(ID, 7) CALL(TWICE, a, b) CALL(ID)\n#define GNU(args...) [args]\nGNU() GNU(1, 2)\n\
+         #define L(x) x + L\nL(L)(1) L(L(1))\n#define PAREN (\n#define F(x) <x>\nF PAREN 1)\n",
+        &[],
+        &[],
+        false,
+    ),
+    // Stringizing and pasting: spaces, quotes, backslashes, placemarkers.
+    (
+        "#define S(x) #x\n#define XS(x) S(x)\n#define CAT(a, b) a ## b\n#define XCAT(a, b) CAT(a, b)\n\
+         S(  a  \"b\\n\"  'c'  ) S() XS(__LINE__) S(a\\\\) CAT(x, 1) CAT(, y) CAT(z, ) CAT(,)\n\
+         XCAT(CAT(1, 2), 3) CAT(<, <=) CAT(-, >) CAT(., 5) CAT(L, 'a') XS(CAT(a b, c d))\n\
+         #define V(fmt, ...) f(fmt, ## __VA_ARGS__)\nV(1) V(1, 2)\nS(\\)\n",
+        &[],
+        &[],
+        false,
+    ),
+    // Pasting that forms no token: an error in C.
+    ("#define CAT(a, b) a ## b\nCAT(+, -) CAT(/, /)\n", &[], &[], false),
+    // Spacing: what would read as other tokens gets a space.
+    (
+        "#define M -\n#define E\n#define P +\n-M M- -E- P+ +P a/**/b x/E/y 1 E.2 .E 3 L E\"s\" u8 E\"t\"\n\
+         M>M a E= b <E< x E## y 0x E1 1E+ E2 .. E. #E# %E> <E: & E&\n",
+        &[],
+        &[],
+        false,
+    ),
+    // #if arithmetic, with clang's warnings.
+    (
+        "#if 1 + 2 * 3 == 7 && (1 ? 2 : 3) == 2 && -1 < 0 && -1 > 0u\nok1\n#endif\n\
+         #if (2 || 1 / 0) && !(0 && 1 / 0) && (1, 2) == 2 && (0 ? 1 / 0 : 4) == 4\nok2\n#elif 1\nno\n#else\nno\n#endif\n\
+         #if defined(X) || defined Y || __LINE__ == 0\nno\n#elif 'a' == 97 && '\\377' == 255 && 'ab' == 24930\nok3\n#endif\n\
+         #if 0x7fffffffffffffff + 1 < 0 && 18446744073709551615 == -1 && 1 << 63 < 0\nok4\n#endif\n\
+         #if 7 / -2 == -3 && 7 % -2 == 1 && -8 >> 1 == -4 && 1 << 64 == 0 && -9223372036854775807 - 1 < 0\nok5\n#endif\n\
+         #if -0x8000000000000000 && 0x8000000000000000 / -1 && ~0u == 18446744073709551615u && 10ULL > 9ll\nok6\n#endif\n\
+         #if 01 == 1 && 0x10 == 16 && 010 == 8 && 'abcde' && '\\x41' == 65\nok7\n#endif\n",
+        &[],
+        &[],
+        false,
+    ),
+    // #if's errors.
+    ("#if f(1)\n#endif\n#if 1 :\n#endif\n#if (1 ? 2)\n#endif\n#if 1.5e3\n#endif\n#if 08\n#endif\n", &[], &[], false),
+    // __FILE__, __LINE__, #line and line markers.
+    (
+        "__FILE__ __LINE__\n#line 100\n__LINE__\n#line 7 \"renamed.c\"\n__FILE__ __LINE__\n\
+         # 20 \"marker.h\" 1\n__FILE__ __LINE__\n# 30 \"back.c\" 2\n__LINE__\n#line 010\n__LINE__\n\
+         #define N 40\n#line N \"x\\\\y.c\"\n__FILE__\n# 50 \"z.c\" 1 3 4\n__LINE__\n",
+        &[],
+        &[],
+        false,
+    ),
+    // Headers: guarded, once, next to the including file, through a macro,
+    // angled through -I, angled found only as quoted (an error).
+    (
+        "#include \"g.h\"\n#include \"g.h\"\n#include \"once.h\"\n#include \"once.h\"\n#include \"sub/s.h\"\n\
+         #define H \"g.h\"\n#include H\n#define AH <inc.h>\n#include AH\n#include <inc.h> // again\n\
+         #include \"./sub/s.h\"\nend __FILE__\n",
+        &[
+            ("g.h", "#ifndef G_H\n#define G_H\ng __FILE__\n#endif\n"),
+            ("once.h", "#pragma once\nonce __LINE__\n"),
+            ("sub/s.h", "s __FILE__\n#include \"t.h\"\n"),
+            ("sub/t.h", "t __FILE__ __LINE__\n"),
+            ("inc/inc.h", "#if !defined(INC_H)\n#define INC_H\ninc __FILE__\n#endif\n"),
+        ],
+        &["-I{dir}/inc"],
+        false,
+    ),
+    ("#include <g.h>\n", &[("g.h", "g\n")], &[], false),
+    // Pragmas and #ident pass on; the null directive; #warning.
+    (
+        "#pragma weird  a   b\n#pragma once\n#define V \"v1\"\n#ident V\n#sccs \"v2\" x\n#\n# /* nothing */\n\
+         int x;\n#warning careful /* c */ here \\\n  more\n",
+        &[],
+        &[],
+        false,
+    ),
+    ("#error stop  here \\\n and here\n", &[], &[], false),
+    // Trigraphs, line splices, comments.
+    (
+        "??=define T ??( ??) ??< ??> ??! ??' ??-\nT\nin\\\nt x = 1;\n#define SP 1 \\  \n + 2\nSP\n\
+         // comment ??/\nstill comment\n\"??/\"\" '??''\n/* a /* b */ c\n/\\\n* split */ d\n",
+        &[],
+        &[],
+        false,
+    ),
+    // A byte-order mark, whitespace past ASCII, characters that are no token.
+    ("\u{feff}int a;\u{a0}int b;\u{3000}c \u{e9} @ ` \\ $\n'x \"y\n'' \n", &[], &[], false),
+    // A macro's arguments across lines and directives; an expansion to
+    // nothing hands its spacing on.
+    (
+        "#define F(x) [x]\nF(1\n#define Y 2\nY)\nF\n(3)\n#define E\nE int a;\n  E b\nE\n x E\n",
+        &[],
+        &[],
+        false,
+    ),
+    ("#define F(x) [x]\nF(1\n#include \"x.h\"\n)\n", &[], &[], false),
+    // `defined` from an expansion.
+    (
+        "#define D defined(D)\n#if D\nyes\n#endif\n#define FD(x) defined(x)\n#if FD(FD)\nyes\n#endif\n",
+        &[],
+        &[],
+        false,
+    ),
+    // -D and -U, in order.
+    (
+        "ONE TWO F(3) EMPTY __STDC_VERSION__ __STDC_HOSTED__ __riscv_xlen __merlin__ __SIZE_TYPE__\n",
+        &[],
+        &["-DONE", "-DTWO=2", "-DF(x)=(x+1)", "-UONE", "-DEMPTY="],
+        false,
+    ),
+    ("x\n", &[], &["-D1=2", "-DF(=x", "-U__FILE__"], false),
+    // Redefinitions, builtins.
+    (
+        "#define R 1\n#define R 1\n#define R  2\n#define R(x) x\n#undef __FILE__\n#define __LINE__ 5\n__LINE__\n\
+         #undef __STDC__\n#define __STDC_HOSTED__ 2\n",
+        &[],
+        &[],
+        false,
+    ),
+    // An unterminated call at the end of the file.
+    ("#define F(x) x\nF(1, 2", &[], &[], false),
+    // NUL bytes in literals, in what is stringized and passed on, in a
+    // name #line gives (__FILE__, a diagnostic's file) and in a warning.
+    (
+        "#if '\0' == 0\nzero\n#endif\n#if 'a\0' == 0x6100\nmulti\n#endif\n#define S(x) #x\nS(p\0q) S(\"\0\")\n\
+         #pragma x\0y\n#ident \"a\0b\"\n#line 1 \"a\0b\"\n__FILE__ __LINE__\n#warning w\0arn\n",
+        &[],
+        &[],
+        false,
+    ),
+    // ... in an #error, in what pasting forms, in a header's name.
+    (
+        "#error a\0b\n#define CAT(a, b) a ## b\nCAT(x, \0)\n#include \"g.h\0x\"\n",
+        &[("g.h", "g\n")],
+        &[],
+        false,
+    ),
+    // ... after a backslash: an escape C has not, in a character constant
+    // and in a name #line gives.
+    ("#if '\\\0' == 0\nz\n#endif\n#line 1 \"\\\0\"\nx\n", &[], &[], false),
+    // ... in assembly's line markers.
+    ("  nop\n#line 5 \"n\0m.S\"\n  nop\n", &[], &[], true),
+    // The bytes that stand around a file's number in merlin's messages
+    // (FILE_MARK, U+0001), in a message that quotes the source: the place
+    // named, a number no file has, a mark without its pair.
+    (
+        "#warning x\u{1}y\n#warning a\u{1}0\u{1}b\u{1}7\u{1}c\n#error a\u{1}+0\u{1}b\u{1}\n",
+        &[],
+        &[],
+        false,
+    ),
+    // Assembly: comments, pasting that forms no token, `#` before anything.
+    (
+        "# a comment\n#if 1\n  li a0, 1 # trailing\n#endif\n#define CALL(f) call f ## @plt\n\
+         #define DOT(n) . ## n\n#define HASH(x) # x y\n\tCALL(foo)\n\tDOT(text)\n\tHASH(z)\n\
+         $x: .word 'c', '\\n'\n\\rs1 ??= 0\n/* examples/*/ x */\n# 2^64 - 1\n#define EMPTY\nEMPTY li a0, 2\n\
+         \n\n\n\n\n\n\n\n\n\n\nfar: nop\n",
+        &[],
+        &[],
+        true,
+    ),
+    // Assembly's line markers: headers, blank lines, #line.
+    (
+        "start:\n#include \"h.S\"\n  after\n#include \"sub/i.S\"\n\n\n\n  later\n#line 40 \"other.S\"\n  renamed\n\
+         \n\n\n\n\n\n\n\n\n\n  far __LINE__ __FILE__\n",
+        &[
+            ("h.S", "\n  in_h\n#define HM 1\n"),
+            ("sub/i.S", "  in_i HM\n#include \"j.S\"\n  back_in_i\n"),
+            ("sub/j.S", "#ifndef J\n#define J\n  in_j\n#endif\n"),
+        ],
+        &[],
+        true,
+    ),
+];
+
+/// A source to preprocess in a directory of its own: its text, its headers
+/// (name, text), its options and whether it is assembly.
+type PpInput = (String, Vec<(&'static str, &'static str)>, Vec<&'static str>, bool);
+
+/// Every `cc1 -E` the preprocessor's test runs, and the files the image
+/// holds for them (image path, contents): every C and `.S` file of the
+/// repository ([`repo_sources`]) as the builds preprocess them (the kernel's
+/// with `-I kernel/include`, `.S` files with `-I include` too, the linker
+/// script also with `-P`, a multi-file test case with its `include/`),
+/// `include/asm.h` as assembly, the lexer's and the preprocessor's rows of
+/// merlin's diagnostics table, each with its headers in `/d/N`, and
+/// [`PP_INPUTS`], in `/d/N` after them.
+fn pp_jobs() -> (Vec<PpJob>, BTreeMap<String, Vec<u8>>) {
+    let root = repo_root();
+    let sources = repo_sources();
+    let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for rel in &sources {
+        let path = image_path(rel);
+        assert!(!files.contains_key(&path), "{rel}: two files at {path}");
+        files.insert(path, std::fs::read(root.join(rel)).unwrap());
+    }
+    let include = image_path("include");
+    let kernel_include = image_path("kernel/include");
+    let mut jobs = Vec::new();
+    for rel in &sources {
+        let kernel = rel.starts_with("kernel/") && !rel.starts_with("kernel/user/");
+        if rel.ends_with(".c") {
+            let mut includes = Vec::new();
+            if kernel {
+                includes.push(kernel_include.clone());
+            }
+            // A multi-file test case's own headers.
+            if let Some(rest) = rel.strip_prefix("crates/merlin/tests/multi/") {
+                let dir = rest.split('/').next().unwrap();
+                let inc = format!("crates/merlin/tests/multi/{dir}/include");
+                if root.join(&inc).is_dir() {
+                    includes.push(image_path(&inc));
+                }
+            }
+            jobs.push(PpJob::new(image_path(rel), merlin::Lang::C, &includes, &[], true));
+        } else if rel.ends_with(".S") {
+            let mut includes = vec![include.clone()];
+            if rel.starts_with("kernel/") {
+                includes.push(kernel_include.clone());
+            }
+            let lang = merlin::Lang::AssemblerWithCpp;
+            jobs.push(PpJob::new(image_path(rel), lang, &includes, &[], true));
+            if rel.ends_with(".lds.S") {
+                jobs.push(PpJob::new(image_path(rel), lang, &includes, &[], false));
+            }
+        }
+    }
+    let lang = merlin::Lang::AssemblerWithCpp;
+    jobs.push(PpJob::new(
+        image_path("include/asm.h"),
+        lang,
+        &[include],
+        &[],
+        true,
+    ));
+    // The rows, then the inputs written for this test, each in a directory
+    // of its own: `/d/N/t.c` (`t.S`) and its headers.
+    let rows: Vec<PpInput> = lexer_rows::cases()
+        .into_iter()
+        .chain(preprocessor_rows::cases())
+        .map(|c| (c.src, c.files, c.args, false))
+        .chain(
+            PP_INPUTS
+                .iter()
+                .map(|(src, files, args, asm)| (src.to_string(), files.to_vec(), args.to_vec(), *asm)),
+        )
+        .collect();
+    for (k, (src, headers, args, asm)) in rows.into_iter().enumerate() {
+        let dir = format!("/d/{k}");
+        for (name, text) in headers {
+            files.insert(format!("{dir}/{name}"), text.as_bytes().to_vec());
+        }
+        let input = format!("{dir}/t.{}", if asm { "S" } else { "c" });
+        files.insert(input.clone(), src.into_bytes());
+        let args: Vec<String> = args.iter().map(|a| a.replace("{dir}", &dir)).collect();
+        let (includes, macros): (Vec<&String>, Vec<&String>) = args.iter().partition(|a| a.starts_with("-I"));
+        let includes: Vec<String> = includes.iter().map(|i| i[2..].to_string()).collect();
+        let macros: Vec<&str> = macros.iter().map(|m| m.as_str()).collect();
+        let lang = if asm {
+            merlin::Lang::AssemblerWithCpp
+        } else {
+            merlin::Lang::C
+        };
+        jobs.push(PpJob::new(input, lang, &includes, &macros, true));
+    }
+    (jobs, files)
+}
+
+/// The directories `files` are in, parents first (as [`image_of`] makes
+/// them), but `/out`, which it makes itself.
+fn dirs_of(files: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    let mut dirs = BTreeSet::new();
+    for path in files.keys() {
+        let mut d = path.as_str();
+        while let Some((parent, _)) = d.rsplit_once('/') {
+            if parent.is_empty() {
+                break;
+            }
+            dirs.insert(parent.to_string());
+            d = parent;
+        }
+    }
+    dirs.into_iter().collect()
+}
+
+/// Machines the preprocessor's corpus is split over: more than the other
+/// tests', for its 500 runs of `cc1`.
+const PP_MACHINES: usize = 8;
+
+/// The machine of the preprocessor's tests: [`machine_config`]'s, with more
+/// RAM, which a compiler's process takes more of than the assembler's.
+fn cc1_machine_config() -> MachineConfig {
+    MachineConfig {
+        ram_size: 32 << 20,
+        ..machine_config()
+    }
+}
+
+/// Boots the disk kernel on `image`, as [`boot`] does, on
+/// [`cc1_machine_config`]'s machine.
+fn boot_cc1(image: Vec<u8>, input: &str, max_steps: u64) -> (String, Vec<u8>) {
+    let disk = MemDisk::from_image(image).unwrap();
+    let mut m = Machine::with_backends(cc1_machine_config(), vec![Box::new(disk)]).unwrap();
+    m.cpu.bus.uart.capture = true;
+    let elf = std::fs::read(repo_root().join("kernel").join(kernel::DISK_KERNEL)).unwrap();
+    m.load_elf(&elf).unwrap();
+    m.set_uart_input(kernel::typed(input.as_bytes()));
+    let r = m.run(Some(max_steps), |_| {});
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    assert_eq!(r, RunResult::Exited(0), "{out}");
+    let d = &mut m.cpu.bus.disks[0];
+    let mut data = vec![0; d.capacity() as usize * camelot_fs::SECTOR_SIZE];
+    d.backend().read(0, &mut data).unwrap();
+    (out, data)
+}
+
+/// Runs `jobs` (each with its number in the whole list, for its output file
+/// `/out/N`) with `/bin/cc1` on a machine whose image holds `files`, and
+/// compares each with `merlin -E`: the file it writes, if it succeeds, and
+/// what it says. Returns what differs.
+fn preprocess_on_camelot(jobs: &[(usize, &PpJob)], files: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    let commands: Vec<String> = jobs
+        .iter()
+        .map(|(k, job)| job.command(&format!("/out/{k}")))
+        .collect();
+    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let listed: Vec<(String, Vec<u8>)> = files.iter().map(|(p, d)| (p.clone(), d.clone())).collect();
+    let dirs = dirs_of(files);
+    let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    // An inode for every file, directory and output, and some to spare.
+    let ninodes = (listed.len() + dirs.len() + jobs.len() + 64) as u32;
+    let image = image_with_inodes(&["cc1"], &dirs, &listed, ninodes);
+    let (out, disk) = boot_cc1(image, &input, 200_000_000_000);
+    let fs = Fs::open(&disk).unwrap();
+    let mut wrong = Vec::new();
+    for (i, (k, job)) in jobs.iter().enumerate() {
+        let (text, said) = merlin_e(job, files);
+        let want_said = if text.is_some() {
+            said
+        } else {
+            format!("{said}cc1: exit 1\n")
+        };
+        let got_said = shell_output(&out, &commands[i]).replace('\r', "");
+        let written = fs.read_file(&format!("/out/{k}")).ok();
+        let want_written = text.map(String::into_bytes);
+        if got_said != want_said {
+            wrong.push(format!(
+                "{}: said\n{got_said}\nmerlin says\n{want_said}",
+                commands[i]
+            ));
+        }
+        if written != want_written {
+            let show = |w: &Option<Vec<u8>>| match w {
+                Some(t) => String::from_utf8_lossy(t).into_owned(),
+                None => "(no file)".to_string(),
+            };
+            wrong.push(format!(
+                "{}: wrote\n{}\nmerlin writes\n{}",
+                commands[i],
+                show(&written),
+                show(&want_written)
+            ));
+        }
+    }
+    wrong
+}
+
+/// #241's first stage: `/bin/cc1 -E` on Camelot writes what the host's
+/// `merlin -E` writes, and says what it says, byte for byte, for every job
+/// of [`pp_jobs`]: the repository's C and `.S` files, the diagnostics
+/// table's rows of the lexer and the preprocessor, and [`PP_INPUTS`]. The
+/// corpus is run once, split over [`PP_MACHINES`] machines.
+#[test]
+fn the_preprocessor_on_camelot_writes_what_merlin_writes() {
+    let (jobs, files) = pp_jobs();
+    assert!(jobs.len() > 400, "{}", jobs.len());
+    // The corpus has both: what preprocesses (with warnings too) and what
+    // merlin refuses.
+    let results: Vec<(Option<String>, String)> = jobs.iter().map(|j| merlin_e(j, &files)).collect();
+    let refused = results.iter().filter(|(t, _)| t.is_none()).count();
+    let warned = results
+        .iter()
+        .filter(|(t, s)| t.is_some() && !s.is_empty())
+        .count();
+    assert!(refused > 40 && warned > 20, "{refused} refused, {warned} warned");
+    // Each machine gets every PP_MACHINES-th job, so the big ones spread
+    // out.
+    let numbered: Vec<(usize, &PpJob)> = jobs.iter().enumerate().collect();
+    let wrong: Vec<String> = std::thread::scope(|scope| {
+        let runs: Vec<_> = (0..PP_MACHINES)
+            .map(|m| {
+                let share: Vec<(usize, &PpJob)> =
+                    numbered.iter().copied().skip(m).step_by(PP_MACHINES).collect();
+                let files = &files;
+                scope.spawn(move || preprocess_on_camelot(&share, files))
+            })
+            .collect();
+        runs.into_iter().flat_map(|r| r.join().unwrap()).collect()
+    });
+    assert!(wrong.is_empty(), "{} differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// cc1's command line is merlin's (main.rs), with `cc1` for `merlin` in its
+/// messages: the usage errors, a file it cannot read, output to standard
+/// output for several inputs, and what this stage refuses (compiling).
+#[test]
+fn cc1_takes_merlins_command_line() {
+    let a = "#define A 1\nint a = A;\n";
+    let b = "  .word __LINE__\n";
+    let files = [
+        ("/d/a.c".to_string(), a.as_bytes().to_vec()),
+        ("/d/b.S".to_string(), b.as_bytes().to_vec()),
+    ];
+    let usage = "usage: cc1 [options] input.c...\n";
+    // (command, what it says first, and its exit status).
+    let cases: &[(&str, String, u32)] = &[
+        ("cc1 -q /d/a.c", format!("cc1: unknown option -q\n{usage}"), 2),
+        (
+            "cc1 -E -march=rv32ima_zicsr_zifencei /d/a.c",
+            format!(
+                "cc1: unsupported -march 'rv32ima_zicsr_zifencei' (merlin takes rv64ima_zicsr_zifencei)\n{usage}"
+            ),
+            2,
+        ),
+        ("cc1 -E -march rv64ima_zicsr_zifencei /d/a.c", format!("cc1: unknown option -march\n{usage}"), 2),
+        ("cc1 -E -mabi=ilp32 /d/a.c", format!("cc1: unknown target ABI 'ilp32'\n{usage}"), 2),
+        ("cc1 -E -x fortran /d/a.c", format!("cc1: language not recognized: 'fortran'\n{usage}"), 2),
+        ("cc1 -E /d/a.c -D", format!("cc1: -D needs a macro name\n{usage}"), 2),
+        ("cc1 -E -D=1 /d/a.c", format!("cc1: -D needs a macro name\n{usage}"), 2),
+        ("cc1 -E /d/a.c -U", format!("cc1: -U needs a macro name\n{usage}"), 2),
+        ("cc1 -E /d/a.c -I", format!("cc1: -I needs a directory\n{usage}"), 2),
+        ("cc1 -E /d/a.c -o", format!("cc1: -o needs a file name\n{usage}"), 2),
+        ("cc1 -E /d/a.c -x", format!("cc1: -x needs a language\n{usage}"), 2),
+        (
+            "cc1 -E -o /out/x /d/a.c /d/b.S",
+            format!("cc1: -o needs a single input file\n{usage}"),
+            2,
+        ),
+        (
+            "cc1 -g -fdebug-compilation-dir=/d /d/b.S",
+            format!(
+                "cc1: /d/b.S: assembler-with-cpp input is only preprocessed (-E); merlin-as assembles the \
+                 output\n{usage}"
+            ),
+            2,
+        ),
+        ("cc1 -E", usage.to_string(), 2),
+        (
+            "cc1 -E /d/missing.c",
+            "cc1: cannot read /d/missing.c: no such file or directory\n".to_string(),
+            2,
+        ),
+        // A directory is no file to read, as merlin finds.
+        ("cc1 -E /d", "cc1: cannot read /d: is a directory\n".to_string(), 2),
+        (
+            "cc1 /d/a.c",
+            "cc1: only preprocessing (-E) is here yet: compiling comes with merlin's parser\n".to_string(),
+            2,
+        ),
+    ];
+    // What merlin writes for both files: on standard output, one after the
+    // other.
+    let job_a = PpJob::new("/d/a.c".into(), merlin::Lang::C, &[], &[], true);
+    let job_b = PpJob::new("/d/b.S".into(), merlin::Lang::AssemblerWithCpp, &[], &[], true);
+    let map: BTreeMap<String, Vec<u8>> = files.iter().cloned().collect();
+    let both = format!(
+        "{}{}",
+        merlin_e(&job_a, &map).0.unwrap(),
+        merlin_e(&job_b, &map).0.unwrap()
+    );
+    let together = "cc1 -E -g /d/a.c /d/b.S";
+    let help = "cc1 --help";
+    let mut commands: Vec<&str> = cases.iter().map(|(c, ..)| *c).collect();
+    commands.extend([together, help]);
+    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let (out, _) = boot_cc1(image_of(&["cc1"], &["/d"], &files), &input, 20_000_000_000);
+    for (command, said, status) in cases {
+        let got = shell_output(&out, command).replace('\r', "");
+        assert!(got.starts_with(said.as_str()), "{command}: {got}");
+        assert!(
+            got.ends_with(&format!("cc1: exit {status}\n")),
+            "{command}: {got}"
+        );
+    }
+    assert_eq!(shell_output(&out, together).replace('\r', ""), both);
+    assert!(shell_output(&out, help).replace('\r', "").starts_with(usage));
 }

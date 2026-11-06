@@ -72,8 +72,27 @@ pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
 /// over 200 KB, `ld` not much less, nearly half together of what the
 /// smallest machine, 3 MiB, has left once the kernel and the programs it
 /// embeds, a little over 2 MiB, are loaded. `ar` makes and reads archives
-/// for them, files too.
-pub const DISK_ONLY: &[&str] = &["ar", "as", "ld"];
+/// for them, files too, and `cc1`, the C compiler, is bigger than both.
+pub const DISK_ONLY: &[&str] = &["ar", "as", "cc1", "ld"];
+
+/// Programs of several files whose name is not their directory's: (the
+/// directory, the program). `kernel/user/cc` is `/bin/cc1`, the compiler
+/// proper (merlin rewritten in C, #241), as clang's `-cc1` and GCC's `cc1`
+/// are, which the `cc` driver runs (#242).
+pub const RENAMED: &[(&str, &str)] = &[("cc", "cc1")];
+
+/// The name of the program whose source's stem is `stem`, of language
+/// `lang`: the stem itself, but for a directory ([`Lang::Dir`]) of
+/// [`RENAMED`] (a file `cc.c` is the program `cc`).
+pub fn program_name(stem: &str, lang: Lang) -> &str {
+    if lang != Lang::Dir {
+        return stem;
+    }
+    RENAMED
+        .iter()
+        .find(|(dir, _)| *dir == stem)
+        .map_or(stem, |(_, name)| name)
+}
 
 /// The programs the kernel builds in: all but [`DISK_ONLY`], by name.
 pub fn embedded(programs: &[Program]) -> Vec<&Program> {
@@ -136,8 +155,9 @@ pub enum Lang {
 /// library's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
-    /// The file's stem, relative to [`USER_DIR`]: for a program, its name;
-    /// for a library member, `lib/` and its name.
+    /// The file's stem, relative to [`USER_DIR`]: for a program, its file's
+    /// or its directory's name (which [`Source::name`] makes the program's,
+    /// [`RENAMED`] aside); for a library member, `lib/` and its name.
     pub stem: String,
     pub lang: Lang,
 }
@@ -151,6 +171,11 @@ impl Source {
             Lang::AsmCpp => format!("{}.S", self.stem),
             Lang::Dir => format!("{}/", self.stem),
         }
+    }
+
+    /// The name of the program it is, as `/bin` has it ([`program_name`]).
+    pub fn name(&self) -> &str {
+        program_name(&self.stem, self.lang)
     }
 
     /// The files a program is built from: itself, or, for a [`Lang::Dir`]
@@ -206,7 +231,8 @@ pub enum CCompiler<'a> {
 /// A linked user program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
-    /// The source's stem: what the shell calls it.
+    /// Its name ([`Source::name`]: the source's stem, or a directory's
+    /// [`RENAMED`] name): what the shell calls it.
     pub name: String,
     /// The executable merlin-ld wrote, without its debug information: what
     /// the kernel embeds and `/bin` holds, linked from the installed start
@@ -293,21 +319,21 @@ pub fn programs(dir: &Path) -> Result<Vec<Source>, String> {
         }
     }
     for s in &progs {
-        if !valid_name(&s.stem) {
+        if !valid_name(s.name()) {
             return Err(format!(
                 "{}: a program name is 1 to {MAX_NAME} of a-z, 0-9 and _",
                 dir.join(s.file()).display()
             ));
         }
     }
-    progs.sort_by(|a, b| a.stem.cmp(&b.stem));
-    if let Some(w) = progs.windows(2).find(|w| w[0].stem == w[1].stem) {
+    progs.sort_by(|a, b| a.name().cmp(b.name()));
+    if let Some(w) = progs.windows(2).find(|w| w[0].name() == w[1].name()) {
         return Err(format!(
             "{}: both {} and {} define program {}",
             dir.display(),
             w[0].file(),
             w[1].file(),
-            w[0].stem
+            w[0].name()
         ));
     }
     if progs.is_empty() {
@@ -318,7 +344,7 @@ pub fn programs(dir: &Path) -> Result<Vec<Source>, String> {
 
 /// The programs' names in `dir`, in order.
 pub fn program_names(dir: &Path) -> Result<Vec<String>, String> {
-    Ok(programs(dir)?.into_iter().map(|s| s.stem).collect())
+    Ok(programs(dir)?.into_iter().map(|s| s.name().to_string()).collect())
 }
 
 /// The assembly for `src` (in `dir`): the file itself, a `.S` file as merlin
@@ -516,7 +542,7 @@ pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> R
     // otherwise keep).
     let installed = toolchain::link_with(dir, SCRIPT, &rt.installed().link_inputs(own), &prog.stem, clang)?;
     Ok(Program {
-        name: prog.stem.clone(),
+        name: prog.name().to_string(),
         elf: merlin_ld::strip_debug(&installed).map_err(|e| format!("{}: {e}", prog.stem))?,
         debug,
     })
@@ -560,7 +586,7 @@ pub fn build_program(dir: &Path, prog: &Source) -> Result<Program, String> {
 pub fn build_named(dir: &Path, name: &str) -> Result<Program, String> {
     let prog = programs(dir)?
         .into_iter()
-        .find(|s| s.stem == name)
+        .find(|s| s.name() == name)
         .ok_or_else(|| format!("no program called {name} in {}", dir.display()))?;
     build_program(dir, &prog)
 }
@@ -582,7 +608,7 @@ pub fn build_all_with(dir: &Path, cc: CCompiler) -> Result<Vec<Program>, String>
 pub fn embedded_sources(dir: &Path) -> Result<Vec<Source>, String> {
     Ok(programs(dir)?
         .into_iter()
-        .filter(|p| !DISK_ONLY.contains(&p.stem.as_str()))
+        .filter(|p| !DISK_ONLY.contains(&p.name()))
         .collect())
 }
 
@@ -901,6 +927,27 @@ mod tests {
         std::fs::remove_file(dir.join("a.c")).unwrap();
         std::fs::write(dir.join("Bad-Name.s"), "").unwrap();
         assert!(program_names(&dir).unwrap_err().contains("a program name is"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory of RENAMED is the program it names, and only the
+    /// directory: `cc/` is `cc1`, `cc.c` next to it the program `cc` (the
+    /// driver, #242).
+    #[test]
+    fn only_a_directory_is_renamed() {
+        assert_eq!(program_name("cc", Lang::Dir), "cc1");
+        assert_eq!(program_name("cc", Lang::C), "cc");
+        assert_eq!(program_name("as", Lang::Dir), "as");
+        let dir = scratch("renamed");
+        write_runtime(&dir);
+        std::fs::create_dir_all(dir.join("cc")).unwrap();
+        std::fs::write(dir.join("cc").join("main.c"), "").unwrap();
+        assert_eq!(program_names(&dir).unwrap(), ["cc1"]);
+        std::fs::write(dir.join("cc.c"), "").unwrap();
+        assert_eq!(program_names(&dir).unwrap(), ["cc", "cc1"]);
+        let progs = programs(&dir).unwrap();
+        assert_eq!(progs, [src("cc", Lang::C), src("cc", Lang::Dir)]);
+        assert_eq!(progs[1].parts(&dir).unwrap(), [src("cc/main", Lang::C)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
