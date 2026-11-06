@@ -36,13 +36,14 @@ const COMMANDS: &[&str] = &[
     "guitest draw /out",
     "guitest text /out",
     "guitest image /out",
+    "guitest widgets /out",
     "guitest damage",
     "guitest keys",
     "guitest utf8",
 ];
 
 /// The images the scenes write to `/out`.
-const IMAGES: &[&str] = &["draw", "text", "image"];
+const IMAGES: &[&str] = &["draw", "text", "image", "widgets", "input"];
 
 /// An image with `/dev/console`, the shell and [`BINS`] in `/bin`, the
 /// desktop's `/usr/share`, and an empty `/out`.
@@ -175,11 +176,33 @@ fn the_scenes_draw_the_expected_images() {
     assert!(wrong.is_empty(), "{wrong:#?} (drawn in {})", actual.display());
 }
 
-/// The text the scenes print: the font's size and advance, the damage
-/// lists, the keyboard's characters, UTF-8 decoded and encoded.
+/// The text the scenes print: the widgets' layout, actions and damage
+/// (only what changed is drawn again), the font's size and advance, the
+/// damage lists, the keyboard's characters, UTF-8 decoded and encoded.
 #[test]
 fn the_scenes_print_what_they_did() {
     let run = run();
+    assert_eq!(
+        output(&run.out, "guitest widgets /out"),
+        "list 4,58 180x82, 4 lines; ok 164,144 32x24\n\
+         first: 0,0 200x172 (bounds 0,0 200x172)\n\
+         again: (bounds 0,0 0x0)\n\
+         action: field 0\n\
+         field: \"Arthur\", cursor 1\n\
+         typed: 52,30 144x24 (bounds 52,30 144x24)\n\
+         action: list 0\n\
+         action: list 1\n\
+         list: selected 1, top 3, bar 3\n\
+         action: list 5\n\
+         list: selected 5\n\
+         list: 52,30 144x24 4,58 192x82 (bounds 4,30 192x110)\n\
+         action: button OK 0\n\
+         action: button Cancel 0\n\
+         menu: 96,144 64x24 164,144 32x24 4,4 180x136 (bounds 4,4 192x164)\n\
+         action: menu File 2\n\
+         closed: 4,4 180x136 (bounds 4,4 180x136)\n\
+         menu open: 0\n"
+    );
     assert_eq!(
         output(&run.out, "guitest text /out"),
         "font 8x16, 512 glyphs\nadvance 120, width 120\nheight 16, large 32\n"

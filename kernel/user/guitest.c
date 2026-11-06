@@ -234,6 +234,154 @@ static void scene_damage(void) {
     print_damage("full", &d);
 }
 
+/* ---- widgets ---- */
+
+static void act(struct gui_widget *w, int value) {
+    printf("action: %s %d\n", (const char *)w->data, value);
+}
+
+static void show_damage(const char *what, struct gui_ui *ui) {
+    print_damage(what, &ui->damage);
+    gui_damage_clear(&ui->damage);
+}
+
+/* A key pressed and let go of. */
+static void tap(struct gui_ui *ui, uint code) {
+    gui_ui_key(ui, code, 1);
+    gui_ui_key(ui, code, 0);
+}
+
+static void click(struct gui_ui *ui, int x, int y) {
+    gui_ui_pointer(ui, x, y);
+    gui_ui_button(ui, BTN_LEFT, 1);
+    gui_ui_button(ui, BTN_LEFT, 0);
+}
+
+static void centre(struct gui_widget *w, int *x, int *y) {
+    *x = w->rect.x + w->rect.w / 2;
+    *y = w->rect.y + w->rect.h / 2;
+}
+
+static void scene_widgets(const char *dir) {
+    struct gui_font f;
+    int r = gui_font_load(&f, FONT);
+    if (r < 0) {
+        fail(FONT, r);
+        return;
+    }
+    static const char *const file_items[] = {"Open", "Save", "Quit"};
+    static const char *const edit_items[] = {"Cut", "Copy", "Paste"};
+    static const char *const knights[] = {"Arthur",   "Lancelot", "Galahad", "Percival", "Gawain",
+                                          "Bedivere", "Tristan",  "Kay",     "Gareth",   "Bors"};
+    struct gui_ui ui;
+    gui_ui_init(&ui, &f);
+    struct gui_widget *root = gui_column(&ui, NULL, 4, 4);
+    struct gui_widget *bar = gui_row(&ui, root, 0, 0);
+    struct gui_widget *file = gui_menu(&ui, bar, "File", file_items, 3, act);
+    file->data = "menu File";
+    gui_menu(&ui, bar, "Edit", edit_items, 3, act)->data = "menu Edit";
+    struct gui_widget *name_row = gui_row(&ui, root, 4, 0);
+    gui_label(&ui, name_row, "Name:");
+    struct gui_widget *name = gui_field(&ui, name_row, 12, 32, act);
+    name->data = "field";
+    gui_grow(name);
+    struct gui_widget *list = gui_list(&ui, root, knights, 10, 4, act);
+    list->data = "list";
+    gui_grow(list->parent);
+    struct gui_widget *buttons = gui_row(&ui, root, 4, 0);
+    struct gui_widget *gap = gui_label(&ui, buttons, "");
+    gui_grow(gap);
+    gui_button(&ui, buttons, "Cancel", act)->data = "button Cancel";
+    struct gui_widget *ok = gui_button(&ui, buttons, "OK", act);
+    ok->data = "button OK";
+
+    struct gui_buffer b;
+    if (new_buffer(&b, 200, 172) < 0) {
+        gui_ui_free(&ui);
+        gui_font_free(&f);
+        return;
+    }
+    gui_ui_layout(&ui, gui_rect(0, 0, 200, 172));
+    printf("list %d,%d %dx%d, %d lines; ok %d,%d %dx%d\n", list->rect.x, list->rect.y, list->rect.w,
+           list->rect.h, list->buddy->page, ok->rect.x, ok->rect.y, ok->rect.w, ok->rect.h);
+    gui_ui_draw(&ui, &b);
+    show_damage("first", &ui);
+    write_ppm(dir, "widgets", &b);
+
+    /* Nothing changed: nothing drawn. */
+    gui_ui_draw(&ui, &b);
+    show_damage("again", &ui);
+
+    /* Typing in the field: a click gives it the focus. */
+    int x, y;
+    centre(name, &x, &y);
+    click(&ui, x, y);
+    /* "Krthurx", one back, to the start, one deleted, "A": "Arthur". */
+    static const uint arthur[] = {KEY_R, KEY_T, KEY_H, KEY_U, KEY_R, KEY_X, KEY_BACKSPACE, KEY_HOME, KEY_DELETE};
+    gui_ui_key(&ui, KEY_LEFTSHIFT, 1);
+    tap(&ui, KEY_K);
+    gui_ui_key(&ui, KEY_LEFTSHIFT, 0);
+    for (int i = 0; i < 9; i++) {
+        tap(&ui, arthur[i]);
+    }
+    gui_ui_key(&ui, KEY_LEFTSHIFT, 1);
+    tap(&ui, KEY_A);
+    gui_ui_key(&ui, KEY_LEFTSHIFT, 0);
+    tap(&ui, KEY_ENTER);
+    printf("field: \"%s\", cursor %d\n", name->chars, name->cursor);
+    gui_ui_draw(&ui, &b);
+    show_damage("typed", &ui);
+
+    /* Tab to the list; down twice; the wheel. */
+    tap(&ui, KEY_TAB);
+    tap(&ui, KEY_DOWN);
+    tap(&ui, KEY_DOWN);
+    centre(list, &x, &y);
+    gui_ui_pointer(&ui, x, y);
+    gui_ui_scroll(&ui, 1);
+    printf("list: selected %d, top %d, bar %d\n", list->selected, list->top, list->buddy->value);
+    /* A click on the third line shown. */
+    click(&ui, x, list->rect.y + 3 + 2 * (f.height + 2) + 4);
+    printf("list: selected %d\n", list->selected);
+    gui_ui_draw(&ui, &b);
+    show_damage("list", &ui);
+
+    /* OK pressed, the pointer moved off it, let go: no action; then a
+     * click. */
+    centre(ok, &x, &y);
+    gui_ui_pointer(&ui, x, y);
+    gui_ui_button(&ui, BTN_LEFT, 1);
+    gui_ui_pointer(&ui, 2, 160);
+    gui_ui_button(&ui, BTN_LEFT, 0);
+    click(&ui, x, y);
+    /* Shift+Tab back from OK to Cancel, and Enter. */
+    gui_ui_key(&ui, KEY_LEFTSHIFT, 1);
+    tap(&ui, KEY_TAB);
+    gui_ui_key(&ui, KEY_LEFTSHIFT, 0);
+    tap(&ui, KEY_ENTER);
+
+    /* The File menu opened, the pointer on its second item. */
+    centre(file, &x, &y);
+    click(&ui, x, y);
+    gui_ui_pointer(&ui, x, ui.popup.y + 2 + (f.height + 2) + 4);
+    gui_ui_draw(&ui, &b);
+    show_damage("menu", &ui);
+    write_ppm(dir, "input", &b);
+    /* Down, and Enter: the third. */
+    tap(&ui, KEY_DOWN);
+    tap(&ui, KEY_ENTER);
+    gui_ui_draw(&ui, &b);
+    show_damage("closed", &ui);
+    /* Opened again, and a click outside closes it. */
+    click(&ui, x, y);
+    click(&ui, 190, 100);
+    printf("menu open: %d\n", ui.menu != NULL);
+
+    gui_buffer_free(&b);
+    gui_ui_free(&ui);
+    gui_font_free(&f);
+}
+
 /* ---- keys ---- */
 
 static void type_keys(struct gui_keyboard *k, const char *what, const uint *codes, int n) {
@@ -322,6 +470,8 @@ int main(int argc, char **argv) {
         scene_text(dir);
     } else if (strcmp(what, "image") == 0) {
         scene_image(dir);
+    } else if (strcmp(what, "widgets") == 0) {
+        scene_widgets(dir);
     } else if (strcmp(what, "damage") == 0) {
         scene_damage();
     } else if (strcmp(what, "keys") == 0) {

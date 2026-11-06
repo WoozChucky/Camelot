@@ -300,9 +300,11 @@ struct gui_ui {
     struct gui_widget *grab; /* pressed on: gets the motion and the release */
     struct gui_widget *menu; /* the open menu */
     struct gui_rect popup;   /* where its items are */
+    int popup_dirty;         /* its items to be drawn again */
     const struct gui_font *font;
     struct gui_keyboard keyboard;
-    struct gui_damage damage;
+    struct gui_damage damage;     /* what gui_ui_draw drew, for the window */
+    struct gui_damage background; /* to be cleared to the window's colour */
     int x; /* the pointer */
     int y;
 };
