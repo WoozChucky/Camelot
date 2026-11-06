@@ -3672,7 +3672,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 47, "{calls:?}");
+    assert_eq!(calls.len(), 52, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -3726,10 +3726,13 @@ fn the_system_call_document_matches_the_code() {
                 listed += 1;
             }
         }
-        // A call that takes a pointer can fail with -EFAULT, and only those;
-        // only the calls that can't fail list no error.
+        // A call that takes a pointer can fail with -EFAULT, and only those,
+        // but for the memory mappings' calls: their pointer is an address to
+        // map at or unmap, never memory the kernel reads or writes. Only the
+        // calls that can't fail list no error.
+        let addresses = ["mmap", "munmap", "mprotect"];
         assert_eq!(
-            args.contains('*'),
+            args.contains('*') && !addresses.contains(&name.as_str()),
             returns.contains("`-EFAULT`"),
             "{name}: {returns}"
         );
@@ -3846,6 +3849,8 @@ fn the_system_call_document_matches_the_code() {
     }
     let console = exactly(&read("kernel/include/file.h"), "CONSOLE");
     assert_eq!(console[0].0, u32::from(xtask::fs::CONSOLE_MAJOR));
+    let fb = exactly(&read("kernel/include/file.h"), "FB");
+    assert_eq!(fb[0].0, u32::from(xtask::fs::FB_MAJOR));
 }
 
 // ---- The clang reference build (ignored: needs LLVM) ----

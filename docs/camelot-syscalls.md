@@ -30,7 +30,7 @@ The Linux RISC-V convention, which is also the C calling convention's, so a
 stub is two instructions:
 
 - The program executes `ecall` in U-mode with the call number in `a7` and
-  the arguments in `a0`-`a5` (`setsockopt` takes five, the most). An
+  the arguments in `a0`-`a5` (`mmap` takes six, the most). An
   argument is a register, read at its C type: an `int` is the register's
   low 32 bits (which the calling convention keeps sign-extended on RV64), a
   pointer, a `size_t` or an `off_t` all of it. The number is all of `a7`, a
@@ -39,8 +39,8 @@ stub is two instructions:
   width, so an error is negative to a 64-bit program too (-14 is
   0xffff_ffff_ffff_fff2, not 0x0000_0000_ffff_fff2). A value from -4095 to
   -1 is an error: minus one of the error numbers below. Every other value
-  is a success: a count, a descriptor, or for `sbrk` an address (user
-  addresses are below `USER_TOP`, so never in that range).
+  is a success: a count, a descriptor, or for `sbrk` and `mmap` an address
+  (user addresses are below `USER_TOP`, so never in that range).
 - Every register but `a0` is preserved, `a1`-`a7` and the temporaries
   included, and `pc` continues after the `ecall`.
 
@@ -146,6 +146,11 @@ headers and checks each size.
 | 45 | `futex_wait` | `int *addr, int val` | 0; `-EAGAIN`, `-EINVAL`, `-EINTR`, `-EFAULT` |
 | 46 | `futex_wake` | `int *addr, int n` | the number of threads woken; `-EINVAL`, `-EFAULT` |
 | 47 | `fcntl` | `int fd, int cmd, int arg` | the descriptor's flags, a new descriptor, or 0; `-EBADF`, `-EINVAL`, `-EMFILE` |
+| 48 | `mmap` | `void *addr, size_t len, int prot, int flags, int fd, off_t offset` | the mapping's address, a pointer; `-EINVAL`, `-ENOMEM`, `-EEXIST`, `-EBADF`, `-EACCES`, `-ENODEV`, `-EOVERFLOW`, `-EOPNOTSUPP` |
+| 49 | `munmap` | `void *addr, size_t len` | 0; `-EINVAL`, `-ENOMEM` |
+| 50 | `mprotect` | `void *addr, size_t len, int prot` | 0; `-EINVAL`, `-ENOMEM`, `-EACCES` |
+| 51 | `memfd_create` | `const char *name, uint flags` | a new descriptor; `-EINVAL`, `-EFAULT`, `-EMFILE`, `-ENFILE` |
+| 52 | `ftruncate` | `int fd, off_t length` | 0; `-EBADF`, `-EINVAL`, `-EFBIG` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -297,10 +302,11 @@ opens:
 - a directory, for reading only: anything else is `-EISDIR`, and so is
   `O_CREAT` on a missing name with a trailing slash (`newf/` names a
   directory, and `open` makes only files);
-- a device node (`/dev/console`), which gives the device itself: the
-  console's reads and writes, in the access mode asked for, also on a
-  read-only filesystem; a node whose major number has no driver is
-  `-ENODEV`.
+- a device node (`/dev/console`, `/dev/fb0`), which gives the device
+  itself, in the access mode asked for, also on a read-only filesystem:
+  the console's reads and writes, the framebuffer's memory to map ("Memory
+  mappings"; its `read` and `write` are `-EINVAL`); a node whose major
+  number has no driver is `-ENODEV`.
 
 A file bigger than the kernel reads or writes, 2^32 - 1 blocks (ext4's
 `s_maxbytes`), is `-EOVERFLOW`: only a damaged inode can be one, as the
@@ -692,7 +698,8 @@ waiter: no wakeup is lost between them. `futex_wake` wakes up to `n` of
 the threads of the caller's process that wait on `addr` (none for `n` of 0
 or less), the ones that waited first not necessarily first, and returns
 how many it woke. A futex belongs to a process: it never wakes another
-process's threads, as no memory is shared between processes. Errors, for
+process's threads, even on memory the two share ("Memory mappings",
+Linux's private futexes). Errors, for
 both: `-EINVAL` if `addr` is not 4-byte aligned, `-EFAULT` if it is not
 readable user memory; and `-EINTR` if the waiter is killed.
 
@@ -712,13 +719,183 @@ before it waits for the others, so one of them reading the same file, or
 writing to any, still finishes its call.
 
 **Buffers another thread unmaps.** A pointer is checked when the call
-starts, but another thread's `sbrk` may unmap part of the buffer while
-the call is under way (a `write` to a full pipe, say). The call then
+starts, but another thread's `sbrk`, `munmap` or `mprotect` may unmap part
+of the buffer, or take an access away, while the call is under way (a
+`write` to a full pipe, say). The call then
 stops where the copy fails: `read` and `write` return the bytes moved
 until then, or `-EFAULT` if none, and the bytes they couldn't copy are
 neither written nor taken from the pipe; the calls that fill in a struct
 (`fstat`, `procs`, `harts`, `pipe`, `getsockname`, `getpeername`) return
 `-EFAULT`, and `pipe` closes the descriptors it made.
+
+## Memory mappings
+
+Besides its program, its heap and its stack, a process may have memory
+mappings: ranges of its address space that `mmap` maps and `munmap` takes
+away, each with its protections (`mprotect`), as Linux's: anonymous memory
+of the process's own, memory shared with other processes ("Shared
+memory" below), and a device's memory ("A device's memory" below). Inside
+the kernel each mapping is an area (`kernel/mmap.c`, the shared objects
+`kernel/shm.c`, the framebuffer `kernel/fb.c`;
+`docs/excalibur-spec.md` section 10, "Kernel memory mappings").
+
+**Where they go.** Between the end of the heap and the guard page under the
+stack's limit (`USER_LOAD_TOP`, "Starting a program"), from the top down:
+each new mapping goes in the highest room that fits it, as Linux's go
+below the stack. The heap can't grow into a mapping (`sbrk` fails with
+`-ENOMEM` then), and the program, the heap and the stack are not mappings:
+`munmap` and `mprotect` leave them alone.
+
+**Pages on demand.** A mapping's pages are mapped the first time they are
+touched, by the program or by a system call that reads or writes them (a
+`read` into a buffer there, say): an untouched page costs no memory, so a
+program may map far more than the machine has, as long as it doesn't use
+it all. Anonymous memory reads zero at first. A touch the mapping's
+protections don't allow (a write to a read-only mapping, any access to a
+`PROT_NONE` one) is a fault, and kills the program ("exit"), as Linux's
+`SIGSEGV` would; so does a page that can't be had then. A device's
+mapping too maps a page at its first touch, but the page is the device's.
+A system call checks a whole buffer before it reads or writes any of it,
+so every page of the buffer is mapped then, even if the call uses fewer
+bytes (a `read` that finds 10 bytes waiting maps all of a 1 MiB buffer),
+and a buffer bigger than the free memory is `-EFAULT`.
+
+The values are Linux's:
+
+| Name | Value | |
+|---|---|---|
+| `PROT_NONE` | 0 | no access |
+| `PROT_READ` | 1 | readable |
+| `PROT_WRITE` | 2 | writable, and so readable: a RISC-V page can't be writable and not readable |
+| `PROT_EXEC` | 4 | executable |
+| `PROT_SEM` | 8 | `mprotect` only: accepted, means nothing (every page allows atomics) |
+| `MAP_SHARED` | 0x01 | shared with every other mapping of the same memory |
+| `MAP_PRIVATE` | 0x02 | the process's own |
+| `MAP_SHARED_VALIDATE` | 0x03 | `MAP_SHARED` of a descriptor, but a flag Linux doesn't know is `-EOPNOTSUPP` |
+| `MAP_FIXED` | 0x10 | exactly at `addr`, replacing what is mapped there |
+| `MAP_ANONYMOUS` | 0x20 | no file: zeroed memory |
+| `MAP_NORESERVE` | 0x4000 | accepted: nothing is reserved anyway |
+| `MAP_POPULATE` | 0x8000 | map every page now, rather than on first touch |
+| `MAP_FIXED_NOREPLACE` | 0x100000 | exactly at `addr`, but never over a mapping |
+
+**mmap(addr, len, prot, flags, fd, offset)** maps `len` bytes, rounded up
+to whole pages, and returns where, a page-aligned address (or minus an
+error, as a pointer, as `sbrk` returns one). `flags` holds one of
+`MAP_SHARED`, `MAP_PRIVATE` and `MAP_SHARED_VALIDATE` and any of the
+others; flags Camelot doesn't know are ignored, as Linux ignores them, but
+for a descriptor's `MAP_SHARED_VALIDATE` mapping, which refuses those
+Linux doesn't know either (outside its `LEGACY_MAP_MASK` and
+`MAP_FIXED_NOREPLACE`). Bits of `prot` other than the three are ignored
+too, as Linux's `mmap` ignores them. With `MAP_ANONYMOUS` the
+mapping is anonymous memory, zeroed, and `fd` and `offset` are ignored;
+`MAP_SHARED` anonymous memory is the same as `MAP_PRIVATE`, since Camelot
+has no `fork` whose child could share it. Without, it maps what the
+descriptor `fd` has from `offset` on, page aligned. Where it goes:
+with `MAP_FIXED` or `MAP_FIXED_NOREPLACE`, at `addr` exactly, which must be
+page aligned, and the whole range in the mapping room above (from the
+heap's end, page aligned, to `USER_LOAD_TOP`); `MAP_FIXED` first unmaps
+whatever mappings are there, as `munmap` would. Without either, `addr` is
+a hint: taken, rounded up to a page, if the room is free there, and
+otherwise the highest room that fits. Errors:
+
+- `-EINVAL`: `len` is 0, `flags`' type (its low four bits) is none of
+  the three (or `MAP_SHARED_VALIDATE` with `MAP_ANONYMOUS`, as on Linux),
+  `addr` is not page aligned with `MAP_FIXED` or
+  `MAP_FIXED_NOREPLACE`, or `offset` is negative or not page aligned for a
+  descriptor;
+- `-EOPNOTSUPP`: a descriptor's `MAP_SHARED_VALIDATE` mapping with a flag
+  Linux doesn't know;
+- `-EOVERFLOW`: a shared-memory object's mapping that reaches past the
+  largest object (1 GiB), whose pages can never be;
+- `-EINVAL` too: a `MAP_PRIVATE` mapping of a shared-memory object (a
+  private mapping of one is a copy-on-write one on Linux, which Camelot
+  doesn't have);
+- `-EBADF`: `fd` is not an open descriptor (without `MAP_ANONYMOUS`);
+- `-EACCES`: `fd` is not open for reading, or the mapping is writable
+  and writes what `fd` is open on (`MAP_SHARED`, or any mapping of a
+  device) while `fd` is not open for writing;
+- `-ENODEV`: `fd` is not something that can be mapped (only shared-memory
+  objects and `/dev/fb0` can be): a regular file, a directory, a pipe, a
+  socket, the console;
+- a device's own errors: for `/dev/fb0`, `-EINVAL` for a range past its
+  memory, `-ENODEV` on a machine without a framebuffer;
+- `-EEXIST`: `MAP_FIXED_NOREPLACE` over a mapping;
+- `-ENOMEM`: no room for it (or, with `MAP_FIXED`, its range is not in the
+  mapping room), anonymous memory bigger than the RAM (as `sbrk` fails at
+  once for that), or the kernel's table of mappings (128 for every
+  process together) is full.
+
+**munmap(addr, len)** takes away every mapping, or part of one, in the
+`len` bytes at `addr`, rounded up to whole pages: their pages are no
+longer the program's (anonymous memory is freed), on every hart running
+one of its threads, before it returns. A part of the range with no mapping
+is fine. Returns 0. Errors: `-EINVAL` if `addr` is not page aligned, `len`
+is 0, or the range goes past user space; `-ENOMEM` if a mapping has to be
+cut in two and the kernel's table is full.
+
+**mprotect(addr, len, prot)** gives the mappings in the `len` bytes at
+`addr`, rounded up to whole pages, the protections `prot`, on every hart:
+their pages keep what they hold, a `PROT_NONE` page too. Returns 0 (also
+for `len` 0, whatever `prot`). Errors, in Linux's order: `-EINVAL` if
+`addr` is not page aligned; `-ENOMEM` if the range goes past user space;
+`-EINVAL` if `prot` has bits other than the three and `PROT_SEM`
+(`PROT_GROWSDOWN` and `PROT_GROWSUP` included: no mapping grows);
+`-ENOMEM` if part of the range is not a mapping (the program, the heap
+and the stack included), or a mapping has to be cut and the kernel's
+table is full; `-EACCES` if `prot` makes writable a mapping
+that writes what a descriptor not open for writing was open on (as
+`mmap` would refuse it).
+
+A mapping's pages are given back when it is unmapped, when the program is
+replaced (`exec`), and when the process ends.
+
+**Shared memory.** `memfd_create` makes a shared-memory object, Linux's
+anonymous memory file: memory that two processes map with `MAP_SHARED`
+to see each other's writes, on any hart, as a GUI client and the display
+server share a window's pixels. The other process gets the object's
+descriptor as any other (a child's descriptors 0 to 2 from `spawn`).
+Its pages are made on demand, zeroed, the first time a mapping touches
+them, and belong to the object, which lives while a descriptor or a
+mapping holds it: a process may close the descriptor once it has mapped
+the object. Its size is `ftruncate`'s, 0 at first, and at most 1 GiB: a
+mapping may go past the end, but a touch of a page wholly past it is a
+fault, which kills the program (as Linux's `SIGBUS`). A shrink frees the
+pages past the new end, but those a mapping has touched, which stay mapped
+there until the mapping goes (Linux takes them away from the mappings
+too); a later growth over them makes them read zero again, as new memory
+would. The object is no regular file: `read`, `write` (`-EINVAL`) and
+`lseek` (`-ESPIPE`) don't work on it, as they do on Linux's; `fstat` says
+it is a regular file (`T_FILE`, no inode number, 1 link) of its size. A
+futex in shared memory belongs to each process apart: one process's
+`futex_wake` never wakes another's threads.
+
+**memfd_create(name, flags)** makes an empty shared-memory object and
+returns a descriptor for it, the lowest free one, open for reading and
+writing. `name` only names it to someone debugging (Linux shows it in
+`/proc`): it must be readable, and at most 249 bytes long. `flags` holds
+any of `MFD_CLOEXEC` (1: the descriptor closes on `exec`, as `O_CLOEXEC`)
+and `MFD_ALLOW_SEALING` (2: accepted, though Camelot has no seals).
+Errors: `-EFAULT` for a bad `name`, `-EINVAL` for a longer one or another
+flag, `-EMFILE`, `-ENFILE` (no open file left, or none of the kernel's 32
+objects).
+
+**ftruncate(fd, length)** sets the size of the shared-memory object `fd`
+is open on to `length` bytes. Returns 0. Errors: `-EBADF`; `-EINVAL` if
+`fd` is no shared-memory object (`ftruncate` of a regular file is not
+there yet) or not open for writing, or `length` is negative; `-EFBIG` past
+1 GiB.
+
+**A device's memory.** `/dev/fb0`, the framebuffer's device node on the
+root image, maps the framebuffer's memory (640x480 pixels of 32 bits,
+`docs/excalibur-spec.md` section 9.3), from `offset` on, its last page
+whole: a program draws by writing pixels there, and the screen shows them.
+The pages are the device's, mapped as they are touched and never freed;
+`MAP_PRIVATE` maps the same pages as `MAP_SHARED` (writes go to the
+device either way, as Linux's framebuffer devices do), so a writable
+mapping of either kind needs the descriptor open for writing. A system
+call's buffer can't be in a device's memory (the kernel copies only to
+and from RAM): `write` from a framebuffer mapping, say, fails with
+`-EFAULT`.
 
 ## Error numbers
 
@@ -735,17 +912,17 @@ Linux's values for the same conditions.
 | 9 | `EBADF` | not an open descriptor, or not open for that |
 | 10 | `ECHILD` | wait: no such child |
 | 11 | `EAGAIN` | spawn, thread_create: every slot is taken; futex_wait: the word is not the value; a socket's receive timeout ran out |
-| 12 | `ENOMEM` | out of memory, or the heap would reach the stack |
-| 13 | `EACCES` | spawn, exec: not a regular file |
+| 12 | `ENOMEM` | out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping |
+| 13 | `EACCES` | spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that access |
 | 14 | `EFAULT` | a pointer argument is not valid user memory |
-| 17 | `EEXIST` | the name is taken |
-| 19 | `ENODEV` | open: a device node with no driver; the network: no network card |
+| 17 | `EEXIST` | the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping |
+| 19 | `ENODEV` | open: a device node with no driver; the network: no network card; mmap: a file that can't be mapped |
 | 20 | `ENOTDIR` | a name on the way is not a directory |
 | 21 | `EISDIR` | open: a directory, for writing |
 | 22 | `EINVAL` | an argument is out of range |
-| 23 | `ENFILE` | every one of the kernel's open files is taken |
+| 23 | `ENFILE` | every one of the kernel's open files is taken; memfd_create: every shared-memory object |
 | 24 | `EMFILE` | every descriptor of the process is taken |
-| 27 | `EFBIG` | write: past the largest file |
+| 27 | `EFBIG` | write: past the largest file; ftruncate: past the largest shared-memory object |
 | 28 | `ENOSPC` | no free block or inode on the disk |
 | 29 | `ESPIPE` | lseek: a pipe or a device |
 | 30 | `EROFS` | the filesystem is read-only |
@@ -753,13 +930,13 @@ Linux's values for the same conditions.
 | 36 | `ENAMETOOLONG` | a name longer than 14 bytes, or a path longer than `MAXPATH` |
 | 38 | `ENOSYS` | no such system call |
 | 39 | `ENOTEMPTY` | unlink: a directory with entries |
-| 75 | `EOVERFLOW` | open: a file bigger than the kernel's offsets reach |
+| 75 | `EOVERFLOW` | open: a file bigger than the kernel's offsets reach; mmap: past the largest object |
 | 88 | `ENOTSOCK` | a socket call on a descriptor that is not a socket |
 | 89 | `EDESTADDRREQ` | send: a UDP socket with no peer, and no address given |
 | 90 | `EMSGSIZE` | a datagram too big for one packet |
 | 92 | `ENOPROTOOPT` | setsockopt: an option sockets don't have |
 | 93 | `EPROTONOSUPPORT` | socket: a protocol the type doesn't have |
-| 95 | `EOPNOTSUPP` | listen, accept: not on a UDP socket |
+| 95 | `EOPNOTSUPP` | listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses |
 | 97 | `EAFNOSUPPORT` | an address family other than `AF_INET` |
 | 98 | `EADDRINUSE` | a port that is taken |
 | 99 | `EADDRNOTAVAIL` | bind: an address that is not this host's |

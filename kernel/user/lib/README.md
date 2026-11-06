@@ -14,7 +14,7 @@ together.
 | `environ.c` | `environ`, the program's environment: `crt0.S` sets it to `main`'s `envp` before calling `main`, as glibc's `__libc_start_main` does, so every program has this member, and only this one of the environment's (as glibc's `posix/environ.c` is a file of its own) |
 | `getenv.c` | `getenv`, `setenv`, `unsetenv` over `environ`, as POSIX has them, but for returning a negative error number (`-EINVAL` for an empty name or one with a `=`, `-ENOMEM`): `setenv` adds a variable by growing the array it made last with `realloc` (none the first time), copying `environ`'s pointers into it when `environ` is another array, as glibc's `__add_to_environ` does, `unsetenv` takes entries out of whichever array it is in place; neither frees a string, as glibc's keep them, so a value `getenv` returned stays good; the two hold a mutex of their own, glibc's `envlock`, so they may run in several threads at once, but not alongside a `getenv` or anything else reading `environ` |
 
-| `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk`, under a mutex |
+| `malloc.c` | `malloc`, `free`, `calloc`, `realloc` on top of `sbrk`, under a mutex, and blocks of 128 KiB or more in mappings of their own (`mmap`) |
 | `printf.c` | `printf`, `fprintf` (to a descriptor), `snprintf`, `puts` |
 | `getline.c` | `getline` (a console line from stdin), `reader_init` and `reader_getline` (lines from any descriptor) |
 | `strerror.c` | `strerror`: a short message for each error number |
@@ -131,8 +131,19 @@ one atomic instruction each way when no other thread wants it. `free` puts a blo
 in its place in the ring and merges it with a free neighbour on either side,
 so freeing everything gives the heap back as one block. When no block is
 big enough, `malloc` grows the heap with `sbrk`, by at least a page, and
-frees the new memory into the ring. Nothing is ever given back to the
-kernel: the heap goes when the program exits.
+frees the new memory into the ring. The heap is never given back to the
+kernel: it goes when the program exits.
+
+A request of 128 KiB or more (glibc's default `M_MMAP_THRESHOLD`) gets a
+mapping of its own instead, anonymous and private (`mmap`, whole pages with
+the header, the block at the header's size into the first), and `free`
+gives it back to the kernel at once (`munmap`), so a big buffer doesn't
+keep the heap big after it is gone. Its header's link, unused while a block
+is handed out, says which it is: 1 for a mapping (no free block can be at
+address 1), `NULL` for the heap. When the kernel has no room for the
+mapping, `malloc` takes the block from the heap after all, as glibc falls
+back. `calloc` doesn't clear such a block, which is new zeroed memory:
+writing zeros would only make the kernel map every page of it at once.
 
 ## Threads
 

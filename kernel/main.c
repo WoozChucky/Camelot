@@ -15,9 +15,11 @@
 #include "kalloc.h"
 #include "kprintf.h"
 #include "memlayout.h"
+#include "mmap.h"
 #include "net.h"
 #include "mmio.h"
 #include "proc.h"
+#include "shm.h"
 #include "riscv.h"
 #include "sbi.h"
 #include "smp.h"
@@ -369,6 +371,8 @@ int kmain(void) {
     proc_init();
     console_init();
     file_init();
+    mmap_init();
+    shm_init();
     trap_init();
     kprintf("timer: %u Hz tick, %u Hz timebase\n", TICK_HZ, timebase_hz());
     blk_init();

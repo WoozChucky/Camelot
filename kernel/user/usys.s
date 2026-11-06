@@ -53,6 +53,11 @@
     .equ SYS_futex_wait, 45
     .equ SYS_futex_wake, 46
     .equ SYS_fcntl, 47
+    .equ SYS_mmap, 48
+    .equ SYS_munmap, 49
+    .equ SYS_mprotect, 50
+    .equ SYS_memfd_create, 51
+    .equ SYS_ftruncate, 52
 
     .text
 
@@ -385,6 +390,41 @@ futex_wake:
     .globl fcntl
 fcntl:
     li    a7, SYS_fcntl
+    ecall
+    ret
+
+# void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
+    .globl mmap
+mmap:
+    li    a7, SYS_mmap
+    ecall
+    ret
+
+# int munmap(void *addr, size_t len)
+    .globl munmap
+munmap:
+    li    a7, SYS_munmap
+    ecall
+    ret
+
+# int mprotect(void *addr, size_t len, int prot)
+    .globl mprotect
+mprotect:
+    li    a7, SYS_mprotect
+    ecall
+    ret
+
+# int memfd_create(const char *name, uint flags)
+    .globl memfd_create
+memfd_create:
+    li    a7, SYS_memfd_create
+    ecall
+    ret
+
+# int ftruncate(int fd, off_t length)
+    .globl ftruncate
+ftruncate:
+    li    a7, SYS_ftruncate
     ecall
     ret
 

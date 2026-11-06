@@ -2,7 +2,7 @@
 //! (docs/camelot-fs.md), built with the `camelot-fs` crate's mkfs: the files
 //! in `kernel/fs/` (a README) at `/`, the user programs of `kernel/user`,
 //! built with merlin, merlin-as and merlin-ld exactly as the kernel embeds them, in
-//! `/bin`, and the console's device node, `/dev/console`. No LLVM needed.
+//! `/bin`, and the device nodes, `/dev/console` and `/dev/fb0`. No LLVM needed.
 //!
 //! The image is bootable ([`build_bootable`]): Camelot's bootloader
 //! (`kernel/boot/boot.s`, built with merlin-as + merlin-ld) in the boot
@@ -44,6 +44,8 @@ pub const BIN: &str = "/bin";
 pub const DEV: &str = "/dev";
 /// The console's device number (`CONSOLE` in kernel/include/file.h).
 pub const CONSOLE_MAJOR: u16 = 1;
+/// The framebuffer's device number (`FB` in kernel/include/file.h).
+pub const FB_MAJOR: u16 = 2;
 
 /// The default output path.
 pub fn default_out(root: &Path) -> PathBuf {
@@ -51,7 +53,7 @@ pub fn default_out(root: &Path) -> PathBuf {
 }
 
 /// Builds the root image: `opts`' shape, `kernel/fs/` at `/`, the programs
-/// in `/bin`, `/dev/console`.
+/// in `/bin`, `/dev/console` and `/dev/fb0`.
 pub fn build(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
     build_with(root, opts, CCompiler::Merlin)
 }
@@ -64,6 +66,7 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
     fs.add_host_dir(&root.join(ROOT_DIR), "/")?;
     fs.mkdir(DEV)?;
     fs.add_device(&format!("{DEV}/console"), CONSOLE_MAJOR, 0)?;
+    fs.add_device(&format!("{DEV}/fb0"), FB_MAJOR, 0)?;
     fs.mkdir(BIN)?;
     for prog in userprogs::build_all_with(&userprogs::user_dir(root), cc)? {
         fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
