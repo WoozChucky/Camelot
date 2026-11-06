@@ -324,12 +324,17 @@ fn cat_pipeline(s: Setup) {
     let listed = processes(&after(&out, "info processes", main_stop));
     let reader = marked(&after(&out, "info processes", main_stop));
     assert_ne!(writer, reader);
-    // The shell and the two cats, the one stopped running on hart 0.
+    // Init, the shell and the two cats, the one stopped running on hart 0
+    // (init's shd ended at once: the machine has no network card).
     let names: Vec<(&str, &str)> = listed
         .iter()
         .map(|p| (p.name.as_str(), p.state.as_str()))
         .collect();
-    assert_eq!(names, [("sh", "live"), ("cat", "live"), ("cat", "live")], "{out}");
+    assert_eq!(
+        names,
+        [("init", "live"), ("sh", "live"), ("cat", "live"), ("cat", "live")],
+        "{out}"
+    );
     let reader_listed = listed.iter().find(|p| p.pid == reader).unwrap();
     assert_eq!(reader_listed.harts, "hart 0");
     let reader_satp = reader_listed.satp.clone();

@@ -213,6 +213,26 @@ pub fn printed(m: &Machine) -> String {
     String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned()
 }
 
+/// What the server root image prints on a machine without a network card:
+/// the `shd` its init starts (`/etc/rc`'s `respawn /bin/shd`) ends at once,
+/// and init leaves it. The lines land wherever they do among the shell's.
+pub const SHD_WITHOUT_NETWORK: [&str; 2] = [
+    "shd: socket: no network card\n",
+    "init: /bin/shd ended at once, exit 1: not started again\n",
+];
+
+/// `out`, what the server root image printed, without
+/// [`SHD_WITHOUT_NETWORK`]'s lines, which must each be there once.
+#[allow(dead_code)]
+pub fn without_shd(out: &str) -> String {
+    for line in SHD_WITHOUT_NETWORK {
+        assert_eq!(out.matches(line).count(), 1, "{line:?} in\n{out}");
+    }
+    SHD_WITHOUT_NETWORK
+        .iter()
+        .fold(out.to_string(), |out, line| out.replacen(line, "", 1))
+}
+
 /// The address of symbol `name`: in the kernel image, a link address.
 pub fn sym(elf: &grail::elf::Elf, name: &str) -> u64 {
     elf.symbol(name).unwrap_or_else(|| panic!("no symbol {name}"))
