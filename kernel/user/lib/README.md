@@ -3,13 +3,18 @@
 The C library of Camelot's user programs: what `kernel/user/user.h`
 declares besides the system calls. It is small, written in the C that
 merlin compiles (so the same sources can one day be compiled on Camelot
-itself), and has no `FILE`, no locale and no floating point. Every
+itself) but for a few members in assembly (the atomics, `thread_start`,
+`strlen`, `strcmp` and the memory functions, which merlin's C would make
+many times slower),
+and has no `FILE`, no locale and no floating point. Every
 function's contract is in `user.h`; this file says how the library is put
 together.
 
 | File | What it has |
 |---|---|
-| `string.c` | `strlen`, `strcmp`, `strncmp`, `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, `memset`, `memcpy`, `memmove`, `memcmp` |
+| `string.c` | `strncmp`, `strcpy`, `strcat`, `strchr`, `strrchr`, `strstr`, a byte at a time |
+| `strlen.S`, `strcmp.S` | `strlen`, `strcmp`: the kernel's (each includes `kernel/strlen.S` or `strcmp.S`), two bytes a round in assembly, several times fewer instructions than merlin's C |
+| `memset.S`, `memcpy.S`, `memmove.S`, `memcmp.S` | `memset`, `memcpy`, `memmove`, `memcmp`: the kernel's (each includes `kernel/mem*.S`), in assembly, a register at a time where both pointers are on a register boundary (`memmove` also where they are not, shifting), as Linux's and the C libraries' are, so a program copies and clears as fast as the kernel; a member each, as `libc.a` has them |
 | `stdlib.c` | `atoi`, `strtol` (bases 2 to 36, or 0 for C's prefixes; out of range gives `LONG_MAX` or `LONG_MIN`) |
 | `environ.c` | `environ`, the program's environment: `crt0.S` sets it to `main`'s `envp` before calling `main`, as glibc's `__libc_start_main` does, so every program has this member, and only this one of the environment's (as glibc's `posix/environ.c` is a file of its own) |
 | `getenv.c` | `getenv`, `setenv`, `unsetenv` over `environ`, as POSIX has them, but for returning a negative error number (`-EINVAL` for an empty name or one with a `=`, `-ENOMEM`): `setenv` adds a variable by growing the array it made last with `realloc` (none the first time), copying `environ`'s pointers into it when `environ` is another array, as glibc's `__add_to_environ` does, `unsetenv` takes entries out of whichever array it is in place; neither frees a string, as glibc's keep them, so a value `getenv` returned stays good; the two hold a mutex of their own, glibc's `envlock`, so they may run in several threads at once, but not alongside a `getenv` or anything else reading `environ` |
@@ -37,7 +42,7 @@ is linked the way a C library is linked from an archive (`libc.a`): each
 file here is a *member*, compiled and assembled once for all the programs,
 and a member goes into a program only if it defines a symbol that the
 program, or a member already in, refers to and nothing else defines. So
-`hello`, which calls `printf`, gets `printf.c` and, through it, `string.c`
+`hello`, which calls `printf`, gets `printf.c` and, through it, `strlen.S`
 (for `strlen`), and `environ.c` through crt0, but not `malloc.c`; `grep`, which calls `realloc`, gets
 `malloc.c` too. A program carries only the code and the static data it can
 use, and the members' `static` variables (malloc's free list) exist only in
@@ -55,7 +60,7 @@ merlin-ld -T user.ld -o cat cat.c.o crt0.S.o usys.s.o \
           lib/stat.c.o lib/stdlib.c.o lib/strerror.c.o lib/string.c.o --end-lib
 ```
 
-The members include `../user.h`; merlin compiles them like the programs.
+The C members include `../user.h`; merlin compiles them like the programs.
 After changing anything here, run `cargo xtask kernel` (the programs are
 embedded in the kernel) and commit `kernel/kernel.elf` and
 `kernel/kernel-disk.elf`; `cargo test` checks them. Adding a function: declare it
