@@ -521,13 +521,14 @@ fn the_c_tools_tables_are_the_host_tools() {
 /// The second step (#136): the linker that runs on Camelot (`kernel/user/ld`,
 /// `/bin/ld`) links every user program from the host's objects into the
 /// executable merlin-ld makes, byte for byte, without the line tables (`-S`,
-/// as `/bin` holds them); and a few with them too, as `cargo xtask kernel`
-/// writes them to target/kernel/obj/user (the debug sections, their
-/// relocations and headers): programs of C with the library's members, and
-/// `as`, of several files. Each is linked as a C program is on Linux, from
-/// the root image's `/usr/lib` (#240): `crt0.o`, the program's objects,
-/// then `-L/usr/lib -lc`, which /bin/ld finds and takes the members of
-/// `libc.a` it needs from, in ld.lld's order, as merlin-ld does.
+/// as `/bin` holds them); and a few with them too (the debug sections,
+/// their relocations and headers): programs of C with the library's
+/// members, and `as`, of several files. Each is linked as a C program is on
+/// Linux, from the root image's `/usr/lib` (#240): `crt0.o`, the program's
+/// objects, then `-L/usr/lib -lc`, which /bin/ld finds and takes the
+/// members of `libc.a` it needs from, in ld.lld's order, as merlin-ld
+/// does. The installed objects are stripped, so a link without `-S` has
+/// the program's own line tables, not the library's.
 #[test]
 fn the_linker_on_camelot_links_every_user_program_as_merlin_ld_does() {
     link_every_program(&|name| ["hello", "cat", "grep", "as"].contains(&name));
@@ -578,7 +579,7 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
             Job {
                 name: prog.stem.clone(),
                 files,
-                want: userprogs::link_program(&dir, prog, CCompiler::Merlin, &rt).unwrap(),
+                want: installed_link(&dir, prog, &rt),
             }
         })
         .collect();
@@ -647,6 +648,22 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// `prog` as merlin-ld links it from the root image's `/usr/lib`, the
+/// installed (stripped) start code and library: with `-S` it is what `/bin`
+/// holds, which this checks, and without it it has the program's own line
+/// tables only.
+fn installed_link(
+    dir: &std::path::Path,
+    prog: &userprogs::Source,
+    rt: &userprogs::Runtime,
+) -> userprogs::Program {
+    use userprogs::CCompiler;
+    let want = userprogs::link_program(dir, prog, CCompiler::Merlin, rt.installed()).unwrap();
+    let host = userprogs::link_program(dir, prog, CCompiler::Merlin, rt).unwrap();
+    assert!(want.elf == host.elf, "{}: not /bin's program", prog.stem);
+    want
+}
+
 /// The root image's `/usr/lib`.
 const USR_LIB: &str = xtask::fs::LIB;
 /// The directories of the root image's `/usr`, made before its files.
@@ -711,7 +728,8 @@ fn hello_assembled_and_linked_on_camelot_is_the_hosts_and_runs() {
 /// ```
 ///
 /// are the host's programs byte for byte: with `-S` what `/bin` holds, and
-/// without it the line tables too. Then they run, from `/out`. A program
+/// without it merlin-ld's link of the same files, the program's own line
+/// tables kept (the installed library has none). Then they run, from `/out`. A program
 /// of several files (`/bin/ar`) is linked from its objects in order.
 #[test]
 fn c_programs_assembled_and_linked_on_camelot_are_the_hosts_and_run() {
@@ -726,7 +744,7 @@ fn c_programs_assembled_and_linked_on_camelot_are_the_hosts_and_run() {
     let progs = userprogs::programs(&dir).unwrap();
     for name in ["hello", "cat", "grep", "printenv", "ar"] {
         let prog = progs.iter().find(|p| p.stem == name).unwrap();
-        let want = userprogs::link_program(&dir, prog, CCompiler::Merlin, &rt).unwrap();
+        let want = installed_link(&dir, prog, &rt);
         let mut objects = Vec::new();
         for (j, (_, text)) in userprogs::program_assembly(&dir, prog, CCompiler::Merlin)
             .unwrap()

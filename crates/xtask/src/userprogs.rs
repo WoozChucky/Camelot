@@ -209,11 +209,13 @@ pub struct Program {
     /// The source's stem: what the shell calls it.
     pub name: String,
     /// The executable merlin-ld wrote, without its debug information: what
-    /// the kernel embeds and `/bin` holds.
+    /// the kernel embeds and `/bin` holds, linked from the installed start
+    /// code and library ([`Runtime::installed`]), as on Camelot.
     pub elf: Vec<u8>,
-    /// The same with its debug information (the line tables of `-g`), for
-    /// a debugger: `cargo xtask kernel` writes it to `user/<name>.elf` in the
-    /// object directory.
+    /// The same with its debug information (the line tables of `-g`, the
+    /// library's too), for a debugger: `cargo xtask kernel` writes it to
+    /// `user/<name>.elf` in the object directory. It loads the same bytes;
+    /// its symbol table also has the library's `STT_FILE` symbols.
     pub debug: Vec<u8>,
 }
 
@@ -381,6 +383,9 @@ pub struct Runtime {
     /// `libc.a`: the members in an archive, byte for byte as `llvm-ar rcs`
     /// writes it (`elf::archive::write`).
     pub archive: Vec<u8>,
+    /// The same, installed ([`Runtime::stripped`]); `None` in a runtime
+    /// that is already the installed one.
+    installed: Option<Box<Runtime>>,
 }
 
 impl Runtime {
@@ -395,6 +400,56 @@ impl Runtime {
         });
         inputs
     }
+
+    /// The start code and the library as they are installed, on the root
+    /// image's `/usr/lib`: each object stripped of its debug information
+    /// (`elf::strip`, as `strip --strip-debug` does), as Linux
+    /// distributions ship static libraries, and the archive of the
+    /// stripped members. A program linked from them is the program linked
+    /// from these but for its own line tables; the host keeps these, with
+    /// the library's, for merlin-dbg.
+    pub fn stripped(&self) -> Result<Runtime, String> {
+        let strip = |objs: &[merlin_ld::Input]| -> Result<Vec<merlin_ld::Input>, String> {
+            objs.iter()
+                .map(|o| {
+                    let data =
+                        elf::strip::strip_debug(&o.data).map_err(|e| format!("{}: {}", o.name, e.0))?;
+                    Ok(merlin_ld::Input {
+                        name: o.name.clone(),
+                        data,
+                    })
+                })
+                .collect()
+        };
+        let objects = strip(&self.objects)?;
+        let library = strip(&self.library)?;
+        let archive = archive(&library)?;
+        Ok(Runtime {
+            objects,
+            library,
+            archive,
+            installed: None,
+        })
+    }
+
+    /// [`Runtime::stripped`], made once by [`build_runtime`]: what the root
+    /// image's `/usr/lib` holds, and what `/bin`'s programs are linked from.
+    pub fn installed(&self) -> &Runtime {
+        self.installed.as_deref().unwrap_or(self)
+    }
+}
+
+/// The library's members in an archive (`libc.a`), as `llvm-ar rcs` writes
+/// it.
+fn archive(library: &[merlin_ld::Input]) -> Result<Vec<u8>, String> {
+    let members: Vec<elf::archive::NewMember> = library
+        .iter()
+        .map(|m| elf::archive::NewMember {
+            name: &m.name,
+            data: &m.data,
+        })
+        .collect();
+    elf::archive::write(&members).map_err(|e| format!("{LIBC}: {}", e.0))
 }
 
 /// The name a source has in the C library's archive: its file name's stem
@@ -434,19 +489,15 @@ pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
             data: object(dir, s, cc)?.data,
         });
     }
-    let members: Vec<elf::archive::NewMember> = library
-        .iter()
-        .map(|m| elf::archive::NewMember {
-            name: &m.name,
-            data: &m.data,
-        })
-        .collect();
-    let archive = elf::archive::write(&members).map_err(|e| format!("{LIBC}: {}", e.0))?;
-    Ok(Runtime {
+    let archive = archive(&library)?;
+    let mut rt = Runtime {
         objects,
         library,
         archive,
-    })
+        installed: None,
+    };
+    rt.installed = Some(Box::new(rt.stripped()?));
+    Ok(rt)
 }
 
 /// Links program `prog` from `dir`: the start code, it compiled by `cc`
@@ -455,12 +506,18 @@ pub fn build_runtime(dir: &Path, cc: CCompiler) -> Result<Runtime, String> {
 /// warnings are errors here, but for clang's duplicate string literals in
 /// the reference build ([`toolchain::link_with`]).
 pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> Result<Program, String> {
-    let inputs = rt.link_inputs(program_objects(dir, prog, cc)?);
+    let own = program_objects(dir, prog, cc)?;
     let clang = matches!(cc, CCompiler::Clang(_));
-    let debug = toolchain::link_with(dir, SCRIPT, &inputs, &prog.stem, clang)?;
+    // For merlin-dbg: the library's line tables too.
+    let debug = toolchain::link_with(dir, SCRIPT, &rt.link_inputs(own.clone()), &prog.stem, clang)?;
+    // What /bin holds: linked from the installed start code and library,
+    // as on Camelot, without the line tables (stripped objects have no
+    // STT_FILE symbols either, which the executable's symbol table would
+    // otherwise keep).
+    let installed = toolchain::link_with(dir, SCRIPT, &rt.installed().link_inputs(own), &prog.stem, clang)?;
     Ok(Program {
         name: prog.stem.clone(),
-        elf: merlin_ld::strip_debug(&debug).map_err(|e| format!("{}: {e}", prog.stem))?,
+        elf: merlin_ld::strip_debug(&installed).map_err(|e| format!("{}: {e}", prog.stem))?,
         debug,
     })
 }

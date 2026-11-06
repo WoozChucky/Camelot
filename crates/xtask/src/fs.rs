@@ -68,18 +68,22 @@ pub fn default_out(root: &Path) -> PathBuf {
 /// [`userprogs::HEADERS`] in [`INCLUDE`], and in [`LIB`] the start code
 /// (`crt0.o`), the C library ([`userprogs::LIBC`]) and the programs' linker
 /// script ([`userprogs::SCRIPT`]), from `rt`, the runtime the programs of
-/// `/bin` are linked with, and `user_dir` (`kernel/user`). So on Camelot
+/// `/bin` are linked with, and `user_dir` (`kernel/user`). The objects are
+/// installed stripped of their debug information
+/// ([`userprogs::Runtime::stripped`]), as distributions install a C
+/// library. So on Camelot
 ///
 /// ```text
 /// ld -T /usr/lib/user.ld -o PROG /usr/lib/crt0.o PROG.o -L/usr/lib -lc
 /// ```
 ///
-/// links a program as the host links it.
+/// links a program as the host links it: with `-S`, what `/bin` holds.
 pub fn usr_files(user_dir: &Path, rt: &userprogs::Runtime) -> Result<Vec<(String, Vec<u8>)>, String> {
     let read = |name: &str| {
         let path = user_dir.join(name);
         std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))
     };
+    let rt = rt.installed();
     let mut files = Vec::new();
     for h in userprogs::HEADERS {
         files.push((format!("{INCLUDE}/{h}"), read(h)?));

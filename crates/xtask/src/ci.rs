@@ -52,8 +52,10 @@ const STEPS: &[Step] = &[
         args: &["-p", "excalibur", "--test", "disasm"],
     },
     Step {
-        what: "the elf crate against llvm-readelf, llvm-dwarfdump and llvm-ar, both classes",
-        args: &["-p", "elf", "--test", "llvm", "--test", "archive"],
+        what: "the elf crate against llvm-readelf, llvm-dwarfdump, llvm-ar and llvm-strip",
+        args: &[
+            "-p", "elf", "--test", "llvm", "--test", "archive", "--test", "strip",
+        ],
     },
     Step {
         what: "merlin-as: encodings, round trips, line tables, mapping symbols, hello",

@@ -2,10 +2,13 @@
 //! and that changes nothing the machine loads: the committed kernels' segments
 //! are byte for byte those of a build without debug information, the programs
 //! the kernel embeds and `/bin` holds have none (merlin-ld strips it), and so the
-//! root image holds the same programs and kernel either way. Only the objects
-//! programs are linked from on Camelot, `/usr/lib/crt0.o` and `libc.a`, keep
-//! their line tables, as the host links its programs from them (#240): the
-//! programs linked with or without them are the same.
+//! root image holds the same programs and kernel either way. The objects
+//! programs are linked from on Camelot, `/usr/lib/crt0.o` and `libc.a`, are
+//! installed stripped (#240), which leaves none of their line tables; but an
+//! object compiled with `-g` keeps a section symbol or two its relocations
+//! of the line tables needed (llvm-strip keeps them too), so they are not
+//! the objects of a build without `-g`. The programs linked from either are
+//! the same.
 
 use std::path::{Path, PathBuf};
 use xtask::{fs, kernel, toolchain, userprogs};
@@ -68,7 +71,8 @@ fn debug_information_changes_no_loaded_byte() {
     }
 
     // A program: its debug ELF has the line tables, the one it is installed
-    // as does not, and both load the same; without -g it is the installed one.
+    // as does not, and both load the same; without -g it is the installed
+    // one, and its debug ELF loads the same and has no line table.
     let user = userprogs::user_dir(&repo_root());
     let prog = userprogs::build_named(&user, "echo").unwrap();
     let plain_prog = toolchain::without_debug_info(|| userprogs::build_named(&user, "echo").unwrap());
@@ -80,11 +84,12 @@ fn debug_information_changes_no_loaded_byte() {
     let prog_objects = userprogs::program_objects(&user, &echo, userprogs::CCompiler::Merlin).unwrap();
     assert!(has_line_table(&prog.debug) && !has_line_table(&prog.elf));
     assert!(loaded(&prog.debug) == loaded(&prog.elf));
-    assert!(plain_prog.elf == prog.elf && plain_prog.debug == prog.elf);
+    assert!(plain_prog.elf == prog.elf);
+    assert!(!has_line_table(&plain_prog.debug) && loaded(&plain_prog.debug) == loaded(&prog.elf));
 
     // The root image: the same kernel, and every file the same but the
-    // objects of /usr/lib, which have the same members and link the same
-    // program.
+    // objects of /usr/lib, which have the same members, none with a line
+    // table, and link the same program.
     let image = fs::build_bootable(&repo_root(), fs::IMAGE_SIZE).unwrap();
     let plain_image =
         toolchain::without_debug_info(|| fs::build_bootable(&repo_root(), fs::IMAGE_SIZE).unwrap());
@@ -125,6 +130,13 @@ fn debug_information_changes_no_loaded_byte() {
             .collect()
     };
     assert_eq!(members(&with), members(&without));
+    for f in [&with, &without] {
+        let a = f.read_file("/usr/lib/libc.a").unwrap();
+        for m in elf::archive::parse(&a).unwrap().members {
+            assert!(!has_line_table(m.data), "{} has a line table", m.name);
+        }
+        assert!(!has_line_table(&f.read_file("/usr/lib/crt0.o").unwrap()));
+    }
     let link = |f: &camelot_fs::read::Fs| {
         let input = |p: &str| merlin_ld::Input {
             name: p.into(),

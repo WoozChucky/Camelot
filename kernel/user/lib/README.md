@@ -57,7 +57,10 @@ it at the end of the link so far: the members the program calls come in
 archive order, and a member that only another member needs comes right
 after that one if it is earlier in the archive. On its
 command line, and on Camelot's `/bin/ld`, whose root image holds the same
-files in `/usr`:
+files in `/usr`, stripped of their debug information as distributions
+install a C library (`elf::strip`, as `strip --strip-debug`; the host links
+`/bin`'s programs from these too, and keeps the line tables for its debug
+ELFs):
 
 ```
 merlin-ld -T user.ld -o cat crt0.o cat.o libc.a

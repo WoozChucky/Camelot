@@ -352,9 +352,11 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
 fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() {
     // #240: /usr/include has the header the programs and the library are
     // compiled with, and /usr/lib the start code, the C library and the
-    // linker script every program of /bin is linked from, byte for byte:
-    // libc.a is the library's members in an archive (llvm-ar's format,
-    // elf::archive), named as a C library names them.
+    // linker script every program of /bin is linked from: the host's
+    // objects stripped of their debug information, as distributions
+    // install a C library (elf::strip), and libc.a the stripped members in
+    // an archive (llvm-ar's format, elf::archive), named as a C library
+    // names them.
     let root = repo_root();
     let user = xtask::userprogs::user_dir(&root);
     let image = xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap();
@@ -368,11 +370,16 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
         read("/usr/lib/user.ld"),
         std::fs::read(user.join("user.ld")).unwrap()
     );
-    let rt = xtask::userprogs::build_runtime(&user, xtask::userprogs::CCompiler::Merlin).unwrap();
+    let cc = xtask::userprogs::CCompiler::Merlin;
+    let rt = xtask::userprogs::build_runtime(&user, cc).unwrap();
     assert_eq!(rt.objects.len(), 1);
-    assert_eq!(read("/usr/lib/crt0.o"), rt.objects[0].data);
+    let has_debug = |obj: &[u8]| {
+        let e = elf::Elf::parse(obj).unwrap();
+        e.sections.iter().any(|s| elf::strip::is_debug_section(&s.name))
+    };
+    let crt0 = read("/usr/lib/crt0.o");
+    assert_eq!(crt0, elf::strip::strip_debug(&rt.objects[0].data).unwrap());
     let libc = read("/usr/lib/libc.a");
-    assert_eq!(libc, rt.archive);
     let archive = elf::archive::parse(&libc).unwrap();
     let names: Vec<&str> = archive.members.iter().map(|m| m.name.as_str()).collect();
     let sources: Vec<String> = xtask::userprogs::library(&user)
@@ -385,8 +392,18 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
         assert!(names.contains(&want), "{want} not in libc.a: {names:?}");
     }
     for (m, o) in archive.members.iter().zip(&rt.library) {
-        assert_eq!(m.data, &o.data[..], "{}", m.name);
+        assert!(!has_debug(m.data), "{} keeps debug information", m.name);
+        assert_eq!(
+            m.data,
+            &elf::strip::strip_debug(&o.data).unwrap()[..],
+            "{}",
+            m.name
+        );
     }
+    assert!(has_debug(
+        &rt.library.iter().find(|m| m.name == "printf.o").unwrap().data
+    ));
+    assert_eq!(libc, rt.installed().archive);
     // The symbol table says where printf and the system calls are.
     let defines = |sym: &str| {
         archive
@@ -398,23 +415,8 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
     assert_eq!(defines("printf"), Some("printf.o"));
     assert_eq!(defines("write"), Some("usys.o"));
     assert_eq!(defines("main"), None);
-    // Every program in /bin is the link of crt0.o, its objects and libc.a.
-    let hello = xtask::userprogs::programs(&user)
-        .unwrap()
-        .into_iter()
-        .find(|p| p.stem == "hello")
-        .unwrap();
-    let own = xtask::userprogs::program_objects(&user, &hello, xtask::userprogs::CCompiler::Merlin).unwrap();
-    let mut inputs = vec![merlin_ld::Input {
-        name: "/usr/lib/crt0.o".into(),
-        data: read("/usr/lib/crt0.o"),
-    }];
-    inputs.extend(own);
-    inputs.push(merlin_ld::Input {
-        name: "/usr/lib/libc.a".into(),
-        data: libc.clone(),
-    });
-    let files: Vec<(&merlin_ld::Input, bool)> = inputs.iter().map(|i| (i, false)).collect();
+    // Every program in /bin is the link of the image's crt0.o, its objects
+    // and the image's libc.a, without its line tables.
     let script = String::from_utf8(read("/usr/lib/user.ld")).unwrap();
     let opts = merlin_ld::Options {
         script: Some(merlin_ld::ScriptSource {
@@ -423,9 +425,60 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
         }),
         entry: None,
     };
-    let linked = merlin_ld::link_files(&files, &opts).unwrap();
-    let stripped = merlin_ld::strip_debug(&linked.elf).unwrap();
-    assert_eq!(stripped, read("/bin/hello"));
+    let progs = xtask::userprogs::programs(&user).unwrap();
+    assert!(progs.len() > 30, "{}", progs.len());
+    for prog in &progs {
+        let mut inputs = vec![merlin_ld::Input {
+            name: "/usr/lib/crt0.o".into(),
+            data: crt0.clone(),
+        }];
+        inputs.extend(xtask::userprogs::program_objects(&user, prog, cc).unwrap());
+        inputs.push(merlin_ld::Input {
+            name: "/usr/lib/libc.a".into(),
+            data: libc.clone(),
+        });
+        let files: Vec<(&merlin_ld::Input, bool)> = inputs.iter().map(|i| (i, false)).collect();
+        let linked = merlin_ld::link_files(&files, &opts).unwrap();
+        let stripped = merlin_ld::strip_debug(&linked.elf).unwrap();
+        assert!(
+            stripped == read(&format!("/bin/{}", prog.stem)),
+            "/bin/{} is not the link of /usr/lib's files",
+            prog.stem
+        );
+    }
+}
+
+/// The objects of /usr/lib are what `llvm-strip -g` makes of the host's,
+/// every one of them, byte for byte (`elf::strip`; its fixtures hold four,
+/// crates/elf/tests/strip). Needs llvm-strip, found next to clang or on
+/// PATH.
+#[test]
+#[ignore]
+fn the_installed_objects_are_what_llvm_strip_makes() {
+    let strip = xtask::tools::find("llvm-strip").expect("llvm-strip not found");
+    let user = xtask::userprogs::user_dir(&repo_root());
+    let rt = xtask::userprogs::build_runtime(&user, xtask::userprogs::CCompiler::Merlin).unwrap();
+    let dir = std::env::temp_dir().join(format!("xtask-strip-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for o in rt.objects.iter().chain(&rt.library) {
+        let (input, output) = (dir.join(&o.name), dir.join(format!("{}.stripped", o.name)));
+        std::fs::write(&input, &o.data).unwrap();
+        let status = std::process::Command::new(&strip)
+            .arg("-g")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert!(status.success(), "llvm-strip -g {}", o.name);
+        let want = std::fs::read(&output).unwrap();
+        assert!(
+            elf::strip::strip_debug(&o.data).unwrap() == want,
+            "{} is not llvm-strip's",
+            o.name
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
