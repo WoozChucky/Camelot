@@ -27,9 +27,11 @@
 //!   "defined by this member if anyone needs it", unless something already
 //!   defines it (or an earlier member does lazily). If the program already
 //!   refers to one of them, the member is extracted there and then.
-//! - After the last file, a lazy entry symbol (`-e`, `ENTRY(...)`, or
-//!   `_start`) extracts its member: "if an entry symbol is in a static
-//!   archive, pull out that file now".
+//! - Once every file is read, the entry symbol (`-e`, `ENTRY(...)`, or
+//!   `_start`) extracts its member if it is still lazy: start code may come
+//!   from an archive, and nothing else may refer to it. Then so does each
+//!   symbol the linker script's expressions name, in the order written
+//!   (`foo = bar;` extracts `bar`'s member), as ld.lld refers to them.
 //!
 //! So `crt0.o prog.o -lc` links crt0.o, prog.o, then each member of libc.a
 //! as it is found needed: in archive order for what the program calls, and
@@ -48,8 +50,11 @@
 //!
 //! Every member must still be an object merlin-ld links, needed or not, as
 //! ld.lld reads its lazy objects: an ELF32 (RV32) member is an error
-//! ([`object::parse`]). A member of an archive that is not an ELF file (a
-//! text file) is left out with a warning, as ld.lld leaves it.
+//! ([`object::parse`]). A member of an archive that is not a relocatable
+//! ELF object (a text file, an executable) is left out with a warning, as
+//! ld.lld leaves it. The archive's symbol table is not read: like ld.lld,
+//! merlin-ld goes by the members' own symbols, so a table out of date
+//! changes nothing. A thin archive (`!<thin>`) is refused.
 
 use crate::object::{self, Object};
 use crate::{Error, Input};
@@ -152,8 +157,9 @@ impl<'a> Resolver<'a> {
 /// The files a link of `files` links, in ld.lld's order ([the module's
 /// description](self)): indexes into `files`, which are in command-line
 /// order, `lazy` saying which are library members. `entry` is the entry
-/// symbol's name, if the entry is not an address.
-pub(crate) fn order(files: &[&Object], lazy: &[bool], entry: Option<&str>) -> Vec<usize> {
+/// symbol's name, if the entry is not an address, and `script` the symbols
+/// the linker script names ([`crate::script::Script::referenced_symbols`]).
+pub(crate) fn order(files: &[&Object], lazy: &[bool], entry: Option<&str>, script: &[&str]) -> Vec<usize> {
     let mut r = Resolver {
         files,
         lazy: lazy.to_vec(),
@@ -167,8 +173,12 @@ pub(crate) fn order(files: &[&Object], lazy: &[bool], entry: Option<&str>) -> Ve
             r.link(i);
         }
     }
-    if let Some(Sym::Lazy { file, .. }) = entry.and_then(|e| r.symbols.get(e).copied()) {
-        r.extract(file);
+    // A reference the entry point makes, then the script's: strong, so a
+    // member only weakly wanted until now is extracted too.
+    for name in entry.into_iter().chain(script.iter().copied()) {
+        if let Some(Sym::Lazy { file, .. }) = r.symbols.get(name).copied() {
+            r.extract(file);
+        }
     }
     r.linked
 }
@@ -194,23 +204,31 @@ fn parse_all(inputs: &[Input]) -> Result<Vec<Object>, Vec<Error>> {
 /// them after `inputs` ([`order`]). The files are checked as
 /// [`crate::link_with_library`] checks them: the objects, then the members.
 pub fn needed(inputs: &[Input], library: &[Input], entry: Option<&str>) -> Result<Vec<usize>, Vec<Error>> {
+    needed_with(inputs, library, entry, &[])
+}
+
+/// [`needed`], with `script` the symbols a linker script names.
+pub fn needed_with(
+    inputs: &[Input],
+    library: &[Input],
+    entry: Option<&str>,
+    script: &[&str],
+) -> Result<Vec<usize>, Vec<Error>> {
     let objects = parse_all(inputs)?;
     let members = parse_all(library)?;
     let all: Vec<&Object> = objects.iter().chain(&members).collect();
     let lazy: Vec<bool> = (0..all.len()).map(|i| i >= objects.len()).collect();
-    Ok(order(&all, &lazy, entry)
+    Ok(order(&all, &lazy, entry, script)
         .into_iter()
         .filter_map(|i| i.checked_sub(objects.len()))
         .collect())
 }
 
-/// `inputs` followed by the members of `library` they need ([`needed`]),
-/// in the order a link puts them: what to hand the linker.
-pub fn with_needed(inputs: &[Input], library: &[Input]) -> Result<Vec<Input>, Vec<Error>> {
-    let needed = needed(inputs, library, None)?;
-    let mut all = inputs.to_vec();
-    all.extend(needed.into_iter().map(|i| library[i].clone()));
-    Ok(all)
+/// Whether an archive member is a relocatable ELF object (`ET_REL`, the
+/// little-endian `e_type` at byte 16): what a link takes from an archive,
+/// as ld.lld does. Anything else is left out with a warning.
+fn is_relocatable(data: &[u8]) -> bool {
+    data.starts_with(b"\x7fELF") && data.get(16..18) == Some(&[1, 0])
 }
 
 /// A command line's files, its archives replaced by their members
@@ -232,11 +250,16 @@ pub fn expand_archives(files: &[(&Input, bool)]) -> Result<Expanded, Vec<Error>>
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
     for &(input, lazy) in files {
+        if elf::archive::is_thin(&input.data) {
+            errors.push(Error(format!("{}: thin archives are not supported", input.name)));
+            continue;
+        }
         if !elf::archive::is_archive(&input.data) {
             out.push((input.clone(), lazy));
             continue;
         }
-        let archive = match elf::archive::parse(&input.data) {
+        // The members alone: the symbol table is not read.
+        let archive = match elf::archive::parse_members(&input.data) {
             Ok(a) => a,
             Err(e) => {
                 errors.push(Error(format!("{}: {}", input.name, e.0)));
@@ -244,7 +267,7 @@ pub fn expand_archives(files: &[(&Input, bool)]) -> Result<Expanded, Vec<Error>>
             }
         };
         for m in &archive.members {
-            if !m.data.starts_with(b"\x7fELF") {
+            if !is_relocatable(m.data) {
                 warnings.push(format!(
                     "{}: archive member '{}' is neither ET_REL nor LLVM bitcode",
                     input.name, m.name
@@ -353,7 +376,7 @@ mod tests {
         // is extracted when it is read, and b.o, lazy since the start, by
         // a.o's reference.
         let files = [&b, &unused, &main, &a];
-        assert_eq!(order(&files, &[true, true, false, true], None), [2, 3, 0]);
+        assert_eq!(order(&files, &[true, true, false, true], None, &[]), [2, 3, 0]);
     }
 
     #[test]
@@ -381,6 +404,27 @@ mod tests {
         assert_eq!(needed(&program, &library, Some("_start")).unwrap(), [0]);
         assert_eq!(
             needed(&program, &library, Some("nowhere")).unwrap(),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn the_scripts_symbols_extract_their_members_after_the_entrys() {
+        // main.o wants `hook` weakly: only the script's reference, a strong
+        // one, extracts it, after the entry's member.
+        let program = [obj("main.o", &["main"], &[], &["hook"])];
+        let library = [
+            obj("hook.o", &["hook"], &[], &[]),
+            obj("crt.o", &["_start"], &["main"], &[]),
+            obj("limit.o", &["limit"], &[], &[]),
+        ];
+        let script = ["hook", "nowhere", "limit", "hook"];
+        assert_eq!(
+            needed_with(&program, &library, Some("_start"), &script).unwrap(),
+            [1, 0, 2]
+        );
+        assert_eq!(
+            needed_with(&program, &library, None, &[]).unwrap(),
             Vec::<usize>::new()
         );
     }
@@ -478,5 +522,36 @@ mod tests {
         bad.data.truncate(70);
         let errs = expand_archives(&[(&bad, false)]).unwrap_err();
         assert!(errs[0].0.starts_with("/usr/lib/libx.a: "), "{errs:?}");
+
+        // An executable is no member for a link either: e_type 2.
+        let mut exe = f.data.clone();
+        exe[16] = 2;
+        let with_exe = Input {
+            name: "withexe.a".into(),
+            data: elf::archive::write(&[elf::archive::NewMember {
+                name: "exe.o",
+                data: &exe,
+            }])
+            .unwrap(),
+        };
+        let Expanded { files, warnings } = expand_archives(&[(&with_exe, false)]).unwrap();
+        assert!(files.is_empty());
+        assert_eq!(
+            warnings,
+            ["withexe.a: archive member 'exe.o' is neither ET_REL nor LLVM bitcode"]
+        );
+        // A symbol table pointing between members is not read.
+        let mut stale = lib.clone();
+        stale.data[8 + 60 + 7] += 2;
+        assert!(elf::archive::parse(&stale.data).is_err());
+        let Expanded { files, .. } = expand_archives(&[(&stale, false)]).unwrap();
+        assert_eq!(files.len(), 2);
+        // A thin archive is refused.
+        let thin = Input {
+            name: "thin.a".into(),
+            data: b"!<thin>\n".to_vec(),
+        };
+        let errs = expand_archives(&[(&thin, false)]).unwrap_err();
+        assert_eq!(errs[0].0, "thin.a: thin archives are not supported");
     }
 }

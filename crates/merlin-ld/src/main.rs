@@ -123,7 +123,7 @@ fn main() -> ExitCode {
         eprintln!("merlin-ld: --start-lib without --end-lib");
         return ExitCode::from(2);
     }
-    if inputs.iter().all(|(_, lib)| *lib) {
+    if inputs.is_empty() {
         eprintln!("merlin-ld: no input files\n{USAGE}");
         return ExitCode::from(2);
     }

@@ -122,7 +122,13 @@ pub fn link_files(files: &[(&Input, bool)], opts: &Options) -> Result<Linked, Ve
     let (objects, script) = layout::read(&files, opts)?;
     let lazy: Vec<bool> = files.iter().map(|&(_, lazy)| lazy).collect();
     let entry = layout::entry_symbol(opts, &script);
-    let order = library::order(&objects.iter().collect::<Vec<_>>(), &lazy, entry.as_deref());
+    let referenced = script.referenced_symbols();
+    let order = library::order(
+        &objects.iter().collect::<Vec<_>>(),
+        &lazy,
+        entry.as_deref(),
+        &referenced,
+    );
     let mut objects: Vec<Option<object::Object>> = objects.into_iter().map(Some).collect();
     let objects = order.into_iter().filter_map(|i| objects[i].take()).collect();
     let mut linked = finish(layout::build_from(objects, script, opts)?)?;

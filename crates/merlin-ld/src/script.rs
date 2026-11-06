@@ -151,6 +151,19 @@ impl Expr {
         }
     }
 
+    /// Appends the symbols the expression names, left to right.
+    fn symbols<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Expr::Symbol(name) => out.push(name),
+            Expr::Align(n) => n.symbols(out),
+            Expr::Add(a, b) | Expr::Sub(a, b) => {
+                a.symbols(out);
+                b.symbols(out);
+            }
+            Expr::Num(_) | Expr::Dot | Expr::Addr(_) | Expr::Origin(_) | Expr::Length(_) => {}
+        }
+    }
+
     /// Appends the output sections the expression names with `ADDR(...)`.
     fn addr_names<'a>(&'a self, out: &mut Vec<&'a str>) {
         match self {
@@ -166,6 +179,30 @@ impl Expr {
 }
 
 impl Script {
+    /// The symbols the script's expressions name, in the order they are
+    /// written (assignments' right-hand sides, `AT` and `ALIGN`), with
+    /// repeats: ld.lld refers to each, which extracts the library member
+    /// that defines it ([`crate::library`]). A name assigned to is not one.
+    pub fn referenced_symbols(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for c in &self.commands {
+            match c {
+                Command::Assign(a) => a.expr.symbols(&mut out),
+                Command::Output(o) => {
+                    for e in o.at.iter().chain(&o.align) {
+                        e.symbols(&mut out);
+                    }
+                    for i in &o.items {
+                        if let Item::Assign(a) = i {
+                            a.expr.symbols(&mut out);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The output sections some expression of the script names with
     /// `ADDR(...)`, anywhere in it. ld.lld keeps such a section even when
     /// nothing goes in it (its `usedInExpression`): an empty section still

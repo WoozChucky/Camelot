@@ -175,25 +175,30 @@ struct ar_member {
     uint len;
 };
 
-/* Whether the file is an ar archive ("!<arch>\n"). */
+/* Whether the file is an ar archive ("!<arch>\n"), or a thin one
+ * ("!<thin>\n"), which is refused. */
 int is_archive(const uchar *data, uint len);
-/* An archive's members, in order, the symbol table and the long names
- * left out (the elf crate's archive::parse). 0 with *err set if it is
- * corrupt. */
+int is_thin_archive(const uchar *data, uint len);
+/* An archive's members, in order, the symbol table (not read) and the
+ * long names left out (the elf crate's archive::parse_members). 0 with
+ * *err set if it is corrupt. */
 int archive_parse(uchar *data, uint len, struct ar_member **out, uint *count, char **err);
 
 /* ---- Libraries (library.c) ---- */
+struct script;
 /* Parses the n files of a command line, in its order, lazy[i] saying which
  * are library members, and picks the members the others need, in the
  * order ld.lld links them (merlin-ld's layout::read and library::order):
  * each file not a member in its place, each member needed where its
- * symbol was first needed, depth first, and last the one that defines
- * `entry` (NULL: none) if nothing needed it before. Every file must be an
+ * symbol was first needed, depth first, then the one that defines `entry`
+ * (NULL: none) if nothing needed it before, then those that define the
+ * symbols `script`'s expressions name (NULL: none), in the order written. Every file must be an
  * object merlin-ld links, a member too, needed or not (an ELF32 one is
  * not). Returns the objects and their count in *count, or NULL after adding
  * errors; NULL too when errors were added before (the script's), once
  * every file is parsed. */
-struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, const char *entry, uint *count);
+struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, const char *entry,
+                                 struct script *script, uint *count);
 
 /* ---- Linker scripts (script.c) ---- */
 enum { X_NUM, X_DOT, X_SYMBOL, X_ALIGN, X_ORIGIN, X_LENGTH, X_ADDR, X_ADD, X_SUB };

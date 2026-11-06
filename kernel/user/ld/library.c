@@ -7,8 +7,9 @@
  * member that lazily defines it there and then (depth first); a weak
  * reference extracts nothing. A member is only noted: what it defines
  * becomes lazy, unless the program already refers to one of its symbols,
- * which extracts it at once. After the last file, a lazy entry symbol
- * extracts its member. */
+ * which extracts it at once. Once every file is read, the entry symbol
+ * extracts its member if it is still lazy, then so does each symbol the
+ * script's expressions name, in the order written. */
 #include "ld.h"
 
 /* What a name is in the symbol table (absent: 0). A lazy symbol is
@@ -98,7 +99,48 @@ static void extract(uint i) {
     }
 }
 
-struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, const char *entry, uint *count) {
+/* A strong reference to `name` after the files: extracts the member that
+ * lazily defines it, if one does. */
+static void refer(char *name) {
+    int v = state(name);
+    if (v >= LAZY) {
+        extract((uint)(v - LAZY) / 2);
+    }
+}
+
+/* The references of the symbols `e` names, left to right. */
+static void refer_expr(struct expr *e) {
+    if (e == NULL) {
+        return;
+    }
+    if (e->kind == X_SYMBOL) {
+        refer(e->name);
+    }
+    refer_expr(e->a);
+    refer_expr(e->b);
+}
+
+/* The symbols the script's expressions name (merlin-ld's
+ * Script::referenced_symbols): assignments, AT and ALIGN, as written. */
+static void refer_script(struct script *s) {
+    for (uint i = 0; i < s->ncommands; i++) {
+        struct command *c = &s->commands[i];
+        if (!c->is_output) {
+            refer_expr(c->assign.e);
+            continue;
+        }
+        refer_expr(c->out.at);
+        refer_expr(c->out.align);
+        for (uint k = 0; k < c->out.nitems; k++) {
+            if (c->out.items[k].is_assign) {
+                refer_expr(c->out.items[k].assign.e);
+            }
+        }
+    }
+}
+
+struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, const char *entry,
+                                 struct script *script, uint *count) {
     struct object *objects = xcalloc((n ? n : 1) * sizeof(struct object));
     for (uint i = 0; i < n; i++) {
         char *err;
@@ -112,11 +154,9 @@ struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, const 
     if (errors.n != 0) {
         return NULL;
     }
-    uint members = 0;
-    for (uint i = 0; i < n; i++) {
-        members += lazy[i] != 0;
-    }
-    if (members == n) {
+    /* Library members alone are a link (the entry symbol may extract
+     * one), as in ld.lld: only no file at all is no input. */
+    if (n == 0) {
         error("no input files");
         return NULL;
     }
@@ -136,10 +176,10 @@ struct object *parse_with_needed(struct input *inputs, int *lazy, uint n, const 
         }
     }
     if (entry != NULL) {
-        int v = state((char *)entry);
-        if (v >= LAZY) {
-            extract((uint)(v - LAZY) / 2);
-        }
+        refer((char *)entry);
+    }
+    if (script != NULL) {
+        refer_script(script);
     }
     struct object *all = xcalloc((n ? n : 1) * sizeof(struct object));
     for (uint k = 0; k < nlinked; k++) {

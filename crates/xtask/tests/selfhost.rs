@@ -793,7 +793,7 @@ fn the_archiver_on_camelot_writes_what_llvm_ar_writes() {
     let rt =
         userprogs::build_runtime(&userprogs::user_dir(&repo_root()), userprogs::CCompiler::Merlin).unwrap();
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    for f in ["a.o", "b.o", "c.o", "nosyms.o", "notes.txt"] {
+    for f in ["a.o", "b.o", "c.o", "nosyms.o", "notes.txt", "more.txt"] {
         files.push((format!("/src/{f}"), read(f)));
     }
     files.push(("/src/new/a.o".into(), read("new/a.o")));
@@ -817,6 +817,24 @@ fn the_archiver_on_camelot_writes_what_llvm_ar_writes() {
         ),
         ("ar -rcs /out/nosyms.a /src/nosyms.o".into(), "".into()),
         ("ar rcs /out/empty.a".into(), "".into()),
+        // Text files only: no symbol table, as llvm-ar writes it.
+        (
+            "ar rcs /out/text.a /src/notes.txt /src/more.txt".into(),
+            "".into(),
+        ),
+        // Two members of one name: each name given stands for one, the
+        // first not yet taken, as in llvm-ar.
+        ("ar rcs /out/dup.a /src/a.o /src/new/a.o".into(), "".into()),
+        ("ar t /out/dup.a a.o".into(), "a.o\n".into()),
+        ("ar t /out/dup.a a.o a.o".into(), "a.o\na.o\n".into()),
+        (
+            "ar t /out/dup.a a.o a.o a.o".into(),
+            "a.o\na.o\nar: error: 'a.o' was not found\nar: exit 1\n".into(),
+        ),
+        ("mkdir /z".into(), "".into()),
+        ("cd /z".into(), "".into()),
+        ("ar x /out/dup.a a.o".into(), "".into()),
+        ("cd /".into(), "".into()),
         (
             "ar r /out/loud.a /src/c.o".into(),
             "ar: creating /out/loud.a\n".into(),
@@ -897,6 +915,7 @@ fn the_archiver_on_camelot_writes_what_llvm_ar_writes() {
         "longnames.a",
         "nosymtab.a",
         "objs.a",
+        "text.a",
     ]
     .into_iter()
     .map(|f| (f, read(f)))
@@ -906,6 +925,18 @@ fn the_archiver_on_camelot_writes_what_llvm_ar_writes() {
         data: &read("c.o"),
     }];
     wants.push(("loud.a", elf::archive::write(&c_only).unwrap()));
+    let (a, new_a) = (read("a.o"), read("new/a.o"));
+    let dup = [
+        elf::archive::NewMember {
+            name: "a.o",
+            data: &a,
+        },
+        elf::archive::NewMember {
+            name: "a.o",
+            data: &new_a,
+        },
+    ];
+    wants.push(("dup.a", elf::archive::write(&dup).unwrap()));
     wants.push(("libc.a", rt.archive.clone()));
     wants.push(("libc2.a", rt.archive.clone()));
     for (f, want) in &wants {
@@ -924,6 +955,7 @@ fn the_archiver_on_camelot_writes_what_llvm_ar_writes() {
     assert_eq!(&fs.read_file("/x/printf.o").unwrap(), member("printf.o"));
     assert_eq!(&fs.read_file("/x/usys.o").unwrap(), member("usys.o"));
     assert!(fs.read_file("/x/malloc.o").is_err());
+    assert_eq!(fs.read_file("/z/a.o").unwrap(), a, "x takes the first a.o");
     for f in ["a.o", "nosyms.o", "b.o", "c.o", "notes.txt"] {
         assert_eq!(fs.read_file(&format!("/y/{f}")).unwrap(), read(f), "/y/{f}");
     }
@@ -1530,11 +1562,14 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         ),
     ];
     // Archives (#240), which an input is when its bytes are one, whatever
-    // its name: a member that is not an ELF file is left out with a
-    // warning, a member's error names it lib.a(m.o), an archive alone is
-    // no input, a corrupt archive and a symbol table pointing between
-    // members are errors, and the entry symbol extracts the member that
-    // defines it (with only a text member besides, which warns).
+    // its name: a member that is not a relocatable object (a text file, an
+    // executable) is left out with a warning, a member's error names it
+    // lib.a(m.o), an archive alone links what the entry symbol extracts
+    // (nothing here: no code, and the entry's warning), a corrupt archive
+    // and a thin one are errors, a symbol table pointing between members
+    // is never read, the entry symbol extracts the member that defines it
+    // and so does a symbol the script names (each with a text member
+    // besides, which warns).
     let ar = |members: &[(&str, &[u8])]| {
         let members: Vec<elf::archive::NewMember> = members
             .iter()
@@ -1550,6 +1585,10 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
     // The first symbol's member offset, past the count: off by two.
     bad_table[8 + 60 + 7] += 2;
     let truncated_ar = lib[..lib.len() - 3].to_vec();
+    let mut exe = f.clone();
+    exe[16] = 2;
+    let with_exe = ar(&[("exe.o", &exe), ("f.o", &f)]);
+    let names_g = format!("{}    g = f;\n}}\n", script.trim_end().strip_suffix('}').unwrap());
     cases.extend([
         (vec![calls_f.clone(), lib.clone()], script.to_string(), ""),
         (
@@ -1565,6 +1604,9 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
             script.into(),
             "",
         ),
+        (vec![calls_f.clone(), with_exe], script.into(), ""),
+        (vec![b"!<thin>\n".to_vec()], script.into(), ""),
+        (vec![start.clone(), lib.clone()], names_g, ""),
         (vec![calls_f.clone(), f.clone()], script.into(), "-lnope"),
     ]);
     // The cases whose executable is 4 GiB or more (below), which

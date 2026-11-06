@@ -958,7 +958,9 @@ pub(crate) fn read(files: &[(&Input, bool)], opts: &Options) -> Result<(Vec<Obje
     let Some(script) = script.filter(|_| errors.is_empty()) else {
         return Err(errors);
     };
-    if files.iter().all(|&(_, lazy)| lazy) {
+    // Library members alone are a link: the entry symbol may extract one,
+    // as in ld.lld. Only no file at all is no input.
+    if files.is_empty() {
         return Err(vec![err("no input files")]);
     }
     Ok((objects, script))

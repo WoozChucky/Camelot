@@ -273,11 +273,7 @@ int main(int argc, char **argv) {
         fprintf(2, "ld: --start-lib without --end-lib\n");
         return 2;
     }
-    uint nfiles = 0;
-    for (uint i = 0; i < nnames; i++) {
-        nfiles += !names[i].lib;
-    }
-    if (nfiles == 0) {
+    if (nnames == 0) {
         fprintf(2, "ld: no input files\n%s\n", USAGE);
         return 2;
     }
@@ -315,6 +311,10 @@ int main(int argc, char **argv) {
             fprintf(2, "ld: cannot read %s: %s\n", in.name, strerror(-err));
             return 2;
         }
+        if (is_thin_archive(in.data, in.len)) {
+            error(fmt("%s: thin archives are not supported", in.name));
+            continue;
+        }
         if (!is_archive(in.data, in.len)) {
             files = grow(files, &cap, n + 1, sizeof(struct input));
             lazy = grow(lazy, &lazy_cap, n + 1, sizeof(int));
@@ -330,7 +330,10 @@ int main(int argc, char **argv) {
             continue;
         }
         for (uint k = 0; k < count; k++) {
-            if (members[k].len < 4 || memcmp(members[k].data, "\177ELF", 4) != 0) {
+            /* What a link takes from an archive: relocatable ELF objects
+             * (ET_REL, e_type 1 at byte 16), as ld.lld. */
+            uchar *d = members[k].data;
+            if (members[k].len < 18 || memcmp(d, "\177ELF", 4) != 0 || d[16] != 1 || d[17] != 0) {
                 add_message(&warnings, fmt("%s: archive member '%s' is neither ET_REL nor LLVM bitcode",
                                            in.name, members[k].name));
                 continue;
@@ -375,7 +378,8 @@ int main(int argc, char **argv) {
         entry_name = NULL;
     }
     uint nobjects;
-    struct object *objects = parse_with_needed(files, lazy, n, entry_name, &nobjects);
+    struct object *objects =
+        parse_with_needed(files, lazy, n, entry_name, errors.n == 0 ? &read : NULL, &nobjects);
     struct layout layout;
     uchar **images, **debug;
     if (objects == NULL || !layout_build(objects, nobjects, script, script_text, entry, &layout) ||

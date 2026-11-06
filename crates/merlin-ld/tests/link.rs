@@ -632,9 +632,11 @@ fn multiobj_matches_ld_lld_and_runs() {
 /// members it needs in the order it takes them: after the objects
 /// (link.ld), before them (first.ld, where crt0.o's exit is extracted
 /// before main.o is read), and the start code in an archive, which only
-/// the entry symbol extracts (entry.ld). In every one the member nobody
-/// needs (unused.o, with a second strlen) and the one only a weak
-/// reference wants (hook.o) stay out.
+/// the entry symbol extracts (entry.ld), archives alone, the program in
+/// one too (alone.ld), and a symbol the script names, which extracts the
+/// member a weak reference left out (script.ld). In every one the member
+/// nobody needs (unused.o, with a second strlen) stays out, and the one
+/// only a weak reference wants (hook.o) but where the script names it.
 #[test]
 fn archives_match_ld_lld_and_run() {
     let lib = std::fs::read(fixtures().join("archive/libdemo.a")).unwrap();
@@ -645,18 +647,28 @@ fn archives_match_ld_lld_and_run() {
         ["strlen.o", "unused.o", "puts.o", "putc.o", "exit.o", "hook.o"]
     );
     let out = "Linked from libdemo.a\n";
-    for (name, order) in [
-        ("link", ["_start", "main", "puts", "strlen", "putc", "exit"]),
-        ("first", ["_start", "exit", "main", "puts", "strlen", "putc"]),
-        ("entry", ["_start", "main", "puts", "strlen", "putc", "exit"]),
+    let usual: &[&str] = &["_start", "main", "puts", "strlen", "putc", "exit"];
+    for (name, order, exit) in [
+        ("link", usual, 22),
+        (
+            "first",
+            &["_start", "exit", "main", "puts", "strlen", "putc"][..],
+            22,
+        ),
+        ("entry", usual, 22),
+        ("alone", usual, 22),
+        (
+            "script",
+            &["_start", "main", "puts", "strlen", "putc", "exit", "hook"][..],
+            23,
+        ),
     ] {
-        let linked = assert_matches_ld_lld_exit(&format!("archive/{name}"), out, 22);
+        let linked = assert_matches_ld_lld_exit(&format!("archive/{name}"), out, exit);
         let l = &linked.layout;
         let at: Vec<u64> = order.iter().map(|s| l.symbol(s).unwrap()).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{name}: {order:?} at {at:x?}");
-        for unlinked in ["unused", "hook"] {
-            assert_eq!(l.symbol(unlinked), None, "{name}: {unlinked}");
-        }
+        assert_eq!(l.symbol("unused"), None, "{name}: unused");
+        assert_eq!(l.symbol("hook").is_some(), name == "script", "{name}: hook");
     }
 }
 
