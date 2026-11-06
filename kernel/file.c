@@ -384,6 +384,13 @@ int filemmap(struct file *f, u32 type, u32 prot, u64 offset, usize size, struct 
         if (type != MAP_SHARED) {
             return -EINVAL;
         }
+        /* No page past the largest object can ever be: a mapping that
+         * reaches there is refused, as Linux refuses one past a file's
+         * largest size (file_mmap_ok()). It also keeps a mapping of an
+         * object, like an anonymous one, a size the kernel can go over. */
+        if (offset > SHM_MAX_SIZE || size > SHM_MAX_SIZE - offset) {
+            return -EOVERFLOW;
+        }
         a->kind = AREA_SHM;
         a->shm = f->shm;
         a->pgoff = offset / PGSIZE;

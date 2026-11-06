@@ -146,7 +146,7 @@ headers and checks each size.
 | 45 | `futex_wait` | `int *addr, int val` | 0; `-EAGAIN`, `-EINVAL`, `-EINTR`, `-EFAULT` |
 | 46 | `futex_wake` | `int *addr, int n` | the number of threads woken; `-EINVAL`, `-EFAULT` |
 | 47 | `fcntl` | `int fd, int cmd, int arg` | the descriptor's flags, a new descriptor, or 0; `-EBADF`, `-EINVAL`, `-EMFILE` |
-| 48 | `mmap` | `void *addr, size_t len, int prot, int flags, int fd, off_t offset` | the mapping's address, a pointer; `-EINVAL`, `-ENOMEM`, `-EEXIST`, `-EBADF`, `-EACCES`, `-ENODEV` |
+| 48 | `mmap` | `void *addr, size_t len, int prot, int flags, int fd, off_t offset` | the mapping's address, a pointer; `-EINVAL`, `-ENOMEM`, `-EEXIST`, `-EBADF`, `-EACCES`, `-ENODEV`, `-EOVERFLOW`, `-EOPNOTSUPP` |
 | 49 | `munmap` | `void *addr, size_t len` | 0; `-EINVAL`, `-ENOMEM` |
 | 50 | `mprotect` | `void *addr, size_t len, int prot` | 0; `-EINVAL`, `-ENOMEM`, `-EACCES` |
 | 51 | `memfd_create` | `const char *name, uint flags` | a new descriptor; `-EINVAL`, `-EFAULT`, `-EMFILE`, `-ENFILE` |
@@ -754,7 +754,11 @@ it all. Anonymous memory reads zero at first. A touch the mapping's
 protections don't allow (a write to a read-only mapping, any access to a
 `PROT_NONE` one) is a fault, and kills the program ("exit"), as Linux's
 `SIGSEGV` would; so does a page that can't be had then. A device's
-mapping is the exception: its pages are the device's, all mapped by `mmap`.
+mapping too maps a page at its first touch, but the page is the device's.
+A system call checks a whole buffer before it reads or writes any of it,
+so every page of the buffer is mapped then, even if the call uses fewer
+bytes (a `read` that finds 10 bytes waiting maps all of a 1 MiB buffer),
+and a buffer bigger than the free memory is `-EFAULT`.
 
 The values are Linux's:
 
@@ -764,8 +768,10 @@ The values are Linux's:
 | `PROT_READ` | 1 | readable |
 | `PROT_WRITE` | 2 | writable, and so readable: a RISC-V page can't be writable and not readable |
 | `PROT_EXEC` | 4 | executable |
+| `PROT_SEM` | 8 | `mprotect` only: accepted, means nothing (every page allows atomics) |
 | `MAP_SHARED` | 0x01 | shared with every other mapping of the same memory |
 | `MAP_PRIVATE` | 0x02 | the process's own |
+| `MAP_SHARED_VALIDATE` | 0x03 | `MAP_SHARED`, but a flag Linux doesn't know is `-EOPNOTSUPP` |
 | `MAP_FIXED` | 0x10 | exactly at `addr`, replacing what is mapped there |
 | `MAP_ANONYMOUS` | 0x20 | no file: zeroed memory |
 | `MAP_NORESERVE` | 0x4000 | accepted: nothing is reserved anyway |
@@ -775,8 +781,12 @@ The values are Linux's:
 **mmap(addr, len, prot, flags, fd, offset)** maps `len` bytes, rounded up
 to whole pages, and returns where, a page-aligned address (or minus an
 error, as a pointer, as `sbrk` returns one). `flags` holds one of
-`MAP_SHARED` and `MAP_PRIVATE` and any of the others; flags Camelot
-doesn't know are ignored, as Linux ignores them. With `MAP_ANONYMOUS` the
+`MAP_SHARED`, `MAP_PRIVATE` and `MAP_SHARED_VALIDATE` and any of the
+others; flags Camelot doesn't know are ignored, as Linux ignores them, but
+for a descriptor's `MAP_SHARED_VALIDATE` mapping, which refuses those
+Linux doesn't know either (outside its `LEGACY_MAP_MASK` and
+`MAP_FIXED_NOREPLACE`). Bits of `prot` other than the three are ignored
+too, as Linux's `mmap` ignores them. With `MAP_ANONYMOUS` the
 mapping is anonymous memory, zeroed, and `fd` and `offset` are ignored;
 `MAP_SHARED` anonymous memory is the same as `MAP_PRIVATE`, since Camelot
 has no `fork` whose child could share it. Without, it maps what the
@@ -788,10 +798,14 @@ whatever mappings are there, as `munmap` would. Without either, `addr` is
 a hint: taken, rounded up to a page, if the room is free there, and
 otherwise the highest room that fits. Errors:
 
-- `-EINVAL`: `len` is 0, `prot` has bits other than the three, `flags`
-  has neither `MAP_SHARED` nor `MAP_PRIVATE` (or both), `addr` is not page
-  aligned with `MAP_FIXED` or `MAP_FIXED_NOREPLACE`, or `offset` is
-  negative or not page aligned for a descriptor;
+- `-EINVAL`: `len` is 0, `flags`' type (its low four bits) is none of
+  the three, `addr` is not page aligned with `MAP_FIXED` or
+  `MAP_FIXED_NOREPLACE`, or `offset` is negative or not page aligned for a
+  descriptor;
+- `-EOPNOTSUPP`: a descriptor's `MAP_SHARED_VALIDATE` mapping with a flag
+  Linux doesn't know;
+- `-EOVERFLOW`: a shared-memory object's mapping that reaches past the
+  largest object (1 GiB), whose pages can never be;
 - `-EINVAL` too: a `MAP_PRIVATE` mapping of a shared-memory object (a
   private mapping of one is a copy-on-write one on Linux, which Camelot
   doesn't have);
@@ -803,7 +817,7 @@ otherwise the highest room that fits. Errors:
   objects and `/dev/fb0` can be): a regular file, a directory, a pipe, a
   socket, the console;
 - a device's own errors: for `/dev/fb0`, `-EINVAL` for a range past its
-  memory, `-ENODEV` on a machine without a framebuffer.
+  memory, `-ENODEV` on a machine without a framebuffer;
 - `-EEXIST`: `MAP_FIXED_NOREPLACE` over a mapping;
 - `-ENOMEM`: no room for it (or, with `MAP_FIXED`, its range is not in the
   mapping room), anonymous memory bigger than the RAM (as `sbrk` fails at
@@ -821,10 +835,13 @@ cut in two and the kernel's table is full.
 **mprotect(addr, len, prot)** gives the mappings in the `len` bytes at
 `addr`, rounded up to whole pages, the protections `prot`, on every hart:
 their pages keep what they hold, a `PROT_NONE` page too. Returns 0 (also
-for `len` 0). Errors: `-EINVAL` if `addr` is not page aligned or `prot`
-has other bits; `-ENOMEM` if part of the range is not a mapping (the
-program, the heap and the stack included), or a mapping has to be cut and
-the kernel's table is full; `-EACCES` if `prot` makes writable a mapping
+for `len` 0, whatever `prot`). Errors, in Linux's order: `-EINVAL` if
+`addr` is not page aligned; `-ENOMEM` if the range goes past user space;
+`-EINVAL` if `prot` has bits other than the three and `PROT_SEM`
+(`PROT_GROWSDOWN` and `PROT_GROWSUP` included: no mapping grows);
+`-ENOMEM` if part of the range is not a mapping (the program, the heap
+and the stack included), or a mapping has to be cut and the kernel's
+table is full; `-EACCES` if `prot` makes writable a mapping
 that writes what a descriptor not open for writing was open on (as
 `mmap` would refuse it).
 
@@ -871,7 +888,7 @@ there yet) or not open for writing, or `length` is negative; `-EFBIG` past
 root image, maps the framebuffer's memory (640x480 pixels of 32 bits,
 `docs/excalibur-spec.md` section 9.3), from `offset` on, its last page
 whole: a program draws by writing pixels there, and the screen shows them.
-The pages are the device's, mapped all at once by `mmap` and never freed;
+The pages are the device's, mapped as they are touched and never freed;
 `MAP_PRIVATE` maps the same pages as `MAP_SHARED` (writes go to the
 device either way, as Linux's framebuffer devices do), so a writable
 mapping of either kind needs the descriptor open for writing. A system
@@ -912,13 +929,13 @@ Linux's values for the same conditions.
 | 36 | `ENAMETOOLONG` | a name longer than 14 bytes, or a path longer than `MAXPATH` |
 | 38 | `ENOSYS` | no such system call |
 | 39 | `ENOTEMPTY` | unlink: a directory with entries |
-| 75 | `EOVERFLOW` | open: a file bigger than the kernel's offsets reach |
+| 75 | `EOVERFLOW` | open: a file bigger than the kernel's offsets reach; mmap: past the largest object |
 | 88 | `ENOTSOCK` | a socket call on a descriptor that is not a socket |
 | 89 | `EDESTADDRREQ` | send: a UDP socket with no peer, and no address given |
 | 90 | `EMSGSIZE` | a datagram too big for one packet |
 | 92 | `ENOPROTOOPT` | setsockopt: an option sockets don't have |
 | 93 | `EPROTONOSUPPORT` | socket: a protocol the type doesn't have |
-| 95 | `EOPNOTSUPP` | listen, accept: not on a UDP socket |
+| 95 | `EOPNOTSUPP` | listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses |
 | 97 | `EAFNOSUPPORT` | an address family other than `AF_INET` |
 | 98 | `EADDRINUSE` | a port that is taken |
 | 99 | `EADDRNOTAVAIL` | bind: an address that is not this host's |

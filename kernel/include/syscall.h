@@ -99,13 +99,13 @@
 #define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH */
 #define ENOSYS 38       /* no such system call */
 #define ENOTEMPTY 39    /* unlink: a directory with entries */
-#define EOVERFLOW 75    /* open: a file bigger than the kernel's offsets reach */
+#define EOVERFLOW 75    /* open: a file bigger than the kernel's offsets reach; mmap: past the largest object */
 #define ENOTSOCK 88     /* a socket call on a descriptor that is not a socket */
 #define EDESTADDRREQ 89 /* send: a UDP socket with no peer, and no address given */
 #define EMSGSIZE 90     /* a datagram too big for one packet */
 #define ENOPROTOOPT 92  /* setsockopt: an option sockets don't have */
 #define EPROTONOSUPPORT 93 /* socket: a protocol the type doesn't have */
-#define EOPNOTSUPP 95   /* listen, accept: not on a UDP socket */
+#define EOPNOTSUPP 95   /* listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses */
 #define EAFNOSUPPORT 97 /* an address family other than AF_INET */
 #define EADDRINUSE 98   /* a port that is taken */
 #define EADDRNOTAVAIL 99 /* bind: an address that is not this host's */

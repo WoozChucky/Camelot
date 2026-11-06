@@ -188,7 +188,10 @@ void *calloc(size_t count, size_t size) {
         return NULL;
     }
     void *p = malloc(count * size);
-    if (p != NULL) {
+    /* A block in a mapping of its own is new zeroed memory: writing zeros
+     * would only make the kernel map every page of it now (glibc skips
+     * them too). */
+    if (p != NULL && ((struct header *)p - 1)->next != MAPPED) {
         memset(p, 0, count * size);
     }
     return p;

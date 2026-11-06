@@ -364,6 +364,9 @@ static void test_mapped(void) {
     check(again == q && again[0] == 0, "free gives it back: the next gets its address, zeroed");
     free(again);
     free(p);
+    int *zeroed = calloc(64 * 1024, sizeof(int));
+    check(zeroed != NULL && zeroed[0] == 0 && zeroed[64 * 1024 - 1] == 0, "calloc of a mapped block reads zero");
+    free(zeroed);
     char *small = malloc(1000);
     check(small != NULL && small < top, "a small block still comes from the heap");
     free(small);

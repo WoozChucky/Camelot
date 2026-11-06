@@ -117,15 +117,21 @@ bool mm_overlaps(struct proc *p, uintptr start, uintptr end) {
 
 /* Calls `fn` on the PTE of every page in [start, end) of `pt` that has
  * one (a leaf, or a page kept for PROT_NONE): the pages an area has been
- * given so far. A missing table skips the 2 MiB it would map, so a big
- * area that was hardly touched is quick to go over. */
+ * given so far. A missing table skips all it would map (2 MiB, 1 GiB or
+ * 512 GiB), so a big area that was hardly touched is quick to go over. */
 static void each_pte(pagetable_t pt, uintptr start, uintptr end, void (*fn)(pte_t *pte, void *arg),
                      void *arg) {
     uintptr a = start;
     while (a < end) {
-        pte_t *pte = walk(pt, a, false);
+        uintptr skip;
+        pte_t *pte = walk_scan(pt, a, &skip);
         if (pte == NULL) {
-            a = (a + LEVEL_SIZE(1)) & ~(LEVEL_SIZE(1) - 1);
+            uintptr next = (a + skip) & ~(skip - 1);
+            /* Past the top of user space: nothing more. */
+            if (next <= a) {
+                return;
+            }
+            a = next;
             continue;
         }
         if (*pte != 0) {
@@ -400,10 +406,19 @@ static uintptr find_room(struct proc *p, uintptr lo, uintptr hi, usize size) {
 long mm_mmap(uintptr addr, usize len, u32 prot, u32 flags, int fd, off_t offset) {
     struct proc *p = myproc();
     u32 type = flags & MAP_TYPE;
-    if (len == 0 || (prot & ~(u32)(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 ||
-        (type != MAP_SHARED && type != MAP_PRIVATE)) {
+    if (len == 0 || (type != MAP_SHARED && type != MAP_PRIVATE && type != MAP_SHARED_VALIDATE)) {
         return -EINVAL;
     }
+    if (type == MAP_SHARED_VALIDATE) {
+        /* MAP_SHARED, but a descriptor's mapping refuses the flags Linux
+         * doesn't know rather than ignore them. */
+        if ((flags & MAP_ANONYMOUS) == 0 && (flags & ~(u32)MAP_VALIDATE_FLAGS) != 0) {
+            return -EOPNOTSUPP;
+        }
+        type = MAP_SHARED;
+    }
+    /* Other bits of `prot` are ignored, as Linux's mmap ignores them. */
+    prot &= PROT_READ | PROT_WRITE | PROT_EXEC;
     bool fixed = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
     if (fixed && addr % PGSIZE != 0) {
         return -EINVAL;
@@ -504,10 +519,12 @@ long mm_mmap(uintptr addr, usize len, u32 prot, u32 flags, int fd, off_t offset)
     release(&p->vm_lock);
     releasesleep(&p->heap_lock);
     if (flags & MAP_POPULATE) {
-        /* Every page now, as a touch of each would map it; one that can't
-         * be had is left to fault later. */
+        /* Every page now, as a touch of each would map it, until one can't
+         * be had (no free page, the object's end): the rest fault later. */
         for (uintptr page = start; page < start + size; page += PGSIZE) {
-            mm_fault(p->pagetable, page, 0);
+            if (!mm_fault(p->pagetable, page, 0)) {
+                break;
+            }
         }
     }
     return (long)start;
@@ -541,7 +558,9 @@ static void protect_pte(pte_t *pte, void *arg) {
 }
 
 long mm_mprotect(uintptr addr, usize len, u32 prot) {
-    if (addr % PGSIZE != 0 || (prot & ~(u32)(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0) {
+    /* Linux's order: the address, nothing to do, the range, then the
+     * protections. */
+    if (addr % PGSIZE != 0) {
         return -EINVAL;
     }
     if (len == 0) {
@@ -551,6 +570,13 @@ long mm_mprotect(uintptr addr, usize len, u32 prot) {
     if (!user_pages(addr, len, &end)) {
         return -ENOMEM;
     }
+    /* PROT_SEM is accepted and means nothing, as on RISC-V Linux; any
+     * other bit is -EINVAL, PROT_GROWSDOWN and PROT_GROWSUP too, since no
+     * area grows. */
+    if ((prot & ~(u32)(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM)) != 0) {
+        return -EINVAL;
+    }
+    prot &= PROT_READ | PROT_WRITE | PROT_EXEC;
     struct proc *p = myproc();
     acquiresleep(&p->heap_lock);
     /* Every page of the range must be in an area, with no hole: else

@@ -30,7 +30,7 @@ pub const RUN_MAX_STEPS: u64 = 150_000_000;
 
 /// The checks `maptest` makes (kernel/user/maptest.c), and `maptest
 /// threads`: each must run every one.
-pub const MAPTEST_CHECKS: u32 = 101;
+pub const MAPTEST_CHECKS: u32 = 106;
 pub const MAPTEST_THREADS_CHECKS: u32 = 15;
 
 /// Where the kernel image is linked (its symbols' addresses) and where it is

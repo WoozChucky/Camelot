@@ -121,8 +121,10 @@ _Static_assert(offsetof(struct thread, kstack) == THREAD_KSTACK, "the tests read
  * threads may change (the fd_ functions below). `heap_lock`, a sleep lock,
  * makes sbrk(), the stack's growth, mmap, munmap and mprotect one thread at
  * a time; `vm_lock`, a spinlock, guards the mappings for the page faults
- * that map their pages (mmap.h). The page table and the heap's bounds
- * change only under heap_lock, or while the process has one thread (exec);
+ * that map their pages (mmap.h). The heap's bounds and the mappings change
+ * only under heap_lock, or while the process has one thread (exec); so does
+ * the page table, but for a fault adding a page of a mapping (under vm_lock
+ * alone, every page the kernel maps for the process being under it);
  * others (ps) read them under proc_lock and may see them just before or
  * after a change. */
 struct proc {

@@ -142,7 +142,8 @@ keep the heap big after it is gone. Its header's link, unused while a block
 is handed out, says which it is: 1 for a mapping (no free block can be at
 address 1), `NULL` for the heap. When the kernel has no room for the
 mapping, `malloc` takes the block from the heap after all, as glibc falls
-back.
+back. `calloc` doesn't clear such a block, which is new zeroed memory:
+writing zeros would only make the kernel map every page of it at once.
 
 ## Threads
 

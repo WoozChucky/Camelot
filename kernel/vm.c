@@ -147,7 +147,8 @@ pagetable_t pagetable_create(void) {
 /* The PTE that maps `va` at `level` in `pt`, or the superpage leaf above
  * `level` that maps it, with the level of the PTE returned in *at. With
  * `alloc`, the tables down to `level` are created as needed; NULL if that
- * needs a page and none is free, or (without `alloc`) if one is missing. */
+ * needs a page and none is free, or (without `alloc`) if one is missing,
+ * with *at then the level of the invalid PTE where the walk stopped. */
 static pte_t *lookup(pagetable_t pt, uintptr va, int level, bool alloc, int *at) {
     for (int l = PT_LEVELS - 1;; l--) {
         pte_t *pte = &pt[VPN(va, l)];
@@ -159,6 +160,7 @@ static pte_t *lookup(pagetable_t pt, uintptr va, int level, bool alloc, int *at)
             pt = (pagetable_t)va(PTE2PA(*pte));
         } else {
             if (!alloc) {
+                *at = l;
                 return NULL;
             }
             pagetable_t table = pagetable_create();
@@ -177,6 +179,19 @@ pte_t *walk(pagetable_t pt, uintptr va, bool alloc) {
     pte_t *pte = lookup(pt, va, 0, alloc, &at);
     if (pte != NULL && at != 0) {
         panic("walk: unexpected " SUPERPAGE);
+    }
+    return pte;
+}
+
+pte_t *walk_scan(pagetable_t pt, uintptr va, uintptr *skip) {
+    int at;
+    pte_t *pte = lookup(pt, va, 0, false, &at);
+    if (pte == NULL) {
+        /* The invalid PTE at level `at` would map LEVEL_SIZE(at) bytes:
+         * none of them has a page. */
+        *skip = LEVEL_SIZE(at);
+    } else if (at != 0) {
+        panic("walk_scan: unexpected " SUPERPAGE);
     }
     return pte;
 }

@@ -133,7 +133,8 @@ static void anonymous_checks(void) {
     check(p[2 * PAGE] == 'e', "writable again");
     check_eq(mprotect(p, 4 * PAGE, PROT_READ), -ENOMEM, "mprotect past the mapping");
     check_eq(mprotect(p + 1, PAGE, PROT_READ), -EINVAL, "mprotect an unaligned address");
-    check_eq(mprotect(p, PAGE, 8), -EINVAL, "mprotect with a protection that doesn't exist");
+    check_eq(mprotect(p, PAGE, 0x10), -EINVAL, "mprotect with a protection that doesn't exist");
+    check_eq(mprotect(p, PAGE, PROT_READ | PROT_WRITE | PROT_SEM), 0, "PROT_SEM, which means nothing");
     check_eq(mprotect(p, 0, PROT_READ), 0, "mprotect of nothing");
 
     /* A hint is taken where there is room. */
@@ -149,8 +150,14 @@ static void anonymous_checks(void) {
 
 static void error_checks(void) {
     check_eq(anon(0), -EINVAL, "mmap of nothing");
-    check_eq(map(0, PAGE, 8, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), -EINVAL, "a protection that doesn't exist");
+    long odd = map(0, PAGE, PROT_READ | PROT_WRITE | 0x10, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(odd > 0, "a protection bit mmap doesn't know is ignored");
+    if (odd > 0) {
+        *(char *)odd = 1;
+        munmap((void *)odd, PAGE);
+    }
     check_eq(map(0, PAGE, PROT_READ, MAP_ANONYMOUS, -1, 0), -EINVAL, "neither shared nor private");
+    check_eq(map(0, PAGE, PROT_READ, 0x04 | MAP_ANONYMOUS, -1, 0), -EINVAL, "a type that doesn't exist");
     check_eq(map((void *)(PAGE + 1), PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0),
              -EINVAL, "MAP_FIXED at an unaligned address");
     check_eq(map(0, PAGE, PROT_READ, MAP_PRIVATE, 15, 0), -EBADF, "a descriptor that isn't open");
@@ -243,6 +250,15 @@ static void memfd_checks(void) {
 
     check_eq(map(0, PAGE, PROT_READ, MAP_PRIVATE, fd, 0), -EINVAL, "a private mapping of the object");
     check_eq(map(0, PAGE, PROT_READ, MAP_SHARED, fd, 1), -EINVAL, "an unaligned offset");
+    long v = map(0, PAGE, PROT_READ, MAP_SHARED_VALIDATE, fd, (off_t)PAGE);
+    check(v > 0 && ((char *)v)[5] == 'x', "MAP_SHARED_VALIDATE is MAP_SHARED");
+    if (v > 0) {
+        munmap((void *)v, PAGE);
+    }
+    check_eq(map(0, PAGE, PROT_READ, MAP_SHARED_VALIDATE | 0x80, fd, 0), -EOPNOTSUPP,
+             "that refuses a flag Linux doesn't know");
+    check_eq(map(0, 2 * PAGE, PROT_READ, MAP_SHARED, fd, (off_t)(1024 * MIB - PAGE)), -EOVERFLOW,
+             "a mapping past the largest object");
     char buf[4];
     check_eq(read(fd, buf, 4), -EINVAL, "read() of the object");
     check_eq(write(fd, buf, 4), -EINVAL, "write() to it");

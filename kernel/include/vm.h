@@ -292,6 +292,12 @@ pagetable_t pagetable_create(void);
  * the way. */
 pte_t *walk(pagetable_t pt, uintptr va, bool alloc);
 
+/* walk() without `alloc`, for going over a range: the level-0 PTE for
+ * `va`, or NULL if a table is missing, with *skip then the bytes the
+ * missing table's entry would map (2 MiB, 1 GiB, 512 GiB), from the
+ * multiple of *skip below `va`: none of them has a page. */
+pte_t *walk_scan(pagetable_t pt, uintptr va, uintptr *skip);
+
 /* Maps the `size` bytes at `va` to the physical range at `pa`, with
  * permissions `perm` (some of PTE_R/W/X/U, or a PAGE_KERNEL one: with A, D
  * and G, never U; a user one gets PTE_USER_AD(perm) besides). `va`, `pa`

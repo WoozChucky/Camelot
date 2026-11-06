@@ -19,8 +19,8 @@
  *                which it owns, mapped on the first touch, so that every
  *                process mapping it sees the same memory
  *   AREA_DEVICE  a device's memory (a driver's mmap hook, file.h): physical
- *                pages that are not RAM's, mapped whole at mmap() and never
- *                freed
+ *                pages that are not RAM's, mapped on the first touch like
+ *                the others, and never freed
  *
  * A page of an area is in one of three states in the process's page table:
  * no PTE (never touched), a valid leaf with the area's permissions, or,
@@ -48,18 +48,32 @@
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC 0x4
+/* Accepted by mprotect and meaning nothing (Linux's, for atomics, which
+ * every RISC-V page allows). mmap ignores every other bit, as Linux's
+ * does; mprotect refuses them. */
+#define PROT_SEM 0x8
 
-/* mmap's flags (Linux's values). One of MAP_SHARED and MAP_PRIVATE, in
- * MAP_TYPE's bits; flags Camelot doesn't know are ignored, as Linux ignores
- * them. */
+/* mmap's flags (Linux's values). One of MAP_SHARED, MAP_PRIVATE and
+ * MAP_SHARED_VALIDATE, in MAP_TYPE's bits; flags Camelot doesn't know are
+ * ignored, as Linux ignores them, but for MAP_SHARED_VALIDATE. */
 #define MAP_SHARED 0x01
 #define MAP_PRIVATE 0x02
+#define MAP_SHARED_VALIDATE 0x03 /* MAP_SHARED, unknown flags -EOPNOTSUPP */
 #define MAP_TYPE 0x0f
 #define MAP_FIXED 0x10           /* exactly at addr, replacing what is there */
 #define MAP_ANONYMOUS 0x20       /* no file: zeroed memory */
 #define MAP_NORESERVE 0x4000     /* accepted; nothing is reserved anyway */
 #define MAP_POPULATE 0x8000      /* map every page now, not on first touch */
 #define MAP_FIXED_NOREPLACE 0x100000 /* exactly at addr, -EEXIST if taken */
+/* The flags MAP_SHARED_VALIDATE takes for a descriptor: Linux's
+ * LEGACY_MAP_MASK (the types; MAP_FIXED, MAP_ANONYMOUS, MAP_GROWSDOWN
+ * 0x100, MAP_DENYWRITE 0x800, MAP_EXECUTABLE 0x1000, MAP_LOCKED 0x2000,
+ * MAP_NORESERVE, MAP_POPULATE, MAP_NONBLOCK 0x10000, MAP_STACK 0x20000,
+ * MAP_HUGETLB 0x40000, MAP_UNINITIALIZED 0x4000000) and
+ * MAP_FIXED_NOREPLACE. The ones Camelot doesn't know it ignores here too. */
+#define MAP_VALIDATE_FLAGS                                                                            \
+    (MAP_SHARED | MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS | 0x100 | 0x800 | 0x1000 | 0x2000 |         \
+     MAP_NORESERVE | MAP_POPULATE | 0x10000 | 0x20000 | 0x40000 | 0x4000000 | MAP_FIXED_NOREPLACE)
 
 /* The kernel's areas, every process's together (Linux bounds a process's
  * with vm.max_map_count): mmap() fails with -ENOMEM when none is free. */
