@@ -26,6 +26,7 @@ void cpu_init(void) {
     c->hartid = cpuid();
     c->pagetable = NULL;
     c->ticks = 0;
+    c->idle_ticks = 0;
     c->switches = 0;
     c->idle = false;
 }

@@ -196,11 +196,11 @@ primes [20000, 30000): 983
 primes [30000, 40000): 958
 primes: 4203 below 40000, 4 workers
 $ harts
-HART   PID    TICKS SWITCHES
-   0     1       20        9
-   1     7       10       14
-   2     -       10        6
-   3     -       10        5
+HART   PID    TICKS     IDLE SWITCHES
+   0     1       20        9        9
+   1     7       10        2       14
+   2     -       10        8        6
+   3     -       10        9        5
 ```
 
 The workers' lines come in whatever order they finish. Each hart has its own

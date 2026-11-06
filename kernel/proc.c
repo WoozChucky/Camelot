@@ -1279,6 +1279,7 @@ int proc_harts(struct hartinfo *out, int max) {
             info->pid = c->proc != NULL ? c->proc->pid : 0;
             info->ticks = c->ticks;
             info->switches = c->switches;
+            info->idle = c->idle_ticks;
         }
         n++;
     }

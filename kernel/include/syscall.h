@@ -206,15 +206,17 @@ struct procinfo {
     char name[16];
 };
 
-/* What harts stores for each hart running the kernel: 16 bytes. `pid` is
+/* What harts stores for each hart running the kernel: 20 bytes. `pid` is
  * the process running on it (the caller, on the caller's hart), 0 while the
- * hart idles; `ticks` the timer ticks it has taken and `switches` the
- * processes it has switched to, both since it started. */
+ * hart idles; `ticks` the timer ticks it has taken, `switches` the
+ * processes it has switched to and `idle` the ticks that came while it ran
+ * none, all since it started. */
 struct hartinfo {
     u32 hart;
     u32 pid;
     u32 ticks;
     u32 switches;
+    u32 idle;
 };
 
 /* The network's counters, in netinfo's `stats` (docs/camelot-net.md,

@@ -307,12 +307,13 @@ struct procinfo {
     char name[16];
 };
 
-/* What harts stores for each hart: 16 bytes. */
+/* What harts stores for each hart: 20 bytes. */
 struct hartinfo {
     uint hart;     /* its id, 0 to the number of harts - 1 */
     uint pid;      /* the process it runs (the caller, on the caller's hart), 0 while idle */
     uint ticks;    /* timer ticks it has taken */
     uint switches; /* processes it has switched to */
+    uint idle;     /* the ticks that came while it ran no process: busy is ticks - idle */
 };
 
 #define PROC_RUNNABLE 1 /* waiting for its turn */

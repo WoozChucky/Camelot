@@ -88,7 +88,7 @@ headers and checks each size.
 | `struct stat` | 24 | `fstat`'s: `size` is an `off_t` |
 | `struct dirent` | 16 | a directory's entries, as `read` gives them |
 | `struct procinfo` | 40 | `procs`': `size` is a `size_t` |
-| `struct hartinfo` | 16 | `harts`' |
+| `struct hartinfo` | 20 | `harts`' |
 | `struct net_stats` | 108 | the network's counters |
 | `struct netinfo` | 132 | `netinfo`'s |
 | `struct ping_reply` | 16 | `ping`'s |
@@ -560,7 +560,7 @@ must be writable, however many are stored, or it is `-EFAULT` and nothing
 is.
 
 **harts(buf, max)** describes the harts the kernel runs on, from hart 0
-up, in the array of `max` `struct hartinfo` (16 bytes each, `user.h`) at
+up, in the array of `max` `struct hartinfo` (20 bytes each, `user.h`) at
 `buf`, and returns how many there are: 1 on a one-hart machine, else every
 hart Grail has (`--harts`; `docs/excalibur-spec.md` section 10, "Kernel
 SMP"). As for `procs`, only the first `max` are stored, `harts(NULL, 0)`
@@ -568,8 +568,13 @@ just counts them, and all of `buf`, `max` entries, must be writable, or it
 is `-EFAULT`. Each entry holds `hart`, its id (0 to the count - 1); `pid`,
 the process it is running, which on the caller's own hart is the caller,
 or 0 while it idles; `ticks`, the timer ticks it has taken since it
-started (each hart has its own timer: hart 0's are `uptime`'s); and
-`switches`, the times it has switched to a process since it started. A
+started (each hart has its own timer: hart 0's are `uptime`'s);
+`switches`, the times it has switched to a process since it started; and
+`idle`, those of its ticks that came while it ran no process (in the
+scheduler, or waiting for an interrupt), so that how busy a hart was
+between two calls is the ticks that were not idle, over the ticks, as
+Linux's idle time in `/proc/stat` gives it (the panel's and the system
+monitor's meters). A
 process runs on one hart at a time, but not always the same one.
 
 The network's calls are what the `ifconfig` and `ping` programs use;
