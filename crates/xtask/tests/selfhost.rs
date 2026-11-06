@@ -2877,8 +2877,8 @@ fn cc1_compiles_itself_on_camelot() {
 /// Everything: `cc1 -E` on every C and `.S` file of the repository, every
 /// row of the lexer's and the preprocessor's tables and [`PP_INPUTS`]; `cc1`
 /// compiling every C file of the repository and every row of merlin's
-/// diagnostics table; and `cc1` compiling every file of its own. Some ten
-/// minutes on 2 machines: run before a change to cc1 is called ready
+/// diagnostics table; and `cc1` compiling every file of its own. About an
+/// hour on 2 machines: run before a change to cc1 is called ready
 /// (README.md).
 #[test]
 #[ignore]
