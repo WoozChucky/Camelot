@@ -37,13 +37,19 @@ fn camelot_vms_need_no_program() {
     let create = |members: Vec<(&str, Json)>| api.post("vms", &obj(members));
     let image = avalon_client::BASE_IMAGE;
 
-    // No image yet: the page is told its name, and a create says what to do.
+    // No image yet: the page is told each profile's, and a create says what to do.
     let disks = api.expect(200, api.get("disks"));
-    assert_eq!(s(&disks, "camelot_image"), "os-base");
-    // And its firmware and RAM, as `bios` and `ram` take them, for the form to
+    let profiles = disks.get("profiles").and_then(Json::as_array).unwrap();
+    let names: Vec<&str> = profiles.iter().map(|p| s(p, "name")).collect();
+    assert_eq!(names, ["server", "desktop"]);
+    // And their firmware and RAM, as `bios` and `ram` take them, for the form to
     // start with.
-    assert_eq!(s(&disks, "camelot_bios"), "default");
-    assert_eq!(disks.get("camelot_ram").and_then(Json::as_u64), Some(6));
+    for (profile, (image, ram)) in profiles.iter().zip([("os-base", 6), ("os-desktop", 64)]) {
+        assert_eq!(s(profile, "image"), image);
+        assert_eq!(s(profile, "bios"), "default");
+        assert_eq!(profile.get("ram").and_then(Json::as_u64), Some(ram));
+        assert!(s(profile, "about").starts_with("a Camelot "));
+    }
     let r = create(vec![("name", "early".into()), ("camelot", true.into())]);
     assert_eq!(r.status, 404, "{}", r.text());
     assert_eq!(
@@ -121,6 +127,23 @@ fn camelot_vms_need_no_program() {
     );
     assert_eq!(s(&three, "state"), "created");
 
+    // A desktop, by its profile: a copy of the desktop's image, the desktop's RAM.
+    let desktop = avalon_client::DESKTOP_IMAGE;
+    std::fs::write(platform.dir.path().join(desktop), spinning_image(32)).unwrap();
+    let r = api.expect(
+        201,
+        create(vec![("name", "desk".into()), ("profile", "desktop".into())]),
+    );
+    assert_eq!(s(&r, "disk"), "desk-disk0");
+    let desk = api.expect(200, api.get("vms/desk"));
+    assert_eq!(s(&desk, "ram_text"), "64 MiB");
+    assert_eq!(s(&desk, "bios"), "default");
+    let disks = api.expect(200, api.get("disks"));
+    assert_eq!(n(disk(&disks, "desk-disk0"), "sectors"), 32);
+    let r = create(vec![("name", "desk2".into()), ("profile", "laptop".into())]);
+    assert_eq!(r.status, 400);
+    assert_eq!(r.error(), "profile: no profile 'laptop' (server or desktop)");
+
     // A program and a disk: the program is optional; the VM boots from the disk.
     api.expect(
         201,
@@ -186,22 +209,23 @@ fn the_new_vm_form_offers_camelot() {
     let platform = Platform::start("camelot-page", 64);
     let js = request(platform.pendragon.addr(), "GET", "/app.js", &[], b"").text();
     for needed in [
-        "Camelot (boot from disk)",
+        "Camelot (boot from disk), as a ",
         "Program (ELF)",
-        "camelot: bootCamelot.checked",
-        "list.camelot_image",
+        "profile: bootCamelot.checked ? profileChoice.value : null,",
+        "list.profiles.map((p) => option(p.name, p.name))",
         "cargo xtask up",
         "or a disk to boot from",
         // The paging, as Round Table's --paging takes it, and the Camelot image.
         "paging: paging.value,",
         "option(\"sv48\", \"Sv48 and Sv39\", true), option(\"sv39\", \"Sv39 alone\")",
-        "const image = images.camelot_image;",
+        "const image = profile.image;",
         // The firmware, as Round Table's --bios takes it: a Camelot VM's own (the
         // server's) until it is typed in, else none.
         "const biosField = field(",
         "\"Firmware\",",
         "el(\"option\", { value: \"none\" }), el(\"option\", { value: \"default\" })",
-        "bios.value = bootCamelot.checked ? images.camelot_bios : \"none\";",
+        "bios.value = bootCamelot.checked ? profile.bios : \"none\";",
+        "ram.value = String(bootCamelot.checked ? profile.ram : 4);",
         "bios: bios.value.trim(),",
         "[\"Arch\", vm.arch_text]",
     ] {
@@ -211,16 +235,17 @@ fn the_new_vm_form_offers_camelot() {
     let send = js.find("request.program = toBase64").unwrap();
     assert_eq!(
         &js[js[..send].rfind("if (").unwrap()..send].trim(),
-        &"if (!request.camelot && file) {"
+        &"if (!request.profile && file) {"
     );
     // Camelot is the default when Lake has the image (and the form was not opened
     // for a disk of the VM's own): the statement that chooses it, whole.
     let choose = js.find("bootCamelot.checked = true;").unwrap();
     assert_eq!(
         &js[js[..choose].rfind("if (").unwrap()..choose].trim(),
-        &"if (hasImage && !disk) {"
+        &"if (offered && !disk) {"
     );
-    assert!(js.contains("const hasImage = list.disks.some((d) => d.name === list.camelot_image);"));
+    assert!(js.contains("const hasImage = (p) => list.disks.some((d) => d.name === p.image);"));
+    assert!(js.contains("const offered = list.profiles.find(hasImage);"));
     // The form's RAM is the platform's default, in MiB: 4.
     let mib = avalon_proto::DEFAULT_RAM_SIZE >> 20;
     assert_eq!(mib, 4);

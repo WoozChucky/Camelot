@@ -373,11 +373,13 @@ function newVmPage(main, ctx, disk) {
   const start = el("input", { type: "checkbox", checked: true });
   const submit = el("button", { type: "submit", class: "primary" }, "Create");
 
-  // What the VM boots: Camelot from a copy of Lake's Camelot image of its own (the
-  // choice when Lake has that image), or an uploaded program (an ELF), which may be
-  // left out when there is a disk to boot from instead.
+  // What the VM boots: Camelot, as one of its hardware profiles (server, desktop),
+  // from a copy of the profile's Lake image of its own (the choice when Lake has
+  // one), or an uploaded program (an ELF), which may be left out when there is a
+  // disk to boot from instead.
   const bootCamelot = el("input", { type: "radio", name: "boot", value: "camelot" });
   const bootProgram = el("input", { type: "radio", name: "boot", value: "program", checked: true });
+  const profileChoice = el("select", { class: "profile" }, option("server", "server", true));
   const camelotHint = el("span", { class: "muted" }, " Lake's image is copied to a disk of the VM's own, NAME-disk0");
   const programField = field("Program", program, "an Excalibur ELF executable; without one the VM boots from its first disk");
   const pagingField = field("Paging", paging, "Sv48 and Sv39, or Sv39 alone as most RV64 boards");
@@ -386,38 +388,44 @@ function newVmPage(main, ctx, disk) {
     bios,
     "none, default (Camelot's SBI, which kernel.elf runs on) or a firmware file on Avalon's host",
   );
-  // Lake's images, and the Camelot image (from the disks list).
+  // Lake's images, and the Camelot profiles (from the disks list).
   let images = null;
-  // The RAM follows the choice until it is typed in: a Camelot VM's (its firmware
-  // keeps 2 MiB on top), else the platform's 4 MiB.
+  const chosenProfile = () => images && images.profiles.find((p) => p.name === profileChoice.value);
+  // The RAM follows the choice until it is typed in: the Camelot profile's (a
+  // server's firmware keeps 2 MiB on top of 4), else the platform's 4 MiB.
   let ramTyped = false;
   ram.addEventListener("input", () => { ramTyped = true; });
-  // So does the firmware: a Camelot VM's (Camelot's own, which the image boots
-  // through), else none, as the server chooses when it is left empty.
+  // So does the firmware: the Camelot profile's (Camelot's own, which the image
+  // boots through), else none, as the server chooses when it is left empty.
   let biosTyped = false;
   bios.addEventListener("input", () => { biosTyped = true; });
   const showBoot = () => {
     programField.hidden = bootCamelot.checked;
-    if (images && !ramTyped) {
-      ram.value = String(bootCamelot.checked ? images.camelot_ram : 4);
+    profileChoice.disabled = !bootCamelot.checked;
+    const profile = chosenProfile();
+    if (profile && !ramTyped) {
+      ram.value = String(bootCamelot.checked ? profile.ram : 4);
     }
-    if (images && !biosTyped) {
-      bios.value = bootCamelot.checked ? images.camelot_bios : "none";
+    if (profile && !biosTyped) {
+      bios.value = bootCamelot.checked ? profile.bios : "none";
     }
-    if (images) {
-      const image = images.camelot_image;
+    if (profile) {
+      const image = profile.image;
       camelotHint.textContent = images.disks.some((d) => d.name === image)
         ? " Lake's image " + image + " is copied to a disk of the VM's own, NAME-disk0"
         : " Lake has no image named " + image + " to copy: start the platform with cargo xtask up";
+      profileChoice.title = profile.about;
     }
   };
   bootCamelot.addEventListener("change", showBoot);
   bootProgram.addEventListener("change", showBoot);
+  profileChoice.addEventListener("change", showBoot);
   const boot = el(
     "fieldset",
     { class: "boot" },
     el("legend", {}, "Boots"),
-    el("label", { class: "inline" }, bootCamelot, " Camelot (boot from disk)"),
+    el("label", { class: "inline" }, bootCamelot, " Camelot (boot from disk), as a "),
+    profileChoice,
     camelotHint,
     el("label", { class: "inline" }, bootProgram, " Program (ELF)"),
   );
@@ -457,7 +465,7 @@ function newVmPage(main, ctx, disk) {
         clock: clock.value,
         harts: harts.value,
         start: start.checked,
-        camelot: bootCamelot.checked,
+        profile: bootCamelot.checked ? profileChoice.value : null,
         disks: [...disks.querySelectorAll(".disk-row")]
           .map((row) => ({
             source: row.querySelector(".disk-source").value.trim(),
@@ -470,9 +478,9 @@ function newVmPage(main, ctx, disk) {
         })),
       };
       const file = program.files[0];
-      if (!request.camelot && file) {
+      if (!request.profile && file) {
         request.program = toBase64(new Uint8Array(await file.arrayBuffer()));
-      } else if (!request.camelot && request.disks.length === 0) {
+      } else if (!request.profile && request.disks.length === 0) {
         throw new Error("Choose the program to run (an ELF file), or a disk to boot from.");
       }
       const created = await api("POST", "vms", request);
@@ -485,8 +493,8 @@ function newVmPage(main, ctx, disk) {
   main.append(el("h1", {}, "New VM"), error, form);
 
   // Offer Lake's images as disk sources, and prefill the one asked for (Attach on
-  // the disks page). Camelot is the first choice when Lake has its image and no disk
-  // was asked for.
+  // the disks page). Camelot is the first choice when Lake has a profile's image and
+  // no disk was asked for, as the first profile whose image Lake has.
   showBoot();
   api("GET", "disks", undefined, ctx.abort.signal)
     .then((list) => {
@@ -494,8 +502,13 @@ function newVmPage(main, ctx, disk) {
       for (const d of list.disks) lakeImages.append(el("option", { value: "lake://" + lake + "/" + d.name }));
       if (disk) addDisk("lake://" + lake + "/" + disk);
       images = list;
-      const hasImage = list.disks.some((d) => d.name === list.camelot_image);
-      if (hasImage && !disk) {
+      profileChoice.replaceChildren(...list.profiles.map((p) => option(p.name, p.name)));
+      const hasImage = (p) => list.disks.some((d) => d.name === p.image);
+      const offered = list.profiles.find(hasImage);
+      if (offered) {
+        profileChoice.value = offered.name;
+      }
+      if (offered && !disk) {
         bootCamelot.checked = true;
       }
       showBoot();

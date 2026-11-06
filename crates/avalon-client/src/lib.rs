@@ -273,7 +273,7 @@ pub const PRESETS: [Preset; 2] = [
     },
     Preset {
         name: "desktop",
-        about: "a Camelot desktop: the display server and the desktop on its screen",
+        about: "a Camelot desktop: its own image, and RAM for the largest display mode",
         image: DESKTOP_IMAGE,
         ram_size: DESKTOP_RAM,
     },
@@ -282,6 +282,15 @@ pub const PRESETS: [Preset; 2] = [
 /// The preset named `name`.
 pub fn preset(name: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.name == name)
+}
+
+/// The preset named `name`, or why there is none (`no profile 'NAME' (server or
+/// desktop)`), as Round Table's `--profile` and Pendragon's `profile` take it.
+pub fn parse_preset(name: &str) -> Result<&'static Preset, String> {
+    preset(name).ok_or_else(|| {
+        let names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+        format!("no profile '{name}' ({})", names.join(" or "))
+    })
 }
 
 /// The firmware a Camelot VM boots unless its creator says otherwise: Camelot's own
@@ -836,6 +845,30 @@ mod tests {
             while conn.recv().is_ok() {}
         });
         addr
+    }
+
+    #[test]
+    fn the_presets() {
+        let server = parse_preset("server").unwrap();
+        assert_eq!((server.image, server.ram_size), (BASE_IMAGE, CAMELOT_RAM));
+        let desktop = parse_preset("desktop").unwrap();
+        assert_eq!((desktop.image, desktop.ram_size), (DESKTOP_IMAGE, DESKTOP_RAM));
+        // Both on Camelot's firmware, Avalon's defaults otherwise, no disk yet.
+        let machine = desktop.profile();
+        assert_eq!((machine.bios, machine.ram_size), (camelot_bios(), DESKTOP_RAM));
+        assert_eq!(
+            HardwareProfile {
+                ram_size: avalon_proto::DEFAULT_RAM_SIZE,
+                bios: Bios::None,
+                ..machine
+            },
+            HardwareProfile::default()
+        );
+        assert_eq!(
+            parse_preset("laptop").unwrap_err(),
+            "no profile 'laptop' (server or desktop)"
+        );
+        assert_eq!(preset("Server"), None);
     }
 
     #[test]
