@@ -1,0 +1,28 @@
+/* XPM */
+/* The pointer's arrow (#183): black edged, white inside, its hotspot the
+ * tip at 0, 0. */
+static char *cursor[] = {
+/* width height colours characters-a-pixel hotspot-x hotspot-y */
+"11 17 3 1 0 0",
+". c None",
+"X c #000000",
+"- c #FFFFFF",
+/* the pixels */
+"X..........",
+"XX.........",
+"X-X........",
+"X--X.......",
+"X---X......",
+"X----X.....",
+"X-----X....",
+"X------X...",
+"X-------X..",
+"X--------X.",
+"X-----XXXXX",
+"X--X--X....",
+"X-X.X--X...",
+"XX..X--X...",
+"X....X--X..",
+".....X--X..",
+"......XX..."
+};

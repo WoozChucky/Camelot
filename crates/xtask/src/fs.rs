@@ -60,9 +60,11 @@ pub const PROFILES_DIR: &str = "kernel/profiles";
 /// The programs of `kernel/user` only the desktop image has: the server
 /// image leaves them out of `/bin`. The desktop's programs join it as they
 /// come (#183-#185).
-pub const DESKTOP_PROGRAMS: &[&str] = &[];
+pub const DESKTOP_PROGRAMS: &[&str] = &["guitest"];
 /// Where the desktop image puts the fonts, as Linux distributions do.
 pub const FONTS: &str = "/usr/share/fonts";
+/// Where it puts the images the GUI library reads (QOI files).
+pub const IMAGES: &str = "/usr/share/images";
 
 /// A root image's profile: one kernel, two images, told apart by their
 /// programs, the files under `/etc` and `/usr/share`, and what init starts
@@ -157,7 +159,8 @@ pub const LIB: &str = "/usr/lib";
 
 /// What the root image's `/usr` holds (path, contents): the headers of
 /// [`userprogs::HEADERS`] in [`INCLUDE`], and in [`LIB`] the start code
-/// (`crt0.o`), the C library ([`userprogs::LIBC`]) and the programs' linker
+/// (`crt0.o`), the C library ([`userprogs::LIBC`]), the GUI library
+/// ([`userprogs::LIBGUI`]) and the programs' linker
 /// script ([`userprogs::SCRIPT`]), from `rt`, the runtime the programs of
 /// `/bin` are linked with, and `user_dir` (`kernel/user`). The objects are
 /// installed stripped of their debug information
@@ -183,8 +186,50 @@ pub fn usr_files(user_dir: &Path, rt: &userprogs::Runtime) -> Result<Vec<(String
         files.push((format!("{LIB}/{}", o.name), o.data.clone()));
     }
     files.push((format!("{LIB}/{}", userprogs::LIBC), rt.archive.clone()));
+    files.push((format!("{LIB}/{}", userprogs::LIBGUI), rt.gui_archive.clone()));
     files.push((format!("{LIB}/{}", userprogs::SCRIPT), read(userprogs::SCRIPT)?));
     Ok(files)
+}
+
+/// The desktop's `/usr/share` ([`SHARE_DIRS`] and the files in them): the
+/// console's font (`kernel/fonts`), for the GUI library to draw text with, in
+/// [`FONTS`], converted to PSF2 as the kernel embeds it
+/// ([`crate::font::psf1_to_psf2`]), a directory a font, as distributions have
+/// them, since a name has 14 bytes at most (docs/camelot-fs.md); and the
+/// images of `kernel/images` in [`IMAGES`] ([`crate::images`]).
+pub fn share_files(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let read =
+        |path: PathBuf| std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()));
+    let fonts = root.join("kernel/fonts");
+    let mut files = vec![
+        (
+            format!("{FONTS}/spleen/8x16.psfu"),
+            crate::font::psf1_to_psf2(&read(root.join(crate::font::SOURCE))?)?,
+        ),
+        (
+            format!("{FONTS}/spleen/LICENSE"),
+            read(fonts.join("LICENSE.spleen"))?,
+        ),
+    ];
+    for (name, qoi) in crate::images::build(root)? {
+        files.push((format!("{IMAGES}/{name}"), qoi));
+    }
+    Ok(files)
+}
+
+/// The directories of `/usr/share`, in the order they are made.
+pub const SHARE_DIRS: &[&str] = &["/usr/share", FONTS, "/usr/share/fonts/spleen", IMAGES];
+
+/// Makes [`SHARE_DIRS`] on `fs` (after `/usr`) and writes `files`
+/// ([`share_files`]) there.
+pub fn add_share(fs: &mut Mkfs, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+    for d in SHARE_DIRS {
+        fs.mkdir(d)?;
+    }
+    for (path, data) in files {
+        fs.add_file(path, data)?;
+    }
+    Ok(())
 }
 
 /// Makes `/usr`, `/usr/include` and `/usr/lib` on `fs` and writes `files`
@@ -255,18 +300,7 @@ fn build_image(
     }
     add_usr(&mut fs, &usr_files(&user, &rt)?)?;
     if profile == Some(Profile::Desktop) {
-        // The console's font (kernel/fonts), for the desktop's programs to draw
-        // with: a directory a font, as distributions have them, since a name has
-        // 14 bytes at most (docs/camelot-fs.md).
-        fs.mkdir("/usr/share")?;
-        fs.mkdir(FONTS)?;
-        fs.mkdir(&format!("{FONTS}/spleen"))?;
-        let fonts = root.join("kernel/fonts");
-        for (host, name) in [("spleen-8x16.psfu", "8x16.psfu"), ("LICENSE.spleen", "LICENSE")] {
-            let path = fonts.join(host);
-            let data = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            fs.add_file(&format!("{FONTS}/spleen/{name}"), &data)?;
-        }
+        add_share(&mut fs, &share_files(root)?)?;
     }
     Ok(fs.finish())
 }
