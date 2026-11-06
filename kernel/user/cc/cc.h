@@ -246,35 +246,6 @@ struct diag *lex_decode(const char *text, struct pos pos, struct diag **diags, s
 void diag_append(struct diag **list, struct diag *d);
 
 
-/* ---- The preprocessor (preprocess.c) ---- */
-/* The language of the input, as clang's -x names it. */
-enum { LANG_C, LANG_ASM };
-
-/* A -D or -U, as written after it. */
-struct cmd_macro {
-    int undef;
-    const char *text;
-};
-
-/* What the command line tells the preprocessor (merlin's Options). */
-struct options {
-    const char **include_dirs;
-    uint ninclude_dirs;
-    struct cmd_macro *macros;
-    uint nmacros;
-    int lang;
-    /* Preprocessed assembly has line markers: -P turns them off. */
-    int line_markers;
-};
-
-/* Preprocesses the file `name`, whose text is src (n bytes), for -E: the
- * text merlin -E writes, as C (merlin's spell) or as assembly (print_asm),
- * in *out, and the diagnostics, in order, in *diags (a malloc'd array of
- * *ndiags). Returns 0 if one of them is an error (the text is then not to
- * be written). */
-int preprocess_text(const char *name, const char *src, uint n, struct options *opts, struct buf *out,
-                    struct diag ***diags, uint *ndiags);
-
 /* ---- 128-bit integers (util.c) ----
  * merlin's constants are Rust's i128s, which hold every value of every
  * integer type (an unsigned long goes up to 2^64 - 1) as the number it is,
@@ -359,6 +330,18 @@ void posmap_put(struct posmap *m, struct pos key, void *value);
 /* A position, kept in the arena, as a posmap's value. */
 struct pos *pos_box(struct pos p);
 
+/* A map from 64-bit numbers (expression ids, local ids) to pointers. */
+struct intmap {
+    uint64_t *keys;
+    void **values;
+    uchar *used;
+    uint cap;
+    uint count;
+};
+void *intmap_get(struct intmap *m, uint64_t key);
+int intmap_has(struct intmap *m, uint64_t key);
+void intmap_put(struct intmap *m, uint64_t key, void *value);
+
 /* ---- The parser's tokens (lexer.c, merlin's Token and Tok) ---- */
 enum { TK_IDENT, TK_NUM, TK_STR, TK_KW, TK_PUNCT, TK_UNKNOWN, TK_EOF };
 
@@ -386,6 +369,56 @@ int kw_starts_decl(int k);
  * preprocessed ones; diagnostics added to diags; 0 for a keyword merlin
  * does not handle, the last diagnostic its error. */
 int lex_finish(struct pptok *toks, uint n, struct pos end, struct token **out, uint *nout, struct vec *diags);
+
+/* ---- The preprocessor (preprocess.c) ---- */
+/* The language of the input, as clang's -x names it. */
+enum { LANG_C, LANG_ASM };
+
+/* A -D or -U, as written after it. */
+struct cmd_macro {
+    int undef;
+    const char *text;
+};
+
+/* What the command line tells the preprocessor (merlin's Options). */
+struct options {
+    const char **include_dirs;
+    uint ninclude_dirs;
+    struct cmd_macro *macros;
+    uint nmacros;
+    int lang;
+    /* Preprocessed assembly has line markers: -P turns them off. */
+    int line_markers;
+};
+
+/* Preprocesses the file `name`, whose text is src (n bytes), for -E: the
+ * text merlin -E writes, as C (merlin's spell) or as assembly (print_asm),
+ * in *out, and the diagnostics, in order, in *diags (a malloc'd array of
+ * *ndiags). Returns 0 if one of them is an error (the text is then not to
+ * be written). */
+int preprocess_text(const char *name, const char *src, uint n, struct options *opts, struct buf *out,
+                    struct diag ***diags, uint *ndiags);
+
+/* What preprocessing a translation unit to compile it gives (merlin's
+ * Output). */
+struct pp_output {
+    /* Every token, macros replaced, directives gone. */
+    struct pptok *toks;
+    uint ntoks;
+    /* The positions of the tokens a macro's expansion made. */
+    struct posmap macros;
+    /* The end of the file being compiled. */
+    struct pos end;
+    /* The name of each file, by number. */
+    const char **files;
+    uint nfiles;
+    /* The diagnostics, in order, and for each where the last token that
+     * came out before it is. */
+    struct diag **diags;
+    struct pos *after;
+    uint ndiags;
+};
+int preprocess_unit(const char *name, const char *src, uint n, struct options *opts, struct pp_output *out);
 
 /* ---- Types (types.c, merlin's types.rs) ---- */
 
@@ -1019,6 +1052,67 @@ int correction(const char *typo, const char **names, uint n);
 /* Parses the tokens (TK_EOF last): 1 and the program, or 0, the syntax
  * error and what came before it in *prog. */
 int parse_program(struct token *toks, uint ntoks, struct program *prog, struct diag **error);
+
+/* ---- Sema (sema.c, merlin's sema.rs) ---- */
+
+/* merlin's check_after: 0 with the warnings added to the program's, or 1
+ * with every diagnostic in *errors. earlier: where the errors before sema's
+ * are reported. */
+int sema_check(struct program *prog, struct pos *earlier, uint nearlier, struct vec *errors);
+/* merlin's check_cut, of a program a syntax error at cut cut short: the
+ * diagnostics before the error and after it. */
+void sema_check_cut(struct program *prog, struct pos *earlier, uint nearlier, struct pos cut, struct vec *before,
+                    struct vec *after);
+/* e wrapped in an implicit conversion to `to`, in place, unless it has that
+ * type. */
+void coerce(struct expr *e, struct type *to);
+/* The type of l op r for arithmetic, bitwise and shift operators, of
+ * decayed operands; NULL if C does not allow them. */
+struct type *arith_type(int op, struct type *l, struct type *r);
+char *symbol_key(const char *base, uint n);
+char *symbol_base(const char *key);
+int same_operand(struct expr *a, struct expr *b);
+
+/* ---- What can run (flow.c, merlin's flow.rs) ---- */
+
+/* Walks a function's checked body: the ids of the expressions that may be
+ * evaluated in *live, whether control can fall off its end, whether a
+ * return can be reached. */
+int flow_analyze(struct vec *body, struct intmap *live, int *falls_off, int *returns);
+
+/* ---- Unsequenced side effects (sequence.c, merlin's sequence.rs) ---- */
+
+/* A -Wunsequenced warning: where, its message, the expression it is of. */
+struct finding {
+    struct pos at;
+    const char *msg;
+    uint64_t of;
+};
+/* The warnings of a full expression, of a declaration's list: how many, a
+ * malloc'd array of them in *out. */
+uint sequence_check(struct expr *e, struct finding **out);
+uint sequence_check_init(struct init *init, struct finding **out);
+
+/* ---- The calling convention (abi.c, merlin's abi.rs) ---- */
+
+/* The bytes of a register, and of an argument word; the argument
+ * registers, a0 to a7. */
+#define WORD PTR_SIZE
+#define ARG_REGS 8
+/* How one argument or result travels: a scalar in a register, a small
+ * struct as one or two words, a big one as the address of a copy. */
+enum { PASS_SCALAR, PASS_WORDS1, PASS_WORDS2, PASS_REF };
+int abi_classify(struct type *ty);
+uint abi_registers(int pass);
+int abi_returns_in_memory(struct type *ret);
+uint abi_call_arguments(struct type *ret, struct type **args, uint n, uint *words, int *passes);
+uint abi_stack_words(uint total);
+
+/* ---- Code generation (codegen.c, merlin's codegen.rs) ---- */
+
+/* The assembly of a checked program (merlin's generate_with, without -g):
+ * 1 and the text appended to out, or 0 and the error. */
+int codegen_generate(struct program *prog, struct buf *out, struct diag **error);
 
 /* --dump-ast's text. */
 void ast_dump(struct program *p, struct buf *out);

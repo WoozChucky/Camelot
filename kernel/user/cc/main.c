@@ -124,6 +124,342 @@ static void write_out(const char *data, uint len) {
     }
 }
 
+/* ---- The front end (merlin's lib.rs) ---- */
+
+/* How many errors clang gives before it stops (-ferror-limit=20): the one
+ * that would be the 20th is its fatal error instead. */
+#define ERROR_LIMIT 20
+
+/* The diagnostics up to clang's error limit, and its fatal error there if
+ * they reach it (merlin's error_limit). */
+static struct vec error_limit(struct vec ds) {
+    struct vec out;
+    memset(&out, 0, sizeof out);
+    uint errors = 0;
+    for (uint i = 0; i < ds.n; i++) {
+        struct diag *d = ds.v[i];
+        if (!diag_is_warning(d)) {
+            errors++;
+            if (errors == ERROR_LIMIT) {
+                struct diag *f = diag_fatal(pos_at(0, 0, 0), "too many errors emitted, stopping now [-ferror-limit=]");
+                f->file = "";
+                vec_push(&out, f);
+                break;
+            }
+        }
+        vec_push(&out, d);
+    }
+    return out;
+}
+
+/* The diagnostics of the lexer and those of the parser and sema, in the
+ * order clang gives them (merlin's in_clangs_order): clang lexes as it
+ * parses, so a token's diagnostic comes among those of the code around it,
+ * by its position, while the parser's and sema's keep their order. */
+static struct vec in_clangs_order(struct vec lexed, struct vec checked) {
+    struct vec out;
+    memset(&out, 0, sizeof out);
+    uint l = 0;
+    for (uint i = 0; i < checked.n; i++) {
+        struct diag *d = checked.v[i];
+        while (l < lexed.n && pos_cmp(((struct diag *)lexed.v[l])->pos, d->pos) <= 0) {
+            vec_push(&out, lexed.v[l++]);
+        }
+        vec_push(&out, d);
+    }
+    while (l < lexed.n) {
+        vec_push(&out, lexed.v[l++]);
+    }
+    return out;
+}
+
+/* The preprocessor's diagnostics and those of what reads its tokens (later,
+ * in clang's order among themselves), in the order clang gives them
+ * (merlin's Output::merge): each of the preprocessor's comes before what
+ * is reported at or after the last token that came out before it. */
+static struct vec merge(struct pp_output *pp, struct vec later) {
+    struct vec out;
+    memset(&out, 0, sizeof out);
+    uint k = 0;
+    for (uint i = 0; i < pp->ndiags; i++) {
+        while (k < later.n && pos_cmp(((struct diag *)later.v[k])->pos, pp->after[i]) < 0) {
+            vec_push(&out, later.v[k++]);
+        }
+        vec_push(&out, pp->diags[i]);
+    }
+    while (k < later.n) {
+        vec_push(&out, later.v[k++]);
+    }
+    return out;
+}
+
+/* Names the file of every diagnostic not in the file being compiled. */
+static void name_files(struct pp_output *pp, struct vec *ds) {
+    for (uint i = 0; i < ds->n; i++) {
+        diag_name_files(ds->v[i], pp->files, pp->nfiles);
+    }
+}
+
+/* The front end after the preprocessor: tokens, syntax tree, checks
+ * (merlin's check). 1 and the program, its warnings (the preprocessor's
+ * among them) in prog->warnings; or 0 and every diagnostic in *errors. */
+static int check(struct pp_output *pp, struct program *prog, struct vec *errors) {
+    /* The lexer's diagnostics: clang goes on after an error in a literal,
+     * or a token that is none, and so does merlin. */
+    struct token *toks;
+    uint ntoks;
+    struct vec lexed;
+    memset(&lexed, 0, sizeof lexed);
+    if (!lex_finish(pp->toks, pp->ntoks, pp->end, &toks, &ntoks, &lexed)) {
+        *errors = merge(pp, lexed);
+        return 0;
+    }
+    /* Where the errors before sema's are, which leave out clang's analysis
+     * of the functions done after them. */
+    struct pos *earlier = malloc((pp->ndiags + lexed.n + 1) * sizeof(struct pos));
+    uint nearlier = 0;
+    uint capearlier = pp->ndiags + lexed.n + 1;
+    if (earlier == NULL) {
+        die("out of memory");
+    }
+    for (uint i = 0; i < pp->ndiags; i++) {
+        if (!diag_is_warning(pp->diags[i])) {
+            earlier[nearlier++] = pp->after[i];
+        }
+    }
+    for (uint i = 0; i < lexed.n; i++) {
+        if (!diag_is_warning(lexed.v[i])) {
+            earlier[nearlier++] = ((struct diag *)lexed.v[i])->pos;
+        }
+    }
+    struct diag *syntax;
+    int parsed_ok = parse_program(toks, ntoks, prog, &syntax);
+    prog->written.macros = pp->macros;
+    /* The parser's warnings (it stops at its first error) come as it reads,
+     * as the lexer's do; sema's after them. The parser's errors it goes on
+     * after count too. */
+    struct vec parsed = vec_take(&prog->warnings);
+    for (uint i = 0; i < parsed.n; i++) {
+        if (!diag_is_warning(parsed.v[i])) {
+            earlier = grow(earlier, &capearlier, nearlier + 1, sizeof(struct pos));
+            earlier[nearlier++] = ((struct diag *)parsed.v[i])->pos;
+        }
+    }
+    struct vec checked;
+    if (parsed_ok) {
+        struct vec all;
+        if (sema_check(prog, earlier, nearlier, &all)) {
+            checked = all;
+        } else {
+            checked = vec_take(&prog->warnings);
+        }
+    } else {
+        /* What came before a syntax error is checked as clang checks it as
+         * it parses, errors too; the end of the function it is in, and of
+         * the file, come after it. */
+        struct vec after;
+        sema_check_cut(prog, earlier, nearlier, syntax->pos, &checked, &after);
+        vec_push(&checked, syntax);
+        vec_extend(&checked, &after);
+    }
+    free(earlier);
+    struct vec read = in_clangs_order(lexed, parsed);
+    struct vec diagnostics = error_limit(merge(pp, in_clangs_order(read, checked)));
+    int all_warnings = 1;
+    for (uint i = 0; i < diagnostics.n; i++) {
+        if (!diag_is_warning(diagnostics.v[i])) {
+            all_warnings = 0;
+        }
+    }
+    if (parsed_ok && all_warnings) {
+        prog->warnings = diagnostics;
+        return 1;
+    }
+    *errors = diagnostics;
+    return 0;
+}
+
+/* The base name of the file being compiled, as LLVM's sys::path::filename
+ * has it (POSIX style, merlin-as's dwarf::file_name): the last component,
+ * a trailing `/` being the component `.`, a root directory alone `/`. */
+static uint root_dir_start(const char *p, int *has) {
+    uint n = (uint)strlen(p);
+    *has = 0;
+    if (n > 3 && p[0] == '/' && p[1] == '/' && p[2] != '/') {
+        const char *s = strchr(p + 2, '/');
+        if (s == NULL) {
+            return 0;
+        }
+        *has = 1;
+        return (uint)(s - p);
+    }
+    if (n > 0 && p[0] == '/') {
+        *has = 1;
+    }
+    return 0;
+}
+
+static uint filename_pos(const char *p, uint n) {
+    if (n > 0 && p[n - 1] == '/') {
+        return n - 1;
+    }
+    int last = -1;
+    for (uint i = 0; i < n; i++) {
+        if (p[i] == '/') {
+            last = (int)i;
+        }
+    }
+    if (last < 0) {
+        return 0;
+    }
+    if (last == 1 && p[0] == '/') {
+        return 0;
+    }
+    return (uint)last + 1;
+}
+
+static const char *file_name(const char *p) {
+    uint n = (uint)strlen(p);
+    int has_root;
+    uint root = root_dir_start(p, &has_root);
+    /* Skip the trailing separators, unless one is the root directory. */
+    uint end = n;
+    while (end > 0 && !(has_root && end - 1 == root) && p[end - 1] == '/') {
+        end--;
+    }
+    if (n > 0 && p[n - 1] == '/' && (!has_root || end > root + 1)) {
+        return ".";
+    }
+    uint start = filename_pos(p, end);
+    return arena_strndup(p + start, end - start);
+}
+
+/* A string as the assembler reads one, quoted (merlin's debug::quoted). */
+static void quoted(struct buf *b, const char *s) {
+    buf_byte(b, '"');
+    for (; *s; s++) {
+        uint c = (uchar)*s;
+        if (c == '"') {
+            buf_str(b, "\\\"");
+        } else if (c == '\\') {
+            buf_str(b, "\\\\");
+        } else if (c >= 0x20 && c <= 0x7e) {
+            buf_byte(b, c);
+        } else if (c == 8) {
+            buf_str(b, "\\b");
+        } else if (c == 12) {
+            buf_str(b, "\\f");
+        } else if (c == '\n') {
+            buf_str(b, "\\n");
+        } else if (c == '\r') {
+            buf_str(b, "\\r");
+        } else if (c == '\t') {
+            buf_str(b, "\\t");
+        } else {
+            buf_byte(b, '\\');
+            buf_byte(b, '0' + (c >> 6));
+            buf_byte(b, '0' + (c >> 3 & 7));
+            buf_byte(b, '0' + (c & 7));
+        }
+    }
+    buf_byte(b, '"');
+}
+
+/* Prints a list of diagnostics, as clang does. */
+static void print_all(struct vec *ds, const char *input) {
+    for (uint i = 0; i < ds->n; i++) {
+        diag_print(ds->v[i], input);
+    }
+}
+
+/* Compiles (or dumps) one translation unit (merlin's compile_warned and
+ * parse_with): 1 and the text in *text with its warnings printed, or 0
+ * with every diagnostic printed. */
+static int compile_unit(const char *name, const char *src, uint n, struct options *opts, int dump, struct buf *text) {
+    struct pp_output pp;
+    if (!preprocess_unit(name, src, n, opts, &pp)) {
+        for (uint i = 0; i < pp.ndiags; i++) {
+            diag_print(pp.diags[i], name);
+        }
+        return 0;
+    }
+    struct program prog;
+    struct vec errors;
+    if (!check(&pp, &prog, &errors)) {
+        name_files(&pp, &errors);
+        print_all(&errors, name);
+        return 0;
+    }
+    name_files(&pp, &prog.warnings);
+    if (dump) {
+        ast_dump(&prog, text);
+        print_all(&prog.warnings, name);
+        return 1;
+    }
+    struct diag *error = NULL;
+    struct buf asm_text;
+    memset(&asm_text, 0, sizeof asm_text);
+    if (!codegen_generate(&prog, &asm_text, &error)) {
+        diag_name_files(error, pp.files, pp.nfiles);
+        print_all(&prog.warnings, name);
+        diag_print(error, name);
+        buf_free(&asm_text);
+        return 0;
+    }
+    /* `.file "NAME"`, the first line of the assembly, as clang writes it:
+     * the base name of the file being compiled (merlin's file_directive). */
+    buf_str(text, "    .file ");
+    quoted(text, file_name(name));
+    buf_byte(text, '\n');
+    buf_put(text, asm_text.data, asm_text.len);
+    buf_free(&asm_text);
+    print_all(&prog.warnings, name);
+    return 1;
+}
+
+/* Compiles or dumps one input file (merlin's translate): 0, or the exit
+ * status of a failure. */
+static int compile_file(struct input *in, const char *output, struct options *opts, int dump) {
+    uint len = 0;
+    int err = 0;
+    char *src = read_file(in->name, &len, &err);
+    if (src == NULL) {
+        fprintf(2, "cc1: cannot read %s: %s\n", in->name, strerror(-err));
+        return 2;
+    }
+    if (!valid_utf8((uchar *)src, len)) {
+        fprintf(2, "cc1: cannot read %s: stream did not contain valid UTF-8\n", in->name);
+        return 2;
+    }
+    opts->lang = in->lang;
+    struct buf text;
+    memset(&text, 0, sizeof text);
+    int ok = compile_unit(in->name, src, len, opts, dump, &text);
+    if (!ok) {
+        buf_free(&text);
+        return 1;
+    }
+    /* Without -o: the input with .s for .c (or added), or for --dump-ast
+     * standard output. */
+    const char *out = output;
+    if (out == NULL && dump) {
+        write_out(text.data, text.len);
+        buf_free(&text);
+        return 0;
+    }
+    if (out == NULL) {
+        out = ends_with(in->name, ".c") ? fmt("%s.s", arena_strndup(in->name, (uint)strlen(in->name) - 2))
+                                         : fmt("%s.s", in->name);
+    }
+    int r = write_file(out, text.data, text.len);
+    buf_free(&text);
+    if (r < 0) {
+        fprintf(2, "cc1: cannot write %s: %s\n", out, strerror(-r));
+        return 2;
+    }
+    return 0;
+}
+
 /* Preprocesses one input file (merlin's translate, for -E): 0, or the exit
  * status of a failure. */
 static int translate(struct input *in, const char *output, struct options *opts) {
@@ -196,6 +532,7 @@ int main(int argc, char **argv) {
     uint capdirs = 0;
     uint capmacros = 0;
     const char *abi = NULL;
+    int debug = 0;
     /* -x LANG applies to the inputs after it, as in clang; -1 goes by each
      * file's name. */
     int lang = -1;
@@ -206,7 +543,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(a, "-P") == 0) {
             opts.line_markers = 0;
         } else if (strcmp(a, "-g") == 0) {
-            /* Debug information changes nothing that -E writes. */
+            debug = 1;
         } else if (strncmp(a, "-fdebug-compilation-dir", 23) == 0) {
             char *v = a + 23;
             if (*v == 0) {
@@ -294,14 +631,16 @@ int main(int argc, char **argv) {
                                    inputs[i].name));
         }
     }
-    /* This stage of cc1 is merlin's preprocessor (#241). */
-    if (mode != MODE_PREPROCESS) {
-        fprintf(2, "cc1: only preprocessing (-E) is here yet: compiling comes with merlin's parser\n");
+    /* -g is merlin's debug information, which comes with the next stage of
+     * cc1 (#241); it changes nothing -E writes. */
+    if (debug && mode == MODE_COMPILE) {
+        fprintf(2, "cc1: -g is not here yet: debug information comes with merlin's debug.rs\n");
         return 2;
     }
     int status = 0;
     for (uint i = 0; i < ninputs; i++) {
-        int r = translate(&inputs[i], output, &opts);
+        int r = mode == MODE_PREPROCESS ? translate(&inputs[i], output, &opts)
+                                        : compile_file(&inputs[i], output, &opts, mode == MODE_DUMP_AST);
         if (r != 0) {
             status = r;
         }

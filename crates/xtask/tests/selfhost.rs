@@ -2441,8 +2441,8 @@ fn cc1_takes_merlins_command_line() {
             2,
         ),
         (
-            "cc1 /d/a.c",
-            "cc1: only preprocessing (-E) is here yet: compiling comes with merlin's parser\n".to_string(),
+            "cc1 -g /d/a.c",
+            "cc1: -g is not here yet: debug information comes with merlin's debug.rs\n".to_string(),
             2,
         ),
     ];

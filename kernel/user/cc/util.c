@@ -872,6 +872,74 @@ void posmap_put(struct posmap *m, struct pos key, void *value) {
     }
 }
 
+/* ---- Integer maps ---- */
+
+static uint int_hash(uint64_t k) {
+    k ^= k >> 33;
+    k *= 0xff51afd7ed558ccdull;
+    k ^= k >> 33;
+    return (uint)k;
+}
+
+static int intmap_slot(struct intmap *m, uint64_t key) {
+    if (m->cap == 0) {
+        return -1;
+    }
+    for (uint i = int_hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
+        if (!m->used[i]) {
+            return -1;
+        }
+        if (m->keys[i] == key) {
+            return (int)i;
+        }
+    }
+}
+
+void *intmap_get(struct intmap *m, uint64_t key) {
+    int i = intmap_slot(m, key);
+    return i < 0 ? NULL : m->values[i];
+}
+
+int intmap_has(struct intmap *m, uint64_t key) {
+    return intmap_slot(m, key) >= 0;
+}
+
+void intmap_put(struct intmap *m, uint64_t key, void *value) {
+    if ((m->count + 1) * 2 > m->cap) {
+        struct intmap old = *m;
+        uint cap = m->cap ? m->cap * 2 : 64;
+        m->keys = calloc(cap, sizeof(uint64_t));
+        m->values = calloc(cap, sizeof(void *));
+        m->used = calloc(cap, 1);
+        if (m->keys == NULL || m->values == NULL || m->used == NULL) {
+            die("out of memory");
+        }
+        m->cap = cap;
+        m->count = 0;
+        for (uint i = 0; i < old.cap; i++) {
+            if (old.used[i]) {
+                intmap_put(m, old.keys[i], old.values[i]);
+            }
+        }
+        free(old.keys);
+        free(old.values);
+        free(old.used);
+    }
+    for (uint i = int_hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
+        if (!m->used[i]) {
+            m->used[i] = 1;
+            m->keys[i] = key;
+            m->values[i] = value;
+            m->count++;
+            return;
+        }
+        if (m->keys[i] == key) {
+            m->values[i] = value;
+            return;
+        }
+    }
+}
+
 struct pos *pos_box(struct pos p) {
     struct pos *r = arena_alloc(sizeof *r);
     *r = p;

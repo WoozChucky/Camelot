@@ -357,7 +357,7 @@ int64_t ty_size(struct type *t) {
         return (int64_t)(uint)((uint)e * t->len);
     }
     case TY_RECORD:
-        return t->rec->body != NULL ? t->rec->body->size : -1;
+        return t->rec->body != NULL ? (int64_t)t->rec->body->size : -1;
     default:
         return ty_size(t->to);
     }

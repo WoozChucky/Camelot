@@ -451,6 +451,16 @@ struct pp {
     int carry_space;
     int carry_lead;
     struct printer print;
+    /* Compiling, not -E: the tokens are collected (merlin's Output) rather
+     * than written out. */
+    int collect;
+    struct pptok *out;
+    uint nout;
+    uint capout;
+    /* The positions of the tokens a macro's expansion made. */
+    struct posmap macro_sites;
+    /* The end of the file being compiled. */
+    struct pos end;
 };
 
 /* The components of a path, as Rust's Path::components gives them on
@@ -3271,6 +3281,7 @@ static struct diag *run(struct pp *pp, const char *src, uint n) {
         free(lx.toks);
         return lx.error;
     }
+    pp->end = lx.end;
     enter(pp, &lx, src, 0, 0);
     for (;;) {
         struct ptok t;
@@ -3283,10 +3294,69 @@ static struct diag *run(struct pp *pp, const char *src, uint n) {
             break;
         }
         pp->last_out = t.t.pos;
-        emit(pp, &t);
+        if (pp->collect) {
+            pp->out = grow(pp->out, &pp->capout, pp->nout + 1, sizeof(struct pptok));
+            pp->out[pp->nout++] = t.t;
+            if (t.has_site) {
+                posmap_put(&pp->macro_sites, t.t.pos, NULL);
+            }
+        } else {
+            emit(pp, &t);
+        }
         pp->emitted++;
     }
     return NULL;
+}
+
+/* The file names, by number, for naming diagnostics (malloc'd). */
+static const char **file_names(struct pp *pp) {
+    const char **files = malloc((pp->nfiles + 1) * sizeof(char *));
+    if (files == NULL) {
+        die("out of memory");
+    }
+    for (uint i = 0; i < pp->nfiles; i++) {
+        files[i] = pp->files[i].name;
+    }
+    return files;
+}
+
+/* Preprocesses the file `name` to compile it (merlin's preprocess_recovering):
+ * 1 and the translation unit's tokens with their diagnostics, errors among
+ * them, in *out; or 0 if what stops clang stopped it (a header not found,
+ * a lexical error in the file being compiled), out->diags then having the
+ * diagnostics before it and that one. Diagnostics in headers name them. */
+int preprocess_unit(const char *name, const char *src, uint n, struct options *opts, struct pp_output *out) {
+    struct pp *pp = calloc(1, sizeof(struct pp));
+    if (pp == NULL) {
+        die("out of memory");
+    }
+    pp->opts = opts;
+    pp->asm = opts->lang == LANG_ASM;
+    pp->collect = 1;
+    new_file(pp, name, normalize(name));
+    struct diag *e = run(pp, src, n);
+    const char **files = file_names(pp);
+    for (uint i = 0; i < pp->ndiags; i++) {
+        diag_name_files(pp->diags[i], files, pp->nfiles);
+    }
+    memset(out, 0, sizeof *out);
+    out->files = files;
+    out->nfiles = pp->nfiles;
+    if (e != NULL) {
+        diag_name_files(e, files, pp->nfiles);
+        report(pp, e);
+    }
+    out->diags = pp->diags;
+    out->after = pp->after;
+    out->ndiags = pp->ndiags;
+    if (e != NULL) {
+        return 0;
+    }
+    out->toks = pp->out;
+    out->ntoks = pp->nout;
+    out->macros = pp->macro_sites;
+    out->end = pp->end;
+    return 1;
 }
 
 int preprocess_text(const char *name, const char *src, uint n, struct options *opts, struct buf *out,
