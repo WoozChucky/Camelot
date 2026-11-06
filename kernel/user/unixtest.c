@@ -156,6 +156,7 @@ static void pair_checks(void) {
     check_eq(shutdown(sv[0], SHUT_WR), 0, "shutdown SHUT_WR");
     check_eq(read(sv[1], buf, sizeof buf), 0, "the peer reads the end");
     check_eq(write(sv[0], "x", 1), -EPIPE, "and this end sends no more");
+    check_eq(write(sv[0], "", 0), -EPIPE, "not even nothing");
     check_eq(write(sv[1], "y", 1), 1, "the peer still sends");
     check_eq(read(sv[0], buf, sizeof buf), 1, "and this end still reads");
     check_eq(shutdown(sv[0], 3), -EINVAL, "shutdown 3");
@@ -180,6 +181,7 @@ static void pair_checks(void) {
     check_eq(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv), -ESOCKTNOSUPPORT, "a local SOCK_DGRAM pair");
     check_eq(socketpair(AF_UNIX, SOCK_STREAM, 7, sv), -EPROTONOSUPPORT, "protocol 7");
     check_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, (int *)0x10), -EFAULT, "a bad pointer");
+    check_eq(socketpair(AF_UNIX, SOCK_DGRAM, 0, (int *)0x10), -ESOCKTNOSUPPORT, "the type before the pointer");
 }
 
 static void name_checks(void) {
@@ -191,6 +193,7 @@ static void name_checks(void) {
     char buf[64];
     check_eq(read(l, buf, sizeof buf), -EINVAL, "read on a socket not connected");
     check_eq(write(l, "x", 1), -ENOTCONN, "write on one");
+    check_eq(write(l, "", 0), -ENOTCONN, "writing nothing on one");
     struct sockaddr_un a;
     struct sockaddr_un got;
     check_eq(getpeername(l, &got), -ENOTCONN, "getpeername: not connected");
@@ -435,6 +438,41 @@ static void rights_checks(void) {
     close(sv[1]);
 }
 
+/* Builds a chain of sockets, each waiting in the next one's queue, as long
+ * as the open files allow (at most 64), and closes its end: the last
+ * close frees every socket in it. Its length. */
+static int chain(void) {
+    int sv[2];
+    int prev = -1;
+    int levels = 0;
+    while (levels < 64 && socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+        if (prev >= 0) {
+            long sent = send_fds(sv[0], "x", 1, &prev, 1, 0);
+            close(prev);
+            if (sent != 1) {
+                close(sv[0]);
+                close(sv[1]);
+                return -1;
+            }
+        }
+        close(sv[0]);
+        prev = sv[1];
+        levels++;
+    }
+    if (prev >= 0) {
+        close(prev);
+    }
+    return levels;
+}
+
+static void chain_checks(void) {
+    /* Each socket's close closes the next: a kernel that recursed would
+     * need its stack many times over. */
+    int levels = chain();
+    check(levels >= 32, "a chain of sockets in sockets");
+    check_eq(chain(), levels, "all of it freed: as long again");
+}
+
 static void inet_checks(void) {
     /* UDP: an address and buffers each way; a datagram cut short. */
     struct sockaddr_in a1;
@@ -584,6 +622,7 @@ int main(int argc, char **argv) {
     pair_checks();
     name_checks();
     rights_checks();
+    chain_checks();
     inet_checks();
     share_checks();
     check(!is_open(3) && !is_open(4) && !is_open(5), "no descriptor left open");

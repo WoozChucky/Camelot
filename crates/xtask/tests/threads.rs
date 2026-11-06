@@ -596,9 +596,10 @@ fn threads_using_the_filesystem_end_with_their_process_on_one_and_four_harts() {
 
 #[test]
 fn poll_loses_no_wakeup_on_one_and_four_harts() {
-    // Issue #180: four threads pass a byte round a ring of pipes, each one
-    // waiting for it in poll() on its own pipe and on one nothing is
-    // written to: a wakeup lost would leave the ring stopped, and the
+    // Issue #180: two pairs of threads pass a byte back and forth, one pair
+    // over pipes and one over a local socket pair, each thread waiting for
+    // it in poll() on its own end and on 40 copies of a pipe nothing is
+    // written to: a wakeup lost would leave its pair stopped, and the
     // command would never end. On 4 harts the threads run side by side, so
     // a write's wakeup comes from another hart while its reader may still
     // be scanning its files.

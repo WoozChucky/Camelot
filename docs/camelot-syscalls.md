@@ -376,7 +376,8 @@ returns at once, the end or the error; so a program that holds a
 connection without reading it can tell the other end hung up (`shd`
 does, for its sessions). A local socket is `T_SOCKET` too ("Local
 sockets"), and the same: its `ino` 0, its size the bytes waiting in it,
-its `nlink` 0 once its peer has closed or shut its sending down.
+its `nlink` 0 once nothing more will arrive: its peer has closed or shut
+its sending down, or the socket was shut down for reading.
 `-EBADF`, or `-EFAULT` if `st` is not writable.
 
 **stat(path, st)** stores in `st` what `fstat` would of the file at `path`

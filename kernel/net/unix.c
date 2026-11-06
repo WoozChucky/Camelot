@@ -94,6 +94,10 @@ _Static_assert(sizeof(struct unix_sock) <= PGSIZE, "a socket fits a page");
 
 static struct spinlock unix_lock;
 static struct unix_sock *socks; /* every socket, under unix_lock */
+/* Sockets closed, waiting for unix_close() to free them, linked by `next`,
+ * and whether a thread is freeing them: under unix_lock. */
+static struct unix_sock *dying;
+static bool reaping;
 
 void unix_init(void) {
     initlock(&unix_lock, "unix");
@@ -207,29 +211,42 @@ static void us_free(struct unix_sock *u) {
     kfree(u);
 }
 
+/* Closing a socket closes the files waiting in it, which may be sockets
+ * holding files of their own, and so on: a process can make that chain as
+ * long as there are open files. Freed from a loop, not by recursion, the
+ * chain costs no stack: the sockets closed go on the `dying` list, and the
+ * one thread freeing them (`reaping`) frees those its closes add too.
+ * Another thread's closes meanwhile are left to it as well. */
 void unix_close(struct unix_sock *u) {
+    acquire(&unix_lock);
     /* The socket and, for a listener, the connections it never accepted:
      * their clients see them reset, as on Linux. */
-    struct unix_sock *dead[1 + UNIX_BACKLOG];
-    u32 ndead = 0;
-    acquire(&unix_lock);
-    dead[ndead++] = u;
-    for (u32 i = 0; i < u->nbacklog; i++) {
-        dead[ndead++] = u->backlog[i];
+    for (u32 i = 0; i <= u->nbacklog; i++) {
+        struct unix_sock *d = i == 0 ? u : u->backlog[i - 1];
+        hang_up(d, i > 0);
+        unlist(d);
+        /* Its peer's writers wait for room in it; connect() for room in a
+         * listener's backlog. */
+        wakeup(d);
+        d->next = dying;
+        dying = d;
     }
     u->nbacklog = 0;
     u->state = UNIX_UNCONNECTED;
-    for (u32 i = 0; i < ndead; i++) {
-        hang_up(dead[i], i > 0);
-        unlist(dead[i]);
-        /* Its peer's writers wait for room in it; connect() for room in a
-         * listener's backlog. */
-        wakeup(dead[i]);
+    if (reaping) {
+        release(&unix_lock);
+        return;
     }
+    reaping = true;
+    while (dying != NULL) {
+        struct unix_sock *d = dying;
+        dying = d->next;
+        release(&unix_lock);
+        us_free(d); /* may come back here, to add to `dying` */
+        acquire(&unix_lock);
+    }
+    reaping = false;
     release(&unix_lock);
-    for (u32 i = 0; i < ndead; i++) {
-        us_free(dead[i]);
-    }
 }
 
 /* ---- moving bytes ---- */
@@ -245,7 +262,13 @@ static isize unix_send(struct unix_sock *u, struct uio *io, struct file **files,
     int err = 0;
     bool pending = nfiles > 0;
     acquire(&unix_lock);
-    while (done < n) {
+    /* Checked first, as Linux does, so sending nothing fails the same. */
+    if (u->state != UNIX_CONNECTED) {
+        err = -ENOTCONN;
+    } else if ((u->shut & SEND_SHUT) != 0) {
+        err = -EPIPE;
+    }
+    while (err == 0 && done < n) {
         if (u->state != UNIX_CONNECTED) {
             err = -ENOTCONN;
             break;
@@ -551,16 +574,16 @@ int unix_sys_socketpair(u32 domain, u32 type, u32 protocol, uintptr ufds) {
     if (domain != AF_UNIX) {
         return -EAFNOSUPPORT;
     }
-    pagetable_t pt = user_pt();
-    int fds[2];
-    if (!uvm_range_ok(pt, ufds, sizeof fds, PTE_W)) {
-        return -EFAULT;
-    }
     if (protocol != 0 && protocol != AF_UNIX) {
         return -EPROTONOSUPPORT;
     }
     if (type != SOCK_STREAM) {
         return -ESOCKTNOSUPPORT;
+    }
+    pagetable_t pt = user_pt();
+    int fds[2];
+    if (!uvm_range_ok(pt, ufds, sizeof fds, PTE_W)) {
+        return -EFAULT;
     }
     struct file *fa = filealloc();
     struct file *fb = fa != NULL ? filealloc() : NULL;

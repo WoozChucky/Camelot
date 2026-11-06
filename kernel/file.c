@@ -341,15 +341,16 @@ isize filewrite(struct file *f, pagetable_t pt, uintptr src, usize n) {
         n = MAX_RW_COUNT;
     }
     /* A socket's write is its send, which for 0 bytes on UDP is still a
-     * datagram (an empty one). */
+     * datagram (an empty one), and on a local socket fails as any send
+     * would: not connected, or shut down. */
     if (f->type == FD_SOCKET) {
         return socket_write(f->sock, pt, src, n);
     }
-    if (n == 0) {
-        return 0;
-    }
     if (f->type == FD_UNIX) {
         return unix_write(f->usock, pt, src, n);
+    }
+    if (n == 0) {
+        return 0;
     }
     if (f->type == FD_PIPE) {
         return pipewrite(f->pipe, pt, src, n);

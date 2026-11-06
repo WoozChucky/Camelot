@@ -83,7 +83,7 @@
 #define ESRCH 3         /* kill: no such process; thread_join: no such thread */
 #define EINTR 4         /* a wait ended because the process was killed */
 #define ENXIO 6         /* open: a socket's inode, which only connect() reaches */
-#define E2BIG 7        /* spawn, exec: argument list too long */
+#define E2BIG 7         /* spawn, exec: argument list too long */
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
 #define ECHILD 10       /* wait: no such child */

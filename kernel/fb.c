@@ -109,6 +109,9 @@ static usize stale_pages;
 /* Under vblank_lock. */
 static u32 waiters;    /* threads waiting for a vertical blank */
 static u32 vblank_seq; /* vertical blanks the interrupt has seen */
+/* A poller found a flip pending since the last vertical blank: the
+ * interrupt stays on for it, whoever else turned it on (fb_poll). */
+static bool poll_armed;
 
 static u32 rd(u32 off) {
     return mmio_read32(regs + off);
@@ -239,7 +242,9 @@ bool fb_intr(u32 source) {
     }
     acquire(&vblank_lock);
     /* Clearing VBLANK lowers the line; the interrupt stays on while
-     * someone waits for the next one. */
+     * someone waits for the next one. A poller woken arms it again if a
+     * flip is still pending. */
+    poll_armed = false;
     wr(FB_IRQ, waiters > 0 ? IRQ_ENABLE | IRQ_VBLANK : IRQ_VBLANK);
     vblank_seq++;
     release(&vblank_lock);
@@ -261,15 +266,20 @@ u32 fb_poll(struct file *f, struct poll_table *pt) {
     u32 mask = POLL_READY_OUT;
     if ((rd(FB_STATUS) & STATUS_FLIP_PENDING) != 0) {
         mask = 0;
-        /* The interrupt on, for the vertical blank that takes the flip: the
-         * handler turns it off again unless a thread waits in
-         * wait_vblank_locked(), and the poller, woken, turns it on again
-         * if a flip is still pending. Enabled from a cleared VBLANK, as for
-         * a waiter; and the flip may have been taken meanwhile. */
-        if (irq != 0 && (rd(FB_IRQ) & IRQ_ENABLE) == 0) {
-            wr(FB_IRQ, IRQ_ENABLE | IRQ_VBLANK);
-            if ((rd(FB_STATUS) & STATUS_FLIP_PENDING) == 0) {
-                mask = POLL_READY_OUT;
+        /* The interrupt on, for the vertical blank that takes the flip,
+         * and armed for it: a thread leaving wait_vblank_locked() leaves it
+         * on then, even if it was the one that turned it on. The handler
+         * turns it off again unless a thread waits there, and the poller,
+         * woken, arms it again if a flip is still pending. Enabled from a
+         * cleared VBLANK, as for a waiter; and the flip may have been taken
+         * meanwhile. */
+        if (irq != 0) {
+            poll_armed = true;
+            if ((rd(FB_IRQ) & IRQ_ENABLE) == 0) {
+                wr(FB_IRQ, IRQ_ENABLE | IRQ_VBLANK);
+                if ((rd(FB_STATUS) & STATUS_FLIP_PENDING) == 0) {
+                    mask = POLL_READY_OUT;
+                }
             }
         }
     }
@@ -299,7 +309,7 @@ static int wait_vblank_locked(void) {
         sleep(&vblank_seq, &vblank_lock);
     }
     waiters--;
-    if (waiters == 0) {
+    if (waiters == 0 && !poll_armed) {
         wr(FB_IRQ, IRQ_VBLANK);
     }
     return r;

@@ -2596,7 +2596,7 @@ fn local_sockets_connect_and_pass_descriptors() {
     type_line(&tx, "unixtest\n");
     step_to_prompt(&mut m, 2);
     let out = printed(&m);
-    assert_eq!(all_checks_pass(&out, "unixtest", "unixtest"), 148, "{out}");
+    assert_eq!(all_checks_pass(&out, "unixtest", "unixtest"), 153, "{out}");
 }
 
 /// Steps `m` until the kernel's tick counter has gone `n` ticks on.
