@@ -191,11 +191,11 @@ u64 shm_size(struct shm_object *o) {
     return size;
 }
 
-bool shm_page(struct shm_object *o, u64 index, phys_addr_t *out) {
+long shm_page(struct shm_object *o, u64 index, phys_addr_t *out) {
     acquire(&shm_lock);
     if (index >= pages_for(o->size)) {
         release(&shm_lock);
-        return false;
+        return -EFAULT;
     }
     phys_addr_t *entry = page_entry(o, index, true);
     if (entry != NULL && *entry == 0) {
@@ -204,10 +204,11 @@ bool shm_page(struct shm_object *o, u64 index, phys_addr_t *out) {
             *entry = pa(page);
         }
     }
-    bool ok = entry != NULL && *entry != 0;
-    if (ok) {
+    /* No table for the entry, or no page for it: memory ran out. */
+    long r = entry != NULL && *entry != 0 ? 0 : -ENOMEM;
+    if (r == 0) {
         *out = *entry;
     }
     release(&shm_lock);
-    return ok;
+    return r;
 }

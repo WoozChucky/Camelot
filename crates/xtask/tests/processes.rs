@@ -1050,14 +1050,17 @@ fn memory_mappings_are_mapped_on_demand_and_given_back() {
     // shared-memory objects (memfd_create, ftruncate, two mappings of one
     // in a process and in two); then a touch of a PROT_NONE page, of an
     // unmapped one, a store to a read-only one and a touch past an object's
-    // end, each killing the program: every page is back after each command,
-    // the mappings' and the objects' included.
+    // end, each killing the program, and writes to every page of a mapping
+    // bigger than the machine, killed when memory runs out, which is said
+    // first: every page is back after each command, the mappings' and the
+    // objects' included.
     let commands = [
         "maptest",
         "maptest none",
         "maptest unmapped",
         "maptest readonly",
         "maptest past",
+        "maptest full",
         "echo alive",
     ];
     let out = run_counting_pages(8, &commands);
@@ -1078,6 +1081,13 @@ fn memory_mappings_are_mapped_on_demand_and_given_back() {
             "{command}: {out}"
         );
     }
+    let full = command_output(&out, "maptest full");
+    assert!(
+        full[0].starts_with("pid ")
+            && full[0].contains(" (maptest): no memory for a page of its mapping at 0x"),
+        "{out}"
+    );
+    assert!(full[1].ends_with(" (maptest) killed: store page fault"), "{out}");
     assert_eq!(command_output(&out, "echo alive"), ["alive"]);
 
     // In Sv39's smaller user space too.
