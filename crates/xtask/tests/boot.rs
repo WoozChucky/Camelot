@@ -297,6 +297,17 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
         b"echo from the disk\nls /bin | wc > /count\ncat /count\nexit\n",
     );
     assert_eq!(result, RunResult::Exited(0), "{out}");
+    // Init ran the server's /etc/rc: the shell, whose exit ends the machine, and
+    // shd, which this machine without a network card does not keep (each line
+    // once, wherever it lands among the shell's).
+    let shd = [
+        "shd: socket: no network card\n",
+        "init: /bin/shd ended at once, exit 1: not started again\n",
+    ];
+    for line in shd {
+        assert_eq!(out.matches(line).count(), 1, "{out}");
+    }
+    let out = shd.iter().fold(out, |out, line| out.replacen(line, "", 1));
     assert!(
         out.starts_with(&format!(
             "boot: kernel at sector 0x{:08x}\n{}Camelot v0.1.0 booting...\n",
@@ -495,7 +506,8 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
     let err = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, 1024).unwrap_err();
     assert!(
         err.starts_with(&format!(
-            "the root filesystem does not fit in a 1024-block image, where the kernel leaves it {} blocks",
+            "the server root filesystem does not fit in a 1024-block image, where the kernel leaves it {} \
+             blocks",
             1024 - kernel_blocks
         )) && err.ends_with("give a bigger --size"),
         "{err}"
@@ -512,7 +524,7 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
     // and does not suggest one.
     let err = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, u32::MAX).unwrap_err();
     assert!(
-        err.starts_with(&format!("cannot build a {}-block root image: ", u32::MAX))
+        err.starts_with(&format!("cannot build a {}-block server root image: ", u32::MAX))
             && !err.contains("--size"),
         "{err}"
     );
@@ -869,4 +881,25 @@ fn the_spec_gives_the_root_images_size() {
         "the spec says {mib} MiB, xtask::fs::IMAGE_SIZE is {blocks} blocks"
     );
     assert_eq!(blocks % 1024, 0, "a whole number of MiB");
+    // And the desktop's, once too: The desktop's is **N MiB in all**.
+    let mib = spec
+        .split("The desktop's is **")
+        .nth(1)
+        .and_then(|rest| rest.split(" MiB in all**").next())
+        .expect("the spec's \"Root image\" says: The desktop's is **N MiB in all**");
+    let blocks = xtask::fs::DESKTOP_IMAGE_SIZE;
+    assert_eq!(
+        mib,
+        format!("{}", blocks / 1024),
+        "the spec says {mib} MiB, xtask::fs::DESKTOP_IMAGE_SIZE is {blocks} blocks"
+    );
+    assert_eq!(blocks % 1024, 0, "a whole number of MiB");
+    for profile in xtask::fs::Profile::ALL {
+        assert_eq!(spec.matches(" MiB in all**").count(), 2, "one size a profile");
+        assert!(
+            spec.contains(&format!("**{}**", profile.name())),
+            "{}",
+            profile.name()
+        );
+    }
 }

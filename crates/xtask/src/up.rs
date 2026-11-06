@@ -858,7 +858,11 @@ pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr, timeout: Duration
         .set_read_timeout(Some(POLL))
         .map_err(|e| e.to_string())?;
     let mut output = String::from_utf8_lossy(&scrollback).into_owned();
-    while !output.ends_with(&format!("\n{PROMPT}")) {
+    // The prompt, which init's lines about shd may follow (or come before).
+    while !output.contains(&format!("\n{PROMPT}")) {
+        if let Some(failure) = shd_failure(&output) {
+            return Err(failure.to_string());
+        }
         if Instant::now() > deadline {
             return Err("its shell never showed a prompt".into());
         }

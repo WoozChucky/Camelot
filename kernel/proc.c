@@ -712,8 +712,10 @@ static void init_start(void) {
     if (fs_mounted) {
         p->cwd = iget(fs_dev, ROOTINO);
     }
+    /* Init from the filesystem only, when there is one: the embedded init
+     * would look for its rc and its shell there, and not find them. */
     const char *path = init_path;
-    int err = exec_init(path, init_name);
+    int err = exec_init(path, init_name, init_fallback_path == NULL);
     if (err < 0 && init_fallback_path != NULL) {
         /* As Linux's kernel_init tries init, then sh: a missing init is no
          * error, one that is there and won't start is said. */
@@ -721,7 +723,7 @@ static void init_start(void) {
             kprintf("cannot start %s: error %d\n", path, -err);
         }
         path = init_fallback_path;
-        err = exec_init(path, init_fallback_name);
+        err = exec_init(path, init_fallback_name, true);
     } else if (err == 0) {
         acquire(&proc_lock);
         init_reaps = true;

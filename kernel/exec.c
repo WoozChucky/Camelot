@@ -126,10 +126,10 @@ static void add_string(struct proc_args *args, const char *s) {
     memcpy(proc_args_push(args, n), s, n);
 }
 
-int exec_init(const char *path, const char *name) {
+int exec_init(const char *path, const char *name, bool embedded) {
     struct elf_file f;
     int err = prog_open(path, !fs_mounted, &f);
-    if (err == -ENOENT && fs_mounted) {
+    if (err == -ENOENT && fs_mounted && embedded) {
         /* A root filesystem without a shell still boots to one. */
         err = prog_open(path, true, &f);
     }
