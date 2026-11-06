@@ -12,9 +12,10 @@
  *   inputtest overflow      prints "inputtest: ready", waits for a line
  *                           (the UART's: the keyboard is the reader's) while
  *                           a test types more than a ring holds, then reads
- *                           what is there and prints "N events", the first
- *                           and the last but one ("type code value"), and
- *                           which of KEY_A and KEY_B EVIOCGKEY says are held
+ *                           one event and then two, a packet, and prints them
+ *                           ("type code value"), which of KEY_A and KEY_B
+ *                           EVIOCGKEY says are held, and what is left: "N
+ *                           events left, M keys"
  *   inputtest grab          two readers of the keyboard, the first grabbing
  *                           it: prints "inputtest: grabbed" and the key the
  *                           first reads (a press and its SYN_REPORT), lets
@@ -173,15 +174,20 @@ int main(int argc, char **argv) {
         char line[8];
         read(0, line, sizeof line);
         static struct input_event ev[256];
-        long n = read(fd, ev, sizeof ev) / (long)sizeof ev[0];
-        printf("%ld events\n", n);
-        printf("%d %d %d\n", ev[0].type, ev[0].code, ev[0].value);
-        if (n >= 2) {
-            printf("%d %d %d\n", ev[n - 2].type, ev[n - 2].code, ev[n - 2].value);
+        long n = read(fd, ev, sizeof ev[0]) / (long)sizeof ev[0];
+        n += read(fd, ev + 1, 2 * sizeof ev[0]) / (long)sizeof ev[0];
+        for (long i = 0; i < n; i++) {
+            printf("%d %d %d\n", ev[i].type, ev[i].code, ev[i].value);
         }
         unsigned char keys[96];
         ioctl(fd, EVIOCGKEY(sizeof keys), keys);
         printf("held: KEY_A %d, KEY_B %d\n", has_bit(keys, KEY_A), has_bit(keys, KEY_B));
+        n = read(fd, ev, sizeof ev) / (long)sizeof ev[0];
+        int key_events = 0;
+        for (long i = 0; i < n; i++) {
+            key_events += ev[i].type == EV_KEY;
+        }
+        printf("%ld events left, %d keys\n", n, key_events);
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "grab") == 0) {

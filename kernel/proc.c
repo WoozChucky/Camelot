@@ -1183,6 +1183,11 @@ int proc_wait(int pid, uintptr status) {
                 }
                 proc_free(child);
                 release(&proc_lock);
+                /* A child that still mapped /dev/fb0 may have left the
+                 * display's buffer to free: free it before the caller goes
+                 * on to make another process. (proc_exit's reaps of its
+                 * zombies are freed by the scheduler it switches to.) */
+                fb_reclaim();
                 return child_pid;
             }
         }

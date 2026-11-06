@@ -127,6 +127,27 @@ static void push(struct reader *r, const struct input_event *ev, u32 n) {
     wakeup(r);
 }
 
+/* Drops the events of `type` waiting in `r`'s ring, and the SYN_REPORTs that
+ * then end empty packets, but for one that leads (it ends a packet the
+ * reader has read part of): Linux's __evdev_flush_queue. EVIOCGKEY does it,
+ * so that a reader that was given the keys' state isn't told again of the
+ * changes that made it. Holding input_lock. */
+static void flush_type(struct reader *r, u16 type) {
+    u32 to = r->tail;
+    u32 in_packet = 1; /* events kept since the last SYN_REPORT kept */
+    for (u32 i = r->tail; i != r->head; i++) {
+        struct input_event ev = r->ring[i % RING];
+        bool report = ev.type == EV_SYN && ev.code == SYN_REPORT;
+        if (ev.type == type || (report && in_packet == 0)) {
+            continue;
+        }
+        r->ring[to % RING] = ev;
+        to++;
+        in_packet = report ? 0 : in_packet + 1;
+    }
+    r->head = to;
+}
+
 /* The most events a driver reports at once, its SYN_REPORT added. */
 #define PACKET_MAX 8
 
@@ -341,10 +362,13 @@ long input_ioctl(struct file *f, u32 request, uintptr arg) {
     }
     if (nr == EVIOC_KEY_NR) {
         /* The keys held, as the readers were told: what a reader asks for
-         * after a SYN_DROPPED, to learn what it missed (Linux's evdev). */
+         * after a SYN_DROPPED, to learn what it missed. The key events
+         * waiting for this reader go, since the state has them (Linux's
+         * evdev_handle_get_val), even if the copy then fails. */
         u64 down[WORDS(KEY_CNT)];
         acquire(&input_lock);
         memcpy(down, d->down, sizeof down);
+        flush_type(r, EV_KEY);
         release(&input_lock);
         return to_user(pt, arg, down, KEY_CNT / 8, size);
     }

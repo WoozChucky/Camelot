@@ -1260,9 +1260,10 @@ fn input_events(
 #[test]
 fn a_reader_that_falls_behind_finds_syn_dropped_and_asks_what_is_held() {
     // A reader's ring holds 128 events: one that doesn't read while 100
-    // keys are pressed and released (400 events) loses what it had not
-    // read, finds SYN_DROPPED in its place and the packets since, and
-    // learns from EVIOCGKEY that B, pressed last, is held (Linux's evdev).
+    // keys are pressed and released (402 events with B's press) loses what
+    // it had not read, finds SYN_DROPPED in its place and whole packets
+    // since, and learns from EVIOCGKEY that B, pressed last, is held, which
+    // drops the key events still waiting for it (Linux's evdev).
     let (mut m, _, tx, _) = root_machine();
     type_line(&tx, "inputtest overflow\n");
     step_to_output(&mut m, "inputtest: ready\n");
@@ -1285,11 +1286,22 @@ fn a_reader_that_falls_behind_finds_syn_dropped_and_asks_what_is_held() {
     let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured[at..]).into_owned();
     // After the echo of the line typed.
     let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
-    let n: usize = lines[0].strip_suffix(" events").unwrap().parse().unwrap();
-    assert!(n <= 128, "{out}");
+    // Each overflow empties the ring for SYN_DROPPED and the packet that
+    // overflowed it: the last one leaves SYN_DROPPED and the last 11
+    // packets (A pressed and released 5 times, then B pressed). The reader
+    // reads SYN_DROPPED, then a whole packet, A's press; EVIOCGKEY drops
+    // the 10 key events left, and the SYN_REPORTs of the packets they made
+    // but the first, which ends the packet read (Linux's
+    // __evdev_flush_queue keeps a leading one).
     assert_eq!(
-        lines[1..4],
-        ["0 3 0", "1 48 1", "held: KEY_A 0, KEY_B 1"],
+        lines[..5],
+        [
+            "0 3 0",
+            "1 30 1",
+            "0 0 0",
+            "held: KEY_A 0, KEY_B 1",
+            "1 events left, 0 keys"
+        ],
         "{out}"
     );
 }

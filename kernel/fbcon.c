@@ -499,6 +499,9 @@ void fbcon_putc(char c) {
     }
     switch (ch) {
     case '\n':
+    case '\v':
+    case '\f':
+        /* VT and FF as LF, as Linux's VT takes them. */
         newline();
         break;
     case '\r':
@@ -527,7 +530,8 @@ void fbcon_putc(char c) {
         state = ST_ESC;
         break;
     default:
-        /* Any other control character (C0, DEL) does nothing, as on a VT;
+        /* Any other control character (C0, DEL) does nothing, as on
+         * Linux's VT;
          * a byte past ASCII is drawn as '?'. */
         if (ch >= 0x20 && ch != 0x7f) {
             put_char(ch);

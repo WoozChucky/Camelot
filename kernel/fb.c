@@ -17,8 +17,8 @@
  *                 it, under a process's vm_lock or under proc_lock (a
  *                 process reaped with the device still mapped, proc_free),
  *                 so nothing under it sleeps or wakes a sleeper, which
- *                 would take proc_lock; only leaves come after it, the page
- *                 allocator's lock and uart_tx_lock (fbcon_suspend,
+ *                 would take proc_lock, and frees nothing; only a leaf
+ *                 comes after it, uart_tx_lock (fbcon_suspend,
  *                 fbcon_resume).
  *   vblank_lock   a spinlock: the vertical blank's count, its waiters and
  *                 the interrupt's enable; waiters sleep with it, so it
@@ -26,8 +26,9 @@
  *
  * A buffer in RAM that the last mapping's going lets go of may be let go
  * of under proc_lock: it is freed later, by fb_reclaim(), where no lock is
- * held (the scheduler calls it after each switch back, as it does
- * kstack_reclaim()), rather than with every interrupt off. */
+ * held (fb_close, the next mode change, proc_wait after a reap, and the
+ * scheduler after each switch back, as it calls kstack_reclaim()), rather
+ * than under locks that every hart's scheduler waits for. */
 #include "fb.h"
 #include "fbcon.h"
 #include "file.h"
@@ -284,7 +285,12 @@ static void release_display(void) {
         wr(FB_MODE, 0);
     }
     if (smem_ram != NULL) {
-        /* At most one: a new buffer is made only after fb_reclaim(). */
+        /* At most one: a new buffer is made only after fb_reclaim(), by a
+         * request on an open file, which keeps the display from being let
+         * go of meanwhile. */
+        if (stale_ram != NULL) {
+            panic("fb: a second buffer to free");
+        }
         stale_ram = smem_ram;
         stale_pages = smem_pages;
         smem_ram = NULL;
