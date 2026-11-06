@@ -14,6 +14,7 @@
 #include "net.h"
 #include "pipe.h"
 #include "poll.h"
+#include "pty.h"
 #include "shm.h"
 #include "string.h"
 #include "trap.h"
@@ -38,7 +39,7 @@ void file_init(void) {
  * ioctl, fb.h), INPUT the keyboard and the pointer (their events, input.h).
  * A major whose entry is all NULL has no driver. */
 const struct devsw devsw[NDEV] = {
-    [CONSOLE] = {.read = console_read, .write = console_write, .poll = console_poll},
+    [CONSOLE] = {.read = console_read, .write = console_write, .ioctl = console_ioctl, .poll = console_poll},
     [FB] = {.open = fb_open,
             .close = fb_close,
             .ioctl = fb_ioctl,
@@ -51,6 +52,18 @@ const struct devsw devsw[NDEV] = {
                .read = input_read,
                .ioctl = input_ioctl,
                .poll = input_poll},
+    [PTMX] = {.open = ptmx_open,
+              .close = ptmx_close,
+              .read = ptmx_read,
+              .write = ptmx_write,
+              .ioctl = ptmx_ioctl,
+              .poll = ptmx_poll},
+    [PTS] = {.open = pts_open,
+             .close = pts_close,
+             .read = pts_read,
+             .write = pts_write,
+             .ioctl = pts_ioctl,
+             .poll = pts_poll},
 };
 
 bool device_has_driver(u32 major) {

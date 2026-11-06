@@ -2,8 +2,9 @@
 //! (docs/camelot-fs.md), built with the `camelot-fs` crate's mkfs: the files
 //! in `kernel/fs/` (a README) at `/`, the user programs of `kernel/user`,
 //! built with merlin, merlin-as and merlin-ld exactly as the kernel embeds them, in
-//! `/bin`, the device nodes, `/dev/console`, `/dev/fb0` and
-//! `/dev/input/event0` and `event1`, and what a C program is built from
+//! `/bin`, the device nodes, `/dev/console`, `/dev/fb0`,
+//! `/dev/input/event0` and `event1`, `/dev/ptmx` and the pseudo-terminals'
+//! `/dev/pts/0` to `15`, and what a C program is built from
 //! ([`usr_files`]): the header in `/usr/include`, and in `/usr/lib` the
 //! start code `crt0.o`, the C library `libc.a` and the linker script
 //! `user.ld`, the very files the programs of `/bin` were linked from. No
@@ -56,6 +57,14 @@ pub const FB_MAJOR: u16 = 2;
 /// The input devices' number (`INPUT` in kernel/include/file.h): minor 0
 /// is the keyboard, `/dev/input/event0`, and 1 the pointer, `event1`.
 pub const INPUT_MAJOR: u16 = 3;
+/// `/dev/ptmx`'s device number (`PTMX` in kernel/include/file.h): opening
+/// it makes a pseudo-terminal.
+pub const PTMX_MAJOR: u16 = 4;
+/// The pseudo-terminals' slaves' number (`PTS`): minor N is `/dev/pts/N`.
+pub const PTS_MAJOR: u16 = 5;
+/// The slaves' nodes the image has, `/dev/pts/0` up (`NPTY` in
+/// kernel/include/pty.h): Camelot has no devpts to make them as they come.
+pub const NPTY: u16 = 16;
 /// Where the headers go, as on Linux: a compiler on Camelot looks there.
 pub const INCLUDE: &str = "/usr/include";
 /// Where the start code, the C library and the programs' linker script go.
@@ -111,8 +120,8 @@ pub fn add_usr(fs: &mut Mkfs, files: &[(String, Vec<u8>)]) -> Result<(), String>
 }
 
 /// Builds the root image: `opts`' shape, `kernel/fs/` at `/`, the programs
-/// in `/bin`, `/dev/console`, `/dev/fb0` and `/dev/input/event0` and `event1`,
-/// and `/usr` ([`usr_files`]).
+/// in `/bin`, `/dev/console`, `/dev/fb0`, `/dev/input/event0` and `event1`,
+/// `/dev/ptmx` and `/dev/pts/0` to `15`, and `/usr` ([`usr_files`]).
 pub fn build(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
     build_with(root, opts, CCompiler::Merlin)
 }
@@ -129,6 +138,11 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
     fs.mkdir(&format!("{DEV}/input"))?;
     fs.add_device(&format!("{DEV}/input/event0"), INPUT_MAJOR, 0)?;
     fs.add_device(&format!("{DEV}/input/event1"), INPUT_MAJOR, 1)?;
+    fs.add_device(&format!("{DEV}/ptmx"), PTMX_MAJOR, 0)?;
+    fs.mkdir(&format!("{DEV}/pts"))?;
+    for n in 0..NPTY {
+        fs.add_device(&format!("{DEV}/pts/{n}"), PTS_MAJOR, n)?;
+    }
     fs.mkdir(BIN)?;
     let user = userprogs::user_dir(root);
     let rt = userprogs::build_runtime(&user, cc)?;

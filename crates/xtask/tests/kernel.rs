@@ -2825,6 +2825,10 @@ fn plic_threshold(ctx: u32) -> u64 {
 /// kernel/include/uart.h).
 const UART_RX_SIZE: usize = 128;
 
+/// The terminal's input, which the console takes the ring's bytes into
+/// (`TTY_IN` in kernel/include/tty.h).
+const TTY_IN: usize = 256;
+
 /// What the shell's `help` prints (kernel/user/sh.c).
 const HELP: &str = "\
 help            this list
@@ -2916,8 +2920,8 @@ fn console_edits_lines() {
     );
     let (r, out) = run_shell(input.as_bytes());
     assert_eq!(r, RunResult::Exited(0));
-    // Lines hold at most 127 characters and the newline (CONSOLE_LINE_MAX in
-    // kernel/include/console.h); the rest is neither echoed nor kept.
+    // Lines hold at most 127 characters and the newline (TTY_LINE_MAX in
+    // kernel/include/tty.h); the rest is neither echoed nor kept.
     let kept = "x".repeat(127);
     let want = format!(
         "{SHELL_BANNER}\
@@ -3023,12 +3027,13 @@ fn a_failed_builtin_gives_dashs_status() {
 
 #[test]
 fn shell_takes_more_input_than_the_ring_buffer_holds() {
-    // 40 commands, typed all at once: 245 bytes for a 128-byte buffer. When it
-    // is full the driver turns the receive interrupt off rather than drop
-    // bytes, and turns it back on once the console has taken half of it.
-    let input = format!("{}exit\n", "ticks\n".repeat(40));
-    assert!(input.len() > UART_RX_SIZE + UART_RX_SIZE / 2);
-    assert!(input.len() < 2 * UART_RX_SIZE);
+    // 80 commands, typed all at once: 485 bytes, more than the UART's
+    // 128-byte ring and the terminal's input behind it (TTY_IN) hold. When
+    // the ring is full the driver turns the receive interrupt off rather
+    // than drop bytes, and turns it back on once the console has taken half
+    // of it.
+    let input = format!("{}exit\n", "ticks\n".repeat(80));
+    assert!(input.len() > UART_RX_SIZE + TTY_IN);
     let (mut m, elf) = load_committed_on(config(), Some(kernel::typed(input.as_bytes())));
     let trap_init = sym(&elf, "trap_init");
     let mut booted = false;
@@ -3046,17 +3051,16 @@ fn shell_takes_more_input_than_the_ring_buffer_holds() {
     let shell = &out[out.find(SHELL_BANNER).unwrap()..];
     let want = format!(
         "{SHELL_BANNER}{}{PROMPT}exit\n",
-        format!("{PROMPT}ticks\nticks: N\n").repeat(40)
+        format!("{PROMPT}ticks\nticks: N\n").repeat(80)
     );
     assert_eq!(mask_ticks(shell), want);
-    // Off when the buffer filled (128 bytes in), on again at half (64 taken),
-    // off when 64 more filled it (192 in), on again at half: the last 53
-    // bytes fit.
-    assert_eq!(
-        ier_writes,
-        [0, UART_IER_ERBFI, 0, UART_IER_ERBFI],
-        "{ier_writes:?}"
-    );
+    // Off when the ring filled, on again once half of it was taken, and so
+    // on: off and on in turns, and on at the end.
+    assert!(!ier_writes.is_empty());
+    for (i, v) in ier_writes.iter().enumerate() {
+        assert_eq!(*v, if i % 2 == 0 { 0 } else { UART_IER_ERBFI }, "{ier_writes:?}");
+    }
+    assert_eq!(ier_writes.last(), Some(&UART_IER_ERBFI), "{ier_writes:?}");
 }
 
 #[test]

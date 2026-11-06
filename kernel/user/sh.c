@@ -107,7 +107,7 @@
 #include "user.h"
 
 #define PROMPT "$ "
-/* The console's longest line (CONSOLE_LINE_MAX in kernel/include/console.h),
+/* A terminal's longest line (TTY_LINE_MAX in kernel/include/tty.h),
  * its newline included, and a NUL. */
 #define LINE_SIZE 129
 /* Background programs not collected yet that the shell remembers the names
