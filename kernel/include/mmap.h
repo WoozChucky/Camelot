@@ -134,11 +134,13 @@ long mm_mprotect(uintptr addr, usize len, u32 prot);
  * of the current process's areas not mapped yet whose protections allow
  * `access` (PTE_R, PTE_W or PTE_X): a page fault from U-mode (trap.c) and
  * a system call's check of a user range (uvm_range_ok(), vm.c), since the
- * kernel never faults on user memory, alike. True if the page is mapped
- * now (or was already, by another thread); false if the access is not
- * allowed there, or no page could be had. Takes only spinlocks, so it may
- * be called holding any spinlock but vm_lock's and kmem's. */
-bool mm_fault(pagetable_t pt, uintptr va, u32 access);
+ * kernel never faults on user memory, alike. 0 if the page is mapped now
+ * (or was already, by another thread); -EFAULT if the access is not
+ * allowed there (no area, its protections, past a shared object's end);
+ * -ENOMEM if no page could be had for it, or no page table. Takes only
+ * spinlocks, so it may be called holding any spinlock but vm_lock's and
+ * kmem's. */
+long mm_fault(pagetable_t pt, uintptr va, u32 access);
 
 /* Whether [start, end) overlaps one of `p`'s areas: sbrk() checks that the
  * heap doesn't grow into one. Called holding p->heap_lock. */

@@ -11,6 +11,8 @@
  *   maptest unmapped     touches a page after munmap: killed
  *   maptest readonly     writes a read-only page: killed
  *   maptest past         touches a page past a shared object's end: killed
+ *   maptest full         writes every page of 200 mappings of 1 MiB, more
+ *                        than the machine's memory: killed when it runs out
  *   maptest fb           draws into /dev/fb0's memory (a root image's),
  *                        prints "maptest: drawn" and waits for a line
  *   maptest threads      threads map and unmap memory at once
@@ -570,6 +572,22 @@ int main(int argc, char **argv) {
         char *p = (char *)map(0, 2 * PAGE, PROT_READ, MAP_SHARED, fd, 0);
         return p[0] + p[PAGE];
     }
+    if (argc == 2 && strcmp(argv[1], "full") == 0) {
+        /* 200 mappings of 1 MiB, each of which mmap takes (no page backs
+         * one until it is touched), every page written: memory runs out on
+         * the way. */
+        for (int i = 0; i < 200; i++) {
+            char *p = (char *)anon(MIB);
+            if ((long)p <= 0) {
+                printf("maptest: mmap failed: %ld\n", (long)p);
+                return 1;
+            }
+            for (unsigned long off = 0; off < MIB; off += PAGE) {
+                p[off] = 1;
+            }
+        }
+        return 0;
+    }
     if (argc == 2) {
         long m = anon(PAGE);
         char *p = (char *)m;
@@ -591,7 +609,7 @@ int main(int argc, char **argv) {
     int fb = argc == 2 && strcmp(argv[1], "fb") == 0;
     int threads = argc == 2 && strcmp(argv[1], "threads") == 0;
     if (argc != 1 && !fb && !threads) {
-        printf("usage: maptest [none | unmapped | readonly | past | fb | threads]\n");
+        printf("usage: maptest [none | unmapped | readonly | past | full | fb | threads]\n");
         return 1;
     }
     if (pipe(fds) != 0) {

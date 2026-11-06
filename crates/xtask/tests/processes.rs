@@ -188,14 +188,14 @@ fn all_checks_pass(out: &str, command: &str, program: &str) -> u32 {
 }
 
 /// A disk with the root filesystem (`xtask::fs::build`: the programs in
-/// /bin), `blocks` blocks, and `extra` files besides (in `/`, `/bin` or
-/// `/etc`, made for them).
-fn root_disk(blocks: u32, extra: &[(&str, &[u8])]) -> DiskConfig {
+/// /bin), laid out as in the root image (`xtask::fs::IMAGE_SIZE` blocks
+/// less the kernel's), so that the programs have the room they have on
+/// Camelot (filetest writes a file of 300 KiB beside them), and `extra`
+/// files besides (in `/`, `/bin` or `/etc`, made for them).
+fn root_disk(extra: &[(&str, &[u8])]) -> DiskConfig {
     let root = repo_root();
-    let opts = camelot_fs::mkfs::Options {
-        size: blocks,
-        ..camelot_fs::mkfs::Options::default()
-    };
+    let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
+    let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
     let image = if extra.is_empty() {
         xtask::fs::build(&root, &opts).unwrap()
     } else {
@@ -521,7 +521,7 @@ once /bin/echo 1 2 3 4 5 6 7 8
 ";
     let input = b"ps\nsleep 2\nps\nsh\nsleep 3 &\nexit\nps\nsleep 4\nps\nkill 1\ninit\nexit 3\n";
     let setup = Setup {
-        disks: vec![root_disk(4096, &[("/etc/rc", rc)])],
+        disks: vec![root_disk(&[("/etc/rc", rc)])],
         ..Setup::default()
     };
     let (mut m, _) = load(setup.config(), Some(kernel::typed(input)));
@@ -1163,14 +1163,17 @@ fn memory_mappings_are_mapped_on_demand_and_given_back() {
     // shared-memory objects (memfd_create, ftruncate, two mappings of one
     // in a process and in two); then a touch of a PROT_NONE page, of an
     // unmapped one, a store to a read-only one and a touch past an object's
-    // end, each killing the program: every page is back after each command,
-    // the mappings' and the objects' included.
+    // end, each killing the program, and writes to every page of a mapping
+    // bigger than the machine, killed when memory runs out, which is said
+    // first: every page is back after each command, the mappings' and the
+    // objects' included.
     let commands = [
         "maptest",
         "maptest none",
         "maptest unmapped",
         "maptest readonly",
         "maptest past",
+        "maptest full",
         "echo alive",
     ];
     let out = run_counting_pages(8, &commands);
@@ -1191,6 +1194,13 @@ fn memory_mappings_are_mapped_on_demand_and_given_back() {
             "{command}: {out}"
         );
     }
+    let full = command_output(&out, "maptest full");
+    assert!(
+        full[0].starts_with("pid ")
+            && full[0].contains(" (maptest): no memory for a page of its mapping at 0x"),
+        "{out}"
+    );
+    assert!(full[1].ends_with(" (maptest) killed: store page fault"), "{out}");
     assert_eq!(command_output(&out, "echo alive"), ["alive"]);
 
     // In Sv39's smaller user space too.
@@ -1219,7 +1229,7 @@ fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             ..Setup::default()
         }
         .config(),
@@ -1262,7 +1272,7 @@ fn root_machine() -> (Machine, grail::elf::Elf, std::sync::mpsc::Sender<u8>, u32
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             ..Setup::default()
         }
         .config(),
@@ -2497,7 +2507,7 @@ fn an_elf32_program_is_refused() {
     assert_eq!(prog32[4], 1, "not ELFCLASS32");
     let out = run(
         Setup {
-            disks: vec![root_disk(4096, &[("/bin/prog32", &prog32)])],
+            disks: vec![root_disk(&[("/bin/prog32", &prog32)])],
             ..Setup::default()
         },
         b"prog32\nhello\nexit 0\n",
@@ -2548,7 +2558,7 @@ fn files_pipes_and_64_bit_offsets_on_a_disk() {
     // and stat's 24 bytes.
     let out = run(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             ..Setup::default()
         },
         b"filetest\nexit 0\n",
@@ -2657,7 +2667,7 @@ fn the_calls_take_and_return_64_bit_values() {
     );
     let out = run(
         Setup {
-            disks: vec![root_disk(4096, &[("/bin/high", &elf)])],
+            disks: vec![root_disk(&[("/bin/high", &elf)])],
             ..Setup::default()
         },
         b"high\nexit 0\n",
@@ -2675,7 +2685,7 @@ fn poll_waits_on_every_kind_of_file() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, _) = load(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             nets: vec![NetConfig::user(Vec::new())],
             ..Setup::default()
         }
@@ -2699,7 +2709,7 @@ fn local_sockets_connect_and_pass_descriptors() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, _) = load(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             nets: vec![NetConfig::user(Vec::new())],
             ..Setup::default()
         }
@@ -2723,7 +2733,7 @@ fn pseudo_terminals_run_the_shell() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, _) = load(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             ..Setup::default()
         }
         .config(),

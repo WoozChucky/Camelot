@@ -95,8 +95,9 @@ u32 shm_seals(struct shm_object *o);
 u64 shm_size(struct shm_object *o);
 
 /* The physical address of page `index` of `o`, made (zeroed) if it wasn't
- * yet: what a fault maps. False if the page is past the object's size, or
- * no page could be had. Takes only shm_lock and kmem's. */
-bool shm_page(struct shm_object *o, u64 index, phys_addr_t *pa);
+ * yet: what a fault maps. 0, -EFAULT if the page is past the object's size
+ * (Linux's SIGBUS), or -ENOMEM if no page could be had. Takes only
+ * shm_lock and kmem's. */
+long shm_page(struct shm_object *o, u64 index, phys_addr_t *pa);
 
 #endif

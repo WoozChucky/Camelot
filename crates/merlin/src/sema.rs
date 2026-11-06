@@ -3713,6 +3713,11 @@ impl<'a> FnChecker<'a> {
                         Type::Func(Box::new(sig.ty.clone()))
                     }
                     None => match self.written.corrections.get(&pos).cloned() {
+                        // The correction taken already, to a name that is
+                        // not declared after all (its declaration was cut
+                        // short by a syntax error, `int head = heads + ;`):
+                        // reported, and nothing more to check.
+                        Some(c) if c.name == *name => return Err(Reported),
                         // clang's typo correction: the name taken for one in
                         // scope, which the expression then is.
                         Some(c) => {

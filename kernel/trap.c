@@ -358,7 +358,9 @@ static bool stack_fault(struct trap_frame *f) {
  * (mm_fault(), mmap.h: demand paging). Any other fault in a mapping (an
  * access its protections don't allow, a page past a shared object's end,
  * no memory left) is the program's: it kills it, as Linux's SIGSEGV and
- * SIGBUS would. */
+ * SIGBUS would, and its OOM killer when memory runs out, which is said
+ * first, as for the stack: the fault's report alone would read as an
+ * address the program has no mapping at. */
 static bool area_fault(struct trap_frame *f) {
     u32 access;
     if (f->scause == CAUSE_LOAD_PAGE_FAULT) {
@@ -370,7 +372,12 @@ static bool area_fault(struct trap_frame *f) {
     } else {
         return false;
     }
-    if (!mm_fault(myproc()->pagetable, f->stval, access)) {
+    struct proc *p = myproc();
+    long r = mm_fault(p->pagetable, f->stval, access);
+    if (r == -ENOMEM) {
+        kprintf("pid %u (%s): no memory for a page of its mapping at " REG_FMT "\n", p->pid, p->name, f->stval);
+    }
+    if (r != 0) {
         return false;
     }
     /* A new mapping only: this hart may have cached the missing one. */
