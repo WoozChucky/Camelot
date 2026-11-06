@@ -91,8 +91,10 @@ struct file {
  *             f_op->mmap): given the mapping's offset into that memory and
  *             its size (whole pages), 0 with the physical address of the
  *             first page in *pa, the rest following it, or an error
- *             (-EINVAL past the memory). NULL: -ENODEV. The area made
- *             of it is then a vm_open's, as filemmap() calls it
+ *             (-EINVAL past the memory). NULL: -ENODEV. A mapping it
+ *             gives counts as a vm_open's, taken with the address, so
+ *             that the memory can't change between the two (mmap.c lets
+ *             go of it with a vm_close if the mapping isn't made)
  *   vm_open   a mapping of the device's memory more, or one fewer: an area
  *   vm_close  split in two, merged or unmapped (Linux's vm_operations
  *             open and close), so that the driver knows while its memory

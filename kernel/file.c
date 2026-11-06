@@ -32,10 +32,15 @@ void file_init(void) {
 
 /* The drivers, by major number: 0 is none, CONSOLE the console (reads and
  * writes), FB the framebuffer (its memory, for mmap, and its mode through
- * ioctl). A major whose entry is all NULL has no driver. */
+ * ioctl, fb.h). A major whose entry is all NULL has no driver. */
 const struct devsw devsw[NDEV] = {
     [CONSOLE] = {.read = console_read, .write = console_write},
-    [FB] = {.ioctl = fb_ioctl, .mmap = fb_mmap},
+    [FB] = {.open = fb_open,
+            .close = fb_close,
+            .ioctl = fb_ioctl,
+            .mmap = fb_mmap,
+            .vm_open = fb_vm_open,
+            .vm_close = fb_vm_close},
 };
 
 bool device_has_driver(u32 major) {
@@ -432,8 +437,6 @@ int filemmap(struct file *f, u32 type, u32 prot, u64 offset, usize size, struct 
         }
         a->kind = AREA_DEVICE;
         a->major = f->major;
-        /* The new area, which mmap makes or lets go of (drop_backing). */
-        device_vm_open(f->major);
         a->may_write = f->writable;
         return 0;
     }

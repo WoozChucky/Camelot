@@ -174,6 +174,83 @@ typedef unsigned long long uint64_t;
 #define MFD_CLOEXEC 0x1
 #define MFD_ALLOW_SEALING 0x2
 
+/* /dev/fb0's ioctl requests and structures, Linux's fbdev
+ * (<linux/fb.h>; kernel/include/fb.h, docs/camelot-syscalls.md "The
+ * framebuffer"). */
+#define FBIOGET_VSCREENINFO 0x4600
+#define FBIOPUT_VSCREENINFO 0x4601
+#define FBIOGET_FSCREENINFO 0x4602
+#define FBIOPAN_DISPLAY 0x4606
+#define FBIOBLANK 0x4611
+#define FBIO_WAITFORVSYNC 0x40044620
+#define FB_ACTIVATE_NOW 0
+#define FB_ACTIVATE_NXTOPEN 1
+#define FB_ACTIVATE_TEST 2
+#define FB_ACTIVATE_MASK 15
+#define FB_ACTIVATE_VBL 16
+#define FB_TYPE_PACKED_PIXELS 0
+#define FB_VISUAL_TRUECOLOR 2
+#define FB_BLANK_UNBLANK 0
+#define FB_BLANK_POWERDOWN 4
+
+struct fb_bitfield {
+    uint offset;
+    uint length;
+    uint msb_right;
+};
+
+/* 160 bytes: the mode, the buffer's size and the row shown from. */
+struct fb_var_screeninfo {
+    uint xres;
+    uint yres;
+    uint xres_virtual;
+    uint yres_virtual;
+    uint xoffset;
+    uint yoffset;
+    uint bits_per_pixel;
+    uint grayscale;
+    struct fb_bitfield red;
+    struct fb_bitfield green;
+    struct fb_bitfield blue;
+    struct fb_bitfield transp;
+    uint nonstd;
+    uint activate;
+    uint height;
+    uint width;
+    uint accel_flags;
+    uint pixclock;
+    uint left_margin;
+    uint right_margin;
+    uint upper_margin;
+    uint lower_margin;
+    uint hsync_len;
+    uint vsync_len;
+    uint sync;
+    uint vmode;
+    uint rotate;
+    uint colorspace;
+    uint reserved[4];
+};
+
+/* 80 bytes: the buffer. */
+struct fb_fix_screeninfo {
+    char id[16];
+    unsigned long smem_start;
+    uint smem_len;
+    uint type;
+    uint type_aux;
+    uint visual;
+    ushort xpanstep;
+    ushort ypanstep;
+    ushort ywrapstep;
+    uint line_length;
+    unsigned long mmio_start;
+    uint mmio_len;
+    uint accel;
+    ushort capabilities;
+    ushort reserved[2];
+};
+
 /* lseek's `whence`. */
 #define SEEK_SET 0
 #define SEEK_CUR 1

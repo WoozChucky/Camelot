@@ -1127,6 +1127,83 @@ fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
     }
 }
 
+/// A machine with the root image, booted to its first prompt, and the pages
+/// spare then.
+fn root_machine() -> (Machine, grail::elf::Elf, std::sync::mpsc::Sender<u8>, u32) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load(
+        Setup {
+            disks: vec![root_disk(4096, &[])],
+            ..Setup::default()
+        }
+        .config(),
+        Some(rx),
+    );
+    step_to_prompt(&mut m, 1);
+    let spare = spare_pages(&m, &elf);
+    (m, elf, tx, spare)
+}
+
+#[test]
+fn the_framebuffer_device_answers_linuxs_fbdev_requests() {
+    // Issue #178: fbtest's checks of /dev/fb0's ioctls: the mode and the
+    // buffer (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO), modes set and
+    // tested (FBIOPUT_VSCREENINFO) in RAM and back in VRAM, -EBUSY while the
+    // buffer is mapped, a double-height buffer flipped with FBIOPAN_DISPLAY,
+    // FBIO_WAITFORVSYNC, FBIOBLANK and the errors. Every buffer in RAM is
+    // given back once the device is let go, and the display is 640x480
+    // from VRAM again.
+    let (mut m, elf, tx, before) = root_machine();
+    for b in b"fbtest\n" {
+        tx.send(*b).unwrap();
+    }
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(all_checks_pass(&out, "fbtest", "fbtest"), 63, "{out}");
+    assert_eq!(spare_pages(&m, &elf), before, "{out}");
+    let fb = &m.cpu.bus.fb;
+    assert_eq!((fb.mode().width, fb.mode().height, fb.scanout()), (640, 480, 0));
+    assert!(fb.enabled());
+}
+
+#[test]
+fn a_program_shows_800x600_from_ram_with_a_flip() {
+    // `fbtest show` sets 800x600 with two frames in RAM, draws both and
+    // flips to the second: the display scans it out, from row 608, the
+    // first on a page after the first frame.
+    // When the program lets go of the device, the display is 640x480 from
+    // VRAM again and the buffer's pages are free.
+    let (mut m, elf, tx, before) = root_machine();
+    for b in b"fbtest show\n" {
+        tx.send(*b).unwrap();
+    }
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| m.cpu.bus.uart.captured.ends_with(b"fbtest: shown\n"),
+    );
+    let fb = &m.cpu.bus.fb;
+    assert_eq!((fb.mode().width, fb.mode().height), (800, 600));
+    let scanout = fb.scanout();
+    assert!(scanout != 0 && scanout % 4096 == 0, "{scanout:#x}");
+    assert!(spare_pages(&m, &elf) <= before - 1208 * 800 * 4 / 4096);
+    let frame = m.cpu.bus.frame();
+    assert_eq!((frame.width, frame.height), (800, 600));
+    for (x, y) in [(0, 0), (799, 0), (123, 321), (0, 599), (799, 599)] {
+        assert_eq!(
+            frame.pixel(x, y),
+            (x & 0xff) << 16 | (y & 0xff) << 8 | 0x41,
+            "({x}, {y})"
+        );
+    }
+    tx.send(b'\n').unwrap();
+    step_to_prompt(&mut m, 2);
+    let fb = &m.cpu.bus.fb;
+    assert_eq!((fb.mode().width, fb.mode().height, fb.scanout()), (640, 480, 0));
+    assert_eq!(spare_pages(&m, &elf), before, "{}", printed(&m));
+}
+
 #[test]
 fn bad_pointers_are_refused() {
     // Issue #21's second criterion. badptr hands write and read kernel

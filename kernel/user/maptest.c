@@ -407,11 +407,13 @@ static void fb_checks(void) {
     check_eq(map(0, PAGE, PROT_READ, MAP_SHARED, fd, (off_t)FB_SIZE), -EINVAL, "an offset at its end");
     char buf[4];
     check_eq(read(fd, buf, 4), -EINVAL, "read() of the device");
+    /* Opened before the other goes: the device stays in use, so the
+     * console doesn't take the screen back meanwhile (fb.h). */
+    int ro = open("/dev/fb0", O_RDONLY);
     check_eq(munmap((void *)second, PAGE), 0, "munmap the second");
     check_eq(munmap(px, FB_SIZE), 0, "munmap the first");
     close(fd);
 
-    int ro = open("/dev/fb0", O_RDONLY);
     check_eq(map(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, ro, 0), -EACCES,
              "a writable mapping of a descriptor open for reading");
     check_eq(map(0, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, ro, 0), -EACCES,

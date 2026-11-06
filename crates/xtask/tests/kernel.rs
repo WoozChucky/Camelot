@@ -34,7 +34,7 @@ use grail::block::{
 };
 use grail::bus::{BLK_BASE, BLK_SIZE, MAX_DISKS, PLIC_BASE, RAM_BASE, SYSINFO_BASE, SYSINFO_SIZE, UART_BASE};
 use grail::cpu::Mode;
-use grail::devices::{BLK_IRQ, UART_IRQ};
+use grail::devices::{BLK_IRQ, FB_IRQ, UART_IRQ};
 use grail::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use grail::sysinfo::{REG_MAGIC, REG_TIMEBASE_HZ};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
@@ -114,6 +114,10 @@ fn mode() -> PagingMode {
 /// The kernel stacks' size and slot, and how many slots there are, at the
 /// start of the vmalloc area (vm.h).
 const KSTACK_SIZE: u64 = 16 * 1024;
+
+/// The PLIC sources the kernel enables on every machine of the tests: the
+/// UART's and the display's vertical blank.
+const BOOT_IRQS: u64 = 1 << UART_IRQ | 1 << FB_IRQ;
 const KSTACK_SLOT: u64 = 2 * KSTACK_SIZE;
 const KSTACK_SLOTS: u64 = 64;
 
@@ -132,6 +136,7 @@ kprintf self-test: 33/33 passed
 ram: 8 MiB at 0x80000000
 paging: on (MODE)
 vm self-test: 26/26 passed
+fb: 640x480, 6 modes, irq 16
 timer: 10 Hz tick, 10000000 Hz timebase
 disk: none
 tick 1
@@ -2421,17 +2426,19 @@ fn check_kernel_memory(ram_mib: usize) {
         }
     }
     assert_eq!(fixmap, 2, "the fixmap: sysinfo and the UART");
-    // What the drivers asked for: sysinfo, the UART and the PLIC; not the
-    // CLINT, which is the firmware's, nor the test device or the
-    // framebuffer.
-    for base in [SYSINFO_BASE, UART_BASE, PLIC_BASE] {
+    // What the drivers asked for: sysinfo, the UART, the PLIC and the
+    // display, its registers and VRAM; not the CLINT, which is the
+    // firmware's, nor the test device.
+    for base in [
+        SYSINFO_BASE,
+        UART_BASE,
+        PLIC_BASE,
+        grail::bus::FB_CTRL_BASE,
+        grail::bus::VRAM_BASE,
+    ] {
         assert!(devices.contains(&base), "{base:#x} not mapped: {devices:x?}");
     }
-    for base in [
-        grail::bus::CLINT_BASE,
-        grail::bus::TEST_DEV_BASE,
-        grail::bus::FB_CTRL_BASE,
-    ] {
+    for base in [grail::bus::CLINT_BASE, grail::bus::TEST_DEV_BASE] {
         assert!(
             !devices.iter().any(|&d| (base..base + PAGE).contains(&d)),
             "{base:#x}"
@@ -2803,10 +2810,12 @@ fn plic_routes_the_uart_to_the_kernel() {
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == wfi);
     let mut reg = |addr| m.cpu.bus.read(addr, 4).unwrap();
-    // Source 1 (the UART) at priority 1, enabled for context 1 (S-mode) only,
-    // whose threshold of 0 lets it through.
+    // Source 1 (the UART) and 16 (the display's vertical blank) at priority
+    // 1, enabled for context 1 (S-mode) only, whose threshold of 0 lets
+    // them through.
     assert_eq!(reg(plic_priority(UART_IRQ)), 1);
-    assert_eq!(reg(plic_enable(1)), 1 << UART_IRQ);
+    assert_eq!(reg(plic_priority(FB_IRQ)), 1);
+    assert_eq!(reg(plic_enable(1)), BOOT_IRQS);
     assert_eq!(reg(plic_threshold(1)), 0);
     assert_eq!(reg(plic_enable(0)), 0);
     // sie.SEIE on (with the tick's STIE and the IPI's SSIE, and M-mode's
@@ -3129,7 +3138,7 @@ fn kernel_boots_without_a_disk_and_says_so() {
     assert!(out.contains("timebase\ndisk: none\ntick 1\n"), "{out}");
     assert!(t.commands.is_empty() && t.sleeps.is_empty(), "{t:?}");
     assert_eq!(t.accesses, 0, "{t:?}");
-    assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(1 << UART_IRQ));
+    assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(BOOT_IRQS));
 }
 
 #[test]
@@ -3155,7 +3164,7 @@ fn disk_blocks_round_trip_through_the_cache_with_interrupts() {
     assert_eq!(m.cpu.bus.read(plic_priority(BLK_IRQ), 4), Ok(1));
     assert_eq!(
         m.cpu.bus.read(plic_enable(1), 4),
-        Ok(1 << UART_IRQ | 1 << BLK_IRQ)
+        Ok(BOOT_IRQS | 1 << BLK_IRQ)
     );
 
     // One request at a time, each finished by its interrupt: every command
@@ -3281,11 +3290,11 @@ fn kernel_processes_give_back_their_pages() {
         |m| printed(m).ends_with(PROMPT),
     );
     assert!(printed(&with_disk).contains(" passed\n"));
-    // But for the disk's registers' mapping: their ioremap() takes a page
-    // for the table it needs.
+    // The disk's registers' mapping takes no page for a table: their
+    // ioremap() comes after the display's, whose last table has room.
     let tables = |m: &Machine| kernel_leaves(m, kernel_pagetable_pa(m, &elf)).1.len() as u32;
     let disk_tables = tables(&with_disk) - tables(&plain);
-    assert_eq!(disk_tables, 1);
+    assert_eq!(disk_tables, 0);
     assert_eq!(
         common::free_pages(&with_disk, &elf) + disk_tables,
         common::free_pages(&plain, &elf)
@@ -3473,7 +3482,7 @@ fn a_disk_entry_without_a_usable_interrupt_is_skipped() {
         assert_eq!(mask(&printed(&m)), halted_output(), "irq {irq}");
         assert_eq!(t.accesses, 0, "irq {irq}: {t:?}");
         assert_eq!(m.cpu.bus.disks[0].ctrl, 0);
-        assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(1 << UART_IRQ));
+        assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(BOOT_IRQS));
     }
 }
 
@@ -3499,7 +3508,7 @@ fn every_disk_is_found_and_disk_0_is_tested() {
     assert_eq!(m.cpu.bus.disks[1].ctrl, 1);
     assert_eq!(
         m.cpu.bus.read(plic_enable(1), 4),
-        Ok(1 << UART_IRQ | 1 << BLK_IRQ | 1 << (BLK_IRQ + 1))
+        Ok(BOOT_IRQS | 1 << BLK_IRQ | 1 << (BLK_IRQ + 1))
     );
     assert_eq!(disk_contents(&mut m, 1), second);
 }

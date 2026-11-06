@@ -48,6 +48,7 @@ kprintf self-test: 33/33 passed
 ram: 128 MiB at 0x80000000
 paging: on (Sv48)
 vm self-test: 26/26 passed
+fb: 640x480, 6 modes, irq 16
 timer: 10 Hz tick, 10000000 Hz timebase
 disk: none
 tick 1
@@ -75,6 +76,7 @@ cargo run --release -p grail -- --disk examples/disk/disk.img kernel/kernel.elf
 ```
 
 ```
+fb: 640x480, 6 modes, irq 16
 timer: 10 Hz tick, 10000000 Hz timebase
 disk 0: 8 sectors (4 KiB), irq 3
 tick 1
