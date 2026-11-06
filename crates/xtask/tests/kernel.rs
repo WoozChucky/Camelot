@@ -1324,6 +1324,24 @@ fn kernel_memory_functions_at_every_alignment() {
             }
         }
     }
+    // And farther apart, every distance either way to 80 bytes, past a round
+    // of eight registers (64 bytes) plus a register's alignment: memmove's
+    // way down and up, and memcpy (dst never overlapping src there), at the
+    // lengths around the registers' and the rounds' steps.
+    for s in 0..80 {
+        for d in 0..80 {
+            for n in [16u64, 17, 23, 63, 64, 65, 71, 127, 128, 129, 200, 1000] {
+                let len = (n + 80) as usize;
+                put_bytes(&mut m, buf, &whole[..len]);
+                let overlap = s.max(d) < s.min(d) + n;
+                let f = if overlap { "memmove" } else { "memcpy" };
+                assert_eq!(call_kernel(&mut m, &elf, f, &[buf + d, buf + s, n]), buf + d);
+                let mut want = whole[..len].to_vec();
+                want.copy_within(s as usize..(s + n) as usize, d as usize);
+                assert_eq!(get_bytes(&m, buf, n + 80), want, "{f} {s}->{d}+{n} in place");
+            }
+        }
+    }
     // memcmp: 0 for equal bytes, whatever comes after them; else -1 or 1
     // as the first byte that differs is lower or higher, as unsigned bytes
     // (0x80 above 0x01), wherever it is: before a register boundary, in a
