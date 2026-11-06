@@ -17,6 +17,9 @@
 #include "trap.h"
 #include "blk.h"
 #include "console.h"
+#include "fb.h"
+#include "fbcon.h"
+#include "input.h"
 #include "kprintf.h"
 #include "net.h"
 #include "nic.h"
@@ -96,6 +99,7 @@ const char *trap_cause_name(uintptr cause) {
 }
 
 static void halt_after_panic(void) {
+    fbcon_panic_flush();
     machine_power_off(PANIC_EXIT_CODE);
 }
 
@@ -237,7 +241,7 @@ static void external_interrupt(void) {
     u32 irq = plic_claim();
     if (irq == PLIC_IRQ_UART) {
         console_intr();
-    } else if (!blk_intr(irq)) {
+    } else if (!blk_intr(irq) && !fb_intr(irq) && !keyboard_intr(irq) && !pointer_intr(irq)) {
         nic_intr(irq);
     }
     /* 0: nothing left to claim. Only enabled sources can be claimed, so any
@@ -279,6 +283,7 @@ static void clock_tick(u32 n) {
     wakeup((const void *)&ticks);
     release(&tickslock);
     net_timer();
+    fbcon_flush();
 }
 
 /* The supervisor timer interrupt: this hart's tick. The next one first,
@@ -423,9 +428,8 @@ bool is_page_fault(uintptr scause) {
 
 void trap_init(void) {
     initlock(&tickslock, "ticks");
-    plic_init();
-    /* The timer, IPIs and devices; then the first tick, one interval from
-     * now. */
+    /* The timer, IPIs and devices (the PLIC set up already: plic_init());
+     * then the first tick, one interval from now. */
     w_sie(r_sie() | SIE_STIE | SIE_SSIE | SIE_SEIE);
     timer_start();
     w_sstatus(r_sstatus() | SSTATUS_SIE);

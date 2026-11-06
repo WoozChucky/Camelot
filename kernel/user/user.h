@@ -65,6 +65,7 @@ typedef unsigned long long uint64_t;
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping */
 #define EACCES 13       /* spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
+#define EBUSY 16        /* ioctl: the device's memory is mapped, and the request would change it */
 #define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */
 #define ENODEV 19       /* open: a device node with no driver; mmap: a file that can't be mapped */
 #define ENOTDIR 20      /* a name on the way is not a directory */
@@ -72,6 +73,7 @@ typedef unsigned long long uint64_t;
 #define EINVAL 22       /* an argument is out of range */
 #define ENFILE 23       /* every slot of the kernel's open file table is taken */
 #define EMFILE 24       /* every descriptor of the process is taken */
+#define ENOTTY 25       /* ioctl: not a device, or a request the device doesn't know */
 #define EFBIG 27        /* write: past the largest file */
 #define ENOSPC 28       /* no free block or inode on the disk */
 #define ESPIPE 29       /* lseek: not on a pipe or a device */
@@ -171,6 +173,83 @@ typedef unsigned long long uint64_t;
 /* memfd_create's flags (Linux's values; kernel/include/shm.h). */
 #define MFD_CLOEXEC 0x1
 #define MFD_ALLOW_SEALING 0x2
+
+/* /dev/fb0's ioctl requests and structures, Linux's fbdev
+ * (<linux/fb.h>; kernel/include/fb.h, docs/camelot-syscalls.md "The
+ * framebuffer"). */
+#define FBIOGET_VSCREENINFO 0x4600
+#define FBIOPUT_VSCREENINFO 0x4601
+#define FBIOGET_FSCREENINFO 0x4602
+#define FBIOPAN_DISPLAY 0x4606
+#define FBIOBLANK 0x4611
+#define FBIO_WAITFORVSYNC 0x40044620
+#define FB_ACTIVATE_NOW 0
+#define FB_ACTIVATE_NXTOPEN 1
+#define FB_ACTIVATE_TEST 2
+#define FB_ACTIVATE_MASK 15
+#define FB_ACTIVATE_VBL 16
+#define FB_TYPE_PACKED_PIXELS 0
+#define FB_VISUAL_TRUECOLOR 2
+#define FB_BLANK_UNBLANK 0
+#define FB_BLANK_POWERDOWN 4
+
+struct fb_bitfield {
+    uint offset;
+    uint length;
+    uint msb_right;
+};
+
+/* 160 bytes: the mode, the buffer's size and the row shown from. */
+struct fb_var_screeninfo {
+    uint xres;
+    uint yres;
+    uint xres_virtual;
+    uint yres_virtual;
+    uint xoffset;
+    uint yoffset;
+    uint bits_per_pixel;
+    uint grayscale;
+    struct fb_bitfield red;
+    struct fb_bitfield green;
+    struct fb_bitfield blue;
+    struct fb_bitfield transp;
+    uint nonstd;
+    uint activate;
+    uint height;
+    uint width;
+    uint accel_flags;
+    uint pixclock;
+    uint left_margin;
+    uint right_margin;
+    uint upper_margin;
+    uint lower_margin;
+    uint hsync_len;
+    uint vsync_len;
+    uint sync;
+    uint vmode;
+    uint rotate;
+    uint colorspace;
+    uint reserved[4];
+};
+
+/* 80 bytes: the buffer. */
+struct fb_fix_screeninfo {
+    char id[16];
+    unsigned long smem_start;
+    uint smem_len;
+    uint type;
+    uint type_aux;
+    uint visual;
+    ushort xpanstep;
+    ushort ypanstep;
+    ushort ywrapstep;
+    uint line_length;
+    unsigned long mmio_start;
+    uint mmio_len;
+    uint accel;
+    ushort capabilities;
+    ushort reserved[2];
+};
 
 /* lseek's `whence`. */
 #define SEEK_SET 0
@@ -300,6 +379,145 @@ struct timeval {
     long tv_usec;
 };
 
+/* /dev/input/event0 (the keyboard) and event1 (the pointer): Linux's evdev
+ * (<linux/input.h>, <linux/input-event-codes.h>; kernel/include/input.h,
+ * docs/camelot-syscalls.md "Input devices"). A read gives whole events. */
+struct input_event {
+    struct timeval time;
+    ushort type;
+    ushort code;
+    int value;
+};
+
+struct input_id {
+    ushort bustype;
+    ushort vendor;
+    ushort product;
+    ushort version;
+};
+
+struct input_absinfo {
+    int value;
+    int minimum;
+    int maximum;
+    int fuzz;
+    int flat;
+    int resolution;
+};
+
+#define EV_VERSION 0x010001
+#define EVIOCGVERSION 0x80044501
+#define EVIOCGID 0x80084502
+#define EVIOCGRAB 0x40044590
+#define EVIOCGNAME(len) (0x80004506 | (len) << 16)
+#define EVIOCGBIT(ev, len) (0x80004520 + (ev) | (len) << 16)
+#define EVIOCGABS(abs) (0x80184540 + (abs))
+#define EVIOCGKEY(len) (0x80004518 | (len) << 16)
+
+#define EV_SYN 0x00
+#define EV_KEY 0x01
+#define EV_REL 0x02
+#define EV_ABS 0x03
+#define EV_MSC 0x04
+#define EV_CNT 0x20
+#define SYN_REPORT 0
+#define SYN_DROPPED 3
+#define REL_X 0x00
+#define REL_Y 0x01
+#define REL_WHEEL 0x08
+#define ABS_X 0x00
+#define ABS_Y 0x01
+#define BTN_LEFT 0x110
+#define BTN_RIGHT 0x111
+#define BTN_MIDDLE 0x112
+#define KEY_CNT 0x300
+#define BUS_HOST 0x19
+
+/* The keys of a PC keyboard's main block and the keys around it. */
+#define KEY_ESC 1
+#define KEY_1 2
+#define KEY_2 3
+#define KEY_3 4
+#define KEY_4 5
+#define KEY_5 6
+#define KEY_6 7
+#define KEY_7 8
+#define KEY_8 9
+#define KEY_9 10
+#define KEY_0 11
+#define KEY_MINUS 12
+#define KEY_EQUAL 13
+#define KEY_BACKSPACE 14
+#define KEY_TAB 15
+#define KEY_Q 16
+#define KEY_W 17
+#define KEY_E 18
+#define KEY_R 19
+#define KEY_T 20
+#define KEY_Y 21
+#define KEY_U 22
+#define KEY_I 23
+#define KEY_O 24
+#define KEY_P 25
+#define KEY_LEFTBRACE 26
+#define KEY_RIGHTBRACE 27
+#define KEY_ENTER 28
+#define KEY_LEFTCTRL 29
+#define KEY_A 30
+#define KEY_S 31
+#define KEY_D 32
+#define KEY_F 33
+#define KEY_G 34
+#define KEY_H 35
+#define KEY_J 36
+#define KEY_K 37
+#define KEY_L 38
+#define KEY_SEMICOLON 39
+#define KEY_APOSTROPHE 40
+#define KEY_GRAVE 41
+#define KEY_LEFTSHIFT 42
+#define KEY_BACKSLASH 43
+#define KEY_Z 44
+#define KEY_X 45
+#define KEY_C 46
+#define KEY_V 47
+#define KEY_B 48
+#define KEY_N 49
+#define KEY_M 50
+#define KEY_COMMA 51
+#define KEY_DOT 52
+#define KEY_SLASH 53
+#define KEY_RIGHTSHIFT 54
+#define KEY_LEFTALT 56
+#define KEY_SPACE 57
+#define KEY_CAPSLOCK 58
+#define KEY_F1 59
+#define KEY_F2 60
+#define KEY_F3 61
+#define KEY_F4 62
+#define KEY_F5 63
+#define KEY_F6 64
+#define KEY_F7 65
+#define KEY_F8 66
+#define KEY_F9 67
+#define KEY_F10 68
+#define KEY_F11 87
+#define KEY_F12 88
+#define KEY_RIGHTCTRL 97
+#define KEY_RIGHTALT 100
+#define KEY_HOME 102
+#define KEY_UP 103
+#define KEY_PAGEUP 104
+#define KEY_LEFT 105
+#define KEY_RIGHT 106
+#define KEY_END 107
+#define KEY_DOWN 108
+#define KEY_PAGEDOWN 109
+#define KEY_INSERT 110
+#define KEY_DELETE 111
+#define KEY_LEFTMETA 125
+#define KEY_RIGHTMETA 126
+
 /* An address in network byte order (big-endian): use htonl and ntohl. */
 struct in_addr {
     uint s_addr;
@@ -373,6 +591,7 @@ int munmap(void *addr, size_t len);
 int mprotect(void *addr, size_t len, int prot);
 int memfd_create(const char *name, uint flags);
 int ftruncate(int fd, off_t length);
+int ioctl(int fd, unsigned long request, ...);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);

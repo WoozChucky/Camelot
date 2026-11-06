@@ -385,6 +385,9 @@ void syscall(struct trap_frame *f) {
     case SYS_ftruncate:
         ret = sys_ftruncate(f);
         break;
+    case SYS_ioctl:
+        ret = sys_ioctl(f);
+        break;
     default:
         ret = -ENOSYS;
         break;

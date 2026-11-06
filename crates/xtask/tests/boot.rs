@@ -354,9 +354,9 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
     let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
     let kernel_blocks = boot::loadable(&kernel).unwrap().len().div_ceil(BSIZE) as u32;
     // A bigger --size: a bigger filesystem, the same kernel.
-    let image = xtask::fs::build_bootable(&root, 3000).unwrap();
-    assert_eq!(image.len(), 3000 * BSIZE);
-    assert_eq!(fsck::check(&image).unwrap().sb.size, 3000 - kernel_blocks);
+    let image = xtask::fs::build_bootable(&root, 4200).unwrap();
+    assert_eq!(image.len(), 4200 * BSIZE);
+    assert_eq!(fsck::check(&image).unwrap().sb.size, 4200 - kernel_blocks);
     // The programs do not fit in 1 MiB, nor anything in the kernel's own size.
     let err = xtask::fs::build_bootable(&root, 1024).unwrap_err();
     assert!(

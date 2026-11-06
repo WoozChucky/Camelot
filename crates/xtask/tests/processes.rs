@@ -20,8 +20,9 @@
 mod common;
 
 use common::{
-    command_output, image_pa, kpa, peek64, printed, proc_name, spare_pages, sym, LockWatch, CPU_PROC,
-    KSTACK_PAGES, MAPTEST_CHECKS, PROC_PID, PROMPT,
+    command_output, image_pa, kpa, peek64, printed, proc_name, screen, screen_rows_of, screen_text,
+    spare_pages, step_to_frame, sym, LockWatch, ScreenCell, CPU_PROC, KSTACK_PAGES, MAPTEST_CHECKS, PROC_PID,
+    PROMPT,
 };
 use excalibur::csr::{IRQ_S_EXT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPP};
 use grail::cpu::Mode;
@@ -1097,8 +1098,10 @@ fn memory_mappings_are_mapped_on_demand_and_given_back() {
 fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
     // Issue #179's device mappings: `maptest fb` on the root image maps
     // /dev/fb0, the framebuffer's VRAM, draws a pattern into it and checks
-    // the errors. The display shows what it drew, and no page of RAM went
-    // to it: a device's pages are the device's.
+    // the errors. The display shows what it drew while the program has the
+    // device, and no page of RAM went to it: a device's pages are the
+    // device's. Once it lets go, the framebuffer console (fbcon.h) takes
+    // the screen back and draws its text again.
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load(
         Setup {
@@ -1110,13 +1113,17 @@ fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
     );
     step_to_prompt(&mut m, 1);
     let before = spare_pages(&m, &elf);
-    for b in b"maptest fb\n" {
-        tx.send(*b).unwrap();
-    }
-    step_to_prompt(&mut m, 2);
-    let out = printed(&m);
-    assert_eq!(spare_pages(&m, &elf), before, "{out}");
-    assert_eq!(all_checks_pass(&out, "maptest fb", "maptest"), 15, "{out}");
+    type_line(&tx, "maptest fb\n");
+    step_to_output(&mut m, "maptest: drawn\n");
+    // Ticks on: the console doesn't draw over it.
+    let ticks = sym(&elf, "ticks");
+    let now = common::peek(&m.cpu, ticks);
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| common::peek(&m.cpu, ticks) >= now + 2,
+    );
     let fb = &m.cpu.bus.fb;
     for (x, y) in [(0, 0), (1, 0), (639, 0), (0, 479), (321, 123), (639, 479)] {
         assert_eq!(
@@ -1125,6 +1132,430 @@ fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
             "({x}, {y})"
         );
     }
+    type_line(&tx, "\n");
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(spare_pages(&m, &elf), before, "{out}");
+    assert_eq!(all_checks_pass(&out, "maptest fb", "maptest"), 15, "{out}");
+    step_to_frame(&mut m);
+    assert_eq!(screen_text(&m), screen_rows_of(&out), "{out}");
+    assert_eq!(m.cpu.bus.fb.pixel(639, 479), 0);
+}
+
+/// A machine with the root image, booted to its first prompt, and the pages
+/// spare then.
+fn root_machine() -> (Machine, grail::elf::Elf, std::sync::mpsc::Sender<u8>, u32) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load(
+        Setup {
+            disks: vec![root_disk(4096, &[])],
+            ..Setup::default()
+        }
+        .config(),
+        Some(rx),
+    );
+    step_to_prompt(&mut m, 1);
+    let spare = spare_pages(&m, &elf);
+    (m, elf, tx, spare)
+}
+
+#[test]
+fn the_framebuffer_device_answers_linuxs_fbdev_requests() {
+    // Issue #178: fbtest's checks of /dev/fb0's ioctls: the mode and the
+    // buffer (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO), modes set and
+    // tested (FBIOPUT_VSCREENINFO) in RAM and back in VRAM, -EBUSY while the
+    // buffer is mapped, a double-height buffer flipped with FBIOPAN_DISPLAY,
+    // FBIO_WAITFORVSYNC, FBIOBLANK and the errors. Every buffer in RAM is
+    // given back once the device is let go, and the display is 640x480
+    // from VRAM again.
+    let (mut m, elf, tx, before) = root_machine();
+    for b in b"fbtest\n" {
+        tx.send(*b).unwrap();
+    }
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(all_checks_pass(&out, "fbtest", "fbtest"), 63, "{out}");
+    assert_eq!(spare_pages(&m, &elf), before, "{out}");
+    let fb = &m.cpu.bus.fb;
+    assert_eq!((fb.mode().width, fb.mode().height, fb.scanout()), (640, 480, 0));
+    assert!(fb.enabled());
+}
+
+#[test]
+fn a_program_shows_800x600_from_ram_with_a_flip() {
+    // `fbtest show` sets 800x600 with two frames in RAM, draws both and
+    // flips to the second: the display scans it out, from row 608, the
+    // first on a page after the first frame.
+    // When the program lets go of the device, the display is 640x480 from
+    // VRAM again and the buffer's pages are free.
+    let (mut m, elf, tx, before) = root_machine();
+    for b in b"fbtest show\n" {
+        tx.send(*b).unwrap();
+    }
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| m.cpu.bus.uart.captured.ends_with(b"fbtest: shown\n"),
+    );
+    let fb = &m.cpu.bus.fb;
+    assert_eq!((fb.mode().width, fb.mode().height), (800, 600));
+    let scanout = fb.scanout();
+    assert!(scanout != 0 && scanout % 4096 == 0, "{scanout:#x}");
+    assert!(spare_pages(&m, &elf) <= before - 1208 * 800 * 4 / 4096);
+    let frame = m.cpu.bus.frame();
+    assert_eq!((frame.width, frame.height), (800, 600));
+    for (x, y) in [(0, 0), (799, 0), (123, 321), (0, 599), (799, 599)] {
+        assert_eq!(
+            frame.pixel(x, y),
+            (x & 0xff) << 16 | (y & 0xff) << 8 | 0x41,
+            "({x}, {y})"
+        );
+    }
+    tx.send(b'\n').unwrap();
+    step_to_prompt(&mut m, 2);
+    let fb = &m.cpu.bus.fb;
+    assert_eq!((fb.mode().width, fb.mode().height, fb.scanout()), (640, 480, 0));
+    assert_eq!(spare_pages(&m, &elf), before, "{}", printed(&m));
+}
+
+/// Types `line` on the UART.
+fn type_line(tx: &std::sync::mpsc::Sender<u8>, line: &str) {
+    for b in line.bytes() {
+        tx.send(b).unwrap();
+    }
+}
+
+/// Steps `m` until what it printed ends with `tail`.
+fn step_to_output(m: &mut Machine, tail: &str) {
+    step_until(
+        m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| m.cpu.bus.uart.captured.ends_with(tail.as_bytes()),
+    );
+}
+
+/// Runs `command`, an `inputtest` that prints `ready` when it is reading,
+/// on a root machine; then gives it `input` (each a key or a pointer
+/// change) and returns the lines it printed after `ready`, once it is back
+/// at the prompt. `before` runs first, at the prompt.
+fn input_events(
+    command: &str,
+    before: impl FnOnce(&mut Machine, &grail::elf::Elf),
+    input: impl FnOnce(&mut Machine),
+) -> (Machine, String) {
+    let (mut m, elf, tx, _) = root_machine();
+    before(&mut m, &elf);
+    type_line(&tx, &format!("{command}\n"));
+    step_to_output(&mut m, "inputtest: ready\n");
+    let at = m.cpu.bus.uart.captured.len();
+    input(&mut m);
+    step_to_prompt(&mut m, 2);
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured[at..]).into_owned();
+    let out = out.strip_suffix(PROMPT).unwrap_or(&out).to_string();
+    (m, out)
+}
+
+#[test]
+fn a_reader_that_falls_behind_finds_syn_dropped_and_asks_what_is_held() {
+    // A reader's ring holds 128 events: one that doesn't read while 100
+    // keys are pressed and released (402 events with B's press) loses what
+    // it had not read, finds SYN_DROPPED in its place and whole packets
+    // since, and learns from EVIOCGKEY that B, pressed last, is held, which
+    // drops the key events still waiting for it (Linux's evdev).
+    let (mut m, _, tx, _) = root_machine();
+    type_line(&tx, "inputtest overflow\n");
+    step_to_output(&mut m, "inputtest: ready\n");
+    let at = m.cpu.bus.uart.captured.len();
+    let a = key(b'a', 0x04);
+    let mut keys = Vec::new();
+    for _ in 0..100 {
+        keys.push(a);
+        keys.push(release(a));
+    }
+    keys.push(key(b'b', 0x05));
+    for chunk in keys.chunks(32) {
+        for k in chunk {
+            assert!(m.key_event(*k));
+        }
+        step_until(&mut m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.bus.kbd.is_empty());
+    }
+    type_line(&tx, "\n");
+    step_to_prompt(&mut m, 2);
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured[at..]).into_owned();
+    // After the echo of the line typed.
+    let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+    // Each overflow empties the ring for SYN_DROPPED and the packet that
+    // overflowed it: the last one leaves SYN_DROPPED and the last 11
+    // packets (A pressed and released 5 times, then B pressed). The reader
+    // reads SYN_DROPPED, then a whole packet, A's press; EVIOCGKEY drops
+    // the 10 key events left, and the SYN_REPORTs of the packets they made
+    // but the first, which ends the packet read (Linux's
+    // __evdev_flush_queue keeps a leading one).
+    assert_eq!(
+        lines[..5],
+        [
+            "0 3 0",
+            "1 30 1",
+            "0 0 0",
+            "held: KEY_A 0, KEY_B 1",
+            "1 events left, 0 keys"
+        ],
+        "{out}"
+    );
+}
+
+/// A key of both forms, as a host sends it: its ASCII-mode code and its
+/// usage.
+fn key(code: u8, usage: u16) -> grail::keyboard::KeyEvent {
+    grail::keyboard::KeyEvent::press(code).with_usage(usage)
+}
+
+fn release(k: grail::keyboard::KeyEvent) -> grail::keyboard::KeyEvent {
+    grail::keyboard::KeyEvent { release: true, ..k }
+}
+
+#[test]
+fn the_input_devices_answer_evdevs_requests() {
+    // Issue #178: inputtest's checks of /dev/input/event0 and event1:
+    // EVIOCGVERSION, EVIOCGID, EVIOCGNAME, EVIOCGBIT, EVIOCGABS (the
+    // display's size), EVIOCGRAB's rules, reads of whole events and the
+    // errors. The keyboard is in raw mode while it has a reader, and back
+    // in ASCII mode, the console's, after.
+    let (mut m, _, tx, _) = root_machine();
+    type_line(&tx, "inputtest\n");
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(all_checks_pass(&out, "inputtest", "inputtest"), 48, "{out}");
+    assert!(!m.cpu.bus.kbd.raw());
+}
+
+#[test]
+fn keys_reach_a_reader_as_linux_key_codes() {
+    // A reader of the keyboard puts it in raw mode: each key is its HID
+    // usage, which the driver makes Linux's key code, a press and a release
+    // each with its SYN_REPORT. A modifier is a key of its own; a press of
+    // a key already down is no event.
+    let (m, out) = input_events(
+        "inputtest keys 8",
+        |_, _| {},
+        |m| {
+            assert!(m.cpu.bus.kbd.raw());
+            let a = key(b'a', 0x04);
+            assert!(m.key_event(a));
+            assert!(m.key_event(release(a)));
+            assert!(m.key_event(key(0, 0xe1))); // Left Shift
+            assert!(m.key_event(key(0, 0xe3))); // Left GUI
+        },
+    );
+    assert_eq!(
+        out,
+        "1 30 1\n0 0 0\n1 30 0\n0 0 0\n1 42 1\n0 0 0\n1 125 1\n0 0 0\n"
+    );
+    assert!(!m.cpu.bus.kbd.raw());
+}
+
+#[test]
+fn a_keyboard_without_raw_mode_gives_key_codes_made_from_ascii() {
+    // The driver found no raw mode (as on a keyboard before it): an ASCII
+    // code becomes the key that types it on a US layout, with the Shift
+    // and Ctrl its bits say pressed (and let go) around it.
+    let (_, out) = input_events(
+        "inputtest keys 9",
+        |m, elf| {
+            m.cpu
+                .bus
+                .load(image_pa(sym(elf, "keyboard_has_raw")), &[0; 4])
+                .unwrap()
+        },
+        |m| {
+            assert!(!m.cpu.bus.kbd.raw());
+            let shifted = key(b'A', 0x04).with_shift(true);
+            assert!(m.key_event(shifted));
+            assert!(m.key_event(release(shifted)));
+            let ctrl_c = key(b'c', 0x06).with_ctrl(true);
+            assert!(m.key_event(ctrl_c));
+            assert!(m.key_event(release(ctrl_c)));
+        },
+    );
+    assert_eq!(
+        out,
+        "1 42 1\n1 30 1\n0 0 0\n1 30 0\n0 0 0\n1 42 0\n1 29 1\n1 46 1\n0 0 0\n"
+    );
+}
+
+#[test]
+fn the_console_types_what_the_keyboard_types() {
+    // With no reader, the keyboard is the console's, in ASCII mode: the
+    // characters the host's layout typed, which the line editor echoes as
+    // it does the UART's. Ctrl with a letter is its control character:
+    // Ctrl-H erases.
+    let (mut m, _) = load_committed(None);
+    step_to_prompt(&mut m, 1);
+    for c in "hellp".bytes() {
+        assert!(m.key_event(key(c, 0)));
+    }
+    assert!(m.key_event(key(b'h', 0x0b).with_ctrl(true)));
+    for c in "o\n".bytes() {
+        assert!(m.key_event(key(c, 0)));
+    }
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert!(
+        out.ends_with(&format!(
+            "{PROMPT}hellp\x08 \x08o\nhello from user mode\n{PROMPT}"
+        )),
+        "{out}"
+    );
+    // And the framebuffer console shows it, the letter erased gone.
+    step_to_frame(&mut m);
+    let rows = screen_text(&m);
+    let end = rows.iter().rposition(|r| !r.is_empty()).unwrap();
+    assert_eq!(
+        rows[end - 2..=end],
+        ["$ hello", "hello from user mode", "$"],
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn the_framebuffer_console_acts_on_ansis_escape_sequences() {
+    // `fbtest ansi` writes text with the control characters and escape
+    // sequences the console acts on (fbcon.h): colours, bold and reverse
+    // video, a tab, a backspace, the cursor's moves and erasing. Its
+    // layout is in kernel/user/fbtest.c.
+    let (mut m, _, tx, _) = root_machine();
+    type_line(&tx, "fbtest ansi\n");
+    step_to_prompt(&mut m, 2);
+    step_to_frame(&mut m);
+    let rows = screen_text(&m);
+    let mut want = vec![String::new(); 30];
+    for (i, row) in [
+        "plain",
+        "red bold green reverse",
+        "white on blue",
+        "tab     x",
+        "abd",
+        "xxxx",
+        "         at 7,10",
+        "adef",
+        "",
+        "",
+        "",
+        &"w".repeat(80),
+        "wwwww",
+        "fbtest: ansi",
+        "$",
+    ]
+    .iter()
+    .enumerate()
+    {
+        want[i] = row.to_string();
+    }
+    assert_eq!(rows, want, "{}", printed(&m));
+    let cells = screen(&m);
+    let cell = |row: usize, col: usize| cells[row][col];
+    const GREY: u32 = 0xaaaaaa;
+    assert_eq!(
+        cell(0, 0),
+        ScreenCell {
+            ch: 'p',
+            fg: GREY,
+            bg: 0
+        }
+    );
+    assert_eq!(
+        cell(1, 0),
+        ScreenCell {
+            ch: 'r',
+            fg: 0xaa0000,
+            bg: 0
+        },
+        "red"
+    );
+    assert_eq!(
+        cell(1, 4),
+        ScreenCell {
+            ch: 'b',
+            fg: 0x55ff55,
+            bg: 0
+        },
+        "bold: the bright green"
+    );
+    assert_eq!(
+        cell(1, 15),
+        ScreenCell {
+            ch: 'r',
+            fg: 0,
+            bg: GREY
+        },
+        "reverse video"
+    );
+    assert_eq!(
+        cell(2, 0),
+        ScreenCell {
+            ch: 'w',
+            fg: 0xffffff,
+            bg: 0x0000aa
+        },
+        "bright white on blue"
+    );
+    assert_eq!(cell(2, 5).bg, 0x0000aa, "a space in blue");
+    assert_eq!(cell(2, 13).bg, 0, "and none after");
+    // The cursor: an inverse cell after the prompt.
+    assert_eq!(
+        cell(14, 2),
+        ScreenCell {
+            ch: ' ',
+            fg: GREY,
+            bg: GREY
+        }
+    );
+}
+
+#[test]
+fn the_pointer_reports_where_it_is_its_buttons_and_the_wheel() {
+    // The pointer in absolute mode: a move is ABS_X and ABS_Y, the axes
+    // that changed; a button BTN_LEFT; a notch REL_WHEEL; each change a
+    // packet.
+    use grail::pointer::{PointerInput, BUTTON_LEFT};
+    let (_, out) = input_events(
+        "inputtest pointer 11",
+        |_, _| {},
+        |m| {
+            assert!(m.pointer_event(PointerInput::move_to(100, 200)));
+            assert!(m.pointer_event(PointerInput::move_to(100, 201)));
+            assert!(m.pointer_event(PointerInput::buttons(BUTTON_LEFT)));
+            assert!(m.pointer_event(PointerInput::buttons(BUTTON_LEFT).with_wheel(1)));
+            assert!(m.pointer_event(PointerInput::buttons(0)));
+        },
+    );
+    assert_eq!(
+        out,
+        "3 0 100\n3 1 200\n0 0 0\n3 1 201\n0 0 0\n1 272 1\n0 0 0\n2 8 1\n0 0 0\n1 272 0\n0 0 0\n"
+    );
+}
+
+#[test]
+fn a_grab_keeps_the_keys_from_the_other_readers() {
+    // Two readers of the keyboard, the first grabbing it: a key goes to it
+    // alone. Once it lets go, the next goes to every reader: the second
+    // reads that one, and never saw the first.
+    let (mut m, _, tx, _) = root_machine();
+    type_line(&tx, "inputtest grab\n");
+    step_to_output(&mut m, "inputtest: grabbed\n");
+    assert!(m.key_event(key(b'a', 0x04)));
+    step_to_output(&mut m, "inputtest: let go\n");
+    assert!(m.key_event(key(b'b', 0x05)));
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert!(
+        out.ends_with(&format!(
+            "inputtest: grabbed\n1 30 1\n0 0 0\ninputtest: let go\n1 48 1\n0 0 0\n{PROMPT}"
+        )),
+        "{out}"
+    );
 }
 
 #[test]
@@ -1303,7 +1734,17 @@ fn sleeping_processes_leave_the_cpu_idle() {
     let ticks = image_pa(sym(&elf, "ticks"));
     step_to_user(&mut m, &elf, "systest");
     let start = m.cpu.bus.peek(ticks).unwrap();
+    // The echo of the command line may have left the framebuffer console a
+    // scroll to do at the next tick (fbcon_flush, some 200,000 steps with
+    // the screen full), which runs after the tick has counted itself: the
+    // steps are counted from the tick after that one.
     let mut user_steps = 0;
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |cpu| user_steps += u64::from(cpu.mode == Mode::U),
+        |m| m.cpu.bus.peek(ticks).unwrap() > start + 1,
+    );
     let steps = step_until(
         &mut m,
         RUN_MAX_STEPS,
@@ -1312,7 +1753,10 @@ fn sleeping_processes_leave_the_cpu_idle() {
     );
     let slept = m.cpu.bus.peek(ticks).unwrap() - start;
     assert!((50..=51).contains(&slept), "{slept} ticks");
-    assert!(steps < 50 * 15_000, "{steps} steps for {slept} ticks");
+    assert!(
+        steps < 48 * 15_000,
+        "{steps} steps for {slept} ticks less the first two"
+    );
     assert!(user_steps < 10_000, "{user_steps} steps in U-mode");
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
 }

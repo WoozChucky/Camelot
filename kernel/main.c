@@ -10,6 +10,8 @@
 #include "blk.h"
 #include "blktest.h"
 #include "console.h"
+#include "fb.h"
+#include "input.h"
 #include "file.h"
 #include "fstest.h"
 #include "kalloc.h"
@@ -17,6 +19,7 @@
 #include "memlayout.h"
 #include "mmap.h"
 #include "net.h"
+#include "plic.h"
 #include "mmio.h"
 #include "proc.h"
 #include "shm.h"
@@ -373,6 +376,11 @@ int kmain(void) {
     file_init();
     mmap_init();
     shm_init();
+    /* The PLIC, then the display, which needs no interrupt to start: its
+     * mappings take a while, done before the timer's first interval. */
+    plic_init();
+    fb_init();
+    input_init();
     trap_init();
     kprintf("timer: %u Hz tick, %u Hz timebase\n", TICK_HZ, timebase_hz());
     blk_init();
