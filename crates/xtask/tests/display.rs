@@ -95,7 +95,12 @@ impl Desk {
         m.load_elf(&elf).unwrap();
         let (tx, rx) = channel();
         m.set_uart_input(rx);
-        let mut d = Desk { m, tx, seen: 0, input: 0 };
+        let mut d = Desk {
+            m,
+            tx,
+            seen: 0,
+            input: 0,
+        };
         d.wait_for("$ ");
         d
     }
@@ -198,10 +203,7 @@ impl Desk {
     fn screen(&self) -> (u32, u32, Vec<u8>) {
         let frame = self.m.cpu.bus.frame();
         let pixels = frame.composited().expect("the display is on");
-        let rgb = pixels
-            .chunks(4)
-            .flat_map(|p| [p[2], p[1], p[0]])
-            .collect();
+        let rgb = pixels.chunks(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
         (frame.width, frame.height, rgb)
     }
 
@@ -226,11 +228,7 @@ impl Desk {
                 if (ww, wh) != (w, h) {
                     format!("{ww}x{wh}, drawn {w}x{h}")
                 } else {
-                    let n = want
-                        .chunks(3)
-                        .zip(rgb.chunks(3))
-                        .filter(|(a, b)| a != b)
-                        .count();
+                    let n = want.chunks(3).zip(rgb.chunks(3)).filter(|(a, b)| a != b).count();
                     format!("{n} pixels differ")
                 }
             });
@@ -287,7 +285,13 @@ fn windows_are_composited_raised_moved_and_closed() {
     let out = d.out();
     assert_eq!(
         said(&out[from..], "red"),
-        ["pointer 12 52", "focus 1", "modifiers 0 0", "button 272 1", "button 272 0"]
+        [
+            "pointer 12 52",
+            "focus 1",
+            "modifiers 0 0",
+            "button 272 1",
+            "button 272 0"
+        ]
     );
     assert_eq!(said(&out[from..], "green"), ["focus 0"]);
     d.expect_screen("raised");

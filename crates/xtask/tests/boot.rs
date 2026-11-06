@@ -1032,9 +1032,8 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
     // the display server is ready.
     const READY: &str = "compositor: ready on /run/wayland-0 (640x480)\n";
     let printed = |m: &Machine| String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-    let done = |out: &str| {
-        out.contains(READY) && out.find("$ ps\n").is_some_and(|at| out[at + 5..].contains("$ "))
-    };
+    let done =
+        |out: &str| out.contains(READY) && out.find("$ ps\n").is_some_and(|at| out[at + 5..].contains("$ "));
     let mut steps = 0;
     while !done(&printed(&m)) {
         assert!(steps < 2 * BOOT_MAX_STEPS, "{}", printed(&m));
