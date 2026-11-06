@@ -8,7 +8,7 @@
  * bits of a0), a user address is a pointer, a size a size_t and a file
  * offset an off_t (types.h).
  *
- * kernel/user/usys.s (the stubs) and kernel/user/user.h (the error numbers)
+ * kernel/user/lib/usys.s (the stubs) and kernel/user/user.h (the errors)
  * have their own copies of these numbers, and the document a table of them;
  * a test checks that all four agree. */
 #ifndef CAMELOT_SYSCALL_H

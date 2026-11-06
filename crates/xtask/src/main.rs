@@ -40,7 +40,7 @@ tasks:
                -v: print the equivalent merlin-as/merlin-ld command lines
   hello        reference build: assemble examples/hello/hello.S with merlin-as, link it
                with ld.lld into crates/merlin-as/tests/golden/hello.elf; takes --lld and -v
-  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-readobj,
+  ld-fixtures  regenerate crates/merlin-ld/tests/fixtures (clang, ld.lld, llvm-ar, llvm-readobj,
                llvm-objdump); takes --clang, --lld and -v like kernel
                --out DIR: regenerate into DIR (new or empty) from copies of the sources instead,
                leaving the committed files as they are (diff -r shows what would change)
@@ -521,13 +521,14 @@ fn ld_fixtures(k: LdFixturesArgs) -> ExitCode {
         eprintln!("xtask: clang not found; pass --clang PATH");
         return ExitCode::FAILURE;
     };
-    let (Some(lld), Some(readobj), Some(objdump)) = (
+    let (Some(lld), Some(ar), Some(readobj), Some(objdump)) = (
         k.lld.or_else(|| tools::find_beside("ld.lld", &clang)),
+        tools::find_beside("llvm-ar", &clang),
         tools::find_beside("llvm-readobj", &clang),
         tools::find_beside("llvm-objdump", &clang),
     ) else {
         eprintln!(
-            "xtask: ld.lld, llvm-readobj and llvm-objdump must be next to {} or on PATH",
+            "xtask: ld.lld, llvm-ar, llvm-readobj and llvm-objdump must be next to {} or on PATH",
             clang.display()
         );
         return ExitCode::FAILURE;
@@ -536,6 +537,7 @@ fn ld_fixtures(k: LdFixturesArgs) -> ExitCode {
     let t = xtask::ld_fixtures::Tools {
         clang,
         lld,
+        ar,
         readobj,
         objdump,
         verbose: k.verbose,

@@ -8,8 +8,9 @@
 //!
 //! [`reloc`] is where each relocation's formula and instruction field are
 //! explained; start there to see how addresses get into the code.
-//! [`library`] picks the members of a library a program needs, as ld does
-//! with an archive ([`link_with_library`]).
+//! [`library`] picks the members of a library a program needs, as ld.lld
+//! does with an archive ([`link_files`]); `-L` and `-l` find an archive by
+//! name as ld does ([`search_library`]).
 
 pub mod layout;
 pub mod library;
@@ -95,7 +96,7 @@ pub fn strip_debug(elf: &[u8]) -> Result<Vec<u8>, Error> {
 
 /// Links `inputs` with the members of `library` they need (objects linked
 /// only when they define something still undefined, like an archive's:
-/// [`library`]), after them in library order.
+/// [`library`]), after them in the order ld.lld would link them.
 pub fn link_with_library(inputs: &[Input], library: &[Input], opts: &Options) -> Result<Linked, Vec<Error>> {
     let files: Vec<(&Input, bool)> = inputs
         .iter()
@@ -107,20 +108,54 @@ pub fn link_with_library(inputs: &[Input], library: &[Input], opts: &Options) ->
 
 /// Links the files of a command line, in its order, each with whether it
 /// is a library member (between `--start-lib` and `--end-lib`): what
-/// merlin-ld's command line does. The members are linked only when needed
-/// ([`library`]), after the other files, in library order, but the script
-/// and every file are read in command-line
+/// merlin-ld's command line does. An archive (`libc.a`) stands for its
+/// members, each a library member ([`library::expand_archives`]). The
+/// members are linked only when needed, in the order ld.lld links them
+/// ([`library`]), but the script and every file are read in command-line
 /// order, as ld.lld does ([`layout::read`]): so are their errors.
 pub fn link_files(files: &[(&Input, bool)], opts: &Options) -> Result<Linked, Vec<Error>> {
-    let (objects, script) = layout::read(files, opts)?;
+    let library::Expanded {
+        files: expanded,
+        warnings,
+    } = library::expand_archives(files)?;
+    let files: Vec<(&Input, bool)> = expanded.iter().map(|(i, lazy)| (i, *lazy)).collect();
+    let (objects, script) = layout::read(&files, opts)?;
     let lazy: Vec<bool> = files.iter().map(|&(_, lazy)| lazy).collect();
-    let pulled = library::pulled(&objects.iter().collect::<Vec<_>>(), &lazy);
-    let (program, members): (Vec<_>, Vec<_>) = objects
-        .into_iter()
-        .zip(lazy)
-        .zip(pulled)
-        .filter(|&((_, lazy), pulled)| !lazy || pulled)
-        .partition(|&((_, lazy), _)| !lazy);
-    let objects = program.into_iter().chain(members).map(|((o, _), _)| o).collect();
-    finish(layout::build_from(objects, script, opts)?)
+    let entry = layout::entry_symbol(opts, &script);
+    let referenced = script.referenced_symbols();
+    let order = library::order(
+        &objects.iter().collect::<Vec<_>>(),
+        &lazy,
+        entry.as_deref(),
+        &referenced,
+    );
+    let mut objects: Vec<Option<object::Object>> = objects.into_iter().map(Some).collect();
+    let objects = order.into_iter().filter_map(|i| objects[i].take()).collect();
+    let mut linked = finish(layout::build_from(objects, script, opts)?)?;
+    linked.layout.warnings.splice(0..0, warnings);
+    Ok(linked)
+}
+
+/// Where `-lNAME` is: the first `-L` directory, in command-line order, that
+/// holds `libNAME.a`, as ld finds a library when it links statically (every
+/// `-L` counts, wherever it is on the command line: ld.lld and GNU ld read
+/// them all first). `-l:FILE` looks for FILE itself. merlin-ld has no
+/// shared libraries, so `libNAME.so` is never looked for, as with ld's
+/// `-static`. Fails as ld.lld does: `unable to find library -lNAME`.
+pub fn search_library(name: &str, dirs: &[String], exists: impl Fn(&str) -> bool) -> Result<String, Error> {
+    let file = match name.strip_prefix(':') {
+        Some(file) => file.to_string(),
+        None => format!("lib{name}.a"),
+    };
+    for dir in dirs {
+        let path = if dir.ends_with('/') {
+            format!("{dir}{file}")
+        } else {
+            format!("{dir}/{file}")
+        };
+        if exists(&path) {
+            return Ok(path);
+        }
+    }
+    Err(Error(format!("unable to find library -l{name}")))
 }

@@ -1239,10 +1239,6 @@ int layout_build(struct object *objects, uint nobjects, const char *name, const 
     L = l;
     l->objects = objects;
     l->nobjects = nobjects;
-    if (nobjects == 0) {
-        error("no input files");
-        return 0;
-    }
     int have_script = name != NULL;
     script_name = have_script ? name : "<default layout>";
     uint line;

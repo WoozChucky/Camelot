@@ -958,10 +958,30 @@ pub(crate) fn read(files: &[(&Input, bool)], opts: &Options) -> Result<(Vec<Obje
     let Some(script) = script.filter(|_| errors.is_empty()) else {
         return Err(errors);
     };
-    if files.iter().all(|&(_, lazy)| lazy) {
+    // Library members alone are a link: the entry symbol may extract one,
+    // as in ld.lld. Only no file at all is no input.
+    if files.is_empty() {
         return Err(vec![err("no input files")]);
     }
     Ok((objects, script))
+}
+
+/// The entry point's name, and whether it was given (`-e`): `-e`, else the
+/// script's `ENTRY(...)`, else `_start`, as in ld.lld. It may be an address.
+fn entry_name(opts: &Options, script: &Script) -> (String, bool) {
+    match (&opts.entry, &script.entry) {
+        (Some(e), _) => (e.clone(), true),
+        (None, Some(e)) => (e.clone(), false),
+        (None, None) => ("_start".to_string(), false),
+    }
+}
+
+/// The entry symbol a link looks for ([`entry_name`]), unless the entry is
+/// an address: a library member that defines it is linked
+/// ([`crate::library`]).
+pub(crate) fn entry_symbol(opts: &Options, script: &Script) -> Option<String> {
+    let (entry, _) = entry_name(opts, script);
+    script::parse_number(&entry).is_none().then_some(entry)
 }
 
 /// The layout of a link of `inputs`, every one linked.
@@ -1420,11 +1440,7 @@ pub(crate) fn build_from(objects: Vec<Object>, script: Script, opts: &Options) -
     }
 
     // 6. Entry point: -e, else ENTRY(...), else _start.
-    let (entry, explicit) = match (&opts.entry, &script.entry) {
-        (Some(e), _) => (e.clone(), true),
-        (None, Some(e)) => (e.clone(), false),
-        (None, None) => ("_start".to_string(), false),
-    };
+    let (entry, explicit) = entry_name(opts, &script);
     if let Some(n) = script::parse_number(&entry) {
         // Any address, `-e 0xffffffff80000000` too.
         layout.entry = n;

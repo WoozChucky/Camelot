@@ -28,36 +28,43 @@ together.
 | `inet.c` | `htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`, `inet_addr`, `inet_ntoa`, `sockaddr_set`: addresses and byte order |
 | `cmsg.c` | `cmsg_nxthdr`, behind `CMSG_NXTHDR`: the next control message of a `struct msghdr` (`sendmsg`, `recvmsg`) |
 | `resolve.c` | `resolve`: a host's address, from its text or by a DNS query (RFC 1035) to the server the network gave; `resolve_error` |
+| `usys.s` | the system call stubs, one per call (`docs/camelot-syscalls.md`): the number in `a7`, `ecall`, `ret` |
 | `atomic.s` | `atomic_swap`, `atomic_add`, `atomic_cas`, `atomic_load`, `atomic_store`; `spin_lock`, `spin_unlock` |
 | `mutex.c` | `mutex_lock`, `mutex_trylock`, `mutex_unlock`: a mutex that sleeps on a futex |
 | `thread.S` | `thread_start`: a C function in a new thread (preprocessed for `<asm.h>`: its two stack slots are pointers) |
 
 ## How programs get it
 
-Every `kernel/user/X.c` (or `X.s`) is a program, linked with the runtime
-(`crt0.S`, which sets `environ` to `envp`, calls `main` and then `exit`, and
-`usys.s`, the system call stubs) and with the library
-(`crates/xtask/src/userprogs.rs`). The library
-is linked the way a C library is linked from an archive (`libc.a`): each
-file here is a *member*, compiled and assembled once for all the programs,
-and a member goes into a program only if it defines a symbol that the
-program, or a member already in, refers to and nothing else defines. So
+Every `kernel/user/X.c` (or `X.s`) is a program, linked as a C program is
+on Linux: the start code first (`crt0.S`, which sets `environ` to `envp`,
+calls `main` and then `exit`), then the program, then the library
+(`crates/xtask/src/userprogs.rs`). The library is an archive, `libc.a`:
+each file here is a *member*, compiled and assembled once for all the
+programs and named by its stem (`printf.c` is `printf.o`, so two files of
+one stem are refused), written by the elf crate as llvm-ar writes it, and a
+member goes into a program only if it defines a symbol that the program, or
+a member already in, refers to and nothing else defines. So
 `hello`, which calls `printf`, gets `printf.c` and, through it, `strlen.S`
 (for `strlen`), and `environ.c` through crt0, but not `malloc.c`; `grep`, which calls `realloc`, gets
 `malloc.c` too. A program carries only the code and the static data it can
 use, and the members' `static` variables (malloc's free list) exist only in
 the programs that need them.
 
-merlin-ld does the choosing (`crates/merlin-ld/src/library.rs`): given the
-program's objects and the library's, it pulls in members until nothing
-undefined is left that a member defines, then links them after the
-program's objects, in file name order. On its command line the members go
-between `--start-lib` and `--end-lib`, as with ld.lld:
+merlin-ld does the choosing (`crates/merlin-ld/src/library.rs`), as
+ld.lld does: it reads the files in order, links a member the moment
+something already linked needs one of its symbols, depth first, and puts
+it at the end of the link so far: the members the program calls come in
+archive order, and a member that only another member needs comes right
+after that one if it is earlier in the archive. On its
+command line, and on Camelot's `/bin/ld`, whose root image holds the same
+files in `/usr`, stripped of their debug information as distributions
+install a C library (`elf::strip`, as `strip --strip-debug`; the host links
+`/bin`'s programs from these too, and keeps the line tables for its debug
+ELFs):
 
 ```
-merlin-ld -T user.ld -o cat cat.c.o crt0.S.o usys.s.o \
-          --start-lib lib/getline.c.o lib/malloc.c.o lib/printf.c.o lib/spin.c.o \
-          lib/stdlib.c.o lib/strerror.c.o lib/string.c.o --end-lib
+merlin-ld -T user.ld -o cat crt0.o cat.o libc.a
+ld -T /usr/lib/user.ld -o cat /usr/lib/crt0.o cat.o -L/usr/lib -lc
 ```
 
 The C members include `../user.h`; merlin compiles them like the programs.

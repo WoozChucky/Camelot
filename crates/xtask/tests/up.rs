@@ -71,6 +71,15 @@ fn root_image() -> &'static [u8] {
     })
 }
 
+/// A line of `round-table disk list` for a copy of the root image
+/// (`xtask::fs::IMAGE_SIZE` blocks of 1 KiB, two sectors each), in the columns
+/// the list has for this test's disks: names up to `pdvm-disk0`.
+fn image_line(name: &str, attached: &str) -> String {
+    let blocks = xtask::fs::IMAGE_SIZE;
+    let size = format!("{} MiB", blocks / 1024);
+    format!("{name:<12}{size:<7}{:<9}{attached}\n", blocks * 2)
+}
+
 /// A Camelot VM's hardware, as Round Table's `--camelot` and `up`'s demo make it:
 /// Camelot's firmware, and its 2 MiB on top of the default 4 MiB of RAM.
 fn camelot_profile() -> avalon_proto::HardwareProfile {
@@ -605,11 +614,11 @@ ID  NAME  STATE    RAM    CLOCK       DISKS  NETS
     assert!(disks.contains(r#""camelot_image":"os-base""#), "{disks}");
     let lake_disks = rt(&["disk", "list"]);
     for line in [
-        "os-base     4 MiB  8192     no\n",
-        "pdvm-disk0  4 MiB  8192     read-write\n",
-        "rtvm-disk0  4 MiB  8192     read-write\n",
+        image_line("os-base", "no"),
+        image_line("pdvm-disk0", "read-write"),
+        image_line("rtvm-disk0", "read-write"),
     ] {
-        assert!(lake_disks.contains(line), "{line:?} in {lake_disks}");
+        assert!(lake_disks.contains(&line), "{line:?} in {lake_disks}");
     }
 
     // The console: Camelot booted to its shell, with the paging the VM has (and
@@ -665,8 +674,8 @@ ID  NAME  STATE    RAM    CLOCK       DISKS  NETS
     let (status, body) = http_request(platform.pendragon, "POST", "/api/vms/pdvm/stop", token, "");
     assert_eq!(status, 200, "{body}");
     let start = Instant::now();
-    while !rt(&["disk", "list"]).contains("pdvm-disk0  4 MiB  8192     no\n")
-        || !rt(&["disk", "list"]).contains("rtvm-disk0  4 MiB  8192     no\n")
+    while !rt(&["disk", "list"]).contains(&image_line("pdvm-disk0", "no"))
+        || !rt(&["disk", "list"]).contains(&image_line("rtvm-disk0", "no"))
     {
         assert!(start.elapsed() < SLOW, "the disks are still attached");
         std::thread::sleep(Duration::from_millis(20));
