@@ -1,19 +1,24 @@
-/* ld: `ld [-T script] [-e entry] [-o out] [-S] input.o ... [--start-lib
- * lib.o ... --end-lib] [@file]`, merlin-ld's command line (main.rs, lib.rs).
- * The link: the objects and the library members they need (library.c),
- * the layout (layout.c), the relocated contents (relocate.c), the file
+/* ld: `ld [-T script] [-e entry] [-o out] [-S] [-L dir] input.o ...
+ * [lib.a] [-lname] [--start-lib lib.o ... --end-lib] [@file]`, merlin-ld's
+ * command line (main.rs, lib.rs). The link: the objects, the archives'
+ * members (archive.c) and the library members they need (library.c), the
+ * layout (layout.c), the relocated contents (relocate.c), the file
  * (write.c). Errors are reported as merlin-ld reports them; a link with
  * errors writes nothing. */
 #include "ld.h"
 
 static const char USAGE[] =
-    "usage: ld [options] input.o ...\n"
+    "usage: ld [options] input.o ... [lib.a] [-lNAME]\n"
     "\n"
     "  -o FILE        output executable (default: a.out)\n"
     "  -T FILE        linker script (default: .text at 0x80000000, then .rodata, .data, .bss)\n"
     "  -e SYMBOL      entry point symbol or address (overrides ENTRY in the script)\n"
     "  -S, --strip-debug\n"
     "                 leave out the debug information (.debug_* sections)\n"
+    "  -L DIR         look for -l libraries in DIR (every -L, in order)\n"
+    "  -l NAME        the archive libNAME.a of the first -L directory that has it\n"
+    "                 (-l:FILE: FILE itself); an archive's members, as the objects\n"
+    "                 of --start-lib, are linked only if needed\n"
     "  --start-lib    the objects up to --end-lib are a library: each is linked\n"
     "                 only if it defines a symbol the others need (like ld.lld's)\n"
     "  --end-lib      ends a library\n"
@@ -133,11 +138,39 @@ static void print_errors(void) {
     }
 }
 
-/* An input file of the command line, and whether it is a library member. */
+/* An input file of the command line, or the library -l names, and
+ * whether it is a library member. */
 struct arg_input {
     char *name;
     int lib;
+    int search;
 };
+
+/* Whether `path` can be opened: a file -l may find. */
+static int exists(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+    struct stat st;
+    int r = fstat(fd, &st);
+    close(fd);
+    return r == 0 && st.type == T_FILE;
+}
+
+/* Where -lNAME is (merlin-ld's search_library): libNAME.a, or FILE for
+ * -l:FILE, in the first of the n directories that has it. NULL if none. */
+static char *search_library(const char *name, char **dirs, uint n) {
+    char *file = name[0] == ':' ? xstrdup(name + 1) : fmt("lib%s.a", name);
+    for (uint i = 0; i < n; i++) {
+        uint len = (uint)strlen(dirs[i]);
+        char *path = len > 0 && dirs[i][len - 1] == '/' ? fmt("%s%s", dirs[i], file) : fmt("%s/%s", dirs[i], file);
+        if (exists(path)) {
+            return path;
+        }
+    }
+    return NULL;
+}
 
 int main(int argc, char **argv) {
     char **args;
@@ -147,6 +180,8 @@ int main(int argc, char **argv) {
     }
     struct arg_input *names = xcalloc((nargs + 1) * sizeof(struct arg_input));
     uint nnames = 0;
+    char **dirs = xcalloc((nargs + 1) * sizeof(char *));
+    uint ndirs = 0;
     int in_lib = 0, strip = 0;
     char *output = "a.out";
     char *script = NULL;
@@ -163,6 +198,10 @@ int main(int argc, char **argv) {
         }
         char **target = NULL;
         const char *name = NULL;
+        /* -L DIR and -l NAME take their value as -o does; -LDIR and -lNAME
+         * joined. */
+        char *dir = NULL;
+        char *library = NULL;
         if (strcmp(flag, "-o") == 0) {
             target = &output;
             name = "-o";
@@ -192,6 +231,16 @@ int main(int argc, char **argv) {
         } else if (strcmp(flag, "-h") == 0 || strcmp(flag, "--help") == 0) {
             printf("%s\n", USAGE);
             return 0;
+        } else if (strcmp(flag, "-L") == 0 || strcmp(flag, "--library-path") == 0) {
+            target = &dir;
+            name = "-L";
+        } else if (strcmp(flag, "-l") == 0 || strcmp(flag, "--library") == 0) {
+            target = &library;
+            name = "-l";
+        } else if (flag[0] == '-' && flag[1] == 'L') {
+            dir = a + 2;
+        } else if (flag[0] == '-' && flag[1] == 'l') {
+            library = a + 2;
         } else if (flag[0] == '-' && flag[1] != 0) {
             fprintf(2, "ld: unknown option %s\n%s\n", flag, USAGE);
             return 2;
@@ -210,6 +259,15 @@ int main(int argc, char **argv) {
                 return 2;
             }
         }
+        if (dir != NULL) {
+            dirs[ndirs++] = dir;
+        }
+        if (library != NULL) {
+            names[nnames].name = library;
+            names[nnames].lib = in_lib;
+            names[nnames].search = 1;
+            nnames++;
+        }
     }
     if (in_lib) {
         fprintf(2, "ld: --start-lib without --end-lib\n");
@@ -224,20 +282,70 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* In command-line order, which ld.lld reads them in, library members
-     * too. */
-    struct input *files = xcalloc((nnames + 1) * sizeof(struct input));
-    int *lazy = xcalloc((nnames + 1) * sizeof(int));
+    /* Every -L counts for every -l, as in ld: the directories are all
+     * known before a library is looked for. */
+    int missing = 0;
     for (uint i = 0; i < nnames; i++) {
-        struct input *in = &files[i];
-        lazy[i] = names[i].lib;
+        if (names[i].search) {
+            char *path = search_library(names[i].name, dirs, ndirs);
+            if (path == NULL) {
+                fprintf(2, "ld: error: unable to find library -l%s\n", names[i].name);
+                missing = 1;
+            }
+            names[i].name = path;
+        }
+    }
+    if (missing) {
+        return 1;
+    }
+
+    /* In command-line order, which ld.lld reads them in, library members
+     * too; an archive stands for its members, each a library member
+     * (merlin-ld's library::expand_archives), named lib.a(m.o). */
+    uint cap = 0, n = 0;
+    struct input *files = NULL;
+    int *lazy = NULL;
+    uint lazy_cap = 0;
+    for (uint i = 0; i < nnames; i++) {
+        struct input in;
         int err;
-        in->name = names[i].name;
-        in->data = read_file(in->name, &in->len, &err);
-        if (in->data == NULL) {
-            fprintf(2, "ld: cannot read %s: %s\n", in->name, strerror(err));
+        in.name = names[i].name;
+        in.data = read_file(in.name, &in.len, &err);
+        if (in.data == NULL) {
+            fprintf(2, "ld: cannot read %s: %s\n", in.name, strerror(err));
             return 2;
         }
+        if (!is_archive(in.data, in.len)) {
+            files = grow(files, &cap, n + 1, sizeof(struct input));
+            lazy = grow(lazy, &lazy_cap, n + 1, sizeof(int));
+            files[n] = in;
+            lazy[n++] = names[i].lib;
+            continue;
+        }
+        struct ar_member *members;
+        uint count;
+        char *msg;
+        if (!archive_parse(in.data, in.len, &members, &count, &msg)) {
+            error(fmt("%s: %s", in.name, msg));
+            continue;
+        }
+        for (uint k = 0; k < count; k++) {
+            if (members[k].len < 4 || memcmp(members[k].data, "\177ELF", 4) != 0) {
+                add_message(&warnings, fmt("%s: archive member '%s' is neither ET_REL nor LLVM bitcode",
+                                           in.name, members[k].name));
+                continue;
+            }
+            files = grow(files, &cap, n + 1, sizeof(struct input));
+            lazy = grow(lazy, &lazy_cap, n + 1, sizeof(int));
+            files[n].name = fmt("%s(%s)", in.name, members[k].name);
+            files[n].data = members[k].data;
+            files[n].len = members[k].len;
+            lazy[n++] = 1;
+        }
+    }
+    if (errors.n != 0) {
+        print_errors();
+        return 1;
     }
     char *script_text = NULL;
     if (script != NULL) {
@@ -259,8 +367,15 @@ int main(int argc, char **argv) {
     if (!script_parse(script_text != NULL ? script_text : DEFAULT_SCRIPT, &read, &line, &msg)) {
         error(fmt("%s:%u: %s", script != NULL ? script : "<default layout>", line, msg));
     }
+    /* The entry symbol, which extracts the member that defines it: -e,
+     * else ENTRY(...), else _start, unless it is an address. */
+    const char *entry_name = entry != NULL ? entry : read.entry != NULL ? read.entry : "_start";
+    uint64_t entry_addr;
+    if (errors.n != 0 || parse_number(entry_name, &entry_addr)) {
+        entry_name = NULL;
+    }
     uint nobjects;
-    struct object *objects = parse_with_needed(files, lazy, nnames, &nobjects);
+    struct object *objects = parse_with_needed(files, lazy, n, entry_name, &nobjects);
     struct layout layout;
     uchar **images, **debug;
     if (objects == NULL || !layout_build(objects, nobjects, script, script_text, entry, &layout) ||

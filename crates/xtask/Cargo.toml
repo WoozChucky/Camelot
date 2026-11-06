@@ -13,7 +13,7 @@ avalon-proto = { path = "../avalon-proto" }
 camelot-fs = { path = "../camelot-fs" }
 # The C tools' tables (c_tables.rs): opcodes, register, CSR and relocation names.
 excalibur = { path = "../excalibur" }
-# The C linker's relocation names (c_tables.rs), and the tests' ELF reading.
+# The C linker's relocation names (c_tables.rs), libc.a (elf::archive), and the tests' ELF reading.
 elf = { path = "../elf" }
 grail = { path = "../grail" }
 merlin = { path = "../merlin" }

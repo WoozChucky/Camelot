@@ -50,8 +50,8 @@ const STEPS: &[Step] = &[
         args: &["-p", "excalibur", "--test", "disasm"],
     },
     Step {
-        what: "the elf crate against llvm-readelf and llvm-dwarfdump, both classes",
-        args: &["-p", "elf", "--test", "llvm"],
+        what: "the elf crate against llvm-readelf, llvm-dwarfdump and llvm-ar, both classes",
+        args: &["-p", "elf", "--test", "llvm", "--test", "archive"],
     },
     Step {
         what: "merlin-as: encodings, round trips, line tables, mapping symbols, hello",
@@ -204,7 +204,7 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "the committed examples, boot programs and hello are current; a boot block and the root \
-               image boot",
+               image boot, its /usr what the programs are linked from",
         args: &[
             "-p",
             "xtask",
@@ -219,6 +219,7 @@ const STEPS: &[Step] = &[
             "committed_boot_programs_are_up_to_date",
             "a_boot_block_boots_through_the_rom",
             "the_root_image_boots_from_disk_and_runs_programs_from_bin",
+            "the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from",
             "hello",
         ],
     },

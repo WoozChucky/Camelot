@@ -2,7 +2,11 @@
 //! (docs/camelot-fs.md), built with the `camelot-fs` crate's mkfs: the files
 //! in `kernel/fs/` (a README) at `/`, the user programs of `kernel/user`,
 //! built with merlin, merlin-as and merlin-ld exactly as the kernel embeds them, in
-//! `/bin`, and the device nodes, `/dev/console` and `/dev/fb0`. No LLVM needed.
+//! `/bin`, the device nodes, `/dev/console` and `/dev/fb0`, and what a C
+//! program is built from ([`usr_files`]): the header in `/usr/include`, and
+//! in `/usr/lib` the start code `crt0.o`, the C library `libc.a` and the
+//! linker script `user.ld`, the very files the programs of `/bin` were
+//! linked from. No LLVM needed.
 //!
 //! The image is bootable ([`build_bootable`]): Camelot's bootloader
 //! (`kernel/boot/boot.s`, built with merlin-as + merlin-ld) in the boot
@@ -46,14 +50,58 @@ pub const DEV: &str = "/dev";
 pub const CONSOLE_MAJOR: u16 = 1;
 /// The framebuffer's device number (`FB` in kernel/include/file.h).
 pub const FB_MAJOR: u16 = 2;
+/// Where the headers go, as on Linux: a compiler on Camelot looks there.
+pub const INCLUDE: &str = "/usr/include";
+/// Where the start code, the C library and the programs' linker script go.
+pub const LIB: &str = "/usr/lib";
 
 /// The default output path.
 pub fn default_out(root: &Path) -> PathBuf {
     root.join(DEFAULT_OUT)
 }
 
+/// What the root image's `/usr` holds (path, contents): the headers of
+/// [`userprogs::HEADERS`] in [`INCLUDE`], and in [`LIB`] the start code
+/// (`crt0.o`), the C library ([`userprogs::LIBC`]) and the programs' linker
+/// script ([`userprogs::SCRIPT`]), from `rt`, the runtime the programs of
+/// `/bin` are linked with, and `user_dir` (`kernel/user`). So on Camelot
+///
+/// ```text
+/// ld -T /usr/lib/user.ld -o PROG /usr/lib/crt0.o PROG.o -L/usr/lib -lc
+/// ```
+///
+/// links a program as the host links it.
+pub fn usr_files(user_dir: &Path, rt: &userprogs::Runtime) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let read = |name: &str| {
+        let path = user_dir.join(name);
+        std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+    };
+    let mut files = Vec::new();
+    for h in userprogs::HEADERS {
+        files.push((format!("{INCLUDE}/{h}"), read(h)?));
+    }
+    for o in &rt.objects {
+        files.push((format!("{LIB}/{}", o.name), o.data.clone()));
+    }
+    files.push((format!("{LIB}/{}", userprogs::LIBC), rt.archive.clone()));
+    files.push((format!("{LIB}/{}", userprogs::SCRIPT), read(userprogs::SCRIPT)?));
+    Ok(files)
+}
+
+/// Makes `/usr`, `/usr/include` and `/usr/lib` on `fs` and writes `files`
+/// ([`usr_files`]) there.
+pub fn add_usr(fs: &mut Mkfs, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+    for d in ["/usr", INCLUDE, LIB] {
+        fs.mkdir(d)?;
+    }
+    for (path, data) in files {
+        fs.add_file(path, data)?;
+    }
+    Ok(())
+}
+
 /// Builds the root image: `opts`' shape, `kernel/fs/` at `/`, the programs
-/// in `/bin`, `/dev/console` and `/dev/fb0`.
+/// in `/bin`, `/dev/console` and `/dev/fb0`, and `/usr` ([`usr_files`]).
 pub fn build(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
     build_with(root, opts, CCompiler::Merlin)
 }
@@ -68,9 +116,13 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
     fs.add_device(&format!("{DEV}/console"), CONSOLE_MAJOR, 0)?;
     fs.add_device(&format!("{DEV}/fb0"), FB_MAJOR, 0)?;
     fs.mkdir(BIN)?;
-    for prog in userprogs::build_all_with(&userprogs::user_dir(root), cc)? {
+    let user = userprogs::user_dir(root);
+    let rt = userprogs::build_runtime(&user, cc)?;
+    for prog in userprogs::programs(&user)? {
+        let prog = userprogs::link_program(&user, &prog, cc, &rt)?;
         fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
     }
+    add_usr(&mut fs, &usr_files(&user, &rt)?)?;
     Ok(fs.finish())
 }
 

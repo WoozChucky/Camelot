@@ -349,14 +349,95 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
 }
 
 #[test]
+fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() {
+    // #240: /usr/include has the header the programs and the library are
+    // compiled with, and /usr/lib the start code, the C library and the
+    // linker script every program of /bin is linked from, byte for byte:
+    // libc.a is the library's members in an archive (llvm-ar's format,
+    // elf::archive), named as a C library names them.
+    let root = repo_root();
+    let user = xtask::userprogs::user_dir(&root);
+    let image = xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap();
+    let fs = Fs::open(&image).unwrap();
+    let read = |path: &str| fs.read_file(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    assert_eq!(
+        read("/usr/include/user.h"),
+        std::fs::read(user.join("user.h")).unwrap()
+    );
+    assert_eq!(
+        read("/usr/lib/user.ld"),
+        std::fs::read(user.join("user.ld")).unwrap()
+    );
+    let rt = xtask::userprogs::build_runtime(&user, xtask::userprogs::CCompiler::Merlin).unwrap();
+    assert_eq!(rt.objects.len(), 1);
+    assert_eq!(read("/usr/lib/crt0.o"), rt.objects[0].data);
+    let libc = read("/usr/lib/libc.a");
+    assert_eq!(libc, rt.archive);
+    let archive = elf::archive::parse(&libc).unwrap();
+    let names: Vec<&str> = archive.members.iter().map(|m| m.name.as_str()).collect();
+    let sources: Vec<String> = xtask::userprogs::library(&user)
+        .unwrap()
+        .iter()
+        .map(xtask::userprogs::member_name)
+        .collect();
+    assert_eq!(names, sources);
+    for want in ["printf.o", "malloc.o", "usys.o", "environ.o", "memcpy.o"] {
+        assert!(names.contains(&want), "{want} not in libc.a: {names:?}");
+    }
+    for (m, o) in archive.members.iter().zip(&rt.library) {
+        assert_eq!(m.data, &o.data[..], "{}", m.name);
+    }
+    // The symbol table says where printf and the system calls are.
+    let defines = |sym: &str| {
+        archive
+            .symbols
+            .iter()
+            .find(|(s, _)| s == sym)
+            .map(|&(_, m)| archive.members[m].name.as_str())
+    };
+    assert_eq!(defines("printf"), Some("printf.o"));
+    assert_eq!(defines("write"), Some("usys.o"));
+    assert_eq!(defines("main"), None);
+    // Every program in /bin is the link of crt0.o, its objects and libc.a.
+    let hello = xtask::userprogs::programs(&user)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.stem == "hello")
+        .unwrap();
+    let own = xtask::userprogs::program_objects(&user, &hello, xtask::userprogs::CCompiler::Merlin).unwrap();
+    let mut inputs = vec![merlin_ld::Input {
+        name: "/usr/lib/crt0.o".into(),
+        data: read("/usr/lib/crt0.o"),
+    }];
+    inputs.extend(own);
+    inputs.push(merlin_ld::Input {
+        name: "/usr/lib/libc.a".into(),
+        data: libc.clone(),
+    });
+    let files: Vec<(&merlin_ld::Input, bool)> = inputs.iter().map(|i| (i, false)).collect();
+    let script = String::from_utf8(read("/usr/lib/user.ld")).unwrap();
+    let opts = merlin_ld::Options {
+        script: Some(merlin_ld::ScriptSource {
+            name: "user.ld".into(),
+            text: script,
+        }),
+        entry: None,
+    };
+    let linked = merlin_ld::link_files(&files, &opts).unwrap();
+    let stripped = merlin_ld::strip_debug(&linked.elf).unwrap();
+    assert_eq!(stripped, read("/bin/hello"));
+}
+
+#[test]
 fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
     let root = repo_root();
     let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
     let kernel_blocks = boot::loadable(&kernel).unwrap().len().div_ceil(BSIZE) as u32;
     // A bigger --size: a bigger filesystem, the same kernel.
-    let image = xtask::fs::build_bootable(&root, 3000).unwrap();
-    assert_eq!(image.len(), 3000 * BSIZE);
-    assert_eq!(fsck::check(&image).unwrap().sb.size, 3000 - kernel_blocks);
+    let bigger = xtask::fs::IMAGE_SIZE + 1024;
+    let image = xtask::fs::build_bootable(&root, bigger).unwrap();
+    assert_eq!(image.len(), bigger as usize * BSIZE);
+    assert_eq!(fsck::check(&image).unwrap().sb.size, bigger - kernel_blocks);
     // The programs do not fit in 1 MiB, nor anything in the kernel's own size.
     let err = xtask::fs::build_bootable(&root, 1024).unwrap_err();
     assert!(

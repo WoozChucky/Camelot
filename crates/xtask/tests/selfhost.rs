@@ -524,7 +524,10 @@ fn the_c_tools_tables_are_the_host_tools() {
 /// as `/bin` holds them); and a few with them too, as `cargo xtask kernel`
 /// writes them to target/kernel/obj/user (the debug sections, their
 /// relocations and headers): programs of C with the library's members, and
-/// `as`, of several files.
+/// `as`, of several files. Each is linked as a C program is on Linux, from
+/// the root image's `/usr/lib` (#240): `crt0.o`, the program's objects,
+/// then `-L/usr/lib -lc`, which /bin/ld finds and takes the members of
+/// `libc.a` it needs from, in ld.lld's order, as merlin-ld does.
 #[test]
 fn the_linker_on_camelot_links_every_user_program_as_merlin_ld_does() {
     link_every_program(&|name| ["hello", "cat", "grep", "as"].contains(&name));
@@ -539,28 +542,18 @@ fn the_linker_on_camelot_keeps_the_line_tables_as_merlin_ld_does() {
 }
 
 /// Links every user program on Camelot with `-S`, and without it those
-/// `with_debug` names, and compares the executables with merlin-ld's. The objects go in `/o`, each program's
-/// command line in a response file in `/a` (a link line is longer than a
-/// console line), the results in `/out`.
+/// `with_debug` names, and compares the executables with merlin-ld's. The
+/// objects go in `/o`, each program's command line in a response file in
+/// `/a` (a link line can be longer than a console line), the results in
+/// `/out`; the start code, the library and the script are the root image's
+/// `/usr` ([`usr_image_files`]).
 fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
     use userprogs::CCompiler;
     let dir = userprogs::user_dir(&repo_root());
     let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
     let progs = userprogs::programs(&dir).unwrap();
-    // What every machine has: the script, the runtime's objects and the
-    // library's members.
-    let script = std::fs::read(dir.join(userprogs::SCRIPT)).unwrap();
-    let mut shared: Vec<(String, Vec<u8>)> = vec![("/user.ld".into(), script)];
-    let mut runtime = Vec::new();
-    for (i, o) in rt.objects.iter().enumerate() {
-        runtime.push(format!("/o/r{i}.o"));
-        shared.push((format!("/o/r{i}.o"), o.data.clone()));
-    }
-    let mut library = Vec::new();
-    for (i, o) in rt.library.iter().enumerate() {
-        library.push(format!("/o/l{i}.o"));
-        shared.push((format!("/o/l{i}.o"), o.data.clone()));
-    }
+    // What every machine has: the root image's /usr.
+    let shared = usr_image_files(&rt);
     // Per program: its own objects, its response file, and what merlin-ld
     // makes of them.
     struct Job {
@@ -572,20 +565,15 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
         .iter()
         .enumerate()
         .map(|(k, prog)| {
-            let objects = userprogs::program_objects(&dir, prog, CCompiler::Merlin, &rt).unwrap();
-            let own = &objects[..objects.len() - rt.objects.len()];
+            let own = userprogs::program_objects(&dir, prog, CCompiler::Merlin).unwrap();
             let mut files = Vec::new();
-            let mut args = format!("-T /user.ld -o /out/{k}");
+            let mut args = format!("-T {USR_LIB}/user.ld -o /out/{k} {USR_LIB}/crt0.o");
             for (j, o) in own.iter().enumerate() {
                 let path = format!("/o/p{k}_{j}.o");
                 args.push_str(&format!(" {path}"));
                 files.push((path, o.data.clone()));
             }
-            args.push_str(&format!(" {}\n--start-lib", runtime.join(" ")));
-            for l in &library {
-                args.push_str(&format!("\n  {l}"));
-            }
-            args.push_str("\n--end-lib\n");
+            args.push_str(&format!("\n-L{USR_LIB} -lc\n"));
             files.push((format!("/a/{k}"), args.into_bytes()));
             Job {
                 name: prog.stem.clone(),
@@ -624,7 +612,8 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
                         commands.push(c.clone());
                     }
                     let input = format!("{}\nexit 0\n", commands.join("\n"));
-                    let (out, disk) = boot(image_of(&["ld"], &["/o", "/a"], &files), &input, 20_000_000_000);
+                    let dirs = [USR_DIRS, &["/o", "/a"]].concat();
+                    let (out, disk) = boot(image_of(&["ld"], &dirs, &files), &input, 20_000_000_000);
                     let fs = Fs::open(&disk).unwrap();
                     let mut wrong = Vec::new();
                     for (command, file, job, want) in &checks {
@@ -656,6 +645,17 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
         runs.into_iter().flat_map(|r| r.join().unwrap()).collect()
     });
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The root image's `/usr/lib`.
+const USR_LIB: &str = xtask::fs::LIB;
+/// The directories of the root image's `/usr`, made before its files.
+const USR_DIRS: &[&str] = &["/usr", xtask::fs::INCLUDE, xtask::fs::LIB];
+
+/// What the root image's `/usr` holds for the runtime `rt`
+/// (`xtask::fs::usr_files`): the header, `crt0.o`, `libc.a` and `user.ld`.
+fn usr_image_files(rt: &userprogs::Runtime) -> Vec<(String, Vec<u8>)> {
+    xtask::fs::usr_files(&userprogs::user_dir(&repo_root()), rt).unwrap()
 }
 
 /// #23's acceptance: `hello` assembled and linked inside Camelot, by `/bin/as`
@@ -1301,6 +1301,44 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
             "",
         ),
     ];
+    // Archives (#240), which an input is when its bytes are one, whatever
+    // its name: a member that is not an ELF file is left out with a
+    // warning, a member's error names it lib.a(m.o), an archive alone is
+    // no input, a corrupt archive and a symbol table pointing between
+    // members are errors, and the entry symbol extracts the member that
+    // defines it (with only a text member besides, which warns).
+    let ar = |members: &[(&str, &[u8])]| {
+        let members: Vec<elf::archive::NewMember> = members
+            .iter()
+            .map(|&(name, data)| elf::archive::NewMember { name, data })
+            .collect();
+        elf::archive::write(&members).unwrap()
+    };
+    let calls_f = obj(".text\n.globl _start\n_start: call f\n");
+    let f = obj(".text\n.globl f\nf: nop\n");
+    let f_undefined = obj(".text\n.globl f\nf: call nowhere\n");
+    let lib = ar(&[("notes.txt", b"text"), ("f.o", &f)]);
+    let mut bad_table = lib.clone();
+    // The first symbol's member offset, past the count: off by two.
+    bad_table[8 + 60 + 7] += 2;
+    let truncated_ar = lib[..lib.len() - 3].to_vec();
+    cases.extend([
+        (vec![calls_f.clone(), lib.clone()], script.to_string(), ""),
+        (
+            vec![calls_f.clone(), ar(&[("f_undefined.o", &f_undefined)])],
+            script.into(),
+            "",
+        ),
+        (vec![lib.clone()], script.into(), ""),
+        (vec![calls_f.clone(), truncated_ar], script.into(), ""),
+        (vec![calls_f.clone(), bad_table], script.into(), ""),
+        (
+            vec![f.clone(), ar(&[("readme", b"odd"), ("start.o", &calls_f)])],
+            script.into(),
+            "",
+        ),
+        (vec![calls_f.clone(), f.clone()], script.into(), "-lnope"),
+    ]);
     // The cases whose executable is 4 GiB or more (below), which
     // merlin-ld writes from an image that size in memory. /bin/ld computes
     // the same sizes and offsets, but holds no such image (this machine has
@@ -1397,6 +1435,15 @@ fn the_linker_on_camelot_reports_merlin_ld_errors_and_warnings() {
         if let Some(e) = extra.strip_prefix("-e ") {
             opts.entry = Some(e.to_string());
             args.push_str(&format!(" {extra}"));
+        }
+        if let Some(name) = extra.strip_prefix("-l") {
+            // A library no -L directory has (there is none): ld says so
+            // before it reads a file.
+            args.push_str(&format!(" -L/e {extra}"));
+            commands.push(args);
+            let e = merlin_ld::search_library(name, &["/e".into()], |_| false).unwrap_err();
+            wants.push(Want::Errors(format!("ld: error: {e}\n")));
+            continue;
         }
         commands.push(args);
         if huge.contains(&k) {

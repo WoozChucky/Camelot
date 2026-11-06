@@ -91,19 +91,12 @@ fn field(h: &[u8], at: usize, len: usize) -> &[u8] {
     &f[..end]
 }
 
-/// A decimal header field.
-fn decimal(h: &[u8], at: usize, len: usize, what: &str, offset: usize) -> Result<usize, Error> {
-    let f = field(h, at, len);
-    let text = std::str::from_utf8(f)
-        .ok()
-        .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()));
-    match text.and_then(|t| t.parse().ok()) {
-        Some(v) => Ok(v),
-        None => bad(format!(
-            "archive member at {offset}: bad {what} {:?}",
-            String::from_utf8_lossy(f)
-        )),
+/// A decimal number: digits only, at least one.
+fn digits(f: &[u8]) -> Option<usize> {
+    if f.is_empty() || !f.iter().all(u8::is_ascii_digit) {
+        return None;
     }
+    std::str::from_utf8(f).ok()?.parse().ok()
 }
 
 fn be32(data: &[u8], at: usize) -> Option<usize> {
@@ -129,7 +122,9 @@ pub fn parse(data: &[u8]) -> Result<Archive<'_>, Error> {
         if &h[58..60] != b"`\n" {
             return bad(format!("archive member at {at}: bad header end"));
         }
-        let size = decimal(h, 48, 10, "size", at)?;
+        let Some(size) = digits(field(h, 48, 10)) else {
+            return bad(format!("archive member at {at}: bad size"));
+        };
         let start = at + HEADER_SIZE;
         let Some(body) = start.checked_add(size).and_then(|end| data.get(start..end)) else {
             return bad(format!("archive member at {at}: {size} bytes run past the end"));
@@ -168,15 +163,8 @@ pub fn parse(data: &[u8]) -> Result<Archive<'_>, Error> {
 /// into the long names.
 fn member_name(field: &[u8], long_names: &[u8], at: usize) -> Result<String, Error> {
     let name = if let Some(off) = field.strip_prefix(b"/") {
-        let off = std::str::from_utf8(off)
-            .ok()
-            .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
-            .and_then(|t| t.parse::<usize>().ok());
-        let Some(rest) = off.and_then(|o| long_names.get(o..)) else {
-            return bad(format!(
-                "archive member at {at}: bad long name {:?}",
-                String::from_utf8_lossy(field)
-            ));
+        let Some(rest) = digits(off).and_then(|o| long_names.get(o..)) else {
+            return bad(format!("archive member at {at}: bad long name"));
         };
         match rest.windows(2).position(|w| w == b"/\n") {
             Some(end) => &rest[..end],
@@ -188,7 +176,7 @@ fn member_name(field: &[u8], long_names: &[u8], at: usize) -> Result<String, Err
             None => return bad(format!("archive member at {at}: name without a /")),
         }
     };
-    String::from_utf8(name.to_vec()).map_err(|_| Error(format!("archive member at {at}: name is not UTF-8")))
+    Ok(String::from_utf8_lossy(name).into_owned())
 }
 
 /// The symbol table's entries, each matched to the member at its offset.

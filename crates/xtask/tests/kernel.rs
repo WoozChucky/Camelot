@@ -3927,7 +3927,7 @@ fn the_system_call_document_matches_the_code() {
     };
     let doc = read("docs/camelot-syscalls.md");
     let header = read("kernel/include/syscall.h");
-    let usys = read("kernel/user/usys.s");
+    let usys = read("kernel/user/lib/usys.s");
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");

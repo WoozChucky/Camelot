@@ -117,7 +117,9 @@ pub fn assemble(name: &str, text: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Links `inputs` with merlin-ld and the linker script `script` (read from
-/// `dir`). merlin-ld's warnings are errors here: a kernel or a program
+/// `dir`), in order, as its command line would give them: an archive among
+/// them (`libc.a`) gives the members the others need, in ld.lld's order
+/// (`merlin_ld::link_files`). merlin-ld's warnings are errors here: a kernel or a program
 /// should link cleanly. `what` names the result in errors.
 pub fn link(dir: &Path, script: &str, inputs: &[merlin_ld::Input], what: &str) -> Result<Vec<u8>, String> {
     link_with(dir, script, inputs, what, false)
@@ -158,7 +160,8 @@ pub fn link_script(
         }),
         entry: None,
     };
-    let linked = merlin_ld::link(inputs, &opts).map_err(|errors| {
+    let files: Vec<(&merlin_ld::Input, bool)> = inputs.iter().map(|i| (i, false)).collect();
+    let linked = merlin_ld::link_files(&files, &opts).map_err(|errors| {
         let lines: Vec<String> = errors.iter().map(|e| format!("merlin-ld: error: {e}")).collect();
         format!("linking {what}:\n{}", lines.join("\n"))
     })?;
