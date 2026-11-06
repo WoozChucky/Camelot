@@ -59,6 +59,11 @@ struct buf {
     u8 data[BSIZE];
 };
 
+/* `data` follows a pointer, so it is 8-aligned, as the buffers are: the
+ * bitmap scan (fs.c) reads it 64 bits at a time, and memcpy and memmove
+ * copy whole registers between two buffers' blocks. */
+_Static_assert(offsetof(struct buf, data) % 8 == 0, "a block's data is 8-aligned");
+
 /* bread() calls served from the cache, and those that read the disk. */
 extern u32 bio_hits;
 extern u32 bio_misses;

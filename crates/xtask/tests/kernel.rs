@@ -1381,6 +1381,79 @@ fn kernel_memory_functions_at_every_alignment() {
 }
 
 #[test]
+fn the_bitmap_scan_finds_the_bit_the_bit_by_bit_loop_found() {
+    // balloc (kernel/fs.c) scans a bitmap block with bitmap_first_clear, a
+    // 64-bit word at a time, skipping words with every bit set, where it
+    // used to test each bit: the first clear bit at or after `from` and
+    // before `size`, else `size`. The same bit, so the same block, as that
+    // loop, for clear bits in every place of a word (each byte first_one
+    // skips and each bit of the byte it stops in), before and after
+    // `from`, and at and past `size`.
+    let (mut m, elf) = call_machine();
+    let map = CALL_DATA;
+    let first_clear = |bits: &[u8], size: u64, from: u64| {
+        (from..size)
+            .find(|&i| bits[i as usize / 8] & (1 << (i % 8)) == 0)
+            .unwrap_or(size)
+    };
+    let mut cases = 0;
+    let mut scan = |m: &mut Machine, bits: &[u8], size: u64, from: u64| {
+        put_bytes(m, map, bits);
+        let got = call_kernel(m, &elf, "bitmap_first_clear", &[map, from, size]) as u32;
+        assert_eq!(
+            got as u64,
+            first_clear(bits, size, from),
+            "size {size}, from {from}"
+        );
+        cases += 1;
+    };
+    // Every bit set but one.
+    for p in [
+        0u64, 1, 7, 8, 15, 16, 31, 32, 33, 47, 48, 62, 63, 64, 65, 127, 128, 4000, 8190, 8191,
+    ] {
+        let mut bits = vec![0xff; 1024];
+        bits[p as usize / 8] &= !(1 << (p % 8));
+        for size in [8192, 8191, 8128, p + 1, p, 100, 65, 64, 1] {
+            for from in [0, 1, p.saturating_sub(1), p, p + 1, 63, 64, 8191, 8192] {
+                scan(&mut m, &bits, size, from);
+            }
+        }
+    }
+    // None set, none clear.
+    for byte in [0x00, 0xff] {
+        for (size, from) in [(8192, 0), (8192, 8191), (8192, 100), (77, 13), (64, 64), (0, 0)] {
+            scan(&mut m, &[byte; 1024], size, from);
+        }
+    }
+    // Mostly full maps, as a disk in use has: each byte clear with
+    // probability 1/16, a bit of it chosen at random.
+    let mut seed = 0x1234_5678_9abc_def1u64;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed >> 33
+    };
+    for _ in 0..40 {
+        let bits: Vec<u8> = (0..1024)
+            .map(|_| {
+                if next() % 16 == 0 {
+                    !(1u8 << (next() % 8))
+                } else {
+                    0xff
+                }
+            })
+            .collect();
+        for _ in 0..8 {
+            let size = 1 + next() % 8192;
+            let from = next() % 8200;
+            scan(&mut m, &bits, size, from);
+        }
+    }
+    assert!(cases > 1500, "{cases} cases");
+}
+
+#[test]
 fn ksnprintf_corner_cases() {
     // What the boot-time kprintf self-test leaves out.
     let (mut m, elf) = call_machine();

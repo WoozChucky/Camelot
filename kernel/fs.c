@@ -269,22 +269,64 @@ static bool btake(u32 dev, u32 bno) {
     return was_free;
 }
 
+/* Where the lowest 1 of `x`, which has one, is: whole zero bytes skipped
+ * eight bits a step, then the bits of the byte that has it one at a time,
+ * fifteen steps at most. Excalibur has no instruction that counts the
+ * trailing zeros (Zbb's ctz), and this runs once per block allocated. */
+static u32 first_one(u64 x) {
+    u32 at = 0;
+    for (; (x & 0xff) == 0; x >>= 8) {
+        at += 8;
+    }
+    for (; (x & 1) == 0; x >>= 1) {
+        at++;
+    }
+    return at;
+}
+
+/* The first clear bit of a bitmap of `nbits` bits at `map`, at `start`
+ * or after it; `nbits` when every one of those is set. A 64-bit word at a
+ * time, as ext4's allocator scans its bitmaps (Linux's
+ * find_next_zero_bit_le): a word of 64 blocks in use is one comparison,
+ * where testing bit by bit is 64 rounds.
+ *
+ * Bit i is bit i % 8 of byte i / 8 (docs/camelot-fs.md, "Free-block
+ * bitmap"), which on little-endian Excalibur is bit i % 64 of 64-bit word
+ * i / 64: inverting a word makes its clear bits the ones to look for. In
+ * the word holding `start` the bits below it are cleared from that
+ * inverse first, and a hit in the last word past `nbits` (a disk that
+ * ends inside it) is no hit. */
+static u32 bitmap_first_clear(const u64 *map, u32 start, u32 nbits) {
+    for (u32 w = start / 64; w * 64 < nbits; w++) {
+        u64 clear = ~map[w];
+        if (w == start / 64) {
+            clear &= ~(((u64)1 << (start % 64)) - 1);
+        }
+        if (clear != 0) {
+            u32 bit = w * 64 + first_one(clear);
+            return bit < nbits ? bit : nbits;
+        }
+    }
+    return nbits;
+}
+
 /* Allocates a data block, zeroed; 0 if none is free. `goal` first, when it
  * is a free data block (the block after a file's last, so that the file
  * stays one extent; 0 for none), else the first free block from the start
- * of the data region. */
+ * of the data region: in each bitmap block, the first clear bit at or
+ * after the data region's start and before the disk's end. A bitmap
+ * block's data is 8-aligned (bio.h), so it is read as 64-bit words. */
 static u32 balloc(u32 dev, u32 goal) {
     if (goal >= fs_sb.datastart && goal < fs_sb.size && btake(dev, goal)) {
         return goal;
     }
     for (u32 base = 0; base < fs_sb.size; base += BPB) {
         struct buf *b = fs_bread(dev, BBLOCK(base, fs_sb));
-        for (u32 i = 0; i < BPB && base + i < fs_sb.size; i++) {
-            u8 mask = (u8)(1 << (i % 8));
-            if (base + i < fs_sb.datastart || (b->data[i / 8] & mask) != 0) {
-                continue;
-            }
-            b->data[i / 8] |= mask;
+        u32 bits = fs_sb.size - base < BPB ? fs_sb.size - base : BPB;
+        u32 from = fs_sb.datastart > base ? fs_sb.datastart - base : 0;
+        u32 i = bitmap_first_clear((const u64 *)b->data, from, bits);
+        if (i < bits) {
+            b->data[i / 8] |= (u8)(1 << (i % 8));
             log_write(b);
             brelse(b);
             bzero(dev, base + i);
