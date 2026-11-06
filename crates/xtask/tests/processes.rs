@@ -607,6 +607,26 @@ fn the_shell_runs_64_bit_programs() {
 }
 
 #[test]
+fn date_prints_the_real_time_clock() {
+    // The machine's clock starts at 2026-01-01 00:00:00 UTC (MachineConfig's
+    // default), and the kernel's date runs on from there: the shell's first
+    // commands come seconds in.
+    let out = run(Setup::default(), b"date\ndate -s\ndate now\nexit 0\n");
+    let date = command_output(&out, "date");
+    assert_eq!(date.len(), 1, "{out}");
+    assert!(
+        date[0].starts_with("Thu Jan  1 00:00:") && date[0].ends_with(" UTC 2026"),
+        "{out}"
+    );
+    let secs: u64 = command_output(&out, "date -s")[0].parse().unwrap();
+    assert!((1_767_225_600..1_767_225_660).contains(&secs), "{out}");
+    assert_eq!(
+        command_output(&out, "date now"),
+        ["usage: date [-s]", "date: exit 2"]
+    );
+}
+
+#[test]
 fn a_process_page_table_maps_its_program_and_the_kernel() {
     let (mut m, elf) = load_committed(Some(kernel::typed(b"ding\nexit\n")));
     step_to_user(&mut m, &elf, "ding");

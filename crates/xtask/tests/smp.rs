@@ -43,6 +43,7 @@ paging: on (Sv48)
 vm self-test: 26/26 passed
 fb: 640x480, 6 modes, irq 16
 timer: 10 Hz tick, 10000000 Hz timebase
+rtc: 2026-01-01 00:00 UTC
 disk: none
 tick 1
 tick 2

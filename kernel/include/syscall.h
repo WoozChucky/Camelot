@@ -77,6 +77,8 @@
 #define SYS_recvmsg 57       /* recvmsg(fd, msg, flags): bytes received, descriptors with them */
 #define SYS_stat 58          /* stat(path, st): 0, with *st filled in */
 #define SYS_getsockopt 59    /* getsockopt(fd, level, option, value, len): 0, the option at value, its size in *len */
+#define SYS_clock_gettime 60 /* clock_gettime(clock, ts): 0, the clock's time in *ts */
+#define SYS_sysinfo 61       /* sysinfo(info): 0, the memory, processes and uptime in *info */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process; ftruncate, fcntl: a seal */
@@ -288,6 +290,38 @@ struct ping_reply {
 struct timeval {
     time_t tv_sec;
     long tv_usec;
+};
+
+/* A time: seconds and nanoseconds, two longs, as Linux's (16 bytes):
+ * clock_gettime's. */
+struct timespec {
+    time_t tv_sec;
+    long tv_nsec;
+};
+
+/* clock_gettime's clocks, Linux's numbers: the date, and the time since
+ * boot. */
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+
+/* What sysinfo stores, Linux's struct sysinfo on LP64 (112 bytes): the
+ * time since boot in seconds, the memory in units of mem_unit bytes (1),
+ * and the number of processes. Camelot has no load average, swap or high
+ * memory: those are 0. */
+struct sysinfo {
+    long uptime;
+    unsigned long loads[3];
+    unsigned long totalram;
+    unsigned long freeram;
+    unsigned long sharedram;
+    unsigned long bufferram;
+    unsigned long totalswap;
+    unsigned long freeswap;
+    u16 procs;
+    u16 pad;
+    unsigned long totalhigh;
+    unsigned long freehigh;
+    u32 mem_unit;
 };
 
 /* SO_PEERCRED's: the process at a local socket's other end, as Linux's (12

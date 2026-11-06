@@ -65,6 +65,8 @@
     .equ SYS_recvmsg, 57
     .equ SYS_stat, 58
     .equ SYS_getsockopt, 59
+    .equ SYS_clock_gettime, 60
+    .equ SYS_sysinfo, 61
 
     .text
 
@@ -482,6 +484,20 @@ recvmsg:
     .globl stat
 stat:
     li    a7, SYS_stat
+    ecall
+    ret
+
+# int clock_gettime(int clock, struct timespec *ts)
+    .globl clock_gettime
+clock_gettime:
+    li    a7, SYS_clock_gettime
+    ecall
+    ret
+
+# int sysinfo(struct sysinfo *info)
+    .globl sysinfo
+sysinfo:
+    li    a7, SYS_sysinfo
     ecall
     ret
 

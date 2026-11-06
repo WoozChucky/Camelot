@@ -19,6 +19,7 @@
 #include "net.h"
 #include "poll.h"
 #include "proc.h"
+#include "rtc.h"
 #include "string.h"
 #include "sysfile.h"
 #include "unix.h"
@@ -201,6 +202,43 @@ static long sys_harts(struct trap_frame *f) {
     return n;
 }
 
+/* clock_gettime(clock, ts): the date or the time since boot (rtc.h), in
+ * seconds and nanoseconds. */
+static long sys_clock_gettime(struct trap_frame *f) {
+    u32 clock = (u32)arg(f, 0);
+    u64 ns;
+    if (clock == CLOCK_REALTIME) {
+        ns = clock_realtime_ns();
+    } else if (clock == CLOCK_MONOTONIC) {
+        ns = clock_monotonic_ns();
+    } else {
+        return -EINVAL;
+    }
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ns / NSEC_PER_SEC);
+    ts.tv_nsec = (long)(ns % NSEC_PER_SEC);
+    if (copyout(myproc()->pagetable, arg(f, 1), &ts, sizeof ts) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+/* sysinfo(info): Linux's, with what Camelot has: the uptime, the pages the
+ * allocator manages and has free, and the processes. */
+static long sys_sysinfo(struct trap_frame *f) {
+    struct sysinfo info;
+    memset(&info, 0, sizeof info);
+    info.uptime = (long)(clock_monotonic_ns() / NSEC_PER_SEC);
+    info.totalram = (unsigned long)ktotal_pages() * PGSIZE;
+    info.freeram = (unsigned long)kfree_pages() * PGSIZE;
+    info.procs = (u16)proc_list(NULL, 0);
+    info.mem_unit = 1;
+    if (copyout(myproc()->pagetable, arg(f, 0), &info, sizeof info) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
 /* Whether call `num` goes into the network stack: netinfo to setsockopt,
  * numbered one after another, and getsockopt, sendmsg and recvmsg. They
  * run under net_lock (net.h), but for a local socket's. */
@@ -375,6 +413,12 @@ void syscall(struct trap_frame *f) {
     case SYS_getsockopt:
         ret = local ? unix_sys_getsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), arg(f, 4))
                     : sock_sys_getsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), arg(f, 4));
+        break;
+    case SYS_clock_gettime:
+        ret = sys_clock_gettime(f);
+        break;
+    case SYS_sysinfo:
+        ret = sys_sysinfo(f);
         break;
     case SYS_socketpair:
         ret = unix_sys_socketpair((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3));

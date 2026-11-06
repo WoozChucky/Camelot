@@ -93,6 +93,8 @@ headers and checks each size.
 | `struct netinfo` | 132 | `netinfo`'s |
 | `struct ping_reply` | 16 | `ping`'s |
 | `struct timeval` | 16 | `SO_RCVTIMEO`'s: two `long`s, `tv_sec` a `time_t` |
+| `struct timespec` | 16 | `clock_gettime`'s: two `long`s, `tv_sec` a `time_t`, then `tv_nsec` |
+| `struct sysinfo` | 112 | `sysinfo`'s, Linux's: `long`s and `unsigned long`s, two `unsigned short`s and an `unsigned int` |
 | `struct sockaddr_in` | 16 | an IPv4 address and port |
 | `struct fb_var_screeninfo` | 160 | the framebuffer's mode and the row shown ("The framebuffer") |
 | `struct fb_fix_screeninfo` | 80 | the framebuffer's buffer |
@@ -172,6 +174,8 @@ headers and checks each size.
 | 57 | `recvmsg` | `int fd, struct msghdr *msg, int flags` | bytes received, 0 at the end; `recv`'s errors, `-EMSGSIZE`, `-EOPNOTSUPP`, `-ENOBUFS`, `-EFAULT` |
 | 58 | `stat` | `const char *path, struct stat *st` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EFAULT` |
 | 59 | `getsockopt` | `int fd, int level, int option, void *value, uint *len` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOPROTOOPT` |
+| 60 | `clock_gettime` | `int clock, struct timespec *ts` | 0; `-EINVAL`, `-EFAULT` |
+| 61 | `sysinfo` | `struct sysinfo *info` | 0; `-EFAULT` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -319,6 +323,30 @@ returns those addresses whole.
 
 **uptime()** returns the timer ticks since boot (10 a second at the nominal
 clock), as an unsigned number.
+
+**clock_gettime(clock, ts)** stores the time of `clock` at `ts`, a
+`struct timespec` (16 bytes: seconds, then nanoseconds, below 10^9), as
+Linux's: `CLOCK_MONOTONIC` (1) the time since boot, counted by `time`
+(the CLINT's `mtime`) at the timebase, to the nanosecond the timebase
+allows, and `CLOCK_REALTIME` (0) the date, the time since 1970-01-01
+00:00:00 UTC. The kernel reads the real-time clock once, at boot
+(`docs/excalibur-spec.md` section 9.9; it prints `rtc: 2026-01-01 00:00
+UTC`), and the date runs on the monotonic clock from there, as Linux
+keeps its system time; without a real-time clock (`rtc: none`) the date
+is the time since boot, from 1970. Grail starts the clock at the host's
+time, or a test's machine at a fixed date (`--rtc`). Another clock is
+`-EINVAL`; `ts` not 16 writable bytes `-EFAULT`. There is no
+`clock_settime`. The C library's `time` and `gmtime_r` (UTC only: there
+are no time zones) are built on it, and `date` prints it.
+
+**sysinfo(info)** stores Linux's `struct sysinfo` (112 bytes, `user.h`) at
+`info`, with what Camelot has: `uptime`, the seconds since boot;
+`totalram`, the memory the kernel's page allocator manages (RAM less the
+kernel's image, the firmware's and the device tree's), and `freeram`, what
+of it is free, both in bytes (`mem_unit` is 1); and `procs`, the number of
+processes, as `procs(NULL, 0)` counts them. The load averages, `sharedram`,
+`bufferram`, the swap and the high memory are 0. `-EFAULT` if `info` is
+not 112 writable bytes.
 
 **open(path, flags)** opens the file at `path` and returns a new descriptor
 for it, the lowest one free. `flags` is one access mode, `O_RDONLY` (0),
