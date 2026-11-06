@@ -665,7 +665,8 @@ fn the_disk_kernel_runs_programs_from_bin_on_four_harts() {
     // The root image, made bootable, boots the disk kernel on four harts,
     // through Camelot's firmware and the boot ROM; its shell runs harts and
     // stress from /bin, and the disk is consistent afterwards.
-    let image = xtask::fs::build_bootable(&repo_root(), xtask::fs::IMAGE_SIZE).unwrap();
+    let image =
+        xtask::fs::build_bootable(&repo_root(), xtask::fs::Profile::Server, xtask::fs::IMAGE_SIZE).unwrap();
     let mut m = Machine::new(MachineConfig {
         harts: 4,
         disks: vec![DiskConfig::memory(image)],

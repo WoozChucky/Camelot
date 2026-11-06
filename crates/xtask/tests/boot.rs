@@ -248,10 +248,10 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     // firmware, which keeps 2 MiB), whose shell runs programs from `/bin` and
     // writes to the disk.
     let root = repo_root();
-    let image = xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap();
+    let image = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, xtask::fs::IMAGE_SIZE).unwrap();
     let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
     let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
-    let plain = xtask::fs::build(&root, &opts).unwrap();
+    let plain = xtask::fs::build_profile(&root, &opts, xtask::fs::Profile::Server).unwrap();
 
     // IMAGE_SIZE blocks in all: the filesystem, the same as without booting, and
     // the disk kernel after it, as much of it as the bootloader loads (no symbols).
@@ -359,7 +359,7 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
     // names them.
     let root = repo_root();
     let user = xtask::userprogs::user_dir(&root);
-    let image = xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap();
+    let image = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, xtask::fs::IMAGE_SIZE).unwrap();
     let fs = Fs::open(&image).unwrap();
     let read = |path: &str| fs.read_file(path).unwrap_or_else(|e| panic!("{path}: {e}"));
     assert_eq!(
@@ -488,11 +488,11 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
     let kernel_blocks = boot::loadable(&kernel).unwrap().len().div_ceil(BSIZE) as u32;
     // A bigger --size: a bigger filesystem, the same kernel.
     let bigger = xtask::fs::IMAGE_SIZE + 1024;
-    let image = xtask::fs::build_bootable(&root, bigger).unwrap();
+    let image = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, bigger).unwrap();
     assert_eq!(image.len(), bigger as usize * BSIZE);
     assert_eq!(fsck::check(&image).unwrap().sb.size, bigger - kernel_blocks);
     // The programs do not fit in 1 MiB, nor anything in the kernel's own size.
-    let err = xtask::fs::build_bootable(&root, 1024).unwrap_err();
+    let err = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, 1024).unwrap_err();
     assert!(
         err.starts_with(&format!(
             "the root filesystem does not fit in a 1024-block image, where the kernel leaves it {} blocks",
@@ -500,7 +500,7 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
         )) && err.ends_with("give a bigger --size"),
         "{err}"
     );
-    let err = xtask::fs::build_bootable(&root, kernel_blocks).unwrap_err();
+    let err = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, kernel_blocks).unwrap_err();
     assert_eq!(
         err,
         format!(
@@ -510,7 +510,7 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
     );
     // Too big is not cured by a bigger --size: the error says what is wrong
     // and does not suggest one.
-    let err = xtask::fs::build_bootable(&root, u32::MAX).unwrap_err();
+    let err = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, u32::MAX).unwrap_err();
     assert!(
         err.starts_with(&format!("cannot build a {}-block root image: ", u32::MAX))
             && !err.contains("--size"),

@@ -60,7 +60,9 @@ const KERNEL: &str = "kernel/kernel-disk.elf";
 /// The bootable root image, built once, as `cargo xtask fs` builds it.
 fn image() -> &'static [u8] {
     static IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
-    IMAGE.get_or_init(|| xtask::fs::build_bootable(&path("."), xtask::fs::IMAGE_SIZE).unwrap())
+    IMAGE.get_or_init(|| {
+        xtask::fs::build_bootable(&path("."), xtask::fs::Profile::Server, xtask::fs::IMAGE_SIZE).unwrap()
+    })
 }
 
 /// cat with its debugging information, and the program `/bin` holds, the same code.

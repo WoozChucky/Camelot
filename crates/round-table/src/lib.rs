@@ -723,6 +723,7 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
                     &mut lake,
                     &invocation.lake,
                     &create.name,
+                    avalon_client::BASE_IMAGE,
                     create.profile.clone(),
                 )
                 .map_err(|e| Failure::Failed(e.to_string()))?;

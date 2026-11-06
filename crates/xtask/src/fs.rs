@@ -40,12 +40,88 @@ pub const KERNEL: &str = "kernel/kernel-disk.elf";
 /// `/usr` holds take what they need; the rest is the shell's to write files in
 /// (`crates/xtask/tests/boot.rs` checks that at least a fifth is free).
 /// Raised from 4 MiB when the programs outgrew it, with room for the C
-/// compiler (#243) and the desktop's programs to come.
+/// compiler (#243). The server's ([`Profile::Server`]).
 pub const IMAGE_SIZE: u32 = 8192;
+/// The desktop image's size ([`Profile::Desktop`]), in 1 KiB blocks: 16 MiB,
+/// room for the display server, the GUI library's programs, fonts and apps
+/// (#183-#185) on top of what the server has.
+pub const DESKTOP_IMAGE_SIZE: u32 = 16384;
+/// Where the profiles' own files are (under the repository root): a tree for
+/// each, `kernel/profiles/<name>/`, copied to `/` over [`ROOT_DIR`]'s.
+pub const PROFILES_DIR: &str = "kernel/profiles";
+/// The programs of `kernel/user` only the desktop image has: the server
+/// image leaves them out of `/bin`. The desktop's programs join it as they
+/// come (#183-#185).
+pub const DESKTOP_PROGRAMS: &[&str] = &[];
+/// Where the desktop image puts the fonts, as Linux distributions do.
+pub const FONTS: &str = "/usr/share/fonts";
+
+/// A root image's profile: one kernel, two images, told apart by their
+/// programs, the files under `/etc` and `/usr/share`, and what init starts
+/// (their `/etc/rc`), as Ubuntu Server and Ubuntu Desktop share a kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    /// The console's shell, whose end stops the machine, and `shd`.
+    Server,
+    /// The server's programs and the desktop's, the fonts, and an `/etc/rc`
+    /// that starts the desktop (and a console shell, and `shd`).
+    Desktop,
+}
+
+impl Profile {
+    /// Every profile.
+    pub const ALL: [Profile; 2] = [Profile::Server, Profile::Desktop];
+
+    /// Its name, as `--profile` takes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Profile::Server => "server",
+            Profile::Desktop => "desktop",
+        }
+    }
+
+    /// The profile named `name`.
+    pub fn parse(name: &str) -> Result<Profile, String> {
+        Profile::ALL
+            .into_iter()
+            .find(|p| p.name() == name)
+            .ok_or_else(|| format!("unknown profile {name} (server or desktop)"))
+    }
+
+    /// Its bootable image's size by default, in 1 KiB blocks: the one place
+    /// each is given.
+    pub fn image_size(self) -> u32 {
+        match self {
+            Profile::Server => IMAGE_SIZE,
+            Profile::Desktop => DESKTOP_IMAGE_SIZE,
+        }
+    }
+
+    /// Where `cargo xtask fs` writes its image by default (under `root`, the
+    /// repository): the server's is [`DEFAULT_OUT`].
+    pub fn default_out(self, root: &Path) -> PathBuf {
+        match self {
+            Profile::Server => root.join(DEFAULT_OUT),
+            Profile::Desktop => root.join(DESKTOP_OUT),
+        }
+    }
+
+    /// Whether its `/bin` has the program `name`.
+    pub fn has_program(self, name: &str) -> bool {
+        self == Profile::Desktop || !DESKTOP_PROGRAMS.contains(&name)
+    }
+
+    /// The tree of its own files, under `root`.
+    pub fn dir(self, root: &Path) -> PathBuf {
+        root.join(PROFILES_DIR).join(self.name())
+    }
+}
 /// The host directory copied to `/`.
 pub const ROOT_DIR: &str = "kernel/fs";
-/// Where the image goes by default (under the repository root).
+/// Where the image goes by default (under the repository root): the
+/// server's, and the desktop's.
 pub const DEFAULT_OUT: &str = "target/camelot-fs.img";
+pub const DESKTOP_OUT: &str = "target/camelot-desktop.img";
 /// Where the user programs go.
 pub const BIN: &str = "/bin";
 /// The device nodes' directory.
@@ -119,9 +195,11 @@ pub fn add_usr(fs: &mut Mkfs, files: &[(String, Vec<u8>)]) -> Result<(), String>
     Ok(())
 }
 
-/// Builds the root image: `opts`' shape, `kernel/fs/` at `/`, the programs
-/// in `/bin`, `/dev/console`, `/dev/fb0`, `/dev/input/event0` and `event1`,
-/// `/dev/ptmx` and `/dev/pts/0` to `15`, and `/usr` ([`usr_files`]).
+/// Builds the root image every profile starts from: `opts`' shape,
+/// `kernel/fs/` at `/`, every program in `/bin`, `/dev/console`, `/dev/fb0`,
+/// `/dev/input/event0` and `event1`, `/dev/ptmx` and `/dev/pts/0` to `15`,
+/// and `/usr` ([`usr_files`]). No `/etc/rc`: its init runs the shell, as
+/// pid 1, as if there were no init (the tests' images).
 pub fn build(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
     build_with(root, opts, CCompiler::Merlin)
 }
@@ -130,8 +208,27 @@ pub fn build(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
 /// kernel checks that `/bin` holds the programs it embeds, so it needs an
 /// image of its own.
 pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>, String> {
+    build_image(root, opts, cc, None)
+}
+
+/// [`build`] for `profile`: its programs in `/bin`, its tree
+/// ([`Profile::dir`]: `/etc/rc`) over `kernel/fs/`'s, and, on the desktop,
+/// the fonts in [`FONTS`].
+pub fn build_profile(root: &Path, opts: &Options, profile: Profile) -> Result<Vec<u8>, String> {
+    build_image(root, opts, CCompiler::Merlin, Some(profile))
+}
+
+fn build_image(
+    root: &Path,
+    opts: &Options,
+    cc: CCompiler,
+    profile: Option<Profile>,
+) -> Result<Vec<u8>, String> {
     let mut fs = Mkfs::new(opts)?;
     fs.add_host_dir(&root.join(ROOT_DIR), "/")?;
+    if let Some(p) = profile {
+        fs.add_host_dir(&p.dir(root), "/")?;
+    }
     fs.mkdir(DEV)?;
     fs.add_device(&format!("{DEV}/console"), CONSOLE_MAJOR, 0)?;
     fs.add_device(&format!("{DEV}/fb0"), FB_MAJOR, 0)?;
@@ -148,9 +245,25 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
     let rt = userprogs::build_runtime(&user, cc)?;
     for prog in userprogs::programs(&user)? {
         let prog = userprogs::link_program(&user, &prog, cc, &rt)?;
-        fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
+        if profile.is_none_or(|p| p.has_program(&prog.name)) {
+            fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
+        }
     }
     add_usr(&mut fs, &usr_files(&user, &rt)?)?;
+    if profile == Some(Profile::Desktop) {
+        // The console's font (kernel/fonts), for the desktop's programs to draw
+        // with: a directory a font, as distributions have them, since a name has
+        // 14 bytes at most (docs/camelot-fs.md).
+        fs.mkdir("/usr/share")?;
+        fs.mkdir(FONTS)?;
+        fs.mkdir(&format!("{FONTS}/spleen"))?;
+        let fonts = root.join("kernel/fonts");
+        for (host, name) in [("spleen-8x16.psfu", "8x16.psfu"), ("LICENSE.spleen", "LICENSE")] {
+            let path = fonts.join(host);
+            let data = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            fs.add_file(&format!("{FONTS}/spleen/{name}"), &data)?;
+        }
+    }
     Ok(fs.finish())
 }
 
@@ -175,27 +288,29 @@ pub fn bootable_layout(size: u32, kernel: &[u8]) -> Result<Options, String> {
     })
 }
 
-/// [`build`], made bootable, `size` blocks in all ([`IMAGE_SIZE`] by default): the
-/// bootloader from `kernel/boot/boot.S` in the boot block, [`KERNEL`] after the
-/// filesystem (`camelot_fs::boot::install`), and the filesystem as big as the rest
+/// [`build_profile`], made bootable, `size` blocks in all
+/// ([`Profile::image_size`] by default): the bootloader from
+/// `kernel/boot/boot.S` in the boot block, [`KERNEL`] after the filesystem
+/// (`camelot_fs::boot::install`), and the filesystem as big as the rest
 /// ([`bootable_layout`]). Fails, saying so, when the files do not fit.
-pub fn build_bootable(root: &Path, size: u32) -> Result<Vec<u8>, String> {
+pub fn build_bootable(root: &Path, profile: Profile, size: u32) -> Result<Vec<u8>, String> {
     let kernel_path = root.join(KERNEL);
     let kernel =
         std::fs::read(&kernel_path).map_err(|e| format!("cannot read {}: {e}", kernel_path.display()))?;
     let opts = bootable_layout(size, &kernel)?;
-    let mut image = build(root, &opts).map_err(|e| {
+    let mut image = build_profile(root, &opts, profile).map_err(|e| {
         // Only running out of blocks or inodes is cured by a bigger image;
         // anything else (a missing file, a program that does not compile, a
         // size too big for a filesystem) is reported as it is.
         if e.contains("no space left") || e.contains("no inode left") {
             format!(
-                "the root filesystem does not fit in a {size}-block image, where the kernel leaves it \
-                 {} blocks ({e}): give a bigger --size",
+                "the {} root filesystem does not fit in a {size}-block image, where the kernel leaves \
+                 it {} blocks ({e}): give a bigger --size",
+                profile.name(),
                 opts.size
             )
         } else {
-            format!("cannot build a {size}-block root image: {e}")
+            format!("cannot build a {size}-block {} root image: {e}", profile.name())
         }
     })?;
     let bootloader = crate::boot::bootloader(root)?;

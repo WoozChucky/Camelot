@@ -30,6 +30,8 @@ tasks:
                the user programs in /bin (merlin, merlin-as, merlin-ld; no LLVM), /dev/console,
                made bootable with kernel/boot/boot.elf and kernel/kernel-disk.elf
                (grail --ram 6 --disk target/camelot-fs.img boots it)
+               --profile server|desktop: the image's programs, /etc/rc (what init starts) and
+               /usr/share (default server; desktop: target/camelot-desktop.img, {desktop_size});
                -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default
                {image_size}), the filesystem filling what the kernel leaves;
                --no-boot: the filesystem alone, N blocks (the same default)
@@ -61,10 +63,12 @@ kernel options:
                      exit code
   -v, --verbose      print each command (for merlin, its command-line equivalent)";
 
-/// [`USAGE`] with the default root image size filled in.
+/// [`USAGE`] with the default root images' sizes filled in.
 fn usage() -> String {
-    let blocks = xtask::fs::IMAGE_SIZE;
-    USAGE.replace("{image_size}", &format!("{blocks}: {} MiB", blocks / 1024))
+    let size = |blocks: u32| format!("{blocks}: {} MiB", blocks / 1024);
+    USAGE
+        .replace("{image_size}", &size(xtask::fs::IMAGE_SIZE))
+        .replace("{desktop_size}", &size(xtask::fs::DESKTOP_IMAGE_SIZE))
 }
 
 /// `--cc`: which C compiler builds the kernel.
@@ -169,11 +173,23 @@ fn parse_ld_fixtures_args(args: &[String]) -> Result<LdFixturesArgs, String> {
     Ok(l)
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct FsArgs {
+    profile: xtask::fs::Profile,
     out: Option<PathBuf>,
     size: Option<u32>,
     no_boot: bool,
+}
+
+impl Default for FsArgs {
+    fn default() -> FsArgs {
+        FsArgs {
+            profile: xtask::fs::Profile::Server,
+            out: None,
+            size: None,
+            no_boot: false,
+        }
+    }
 }
 
 fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
@@ -183,6 +199,7 @@ fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
         let mut value = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
             "-o" => f.out = Some(value("-o")?.into()),
+            "--profile" => f.profile = xtask::fs::Profile::parse(&value("--profile")?)?,
             "--size" => {
                 let v = value("--size")?;
                 f.size = Some(v.parse().map_err(|_| format!("bad size {v} (blocks)"))?);
@@ -439,21 +456,22 @@ fn build_boot(args: ExamplesArgs) -> ExitCode {
     }
 }
 
-/// `cargo xtask fs`: the root filesystem image, bootable unless
-/// `--no-boot`, checked with fsck after it is built.
+/// `cargo xtask fs`: the root filesystem image of a profile, bootable
+/// unless `--no-boot`, checked with fsck after it is built.
 fn build_fs(f: FsArgs) -> ExitCode {
     let root = repo_root();
-    let out = f.out.clone().unwrap_or_else(|| xtask::fs::default_out(&root));
+    let out = f.out.clone().unwrap_or_else(|| f.profile.default_out(&root));
+    let size = f.size.unwrap_or(f.profile.image_size());
     let built = if f.no_boot {
         // As big as the root image by default, so that every program fits
         // with the room it has there.
         let opts = camelot_fs::mkfs::Options {
-            size: f.size.unwrap_or(xtask::fs::IMAGE_SIZE),
+            size,
             ..camelot_fs::mkfs::Options::default()
         };
-        xtask::fs::build(&root, &opts)
+        xtask::fs::build_profile(&root, &opts, f.profile)
     } else {
-        xtask::fs::build_bootable(&root, f.size.unwrap_or(xtask::fs::IMAGE_SIZE))
+        xtask::fs::build_bootable(&root, f.profile, size)
     };
     let image = match built {
         Ok(image) => image,
@@ -811,11 +829,20 @@ mod tests {
         assert_eq!(
             parse(&["-o", "d.img", "--size", "512"]).unwrap(),
             FsArgs {
+                profile: xtask::fs::Profile::Server,
                 out: Some("d.img".into()),
                 size: Some(512),
                 no_boot: false,
             }
         );
+        assert_eq!(
+            parse(&["--profile", "desktop"]).unwrap().profile,
+            xtask::fs::Profile::Desktop
+        );
+        assert!(parse(&["--profile", "laptop"])
+            .unwrap_err()
+            .contains("unknown profile laptop"));
+        assert!(parse(&["--profile"]).unwrap_err().contains("needs a value"));
         assert!(parse(&["--no-boot"]).unwrap().no_boot);
         assert!(parse(&["--xlen", "64"])
             .unwrap_err()

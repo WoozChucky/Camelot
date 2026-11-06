@@ -2,13 +2,15 @@
 //!
 //! 1. **Build** ([`build`]): the platform's binaries in release mode
 //!    (`cargo build --release -p lake -p avalon -p pendragon -p round-table -p herald`),
-//!    and the bootable Camelot root image, as `cargo xtask fs` builds it
-//!    (`target/camelot-fs.img`). `--no-build` skips both and uses what is there.
+//!    and the bootable Camelot root images of both profiles, as `cargo xtask fs`
+//!    builds them (`target/camelot-fs.img`, the server's, and
+//!    `target/camelot-desktop.img`). `--no-build` skips them and uses what is there.
 //! 2. **Seed** ([`seed`]): Lake's images directory (`target/platform/images` by
-//!    default) gets the root image as the disk `os-base`, the image a Camelot VM's
-//!    disk is a copy of (`avalon_client::BASE_IMAGE`). It is written when it is
-//!    missing and replaced when it differs from the one just built; nothing else in
-//!    the directory is touched.
+//!    default) gets the server's root image as the disk `os-base`, the image a
+//!    Camelot VM's disk is a copy of (`avalon_client::BASE_IMAGE`), and the desktop's
+//!    as `os-desktop` (`avalon_client::DESKTOP_IMAGE`, a Camelot desktop's). Each is
+//!    written when it is missing and replaced when it differs from the one just
+//!    built; nothing else in the directory is touched.
 //! 3. **Start** ([`Platform::start`]): Lake, Avalon and Pendragon, as child processes
 //!    of the built binaries, one after the other, each once the one before it is
 //!    listening. Their output is read by a thread per pipe and printed with the name of
@@ -21,10 +23,11 @@
 //!    VM `vm001` with a Camelot VM's hardware (Camelot's firmware and 6 MiB of RAM,
 //!    `avalon_client::CAMELOT_RAM`) that boots from `vm001-disk0`,
 //!    its own copy of the image, plugged into it and started. The gateway forwards
-//!    127.0.0.1:2323 (`--shd`) to the VM's port 23, and once the VM is at its prompt,
-//!    `up` types `shd &` on its console: the shell server, which gives each connection
-//!    (`herald --tcp 127.0.0.1:2323`) a shell of its own, beside the console's. `up`
-//!    checks that a shell answers through the forward; if none does (an old disk
+//!    127.0.0.1:2323 (`--shd`) to the VM's port 23, where `shd` listens, the shell
+//!    server the image's init starts, which gives each connection (`herald --tcp
+//!    127.0.0.1:2323`) a shell of its own, beside the console's. `up` checks that a
+//!    shell answers through the forward, and types `shd &` on the console of a disk
+//!    from before init, whose shd nothing starts; if none answers (an old disk
 //!    without `/bin/shd`, say, which the console tells at once), it says so and how
 //!    to start it, and goes on. So it does when the forward cannot be set up (its
 //!    address is taken), without shd. Either way its summary leaves `herald --tcp` out.
@@ -38,8 +41,9 @@
 //! already, and a VM keeps nothing that is not on its disks, so stopping a server
 //! loses nothing.
 
+use crate::fs::Profile;
 use avalon_client::{
-    camelot_bios, create_camelot_vm, vm_disk, CamelotError, Client, BASE_IMAGE, CAMELOT_RAM,
+    camelot_bios, create_camelot_vm, vm_disk, CamelotError, Client, BASE_IMAGE, CAMELOT_RAM, DESKTOP_IMAGE,
 };
 use avalon_proto::{
     DeviceSpec, DiskSource, DiskSpec, ErrorCode, FwdProto, HardwareProfile, Message, NatConfig, NetSpec,
@@ -95,19 +99,20 @@ pub const INTERRUPTED: &str = "interrupted";
 
 pub const USAGE: &str = "usage: cargo xtask up [options]
 
-Brings the Avalon platform up: builds it, puts the Camelot root image in Lake's
-images directory as the image os-base, and runs Lake, Avalon and Pendragon until
-Ctrl-C (or until one of them ends), their output prefixed by server.
+Brings the Avalon platform up: builds it, puts the Camelot root images in Lake's
+images directory as the images os-base (the server's) and os-desktop, and runs
+Lake, Avalon and Pendragon until Ctrl-C (or until one of them ends), their output
+prefixed by server.
 
   --images DIR       Lake's images directory (default target/platform/images).
-                     Only the image os-base is written there: created when
-                     missing, replaced when the build has changed it
+                     Only the images os-base and os-desktop are written there:
+                     created when missing, replaced when the build has changed them
   --lake ADDR        where Lake listens (default 127.0.0.1:7401)
   --avalon ADDR      where Avalon listens (default 127.0.0.1:7400)
   --pendragon ADDR   where Pendragon serves its page (default 127.0.0.1:7402)
                      ADDR is host:port, or a host alone for the default port
-  --no-build         use the binaries and the image already built
-                     (target/camelot-fs.img)
+  --no-build         use the binaries and the images already built
+                     (target/camelot-fs.img, target/camelot-desktop.img)
   --demo             also create a switch nat with a NAT gateway and a VM vm001
                      that boots from its own copy of the image, vm001-disk0,
                      plugged into it, and start it, with shd, its shell server,
@@ -124,8 +129,10 @@ pub struct Options {
     pub root: PathBuf,
     /// Where the built binaries are (`target/release`).
     pub bin_dir: PathBuf,
-    /// The bootable root image, as `cargo xtask fs` writes it.
+    /// The bootable root image, as `cargo xtask fs` writes it (the server's).
     pub image: PathBuf,
+    /// The desktop's, as `cargo xtask fs --profile desktop` writes it.
+    pub desktop_image: PathBuf,
     /// Lake's images directory.
     pub images: PathBuf,
     pub lake: SocketAddr,
@@ -148,7 +155,8 @@ impl Options {
         Options {
             root: root.to_path_buf(),
             bin_dir: target.join("release"),
-            image: crate::fs::default_out(root),
+            image: Profile::Server.default_out(root),
+            desktop_image: Profile::Desktop.default_out(root),
             images: DEFAULT_IMAGES
                 .split('/')
                 .fold(root.to_path_buf(), |path, part| path.join(part)),
@@ -166,7 +174,19 @@ impl Options {
         self.bin_dir
             .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
     }
+
+    /// Where `profile`'s root image is built.
+    pub fn image_of(&self, profile: Profile) -> &Path {
+        match profile {
+            Profile::Server => &self.image,
+            Profile::Desktop => &self.desktop_image,
+        }
+    }
 }
+
+/// The images `up` puts in Lake's directory: each profile's root image, and its
+/// name there.
+pub const IMAGES: [(Profile, &str); 2] = [(Profile::Server, BASE_IMAGE), (Profile::Desktop, DESKTOP_IMAGE)];
 
 /// Parses `up`'s arguments (after `up`). `Ok(None)` asks for the help text.
 pub fn parse_args(args: &[String], root: &Path) -> Result<Option<Options>, String> {
@@ -205,9 +225,9 @@ pub type Log<'a> = &'a mut dyn FnMut(&str);
 // ---- Build and seed ----
 
 /// Builds the binaries (`cargo build --release -p ...`, its output on this process's
-/// stderr) and the bootable root image, written to `options.image` as `cargo xtask
-/// fs` builds it. Returns the image.
-pub fn build(options: &Options, log: Log) -> Result<Vec<u8>, String> {
+/// stderr) and the bootable root images, each written where [`Options::image_of`]
+/// says, as `cargo xtask fs` builds it. Returns the images, in [`IMAGES`]' order.
+pub fn build(options: &Options, log: Log) -> Result<Vec<Vec<u8>>, String> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(&options.root).args(["build", "--release"]);
@@ -225,14 +245,22 @@ pub fn build(options: &Options, log: Log) -> Result<Vec<u8>, String> {
     if !status.success() {
         return Err(format!("cargo build failed ({status})"));
     }
-    let path = &options.image;
-    log(&format!("up: building the root image {}", path.display()));
-    let image = crate::fs::build_bootable(&options.root, crate::fs::IMAGE_SIZE)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let mut images = Vec::new();
+    for (profile, _) in IMAGES {
+        let path = options.image_of(profile);
+        log(&format!(
+            "up: building the {} root image {}",
+            profile.name(),
+            path.display()
+        ));
+        let image = crate::fs::build_bootable(&options.root, profile, profile.image_size())?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(path, &image).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        images.push(image);
     }
-    std::fs::write(path, &image).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    Ok(image)
+    Ok(images)
 }
 
 /// What [`seed`] did with a base image.
@@ -265,29 +293,36 @@ pub fn seed(dir: &Path, name: &str, image: &[u8]) -> io::Result<Seeded> {
     Ok(seeded)
 }
 
-/// The root image to seed: the one just built, or with `--no-build` the one at
-/// `options.image` if it is there (`None`: leave the base image in the images
-/// directory as it is).
-fn image_to_seed(options: &Options, log: Log) -> Result<Option<Vec<u8>>, String> {
+/// The root images to seed, in [`IMAGES`]' order: the ones just built, or with
+/// `--no-build` the ones built before, those that are there (`None`: leave the
+/// image in the images directory as it is).
+fn images_to_seed(options: &Options, log: Log) -> Result<Vec<Option<Vec<u8>>>, String> {
     if options.build {
-        return build(options, log).map(Some);
+        return Ok(build(options, log)?.into_iter().map(Some).collect());
     }
-    match std::fs::read(&options.image) {
-        Ok(image) => Ok(Some(image)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("cannot read {}: {e}", options.image.display())),
-    }
+    IMAGES
+        .iter()
+        .map(|&(profile, _)| {
+            let path = options.image_of(profile);
+            match std::fs::read(path) {
+                Ok(image) => Ok(Some(image)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+            }
+        })
+        .collect()
 }
 
 /// Builds (unless `--no-build`) and seeds the images directory with the base
-/// image; with `--no-build`, checks that the binaries are there and that Lake will
-/// have the image to copy.
+/// image and the desktop's; with `--no-build`, checks that the binaries are there
+/// and that Lake will have the base image to copy (without a desktop image, it says
+/// that desktops can't be made, and goes on).
 ///
 /// With `--demo`, when the image has just been replaced and the demo VM's disk is
 /// there from an earlier run, says that the disk is a copy of the old image: the
 /// demo boots from it as it is (with what the VM wrote to it), not from the new build.
 pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
-    let image = image_to_seed(options, log)?;
+    let images = images_to_seed(options, log)?;
     for name in SERVERS {
         let path = options.binary(name);
         if !path.is_file() {
@@ -297,7 +332,20 @@ pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
             ));
         }
     }
-    let name = BASE_IMAGE;
+    for ((profile, name), image) in IMAGES.into_iter().zip(images) {
+        seed_one(options, profile, name, image, log)?;
+    }
+    Ok(())
+}
+
+/// [`prepare`]'s seeding of `profile`'s image as `name`.
+fn seed_one(
+    options: &Options,
+    profile: Profile,
+    name: &str,
+    image: Option<Vec<u8>>,
+    log: Log,
+) -> Result<(), String> {
     let base = options.images.join(name);
     match image {
         Some(image) => {
@@ -313,7 +361,8 @@ pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
                 options.images.display()
             ));
             let demo_disk = options.images.join(vm_disk(DEMO_VM));
-            if seeded == Seeded::Replaced && options.demo && demo_disk.is_file() {
+            if profile == Profile::Server && seeded == Seeded::Replaced && options.demo && demo_disk.is_file()
+            {
                 log(&format!(
                     "up: note: the demo VM's disk {} is a copy of the image {BASE_IMAGE} from \
                      before this build, and the demo boots it as it is; to boot the new build, \
@@ -324,11 +373,17 @@ pub fn prepare(options: &Options, log: Log) -> Result<(), String> {
             }
         }
         None if base.is_file() => {}
+        None if profile == Profile::Desktop => log(&format!(
+            "up: note: there is no {} to put in {} as the image {name}, so no Camelot desktop \
+             can be made: run cargo xtask up without --no-build",
+            options.image_of(profile).display(),
+            options.images.display()
+        )),
         None => {
             return Err(format!(
                 "there is no {} to put in {} as the image {name}: run cargo xtask up without \
                  --no-build",
-                options.image.display(),
+                options.image_of(profile).display(),
                 options.images.display()
             ))
         }
@@ -670,7 +725,14 @@ impl Platform {
             ..HardwareProfile::default()
         };
         let disk = vm_disk(DEMO_VM);
-        let id = match create_camelot_vm(&mut avalon, &mut lake, &lake_addr, DEMO_VM, profile.clone()) {
+        let id = match create_camelot_vm(
+            &mut avalon,
+            &mut lake,
+            &lake_addr,
+            DEMO_VM,
+            BASE_IMAGE,
+            profile.clone(),
+        ) {
             Ok((id, _)) => {
                 log(&format!("up: demo: created disk {disk}, a copy of {BASE_IMAGE}"));
                 id
@@ -772,11 +834,17 @@ impl Drop for Platform {
 /// then for a shell through the forward.
 pub const SHD_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Starts `shd` in VM `vm` on the Avalon server at `avalon`: waits for the shell's
-/// prompt on its console, types `shd &`, and waits until a shell answers at `shd`,
-/// the forwarded port (then leaves it with `exit`). Fails if any of it does not
-/// happen within `timeout` (`up` gives [`SHD_TIMEOUT`]), and as soon as the console
-/// says it went wrong: the shell finding no `/bin/shd` (`sh: shd: no such program`,
+/// How long [`start_shd`] gives the `shd` the server image's init starts to answer,
+/// once the console's shell has its prompt, before it types `shd &` itself.
+pub const SHD_GRACE: Duration = Duration::from_secs(5);
+
+/// Makes sure `shd` runs in VM `vm` on the Avalon server at `avalon`: waits for the
+/// shell's prompt on its console, then until a shell answers at `shd`, the forwarded
+/// port (and leaves it with `exit`). The server image's init starts `shd` (its
+/// `/etc/rc`); a disk from before init, which doesn't, gets `shd &` typed on its
+/// console once no shell has answered for [`SHD_GRACE`]. Fails if no shell answers
+/// within `timeout` (`up` gives [`SHD_TIMEOUT`]), and as soon as the console says it
+/// went wrong: init or the shell finding no `/bin/shd` (`sh: shd: no such program`,
 /// an older disk), or `shd` itself giving up (`shd: port 23: address in use`, say).
 pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
@@ -796,23 +864,27 @@ pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr, timeout: Duration
         }
         read_console(conn, &mut output)?;
     }
-    let typed = output.len();
-    conn.send(&Message::ConsoleInput {
-        vm: id,
-        data: b"shd &\n".to_vec(),
-    })
-    .map_err(|e| format!("its console: {e}"))?;
+    let prompted = Instant::now();
+    let mut typed = false;
     // Until shd listens, the gateway's connection to the VM is refused, and so the
     // host's ends at once: try again a little later, reading the console meanwhile.
     loop {
-        if let Some(failure) = shd_failure(&output[typed..]) {
-            return Err(failure.to_string());
-        }
         if shell_answers(shd, deadline) {
             return Ok(());
         }
+        if let Some(failure) = shd_failure(&output) {
+            return Err(failure.to_string());
+        }
         if Instant::now() > deadline {
             return Err(format!("no shell answered at {shd}"));
+        }
+        if !typed && prompted.elapsed() >= SHD_GRACE {
+            conn.send(&Message::ConsoleInput {
+                vm: id,
+                data: b"shd &\n".to_vec(),
+            })
+            .map_err(|e| format!("its console: {e}"))?;
+            typed = true;
         }
         read_console(conn, &mut output)?;
     }
@@ -836,10 +908,11 @@ fn read_console(conn: &mut avalon_proto::Connection<TcpStream>, output: &mut Str
     }
 }
 
-/// The line of a console's output, from where `shd &` was typed, that says `shd` did
-/// not start: the shell's (`sh: shd: REASON`, it could not start the program) or
-/// shd's own (`shd: ...`, an error: without -v shd prints nothing else). None while
-/// the whole lines so far say neither.
+/// The line of a console's output that says `shd` did not start: init's (`init:
+/// cannot start /bin/shd: REASON`, `init: /bin/shd ended at once, ...`), the
+/// shell's (`sh: shd: REASON`, it could not start the program typed) or shd's own
+/// (`shd: ...`, an error: without -v shd prints nothing else). None while the whole
+/// lines so far say none of these.
 fn shd_failure(output: &str) -> Option<&str> {
     // Whole lines only: the last one may still be coming.
     let whole = &output[..output.rfind('\n').map_or(0, |i| i + 1)];
@@ -847,7 +920,12 @@ fn shd_failure(output: &str) -> Option<&str> {
         .lines()
         // A background shd's error comes after the prompt that followed its line.
         .map(|l| l.trim_end_matches('\r').trim_start_matches(PROMPT))
-        .find(|l| l.starts_with("sh: shd: ") || l.starts_with("shd: "))
+        .find(|l| {
+            l.starts_with("sh: shd: ")
+                || l.starts_with("shd: ")
+                || l.starts_with("init: cannot start /bin/shd: ")
+                || l.starts_with("init: /bin/shd ")
+        })
 }
 
 /// Whether a Camelot shell greets a connection to `addr` before `deadline`; if one
@@ -1286,6 +1364,16 @@ mod tests {
         );
         // Only a whole line counts.
         assert_eq!(shd_failure("shd &\n[5]\n$ shd: port 23: addr"), None);
+        // Init's, for the shd /etc/rc lists.
+        assert_eq!(
+            shd_failure("init: cannot start /bin/shd: no such file or directory\nType help"),
+            Some("init: cannot start /bin/shd: no such file or directory")
+        );
+        assert_eq!(
+            shd_failure("init: /bin/shd ended at once, exit 1: not started again\n"),
+            Some("init: /bin/shd ended at once, exit 1: not started again")
+        );
+        assert_eq!(shd_failure("init: /bin/shdx ended at once\n"), None);
         assert_eq!(shd_failure("shd &\n[5]\n$ shd"), None);
     }
 

@@ -472,9 +472,15 @@ impl App {
         let (id, disk) = if create.camelot {
             // Its own copy of Lake's Camelot image, as Round Table's create --camelot.
             let mut lake = self.lake()?;
-            let (id, disk) =
-                create_camelot_vm(&mut avalon, &mut lake, &self.lake, &create.name, create.profile)
-                    .map_err(camelot_fail)?;
+            let (id, disk) = create_camelot_vm(
+                &mut avalon,
+                &mut lake,
+                &self.lake,
+                &create.name,
+                avalon_client::BASE_IMAGE,
+                create.profile,
+            )
+            .map_err(camelot_fail)?;
             (id, Some(disk))
         } else {
             let id = avalon

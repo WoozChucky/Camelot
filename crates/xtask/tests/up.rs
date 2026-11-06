@@ -58,17 +58,26 @@ impl Output {
     }
 }
 
-/// The root image `up` builds, built once (with the binaries) for every test.
-fn root_image() -> &'static [u8] {
-    static IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
-    IMAGE.get_or_init(|| {
+/// The root images `up` builds, the server's and the desktop's, built once (with
+/// the binaries) for every test.
+fn root_images() -> &'static [Vec<u8>] {
+    static IMAGES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    IMAGES.get_or_init(|| {
         let dir = TempDir::new("build");
         let mut options = Options::new(&xtask::repo_root());
         options.image = dir.0.join("camelot-fs.img");
-        let image = up::build(&options, &mut |line| eprintln!("{line}")).unwrap();
-        assert_eq!(std::fs::read(&options.image).unwrap(), image);
-        image
+        options.desktop_image = dir.0.join("camelot-desktop.img");
+        let images = up::build(&options, &mut |line| eprintln!("{line}")).unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(std::fs::read(&options.image).unwrap(), images[0]);
+        assert_eq!(std::fs::read(&options.desktop_image).unwrap(), images[1]);
+        images
     })
+}
+
+/// The server's root image, the base image ([`root_images`]).
+fn root_image() -> &'static [u8] {
+    &root_images()[0]
 }
 
 /// A line of `round-table disk list` for a copy of the root image
@@ -97,6 +106,8 @@ fn options(dir: &TempDir) -> Options {
     o.images = dir.0.join("images");
     o.image = dir.0.join("camelot-fs.img");
     std::fs::write(&o.image, root_image()).unwrap();
+    o.desktop_image = dir.0.join("camelot-desktop.img");
+    std::fs::write(&o.desktop_image, &root_images()[1]).unwrap();
     o.build = false;
     let any = "127.0.0.1:0".parse().unwrap();
     (o.lake, o.avalon, o.pendragon) = (any, any, any);
@@ -381,6 +392,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         &mut lake,
         &platform.lake.to_string(),
         "second",
+        avalon_client::BASE_IMAGE,
         camelot_profile(),
     )
     .unwrap();
@@ -787,6 +799,7 @@ fn a_disk_without_shd_leaves_the_demo_without_shd() {
         &mut lake,
         &platform.lake.to_string(),
         "vm001",
+        avalon_client::BASE_IMAGE,
         camelot_profile(),
     )
     .unwrap();
