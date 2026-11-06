@@ -7,6 +7,10 @@
 //! comparing the bytes. The parts that draw nothing (damage lists, the
 //! keyboard, UTF-8) print what they did, which is compared too.
 //!
+//! An ignored test, which needs clang, does the same with the programs and
+//! the libraries compiled by clang (the reference build's flags, `-O2
+//! -Wall -Wextra -Werror`): the same images, the same text.
+//!
 //! When the drawing changes on purpose, `GUI_BLESS=1 cargo test --release
 //! -p xtask --test gui` writes the new expected images; look at them before
 //! committing. A failing comparison leaves the image drawn in
@@ -18,6 +22,7 @@ use grail::block::MemDisk;
 use grail::{Machine, MachineConfig, RunResult};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use userprogs::CCompiler;
 use xtask::{kernel, png, repo_root, userprogs};
 
 const PROMPT: &str = "$ ";
@@ -48,9 +53,10 @@ const IMAGES: &[&str] = &[
     "draw", "text", "image", "widgets", "input", "wayland1", "wayland2", "wayland3",
 ];
 
-/// An image with `/dev/console`, the shell and [`BINS`] in `/bin`, the
-/// desktop's `/usr/share`, and an empty `/run` and `/out`.
-fn image() -> Vec<u8> {
+/// An image with `/dev/console`, the shell and [`BINS`] in `/bin` (their C
+/// and the libraries' compiled by `cc`), the desktop's `/usr/share`, and an
+/// empty `/run` and `/out`.
+fn image(cc: CCompiler) -> Vec<u8> {
     let root = repo_root();
     let share = xtask::fs::share_files(&root).unwrap();
     let mut fs = Mkfs::new(&Options {
@@ -63,8 +69,11 @@ fn image() -> Vec<u8> {
         .unwrap();
     fs.mkdir("/bin").unwrap();
     let user = userprogs::user_dir(&root);
+    let rt = userprogs::build_runtime(&user, cc).unwrap();
+    let progs = userprogs::programs(&user).unwrap();
     for name in std::iter::once(&"sh").chain(BINS) {
-        let prog = userprogs::build_named(&user, name).unwrap();
+        let src = progs.iter().find(|p| p.name() == *name).unwrap();
+        let prog = userprogs::link_program(&user, src, cc, &rt).unwrap();
         fs.add_file(&format!("/bin/{name}"), &prog.elf).unwrap();
     }
     fs.mkdir("/usr").unwrap();
@@ -75,30 +84,33 @@ fn image() -> Vec<u8> {
 }
 
 /// Boots the disk kernel on [`image`] (16 MiB of RAM besides the
-/// firmware's), runs [`COMMANDS`] and `exit 0`; once for every test.
+/// firmware's), runs [`COMMANDS`] and `exit 0`.
+fn boot(cc: CCompiler) -> Run {
+    let config = MachineConfig {
+        bios: grail::Bios::Default,
+        ram_size: 16 * 1024 * 1024 + grail::firmware::FW_SIZE as usize,
+        ..MachineConfig::default()
+    };
+    let disk = MemDisk::from_image(image(cc)).unwrap();
+    let mut m = Machine::with_backends(config, vec![Box::new(disk)]).unwrap();
+    m.cpu.bus.uart.capture = true;
+    let elf = std::fs::read(repo_root().join("kernel").join(kernel::DISK_KERNEL)).unwrap();
+    m.load_elf(&elf).unwrap();
+    let input = format!("{}\nexit 0\n", COMMANDS.join("\n"));
+    m.set_uart_input(kernel::typed(input.as_bytes()));
+    let r = m.run(Some(4_000_000_000), |_| {});
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    assert_eq!(r, RunResult::Exited(0), "{out}");
+    let d = &mut m.cpu.bus.disks[0];
+    let mut data = vec![0; d.capacity() as usize * camelot_fs::SECTOR_SIZE];
+    d.backend().read(0, &mut data).unwrap();
+    Run { out, disk: data }
+}
+
+/// [`boot`] with merlin's programs, once for every test.
 fn run() -> &'static Run {
     static RUN: OnceLock<Run> = OnceLock::new();
-    RUN.get_or_init(|| {
-        let config = MachineConfig {
-            bios: grail::Bios::Default,
-            ram_size: 16 * 1024 * 1024 + grail::firmware::FW_SIZE as usize,
-            ..MachineConfig::default()
-        };
-        let disk = MemDisk::from_image(image()).unwrap();
-        let mut m = Machine::with_backends(config, vec![Box::new(disk)]).unwrap();
-        m.cpu.bus.uart.capture = true;
-        let elf = std::fs::read(repo_root().join("kernel").join(kernel::DISK_KERNEL)).unwrap();
-        m.load_elf(&elf).unwrap();
-        let input = format!("{}\nexit 0\n", COMMANDS.join("\n"));
-        m.set_uart_input(kernel::typed(input.as_bytes()));
-        let r = m.run(Some(4_000_000_000), |_| {});
-        let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-        assert_eq!(r, RunResult::Exited(0), "{out}");
-        let d = &mut m.cpu.bus.disks[0];
-        let mut data = vec![0; d.capacity() as usize * camelot_fs::SECTOR_SIZE];
-        d.backend().read(0, &mut data).unwrap();
-        Run { out, disk: data }
-    })
+    RUN.get_or_init(|| boot(CCompiler::Merlin))
 }
 
 /// What the shell printed after `command`, up to its next prompt.
@@ -140,7 +152,35 @@ fn expected_dir() -> PathBuf {
 /// Every scene's image is its expected one.
 #[test]
 fn the_scenes_draw_the_expected_images() {
-    let run = run();
+    check_images(run(), std::env::var_os("GUI_BLESS").is_some());
+}
+
+/// The text the scenes print: the widgets' layout, actions and damage
+/// (only what changed is drawn again), the font's size and advance, the
+/// damage lists, the keyboard's characters, UTF-8 decoded and encoded, and
+/// what guidemo asks of the display server ([`WAYLAND_LOG`]).
+#[test]
+fn the_scenes_print_what_they_did() {
+    check_output(run());
+}
+
+/// The reference build: the scenes' programs and the libraries compiled
+/// by clang draw the same images and print the same.
+#[test]
+#[ignore = "needs clang"]
+fn compiled_by_clang_the_scenes_are_the_same() {
+    let clang = xtask::tools::find("clang").expect("clang (the official LLVM install, or on PATH)");
+    let dir = std::env::temp_dir().join(format!("xtask-gui-clang-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let user = userprogs::user_dir(&repo_root());
+    userprogs::compile_clang(&clang, &user, &dir, false).unwrap();
+    let run = boot(CCompiler::Clang(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
+    check_output(&run);
+    check_images(&run, false);
+}
+
+fn check_images(run: &Run, bless: bool) {
     for c in COMMANDS {
         assert_eq!(
             output(&run.out, c).lines().find(|l| l.starts_with("guitest:")),
@@ -149,7 +189,6 @@ fn the_scenes_draw_the_expected_images() {
         );
     }
     let fs = Fs::open(&run.disk).unwrap();
-    let bless = std::env::var_os("GUI_BLESS").is_some();
     let actual = repo_root().join("target/gui-actual");
     let mut wrong = Vec::new();
     for name in IMAGES {
@@ -235,12 +274,7 @@ frames: 3
 guidemo exited 0
 ";
 
-/// The text the scenes print: the widgets' layout, actions and damage
-/// (only what changed is drawn again), the font's size and advance, the
-/// damage lists, the keyboard's characters, UTF-8 decoded and encoded.
-#[test]
-fn the_scenes_print_what_they_did() {
-    let run = run();
+fn check_output(run: &Run) {
     assert_eq!(output(&run.out, "guitest wayland /out"), WAYLAND_LOG);
     assert_eq!(
         output(&run.out, "guitest widgets /out"),

@@ -411,6 +411,34 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
         &rt.library.iter().find(|m| m.name == "printf.o").unwrap().data
     ));
     assert_eq!(libc, rt.installed().archive);
+    // #183: the GUI library beside it, gui.h and libgui.a, its members
+    // stripped as libc.a's are.
+    assert_eq!(
+        read("/usr/include/gui.h"),
+        std::fs::read(user.join("gui.h")).unwrap()
+    );
+    let libgui = read("/usr/lib/libgui.a");
+    let gui = elf::archive::parse(&libgui).unwrap();
+    let names: Vec<&str> = gui.members.iter().map(|m| m.name.as_str()).collect();
+    let sources: Vec<String> = xtask::userprogs::gui_library(&user)
+        .unwrap()
+        .iter()
+        .map(xtask::userprogs::member_name)
+        .collect();
+    assert_eq!(names, sources);
+    for want in ["draw.o", "font.o", "widget.o", "client.o"] {
+        assert!(names.contains(&want), "{want} not in libgui.a: {names:?}");
+    }
+    for (m, o) in gui.members.iter().zip(&rt.gui) {
+        assert!(!has_debug(m.data), "{} keeps debug information", m.name);
+        assert_eq!(
+            m.data,
+            &elf::strip::strip_debug(&o.data).unwrap()[..],
+            "{}",
+            m.name
+        );
+    }
+    assert_eq!(libgui, rt.installed().gui_archive);
     // The symbol table says where printf and the system calls are.
     let defines = |sym: &str| {
         archive
@@ -422,8 +450,9 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
     assert_eq!(defines("printf"), Some("printf.o"));
     assert_eq!(defines("write"), Some("usys.o"));
     assert_eq!(defines("main"), None);
-    // Every program in /bin is the link of the image's crt0.o, its objects
-    // and the image's libc.a, without its line tables.
+    // Every program in /bin is the link of the image's crt0.o, its objects,
+    // the image's libgui.a and libc.a, without its line tables (the
+    // server's /bin has every program but the desktop's).
     let script = String::from_utf8(read("/usr/lib/user.ld")).unwrap();
     let opts = merlin_ld::Options {
         script: Some(merlin_ld::ScriptSource {
@@ -435,11 +464,20 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
     let progs = xtask::userprogs::programs(&user).unwrap();
     assert!(progs.len() > 30, "{}", progs.len());
     for prog in &progs {
+        let installed = fs.read_file(&format!("/bin/{}", prog.name()));
+        if xtask::fs::DESKTOP_PROGRAMS.contains(&prog.name()) {
+            assert!(installed.is_err(), "the server has /bin/{}", prog.name());
+            continue;
+        }
         let mut inputs = vec![merlin_ld::Input {
             name: "/usr/lib/crt0.o".into(),
             data: crt0.clone(),
         }];
         inputs.extend(xtask::userprogs::program_objects(&user, prog, cc).unwrap());
+        inputs.push(merlin_ld::Input {
+            name: "/usr/lib/libgui.a".into(),
+            data: libgui.clone(),
+        });
         inputs.push(merlin_ld::Input {
             name: "/usr/lib/libc.a".into(),
             data: libc.clone(),
@@ -448,7 +486,7 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
         let linked = merlin_ld::link_files(&files, &opts).unwrap();
         let stripped = merlin_ld::strip_debug(&linked.elf).unwrap();
         assert!(
-            stripped == read(&format!("/bin/{}", prog.name())),
+            stripped == installed.unwrap(),
             "/bin/{} is not the link of /usr/lib's files",
             prog.name()
         );
@@ -904,7 +942,9 @@ fn the_spec_gives_the_root_images_size() {
 fn the_profiles_images_differ_in_their_etc_rc_and_fonts() {
     // Issue #182: each profile's directory of kernel/profiles goes over
     // kernel/fs byte for byte (its /etc/rc); the desktop's has the console's
-    // font and its licence in /usr/share/fonts; both have every program.
+    // font, converted to PSF2, and its licence in /usr/share/fonts, the
+    // images in /usr/share/images, and the programs that draw (#183); the
+    // server has every other program.
     let root = repo_root();
     let programs = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root)).unwrap();
     for profile in xtask::fs::Profile::ALL {
@@ -930,18 +970,28 @@ fn the_profiles_images_differ_in_their_etc_rc_and_fonts() {
             .into_iter()
             .map(|e| String::from_utf8_lossy(&e.name).into_owned())
             .collect();
+        let desktop = profile == xtask::fs::Profile::Desktop;
         for p in &programs {
-            assert!(bin.contains(p), "{}: no /bin/{p}", profile.name());
+            let wanted = desktop || !xtask::fs::DESKTOP_PROGRAMS.contains(&p.as_str());
+            assert_eq!(bin.contains(p), wanted, "{}: /bin/{p}", profile.name());
         }
         let font = fs.read_file("/usr/share/fonts/spleen/8x16.psfu");
+        let image = fs.read_file("/usr/share/images/castle.qoi");
         match profile {
-            xtask::fs::Profile::Server => assert!(font.is_err(), "the server has no fonts"),
+            xtask::fs::Profile::Server => {
+                assert!(font.is_err(), "the server has no fonts");
+                assert!(image.is_err(), "the server has no images");
+            }
             xtask::fs::Profile::Desktop => {
                 let fonts = root.join("kernel/fonts");
-                assert_eq!(
-                    font.unwrap(),
-                    std::fs::read(fonts.join("spleen-8x16.psfu")).unwrap()
-                );
+                let psf1 = std::fs::read(fonts.join("spleen-8x16.psfu")).unwrap();
+                let font = font.unwrap();
+                assert_eq!(font, xtask::font::psf1_to_psf2(&psf1).unwrap());
+                assert_eq!(&font[..4], &[0x72, 0xb5, 0x4a, 0x86], "PSF2's magic");
+                for (name, data) in xtask::images::build(&root).unwrap() {
+                    assert_eq!(fs.read_file(&format!("/usr/share/images/{name}")).unwrap(), data);
+                }
+                assert!(image.is_ok());
                 assert_eq!(
                     fs.read_file("/usr/share/fonts/spleen/LICENSE").unwrap(),
                     std::fs::read(fonts.join("LICENSE.spleen")).unwrap()
