@@ -11,7 +11,8 @@
 //!   generated into `kernel/font.c`.
 //! * [`fs`]: builds the root filesystem image (the user programs and a
 //!   README) with the `camelot-fs` crate's mkfs, bootable with the disk kernel
-//!   ([`fs::IMAGE_SIZE`] blocks in all).
+//!   ([`fs::IMAGE_SIZE`] blocks in all), of a profile ([`fs::Profile`]: the
+//!   server's, or the desktop's of [`fs::DESKTOP_IMAGE_SIZE`] blocks).
 //! * [`boot`]: builds the boot ROM's disk loader and Camelot's bootloader
 //!   with merlin-as + merlin-ld.
 //! * [`toolchain`]: merlin, merlin-as and merlin-ld as libraries, for the
@@ -22,7 +23,8 @@
 //!   llvm-readobj).
 //! * [`tools`]: finds the LLVM tools.
 //! * [`up`]: brings the Avalon platform up (Lake, Avalon and Pendragon, with
-//!   Camelot's root image as Lake's image `os-base`) until Ctrl-C.
+//!   Camelot's root images as Lake's images `os-base` and `os-desktop`) until
+//!   Ctrl-C.
 //! * [`userprogs`]: builds the user programs in `kernel/user/` with merlin,
 //!   merlin-as and merlin-ld (or clang's C output, for the reference build)
 //!   and generates the assembly that embeds them in the kernel (`userprogs.s`,

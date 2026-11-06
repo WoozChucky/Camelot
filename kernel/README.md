@@ -226,7 +226,9 @@ foreground, where Ctrl-C ends it; `wait` collects the background ones,
 `cd [DIR]` changes the working directory, `exec PROG [ARG...]` replaces the shell with PROG (and
 `exec < FILE` or `exec > FILE` redirects the shell itself), `help` lists the
 built-ins, and `exit [N]` (or Ctrl-D on an empty line) ends the shell, after
-which the kernel stops the machine with its status as the exit code. Lines are edited with backspace and end with Enter. In a terminal,
+which the kernel stops the machine with its status as the exit code (the
+console's shell of the server's root image, through init, which ends the
+machine when its `once` services have ended). Lines are edited with backspace and end with Enter. In a terminal,
 Grail passes each key to the kernel as it is typed and the kernel does the
 echoing; piped input works too:
 
@@ -269,6 +271,7 @@ program gets only the parts it uses) and `user/user.ld`. `user/README.md` has ea
 
 | Program | What it does |
 |---|---|
+| `init` | the first process: starts `/etc/rc`'s services, collects orphans |
 | `sh` | the shell |
 | `hello` | prints a line and exits |
 | `echo` | prints its arguments (`-n`: without the newline) |
@@ -415,8 +418,11 @@ grail --ram 8 --paging sv39 --harts 4 kernel/kernel.elf
   `NR_CACHED_STACKS`); the others are unmapped and their pages freed where
   no lock is held (`kstack_reclaim()`).
 - The boot runs every self-test, on 1 to 8 harts, loaded by Grail or from a
-  disk (through `boot/boot.S`'s bootloader), then the shell, a 64-bit
-  program, as the first process, pid 1, as Linux's init.
+  disk (through `boot/boot.S`'s bootloader), then init (`user/init.c`, a
+  64-bit program), as the first process, pid 1, Linux's init: it starts
+  the services of the image's `/etc/rc` (the root image's profiles,
+  `profiles/`) and collects orphans; without `/bin/init` the shell is
+  the first process, and init without `/etc/rc` execs it.
 - User space is the lower half (#155): below `USER_TOP`, 2^47 in Sv48 and
   2^38 in Sv39, Linux's `TASK_SIZE`, with the stack under it and the
   program at 0x1000. Every process's root table copies the kernel's

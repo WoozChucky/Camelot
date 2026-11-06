@@ -10,6 +10,14 @@
 //! `user.ld`, the very files the programs of `/bin` were linked from. No
 //! LLVM needed.
 //!
+//! `--profile` chooses what the image is for ([`Profile`]): its directory of
+//! `kernel/profiles/` goes over `kernel/fs/`, with the `/etc/rc` init runs
+//! (excalibur-spec section 10, "Init and the shell"). The server's, the
+//! default, runs the console's shell and `shd`; the desktop's
+//! (`target/camelot-desktop.img`, [`DESKTOP_IMAGE_SIZE`] blocks) keeps them
+//! running and has the fonts in `/usr/share/fonts`. [`build`], the tests'
+//! images, has no profile, so no `/etc/rc`: the shell is the first process.
+//!
 //! The image is bootable ([`build_bootable`]): Camelot's bootloader
 //! (`kernel/boot/boot.s`, built with merlin-as + merlin-ld) in the boot
 //! block and the committed disk kernel, `kernel/kernel-disk.elf` ([`KERNEL`]),
@@ -64,7 +72,8 @@ pub enum Profile {
     /// The console's shell, whose end stops the machine, and `shd`.
     Server,
     /// The server's programs and the desktop's, the fonts, and an `/etc/rc`
-    /// that starts the desktop (and a console shell, and `shd`).
+    /// that keeps a console shell and `shd` running (the display server and
+    /// the desktop join it as they come, #184 and #185).
     Desktop,
 }
 
