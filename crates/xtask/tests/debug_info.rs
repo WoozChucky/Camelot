@@ -90,9 +90,10 @@ fn debug_information_changes_no_loaded_byte() {
     // The root image: the same kernel, and every file the same but the
     // objects of /usr/lib, which have the same members, none with a line
     // table, and link the same program.
-    let image = fs::build_bootable(&repo_root(), fs::IMAGE_SIZE).unwrap();
-    let plain_image =
-        toolchain::without_debug_info(|| fs::build_bootable(&repo_root(), fs::IMAGE_SIZE).unwrap());
+    let image = fs::build_bootable(&repo_root(), fs::Profile::Server, fs::IMAGE_SIZE).unwrap();
+    let plain_image = toolchain::without_debug_info(|| {
+        fs::build_bootable(&repo_root(), fs::Profile::Server, fs::IMAGE_SIZE).unwrap()
+    });
     assert!(
         camelot_fs::boot::kernel_image(&image).unwrap()
             == camelot_fs::boot::kernel_image(&plain_image).unwrap(),

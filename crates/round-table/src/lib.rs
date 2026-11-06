@@ -6,9 +6,9 @@
 //! tests call [`run`] the same way against servers running in process.
 
 use avalon_client::{
-    arch_text, camelot_bios, create_camelot_vm, device_name, disk_source_text, format_hz, format_size,
-    mac_text, parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd,
-    parse_net, parse_paging, parse_ram, vm_disk, Client, VmAction,
+    arch_text, create_camelot_vm, device_name, disk_source_text, format_hz, format_size, mac_text,
+    parse_addr, parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net,
+    parse_paging, parse_preset, parse_ram, preset, vm_disk, Client, Preset, VmAction, PRESETS,
 };
 use avalon_proto::{
     validate_name, Bios, DeviceSpec, DiskInfo, DiskSpec, HardwareProfile, NatConfig, NetSpec, PortOwner,
@@ -35,10 +35,13 @@ VM commands, sent to Avalon:
                   executable, read here and sent to Avalon), in state created.
                   Without a program the VM boots from its first --disk, as
                   grail --disk IMG does
-  create --name NAME --camelot [--lake ADDR] [options]
+  create --name NAME --profile PROFILE [--lake ADDR] [options]
                   create a VM that boots Camelot from a disk of its own:
-                  Lake's image os-base (cargo xtask up puts it there) is
-                  copied to NAME-disk0, which becomes the VM's first disk
+                  the profile's Lake image (cargo xtask up puts them there)
+                  is copied to NAME-disk0, which becomes the VM's first
+                  disk. PROFILE is server (image os-base) or desktop
+                  (os-desktop); --camelot is --profile server
+  profiles        the hardware profiles of Camelot VMs: image, RAM, firmware
   list            every VM: id, name, state, RAM, clock, disks and cards
   info VM         one VM in detail: hardware, disks, network cards, steps
                   run, devices
@@ -62,10 +65,11 @@ create options:
                   program runs in M-mode), default (Camelot's firmware, which
                   starts the program, or the disk's boot block, in S-mode)
                   or the path of a firmware file on Avalon's host. A Camelot
-                  VM (--camelot) has default unless this says otherwise
+                  VM (--profile) has default unless this says otherwise
   --ram SIZE      RAM size: MiB, or a number with a unit, M/MiB, G/GiB or
                   T/TiB (--ram 64, --ram 16G); 1 MiB to 1 TiB (default 4 MiB;
-                  6 MiB for a Camelot VM, whose firmware keeps 2 MiB)
+                  a Camelot VM has its profile's: 6 MiB for a server, whose
+                  firmware keeps 2 MiB, 64 MiB for a desktop)
   --clock FREQ    real time: run FREQ instructions per second. FREQ is a
                   number with an optional unit, Hz, kHz or MHz: 10MHz, 500kHz,
                   1.5MHz, 5Hz. Without it the VM runs at full speed and
@@ -82,9 +86,13 @@ create options:
                   address ADDR (02:00:00:00:00:01; without one Avalon makes
                   one up from the VM's name). Repeat for more cards, up to 4
   --start         start the VM as soon as it is created
-  --camelot       boot Camelot from NAME-disk0, a copy of Lake's image os-base
-                  made on the Lake at --lake ADDR (no program); Avalon
-                  reaches the disk at that address too
+  --profile PROFILE
+                  a Camelot VM of that hardware profile (round-table
+                  profiles lists them), booting from NAME-disk0, a copy of
+                  the profile's image made on the Lake at --lake ADDR (no
+                  program); Avalon reaches the disk at that address too.
+                  --ram, --bios and the rest change the profile's machine
+  --camelot       --profile server
 
 Switch commands, sent to Avalon:
   switch create NAME [--nat [--hostfwd RULE]...]
@@ -140,7 +148,7 @@ ends, too.
 Options:
   --server ADDR   Avalon's address, for the VM commands: host:port, or a
                   host alone for port 7400 (default 127.0.0.1:7400)
-  --lake ADDR     Lake's address, for the disk commands and create --camelot:
+  --lake ADDR     Lake's address, for the disk commands and create --profile:
                   host:port, or a host alone for port 7401 (default
                   127.0.0.1:7401)
   -h, --help      show this text
@@ -162,6 +170,7 @@ pub struct Invocation {
 pub enum Command {
     Help,
     Create(Create),
+    Profiles,
     List,
     Info(VmRef),
     Action(VmAction, VmRef),
@@ -218,8 +227,9 @@ pub struct Create {
     pub profile: HardwareProfile,
     /// `None`: boot from the first disk.
     pub program: Option<PathBuf>,
-    /// Boot Camelot from a copy of Lake's image `os-base`, made first (`--camelot`).
-    pub camelot: bool,
+    /// Boot Camelot as this hardware profile, from a copy of its Lake image made
+    /// first (`--profile`; `--camelot` is the server's).
+    pub camelot: Option<&'static Preset>,
     pub start: bool,
 }
 
@@ -260,7 +270,7 @@ pub fn run(args: &[String], out: &mut dyn Write) -> Result<(), Failure> {
 // ---- Parsing ----
 
 /// Every option, and whether it takes a value.
-const OPTIONS: [(&str, bool); 20] = [
+const OPTIONS: [(&str, bool); 21] = [
     ("--server", true),
     ("--lake", true),
     ("--name", true),
@@ -281,6 +291,7 @@ const OPTIONS: [(&str, bool); 20] = [
     ("--off", false),
     ("--from", true),
     ("--camelot", false),
+    ("--profile", true),
 ];
 
 /// Options that may be given more than once.
@@ -364,9 +375,14 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 "--net",
                 "--start",
                 "--camelot",
+                "--profile",
                 "--lake",
             ],
         ),
+        "profiles" => {
+            no_arguments(word, rest)?;
+            (Command::Profiles, &[])
+        }
         "list" => {
             no_arguments(word, rest)?;
             (Command::List, &["--server"])
@@ -485,31 +501,40 @@ fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Cre
         }
     }
     let name = name.ok_or("'create' needs --name NAME")?;
-    let camelot = options.iter().any(|(f, _)| *f == "--camelot");
-    if camelot && program.is_some() {
-        return Err("'create --camelot' boots Camelot from its disk, and takes no program".into());
+    let given = |flag: &str| options.iter().find(|(f, _)| *f == flag).map(|(_, v)| v.as_str());
+    let camelot = match (given("--profile"), given("--camelot")) {
+        (Some(_), Some(_)) => return Err("--camelot is --profile server: give one of them".into()),
+        (Some(p), None) => Some(parse_preset(p).map_err(|e| format!("--profile: {e}"))?),
+        (None, Some(_)) => preset("server"),
+        (None, None) => None,
+    };
+    if camelot.is_some() && program.is_some() {
+        return Err("'create --profile' boots Camelot from its disk, and takes no program".into());
     }
-    if camelot && validate_name(&vm_disk(&name)).is_err() {
+    if camelot.is_some() && validate_name(&vm_disk(&name)).is_err() {
         return Err(format!(
             "--name: '{name}' is too long for a Camelot VM, whose disk is named {}",
             vm_disk(&name)
         ));
     }
-    if !camelot && options.iter().any(|(f, _)| *f == "--lake") {
-        return Err("'create' takes --lake only with --camelot (the Lake that copies the disk)".into());
+    if camelot.is_none() && given("--lake").is_some() {
+        return Err("'create' takes --lake only with --profile (the Lake that copies the disk)".into());
     }
-    // A Camelot VM's defaults: Camelot's firmware, and the RAM it keeps on top of
-    // the platform's 4 MiB.
-    if camelot && !options.iter().any(|(f, _)| *f == "--bios") {
-        profile.bios = camelot_bios();
-    }
-    if camelot && !options.iter().any(|(f, _)| *f == "--ram") {
-        profile.ram_size = avalon_client::CAMELOT_RAM;
+    // A Camelot VM's defaults, its profile's: Camelot's firmware, and its RAM (a
+    // server's, the firmware's 2 MiB on top of the platform's 4).
+    if let Some(preset) = camelot {
+        let machine = preset.profile();
+        if given("--bios").is_none() {
+            profile.bios = machine.bios;
+        }
+        if given("--ram").is_none() {
+            profile.ram_size = machine.ram_size;
+        }
     }
     let has_disk = profile.devices.iter().any(|d| matches!(d, DeviceSpec::Disk(_)));
-    if program.is_none() && !has_disk && !camelot {
+    if program.is_none() && !has_disk && camelot.is_none() {
         return Err(
-            "'create' needs the program to run (an ELF file), a --disk to boot from, or --camelot".into(),
+            "'create' needs the program to run (an ELF file), a --disk to boot from, or --profile".into(),
         );
     }
     Ok(Create {
@@ -716,18 +741,18 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
                 None => Vec::new(),
             };
             let mut avalon = connect("Avalon", &invocation.server)?;
-            let (id, mut text) = if create.camelot {
+            let (id, mut text) = if let Some(preset) = create.camelot {
                 let mut lake = connect("Lake", &invocation.lake)?;
                 let (id, disk) = create_camelot_vm(
                     &mut avalon,
                     &mut lake,
                     &invocation.lake,
                     &create.name,
+                    preset.image,
                     create.profile.clone(),
                 )
                 .map_err(|e| Failure::Failed(e.to_string()))?;
-                let image = avalon_client::BASE_IMAGE;
-                (id, format!("created disk {disk} (a copy of {image})\n"))
+                (id, format!("created disk {disk} (a copy of {})\n", preset.image))
             } else {
                 let id = avalon
                     .create_vm(&create.name, create.profile.clone(), program)
@@ -748,6 +773,7 @@ pub fn execute(invocation: &Invocation, out: &mut dyn Write) -> Result<(), Failu
             }
             text
         }
+        Command::Profiles => profile_table(&PRESETS),
         Command::List => vm_table(
             &connect("Avalon", &invocation.server)?
                 .list_vms()
@@ -1041,6 +1067,24 @@ fn sectors_text(sectors: u64) -> String {
     format!("{}, {sectors} {unit}", format_size(bytes))
 }
 
+/// The hardware profiles of Camelot VMs, as `profiles` prints them.
+pub fn profile_table(presets: &[Preset]) -> String {
+    let rows: Vec<Vec<String>> = presets
+        .iter()
+        .map(|p| {
+            let machine = p.profile();
+            vec![
+                p.name.to_string(),
+                p.image.to_string(),
+                format_size(machine.ram_size),
+                machine.bios.to_string(),
+                p.about.to_string(),
+            ]
+        })
+        .collect();
+    table(&["NAME", "IMAGE", "RAM", "BIOS", "ABOUT"], &rows)
+}
+
 /// `disk list`: one row per image.
 pub fn disk_table(disks: &[DiskInfo]) -> String {
     if disks.is_empty() {
@@ -1251,8 +1295,7 @@ mod tests {
         assert_eq!(avalon_proto::DEFAULT_RAM_SIZE, 4 << 20);
         let mib = avalon_proto::DEFAULT_RAM_SIZE >> 20;
         assert!(USAGE.contains(&format!(
-            "(default {mib} MiB;\n                  {} MiB for a Camelot VM,",
-            avalon_client::CAMELOT_RAM >> 20
+            "(default {mib} MiB;\n                  a Camelot VM has its profile's"
         )));
         assert!(!c.start);
         // No program: the VM boots from its disk.
@@ -1266,20 +1309,34 @@ mod tests {
             panic!()
         };
         assert_eq!(c.program, Some(PathBuf::from("-prog.elf")));
-        assert!(!c.camelot);
+        assert!(c.camelot.is_none());
         // Camelot from a copy of Lake's image: no program, no disk needed; Lake's
         // address is the invocation's.
         let inv = parse("create --name os --camelot --lake store --net lan --start").unwrap();
         assert_eq!(inv.lake, "store:7401");
         let Command::Create(c) = inv.command else { panic!() };
-        assert!(c.camelot && c.start);
+        assert_eq!(c.camelot, preset("server"));
+        assert!(c.start);
         assert_eq!((c.name.as_str(), c.program), ("os", None));
         assert_eq!(c.profile.devices.len(), 1, "the card; the disk comes from Lake");
         let Command::Create(c) = command("create --camelot --name os --disk-ro data.img") else {
             panic!()
         };
-        assert!(c.camelot);
+        assert_eq!(c.camelot.map(|p| p.image), Some(avalon_client::BASE_IMAGE));
         assert_eq!(c.profile.devices.len(), 1);
+        // A profile by name: the desktop's image and RAM.
+        let Command::Create(c) = command("create --name os --profile desktop") else {
+            panic!()
+        };
+        assert_eq!(c.camelot.map(|p| p.image), Some(avalon_client::DESKTOP_IMAGE));
+        assert_eq!(
+            (c.profile.bios, c.profile.ram_size),
+            (Bios::Default, avalon_client::DESKTOP_RAM)
+        );
+        let Command::Create(c) = command("create --name os --profile=server") else {
+            panic!()
+        };
+        assert_eq!(c.camelot, preset("server"));
         // Sv39 alone; up to 1 TiB of RAM.
         let Command::Create(c) = command("create --name os --camelot --paging sv39 --ram 1T") else {
             panic!()
@@ -1301,6 +1358,16 @@ mod tests {
             bios("create --name os --camelot --bios none --ram 16"),
             (Bios::None, 16)
         );
+        assert_eq!(
+            bios("create --name os --profile desktop --ram 32"),
+            (Bios::Default, 32)
+        );
+        // The usage gives each profile's RAM.
+        assert!(USAGE.contains(&format!(
+            "{} MiB for a server, whose\n                  firmware keeps 2 MiB, {} MiB for a desktop)",
+            avalon_client::CAMELOT_RAM >> 20,
+            avalon_client::DESKTOP_RAM >> 20
+        )));
         assert_eq!(
             bios("create --name os --bios fw_jump.bin --disk a.img"),
             (Bios::File("fw_jump.bin".into()), 4)
@@ -1354,11 +1421,11 @@ mod tests {
             ("info 1 2", "'info' takes one VM (got '2' as well)"),
             (
                 "create --name a",
-                "'create' needs the program to run (an ELF file), a --disk to boot from, or --camelot",
+                "'create' needs the program to run (an ELF file), a --disk to boot from, or --profile",
             ),
             (
                 "create --name a --camelot a.elf",
-                "'create --camelot' boots Camelot from its disk, and takes no program",
+                "'create --profile' boots Camelot from its disk, and takes no program",
             ),
             ("create --name a --camelot=yes", "--camelot takes no value"),
             (
@@ -1373,6 +1440,17 @@ mod tests {
             ("disk create a --from b --from c", "--from is given twice"),
             ("disk list --from b", "'disk list' does not take --from"),
             ("list --camelot", "'list' does not take --camelot"),
+            (
+                "create --name a --profile laptop",
+                "--profile: no profile 'laptop' (server or desktop)",
+            ),
+            (
+                "create --name a --camelot --profile server",
+                "--camelot is --profile server: give one of them",
+            ),
+            ("create --name a --profile", "--profile needs a value"),
+            ("profiles all", "'profiles' takes no arguments (got 'all')"),
+            ("profiles --ram 2", "'profiles' does not take --ram"),
             (
                 "create a.elf b.elf --name a",
                 "'create' takes one program (got 'b.elf' as well)",
@@ -1443,7 +1521,7 @@ mod tests {
             ),
             (
                 "create a.elf --name a --lake x",
-                "'create' takes --lake only with --camelot",
+                "'create' takes --lake only with --profile",
             ),
             ("start 1 --lake x", "'start' does not take --lake"),
         ] {
