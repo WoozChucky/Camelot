@@ -9,6 +9,8 @@
 //!   merlin-ld, no LLVM, or the clang -O2 + ld.lld reference build.
 //! * [`font`]: the framebuffer console's font, converted to PSF2 and
 //!   generated into `kernel/font.c`.
+//! * [`wayland`]: the Wayland protocol tables, generated from
+//!   `protocols/*.xml` into `kernel/user/gui/protocol.[ch]`.
 //! * [`fs`]: builds the root filesystem image (the user programs and a
 //!   README) with the `camelot-fs` crate's mkfs, bootable with the disk kernel
 //!   ([`fs::IMAGE_SIZE`] blocks in all), of a profile ([`fs::Profile`]: the
@@ -45,6 +47,7 @@ pub mod toolchain;
 pub mod tools;
 pub mod up;
 pub mod userprogs;
+pub mod wayland;
 
 use std::path::{Path, PathBuf};
 

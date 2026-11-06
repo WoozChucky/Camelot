@@ -233,6 +233,10 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
+        what: "the Wayland protocol tables are current, and the protocols their releases (#184)",
+        args: &["-p", "xtask", "--test", "protocol"],
+    },
+    Step {
         what: "the GUI library (#183): drawing, text, images and widgets against their expected \
                images, the damage lists, the keyboard, UTF-8, and the Wayland client against a \
                scripted display server",

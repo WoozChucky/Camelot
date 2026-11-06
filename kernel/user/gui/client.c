@@ -19,6 +19,16 @@
 #include "../gui.h"
 #include "protocol.h"
 
+/* The versions the client binds, at most (it takes the server's when that
+ * is lower): wl_surface.damage_buffer is wl_compositor version 4's. */
+#define WL_COMPOSITOR_VERSION 4
+#define WL_SHM_VERSION 1
+#define XDG_WM_BASE_VERSION 1
+#define WL_SEAT_VERSION 1
+
+/* wl_display, always object 1. */
+#define WL_DISPLAY_ID 1
+
 /* Ids the client reuses once the server has said so (wl_display.delete_id);
  * past them it takes new ones. */
 #define FREE_IDS 32

@@ -70,6 +70,7 @@ A **docs-only** change touches only Markdown (`docs/`, READMEs, this file), and 
 cargo test --release -p xtask --test boot --test fs --test kernel --test up -- the_rom_the_bootloader_mkfs_and_the_documents_agree the_firmware_grail_the_kernel_and_the_documents_agree the_spec_gives_the_root_images_size the_format_document_matches the_system_call_document_matches the_readme_quick_start
 cargo test --release -p avalon --test server -- the_readme_client_example
 cargo test --release -p lake --test avalon -- the_readme_lake_example
+cargo test --release -p xtask --test protocol -- the_protocols_are_their_releases
 ```
 
 A new test that reads a document joins this list, and `ci.rs`'s (`grep -rln '\.md' crates/*/tests` finds them).
