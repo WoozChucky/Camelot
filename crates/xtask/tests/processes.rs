@@ -21,7 +21,7 @@ mod common;
 
 use common::{
     command_output, image_pa, kpa, peek64, printed, proc_name, spare_pages, sym, LockWatch, CPU_PROC,
-    KSTACK_PAGES, PROC_PID, PROMPT,
+    KSTACK_PAGES, MAPTEST_CHECKS, PROC_PID, PROMPT,
 };
 use excalibur::csr::{IRQ_S_EXT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPP};
 use grail::cpu::Mode;
@@ -1092,9 +1092,6 @@ fn memory_mappings_are_mapped_on_demand_and_given_back() {
         "{out}"
     );
 }
-
-/// maptest's checks (kernel/user/maptest.c).
-const MAPTEST_CHECKS: u32 = 101;
 
 #[test]
 fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {

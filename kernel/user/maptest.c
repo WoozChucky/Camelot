@@ -12,6 +12,7 @@
  *   maptest readonly     writes a read-only page: killed
  *   maptest past         touches a page past a shared object's end: killed
  *   maptest fb           draws into /dev/fb0's memory (a root image's)
+ *   maptest threads      threads map and unmap memory at once
  *   maptest child        (shared_checks()'s child) */
 #include "user.h"
 
@@ -278,21 +279,37 @@ static void memfd_checks(void) {
     close(longest);
 }
 
+/* The rounds of shared_checks()' exchange: the parent stores an odd turn
+ * in the object's first word, the child answers with the next, even one. */
+#define TURNS 200
+
+/* Waits for the word at `w` to be `turn`: spinning, so that on several harts
+ * both processes run at once, and yielding now and then, so that on one the
+ * other gets to run. */
+static void await_turn(int *w, int turn) {
+    for (int spins = 1; atomic_load(w) != turn; spins++) {
+        if (spins % 256 == 0) {
+            yield();
+        }
+    }
+}
+
 /* `maptest child`: the other end of shared_checks(), with the object at
- * descriptor 0. Waits for the parent's word, answers with its own. */
+ * descriptor 0. Waits for each of the parent's turns, checks the word it
+ * wrote with it, and answers with its own. */
 static int child(void) {
     int *w = (int *)map(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, 0, 0);
     if ((long)w < 0) {
         return 2;
     }
-    while (atomic_load(&w[0]) != 1) {
-        yield();
+    for (int turn = 1; turn < TURNS; turn += 2) {
+        await_turn(&w[0], turn);
+        if (w[1] != 0x1234 + turn) {
+            return 3;
+        }
+        w[2] = 0x5678 + turn;
+        atomic_store(&w[0], turn + 1);
     }
-    if (w[1] != 0x1234) {
-        return 3;
-    }
-    w[2] = 0x5678;
-    atomic_store(&w[0], 2);
     return 0;
 }
 
@@ -316,12 +333,14 @@ static void shared_checks(void) {
     close(console);
     close(fd);
     check(pid > 0, "spawn the child");
-    w[1] = 0x1234;
-    atomic_store(&w[0], 1);
-    while (pid > 0 && atomic_load(&w[0]) != 2) {
-        yield();
+    int seen = 0;
+    for (int turn = 1; pid > 0 && turn < TURNS; turn += 2) {
+        w[1] = 0x1234 + turn;
+        atomic_store(&w[0], turn);
+        await_turn(&w[0], turn + 1);
+        seen += w[2] == 0x5678 + turn;
     }
-    check_eq(w[2], 0x5678, "the child's write");
+    check_eq(seen, TURNS / 2, "the child's writes");
     int status = -1;
     check_eq(wait(pid, &status), pid, "the child ends");
     check_eq(status, 0, "having seen the parent's write");
@@ -386,6 +405,98 @@ static void fb_checks(void) {
     close(ro);
 }
 
+/* `maptest threads`: the main thread and MAPPERS - 1 more each, ROUNDS
+ * times, map AREA_PAGES pages, fill them, make them read-only and unmap
+ * them, at once (on several harts, side by side). The addresses one thread
+ * unmaps are the next mapping's, often another thread's, on another hart:
+ * munmap must have shot the old translations down on every hart running
+ * the process before the pages are reused. A hart that kept one would read
+ * the old pages through the new mapping, or write into pages that have gone
+ * to another: so a new mapping must read zero, and what a thread wrote must
+ * stay until it unmaps it. Each round also adds one to a counter in a shared
+ * object's page, mapped twice. */
+#define MAPPERS 4
+#define ROUNDS 40
+#define AREA_PAGES 4
+#define MAPPER_STACK 4096
+
+static char mapper_stacks[MAPPERS][MAPPER_STACK];
+/* Per thread, what went wrong: no mapping, a page that didn't read zero, a
+ * mark that changed, munmap or mprotect failing. */
+static int mapper_bad[MAPPERS];
+static int *counter;
+
+/* Whether every page of the area at `w` holds `mark`, first word and last. */
+static int marked(uint *w, uint mark) {
+    for (size_t i = 0; i < AREA_PAGES; i++) {
+        uint *page = w + i * PAGE / 4;
+        if (page[0] != mark || page[PAGE / 4 - 1] != mark) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int mapper(void *arg) {
+    int me = (int)(uintptr_t)arg;
+    for (int r = 0; r < ROUNDS; r++) {
+        long m = anon(AREA_PAGES * PAGE);
+        if (m <= 0) {
+            mapper_bad[me]++;
+            continue;
+        }
+        uint *w = (uint *)m;
+        if (!marked(w, 0)) {
+            mapper_bad[me]++;
+        }
+        uint mark = (uint)(me + 1) << 16 | (uint)(r + 1);
+        for (size_t i = 0; i < AREA_PAGES; i++) {
+            w[i * PAGE / 4] = mark;
+            w[(i + 1) * PAGE / 4 - 1] = mark;
+        }
+        if (r % 8 == 0) {
+            yield();
+        }
+        if (mprotect(w, AREA_PAGES * PAGE, PROT_READ) != 0 || !marked(w, mark)) {
+            mapper_bad[me]++;
+        }
+        if (munmap(w, AREA_PAGES * PAGE) != 0) {
+            mapper_bad[me]++;
+        }
+        atomic_add(counter, 1);
+    }
+    return me + 100;
+}
+
+static void threads_checks(void) {
+    int fd = memfd_create("counter", 0);
+    check_eq(ftruncate(fd, (off_t)PAGE), 0, "the counter's object");
+    long a = map(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    long b = map(0, PAGE, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    check(a > 0 && b > 0, "mapped twice");
+    if (a <= 0 || b <= 0) {
+        return;
+    }
+    counter = (int *)a;
+    int tids[MAPPERS];
+    for (int i = 1; i < MAPPERS; i++) {
+        tids[i] = thread_start(mapper, (void *)(uintptr_t)i, mapper_stacks[i], MAPPER_STACK);
+        check(tids[i] > 0, "start a thread");
+    }
+    mapper((void *)0);
+    for (int i = 1; i < MAPPERS; i++) {
+        int status = -1;
+        check(tids[i] > 0 && thread_join(tids[i], &status) == 0 && status == i + 100, "join it");
+    }
+    for (int i = 0; i < MAPPERS; i++) {
+        check_eq(mapper_bad[i], 0, "a thread's mappings");
+    }
+    check_eq(*(int *)b, MAPPERS * ROUNDS, "the counter, through the other mapping");
+    check_eq(munmap((void *)a, PAGE), 0, "munmap the counter");
+    check_eq(munmap((void *)b, PAGE), 0, "and its other mapping");
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "child") == 0) {
         return child();
@@ -416,8 +527,9 @@ int main(int argc, char **argv) {
         }
     }
     int fb = argc == 2 && strcmp(argv[1], "fb") == 0;
-    if (argc != 1 && !fb) {
-        printf("usage: maptest [none | unmapped | readonly | past | fb]\n");
+    int threads = argc == 2 && strcmp(argv[1], "threads") == 0;
+    if (argc != 1 && !fb && !threads) {
+        printf("usage: maptest [none | unmapped | readonly | past | fb | threads]\n");
         return 1;
     }
     if (pipe(fds) != 0) {
@@ -426,6 +538,8 @@ int main(int argc, char **argv) {
     }
     if (fb) {
         fb_checks();
+    } else if (threads) {
+        threads_checks();
     } else {
         anonymous_checks();
         error_checks();

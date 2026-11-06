@@ -12,7 +12,10 @@
 //! before it returns. `threadtest fs`, booted with the root image, checks
 //! threads using the filesystem while another of their process execs, exits,
 //! is killed or closes their descriptor: each ends, and the disk is left
-//! consistent and as it was.
+//! consistent and as it was. `maptest threads` (issue #179) maps and unmaps
+//! memory from four threads at once: munmap frees pages only after a
+//! shootdown that reached every hart running the process; and `maptest`'s
+//! two processes share an object while running on two harts at once.
 //!
 //! The tests watch every hart's turn with `Cpu::step_traced`, as smp.rs's
 //! do, and read the kernel's tables from memory (the layouts are in the
@@ -93,7 +96,8 @@ fn check_only_the_shell(m: &Machine, elf: &grail::elf::Elf) {
 
 /// Watches every hart for threads of the process called `name` in U-mode:
 /// whether two of its threads ever ran at the same time, on different
-/// harts with the process's page table in satp.
+/// harts with the process's page table in satp; and whether two processes
+/// of that name did.
 struct SideBySide {
     cpus: u64,
     name: &'static str,
@@ -102,6 +106,8 @@ struct SideBySide {
     on: [(u64, u64); grail::MAX_HARTS],
     /// The most of the process's threads seen in U-mode at once.
     most: usize,
+    /// The most processes called `name` seen in U-mode at once.
+    apart: usize,
 }
 
 impl SideBySide {
@@ -112,6 +118,7 @@ impl SideBySide {
             harts,
             on: [(0, 0); grail::MAX_HARTS],
             most: 0,
+            apart: 0,
         }
     }
 
@@ -139,6 +146,7 @@ impl SideBySide {
             if procs.len() == 1 && threads.len() == running.len() {
                 self.most = self.most.max(threads.len());
             }
+            self.apart = self.apart.max(procs.len());
         }
     }
 }
@@ -273,6 +281,45 @@ impl Shootdowns {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Watches munmap's unmap_range() (mmap.c) free the pages it unmapped
+/// (release_areas()) only after its tlb_shootdown(): Grail has no TLB, so a
+/// translation a hart kept would never show, and the order is what the test
+/// can check. [`Shootdowns`] checks that the shootdown reached every hart.
+/// `unmaps` counts the frees.
+struct UnmapOrder {
+    unmap: Range<u64>,
+    release: u64,
+    shootdown: u64,
+    /// Per hart: whether it has called tlb_shootdown() since it last
+    /// entered unmap_range().
+    shot: [bool; grail::MAX_HARTS],
+    unmaps: u32,
+}
+
+impl UnmapOrder {
+    fn new(elf: &grail::elf::Elf) -> UnmapOrder {
+        UnmapOrder {
+            unmap: function("unmap_range"),
+            release: sym(elf, "release_areas"),
+            shootdown: sym(elf, "tlb_shootdown"),
+            shot: [false; grail::MAX_HARTS],
+            unmaps: 0,
+        }
+    }
+
+    fn step(&mut self, cpu: &Cpu) {
+        let h = cpu.id as usize;
+        if cpu.pc == self.unmap.start {
+            self.shot[h] = false;
+        } else if cpu.pc == self.shootdown && self.unmap.contains(&cpu.x[1]) {
+            self.shot[h] = true;
+        } else if cpu.pc == self.release && self.unmap.contains(&cpu.x[1]) {
+            assert!(self.shot[h], "hart {h}'s munmap freed pages before its shootdown");
+            self.unmaps += 1;
         }
     }
 }
@@ -413,6 +460,79 @@ fn threadtest_passes_on_one_and_four_harts() {
                 shootdowns.most >= 2,
                 "no shootdown found two other harts running the process"
             );
+        }
+        exit_shell(&mut m, &tx);
+    }
+}
+
+#[test]
+fn munmap_shoots_down_every_hart_and_processes_share_objects_on_one_and_four_harts() {
+    // Issue #179: `maptest threads`' four threads map, fill and unmap
+    // memory at once, each taking addresses another has just unmapped; on 4
+    // harts they run side by side. Each new mapping reads zero and a
+    // thread's writes stay its own; every munmap frees its pages only after
+    // its shootdown, and every shootdown (munmap's and mprotect's) reaches
+    // every other hart running the process before it returns (two of them
+    // at once at least once). `maptest`'s shared
+    // object is seen by two processes running at the same time on two
+    // harts. Afterwards every page and thread slot is back.
+    let threads = format!("maptest: {MAPTEST_THREADS_CHECKS} checks, 0 failed");
+    let shared = format!("maptest: {MAPTEST_CHECKS} checks, 0 failed");
+    for harts in [1, 4] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (mut m, elf) = load(harts, rx);
+        step_to_prompt(&mut m);
+        warm_up(&mut m, &tx, "maptest threads", &threads);
+        warm_up(&mut m, &tx, "maptest", &shared);
+        let before = kstacks::pages(&mut m, &committed_elf());
+
+        let mut locks = LockWatch::new(&elf);
+        let mut shootdowns = Shootdowns::new(&elf, &m, harts);
+        let mut side = SideBySide::new(&elf, "maptest", harts);
+        let mut order = UnmapOrder::new(&elf);
+        run_command(&mut m, &tx, "maptest threads", |cpu| {
+            locks.step(cpu);
+            shootdowns.step(cpu);
+            side.step(cpu);
+            order.step(cpu);
+        });
+        let out = printed(&m);
+        assert_eq!(
+            command_output(&out, "maptest threads"),
+            [&threads],
+            "{harts} harts"
+        );
+        // Every round's munmap, and the counter's two.
+        assert!(order.unmaps >= 4 * 40 + 2, "{} unmaps", order.unmaps);
+        check_only_the_shell(&m, &elf);
+
+        let mut processes = SideBySide::new(&elf, "maptest", harts);
+        run_command(&mut m, &tx, "maptest", |cpu| {
+            locks.step(cpu);
+            shootdowns.step(cpu);
+            processes.step(cpu);
+        });
+        let out = printed(&m);
+        assert_eq!(command_output(&out, "maptest"), [&shared], "{harts} harts");
+        assert_eq!(
+            kstacks::pages(&mut m, &committed_elf()),
+            before,
+            "{harts} harts: pages leaked"
+        );
+        check_only_the_shell(&m, &elf);
+        if harts == 1 {
+            assert_eq!((side.most, processes.apart), (1, 1));
+        } else {
+            assert!(side.most >= 2, "the threads never ran side by side");
+            assert!(
+                shootdowns.shared > 0,
+                "no shootdown reached another hart running the process"
+            );
+            assert!(
+                shootdowns.most >= 2,
+                "no shootdown found two other harts running the process"
+            );
+            assert_eq!(processes.apart, 2, "maptest and its child never ran at once");
         }
         exit_shell(&mut m, &tx);
     }
