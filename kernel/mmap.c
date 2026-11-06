@@ -143,31 +143,31 @@ static void each_pte(pagetable_t pt, uintptr start, uintptr end, void (*fn)(pte_
 
 /* The physical page an area maps at `page`, one of its own: a new zeroed
  * page for anonymous memory, the object's page (made if need be) for a
- * shared-memory object, the device's page for a device. False if there is
- * none: no free page, or past the object's end. */
-static bool area_page(struct vm_area *a, uintptr page, phys_addr_t *out) {
+ * shared-memory object, the device's page for a device. 0; -ENOMEM if no
+ * page could be had; -EFAULT past a shared object's end. */
+static long area_page(struct vm_area *a, uintptr page, phys_addr_t *out) {
     if (a->kind == AREA_ANON) {
         void *mem = kzalloc();
         if (mem == NULL) {
-            return false;
+            return -ENOMEM;
         }
         *out = pa(mem);
-        return true;
+        return 0;
     }
     if (a->kind == AREA_SHM) {
         return shm_page(a->shm, a->pgoff + (page - a->start) / PGSIZE, out);
     }
     *out = a->device + (page - a->start);
-    return true;
+    return 0;
 }
 
-bool mm_fault(pagetable_t pt, uintptr va, u32 access) {
+long mm_fault(pagetable_t pt, uintptr va, u32 access) {
     struct proc *p = myproc();
     if (p == NULL || p->pagetable != pt || va >= USER_TOP) {
-        return false;
+        return -EFAULT;
     }
     uintptr page = PGROUNDDOWN(va);
-    bool ok = false;
+    long r = -EFAULT;
     acquire(&p->vm_lock);
     struct vm_area *a = area_find(p, va);
     u32 perm = a != NULL ? prot_perm(a->prot) : 0;
@@ -176,20 +176,22 @@ bool mm_fault(pagetable_t pt, uintptr va, u32 access) {
         if (pte != NULL && (*pte & PTE_V) != 0) {
             /* Another thread mapped it first: fine if the access is
              * allowed, as it is unless the protections changed since. */
-            ok = (*pte & access) == access;
+            r = (*pte & access) == access ? 0 : -EFAULT;
         } else if (pte == NULL || *pte == 0) {
             phys_addr_t pa;
-            if (area_page(a, page, &pa)) {
-                if (map_pages(pt, page, pa, PGSIZE, perm | PTE_U) == 0) {
-                    ok = true;
-                } else if (a->kind == AREA_ANON) {
+            r = area_page(a, page, &pa);
+            /* The page, then a page table for it if need be: either can
+             * be the one memory runs out of. */
+            if (r == 0 && map_pages(pt, page, pa, PGSIZE, perm | PTE_U) != 0) {
+                if (a->kind == AREA_ANON) {
                     kfree(va(pa));
                 }
+                r = -ENOMEM;
             }
         }
     }
     release(&p->vm_lock);
-    return ok;
+    return r;
 }
 
 /* Splits `a` in two at `at`, strictly inside it, with `b`, a free area:
@@ -534,7 +536,7 @@ long mm_mmap(uintptr addr, usize len, u32 prot, u32 flags, int fd, off_t offset)
         /* Every page now, as a touch of each would map it, until one can't
          * be had (no free page, the object's end): the rest fault later. */
         for (uintptr page = start; page < start + size; page += PGSIZE) {
-            if (!mm_fault(p->pagetable, page, 0)) {
+            if (mm_fault(p->pagetable, page, 0) != 0) {
                 break;
             }
         }

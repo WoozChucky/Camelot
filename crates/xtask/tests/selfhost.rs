@@ -362,7 +362,11 @@ fn machine_config() -> MachineConfig {
 /// Returns what it printed and the disk afterwards. The kernel has 4 MiB of
 /// RAM besides the firmware's, which the assembler is written to fit in.
 fn boot(image: Vec<u8>, input: &str, max_steps: u64) -> (String, Vec<u8>) {
-    let config = machine_config();
+    boot_on(machine_config(), image, input, max_steps)
+}
+
+/// [`boot`] on a machine of `config`.
+fn boot_on(config: MachineConfig, image: Vec<u8>, input: &str, max_steps: u64) -> (String, Vec<u8>) {
     let disk = MemDisk::from_image(image).unwrap();
     let mut m = Machine::with_backends(config, vec![Box::new(disk)]).unwrap();
     m.cpu.bus.uart.capture = true;
@@ -640,6 +644,18 @@ fn the_linker_on_camelot_keeps_the_line_tables_as_merlin_ld_does() {
     link_every_program(&|_| true);
 }
 
+/// The linker's machine: [`machine_config`]'s with 8 MiB of RAM for the
+/// kernel instead of 4. `ld` holds a link's objects and the image it builds
+/// in memory, as merlin-ld does, and cc1's (1.7 MB of objects, a 1 MB
+/// program) take more than 4 MiB leaves the program: on 6 MiB its
+/// mappings' pages run out.
+fn link_machine_config() -> MachineConfig {
+    MachineConfig {
+        ram_size: (8 << 20) + grail::firmware::FW_SIZE as usize,
+        ..machine_config()
+    }
+}
+
 /// Links every user program on Camelot with `-S`, and without it those
 /// `with_debug` names, and compares the executables with merlin-ld's. The
 /// objects go in `/o`, each program's command line in a response file in
@@ -712,7 +728,12 @@ fn link_every_program(with_debug: &(dyn Fn(&str) -> bool + Sync)) {
                     }
                     let input = format!("{}\nexit 0\n", commands.join("\n"));
                     let dirs = [USR_DIRS, &["/o", "/a"]].concat();
-                    let (out, disk) = boot(image_of(&["ld"], &dirs, &files), &input, 20_000_000_000);
+                    let (out, disk) = boot_on(
+                        link_machine_config(),
+                        image_of(&["ld"], &dirs, &files),
+                        &input,
+                        20_000_000_000,
+                    );
                     let fs = Fs::open(&disk).unwrap();
                     let mut wrong = Vec::new();
                     for (command, file, job, want) in &checks {
@@ -2345,19 +2366,7 @@ fn cc1_machine_config() -> MachineConfig {
 /// Boots the disk kernel on `image`, as [`boot`] does, on
 /// [`cc1_machine_config`]'s machine.
 fn boot_cc1(image: Vec<u8>, input: &str, max_steps: u64) -> (String, Vec<u8>) {
-    let disk = MemDisk::from_image(image).unwrap();
-    let mut m = Machine::with_backends(cc1_machine_config(), vec![Box::new(disk)]).unwrap();
-    m.cpu.bus.uart.capture = true;
-    let elf = std::fs::read(repo_root().join("kernel").join(kernel::DISK_KERNEL)).unwrap();
-    m.load_elf(&elf).unwrap();
-    m.set_uart_input(kernel::typed(input.as_bytes()));
-    let r = m.run(Some(max_steps), |_| {});
-    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-    assert_eq!(r, RunResult::Exited(0), "{out}");
-    let d = &mut m.cpu.bus.disks[0];
-    let mut data = vec![0; d.capacity() as usize * camelot_fs::SECTOR_SIZE];
-    d.backend().read(0, &mut data).unwrap();
-    (out, data)
+    boot_on(cc1_machine_config(), image, input, max_steps)
 }
 
 /// Runs `jobs` (each with its number in the whole list, for its output file
@@ -2800,18 +2809,7 @@ fn compile_on_camelot(jobs: &[(usize, &CcJob)], files: &BTreeMap<String, Vec<u8>
     let written: usize = want.iter().map(|(t, _)| t.as_ref().map_or(0, String::len)).sum();
     let ninodes = (listed.len() + dirs.len() + jobs.len() + 64) as u32;
     let image = image_with_room(&["cc1"], &dirs, &listed, ninodes, 2 * written);
-    let disk = MemDisk::from_image(image).unwrap();
-    let mut m = Machine::with_backends(cc1_compile_config(), vec![Box::new(disk)]).unwrap();
-    m.cpu.bus.uart.capture = true;
-    let elf = std::fs::read(repo_root().join("kernel").join(kernel::DISK_KERNEL)).unwrap();
-    m.load_elf(&elf).unwrap();
-    m.set_uart_input(kernel::typed(input.as_bytes()));
-    let r = m.run(Some(20_000_000_000_000), |_| {});
-    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-    assert_eq!(r, RunResult::Exited(0), "{out}");
-    let d = &mut m.cpu.bus.disks[0];
-    let mut data = vec![0; d.capacity() as usize * camelot_fs::SECTOR_SIZE];
-    d.backend().read(0, &mut data).unwrap();
+    let (out, data) = boot_on(cc1_compile_config(), image, &input, 20_000_000_000_000);
     let fs = Fs::open(&data).unwrap();
     let mut wrong = Vec::new();
     for (i, ((k, _), (text, said))) in jobs.iter().zip(want).enumerate() {

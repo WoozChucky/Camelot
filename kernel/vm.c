@@ -875,7 +875,7 @@ static bool range_mapped(pagetable_t pt, uintptr va, usize len, u32 perm, bool f
     u32 want = perm | PTE_U | PTE_V;
     for (uintptr a = PGROUNDDOWN(va); a < va + len; a += PGSIZE) {
         pte_t *pte = walk(pt, a, false);
-        if (fault && (pte == NULL || (*pte & PTE_V) == 0) && mm_fault(pt, a, perm)) {
+        if (fault && (pte == NULL || (*pte & PTE_V) == 0) && mm_fault(pt, a, perm) == 0) {
             pte = walk(pt, a, false);
         }
         if (pte == NULL || (*pte & want) != want || !pte_in_ram(*pte)) {
