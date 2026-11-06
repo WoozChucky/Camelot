@@ -313,8 +313,10 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
         "{out}"
     );
     assert!(out.contains("\nram: 6 MiB at 0x80000000\n"), "{out}");
-    // Every program.
-    let programs: Vec<String> = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root)).unwrap();
+    // Every program the server has (not the desktop's).
+    let programs: Vec<String> = xtask::fs::Profile::Server
+        .programs(&xtask::userprogs::user_dir(&root))
+        .unwrap();
     assert!(
         out.contains(&format!(
             "fs: /bin holds {} programs, the kernel none\n",

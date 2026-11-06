@@ -122,6 +122,14 @@ impl Profile {
         self == Profile::Desktop || !DESKTOP_PROGRAMS.contains(&name)
     }
 
+    /// The names of the programs of `kernel/user` (`user`, as
+    /// [`userprogs::user_dir`] gives it) its `/bin` has.
+    pub fn programs(self, user: &Path) -> Result<Vec<String>, String> {
+        let mut names = userprogs::program_names(user)?;
+        names.retain(|n| self.has_program(n));
+        Ok(names)
+    }
+
     /// The tree of its own files, under `root`.
     pub fn dir(self, root: &Path) -> PathBuf {
         root.join(PROFILES_DIR).join(self.name())
@@ -245,7 +253,8 @@ pub fn add_usr(fs: &mut Mkfs, files: &[(String, Vec<u8>)]) -> Result<(), String>
 }
 
 /// Builds the root image every profile starts from: `opts`' shape,
-/// `kernel/fs/` at `/`, every program in `/bin`, `/dev/console`, `/dev/fb0`,
+/// `kernel/fs/` at `/`, the server's programs in `/bin` (the desktop's need
+/// its `/usr/share`), `/dev/console`, `/dev/fb0`,
 /// `/dev/input/event0` and `event1`, `/dev/ptmx` and `/dev/pts/0` to `15`,
 /// and `/usr` ([`usr_files`]). No `/etc/rc`: its init runs the shell, as
 /// pid 1, as if there were no init (the tests' images).
@@ -294,7 +303,7 @@ fn build_image(
     let rt = userprogs::build_runtime(&user, cc)?;
     for prog in userprogs::programs(&user)? {
         let prog = userprogs::link_program(&user, &prog, cc, &rt)?;
-        if profile.is_none_or(|p| p.has_program(&prog.name)) {
+        if profile.unwrap_or(Profile::Server).has_program(&prog.name) {
             fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
         }
     }

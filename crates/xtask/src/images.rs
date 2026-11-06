@@ -321,7 +321,7 @@ mod tests {
             0x8001_0103,
             0,
         ]);
-        pixels.extend((0..50).map(|i| 0xff00_0000 | i * 0x0103_07));
+        pixels.extend((0..50).map(|i| 0xff00_0000 | (i * 0x01_0307)));
         let img = Image {
             width: pixels.len() as u32,
             height: 1,
