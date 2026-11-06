@@ -91,12 +91,15 @@ static void write_header(u32 n, const u32 *blocks) {
 }
 
 /* Step 1: copies each block of the transaction, pinned in the cache, to its
- * slot. */
+ * slot. Two buffers' blocks never overlap, and their data is 8-aligned
+ * (bio.h): memcpy, whose rounds of eight registers copy a block in fewer
+ * instructions than memmove's one register at a time. The replay below
+ * likewise. */
 static void write_slots(void) {
     for (u32 i = 0; i < log.lh.n; i++) {
         struct buf *to = fs_bread(log.dev, log.start + 1 + i);
         struct buf *from = fs_bread(log.dev, log.lh.block[i]);
-        memmove(to->data, from->data, BSIZE);
+        memcpy(to->data, from->data, BSIZE);
         write_or_panic(to);
         brelse(from);
         brelse(to);
@@ -137,7 +140,7 @@ static void replay(u32 n) {
     for (u32 i = 0; i < n; i++) {
         struct buf *from = fs_bread(log.dev, log.start + 1 + i);
         struct buf *to = fs_bread(log.dev, replay_blocks[i]);
-        memmove(to->data, from->data, BSIZE);
+        memcpy(to->data, from->data, BSIZE);
         write_or_panic(to);
         brelse(to);
         brelse(from);

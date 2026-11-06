@@ -1210,6 +1210,265 @@ fn kernel_string_functions() {
     assert_eq!(cmp(&mut m, b, a, 4), 1);
     assert_eq!(cmp(&mut m, a + 4, b + 4, 1), 1, "0x80 > 0x01");
     assert_eq!(cmp(&mut m, a, b, 0), 0);
+
+    // strlen, from every alignment; strcmp: 0 for the same string, else
+    // the sign of the first difference as unsigned bytes, a prefix first.
+    for start in 0..8 {
+        for n in 0..40 {
+            put_bytes(&mut m, a + start, &[&mem_pattern(n, 0)[..], &[0, 7]].concat());
+            assert_eq!(
+                call_kernel(&mut m, &elf, "strlen", &[a + start]),
+                n as u64,
+                "strlen {start}+{n}"
+            );
+        }
+    }
+    let strcmp = |m: &mut Machine, x: &[u8], y: &[u8]| {
+        put_bytes(m, a, &[x, &[0]].concat());
+        put_bytes(m, b, &[y, &[0]].concat());
+        (call_kernel(m, &elf, "strcmp", &[a, b]) as i64).signum()
+    };
+    assert_eq!(strcmp(&mut m, b"camelot", b"camelot"), 0);
+    assert_eq!(strcmp(&mut m, b"", b""), 0);
+    assert_eq!(strcmp(&mut m, b"abc", b"abd"), -1);
+    assert_eq!(strcmp(&mut m, b"abd", b"abc"), 1);
+    assert_eq!(strcmp(&mut m, b"ab", b"abc"), -1, "a prefix comes first");
+    assert_eq!(strcmp(&mut m, b"abc", b"ab"), 1);
+    assert_eq!(strcmp(&mut m, b"\xff", b"a"), 1, "unsigned bytes");
+}
+
+/// The lengths the memory functions are checked at: every one to past 64,
+/// then around the larger steps of their loops (memcpy's 128-byte rounds,
+/// memset's 256-byte ones) and a page and more.
+fn mem_lengths() -> impl Iterator<Item = u64> {
+    (0..=80).chain([127, 128, 129, 255, 256, 257, 1000, 1024, 4096, 4101])
+}
+
+/// Bytes that differ from their neighbours and from `seed`'s, so a byte
+/// copied from the wrong place shows.
+fn mem_pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed) | 1)
+        .collect()
+}
+
+/// Guard bytes around what a call may write: nothing past its bytes moves.
+const GUARD: u64 = 16;
+
+#[test]
+fn kernel_memory_functions_at_every_alignment() {
+    // memset, memcpy, memmove and memcmp (kernel/memset.S, memcpy.S,
+    // memmove.S and memcmp.S) work a register at a time once their
+    // pointers are on a register boundary, and a byte at a time around
+    // that and when the two pointers are differently aligned: checked for
+    // every alignment of each pointer within a register (0 to 7) and every
+    // length to 80, and at the lengths their larger loops change at.
+    let (mut m, elf) = call_machine();
+    let src = CALL_DATA;
+    let dst = CALL_DATA + 0x4000;
+    for da in 0..8 {
+        for n in mem_lengths() {
+            // memset: c's low byte, n times, and nothing either side.
+            put_bytes(&mut m, dst, &vec![0xee; (n + 8 + 2 * GUARD) as usize]);
+            let at = dst + GUARD + da;
+            assert_eq!(call_kernel(&mut m, &elf, "memset", &[at, 0x1ab, n]), at);
+            let got = get_bytes(&m, dst, n + 8 + 2 * GUARD);
+            let (before, rest) = got.split_at((GUARD + da) as usize);
+            let (set, after) = rest.split_at(n as usize);
+            assert!(
+                before.iter().chain(after).all(|&b| b == 0xee),
+                "memset {da}+{n}: past the bytes"
+            );
+            assert!(set.iter().all(|&b| b == 0xab), "memset {da}+{n}");
+        }
+    }
+    for sa in 0..8 {
+        for da in 0..8 {
+            for n in mem_lengths() {
+                // memcpy and memmove, apart: the bytes, and nothing past them.
+                let bytes = mem_pattern(n as usize, (sa * 8 + da) as u8);
+                for f in ["memcpy", "memmove"] {
+                    put_bytes(&mut m, src + sa, &bytes);
+                    put_bytes(&mut m, dst, &vec![0xee; (n + 8 + 2 * GUARD) as usize]);
+                    let at = dst + GUARD + da;
+                    assert_eq!(call_kernel(&mut m, &elf, f, &[at, src + sa, n]), at);
+                    let got = get_bytes(&m, dst, n + 8 + 2 * GUARD);
+                    let (before, rest) = got.split_at((GUARD + da) as usize);
+                    let (copied, after) = rest.split_at(n as usize);
+                    assert!(
+                        before.iter().chain(after).all(|&b| b == 0xee),
+                        "{f} {sa}->{da}+{n}: past the bytes"
+                    );
+                    assert_eq!(copied, bytes, "{f} {sa}->{da}+{n}");
+                }
+            }
+        }
+    }
+    // memmove within one buffer, overlapping both ways: dst below src (a
+    // forward copy) and above it (a backward one), every pair of offsets to
+    // 24 apart, so every alignment of each and every distance up to three
+    // registers.
+    let buf = CALL_DATA + 0x8000;
+    let whole = mem_pattern(4200, 0x55);
+    for s in 0..24 {
+        for d in 0..24 {
+            for n in mem_lengths().filter(|&n| n + 24 <= whole.len() as u64) {
+                put_bytes(&mut m, buf, &whole[..(n + 24) as usize]);
+                assert_eq!(
+                    call_kernel(&mut m, &elf, "memmove", &[buf + d, buf + s, n]),
+                    buf + d
+                );
+                let mut want = whole[..(n + 24) as usize].to_vec();
+                want.copy_within(s as usize..(s + n) as usize, d as usize);
+                assert_eq!(get_bytes(&m, buf, n + 24), want, "memmove {s}->{d}+{n} in place");
+            }
+        }
+    }
+    // And farther apart, every distance either way to 80 bytes, past a round
+    // of eight registers (64 bytes) plus a register's alignment: memmove's
+    // way down and up, and memcpy (dst never overlapping src there), at the
+    // lengths around the registers' and the rounds' steps.
+    for s in 0..80 {
+        for d in 0..80 {
+            for n in [16u64, 17, 23, 63, 64, 65, 71, 127, 128, 129, 200, 1000] {
+                let len = (n + 80) as usize;
+                put_bytes(&mut m, buf, &whole[..len]);
+                let overlap = s.max(d) < s.min(d) + n;
+                let f = if overlap { "memmove" } else { "memcpy" };
+                assert_eq!(call_kernel(&mut m, &elf, f, &[buf + d, buf + s, n]), buf + d);
+                let mut want = whole[..len].to_vec();
+                want.copy_within(s as usize..(s + n) as usize, d as usize);
+                assert_eq!(get_bytes(&m, buf, n + 80), want, "{f} {s}->{d}+{n} in place");
+            }
+        }
+    }
+    // memcmp: 0 for equal bytes, whatever comes after them; else -1 or 1
+    // as the first byte that differs is lower or higher, as unsigned bytes
+    // (0x80 above 0x01), wherever it is: before a register boundary, in a
+    // whole register (the first, last or a middle byte of it) or after.
+    let cmp = |m: &mut Machine, x, y, n| call_kernel(m, &elf, "memcmp", &[x, y, n]) as i64;
+    for sa in 0..8 {
+        for da in 0..8 {
+            for n in mem_lengths().filter(|&n| n <= 256) {
+                let bytes = mem_pattern(n as usize, 3);
+                put_bytes(&mut m, src + sa, &bytes);
+                put_bytes(&mut m, dst + da, &bytes);
+                // Different bytes after the n.
+                put_bytes(&mut m, src + sa + n, &[1]);
+                put_bytes(&mut m, dst + da + n, &[2]);
+                assert_eq!(
+                    cmp(&mut m, src + sa, dst + da, n),
+                    0,
+                    "memcmp {sa}/{da}+{n} equal"
+                );
+                let at: Vec<u64> = if n <= 40 {
+                    (0..n).collect()
+                } else {
+                    vec![0, 1, 7, 8, 9, n / 2, n - 9, n - 8, n - 1]
+                };
+                for p in at {
+                    let (x, y) = (src + sa + p, dst + da + p);
+                    put_bytes(&mut m, x, &[0x80]);
+                    put_bytes(&mut m, y, &[0x01]);
+                    assert_eq!(
+                        cmp(&mut m, src + sa, dst + da, n),
+                        1,
+                        "memcmp {sa}/{da}+{n} at {p}"
+                    );
+                    assert_eq!(
+                        cmp(&mut m, dst + da, src + sa, n),
+                        -1,
+                        "memcmp {da}/{sa}+{n} at {p}"
+                    );
+                    // A later difference the other way does not count.
+                    if p + 1 < n {
+                        put_bytes(&mut m, y + 1, &[0xff]);
+                        assert_eq!(
+                            cmp(&mut m, src + sa, dst + da, n),
+                            1,
+                            "memcmp {sa}/{da}+{n} at {p}, then"
+                        );
+                        put_bytes(&mut m, y + 1, &bytes[(p + 1) as usize..(p + 2) as usize]);
+                    }
+                    put_bytes(&mut m, x, &bytes[p as usize..(p + 1) as usize]);
+                    put_bytes(&mut m, y, &bytes[p as usize..(p + 1) as usize]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_bitmap_scan_finds_the_bit_the_bit_by_bit_loop_found() {
+    // balloc (kernel/fs.c) scans a bitmap block with bitmap_first_clear, a
+    // 64-bit word at a time, skipping words with every bit set, where it
+    // used to test each bit: the first clear bit at or after `from` and
+    // before `size`, else `size`. The same bit, so the same block, as that
+    // loop, for clear bits in every place of a word (each byte first_one
+    // skips and each bit of the byte it stops in), before and after
+    // `from`, and at and past `size`.
+    let (mut m, elf) = call_machine();
+    let map = CALL_DATA;
+    let first_clear = |bits: &[u8], size: u64, from: u64| {
+        (from..size)
+            .find(|&i| bits[i as usize / 8] & (1 << (i % 8)) == 0)
+            .unwrap_or(size)
+    };
+    let mut cases = 0;
+    let mut scan = |m: &mut Machine, bits: &[u8], size: u64, from: u64| {
+        put_bytes(m, map, bits);
+        let got = call_kernel(m, &elf, "bitmap_first_clear", &[map, from, size]) as u32;
+        assert_eq!(
+            got as u64,
+            first_clear(bits, size, from),
+            "size {size}, from {from}"
+        );
+        cases += 1;
+    };
+    // Every bit set but one.
+    for p in [
+        0u64, 1, 7, 8, 15, 16, 31, 32, 33, 47, 48, 62, 63, 64, 65, 127, 128, 4000, 8190, 8191,
+    ] {
+        let mut bits = vec![0xff; 1024];
+        bits[p as usize / 8] &= !(1 << (p % 8));
+        for size in [8192, 8191, 8128, p + 1, p, 100, 65, 64, 1] {
+            for from in [0, 1, p.saturating_sub(1), p, p + 1, 63, 64, 8191, 8192] {
+                scan(&mut m, &bits, size, from);
+            }
+        }
+    }
+    // None set, none clear.
+    for byte in [0x00, 0xff] {
+        for (size, from) in [(8192, 0), (8192, 8191), (8192, 100), (77, 13), (64, 64), (0, 0)] {
+            scan(&mut m, &[byte; 1024], size, from);
+        }
+    }
+    // Mostly full maps, as a disk in use has: each byte clear with
+    // probability 1/16, a bit of it chosen at random.
+    let mut seed = 0x1234_5678_9abc_def1u64;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed >> 33
+    };
+    for _ in 0..40 {
+        let bits: Vec<u8> = (0..1024)
+            .map(|_| {
+                if next() % 16 == 0 {
+                    !(1u8 << (next() % 8))
+                } else {
+                    0xff
+                }
+            })
+            .collect();
+        for _ in 0..8 {
+            let size = 1 + next() % 8192;
+            let from = next() % 8200;
+            scan(&mut m, &bits, size, from);
+        }
+    }
+    assert!(cases > 1500, "{cases} cases");
 }
 
 #[test]

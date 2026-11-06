@@ -16,7 +16,7 @@ The code is in `kernel/net/`, one file per layer, with the whole interface in
 | `nic.c` | the card: descriptor rings, the interrupt, the transmit queue |
 | `pbuf.c` | the packet buffer pool |
 | `ether.c` | Ethernet II: filtering by address, dispatch by EtherType |
-| `arp.c` | the ARP cache: requests, replies, timeouts, the packet waiting for an answer |
+| `arp.c` | the ARP cache: requests, replies, timeouts, the packets waiting for an answer |
 | `ip.c` | IPv4: header checks, checksums, routing, loopback |
 | `icmp.c` | echo requests and replies |
 | `udp.c` | UDP: ports, checksums, the kernel-internal socket API, the echo service |
@@ -126,9 +126,12 @@ to the asker. The cache has 16 entries (`ARP_ENTRIES`), each:
 
 - **resolved**: good for 60 s (`ARP_TIMEOUT`), then forgotten;
 - **pending**: a request is out, repeated every second (`ARP_RETRY`), three
-  times in all (`ARP_TRIES`). One packet waits in the entry for the answer;
-  a newer one replaces it, and the replaced one counts in `arp-failed`;
-- **failed**: three requests went unanswered: the waiting packet is dropped
+  times in all (`ARP_TRIES`). The packets sent meanwhile wait in the entry,
+  in order, up to 8 (`ARP_QUEUE`), and all go when the answer comes, as
+  Linux's neighbour entries queue them (a TCP retransmission's segments to a
+  gateway whose entry expired go together, not only the last); with 8
+  waiting the oldest is dropped for the next and counts in `arp-failed`;
+- **failed**: three requests went unanswered: the waiting packets are dropped
   (`arp-failed`), and for 3 s (`ARP_HOLD`) sending to the address fails at
   once with `-EHOSTUNREACH` (also `arp-failed`) rather than asking again.
 

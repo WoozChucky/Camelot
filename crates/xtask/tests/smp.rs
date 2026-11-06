@@ -125,10 +125,15 @@ fn boots_on_every_hart_count() {
     // self-test, which unmaps a page of the kernel page table and so shoots
     // it down on every hart (smp.c), and has done so by the time the
     // self-test frees the page: the shootdown waits for every hart.
+    //
+    // A hart takes its first tick an interval after it starts (timer_start),
+    // and the boot reaches the shell sooner than that after starting the
+    // last one: `sleep 0.2` lets two ticks go by before harts reads every
+    // hart's count.
     let serve = function("tlb_serve");
     let selftest = function("tlb_selftest");
     for harts in [1, 2, 4, 8] {
-        let (mut m, elf) = load(harts, kernel::typed(b"harts\nexit\n"));
+        let (mut m, elf) = load(harts, kernel::typed(b"sleep 0.2\nharts\nexit\n"));
         let sfence = sym(&elf, "sfence_vma");
         let kfree = sym(&elf, "kfree");
         let ticks = image_pa(sym(&elf, "ticks"));
@@ -136,7 +141,7 @@ fn boots_on_every_hart_count() {
         // The harts that had flushed when hart 0 freed the test page.
         let mut flushed_at_free = None;
         // mtime at the first tick (the boot's `tick 1`) and at each
-        // prompt (the second comes right after harts's output), and the
+        // prompt (the third comes right after harts's output), and the
         // clock, `ticks`, at each prompt.
         let (mut seen, mut first_tick, mut prompts, mut clock) = (0, None, Vec::new(), Vec::new());
         let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
@@ -174,17 +179,17 @@ fn boots_on_every_hart_count() {
             assert_eq!(flushed_at_free.as_ref(), Some(&others), "{harts} harts");
         }
         let lines = parse_harts(&command_output(&out, "harts"));
-        assert_eq!(prompts.len(), 2, "{harts} harts:\n{out}");
-        let since_first = prompts[1] - first_tick.unwrap();
+        assert_eq!(prompts.len(), 3, "{harts} harts:\n{out}");
+        let since_first = prompts[2] - first_tick.unwrap();
         check_harts(&lines, harts as u32, since_first);
         // The clock that sleep and uptime read counts hart 0's ticks alone:
         // ten a second however many harts tick (a few fewer if some came
         // while interrupts were off), not one per tick of every hart.
         let expected = 1 + (since_first / TICK_INTERVAL) as u32;
         assert!(
-            clock[1] <= expected && clock[1] + 3 >= expected,
+            clock[2] <= expected && clock[2] + 3 >= expected,
             "{harts} harts: the clock counted {} ticks in {since_first} after the first",
-            clock[1]
+            clock[2]
         );
     }
 }

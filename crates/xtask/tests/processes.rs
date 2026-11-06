@@ -1195,7 +1195,8 @@ fn the_system_calls_do_what_the_document_says() {
 
 #[test]
 fn the_c_library_does_what_user_h_says() {
-    // libtest checks the user C library (kernel/user/lib): strings, numbers
+    // libtest checks the user C library (kernel/user/lib): strings, the
+    // memory functions at every alignment of their pointers, numbers
     // (strtol's 64-bit LONG_MAX), snprintf's formats (%ld of 64-bit values,
     // %p's 16 digits), malloc's 16-byte blocks and free (a big block in a
     // mapping of its own, given back by free), readers on a pipe

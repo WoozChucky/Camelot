@@ -17,7 +17,10 @@
  * request and answers without asking.
  *
  * The cache has ARP_ENTRIES entries, each FREE, PENDING (a request is out,
- * and the one packet waiting for the answer sits in the entry), RESOLVED
+ * and the packets waiting for the answer, up to ARP_QUEUE, are queued in
+ * the entry, as Linux's neighbour entries queue them: a burst sent while
+ * the address is asked for, a TCP retransmission's segments say, all go
+ * once it answers, not only the last), RESOLVED
  * (good for ARP_TIMEOUT ticks) or FAILED (ARP_TRIES requests went
  * unanswered; for ARP_HOLD ticks, sending there fails at once). arp_timer()
  * moves entries along every tick. */
@@ -41,8 +44,9 @@ struct arp_entry {
     /* The tick it was answered (RESOLVED), last asked (PENDING) or given up
      * (FAILED). */
     u32 time;
-    u32 tries;            /* requests sent, while PENDING */
-    struct pbuf *waiting; /* the frame to send once answered, while PENDING */
+    u32 tries; /* requests sent, while PENDING */
+    /* The frames to send once answered, oldest first, while PENDING. */
+    struct pbuf_queue waiting;
 };
 
 static struct arp_entry cache[ARP_ENTRIES];
@@ -56,17 +60,18 @@ static struct arp_entry *lookup(u32 addr) {
     return NULL;
 }
 
-/* Drops the packet waiting in `e`, if any: its next hop is out of reach. */
+/* Drops the packets waiting in `e`, if any: their next hop is out of
+ * reach. */
 static void drop_waiting(struct arp_entry *e) {
-    if (e->waiting != NULL) {
+    struct pbuf *p;
+    while ((p = pbuf_pop(&e->waiting)) != NULL) {
         net_stats.arp_failed++;
-        pbuf_free(e->waiting);
-        e->waiting = NULL;
+        pbuf_free(p);
     }
 }
 
 /* A free entry for `addr`: a FREE one, or else the one used longest ago
- * (its waiting packet, if any, dropped). */
+ * (its waiting packets, if any, dropped). */
 static struct arp_entry *take_entry(u32 addr) {
     struct arp_entry *best = &cache[0];
     for (u32 i = 0; i < ARP_ENTRIES; i++) {
@@ -117,16 +122,16 @@ static void send_request(struct arp_entry *e) {
     send_arp(ARP_REQUEST, ether_broadcast, unknown, e->addr);
 }
 
-/* `e` now knows `mac`: it is RESOLVED, and the packet waiting in it goes. */
+/* `e` now knows `mac`: it is RESOLVED, and the packets waiting in it go,
+ * in the order they came. */
 static void resolved(struct arp_entry *e, const u8 *mac) {
     for (u32 i = 0; i < ETH_ALEN; i++) {
         e->mac[i] = mac[i];
     }
     e->state = ARP_RESOLVED;
     e->time = ticks;
-    struct pbuf *p = e->waiting;
-    e->waiting = NULL;
-    if (p != NULL) {
+    struct pbuf *p;
+    while ((p = pbuf_pop(&e->waiting)) != NULL) {
         ether_output(p, e->mac, ETH_TYPE_IP);
     }
 }
@@ -184,13 +189,18 @@ int arp_output(struct pbuf *p, u32 next_hop) {
     if (e == NULL) {
         e = take_entry(next_hop);
         e->state = ARP_PENDING;
-        e->waiting = p;
+        pbuf_push(&e->waiting, p);
         send_request(e);
         return 0;
     }
-    /* PENDING: the newest packet waits, the one before is dropped. */
-    drop_waiting(e);
-    e->waiting = p;
+    /* PENDING: the packet waits behind the others; with ARP_QUEUE waiting
+     * already, the oldest goes, as Linux's __neigh_event_send() drops the
+     * head of its queue. */
+    if (e->waiting.len >= ARP_QUEUE) {
+        net_stats.arp_failed++;
+        pbuf_free(pbuf_pop(&e->waiting));
+    }
+    pbuf_push(&e->waiting, p);
     return 0;
 }
 
