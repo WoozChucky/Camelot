@@ -4029,7 +4029,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 49, "{errors:?}");
+    assert_eq!(errors.len(), 50, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
 
@@ -4095,13 +4095,13 @@ fn the_system_call_document_matches_the_code() {
             Some((name, cells.get(2)?.parse().ok()?))
         })
         .collect();
-    assert_eq!(sizes.len(), 20, "{sizes:?}");
+    assert_eq!(sizes.len(), 22, "{sizes:?}");
     for (dir, include, headers) in [
         ("kernel/user", None, "#include \"user.h\"\n"),
         (
             "kernel",
             Some("include"),
-            "#include \"syscall.h\"\n#include \"fs.h\"\n#include \"fb.h\"\n#include \"input.h\"\n#include \"poll.h\"\n",
+            "#include \"syscall.h\"\n#include \"fs.h\"\n#include \"fb.h\"\n#include \"input.h\"\n#include \"poll.h\"\n#include \"tty.h\"\n",
         ),
     ] {
         let mut src = headers.to_string();
