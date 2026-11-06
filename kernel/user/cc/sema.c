@@ -4185,6 +4185,12 @@ static int check_expr(struct fnc *c, struct expr *e) {
         if (cr == NULL) {
             return fail(c, pos, fmt("use of undeclared identifier '%s'", e->name));
         }
+        /* The correction taken already, to a name that is not declared
+         * after all (its declaration was cut short by a syntax error,
+         * `int head = heads + ;`): reported, and nothing more to check. */
+        if (strcmp(cr->name, e->name) == 0) {
+            return 1;
+        }
         struct diag *d = diag_error(pos, fmt("use of undeclared identifier '%s'; did you mean '%s'?", e->name, cr->name));
         push(c, diag_note(d, cr->pos, fmt("'%s' declared here", cr->name)));
         if (cr->has_enumerator) {

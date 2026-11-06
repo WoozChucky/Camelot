@@ -1,5 +1,7 @@
-/* cc1: memory, byte buffers, formatting, maps and UTF-8 (see cc.h). What
- * Rust's standard library gives merlin: String, Vec, HashMap, format!. */
+/* cc1: memory (the arena and the translation unit's heap), byte buffers,
+ * formatting, maps, vectors, sorting, 128-bit integers and UTF-8 (see
+ * cc.h). What Rust's standard library gives merlin: String, Vec, HashMap,
+ * format!, sort, i128. */
 #include "cc.h"
 
 typedef __builtin_va_list va_list;

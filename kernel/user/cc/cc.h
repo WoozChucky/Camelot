@@ -6,18 +6,37 @@
  * It is the compiler proper, as clang's `-cc1` and GCC's `cc1` are: the
  * `cc` driver (#242) runs it, then as and ld.
  *
- * It lands in stages. This one is the program's structure and the
- * preprocessor: `cc1 -E`, for C and for assembly (`.S`). Each file mirrors
- * a module of merlin, whose comments explain the rules in more depth:
+ * It lands in stages: the preprocessor (`cc1 -E`, for C and for assembly,
+ * `.S`), then the compiler without -g (C to assembly for as, and
+ * --dump-ast), which is what it is now; -g and the rest of merlin's
+ * diagnostics come next. Each file mirrors a module of merlin:
  *
- *   main.c        the command line, reading the file (main.rs, lib.rs)
- *   util.c        memory (the arena), byte buffers, formatting, maps
+ *   main.c        the command line and the front end's driver: reading
+ *                 the file, the order of the diagnostics, the error limit,
+ *                 the output (main.rs, lib.rs)
+ *   util.c        memory (the arena, the translation unit's heap), byte
+ *                 buffers, formatting, maps, vectors, 128-bit integers,
+ *                 sorting, UTF-8
  *   diag.c        diagnostics, printed as clang prints them (lib.rs's Error)
- *   lexer.c       text to preprocessing tokens, literals (lexer.rs)
- *   preprocess.c  directives, macros, `#if`, the -E output (preprocess.rs)
+ *   lexer.c       text to preprocessing tokens, literals, and the parser's
+ *                 tokens of them (lexer.rs)
+ *   preprocess.c  directives, macros, `#if`, the -E output, the tokens it
+ *                 hands the compiler (preprocess.rs)
+ *   types.c       C's types, their sizes and how clang names them (types.rs)
+ *   ast.c         the syntax tree, and --dump-ast's printer (ast.rs)
+ *   consteval.c   constant expressions (consteval.rs)
+ *   parser.c      tokens to the syntax tree (parser.rs)
+ *   sema.c        names, types, conversions, warnings (sema.rs)
+ *   flow.c        what of a function can run (flow.rs)
+ *   sequence.c    -Wunsequenced (sequence.rs)
+ *   elide.c       what a constant condition leaves out (elide.rs)
+ *   abi.c         the calling convention (abi.rs)
+ *   codegen.c     the checked tree to assembly (codegen.rs)
  *   tables.h      merlin's tables, generated from its sources by `cargo
  *   tables.c      xtask kernel` (crates/xtask/src/c_tables.rs): the
- *                 punctuators, the directives' names, the predefined macros
+ *                 punctuators, the directives' names, the predefined
+ *                 macros, the keywords, the parser's lists and limits, the
+ *                 registers' names
  *
  * Its numbers are merlin's types: uint for Rust's u32, int64_t and
  * uint64_t for i64 and u64. Text is UTF-8, as Rust's strings are, and is
@@ -67,7 +86,7 @@ void heap_free(void *p);
 void *grow(void *p, uint *cap, uint need, uint size);
 void die(const char *msg);
 
-/* A byte buffer (malloc'd). */
+/* A byte buffer (on the heap). */
 struct buf {
     char *data;
     uint len;
@@ -234,7 +253,7 @@ int tok_is_punct(const struct pptok *t, const char *p);
 /* The identifier's name, or NULL if it is no identifier. */
 const char *tok_ident(const struct pptok *t);
 
-/* What lexing a file gives: its tokens (malloc'd, `n` of them) and where
+/* What lexing a file gives: its tokens (on the heap, `n` of them) and where
  * it ends, or an error (an unterminated comment). */
 struct lexed {
     struct pptok *toks;
@@ -343,7 +362,7 @@ i128 i128_min(i128 a, i128 b);
 i128 i128_max(i128 a, i128 b);
 
 /* ---- Vectors (util.c) ----
- * A growable array of pointers (malloc'd), Rust's Vec of what merlin keeps
+ * A growable array of pointers (on the heap), Rust's Vec of what merlin keeps
  * by value: in cc1 each element is its own object, in the arena, so moving
  * one between vectors moves the pointer. */
 struct vec {
@@ -419,7 +438,7 @@ struct token {
 };
 
 int kw_starts_decl(int k);
-/* Phase 7: the parser's tokens (a malloc'd array, TK_EOF last) of the
+/* Phase 7: the parser's tokens (an array on the heap, TK_EOF last) of the
  * preprocessed ones; diagnostics added to diags; 0 for a keyword merlin
  * does not handle, the last diagnostic its error. */
 int lex_finish(struct pptok *toks, uint n, struct pos end, struct token **out, uint *nout, struct vec *diags);
@@ -447,7 +466,7 @@ struct options {
 
 /* Preprocesses the file `name`, whose text is src (n bytes), for -E: the
  * text merlin -E writes, as C (merlin's spell) or as assembly (print_asm),
- * in *out, and the diagnostics, in order, in *diags (a malloc'd array of
+ * in *out, and the diagnostics, in order, in *diags (an array on the heap of
  * *ndiags). Returns 0 if one of them is an error (the text is then not to
  * be written). */
 int preprocess_text(const char *name, const char *src, uint n, struct options *opts, struct buf *out,
@@ -1145,7 +1164,7 @@ struct finding {
     uint64_t of;
 };
 /* The warnings of a full expression, of a declaration's list: how many, a
- * malloc'd array of them in *out. */
+ * array of them on the heap in *out. */
 uint sequence_check(struct expr *e, struct finding **out);
 uint sequence_check_init(struct init *init, struct finding **out);
 
