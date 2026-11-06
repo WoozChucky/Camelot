@@ -2599,6 +2599,29 @@ fn local_sockets_connect_and_pass_descriptors() {
     assert_eq!(all_checks_pass(&out, "unixtest", "unixtest"), 153, "{out}");
 }
 
+#[test]
+fn pseudo_terminals_run_the_shell() {
+    // Issue #181: ptytest's checks of the terminals: pseudo-terminal pairs,
+    // the line discipline's canonical and raw modes, VMIN and VTIME,
+    // termios, the window size, Ctrl-C killing the foreground, hanging up,
+    // the console's termios; and the shell on a slave, typed at from the
+    // master.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, _) = load(
+        Setup {
+            disks: vec![root_disk(4096, &[])],
+            ..Setup::default()
+        }
+        .config(),
+        Some(rx),
+    );
+    step_to_prompt(&mut m, 1);
+    type_line(&tx, "ptytest\n");
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(all_checks_pass(&out, "ptytest", "ptytest"), 115, "{out}");
+}
+
 /// Steps `m` until the kernel's tick counter has gone `n` ticks on.
 fn step_ticks(m: &mut Machine, elf: &grail::elf::Elf, n: u32) {
     let ticks = image_pa(sym(elf, "ticks"));

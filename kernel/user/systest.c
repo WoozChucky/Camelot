@@ -559,14 +559,14 @@ static void test_files(void) {
     check_eq(write(STDERR, "", 0), 0, "an empty write to stderr");
 }
 
-/* ioctl: the console and a pipe know no request; only a device's driver
- * answers one (fbtest and inputtest check theirs). */
+/* ioctl: a pipe knows no request; only a device's driver answers one
+ * (fbtest, inputtest and ptytest check theirs, the console's too). */
 static void test_ioctl(void) {
     int p[2];
     check_eq(ioctl(9, 0x4600, 0), -EBADF, "ioctl on a closed descriptor");
     check_eq(ioctl(-1, 0x4600, 0), -EBADF, "ioctl on -1");
-    check_eq(ioctl(STDOUT, 0x5401, 0), -ENOTTY, "the console has no requests (TCGETS)");
-    check_eq(ioctl(STDIN, 0, 0), -ENOTTY, "nor request 0");
+    check_eq(ioctl(STDOUT, 0x5401, 0), -EFAULT, "the console's TCGETS, to address 0");
+    check_eq(ioctl(STDIN, 0, 0), -ENOTTY, "the console has no request 0");
     check_eq(pipe(p), 0, "a pipe");
     check_eq(ioctl(p[0], 0x4600, 0), -ENOTTY, "ioctl on a pipe");
     close(p[0]);
