@@ -10,16 +10,18 @@
 //! session with a view that is a few vectors, on any platform. The Windows view is
 //! `crate::window`, Grail's own framebuffer window.
 
-use crate::{ended, out_of_step, End};
+use crate::{close_in_order, ended, out_of_step, End};
 use avalon_proto::{
-    kind_of, AttachKind, Connection, Cursor, Error, Frame, KeyEvent, Message, MessageKind, PointerChange,
-    PointerMotion, Screen, VmRef, VmState, VmSummary, PIXEL_FORMAT_XRGB8888, POINTER_BUTTONS,
+    close_gracefully, kind_of, AttachKind, Connection, Cursor, Error, Frame, KeyEvent, Message, MessageKind,
+    PointerChange, PointerMotion, Screen, VmRef, VmState, VmSummary, PIXEL_FORMAT_XRGB8888, POINTER_BUTTONS,
     SCREEN_FRAME_OVERHEAD,
 };
 use grail::framebuffer::CursorPlane;
 use grail::pointer::Motion;
 use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Longest a session waits for the server before it looks at the view again: the
@@ -149,42 +151,71 @@ impl ScreenSession {
     /// Events this session does not need (other VMs', console output, ones that fail
     /// to decode) are passed over, as the protocol says a client should.
     pub fn run(&mut self, view: &mut dyn View) -> Result<End, Error> {
+        let early = match self.catch_up(view) {
+            Ok(None) => None,
+            Ok(Some(end)) => Some(Ok(end)),
+            Err(e) => Some(Err(e)),
+        };
+        if let Some(result) = early {
+            // In order, as below (`close_in_order`); with no reading thread yet, what
+            // the server still sends is read here.
+            close_gracefully(self.conn.get_ref(), || false);
+            return result;
+        }
+
+        let (tx, events) = mpsc::channel();
+        let mut reader = self.conn.try_clone()?;
+        reader.get_ref().set_read_timeout(None)?;
+        let read_all = Arc::new(AtomicBool::new(false));
+        let reader_done = Arc::clone(&read_all);
+        let reading = std::thread::spawn(move || loop {
+            let frame = reader.recv_frame();
+            let fatal = matches!(&frame, Err(e) if e.is_fatal());
+            if fatal {
+                reader_done.store(true, Ordering::SeqCst);
+            }
+            if tx.send(frame).is_err() || fatal {
+                break;
+            }
+        });
+        let result = self.stream(view, &events);
+        close_in_order(
+            self.conn.get_ref(),
+            &events,
+            &read_all,
+            |frame| matches!(frame, Err(e) if e.is_fatal()),
+        );
+        // Unblocks the reading thread, if it is still reading (a server that did not
+        // close in time), and closes the connection.
+        let _ = self.conn.get_ref().shutdown(Shutdown::Both);
+        let _ = reading.join();
+        result
+    }
+
+    /// Before the session loop: the VM's state and the frames read while attaching,
+    /// shown. The end of the session, if they end it.
+    fn catch_up(&mut self, view: &mut dyn View) -> Result<Option<End>, Error> {
         view.vm_state(self.vm.state);
         // Events read while attaching come first: the full frame, and maybe more.
         while self.conn.queued_events() > 0 {
             if let Ok(event) = self.conn.recv() {
                 if let Some(end) = self.on_server(event.type_code(), Ok(event), view)? {
                     view.draw(&self.screen, &self.cursor);
-                    return Ok(end);
+                    return Ok(Some(end));
                 }
             }
         }
         view.draw(&self.screen, &self.cursor);
         (self.dirty, self.cursor_dirty) = (false, false);
         if ended(self.vm.state) {
-            return Ok(End::VmEnded(self.vm.state));
+            return Ok(Some(End::VmEnded(self.vm.state)));
         }
-
-        let (tx, events) = mpsc::channel();
-        let mut reader = self.conn.try_clone()?;
-        reader.get_ref().set_read_timeout(None)?;
-        let reading = std::thread::spawn(move || loop {
-            let frame = reader.recv_frame();
-            let fatal = matches!(&frame, Err(e) if e.is_fatal());
-            if tx.send(frame).is_err() || fatal {
-                break;
-            }
-        });
-        let result = self.stream(view, events);
-        // Unblocks the reading thread (and tells the server we are gone).
-        let _ = self.conn.get_ref().shutdown(Shutdown::Both);
-        let _ = reading.join();
-        result
+        Ok(None)
     }
 
     /// The session loop. The view is pumped at least every [`POLL`], and drawn once
     /// after each batch of frames rather than once per frame.
-    fn stream(&mut self, view: &mut dyn View, events: Receiver<Result<Frame, Error>>) -> Result<End, Error> {
+    fn stream(&mut self, view: &mut dyn View, events: &Receiver<Result<Frame, Error>>) -> Result<End, Error> {
         let mut deadline: Option<Instant> = None;
         loop {
             if deadline.is_none() {

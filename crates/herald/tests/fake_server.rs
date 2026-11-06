@@ -299,3 +299,40 @@ fn destroyed() {
     assert_eq!(herald.end().unwrap(), End::Destroyed);
     server.join().unwrap();
 }
+
+/// Detaching while the server's frames are still coming (#234): closing then, with
+/// them unread, would reset the connection, and the server could lose what Herald sent
+/// last. Herald closes in order instead: the server reads everything Herald sent and
+/// then a clean end, and its own sending never fails.
+#[test]
+fn detaching_while_the_server_sends_closes_in_order() {
+    for _ in 0..10 {
+        let (addr, server) = fake_server(|mut conn| {
+            fake_attach(&mut conn, VM, VmState::Running, b"", &[]);
+            // Another VM's output: Herald passes it over.
+            let flood = Message::ConsoleOutput {
+                vm: VM + 1,
+                data: vec![b'.'; 1024],
+            };
+            let (got, end, flooding) =
+                flood_until_the_client_closes(conn, flood, Message::ConsoleDetach { vm: VM });
+            let (detach, input) = got.split_last().expect("nothing came");
+            assert_eq!(*detach, Message::ConsoleDetach { vm: VM });
+            let mut typed = Vec::new();
+            for msg in input {
+                match msg {
+                    Message::ConsoleInput { vm: VM, data } => typed.extend_from_slice(data),
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!(typed, b"key");
+            assert!(matches!(end, Error::Closed), "a clean end, not {end}");
+            flooding.expect("the server's sending ends cleanly too");
+        });
+        let mut herald = Herald::attach_at(&addr, avalon_proto::VmRef::Id(VM), |_| {});
+        herald.type_keys(b"key");
+        herald.type_keys(&[DETACH_KEY]);
+        assert_eq!(herald.end().unwrap(), End::Detached);
+        server.join().unwrap();
+    }
+}

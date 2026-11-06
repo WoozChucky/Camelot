@@ -26,12 +26,11 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 
-use avalon_proto::LINGER;
-
-use crate::DETACH_KEY;
+use crate::{close_in_order, DETACH_KEY};
 
 /// Most bytes read from the connection at once.
 const READ_SIZE: usize = 4096;
@@ -266,14 +265,14 @@ impl TcpSession {
     /// (with the echo to `out`) if [`TcpSession::edit`] is on. The end of the input
     /// shuts the sending side down, and the session goes on until the far end closes.
     ///
-    /// Leaving (the detach key) closes in order. Herald's side is shut down first, so
-    /// that a FIN follows what was sent; then what the far end still sends is read, and
-    /// dropped, until it closes its side, for at most [`LINGER`]. Only then is the
-    /// socket closed, with nothing unread, so the close is not a reset (RFC 1122
-    /// 4.2.2.13), which could make the far end lose what it had not yet read. A far end
-    /// that never closes is waited for only so long: past that, the close may reset
-    /// after all. When the session ends with the far end's close, everything it sent
-    /// has been read already.
+    /// Leaving (the detach key) closes in order, as every end of a session does. Herald's
+    /// side is shut down first, so that a FIN follows what was sent; then what the far
+    /// end still sends is read, and dropped, until it closes its side, for at most
+    /// [`avalon_proto::LINGER`]. Only then is the socket closed, with nothing unread, so
+    /// the close is not a reset (RFC 1122 4.2.2.13), which could make the far end lose
+    /// what it had not yet read. A far end that never closes is waited for only so
+    /// long: past that, the close may reset after all. When the session ends with the
+    /// far end's close, everything it sent has been read already.
     ///
     /// A failure to write `out`, or of the connection (other than a reset, which is
     /// its end), is an error. `input` is read on a thread of its own, which stays
@@ -283,6 +282,8 @@ impl TcpSession {
         let (tx, events) = mpsc::channel();
         let mut reader = self.stream.try_clone()?;
         let server_tx = tx.clone();
+        let read_all = Arc::new(AtomicBool::new(false));
+        let reader_done = Arc::clone(&read_all);
         let reading = std::thread::spawn(move || {
             let mut buf = vec![0u8; READ_SIZE];
             loop {
@@ -294,6 +295,9 @@ impl TcpSession {
                     Err(e) => Event::Failed(e),
                 };
                 let last = !matches!(event, Event::Data(_));
+                if last {
+                    reader_done.store(true, Ordering::SeqCst);
+                }
                 if server_tx.send(event).is_err() || last {
                     break;
                 }
@@ -302,9 +306,11 @@ impl TcpSession {
         std::thread::spawn(move || forward_input(input, tx));
 
         let result = self.serve(&events, out);
-        if let Ok(TcpEnd::Left) = result {
-            self.linger(&events);
-        }
+        // After the far end's close everything has been read; after leaving, a failed
+        // write, or one of `out`, it may still be sending. The input is not looked at.
+        close_in_order(&self.stream, &events, &read_all, |event| {
+            matches!(event, Event::Closed | Event::Failed(_))
+        });
         // Unblocks the reading thread, if it is still reading (a far end that did not
         // close in time, or a failure), and closes the connection.
         let _ = self.stream.shutdown(Shutdown::Both);
@@ -375,30 +381,6 @@ impl TcpSession {
                     input_done = true;
                     let _ = self.stream.shutdown(Shutdown::Write);
                 }
-            }
-        }
-    }
-
-    /// After leaving: shuts the sending side down, then drops what the far end sends
-    /// (the reading thread still reads it) until its close, a failure, or [`LINGER`]. The
-    /// input is not looked at any more.
-    fn linger(&self, events: &Receiver<Event>) {
-        if self.stream.shutdown(Shutdown::Write).is_err() {
-            // Not connected any more: nothing to wait for.
-            return;
-        }
-        let deadline = Instant::now() + LINGER;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            // Checked here, not left to recv_timeout: with events queued it would keep
-            // returning them past the deadline, for a far end that keeps sending.
-            if left.is_zero() {
-                return;
-            }
-            match events.recv_timeout(left) {
-                Ok(Event::Data(_) | Event::Input(_) | Event::InputEnded) => {}
-                Ok(Event::Closed | Event::Failed(_)) => return,
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return,
             }
         }
     }

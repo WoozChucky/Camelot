@@ -32,12 +32,14 @@ pub mod tcp;
 pub mod window;
 
 use avalon_proto::{
-    kind_of, AttachKind, Connection, Error, Frame, Message, MessageKind, VmRef, VmState, VmSummary,
-    DEFAULT_AVALON_ADDR,
+    close_gracefully, kind_of, AttachKind, Connection, Error, Frame, Message, MessageKind, VmRef, VmState,
+    VmSummary, DEFAULT_AVALON_ADDR, LINGER,
 };
 use std::io::{self, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Herald's name in the `Hello` it sends.
@@ -164,6 +166,56 @@ impl Session {
         out: &mut dyn Write,
         notices: &mut dyn Write,
     ) -> Result<End, Error> {
+        let early = match self.catch_up(out, notices) {
+            Ok(None) => None,
+            Ok(Some(end)) => Some(Ok(end)),
+            Err(e) => Some(Err(e)),
+        };
+        if let Some(result) = early {
+            // In order, as below (`close_in_order`); with no reading thread yet, what
+            // the server still sends is read here.
+            close_gracefully(self.conn.get_ref(), || false);
+            return result;
+        }
+
+        let (tx, events) = mpsc::channel();
+        let mut reader = self.conn.try_clone()?;
+        // The reading thread waits for as long as the session lasts.
+        reader.get_ref().set_read_timeout(None)?;
+        let server_tx = tx.clone();
+        let read_all = Arc::new(AtomicBool::new(false));
+        let reader_done = Arc::clone(&read_all);
+        // Whole frames, not messages: a frame that fails to decode must still be placed
+        // by its type (a reply that fails to decode is still the reply).
+        let reading = std::thread::spawn(move || loop {
+            let frame = reader.recv_frame();
+            let fatal = matches!(&frame, Err(e) if e.is_fatal());
+            if fatal {
+                reader_done.store(true, Ordering::SeqCst);
+            }
+            if server_tx.send(Event::Server(frame)).is_err() || fatal {
+                break;
+            }
+        });
+        std::thread::spawn(move || forward_input(input, tx));
+
+        let result = self.stream(&events, out, notices);
+        close_in_order(
+            self.conn.get_ref(),
+            &events,
+            &read_all,
+            |event| matches!(event, Event::Server(Err(e)) if e.is_fatal()),
+        );
+        // Unblocks the reading thread, if it is still reading (a server that did not
+        // close in time), and closes the connection.
+        let _ = self.conn.get_ref().shutdown(Shutdown::Both);
+        let _ = reading.join();
+        result
+    }
+
+    /// Before the session loop: the scrollback, and the events read while attaching.
+    /// The end of the session, if they end it.
+    fn catch_up(&mut self, out: &mut dyn Write, notices: &mut dyn Write) -> Result<Option<End>, Error> {
         out.write_all(&self.scrollback)?;
         out.flush()?;
 
@@ -172,41 +224,20 @@ impl Session {
         while self.conn.queued_events() > 0 {
             if let Ok(event) = self.conn.recv() {
                 if let Some(end) = self.on_server(event.type_code(), Ok(event), out, notices)? {
-                    return Ok(end);
+                    return Ok(Some(end));
                 }
             }
         }
         if ended(self.vm.state) {
-            return Ok(End::VmEnded(self.vm.state));
+            return Ok(Some(End::VmEnded(self.vm.state)));
         }
-
-        let (tx, events) = mpsc::channel();
-        let mut reader = self.conn.try_clone()?;
-        // The reading thread waits for as long as the session lasts.
-        reader.get_ref().set_read_timeout(None)?;
-        let server_tx = tx.clone();
-        // Whole frames, not messages: a frame that fails to decode must still be placed
-        // by its type (a reply that fails to decode is still the reply).
-        let reading = std::thread::spawn(move || loop {
-            let frame = reader.recv_frame();
-            let fatal = matches!(&frame, Err(e) if e.is_fatal());
-            if server_tx.send(Event::Server(frame)).is_err() || fatal {
-                break;
-            }
-        });
-        std::thread::spawn(move || forward_input(input, tx));
-
-        let result = self.stream(events, out, notices);
-        // Unblocks the reading thread (and tells the server we are gone).
-        let _ = self.conn.get_ref().shutdown(Shutdown::Both);
-        let _ = reading.join();
-        result
+        Ok(None)
     }
 
     /// The session loop.
     fn stream(
         &mut self,
-        events: Receiver<Event>,
+        events: &Receiver<Event>,
         out: &mut dyn Write,
         notices: &mut dyn Write,
     ) -> Result<End, Error> {
@@ -347,6 +378,52 @@ impl Session {
 /// (as `Connection::request` reports it).
 pub(crate) fn out_of_step(cause: Error) -> Error {
     Error::OutOfStep(format!("waiting for a reply, got: {cause}"))
+}
+
+/// Ends a session's connection in order, before it is closed: shuts the sending side
+/// down, so that a FIN follows what was sent, then takes what the session's reading
+/// thread still reads and drops it, until `last` says an event was the thread's last
+/// (the far end closed, or the connection failed), or for at most [`LINGER`]. Every
+/// kind of session does this, the console's, the screen's and `--tcp`'s, however it
+/// ended. The reading thread sets `read_all` before it sends its last event: then
+/// everything has been read, whether the session took that event or not, and there
+/// is nothing to wait for. The caller then shuts the connection down and closes it,
+/// with nothing unread if the far end closed in time.
+///
+/// A socket closed with received bytes unread resets the connection rather than
+/// closing it (RFC 1122 4.2.2.13), and on Windows already the shutdown of its reading
+/// side does; the far end, when the reset comes, may throw away what it had received
+/// and not yet read: what Herald sent last (#234). So Herald closes as a lingering
+/// close does, [`avalon_proto::close_gracefully`], with which Avalon's servers end
+/// their connections. A far end that never closes is waited for only so long: past
+/// that, the close may reset after all.
+pub(crate) fn close_in_order<E>(
+    stream: &TcpStream,
+    events: &Receiver<E>,
+    read_all: &AtomicBool,
+    last: impl Fn(&E) -> bool,
+) {
+    if read_all.load(Ordering::SeqCst) {
+        return;
+    }
+    if stream.shutdown(Shutdown::Write).is_err() {
+        // Not connected any more: nothing to wait for.
+        return;
+    }
+    let deadline = Instant::now() + LINGER;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // Checked here, not left to recv_timeout: with events queued it would keep
+        // returning them past the deadline, for a far end that keeps sending.
+        if left.is_zero() {
+            return;
+        }
+        match events.recv_timeout(left) {
+            Ok(event) if last(&event) => return,
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 /// Passes input bytes on to the session loop, a burst at a time, then its end.

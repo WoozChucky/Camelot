@@ -273,3 +273,50 @@ pub fn fake_attach(
     }))
     .unwrap();
 }
+
+/// A fake server's side after an attach, for a client that leaves while the server's
+/// frames are still coming (#234): sends `flood` without pause, so that some always
+/// wait unread on the client's side when it closes, answers `detach` with `Ok` when it
+/// comes, and reads what the client sends until its end. Then it stops flooding and
+/// closes. Returns what it read, how the reading ended (`Error::Closed` is a clean
+/// end, a reset is not), and how the flooding did.
+pub fn flood_until_the_client_closes(
+    mut conn: Connection<TcpStream>,
+    flood: Message,
+    detach: Message,
+) -> (Vec<Message>, avalon_proto::Error, Result<(), avalon_proto::Error>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let detached = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut writer = conn.try_clone().unwrap();
+    let flooding = {
+        let (detached, stop) = (Arc::clone(&detached), Arc::clone(&stop));
+        std::thread::spawn(move || -> Result<(), avalon_proto::Error> {
+            let mut replied = false;
+            while !stop.load(Ordering::SeqCst) {
+                if !replied && detached.load(Ordering::SeqCst) {
+                    writer.send(&Message::Ok)?;
+                    replied = true;
+                }
+                writer.send(&flood)?;
+            }
+            // The client waits for this end's close before it closes its own.
+            writer.get_ref().shutdown(std::net::Shutdown::Write)?;
+            Ok(())
+        })
+    };
+    let mut got = Vec::new();
+    let end = loop {
+        match conn.recv() {
+            Ok(msg) => {
+                if msg == detach {
+                    detached.store(true, Ordering::SeqCst);
+                }
+                got.push(msg);
+            }
+            Err(e) => break e,
+        }
+    };
+    stop.store(true, Ordering::SeqCst);
+    (got, end, flooding.join().unwrap())
+}

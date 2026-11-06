@@ -730,3 +730,37 @@ fn an_unknown_pixel_format_is_refused() {
     }
     server.join().unwrap();
 }
+
+/// Closing the view while the server's frames are still coming (#234): the session
+/// closes in order, as the console's does, so the server reads the detach and then a
+/// clean end, and its own sending never fails.
+#[test]
+fn closing_the_view_while_the_server_sends_closes_in_order() {
+    for _ in 0..10 {
+        let (addr, server) = fake_server(|mut conn| {
+            fake_screen_attach(&mut conn, 4, 4, 0);
+            // Another VM's frames: the session passes them over.
+            let flood = Message::ScreenFrame {
+                vm: 2,
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 4],
+            };
+            let (got, end, flooding) =
+                flood_until_the_client_closes(conn, flood, Message::ScreenDetach { vm: 1 });
+            assert_eq!(got, [Message::ScreenDetach { vm: 1 }]);
+            assert!(
+                matches!(end, avalon_proto::Error::Closed),
+                "a clean end, not {end}"
+            );
+            flooding.expect("the server's sending ends cleanly too");
+        });
+        let conn = Connection::connect(addr.as_str(), herald::AGENT).unwrap();
+        let running = Running::start(ScreenSession::attach(conn, &VmRef::Id(1)).unwrap());
+        running.view.close();
+        assert_eq!(running.end().0.unwrap(), End::Detached);
+        server.join().unwrap();
+    }
+}
