@@ -98,16 +98,24 @@ static void test_strings(void) {
  * register at a time where their pointers are on a register boundary, and
  * a byte at a time around that: checked at every alignment of each pointer
  * within a register (0 to 7) and every length to 64, and at a few long
- * lengths for two alignments, co-aligned and not, with guard bytes either
- * side that must not change. One check for each function and pair of
- * alignments; the first wrong case is printed. (kernel.rs's
- * kernel_memory_functions_at_every_alignment checks the same code, the
- * kernel's, at more lengths: merlin's C makes the checking slow here.) */
+ * lengths for alignments 0 and 5 of each, so co-aligned and not, with
+ * guard bytes either side that must not change. One check for each
+ * function and pair of alignments; the first wrong case is printed.
+ * (kernel.rs's kernel_memory_functions_at_every_alignment checks the same
+ * code, the kernel's, at more lengths: merlin's C makes the checking slow
+ * here.)
+ *
+ * The buffers are arrays of uint64_t, so that each starts on a register
+ * boundary (merlin aligns a uchar array to a byte) and an offset from its
+ * start, MEM_GUARD (8) included, is an alignment. */
 
 #define MEM_GUARD 8
 #define MEM_LONGEST 4101
-static uchar mem_src[MEM_LONGEST + 8 + 2 * MEM_GUARD];
-static uchar mem_dst[MEM_LONGEST + 8 + 2 * MEM_GUARD];
+#define MEM_SIZE ((MEM_LONGEST + 8 + 2 * MEM_GUARD + 7) / 8 * 8)
+static uint64_t mem_src_words[MEM_SIZE / 8];
+static uint64_t mem_dst_words[MEM_SIZE / 8];
+#define mem_src ((uchar *)mem_src_words)
+#define mem_dst ((uchar *)mem_dst_words)
 
 /* The byte at offset `i` of the patterns: different from its neighbours. */
 #define MEM_BYTE(i) ((uchar)((i) * 7 + 3) | 1)
@@ -152,7 +160,7 @@ static void mem_report(const char *f, size_t sa, size_t da, size_t n) {
 }
 
 static void test_memory_alignments(void) {
-    for (size_t i = 0; i < sizeof mem_src; i++) {
+    for (size_t i = 0; i < MEM_SIZE; i++) {
         mem_src[i] = MEM_BYTE(i);
         mem_dst[i] = 0xee;
     }

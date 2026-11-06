@@ -271,7 +271,7 @@ static bool btake(u32 dev, u32 bno) {
 
 /* Where the lowest 1 of `x`, which has one, is: whole zero bytes skipped
  * eight bits a step, then the bits of the byte that has it one at a time,
- * fifteen steps at most. Excalibur has no instruction that counts the
+ * fourteen steps at most. Excalibur has no instruction that counts the
  * trailing zeros (Zbb's ctz), and this runs once per block allocated. */
 static u32 first_one(u64 x) {
     u32 at = 0;

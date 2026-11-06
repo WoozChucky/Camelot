@@ -102,17 +102,41 @@ static void halt_after_panic(void) {
  * reports it; another that panics too meanwhile stops where it is, as do
  * the others the next time they write to the UART (uart_putc), so the
  * report comes out whole; and a panic inside the report halts at once.
- * The first one also interrupts every other running hart, as Linux's
- * panic() stops the other CPUs (smp_send_stop()): an IPI, whose handler
- * stops there (ipi_interrupt, and the tick's too), so a hart that has
- * nothing more to print, back in a process say, stops as well, before the
- * report is done and the machine halts. A hart running with interrupts
- * off takes it when it turns them on, or stops at its next byte.
+ * The first one also stops every other running hart, as Linux's panic()
+ * stops the other CPUs (smp_send_stop()): an IPI, whose handler stops
+ * there (ipi_interrupt, and the tick's too), so a hart that has nothing
+ * more to print, back in a process say, stops as well. It waits up to a
+ * second for each to say it has stopped (its bit in panic_stopped, which
+ * panic_freeze() sets), and names those that did not, with Linux's
+ * warning: a hart spinning with interrupts off, on a lock this one held
+ * when it panicked say, takes the IPI only when it turns them on.
  *
  * Between the swap and the store of panic_hart, `panicking` is set but
  * panic_hart is still PANIC_NO_HART, which is no hart's id: a hart that
  * looks then takes the panic for another's and stops, as it should. Hence
  * interrupts off first, so that nothing runs on this hart in between. */
+static volatile u32 panic_stopped;
+
+/* The harts of `mask` as Linux's %*pbl prints a CPU list: 1,3-5. */
+static void print_harts(u32 mask) {
+    bool first = true;
+    for (u32 i = 0; i < 32; i++) {
+        if ((mask & (1u << i)) == 0) {
+            continue;
+        }
+        u32 last = i;
+        while (last + 1 < 32 && (mask & (1u << (last + 1))) != 0) {
+            last++;
+        }
+        kprintf("%s%u", first ? "" : ",", i);
+        if (last != i) {
+            kprintf("-%u", last);
+        }
+        first = false;
+        i = last;
+    }
+}
+
 static void panic_begin(void) {
     intr_off();
     if (atomic_swap((volatile u32 *)&panicking, true)) {
@@ -123,13 +147,24 @@ static void panic_begin(void) {
     }
     panic_hart = cpuid();
     u32 others = harts_running() & ~(1u << cpuid());
-    if (others != 0) {
-        sbi_send_ipi(others, 0);
+    if (others == 0) {
+        return;
+    }
+    sbi_send_ipi(others, 0);
+    u64 deadline = r_time() + timebase_hz();
+    while ((panic_stopped & others) != others && r_time() < deadline) {
+    }
+    u32 running = others & ~panic_stopped;
+    if (running != 0) {
+        kprintf("SMP: failed to stop secondary CPUs ");
+        print_harts(running);
+        kprintf("\n");
     }
 }
 
 void panic_freeze(void) {
     intr_off();
+    atomic_or(&panic_stopped, 1u << cpuid());
     for (;;) {
         wfi();
     }
@@ -252,8 +287,11 @@ static void clock_tick(u32 n) {
  * took it with the request not yet in sight, still flushes within a tick,
  * and the hart waiting for it isn't left waiting for good. */
 static void timer_interrupt(void) {
+    /* Acknowledged first (the next deadline clears STIP), so that a hart a
+     * panic stops here waits in wfi rather than waking at once. */
+    u32 n = timer_next();
     panic_stop_others();
-    clock_tick(timer_next());
+    clock_tick(n);
     tlb_serve();
 }
 
@@ -262,10 +300,13 @@ static void timer_interrupt(void) {
  * sret (and finds nothing to do, if this one did it). Then serve what other
  * harts asked for. An IPI that only woke an idle hart (kick_idle(), proc.c)
  * has nothing more to do: the hart's scheduler looks for work once wfi
- * returns. One from a hart that panicked stops this one (panic_begin). */
+ * returns. One from a hart that panicked stops this one (panic_begin),
+ * after SSIP is clear, as Linux acknowledges an IPI before it handles it:
+ * otherwise the pending interrupt would wake the stopped hart's wfi at
+ * once, every time. */
 static void ipi_interrupt(void) {
-    panic_stop_others();
     w_sip(r_sip() & ~SIP_SSIP);
+    panic_stop_others();
     tlb_serve();
 }
 
