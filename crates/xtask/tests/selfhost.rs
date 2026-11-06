@@ -598,9 +598,11 @@ nop
 
 #[test]
 fn the_c_tools_tables_are_the_host_tools() {
-    // kernel/user/as/tables.[ch] and kernel/user/ld/tables.[ch] are generated
-    // from merlin-as's, excalibur's and the elf crate's tables
-    // (crates/xtask/src/c_tables.rs) by `cargo xtask kernel`.
+    // kernel/user/as/tables.[ch], kernel/user/ld/tables.[ch] and
+    // kernel/user/cc/tables.[ch] are generated from merlin-as's, excalibur's,
+    // the elf crate's and merlin's tables (crates/xtask/src/c_tables.rs) by
+    // `cargo xtask kernel`. The kernels embed none of cc1, so this is what
+    // tells a stale cc/tables.c.
     for (file, want) in xtask::c_tables::files() {
         let path = repo_root().join(file);
         let committed = std::fs::read_to_string(&path).unwrap().replace('\r', "");
@@ -2161,6 +2163,36 @@ const PP_INPUTS: &[(&str, &[(&str, &str)], &[&str], bool)] = &[
     ),
     // An unterminated call at the end of the file.
     ("#define F(x) x\nF(1, 2", &[], &[], false),
+    // NUL bytes in literals, in what is stringized and passed on, in a
+    // name #line gives (__FILE__, a diagnostic's file) and in a warning.
+    (
+        "#if '\0' == 0\nzero\n#endif\n#if 'a\0' == 0x6100\nmulti\n#endif\n#define S(x) #x\nS(p\0q) S(\"\0\")\n\
+         #pragma x\0y\n#ident \"a\0b\"\n#line 1 \"a\0b\"\n__FILE__ __LINE__\n#warning w\0arn\n",
+        &[],
+        &[],
+        false,
+    ),
+    // ... in an #error, in what pasting forms, in a header's name.
+    (
+        "#error a\0b\n#define CAT(a, b) a ## b\nCAT(x, \0)\n#include \"g.h\0x\"\n",
+        &[("g.h", "g\n")],
+        &[],
+        false,
+    ),
+    // ... after a backslash: an escape C has not, in a character constant
+    // and in a name #line gives.
+    ("#if '\\\0' == 0\nz\n#endif\n#line 1 \"\\\0\"\nx\n", &[], &[], false),
+    // ... in assembly's line markers.
+    ("  nop\n#line 5 \"n\0m.S\"\n  nop\n", &[], &[], true),
+    // The bytes that stand around a file's number in merlin's messages
+    // (FILE_MARK, U+0001), in a message that quotes the source: the place
+    // named, a number no file has, a mark without its pair.
+    (
+        "#warning x\u{1}y\n#warning a\u{1}0\u{1}b\u{1}7\u{1}c\n#error a\u{1}+0\u{1}b\u{1}\n",
+        &[],
+        &[],
+        false,
+    ),
     // Assembly: comments, pasting that forms no token, `#` before anything.
     (
         "# a comment\n#if 1\n  li a0, 1 # trailing\n#endif\n#define CALL(f) call f ## @plt\n\
@@ -2463,6 +2495,8 @@ fn cc1_takes_merlins_command_line() {
             "cc1: cannot read /d/missing.c: no such file or directory\n".to_string(),
             2,
         ),
+        // A directory is no file to read, as merlin finds.
+        ("cc1 -E /d", "cc1: cannot read /d: is a directory\n".to_string(), 2),
         (
             "cc1 -g /d/a.c",
             "cc1: -g is not here yet: debug information comes with merlin's debug.rs\n".to_string(),

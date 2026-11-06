@@ -225,10 +225,7 @@ static struct diag *initializer(struct parser *p, struct init **out);
 /* The characters of s (UTF-8), in *n of them. */
 static uint *chars_of(const char *s, uint *n) {
     uint len = (uint)strlen(s);
-    uint *out = malloc((len + 1) * sizeof(uint));
-    if (out == NULL) {
-        die("out of memory");
-    }
+    uint *out = heap_alloc((len + 1) * sizeof(uint));
     uint k = 0;
     for (uint i = 0; i < len;) {
         uint l;
@@ -245,10 +242,7 @@ static uint edit_distance(const char *a, const char *b) {
     uint nb;
     uint *ca = chars_of(a, &na);
     uint *cb = chars_of(b, &nb);
-    uint *row = malloc((nb + 1) * sizeof(uint));
-    if (row == NULL) {
-        die("out of memory");
-    }
+    uint *row = heap_alloc((nb + 1) * sizeof(uint));
     for (uint j = 0; j <= nb; j++) {
         row[j] = j;
     }
@@ -269,9 +263,9 @@ static uint edit_distance(const char *a, const char *b) {
         }
     }
     uint d = row[nb];
-    free(ca);
-    free(cb);
-    free(row);
+    heap_free(ca);
+    heap_free(cb);
+    heap_free(row);
     return d;
 }
 
@@ -283,14 +277,14 @@ static uint edit_distance(const char *a, const char *b) {
  * distance or more (merlin's correction). */
 int correction(const char *typo, const char **names, uint n) {
     uint len;
-    free(chars_of(typo, &len));
+    heap_free(chars_of(typo, &len));
     uint bound = (len + 2) / 3;
     int best = -1;
     uint best_d = 0;
     int tied = 0;
     for (uint i = 0; i < n; i++) {
         uint nlen;
-        free(chars_of(names[i], &nlen));
+        heap_free(chars_of(names[i], &nlen));
         uint diff = len > nlen ? len - nlen : nlen - len;
         if (diff > 0 && len / diff < 3) {
             continue;
@@ -538,8 +532,8 @@ static const char **names_in_scope(struct parser *p, struct name ***what, uint *
             count++;
         }
     }
-    free(seen.keys);
-    free(seen.values);
+    heap_free(seen.keys);
+    heap_free(seen.values);
     *what = whats;
     *n = count;
     return names;
@@ -552,11 +546,8 @@ static struct correction *correct_expr(struct parser *p, const char *typo) {
     struct name **what;
     uint n;
     const char **names = names_in_scope(p, &what, &n);
-    const char **cand = malloc((n + 1) * sizeof(char *));
-    struct name **cwhat = malloc((n + 1) * sizeof(struct name *));
-    if (cand == NULL || cwhat == NULL) {
-        die("out of memory");
-    }
+    const char **cand = heap_alloc((n + 1) * sizeof(char *));
+    struct name **cwhat = heap_alloc((n + 1) * sizeof(struct name *));
     uint k = 0;
     for (uint i = 0; i < n; i++) {
         if (what[i]->kind != NAME_TYPEDEF) {
@@ -577,10 +568,10 @@ static struct correction *correct_expr(struct parser *p, const char *typo) {
             c->of = cwhat[best]->spelled;
         }
     }
-    free(names);
-    free(what);
-    free(cand);
-    free(cwhat);
+    heap_free(names);
+    heap_free(what);
+    heap_free(cand);
+    heap_free(cwhat);
     return c;
 }
 
@@ -591,11 +582,8 @@ static const char *correct_type(struct parser *p, const char *typo, int *has_dec
     struct name **what;
     uint n;
     const char **names = names_in_scope(p, &what, &n);
-    const char **cand = malloc((n + NTYPE_KEYWORDS + 1) * sizeof(char *));
-    struct name **cwhat = malloc((n + NTYPE_KEYWORDS + 1) * sizeof(struct name *));
-    if (cand == NULL || cwhat == NULL) {
-        die("out of memory");
-    }
+    const char **cand = heap_alloc((n + NTYPE_KEYWORDS + 1) * sizeof(char *));
+    struct name **cwhat = heap_alloc((n + NTYPE_KEYWORDS + 1) * sizeof(struct name *));
     uint k = 0;
     for (uint i = 0; i < n; i++) {
         if (what[i]->kind == NAME_TYPEDEF) {
@@ -619,10 +607,10 @@ static const char *correct_type(struct parser *p, const char *typo, int *has_dec
             *decl = cwhat[best]->pos;
         }
     }
-    free(names);
-    free(what);
-    free(cand);
-    free(cwhat);
+    heap_free(names);
+    heap_free(what);
+    heap_free(cand);
+    heap_free(cwhat);
     return r;
 }
 
@@ -651,10 +639,7 @@ static struct diag *unknown_statement_name(struct parser *p, const char *name) {
     struct name **what;
     uint n;
     const char **names = names_in_scope(p, &what, &n);
-    const char **cand = malloc((n + NSTATEMENT_KEYWORDS + 1) * sizeof(char *));
-    if (cand == NULL) {
-        die("out of memory");
-    }
+    const char **cand = heap_alloc((n + NSTATEMENT_KEYWORDS + 1) * sizeof(char *));
     for (uint i = 0; i < n; i++) {
         cand[i] = names[i];
     }
@@ -671,9 +656,9 @@ static struct diag *unknown_statement_name(struct parser *p, const char *name) {
     } else {
         e = diag_error(at, fmt("unknown type name '%s'", name));
     }
-    free(names);
-    free(what);
-    free(cand);
+    heap_free(names);
+    heap_free(what);
+    heap_free(cand);
     return e;
 }
 
@@ -1232,7 +1217,7 @@ static struct stmt *cut_names(struct parser *p, uint mark, uint64_t item) {
         }
         vec_push(&s->list, unevaluated_new(e));
     }
-    free(names.v);
+    heap_free(names.v);
     return s;
 }
 
@@ -1836,7 +1821,7 @@ static struct diag *record_body(struct parser *p, struct record *record, struct 
         return diag_error(open, fmt("%s is too large", record_keyword(record)));
     }
     record_complete(record, members, n, at);
-    free(members);
+    heap_free(members);
     return NULL;
 }
 
@@ -1950,7 +1935,7 @@ static struct diag *enum_spec(struct parser *p, struct pos kw_pos, struct type *
     memcpy(en->constants, constants, n * sizeof(struct enum_const));
     en->nconstants = n;
     en->pos = kw_pos;
-    free(constants);
+    heap_free(constants);
     struct spelling *s = spelling_enum(en);
     /* The constants now name their enum, for the code after it. */
     struct scope *sc = innermost(p);
@@ -2245,9 +2230,9 @@ static struct diag *declarator_ops(struct parser *p, int ctx, const char **name,
     for (uint i = 0; i < inner.n; i++) {
         *derive_push(ops, 0) = inner.v[i];
     }
-    free(ptrs.v);
-    free(sfx.v);
-    free(inner.v);
+    heap_free(ptrs.v);
+    heap_free(sfx.v);
+    heap_free(inner.v);
     return NULL;
 }
 
@@ -2420,7 +2405,7 @@ static struct diag *declarator(struct parser *p, struct type *base, int ctx, str
             }
         }
     }
-    free(ops.v);
+    heap_free(ops.v);
     if (has_too_large) {
         return diag_error(too_large,
                           fmt("array is too large: merlin's objects are at most %u bytes", MAX_OBJECT_SIZE));
@@ -2432,7 +2417,7 @@ static struct diag *declarator(struct parser *p, struct type *base, int ctx, str
     out->unevaluated.start = start;
     out->unevaluated.end = p->unevaluated.n;
     variable_sizes(p, out, ctx, sizes, nsizes, variable);
-    free(sizes);
+    heap_free(sizes);
     /* A parameter is never folded (see folded); a type name is as its use
      * says (type_name_folded). */
     if (ctx == CTX_PARAM) {
@@ -2575,7 +2560,7 @@ static struct diag *params_inner(struct parser *p, struct pos open, struct param
     if (count > 0) {
         memcpy(*out, ps, count * sizeof(struct param));
     }
-    free(ps);
+    heap_free(ps);
     *n = count;
     return NULL;
 }
@@ -2655,7 +2640,7 @@ static struct diag *designation(struct parser *p, struct designator ***out, uint
     if (count > 0) {
         memcpy(*out, ds, count * sizeof(struct designator *));
     }
-    free(ds);
+    heap_free(ds);
     *n = count;
     if (eat_punct(p, "=")) {
         return NULL;
@@ -3764,7 +3749,7 @@ static struct diag *postfix_ops(struct parser *p, struct expr *e, struct expr **
             if (nargs > 0) {
                 memcpy(c->args, args, nargs * sizeof(struct expr *));
             }
-            free(args);
+            heap_free(args);
             c->nargs = nargs;
             c->at = open;
             c->at2 = close;
@@ -4339,8 +4324,8 @@ static int failed_requirement(struct assert_printer *pr, struct expr *original, 
             break;
         }
     }
-    free(written.v);
-    free(values.v);
+    heap_free(written.v);
+    heap_free(values.v);
     if (found) {
         return 1;
     }
@@ -4409,7 +4394,9 @@ static struct diag *static_assertion(struct parser *p) {
         return e;
     }
     uint last = p->pos;
+    /* The message, msglen bytes (a string literal may hold a NUL). */
     const char *msg = NULL;
+    uint msglen = 0;
     if (eat_punct(p, ",")) {
         if (tok(p)->kind != TK_STR) {
             return expected(p, "string literal for diagnostic message in static_assert");
@@ -4420,7 +4407,7 @@ static struct diag *static_assertion(struct parser *p) {
             buf_put(&text, tok(p)->bytes, tok(p)->len);
             advance(p);
         }
-        msg = from_utf8_lossy((uchar *)text.data, text.len);
+        msg = from_utf8_lossy((uchar *)text.data, text.len, &msglen);
         buf_free(&text);
     } else if (is_punct(p, ")")) {
         warn(p, diag_warning(here(p), "'_Static_assert' with no message is a C23 extension", "c23-extensions"));
@@ -4442,21 +4429,24 @@ static struct diag *static_assertion(struct parser *p) {
     pr.toks = p->toks + first;
     pr.ntoks = last - first;
     pr.parens = &parens;
-    const char *suffix = msg != NULL ? fmt(": %s", msg) : "";
+    uint slen = 0;
+    const char *suffix = msg != NULL ? fmtn(&slen, ": %b", msg, msglen) : "";
     struct diag *failed;
+    uint len;
     struct expr *term;
     struct expr *value;
     if (failed_requirement(&pr, original, cond, &term, &value)) {
         char *what = pr_expr(&pr, term, 1);
-        failed = diag_error(pr_begin(&pr, term, 1),
-                            fmt("static assertion failed due to requirement '%s'%s", what, suffix));
+        const char *m = fmtn(&len, "static assertion failed due to requirement '%s'%b", what, suffix, slen);
+        failed = diag_error_n(pr_begin(&pr, term, 1), m, len);
         struct pos note_at;
         char *note;
         if (evaluates_to(&pr, term, value, &note_at, &note)) {
             diag_note(failed, note_at, note);
         }
     } else {
-        failed = diag_error(at, fmt("static assertion failed%s", suffix));
+        const char *m = fmtn(&len, "static assertion failed%b", suffix, slen);
+        failed = diag_error_n(at, m, len);
     }
     if (p->unevaluated.n == mark) {
         /* `_Static_assert(0, "")`: of a lone literal, nothing was kept to
@@ -4484,10 +4474,7 @@ static void take_written(struct parser *p, struct program *prog) {
  * before it), for sema to find in them the warnings clang gives before
  * such an error. */
 int parse_program(struct token *toks, uint ntoks, struct program *prog, struct diag **error) {
-    struct parser *p = calloc(1, sizeof(struct parser));
-    if (p == NULL) {
-        die("out of memory");
-    }
+    struct parser *p = heap_calloc(1, sizeof(struct parser));
     p->toks = toks;
     p->ntoks = ntoks;
     /* The type clang's <stdarg.h> builds va_list from: on RISC-V a plain

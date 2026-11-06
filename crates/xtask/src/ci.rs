@@ -15,7 +15,8 @@
 //! - Grail's display controller, and its keyboard in both of its modes, through
 //!   `examples/kbd-echo`;
 //! - the committed binaries are what the tools build now: the kernel, the
-//!   examples, the boot programs, hello, the disk image; and the kernel boots,
+//!   examples, the boot programs, hello, the disk image, and the generated
+//!   tables of the tools that run on Camelot; and the kernel boots,
 //!   on 1 to 8 harts, under Sv48 and Sv39, from disk, and panics as it should,
 //!   its boot and shell on the framebuffer console too;
 //! - processes' system call ABI: results sign-extended, pointers into the
@@ -182,6 +183,17 @@ const STEPS: &[Step] = &[
             "kernel_memory_functions_at_every_alignment",
             "the_bitmap_scan_finds_the_bit_the_bit_by_bit_loop_found",
             "the_framebuffer_console_shows_the_boot_and_the_shell",
+        ],
+    },
+    Step {
+        what: "the tools that run on Camelot have the host tools' tables (as, ld, cc1: c_tables.rs)",
+        args: &[
+            "-p",
+            "xtask",
+            "--test",
+            "selfhost",
+            "--",
+            "the_c_tools_tables_are_the_host_tools",
         ],
     },
     Step {

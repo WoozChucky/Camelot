@@ -758,7 +758,7 @@ static void variable(struct filegen *file, struct declarator *d, int local) {
     for (uint i = 0; i < lines.n; i++) {
         buf_fmt(&file->out, "    %s\n", (char *)lines.v[i]);
     }
-    free(lines.v);
+    heap_free(lines.v);
     finish_symbol(file, sym);
 }
 
@@ -777,7 +777,7 @@ static void strings(struct filegen *file) {
         for (uint k = 0; k < lines.n; k++) {
             buf_fmt(&file->out, "    %s\n", (char *)lines.v[k]);
         }
-        free(lines.v);
+        heap_free(lines.v);
     }
     file->strings.n = 0;
 }
@@ -1591,7 +1591,7 @@ static void unscoped_stmt(struct funcgen *g, struct stmt *s) {
                 for (uint i = 0; i < run.n; i++) {
                     stmt(g, run.v[i]);
                 }
-                free(run.v);
+                heap_free(run.v);
                 return;
             }
         }
@@ -1851,17 +1851,14 @@ static void local_decl(struct funcgen *g, struct declarator *d) {
     if (cst) {
         struct image im;
         im.size = (uint)ty_size(d->ty);
-        im.bytes = calloc(im.size + 1, sizeof(int));
-        if (im.bytes == NULL) {
-            die("out of memory");
-        }
+        im.bytes = heap_calloc(im.size + 1, sizeof(int));
         im.nonzero = 0;
         im.symbol = 0;
         constant_image(d->ty, d->init, 0, &im);
         if (image_copied(&im)) {
             take_name(g->file, fmt("__const.%s.%s", g->func->name, d->name));
         }
-        free(im.bytes);
+        heap_free(im.bytes);
     }
 }
 
@@ -2795,19 +2792,13 @@ static void call(struct funcgen *g, struct expr *e) {
  * underestimated; making a branch long moves code after it, so this
  * repeats until nothing changes. */
 static uchar *relax_branches(struct line *lines, uint n) {
-    uchar *lng = calloc(n + 1, 1);
-    int64_t *addr = malloc((n + 1) * sizeof(int64_t));
-    if (lng == NULL || addr == NULL) {
-        die("out of memory");
-    }
+    uchar *lng = heap_calloc(n + 1, 1);
+    int64_t *addr = heap_alloc((n + 1) * sizeof(int64_t));
     for (;;) {
         /* Where each line starts and where each label is (as pc + 1). */
         struct map labels;
         memset(&labels, 0, sizeof labels);
-        int64_t *at = malloc((n + 1) * sizeof(int64_t));
-        if (at == NULL) {
-            die("out of memory");
-        }
+        int64_t *at = heap_alloc((n + 1) * sizeof(int64_t));
         uint nat = 0;
         int64_t pc = 0;
         for (uint i = 0; i < n; i++) {
@@ -2834,11 +2825,11 @@ static uchar *relax_branches(struct line *lines, uint n) {
                 changed = 1;
             }
         }
-        free(labels.keys);
-        free(labels.values);
-        free(at);
+        heap_free(labels.keys);
+        heap_free(labels.values);
+        heap_free(at);
         if (!changed) {
-            free(addr);
+            heap_free(addr);
             return lng;
         }
     }
@@ -2907,10 +2898,7 @@ static struct diag *function(struct filegen *file, struct function *f) {
     int va_save = f->variadic ? WORD * (int)(ARG_REGS - (named_words < ARG_REGS ? named_words : ARG_REGS)) : 0;
     int header = SAVED_REGS + va_save;
     uint n = f->locals.n;
-    uchar *all = malloc(n + 1);
-    if (all == NULL) {
-        die("out of memory");
-    }
+    uchar *all = heap_alloc(n + 1);
     memset(all, 1, n + 1);
     uint pass;
     uchar *used = NULL;
@@ -2927,14 +2915,11 @@ static struct diag *function(struct filegen *file, struct function *f) {
                 frame = 0;
             }
         } else if (!layout(&f->locals, used, header, &offsets, &frame)) {
-            free(all);
+            heap_free(all);
             return diag_error(f->pos,
                               fmt("the locals of '%s' need a stack frame larger than 2 GiB", f->name));
         }
-        g = calloc(1, sizeof(struct funcgen));
-        if (g == NULL) {
-            die("out of memory");
-        }
+        g = heap_calloc(1, sizeof(struct funcgen));
         g->func = f;
         g->offsets = offsets;
         g->frame = frame;
@@ -2942,10 +2927,7 @@ static struct diag *function(struct filegen *file, struct function *f) {
         g->va_save = va_save;
         g->file = file;
         g->ret_label = fmt(".L.return.%s", f->name);
-        g->used = calloc(n + 1, 1);
-        if (g->used == NULL) {
-            die("out of memory");
-        }
+        g->used = heap_calloc(n + 1, 1);
         for (uint i = 0; i < n && i < f->nparams; i++) {
             g->used[i] = 1;
         }
@@ -2959,10 +2941,10 @@ static struct diag *function(struct filegen *file, struct function *f) {
             file->labels = labels;
             vec_truncate(&file->strings, strings_n);
             used = g->used;
-            free(g->lines);
-            free(g->reached.keys);
-            free(g->reached.values);
-            free(g);
+            heap_free(g->lines);
+            heap_free(g->reached.keys);
+            heap_free(g->reached.values);
+            heap_free(g);
         }
     }
     begin_symbol(file);
@@ -2975,9 +2957,9 @@ static struct diag *function(struct filegen *file, struct function *f) {
     }
     render(g->lines, g->nlines, lng, &file->out);
     finish_symbol(file, f->name);
-    free(lng);
-    free(g->lines);
-    free(all);
+    heap_free(lng);
+    heap_free(g->lines);
+    heap_free(all);
     return NULL;
 }
 
@@ -3005,7 +2987,7 @@ static struct diag *deferred(struct filegen *file) {
             }
         }
     }
-    free(now.v);
+    heap_free(now.v);
     return NULL;
 }
 
@@ -3066,10 +3048,7 @@ int codegen_generate(struct program *prog, struct buf *out, struct diag **error)
         }
     }
     /* The definitions, in the order they come. */
-    struct filegen *file = calloc(1, sizeof(struct filegen));
-    if (file == NULL) {
-        die("out of memory");
-    }
+    struct filegen *file = heap_calloc(1, sizeof(struct filegen));
     file->section = "";
     struct vec defs;
     memset(&defs, 0, sizeof defs);
@@ -3099,11 +3078,8 @@ int codegen_generate(struct program *prog, struct buf *out, struct diag **error)
         map_put(&file->by_symbol, def_symbol(&file->defs[k]), (void *)((uintptr_t)k + 1));
     }
     file->ndefs = n;
-    file->emitted = calloc(n + 1, 1);
-    file->waiting = calloc(n + 1, 1);
-    if (file->emitted == NULL || file->waiting == NULL) {
-        die("out of memory");
-    }
+    file->emitted = heap_calloc(n + 1, 1);
+    file->waiting = heap_calloc(n + 1, 1);
     /* clang's front end: the file, as it comes, emits what must be emitted
      * and keeps the rest for when it is used; then the tentative
      * definitions; then what was used, each one's uses right after it. */

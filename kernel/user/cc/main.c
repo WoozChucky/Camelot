@@ -67,11 +67,19 @@ static int lang_of_file(const char *name) {
     return ends_with(name, ".S") || ends_with(name, ".sx") ? LANG_ASM : LANG_C;
 }
 
-/* The whole file, NUL-terminated, or NULL with *err set. */
+/* The whole file, NUL-terminated, or NULL with *err set: a directory is
+ * none (-EISDIR), as Rust's read_to_string refuses one. */
 static char *read_file(const char *path, uint *len, int *err) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         *err = fd;
+        return NULL;
+    }
+    struct stat st;
+    int r = fstat(fd, &st);
+    if (r < 0 || st.type == T_DIR) {
+        close(fd);
+        *err = r < 0 ? r : -EISDIR;
         return NULL;
     }
     struct buf b;
@@ -114,13 +122,17 @@ static int write_file(const char *path, const char *data, uint len) {
     return close(fd);
 }
 
-/* Writes all of data to standard output. */
+/* Writes all of data to standard output. A failure stops cc1 with exit
+ * status 2, its status for a file it cannot write (-o, as merlin's); there
+ * merlin's print! panics instead, exit status 101, which is Rust's and no
+ * compiler's. */
 static void write_out(const char *data, uint len) {
     uint done = 0;
     while (done < len) {
         int r = write(1, data + done, len - done);
         if (r <= 0) {
-            return;
+            fprintf(2, "cc1: cannot write standard output: %s\n", strerror(r < 0 ? -r : ENOSPC));
+            exit(2);
         }
         done += (uint)r;
     }
@@ -198,7 +210,7 @@ static struct vec merge(struct pp_output *pp, struct vec later) {
 /* Names the file of every diagnostic not in the file being compiled. */
 static void name_files(struct pp_output *pp, struct vec *ds) {
     for (uint i = 0; i < ds->n; i++) {
-        diag_name_files(ds->v[i], pp->files, pp->nfiles);
+        diag_name_files(ds->v[i], pp->files, pp->lens, pp->nfiles);
     }
 }
 
@@ -218,12 +230,9 @@ static int check(struct pp_output *pp, struct program *prog, struct vec *errors)
     }
     /* Where the errors before sema's are, which leave out clang's analysis
      * of the functions done after them. */
-    struct pos *earlier = malloc((pp->ndiags + lexed.n + 1) * sizeof(struct pos));
+    struct pos *earlier = heap_alloc((pp->ndiags + lexed.n + 1) * sizeof(struct pos));
     uint nearlier = 0;
     uint capearlier = pp->ndiags + lexed.n + 1;
-    if (earlier == NULL) {
-        die("out of memory");
-    }
     for (uint i = 0; i < pp->ndiags; i++) {
         if (!diag_is_warning(pp->diags[i])) {
             earlier[nearlier++] = pp->after[i];
@@ -264,7 +273,7 @@ static int check(struct pp_output *pp, struct program *prog, struct vec *errors)
         vec_push(&checked, syntax);
         vec_extend(&checked, &after);
     }
-    free(earlier);
+    heap_free(earlier);
     struct vec read = in_clangs_order(lexed, parsed);
     struct vec diagnostics = error_limit(merge(pp, in_clangs_order(read, checked)));
     int all_warnings = 1;
@@ -402,7 +411,7 @@ static int compile_unit(const char *name, const char *src, uint n, struct option
     struct buf asm_text;
     memset(&asm_text, 0, sizeof asm_text);
     if (!codegen_generate(&prog, &asm_text, &error)) {
-        diag_name_files(error, pp.files, pp.nfiles);
+        diag_name_files(error, pp.files, pp.lens, pp.nfiles);
         print_all(&prog.warnings, name);
         diag_print(error, name);
         buf_free(&asm_text);
@@ -419,61 +428,73 @@ static int compile_unit(const char *name, const char *src, uint n, struct option
     return 1;
 }
 
+/* The input file's text, NUL-terminated (its length in *len), or NULL
+ * with what stops it said: a file it cannot read, or one that is not UTF-8
+ * (Rust's read_to_string reads only that). */
+static char *read_input(struct input *in, uint *len) {
+    int err = 0;
+    char *src = read_file(in->name, len, &err);
+    if (src == NULL) {
+        fprintf(2, "cc1: cannot read %s: %s\n", in->name, strerror(-err));
+        return NULL;
+    }
+    if (!valid_utf8((uchar *)src, *len)) {
+        fprintf(2, "cc1: cannot read %s: stream did not contain valid UTF-8\n", in->name);
+        heap_free(src);
+        return NULL;
+    }
+    return src;
+}
+
+/* Writes a translation unit's output: to `output`, or standard output if
+ * NULL. 0, or 2 for a file it cannot write. */
+static int write_output(const char *output, struct buf *text) {
+    if (output == NULL) {
+        write_out(text->data, text->len);
+        return 0;
+    }
+    int r = write_file(output, text->data, text->len);
+    if (r < 0) {
+        fprintf(2, "cc1: cannot write %s: %s\n", output, strerror(-r));
+        return 2;
+    }
+    return 0;
+}
+
 /* Compiles or dumps one input file (merlin's translate): 0, or the exit
  * status of a failure. */
 static int compile_file(struct input *in, const char *output, struct options *opts, int dump) {
     uint len = 0;
-    int err = 0;
-    char *src = read_file(in->name, &len, &err);
+    char *src = read_input(in, &len);
     if (src == NULL) {
-        fprintf(2, "cc1: cannot read %s: %s\n", in->name, strerror(-err));
-        return 2;
-    }
-    if (!valid_utf8((uchar *)src, len)) {
-        fprintf(2, "cc1: cannot read %s: stream did not contain valid UTF-8\n", in->name);
         return 2;
     }
     opts->lang = in->lang;
     struct buf text;
     memset(&text, 0, sizeof text);
-    int ok = compile_unit(in->name, src, len, opts, dump, &text);
-    if (!ok) {
-        buf_free(&text);
-        return 1;
+    int status = 1;
+    if (compile_unit(in->name, src, len, opts, dump, &text)) {
+        /* Without -o: the input with .s for .c (or added), or for
+         * --dump-ast standard output. */
+        const char *out = output;
+        if (out == NULL && !dump) {
+            out = ends_with(in->name, ".c") ? fmt("%s.s", arena_strndup(in->name, (uint)strlen(in->name) - 2))
+                                             : fmt("%s.s", in->name);
+        }
+        status = write_output(out, &text);
     }
-    /* Without -o: the input with .s for .c (or added), or for --dump-ast
-     * standard output. */
-    const char *out = output;
-    if (out == NULL && dump) {
-        write_out(text.data, text.len);
-        buf_free(&text);
-        return 0;
-    }
-    if (out == NULL) {
-        out = ends_with(in->name, ".c") ? fmt("%s.s", arena_strndup(in->name, (uint)strlen(in->name) - 2))
-                                         : fmt("%s.s", in->name);
-    }
-    int r = write_file(out, text.data, text.len);
-    buf_free(&text);
-    if (r < 0) {
-        fprintf(2, "cc1: cannot write %s: %s\n", out, strerror(-r));
-        return 2;
-    }
-    return 0;
+    /* The translation unit is done: its memory goes, the arena and the
+     * heap (its source, tokens, tree, assembly and diagnostics). */
+    arena_free();
+    return status;
 }
 
 /* Preprocesses one input file (merlin's translate, for -E): 0, or the exit
  * status of a failure. */
 static int translate(struct input *in, const char *output, struct options *opts) {
     uint len = 0;
-    int err = 0;
-    char *src = read_file(in->name, &len, &err);
+    char *src = read_input(in, &len);
     if (src == NULL) {
-        fprintf(2, "cc1: cannot read %s: %s\n", in->name, strerror(-err));
-        return 2;
-    }
-    if (!valid_utf8((uchar *)src, len)) {
-        fprintf(2, "cc1: cannot read %s: stream did not contain valid UTF-8\n", in->name);
         return 2;
     }
     opts->lang = in->lang;
@@ -488,23 +509,11 @@ static int translate(struct input *in, const char *output, struct options *opts)
     for (uint i = 0; i < ndiags; i++) {
         diag_print(diags[i], in->name);
     }
-    free(src);
-    if (!ok) {
-        buf_free(&text);
-        return 1;
-    }
-    if (output == NULL) {
-        write_out(text.data, text.len);
-        buf_free(&text);
-        return 0;
-    }
-    int r = write_file(output, text.data, text.len);
-    buf_free(&text);
-    if (r < 0) {
-        fprintf(2, "cc1: cannot write %s: %s\n", output, strerror(-r));
-        return 2;
-    }
-    return 0;
+    int status = ok ? write_output(output, &text) : 1;
+    /* The translation unit is done: its memory goes, the arena and the
+     * heap (its source, the text and the diagnostics). */
+    arena_free();
+    return status;
 }
 
 /* The value of an option written `-I dir` or `-Idir` (the same for -D, -U,
@@ -523,16 +532,21 @@ static char *value(char **argv, int argc, int *i, uint flag_len) {
 }
 
 int main(int argc, char **argv) {
-    struct input *inputs = NULL;
     uint ninputs = 0;
-    uint capinputs = 0;
     const char *output = NULL;
     int mode = MODE_COMPILE;
     struct options opts;
     memset(&opts, 0, sizeof opts);
     opts.line_markers = 1;
-    uint capdirs = 0;
-    uint capmacros = 0;
+    /* The command line's lists, at most an entry per argument, live for the
+     * whole run: plain malloc, not a translation unit's heap, which goes when
+     * the unit is done. */
+    struct input *inputs = malloc((uint)argc * sizeof(struct input));
+    opts.include_dirs = malloc((uint)argc * sizeof(char *));
+    opts.macros = malloc((uint)argc * sizeof(struct cmd_macro));
+    if (inputs == NULL || opts.include_dirs == NULL || opts.macros == NULL) {
+        die("out of memory");
+    }
     const char *abi = NULL;
     int debug = 0;
     /* -x LANG applies to the inputs after it, as in clang; -1 goes by each
@@ -579,7 +593,6 @@ int main(int argc, char **argv) {
             if (d == NULL) {
                 return usage_error("-I needs a directory");
             }
-            opts.include_dirs = grow(opts.include_dirs, &capdirs, opts.ninclude_dirs + 1, sizeof(char *));
             opts.include_dirs[opts.ninclude_dirs++] = d;
         } else if (strncmp(a, "-D", 2) == 0 || strncmp(a, "-U", 2) == 0) {
             int undef = a[1] == 'U';
@@ -587,7 +600,6 @@ int main(int argc, char **argv) {
             if (m == NULL || m[0] == 0 || (!undef && m[0] == '=')) {
                 return usage_error(undef ? "-U needs a macro name" : "-D needs a macro name");
             }
-            opts.macros = grow(opts.macros, &capmacros, opts.nmacros + 1, sizeof(struct cmd_macro));
             opts.macros[opts.nmacros].undef = undef;
             opts.macros[opts.nmacros].text = m;
             opts.nmacros++;
@@ -608,7 +620,6 @@ int main(int argc, char **argv) {
         } else if (a[0] == '-') {
             return usage_error(fmt("unknown option %s", a));
         } else {
-            inputs = grow(inputs, &capinputs, ninputs + 1, sizeof(struct input));
             inputs[ninputs].name = a;
             inputs[ninputs].lang = lang >= 0 ? lang : lang_of_file(a);
             ninputs++;

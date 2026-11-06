@@ -143,11 +143,8 @@ static void splice(struct lexer *lx, const uchar *src, uint n, int asm) {
         k = 3;
         col = 4;
     }
-    lx->chars = malloc(n + 1);
-    lx->off = malloc((n + 1) * sizeof(uint));
-    if (lx->chars == NULL || lx->off == NULL) {
-        die("out of memory");
-    }
+    lx->chars = heap_alloc(n + 1);
+    lx->off = heap_alloc((n + 1) * sizeof(uint));
     while (k < n) {
         /* The character here after phase 1, and how many bytes it was
          * written as. */
@@ -472,10 +469,10 @@ static void lexer_start(struct lexer *lx, const char *src, uint n, uint file, in
 }
 
 static void lexer_free(struct lexer *lx) {
-    free(lx->chars);
-    free(lx->off);
-    free(lx->lines);
-    free(lx->marks);
+    heap_free(lx->chars);
+    heap_free(lx->off);
+    heap_free(lx->lines);
+    heap_free(lx->marks);
 }
 
 void lex_pp(const char *src, uint n, uint file, int asm, struct lexed *out) {
@@ -541,7 +538,7 @@ int lex_split(const char *text, uint n, int asm, uint max, struct split *s) {
 }
 
 void lex_split_free(struct split *s) {
-    free(s->chars);
+    heap_free(s->chars);
     s->chars = NULL;
 }
 
@@ -575,10 +572,10 @@ static int digit_value(uint c, uint radix) {
     return v >= 0 && (uint)v < radix ? v : -1;
 }
 
-/* Whether the lower-cased text has c. */
-static int has_lower(const char *text, uint c) {
-    for (; *text; text++) {
-        if (lower((uchar)*text) == c) {
+/* Whether the lower-cased text (len bytes) has c. */
+static int has_lower(const char *text, uint len, uint c) {
+    for (uint i = 0; i < len; i++) {
+        if (lower((uchar)text[i]) == c) {
             return 1;
         }
     }
@@ -591,11 +588,10 @@ static int has_lower(const char *text, uint c) {
  * not right after the digits is `invalid digit '9' in octal constant` (`a`
  * to `f` in a decimal one too), at the digit; anything else after them is
  * `invalid suffix 'abc' on integer constant`, at the suffix. */
-struct diag *lex_integer(const char *text, struct pos pos, struct intlit *out) {
+struct diag *lex_integer(const char *text, uint len, struct pos pos, struct intlit *out) {
     memset(out, 0, sizeof *out);
-    uint len = (uint)strlen(text);
     int hex = len >= 2 && text[0] == '0' && lower((uchar)text[1]) == 'x';
-    if (has_lower(text, '.') || (!hex && has_lower(text, 'e')) || (hex && has_lower(text, 'p'))) {
+    if (has_lower(text, len, '.') || (!hex && has_lower(text, len, 'e')) || (hex && has_lower(text, len, 'p'))) {
         return diag_error(pos, "floating-point literals are not supported");
     }
     /* The leading `0` of an octal constant is one of its digits (`0` and
@@ -658,7 +654,7 @@ struct diag *lex_integer(const char *text, struct pos pos, struct intlit *out) {
     }
     if (lng == 3) {
         return diag_error(pos_at(pos.file, pos.line, pos.col + k),
-                          fmt("invalid suffix '%s' on integer constant", suffix));
+                          fmt("invalid suffix '%b' on integer constant", suffix, slen));
     }
     /* The digits are valid, so the only way to fail is to overflow. */
     uint64_t low64 = 0;
@@ -701,10 +697,11 @@ static int is_hex(uint c) {
  * the one it stops at returned. Characters outside ASCII come out as their
  * UTF-8 bytes; in a character constant (char_const) each is too large for
  * it. *units: how many characters it has, each escape one. */
-static struct diag *decode_units(const char *text, struct pos pos, struct diag **diags, int char_const,
-                                 struct buf *out, uint *units) {
+static struct diag *decode_units(const char *text, uint len, struct pos pos, struct diag **diags,
+                                 int char_const, struct buf *out, uint *units) {
     const uchar *body = (const uchar *)text + 1;
-    uint n = (uint)strlen(text) - 2;
+    /* Between the quotes (which the lexer made sure of). */
+    uint n = len >= 2 ? len - 2 : 0;
     uint k = 0;
     *units = 0;
     while (k < n) {
@@ -859,30 +856,31 @@ static struct diag *decode_units(const char *text, struct pos pos, struct diag *
             }
             continue;
         }
-        default:
-            /* clang: the character itself, and a warning. */
-            diag_append(diags, diag_warning(body_at(pos, start),
-                                            fmt("unknown escape sequence '\\%s'",
-                                                arena_strndup((const char *)body + start + 1, elen)),
-                                            "unknown-escape-sequence"));
+        default: {
+            /* clang: the character itself (a NUL too), and a warning. */
+            uint mlen;
+            const char *msg = fmtn(&mlen, "unknown escape sequence '\\%b'", (const char *)body + start + 1, elen);
+            diag_append(diags, diag_warning_n(body_at(pos, start), msg, mlen, "unknown-escape-sequence"));
             buf_put(out, body + start + 1, elen);
             continue;
+        }
         }
         buf_byte(out, byte);
     }
     return NULL;
 }
 
-struct diag *lex_decode(const char *text, struct pos pos, struct diag **diags, struct buf *out) {
+struct diag *lex_decode(const char *text, uint len, struct pos pos, struct diag **diags, struct buf *out) {
     uint units;
-    return decode_units(text, pos, diags, 0, out, &units);
+    return decode_units(text, len, pos, diags, 0, out, &units);
 }
 
 /* A character constant's value, an int (C99 6.4.4.4): its byte, or for
  * several (`'ab'`) the bytes as the digits of a number in base 256, as
  * clang computes it, keeping the low 32 bits, with clang's warning for each
  * (and one more past four characters, which do not all fit). */
-struct diag *lex_char_constant(const char *text, struct pos pos, struct diag **diags, int64_t *value) {
+struct diag *lex_char_constant(const char *text, uint len, struct pos pos, struct diag **diags,
+                               int64_t *value) {
     /* Where the diagnostics of this constant start. */
     struct diag **mine = diags;
     while (*mine != NULL) {
@@ -891,7 +889,7 @@ struct diag *lex_char_constant(const char *text, struct pos pos, struct diag **d
     struct buf bytes;
     memset(&bytes, 0, sizeof bytes);
     uint chars;
-    struct diag *err = decode_units(text, pos, diags, 1, &bytes, &chars);
+    struct diag *err = decode_units(text, len, pos, diags, 1, &bytes, &chars);
     if (err != NULL) {
         buf_free(&bytes);
         return err;
@@ -981,9 +979,9 @@ int kw_starts_decl(int k) {
  * that holds the value; `l` starts at long, `ll` at long long. A decimal
  * one too large for every signed type is an unsigned long long, with
  * clang's warning. */
-static struct diag *int_constant(const char *text, struct pos pos, struct vec *diags, i128 *value, int *kind) {
+static struct diag *int_constant(const char *text, uint len, struct pos pos, struct vec *diags, i128 *value, int *kind) {
     struct intlit lit;
-    struct diag *e = lex_integer(text, pos, &lit);
+    struct diag *e = lex_integer(text, len, pos, &lit);
     if (e != NULL) {
         return e;
     }
@@ -1052,10 +1050,7 @@ static void push_list(struct vec *v, struct diag *list) {
  * nowhere); only a keyword merlin has not (float) stops it, returning 0
  * with the diagnostics before it and that one. */
 int lex_finish(struct pptok *toks, uint n, struct pos end, struct token **out, uint *nout, struct vec *diags) {
-    struct token *t = malloc((n + 1) * sizeof(struct token));
-    if (t == NULL) {
-        die("out of memory");
-    }
+    struct token *t = heap_alloc((n + 1) * sizeof(struct token));
     uint k = 0;
     for (uint i = 0; i < n; i++) {
         struct pptok *p = &toks[i];
@@ -1069,7 +1064,7 @@ int lex_finish(struct pptok *toks, uint n, struct pos end, struct token **out, u
                 o->kw = (uchar)kw;
             } else if (unsupported_keyword(p->text)) {
                 vec_push(diags, diag_error(p->pos, fmt("'%s' is not supported yet", p->text)));
-                free(t);
+                heap_free(t);
                 return 0;
             } else {
                 o->kind = TK_IDENT;
@@ -1079,7 +1074,7 @@ int lex_finish(struct pptok *toks, uint n, struct pos end, struct token **out, u
         }
         case PP_NUMBER: {
             int kind;
-            struct diag *e = int_constant(p->text, p->pos, diags, &o->value, &kind);
+            struct diag *e = int_constant(p->text, p->len, p->pos, diags, &o->value, &kind);
             o->kind = TK_NUM;
             if (e != NULL) {
                 vec_push(diags, e);
@@ -1092,7 +1087,7 @@ int lex_finish(struct pptok *toks, uint n, struct pos end, struct token **out, u
         case PP_CHAR: {
             struct diag *list = NULL;
             int64_t v = 0;
-            struct diag *e = lex_char_constant(p->text, p->pos, &list, &v);
+            struct diag *e = lex_char_constant(p->text, p->len, p->pos, &list, &v);
             push_list(diags, list);
             o->kind = TK_NUM;
             o->ik = IK_INT;
@@ -1107,7 +1102,7 @@ int lex_finish(struct pptok *toks, uint n, struct pos end, struct token **out, u
             struct diag *list = NULL;
             struct buf b;
             memset(&b, 0, sizeof b);
-            struct diag *e = lex_decode(p->text, p->pos, &list, &b);
+            struct diag *e = lex_decode(p->text, p->len, p->pos, &list, &b);
             push_list(diags, list);
             o->kind = TK_STR;
             if (e != NULL) {

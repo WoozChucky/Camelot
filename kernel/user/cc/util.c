@@ -13,42 +13,174 @@ void die(const char *msg) {
 }
 
 /* ---- The arena ----
- * A bump allocator over chunks taken from sbrk: each allocation is the
- * next bytes of the current chunk, 8-aligned; a chunk that has no room
- * left is abandoned for a new one (malloc takes from sbrk too, so two
- * chunks need not be next to each other). Nothing is freed: the
- * compilation's end, the process's exit, frees it all, as compilers that
- * allocate per translation unit do. */
+ * A bump allocator: each allocation is the next bytes of the current chunk,
+ * 8-aligned, and a chunk with no room left for one is followed by a new
+ * chunk (what little is left of the old one, less than BIG bytes, stays
+ * unused). An allocation bigger than BIG gets a block of its own, which
+ * leaves the current chunk as it is. The chunks and blocks come from malloc
+ * (which takes its memory from sbrk) and are freed all together when the
+ * compilation ends (arena_free), as merlin's memory is when a translation
+ * unit is done: nothing in the arena is freed on its own. */
 
 #define CHUNK (256 * 1024)
+#define BIG (CHUNK / 4)
 
-static char *chunk;
-static uint chunk_used;
-static uint chunk_size;
-static uint arena_total;
+/* A chunk or a block of the arena: its header, then its bytes. */
+struct block {
+    struct block *next;
+    uint size;
+    uint used;
+};
+
+#define HEADER ((sizeof(struct block) + 7) & ~7u)
+
+/* The current chunk, the chunks before it after it in the list. */
+static struct block *chunks;
+/* The blocks of the big allocations. */
+static struct block *bigs;
+
+static struct block *new_block(uint size, struct block *next) {
+    if (size > 0xffffffffu - HEADER) {
+        die("out of memory");
+    }
+    struct block *b = malloc(HEADER + size);
+    if (b == NULL) {
+        die("out of memory");
+    }
+    b->next = next;
+    b->size = size;
+    b->used = 0;
+    return b;
+}
 
 void *arena_alloc(uint n) {
-    n = (n + 7) & ~7u;
-    if (chunk == NULL || chunk_size - chunk_used < n) {
-        uint size = n > CHUNK ? n : CHUNK;
-        char *got = sbrk((long)size + 8);
-        if ((long)got < 0) {
-            die("out of memory");
-        }
-        /* sbrk's memory may start anywhere: align it. */
-        chunk = (char *)(((uintptr_t)got + 7) & ~(uintptr_t)7);
-        chunk_used = 0;
-        chunk_size = size;
+    if (n > 0xffffffffu - 7) {
+        die("out of memory");
     }
-    void *r = chunk + chunk_used;
-    chunk_used += n;
-    arena_total += n;
+    n = (n + 7) & ~7u;
+    struct block *b;
+    if (n > BIG) {
+        bigs = new_block(n, bigs);
+        b = bigs;
+    } else {
+        if (chunks == NULL || chunks->size - chunks->used < n) {
+            chunks = new_block(CHUNK, chunks);
+        }
+        b = chunks;
+    }
+    void *r = (char *)b + HEADER + b->used;
+    b->used += n;
     memset(r, 0, n);
     return r;
 }
 
-uint arena_used(void) {
-    return arena_total;
+static void free_blocks(struct block *b) {
+    while (b != NULL) {
+        struct block *next = b->next;
+        free(b);
+        b = next;
+    }
+}
+
+/* ---- The translation unit's heap ----
+ * What grows or is freed early (an array, a map's table, a buffer) is
+ * malloc'd, each block with a header linking it into the list of what the
+ * translation unit holds: heap_free takes one out and frees it, and what is
+ * still there when the translation unit is done goes with the arena. So
+ * whatever a compilation keeps, the syntax tree's arrays as much as its
+ * nodes, is freed when it ends, as merlin's is. */
+
+/* A block's header, before its bytes: 16, which keeps them aligned. */
+struct held {
+    struct held *prev;
+    struct held *next;
+};
+
+/* The blocks held, the newest first. */
+static struct held *heap;
+
+static void hold(struct held *h) {
+    h->prev = NULL;
+    h->next = heap;
+    if (heap != NULL) {
+        heap->prev = h;
+    }
+    heap = h;
+}
+
+static void unhold(struct held *h) {
+    if (h->prev != NULL) {
+        h->prev->next = h->next;
+    } else {
+        heap = h->next;
+    }
+    if (h->next != NULL) {
+        h->next->prev = h->prev;
+    }
+}
+
+void *heap_alloc(size_t n) {
+    if (n > 0xffffffffu) {
+        die("out of memory");
+    }
+    struct held *h = malloc(sizeof(struct held) + n);
+    if (h == NULL) {
+        die("out of memory");
+    }
+    hold(h);
+    return h + 1;
+}
+
+void *heap_calloc(size_t n, size_t size) {
+    if (size != 0 && n > 0xffffffffu / size) {
+        die("out of memory");
+    }
+    void *p = heap_alloc(n * size);
+    memset(p, 0, n * size);
+    return p;
+}
+
+void *heap_realloc(void *p, size_t n) {
+    if (p == NULL) {
+        return heap_alloc(n);
+    }
+    if (n > 0xffffffffu) {
+        die("out of memory");
+    }
+    struct held *h = (struct held *)p - 1;
+    unhold(h);
+    struct held *q = realloc(h, sizeof(struct held) + n);
+    if (q == NULL) {
+        die("out of memory");
+    }
+    hold(q);
+    return q + 1;
+}
+
+void heap_free(void *p) {
+    if (p == NULL) {
+        return;
+    }
+    struct held *h = (struct held *)p - 1;
+    unhold(h);
+    free(h);
+}
+
+/* The identifiers interned in the arena (see intern). */
+static struct map interned;
+
+void arena_free(void) {
+    free_blocks(chunks);
+    free_blocks(bigs);
+    chunks = NULL;
+    bigs = NULL;
+    /* And the heap's blocks, the interned names' table among them. */
+    while (heap != NULL) {
+        struct held *next = heap->next;
+        free(heap);
+        heap = next;
+    }
+    memset(&interned, 0, sizeof interned);
 }
 
 char *arena_strndup(const char *s, uint n) {
@@ -79,10 +211,7 @@ void *grow(void *p, uint *cap, uint need, uint size) {
     if (size != 0 && c > 0xffffffffu / size) {
         die("out of memory");
     }
-    void *q = realloc(p, (size_t)c * size);
-    if (q == NULL) {
-        die("out of memory");
-    }
+    void *q = heap_realloc(p, (size_t)c * size);
     *cap = c;
     return q;
 }
@@ -115,7 +244,7 @@ char *buf_arena(struct buf *b) {
 }
 
 void buf_free(struct buf *b) {
-    free(b->data);
+    heap_free(b->data);
     b->data = NULL;
     b->len = 0;
     b->cap = 0;
@@ -160,6 +289,10 @@ static void vformat(struct buf *b, const char *f, va_list ap) {
             put_decimal(b, wide ? va_arg(ap, uint64_t) : (uint64_t)va_arg(ap, uint));
         } else if (*f == 's') {
             buf_str(b, va_arg(ap, const char *));
+        } else if (*f == 'b') {
+            /* Bytes, which may hold a NUL: a pointer and a length. */
+            const char *s = va_arg(ap, const char *);
+            buf_put(b, s, va_arg(ap, uint));
         } else if (*f == 'c') {
             buf_byte(b, (uchar)va_arg(ap, int));
         } else {
@@ -183,6 +316,19 @@ char *fmt(const char *f, ...) {
     vformat(&b, f, ap);
     va_end(ap);
     char *r = buf_arena(&b);
+    buf_free(&b);
+    return r;
+}
+
+char *fmtn(uint *len, const char *f, ...) {
+    struct buf b;
+    memset(&b, 0, sizeof b);
+    va_list ap;
+    va_start(ap, f);
+    vformat(&b, f, ap);
+    va_end(ap);
+    char *r = buf_arena(&b);
+    *len = b.len;
     buf_free(&b);
     return r;
 }
@@ -215,19 +361,16 @@ void *map_get(struct map *m, const char *key) {
 static void map_resize(struct map *m, uint cap) {
     struct map old = *m;
     m->cap = cap;
-    m->keys = calloc(cap, sizeof(char *));
-    m->values = calloc(cap, sizeof(void *));
-    if (m->keys == NULL || m->values == NULL) {
-        die("out of memory");
-    }
+    m->keys = heap_calloc(cap, sizeof(char *));
+    m->values = heap_calloc(cap, sizeof(void *));
     m->count = 0;
     for (uint i = 0; i < old.cap; i++) {
         if (old.keys[i] != NULL) {
             map_put(m, old.keys[i], old.values[i]);
         }
     }
-    free(old.keys);
-    free(old.values);
+    heap_free(old.keys);
+    heap_free(old.values);
 }
 
 void map_put(struct map *m, const char *key, void *value) {
@@ -275,19 +418,15 @@ int map_remove(struct map *m, const char *key) {
     return 1;
 }
 
-/* The interned identifiers: each text once, the map's value the string. */
-static struct map interned;
-
+/* The interned identifiers (`interned`, above): each text once, the map's
+ * value the string. */
 const char *intern(const char *s, uint len) {
     /* The key to look for must be NUL-terminated: copy short ones to the
      * stack. */
     char small[64];
     char *key = small;
     if (len >= sizeof small) {
-        key = malloc(len + 1);
-        if (key == NULL) {
-            die("out of memory");
-        }
+        key = heap_alloc(len + 1);
     }
     memcpy(key, s, len);
     key[len] = 0;
@@ -298,7 +437,7 @@ const char *intern(const char *s, uint len) {
         found = copy;
     }
     if (key != small) {
-        free(key);
+        heap_free(key);
     }
     return found;
 }
@@ -420,8 +559,9 @@ int valid_utf8(const uchar *s, uint n) {
 }
 
 /* Rust's String::from_utf8_lossy: the bytes as UTF-8, each maximal part of
- * an ill-formed sequence (as Unicode defines it) replaced by U+FFFD. */
-char *from_utf8_lossy(const uchar *s, uint n) {
+ * an ill-formed sequence (as Unicode defines it) replaced by U+FFFD; its
+ * length in *out_len. */
+char *from_utf8_lossy(const uchar *s, uint n, uint *out_len) {
     struct buf b;
     memset(&b, 0, sizeof b);
     uint i = 0;
@@ -477,6 +617,7 @@ char *from_utf8_lossy(const uchar *s, uint n) {
         i += k;
     }
     char *r = buf_arena(&b);
+    *out_len = b.len;
     buf_free(&b);
     return r;
 }
@@ -840,12 +981,9 @@ void posmap_put(struct posmap *m, struct pos key, void *value) {
     if ((m->count + 1) * 2 > m->cap) {
         struct posmap old = *m;
         uint cap = m->cap ? m->cap * 2 : 64;
-        m->keys = calloc(cap, sizeof(struct pos));
-        m->values = calloc(cap, sizeof(void *));
-        m->used = calloc(cap, 1);
-        if (m->keys == NULL || m->values == NULL || m->used == NULL) {
-            die("out of memory");
-        }
+        m->keys = heap_calloc(cap, sizeof(struct pos));
+        m->values = heap_calloc(cap, sizeof(void *));
+        m->used = heap_calloc(cap, 1);
         m->cap = cap;
         m->count = 0;
         for (uint i = 0; i < old.cap; i++) {
@@ -853,9 +991,9 @@ void posmap_put(struct posmap *m, struct pos key, void *value) {
                 posmap_put(m, old.keys[i], old.values[i]);
             }
         }
-        free(old.keys);
-        free(old.values);
-        free(old.used);
+        heap_free(old.keys);
+        heap_free(old.values);
+        heap_free(old.used);
     }
     for (uint i = pos_hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
         if (!m->used[i]) {
@@ -908,12 +1046,9 @@ void intmap_put(struct intmap *m, uint64_t key, void *value) {
     if ((m->count + 1) * 2 > m->cap) {
         struct intmap old = *m;
         uint cap = m->cap ? m->cap * 2 : 64;
-        m->keys = calloc(cap, sizeof(uint64_t));
-        m->values = calloc(cap, sizeof(void *));
-        m->used = calloc(cap, 1);
-        if (m->keys == NULL || m->values == NULL || m->used == NULL) {
-            die("out of memory");
-        }
+        m->keys = heap_calloc(cap, sizeof(uint64_t));
+        m->values = heap_calloc(cap, sizeof(void *));
+        m->used = heap_calloc(cap, 1);
         m->cap = cap;
         m->count = 0;
         for (uint i = 0; i < old.cap; i++) {
@@ -921,9 +1056,9 @@ void intmap_put(struct intmap *m, uint64_t key, void *value) {
                 intmap_put(m, old.keys[i], old.values[i]);
             }
         }
-        free(old.keys);
-        free(old.values);
-        free(old.used);
+        heap_free(old.keys);
+        heap_free(old.values);
+        heap_free(old.used);
     }
     for (uint i = int_hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
         if (!m->used[i]) {

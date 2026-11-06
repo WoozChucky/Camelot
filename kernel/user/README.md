@@ -1,8 +1,8 @@
 # Camelot's user programs
 
 Every `X.c` or `X.s` here is a program called `X`, and so is every
-subdirectory `X/` but `lib/` (a program of several files: `as/`), but
-`cc/`, which is `cc1`, the compiler proper (`userprogs::RENAMED`). They run in U-mode on
+subdirectory `X/` other than `lib/` (a program of several files: `as/`),
+except `cc/`, which is `cc1`, the compiler proper (`userprogs::RENAMED`). They run in U-mode on
 the system calls of `docs/camelot-syscalls.md`, declared in `user.h` with
 the C library of `lib/` (see `lib/README.md`). Built by merlin, merlin-as
 and merlin-ld (`cargo xtask kernel`, which embeds them in the kernel for

@@ -220,7 +220,7 @@ static void end_sequenced(struct seq *s, int had, struct vec outer) {
         u = map_get(&s->usages, sv->key);
         u->uses[MOD_AS_SIDE_EFFECT] = sv->prev;
     }
-    free(saved.v);
+    heap_free(saved.v);
 }
 
 /* The value of e as a sequenced subexpression. */
@@ -421,10 +421,7 @@ static void object_place(struct seq *s, struct expr *e) {
 }
 
 static struct seq *seq_new(void) {
-    struct seq *s = calloc(1, sizeof(struct seq));
-    if (s == NULL) {
-        die("out of memory");
-    }
+    struct seq *s = heap_calloc(1, sizeof(struct seq));
     allocate(s, 0);
     return s;
 }
@@ -432,11 +429,11 @@ static struct seq *seq_new(void) {
 static uint seq_done(struct seq *s, struct finding **out) {
     uint n = s->nfound;
     *out = s->found;
-    free(s->parent);
-    free(s->merged);
-    free(s->usages.keys);
-    free(s->usages.values);
-    free(s);
+    heap_free(s->parent);
+    heap_free(s->merged);
+    heap_free(s->usages.keys);
+    heap_free(s->usages.values);
+    heap_free(s);
     return n;
 }
 

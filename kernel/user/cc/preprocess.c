@@ -79,7 +79,7 @@ static void toks_push(struct toks *l, struct ptok *t) {
 }
 
 static void toks_free(struct toks *l) {
-    free(l->v);
+    heap_free(l->v);
     memset(l, 0, sizeof *l);
 }
 
@@ -97,14 +97,11 @@ static void deque_make_room(struct deque *d) {
         return;
     }
     uint cap = d->cap ? d->cap * 2 : 16;
-    struct ptok *buf = malloc((size_t)cap * sizeof(struct ptok));
-    if (buf == NULL) {
-        die("out of memory");
-    }
+    struct ptok *buf = heap_alloc((size_t)cap * sizeof(struct ptok));
     for (uint i = 0; i < d->len; i++) {
         buf[i] = d->buf[(d->head + i) % d->cap];
     }
-    free(d->buf);
+    heap_free(d->buf);
     d->buf = buf;
     d->head = 0;
     d->cap = cap;
@@ -331,9 +328,12 @@ static int macro_param(struct macro *m, struct pptok *t) {
 /* ---- Files and paths ---- */
 
 struct file {
-    /* For __FILE__ and errors. */
+    /* For __FILE__ and errors: namelen bytes (a name #line gives may hold
+     * a NUL). */
     const char *name;
-    /* For #pragma once and for finding the files it includes. */
+    uint namelen;
+    /* For #pragma once and for finding the files it includes (never a
+     * NUL: a header's name with one is no file). */
     const char *path;
 };
 
@@ -342,9 +342,10 @@ struct cursor {
     struct pptok *toks;
     uint n;
     uint i;
-    /* Its text, for the lines #error and #warning print as written; owned
-     * (freed when the file is left) for a header. */
+    /* Its text (textlen bytes), for the lines #error and #warning print as
+     * written; owned (freed when the file is left) for a header. */
     const char *text;
+    uint textlen;
     int owned;
     /* Its entry in files (#line "name" makes another). */
     uint file;
@@ -473,22 +474,19 @@ struct comp {
     uint end;
 };
 
-/* The components of p, malloc'd; their count in *n. */
-static struct comp *components(const char *p, uint *n) {
-    uint len = (uint)strlen(p);
-    struct comp *c = malloc((len + 1) * sizeof(struct comp));
-    if (c == NULL) {
-        die("out of memory");
-    }
+/* The components of p (len bytes: a file's name may hold a NUL), malloc'd;
+ * their count in *n. */
+static struct comp *components(const char *p, uint len, uint *n) {
+    struct comp *c = heap_alloc((len + 1) * sizeof(struct comp));
     uint k = 0;
     uint i = 0;
-    if (p[0] == '/') {
+    if (len > 0 && p[0] == '/') {
         c[k].kind = COMP_ROOT;
         c[k].start = 0;
         c[k].end = 1;
         k++;
         i = 1;
-    } else if (p[0] == '.' && (p[1] == '/' || p[1] == 0)) {
+    } else if (len > 0 && p[0] == '.' && (len == 1 || p[1] == '/')) {
         c[k].kind = COMP_CUR;
         c[k].start = 0;
         c[k].end = 1;
@@ -520,12 +518,9 @@ static struct comp *components(const char *p, uint *n) {
  * applied where it can be, separators made uniform (merlin's normalize). */
 static const char *normalize(const char *p) {
     uint n;
-    struct comp *c = components(p, &n);
+    struct comp *c = components(p, (uint)strlen(p), &n);
     /* The components kept, as indexes into c. */
-    uint *kept = malloc((n + 1) * sizeof(uint));
-    if (kept == NULL) {
-        die("out of memory");
-    }
+    uint *kept = heap_alloc((n + 1) * sizeof(uint));
     uint k = 0;
     for (uint i = 0; i < n; i++) {
         if (c[i].kind == COMP_CUR) {
@@ -552,22 +547,23 @@ static const char *normalize(const char *p) {
     }
     char *r = buf_arena(&b);
     buf_free(&b);
-    free(kept);
-    free(c);
+    heap_free(kept);
+    heap_free(c);
     return r;
 }
 
-/* The path's parent as Rust's Path::parent gives it, the path as written up
- * to the end of its next-to-last component; NULL for none (the root, or an
- * empty path). */
-static const char *parent(const char *p) {
+/* The parent of p (len bytes) as Rust's Path::parent gives it, the path as
+ * written up to the end of its next-to-last component, its length in
+ * *out; NULL for none (the root, or an empty path). */
+static const char *parent(const char *p, uint len, uint *out) {
     uint n;
-    struct comp *c = components(p, &n);
+    struct comp *c = components(p, len, &n);
     const char *r = NULL;
     if (n > 0 && c[n - 1].kind != COMP_ROOT) {
-        r = arena_strndup(p, n > 1 ? c[n - 2].end : 0);
+        *out = n > 1 ? c[n - 2].end : 0;
+        r = arena_strndup(p, *out);
     }
-    free(c);
+    heap_free(c);
     return r;
 }
 
@@ -650,9 +646,10 @@ static void report_all(struct pp *pp, struct diag *list) {
     }
 }
 
-static uint new_file(struct pp *pp, const char *name, const char *path) {
+static uint new_file(struct pp *pp, const char *name, uint namelen, const char *path) {
     pp->files = grow(pp->files, &pp->capfiles, pp->nfiles + 1, sizeof(struct file));
     pp->files[pp->nfiles].name = name;
+    pp->files[pp->nfiles].namelen = namelen;
     pp->files[pp->nfiles].path = path;
     return pp->nfiles++;
 }
@@ -665,13 +662,14 @@ static void add_mark(struct pp *pp, int kind, uint line, uint file) {
     pp->nmarks++;
 }
 
-static void enter(struct pp *pp, struct lexed *lx, const char *text, int owned, uint file) {
+static void enter(struct pp *pp, struct lexed *lx, const char *text, uint textlen, int owned, uint file) {
     pp->stack = grow(pp->stack, &pp->capstack, pp->nstack + 1, sizeof(struct cursor));
     struct cursor *c = &pp->stack[pp->nstack++];
     memset(c, 0, sizeof *c);
     c->toks = lx->toks;
     c->n = lx->n;
     c->text = text;
+    c->textlen = textlen;
     c->owned = owned;
     c->file = file;
     c->conds = pp->nconds;
@@ -760,48 +758,63 @@ static struct pptok *rest_of_line(struct pp *pp, uint *n) {
  * innermost file), as written: what clang's #error and #warning print.
  * Spaces after the name are left out; comments stay, and a backslash at the
  * end of a line joins the next one to it. */
-static char *raw_rest(struct pp *pp, struct pptok *name) {
+/* The end of the line of the cursor's text that starts at offset `at`: the
+ * offset of its newline, or of the text's end. */
+static uint line_end(struct cursor *c, uint at) {
+    while (at < c->textlen && c->text[at] != '\n') {
+        at++;
+    }
+    return at;
+}
+
+/* The rest of the line after the token `name` (a directive's name in the
+ * innermost file), as written: what clang's #error and #warning print, its
+ * length in *len (it may hold a NUL). Spaces after the name are left out;
+ * comments stay, and a backslash at the end of a line joins the next one
+ * to it. */
+static char *raw_rest(struct pp *pp, struct pptok *name, uint *len) {
     struct cursor *c = top(pp);
-    /* The line as the lexer numbered it, before #line. */
+    /* The line as the lexer numbered it, before #line, and where it starts. */
     uint line = (uint)((int64_t)name->end.line - c->line_delta);
-    const char *s = c->text;
-    for (uint k = 1; k < line && s != NULL; k++) {
-        s = strchr(s, '\n');
-        if (s != NULL) {
-            s++;
+    uint at = 0;
+    int found = 1;
+    for (uint k = 1; k < line && found; k++) {
+        at = line_end(c, at);
+        if (at < c->textlen) {
+            at++;
+        } else {
+            found = 0;
         }
     }
     struct buf b;
     memset(&b, 0, sizeof b);
-    if (s != NULL) {
-        const char *eol = strchr(s, '\n');
-        uint len = eol ? (uint)(eol - s) : (uint)strlen(s);
+    if (found) {
+        uint eol = line_end(c, at);
         /* Columns count bytes. */
-        uint start = name->end.col - 1 < len ? name->end.col - 1 : len;
-        const char *part = s + start;
-        uint plen = len - start;
+        uint start = name->end.col - 1 < eol - at ? at + name->end.col - 1 : eol;
         for (;;) {
-            uint n = plen;
-            if (n > 0 && part[n - 1] == '\r') {
+            uint n = eol - start;
+            if (n > 0 && c->text[start + n - 1] == '\r') {
                 n--;
             }
             /* A backslash at the end joins the next line, if there is one. */
-            if (n > 0 && part[n - 1] == '\\' && part[plen] == '\n') {
-                buf_put(&b, part, n - 1);
-                part = part + plen + 1;
-                eol = strchr(part, '\n');
-                plen = eol ? (uint)(eol - part) : (uint)strlen(part);
+            if (n > 0 && c->text[start + n - 1] == '\\' && eol < c->textlen) {
+                buf_put(&b, c->text + start, n - 1);
+                start = eol + 1;
+                eol = line_end(c, start);
                 continue;
             }
-            buf_put(&b, part, n);
+            buf_put(&b, c->text + start, n);
             break;
         }
     }
-    char *text = buf_arena(&b);
-    buf_free(&b);
-    while (*text == ' ') {
-        text++;
+    uint skip = 0;
+    while (skip < b.len && b.data[skip] == ' ') {
+        skip++;
     }
+    char *text = arena_strndup(b.len ? b.data + skip : "", b.len - skip);
+    *len = b.len - skip;
+    buf_free(&b);
     return text;
 }
 
@@ -818,9 +831,9 @@ static void leave(struct pp *pp) {
         add_mark(pp, MARK_EXIT, c.back, top(pp)->file);
     }
     /* Its tokens are copied wherever they went: the file is done with. */
-    free(c.toks);
+    heap_free(c.toks);
     if (c.owned) {
-        free((char *)c.text);
+        heap_free((char *)c.text);
     }
 }
 
@@ -848,7 +861,7 @@ static int embedded_include(struct pp *pp, struct pptok *name) {
                                 fmt("embedding a #%s directive within macro arguments is not supported", d));
     diag_note(e, name->pos, fmt("expansion of macro '%s' requested here", name->text));
     report(pp, e);
-    free(line);
+    heap_free(line);
     return 1;
 }
 
@@ -917,12 +930,13 @@ static int lparen_follows(struct pp *pp) {
     return t != NULL && tok_is_punct(t, "(");
 }
 
-/* A token made by the preprocessor where the token `at` was. */
-static void made(struct ptok *at, int kind, const char *text, struct ptok *out) {
+/* A token made by the preprocessor where the token `at` was, its text len
+ * bytes. */
+static void made(struct ptok *at, int kind, const char *text, uint len, struct ptok *out) {
     memset(out, 0, sizeof *out);
     out->t.kind = (uchar)kind;
     out->t.text = text;
-    out->t.len = (uint)strlen(text);
+    out->t.len = len;
     out->t.pos = at->t.pos;
     out->t.end = at->t.end;
     out->t.bol = at->t.bol;
@@ -956,7 +970,7 @@ static void expand_alone(struct pp *pp, struct toks *in, struct toks *out) {
         }
         toks_push(out, &t);
     }
-    free(pp->pending.buf);
+    heap_free(pp->pending.buf);
     pp->pending = saved;
     pp->isolated = was_isolated;
     pp->carry_bol = cb;
@@ -1013,8 +1027,8 @@ static struct diag *arguments(struct pp *pp, struct pptok *name, struct macro *m
             for (uint i = 0; i < nargs; i++) {
                 toks_free(&args[i]);
             }
-            free(args);
-            free(starts);
+            heap_free(args);
+            heap_free(starts);
             return e;
         }
         if (!got) {
@@ -1023,8 +1037,8 @@ static struct diag *arguments(struct pp *pp, struct pptok *name, struct macro *m
             for (uint i = 0; i < nargs; i++) {
                 toks_free(&args[i]);
             }
-            free(args);
-            free(starts);
+            heap_free(args);
+            heap_free(starts);
             *call = CALL_UNTERMINATED;
             return NULL;
         }
@@ -1076,21 +1090,18 @@ static struct diag *arguments(struct pp *pp, struct pptok *name, struct macro *m
             wrong = diag_error(rparen->t.pos, "too few arguments provided to function-like macro invocation");
         }
     }
-    free(starts);
+    heap_free(starts);
     if (wrong != NULL) {
         report(pp, defined_here(wrong, m, name));
         for (uint i = 0; i < nlists; i++) {
             toks_free(&args[i]);
         }
-        free(args);
+        heap_free(args);
         *call = CALL_WRONG;
         return NULL;
     }
     /* Exactly the parameters' number of lists, the missing ones empty. */
-    struct toks *out = calloc(wanted + 1, sizeof(struct toks));
-    if (out == NULL) {
-        die("out of memory");
-    }
+    struct toks *out = heap_calloc(wanted + 1, sizeof(struct toks));
     for (uint i = 0; i < nlists; i++) {
         if (i < nargs && i < wanted) {
             out[i] = args[i];
@@ -1098,7 +1109,7 @@ static struct diag *arguments(struct pp *pp, struct pptok *name, struct macro *m
             toks_free(&args[i]);
         }
     }
-    free(args);
+    heap_free(args);
     *args_out = out;
     *call = CALL_ARGS;
     return NULL;
@@ -1108,8 +1119,8 @@ static struct diag *arguments(struct pp *pp, struct pptok *name, struct macro *m
  * of string literals and character constants in it escaped. Other
  * backslashes stay as they are, so an argument that ends in one (`s(\)`)
  * would have no valid literal (C leaves it undefined): clang leaves that
- * backslash out, and warns. *lone: whether it did. */
-static const char *stringize(struct toks *arg, int *lone) {
+ * backslash out, and warns. *lone: whether it did; *len, its length. */
+static const char *stringize(struct toks *arg, int *lone, uint *len) {
     struct buf b;
     memset(&b, 0, sizeof b);
     buf_byte(&b, '"');
@@ -1136,6 +1147,7 @@ static const char *stringize(struct toks *arg, int *lone) {
     }
     buf_byte(&b, '"');
     const char *s = buf_arena(&b);
+    *len = b.len;
     buf_free(&b);
     return s;
 }
@@ -1170,7 +1182,10 @@ static void paste(struct pp *pp, struct ptok *left, struct ptok *right, int spac
             right->t.space = (uchar)space;
             right->lead = space;
         } else {
-            report(pp, diag_error(at, fmt("pasting formed '%s', an invalid preprocessing token", text.data)));
+            uint mlen;
+            const char *msg =
+                fmtn(&mlen, "pasting formed '%b', an invalid preprocessing token", text.data, text.len);
+            report(pp, diag_error_n(at, msg, mlen));
             left->t.pos = at;
         }
         buf_free(&text);
@@ -1261,8 +1276,7 @@ static void substitute(struct pp *pp, struct macro *m, struct toks *args, struct
             here.t.kind = PP_STR;
             here.has_spelled = 0;
             int lone;
-            here.t.text = stringize(arg, &lone);
-            here.t.len = (uint)strlen(here.t.text);
+            here.t.text = stringize(arg, &lone, &here.t.len);
             here.t.msg = NULL;
             if (lone) {
                 report(pp, diag_warning_unflagged(arg->v[arg->n - 1].t.pos,
@@ -1377,17 +1391,18 @@ static struct diag *pp_next(struct pp *pp, struct ptok *out, int *got) {
         if (m->kind == MACRO_FILE) {
             struct buf b;
             memset(&b, 0, sizeof b);
-            const char *file = pp->files[t.t.pos.file].name;
+            struct file *f = &pp->files[t.t.pos.file];
             buf_byte(&b, '"');
-            escape_into(&b, file, (uint)strlen(file));
+            escape_into(&b, f->name, f->namelen);
             buf_byte(&b, '"');
             struct ptok s;
-            made(&t, PP_STR, buf_arena(&b), &s);
+            made(&t, PP_STR, buf_arena(&b), b.len, &s);
             buf_free(&b);
             toks_push(&expansion, &s);
         } else if (m->kind == MACRO_LINE) {
             struct ptok s;
-            made(&t, PP_NUMBER, fmt("%u", t.t.pos.line), &s);
+            const char *line = fmt("%u", t.t.pos.line);
+            made(&t, PP_NUMBER, line, (uint)strlen(line), &s);
             toks_push(&expansion, &s);
         } else if (m->kind == MACRO_OBJECT) {
             struct hideset *hide = hide_union(t.hide, hide_one(name));
@@ -1416,7 +1431,7 @@ static struct diag *pp_next(struct pp *pp, struct ptok *out, int *got) {
             for (uint i = 0; i < m->nparams; i++) {
                 toks_free(&args[i]);
             }
-            free(args);
+            heap_free(args);
         }
         if (expansion.n == 0) {
             pp->carry_bol = t.t.bol;
@@ -1584,7 +1599,7 @@ static struct diag *number(struct eval *ev, struct pptok *t, int live, struct va
         return diag_error(t->pos, "floating point literal in preprocessor expression");
     }
     struct intlit lit;
-    struct diag *e = lex_integer(t->text, t->pos, &lit);
+    struct diag *e = lex_integer(t->text, t->len, t->pos, &lit);
     if (e != NULL) {
         return e;
     }
@@ -1678,7 +1693,7 @@ static struct diag *value(struct eval *ev, int live, struct val *out) {
     if (t.t.kind == PP_CHAR) {
         struct diag *warnings = NULL;
         int64_t v;
-        e = lex_char_constant(t.t.text, pos, &warnings, &v);
+        e = lex_char_constant(t.t.text, t.t.len, pos, &warnings, &v);
         if (e != NULL) {
             return e;
         }
@@ -2010,7 +2025,7 @@ static int condition(struct pp *pp, struct pptok *dir, struct pptok *args, uint 
     ev.end = nargs > 0 ? args[nargs - 1].end : dir->end;
     int v = 0;
     struct diag *e = directive_expression(&ev, &v);
-    free(pp->pending.buf);
+    heap_free(pp->pending.buf);
     pp->pending = saved;
     pp->isolated = was_isolated;
     pp->carry_bol = cb;
@@ -2170,13 +2185,13 @@ static struct diag *define(struct pp *pp, struct pptok *dir, struct pptok *args,
         m->kind = MACRO_FUNCTION;
         e = parameters(rest, nrest, eod, m, &body);
         if (e != NULL) {
-            free(m->params);
+            heap_free(m->params);
             return e;
         }
         /* The parameters, kept with the macro. */
         const char **params = arena_alloc((m->nparams + 1) * sizeof(char *));
         memcpy(params, m->params, m->nparams * sizeof(char *));
-        free(m->params);
+        heap_free(m->params);
         m->params = params;
     } else {
         m->kind = MACRO_OBJECT;
@@ -2284,10 +2299,10 @@ static const char *guard(struct lexed *lx) {
 }
 
 /* `"file"` or `<file>` at the start of an #include's tokens, on a line that
- * ends at eod: the name, whether it was `<file>`, where it is and how many
- * tokens it took (*used, 0 if neither form is there). */
-static struct diag *header_name(struct pptok *t, uint n, struct pos eod, const char **name, int *angled,
-                                struct pos *pos, uint *used) {
+ * ends at eod: the name (*len bytes), whether it was `<file>`, where it is
+ * and how many tokens it took (*used, 0 if neither form is there). */
+static struct diag *header_name(struct pptok *t, uint n, struct pos eod, const char **name, uint *len,
+                                int *angled, struct pos *pos, uint *used) {
     *used = 0;
     if (n == 0) {
         return NULL;
@@ -2295,7 +2310,8 @@ static struct diag *header_name(struct pptok *t, uint n, struct pos eod, const c
     if (t[0].kind == PP_STR) {
         /* Not a string literal: the characters between the quotes, as they
          * are. */
-        *name = arena_strndup(t[0].text + 1, t[0].len - 2);
+        *len = t[0].len - 2;
+        *name = arena_strndup(t[0].text + 1, *len);
         *angled = 0;
         *pos = t[0].pos;
         *used = 1;
@@ -2320,6 +2336,7 @@ static struct diag *header_name(struct pptok *t, uint n, struct pos eod, const c
         buf_put(&b, t[k].text, t[k].len);
     }
     *name = buf_arena(&b);
+    *len = b.len;
     buf_free(&b);
     *angled = 1;
     *pos = t[0].pos;
@@ -2329,31 +2346,37 @@ static struct diag *header_name(struct pptok *t, uint n, struct pos eod, const c
 
 /* The file an #include names: "file" next to the including file first,
  * then in each -I directory in order; <file> only in those. Its name (by
- * the directory it was found in), path and text; 0 if none. */
-static int find(struct pp *pp, const char *header, int angled, const char **name, const char **path,
-                char **text, uint *len) {
+ * the directory it was found in, *namelen bytes), path and text; 0 if
+ * none. The header's name holds no NUL (one that does is no file). */
+static int find(struct pp *pp, const char *header, int angled, const char **name, uint *namelen,
+                const char **path, char **text, uint *len) {
     uint cur = top(pp)->file;
     uint ndirs = pp->opts->ninclude_dirs + 1;
     for (uint k = 0; k < ndirs; k++) {
         const char *shown;
+        uint shownlen = 0;
         const char *dir;
         if (k == 0) {
             if (angled) {
                 continue;
             }
-            dir = parent(pp->files[cur].path);
+            const char *p = pp->files[cur].path;
+            uint plen;
+            dir = parent(p, (uint)strlen(p), &plen);
             if (dir == NULL) {
                 dir = "";
             }
             /* Named by the including file's directory, `.` for one named
              * without (clang: `./sub/s.h` next to `b.S`, the __FILE__ in it
              * too). */
-            shown = parent(pp->files[cur].name);
-            if (shown == NULL || shown[0] == 0) {
+            shown = parent(pp->files[cur].name, pp->files[cur].namelen, &shownlen);
+            if (shown == NULL || shownlen == 0) {
                 shown = ".";
+                shownlen = 1;
             }
         } else {
             shown = pp->opts->include_dirs[k - 1];
+            shownlen = (uint)strlen(shown);
             dir = shown;
         }
         const char *p = normalize(join(dir, header));
@@ -2361,14 +2384,15 @@ static int find(struct pp *pp, const char *header, int angled, const char **name
         if (t == NULL) {
             continue;
         }
-        if (shown[0] == 0) {
+        if (shownlen == 0) {
             *name = header;
+            *namelen = (uint)strlen(header);
         } else {
-            uint n = (uint)strlen(shown);
+            uint n = shownlen;
             while (n > 0 && (shown[n - 1] == '/' || shown[n - 1] == '\\')) {
                 n--;
             }
-            *name = fmt("%s/%s", arena_strndup(shown, n), header);
+            *name = fmtn(namelen, "%b/%s", shown, n, header);
         }
         *path = p;
         *text = t;
@@ -2380,10 +2404,11 @@ static int find(struct pp *pp, const char *header, int angled, const char **name
 static struct diag *include(struct pp *pp, struct pptok *dir, struct pptok *args, uint nargs) {
     struct pos eod = nargs > 0 ? args[nargs - 1].end : dir->end;
     const char *header;
+    uint hlen = 0;
     int angled;
     struct pos pos;
     uint used;
-    struct diag *e = header_name(args, nargs, eod, &header, &angled, &pos, &used);
+    struct diag *e = header_name(args, nargs, eod, &header, &hlen, &angled, &pos, &used);
     if (e != NULL) {
         return e;
     }
@@ -2396,44 +2421,47 @@ static struct diag *include(struct pp *pp, struct pptok *dir, struct pptok *args
         read_all(args, nargs, &in);
         expand_alone(pp, &in, &out);
         toks_free(&in);
-        struct pptok *expanded = malloc((out.n + 1) * sizeof(struct pptok));
-        if (expanded == NULL) {
-            die("out of memory");
-        }
+        struct pptok *expanded = heap_alloc((out.n + 1) * sizeof(struct pptok));
         for (uint i = 0; i < out.n; i++) {
             expanded[i] = out.v[i].t;
         }
         uint n = out.n;
         toks_free(&out);
-        e = header_name(expanded, n, eod, &header, &angled, &pos, &used);
+        e = header_name(expanded, n, eod, &header, &hlen, &angled, &pos, &used);
         if (e == NULL && used == 0) {
             e = diag_error(nargs > 0 ? args[0].pos : dir->end, "expected \"FILENAME\" or <FILENAME>");
         }
         if (e != NULL) {
-            free(expanded);
+            heap_free(expanded);
             return e;
         }
         extra_tokens(pp, expanded + used, n - used, "include", 0);
-        free(expanded);
+        heap_free(expanded);
     }
-    if (header[0] == 0) {
+    if (hlen == 0) {
         return diag_error(pos, "empty filename");
     }
+    /* A name with a NUL names no file (merlin's paths cannot hold one). */
+    int nul = strlen(header) != hlen;
     const char *name;
+    uint namelen;
     const char *path;
     char *text;
     uint len;
-    if (!find(pp, header, angled, &name, &path, &text, &len)) {
+    if (nul || !find(pp, header, angled, &name, &namelen, &path, &text, &len)) {
         /* clang looks for an <a.h> it does not find as "a.h" too, and
          * includes what it finds, with an error. */
-        if (!angled || !find(pp, header, 0, &name, &path, &text, &len)) {
-            return diag_fatal(pos, fmt("'%s' file not found", header));
+        uint mlen;
+        const char *msg;
+        if (nul || !angled || !find(pp, header, 0, &name, &namelen, &path, &text, &len)) {
+            msg = fmtn(&mlen, "'%b' file not found", header, hlen);
+            return diag_fatal_n(pos, msg, mlen);
         }
-        report(pp, diag_error(pos, fmt("'%s' file not found with <angled> include; use \"quotes\" instead",
-                                       header)));
+        msg = fmtn(&mlen, "'%b' file not found with <angled> include; use \"quotes\" instead", header, hlen);
+        report(pp, diag_error_n(pos, msg, mlen));
     }
     if (map_get(&pp->once, path) != NULL) {
-        free(text);
+        heap_free(text);
         return NULL;
     }
     /* A file wholly inside `#ifndef X` ... `#endif` is not read again once X
@@ -2441,19 +2469,19 @@ static struct diag *include(struct pp *pp, struct pptok *dir, struct pptok *args
      * of it would come out, and no line marker says it was entered. */
     const char *g = map_get(&pp->guards, path);
     if (g != NULL && map_get(&pp->macros, g) != NULL) {
-        free(text);
+        heap_free(text);
         return NULL;
     }
     if (pp->nstack >= MAX_INCLUDE_DEPTH) {
-        free(text);
+        heap_free(text);
         return diag_error(pos, "#include nested too deeply");
     }
-    uint id = new_file(pp, name, path);
+    uint id = new_file(pp, name, namelen, path);
     struct lexed lx;
     lex_pp(text, len, id, pp->asm, &lx);
     if (lx.error != NULL) {
-        free(lx.toks);
-        free(text);
+        heap_free(lx.toks);
+        heap_free(text);
         return lx.error;
     }
     g = guard(&lx);
@@ -2463,7 +2491,7 @@ static struct diag *include(struct pp *pp, struct pptok *dir, struct pptok *args
     /* The file that includes it goes on after the directive's line. */
     uint back = (nargs > 0 ? args[nargs - 1].end.line : dir->end.line) + 1;
     add_mark(pp, MARK_ENTER, dir->pos.line, id);
-    enter(pp, &lx, text, 1, id);
+    enter(pp, &lx, text, len, 1, id);
     top(pp)->has_back = 1;
     top(pp)->back = back;
     return NULL;
@@ -2499,12 +2527,13 @@ static struct diag *line_value(struct pp *pp, struct pptok *tok, struct pos eod,
     return NULL;
 }
 
-/* The file name a #line or a line marker gives, a string literal. */
-static struct diag *file_name(struct pp *pp, struct pptok *t, const char **name) {
+/* The file name a #line or a line marker gives, a string literal: *len
+ * bytes, which may hold a NUL. */
+static struct diag *file_name(struct pp *pp, struct pptok *t, const char **name, uint *len) {
     struct diag *warnings = NULL;
     struct buf bytes;
     memset(&bytes, 0, sizeof bytes);
-    struct diag *e = lex_decode(t->text, t->pos, &warnings, &bytes);
+    struct diag *e = lex_decode(t->text, t->len, t->pos, &warnings, &bytes);
     if (e != NULL) {
         buf_free(&bytes);
         return e;
@@ -2545,25 +2574,27 @@ static struct diag *file_name(struct pp *pp, struct pptok *t, const char **name)
             }
         }
         buf_free(&bytes);
-        return diag_error(pos_at(t->pos.file, t->pos.line, t->pos.col + 1 + at),
-                          fmt("invalid escape sequence '%s' in an unevaluated string literal",
-                              arena_strndup(body + at, seq_end - at)));
+        uint mlen;
+        const char *msg = fmtn(&mlen, "invalid escape sequence '%b' in an unevaluated string literal",
+                               body + at, seq_end - at);
+        return diag_error_n(pos_at(t->pos.file, t->pos.line, t->pos.col + 1 + at), msg, mlen);
     }
     *name = buf_arena(&bytes);
+    *len = bytes.len;
     buf_free(&bytes);
     return NULL;
 }
 
 /* After the directive at dir, the next line is line n (of a file called
- * rename, if not NULL). */
-static void renumber(struct pp *pp, struct pptok *dir, uint n, const char *rename) {
+ * rename, renamelen bytes, if not NULL). */
+static void renumber(struct pp *pp, struct pptok *dir, uint n, const char *rename, uint renamelen) {
     struct cursor *c = top(pp);
     /* The directive's own line, as the lexer numbered it. */
     int64_t written = (int64_t)dir->pos.line - c->line_delta;
     if (rename != NULL) {
         /* A name #line gives has no checksum, as clang's: its contents are
          * not what is read. */
-        uint id = new_file(pp, rename, pp->files[c->file].path);
+        uint id = new_file(pp, rename, renamelen, pp->files[c->file].path);
         c = top(pp);
         c->file = id;
     }
@@ -2579,10 +2610,7 @@ static struct pptok *expand_line(struct pp *pp, struct pptok *args, uint nargs, 
     read_all(args, nargs, &in);
     expand_alone(pp, &in, &out);
     toks_free(&in);
-    struct pptok *t = malloc((out.n + 1) * sizeof(struct pptok));
-    if (t == NULL) {
-        die("out of memory");
-    }
+    struct pptok *t = heap_alloc((out.n + 1) * sizeof(struct pptok));
     for (uint i = 0; i < out.n; i++) {
         t[i] = out.v[i].t;
     }
@@ -2601,9 +2629,10 @@ static struct diag *hash_line(struct pp *pp, struct pptok *dir, struct pptok *ar
     const char *missing = "#line directive requires a positive integer argument";
     struct diag *e = line_value(pp, n > 0 ? &t[0] : NULL, eod, missing, "#line", &v);
     const char *rename = NULL;
+    uint renamelen = 0;
     if (e == NULL && n > 1) {
         if (t[1].kind == PP_STR && t[1].text[0] == '"') {
-            e = file_name(pp, &t[1], &rename);
+            e = file_name(pp, &t[1], &rename, &renamelen);
             if (e == NULL) {
                 extra_tokens(pp, t + 2, n - 2, "line", 0);
             }
@@ -2611,11 +2640,11 @@ static struct diag *hash_line(struct pp *pp, struct pptok *dir, struct pptok *ar
             e = diag_error(t[1].pos, "invalid filename for #line directive");
         }
     }
-    free(t);
+    heap_free(t);
     if (e != NULL) {
         return e;
     }
-    renumber(pp, dir, v, rename);
+    renumber(pp, dir, v, rename, renamelen);
     return NULL;
 }
 
@@ -2686,9 +2715,10 @@ static struct diag *line_marker(struct pp *pp, struct pptok *digits, struct ppto
     uint n;
     struct pptok *t = expand_line(pp, args, nargs, &n);
     const char *rename = NULL;
+    uint renamelen = 0;
     if (n > 0) {
         if (t[0].kind == PP_STR && t[0].text[0] == '"') {
-            e = file_name(pp, &t[0], &rename);
+            e = file_name(pp, &t[0], &rename, &renamelen);
             uint entered = 0;
             if (e == NULL) {
                 e = marker_flags(pp, t + 1, n - 1, eod, &entered);
@@ -2700,11 +2730,11 @@ static struct diag *line_marker(struct pp *pp, struct pptok *digits, struct ppto
             e = diag_error(t[0].pos, "invalid filename for line marker directive");
         }
     }
-    free(t);
+    heap_free(t);
     if (e != NULL) {
         return e;
     }
-    renumber(pp, digits, v, rename);
+    renumber(pp, digits, v, rename, renamelen);
     return NULL;
 }
 
@@ -2736,7 +2766,7 @@ static void skip_lines(struct pp *pp) {
             while (nnested > 0) {
                 report(pp, diag_error(nested[--nnested], "unterminated conditional directive"));
             }
-            free(nested);
+            heap_free(nested);
             return;
         }
         if (!(t->bol && tok_is_punct(t, "#"))) {
@@ -2753,7 +2783,7 @@ static void skip_lines(struct pp *pp) {
         struct pptok *args = line + 1;
         const char *d = tok_ident(first);
         if (d == NULL) {
-            free(line);
+            heap_free(line);
             continue;
         }
         if (strcmp(d, "if") == 0 || strcmp(d, "ifdef") == 0 || strcmp(d, "ifndef") == 0) {
@@ -2764,8 +2794,8 @@ static void skip_lines(struct pp *pp) {
         } else if (strcmp(d, "endif") == 0) {
             extra_tokens(pp, args, n - 1, "endif", 0);
             pp->nconds--;
-            free(line);
-            free(nested);
+            heap_free(line);
+            heap_free(nested);
             return;
         } else if ((strcmp(d, "elif") == 0 || strcmp(d, "else") == 0) && nnested == 0) {
             struct cond *c = &pp->conds[pp->nconds - 1];
@@ -2779,18 +2809,18 @@ static void skip_lines(struct pp *pp) {
                 if (!taken) {
                     c->taken = 1;
                     extra_tokens(pp, args, n - 1, "else", 0);
-                    free(line);
-                    free(nested);
+                    heap_free(line);
+                    heap_free(nested);
                     return;
                 }
             } else if (!taken && condition(pp, first, args, n - 1)) {
                 pp->conds[pp->nconds - 1].taken = 1;
-                free(line);
-                free(nested);
+                heap_free(line);
+                heap_free(nested);
                 return;
             }
         }
-        free(line);
+        heap_free(line);
     }
 }
 
@@ -2812,13 +2842,13 @@ static void open_cond(struct pp *pp, struct pos pos, int value) {
 }
 
 /* Passes a directive on to the output as one line of text, in column 1 of
- * the line of its `#` (PP_DIRECTIVE). */
-static void pass_on(struct pp *pp, struct pptok *hash, const char *text) {
+ * the line of its `#` (PP_DIRECTIVE); the text is len bytes. */
+static void pass_on(struct pp *pp, struct pptok *hash, const char *text, uint len) {
     struct ptok t;
     memset(&t, 0, sizeof t);
     t.t.kind = PP_DIRECTIVE;
     t.t.text = text;
-    t.t.len = (uint)strlen(text);
+    t.t.len = len;
     t.t.pos = hash->pos;
     t.t.pos.col = 1;
     t.t.end = hash->end;
@@ -2903,11 +2933,13 @@ static struct diag *directive_line(struct pp *pp, struct pptok *hash, struct ppt
         pp->nconds--;
         return NULL;
     }
-    if (strcmp(d, "error") == 0) {
-        return diag_error(first->pos, raw_rest(pp, first));
-    }
-    if (strcmp(d, "warning") == 0) {
-        report(pp, diag_warning(first->pos, raw_rest(pp, first), "#warnings"));
+    if (strcmp(d, "error") == 0 || strcmp(d, "warning") == 0) {
+        uint len;
+        const char *msg = raw_rest(pp, first, &len);
+        if (d[0] == 'e') {
+            return diag_error_n(first->pos, msg, len);
+        }
+        report(pp, diag_warning_n(first->pos, msg, len, "#warnings"));
         return NULL;
     }
     if (strcmp(d, "pragma") == 0) {
@@ -2934,7 +2966,7 @@ static struct diag *directive_line(struct pp *pp, struct pptok *hash, struct ppt
             }
             buf_put(&b, args[i].text, args[i].len);
         }
-        pass_on(pp, hash, buf_arena(&b));
+        pass_on(pp, hash, buf_arena(&b), b.len);
         buf_free(&b);
         return NULL;
     }
@@ -2944,12 +2976,14 @@ static struct diag *directive_line(struct pp *pp, struct pptok *hash, struct ppt
         uint m;
         struct pptok *t = expand_line(pp, args, nargs, &m);
         if (m > 0 && t[0].kind == PP_STR) {
-            pass_on(pp, hash, fmt("#ident %s", t[0].text));
-            free(t);
+            uint len;
+            const char *text = fmtn(&len, "#ident %b", t[0].text, t[0].len);
+            pass_on(pp, hash, text, len);
+            heap_free(t);
             return NULL;
         }
         e = diag_error(m > 0 ? t[0].pos : first->end, "invalid #ident directive");
-        free(t);
+        heap_free(t);
         return e;
     }
     if (strcmp(d, "line") == 0) {
@@ -2968,7 +3002,7 @@ static struct diag *directive(struct pp *pp) {
     uint n;
     struct pptok *line = rest_of_line(pp, &n);
     struct diag *e = directive_line(pp, &hash, line, n);
-    free(line);
+    heap_free(line);
     return e;
 }
 
@@ -3023,9 +3057,9 @@ static void printer_marker(struct pp *pp, struct printer *p, uint line, const ch
     if (!p->markers) {
         return;
     }
-    const char *name = pp->files[p->file].name;
+    struct file *f = &pp->files[p->file];
     buf_fmt(p->out, "# %u \"", line);
-    escape_into(p->out, name, (uint)strlen(name));
+    escape_into(p->out, f->name, f->namelen);
     buf_fmt(p->out, "\"%s\n", extra);
 }
 
@@ -3216,14 +3250,14 @@ static void emit(struct pp *pp, struct ptok *t) {
 /* Reads a made-up file holding only directives (the predefined macros, the
  * command line's); its number in *id. */
 static struct diag *read_directives(struct pp *pp, const char *name, const char *text, uint *id) {
-    *id = new_file(pp, name, name);
+    *id = new_file(pp, name, (uint)strlen(name), name);
     struct lexed lx;
     lex_pp(text, (uint)strlen(text), *id, 0, &lx);
     if (lx.error != NULL) {
-        free(lx.toks);
+        heap_free(lx.toks);
         return lx.error;
     }
-    enter(pp, &lx, text, 0, *id);
+    enter(pp, &lx, text, (uint)strlen(text), 0, *id);
     struct ptok t;
     int got;
     struct diag *e = pp_next(pp, &t, &got);
@@ -3278,11 +3312,11 @@ static struct diag *run(struct pp *pp, const char *src, uint n) {
     struct lexed lx;
     lex_pp(src, n, 0, pp->asm, &lx);
     if (lx.error != NULL) {
-        free(lx.toks);
+        heap_free(lx.toks);
         return lx.error;
     }
     pp->end = lx.end;
-    enter(pp, &lx, src, 0, 0);
+    enter(pp, &lx, src, n, 0, 0);
     for (;;) {
         struct ptok t;
         int got;
@@ -3308,66 +3342,95 @@ static struct diag *run(struct pp *pp, const char *src, uint n) {
     return NULL;
 }
 
-/* The file names, by number, for naming diagnostics (malloc'd). */
-static const char **file_names(struct pp *pp) {
-    const char **files = malloc((pp->nfiles + 1) * sizeof(char *));
-    if (files == NULL) {
-        die("out of memory");
+static void map_free(struct map *m) {
+    heap_free(m->keys);
+    heap_free(m->values);
+}
+
+/* Frees what the preprocessor malloc'd, but its diagnostics' array, which
+ * preprocess_text hands on: the files still open when an error stopped it,
+ * their tokens and texts, and its tables. */
+static void pp_free(struct pp *pp) {
+    while (pp->nstack > 0) {
+        struct cursor *c = top(pp);
+        heap_free(c->toks);
+        if (c->owned) {
+            heap_free((char *)c->text);
+        }
+        pp->nstack--;
     }
+    heap_free(pp->stack);
+    heap_free(pp->files);
+    heap_free(pp->pending.buf);
+    heap_free(pp->conds);
+    heap_free(pp->marks);
+    heap_free(pp->after);
+    map_free(&pp->macros);
+    map_free(&pp->once);
+    map_free(&pp->guards);
+    heap_free(pp);
+}
+
+/* The files' names and their lengths, by number, for naming diagnostics:
+ * in out (on the heap). */
+static void file_names(struct pp *pp, struct pp_output *out) {
+    out->files = heap_alloc((pp->nfiles + 1) * sizeof(char *));
+    out->lens = heap_alloc((pp->nfiles + 1) * sizeof(uint));
     for (uint i = 0; i < pp->nfiles; i++) {
-        files[i] = pp->files[i].name;
+        out->files[i] = pp->files[i].name;
+        out->lens[i] = pp->files[i].namelen;
     }
-    return files;
+    out->nfiles = pp->nfiles;
 }
 
 /* Preprocesses the file `name` to compile it (merlin's preprocess_recovering):
  * 1 and the translation unit's tokens with their diagnostics, errors among
  * them, in *out; or 0 if what stops clang stopped it (a header not found,
  * a lexical error in the file being compiled), out->diags then having the
- * diagnostics before it and that one. Diagnostics in headers name them. */
+ * diagnostics before it and that one. Diagnostics in headers name them.
+ * What *out holds is the translation unit's, and the preprocessor's own
+ * tables are freed. */
 int preprocess_unit(const char *name, const char *src, uint n, struct options *opts, struct pp_output *out) {
-    struct pp *pp = calloc(1, sizeof(struct pp));
-    if (pp == NULL) {
-        die("out of memory");
-    }
+    struct pp *pp = heap_calloc(1, sizeof(struct pp));
     pp->opts = opts;
     pp->asm = opts->lang == LANG_ASM;
     pp->collect = 1;
-    new_file(pp, name, normalize(name));
+    new_file(pp, name, (uint)strlen(name), normalize(name));
     struct diag *e = run(pp, src, n);
-    const char **files = file_names(pp);
-    for (uint i = 0; i < pp->ndiags; i++) {
-        diag_name_files(pp->diags[i], files, pp->nfiles);
-    }
     memset(out, 0, sizeof *out);
-    out->files = files;
-    out->nfiles = pp->nfiles;
+    file_names(pp, out);
+    for (uint i = 0; i < pp->ndiags; i++) {
+        diag_name_files(pp->diags[i], out->files, out->lens, out->nfiles);
+    }
     if (e != NULL) {
-        diag_name_files(e, files, pp->nfiles);
+        diag_name_files(e, out->files, out->lens, out->nfiles);
         report(pp, e);
     }
+    /* The diagnostics and where each came are handed on, not freed with
+     * the preprocessor. */
     out->diags = pp->diags;
     out->after = pp->after;
     out->ndiags = pp->ndiags;
-    if (e != NULL) {
-        return 0;
+    pp->after = NULL;
+    int ok = e == NULL;
+    if (ok) {
+        out->toks = pp->out;
+        out->ntoks = pp->nout;
+        out->macros = pp->macro_sites;
+        out->end = pp->end;
+    } else {
+        heap_free(pp->out);
     }
-    out->toks = pp->out;
-    out->ntoks = pp->nout;
-    out->macros = pp->macro_sites;
-    out->end = pp->end;
-    return 1;
+    pp_free(pp);
+    return ok;
 }
 
 int preprocess_text(const char *name, const char *src, uint n, struct options *opts, struct buf *out,
                     struct diag ***diags, uint *ndiags) {
-    struct pp *pp = calloc(1, sizeof(struct pp));
-    if (pp == NULL) {
-        die("out of memory");
-    }
+    struct pp *pp = heap_calloc(1, sizeof(struct pp));
     pp->opts = opts;
     pp->asm = opts->lang == LANG_ASM;
-    new_file(pp, name, normalize(name));
+    new_file(pp, name, (uint)strlen(name), normalize(name));
     pp->print.out = out;
     pp->print.line = 1;
     pp->print.entered = 1;
@@ -3391,21 +3454,21 @@ int preprocess_text(const char *name, const char *src, uint n, struct options *o
         buf_byte(out, '\n');
     }
     /* Diagnostics in headers name them. */
-    const char **files = malloc((pp->nfiles + 1) * sizeof(char *));
-    if (files == NULL) {
-        die("out of memory");
-    }
+    const char **names = heap_alloc((pp->nfiles + 1) * sizeof(char *));
+    uint *lens = heap_alloc((pp->nfiles + 1) * sizeof(uint));
     for (uint i = 0; i < pp->nfiles; i++) {
-        files[i] = pp->files[i].name;
+        names[i] = pp->files[i].name;
+        lens[i] = pp->files[i].namelen;
     }
     int ok = e == NULL;
     for (uint i = 0; i < pp->ndiags; i++) {
-        diag_name_files(pp->diags[i], files, pp->nfiles);
+        diag_name_files(pp->diags[i], names, lens, pp->nfiles);
         if (!diag_is_warning(pp->diags[i])) {
             ok = 0;
         }
     }
-    free(files);
+    heap_free(names);
+    heap_free(lens);
     *diags = pp->diags;
     *ndiags = pp->ndiags;
     /* A successful preprocessing of assembly gives no warnings: merlin -E
@@ -3413,5 +3476,6 @@ int preprocess_text(const char *name, const char *src, uint n, struct options *o
     if (ok && pp->asm) {
         *ndiags = 0;
     }
+    pp_free(pp);
     return ok;
 }

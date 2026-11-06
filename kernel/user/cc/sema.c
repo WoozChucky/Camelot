@@ -239,10 +239,7 @@ static void push(struct fnc *c, struct diag *d) {
 }
 
 static struct fnc *fnc_new(struct checker *ck, struct vec *errors) {
-    struct fnc *c = calloc(1, sizeof(struct fnc));
-    if (c == NULL) {
-        die("out of memory");
-    }
+    struct fnc *c = heap_calloc(1, sizeof(struct fnc));
     c->c = ck;
     c->errors = errors;
     c->func = "";
@@ -438,7 +435,7 @@ static int overflows(struct expr *e) {
     for (uint i = 0; i < k.n && !any; i++) {
         any = overflows(k.v[i]);
     }
-    free(k.v);
+    heap_free(k.v);
     return any;
 }
 
@@ -844,7 +841,7 @@ static uint file_unevaluated_before(struct checker *ck, struct vec *us, uint fro
             vec_push(&list, ((struct file_unevaluated *)us->v[i])->u);
         }
         unevaluated_list(c, &list);
-        free(list.v);
+        heap_free(list.v);
     }
     return to;
 }
@@ -862,10 +859,7 @@ static void file_unevaluated(struct checker *ck, struct vec *us) {
  * begin (or -1). */
 static int checked(struct program *prog, struct pos *earlier, uint nearlier, int has_cut, struct pos cut,
                    struct vec *diags) {
-    struct checker *ck = calloc(1, sizeof(struct checker));
-    if (ck == NULL) {
-        die("out of memory");
-    }
+    struct checker *ck = heap_calloc(1, sizeof(struct checker));
     ck->earlier = earlier;
     ck->nearlier = nearlier;
     ck->has_cut = has_cut;
@@ -1362,7 +1356,7 @@ static void mark_definitions(struct checker *ck, struct program *prog) {
         d->define = 1;
         d->ty = ty;
     }
-    free(defs);
+    heap_free(defs);
 }
 
 /* ---- Conversions ---- */
@@ -1476,7 +1470,7 @@ static struct diag *const_fields(struct expr *target, struct pos at) {
             }
         }
     }
-    free(records.v);
+    heap_free(records.v);
     return error;
 }
 
@@ -1618,10 +1612,7 @@ static int finish_switch(struct fnc *c, struct switch_ctx *ctx, struct expr *con
     /* clang sorts the cases by value (keeping their order among equal
      * ones): each duplicate is reported against the one before it. */
     uint n = ctx->labels.n;
-    struct case_label **sorted = malloc((n + 1) * sizeof(struct case_label *));
-    if (sorted == NULL) {
-        die("out of memory");
-    }
+    struct case_label **sorted = heap_alloc((n + 1) * sizeof(struct case_label *));
     for (uint i = 0; i < n; i++) {
         sorted[i] = ctx->labels.v[i];
     }
@@ -1644,7 +1635,7 @@ static int finish_switch(struct fnc *c, struct switch_ctx *ctx, struct expr *con
         push(c, diag_note(diag_error(cur->begin, msg), prev->begin, "previous case defined here"));
     }
     if (erroneous || ctx->incomplete) {
-        free(sorted);
+        heap_free(sorted);
         return 0;
     }
     /* A constant condition no case matches, with no default. */
@@ -1664,17 +1655,14 @@ static int finish_switch(struct fnc *c, struct switch_ctx *ctx, struct expr *con
         }
     }
     if (en == NULL || constant) {
-        free(sorted);
+        heap_free(sorted);
         return 0;
     }
     /* The enum's constants as the condition's promoted type has them, by
      * value, the first of each value. */
     uint nc = en->nconstants;
-    struct case_label *consts = malloc((nc + 1) * sizeof(struct case_label));
-    struct case_label **cs = malloc((nc + 1) * sizeof(struct case_label *));
-    if (consts == NULL || cs == NULL) {
-        die("out of memory");
-    }
+    struct case_label *consts = heap_alloc((nc + 1) * sizeof(struct case_label));
+    struct case_label **cs = heap_alloc((nc + 1) * sizeof(struct case_label *));
     for (uint i = 0; i < nc; i++) {
         consts[i].value = ik_wrap(ctx->kind, en->constants[i].value);
         consts[i].name = en->constants[i].name;
@@ -1716,10 +1704,10 @@ static int finish_switch(struct fnc *c, struct switch_ctx *ctx, struct expr *con
         push(c, diag_warning(begin_written(c, cond), msg, "switch"));
     }
     int covered = unhandled.n == 0;
-    free(unhandled.v);
-    free(consts);
-    free(cs);
-    free(sorted);
+    heap_free(unhandled.v);
+    heap_free(consts);
+    heap_free(cs);
+    heap_free(sorted);
     return covered;
 }
 
@@ -2042,7 +2030,7 @@ static void ret(struct fnc *c, struct expr *e, struct pos pos) {
             push(c, diag_warning(*at, fmt("address of stack memory associated with %s returned", what),
                                  "return-stack-address"));
         }
-        free(found.v);
+        heap_free(found.v);
     }
     full_expression(c, e);
     bounds(c, e);
@@ -2295,7 +2283,7 @@ static void full(struct fnc *c, struct expr *e) {
             }
         }
     }
-    free(work.v);
+    heap_free(work.v);
 }
 
 /* The first operand of ?:, which must be a scalar. */
@@ -2641,7 +2629,7 @@ static int init_check(struct fnc *c, struct type **ty, struct init **init, int c
                 push(c, d->d);
             }
         }
-        free(deferred.v);
+        heap_free(deferred.v);
         return failed;
     }
     return init_list(c, ty, init, constant, has_decl, decl);
@@ -2789,24 +2777,21 @@ static int init_items(struct fnc *c, struct type **ty, struct init **init, int c
     list->items.n = 0;
     struct init *filled;
     if (fill(c, ty, &q, constant, pos, FILL_BRACED, NULL, 0, NULL, &filled)) {
-        free(q.v);
+        heap_free(q.v);
         return 1;
     }
     if (!queue_empty(&q)) {
         struct record *r = ty_record(*ty);
         const char *what = r != NULL ? record_keyword(r) : "array";
-        struct init **rest = malloc((q.n - q.head + 1) * sizeof(struct init *));
-        if (rest == NULL) {
-            die("out of memory");
-        }
+        struct init **rest = heap_alloc((q.n - q.head + 1) * sizeof(struct init *));
         uint nrest = 0;
         for (uint i = q.head; i < q.n; i++) {
             rest[nrest++] = q.v[i].init;
         }
         excess(c, rest, nrest, what);
-        free(rest);
+        heap_free(rest);
     }
-    free(q.v);
+    heap_free(q.v);
     *init = filled;
     return 0;
 }
@@ -3065,7 +3050,7 @@ static int fill(struct fnc *c, struct type **ty, struct queue *q, int constant, 
     for (uint i = 0; i < slots.n; i++) {
         vec_push(&list->items, slots.v[i] != NULL ? slots.v[i] : init_list_new(pos));
     }
-    free(slots.v);
+    heap_free(slots.v);
     *out = list;
     return 0;
 }
@@ -3467,13 +3452,13 @@ static struct diag *const_assignment(struct fnc *c, struct expr *target, struct 
         break;
     }
     if (found == NULL) {
-        free(notes.v);
+        heap_free(notes.v);
         return diag_error(at, "read-only variable is not assignable");
     }
     for (uint i = 0; i < notes.n; i += 2) {
         diag_note(found, *(struct pos *)notes.v[i], notes.v[i + 1]);
     }
-    free(notes.v);
+    heap_free(notes.v);
     return found;
 }
 
@@ -5347,7 +5332,7 @@ static void overflow(struct fnc *c, struct expr *e) {
     for (uint i = 0; i < k.n; i++) {
         overflow(c, k.v[i]);
     }
-    free(k.v);
+    heap_free(k.v);
 }
 
 /* What clang checks of a full expression once it is built: its conversions
@@ -5749,10 +5734,7 @@ static struct diag *never_null(struct fnc *c, struct expr *e, int compared) {
  * error, reported here if the expression has none of its own. A
  * declarator's warning is given if none of its operands has an error. */
 static void unevaluated_list(struct fnc *c, struct vec *us) {
-    uchar *clean = malloc(us->n + 1);
-    if (clean == NULL) {
-        die("out of memory");
-    }
+    uchar *clean = heap_alloc(us->n + 1);
     uint nclean = 0;
     for (uint i = 0; i < us->n; i++) {
         struct unevaluated *u = us->v[i];
@@ -5837,5 +5819,5 @@ static void unevaluated_list(struct fnc *c, struct vec *us) {
             }
         }
     }
-    free(clean);
+    heap_free(clean);
 }
