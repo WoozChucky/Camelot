@@ -38,7 +38,7 @@
 #define NFILE 64
 
 /* Descriptors per process. */
-#define NOFILE 16
+#define NOFILE 32
 
 /* Device numbers (the major of a device inode): the console, the
  * framebuffer (fb.h) and the input devices (input.h), whose minor says
@@ -208,7 +208,7 @@ void inode_stat(struct inode *ip, struct stat *st);
 /* memfd_create(): a new open file, readable and writable, for a new empty
  * shared-memory object (FD_SHM): -ENFILE if the table of files or of
  * objects is full. */
-struct file *file_shm(int *err);
+struct file *file_shm(bool sealing, int *err);
 
 /* ftruncate(): sets the size of the shared-memory object behind `f`. 0, or
  * -EINVAL (not a shared-memory object, or not open for writing; `length`

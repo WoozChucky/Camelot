@@ -200,7 +200,7 @@ _Static_assert(NOFILE <= 32, "a bit of proc.cloexec for each descriptor");
 /* The tests walk procs[] by PROC_SIZE, and read the page table at
  * PROC_PAGETABLE. */
 #define PROC_PAGETABLE 40
-#define PROC_SIZE 336
+#define PROC_SIZE 464
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 _Static_assert(offsetof(struct proc, parent) == 24, "the tests read parent there");
 _Static_assert(offsetof(struct proc, pagetable) == PROC_PAGETABLE, "the tests read pagetable there");

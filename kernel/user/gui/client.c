@@ -19,6 +19,16 @@
 #include "../gui.h"
 #include "protocol.h"
 
+/* The versions the client binds, at most (it takes the server's when that
+ * is lower): wl_surface.damage_buffer is wl_compositor version 4's. */
+#define WL_COMPOSITOR_VERSION 4
+#define WL_SHM_VERSION 1
+#define XDG_WM_BASE_VERSION 1
+#define WL_SEAT_VERSION 1
+
+/* wl_display, always object 1. */
+#define WL_DISPLAY_ID 1
+
 /* Ids the client reuses once the server has said so (wl_display.delete_id);
  * past them it takes new ones. */
 #define FREE_IDS 32
@@ -142,11 +152,17 @@ static int make_buffers(struct gui_window *w, int width, int height) {
     }
     int stride = width * 4;
     size_t one = (size_t)stride * (size_t)height;
-    w->fd = memfd_create("gui-window", MFD_CLOEXEC);
+    w->fd = memfd_create("gui-window", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (w->fd < 0) {
         return w->fd;
     }
     int r = ftruncate(w->fd, (off_t)(2 * one));
+    if (r < 0) {
+        return r;
+    }
+    /* Never smaller, as libwayland's clients seal theirs: the server
+     * takes the buffers only from memory that stays. */
+    r = fcntl(w->fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_SEAL);
     if (r < 0) {
         return r;
     }

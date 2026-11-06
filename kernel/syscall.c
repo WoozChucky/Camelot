@@ -202,10 +202,11 @@ static long sys_harts(struct trap_frame *f) {
 }
 
 /* Whether call `num` goes into the network stack: netinfo to setsockopt,
- * numbered one after another, and sendmsg and recvmsg. They run under
- * net_lock (net.h), but for a local socket's. */
+ * numbered one after another, and getsockopt, sendmsg and recvmsg. They
+ * run under net_lock (net.h), but for a local socket's. */
 static bool is_net_call(uintptr num) {
-    return (num >= SYS_netinfo && num <= SYS_setsockopt) || num == SYS_sendmsg || num == SYS_recvmsg;
+    return (num >= SYS_netinfo && num <= SYS_setsockopt) || num == SYS_getsockopt || num == SYS_sendmsg ||
+           num == SYS_recvmsg;
 }
 
 /* Whether socket call `num` is a local socket's (unix.h): socket() in
@@ -218,7 +219,8 @@ static bool is_local_call(uintptr num, struct trap_frame *f) {
     if (num == SYS_socketpair) {
         return true;
     }
-    bool on_fd = (num >= SYS_bind && num <= SYS_setsockopt) || num == SYS_sendmsg || num == SYS_recvmsg;
+    bool on_fd = (num >= SYS_bind && num <= SYS_setsockopt) || num == SYS_getsockopt || num == SYS_sendmsg ||
+                 num == SYS_recvmsg;
     return on_fd && unix_fd((u32)arg(f, 0));
 }
 
@@ -369,6 +371,10 @@ void syscall(struct trap_frame *f) {
     case SYS_setsockopt:
         ret = local ? unix_sys_setsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), (u32)arg(f, 4))
                     : sock_sys_setsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), (u32)arg(f, 4));
+        break;
+    case SYS_getsockopt:
+        ret = local ? unix_sys_getsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), arg(f, 4))
+                    : sock_sys_getsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), arg(f, 4));
         break;
     case SYS_socketpair:
         ret = unix_sys_socketpair((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3));
