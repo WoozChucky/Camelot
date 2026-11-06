@@ -170,6 +170,13 @@ isize ptmx_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
         }
         u32 room = TTY_IN - (p->tty.in_head - p->tty.in_tail);
         if (room == 0) {
+            /* Ctrl-C takes no room: it gets past input nobody reads. */
+            char c;
+            if (copyin(pt, &c, src + done, 1) == 0 && tty_signal_char(&p->tty, c)) {
+                tty_receive(&p->tty, c);
+                done++;
+                continue;
+            }
             if (proc_killed()) {
                 err = -EINTR;
                 break;
@@ -307,7 +314,7 @@ isize pts_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
         }
         for (u32 i = 0; i < count; i++) {
             char out[2];
-            u32 m = tty_opost(&p->tty, chunk[i], out);
+            u32 m = tty_opost(p->tty.termios.c_oflag, chunk[i], out);
             while (p->master && out_room(p) < m) {
                 if (proc_killed()) {
                     err = -EINTR;
@@ -335,12 +342,21 @@ long pts_ioctl(struct file *f, u32 request, uintptr arg) {
         return -ENOTTY; /* the master's */
     }
     acquire(&pty_lock);
-    long r;
     if (request == TCFLSH && arg <= TCIOFLUSH && arg != TCIFLUSH) {
         p->out_tail = p->out_head; /* the output not read yet */
         wakeup(&p->out_tail);
     }
-    r = tty_ioctl(&p->tty, request, arg);
+    if (request == TCSETSW || request == TCSETSF) {
+        /* Once the master has read what the slave wrote (TCSADRAIN). */
+        while (p->master && p->out_head != p->out_tail) {
+            if (proc_killed()) {
+                release(&pty_lock);
+                return -EINTR;
+            }
+            sleep(&p->out_tail, &pty_lock);
+        }
+    }
+    long r = tty_ioctl(&p->tty, request, arg);
     release(&pty_lock);
     return r;
 }
@@ -348,7 +364,8 @@ long pts_ioctl(struct file *f, u32 request, uintptr arg) {
 u32 pts_poll(struct file *f, struct poll_table *pt) {
     struct pty *p = f->priv;
     acquire(&pty_lock);
-    u32 mask = tty_poll_in(&p->tty, pt) ? POLL_READY_IN : 0;
+    /* Only a file open for reading edits and echoes, as a read would. */
+    u32 mask = f->readable && tty_poll_in(&p->tty, pt) ? POLL_READY_IN : 0;
     poll_wait(pt, &p->out_tail);
     if (!p->master) {
         mask |= POLLHUP;

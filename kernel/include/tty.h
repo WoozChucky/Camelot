@@ -22,13 +22,14 @@
  * mode passes every byte, with Linux's VMIN and VTIME (in tenths of a
  * second, a tick each). With ISIG, VINTR and VQUIT kill the terminal's
  * foreground process (TIOCSPGRP), discarding the input unless NOFLSH and
- * echoing "^C" and a newline; with no foreground set they are dropped, and
- * so is VSUSP (Camelot has no stopped processes). OPOST with ONLCR turns
+ * echoing "^C" and a newline; with no foreground, or one that has ended,
+ * they are dropped, and so is VSUSP (Camelot has no stopped processes). OPOST with ONLCR turns
  * NL into CR NL on output.
  *
- * Locking: every function is called holding the terminal's lock, `lock`,
- * which tty_read() and tty_wait() let go of while they sleep. Readers sleep
- * on the tty, writers waiting for room in its input on `in`. */
+ * Locking: the functions are called holding the terminal's lock, `lock`,
+ * but tty_init() (before anything else can reach the terminal) and
+ * tty_read(), which takes it and lets go of it while it sleeps. Readers
+ * sleep on the tty, writers waiting for room in its input on `in`. */
 #ifndef CAMELOT_TTY_H
 #define CAMELOT_TTY_H
 
@@ -41,7 +42,9 @@ struct spinlock;
 /* ioctl requests (Linux's, asm-generic/ioctls.h). */
 #define TCGETS 0x5401
 #define TCSETS 0x5402
-#define TCSETSW 0x5403 /* TCSETS: output is never held, so nothing to drain */
+/* TCSETS once the output has gone: a pty's slave waits for its master to
+ * read what it wrote. */
+#define TCSETSW 0x5403
 #define TCSETSF 0x5404 /* TCSETS, the input discarded first */
 #define TCFLSH 0x540B
 #define TIOCGPGRP 0x540F
@@ -156,8 +159,9 @@ struct tty {
     u32 in_head;
     u32 in_tail;
     char in[TTY_IN];
-    /* Canonical mode's line: `line_len` bytes, `line_taken` of them read;
-     * once `line_done` nothing is added until it has all been read. In
+    /* Canonical mode's line: `line_len` bytes, `line_taken` of them read
+     * (line_taken <= line_len <= TTY_LINE_MAX); once `line_done` nothing
+     * is added until it has all been read, whatever the mode. In
      * non-canonical mode what a line held when the mode changed is read
      * first. */
     char line[TTY_LINE_MAX];
@@ -176,18 +180,24 @@ void tty_init(struct tty *t, struct spinlock *lock, const struct tty_ops *ops, b
 /* Whether the input has room for one byte more. */
 bool tty_room(const struct tty *t);
 
+/* Whether `c` is one tty_receive() acts on at once rather than keeping
+ * (ISIG's VINTR, VQUIT, VSUSP): it needs no room, so a driver whose input
+ * is full passes it on anyway. */
+bool tty_signal_char(const struct tty *t, char c);
+
 /* A byte typed: mapped and added to the input, or acted on (ISIG); wakes
  * the readers. False if there was no room: the caller keeps it, or drops
  * it. */
 bool tty_receive(struct tty *t, char c);
 
-/* `c` as the output gets it (OPOST, ONLCR) into out[], 1 or 2 bytes:
- * how many. */
-u32 tty_opost(const struct tty *t, char c, char out[2]);
+/* `c` as the output gets it under `oflag` (a terminal's c_oflag: OPOST,
+ * ONLCR) into out[], 1 or 2 bytes: how many. */
+u32 tty_opost(u32 oflag, char c, char out[2]);
 
 /* read() on the terminal: waits as the mode says, then copies to user
- * address `dst` up to `n` bytes: their count, 0 at the end (VEOF on an
- * empty line, or a hung-up terminal), -EFAULT, -EINTR if the process was
+ * address `dst` up to `n` bytes: their count (a hung-up terminal's line
+ * typed part way too), 0 at the end (VEOF on an empty line, or a hung-up
+ * terminal with nothing left), -EFAULT, -EINTR if the process was
  * killed. */
 isize tty_read(struct tty *t, pagetable_t pt, uintptr dst, usize n);
 

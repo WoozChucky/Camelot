@@ -874,6 +874,12 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
             remember(pids[i], name);
             continue;
         }
+        /* The program waited for is the terminal's foreground, which
+         * Ctrl-C kills (docs/camelot-syscalls.md, "Terminals"): one
+         * process until Camelot has process groups (#116). */
+        if (console_input) {
+            tcsetpgrp(STDIN, pids[i]);
+        }
         int status;
         if (wait(pids[i], &status) == pids[i]) {
             last_status = status;

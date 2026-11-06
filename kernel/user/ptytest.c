@@ -121,7 +121,7 @@ static void pair_checks(void) {
     check_eq(tcgetattr(s, &t), 0, "tcgetattr");
     check_eq(t.c_iflag, ICRNL | IXON, "c_iflag");
     check_eq(t.c_oflag, OPOST | ONLCR, "c_oflag");
-    check_eq(t.c_cflag, B38400 | CS8 | CREAD | HUPCL, "c_cflag");
+    check_eq(t.c_cflag, B38400 | CS8 | CREAD, "c_cflag (a pty's: no HUPCL)");
     check_eq(t.c_lflag, ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN, "c_lflag");
     check(t.c_cc[VINTR] == 3 && t.c_cc[VERASE] == 0x7f && t.c_cc[VKILL] == 0x15 && t.c_cc[VEOF] == 4 &&
               t.c_cc[VMIN] == 1 && t.c_cc[VTIME] == 0 && t.c_cc[VWERASE] == 0x17,
@@ -200,6 +200,22 @@ static void canonical_checks(void) {
     write(m, "\n", 1);
     check_eq(read(s, buf, 100), 100, "a read takes 100");
     check_eq(read(s, buf, sizeof buf), 28, "the rest: 27 and the newline");
+    while (expect(m, buf, sizeof buf, NULL, 1) > 0) {
+    }
+
+    /* A line read part way stays the line through a change of mode and
+     * back: nothing is added to it, and the next line comes after it. */
+    for (int i = 0; i < 127; i++) {
+        write(m, "y", 1);
+    }
+    write(m, "\n", 1);
+    check_eq(read(s, buf, 100), 100, "100 of a full line");
+    set_mode(s, 0, 1, 0);
+    set_mode(s, 1, 1, 0);
+    write(m, "\n", 1);
+    check_eq(read(s, buf, sizeof buf), 28, "then its rest, across raw mode and back");
+    check(buf[26] == 'y' && buf[27] == '\n', "its last bytes");
+    check_eq(read(s, buf, sizeof buf), 1, "then the next line");
     while (expect(m, buf, sizeof buf, NULL, 1) > 0) {
     }
 
@@ -322,6 +338,86 @@ static void interrupt_checks(void) {
     check(strcmp(buf, "^C\r\n") == 0, "^C echoed, the line gone");
     check_eq(ioctl(s, FIONREAD, &n), 0, "FIONREAD");
     check_eq(n, 0, "nothing left to read");
+    /* Its foreground ended: Ctrl-C is dropped again. */
+    write(m, "x\x03" "y\n", 4);
+    n = read(s, buf, sizeof buf);
+    check(n == 3 && memcmp(buf, "xy\n", 3) == 0, "Ctrl-C dropped once the foreground has ended");
+    expect(m, buf, sizeof buf, NULL, 1);
+    check(strcmp(buf, "xy\r\n") == 0, "no ^C");
+
+    /* A foreground that doesn't read the slave, its input full: Ctrl-C
+     * still gets through. */
+    int p[2];
+    pipe(p);
+    in = dup(STDIN);
+    close(STDIN);
+    dup(p[0]);
+    pid = spawn("/bin/cat", argv, environ);
+    close(STDIN);
+    dup(in);
+    close(in);
+    check_eq(tcsetpgrp(s, pid), 0, "cat on a pipe in the foreground");
+    for (int i = 0; i < 256; i++) {
+        write(m, "z", 1);
+    }
+    check(!(ready(m, POLLOUT) & POLLOUT), "the slave's input is full");
+    check_eq(write(m, "\x03", 1), 1, "Ctrl-C written all the same");
+    check_eq(wait(pid, &status), pid, "cat ended");
+    check_eq(status, -1, "killed");
+    check(ready(m, POLLOUT) & POLLOUT, "the input thrown away");
+    close(p[0]);
+    close(p[1]);
+    while (expect(m, buf, sizeof buf, NULL, 1) > 0) {
+    }
+    close(s);
+    close(m);
+}
+
+/* tcsetattr(TCSADRAIN) on a slave, in a thread: `drained` once it
+ * returns. */
+struct drain_args {
+    int fd;
+    struct termios t;
+};
+
+static int drained;
+
+static int drain(void *arg) {
+    struct drain_args *a = arg;
+    int r = tcsetattr(a->fd, TCSADRAIN, &a->t);
+    drained = 1;
+    return r;
+}
+
+static void drain_checks(void) {
+    int m;
+    int s;
+    check_eq(open_pair(&m, &s), 0, "a pair");
+    char buf[16];
+    /* A write-only slave's poll neither edits nor echoes. */
+    int wo = open(ptsname(m), O_WRONLY);
+    check(wo >= 0, "the slave, write-only");
+    write(m, "hi\n", 3);
+    check_eq(ready(wo, POLLIN | POLLOUT), POLLOUT, "its poll: writable only");
+    check(!(ready(m, POLLIN) & POLLIN), "nothing echoed");
+    check_eq(read(s, buf, sizeof buf), 3, "the line read");
+    expect(m, buf, sizeof buf, NULL, 1);
+    close(wo);
+
+    /* TCSADRAIN waits until the master has read what the slave wrote. */
+    struct drain_args args;
+    tcgetattr(s, &args.t);
+    args.fd = s;
+    write(s, "out", 3);
+    static char stack[4096];
+    int tid = thread_start(drain, &args, stack, sizeof stack);
+    check(tid > 0, "a thread sets the modes, TCSADRAIN");
+    sleep(3);
+    check(!drained, "it waits while the output is unread");
+    check_eq(read(m, buf, sizeof buf), 3, "the master reads it");
+    int status = -1;
+    check_eq(thread_join(tid, &status), 0, "the thread ends");
+    check(drained && status == 0, "the modes set");
     close(s);
     close(m);
 }
@@ -344,24 +440,27 @@ static void hangup_checks(void) {
     check_eq(write(m, "ok\n", 3), 3, "the master writes again");
     check_eq(read(s, buf, sizeof buf), 3, "the slave reads it");
     expect(m, buf, sizeof buf, NULL, 1);
-    /* The master closes: the slave reads 0, its writes fail. */
+    /* The master closes: the slave reads what was typed, then 0, and its
+     * writes fail. */
+    write(m, "part", 4);
     close(m);
     check(ready(s, POLLIN) & POLLHUP, "the slave sees the hang-up");
-    check_eq(read(s, buf, sizeof buf), 0, "the slave reads the end");
+    check_eq(read(s, buf, sizeof buf), 4, "the line typed part way");
+    check_eq(read(s, buf, sizeof buf), 0, "then the end");
     check_eq(write(s, "x", 1), -EIO, "its writes fail");
     close(s);
 }
 
 static void console_checks(void) {
     /* The console keeps its old ways: no output processing, no Ctrl-U or
-     * Ctrl-W, Ctrl-C dropped (no foreground). */
+     * Ctrl-W; the shell made this program its foreground. */
     struct termios t;
     check_eq(tcgetattr(STDIN, &t), 0, "the console's termios");
     check_eq(t.c_oflag, 0, "no output processing");
     check(t.c_cc[VKILL] == 0 && t.c_cc[VWERASE] == 0, "no VKILL or VWERASE");
     check((t.c_lflag & (ICANON | ECHO | ISIG)) == (ICANON | ECHO | ISIG), "canonical, echo, ISIG");
     check(isatty(STDOUT), "the console is a terminal");
-    check_eq(tcgetpgrp(STDIN), 0, "no foreground");
+    check_eq(tcgetpgrp(STDIN), getpid(), "the shell's foreground: this program");
     int p[2];
     pipe(p);
     check(!isatty(p[0]), "a pipe isn't");
@@ -405,6 +504,12 @@ static void shell_checks(void) {
     write(m, "one\rtwo\r\x04", 9);
     expect(m, buf, sizeof buf, "$ ", 50);
     check(strcmp(buf, "one\r\none\r\ntwo\r\ntwo\r\n$ ") == 0, "cat reads the slave until Ctrl-D");
+    /* The shell makes what it waits for the foreground: Ctrl-C ends it. */
+    write(m, "cat\r", 4);
+    expect(m, buf, sizeof buf, "cat\r\n", 50);
+    write(m, "par\x03", 4);
+    expect(m, buf, sizeof buf, "$ ", 50);
+    check(strcmp(buf, "^C\r\ncat: exit -1\r\n$ ") == 0, "Ctrl-C kills the shell's foreground");
     write(m, "exit 3\r", 7);
     int status = 0;
     check_eq(wait(pid, &status), pid, "sh ends");
@@ -418,6 +523,7 @@ int main(void) {
     raw_checks();
     interrupt_checks();
     hangup_checks();
+    drain_checks();
     console_checks();
     shell_checks();
     check(!isatty(3) && !isatty(4) && !isatty(5), "no descriptor left open");

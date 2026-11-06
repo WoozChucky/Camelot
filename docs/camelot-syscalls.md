@@ -1222,14 +1222,15 @@ terminal emulator holds, as on Linux:
   and `ptsname` do this (`user.h`);
 - what the master writes is the slave's input, through the discipline:
   edited, echoed back to the master, its Ctrl-C acted on; a write waits
-  while the slave's 256-byte input is full;
+  while the slave's 256-byte input is full, but for a Ctrl-C, which takes
+  no room;
 - what the slave writes is what the master reads, through the output
   processing (`ONLCR`: a NL as CR NL), from a 2 KiB buffer, a write waiting
   for room; an echo that finds none is dropped;
 - the pair has one `termios`, window size and foreground, which the
   requests on either end reach;
-- closing the master hangs the slave up: its reads return what was left,
-  then 0, its writes `-EIO`. Once every open slave descriptor is closed,
+- closing the master hangs the slave up: its reads return what was left
+  (a line typed part way too), then 0, its writes `-EIO`. Once every open slave descriptor is closed,
   the master reads what was left, then `-EIO`, and its writes are `-EIO`,
   until a slave is opened again. The pair goes once both ends are.
 
@@ -1240,10 +1241,10 @@ terminal emulator holds, as on Linux:
 |---|---|---|---|
 | `TCGETS` | 0x5401 | `struct termios *` | the modes |
 | `TCSETS` | 0x5402 | `const struct termios *` | sets them (`tcsetattr`'s `TCSANOW`) |
-| `TCSETSW` | 0x5403 | `const struct termios *` | the same, once the output has gone, which it always has (`TCSADRAIN`) |
-| `TCSETSF` | 0x5404 | `const struct termios *` | the same, the input thrown away first (`TCSAFLUSH`) |
+| `TCSETSW` | 0x5403 | `const struct termios *` | the same, once the output has gone (`TCSADRAIN`): on a slave, once the master has read what it wrote (the console's has always gone) |
+| `TCSETSF` | 0x5404 | `const struct termios *` | the same, and the input thrown away (`TCSAFLUSH`) |
 | `TCFLSH` | 0x540B | a number | throws away the input (`TCIFLUSH`, 0), the output not read yet (`TCOFLUSH`, 1), or both (2) |
-| `TIOCGPGRP` | 0x540F | `int *` | the foreground process, 0 for none |
+| `TIOCGPGRP` | 0x540F | `int *` | the foreground process, 0 for none (as it was set, even once it has ended) |
 | `TIOCSPGRP` | 0x5410 | `const int *` | sets it: `-EINVAL` for 0 or less, `-ESRCH` for no such process |
 | `TIOCGWINSZ` | 0x5413 | `struct winsize *` | the size (0 by 0 until set) |
 | `TIOCSWINSZ` | 0x5414 | `const struct winsize *` | sets it |
@@ -1285,18 +1286,23 @@ that asks for it.
 
 **Ctrl-C.** With `ISIG`, `VINTR` (Ctrl-C) and `VQUIT` (Ctrl-\) kill the
 terminal's foreground process as `kill` does (it exits with -1), throw
-away the input unless `NOFLSH`, and echo `^C` and a newline; without a
-foreground process they are dropped. `VSUSP` (Ctrl-Z) is dropped too:
-Camelot doesn't stop processes. The foreground is a process, set with
-`tcsetpgrp`, until Camelot has process groups (issue #116); nothing sets it
-by itself, so a program that wants Ctrl-C to end what it runs sets it.
+away the input unless `NOFLSH`, and echo `^C` and a newline, even when
+the input is full; without a foreground process, or once it has ended,
+they are dropped. `VSUSP` (Ctrl-Z) is dropped too: Camelot doesn't stop
+processes. The foreground is a process, set with `tcsetpgrp`, until
+Camelot has process groups (issue #116). The shell sets it on its
+terminal to each program it waits for, so Ctrl-C ends the program, not
+the shell; any other program that wants Ctrl-C to end what it runs sets
+it.
 
-**Defaults.** A new pty has Linux's (`tty_std_termios`): `ICRNL`, `IXON`,
-`OPOST`, `ONLCR`, `ISIG`, `ICANON`, `ECHO`, `ECHOE`, `ECHOK`, `ECHOCTL`,
-`ECHOKE`, `IEXTEN`, and Linux's control characters (Ctrl-C, Ctrl-\, DEL,
-Ctrl-U, Ctrl-D, Ctrl-W, Ctrl-Z; `VMIN` 1, `VTIME` 0). The console has the
-same but for what it has always done: no output processing (`c_oflag` 0),
-and no `VKILL` or `VWERASE` ("Console input"). Its size is 0 by 0 until a
+**Defaults.** A new pty has Linux's (`tty_std_termios`, the pty driver's
+`c_cflag`): `ICRNL`, `IXON`, `OPOST`, `ONLCR`, `B38400`, `CS8`, `CREAD`,
+`ISIG`, `ICANON`, `ECHO`, `ECHOE`, `ECHOK`, `ECHOCTL`, `ECHOKE`, `IEXTEN`,
+and Linux's control characters (Ctrl-C, Ctrl-\, DEL, Ctrl-U, Ctrl-D,
+Ctrl-W, Ctrl-Z; `VMIN` 1, `VTIME` 0). The console has the same, with
+`HUPCL` as Linux's other terminals, but for what it has always done: no
+output processing (`c_oflag` 0), and no `VKILL` or `VWERASE` ("Console
+input"). Its size is 0 by 0 until a
 program sets it. `cfmakeraw`, in the C library, makes raw mode as glibc's
 does.
 
@@ -1622,7 +1628,8 @@ the middle of other output:
   LF right after a CR is skipped, so raw consoles and piped text both work);
 - Ctrl-D (0x04) ends the line without a newline; on an empty line, the read
   returns 0, the end of the input;
-- Ctrl-C (0x03) kills the foreground process, if one is set (`tcsetpgrp`),
+- Ctrl-C (0x03) kills the foreground process, if one is set (`tcsetpgrp`;
+  the shell sets it to each program it waits for) and still running,
   echoing `^C` and a newline and throwing away the line; without one it is
   ignored, as are the other control characters.
 

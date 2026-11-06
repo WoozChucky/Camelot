@@ -13,10 +13,11 @@
  * echo that finds none is dropped. The pair has one termios, window size
  * and foreground, which the requests on either end reach.
  *
- * Closing the master hangs the slave up: its reads return what was left,
- * then 0, its writes -EIO. Once every slave file has closed (one was open),
- * the master's reads return what was left, then -EIO, and its writes -EIO,
- * until a slave opens again. A pair goes when both ends are closed.
+ * Closing the master hangs the slave up: its reads return what was left
+ * (a line typed part way too), then 0, its writes -EIO. Once every slave
+ * file has closed (one was open), the master's reads return what was
+ * left, then -EIO, and its writes -EIO, until a slave opens again. A pair
+ * goes when both ends are closed.
  *
  * The root image has /dev/ptmx and NPTY slaves' nodes, /dev/pts/0 to 15,
  * since Camelot has no devpts to make them as pairs come and go: a slave

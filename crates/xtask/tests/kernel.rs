@@ -2936,6 +2936,24 @@ fn console_edits_lines() {
 }
 
 #[test]
+fn a_line_longer_than_the_input_buffers_is_cut_not_stuck() {
+    // A line typed all at once that is longer than the UART's ring and the
+    // terminal's input together: the discipline keeps taking bytes while
+    // it edits the line, so the line's end comes in and the shell runs it.
+    let long = "x".repeat(500);
+    assert!(long.len() > UART_RX_SIZE + TTY_IN);
+    let (r, out) = run_shell(format!("{long}\nexit\n").as_bytes());
+    assert_eq!(r, RunResult::Exited(0), "{out}");
+    let kept = "x".repeat(127);
+    let want = format!(
+        "{SHELL_BANNER}\
+         {PROMPT}{kept}\nsh: {kept}: no such program\n\
+         {PROMPT}exit\n"
+    );
+    assert_eq!(mask_ticks(&out), want);
+}
+
+#[test]
 fn end_of_input_ends_the_shell() {
     // Ctrl-D on an empty line: the read returns 0, and the shell exits with
     // the last program's status. Mid-line it ends the line without a

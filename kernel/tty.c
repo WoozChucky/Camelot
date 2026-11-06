@@ -54,6 +54,9 @@ void tty_init(struct tty *t, struct spinlock *lock, const struct tty_ops *ops, b
         t->termios.c_oflag = 0;
         t->termios.c_cc[VKILL] = 0;
         t->termios.c_cc[VWERASE] = 0;
+    } else {
+        /* A pty's slave has no line to hang up (Linux's pty driver). */
+        t->termios.c_cflag &= ~(u32)HUPCL;
     }
 }
 
@@ -61,8 +64,13 @@ bool tty_room(const struct tty *t) {
     return t->in_head - t->in_tail < TTY_IN;
 }
 
-u32 tty_opost(const struct tty *t, char c, char out[2]) {
-    u32 oflag = t->termios.c_oflag;
+bool tty_signal_char(const struct tty *t, char c) {
+    const struct termios *tio = &t->termios;
+    return (tio->c_lflag & ISIG) != 0 && c != 0 &&
+           (c == (char)tio->c_cc[VINTR] || c == (char)tio->c_cc[VQUIT] || c == (char)tio->c_cc[VSUSP]);
+}
+
+u32 tty_opost(u32 oflag, char c, char out[2]) {
     if (c == '\n' && (oflag & OPOST) != 0 && (oflag & ONLCR) != 0) {
         out[0] = '\r';
         out[1] = '\n';
@@ -81,7 +89,7 @@ static void echo(struct tty *t, const char *s, u32 n) {
             t->ops->echo(t, buf, len);
             len = 0;
         }
-        len += tty_opost(t, s[i], buf + len);
+        len += tty_opost(t->termios.c_oflag, s[i], buf + len);
     }
     if (len > 0) {
         t->ops->echo(t, buf, len);
@@ -106,8 +114,8 @@ static void flush_input(struct tty *t) {
 /* VINTR or VQUIT `c` with ISIG: kills the foreground process, as Linux's
  * SIGINT and SIGQUIT end a program that doesn't catch them. */
 static void interrupt(struct tty *t, char c) {
-    if (t->fg == 0) {
-        return; /* no foreground: dropped, as the console always did */
+    if (t->fg == 0 || !proc_exists(t->fg)) {
+        return; /* no foreground (any more): dropped, as the console always did */
     }
     u32 lflag = t->termios.c_lflag;
     if ((lflag & NOFLSH) == 0) {
@@ -120,7 +128,7 @@ static void interrupt(struct tty *t, char c) {
         }
         echo_str(t, "\n");
     }
-    proc_kill_pid(t->fg); /* -ESRCH once it has ended: nothing to do */
+    proc_kill_pid(t->fg);
 }
 
 bool tty_receive(struct tty *t, char c) {
@@ -197,9 +205,13 @@ static void edit(struct tty *t, char c) {
     bool echoing = (lflag & ECHO) != 0;
     u8 b = (u8)c;
     if (c == '\n' || (cc[VEOL] != 0 && b == cc[VEOL])) {
-        /* There is always room: characters stop one byte short. */
-        t->line[t->line_len] = c;
-        t->line_len++;
+        /* There is always room: characters stop one byte short, and
+         * nothing is added to a line once it has ended (line_done stays
+         * set until it has all been read, whatever the mode). */
+        if (t->line_len < TTY_LINE_MAX) {
+            t->line[t->line_len] = c;
+            t->line_len++;
+        }
         t->line_done = true;
         if (echoing || (c == '\n' && (lflag & ECHONL) != 0)) {
             echo(t, &c, 1);
@@ -228,11 +240,22 @@ static void edit(struct tty *t, char c) {
     }
 }
 
+/* Whether input waits: in the ring, or brought in from elsewhere now that
+ * there is room. */
+static bool input_waiting(struct tty *t) {
+    if (t->in_tail == t->in_head && t->ops->pull != NULL) {
+        t->ops->pull(t);
+    }
+    return t->in_tail != t->in_head;
+}
+
 /* Canonical mode: edits the input waiting into the line until it ends or
  * none is left. Whether it has ended. */
 static bool cook_line(struct tty *t) {
     bool took = false;
-    while (!t->line_done && t->in_tail != t->in_head) {
+    /* As the ring empties, input waiting elsewhere comes in: a line longer
+     * than the ring holds goes on in the UART's. */
+    while (!t->line_done && input_waiting(t)) {
         char c = t->in[t->in_tail % TTY_IN];
         t->in_tail++;
         took = true;
@@ -319,7 +342,7 @@ static isize raw_take(struct tty *t, pagetable_t pt, uintptr dst, usize n) {
                 if (t->line_taken == t->line_len) {
                     reset_line(t);
                 }
-            } else if (t->in_tail != t->in_head) {
+            } else if (input_waiting(t)) {
                 c = t->in[t->in_tail % TTY_IN];
                 t->in_tail++;
                 took = true;
@@ -380,9 +403,10 @@ isize tty_read(struct tty *t, pagetable_t pt, uintptr dst, usize n) {
     isize r;
     if ((t->termios.c_lflag & ICANON) == 0) {
         r = raw_take(t, pt, dst, n);
-    } else if (!t->line_done) {
-        r = 0; /* hung up mid-line: the end */
+    } else if (!t->line_done && t->line_len == t->line_taken) {
+        r = 0; /* hung up: the end */
     } else {
+        /* A whole line, or what a hung-up terminal had of one. */
         u32 count = t->line_len - t->line_taken;
         if (count > n) {
             count = (u32)n;
@@ -436,10 +460,8 @@ long tty_ioctl(struct tty *t, u32 request, uintptr arg) {
         if (request == TCSETSF) {
             flush_input(t);
         }
-        if ((n.c_lflag & ICANON) == 0) {
-            /* A line not read yet is input as any other from now on. */
-            t->line_done = false;
-        }
+        /* A line not read yet is read first in either mode: raw reads take
+         * its bytes, and a canonical one, ended, gets nothing added. */
         t->termios = n;
         wakeup(t); /* a read may take what there is under the new mode */
         return 0;

@@ -35,7 +35,8 @@ void console_intr(void);
  * skipped, so raw consoles and piped text both work); Ctrl-D (0x04) ends it
  * without a newline, so on an empty line the read returns 0, the end of the
  * input. Other control characters are ignored, and Ctrl-C too unless a
- * foreground process is set (TIOCSPGRP), which it kills.
+ * foreground process is set (TIOCSPGRP: the shell sets it to the program
+ * it waits for) and running, which it kills.
  *
  * Returns -EFAULT, having taken nothing, if [dst, dst + n) is not writable
  * user memory. */

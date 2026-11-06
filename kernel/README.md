@@ -222,7 +222,7 @@ The shell (`user/sh.c`) runs programs by name, with arguments: `PROG
 program. `CMD < FILE` and `CMD > FILE` redirect its input and output, `CMD |
 CMD` sends the first one's output to the second, and `CMD & CMD` runs the
 first in the background (the shell prints its pid) and the last in the
-foreground; `wait` collects the background ones, `cd [DIR]` changes the
+foreground, where Ctrl-C ends it; `wait` collects the background ones, `cd [DIR]` changes the
 working directory, `exec PROG [ARG...]` replaces the shell with PROG (and
 `exec < FILE` or `exec > FILE` redirects the shell itself), `help` lists the
 built-ins, and `exit [N]` (or Ctrl-D on an empty line) ends the shell, after

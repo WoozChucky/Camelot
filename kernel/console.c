@@ -43,10 +43,12 @@ static void cons_echo(struct tty *t, const char *s, u32 n) {
     release(&uart_tx_lock);
 }
 
-/* Moves the UART's received bytes into the discipline while it has room. */
+/* Moves the UART's received bytes into the discipline while it has room,
+ * and Ctrl-C even when it has none (it takes none). */
 static void cons_pull(struct tty *t) {
     char c;
-    while (tty_room(t) && uart_rx_pop(&c)) {
+    while (uart_rx_peek(&c) && (tty_room(t) || tty_signal_char(t, c))) {
+        uart_rx_pop(&c);
         tty_receive(t, c);
     }
 }
@@ -60,6 +62,8 @@ void console_init(void) {
 
 void console_input(char c) {
     acquire(&cons_lock);
+    /* What the UART's ring holds came first. */
+    cons_pull(&cons);
     tty_receive(&cons, c); /* no room: dropped */
     release(&cons_lock);
 }
@@ -95,6 +99,11 @@ isize console_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
     if (!uvm_range_ok(pt, src, n, PTE_R)) {
         return -EFAULT;
     }
+    /* The output processing as it is now: the termios under the lock,
+     * the printing under the UART's only. */
+    acquire(&cons_lock);
+    u32 oflag = cons.termios.c_oflag;
+    release(&cons_lock);
     char chunk[WRITE_CHUNK];
     char out[2];
     for (usize done = 0; done < n;) {
@@ -104,17 +113,15 @@ isize console_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
         if (copyin(pt, chunk, src + done, count) != 0) {
             return done > 0 ? (isize)done : -EFAULT;
         }
-        acquire(&cons_lock);
         acquire(&uart_tx_lock);
         for (u32 i = 0; i < count; i++) {
-            u32 m = tty_opost(&cons, chunk[i], out);
+            u32 m = tty_opost(oflag, chunk[i], out);
             for (u32 j = 0; j < m; j++) {
                 uart_putc(out[j]);
                 fbcon_putc(out[j]);
             }
         }
         release(&uart_tx_lock);
-        release(&cons_lock);
         done += count;
     }
     return (isize)n;

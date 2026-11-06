@@ -69,6 +69,9 @@ void uart_intr(void);
  * false if the buffer is empty. Never touches RBR. */
 bool uart_rx_pop(char *c);
 
+/* The same, leaving the byte in the buffer. */
+bool uart_rx_peek(char *c);
+
 #endif
 
 #endif
