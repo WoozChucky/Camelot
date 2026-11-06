@@ -223,8 +223,10 @@ fn refused_port() -> RefusedPort {
 fn a_refused_connection_is_reported() {
     let refused = refused_port();
     let port = refused.port;
-    // The race, made certain: every other port is handed out meanwhile, and one that
-    // gets this one listens.
+    // The race: other ports are handed out meanwhile, and one that gets this one
+    // listens. It is made certain on Windows, which hands ports out in turn, so the
+    // loop goes round all of them; on Linux the kernel's bind rules keep the port, and
+    // the loop is short (it picks at random, and soon picks one twice).
     let taken = take_ports_round(port);
     assert!(taken.is_none(), "port {port} was handed out again");
     let (guest, out) = boot(Gateway::new(Config::default()).unwrap(), &format!("c {port}\n"));
