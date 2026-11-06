@@ -72,9 +72,11 @@ pub fn case(src: impl Into<String>, want: &[&str]) -> Case {
     }
 }
 
-/// What kind of diagnostic a row is a row of: its first diagnostic's
-/// severity (`error`, `fatal error`, `warning`) and, for a warning, its
-/// `-W` flag, so that every flag merlin warns with is a kind of its own. A
+/// What a row is a row of: its first diagnostic without its position, with
+/// what it quotes left out (`'...'` becomes `''`) and every run of digits
+/// one `N`, its severity and its `-W` flag kept: so `expected ';' after
+/// expression` at two places is one kind, and so is `use of undeclared
+/// identifier 'x'` of any name, but every message is a kind of its own. A
 /// row without a diagnostic is of the kind "".
 fn row_kind(c: &Case) -> String {
     let Some(first) = &c.first else {
@@ -82,12 +84,22 @@ fn row_kind(c: &Case) -> String {
     };
     // `LINE:COL: ` or `FILE:LINE:COL: ` first, then `error: ...`.
     let message = first.split_once(": ").map_or(first.as_str(), |(_, m)| m);
-    let severity = message.split_once(": ").map_or(message, |(s, _)| s);
-    let flag = message
-        .rfind(" [-W")
-        .filter(|_| message.ends_with(']'))
-        .map_or("", |at| &message[at..]);
-    format!("{severity}{flag}")
+    let mut kind = String::new();
+    let mut quoted = false;
+    let mut digits = false;
+    for ch in message.chars() {
+        let digit = !quoted && ch.is_ascii_digit();
+        if ch == '\'' {
+            quoted = !quoted;
+            kind.push(ch);
+        } else if digit && !digits {
+            kind.push('N');
+        } else if !quoted && !digit {
+            kind.push(ch);
+        }
+        digits = digit;
+    }
+    kind
 }
 
 /// The first row of each kind ([`row_kind`]) of `rows`, one table's, in
@@ -1983,33 +1995,52 @@ fn image_path(rel: &str) -> String {
     format!("{REPO}/{}", parts.join("/"))
 }
 
+/// The repository's files the default tests of cc1 on Camelot take (the
+/// ignored ones take every one). A whole program costs cc1 on Camelot some
+/// 75 million instructions, a row of the diagnostics table some 7 million,
+/// so the sample is chosen: a test case of merlin's for each feature of C
+/// the compiler's code is about (structs and unions passed and returned,
+/// pointers and function pointers, variadic calls, stack arguments,
+/// switch, goto, the initializers clang copies from a constant,
+/// designators, strings, static locals, the preprocessor), one of each
+/// other directory of merlin's tests (`cases-merlin`, `multi`, `abi`), a
+/// file of the kernel's and a user program; and, for `-E`, the kernel's
+/// linker script, its entry, the start code and an example's assembly.
+const SAMPLED: &[&str] = &[
+    "crates/merlin/tests/cases/structs.c",
+    "crates/merlin/tests/cases/unions.c",
+    "crates/merlin/tests/cases/struct_passing.c",
+    "crates/merlin/tests/cases/pointers.c",
+    "crates/merlin/tests/cases/func_ptrs.c",
+    "crates/merlin/tests/cases/varargs.c",
+    "crates/merlin/tests/cases/stack_args.c",
+    "crates/merlin/tests/cases/switch.c",
+    "crates/merlin/tests/cases/goto.c",
+    "crates/merlin/tests/cases/constant_aggregates.c",
+    "crates/merlin/tests/cases/designated.c",
+    "crates/merlin/tests/cases/strings.c",
+    "crates/merlin/tests/cases/static_locals.c",
+    "crates/merlin/tests/cases/preprocessor.c",
+    "crates/merlin/tests/cases-merlin/div_by_zero.c",
+    "crates/merlin/tests/multi/modules/main.c",
+    "crates/merlin/tests/abi/merlin_side.c",
+    "kernel/pipe.c",
+    "kernel/user/cat.c",
+    "kernel/kernel.lds.S",
+    "kernel/entry.S",
+    "kernel/user/crt0.S",
+    "examples/hello/hello.S",
+];
+
+/// Whether the repository's file `rel` is one of [`SAMPLED`]'s.
+fn sampled(rel: &str) -> bool {
+    SAMPLED.contains(&rel)
+}
+
 /// The repository's C files, headers and `.S` files, by path from the root
 /// with `/`, in order: all but those in `target/` and hidden directories
 /// (`.git`, worktrees), and the firmware's (`firmware/`), whose headers'
 /// names are longer than a Camelot directory entry holds.
-/// The repository's files the default tests of cc1 on Camelot take (the
-/// ignored ones take every one): merlin's own test cases, every
-/// directory's (`cases`, `cases-merlin`, `multi`, `abi`), the features of C
-/// they are written to cover; a few of the kernel's files, a user
-/// program's, the C library's and the assembler's; and, for `-E`, the
-/// kernel's linker script, its entry, the start code and an example's
-/// assembly.
-fn sampled(rel: &str) -> bool {
-    const FILES: &[&str] = &[
-        "kernel/pipe.c",
-        "kernel/sleeplock.c",
-        "kernel/user/cat.c",
-        "kernel/user/grep.c",
-        "kernel/user/lib/string.c",
-        "kernel/user/as/lexer.c",
-        "kernel/kernel.lds.S",
-        "kernel/entry.S",
-        "kernel/user/crt0.S",
-        "examples/hello/hello.S",
-    ];
-    (rel.starts_with("crates/merlin/tests/") && rel.ends_with(".c")) || FILES.contains(&rel)
-}
-
 fn repo_sources() -> Vec<String> {
     fn walk(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<String>) {
         for e in std::fs::read_dir(dir).unwrap() {
@@ -2522,7 +2553,7 @@ fn preprocess_corpus(full: bool, want_jobs: usize, refused: usize, warned: usize
 /// preprocessor's tables, and every one of [`PP_INPUTS`].
 #[test]
 fn the_preprocessor_on_camelot_writes_what_merlin_writes() {
-    preprocess_corpus(false, 150, 15, 10);
+    preprocess_corpus(false, 130, 50, 15);
 }
 
 /// cc1's command line is merlin's (main.rs), with `cc1` for `merlin` in its
@@ -2614,9 +2645,11 @@ fn cc1_takes_merlins_command_line() {
 
 // ---- The C compiler, stage 2: the compiler, without -g (#241) ----
 
-/// One `cc1 FILE.c -o OUT.s`: the input file (an image path), the options
-/// before it, as cc1 is given them, and as merlin is; and what the host's
-/// merlin makes of it ([`merlin_s`]), worked out once, by [`cc_jobs`].
+/// One input of `cc1`: the input file (an image path, or for a row of the
+/// diagnostics table one relative to `/d`, where the rows are compiled),
+/// the options before it, as cc1 is given them, and as merlin is; and what
+/// the host's merlin makes of it ([`merlin_s`]), worked out once, by
+/// [`cc_jobs`].
 struct CcJob {
     input: String,
     args: Vec<String>,
@@ -2646,7 +2679,15 @@ impl CcJob {
 /// compiles, and what it prints on stderr (the warnings of a compilation
 /// that succeeds, every diagnostic of one that fails).
 fn merlin_s(job: &CcJob, files: &BTreeMap<String, Vec<u8>>) -> (Option<String>, String) {
-    let text = |p: &str| files.get(p).and_then(|b| String::from_utf8(b.clone()).ok());
+    // A path relative to `/d`, the directory the rows are compiled in.
+    let text = |p: &str| {
+        let path = if p.starts_with('/') {
+            p.to_string()
+        } else {
+            format!("/d/{p}")
+        };
+        files.get(&path).and_then(|b| String::from_utf8(b.clone()).ok())
+    };
     // merlin's paths are the host's (`\` on Windows); the image's are `/`.
     let load = |p: &std::path::Path| text(&p.to_string_lossy().replace('\\', "/"));
     let src = text(&job.input).unwrap_or_else(|| panic!("{}: no such file", job.input));
@@ -2692,9 +2733,10 @@ const CC_INPUTS: &[&str] = &["int f(void) { char a[40 << 20] = {1}; return a[0];
 
 /// The compiler's corpus ([`Corpus`]), the C files with the `-I`
 /// directories the preprocessor's test gives them, and the sources of the
-/// rows, each in a directory of its own (`/d/N/t.c` and its headers); and
-/// the files they read. What the host's merlin makes of
-/// each is worked out here, once.
+/// rows, each in a directory of its own (`/d/N/t.c` and its headers, named
+/// `N/t.c` from `/d`, where [`compile_on_camelot`] compiles them several at
+/// a time); and the files they read. What the host's merlin makes of each
+/// is worked out here, once.
 fn cc_jobs(corpus: Corpus) -> (Vec<CcJob>, BTreeMap<String, Vec<u8>>) {
     let root = repo_root();
     let sources = repo_sources();
@@ -2749,12 +2791,12 @@ fn cc_jobs(corpus: Corpus) -> (Vec<CcJob>, BTreeMap<String, Vec<u8>>) {
         rows.extend(CC_INPUTS.iter().map(|src| case(*src, &[])));
     }
     for (k, c) in rows.into_iter().enumerate() {
-        let dir = format!("/d/{k}");
         for (name, text) in &c.files {
-            files.insert(format!("{dir}/{name}"), text.as_bytes().to_vec());
+            files.insert(format!("/d/{k}/{name}"), text.as_bytes().to_vec());
         }
-        let input = format!("{dir}/t.c");
-        files.insert(input.clone(), c.src.into_bytes());
+        files.insert(format!("/d/{k}/t.c"), c.src.into_bytes());
+        let input = format!("{k}/t.c");
+        let dir = k.to_string();
         let args: Vec<String> = c.args.iter().map(|a| a.replace("{dir}", &dir)).collect();
         let (includes, macros): (Vec<&String>, Vec<&String>) = args.iter().partition(|a| a.starts_with("-I"));
         let includes: Vec<String> = includes.iter().map(|i| i[2..].to_string()).collect();
@@ -2777,53 +2819,170 @@ fn cc1_compile_config() -> MachineConfig {
     }
 }
 
+/// The longest line the shell reads (kernel/user/sh.c's LINE_SIZE, less
+/// its newline and NUL) and the most arguments a program takes, its name
+/// among them (MAXARG, kernel/include/syscall.h): how many rows one `cc1`
+/// can be given.
+const SHELL_LINE: usize = 127;
+const MAXARG: usize = 16;
+
+/// Rows of the diagnostics table with the same options, compiled together.
+type RowGroup<'a> = (Vec<String>, Vec<(usize, &'a CcJob)>);
+
+/// One run of `cc1` on Camelot: its command and the jobs it compiles, each
+/// with its number in the whole list.
+struct CcRun<'a> {
+    command: String,
+    jobs: Vec<(usize, &'a CcJob)>,
+}
+
+/// The runs that compile `jobs`: a repository file alone, `-o /out/N`; the
+/// rows of the diagnostics table, whose files are small, several to a run,
+/// as many as the shell's line and a program's arguments take, those with
+/// the same options together, each written where merlin writes it without
+/// `-o` (`N/t.s`), so that a run costs one start of cc1 for many rows.
+fn cc_runs<'a>(jobs: &[(usize, &'a CcJob)]) -> Vec<CcRun<'a>> {
+    let mut runs = Vec::new();
+    // The rows, by their options: (options, rows), in the order they come.
+    let mut groups: Vec<RowGroup> = Vec::new();
+    for &(k, job) in jobs {
+        if job.input.starts_with('/') {
+            runs.push(CcRun {
+                command: job.command(&format!("/out/{k}")),
+                jobs: vec![(k, job)],
+            });
+        } else if let Some(g) = groups.iter_mut().find(|(args, _)| *args == job.args) {
+            g.1.push((k, job));
+        } else {
+            groups.push((job.args.clone(), vec![(k, job)]));
+        }
+    }
+    for (args, rows) in groups {
+        let head = std::iter::once("cc1".to_string())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut run: Vec<(usize, &CcJob)> = Vec::new();
+        let mut line = head.join(" ");
+        for (k, job) in rows {
+            if !run.is_empty()
+                && (line.len() + 1 + job.input.len() > SHELL_LINE || head.len() + run.len() >= MAXARG)
+            {
+                runs.push(CcRun {
+                    command: line,
+                    jobs: std::mem::take(&mut run),
+                });
+                line = head.join(" ");
+            }
+            line = format!("{line} {}", job.input);
+            run.push((k, job));
+        }
+        if !run.is_empty() {
+            runs.push(CcRun {
+                command: line,
+                jobs: run,
+            });
+        }
+    }
+    runs
+}
+
 /// Runs `jobs` (each with its number in the whole list, for its output file
-/// `/out/N`) with `/bin/cc1` on a machine whose image holds `files`, and
-/// compares each with the host's merlin (the job's `want`): the assembly it
-/// writes, if it compiles, and what it says. Returns what differs.
+/// `/out/N`) with `/bin/cc1` on a machine whose image holds `files`, in the
+/// runs [`cc_runs`] makes of them, from `/d`, and compares each job with
+/// the host's merlin (the job's `want`): the assembly it writes, if it
+/// compiles, and what it says, its lines picked out of its run's by its
+/// path (`N/` for a row); and a run's exit status with merlin's for the
+/// same inputs (1 if one is refused). Returns what differs.
 fn compile_on_camelot(jobs: &[(usize, &CcJob)], files: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
-    let commands: Vec<String> = jobs
-        .iter()
-        .map(|(k, job)| job.command(&format!("/out/{k}")))
-        .collect();
-    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let runs = cc_runs(jobs);
+    let commands: Vec<&str> = runs.iter().map(|r| r.command.as_str()).collect();
+    let input = format!("cd /d\n{}\nexit 0\n", commands.join("\n"));
     let listed: Vec<(String, Vec<u8>)> = files.iter().map(|(p, d)| (p.clone(), d.clone())).collect();
     let dirs = dirs_of(files);
     let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
-    // What merlin makes of each, and room on the image for as much.
-    let want: Vec<(Option<String>, String)> = jobs.iter().map(|(_, j)| j.want.clone()).collect();
-    let written: usize = want.iter().map(|(t, _)| t.as_ref().map_or(0, String::len)).sum();
+    // Room on the image for what merlin writes.
+    let written: usize = jobs
+        .iter()
+        .map(|(_, j)| j.want.0.as_ref().map_or(0, String::len))
+        .sum();
     let ninodes = (listed.len() + dirs.len() + jobs.len() + 64) as u32;
     let image = image_with_room(&["cc1"], &dirs, &listed, ninodes, 2 * written);
     let (out, data) = boot_on(cc1_compile_config(), image, &input, 20_000_000_000_000);
     let fs = Fs::open(&data).unwrap();
+    let show = |w: &Option<Vec<u8>>| match w {
+        Some(t) => format!("{} bytes", t.len()),
+        None => "(no file)".to_string(),
+    };
     let mut wrong = Vec::new();
-    for (i, ((k, _), (text, said))) in jobs.iter().zip(want).enumerate() {
-        let want_said = if text.is_some() {
-            said
-        } else {
-            format!("{said}cc1: exit 1\n")
+    for run in &runs {
+        let got = shell_output(&out, &run.command).replace('\r', "");
+        // The run's exit status, then each input's lines: those that name
+        // its file (or a header next to it), and those after them that name
+        // none (clang's fatal error past the error limit).
+        let refused = run.jobs.iter().any(|(_, j)| j.want.0.is_none());
+        let want_status = if refused { "cc1: exit 1" } else { "" };
+        let (body, got_status) = match got.trim_end_matches('\n').rsplit_once('\n') {
+            Some((body, last)) if last.starts_with("cc1: exit ") => (format!("{body}\n"), last),
+            None if got.starts_with("cc1: exit ") => (String::new(), got.trim_end()),
+            _ => (got.clone(), ""),
         };
-        let got_said = shell_output(&out, &commands[i]).replace('\r', "");
-        let written = fs.read_file(&format!("/out/{k}")).ok();
-        let want_written = text.map(String::into_bytes);
-        if got_said != want_said {
+        if got_status != want_status {
             wrong.push(format!(
-                "{}: said\n{got_said}\nmerlin says\n{want_said}",
-                commands[i]
+                "{}: exit status {got_status:?}, merlin's {want_status:?}",
+                run.command
             ));
         }
-        if written != want_written {
-            let show = |w: &Option<Vec<u8>>| match w {
-                Some(t) => format!("{} bytes", t.len()),
-                None => "(no file)".to_string(),
+        // What the run said is merlin's for its inputs, one after another;
+        // where it is not, each input's lines are picked out of it by the
+        // file they name, for the message.
+        let want_body: String = run.jobs.iter().map(|(_, j)| j.want.1.as_str()).collect();
+        let mut said: Vec<String> = run.jobs.iter().map(|(_, j)| j.want.1.clone()).collect();
+        if body != want_body {
+            said = vec![String::new(); run.jobs.len()];
+        }
+        let mut current = 0;
+        for line in body.lines().filter(|_| body != want_body) {
+            if let Some(i) = run.jobs.iter().position(|(_, j)| {
+                let file = &j.input;
+                let dir = file.rsplit_once('/').map_or("", |(d, _)| d);
+                line.starts_with(&format!("{file}:"))
+                    || (!dir.is_empty() && line.starts_with(&format!("{dir}/")))
+            }) {
+                current = i;
+            }
+            said[current].push_str(line);
+            said[current].push('\n');
+        }
+        let before = wrong.len();
+        for (i, (_, job)) in run.jobs.iter().enumerate() {
+            if said[i] != job.want.1 {
+                wrong.push(format!(
+                    "{} ({}): said\n{}\nmerlin says\n{}",
+                    run.command, job.input, said[i], job.want.1
+                ));
+            }
+        }
+        if body != want_body && wrong.len() == before {
+            wrong.push(format!("{}: said\n{body}\nmerlin says\n{want_body}", run.command));
+        }
+        for (k, job) in &run.jobs {
+            let text = &job.want.0;
+            let out_path = if job.input.starts_with('/') {
+                format!("/out/{k}")
+            } else {
+                format!("/d/{}", job.input.replace(".c", ".s"))
             };
-            wrong.push(format!(
-                "{}: wrote {}, merlin writes {}",
-                commands[i],
-                show(&written),
-                show(&want_written)
-            ));
+            let written = fs.read_file(&out_path).ok();
+            let want_written = text.clone().map(String::into_bytes);
+            if written != want_written {
+                wrong.push(format!(
+                    "{} ({}): wrote {}, merlin writes {}",
+                    run.command,
+                    job.input,
+                    show(&written),
+                    show(&want_written)
+                ));
+            }
         }
     }
     wrong
@@ -2862,7 +3021,7 @@ fn compile_corpus(corpus: Corpus, jobs: usize, compiled: usize, warned: usize, r
 /// of merlin's diagnostics, what compiles, warns and is refused.
 #[test]
 fn the_compiler_on_camelot_writes_what_merlin_writes() {
-    compile_corpus(Corpus::Sample, 200, 80, 80, 20);
+    compile_corpus(Corpus::Sample, 420, 20, 100, 250);
 }
 
 /// `/bin/cc1` compiles some of itself on Camelot ([`OWN_SAMPLE`]): the
