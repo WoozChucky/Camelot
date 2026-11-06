@@ -1,6 +1,9 @@
 # Test binaries and example ELFs are committed so no cross toolchain is needed.
 *.elf binary
 *.o binary
+*.a binary
+# A text member of the archive fixtures, archived byte for byte.
+crates/elf/tests/archive/*.txt -text
 *.img binary
 *.pcap binary
 tests/riscv-tests/rv* binary

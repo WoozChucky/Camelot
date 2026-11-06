@@ -10,13 +10,16 @@
 //! for both (`u64`, an `i64` addend); [`Elf::class`] says which one it was.
 //!
 //! Shared by Grail (loads executables), merlin-objdump (prints everything),
-//! merlin-ld (reads `.o` files) and merlin-dbg. It only reads; merlin-as and
-//! merlin-ld write their own output. Every offset taken from the file is
-//! bounds checked, so a truncated or corrupt file gives an [`Error`], never a
+//! merlin-ld (reads `.o` files and archives) and merlin-dbg. It reads ELF
+//! files only: merlin-as and merlin-ld write their own output. [`archive`]
+//! reads `ar` archives and writes them too, as `cargo xtask fs` writes the
+//! root image's `libc.a`. Every offset taken from the file is bounds
+//! checked, so a truncated or corrupt file gives an [`Error`], never a
 //! panic.
 
 use std::fmt;
 
+pub mod archive;
 pub mod dies;
 pub mod lines;
 pub mod units;
