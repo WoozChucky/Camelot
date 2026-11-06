@@ -1861,9 +1861,10 @@ fn on_a_read_only_root_every_change_fails_and_reading_works() {
 }
 
 #[test]
-fn ls_reports_an_entry_it_cannot_open_rather_than_leaving_it_out() {
-    // ls looks each entry up by opening it: a device node with no driver
-    // can't be, and ls says so where the host lists it, and fails.
+fn ls_lists_an_entry_it_cannot_open_as_the_host_does() {
+    // ls looks each entry up with stat(), which opens nothing: a device
+    // node with no driver, which open() refuses, is listed as the host
+    // lists it.
     let image = small_image_with_programs(&["sh", "ls"]);
     let host = Fs::open(&image).unwrap().ls("/dev").unwrap();
     let run = boot(
@@ -1874,20 +1875,9 @@ fn ls_reports_an_entry_it_cannot_open_rather_than_leaving_it_out() {
             ..READ
         },
     );
-    assert_eq!(run.result, RunResult::Exited(1), "{}", run.out);
-    let mut want: String = host
-        .lines()
-        .map(|l| {
-            if l.ends_with(" nodriver") {
-                "ls: /dev/nodriver: no such device\n".to_string()
-            } else {
-                format!("{l}\n")
-            }
-        })
-        .collect();
-    assert!(want.contains("nodriver"), "{host}");
-    want.push_str("ls: exit 1\n");
-    assert_eq!(shell_output(&run.out, "ls /dev"), want);
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    assert!(host.contains(" nodriver"), "{host}");
+    assert_eq!(shell_output(&run.out, "ls /dev"), host);
 }
 
 /// The crash tests that stop the machine after every sector a test writes,

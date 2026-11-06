@@ -12,6 +12,8 @@ const char *strerror(int err) {
         return "no such process";
     case EINTR:
         return "interrupted";
+    case ENXIO:
+        return "no such device or address";
     case E2BIG:
         return "argument list too long";
     case ENOEXEC:
@@ -72,6 +74,8 @@ const char *strerror(int err) {
         return "message too long";
     case ENOPROTOOPT:
         return "protocol not available";
+    case ESOCKTNOSUPPORT:
+        return "socket type not supported";
     case EPROTONOSUPPORT:
         return "protocol not supported";
     case EOPNOTSUPP:

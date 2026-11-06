@@ -32,6 +32,7 @@
 #include "timer.h"
 #include "trap.h"
 #include "types.h"
+#include "unix.h"
 #include "uart.h"
 #include "vm.h"
 #include "vmtest.h"
@@ -376,6 +377,7 @@ int kmain(void) {
     file_init();
     mmap_init();
     shm_init();
+    unix_init();
     /* The PLIC, then the display, which needs no interrupt to start: its
      * mappings take a while, done before the timer's first interval. */
     plic_init();

@@ -57,6 +57,7 @@ typedef unsigned long long uint64_t;
 #define ENOENT 2        /* no such file or directory */
 #define ESRCH 3         /* kill: no such process; thread_join: no such thread */
 #define EINTR 4         /* a wait ended because the process was killed */
+#define ENXIO 6         /* open: a socket's inode, which only connect() reaches */
 #define E2BIG 7         /* spawn, exec: argument list too long */
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
@@ -88,8 +89,9 @@ typedef unsigned long long uint64_t;
 #define EMSGSIZE 90     /* a datagram too big for one packet */
 #define ENOPROTOOPT 92  /* setsockopt: an option sockets don't have */
 #define EPROTONOSUPPORT 93 /* socket: a protocol the type doesn't have */
+#define ESOCKTNOSUPPORT 94 /* socket, socketpair: a local socket of a type other than SOCK_STREAM */
 #define EOPNOTSUPP 95   /* listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses */
-#define EAFNOSUPPORT 97 /* an address family other than AF_INET */
+#define EAFNOSUPPORT 97 /* socket: neither AF_INET nor AF_UNIX; a TCP or UDP socket's address not AF_INET */
 #define EADDRINUSE 98   /* a port that is taken */
 #define EADDRNOTAVAIL 99 /* bind: an address that is not this host's */
 #define ENETUNREACH 101 /* no route: no address yet, or no gateway */
@@ -360,8 +362,11 @@ struct ping_reply {
     uint rtt_us; /* the round trip, in microseconds */
 };
 
-/* Sockets (docs/camelot-syscalls.md, "Sockets"): IPv4 only, TCP
- * (SOCK_STREAM) and UDP (SOCK_DGRAM). Linux's values and layout. */
+/* Sockets (docs/camelot-syscalls.md, "Sockets" and "Local sockets"):
+ * IPv4's TCP (SOCK_STREAM) and UDP (SOCK_DGRAM), and local streams
+ * (AF_UNIX, SOCK_STREAM). Linux's values and layout. */
+#define AF_UNIX 1
+#define AF_LOCAL AF_UNIX
 #define AF_INET 2
 #define SOCK_STREAM 1
 #define SOCK_DGRAM 2
@@ -372,6 +377,14 @@ struct ping_reply {
 #define SHUT_RDWR 2 /* neither */
 #define SOL_SOCKET 1   /* setsockopt: the socket's own options */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait (a struct timeval) */
+#define SCM_RIGHTS 1   /* a control message of descriptors (ints) */
+
+/* sendmsg's and recvmsg's flags. */
+#define MSG_CTRUNC 0x8              /* recvmsg: descriptors that did not fit were closed */
+#define MSG_TRUNC 0x20              /* recvmsg: a datagram's end did not fit */
+#define MSG_DONTWAIT 0x40           /* -EAGAIN rather than wait (local sockets) */
+#define MSG_NOSIGNAL 0x4000         /* nothing to do: Camelot has no SIGPIPE */
+#define MSG_CMSG_CLOEXEC 0x40000000 /* recvmsg: the descriptors close on exec */
 
 /* poll(): the descriptors and what to wait for (kernel/include/poll.h,
  * docs/camelot-syscalls.md "Polling"). Linux's values and layout. */
@@ -555,6 +568,51 @@ struct sockaddr_in {
     uchar sin_zero[8];
 };
 
+/* A local socket's address: 110 bytes, a path that ends with a NUL. */
+#define UNIX_PATH_MAX 108
+
+struct sockaddr_un {
+    ushort sun_family; /* AF_UNIX */
+    char sun_path[UNIX_PATH_MAX];
+};
+
+/* sendmsg and recvmsg's message (56 bytes): an address, the buffers to
+ * gather from or scatter into (16 bytes each), and the control messages,
+ * each a struct cmsghdr (16 bytes) and its data, 8-byte aligned. */
+struct iovec {
+    void *iov_base;
+    size_t iov_len;
+};
+
+struct msghdr {
+    void *msg_name;        /* an address, or NULL */
+    uint msg_namelen;      /* its size; recvmsg: what it stored */
+    struct iovec *msg_iov;
+    size_t msg_iovlen;
+    void *msg_control;     /* the control messages, or NULL */
+    size_t msg_controllen; /* their size; recvmsg: what it stored */
+    int msg_flags;         /* recvmsg: MSG_CTRUNC, MSG_TRUNC */
+};
+
+struct cmsghdr {
+    size_t cmsg_len; /* CMSG_LEN of the data */
+    int cmsg_level;  /* SOL_SOCKET */
+    int cmsg_type;   /* SCM_RIGHTS */
+};
+
+/* Linux's: a message's length for `len` bytes of data, the room it takes
+ * with its padding, its data, and the first and next messages of a struct
+ * msghdr (NULL at the end; lib/cmsg.c). */
+#define CMSG_ALIGN(len) (((len) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
+#define CMSG_LEN(len) (sizeof(struct cmsghdr) + (len))
+#define CMSG_SPACE(len) (sizeof(struct cmsghdr) + CMSG_ALIGN(len))
+#define CMSG_DATA(cmsg) ((unsigned char *)((struct cmsghdr *)(cmsg) + 1))
+#define CMSG_FIRSTHDR(msg)                                                                       \
+    ((msg)->msg_controllen >= sizeof(struct cmsghdr) ? (struct cmsghdr *)(msg)->msg_control \
+                                                      : (struct cmsghdr *)NULL)
+#define CMSG_NXTHDR(msg, cmsg) cmsg_nxthdr((msg), (cmsg))
+struct cmsghdr *cmsg_nxthdr(struct msghdr *msg, struct cmsghdr *cmsg);
+
 /* The system calls, with Linux's types: a call that returns a count of
  * bytes returns an ssize_t, lseek an off_t; sbrk the old end of the heap
  * and mmap the new mapping's address, a pointer, or minus an error number
@@ -587,17 +645,17 @@ int netinfo(struct netinfo *info);
 int netconf(uint addr, uint mask, uint gateway);
 int ping(uint addr, uint seq, struct ping_reply *reply);
 int socket(int domain, int type, int protocol);
-int bind(int fd, const struct sockaddr_in *addr);
+int bind(int fd, const void *addr);
 int listen(int fd, int backlog);
-int accept(int fd, struct sockaddr_in *addr);
-int connect(int fd, const struct sockaddr_in *addr);
+int accept(int fd, void *addr);
+int connect(int fd, const void *addr);
 ssize_t send(int fd, const void *buf, size_t len);
 ssize_t recv(int fd, void *buf, size_t len);
-ssize_t sendto(int fd, const void *buf, size_t len, const struct sockaddr_in *to);
-ssize_t recvfrom(int fd, void *buf, size_t len, struct sockaddr_in *from);
+ssize_t sendto(int fd, const void *buf, size_t len, const void *to);
+ssize_t recvfrom(int fd, void *buf, size_t len, void *from);
 int shutdown(int fd, int how);
-int getsockname(int fd, struct sockaddr_in *addr);
-int getpeername(int fd, struct sockaddr_in *addr);
+int getsockname(int fd, void *addr);
+int getpeername(int fd, void *addr);
 int setsockopt(int fd, int level, int option, const void *value, uint len);
 int thread_create(void (*entry)(void *), void *arg, void *stack);
 void thread_exit(int status);
@@ -613,6 +671,10 @@ int memfd_create(const char *name, uint flags);
 int ftruncate(int fd, off_t length);
 int ioctl(int fd, unsigned long request, ...);
 int poll(struct pollfd *fds, unsigned long nfds, int timeout);
+int socketpair(int domain, int type, int protocol, int *fds);
+ssize_t sendmsg(int fd, const struct msghdr *msg, int flags);
+ssize_t recvmsg(int fd, struct msghdr *msg, int flags);
+int stat(const char *path, struct stat *st);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);
@@ -788,10 +850,6 @@ char *inet_ntoa(struct in_addr a);
 void sockaddr_set(struct sockaddr_in *sa, uint addr, uint port);
 int resolve(const char *host, struct in_addr *addr);
 const char *resolve_error(int err);
-
-/* fstat() on the file at `path`: opens it for reading, then closes it.
- * Returns 0 or the error (lib/stat.c). */
-int stat(const char *path, struct stat *st);
 
 /* Kills every process `pid` started that has not ended, and theirs, down
  * to the last generation, from one procs() snapshot: the youngest first,

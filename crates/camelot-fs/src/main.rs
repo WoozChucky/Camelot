@@ -194,7 +194,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                     }
                     println!(
                         "{}: clean: {} blocks ({} used, {} free), {} inodes ({} free), \
-                         {} directories, {} files, {} devices",
+                         {} directories, {} files, {} devices, {} sockets",
                         path.display(),
                         r.sb.size,
                         r.used_blocks,
@@ -203,7 +203,8 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                         r.free_inodes,
                         r.dirs,
                         r.files,
-                        r.devices
+                        r.devices,
+                        r.sockets
                     );
                     print_boot(&image);
                     Ok(ExitCode::SUCCESS)

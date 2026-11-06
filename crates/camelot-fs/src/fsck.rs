@@ -12,9 +12,9 @@
 
 use crate::extent::{self, empty_root};
 use crate::{
-    block, block_mut, contents, dirents, read_inode, show_name, superblock, valid_name, write_inode, Dinode,
-    LogHeader, Superblock, BITS_PER_BLOCK, BSIZE, DIRENT_SIZE, MAX_FILE_SIZE, NO_INODE, ROOT_INODE,
-    TRUNCATING, T_DEVICE, T_DIR, T_FILE, T_FREE,
+    block, block_mut, contents, dirents, no_contents, read_inode, show_name, superblock, valid_kind,
+    valid_name, write_inode, Dinode, LogHeader, Superblock, BITS_PER_BLOCK, BSIZE, DIRENT_SIZE,
+    MAX_FILE_SIZE, NO_INODE, ROOT_INODE, TRUNCATING, T_DEVICE, T_DIR, T_FILE, T_FREE, T_SOCKET,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -47,7 +47,7 @@ pub fn recover(image: &mut [u8]) -> Result<usize, String> {
 /// nothing, if its tree is broken.
 fn free_blocks(image: &mut [u8], sb: &Superblock, inum: u32) -> Result<Dinode, String> {
     let mut d = read_inode(image, sb, inum);
-    if d.kind == T_DEVICE {
+    if no_contents(d.kind) {
         return Ok(d);
     }
     let map = extent::walk(image, sb, &d.root).map_err(|e| format!("inode {inum}: {e}"))?;
@@ -114,11 +114,12 @@ pub struct Report {
     pub dirs: u32,
     pub files: u32,
     pub devices: u32,
+    pub sockets: u32,
     /// Inodes of type 0, inode 0 not counted.
     pub free_inodes: u32,
     /// Orphans: allocated inodes with no links and in no directory, which
-    /// the next mount (or [`free_orphans`]) frees. Counted in `dirs`, `files`
-    /// or `devices` too, and their blocks in `used_blocks`.
+    /// the next mount (or [`free_orphans`]) frees. Counted in `dirs`, `files`,
+    /// `devices` or `sockets` too, and their blocks in `used_blocks`.
     pub orphans: u32,
     /// Files with links and `TRUNCATING` set, whose remaining blocks the next
     /// mount (or [`finish_truncations`]) frees. Their blocks count in
@@ -155,6 +156,7 @@ pub fn check(image: &[u8]) -> Result<Report, Vec<String>> {
         dirs: 0,
         files: 0,
         devices: 0,
+        sockets: 0,
         free_inodes: 0,
         orphans,
         truncating: c.truncating,
@@ -166,6 +168,7 @@ pub fn check(image: &[u8]) -> Result<Report, Vec<String>> {
             T_DIR => r.dirs += 1,
             T_FILE => r.files += 1,
             T_DEVICE => r.devices += 1,
+            T_SOCKET => r.sockets += 1,
             _ => r.free_inodes += 1,
         }
     }
@@ -189,6 +192,7 @@ fn type_name(kind: u16) -> &'static str {
         T_DIR => "directory",
         T_FILE => "file",
         T_DEVICE => "device",
+        T_SOCKET => "socket",
         _ => "inode",
     }
 }
@@ -227,8 +231,8 @@ impl Checker<'_> {
                 self.problem(format!("inode 0 has type {}, but is never used", d.kind));
                 continue;
             }
-            if d.kind > T_DEVICE {
-                self.problem(format!("inode {inum}: type {} is not 0 to 3", d.kind));
+            if !valid_kind(d.kind) {
+                self.problem(format!("inode {inum}: type {} is not 0 to 3 or 5", d.kind));
                 continue;
             }
             if d.kind != T_DEVICE && (d.major != 0 || d.minor != 0) {
@@ -255,9 +259,9 @@ impl Checker<'_> {
                 ));
                 continue;
             }
-            if d.kind == T_DEVICE {
+            if no_contents(d.kind) {
                 if d.size != 0 || d.root.iter().any(|&x| x != 0) || truncating {
-                    self.problem(format!("inode {inum}: a device with contents"));
+                    self.problem(format!("inode {inum}: a {} with contents", type_name(d.kind)));
                     continue;
                 }
                 self.sound[inum as usize] = true;
@@ -451,7 +455,7 @@ impl Checker<'_> {
         let mut orphans = 0;
         for inum in 1..self.sb.ninodes {
             let d = read_inode(self.image, &self.sb, inum);
-            if d.kind == T_FREE || d.kind > T_DEVICE {
+            if !valid_kind(d.kind) {
                 continue;
             }
             let n = refs.get(&inum).copied().unwrap_or(0);
@@ -508,6 +512,44 @@ mod tests {
         assert_eq!(r.used_blocks, 3 + 21 + 1);
         assert_eq!(r.truncating, 0);
         assert_eq!(r.free_blocks, r.sb.nblocks - r.used_blocks);
+    }
+
+    #[test]
+    fn a_socket_is_a_name_with_no_contents() {
+        // The kernel's bind() makes one: type 5, nothing else but a link.
+        let mut image = sample();
+        let sb = superblock(&image).unwrap();
+        let i = inode_of(&image, "/console");
+        edit_inode(&mut image, &sb, i, |d| {
+            d.kind = T_SOCKET;
+            d.major = 0;
+            d.minor = 0;
+        });
+        let r = check(&image).unwrap();
+        assert_eq!((r.dirs, r.files, r.devices, r.sockets), (3, 3, 0, 1));
+        let fs = crate::read::Fs::open(&image).unwrap();
+        assert!(fs
+            .ls("/")
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with('s') && l.ends_with(" console")));
+        for (want, kind, size, major) in [
+            ("a socket with contents", T_SOCKET, 1, 0),
+            ("a socket with device numbers", T_SOCKET, 0, 1),
+            ("type 4 is not 0 to 3 or 5", 4, 0, 0),
+        ] {
+            let mut bad = image.clone();
+            edit_inode(&mut bad, &sb, i, |d| {
+                d.kind = kind;
+                d.size = size;
+                d.major = major;
+            });
+            let problems = check(&bad).expect_err(want);
+            assert!(
+                problems.iter().any(|p| p.contains(want)),
+                "want `{want}`, got {problems:#?}"
+            );
+        }
     }
 
     /// Checks `image` after `f` broke it: one of the problems must contain

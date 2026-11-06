@@ -19,6 +19,8 @@
  *              are recv() and send()
  *   FD_SHM     a shared-memory object (memfd_create, shm.h): mapped with
  *              mmap() and sized with ftruncate(), not read or written
+ *   FD_UNIX    a local socket (unix.h, net/unix.c): reads and writes are
+ *              its recv() and send()
  *
  * Every function here runs in a process's kernel thread (they may sleep,
  * for the disk or a pipe) and takes user addresses in that process's page
@@ -53,11 +55,13 @@
 #define FD_DEVICE 3
 #define FD_SOCKET 4
 #define FD_SHM 5
+#define FD_UNIX 6
 
 struct pipe;
 struct poll_table;
 struct socket;
 struct shm_object;
+struct unix_sock;
 
 struct file {
     u32 type;
@@ -67,6 +71,7 @@ struct file {
     struct pipe *pipe;  /* FD_PIPE */
     struct socket *sock; /* FD_SOCKET */
     struct shm_object *shm; /* FD_SHM, with a reference the file holds */
+    struct unix_sock *usock; /* FD_UNIX */
     struct inode *ip;   /* FD_INODE, and FD_DEVICE opened by its path */
     u64 off;            /* FD_INODE: at most MAXFILE_BYTES (fs.h) */
     u16 major;          /* FD_DEVICE */
@@ -139,7 +144,8 @@ void device_vm_close(u32 major);
 long fileioctl(struct file *f, u32 request, uintptr arg);
 
 /* poll() on `f` (poll.h): the POLL bits it is ready for, its channels
- * added to `pt`. A pipe, a socket or a device with a poll hook says; a
+ * added to `pt`. A pipe, a socket (local or not) or a device with a poll
+ * hook says; a
  * file on the disk, a shared-memory object and any other device are
  * always ready to read and write (Linux's DEFAULT_POLLMASK). */
 u32 filepoll(struct file *f, struct poll_table *pt);
@@ -155,8 +161,9 @@ struct file *filealloc(void);
 struct file *filedup(struct file *f);
 
 /* Drops a reference; the last one closes the file: a pipe end is closed
- * (pipeclose), a socket closed (socket_close), an inode let go (iput, in a transaction of its own, which
- * frees it if it was unlinked meanwhile). */
+ * (pipeclose), a socket closed (socket_close, unix_close), an inode let go
+ * (iput, in a transaction of its own, which frees it if it was unlinked
+ * meanwhile). */
 void fileclose(struct file *f);
 
 /* A console file: FD_DEVICE with major CONSOLE, readable or writable as
@@ -191,6 +198,9 @@ off_t filelseek(struct file *f, off_t offset, u32 whence);
 
 /* fstat(): fills *st. */
 void filestat(struct file *f, struct stat *st);
+
+/* What fstat() and stat() say of the locked inode `ip`, into *st. */
+void inode_stat(struct inode *ip, struct stat *st);
 
 /* memfd_create(): a new open file, readable and writable, for a new empty
  * shared-memory object (FD_SHM): -ENFILE if the table of files or of

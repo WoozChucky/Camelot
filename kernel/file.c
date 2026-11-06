@@ -17,6 +17,7 @@
 #include "shm.h"
 #include "string.h"
 #include "trap.h"
+#include "unix.h"
 
 static struct file ftable[NFILE];
 
@@ -93,6 +94,9 @@ u32 filepoll(struct file *f, struct poll_table *pt) {
     if (f->type == FD_SOCKET) {
         return socket_poll(f->sock, pt);
     }
+    if (f->type == FD_UNIX) {
+        return unix_poll(f->usock, pt);
+    }
     if (f->type == FD_DEVICE && devsw[f->major].poll != NULL) {
         return devsw[f->major].poll(f, pt);
     }
@@ -158,6 +162,8 @@ void fileclose(struct file *f) {
         pipeclose(closed.pipe, closed.writable);
     } else if (closed.type == FD_SOCKET) {
         socket_close(closed.sock);
+    } else if (closed.type == FD_UNIX) {
+        unix_close(closed.usock);
     } else if (closed.type == FD_SHM) {
         /* The object stays while a mapping holds it. */
         shm_put(closed.shm);
@@ -306,6 +312,9 @@ isize fileread(struct file *f, pagetable_t pt, uintptr dst, usize n) {
     if (n == 0) {
         return 0;
     }
+    if (f->type == FD_UNIX) {
+        return unix_read(f->usock, pt, dst, n);
+    }
     if (f->type == FD_PIPE) {
         return piperead(f->pipe, pt, dst, n);
     }
@@ -338,6 +347,9 @@ isize filewrite(struct file *f, pagetable_t pt, uintptr src, usize n) {
     }
     if (n == 0) {
         return 0;
+    }
+    if (f->type == FD_UNIX) {
+        return unix_write(f->usock, pt, src, n);
     }
     if (f->type == FD_PIPE) {
         return pipewrite(f->pipe, pt, src, n);
@@ -396,6 +408,10 @@ void filestat(struct file *f, struct stat *st) {
         st->nlink = socket_hung_up(f->sock) ? 0 : 1;
         return;
     }
+    if (f->type == FD_UNIX) {
+        unix_stat(f->usock, st);
+        return;
+    }
     if (f->type == FD_SHM) {
         /* A regular file to Linux's fstat too, with no inode number. */
         st->type = T_FILE;
@@ -410,13 +426,18 @@ void filestat(struct file *f, struct stat *st) {
         return;
     }
     ilock(f->ip);
-    st->ino = f->ip->inum;
-    st->type = f->ip->type;
-    st->nlink = f->ip->nlink;
-    st->size = f->ip->size;
-    st->major = f->ip->major;
-    st->minor = f->ip->minor;
+    inode_stat(f->ip, st);
     iunlock(f->ip);
+}
+
+void inode_stat(struct inode *ip, struct stat *st) {
+    memset(st, 0, sizeof *st);
+    st->ino = ip->inum;
+    st->type = ip->type;
+    st->nlink = ip->nlink;
+    st->size = ip->size;
+    st->major = ip->major;
+    st->minor = ip->minor;
 }
 
 int filemmap(struct file *f, u32 type, u32 prot, u64 offset, usize size, struct vm_area *a) {

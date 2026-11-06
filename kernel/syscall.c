@@ -9,7 +9,8 @@
  * copies through the physical pages (copyin, copyout, copyinstr in vm.c), so
  * a bad pointer is an -EFAULT, never a fault in the kernel. The calls on
  * files and paths are in sysfile.c; running programs in exec.c; the
- * network's in net/net.c, and the sockets' in net/socket.c. */
+ * network's in net/net.c, the sockets' in net/socket.c, and local
+ * sockets' in net/unix.c. */
 #include "syscall.h"
 #include "exec.h"
 #include "kalloc.h"
@@ -20,6 +21,7 @@
 #include "proc.h"
 #include "string.h"
 #include "sysfile.h"
+#include "unix.h"
 #include "vm.h"
 
 /* The arguments as the process passed them: a register each. */
@@ -200,9 +202,24 @@ static long sys_harts(struct trap_frame *f) {
 }
 
 /* Whether call `num` goes into the network stack: netinfo to setsockopt,
- * numbered one after another. They run under net_lock (net.h). */
+ * numbered one after another, and sendmsg and recvmsg. They run under
+ * net_lock (net.h), but for a local socket's. */
 static bool is_net_call(uintptr num) {
-    return num >= SYS_netinfo && num <= SYS_setsockopt;
+    return (num >= SYS_netinfo && num <= SYS_setsockopt) || num == SYS_sendmsg || num == SYS_recvmsg;
+}
+
+/* Whether socket call `num` is a local socket's (unix.h): socket() in
+ * AF_UNIX, socketpair(), or a call on a descriptor that is a local socket.
+ * They go to net/unix.c, without net_lock. */
+static bool is_local_call(uintptr num, struct trap_frame *f) {
+    if (num == SYS_socket) {
+        return (u32)arg(f, 0) == AF_UNIX;
+    }
+    if (num == SYS_socketpair) {
+        return true;
+    }
+    bool on_fd = (num >= SYS_bind && num <= SYS_setsockopt) || num == SYS_sendmsg || num == SYS_recvmsg;
+    return on_fd && unix_fd((u32)arg(f, 0));
 }
 
 void syscall(struct trap_frame *f) {
@@ -220,7 +237,8 @@ void syscall(struct trap_frame *f) {
         kprintf("pid %u (%s) killed: no memory to grow its stack to " REG_FMT "\n", p->pid, p->name, sp);
         proc_exit(-1);
     }
-    bool net = is_net_call(num);
+    bool local = is_local_call(num, f);
+    bool net = !local && is_net_call(num);
     if (net) {
         acquire(&net_lock);
     }
@@ -308,43 +326,60 @@ void syscall(struct trap_frame *f) {
         ret = net_sys_ping((u32)arg(f, 0), (u32)arg(f, 1), arg(f, 2));
         break;
     case SYS_socket:
-        ret = sock_sys_socket((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2));
+        ret = local ? unix_sys_socket((u32)arg(f, 1), (u32)arg(f, 2))
+                    : sock_sys_socket((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2));
         break;
     case SYS_bind:
-        ret = sock_sys_bind((u32)arg(f, 0), arg(f, 1));
+        ret = local ? unix_sys_bind((u32)arg(f, 0), arg(f, 1)) : sock_sys_bind((u32)arg(f, 0), arg(f, 1));
         break;
     case SYS_listen:
-        ret = sock_sys_listen((u32)arg(f, 0), (u32)arg(f, 1));
+        ret = local ? unix_sys_listen((u32)arg(f, 0), (u32)arg(f, 1)) : sock_sys_listen((u32)arg(f, 0), (u32)arg(f, 1));
         break;
     case SYS_accept:
-        ret = sock_sys_accept((u32)arg(f, 0), arg(f, 1));
+        ret = local ? unix_sys_accept((u32)arg(f, 0), arg(f, 1)) : sock_sys_accept((u32)arg(f, 0), arg(f, 1));
         break;
     case SYS_connect:
-        ret = sock_sys_connect((u32)arg(f, 0), arg(f, 1));
+        ret = local ? unix_sys_connect((u32)arg(f, 0), arg(f, 1)) : sock_sys_connect((u32)arg(f, 0), arg(f, 1));
         break;
     case SYS_send:
-        ret = sock_sys_send((u32)arg(f, 0), arg(f, 1), arg(f, 2));
+        ret = local ? unix_sys_sendto((u32)arg(f, 0), arg(f, 1), arg(f, 2), 0)
+                    : sock_sys_send((u32)arg(f, 0), arg(f, 1), arg(f, 2));
         break;
     case SYS_recv:
-        ret = sock_sys_recv((u32)arg(f, 0), arg(f, 1), arg(f, 2));
+        ret = local ? unix_sys_recvfrom((u32)arg(f, 0), arg(f, 1), arg(f, 2), 0)
+                    : sock_sys_recv((u32)arg(f, 0), arg(f, 1), arg(f, 2));
         break;
     case SYS_sendto:
-        ret = sock_sys_sendto((u32)arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
+        ret = local ? unix_sys_sendto((u32)arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3))
+                    : sock_sys_sendto((u32)arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
         break;
     case SYS_recvfrom:
-        ret = sock_sys_recvfrom((u32)arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
+        ret = local ? unix_sys_recvfrom((u32)arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3))
+                    : sock_sys_recvfrom((u32)arg(f, 0), arg(f, 1), arg(f, 2), arg(f, 3));
         break;
     case SYS_shutdown:
-        ret = sock_sys_shutdown((u32)arg(f, 0), (u32)arg(f, 1));
+        ret = local ? unix_sys_shutdown((u32)arg(f, 0), (u32)arg(f, 1)) : sock_sys_shutdown((u32)arg(f, 0), (u32)arg(f, 1));
         break;
     case SYS_getsockname:
-        ret = sock_sys_name((u32)arg(f, 0), arg(f, 1), false);
+        ret = local ? unix_sys_name((u32)arg(f, 0), arg(f, 1), false) : sock_sys_name((u32)arg(f, 0), arg(f, 1), false);
         break;
     case SYS_getpeername:
-        ret = sock_sys_name((u32)arg(f, 0), arg(f, 1), true);
+        ret = local ? unix_sys_name((u32)arg(f, 0), arg(f, 1), true) : sock_sys_name((u32)arg(f, 0), arg(f, 1), true);
         break;
     case SYS_setsockopt:
-        ret = sock_sys_setsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), (u32)arg(f, 4));
+        ret = local ? unix_sys_setsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), (u32)arg(f, 4))
+                    : sock_sys_setsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), (u32)arg(f, 4));
+        break;
+    case SYS_socketpair:
+        ret = unix_sys_socketpair((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3));
+        break;
+    case SYS_sendmsg:
+        ret = local ? unix_sys_sendmsg((u32)arg(f, 0), arg(f, 1), (u32)arg(f, 2))
+                    : sock_sys_sendmsg((u32)arg(f, 0), arg(f, 1), (u32)arg(f, 2));
+        break;
+    case SYS_recvmsg:
+        ret = local ? unix_sys_recvmsg((u32)arg(f, 0), arg(f, 1), (u32)arg(f, 2))
+                    : sock_sys_recvmsg((u32)arg(f, 0), arg(f, 1), (u32)arg(f, 2));
         break;
     case SYS_harts:
         ret = sys_harts(f);
@@ -391,6 +426,9 @@ void syscall(struct trap_frame *f) {
         break;
     case SYS_poll:
         ret = sys_poll(arg(f, 0), arg(f, 1), (long)arg(f, 2));
+        break;
+    case SYS_stat:
+        ret = sys_stat(f);
         break;
     default:
         ret = -ENOSYS;

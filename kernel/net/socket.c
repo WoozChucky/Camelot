@@ -24,6 +24,8 @@
  * stays, and leaves it in the thread's `net_file` for syscall() to let go
  * of once net_lock is free (the last close takes net_lock). */
 #include "file.h"
+#include "kalloc.h"
+#include "msg.h"
 #include "net.h"
 #include "poll.h"
 #include "proc.h"
@@ -169,13 +171,14 @@ static u32 clamp_len(usize n) {
     return n > MAX_LEN ? MAX_LEN : (u32)n;
 }
 
-/* Sends `n` bytes at user address `src`: on a stream, into the
- * connection; as a datagram, to `addr`:`port` if `to`, else to the peer
- * the socket is connected to. */
-static int sock_send(struct socket *s, uintptr src, u32 n, bool to, u32 addr, u32 port) {
+/* Sends `n` bytes at address `src` (in `pt`'s user memory, or kernel
+ * memory when `pt` is NULL): on a stream, into the connection; as a
+ * datagram, to `addr`:`port` if `to`, else to the peer the socket is
+ * connected to. */
+static int sock_send(struct socket *s, pagetable_t pt, uintptr src, u32 n, bool to, u32 addr, u32 port) {
     if (s->type == SOCK_STREAM) {
         /* An address is ignored: the connection says where (as on Linux). */
-        return tcp_send(s->tcp, user_pt(), src, n);
+        return tcp_send(s->tcp, pt, src, n);
     }
     if (s->wr_shut) {
         return -EPIPE;
@@ -193,12 +196,13 @@ static int sock_send(struct socket *s, uintptr src, u32 n, bool to, u32 addr, u3
     if (err < 0) {
         return err;
     }
-    return udp_sendto(s->udp, addr, port, user_pt(), src, n);
+    return udp_sendto(s->udp, addr, port, pt, src, n);
 }
 
-/* Receives up to `n` bytes into user address `dst`; where they came from
- * in *addr and *port. */
-static int sock_recv(struct socket *s, uintptr dst, u32 n, u32 *addr, u32 *port) {
+/* Receives up to `n` bytes into address `dst` (in `pt`'s user memory, or
+ * kernel memory when `pt` is NULL); where they came from in *addr and
+ * *port. */
+static int sock_recv(struct socket *s, pagetable_t pt, uintptr dst, u32 n, u32 *addr, u32 *port) {
     if (s->rd_shut) {
         return 0;
     }
@@ -209,13 +213,13 @@ static int sock_recv(struct socket *s, uintptr dst, u32 n, u32 *addr, u32 *port)
         if (n == 0) {
             return 0; /* nothing to wait for */
         }
-        return tcp_recv(s->tcp, user_pt(), dst, n, s->rcvtimeo);
+        return tcp_recv(s->tcp, pt, dst, n, s->rcvtimeo);
     }
     if (s->udp == NULL) {
         /* No port: nothing can ever come. */
         return -EINVAL;
     }
-    int len = udp_recvfrom(s->udp, user_pt(), dst, n, addr, port, s->rcvtimeo);
+    int len = udp_recvfrom(s->udp, pt, dst, n, addr, port, s->rcvtimeo);
     if (len == -ETIMEDOUT) {
         return -EAGAIN; /* the receive timeout, as on Linux */
     }
@@ -228,19 +232,17 @@ static int sock_recv(struct socket *s, uintptr dst, u32 n, u32 *addr, u32 *port)
  * already (syscall.c). */
 
 isize socket_read(struct socket *s, pagetable_t pt, uintptr dst, usize n) {
-    (void)pt; /* the current process's, as for every system call */
     u32 addr;
     u32 port;
     acquire(&net_lock);
-    int r = sock_recv(s, dst, clamp_len(n), &addr, &port);
+    int r = sock_recv(s, pt, dst, clamp_len(n), &addr, &port);
     release(&net_lock);
     return r;
 }
 
 isize socket_write(struct socket *s, pagetable_t pt, uintptr src, usize n) {
-    (void)pt;
     acquire(&net_lock);
-    int r = sock_send(s, src, clamp_len(n), false, 0, 0);
+    int r = sock_send(s, pt, src, clamp_len(n), false, 0, 0);
     release(&net_lock);
     return r;
 }
@@ -484,7 +486,7 @@ isize sock_sys_sendto(u32 fd, uintptr ubuf, usize len, uintptr uaddr) {
             return err;
         }
     }
-    return sock_send(s, ubuf, clamp_len(len), uaddr != 0, addr, port);
+    return sock_send(s, user_pt(), ubuf, clamp_len(len), uaddr != 0, addr, port);
 }
 
 isize sock_sys_recvfrom(u32 fd, uintptr ubuf, usize len, uintptr uaddr) {
@@ -498,7 +500,7 @@ isize sock_sys_recvfrom(u32 fd, uintptr ubuf, usize len, uintptr uaddr) {
     }
     u32 addr = 0;
     u32 port = 0;
-    int n = sock_recv(s, ubuf, clamp_len(len), &addr, &port);
+    int n = sock_recv(s, user_pt(), ubuf, clamp_len(len), &addr, &port);
     if (n >= 0 && uaddr != 0) {
         (void)put_addr(uaddr, addr, port);
     }
@@ -580,6 +582,156 @@ int sock_sys_setsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, u32 len) 
     if (s == NULL) {
         return err;
     }
+    return sock_opt_rcvtimeo(level, option, uvalue, len, &s->rcvtimeo);
+}
+
+/* ---- sendmsg and recvmsg ---- */
+
+isize sock_sys_sendmsg(u32 fd, uintptr umsg, u32 flags) {
+    int err;
+    struct socket *s = fd_sock(fd, &err);
+    if (s == NULL) {
+        return err;
+    }
+    pagetable_t pt = user_pt();
+    struct msghdr m;
+    if (msg_get(pt, umsg, &m) < 0) {
+        return -EFAULT;
+    }
+    struct uio io;
+    err = uio_iovec(&io, pt, m.msg_iov, m.msg_iovlen, false);
+    if (err < 0) {
+        return err;
+    }
+    /* An address as sendto's: a stream's is only checked. */
+    bool to = m.msg_name != 0 && m.msg_namelen != 0;
+    u32 addr = 0;
+    u32 port = 0;
+    if (to && s->type == SOCK_STREAM) {
+        if (!uvm_range_ok(pt, m.msg_name, m.msg_namelen, PTE_R)) {
+            return -EFAULT;
+        }
+    } else if (to) {
+        if (m.msg_namelen < sizeof(struct sockaddr_in)) {
+            return -EINVAL;
+        }
+        err = get_addr(m.msg_name, &addr, &port);
+        if (err < 0) {
+            return err;
+        }
+    }
+    /* MSG_DONTWAIT is local sockets' only. */
+    if ((flags & ~(u32)MSG_NOSIGNAL) != 0) {
+        return -EOPNOTSUPP;
+    }
+    struct file *files[SCM_MAX_FD];
+    u32 nfiles;
+    err = scm_get(pt, &m, false, files, &nfiles);
+    if (err < 0) {
+        return err;
+    }
+    /* Gathered a page at a time into the kernel's memory: a datagram whole
+     * (no bigger than UDP_MAX_DATA in any case), a stream piece by piece. */
+    u8 *page = kalloc();
+    if (page == NULL) {
+        return -ENOBUFS;
+    }
+    isize done = 0;
+    if (s->type != SOCK_STREAM) {
+        if (io.resid > PGSIZE) {
+            err = -EMSGSIZE;
+        } else {
+            u32 n = io.resid;
+            err = uio_move(&io, page, n, false);
+            if (err == 0) {
+                err = sock_send(s, NULL, (uintptr)page, n, to, addr, port);
+            }
+        }
+        done = err;
+    } else {
+        do {
+            u32 n = io.resid < PGSIZE ? io.resid : PGSIZE;
+            int r = uio_move(&io, page, n, false);
+            if (r == 0) {
+                r = sock_send(s, NULL, (uintptr)page, n, false, 0, 0);
+            }
+            if (r < 0) {
+                done = done > 0 ? done : r;
+                break;
+            }
+            done += r;
+            if ((u32)r < n) {
+                break; /* killed part way */
+            }
+        } while (io.resid > 0);
+    }
+    kfree(page);
+    return done;
+}
+
+isize sock_sys_recvmsg(u32 fd, uintptr umsg, u32 flags) {
+    int err;
+    struct socket *s = fd_sock(fd, &err);
+    if (s == NULL) {
+        return err;
+    }
+    pagetable_t pt = user_pt();
+    struct msghdr m;
+    if (msg_get(pt, umsg, &m) < 0 || msg_check_out(pt, umsg, &m, sizeof(struct sockaddr_in)) < 0) {
+        return -EFAULT;
+    }
+    struct uio io;
+    err = uio_iovec(&io, pt, m.msg_iov, m.msg_iovlen, true);
+    if (err < 0) {
+        return err;
+    }
+    if ((flags & ~(u32)MSG_CMSG_CLOEXEC) != 0) {
+        return -EOPNOTSUPP;
+    }
+    u8 *page = kalloc();
+    if (page == NULL) {
+        return -ENOBUFS;
+    }
+    /* A datagram whole, to learn whether it fits; a stream's bytes as many
+     * as the buffers take, a page at most. */
+    u32 want = s->type == SOCK_STREAM ? (io.resid < PGSIZE ? io.resid : PGSIZE) : PGSIZE;
+    u32 addr = 0;
+    u32 port = 0;
+    int n = sock_recv(s, NULL, (uintptr)page, want, &addr, &port);
+    u32 oflags = 0;
+    if (n >= 0) {
+        u32 keep = (u32)n < io.resid ? (u32)n : io.resid;
+        if (keep < (u32)n) {
+            oflags |= MSG_TRUNC; /* the rest of the datagram is lost */
+        }
+        /* Checked (uio_iovec): another thread may have unmapped a buffer
+         * since, and then what was received is lost. */
+        if (uio_move(&io, page, keep, true) < 0) {
+            n = -EFAULT;
+        } else {
+            n = (int)keep;
+        }
+    }
+    kfree(page);
+    if (n < 0) {
+        return n;
+    }
+    /* A datagram's sender; a stream's none, as Linux's TCP stores. */
+    u32 namelen = 0;
+    if (s->type != SOCK_STREAM && m.msg_name != 0) {
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        put16((u8 *)&a.sin_port, port);
+        put32((u8 *)&a.sin_addr, addr);
+        namelen = sizeof a;
+        (void)copyout(pt, m.msg_name, &a, m.msg_namelen < namelen ? m.msg_namelen : namelen);
+    }
+    (void)msg_put(pt, umsg, namelen, 0, oflags);
+    return n;
+}
+
+int sock_opt_rcvtimeo(u32 level, u32 option, uintptr uvalue, u32 len, u32 *ticks) {
     struct timeval tv;
     if (len != sizeof tv) {
         return -EINVAL;
@@ -599,6 +751,6 @@ int sock_sys_setsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, u32 len) 
     u32 max_sec = 0xffffffffu / hz - 1;
     /* Compared as a time_t: a 64-bit tv_sec past 2^32 is long, not short. */
     u32 sec = tv.tv_sec > (time_t)max_sec ? max_sec : (u32)tv.tv_sec;
-    s->rcvtimeo = sec * hz + ((u32)tv.tv_usec + usec_per_tick - 1) / usec_per_tick;
+    *ticks = sec * hz + ((u32)tv.tv_usec + usec_per_tick - 1) / usec_per_tick;
     return 0;
 }

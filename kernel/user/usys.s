@@ -60,6 +60,10 @@
     .equ SYS_ftruncate, 52
     .equ SYS_ioctl, 53
     .equ SYS_poll, 54
+    .equ SYS_socketpair, 55
+    .equ SYS_sendmsg, 56
+    .equ SYS_recvmsg, 57
+    .equ SYS_stat, 58
 
     .text
 
@@ -442,6 +446,34 @@ ioctl:
     .globl poll
 poll:
     li    a7, SYS_poll
+    ecall
+    ret
+
+# int socketpair(int domain, int type, int protocol, int *fds)
+    .globl socketpair
+socketpair:
+    li    a7, SYS_socketpair
+    ecall
+    ret
+
+# ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
+    .globl sendmsg
+sendmsg:
+    li    a7, SYS_sendmsg
+    ecall
+    ret
+
+# ssize_t recvmsg(int fd, struct msghdr *msg, int flags)
+    .globl recvmsg
+recvmsg:
+    li    a7, SYS_recvmsg
+    ecall
+    ret
+
+# int stat(const char *path, struct stat *st)
+    .globl stat
+stat:
+    li    a7, SYS_stat
     ecall
     ret
 

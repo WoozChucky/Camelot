@@ -619,6 +619,19 @@ int sock_sys_shutdown(u32 fd, u32 how);
 int sock_sys_name(u32 fd, uintptr uaddr, bool peer);
 int sock_sys_setsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, u32 len);
 
+/* sendmsg() and recvmsg() (docs/camelot-syscalls.md, "Messages") on a TCP
+ * or UDP socket: the buffers gathered and scattered through a page of the
+ * kernel's, an address as sendto's and recvfrom's, and no descriptors
+ * (-EINVAL for SOL_SOCKET control messages, as on Linux). */
+isize sock_sys_sendmsg(u32 fd, uintptr umsg, u32 flags);
+isize sock_sys_recvmsg(u32 fd, uintptr umsg, u32 flags);
+
+/* setsockopt()'s one option, every socket's: SO_RCVTIMEO's struct timeval
+ * at `uvalue` (`len` bytes) in ticks, rounded up, in *ticks (0: no limit).
+ * 0, or -EINVAL (a length or a time out of range), -EFAULT, -ENOPROTOOPT
+ * (another level or option). Local sockets (net/unix.c) use it too. */
+int sock_opt_rcvtimeo(u32 level, u32 option, uintptr uvalue, u32 len, u32 *ticks);
+
 /* ---- DHCP (dhcp.c) ---- */
 
 /* Asks for an address, DHCP_TRIES times at most, waiting DHCP_TIMEOUT

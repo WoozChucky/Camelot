@@ -89,6 +89,20 @@ pub const T_FREE: u16 = 0;
 pub const T_DIR: u16 = 1;
 pub const T_FILE: u16 = 2;
 pub const T_DEVICE: u16 = 3;
+/// A local socket's name (`bind`): no contents, as a device. 4 is never an
+/// inode's type: it is `fstat`'s for a pipe, and 5 the same for a socket.
+pub const T_SOCKET: u16 = 5;
+
+/// Whether `kind` is an allocated inode's type.
+pub fn valid_kind(kind: u16) -> bool {
+    matches!(kind, T_DIR | T_FILE | T_DEVICE | T_SOCKET)
+}
+
+/// Whether an inode of `kind` has no contents: a device or a socket, whose
+/// size is 0 and `i_block` all zeros.
+pub fn no_contents(kind: u16) -> bool {
+    kind == T_DEVICE || kind == T_SOCKET
+}
 
 /// `ceil(a / b)`.
 fn div_ceil(a: u32, b: u32) -> u32 {
@@ -273,14 +287,14 @@ impl Superblock {
 /// An on-disk inode (128 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dinode {
-    /// `T_FREE`, `T_DIR`, `T_FILE` or `T_DEVICE`.
+    /// `T_FREE`, `T_DIR`, `T_FILE`, `T_DEVICE` or `T_SOCKET`.
     pub kind: u16,
     pub major: u16,
     pub minor: u16,
     pub nlink: u16,
     pub size: u64,
     /// `i_block`: the root of the extent tree ([`extent`]); zeros for a
-    /// device.
+    /// device or a socket.
     pub root: [u8; extent::ROOT_SIZE],
     /// `TRUNCATING`, or 0.
     pub flags: u32,
@@ -306,11 +320,11 @@ impl Default for Dinode {
 
 impl Dinode {
     /// A new inode of `kind`, empty: a directory or file with an empty
-    /// extent tree, a device with an `i_block` of zeros.
+    /// extent tree, a device or a socket with an `i_block` of zeros.
     pub fn new(kind: u16) -> Dinode {
         Dinode {
             kind,
-            root: if kind == T_DEVICE {
+            root: if no_contents(kind) {
                 [0; extent::ROOT_SIZE]
             } else {
                 extent::empty_root()
