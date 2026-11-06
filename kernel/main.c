@@ -11,6 +11,7 @@
 #include "blktest.h"
 #include "console.h"
 #include "fb.h"
+#include "input.h"
 #include "file.h"
 #include "fstest.h"
 #include "kalloc.h"
@@ -379,6 +380,7 @@ int kmain(void) {
      * mappings take a while, done before the timer's first interval. */
     plic_init();
     fb_init();
+    input_init();
     trap_init();
     kprintf("timer: %u Hz tick, %u Hz timebase\n", TICK_HZ, timebase_hz());
     blk_init();

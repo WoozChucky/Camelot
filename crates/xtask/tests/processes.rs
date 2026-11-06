@@ -1204,6 +1204,174 @@ fn a_program_shows_800x600_from_ram_with_a_flip() {
     assert_eq!(spare_pages(&m, &elf), before, "{}", printed(&m));
 }
 
+/// Types `line` on the UART.
+fn type_line(tx: &std::sync::mpsc::Sender<u8>, line: &str) {
+    for b in line.bytes() {
+        tx.send(b).unwrap();
+    }
+}
+
+/// Steps `m` until what it printed ends with `tail`.
+fn step_to_output(m: &mut Machine, tail: &str) {
+    step_until(m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.bus.uart.captured.ends_with(tail.as_bytes()));
+}
+
+/// Runs `command`, an `inputtest` that prints `ready` when it is reading,
+/// on a root machine; then gives it `input` (each a key or a pointer
+/// change) and returns the lines it printed after `ready`, once it is back
+/// at the prompt. `before` runs first, at the prompt.
+fn input_events(
+    command: &str,
+    before: impl FnOnce(&mut Machine, &grail::elf::Elf),
+    input: impl FnOnce(&mut Machine),
+) -> (Machine, String) {
+    let (mut m, elf, tx, _) = root_machine();
+    before(&mut m, &elf);
+    type_line(&tx, &format!("{command}\n"));
+    step_to_output(&mut m, "inputtest: ready\n");
+    let at = m.cpu.bus.uart.captured.len();
+    input(&mut m);
+    step_to_prompt(&mut m, 2);
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured[at..]).into_owned();
+    let out = out.strip_suffix(PROMPT).unwrap_or(&out).to_string();
+    (m, out)
+}
+
+/// A key of both forms, as a host sends it: its ASCII-mode code and its
+/// usage.
+fn key(code: u8, usage: u16) -> grail::keyboard::KeyEvent {
+    grail::keyboard::KeyEvent::press(code).with_usage(usage)
+}
+
+fn release(k: grail::keyboard::KeyEvent) -> grail::keyboard::KeyEvent {
+    grail::keyboard::KeyEvent { release: true, ..k }
+}
+
+#[test]
+fn the_input_devices_answer_evdevs_requests() {
+    // Issue #178: inputtest's checks of /dev/input/event0 and event1:
+    // EVIOCGVERSION, EVIOCGID, EVIOCGNAME, EVIOCGBIT, EVIOCGABS (the
+    // display's size), EVIOCGRAB's rules, reads of whole events and the
+    // errors. The keyboard is in raw mode while it has a reader, and back
+    // in ASCII mode, the console's, after.
+    let (mut m, _, tx, _) = root_machine();
+    type_line(&tx, "inputtest\n");
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(all_checks_pass(&out, "inputtest", "inputtest"), 46, "{out}");
+    assert!(!m.cpu.bus.kbd.raw());
+}
+
+#[test]
+fn keys_reach_a_reader_as_linux_key_codes() {
+    // A reader of the keyboard puts it in raw mode: each key is its HID
+    // usage, which the driver makes Linux's key code, a press and a release
+    // each with its SYN_REPORT. A modifier is a key of its own; a press of
+    // a key already down is no event.
+    let (m, out) = input_events(
+        "inputtest keys 8",
+        |_, _| {},
+        |m| {
+            assert!(m.cpu.bus.kbd.raw());
+            let a = key(b'a', 0x04);
+            assert!(m.key_event(a));
+            assert!(m.key_event(release(a)));
+            assert!(m.key_event(key(0, 0xe1))); // Left Shift
+            assert!(m.key_event(key(0, 0xe3))); // Left GUI
+        },
+    );
+    assert_eq!(out, "1 30 1\n0 0 0\n1 30 0\n0 0 0\n1 42 1\n0 0 0\n1 125 1\n0 0 0\n");
+    assert!(!m.cpu.bus.kbd.raw());
+}
+
+#[test]
+fn a_keyboard_without_raw_mode_gives_key_codes_made_from_ascii() {
+    // The driver found no raw mode (as on a keyboard before it): an ASCII
+    // code becomes the key that types it on a US layout, with the Shift
+    // and Ctrl its bits say pressed (and let go) around it.
+    let (_, out) = input_events(
+        "inputtest keys 9",
+        |m, elf| m.cpu.bus.load(image_pa(sym(elf, "keyboard_has_raw")), &[0; 4]).unwrap(),
+        |m| {
+            assert!(!m.cpu.bus.kbd.raw());
+            let shifted = key(b'A', 0x04).with_shift(true);
+            assert!(m.key_event(shifted));
+            assert!(m.key_event(release(shifted)));
+            let ctrl_c = key(b'c', 0x06).with_ctrl(true);
+            assert!(m.key_event(ctrl_c));
+            assert!(m.key_event(release(ctrl_c)));
+        },
+    );
+    assert_eq!(
+        out,
+        "1 42 1\n1 30 1\n0 0 0\n1 30 0\n0 0 0\n1 42 0\n1 29 1\n1 46 1\n0 0 0\n"
+    );
+}
+
+#[test]
+fn the_console_types_what_the_keyboard_types() {
+    // With no reader, the keyboard is the console's, in ASCII mode: the
+    // characters the host's layout typed, which the line editor echoes as
+    // it does the UART's. Ctrl with a letter is its control character:
+    // Ctrl-H erases.
+    let (mut m, _) = load_committed(None);
+    step_to_prompt(&mut m, 1);
+    for c in "hellp".bytes() {
+        assert!(m.key_event(key(c, 0)));
+    }
+    assert!(m.key_event(key(b'h', 0x0b).with_ctrl(true)));
+    for c in "o\n".bytes() {
+        assert!(m.key_event(key(c, 0)));
+    }
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert!(out.ends_with(&format!("{PROMPT}hellp\x08 \x08o\nhello from user mode\n{PROMPT}")), "{out}");
+}
+
+#[test]
+fn the_pointer_reports_where_it_is_its_buttons_and_the_wheel() {
+    // The pointer in absolute mode: a move is ABS_X and ABS_Y, the axes
+    // that changed; a button BTN_LEFT; a notch REL_WHEEL; each change a
+    // packet.
+    use grail::pointer::{PointerInput, BUTTON_LEFT};
+    let (_, out) = input_events(
+        "inputtest pointer 11",
+        |_, _| {},
+        |m| {
+            assert!(m.pointer_event(PointerInput::move_to(100, 200)));
+            assert!(m.pointer_event(PointerInput::move_to(100, 201)));
+            assert!(m.pointer_event(PointerInput::buttons(BUTTON_LEFT)));
+            assert!(m.pointer_event(PointerInput::buttons(BUTTON_LEFT).with_wheel(1)));
+            assert!(m.pointer_event(PointerInput::buttons(0)));
+        },
+    );
+    assert_eq!(
+        out,
+        "3 0 100\n3 1 200\n0 0 0\n3 1 201\n0 0 0\n1 272 1\n0 0 0\n2 8 1\n0 0 0\n1 272 0\n0 0 0\n"
+    );
+}
+
+#[test]
+fn a_grab_keeps_the_keys_from_the_other_readers() {
+    // Two readers of the keyboard, the first grabbing it: a key goes to it
+    // alone. Once it lets go, the next goes to every reader: the second
+    // reads that one, and never saw the first.
+    let (mut m, _, tx, _) = root_machine();
+    type_line(&tx, "inputtest grab\n");
+    step_to_output(&mut m, "inputtest: grabbed\n");
+    assert!(m.key_event(key(b'a', 0x04)));
+    step_to_output(&mut m, "inputtest: let go\n");
+    assert!(m.key_event(key(b'b', 0x05)));
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert!(
+        out.ends_with(&format!(
+            "inputtest: grabbed\n1 30 1\n0 0 0\ninputtest: let go\n1 48 1\n0 0 0\n{PROMPT}"
+        )),
+        "{out}"
+    );
+}
+
 #[test]
 fn bad_pointers_are_refused() {
     // Issue #21's second criterion. badptr hands write and read kernel

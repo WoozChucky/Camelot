@@ -119,6 +119,17 @@ bool fb_present(void) {
     return regs != 0;
 }
 
+void fb_mode_size(u32 *width, u32 *height) {
+    if (regs == 0) {
+        *width = 0;
+        *height = 0;
+        return;
+    }
+    /* The display's own registers: what it shows, whoever set it. */
+    *width = rd(FB_WIDTH);
+    *height = rd(FB_HEIGHT);
+}
+
 u32 *fb_vram(void) {
     return vram;
 }

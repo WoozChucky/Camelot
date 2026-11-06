@@ -135,6 +135,9 @@ int fb_mmap(struct file *f, u64 offset, usize size, phys_addr_t *pa);
 void fb_vm_open(void);
 void fb_vm_close(void);
 
+/* The current mode's size: 0 by 0 without a display. Any context. */
+void fb_mode_size(u32 *width, u32 *height);
+
 /* The kernel's pointer to VRAM, 640x480 pixels of 4 bytes, or NULL without
  * a display: where the console draws (fbcon.c). */
 u32 *fb_vram(void);

@@ -6,6 +6,7 @@
 #include "file.h"
 #include "console.h"
 #include "fb.h"
+#include "input.h"
 #include "kalloc.h"
 #include "log.h"
 #include "memlayout.h"
@@ -32,7 +33,8 @@ void file_init(void) {
 
 /* The drivers, by major number: 0 is none, CONSOLE the console (reads and
  * writes), FB the framebuffer (its memory, for mmap, and its mode through
- * ioctl, fb.h). A major whose entry is all NULL has no driver. */
+ * ioctl, fb.h), INPUT the keyboard and the pointer (their events, input.h).
+ * A major whose entry is all NULL has no driver. */
 const struct devsw devsw[NDEV] = {
     [CONSOLE] = {.read = console_read, .write = console_write},
     [FB] = {.open = fb_open,
@@ -41,6 +43,7 @@ const struct devsw devsw[NDEV] = {
             .mmap = fb_mmap,
             .vm_open = fb_vm_open,
             .vm_close = fb_vm_close},
+    [INPUT] = {.open = input_open, .close = input_close, .read = input_read, .ioctl = input_ioctl},
 };
 
 bool device_has_driver(u32 major) {

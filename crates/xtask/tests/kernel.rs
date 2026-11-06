@@ -34,7 +34,7 @@ use grail::block::{
 };
 use grail::bus::{BLK_BASE, BLK_SIZE, MAX_DISKS, PLIC_BASE, RAM_BASE, SYSINFO_BASE, SYSINFO_SIZE, UART_BASE};
 use grail::cpu::Mode;
-use grail::devices::{BLK_IRQ, FB_IRQ, UART_IRQ};
+use grail::devices::{BLK_IRQ, FB_IRQ, KBD_IRQ, PTR_IRQ, UART_IRQ};
 use grail::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use grail::sysinfo::{REG_MAGIC, REG_TIMEBASE_HZ};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
@@ -116,8 +116,8 @@ fn mode() -> PagingMode {
 const KSTACK_SIZE: u64 = 16 * 1024;
 
 /// The PLIC sources the kernel enables on every machine of the tests: the
-/// UART's and the display's vertical blank.
-const BOOT_IRQS: u64 = 1 << UART_IRQ | 1 << FB_IRQ;
+/// UART's, the keyboard's, the pointer's and the display's vertical blank.
+const BOOT_IRQS: u64 = 1 << UART_IRQ | 1 << KBD_IRQ | 1 << PTR_IRQ | 1 << FB_IRQ;
 const KSTACK_SLOT: u64 = 2 * KSTACK_SIZE;
 const KSTACK_SLOTS: u64 = 64;
 
@@ -2810,11 +2810,12 @@ fn plic_routes_the_uart_to_the_kernel() {
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == wfi);
     let mut reg = |addr| m.cpu.bus.read(addr, 4).unwrap();
-    // Source 1 (the UART) and 16 (the display's vertical blank) at priority
-    // 1, enabled for context 1 (S-mode) only, whose threshold of 0 lets
-    // them through.
-    assert_eq!(reg(plic_priority(UART_IRQ)), 1);
-    assert_eq!(reg(plic_priority(FB_IRQ)), 1);
+    // Source 1 (the UART), 2 (the keyboard), 11 (the pointer) and 16 (the
+    // display's vertical blank) at priority 1, enabled for context 1
+    // (S-mode) only, whose threshold of 0 lets them through.
+    for irq in [UART_IRQ, KBD_IRQ, PTR_IRQ, FB_IRQ] {
+        assert_eq!(reg(plic_priority(irq)), 1, "source {irq}");
+    }
     assert_eq!(reg(plic_enable(1)), BOOT_IRQS);
     assert_eq!(reg(plic_threshold(1)), 0);
     assert_eq!(reg(plic_enable(0)), 0);
@@ -3862,6 +3863,8 @@ fn the_system_call_document_matches_the_code() {
     assert_eq!(console[0].0, u32::from(xtask::fs::CONSOLE_MAJOR));
     let fb = exactly(&read("kernel/include/file.h"), "FB");
     assert_eq!(fb[0].0, u32::from(xtask::fs::FB_MAJOR));
+    let input = exactly(&read("kernel/include/file.h"), "INPUT");
+    assert_eq!(input[0].0, u32::from(xtask::fs::INPUT_MAJOR));
 }
 
 // ---- The clang reference build (ignored: needs LLVM) ----

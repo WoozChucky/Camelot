@@ -18,6 +18,7 @@
 #include "blk.h"
 #include "console.h"
 #include "fb.h"
+#include "input.h"
 #include "kprintf.h"
 #include "net.h"
 #include "nic.h"
@@ -193,7 +194,7 @@ static void external_interrupt(void) {
     u32 irq = plic_claim();
     if (irq == PLIC_IRQ_UART) {
         console_intr();
-    } else if (!blk_intr(irq) && !fb_intr(irq)) {
+    } else if (!blk_intr(irq) && !fb_intr(irq) && !keyboard_intr(irq) && !pointer_intr(irq)) {
         nic_intr(irq);
     }
     /* 0: nothing left to claim. Only enabled sources can be claimed, so any
