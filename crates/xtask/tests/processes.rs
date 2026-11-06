@@ -1040,6 +1040,63 @@ fn the_user_stack_grows_on_demand_up_to_its_limit() {
 }
 
 #[test]
+fn memory_mappings_are_mapped_on_demand_and_given_back() {
+    // Issue #179: maptest's checks of mmap, munmap and mprotect on
+    // anonymous memory (placement, MAP_FIXED, splits, protections, the
+    // errors, the kernel's copies into pages not touched yet, the heap
+    // kept out of a mapping, 200 MiB mapped on an 8 MiB machine), and of
+    // shared-memory objects (memfd_create, ftruncate, two mappings of one
+    // in a process and in two); then a touch of a PROT_NONE page, of an
+    // unmapped one, a store to a read-only one and a touch past an object's
+    // end, each killing the program: every page is back after each command,
+    // the mappings' and the objects' included.
+    let commands = [
+        "maptest",
+        "maptest none",
+        "maptest unmapped",
+        "maptest readonly",
+        "maptest past",
+        "echo alive",
+    ];
+    let out = run_counting_pages(8, &commands);
+    assert_eq!(
+        all_checks_pass(&out, "maptest", "maptest"),
+        MAPTEST_CHECKS,
+        "{out}"
+    );
+    for (command, fault) in [
+        ("maptest none", "load page fault"),
+        ("maptest unmapped", "load page fault"),
+        ("maptest readonly", "store page fault"),
+        ("maptest past", "load page fault"),
+    ] {
+        let lines = command_output(&out, command);
+        assert!(
+            lines[0].starts_with("pid ") && lines[0].ends_with(&format!(" (maptest) killed: {fault}")),
+            "{command}: {out}"
+        );
+    }
+    assert_eq!(command_output(&out, "echo alive"), ["alive"]);
+
+    // In Sv39's smaller user space too.
+    let out = run(
+        Setup {
+            paging: grail::Paging::Sv39,
+            ..Setup::default()
+        },
+        b"maptest\nexit 0\n",
+    );
+    assert_eq!(
+        all_checks_pass(&out, "maptest", "maptest"),
+        MAPTEST_CHECKS,
+        "{out}"
+    );
+}
+
+/// maptest's checks (kernel/user/maptest.c).
+const MAPTEST_CHECKS: u32 = 101;
+
+#[test]
 fn bad_pointers_are_refused() {
     // Issue #21's second criterion. badptr hands write and read kernel
     // memory, page 0, a range past the end of user space, the stack's guard

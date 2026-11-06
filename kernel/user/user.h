@@ -62,11 +62,11 @@ typedef unsigned long long uint64_t;
 #define EBADF 9         /* not an open file descriptor, or not open for that */
 #define ECHILD 10       /* wait: no such child */
 #define EAGAIN 11       /* spawn, thread_create: every slot is taken; futex_wait: not the value; a socket's receive timeout ran out */
-#define ENOMEM 12       /* out of memory, or the heap would reach the stack */
-#define EACCES 13       /* spawn, exec: not a regular file */
+#define ENOMEM 12       /* out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping */
+#define EACCES 13       /* spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
-#define EEXIST 17       /* the name is taken */
-#define ENODEV 19       /* open: a device node with no driver */
+#define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */
+#define ENODEV 19       /* open: a device node with no driver; mmap: a file that can't be mapped */
 #define ENOTDIR 20      /* a name on the way is not a directory */
 #define EISDIR 21       /* open: a directory, for writing */
 #define EINVAL 22       /* an argument is out of range */
@@ -151,6 +151,24 @@ typedef unsigned long long uint64_t;
 #define F_SETFD 2            /* sets them to arg */
 #define F_DUPFD_CLOEXEC 1030 /* F_DUPFD, the copy closing on exec */
 #define FD_CLOEXEC 1         /* the descriptor closes on exec */
+
+/* mmap's and mprotect's protections, and mmap's flags (Linux's values;
+ * kernel/include/mmap.h). */
+#define PROT_NONE 0x0
+#define PROT_READ 0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC 0x4
+#define MAP_SHARED 0x01
+#define MAP_PRIVATE 0x02
+#define MAP_FIXED 0x10
+#define MAP_ANONYMOUS 0x20
+#define MAP_NORESERVE 0x4000
+#define MAP_POPULATE 0x8000
+#define MAP_FIXED_NOREPLACE 0x100000
+
+/* memfd_create's flags (Linux's values; kernel/include/shm.h). */
+#define MFD_CLOEXEC 0x1
+#define MFD_ALLOW_SEALING 0x2
 
 /* lseek's `whence`. */
 #define SEEK_SET 0
@@ -298,8 +316,9 @@ struct sockaddr_in {
 };
 
 /* The system calls, with Linux's types: a call that returns a count of
- * bytes returns an ssize_t, lseek an off_t; sbrk the old end of the heap,
- * a pointer, or minus an error number as a pointer ((long)p < 0). */
+ * bytes returns an ssize_t, lseek an off_t; sbrk the old end of the heap
+ * and mmap the new mapping's address, a pointer, or minus an error number
+ * as a pointer ((long)p < 0). */
 void exit(int status);
 ssize_t write(int fd, const void *buf, size_t len);
 ssize_t read(int fd, void *buf, size_t len);
@@ -347,6 +366,11 @@ int gettid(void);
 int futex_wait(int *addr, int val);
 int futex_wake(int *addr, int n);
 int fcntl(int fd, int cmd, int arg);
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset);
+int munmap(void *addr, size_t len);
+int mprotect(void *addr, size_t len, int prot);
+int memfd_create(const char *name, uint flags);
+int ftruncate(int fd, off_t length);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);

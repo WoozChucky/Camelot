@@ -18,11 +18,20 @@
  * before freeing anything, so a copy that saw the old PTEs has finished by
  * then and every later one sees them gone. It is one lock for every
  * process, held for at most a page or so of memcpy, and a leaf of the lock
- * order: nothing else is taken under it. */
+ * order: nothing else is taken under it.
+ *
+ * Demand paging. A page of a memory mapping (mmap.h) is mapped on its first
+ * touch: a program's touch faults, and the kernel's copies, which never
+ * fault, ask for it instead. uvm_range_ok() maps such pages as it checks a
+ * range (mm_fault()), without uvm_lock, since that takes other locks; a
+ * copy checks its range under uvm_lock first, and only if a page is
+ * missing lets go, has uvm_range_ok() map it, and checks again
+ * (lock_range()). */
 #include "vm.h"
 #include "kalloc.h"
 #include "kprintf.h"
 #include "memlayout.h"
+#include "mmap.h"
 #include "mmio.h"
 #include "proc.h"
 #include "riscv.h"
@@ -829,7 +838,10 @@ void uvm_free(pagetable_t pt) {
     pagetable_free(pt);
 }
 
-bool uvm_range_ok(pagetable_t pt, uintptr va, usize len, u32 perm) {
+/* Whether every byte of [va, va + len) is mapped in `pt` with U and all of
+ * `perm`. With `fault`, a page not mapped yet is first offered to
+ * mm_fault(): uvm_range_ok(); without, the range as it is now. */
+static bool range_mapped(pagetable_t pt, uintptr va, usize len, u32 perm, bool fault) {
     if (len == 0) {
         return true;
     }
@@ -840,11 +852,45 @@ bool uvm_range_ok(pagetable_t pt, uintptr va, usize len, u32 perm) {
     u32 want = perm | PTE_U | PTE_V;
     for (uintptr a = PGROUNDDOWN(va); a < va + len; a += PGSIZE) {
         pte_t *pte = walk(pt, a, false);
+        if (fault && (pte == NULL || (*pte & PTE_V) == 0) && mm_fault(pt, a, perm)) {
+            pte = walk(pt, a, false);
+        }
         if (pte == NULL || (*pte & want) != want) {
             return false;
         }
     }
     return true;
+}
+
+bool uvm_range_ok(pagetable_t pt, uintptr va, usize len, u32 perm) {
+    return range_mapped(pt, va, len, perm, true);
+}
+
+void uvm_sync(void) {
+    acquire(&uvm_lock);
+    release(&uvm_lock);
+}
+
+/* Takes uvm_lock with [va, va + len) mapped in `pt` with U and `perm`, the
+ * pages a mapping hadn't given it yet mapped first: true, holding the lock,
+ * or false, not holding it, if the range isn't all user memory with that
+ * access. */
+static bool lock_range(pagetable_t pt, uintptr va, usize len, u32 perm) {
+    acquire(&uvm_lock);
+    if (range_mapped(pt, va, len, perm, false)) {
+        return true;
+    }
+    release(&uvm_lock);
+    if (!uvm_range_ok(pt, va, len, perm)) {
+        return false;
+    }
+    /* Mapped now, unless another thread has unmapped it meanwhile. */
+    acquire(&uvm_lock);
+    if (range_mapped(pt, va, len, perm, false)) {
+        return true;
+    }
+    release(&uvm_lock);
+    return false;
 }
 
 /* The kernel's pointer to user address `va` in `pt`, which must be mapped:
@@ -860,9 +906,7 @@ static usize page_chunk(uintptr va, usize len) {
 }
 
 int copyin(pagetable_t pt, void *dst, uintptr va, usize len) {
-    acquire(&uvm_lock);
-    if (!uvm_range_ok(pt, va, len, PTE_R)) {
-        release(&uvm_lock);
+    if (!lock_range(pt, va, len, PTE_R)) {
         return -1;
     }
     u8 *out = dst;
@@ -878,9 +922,7 @@ int copyin(pagetable_t pt, void *dst, uintptr va, usize len) {
 }
 
 int copyout(pagetable_t pt, uintptr va, const void *src, usize len) {
-    acquire(&uvm_lock);
-    if (!uvm_range_ok(pt, va, len, PTE_W)) {
-        release(&uvm_lock);
+    if (!lock_range(pt, va, len, PTE_W)) {
         return -1;
     }
     const u8 *in = src;
@@ -899,12 +941,10 @@ int copyinstr(pagetable_t pt, char *dst, uintptr va, u32 max) {
     /* Page by page: the string's length isn't known up front, and the page
      * after its NUL needn't be mapped. */
     u32 len = 0;
-    acquire(&uvm_lock);
     while (len < max) {
         usize n = page_chunk(va, max - len);
-        if (!uvm_range_ok(pt, va, n, PTE_R)) {
+        if (!lock_range(pt, va, n, PTE_R)) {
             dst[len] = 0;
-            release(&uvm_lock);
             return -1;
         }
         const u8 *src = user_ptr(pt, va);
@@ -916,9 +956,9 @@ int copyinstr(pagetable_t pt, char *dst, uintptr va, u32 max) {
             }
             len++;
         }
+        release(&uvm_lock);
         va += n;
     }
-    release(&uvm_lock);
     dst[max - 1] = 0;
     return -2;
 }
@@ -926,11 +966,9 @@ int copyinstr(pagetable_t pt, char *dst, uintptr va, u32 max) {
 u32 strnlen_user(pagetable_t pt, uintptr va, u32 max) {
     /* Page by page, as copyinstr() reads. */
     u32 len = 0;
-    acquire(&uvm_lock);
     while (len < max) {
         usize n = page_chunk(va, max - len);
-        if (!uvm_range_ok(pt, va, n, PTE_R)) {
-            release(&uvm_lock);
+        if (!lock_range(pt, va, n, PTE_R)) {
             return 0;
         }
         const u8 *src = user_ptr(pt, va);
@@ -941,8 +979,8 @@ u32 strnlen_user(pagetable_t pt, uintptr va, u32 max) {
                 return len;
             }
         }
+        release(&uvm_lock);
         va += n;
     }
-    release(&uvm_lock);
     return max + 1;
 }

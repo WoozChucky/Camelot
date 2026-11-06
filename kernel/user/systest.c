@@ -534,7 +534,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(48, 0, 0, 0), -ENOSYS, "call 48");
+    check_eq(syscall(53, 0, 0, 0), -ENOSYS, "call 53");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
     /* The result is a long, sign-extended in a0: an error is negative
      * whatever the width, as a long and as an ssize_t (read's). */

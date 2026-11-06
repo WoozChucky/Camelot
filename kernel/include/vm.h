@@ -413,8 +413,18 @@ pagetable_t uvm_create(void);
 void uvm_free(pagetable_t pt);
 
 /* Whether every byte of [va, va + len) is user memory in `pt` mapped with
- * U and all of `perm` (PTE_R, PTE_W). len 0 is always fine. */
+ * U and all of `perm` (PTE_R, PTE_W). len 0 is always fine. A page of one
+ * of the current process's memory mappings that hasn't been touched yet is
+ * mapped first, if the mapping allows the access (mm_fault(), mmap.h): a
+ * system call reaches those pages as the program would. So it may take
+ * spinlocks (the process's vm_lock, kmem's): never call it holding
+ * uvm_lock. */
 bool uvm_range_ok(pagetable_t pt, uintptr va, usize len, u32 perm);
+
+/* Waits for every user copy in progress (copyin() and the others, under
+ * uvm_lock) to finish: after a mapping has been taken away and shot down,
+ * before its pages are freed (unmap_pages(), munmap). */
+void uvm_sync(void);
 
 /* Copies `len` bytes from user address `va` in `pt` to `dst`, through the
  * kernel's mapping of the physical pages (the direct map): the kernel never

@@ -50,7 +50,7 @@ const THREAD_UNUSED: u32 = 0;
 const THREAD_ZOMBIE: u32 = 3;
 /// `struct proc`: its size and state (its name and page table are in
 /// common/mod.rs).
-const PROC_SIZE: u64 = 304;
+const PROC_SIZE: u64 = 336;
 const NPROC: u64 = 8;
 const PROC_STATE: u64 = 0;
 

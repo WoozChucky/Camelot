@@ -8,8 +8,10 @@
 #include "kalloc.h"
 #include "log.h"
 #include "memlayout.h"
+#include "mmap.h"
 #include "net.h"
 #include "pipe.h"
+#include "shm.h"
 #include "string.h"
 #include "trap.h"
 
@@ -43,10 +45,11 @@ static isize nodev_write(pagetable_t pt, uintptr src, usize n) {
     return -ENODEV;
 }
 
-/* The drivers, by major number: 0 is none, CONSOLE the console. */
+/* The drivers, by major number: 0 is none, CONSOLE the console (which has
+ * no memory to map). */
 const struct devsw devsw[NDEV] = {
-    {nodev_read, nodev_write},
-    {console_read, console_write},
+    {nodev_read, nodev_write, NULL},
+    {console_read, console_write, NULL},
 };
 
 bool device_has_driver(u32 major) {
@@ -112,12 +115,41 @@ void fileclose(struct file *f) {
         pipeclose(closed.pipe, closed.writable);
     } else if (closed.type == FD_SOCKET) {
         socket_close(closed.sock);
+    } else if (closed.type == FD_SHM) {
+        /* The object stays while a mapping holds it. */
+        shm_put(closed.shm);
     } else if (closed.ip != NULL) {
         /* The last reference to an unlinked file frees it: a transaction. */
         begin_op();
         iput(closed.ip);
         end_op();
     }
+}
+
+struct file *file_shm(int *err) {
+    struct file *f = filealloc();
+    if (f == NULL) {
+        *err = -ENFILE;
+        return NULL;
+    }
+    struct shm_object *o = shm_create();
+    if (o == NULL) {
+        fileclose(f); /* nothing set yet: just gives the slot back */
+        *err = -ENFILE;
+        return NULL;
+    }
+    f->type = FD_SHM;
+    f->shm = o;
+    f->readable = true;
+    f->writable = true;
+    return f;
+}
+
+int filetruncate(struct file *f, off_t length) {
+    if (f->type != FD_SHM || !f->writable || length < 0) {
+        return -EINVAL;
+    }
+    return shm_truncate(f->shm, (u64)length);
 }
 
 struct file *file_console(bool readable, bool writable) {
@@ -212,6 +244,10 @@ isize fileread(struct file *f, pagetable_t pt, uintptr dst, usize n) {
     if (!uvm_range_ok(pt, dst, n, PTE_W)) {
         return -EFAULT;
     }
+    /* A shared-memory object is read and written through a mapping. */
+    if (f->type == FD_SHM) {
+        return -EINVAL;
+    }
     if (n > MAX_RW_COUNT) {
         n = MAX_RW_COUNT;
     }
@@ -238,6 +274,9 @@ isize filewrite(struct file *f, pagetable_t pt, uintptr src, usize n) {
     }
     if (!uvm_range_ok(pt, src, n, PTE_R)) {
         return -EFAULT;
+    }
+    if (f->type == FD_SHM) {
+        return -EINVAL;
     }
     if (n > MAX_RW_COUNT) {
         n = MAX_RW_COUNT;
@@ -304,6 +343,13 @@ void filestat(struct file *f, struct stat *st) {
         st->nlink = socket_hung_up(f->sock) ? 0 : 1;
         return;
     }
+    if (f->type == FD_SHM) {
+        /* A regular file to Linux's fstat too, with no inode number. */
+        st->type = T_FILE;
+        st->size = (off_t)shm_size(f->shm);
+        st->nlink = 1;
+        return;
+    }
     if (f->ip == NULL) {
         /* The console of the first process, opened by the kernel. */
         st->type = T_DEVICE;
@@ -318,4 +364,42 @@ void filestat(struct file *f, struct stat *st) {
     st->major = f->ip->major;
     st->minor = f->ip->minor;
     iunlock(f->ip);
+}
+
+int filemmap(struct file *f, u32 type, u32 prot, u64 offset, usize size, struct vm_area *a) {
+    /* Linux's checks: a mapping reads the file, and a shared one that
+     * writes, writes it. */
+    if (!f->readable) {
+        return -EACCES;
+    }
+    bool writes_file = type == MAP_SHARED || f->type == FD_DEVICE;
+    if (writes_file && (prot & PROT_WRITE) != 0 && !f->writable) {
+        return -EACCES;
+    }
+    if (f->type == FD_SHM) {
+        /* The object's pages, shared: a private mapping would be a
+         * copy-on-write one, which Camelot doesn't have. */
+        if (type != MAP_SHARED) {
+            return -EINVAL;
+        }
+        a->kind = AREA_SHM;
+        a->shm = f->shm;
+        a->pgoff = offset / PGSIZE;
+        a->may_write = f->writable;
+        /* Taken now, while the descriptor keeps the object alive. */
+        shm_map(f->shm);
+        return 0;
+    }
+    if (f->type == FD_DEVICE && devsw[f->major].mmap != NULL) {
+        /* A device's memory is the device's whatever the type: a private
+         * mapping of it writes it too, as Linux's fbdev maps it. */
+        int r = devsw[f->major].mmap(offset, size, &a->device);
+        if (r != 0) {
+            return r;
+        }
+        a->kind = AREA_DEVICE;
+        a->may_write = f->writable;
+        return 0;
+    }
+    return -ENODEV;
 }

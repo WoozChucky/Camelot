@@ -14,6 +14,7 @@
 #include "exec.h"
 #include "kalloc.h"
 #include "kprintf.h"
+#include "mmap.h"
 #include "net.h"
 #include "proc.h"
 #include "string.h"
@@ -368,6 +369,21 @@ void syscall(struct trap_frame *f) {
         break;
     case SYS_fcntl:
         ret = sys_fcntl(f);
+        break;
+    case SYS_mmap:
+        ret = mm_mmap(arg(f, 0), arg(f, 1), (u32)arg(f, 2), (u32)arg(f, 3), (int)arg(f, 4), (off_t)arg(f, 5));
+        break;
+    case SYS_munmap:
+        ret = mm_munmap(arg(f, 0), arg(f, 1));
+        break;
+    case SYS_mprotect:
+        ret = mm_mprotect(arg(f, 0), arg(f, 1), (u32)arg(f, 2));
+        break;
+    case SYS_memfd_create:
+        ret = sys_memfd_create(f);
+        break;
+    case SYS_ftruncate:
+        ret = sys_ftruncate(f);
         break;
     default:
         ret = -ENOSYS;

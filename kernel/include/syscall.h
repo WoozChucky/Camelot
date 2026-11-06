@@ -65,6 +65,11 @@
 #define SYS_futex_wait 45    /* futex_wait(addr, val): 0 once woken, if *addr was val */
 #define SYS_futex_wake 46    /* futex_wake(addr, n): the number of threads woken */
 #define SYS_fcntl 47         /* fcntl(fd, cmd, arg): a descriptor's flags, or a copy of it */
+#define SYS_mmap 48          /* mmap(addr, len, prot, flags, fd, offset): the mapping's address */
+#define SYS_munmap 49        /* munmap(addr, len): 0 */
+#define SYS_mprotect 50      /* mprotect(addr, len, prot): 0 */
+#define SYS_memfd_create 51  /* memfd_create(name, flags): a descriptor for a new shared-memory object */
+#define SYS_ftruncate 52     /* ftruncate(fd, length): 0, the object's size set */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
@@ -76,11 +81,11 @@
 #define EBADF 9         /* not an open file descriptor, or not open for that */
 #define ECHILD 10       /* wait: no such child */
 #define EAGAIN 11       /* spawn, thread_create: every slot is taken; futex_wait: not the value; a socket's receive timeout ran out */
-#define ENOMEM 12       /* out of memory, or the heap would reach the stack */
-#define EACCES 13       /* spawn, exec: not a regular file */
+#define ENOMEM 12       /* out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping */
+#define EACCES 13       /* spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
-#define EEXIST 17       /* the name is taken */
-#define ENODEV 19       /* open: a device node with no driver */
+#define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */
+#define ENODEV 19       /* open: a device node with no driver; mmap: a file that can't be mapped */
 #define ENOTDIR 20      /* a name on the way is not a directory */
 #define EISDIR 21       /* open: a directory, for writing */
 #define EINVAL 22       /* an argument is out of range */
