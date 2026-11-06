@@ -188,13 +188,14 @@ fn all_checks_pass(out: &str, command: &str, program: &str) -> u32 {
 }
 
 /// A disk with the root filesystem (`xtask::fs::build`: the programs in
-/// /bin), `blocks` blocks, and `extra` files besides.
-fn root_disk(blocks: u32, extra: &[(&str, &[u8])]) -> DiskConfig {
+/// /bin), laid out as in the root image (`xtask::fs::IMAGE_SIZE` blocks
+/// less the kernel's), so that the programs have the room they have on
+/// Camelot (filetest writes a file of 300 KiB beside them), and `extra`
+/// files besides.
+fn root_disk(extra: &[(&str, &[u8])]) -> DiskConfig {
     let root = repo_root();
-    let opts = camelot_fs::mkfs::Options {
-        size: blocks,
-        ..camelot_fs::mkfs::Options::default()
-    };
+    let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
+    let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
     let image = if extra.is_empty() {
         xtask::fs::build(&root, &opts).unwrap()
     } else {
@@ -1105,7 +1106,7 @@ fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             ..Setup::default()
         }
         .config(),
@@ -1148,7 +1149,7 @@ fn root_machine() -> (Machine, grail::elf::Elf, std::sync::mpsc::Sender<u8>, u32
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             ..Setup::default()
         }
         .config(),
@@ -2383,7 +2384,7 @@ fn an_elf32_program_is_refused() {
     assert_eq!(prog32[4], 1, "not ELFCLASS32");
     let out = run(
         Setup {
-            disks: vec![root_disk(4096, &[("/bin/prog32", &prog32)])],
+            disks: vec![root_disk(&[("/bin/prog32", &prog32)])],
             ..Setup::default()
         },
         b"prog32\nhello\nexit 0\n",
@@ -2434,7 +2435,7 @@ fn files_pipes_and_64_bit_offsets_on_a_disk() {
     // and stat's 24 bytes.
     let out = run(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             ..Setup::default()
         },
         b"filetest\nexit 0\n",
@@ -2543,7 +2544,7 @@ fn the_calls_take_and_return_64_bit_values() {
     );
     let out = run(
         Setup {
-            disks: vec![root_disk(4096, &[("/bin/high", &elf)])],
+            disks: vec![root_disk(&[("/bin/high", &elf)])],
             ..Setup::default()
         },
         b"high\nexit 0\n",
@@ -2561,7 +2562,7 @@ fn poll_waits_on_every_kind_of_file() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, _) = load(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             nets: vec![NetConfig::user(Vec::new())],
             ..Setup::default()
         }
@@ -2585,7 +2586,7 @@ fn local_sockets_connect_and_pass_descriptors() {
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, _) = load(
         Setup {
-            disks: vec![root_disk(4096, &[])],
+            disks: vec![root_disk(&[])],
             nets: vec![NetConfig::user(Vec::new())],
             ..Setup::default()
         }
