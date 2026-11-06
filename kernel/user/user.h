@@ -53,7 +53,7 @@ typedef unsigned long long uint64_t;
 
 /* Error numbers: a system call that fails returns minus one of them. They
  * are kernel/include/syscall.h's: a test checks they agree. */
-#define EPERM 1         /* link: not for a directory; kill: a kernel process, or the shell */
+#define EPERM 1         /* link: not for a directory; kill: a kernel process, or the first process */
 #define ENOENT 2        /* no such file or directory */
 #define ESRCH 3         /* kill: no such process; thread_join: no such thread */
 #define EINTR 4         /* a wait ended because the process was killed */
@@ -712,6 +712,11 @@ struct cmsghdr {
                                                       : (struct cmsghdr *)NULL)
 #define CMSG_NXTHDR(msg, cmsg) cmsg_nxthdr((msg), (cmsg))
 struct cmsghdr *cmsg_nxthdr(struct msghdr *msg, struct cmsghdr *cmsg);
+
+/* sysexits.h's exit status of a program that can't run with this machine's
+ * configuration (shd with no network card): init does not start such a
+ * service again. */
+#define EX_CONFIG 78
 
 /* The system calls, with Linux's types: a call that returns a count of
  * bytes returns an ssize_t, lseek an off_t; sbrk the old end of the heap

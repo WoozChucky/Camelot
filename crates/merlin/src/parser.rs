@@ -1524,6 +1524,14 @@ impl Parser<'_> {
         if self.is_punct(close) {
             return Ok(self.advance().pos);
         }
+        // A `;` right before the closing token: clang's `ExpectAndConsume`
+        // calls it out (`f(1;)`, `{1;}`), and would skip it and go on.
+        if self.is_punct(";") && matches!(self.peek_at(1), Tok::Punct(q) if *q == close) {
+            return Err(Error::new(
+                self.here(),
+                format!("unexpected ';' before '{close}'"),
+            ));
+        }
         let opener = match close {
             ")" => "(",
             "]" => "[",

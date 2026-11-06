@@ -56,7 +56,10 @@ static const char *const banner[] = {
 /* Timer ticks to wait for before starting the shell. */
 #define BOOT_TICKS 10
 
-/* The first process: the user-space shell, its path and its name. */
+/* The first process: init (kernel/user/init.c), its path and its name, and
+ * the shell, which runs if there is no init. */
+#define INIT_PATH "/bin/init"
+#define INIT "init"
 #define SHELL_PATH "/bin/sh"
 #define SHELL "sh"
 
@@ -311,13 +314,14 @@ static void deliberate_fault(void) {
     }
 }
 
-/* Starts the user-space shell (kernel/user/sh.c) as the first process and
- * runs processes until it and everything it left running have ended: from
- * the root filesystem's /bin, or the kernel's own copy (exec.h). Returns its
- * exit status, or -1 if it couldn't start. */
-static int run_shell(void) {
+/* Starts init (kernel/user/init.c), or the shell (kernel/user/sh.c) if
+ * there is no init, as the first process and runs processes until it and
+ * everything it left running have ended: from the root filesystem's /bin,
+ * or the kernel's own copy (exec.h). Returns its exit status, or -1 if it
+ * couldn't start. */
+static int run_init(void) {
     int status;
-    if (!proc_run_init(SHELL_PATH, SHELL, &status)) {
+    if (!proc_run_init(INIT_PATH, INIT, SHELL_PATH, SHELL, &status)) {
         return -1;
     }
     return status;
@@ -410,7 +414,7 @@ int kmain(void) {
         kprintf("kstack: less than a quarter of the stack left\n");
         failed++;
     }
-    int status = run_shell();
+    int status = run_init();
     /* Failed self-tests are what the exit code reports first. */
     return failed != 0 ? failed : status;
 }

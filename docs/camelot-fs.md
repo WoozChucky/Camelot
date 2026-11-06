@@ -502,7 +502,7 @@ machine with no disk. The image's size is the one the spec gives (section 10,
 "Root image"; `--size N` for N blocks): the kernel takes about 300 blocks and
 the filesystem every block it leaves, so `size` is the image's blocks minus the
 kernel's. A disk kernel that finds
-no `/bin/sh` panics, having no programs of its own to fall back on.
+neither `/bin/init` nor `/bin/sh` panics, having no programs of its own to fall back on.
 
 The kernel is not a file of the filesystem (`/boot/kernel`, say): a
 bootloader that must fit in 1008 bytes reads a run of sectors far more

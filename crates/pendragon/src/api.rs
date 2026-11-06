@@ -13,9 +13,9 @@ use crate::json::Json;
 use crate::screen::{OpenError, Screens, Viewer, SUBPROTOCOL};
 use crate::websocket::{accept_response, Handshake};
 use avalon_client::{
-    arch_text, camelot_bios, create_camelot_vm, format_hz, format_size, holds_disks, lake_disks, mac_text,
-    parse_clock, parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_paging,
-    parse_ram, CamelotError, Client, Timeouts, VmAction,
+    arch_text, create_camelot_vm, format_hz, format_size, holds_disks, lake_disks, mac_text, parse_clock,
+    parse_disk_size, parse_disk_source, parse_harts, parse_hostfwd, parse_net, parse_paging, parse_preset,
+    parse_ram, preset, CamelotError, Client, Preset, Timeouts, VmAction, PRESETS,
 };
 use avalon_proto::{
     validate_name, Bios, DeviceSpec, DiskInfo, DiskSpec, ErrorCode, HardwareProfile, NatConfig, PortOwner,
@@ -469,12 +469,19 @@ impl App {
     fn create_vm(&self, req: &Request) -> Reply {
         let create = parse_create(&body_json(req)?)?;
         let mut avalon = self.avalon()?;
-        let (id, disk) = if create.camelot {
-            // Its own copy of Lake's Camelot image, as Round Table's create --camelot.
+        let (id, disk) = if let Some(preset) = create.camelot {
+            // Its own copy of its profile's Lake image, as Round Table's create
+            // --profile.
             let mut lake = self.lake()?;
-            let (id, disk) =
-                create_camelot_vm(&mut avalon, &mut lake, &self.lake, &create.name, create.profile)
-                    .map_err(camelot_fail)?;
+            let (id, disk) = create_camelot_vm(
+                &mut avalon,
+                &mut lake,
+                &self.lake,
+                &create.name,
+                preset.image,
+                create.profile,
+            )
+            .map_err(camelot_fail)?;
             (id, Some(disk))
         } else {
             let id = avalon
@@ -577,15 +584,15 @@ impl App {
             200,
             Json::object([
                 ("lake", self.lake.as_str().into()),
-                // The image a Camelot VM's disk is a copy of: the new-VM form
-                // offers Camelot first when Lake has it.
-                ("camelot_image", avalon_client::BASE_IMAGE.into()),
-                // A Camelot VM's RAM in MiB, for the new-VM form.
-                ("camelot_ram", (avalon_client::CAMELOT_RAM >> 20).into()),
-                // And its firmware, as `bios` takes it (Camelot's own): the form's
-                // until it is typed in, as the server's choice when `bios` is left
-                // empty.
-                ("camelot_bios", camelot_bios().to_string().into()),
+                // The hardware profiles of Camelot VMs, for the new-VM form: the
+                // image each one's disk is a copy of (the form offers Camelot first
+                // when Lake has one), its RAM in MiB and its firmware, as `bios`
+                // takes it (Camelot's own), the form's until they are typed in, as
+                // the server's choice when they are left empty.
+                (
+                    "profiles",
+                    Json::Array(PRESETS.iter().map(profile_json).collect()),
+                ),
                 ("disks", Json::Array(disks)),
                 ("vms_error", vms.err().map(|f| f.message).into()),
             ]),
@@ -915,6 +922,19 @@ fn flag(body: &Json, key: &str) -> Result<bool, Fail> {
     }
 }
 
+/// A hardware profile of Camelot VMs, as `GET /api/disks` lists them: `{"name",
+/// "about", "image", "ram", "bios"}`, `ram` in MiB.
+fn profile_json(preset: &Preset) -> Json {
+    let machine = preset.profile();
+    Json::object([
+        ("name", preset.name.into()),
+        ("about", preset.about.into()),
+        ("image", preset.image.into()),
+        ("ram", (machine.ram_size >> 20).into()),
+        ("bios", machine.bios.to_string().into()),
+    ])
+}
+
 /// A VM to create, from the page's form.
 #[derive(Debug)]
 struct Create {
@@ -922,13 +942,15 @@ struct Create {
     profile: HardwareProfile,
     /// Empty: boot from disk 0.
     program: Vec<u8>,
-    /// Boot Camelot from a copy of Lake's image, `os-base`, made first.
-    camelot: bool,
+    /// Boot Camelot as this hardware profile, from a copy of its Lake image made
+    /// first (`profile`; `camelot: true` is the server's).
+    camelot: Option<&'static Preset>,
     start: bool,
 }
 
 /// `{"name", "paging", "bios", "ram", "clock", "harts", "disks": [{"source",
-/// "read_only"}], "nets": [{"switch", "mac"}], "camelot", "program", "start"}`:
+/// "read_only"}], "nets": [{"switch", "mac"}], "profile", "camelot", "program",
+/// "start"}`:
 /// `paging`, `bios`, `ram`, `clock` and `harts` as Round Table's `--paging`, `--bios`,
 /// `--ram`, `--clock` and `--harts` take them (sv48 or sv39, none, default or a file,
 /// MiB or with M/MiB, G/GiB or T/TiB, a frequency with Hz/kHz/MHz, a number of harts;
@@ -936,15 +958,18 @@ struct Create {
 /// source a path on Avalon's host
 /// or `lake://ADDR/NAME`, each network card the switch to plug it into (empty or null:
 /// none) and its MAC address (empty or null: Avalon makes one up), the program an ELF
-/// file in base64. `camelot` true boots Camelot from `<name>-disk0`, a copy of Lake's
-/// image `os-base` that goes before the other disks, as Round Table's `create --camelot`; it takes no program.
+/// file in base64. `profile` (`server`, `desktop`) boots Camelot from `<name>-disk0`, a
+/// copy of the profile's Lake image that goes before the other disks, with the
+/// profile's RAM and firmware unless `ram` and `bios` say otherwise, as Round Table's
+/// `create --profile`; it takes no program. `camelot` true is `profile` `server`.
 /// Otherwise the program may be left out when there is a disk: the VM boots from the
 /// first.
 fn parse_create(body: &Json) -> Result<Create, Fail> {
     only_keys(
         body,
         &[
-            "name", "paging", "bios", "ram", "clock", "harts", "disks", "nets", "camelot", "program", "start",
+            "name", "paging", "bios", "ram", "clock", "harts", "disks", "nets", "profile", "camelot",
+            "program", "start",
         ],
     )?;
     let name = string(body, "name")?.ok_or_else(|| Fail::bad("name: a VM needs a name"))?;
@@ -1009,18 +1034,29 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
         }
         Some(_) => return Err(Fail::bad("nets: not a list")),
     }
-    let camelot = flag(body, "camelot")?;
-    // A Camelot VM's RAM, left empty, is 6 MiB (its firmware keeps 2), as Round
-    // Table's create --camelot without --ram.
-    if camelot && string(body, "ram")?.is_none_or(|s| s.trim().is_empty()) {
-        profile.ram_size = avalon_client::CAMELOT_RAM;
+    let preset = match (
+        string(body, "profile")?.map(str::trim).filter(|s| !s.is_empty()),
+        flag(body, "camelot")?,
+    ) {
+        (Some(_), true) => return Err(Fail::bad("camelot: true is profile server: give one of them")),
+        (Some(name), false) => Some(parse_preset(name).map_err(|e| Fail::bad(format!("profile: {e}")))?),
+        (None, true) => preset("server"),
+        (None, false) => None,
+    };
+    let camelot = preset.is_some();
+    // A Camelot VM's RAM and firmware, left empty, are its profile's (a server's 6
+    // MiB: its firmware keeps 2), as Round Table's create --profile without --ram
+    // or --bios; any other VM's firmware is none. The firmware as Round Table's
+    // --bios takes it.
+    let machine = preset.map(Preset::profile);
+    if let Some(machine) = &machine {
+        if string(body, "ram")?.is_none_or(|s| s.trim().is_empty()) {
+            profile.ram_size = machine.ram_size;
+        }
     }
-    // The firmware as Round Table's --bios takes it; empty or left out, a Camelot VM
-    // has Camelot's own, any other VM none.
     profile.bios = match string(body, "bios")?.map(str::trim).filter(|s| !s.is_empty()) {
         Some(bios) => Bios::parse(bios).map_err(|e| Fail::bad(format!("bios: {e}")))?,
-        None if camelot => camelot_bios(),
-        None => Bios::None,
+        None => machine.map_or(Bios::None, |m| m.bios),
     };
     let program = match (string(body, "program")?, camelot) {
         (Some(_), true) => {
@@ -1053,7 +1089,7 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
         name: name.to_string(),
         profile,
         program,
-        camelot,
+        camelot: preset,
         start: flag(body, "start")?,
     })
 }
@@ -1381,13 +1417,24 @@ mod tests {
 
         // Camelot: no program, nor any disk of its own; or no program but a disk.
         let c = create(r#"{"name": "os", "camelot": true, "nets": [{"switch": "nat"}]}"#).unwrap();
-        assert!(c.camelot && c.program.is_empty());
+        assert!(c.camelot == preset("server") && c.program.is_empty());
         assert_eq!(c.profile.devices, [net(Some("nat"), None)]);
         let c = create(r#"{"name": "os", "camelot": false, "disks": [{"source": "d.img"}]}"#).unwrap();
-        assert!(!c.camelot && c.program.is_empty());
+        assert!(c.camelot.is_none() && c.program.is_empty());
         let c = create(r#"{"name": "os", "camelot": null, "program": null, "disks": [{"source": "d.img"}]}"#)
             .unwrap();
-        assert!(!c.camelot && c.program.is_empty());
+        assert!(c.camelot.is_none() && c.program.is_empty());
+        // A profile by name: its image, RAM and firmware.
+        let c = create(r#"{"name": "os", "profile": "desktop"}"#).unwrap();
+        assert_eq!(c.camelot.map(|p| p.image), Some(avalon_client::DESKTOP_IMAGE));
+        assert_eq!(
+            (c.profile.ram_size, c.profile.bios),
+            (avalon_client::DESKTOP_RAM, Bios::Default)
+        );
+        let c = create(r#"{"name": "os", "profile": "server", "camelot": false, "ram": "8"}"#).unwrap();
+        assert_eq!((c.camelot, c.profile.ram_size), (preset("server"), 8 << 20));
+        let c = create(r#"{"name": "os", "profile": " ", "disks": [{"source": "d.img"}]}"#).unwrap();
+        assert!(c.camelot.is_none());
         // Sv39 alone, with 16 GiB of RAM.
         let c = create(r#"{"name": "os", "camelot": true, "paging": "sv39", "ram": "16G"}"#).unwrap();
         assert_eq!(
@@ -1430,6 +1477,19 @@ mod tests {
                 "program: a Camelot VM boots from its disk, and takes no program",
             ),
             (r#"{"name": "a", "camelot": "yes"}"#, "camelot: not true or false"),
+            (
+                r#"{"name": "a", "profile": "laptop"}"#,
+                "profile: no profile 'laptop' (server or desktop)",
+            ),
+            (
+                r#"{"name": "a", "profile": "server", "camelot": true}"#,
+                "camelot: true is profile server: give one of them",
+            ),
+            (r#"{"name": "a", "profile": 1}"#, "profile: not a string"),
+            (
+                r#"{"name": "a", "profile": "desktop", "program": "AA=="}"#,
+                "program: a Camelot VM boots from its disk, and takes no program",
+            ),
             (r#"{"name": "a", "camelot": false}"#, "program: choose an ELF file to run, or a disk"),
             (r#"{"name": "a", "disks": []}"#, "program: choose an ELF file to run, or a disk"),
             (

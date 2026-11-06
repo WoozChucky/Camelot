@@ -1,4 +1,4 @@
-//! `disk create --from` and `create --camelot` against the real Lake and Avalon, in
+//! `disk create --from` and `create --camelot`/`--profile` against the real Lake and Avalon, in
 //! process: copies of an image, and VMs that boot from copies of Lake's base image
 //! (`os-base`) of their own, two of them running at once.
 //!
@@ -251,5 +251,57 @@ two-disk0  8 KiB  16       read-write
     );
     avalon.stop().unwrap();
     bare.stop().unwrap();
+    lake.stop().unwrap();
+}
+
+#[test]
+fn the_profiles_and_a_desktop() {
+    // The profiles, with no server to ask.
+    assert_eq!(
+        rt(&["profiles"]).unwrap(),
+        "\
+NAME     IMAGE       RAM     BIOS     ABOUT
+server   os-base     6 MiB   default  a Camelot server: the console's shell and shd, its shells over TCP
+desktop  os-desktop  64 MiB  default  a Camelot desktop: its own image, and RAM for the largest display mode
+"
+    );
+    let desktop = avalon_client::DESKTOP_IMAGE;
+    let dir = TempDir::new("desktop");
+    std::fs::write(dir.0.join(desktop), spinning_image(16)).unwrap();
+    let lake = lake(&dir);
+    let lake_addr = lake.addr().to_string();
+    let avalon = avalon(256);
+    let server = avalon.addr().to_string();
+    let run = |args: &[&str]| {
+        let mut full = vec!["--server", &server, "--lake", &lake_addr];
+        full.extend_from_slice(args);
+        rt(&full)
+    };
+    // A desktop: a copy of the desktop's image, the desktop's RAM.
+    assert_eq!(
+        run(&["create", "--name", "desk", "--profile", "desktop", "--start"]).unwrap(),
+        format!("created disk desk-disk0 (a copy of {desktop})\ncreated VM 1 (desk)\nstarted VM 1 (desk)\n")
+    );
+    let addr = avalon.addr();
+    wait_for_state(addr, "desk", |s| s == avalon_proto::VmState::Running);
+    assert_eq!(
+        ok(addr, &["list"]),
+        "\
+ID  NAME  STATE    RAM     CLOCK       DISKS  NETS
+1   desk  running  64 MiB  full speed  1      0
+"
+    );
+    // This Lake has no server image.
+    match run(&["create", "--name", "srv", "--profile", "server"]) {
+        Err(round_table::Failure::Failed(why)) => {
+            assert!(
+                why.starts_with(&format!("the Lake at {lake_addr} has no 'os-base' image")),
+                "{why}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    ok(addr, &["destroy", "desk"]);
+    avalon.stop().unwrap();
     lake.stop().unwrap();
 }

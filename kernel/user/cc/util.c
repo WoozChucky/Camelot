@@ -1,5 +1,7 @@
-/* cc1: memory, byte buffers, formatting, maps and UTF-8 (see cc.h). What
- * Rust's standard library gives merlin: String, Vec, HashMap, format!. */
+/* cc1: memory (the arena and the translation unit's heap), byte buffers,
+ * formatting, maps, vectors, sorting, 128-bit integers and UTF-8 (see
+ * cc.h). What Rust's standard library gives merlin: String, Vec, HashMap,
+ * format!, sort, i128. */
 #include "cc.h"
 
 typedef __builtin_va_list va_list;
@@ -79,6 +81,30 @@ static void free_blocks(struct block *b) {
         struct block *next = b->next;
         free(b);
         b = next;
+    }
+}
+
+void arena_mark(struct arena_point *m) {
+    m->chunk = chunks;
+    m->used = chunks != NULL ? chunks->used : 0;
+    m->big = bigs;
+}
+
+/* New chunks and blocks go at the head of their lists, so what came after
+ * the mark is what is ahead of the marked ones there. */
+void arena_release(struct arena_point *m) {
+    while (chunks != m->chunk) {
+        struct block *next = chunks->next;
+        free(chunks);
+        chunks = next;
+    }
+    if (chunks != NULL) {
+        chunks->used = m->used;
+    }
+    while (bigs != m->big) {
+        struct block *next = bigs->next;
+        free(bigs);
+        bigs = next;
     }
 }
 
@@ -389,6 +415,12 @@ void map_put(struct map *m, const char *key, void *value) {
             return;
         }
     }
+}
+
+void map_free(struct map *m) {
+    heap_free(m->keys);
+    heap_free(m->values);
+    memset(m, 0, sizeof *m);
 }
 
 int map_remove(struct map *m, const char *key) {
@@ -942,6 +974,48 @@ void vec_truncate(struct vec *l, uint n) {
     if (n < l->n) {
         l->n = n;
     }
+}
+
+/* ---- Sorting ---- */
+
+/* Merges the sorted runs v[lo..mid) and v[mid..hi) through tmp, taking
+ * from the left run while the right one's next element is not before it:
+ * equal elements keep their order. */
+static void merge_runs(void **v, void **tmp, uint lo, uint mid, uint hi, int (*before)(void *a, void *b)) {
+    uint i = lo;
+    uint j = mid;
+    uint k = lo;
+    while (i < mid && j < hi) {
+        if (before(v[j], v[i])) {
+            tmp[k++] = v[j++];
+        } else {
+            tmp[k++] = v[i++];
+        }
+    }
+    while (i < mid) {
+        tmp[k++] = v[i++];
+    }
+    while (j < hi) {
+        tmp[k++] = v[j++];
+    }
+    memcpy(v + lo, tmp + lo, (hi - lo) * sizeof(void *));
+}
+
+/* A bottom-up merge sort: runs of 1, 2, 4... elements merged in pairs.
+ * O(n log n), and stable, as Rust's sort is. */
+void sort_stable(void **v, uint n, int (*before)(void *a, void *b)) {
+    if (n < 2) {
+        return;
+    }
+    void **tmp = heap_alloc((size_t)n * sizeof(void *));
+    for (uint width = 1; width < n; width = width > n / 2 ? n : width * 2) {
+        for (uint lo = 0; lo + width < n; lo += 2 * width) {
+            uint mid = lo + width;
+            uint hi = n - mid > width ? mid + width : n;
+            merge_runs(v, tmp, lo, mid, hi, before);
+        }
+    }
+    heap_free(tmp);
 }
 
 /* ---- Position maps ---- */

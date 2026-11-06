@@ -2052,7 +2052,7 @@ static int give(struct giving *g, uint n) {
     return (int)g->nkeys;
 }
 
-void debug_renumber(struct lines *l, struct buf *text) {
+void debug_renumber(struct lines *l, struct buf *text, uint from) {
     /* Arrays count their elements in the type clang names
      * __ARRAY_SIZE_TYPE__. */
     for (uint i = 0; i < l->types.n; i++) {
@@ -2096,11 +2096,13 @@ void debug_renumber(struct lines *l, struct buf *text) {
     int unit_first = o->begins || l->globals.n > 0 || l->literals.n > 0;
     /* 2. The files of the code, as the output needs them. The only .file
      * in the text is .file 0. */
+    /* What came before the code generator's output stays as it is. */
     struct buf out;
     memset(&out, 0, sizeof out);
+    buf_put(&out, text->data, from);
     const char *file0 = NULL;
     uint file0_len = 0;
-    uint at = 0;
+    uint at = from;
     while (at < text->len) {
         uint end = at;
         while (end < text->len && text->data[end] != '\n') {
@@ -2155,8 +2157,9 @@ void debug_renumber(struct lines *l, struct buf *text) {
         /* No .loc came: .file 0 goes first. */
         struct buf with;
         memset(&with, 0, sizeof with);
+        buf_put(&with, out.data, from);
         buf_put(&with, file0, file0_len);
-        buf_put(&with, out.data, out.len);
+        buf_put(&with, out.data + from, out.len - from);
         buf_free(&out);
         out = with;
     }

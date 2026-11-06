@@ -443,10 +443,13 @@ static int walk_stmt(struct walk *w, struct stmt *s, int live) {
             w->breaks.v[w->breaks.n - 1] = (void *)1;
         }
         return 0;
-    default:
+    case S_CONTINUE:
         if (w->continues.n > 0 && live) {
             w->continues.v[w->continues.n - 1] = (void *)1;
         }
+        return 0;
+    default:
+        die("flow: a statement of no kind");
         return 0;
     }
 }

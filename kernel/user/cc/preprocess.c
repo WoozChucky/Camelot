@@ -27,7 +27,13 @@
  * where two tokens would otherwise read as others; assembly as clang's -E
  * writes it (print_asm), each token on the line it came from, with line
  * markers. Both are written as the tokens come, which is what merlin's
- * printers, reading the finished list in order, do too. */
+ * printers, reading the finished list in order, do too.
+ *
+ * To compile, the tokens are collected instead (pp->collect,
+ * preprocess_unit): the translation unit's every token, where the
+ * expansions of macros made some, and each diagnostic with where the last
+ * token before it came out, for the front end to put them in clang's
+ * order (merlin's Output). */
 #include "cc.h"
 
 /* How deeply #includes may nest (clang's limit too). */
@@ -66,7 +72,7 @@ struct ptok {
     int function_body;
 };
 
-/* A growable list of tokens (malloc'd). */
+/* A growable list of tokens (on the heap). */
 struct toks {
     struct ptok *v;
     uint n;
@@ -477,7 +483,7 @@ struct comp {
     uint end;
 };
 
-/* The components of p (len bytes: a file's name may hold a NUL), malloc'd;
+/* The components of p (len bytes: a file's name may hold a NUL), on the heap;
  * their count in *n. */
 static struct comp *components(const char *p, uint len, uint *n) {
     struct comp *c = heap_alloc((len + 1) * sizeof(struct comp));
@@ -753,8 +759,8 @@ static int at_directive(struct pp *pp) {
     return next->bol || (next->kind == PP_IDENT && is_directive_name(next->text));
 }
 
-/* The tokens of the innermost file up to the end of the line (a malloc'd
- * array, *n of them). */
+/* The tokens of the innermost file up to the end of the line (an array on
+ * the heap, *n of them). */
 static struct pptok *rest_of_line(struct pp *pp, uint *n) {
     struct pptok *line = NULL;
     uint cap = 0;
@@ -1010,7 +1016,7 @@ static struct diag *defined_here(struct diag *e, struct macro *m, struct pptok *
  * commas outside parentheses; the commas of the variadic part stay in it)
  * and the `)`. A wrong number of arguments is an error at the first extra
  * one, or at the `)` for too few; the end of the input before the `)` is
- * one at the name. *args is m->nparams lists (malloc'd) for CALL_ARGS. */
+ * one at the name. *args is m->nparams lists (on the heap) for CALL_ARGS. */
 static struct diag *arguments(struct pp *pp, struct pptok *name, struct macro *m, int *call,
                               struct toks **args_out, struct ptok *rparen) {
     struct ptok open;
@@ -2614,7 +2620,7 @@ static void renumber(struct pp *pp, struct pptok *dir, uint n, const char *renam
     add_mark(pp, MARK_RENAME, n, c->file);
 }
 
-/* The tokens of a directive's line, macros replaced: a malloc'd array of
+/* The tokens of a directive's line, macros replaced: an array on the heap of
  * *n. */
 static struct pptok *expand_line(struct pp *pp, struct pptok *args, uint nargs, uint *n) {
     struct toks in;
@@ -3354,12 +3360,7 @@ static struct diag *run(struct pp *pp, const char *src, uint n) {
     return NULL;
 }
 
-static void map_free(struct map *m) {
-    heap_free(m->keys);
-    heap_free(m->values);
-}
-
-/* Frees what the preprocessor malloc'd, but its diagnostics' array, which
+/* Frees what the preprocessor keeps on the heap, but its diagnostics' array, which
  * preprocess_text hands on: the files still open when an error stopped it,
  * their tokens and texts, and its tables. */
 static void pp_free(struct pp *pp) {

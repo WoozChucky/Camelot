@@ -412,6 +412,11 @@ static struct diag *expect_close(struct parser *p, const char *close, struct pos
         }
         return NULL;
     }
+    /* A `;` right before the closing token: clang's ExpectAndConsume calls
+     * it out (`f(1;)`, `{1;}`), and would skip it and go on. */
+    if (is_punct(p, ";") && tok_punct(peek_at(p, 1), close)) {
+        return diag_error(here(p), fmt("unexpected ';' before '%s'", close));
+    }
     const char *opener = strcmp(close, ")") == 0 ? "(" : strcmp(close, "]") == 0 ? "[" : "{";
     return diag_note(expected(p, fmt("'%s'", close)), open, fmt("to match this '%s'", opener));
 }

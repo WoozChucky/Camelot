@@ -179,13 +179,19 @@ process ends once they have. Its exit status is kept for its parent's
 has collected it (or at once, if it has no parent any more). Its descriptors
 are closed and its working directory let go of first, as `close` would
 (which may free a file it held open after its last name was removed). Its
-children are orphaned: they keep running, and nobody collects them. When the
-first process, the shell, exits, the kernel runs until every remaining
-process has ended and then stops the machine with the shell's status as the
-exit code (its low 8 bits, so `exit -2` gives 0xFE). That includes a process
-blocked reading the console, which keeps the machine running until it gets a
-line or the end of the input (`sh &`, then `exit` in the first shell, leaves
-the second one reading). Note that 0xFE is also the code of a kernel panic:
+children are orphaned: they keep running, and become init's children, as
+Linux gives them to its init, which collects them as they end (its `wait`
+gets them); when the first process is not init (the shell, on an image
+without `/etc/rc`, or init once it has `exec`'d another program), nobody
+collects them, and the kernel frees them as they end. When the first
+process (init, or the shell) exits, the kernel runs until every remaining
+process has ended and then stops the machine with its status as the
+exit code (its low 8 bits, so `exit -2` gives 0xFE). Init kills every other
+process first (its `/etc/rc`, excalibur-spec section 10, "Init and the
+shell"); a shell that is the first process does not, and a process blocked
+reading the console keeps the machine running until it gets a line or the
+end of the input (`sh &`, then `exit` in the first shell, leaves the second
+one reading). Note that 0xFE is also the code of a kernel panic:
 the exit code alone can't tell `exit -2` from a panic, the console output
 can. Returning from `main` calls `exit` with the return value (`crt0.S`).
 
@@ -279,7 +285,8 @@ envp are `-EFAULT`. Errors:
 - `-ENOEXEC`: the file is not a valid executable (the kernel also prints why
   on the console: `spawn: PATH: REASON`);
 - `-EAGAIN`: every one of the 8 process slots is taken (zombies count until
-  they are collected), or every one of the 16 thread slots;
+  they are collected; init, on a root image, holds one), or every one of
+  the 16 thread slots;
 - `-ENOMEM`: not enough free memory;
 - `-EFAULT`: `path`, `argv`, `envp` or one of their strings is not
   readable (a path longer than `MAXPATH` is still read to its NUL).
@@ -508,15 +515,16 @@ process may kill itself; `kill` then returns 0 and the process ends on its
 way back from the call. Killing a zombie, which has already ended, does
 nothing and returns 0. Errors: `-ESRCH` when no process has that pid (one
 whose parent has collected it is gone), `-EPERM` for one of the kernel's
-own processes or for the first process, the shell, whose end would be
-Camelot's (it ends only by its own `exit`).
+own processes or for the first process (init, or the shell without one),
+whose end would be Camelot's (it ends only by its own `exit`).
 
 **procs(buf, max)** describes the processes, in pid order, in the array of
 `max` `struct procinfo` (40 bytes each, `user.h`) at `buf`, and returns how
 many processes there are, which may be more than `max`: only the first
 `max` are stored then, and `procs(NULL, 0)` just counts them. Each entry
-holds `pid`; `ppid`, its parent's pid, or 0 for a process without one (the
-shell, an orphan, a kernel process); `state`: `PROC_RUNNABLE` (1, waiting
+holds `pid`; `ppid`, its parent's pid (1 for an orphan init was given), or
+0 for a process without one (the first process, an orphan when the first
+process is not init, a kernel process); `state`: `PROC_RUNNABLE` (1, waiting
 for its turn), `PROC_RUNNING` (2, the caller itself), `PROC_ZOMBIE` (3,
 ended, its status not collected yet) or `PROC_SLEEPING` (4); for a process
 of several threads, running if one of them is, else runnable if one is,
@@ -1404,7 +1412,7 @@ closed. A descriptor's one flag, `FD_CLOEXEC` (`fcntl`, `O_CLOEXEC`), is
 its own: `exec` closes the descriptors that have it, and `spawn` passes
 none of them on.
 
-The first process, the shell, starts with the console as 0 (stdin, for
+The first process (init, or the shell) starts with the console as 0 (stdin, for
 reading), 1 (stdout) and 2 (stderr), both for writing. Every other process
 gets 0, 1 and 2 from its parent at `spawn`, whatever they are by then: the
 shell redirects a program's input or output by putting a file or a pipe at
@@ -1532,7 +1540,7 @@ path, then the environment's, then the arguments', each array's in its
 own order: `copy_string_kernel` and `copy_strings` in `fs/exec.c`), one
 right after another, so argv[0]'s string is the lowest and envp's last
 ends right below the path; each pointer points at its string. The first
-process, the shell, gets the environment Linux gives init
+process (init, or the shell) gets the environment Linux gives init
 (`envp_init` in `init/main.c`): `HOME=/` and `TERM=linux`.
 
 The auxiliary vector has Linux's entries, in Linux's order, with Linux's

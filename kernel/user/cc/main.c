@@ -322,34 +322,29 @@ static int compile_unit(const char *name, const char *src, uint n, struct option
         print_all(&prog.warnings, name);
         return 1;
     }
-    struct diag *error = NULL;
-    struct buf asm_text;
-    memset(&asm_text, 0, sizeof asm_text);
+    /* `.file "NAME"`, the first line of the assembly, as clang writes it with
+     * or without -g: the base name of the file being compiled (merlin's
+     * file_directive), whatever #line says; the code generator's text after
+     * it. The assembler makes it the object's STT_FILE symbol; it has
+     * nothing to do with the numbered .files of a line table. */
+    uint base_len;
+    const char *base = path_file_name(name, (uint)strlen(name), &base_len);
+    buf_str(text, "    .file ");
+    quote(text, base, base_len);
+    buf_byte(text, '\n');
     /* -g: the files the preprocessor read, what the .file directives say
      * of them. */
     struct lines *debug = NULL;
     if (comp_dir != NULL) {
         debug = debug_new(comp_dir, pp.files, pp.lens, pp.sums, pp.nfiles);
     }
-    if (!codegen_generate(&prog, debug, &asm_text, &error)) {
+    struct diag *error;
+    if (!codegen_generate(&prog, debug, text, &error)) {
         diag_name_files(error, pp.files, pp.lens, pp.nfiles);
         print_all(&prog.warnings, name);
         diag_print(error, name);
-        buf_free(&asm_text);
         return 0;
     }
-    /* `.file "NAME"`, the first line of the assembly, as clang writes it with
-     * or without -g: the base name of the file being compiled (merlin's
-     * file_directive), whatever #line says. The assembler makes it the
-     * object's STT_FILE symbol; it has nothing to do with the numbered
-     * .files of a line table. */
-    uint base_len;
-    const char *base = path_file_name(name, (uint)strlen(name), &base_len);
-    buf_str(text, "    .file ");
-    quote(text, base, base_len);
-    buf_byte(text, '\n');
-    buf_put(text, asm_text.data, asm_text.len);
-    buf_free(&asm_text);
     print_all(&prog.warnings, name);
     return 1;
 }

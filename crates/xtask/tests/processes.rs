@@ -191,7 +191,7 @@ fn all_checks_pass(out: &str, command: &str, program: &str) -> u32 {
 /// /bin), laid out as in the root image (`xtask::fs::IMAGE_SIZE` blocks
 /// less the kernel's), so that the programs have the room they have on
 /// Camelot (filetest writes a file of 300 KiB beside them), and `extra`
-/// files besides.
+/// files besides (in `/`, `/bin` or `/etc`, made for them).
 fn root_disk(extra: &[(&str, &[u8])]) -> DiskConfig {
     let root = repo_root();
     let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
@@ -214,6 +214,9 @@ fn root_disk(extra: &[(&str, &[u8])]) -> DiskConfig {
         for p in xtask::userprogs::build_all(&user).unwrap() {
             fs.add_file(&format!("{}/{}", xtask::fs::BIN, p.name), &p.elf)
                 .unwrap();
+        }
+        if extra.iter().any(|(path, _)| path.starts_with("/etc/")) {
+            fs.mkdir("/etc").unwrap();
         }
         for (path, bytes) in extra {
             fs.add_file(path, bytes).unwrap();
@@ -430,17 +433,17 @@ fn booting_drops_into_the_user_shell() {
 
 #[test]
 fn a_program_starts_as_linux_starts_one() {
-    // The first instruction in U-mode is the shell's entry point, crt0's
+    // The first instruction in U-mode is init's entry point, crt0's
     // _start, as pid 1, with Linux's start (docs/camelot-syscalls.md,
     // "Starting a program"): every register zero but sp, which points at
-    // argc, a long, then argv { "sh", NULL }, envp (Linux's environment for
+    // argc, a long, then argv { "init", NULL }, envp (Linux's environment for
     // init, HOME=/ and TERM=linux) and the auxiliary vector, 8 bytes each,
     // under USER_TOP, which depends on the paging mode; the strings, argv's
-    // then envp's, then the path, "/bin/sh", above. Interrupts on, SUM off.
+    // then envp's, then the path, "/bin/init", above. Interrupts on, SUM off.
     // The programs it runs get the same: systest checks its own start, its
     // environment's strings among them, and its children's after a spawn
     // and an exec (the_system_calls_do_what_the_document_says).
-    let sh = user_program("sh");
+    let init = user_program("init");
     for (paging, top) in [
         (grail::Paging::Sv48, 1u64 << 47),
         (grail::Paging::Sv39, 1u64 << 38),
@@ -456,13 +459,122 @@ fn a_program_starts_as_linux_starts_one() {
         step_until(&mut m, MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
         assert_eq!(m.cpu.pc, USER_TEXT, "{paging:?}");
         let cpus = sym(&elf, "cpus");
-        assert_eq!(current_name(&m.cpu, cpus).as_deref(), Some("sh"));
+        assert_eq!(current_name(&m.cpu, cpus).as_deref(), Some("init"));
         let p = peek64(&m.cpu, cpus + CPU_PROC);
         assert_eq!(common::peek(&m.cpu, p + PROC_PID), 1);
-        common::start::check(&m, top, &sh.elf, "/bin/sh", &["sh"], common::start::INIT_ENV);
+        common::start::check(
+            &m,
+            top,
+            &init.elf,
+            "/bin/init",
+            &["init"],
+            common::start::INIT_ENV,
+        );
         assert_ne!(m.cpu.csr.mstatus & MSTATUS_SIE, 0);
         assert_eq!(m.cpu.csr.mstatus & excalibur::csr::MSTATUS_SUM, 0);
     }
+}
+
+/// Each `ps`'s listing in `out`, in order: a process a line, as (pid, ppid,
+/// state, name). Lines that are not a process's (the header, a line another
+/// process printed meanwhile) are left out.
+fn ps_listings(out: &str) -> Vec<Vec<(u32, u32, String, String)>> {
+    out.split(&format!("{PROMPT}ps\n"))
+        .skip(1)
+        .map(|rest| {
+            rest[..rest.find(PROMPT).unwrap_or(rest.len())]
+                .lines()
+                .filter_map(|l| match l.split_whitespace().collect::<Vec<_>>()[..] {
+                    [pid, ppid, state, _size, name] => Some((
+                        pid.parse().ok()?,
+                        ppid.parse().ok()?,
+                        state.to_string(),
+                        name.to_string(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn init_starts_the_services_of_etc_rc_and_ends_the_machine_with_them() {
+    // Issue #182: /bin/init, pid 1, runs /etc/rc's services: the console's
+    // shell once, a sleep respawned each time it ends, hello (which ends at
+    // once, so it is left after five times), shd (which can't run without a
+    // network card, says so and exits EX_CONFIG, so it is left at once,
+    // init saying nothing), a program that is not there; and says what is
+    // wrong with the lines it leaves out (CRLF lines are read as LF ones). Orphans become its children, and
+    // it collects them. It can't be killed, nor run again. `exit 3` ends its
+    // one `once` service, so init ends everything and the machine with 3.
+    let rc = b"# the console's shell, and services that end
+once /bin/sh   # the console's
+respawn /bin/sleep 1.5
+respawn\t/bin/hello
+respawn /bin/nothere\r
+respawn /bin/shd
+once
+bogus /bin/sh
+respawn sh
+once /bin/echo 1 2 3 4 5 6 7 8
+";
+    let input = b"ps\nsleep 2\nps\nsh\nsleep 3 &\nexit\nps\nsleep 4\nps\nkill 1\ninit\nexit 3\n";
+    let setup = Setup {
+        disks: vec![root_disk(&[("/etc/rc", rc)])],
+        ..Setup::default()
+    };
+    let (mut m, _) = load(setup.config(), Some(kernel::typed(input)));
+    let r = m.run(Some(MAX_STEPS), |_| {});
+    let out = printed(&m);
+    assert_eq!(r, RunResult::Exited(3), "{out}");
+    for line in [
+        "init: /etc/rc:7: no program's path\n",
+        "init: /etc/rc:8: bogus: not once or respawn\n",
+        "init: /etc/rc:9: no program's path\n",
+        "init: /etc/rc:10: more than 7 arguments\n",
+        "init: cannot start /bin/nothere: no such file or directory\n",
+        "init: /bin/hello ended at once 5 times, exit 0: not started again\n",
+        "shd: socket: no network card\n",
+        "kill: 1: operation not permitted\n",
+        "init: not the first process\n",
+        "init: exit 1\n",
+    ] {
+        assert_eq!(out.matches(line).count(), 1, "{line:?} in\n{out}");
+    }
+    assert_eq!(out.matches("hello from user mode\n").count(), 5, "{out}");
+    assert!(!out.contains("init: /bin/shd"), "{out}");
+    let ps = ps_listings(&out);
+    assert_eq!(ps.len(), 4, "{out}");
+    let named = |listing: &[(u32, u32, String, String)], name: &str, ppid: u32| -> Vec<u32> {
+        listing
+            .iter()
+            .filter(|p| p.3 == name && p.1 == ppid)
+            .map(|p| p.0)
+            .collect()
+    };
+    // Init is pid 1, with no parent; the shell and the sleep are its.
+    assert_eq!(named(&ps[0], "init", 0), [1], "{out}");
+    let sh = named(&ps[0], "sh", 1);
+    assert_eq!(sh.len(), 1, "{out}");
+    let sleep = named(&ps[0], "sleep", 1);
+    assert_eq!(sleep.len(), 1, "{out}");
+    // 2 seconds later, the sleep of 1.5 seconds is another: started again.
+    let again = named(&ps[1], "sleep", 1);
+    assert_eq!(again.len(), 1, "{out}");
+    assert_ne!(again, sleep, "{out}");
+    // The second shell's background sleep, once that shell has ended, is
+    // init's.
+    let at = out.find("sleep 3 &\n[").unwrap_or_else(|| panic!("{out}")) + "sleep 3 &\n[".len();
+    let orphan: u32 = out[at..at + out[at..].find(']').unwrap()].parse().unwrap();
+    assert!(
+        ps[2].iter().any(|p| p.0 == orphan && p.1 == 1 && p.3 == "sleep"),
+        "{out}"
+    );
+    // Once it has ended, init has collected it: no zombie is left.
+    assert!(!ps[3].iter().any(|p| p.0 == orphan), "{out}");
+    assert!(ps[3].iter().all(|p| p.2 != "zombie"), "{out}");
+    assert_eq!(named(&ps[3], "sh", 1), sh, "{out}");
 }
 
 #[test]
@@ -559,7 +671,8 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
     // Issue #20's first criterion, watched from the hart: two processes in
     // U-mode, each in its own page table, and the CPU only moves between
     // them when a timer tick (or an exit) traps from U-mode. The shell runs
-    // too: it starts ding in the background and waits for dong.
+    // too: it starts ding in the background and waits for dong. (Init runs
+    // first, and execs the shell: there is no /etc/rc.)
     let (mut m, elf) = load_committed(Some(kernel::typed(b"ding & dong\nwait\nexit\n")));
     let (user_vec, cpus) = (sym(&elf, "user_vec"), sym(&elf, "cpus"));
     // The process of each stretch in U-mode, and the last trap from it:
@@ -571,13 +684,13 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
     let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
         if cpu.mode == Mode::U {
             let name = current_name(cpu, cpus).unwrap();
-            if name != "sh" {
+            if name != "sh" && name != "init" {
                 user_steps += 1;
             }
             assert!((USER_TEXT..USER_TOP).contains(&cpu.pc), "U-mode at {:#x}", cpu.pc);
             if stretches.last().map(|s| &s.0) != Some(&name) {
                 if let Some((prev, _)) = stretches.last() {
-                    if prev != "sh" {
+                    if prev != "sh" && prev != "init" {
                         // ding and dong never wait for anything: they leave
                         // the CPU when a tick preempts them, or for good.
                         match last_trap {
@@ -607,7 +720,7 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
         }
     });
     assert_eq!(r, RunResult::Exited(0));
-    let mut satps: Vec<(String, u64)> = stretches.clone();
+    let mut satps: Vec<(String, u64)> = stretches.iter().filter(|s| s.0 != "init").cloned().collect();
     satps.sort();
     satps.dedup();
     let names: Vec<&str> = satps.iter().map(|s| s.0.as_str()).collect();

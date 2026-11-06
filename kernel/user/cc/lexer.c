@@ -13,6 +13,12 @@
  * came before it (a trigraph, a splice's blanks, a comment that seems to
  * open inside a block comment).
  *
+ * To compile, phase 7 (lex_finish, merlin's finish) turns the tokens the
+ * preprocessor hands on into the parser's: an identifier that is a keyword
+ * becomes one, a preprocessing number an integer constant with its value
+ * and its C type, a character constant its value, and a string literal
+ * its bytes, escapes decoded, with the lexer's diagnostics of each.
+ *
  * merlin works on Rust's chars, Unicode scalar values; this works on the
  * UTF-8 bytes, which comes to the same for everything the lexer compares
  * (only ASCII means anything to C), with three places where it would not:

@@ -4091,7 +4091,12 @@ fn the_system_call_document_matches_the_code() {
     let errors = doc_table(&doc, "## Error numbers");
     assert_eq!(errors.len(), 51, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
-    assert_eq!(defines(&user_h, "E"), errors, "user.h");
+    // (Not sysexits.h's exit statuses, EX_CONFIG: no error numbers.)
+    let user_errors: Vec<(u32, String)> = defines(&user_h, "E")
+        .into_iter()
+        .filter(|(_, name)| !name.starts_with("EX_"))
+        .collect();
+    assert_eq!(user_errors, errors, "user.h");
 
     // Each call's arguments are its user.h declaration's parameters, and
     // what it may fail with are error numbers.
