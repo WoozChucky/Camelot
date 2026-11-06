@@ -2,7 +2,10 @@
 //! and that changes nothing the machine loads: the committed kernels' segments
 //! are byte for byte those of a build without debug information, the programs
 //! the kernel embeds and `/bin` holds have none (merlin-ld strips it), and so the
-//! root image is the same either way.
+//! root image holds the same programs and kernel either way. Only the objects
+//! programs are linked from on Camelot, `/usr/lib/crt0.o` and `libc.a`, keep
+//! their line tables, as the host links its programs from them (#240): the
+//! programs linked with or without them are the same.
 
 use std::path::{Path, PathBuf};
 use xtask::{fs, kernel, toolchain, userprogs};
@@ -69,15 +72,81 @@ fn debug_information_changes_no_loaded_byte() {
     let user = userprogs::user_dir(&repo_root());
     let prog = userprogs::build_named(&user, "echo").unwrap();
     let plain_prog = toolchain::without_debug_info(|| userprogs::build_named(&user, "echo").unwrap());
+    let echo = userprogs::programs(&user)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.stem == "echo")
+        .unwrap();
+    let prog_objects = userprogs::program_objects(&user, &echo, userprogs::CCompiler::Merlin).unwrap();
     assert!(has_line_table(&prog.debug) && !has_line_table(&prog.elf));
     assert!(loaded(&prog.debug) == loaded(&prog.elf));
     assert!(plain_prog.elf == prog.elf && plain_prog.debug == prog.elf);
 
-    // The root image, programs and kernel together.
+    // The root image: the same kernel, and every file the same but the
+    // objects of /usr/lib, which have the same members and link the same
+    // program.
     let image = fs::build_bootable(&repo_root(), fs::IMAGE_SIZE).unwrap();
     let plain_image =
         toolchain::without_debug_info(|| fs::build_bootable(&repo_root(), fs::IMAGE_SIZE).unwrap());
-    assert!(image == plain_image, "the root image differs without -g");
+    assert!(
+        camelot_fs::boot::kernel_image(&image).unwrap()
+            == camelot_fs::boot::kernel_image(&plain_image).unwrap(),
+        "the root image's kernel differs without -g"
+    );
+    assert_eq!(
+        image[..camelot_fs::BSIZE],
+        plain_image[..camelot_fs::BSIZE],
+        "the boot block"
+    );
+    let (with, without) = (
+        camelot_fs::read::Fs::open(&image).unwrap(),
+        camelot_fs::read::Fs::open(&plain_image).unwrap(),
+    );
+    let paths =
+        |f: &camelot_fs::read::Fs| -> Vec<String> { f.walk().unwrap().into_iter().map(|(p, _)| p).collect() };
+    assert_eq!(paths(&with), paths(&without));
+    let objects = ["/usr/lib/crt0.o", "/usr/lib/libc.a"];
+    for p in paths(&with) {
+        if objects.contains(&p.as_str()) || with.read_file(&p).is_err() {
+            continue;
+        }
+        assert!(
+            with.read_file(&p) == without.read_file(&p),
+            "{p} differs without -g"
+        );
+    }
+    let members = |f: &camelot_fs::read::Fs| -> Vec<String> {
+        let a = f.read_file("/usr/lib/libc.a").unwrap();
+        elf::archive::parse(&a)
+            .unwrap()
+            .members
+            .iter()
+            .map(|m| m.name.clone())
+            .collect()
+    };
+    assert_eq!(members(&with), members(&without));
+    let link = |f: &camelot_fs::read::Fs| {
+        let input = |p: &str| merlin_ld::Input {
+            name: p.into(),
+            data: f.read_file(p).unwrap(),
+        };
+        let mut inputs = vec![input("/usr/lib/crt0.o")];
+        inputs.extend(prog_objects.clone());
+        inputs.push(input("/usr/lib/libc.a"));
+        let files: Vec<(&merlin_ld::Input, bool)> = inputs.iter().map(|i| (i, false)).collect();
+        let opts = merlin_ld::Options {
+            script: Some(merlin_ld::ScriptSource {
+                name: "user.ld".into(),
+                text: String::from_utf8(f.read_file("/usr/lib/user.ld").unwrap()).unwrap(),
+            }),
+            entry: None,
+        };
+        merlin_ld::strip_debug(&merlin_ld::link_files(&files, &opts).unwrap().elf).unwrap()
+    };
+    assert!(
+        link(&with) == prog.elf && link(&without) == prog.elf,
+        "echo links differently"
+    );
 }
 
 #[test]
