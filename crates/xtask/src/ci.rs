@@ -154,8 +154,9 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "the committed kernel is current, linked high, boots on 1-8 harts, under Sv39 and from \
-               disk, panics as it should, the shell's built-in statuses are dash's, and the boot and the \
-               shell show on the framebuffer console (#178)",
+               disk, panics as it should, the shell's built-in statuses are dash's; its memory \
+               functions at every alignment and its bitmap scan (#133); and the boot and the shell \
+               show on the framebuffer console (#178)",
         args: &[
             "-p",
             "xtask",
@@ -175,6 +176,8 @@ const STEPS: &[Step] = &[
             "the_kernel_falls_back_to_sv39",
             "the_kernel_boots_from_disk",
             "a_failed_builtin_gives_dashs_status",
+            "kernel_memory_functions_at_every_alignment",
+            "the_bitmap_scan_finds_the_bit_the_bit_by_bit_loop_found",
             "the_framebuffer_console_shows_the_boot_and_the_shell",
         ],
     },

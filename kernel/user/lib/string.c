@@ -1,21 +1,7 @@
-/* Strings and memory: a byte at a time, simple first. */
+/* Strings, a byte at a time. strlen and strcmp, and memset, memcpy,
+ * memmove and memcmp, are the kernel's assembly (strlen.S, strcmp.S and
+ * mem*.S here include kernel's). */
 #include "../user.h"
-
-size_t strlen(const char *s) {
-    size_t n = 0;
-    while (s[n]) {
-        n++;
-    }
-    return n;
-}
-
-int strcmp(const char *a, const char *b) {
-    while (*a && *a == *b) {
-        a++;
-        b++;
-    }
-    return (int)(uchar)*a - (int)(uchar)*b;
-}
 
 int strncmp(const char *a, const char *b, size_t n) {
     for (; n > 0; n--, a++, b++) {
@@ -70,51 +56,4 @@ char *strstr(const char *haystack, const char *needle) {
     }
     /* The empty needle is found at the end of an empty haystack too. */
     return n == 0 ? (char *)haystack : NULL;
-}
-
-void *memset(void *dst, int c, size_t n) {
-    uchar *d = (uchar *)dst;
-    while (n--) {
-        *d++ = (uchar)c;
-    }
-    return dst;
-}
-
-void *memcpy(void *dst, const void *src, size_t n) {
-    uchar *d = (uchar *)dst;
-    const uchar *s = (const uchar *)src;
-    while (n--) {
-        *d++ = *s++;
-    }
-    return dst;
-}
-
-/* Like memcpy, but the two may overlap: copies backwards when `dst` is
- * above `src`, so no byte is overwritten before it is copied. */
-void *memmove(void *dst, const void *src, size_t n) {
-    uchar *d = (uchar *)dst;
-    const uchar *s = (const uchar *)src;
-    if (d < s) {
-        while (n--) {
-            *d++ = *s++;
-        }
-    } else {
-        d += n;
-        s += n;
-        while (n--) {
-            *--d = *--s;
-        }
-    }
-    return dst;
-}
-
-int memcmp(const void *a, const void *b, size_t n) {
-    const uchar *x = (const uchar *)a;
-    const uchar *y = (const uchar *)b;
-    for (; n; n--, x++, y++) {
-        if (*x != *y) {
-            return *x < *y ? -1 : 1;
-        }
-    }
-    return 0;
 }

@@ -1,6 +1,10 @@
-/* The handful of string and memory routines the kernel needs. clang may call
- * memcpy/memset/memmove/memcmp on its own even with -ffreestanding (struct
- * copies, large zero-initialisations), so those names must exist. */
+/* The handful of string and memory routines the kernel needs, in
+ * assembly: memset.S, memcpy.S, memmove.S and memcmp.S work a register
+ * at a time where they can, as Linux's and the C libraries' do, strlen.S
+ * and strcmp.S two bytes a round (spec section 10, "Kernel memory").
+ * clang may call memcpy/memset/memmove/memcmp on its own even with
+ * -ffreestanding (struct copies, large zero-initialisations), so those
+ * names must exist. */
 #ifndef CAMELOT_STRING_H
 #define CAMELOT_STRING_H
 

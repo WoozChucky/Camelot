@@ -475,8 +475,8 @@ and wakes it with an IPI (the SBI's `send_ipi`). Only hart 0 counts the clock (`
 the network's timer) and takes the devices' interrupts. Taking away a
 mapping (`unmap_pages()`) shoots it down on the harts that may hold it
 (`tlb_shootdown()`) before the page is reused. A panic on one hart stops
-the others at their next byte to the UART (`uart_putc()` checks), so its
-report comes out whole.
+the others with an IPI, and at their next byte to the UART (`uart_putc()`
+checks), so its report comes out whole.
 
 Locks are always taken in this order, so no two holders can wait for each
 other:
@@ -552,7 +552,8 @@ one process.
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
 | `console.c` | the console device (`read` and `write` on it): `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers); `console_input()`, the keyboard's characters while no process reads it; the output and the echo go to the framebuffer console too |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width; `kprintf` writes to the UART and the framebuffer console |
-| `string.c` | `memset memcpy memmove memcmp strlen strcmp` (clang may call the `mem*` ones by itself); `memset` stores whole registers, as Linux's riscv one, the rest a byte at a time |
+| `memset.S`, `memcpy.S`, `memmove.S`, `memcmp.S` | `memset memcpy memmove memcmp` (clang may call them by itself; `string.h`), in assembly, a register at a time as Linux's and the C libraries' are: whole registers where both pointers are on a register boundary, bytes around them, eight registers a round for `memset` and `memcpy`; `memmove` copies pointers that are differently aligned a register at a time too, from two aligned loads shifted, and `memcpy` hands it those. The user library's are these files (`user/lib/mem*.S` include them) |
+| `strlen.S`, `strcmp.S` | `strlen strcmp`, in assembly, two bytes a round; the user library's too |
 | `kernel.lds.S` | the layout, preprocessed first (`merlin -E -P`, as Linux's `vmlinux.lds.S`): `.text` (`_start` first), then page-aligned `.rodata` and `.data` (so each gets its own page permissions), `.bss`, 16 KiB stack, `__kernel_end`; linked at 0xffff_ffff_8000_0000 and loaded at 0x8020_0000 (`AT`), after the firmware's 2 MiB, the boot stack 32 KiB aligned |
 | `include/` | `types.h` (fixed-width types), `mmio.h` (`volatile` accessors), `varargs.h`, `riscv.h` (CSR bits, cause numbers), `memlayout.h` (page size, linker symbols), `sysinfo.h` (register offsets, device types), `plic.h`, `vm.h` (also the user address space layout), `proc.h` (`struct proc`, `struct thread`, `struct user_program`, sleep and wakeup, the thread and futex calls), `context.h` (`struct context`, `swtch`), `spinlock.h` (`struct spinlock`, `struct cpu`, `NCPU`), `smp.h`, `sleeplock.h`, `elf.h`, `blk.h` (disk registers, `BLK_ERR_` codes), `bio.h` (`struct buf`, `BSIZE`, `NBUF`), `fs.h` (the on-disk structures, `struct inode`, the filesystem's API), `log.h` (transactions, `LOGSIZE`, `MAXOPBLOCKS`), `file.h` (`struct file`, `NFILE`, `NOFILE`, `devsw`), `mmap.h` (`struct vm_area`, `PROT_`, `MAP_`), `shm.h` (`struct shm_object`, `MFD_`), `fb.h`, `pipe.h`, `exec.h`, `sysfile.h`, `errno.h` (`syscall.h`'s error numbers and the kernel's own: `EIO`, `ERANGE`, `ENOTSUPP`), `syscall.h` (the system call and error numbers, `open`'s flags, `struct stat`, `struct netinfo`), `net.h` (the network stack: `struct pbuf`, every layer's functions and limits), `nic.h` (the card's registers and descriptors), and the headers for the above |
 | `kernel.elf` | the prebuilt image, with the user programs built in, committed so `cargo test` and Grail need no build |
@@ -596,11 +597,12 @@ merlin -g -fdebug-compilation-dir=kernel -I include net/arp.c -o net/arp.c.s   #
 merlin -E -P -I ../include -I include kernel.lds.S -o kernel.lds
 merlin-ld -T kernel.lds -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o elf.c.o entry.S.o \
        exec.c.o fb.c.o fbblit.S.o fbcon.c.o file.c.o font.c.o fs.c.o fstest.c.o input.c.o \
-       kalloc.c.o kernelvec.S.o keyboard.c.o kprintf.c.o log.c.o main.c.o mmap.c.o net/arp.c.o \
-       net/dhcp.c.o net/ether.c.o net/icmp.c.o net/ip.c.o net/net.c.o net/nic.c.o net/pbuf.c.o \
-       net/socket.c.o net/tcp.c.o net/udp.c.o pipe.c.o plic.c.o pointer.c.o probe.S.o proc.c.o \
-       riscv.S.o sbi.c.o sbi_ecall.S.o shm.c.o sleeplock.c.o smp.c.o spinlock.S.o spinlock.c.o \
-       string.c.o swtch.S.o syscall.c.o sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
+       kalloc.c.o kernelvec.S.o keyboard.c.o kprintf.c.o log.c.o main.c.o memcmp.S.o memcpy.S.o \
+       memmove.S.o memset.S.o mmap.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o \
+       net/ip.c.o net/net.c.o net/nic.c.o net/pbuf.c.o net/socket.c.o net/tcp.c.o net/udp.c.o \
+       pipe.c.o plic.c.o pointer.c.o probe.S.o proc.c.o riscv.S.o sbi.c.o sbi_ecall.S.o shm.c.o \
+       sleeplock.c.o smp.c.o spinlock.c.o spinlock.S.o strcmp.S.o strlen.S.o swtch.S.o syscall.c.o \
+       sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
        userprogs.s.o uservec.S.o vm.c.o vmtest.c.o
 ```
 

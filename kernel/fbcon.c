@@ -595,7 +595,15 @@ void fbcon_flush(void) {
     release(&uart_tx_lock);
 }
 
+/* Set by the first panic flush: a panic inside it (a fault drawing, say)
+ * comes back through halt_after_panic(), and must not flush again. */
+static bool panic_flushed;
+
 void fbcon_panic_flush(void) {
+    if (panic_flushed) {
+        return;
+    }
+    panic_flushed = true;
     flush_locked();
 }
 

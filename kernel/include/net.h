@@ -239,13 +239,17 @@ int ether_output(struct pbuf *p, const u8 *dst, u32 type);
 #define ARP_RETRY 10    /* 1 s */
 #define ARP_TRIES 3
 #define ARP_HOLD 30 /* 3 s */
+/* The packets an address being asked for holds until it answers (of the
+ * NPBUF there are; the oldest goes when another comes). */
+#define ARP_QUEUE 8
 
 /* An ARP packet (`len` bytes at `arp`, inside p's frame). Takes `p`. */
 void arp_input(struct pbuf *p, const u8 *arp, u32 len);
 
 /* Sends the IPv4 frame in `p` to `next_hop` on the local network: at once
  * if its MAC is known, otherwise once ARP has found it (the frame waits in
- * the cache entry, one per address: a newer one replaces it). Takes `p`.
+ * the cache entry, behind up to ARP_QUEUE - 1 others; the oldest is dropped
+ * when there are more). Takes `p`.
  * Returns 0, -EHOSTUNREACH (the address did not answer lately) or
  * -ENOBUFS. */
 int arp_output(struct pbuf *p, u32 next_hop);
