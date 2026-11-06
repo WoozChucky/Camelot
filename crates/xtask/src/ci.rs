@@ -243,6 +243,12 @@ const STEPS: &[Step] = &[
         args: &["-p", "xtask", "--test", "gui"],
     },
     Step {
+        what: "the display server (#184): windows composited, raised, moved and closed with injected \
+               input against their expected images, clients that break the protocol disconnected, \
+               flips whole at the vertical blank",
+        args: &["-p", "xtask", "--test", "display"],
+    },
+    Step {
         what: "the committed examples, boot programs and hello are current; a boot block and the root \
                images of both profiles boot, its /usr what the programs are linked from",
         args: &[

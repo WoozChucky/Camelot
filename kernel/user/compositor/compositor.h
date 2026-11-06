@@ -1,7 +1,7 @@
 /* The display server (docs/excalibur-spec.md section 10, "The display
- * server"; docs/camelot-desktop.md): a Wayland compositor of the core
- * protocol's subset and xdg-shell's toplevel windows, in one process and
- * one thread, around a poll loop (main.c). It owns /dev/fb0, draws into
+ * server"): a Wayland compositor of the core protocol's subset and
+ * xdg-shell's toplevel windows, in one process and one thread, around a
+ * poll loop (main.c). It owns /dev/fb0, draws into
  * the frame the display isn't showing and flips at the vertical blank
  * (compose.c); it grabs the keyboard and the pointer and is the window
  * manager (wm.c); its clients connect to /run/wayland-0 and speak the wire

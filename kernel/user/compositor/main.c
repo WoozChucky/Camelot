@@ -1,5 +1,5 @@
 /* compositor: Camelot's display server (compositor.h; docs/excalibur-spec.md
- * section 10, "The display server"; docs/camelot-desktop.md).
+ * section 10, "The display server").
  *
  *   compositor [-v] [-l LAUNCHER] [-s SOCKET]
  *
