@@ -26,6 +26,7 @@ together.
 | `spin.c` | `spin`: a busy loop, for tests that need CPU time |
 | `proc.c` | `kill_descendants`: kills what a process started, and theirs (the shell and `shd` hang a session up with it) |
 | `inet.c` | `htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`, `inet_addr`, `inet_ntoa`, `sockaddr_set`: addresses and byte order |
+| `tty.c` | `isatty`, `tcgetattr`, `tcsetattr`, `cfmakeraw`, `tcgetpgrp`, `tcsetpgrp`, `posix_openpt`, `grantpt`, `unlockpt`, `ptsname`, `ttyname`: terminals, over `ioctl` and `fstat` |
 | `cmsg.c` | `cmsg_nxthdr`, behind `CMSG_NXTHDR`: the next control message of a `struct msghdr` (`sendmsg`, `recvmsg`) |
 | `resolve.c` | `resolve`: a host's address, from its text or by a DNS query (RFC 1035) to the server the network gave; `resolve_error` |
 | `usys.s` | the system call stubs, one per call (`docs/camelot-syscalls.md`): the number in `a7`, `ecall`, `ret` |

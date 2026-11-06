@@ -2825,6 +2825,10 @@ fn plic_threshold(ctx: u32) -> u64 {
 /// kernel/include/uart.h).
 const UART_RX_SIZE: usize = 128;
 
+/// The terminal's input, which the console takes the ring's bytes into
+/// (`TTY_IN` in kernel/include/tty.h).
+const TTY_IN: usize = 256;
+
 /// What the shell's `help` prints (kernel/user/sh.c).
 const HELP: &str = "\
 help            this list
@@ -2916,8 +2920,8 @@ fn console_edits_lines() {
     );
     let (r, out) = run_shell(input.as_bytes());
     assert_eq!(r, RunResult::Exited(0));
-    // Lines hold at most 127 characters and the newline (CONSOLE_LINE_MAX in
-    // kernel/include/console.h); the rest is neither echoed nor kept.
+    // Lines hold at most 127 characters and the newline (TTY_LINE_MAX in
+    // kernel/include/tty.h); the rest is neither echoed nor kept.
     let kept = "x".repeat(127);
     let want = format!(
         "{SHELL_BANNER}\
@@ -2929,6 +2933,61 @@ fn console_edits_lines() {
          {PROMPT}exit\n"
     );
     assert_eq!(mask_ticks(&out), want);
+}
+
+#[test]
+fn a_line_longer_than_the_input_buffers_is_cut_not_stuck() {
+    // A line typed all at once that is longer than the UART's ring and the
+    // terminal's input together: the discipline keeps taking bytes while
+    // it edits the line, so the line's end comes in and the shell runs it.
+    let long = "x".repeat(500);
+    assert!(long.len() > UART_RX_SIZE + TTY_IN);
+    let (r, out) = run_shell(format!("{long}\nexit\n").as_bytes());
+    assert_eq!(r, RunResult::Exited(0), "{out}");
+    let kept = "x".repeat(127);
+    let want = format!(
+        "{SHELL_BANNER}\
+         {PROMPT}{kept}\nsh: {kept}: no such program\n\
+         {PROMPT}exit\n"
+    );
+    assert_eq!(mask_ticks(&out), want);
+}
+
+#[test]
+fn ctrl_c_gets_past_input_nobody_reads() {
+    // The shell makes `sleep` the console's foreground; 300 bytes typed at
+    // it fill the terminal's input (TTY_IN) and wait in the UART's ring, a
+    // Ctrl-C behind them. It takes no room: it kills `sleep`, the bytes
+    // ahead of it dropped, and the shell reads the next line.
+    let ahead = "z".repeat(300);
+    assert!(ahead.len() > TTY_IN && ahead.len() < TTY_IN + UART_RX_SIZE);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(config(), Some(rx));
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    for b in b"sleep 100000\n" {
+        tx.send(*b).unwrap();
+    }
+    // The console's foreground: struct tty's `fg` (kernel/include/tty.h),
+    // after two pointers, the 36-byte termios and the 8-byte winsize.
+    let fg = sym(&elf, "cons") + 8 + 8 + 36 + 8;
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| image_u32(m, fg) != 0);
+    // Typed only now, so that the Ctrl-C comes once there is a foreground.
+    for b in format!("{ahead}\x03exit 5\n").bytes() {
+        tx.send(b).unwrap();
+    }
+    assert_eq!(
+        m.run(Some(BOOT_MAX_STEPS), |_| {}),
+        RunResult::Exited(5),
+        "{}",
+        printed(&m)
+    );
+    let out = printed(&m);
+    let want = format!(
+        "{SHELL_BANNER}\
+         {PROMPT}sleep 100000\n^C\nsleep: exit -1\n\
+         {PROMPT}exit 5\n"
+    );
+    assert_eq!(out[out.find(SHELL_BANNER).unwrap()..], want);
 }
 
 #[test]
@@ -3023,12 +3082,13 @@ fn a_failed_builtin_gives_dashs_status() {
 
 #[test]
 fn shell_takes_more_input_than_the_ring_buffer_holds() {
-    // 40 commands, typed all at once: 245 bytes for a 128-byte buffer. When it
-    // is full the driver turns the receive interrupt off rather than drop
-    // bytes, and turns it back on once the console has taken half of it.
-    let input = format!("{}exit\n", "ticks\n".repeat(40));
-    assert!(input.len() > UART_RX_SIZE + UART_RX_SIZE / 2);
-    assert!(input.len() < 2 * UART_RX_SIZE);
+    // 80 commands, typed all at once: 485 bytes, more than the UART's
+    // 128-byte ring and the terminal's input behind it (TTY_IN) hold. When
+    // the ring is full the driver turns the receive interrupt off rather
+    // than drop bytes, and turns it back on once the console has taken half
+    // of it.
+    let input = format!("{}exit\n", "ticks\n".repeat(80));
+    assert!(input.len() > UART_RX_SIZE + TTY_IN);
     let (mut m, elf) = load_committed_on(config(), Some(kernel::typed(input.as_bytes())));
     let trap_init = sym(&elf, "trap_init");
     let mut booted = false;
@@ -3046,17 +3106,16 @@ fn shell_takes_more_input_than_the_ring_buffer_holds() {
     let shell = &out[out.find(SHELL_BANNER).unwrap()..];
     let want = format!(
         "{SHELL_BANNER}{}{PROMPT}exit\n",
-        format!("{PROMPT}ticks\nticks: N\n").repeat(40)
+        format!("{PROMPT}ticks\nticks: N\n").repeat(80)
     );
     assert_eq!(mask_ticks(shell), want);
-    // Off when the buffer filled (128 bytes in), on again at half (64 taken),
-    // off when 64 more filled it (192 in), on again at half: the last 53
-    // bytes fit.
-    assert_eq!(
-        ier_writes,
-        [0, UART_IER_ERBFI, 0, UART_IER_ERBFI],
-        "{ier_writes:?}"
-    );
+    // Off when the ring filled, on again once half of it was taken, and so
+    // on: off and on in turns, and on at the end.
+    assert!(!ier_writes.is_empty());
+    for (i, v) in ier_writes.iter().enumerate() {
+        assert_eq!(*v, if i % 2 == 0 { 0 } else { UART_IER_ERBFI }, "{ier_writes:?}");
+    }
+    assert_eq!(ier_writes.last(), Some(&UART_IER_ERBFI), "{ier_writes:?}");
 }
 
 #[test]
@@ -4025,7 +4084,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 49, "{errors:?}");
+    assert_eq!(errors.len(), 50, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
 
@@ -4091,13 +4150,13 @@ fn the_system_call_document_matches_the_code() {
             Some((name, cells.get(2)?.parse().ok()?))
         })
         .collect();
-    assert_eq!(sizes.len(), 20, "{sizes:?}");
+    assert_eq!(sizes.len(), 22, "{sizes:?}");
     for (dir, include, headers) in [
         ("kernel/user", None, "#include \"user.h\"\n"),
         (
             "kernel",
             Some("include"),
-            "#include \"syscall.h\"\n#include \"fs.h\"\n#include \"fb.h\"\n#include \"input.h\"\n#include \"poll.h\"\n",
+            "#include \"syscall.h\"\n#include \"fs.h\"\n#include \"fb.h\"\n#include \"input.h\"\n#include \"poll.h\"\n#include \"tty.h\"\n",
         ),
     ] {
         let mut src = headers.to_string();

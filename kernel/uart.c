@@ -84,6 +84,14 @@ void uart_intr(void) {
     }
 }
 
+bool uart_rx_peek(u32 i, char *c) {
+    if (rx_head - rx_tail <= i) {
+        return false;
+    }
+    *c = (char)rx_buf[(rx_tail + i) % UART_RX_SIZE];
+    return true;
+}
+
 bool uart_rx_pop(char *c) {
     if (rx_tail == rx_head) {
         return false;

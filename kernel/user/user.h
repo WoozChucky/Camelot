@@ -57,6 +57,7 @@ typedef unsigned long long uint64_t;
 #define ENOENT 2        /* no such file or directory */
 #define ESRCH 3         /* kill: no such process; thread_join: no such thread */
 #define EINTR 4         /* a wait ended because the process was killed */
+#define EIO 5           /* a pseudo-terminal whose other end is gone, or locked */
 #define ENXIO 6         /* open: a socket's inode, which only connect() reaches */
 #define E2BIG 7         /* spawn, exec: argument list too long */
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
@@ -410,6 +411,104 @@ struct pollfd {
 struct timeval {
     time_t tv_sec;
     long tv_usec;
+};
+
+/* Terminals: the console and the pseudo-terminals, /dev/ptmx and
+ * /dev/pts/N (kernel/include/tty.h, pty.h; docs/camelot-syscalls.md
+ * "Terminals"). Linux's requests, and its struct termios for TCGETS, 36
+ * bytes; the flags have Linux's values, written in hex. */
+#define TCGETS 0x5401
+#define TCSETS 0x5402
+#define TCSETSW 0x5403
+#define TCSETSF 0x5404
+#define TCFLSH 0x540B
+#define TIOCGPGRP 0x540F
+#define TIOCSPGRP 0x5410
+#define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
+#define FIONREAD 0x541B
+#define TIOCGPTN 0x80045430
+#define TIOCSPTLCK 0x40045431
+
+#define TCIFLUSH 0
+#define TCOFLUSH 1
+#define TCIOFLUSH 2
+
+/* tcsetattr's `when`. */
+#define TCSANOW 0
+#define TCSADRAIN 1
+#define TCSAFLUSH 2
+
+#define NCCS 19
+struct termios {
+    uint c_iflag;
+    uint c_oflag;
+    uint c_cflag;
+    uint c_lflag;
+    unsigned char c_line;
+    unsigned char c_cc[NCCS];
+};
+
+#define VINTR 0
+#define VQUIT 1
+#define VERASE 2
+#define VKILL 3
+#define VEOF 4
+#define VTIME 5
+#define VMIN 6
+#define VSWTC 7
+#define VSTART 8
+#define VSTOP 9
+#define VSUSP 10
+#define VEOL 11
+#define VREPRINT 12
+#define VDISCARD 13
+#define VWERASE 14
+#define VLNEXT 15
+#define VEOL2 16
+
+/* c_iflag. */
+#define IGNBRK 0x1
+#define BRKINT 0x2
+#define IGNPAR 0x4
+#define PARMRK 0x8
+#define INPCK 0x10
+#define ISTRIP 0x20
+#define INLCR 0x40
+#define IGNCR 0x80
+#define ICRNL 0x100
+#define IXON 0x400
+#define IXOFF 0x1000
+
+/* c_oflag. */
+#define OPOST 0x1
+#define ONLCR 0x4
+
+/* c_cflag. */
+#define B38400 0xf
+#define CSIZE 0x30
+#define CS8 0x30
+#define CREAD 0x80
+#define PARENB 0x100
+#define HUPCL 0x400
+
+/* c_lflag. */
+#define ISIG 0x1
+#define ICANON 0x2
+#define ECHO 0x8
+#define ECHOE 0x10
+#define ECHOK 0x20
+#define ECHONL 0x40
+#define NOFLSH 0x80
+#define ECHOCTL 0x200
+#define ECHOKE 0x800
+#define IEXTEN 0x8000
+
+struct winsize {
+    ushort ws_row;
+    ushort ws_col;
+    ushort ws_xpixel;
+    ushort ws_ypixel;
 };
 
 /* /dev/input/event0 (the keyboard) and event1 (the pointer): Linux's evdev
@@ -857,6 +956,35 @@ const char *resolve_error(int err);
  * caller: kill_descendants(getpid()) ends what a program started). Returns
  * how many it killed. One thread at a time (lib/proc.c). */
 int kill_descendants(int pid);
+
+/* Terminals (lib/tty.c), as POSIX has them, but for returning a negative
+ * error number rather than -1 and errno.
+ *
+ * isatty: 1 if `fd` is a terminal (TCGETS answers), else 0. tcgetattr and
+ * tcsetattr: TCGETS, and TCSETS, TCSETSW or TCSETSF as `when` is TCSANOW,
+ * TCSADRAIN or TCSAFLUSH; cfmakeraw makes `t` raw mode, as glibc's does.
+ * tcgetpgrp and tcsetpgrp: the foreground process (a pid until Camelot has
+ * process groups; 0, none) that Ctrl-C kills, through TIOCGPGRP and
+ * TIOCSPGRP.
+ *
+ * posix_openpt opens /dev/ptmx with `flags` (O_RDWR) and returns the
+ * master's descriptor; grantpt only checks that `fd` is one (Camelot has
+ * no owners to set), and unlockpt unlocks its slave (TIOCSPTLCK), both 0
+ * or an error (-ENOTTY for anything but a master); ptsname is
+ * the slave's path, "/dev/pts/N", in a buffer of its own overwritten by
+ * the next call, or NULL. ttyname is the path of the terminal `fd` is,
+ * "/dev/console" or "/dev/pts/N", the same way, or NULL for anything else. */
+int isatty(int fd);
+int tcgetattr(int fd, struct termios *t);
+int tcsetattr(int fd, int when, const struct termios *t);
+void cfmakeraw(struct termios *t);
+int tcgetpgrp(int fd);
+int tcsetpgrp(int fd, int pid);
+int posix_openpt(int flags);
+int grantpt(int fd);
+int unlockpt(int fd);
+char *ptsname(int fd);
+char *ttyname(int fd);
 
 /* Busy-waits for about `n` iterations of a short loop, a few instructions
  * each: CPU time, as opposed to sleep() (lib/spin.c). */
