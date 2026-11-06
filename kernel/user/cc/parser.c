@@ -201,8 +201,11 @@ struct parser {
     /* struct vec * of statements: the blocks a syntax error cut short, the
      * innermost first. */
     struct vec salvaged;
-    /* Where the `(` around the type name being read is. */
+    /* Where the `(` around the type name being read is, for the note of an
+     * `expected ')'` inside it, if type_open_matched: not for
+     * __builtin_va_arg's, whose `)` clang does not match with its `(`. */
     struct pos type_open;
+    int type_open_matched;
     /* struct expr *: the names read as expressions that nothing declares. */
     struct vec undeclared;
     struct item *partial;
@@ -403,7 +406,9 @@ static struct diag *expect_punct(struct parser *p, const char *s, struct pos *at
 }
 
 /* The bracket that closes the one at open, or clang's error at the token
- * that is there instead, with its note. */
+ * that is there instead, with its note: what clang's
+ * BalancedDelimiterTracker does where it closes a bracket it opened
+ * (consumeClose, its note diagnoseMissingClose's). */
 static struct diag *expect_close(struct parser *p, const char *close, struct pos open, struct pos *at) {
     if (is_punct(p, close)) {
         struct token *t = advance(p);
@@ -412,8 +417,10 @@ static struct diag *expect_close(struct parser *p, const char *close, struct pos
         }
         return NULL;
     }
-    /* A `;` right before the closing token: clang's ExpectAndConsume calls
-     * it out (`f(1;)`, `{1;}`), and would skip it and go on. */
+    /* A `;` right before the closing token: consumeClose calls it out
+     * (`f(1;)`, `{1;}`), consumes the `;` and the bracket and goes on
+     * (RAIIObjectsForParser.h). Where clang closes a bracket without the
+     * tracker (__builtin_va_arg's), there is no such rule. */
     if (is_punct(p, ";") && tok_punct(peek_at(p, 1), close)) {
         return diag_error(here(p), fmt("unexpected ';' before '%s'", close));
     }
@@ -2212,7 +2219,8 @@ static struct diag *declarator_ops(struct parser *p, int ctx, const char **name,
         TRY(expect_close(p, ")", open, NULL));
     } else if (tok(p)->kind == TK_IDENT) {
         if (ctx == CTX_TYPE_NAME) {
-            return diag_note(expected(p, "')'"), p->type_open, "to match this '('");
+            struct diag *e = expected(p, "')'");
+            return p->type_open_matched ? diag_note(e, p->type_open, "to match this '('") : e;
         }
         *name = advance(p)->name;
     } else if (ctx == CTX_PARAM || ctx == CTX_TYPE_NAME) {
@@ -2583,9 +2591,13 @@ static struct diag *params(struct parser *p, struct pos open, struct param **out
 }
 
 /* A type name's declarator, and how it spelled its base, in parentheses
- * opened at open. What it folded is for its use to say. */
-static struct diag *type_name_decl(struct parser *p, struct pos open, struct decl *d, struct spelling **spelled) {
+ * opened at open, which clang matches its `)` with if `matched` (a cast's,
+ * sizeof's and a compound literal's). What it folded is for its use to
+ * say. */
+static struct diag *type_name_decl(struct parser *p, struct pos open, int matched, struct decl *d,
+                                   struct spelling **spelled) {
     p->type_open = open;
+    p->type_open_matched = matched;
     struct specs specs;
     TRY(specifiers(p, CTX_TYPE_NAME, &specs));
     TRY(declarator(p, specs.ty, CTX_TYPE_NAME, d));
@@ -2593,11 +2605,12 @@ static struct diag *type_name_decl(struct parser *p, struct pos open, struct dec
     return NULL;
 }
 
-/* A type name, for casts and sizeof, no compound literal's. */
+/* A type name, __builtin_va_arg's: in parentheses opened at open, whose `)`
+ * clang does not match with it. */
 static struct diag *type_name(struct parser *p, struct pos open, struct type **ty) {
     struct decl d;
     struct spelling *s;
-    TRY(type_name_decl(p, open, &d, &s));
+    TRY(type_name_decl(p, open, 0, &d, &s));
     type_name_folded(p, &d, 0, open);
     *ty = d.ty;
     return NULL;
@@ -3647,7 +3660,7 @@ static struct diag *unary(struct parser *p, struct expr **out) {
         advance(p);
         struct decl d;
         struct spelling *spelled;
-        TRY(type_name_decl(p, pos, &d, &spelled));
+        TRY(type_name_decl(p, pos, 1, &d, &spelled));
         TRY(expect_close(p, ")", pos, NULL));
         int literal = is_punct(p, "{");
         type_name_folded(p, &d, literal, pos);
@@ -3671,7 +3684,7 @@ static struct diag *unary(struct parser *p, struct expr **out) {
             struct pos at = advance(p)->pos;
             struct decl d;
             struct spelling *spelled;
-            TRY(type_name_decl(p, at, &d, &spelled));
+            TRY(type_name_decl(p, at, 1, &d, &spelled));
             TRY(expect_close(p, ")", at, NULL));
             int literal = is_punct(p, "{");
             type_name_folded(p, &d, literal, at);
@@ -3816,8 +3829,13 @@ static struct diag *va_builtin(struct parser *p, const char *name, struct expr *
         TRY(expect_punct(p, ",", NULL));
         struct pos at = here(p);
         struct type *ty;
+        /* clang reads the type and its `)` itself, not as a bracket matched
+         * with its `(` (ParseExpr.cpp): no note, and a `;` before the `)`
+         * is not called out. */
         TRY(type_name(p, open, &ty));
-        TRY(expect_close(p, ")", open, NULL));
+        if (!eat_punct(p, ")")) {
+            return expected(p, "')'");
+        }
         e = expr_new(E_VA_ARG, pos);
         e->x = first;
         e->at = at;
