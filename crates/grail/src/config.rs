@@ -8,6 +8,7 @@ use crate::block::{BlockBackend, FileDisk, MemDisk, MAX_SECTORS, SECTOR_SIZE};
 use crate::bus::{MAX_DISKS, MAX_NETS};
 use crate::lake::LakeDisk;
 use crate::net::{Hub, MacAddr, NetBackend, Pcap};
+pub use crate::rtc::{parse_rtc, Rtc, DEFAULT_RTC_TIME};
 use gateway::{Gateway, HostFwd};
 use std::path::PathBuf;
 
@@ -64,6 +65,11 @@ pub struct MachineConfig {
     /// platform's front ends default to Camelot's firmware, as QEMU's `virt` machine
     /// boots OpenSBI unless told `-bios none` (spec section 7, "Firmware").
     pub bios: Bios,
+    /// Where the real-time clock starts (spec section 9.9, `--rtc`): a fixed time by
+    /// default ([`crate::rtc::DEFAULT_RTC_TIME`]), so a machine built in code reads the
+    /// same times on every run; the `grail` command and the platform start it at the
+    /// host's time.
+    pub rtc: Rtc,
 }
 
 /// What [`MachineConfig::paging`] lets a hart translate with.
@@ -325,6 +331,7 @@ impl Default for MachineConfig {
             nets: Vec::new(),
             paging: Paging::Sv48,
             bios: Bios::None,
+            rtc: Rtc::At(DEFAULT_RTC_TIME),
         }
     }
 }

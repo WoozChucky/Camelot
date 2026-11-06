@@ -54,7 +54,7 @@ fn decimal(value: u128, places: u32) -> String {
 /// The name of a sysinfo device type code (Excalibur spec section 9.5), as the
 /// `sysinfo` example prints it, or `None` for a code this build does not know.
 pub fn device_name(kind: u32) -> Option<&'static str> {
-    const NAMES: [(DeviceType, &str); 11] = [
+    const NAMES: [(DeviceType, &str); 12] = [
         (DeviceType::Clint, "CLINT"),
         (DeviceType::Plic, "PLIC"),
         (DeviceType::Uart, "UART"),
@@ -66,6 +66,7 @@ pub fn device_name(kind: u32) -> Option<&'static str> {
         (DeviceType::Block, "block"),
         (DeviceType::Pointer, "pointer"),
         (DeviceType::Net, "net"),
+        (DeviceType::Rtc, "rtc"),
     ];
     NAMES
         .iter()
@@ -149,6 +150,7 @@ mod tests {
         assert_eq!(device_name(9), Some("block"));
         assert_eq!(device_name(10), Some("pointer"));
         assert_eq!(device_name(11), Some("net"));
+        assert_eq!(device_name(12), Some("rtc"));
         assert_eq!(device_name(0), None);
         assert_eq!(device_name(999), None);
     }

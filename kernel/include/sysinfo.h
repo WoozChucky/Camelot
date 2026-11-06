@@ -55,6 +55,7 @@
 #define DEV_BLOCK 9 /* a disk, one entry each (spec section 9.6) */
 #define DEV_POINTER 10
 #define DEV_NET 11 /* a network card, one entry each (spec section 9.8) */
+#define DEV_RTC 12 /* the real-time clock, Goldfish's (spec section 9.9) */
 
 #ifndef __ASSEMBLER__
 struct sysinfo_device {

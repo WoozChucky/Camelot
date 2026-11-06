@@ -4,13 +4,16 @@ use crate::block::BlockDevice;
 use crate::boot;
 use crate::config::MachineConfig;
 use crate::cpu::Reservation;
-use crate::devices::{Clint, Plic, TestDevice, Uart, BLK_IRQ, FB_IRQ, KBD_IRQ, NET_IRQ, PTR_IRQ, UART_IRQ};
+use crate::devices::{
+    Clint, Plic, TestDevice, Uart, BLK_IRQ, FB_IRQ, KBD_IRQ, NET_IRQ, PTR_IRQ, RTC_IRQ, UART_IRQ,
+};
 use crate::firmware;
 use crate::framebuffer::{Frame, Framebuffer, VRAM_SIZE};
 use crate::keyboard::Keyboard;
 use crate::net::NetDevice;
 use crate::pointer::Pointer;
 use crate::ram::Ram;
+use crate::rtc::RtcDevice;
 use crate::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use std::io::Write;
 
@@ -47,6 +50,9 @@ pub const SYSINFO_BASE: u64 = 0x3000_2000;
 pub const SYSINFO_SIZE: u64 = 0x1000;
 pub const PTR_BASE: u64 = 0x3000_3000;
 pub const PTR_SIZE: u64 = 0x1000;
+/// The real-time clock's registers (spec section 9.9).
+pub const RTC_BASE: u64 = 0x3000_4000;
+pub const RTC_SIZE: u64 = 0x1000;
 pub const VRAM_BASE: u64 = 0x3100_0000;
 pub const RAM_BASE: u64 = 0x8000_0000;
 
@@ -87,6 +93,7 @@ pub fn device_table_with(_config: &MachineConfig, disks: usize, nets: usize) -> 
         dev(DeviceType::Keyboard, KBD_BASE, KBD_SIZE, KBD_IRQ),
         dev(DeviceType::Sysinfo, SYSINFO_BASE, SYSINFO_SIZE, 0),
         dev(DeviceType::Pointer, PTR_BASE, PTR_SIZE, PTR_IRQ),
+        dev(DeviceType::Rtc, RTC_BASE, RTC_SIZE, RTC_IRQ),
         dev(DeviceType::FbVram, VRAM_BASE, VRAM_SIZE.into(), 0),
     ]);
     table
@@ -114,6 +121,7 @@ pub struct Bus {
     pub fb: Framebuffer,
     pub kbd: Keyboard,
     pub ptr: Pointer,
+    pub rtc: RtcDevice,
     /// Disk `i` is at `BLK_BASE + i * BLK_SIZE`, on PLIC source `BLK_IRQ + i`.
     pub disks: Vec<BlockDevice>,
     /// Network card `i` is at `NET_BASE + i * NET_SIZE`, on PLIC source `NET_IRQ + i`.
@@ -167,6 +175,7 @@ impl Bus {
             fb: Framebuffer::new(config.cpu_hz()),
             kbd: Keyboard::default(),
             ptr: Pointer::default(),
+            rtc: RtcDevice::new(config.rtc, config.cpu_hz()),
             sysinfo: Sysinfo::new(config, device_table_with(config, disks.len(), nets.len())),
             disks,
             nets,
@@ -330,12 +339,17 @@ impl Bus {
 
     /// Ticks that may pass at once ([`Bus::skip_time`]) before a device's own clock could
     /// wake a waiting hart, one short of it so that the next step's tick raises the line
-    /// on time: the framebuffer's next vertical blank while its interrupt is enabled.
-    /// `None` when no device keeps time that way.
+    /// on time: the framebuffer's next vertical blank while its interrupt is enabled,
+    /// and the real-time clock's alarm. `None` when no device keeps time that way.
     pub fn device_deadline(&self) -> Option<u64> {
-        self.fb
+        let vblank = self
+            .fb
             .vblank_irq_enabled()
-            .then(|| self.fb.ticks_to_vblank() - 1)
+            .then(|| self.fb.ticks_to_vblank() - 1);
+        [vblank, self.rtc.deadline(self.clint.mtime)]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// What the display shows now (spec section 9.3): from VRAM, or from the buffer in
@@ -376,6 +390,7 @@ impl Bus {
         self.plic.set_level(KBD_IRQ, self.kbd.irq());
         self.plic.set_level(PTR_IRQ, self.ptr.irq());
         self.plic.set_level(FB_IRQ, self.fb.irq());
+        self.plic.set_level(RTC_IRQ, self.rtc.irq(self.clint.mtime));
         for (i, disk) in self.disks.iter().enumerate() {
             self.plic.set_level(BLK_IRQ + i as u32, disk.irq());
         }
@@ -498,6 +513,8 @@ impl Bus {
             self.kbd.read(off, size)
         } else if let Some(off) = at(PTR_BASE, PTR_SIZE) {
             self.ptr.read(off, size)
+        } else if let Some(off) = at(RTC_BASE, RTC_SIZE) {
+            self.rtc.read(off, size, self.clint.mtime)
         } else {
             Err(BusFault)
         };
@@ -580,6 +597,8 @@ impl Bus {
             self.kbd.write(off, size, val)
         } else if let Some(off) = at(PTR_BASE, PTR_SIZE) {
             self.ptr.write(off, size, val)
+        } else if let Some(off) = at(RTC_BASE, RTC_SIZE) {
+            self.rtc.write(off, size, val, self.clint.mtime)
         } else {
             Err(BusFault)
         }
@@ -817,9 +836,10 @@ mod tests {
         );
         assert_eq!(bus.read(SYSINFO_BASE, 1), Err(BusFault));
         assert_eq!(bus.write(SYSINFO_BASE, 2, 0), Err(BusFault));
-        // The next page is the pointer's.
+        // The next page is the pointer's, then the clock's, then nothing.
         assert_eq!(bus.read(SYSINFO_BASE + SYSINFO_SIZE, 4), Ok(0));
-        assert_eq!(bus.read(PTR_BASE + PTR_SIZE, 4), Err(BusFault));
+        assert_eq!(PTR_BASE + PTR_SIZE, RTC_BASE);
+        assert_eq!(bus.read(RTC_BASE + RTC_SIZE, 4), Err(BusFault));
         // Not memory: no instruction fetches from it.
         assert_eq!(bus.read_mem(SYSINFO_BASE, 4), Err(BusFault));
     }
@@ -884,6 +904,8 @@ mod tests {
         assert_eq!((ptr.base, ptr.irq), (PTR_BASE, PTR_IRQ));
         let fb = table.iter().find(|d| d.kind == DeviceType::FbCtrl).unwrap();
         assert_eq!((fb.base, fb.irq), (FB_CTRL_BASE, FB_IRQ));
+        let rtc = table.iter().find(|d| d.kind == DeviceType::Rtc).unwrap();
+        assert_eq!((rtc.base, rtc.irq), (RTC_BASE, RTC_IRQ));
         let vram = table.iter().find(|d| d.kind == DeviceType::FbVram).unwrap();
         assert_eq!(vram.irq, 0);
         // Disks are listed in order, each on its own source.
@@ -908,7 +930,7 @@ mod tests {
         let mut irqs: Vec<u32> = table.iter().map(|d| d.irq).filter(|&irq| irq != 0).collect();
         irqs.sort();
         irqs.dedup();
-        assert_eq!(irqs.len(), 4 + bus.disks.len() + bus.nets.len());
+        assert_eq!(irqs.len(), 5 + bus.disks.len() + bus.nets.len());
         assert!(irqs.iter().all(|&irq| irq < crate::devices::PLIC_SOURCES));
     }
 
@@ -931,7 +953,7 @@ mod tests {
             let bus = bus_with_nets(disks, nets, &hub);
             let table = bus.sysinfo.devices();
             assert_eq!(table, device_table_with(&MachineConfig::default(), disks, nets));
-            assert_eq!(table.len(), 9 + disks + nets);
+            assert_eq!(table.len(), 10 + disks + nets);
             device_table_matches(bus);
         }
         // The highest PLIC source in use.
@@ -1016,7 +1038,7 @@ mod tests {
             let bus = bus_with_disks(n);
             let table = bus.sysinfo.devices();
             assert_eq!(table, device_table(&MachineConfig::default(), n));
-            assert_eq!(table.len(), 9 + n);
+            assert_eq!(table.len(), 10 + n);
             device_table_matches(bus);
         }
     }
@@ -1330,9 +1352,54 @@ mod tests {
         assert_eq!(bus.write(reg(ptr::REG_CTRL), 2, 0), Err(BusFault));
         assert_eq!(bus.ptr.len(), 1);
         assert_eq!(bus.read(PTR_BASE + 0xffc, 4), Ok(0));
-        assert_eq!(bus.read(PTR_BASE + PTR_SIZE, 4), Err(BusFault));
+        assert_eq!(
+            bus.read(PTR_BASE + PTR_SIZE, 8),
+            Err(BusFault),
+            "the clock's page"
+        );
         // Data accesses only.
         assert_eq!(bus.read_mem(PTR_BASE, 4), Err(BusFault));
+    }
+
+    /// The real-time clock on the bus: its time follows `mtime`, and its alarm raises
+    /// PLIC source `RTC_IRQ` and ends a skip to the next timer on time.
+    #[test]
+    fn rtc_registers_on_the_bus() {
+        use crate::rtc::{self, Rtc};
+        let config = MachineConfig {
+            nominal_hz: 1000,
+            rtc: Rtc::At(1),
+            ..MachineConfig::with_ram(4096)
+        };
+        let mut bus = Bus::new(&config, Vec::new());
+        let reg = |off: u32| RTC_BASE + u64::from(off);
+        let time = |bus: &mut Bus| {
+            let low = bus.read(reg(rtc::REG_TIME_LOW), 4).unwrap();
+            low | bus.read(reg(rtc::REG_TIME_HIGH), 4).unwrap() << 32
+        };
+        assert_eq!(time(&mut bus), 1_000_000_000);
+        bus.skip_time(500);
+        assert_eq!(time(&mut bus), 1_500_000_000, "500 ticks of 1 kHz");
+        assert_eq!(bus.read(reg(rtc::REG_TIME_LOW), 8), Err(BusFault));
+        assert_eq!(bus.read(reg(rtc::REG_TIME_LOW), 1), Err(BusFault));
+        assert_eq!(bus.read(RTC_BASE + 0xffc, 4), Ok(0));
+
+        // An alarm at 2 s: 500 ticks away, the line raised on the 500th.
+        bus.write(reg(rtc::REG_ALARM_HIGH), 4, 0).unwrap();
+        bus.write(reg(rtc::REG_ALARM_LOW), 4, 2_000_000_000).unwrap();
+        assert_eq!(bus.device_deadline(), None, "its interrupt is off");
+        bus.write(reg(rtc::REG_IRQ_ENABLED), 4, 1).unwrap();
+        bus.write(PLIC_BASE + 4 * u64::from(RTC_IRQ), 4, 1).unwrap();
+        assert_eq!(bus.device_deadline(), Some(499));
+        bus.skip_time(499);
+        assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(0));
+        bus.tick();
+        assert_eq!(bus.read(PLIC_BASE + 0x1000, 4), Ok(1 << RTC_IRQ));
+        assert_eq!(bus.read(reg(rtc::REG_ALARM_STATUS), 4), Ok(0));
+        // Cleared, the line is low (the PLIC keeps the source pending until claimed).
+        assert!(bus.rtc.irq(bus.clint.mtime));
+        bus.write(reg(rtc::REG_CLEAR_INTERRUPT), 4, 1).unwrap();
+        assert!(!bus.rtc.irq(bus.clint.mtime));
     }
 
     #[test]

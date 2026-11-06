@@ -134,7 +134,7 @@ sysinfo v2
 RAM      64 MiB at 0x0000000080000000
 CPU      2000000 Hz (real time)
 timebase 2000000 Hz
-9 devices:
+10 devices:
   test      0x0000000000100000 + 0x0000000000001000
   CLINT     0x0000000002000000 + 0x0000000000010000
 ...
@@ -447,7 +447,7 @@ harts    1
 steps    8726
 disks    none
 nets     none
-devices  9
+devices  10
   test      0x00100000 + 0x00001000
   CLINT     0x02000000 + 0x00010000
   PLIC      0x0c000000 + 0x04000000
@@ -456,6 +456,7 @@ devices  9
   keyboard  0x30001000 + 0x00001000  irq 2
   sysinfo   0x30002000 + 0x00001000
   pointer   0x30003000 + 0x00001000  irq 11
+  rtc       0x30004000 + 0x00001000  irq 17
   fb-vram   0x31000000 + 0x0012c000
 ```
 

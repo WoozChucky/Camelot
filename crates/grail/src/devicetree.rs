@@ -17,7 +17,8 @@
 //!   register-compatible), the test device (`sifive,test0` with `syscon`, for
 //!   `/poweroff`'s `syscon-poweroff`, which writes 0x5555), and Grail's own devices
 //!   with `camelot,*` compatibles: the disks, the network cards (with
-//!   `local-mac-address`), the display, the keyboard, the pointer and sysinfo;
+//!   `local-mac-address`), the display, the keyboard, the pointer and sysinfo; and
+//!   the real-time clock, `google,goldfish-rtc` as on `virt`;
 //! - `/aliases`: `serial0`, the UART, and `/chosen`: `stdout-path`, the UART.
 //!
 //! The PLIC sources are Grail's (spec section 7.1), not `virt`'s: a driver reads them
@@ -233,6 +234,14 @@ pub fn generate(config: &MachineConfig, bus: &Bus) -> Vec<u8> {
                 if d.irq != 0 {
                     irq(&mut w, d);
                 }
+                w.end_node();
+            }
+            DeviceType::Rtc => {
+                // QEMU `virt`'s clock, which Linux's rtc-goldfish drives.
+                w.begin_node(&format!("rtc@{:x}", d.base));
+                w.prop_str("compatible", "google,goldfish-rtc");
+                reg(&mut w, d);
+                irq(&mut w, d);
                 w.end_node();
             }
             // The display controller's node has it.
