@@ -222,8 +222,8 @@ The shell (`user/sh.c`) runs programs by name, with arguments: `PROG
 program. `CMD < FILE` and `CMD > FILE` redirect its input and output, `CMD |
 CMD` sends the first one's output to the second, and `CMD & CMD` runs the
 first in the background (the shell prints its pid) and the last in the
-foreground; `wait` collects the background ones, `cd [DIR]` changes the
-working directory, `exec PROG [ARG...]` replaces the shell with PROG (and
+foreground, where Ctrl-C ends it; `wait` collects the background ones,
+`cd [DIR]` changes the working directory, `exec PROG [ARG...]` replaces the shell with PROG (and
 `exec < FILE` or `exec > FILE` redirects the shell itself), `help` lists the
 built-ins, and `exit [N]` (or Ctrl-D on an empty line) ends the shell, after
 which the kernel stops the machine with its status as the exit code. Lines are edited with backspace and end with Enter. In a terminal,
@@ -302,6 +302,7 @@ program gets only the parts it uses) and `user/user.ld`. `user/README.md` has ea
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
 | `nettest`, `socktest` | move known bytes through TCP, for the TCP tests; check the socket calls (`socktest: N checks, 0 failed`) |
 | `polltest` | checks `poll` on every kind of file (`polltest: N checks, 0 failed`); `polltest stress R` passes bytes between threads waiting in `poll` on several harts, which a lost wakeup would stop |
+| `ptytest` | checks the terminals: pseudo-terminal pairs, canonical and raw modes, `VMIN`/`VTIME`, `termios`, Ctrl-C and the foreground, hanging up, the console's `termios`; and runs `sh` on a slave, typed at from the master (`ptytest: N checks, 0 failed`) |
 | `unixtest` | checks local sockets, `SCM_RIGHTS`, and `sendmsg`/`recvmsg` on every socket, and shares a memfd with a second process (`unixtest: N checks, 0 failed`) |
 | `badload` | reads kernel memory: killed by a load page fault |
 | `badstore` | writes to its own read-only data: killed by a store page fault |
@@ -547,12 +548,14 @@ one process.
 | `fs.c` | the filesystem (xv6's): `fs_mount()`, the bitmap allocator, the inode cache (`iget`/`ilock`/`iput`, `readi`/`writei`), directories, path lookup (`namei`/`nameiparent`, from the working directory for a relative path), `fs_create()`/`fs_unlink()`/`fs_link()`, `itrunc()` |
 | `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions; to 3, filling the disk) |
 | `net/` | the network stack (`docs/camelot-net.md`), a file per layer: `nic.c` (the card driver: descriptor rings, `nic_intr()`, the transmit queue), `pbuf.c` (the buffer pool), `ether.c`, `arp.c` (the cache), `ip.c` (checks, routing, loopback), `icmp.c` (echo, `icmp_ping()`), `udp.c` (the kernel-internal socket API, the echo service), `tcp.c` (connections, retransmission, the kernel-internal socket API), `dhcp.c` (the client), `net.c` (configuration, `net_boot()`, the counters, `net_timer()`, the `netinfo`/`netconf`/`ping` system calls), `socket.c` (the socket system calls: sockets behind file descriptors), `unix.c` (local sockets, `AF_UNIX` streams: names on the disk, connections, descriptors passed), `msg.c` (`sendmsg` and `recvmsg`'s buffers and `SCM_RIGHTS`) |
-| `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console`, `/dev/fb0`, `/dev/input/event0` and `/dev/input/event1` are made too |
+| `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console`, `/dev/fb0`, `/dev/input/event0` and `/dev/input/event1`, `/dev/ptmx` and `/dev/pts/0` to `15` are made too |
 | `boot/` | the bootloader of a bootable disk (`boot.S`, linked by `link.ld` into the committed `boot.elf` with `cargo xtask boot`), the firmware's next stage: the boot block, which loads the kernel ELF stored after the filesystem; `camelot-fs mkfs --boot` installs it |
 | `riscv.S` | S-mode CSR accessors for C (`r_sstatus`, `w_sie`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()`, `wfi()`, the atomics `atomic_swap()`/`atomic_add()`/`atomic_or()`, and `fence_rw()` |
 | `main.c` | `kmain()`: banner, `sbi_init()`, `kprintf` self-test, memory setup and self-tests, the disk list, the network cards (`net_init`), ten ticks, the optional deliberate fault or memory API misuse, the disk self-test, the filesystem (`fs_boot`), the network's address (`net_boot`), the other harts (`smp_boot`), then the user-space shell as the first process |
 | `uart.c` | 16550 driver: receive interrupt handler `uart_intr()` filling a ring buffer (`uart_rx_pop()`), polling `uart_putc`/`uart_puts` |
-| `console.c` | the console device (`read` and `write` on it): `console_read()` (line editing and echo: backspace, CR/LF/CR LF, Ctrl-D; sleeps until a line is complete), `console_write()`, `console_intr()` (the UART interrupt, waking readers); `console_input()`, the keyboard's characters while no process reads it; the output and the echo go to the framebuffer console too |
+| `console.c` | the console device (`read`, `write` and `ioctl` on it), a terminal of `tty.c`'s line discipline with the defaults it has always had: `console_read()` (`tty_read()`), `console_write()`, `console_intr()` (the UART interrupt: the ring's bytes into the terminal's input, Ctrl-C at once); `console_input()`, the keyboard's characters while no process reads it; the output and the echo go to the framebuffer console too |
+| `tty.c` | the terminals' line discipline (Linux's `n_tty`), the console's and the pseudo-terminals': input mapped and its Ctrl-C acted on as it comes (`tty_receive()`), canonical lines edited and echoed as they are read, non-canonical reads with `VMIN` and `VTIME`, `ONLCR`, and the `termios`, window size, foreground and input requests |
+| `pty.c` | pseudo-terminals: `/dev/ptmx` makes a pair (16 at most) and gives its master, `/dev/pts/N` its slave, a `tty.c` terminal; the master's writes are the slave's input, the slave's writes a 2 KiB ring the master reads; `TIOCGPTN`, `TIOCSPTLCK`, and hanging up either way |
 | `kprintf.c` | `kprintf`/`ksnprintf`: `%d %u %x %p %s %c %%`, `0` flag, width; `kprintf` writes to the UART and the framebuffer console |
 | `memset.S`, `memcpy.S`, `memmove.S`, `memcmp.S` | `memset memcpy memmove memcmp` (clang may call them by itself; `string.h`), in assembly, a register at a time as Linux's and the C libraries' are: whole registers where both pointers are on a register boundary, bytes around them, eight registers a round for `memset` and `memcpy`; `memmove` copies pointers that are differently aligned a register at a time too, from two aligned loads shifted, and `memcpy` hands it those. The user library's are these files (`user/lib/mem*.S` include them) |
 | `strlen.S`, `strcmp.S` | `strlen strcmp`, in assembly, two bytes a round; the user library's too |
@@ -602,10 +605,10 @@ merlin-ld -T kernel.lds -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o el
        kalloc.c.o kernelvec.S.o keyboard.c.o kprintf.c.o log.c.o main.c.o memcmp.S.o memcpy.S.o \
        memmove.S.o memset.S.o mmap.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o \
        net/ip.c.o net/msg.c.o net/net.c.o net/nic.c.o net/pbuf.c.o net/socket.c.o net/tcp.c.o \
-       net/udp.c.o net/unix.c.o pipe.c.o plic.c.o pointer.c.o poll.c.o probe.S.o proc.c.o riscv.S.o \
-       sbi.c.o sbi_ecall.S.o shm.c.o \
+       net/udp.c.o net/unix.c.o pipe.c.o plic.c.o pointer.c.o poll.c.o probe.S.o proc.c.o pty.c.o \
+       riscv.S.o sbi.c.o sbi_ecall.S.o shm.c.o \
        sleeplock.c.o smp.c.o spinlock.c.o spinlock.S.o strcmp.S.o strlen.S.o swtch.S.o syscall.c.o \
-       sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
+       sysfile.c.o sysinfo.c.o timer.c.o trap.c.o tty.c.o uart.c.o \
        userprogs.s.o uservec.S.o vm.c.o vmtest.c.o
 ```
 
