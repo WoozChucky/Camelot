@@ -50,6 +50,8 @@
 #define T_DIR 1
 #define T_FILE 2
 #define T_DEVICE 3
+/* T_SOCKET (5, syscall.h): a local socket's name (unix.c), with no
+ * contents, as a device; 4, T_PIPE, is no inode's. */
 
 /* The format's limits on the log (header included) and the inode count. */
 #define LOG_MIN 2
@@ -308,7 +310,8 @@ struct inode *namei(const char *path, int *err);
 struct inode *nameiparent(const char *path, char *name, int *err);
 
 /* Makes `path` a new inode of `type` (T_FILE, T_DIR with its `.` and `..`,
- * or T_DEVICE with `major`/`minor`) and returns it locked, with a reference;
+ * T_DEVICE with `major`/`minor`, or T_SOCKET) and returns it locked, with a
+ * reference;
  * NULL with *err: -EEXIST (`/` included), -ENOENT/-ENOTDIR/-ENAMETOOLONG
  * (the path; -ENOENT also for a directory that has been removed while still
  * in use, as a working directory), -ENOSPC, -EROFS. In a transaction. */

@@ -1,12 +1,13 @@
 /* ls [PATH...]: lists each directory, or describes each file, named (the
  * working directory without one). A line per entry, as the kernel's boot
  * listing and `camelot-fs ls` print them: the type (d directory, f file, c
- * device), the inode, the links, the size and the name. Exits 1 if a path,
- * or an entry of a directory, can't be opened (it says why), else 0. */
+ * device, s socket), the inode, the links, the size and the name. Exits 1
+ * if a path, or an entry of a directory, can't be looked at (it says why),
+ * else 0. */
 #include "user.h"
 
 static char type_letter(int type) {
-    return type == T_DIR ? 'd' : type == T_FILE ? 'f' : type == T_DEVICE ? 'c' : '?';
+    return type == T_DIR ? 'd' : type == T_FILE ? 'f' : type == T_DEVICE ? 'c' : type == T_SOCKET ? 's' : '?';
 }
 
 static void line(const struct stat *st, const char *name) {
@@ -15,17 +16,21 @@ static void line(const struct stat *st, const char *name) {
 
 /* Lists `path`. Returns 0, or 1 if it can't. */
 static int ls(const char *path) {
+    /* stat() first: a socket's name can't be opened, only looked at. */
+    struct stat st;
+    int r = stat(path, &st);
+    if (r < 0) {
+        fprintf(STDERR, "ls: %s: %s\n", path, strerror(-r));
+        return 1;
+    }
+    if (st.type != T_DIR) {
+        line(&st, path);
+        return 0;
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         fprintf(STDERR, "ls: %s: %s\n", path, strerror(-fd));
         return 1;
-    }
-    struct stat st;
-    fstat(fd, &st);
-    if (st.type != T_DIR) {
-        line(&st, path);
-        close(fd);
-        return 0;
     }
     /* "path/name" for each entry, to look it up. */
     char entry[MAXPATH + 1];
@@ -45,9 +50,7 @@ static int ls(const char *path) {
         }
         memcpy(entry + len + 1, de.name, DIRSIZ);
         entry[len + 1 + DIRSIZ] = 0;
-        /* stat() opens the entry: a device node with no driver, or no open
-         * file to spare, is an error to report, not an entry to leave out. */
-        int r = stat(entry, &st);
+        r = stat(entry, &st);
         if (r == -ENOENT) {
             /* Gone since it was read. */
             continue;

@@ -5,6 +5,7 @@
 #include "file.h"
 #include "kalloc.h"
 #include "kprintf.h"
+#include "poll.h"
 #include "proc.h"
 #include "riscv.h"
 #include "spinlock.h"
@@ -317,6 +318,16 @@ static long get_bits(struct device *d, pagetable_t pt, uintptr arg, u32 ev, usiz
     default:
         return -EINVAL;
     }
+}
+
+u32 input_poll(struct file *f, struct poll_table *pt) {
+    struct reader *r = f->priv;
+    /* push() wakes the reader's ring. */
+    poll_wait(pt, r);
+    acquire(&input_lock);
+    u32 mask = r->head != r->tail ? POLL_READY_IN : 0;
+    release(&input_lock);
+    return mask;
 }
 
 long input_ioctl(struct file *f, u32 request, uintptr arg) {

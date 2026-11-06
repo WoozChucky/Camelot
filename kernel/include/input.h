@@ -157,6 +157,9 @@ int input_open(struct file *f);
 void input_close(struct file *f);
 isize input_read(struct file *f, pagetable_t pt, uintptr dst, usize n);
 long input_ioctl(struct file *f, u32 request, uintptr arg);
+struct poll_table;
+/* Ready to read while the reader's ring holds an event. */
+u32 input_poll(struct file *f, struct poll_table *pt);
 
 /* The drivers (keyboard.c, pointer.c). Each finds its device in the device
  * table, maps it and enables its interrupt; nothing without one. */

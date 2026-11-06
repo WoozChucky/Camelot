@@ -13,9 +13,11 @@
 #include "mmap.h"
 #include "net.h"
 #include "pipe.h"
+#include "poll.h"
 #include "shm.h"
 #include "string.h"
 #include "trap.h"
+#include "unix.h"
 
 static struct file ftable[NFILE];
 
@@ -36,14 +38,19 @@ void file_init(void) {
  * ioctl, fb.h), INPUT the keyboard and the pointer (their events, input.h).
  * A major whose entry is all NULL has no driver. */
 const struct devsw devsw[NDEV] = {
-    [CONSOLE] = {.read = console_read, .write = console_write},
+    [CONSOLE] = {.read = console_read, .write = console_write, .poll = console_poll},
     [FB] = {.open = fb_open,
             .close = fb_close,
             .ioctl = fb_ioctl,
+            .poll = fb_poll,
             .mmap = fb_mmap,
             .vm_open = fb_vm_open,
             .vm_close = fb_vm_close},
-    [INPUT] = {.open = input_open, .close = input_close, .read = input_read, .ioctl = input_ioctl},
+    [INPUT] = {.open = input_open,
+               .close = input_close,
+               .read = input_read,
+               .ioctl = input_ioctl,
+               .poll = input_poll},
 };
 
 bool device_has_driver(u32 major) {
@@ -78,6 +85,22 @@ long fileioctl(struct file *f, u32 request, uintptr arg) {
         return -ENOTTY;
     }
     return devsw[f->major].ioctl(f, request, arg);
+}
+
+u32 filepoll(struct file *f, struct poll_table *pt) {
+    if (f->type == FD_PIPE) {
+        return pipe_poll(f->pipe, f->writable, pt);
+    }
+    if (f->type == FD_SOCKET) {
+        return socket_poll(f->sock, pt);
+    }
+    if (f->type == FD_UNIX) {
+        return unix_poll(f->usock, pt);
+    }
+    if (f->type == FD_DEVICE && devsw[f->major].poll != NULL) {
+        return devsw[f->major].poll(f, pt);
+    }
+    return POLL_READY_IN | POLL_READY_OUT;
 }
 
 /* The most a write puts in one transaction: a page, 4 blocks. A chunk
@@ -139,6 +162,8 @@ void fileclose(struct file *f) {
         pipeclose(closed.pipe, closed.writable);
     } else if (closed.type == FD_SOCKET) {
         socket_close(closed.sock);
+    } else if (closed.type == FD_UNIX) {
+        unix_close(closed.usock);
     } else if (closed.type == FD_SHM) {
         /* The object stays while a mapping holds it. */
         shm_put(closed.shm);
@@ -287,6 +312,9 @@ isize fileread(struct file *f, pagetable_t pt, uintptr dst, usize n) {
     if (n == 0) {
         return 0;
     }
+    if (f->type == FD_UNIX) {
+        return unix_read(f->usock, pt, dst, n);
+    }
     if (f->type == FD_PIPE) {
         return piperead(f->pipe, pt, dst, n);
     }
@@ -313,9 +341,13 @@ isize filewrite(struct file *f, pagetable_t pt, uintptr src, usize n) {
         n = MAX_RW_COUNT;
     }
     /* A socket's write is its send, which for 0 bytes on UDP is still a
-     * datagram (an empty one). */
+     * datagram (an empty one), and on a local socket fails as any send
+     * would: not connected, or shut down. */
     if (f->type == FD_SOCKET) {
         return socket_write(f->sock, pt, src, n);
+    }
+    if (f->type == FD_UNIX) {
+        return unix_write(f->usock, pt, src, n);
     }
     if (n == 0) {
         return 0;
@@ -377,6 +409,10 @@ void filestat(struct file *f, struct stat *st) {
         st->nlink = socket_hung_up(f->sock) ? 0 : 1;
         return;
     }
+    if (f->type == FD_UNIX) {
+        unix_stat(f->usock, st);
+        return;
+    }
     if (f->type == FD_SHM) {
         /* A regular file to Linux's fstat too, with no inode number. */
         st->type = T_FILE;
@@ -391,13 +427,18 @@ void filestat(struct file *f, struct stat *st) {
         return;
     }
     ilock(f->ip);
-    st->ino = f->ip->inum;
-    st->type = f->ip->type;
-    st->nlink = f->ip->nlink;
-    st->size = f->ip->size;
-    st->major = f->ip->major;
-    st->minor = f->ip->minor;
+    inode_stat(f->ip, st);
     iunlock(f->ip);
+}
+
+void inode_stat(struct inode *ip, struct stat *st) {
+    memset(st, 0, sizeof *st);
+    st->ino = ip->inum;
+    st->type = ip->type;
+    st->nlink = ip->nlink;
+    st->size = ip->size;
+    st->major = ip->major;
+    st->minor = ip->minor;
 }
 
 int filemmap(struct file *f, u32 type, u32 prot, u64 offset, usize size, struct vm_area *a) {

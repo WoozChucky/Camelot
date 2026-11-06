@@ -161,6 +161,38 @@ long sys_fstat(struct trap_frame *f) {
     return copyout(pt, arg(f, 1), &st, sizeof st) == 0 ? 0 : -EFAULT;
 }
 
+long sys_stat(struct trap_frame *f) {
+    pagetable_t pt = myproc()->pagetable;
+    char path[MAXPATH + 1];
+    int err = fetch_path(pt, arg(f, 0), path);
+    if (err < 0) {
+        return err;
+    }
+    struct stat st;
+    if (!uvm_range_ok(pt, arg(f, 1), sizeof st, PTE_W)) {
+        return -EFAULT;
+    }
+    if (!fs_mounted) {
+        return -ENOENT;
+    }
+    /* What fstat() of the file opened would say, without opening it: a
+     * socket's name or a device node without a driver too, which open()
+     * refuses. A transaction for iput(), which frees an inode unlinked
+     * meanwhile. */
+    begin_op();
+    struct inode *ip = namei(path, &err);
+    if (ip == NULL) {
+        end_op();
+        return err;
+    }
+    ilock(ip);
+    inode_stat(ip, &st);
+    iunlockput(ip);
+    end_op();
+    /* Checked above, but another thread may have unmapped it since. */
+    return copyout(pt, arg(f, 1), &st, sizeof st) == 0 ? 0 : -EFAULT;
+}
+
 long sys_memfd_create(struct trap_frame *f) {
     /* The name only names the object to someone debugging (Linux shows it
      * in /proc/PID/maps): it is checked as Linux checks it, and dropped. */
@@ -309,6 +341,8 @@ long sys_open(struct trap_frame *f) {
         err = 0; /* namei()'s -ENOENT, if fs_create() made it */
         if (ip->type == T_DIR && writable) {
             err = -EISDIR;
+        } else if (ip->type == T_SOCKET) {
+            err = -ENXIO; /* a socket's name is for connect(), as on Linux */
         } else if (ip->type == T_DEVICE && !device_has_driver(ip->major)) {
             err = -ENODEV;
         } else if (ip->type == T_FILE && writable && fs_readonly) {

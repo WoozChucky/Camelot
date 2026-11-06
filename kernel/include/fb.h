@@ -23,6 +23,7 @@
 #include "vm.h"
 
 struct file;
+struct poll_table;
 
 /* Linux's fbdev requests (include/uapi/linux/fb.h), the same numbers. */
 #define FBIOGET_VSCREENINFO 0x4600
@@ -131,6 +132,10 @@ bool fb_intr(u32 irq);
 int fb_open(struct file *f);
 void fb_close(struct file *f);
 long fb_ioctl(struct file *f, u32 request, uintptr arg);
+/* poll(): ready to write (POLLOUT) unless a flip FBIOPAN_DISPLAY queued is
+ * still pending, as DRM's page flip event says a flip is done: then the
+ * frame not shown may be drawn into. Never ready to read. */
+u32 fb_poll(struct file *f, struct poll_table *pt);
 int fb_mmap(struct file *f, u64 offset, usize size, phys_addr_t *pa);
 void fb_vm_open(void);
 void fb_vm_close(void);
