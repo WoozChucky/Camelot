@@ -701,9 +701,65 @@ fn arp_gives_up_on_an_address_nobody_has() {
     );
     assert!(host.take().is_empty());
     let ifconfig = command(&mut [&mut vm], 0, Some(&mut host), "ifconfig");
-    // Each ping's packet but the last was replaced in the ARP entry by the next one;
-    // the last was dropped when ARP gave up; the fourth was refused.
+    // The three pings' packets waited in the ARP entry and were dropped when ARP gave
+    // up; the fourth was refused.
     assert_eq!(counters(&ifconfig)["arp-failed"], 4, "{ifconfig}");
+    assert_buffers_back(&mut vm);
+    exit(&mut vm);
+}
+
+#[test]
+fn every_packet_waiting_for_an_arp_answer_goes_once_it_comes() {
+    // What is sent to an address ARP is asking for waits in its entry, in order, as
+    // Linux's neighbour entries queue it, and all of it goes when the answer comes. A
+    // TCP retransmission of several segments to a gateway whose entry has just expired
+    // must lose none of them: when only the newest packet waited, the lossy transfer of
+    // kernel_tcp.rs lost the first segment of every retransmission that way, until the
+    // connection gave up. Here two pings' echo requests wait (the first ping times out
+    // while ARP still asks), then the address answers.
+    let hub = Hub::new();
+    let mut vm = Vm::new(
+        vec![NetConfig::hub(&hub)],
+        Vec::new(),
+        &static_config(VM_IP, MASK),
+    );
+    let mut host = Host::new(&hub);
+    boot(&mut [&mut vm], Some(&mut host));
+    const OTHER_IP: [u8; 4] = [10, 0, 9, 60];
+    const OTHER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x60];
+    host.take();
+    let prompts = vm.prompts();
+    vm.type_line("ping 10.0.9.60 3");
+    run_until(&mut [&mut vm], Some(&mut host), |vms| {
+        vms[0].out().contains("seq=1: timed out\n")
+    });
+    // The second ping's request goes into the entry right after.
+    for _ in 0..20 {
+        vm.m.run_for(SLICE, &mut |_| {});
+        host.service();
+    }
+    let echoes = |frames: &[Vec<u8>]| -> Vec<u16> {
+        frames
+            .iter()
+            .filter_map(|f| parse_ipv4(f))
+            .filter(|p| p.dst == OTHER_IP && p.proto == 1 && p.payload[0] == 8)
+            .map(|p| u16::from_be_bytes([p.payload[6], p.payload[7]]))
+            .collect()
+    };
+    let asked = host.take();
+    assert!(echoes(&asked).is_empty(), "nothing goes before the answer");
+    assert!(asked.len() >= 2, "ARP asks: {} frames", asked.len());
+    host.send(ether(
+        VM_MAC,
+        OTHER_MAC,
+        ARP_TYPE,
+        &arp(2, OTHER_MAC, OTHER_IP, VM_MAC, VM_IP),
+    ));
+    run_until(&mut [&mut vm], Some(&mut host), |vms| vms[0].prompts() > prompts);
+    // Both waiting requests, in order, then the third ping's, sent at once.
+    assert_eq!(echoes(&host.take()), [1, 2, 3]);
+    let ifconfig = command(&mut [&mut vm], 0, Some(&mut host), "ifconfig");
+    assert_eq!(counters(&ifconfig)["arp-failed"], 0, "{ifconfig}");
     assert_buffers_back(&mut vm);
     exit(&mut vm);
 }
