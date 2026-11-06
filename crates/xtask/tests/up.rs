@@ -58,27 +58,46 @@ impl Output {
     }
 }
 
-/// The root image `up` builds, built once (with the binaries) for every test.
-fn root_image() -> &'static [u8] {
-    static IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
-    IMAGE.get_or_init(|| {
+/// The root images `up` builds, the server's and the desktop's, built once (with
+/// the binaries) for every test.
+fn root_images() -> &'static [Vec<u8>] {
+    static IMAGES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    IMAGES.get_or_init(|| {
         let dir = TempDir::new("build");
         let mut options = Options::new(&xtask::repo_root());
         options.image = dir.0.join("camelot-fs.img");
-        let image = up::build(&options, &mut |line| eprintln!("{line}")).unwrap();
-        assert_eq!(std::fs::read(&options.image).unwrap(), image);
-        image
+        options.desktop_image = dir.0.join("camelot-desktop.img");
+        let images = up::build(&options, &mut |line| eprintln!("{line}")).unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(std::fs::read(&options.image).unwrap(), images[0]);
+        assert_eq!(std::fs::read(&options.desktop_image).unwrap(), images[1]);
+        images
     })
+}
+
+/// The server's root image, the base image ([`root_images`]).
+fn root_image() -> &'static [u8] {
+    &root_images()[0]
 }
 
 /// A line of `round-table disk list` for a copy of the root image
 /// (`xtask::fs::IMAGE_SIZE` blocks of 1 KiB, two sectors each), in the columns
-/// the list has for this test's disks: names up to `pdvm-disk0`.
+/// the list has for this test's disks: names up to `pdvm-disk0`, sizes up to the
+/// desktop image's 16 MiB.
 fn image_line(name: &str, attached: &str) -> String {
-    let blocks = xtask::fs::IMAGE_SIZE;
-    let size = format!("{} MiB", blocks / 1024);
-    format!("{name:<12}{size:<7}{:<9}{attached}\n", blocks * 2)
+    sized_image_line(name, xtask::fs::IMAGE_SIZE, attached)
 }
+
+/// [`image_line`] for an image of `blocks` blocks.
+fn sized_image_line(name: &str, blocks: u32, attached: &str) -> String {
+    let size = format!("{} MiB", blocks / 1024);
+    format!("{name:<12}{size:<8}{:<9}{attached}\n", blocks * 2)
+}
+
+/// What a Camelot VM without a network card prints once init has started the
+/// shd its `/etc/rc` lists, which can't run there: a VM of [`camelot_profile`]
+/// prints it soon after its shell's prompt, or just before.
+const SHD_WITHOUT_NETWORK: &str = "shd: socket: no network card\n";
 
 /// A Camelot VM's hardware, as Round Table's `--camelot` and `up`'s demo make it:
 /// Camelot's firmware, and its 2 MiB on top of the default 4 MiB of RAM.
@@ -97,6 +116,8 @@ fn options(dir: &TempDir) -> Options {
     o.images = dir.0.join("images");
     o.image = dir.0.join("camelot-fs.img");
     std::fs::write(&o.image, root_image()).unwrap();
+    o.desktop_image = dir.0.join("camelot-desktop.img");
+    std::fs::write(&o.desktop_image, &root_images()[1]).unwrap();
     o.build = false;
     let any = "127.0.0.1:0".parse().unwrap();
     (o.lake, o.avalon, o.pendragon) = (any, any, any);
@@ -185,8 +206,17 @@ impl Console {
 
     /// Reads the console until its output ends with `end`.
     fn wait_for_end(&mut self, end: &str) {
+        self.wait_until(end, |output| output.ends_with(end));
+    }
+
+    /// Reads the console until its output has `text` anywhere.
+    fn wait_for(&mut self, text: &str) {
+        self.wait_until(text, |output| output.contains(text));
+    }
+
+    fn wait_until(&mut self, end: &str, done: impl Fn(&str) -> bool) {
         let start = Instant::now();
-        while !self.output.ends_with(end) {
+        while !done(&self.output) {
             assert!(
                 start.elapsed() < SLOW,
                 "VM {} never printed {end:?}:\n{}",
@@ -381,13 +411,14 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         &mut lake,
         &platform.lake.to_string(),
         "second",
+        avalon_client::BASE_IMAGE,
         camelot_profile(),
     )
     .unwrap();
     assert_eq!(disk, "second-disk0");
     avalon.start_vm(&VmRef::Id(two_id)).unwrap();
     let mut two = Console::attach(platform.avalon, two_id);
-    two.wait_for_end(PROMPT);
+    two.wait_for(SHD_WITHOUT_NETWORK);
     two.type_line("ls /");
     two.wait_for_end(PROMPT);
     let vms = avalon.list_vms().unwrap();
@@ -401,7 +432,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     // Nothing is named after the OS.
     let mut names: Vec<&str> = disks.iter().map(|d| d.name.as_str()).collect();
     names.sort();
-    assert_eq!(names, ["os-base", "second-disk0", "vm001-disk0"]);
+    assert_eq!(names, ["os-base", "os-desktop", "second-disk0", "vm001-disk0"]);
     let mut names: Vec<String> = vms.iter().map(|vm| vm.name.clone()).collect();
     names.sort();
     assert_eq!(names, ["second", "vm001"]);
@@ -611,10 +642,19 @@ ID  NAME  STATE    RAM    CLOCK       DISKS  NETS
     );
     let (status, disks) = http(platform.pendragon, "/api/disks", token);
     assert_eq!(status, 200, "{disks}");
-    assert!(disks.contains(r#""camelot_image":"os-base""#), "{disks}");
+    // Each profile's image, RAM and firmware, for the new-VM form.
+    for profile in [
+        r#""name":"server","#,
+        r#""image":"os-base","ram":6,"bios":"default"}"#,
+        r#""name":"desktop","#,
+        r#""image":"os-desktop","ram":64,"bios":"default"}"#,
+    ] {
+        assert!(disks.contains(profile), "{profile} in {disks}");
+    }
     let lake_disks = rt(&["disk", "list"]);
     for line in [
         image_line("os-base", "no"),
+        sized_image_line("os-desktop", xtask::fs::DESKTOP_IMAGE_SIZE, "no"),
         image_line("pdvm-disk0", "read-write"),
         image_line("rtvm-disk0", "read-write"),
     ] {
@@ -753,21 +793,23 @@ fn a_taken_shd_address_leaves_the_demo_without_shd() {
     check_summary(&summary, 3);
 
     // start_shd with nobody's shell at the address it is given (the listener, which
-    // accepts and says nothing): it types `shd &`, which starts, and gives up when its
-    // time is out.
+    // accepts and says nothing): it gives up when its time is out, before its grace
+    // for init's shd ends, so typing nothing; the one shd is init's.
+    assert!(Duration::from_secs(3) < up::SHD_GRACE);
     let start = Instant::now();
     let e = up::start_shd(platform.avalon, id, taken_addr, Duration::from_secs(3)).unwrap_err();
     assert_eq!(e, format!("no shell answered at {taken_addr}"));
     assert!(start.elapsed() < SLOW, "{:?}", start.elapsed());
-    console.wait_for_end("]\n$ ");
-    assert!(console.output.contains("shd &\n["), "{}", console.output);
+    console.type_line("ps | grep -c shd");
+    console.wait_for_end("\n1\n$ ");
+    assert!(!console.output.contains("shd &"), "{}", console.output);
     drop((console, taken));
     platform.stop(log);
 }
 
 /// The demo on an older disk, one without `/bin/shd`: the console says so at once
-/// (`sh: shd: no such program`), and `up` says shd could not start and how to start
-/// it, leaves `herald --tcp` out of its summary, and carries on.
+/// (init's `init: cannot start /bin/shd: ...`), and `up` says shd could not start
+/// and how to start it, leaves `herald --tcp` out of its summary, and carries on.
 #[test]
 fn a_disk_without_shd_leaves_the_demo_without_shd() {
     let dir = TempDir::new("no-shd");
@@ -787,13 +829,14 @@ fn a_disk_without_shd_leaves_the_demo_without_shd() {
         &mut lake,
         &platform.lake.to_string(),
         "vm001",
+        avalon_client::BASE_IMAGE,
         camelot_profile(),
     )
     .unwrap();
     assert_eq!(disk, "vm001-disk0");
     avalon.start_vm(&VmRef::Id(old)).unwrap();
     let mut console = Console::attach(platform.avalon, old);
-    console.wait_for_end(PROMPT);
+    console.wait_for(SHD_WITHOUT_NETWORK);
     console.type_line("rm /bin/shd");
     console.wait_for_end("rm /bin/shd\n$ ");
     drop(console);
@@ -808,8 +851,8 @@ fn a_disk_without_shd_leaves_the_demo_without_shd() {
     for line in [
         "up: demo: using disk vm001-disk0 from an earlier run".to_string(),
         format!(
-            "up: demo: could not start shd in VM {id} (sh: shd: no such program); type shd & on its \
-             console"
+            "up: demo: could not start shd in VM {id} (init: cannot start /bin/shd: no such file or \
+             directory); type shd & on its console"
         ),
     ] {
         assert!(lines.contains(&line), "no {line:?} in {lines:#?}");

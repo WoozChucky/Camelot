@@ -454,8 +454,9 @@ fn source_line(n: u32) -> String {
 #[test]
 fn stepping_through_a_user_program() {
     // The shell, built with its line tables as `cargo xtask kernel` writes it next to
-    // the objects; the kernel runs the same program without them. It is the first
-    // user program to run, so its main is where the breakpoint stops.
+    // the objects; the kernel runs the same program without them. It is the program
+    // init execs (with no disk, no /etc/rc), so its main is where the breakpoint, for
+    // the program sh alone, stops: init's code is at the same addresses.
     let sh = xtask::userprogs::build_named(&path("kernel/user"), "sh").unwrap();
     let elf = TempFile::new("sh.elf", &sh.debug);
     let main = line_of("kernel/user/sh.c", "int main(void) {");
@@ -464,7 +465,7 @@ fn stepping_through_a_user_program() {
         1,
         b"hello\nexit\n",
         &format!(
-            "add-symbol-file {}\n\
+            "add-symbol-file {} program sh\n\
              break kernel/user/sh.c:{main}\n\
              continue\n\
              next\n\
@@ -484,7 +485,11 @@ fn stepping_through_a_user_program() {
         .lines()
         .find(|l| l.starts_with(&at))
         .unwrap_or_else(|| panic!("no {at:?} in:\n{out}"));
-    let body: u32 = set[at.len()..].parse().unwrap();
+    let body: u32 = set[at.len()..]
+        .strip_suffix(", program sh")
+        .unwrap_or_else(|| panic!("{out}"))
+        .parse()
+        .unwrap();
     assert!(body > main, "{out}");
     let lines: Vec<u32> = source_lines(&out, "kernel/user/sh.c")
         .iter()

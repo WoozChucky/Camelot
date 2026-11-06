@@ -209,7 +209,7 @@ const STEPS: &[Step] = &[
         what: "processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
                Linux's start as pid 1, the environment (#216), memory mappings (#179), /dev/fb0, the \
                input devices and the framebuffer console's escape sequences (#178), poll and local \
-               sockets (#180), pseudo-terminals (#181)",
+               sockets (#180), pseudo-terminals (#181), init and /etc/rc (#182)",
         args: &[
             "-p",
             "xtask",
@@ -229,11 +229,12 @@ const STEPS: &[Step] = &[
             "poll_waits_on_every_kind_of_file",
             "local_sockets_connect_and_pass_descriptors",
             "pseudo_terminals_run_the_shell",
+            "init_starts_the_services_of_etc_rc_and_ends_the_machine_with_them",
         ],
     },
     Step {
         what: "the committed examples, boot programs and hello are current; a boot block and the root \
-               image boot, its /usr what the programs are linked from",
+               images of both profiles boot, its /usr what the programs are linked from",
         args: &[
             "-p",
             "xtask",
@@ -249,6 +250,8 @@ const STEPS: &[Step] = &[
             "a_boot_block_boots_through_the_rom",
             "the_root_image_boots_from_disk_and_runs_programs_from_bin",
             "the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from",
+            "the_profiles_images_differ_in_their_etc_rc_and_fonts",
+            "the_desktop_image_boots_and_init_starts_its_shell_again",
             "hello",
         ],
     },

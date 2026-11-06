@@ -664,8 +664,10 @@ fn systest_passes_on_four_harts() {
 fn the_disk_kernel_runs_programs_from_bin_on_four_harts() {
     // The root image, made bootable, boots the disk kernel on four harts,
     // through Camelot's firmware and the boot ROM; its shell runs harts and
-    // stress from /bin, and the disk is consistent afterwards.
-    let image = xtask::fs::build_bootable(&repo_root(), xtask::fs::IMAGE_SIZE).unwrap();
+    // stress from /bin, and the disk is consistent afterwards. Five workers:
+    // with init, the shell and stress, the process table's 8 slots.
+    let image =
+        xtask::fs::build_bootable(&repo_root(), xtask::fs::Profile::Server, xtask::fs::IMAGE_SIZE).unwrap();
     let mut m = Machine::new(MachineConfig {
         harts: 4,
         disks: vec![DiskConfig::memory(image)],
@@ -674,15 +676,16 @@ fn the_disk_kernel_runs_programs_from_bin_on_four_harts() {
     .unwrap();
     m.boot_from_disk().unwrap();
     m.cpu.bus.uart.capture = true;
-    m.set_uart_input(kernel::typed(b"harts\nstress 6 3\nexit\n"));
+    m.set_uart_input(kernel::typed(b"harts\nstress 5 3\nexit\n"));
     let r = m.run(Some(3 * RUN_MAX_STEPS), |_| {});
     let out = printed(&m);
     assert_eq!(r, RunResult::Exited(0), "{out}");
+    let out = without_shd(&out);
     assert!(out.contains("\nsmp: 4 harts running\n"), "{out}");
     let lines = parse_harts(&command_output(&out, "harts"));
     assert_eq!(lines.len(), 4, "{lines:?}");
     assert!(lines.iter().all(|l| l.2 > 0), "{lines:?}");
-    check_stress_output(&command_output(&out, "stress 6 3"), 6, 3);
+    check_stress_output(&command_output(&out, "stress 5 3"), 5, 3);
     let d = &mut m.cpu.bus.disks[0];
     let mut disk = vec![0; d.capacity() as usize * 512];
     d.backend().read(0, &mut disk).unwrap();

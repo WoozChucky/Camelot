@@ -60,7 +60,9 @@ const KERNEL: &str = "kernel/kernel-disk.elf";
 /// The bootable root image, built once, as `cargo xtask fs` builds it.
 fn image() -> &'static [u8] {
     static IMAGE: OnceLock<Vec<u8>> = OnceLock::new();
-    IMAGE.get_or_init(|| xtask::fs::build_bootable(&path("."), xtask::fs::IMAGE_SIZE).unwrap())
+    IMAGE.get_or_init(|| {
+        xtask::fs::build_bootable(&path("."), xtask::fs::Profile::Server, xtask::fs::IMAGE_SIZE).unwrap()
+    })
 }
 
 /// cat with its debugging information, and the program `/bin` holds, the same code.
@@ -322,12 +324,17 @@ fn cat_pipeline(s: Setup) {
     let listed = processes(&after(&out, "info processes", main_stop));
     let reader = marked(&after(&out, "info processes", main_stop));
     assert_ne!(writer, reader);
-    // The shell and the two cats, the one stopped running on hart 0.
+    // Init, the shell and the two cats, the one stopped running on hart 0
+    // (init's shd can't run: the machine has no network card).
     let names: Vec<(&str, &str)> = listed
         .iter()
         .map(|p| (p.name.as_str(), p.state.as_str()))
         .collect();
-    assert_eq!(names, [("sh", "live"), ("cat", "live"), ("cat", "live")], "{out}");
+    assert_eq!(
+        names,
+        [("init", "live"), ("sh", "live"), ("cat", "live"), ("cat", "live")],
+        "{out}"
+    );
     let reader_listed = listed.iter().find(|p| p.pid == reader).unwrap();
     assert_eq!(reader_listed.harts, "hart 0");
     let reader_satp = reader_listed.satp.clone();

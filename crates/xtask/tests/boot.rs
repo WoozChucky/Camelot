@@ -248,10 +248,10 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     // firmware, which keeps 2 MiB), whose shell runs programs from `/bin` and
     // writes to the disk.
     let root = repo_root();
-    let image = xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap();
+    let image = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, xtask::fs::IMAGE_SIZE).unwrap();
     let kernel = std::fs::read(root.join(xtask::fs::KERNEL)).unwrap();
     let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
-    let plain = xtask::fs::build(&root, &opts).unwrap();
+    let plain = xtask::fs::build_profile(&root, &opts, xtask::fs::Profile::Server).unwrap();
 
     // IMAGE_SIZE blocks in all: the filesystem, the same as without booting, and
     // the disk kernel after it, as much of it as the bootloader loads (no symbols).
@@ -297,6 +297,13 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
         b"echo from the disk\nls /bin | wc > /count\ncat /count\nexit\n",
     );
     assert_eq!(result, RunResult::Exited(0), "{out}");
+    // Init ran the server's /etc/rc: the shell, whose exit ends the machine, and
+    // shd, which can't run on this machine without a network card, says so
+    // once (wherever its line lands among the shell's) and is left.
+    let shd = "shd: socket: no network card\n";
+    assert_eq!(out.matches(shd).count(), 1, "{out}");
+    assert!(!out.contains("init: /bin/shd"), "{out}");
+    let out = out.replacen(shd, "", 1);
     assert!(
         out.starts_with(&format!(
             "boot: kernel at sector 0x{:08x}\n{}Camelot v0.1.0 booting...\n",
@@ -359,7 +366,7 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
     // names them.
     let root = repo_root();
     let user = xtask::userprogs::user_dir(&root);
-    let image = xtask::fs::build_bootable(&root, xtask::fs::IMAGE_SIZE).unwrap();
+    let image = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, xtask::fs::IMAGE_SIZE).unwrap();
     let fs = Fs::open(&image).unwrap();
     let read = |path: &str| fs.read_file(path).unwrap_or_else(|e| panic!("{path}: {e}"));
     assert_eq!(
@@ -488,19 +495,20 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
     let kernel_blocks = boot::loadable(&kernel).unwrap().len().div_ceil(BSIZE) as u32;
     // A bigger --size: a bigger filesystem, the same kernel.
     let bigger = xtask::fs::IMAGE_SIZE + 1024;
-    let image = xtask::fs::build_bootable(&root, bigger).unwrap();
+    let image = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, bigger).unwrap();
     assert_eq!(image.len(), bigger as usize * BSIZE);
     assert_eq!(fsck::check(&image).unwrap().sb.size, bigger - kernel_blocks);
     // The programs do not fit in 1 MiB, nor anything in the kernel's own size.
-    let err = xtask::fs::build_bootable(&root, 1024).unwrap_err();
+    let err = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, 1024).unwrap_err();
     assert!(
         err.starts_with(&format!(
-            "the root filesystem does not fit in a 1024-block image, where the kernel leaves it {} blocks",
+            "the server root filesystem does not fit in a 1024-block image, where the kernel leaves it {} \
+             blocks",
             1024 - kernel_blocks
         )) && err.ends_with("give a bigger --size"),
         "{err}"
     );
-    let err = xtask::fs::build_bootable(&root, kernel_blocks).unwrap_err();
+    let err = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, kernel_blocks).unwrap_err();
     assert_eq!(
         err,
         format!(
@@ -510,9 +518,9 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
     );
     // Too big is not cured by a bigger --size: the error says what is wrong
     // and does not suggest one.
-    let err = xtask::fs::build_bootable(&root, u32::MAX).unwrap_err();
+    let err = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, u32::MAX).unwrap_err();
     assert!(
-        err.starts_with(&format!("cannot build a {}-block root image: ", u32::MAX))
+        err.starts_with(&format!("cannot build a {}-block server root image: ", u32::MAX))
             && !err.contains("--size"),
         "{err}"
     );
@@ -869,4 +877,137 @@ fn the_spec_gives_the_root_images_size() {
         "the spec says {mib} MiB, xtask::fs::IMAGE_SIZE is {blocks} blocks"
     );
     assert_eq!(blocks % 1024, 0, "a whole number of MiB");
+    // And the desktop's, once too: The desktop's is **N MiB in all**.
+    let mib = spec
+        .split("The desktop's is **")
+        .nth(1)
+        .and_then(|rest| rest.split(" MiB in all**").next())
+        .expect("the spec's \"Root image\" says: The desktop's is **N MiB in all**");
+    let blocks = xtask::fs::DESKTOP_IMAGE_SIZE;
+    assert_eq!(
+        mib,
+        format!("{}", blocks / 1024),
+        "the spec says {mib} MiB, xtask::fs::DESKTOP_IMAGE_SIZE is {blocks} blocks"
+    );
+    assert_eq!(blocks % 1024, 0, "a whole number of MiB");
+    for profile in xtask::fs::Profile::ALL {
+        assert_eq!(spec.matches(" MiB in all**").count(), 2, "one size a profile");
+        assert!(
+            spec.contains(&format!("**{}**", profile.name())),
+            "{}",
+            profile.name()
+        );
+    }
+}
+
+#[test]
+fn the_profiles_images_differ_in_their_etc_rc_and_fonts() {
+    // Issue #182: each profile's directory of kernel/profiles goes over
+    // kernel/fs byte for byte (its /etc/rc); the desktop's has the console's
+    // font and its licence in /usr/share/fonts; both have every program.
+    let root = repo_root();
+    let programs = xtask::userprogs::program_names(&xtask::userprogs::user_dir(&root)).unwrap();
+    for profile in xtask::fs::Profile::ALL {
+        let opts = Options {
+            size: profile.image_size(),
+            ..Options::default()
+        };
+        let image = xtask::fs::build_profile(&root, &opts, profile).unwrap();
+        let fs = Fs::open(&image).unwrap();
+        let rc = root
+            .join(xtask::fs::PROFILES_DIR)
+            .join(profile.name())
+            .join("etc/rc");
+        assert_eq!(
+            fs.read_file("/etc/rc").unwrap(),
+            std::fs::read(rc).unwrap(),
+            "{}",
+            profile.name()
+        );
+        let bin: BTreeSet<String> = fs
+            .list("/bin")
+            .unwrap()
+            .into_iter()
+            .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+            .collect();
+        for p in &programs {
+            assert!(bin.contains(p), "{}: no /bin/{p}", profile.name());
+        }
+        let font = fs.read_file("/usr/share/fonts/spleen/8x16.psfu");
+        match profile {
+            xtask::fs::Profile::Server => assert!(font.is_err(), "the server has no fonts"),
+            xtask::fs::Profile::Desktop => {
+                let fonts = root.join("kernel/fonts");
+                assert_eq!(
+                    font.unwrap(),
+                    std::fs::read(fonts.join("spleen-8x16.psfu")).unwrap()
+                );
+                assert_eq!(
+                    fs.read_file("/usr/share/fonts/spleen/LICENSE").unwrap(),
+                    std::fs::read(fonts.join("LICENSE.spleen")).unwrap()
+                );
+            }
+        }
+    }
+    // The tests' image has no profile: no /etc/rc, so the shell is pid 1.
+    let opts = Options {
+        size: xtask::fs::IMAGE_SIZE,
+        ..Options::default()
+    };
+    let plain = Fs::open(&xtask::fs::build(&root, &opts).unwrap()).unwrap();
+    assert!(plain.read_file("/etc/rc").is_err());
+}
+
+#[test]
+fn the_desktop_image_boots_and_init_starts_its_shell_again() {
+    // The desktop's /etc/rc keeps the console's shell running: one that
+    // ends is started again, even at once (but not five times in a row), so
+    // two Ctrl-Ds or `exit`s don't lose it. shd can't run on a machine with
+    // no network card: it says so, and init leaves it.
+    let root = repo_root();
+    let image =
+        xtask::fs::build_bootable(&root, xtask::fs::Profile::Desktop, xtask::fs::DESKTOP_IMAGE_SIZE).unwrap();
+    let mut m = Machine::new(MachineConfig {
+        ram_size: avalon_client::DESKTOP_RAM as usize,
+        ..camelot_vm(vec![DiskConfig::memory(image)])
+    })
+    .unwrap();
+    m.boot_from_disk().unwrap();
+    m.cpu.bus.uart.capture = true;
+    m.set_uart_input(xtask::kernel::typed(b"exit\nexit\nps\n"));
+    // The machine runs on: run it until the third shell's ps is done.
+    let printed = |m: &Machine| String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    let done = |out: &str| out.find("$ ps\n").is_some_and(|at| out[at + 5..].contains("$ "));
+    let mut steps = 0;
+    while !done(&printed(&m)) {
+        assert!(steps < 2 * BOOT_MAX_STEPS, "{}", printed(&m));
+        let result = m.run(Some(1_000_000), |_| {});
+        assert!(
+            !matches!(result, RunResult::Exited(_)),
+            "{result:?}: {}",
+            printed(&m)
+        );
+        steps += 1_000_000;
+    }
+    let out = printed(&m);
+    assert!(out.contains("\nram: 64 MiB at 0x80000000\n"), "{out}");
+    assert_eq!(
+        out.matches("Type help for the list of commands.\n").count(),
+        3,
+        "{out}"
+    );
+    assert_eq!(out.matches("shd: socket: no network card\n").count(), 1, "{out}");
+    assert!(!out.contains("init: "), "{out}");
+    // The third shell is init's child too, pid 1's.
+    let ps = &out[out.find("$ ps\n").unwrap_or_else(|| panic!("{out}"))..];
+    let processes: Vec<Vec<&str>> = ps
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .filter(|w| w.len() == 5)
+        .collect();
+    assert!(
+        processes.iter().any(|w| w[..2] == ["1", "0"] && w[4] == "init"),
+        "{out}"
+    );
+    assert!(processes.iter().any(|w| w[1] == "1" && w[4] == "sh"), "{out}");
 }

@@ -30,7 +30,10 @@ int exec_replace(const char *path, const struct proc_args *args);
 /* The first process's program: the one at `path`, with argv = { name }
  * and Linux's environment for init (init/main.c's envp_init: HOME=/ and
  * TERM=linux). From the root filesystem if there is one, falling back to
- * the embedded programs if it has no such file. Returns 0 or an error. */
-int exec_init(const char *path, const char *name);
+ * the embedded programs if it has no such file and `embedded` says so
+ * (the shell: init, embedded, could not exec a shell the filesystem
+ * lacks). Without a filesystem, the embedded program. Returns 0 or an
+ * error. */
+int exec_init(const char *path, const char *name, bool embedded);
 
 #endif

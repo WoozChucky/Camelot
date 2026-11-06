@@ -40,3 +40,5 @@ crates/elf/tests/llvm/*/*.lines text eol=lf
 # The root filesystem's files are copied into disk images byte for byte:
 # the same bytes on every checkout.
 kernel/fs/** -text
+# What the root image profiles add, copied into the images byte for byte.
+kernel/profiles/** -text

@@ -12,8 +12,9 @@
 //!   device names, MAC addresses).
 //! - [`VmAction::allowed_in`], [`holds_disks`] and [`lake_disks`]: what a VM's state
 //!   and profile mean for what a person may do with it and its disks.
-//! - [`create_camelot_vm`]: a VM that boots Camelot from its own copy of Lake's
-//!   base image ([`BASE_IMAGE`]), with no program to upload.
+//! - [`create_camelot_vm`]: a VM that boots Camelot from its own copy of one of
+//!   Lake's images ([`BASE_IMAGE`], [`DESKTOP_IMAGE`]), with no program to upload;
+//!   [`PRESETS`], the hardware profiles of a Camelot server and a Camelot desktop.
 //! - [`DebugTunnel`]: a debugger's end of a VM's GDB stub, the GDB remote serial
 //!   protocol's bytes over a session (merlin-dbg's `--vm`).
 //!
@@ -217,9 +218,80 @@ pub fn lake_disks(profile: &HardwareProfile) -> impl Iterator<Item = (&str, &str
 }
 
 /// The Lake image a Camelot VM's disk is a copy of: a bootable Camelot root
-/// filesystem, the one `cargo xtask fs` builds. `cargo xtask up` puts it in Lake's
-/// images directory. A neutral name, not the OS's: it is the base image of the VMs.
+/// filesystem, the one `cargo xtask fs` builds (its server profile). `cargo xtask
+/// up` puts it in Lake's images directory. A neutral name, not the OS's: it is the
+/// base image of the VMs.
 pub const BASE_IMAGE: &str = "os-base";
+
+/// The Lake image a Camelot desktop's disk is a copy of: the root filesystem of
+/// `cargo xtask fs --profile desktop`, whose init starts the desktop. `cargo xtask
+/// up` puts it in Lake's images directory beside [`BASE_IMAGE`].
+pub const DESKTOP_IMAGE: &str = "os-desktop";
+
+/// The RAM a Camelot desktop has: room for the display's frames in RAM (one is
+/// 1.2 MB at 640x480 and 8.3 MB at 1920x1080, the display controller's largest
+/// mode, and a desktop draws into one while the other is shown) and the programs
+/// that draw them, on top of the firmware's 2 MiB.
+pub const DESKTOP_RAM: u64 = 64 << 20;
+
+/// A hardware profile people pick by name: the machine of a kind of Camelot VM and
+/// the Lake image its disk is a copy of. Round Table's `create --profile` and
+/// Pendragon's form offer them ([`PRESETS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Preset {
+    /// Its name: `server`, `desktop`.
+    pub name: &'static str,
+    /// What it is for, a line.
+    pub about: &'static str,
+    /// The image its disk is a copy of.
+    pub image: &'static str,
+    pub ram_size: u64,
+}
+
+impl Preset {
+    /// Its machine: Camelot's firmware and its RAM, Avalon's defaults for the rest.
+    /// Its disk is added by [`create_camelot_vm`].
+    pub fn profile(&self) -> HardwareProfile {
+        HardwareProfile {
+            ram_size: self.ram_size,
+            bios: camelot_bios(),
+            ..HardwareProfile::default()
+        }
+    }
+}
+
+/// The hardware profiles of Camelot VMs: a server (the console's shell and shd,
+/// [`CAMELOT_RAM`]) and a desktop (its display and more RAM, [`DESKTOP_RAM`]). The
+/// guest picks its display mode itself, as a desktop on a real display controller
+/// does; the desktop's RAM has room for the largest.
+pub const PRESETS: [Preset; 2] = [
+    Preset {
+        name: "server",
+        about: "a Camelot server: the console's shell and shd, its shells over TCP",
+        image: BASE_IMAGE,
+        ram_size: CAMELOT_RAM,
+    },
+    Preset {
+        name: "desktop",
+        about: "a Camelot desktop: its own image, and RAM for the largest display mode",
+        image: DESKTOP_IMAGE,
+        ram_size: DESKTOP_RAM,
+    },
+];
+
+/// The preset named `name`.
+pub fn preset(name: &str) -> Option<&'static Preset> {
+    PRESETS.iter().find(|p| p.name == name)
+}
+
+/// The preset named `name`, or why there is none (`no profile 'NAME' (server or
+/// desktop)`), as Round Table's `--profile` and Pendragon's `profile` take it.
+pub fn parse_preset(name: &str) -> Result<&'static Preset, String> {
+    preset(name).ok_or_else(|| {
+        let names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+        format!("no profile '{name}' ({})", names.join(" or "))
+    })
+}
 
 /// The firmware a Camelot VM boots unless its creator says otherwise: Camelot's own
 /// (`Bios::Default`, as QEMU's `virt` runs OpenSBI by default), since the root
@@ -240,8 +312,8 @@ pub const CAMELOT_RAM: u64 = avalon_proto::DEFAULT_RAM_SIZE + CAMELOT_FIRMWARE_R
 /// (`grail::firmware::FW_SIZE`).
 pub const CAMELOT_FIRMWARE_RAM: u64 = 2 << 20;
 
-/// The disk a Camelot VM named `vm` boots from: its own copy of
-/// [`BASE_IMAGE`], `<vm>-disk0` (its disk 0).
+/// The disk a Camelot VM named `vm` boots from: its own copy of its image
+/// ([`BASE_IMAGE`], [`DESKTOP_IMAGE`]), `<vm>-disk0` (its disk 0).
 pub fn vm_disk(vm: &str) -> String {
     format!("{vm}-disk0")
 }
@@ -251,8 +323,8 @@ pub fn vm_disk(vm: &str) -> String {
 pub enum CamelotError {
     /// The VM's name is not valid, or leaves no room for `-disk0` in a disk name.
     Name(String),
-    /// The Lake server has no base image `image` ([`BASE_IMAGE`]).
-    NoBaseImage { lake: String, image: &'static str },
+    /// The Lake server has no image `image` to copy ([`BASE_IMAGE`], ...).
+    NoBaseImage { lake: String, image: String },
     /// Lake refused to copy the image (its name is taken, the base image has a
     /// writer), or failed.
     Lake { disk: String, cause: Error },
@@ -289,9 +361,10 @@ impl fmt::Display for CamelotError {
 
 impl std::error::Error for CamelotError {}
 
-/// Creates a VM that boots Camelot: copies the base image ([`BASE_IMAGE`]) on the
-/// Lake server at `lake_addr` (the address Avalon will reach it at too) to
-/// [`vm_disk`]`(name)`, puts that disk first in `profile` (disk 0, read-write) and
+/// Creates a VM that boots Camelot: copies the image `image` ([`BASE_IMAGE`], or a
+/// preset's, [`Preset::image`]) on the Lake server at `lake_addr` (the address
+/// Avalon will reach it at too) to [`vm_disk`]`(name)`, puts that disk first in
+/// `profile` (disk 0, read-write) and
 /// creates the VM with no program, so it boots from the disk (protocol doc,
 /// `CreateVm`). The VM is left in state created. If Avalon refuses the VM, the copy is
 /// deleted again. Returns the VM's id and the disk's name.
@@ -300,6 +373,7 @@ pub fn create_camelot_vm(
     lake: &mut Client,
     lake_addr: &str,
     name: &str,
+    image: &str,
     mut profile: HardwareProfile,
 ) -> Result<(u32, String), CamelotError> {
     validate_name(name).map_err(CamelotError::Name)?;
@@ -312,13 +386,12 @@ pub fn create_camelot_vm(
     })?;
     let source = DiskSource::parse(&format!("{}{lake_addr}/{disk}", avalon_proto::LAKE_SCHEME))
         .map_err(CamelotError::Name)?;
-    let image = BASE_IMAGE;
     if let Err(e) = lake.clone_disk(&disk, image, None) {
         // Only the source can be missing in a clone.
         return Err(match e.code() {
             Some(ErrorCode::NoSuchDisk) => CamelotError::NoBaseImage {
                 lake: lake_addr.to_string(),
-                image,
+                image: image.to_string(),
             },
             _ => CamelotError::Lake { disk, cause: e },
         });
@@ -772,6 +845,30 @@ mod tests {
             while conn.recv().is_ok() {}
         });
         addr
+    }
+
+    #[test]
+    fn the_presets() {
+        let server = parse_preset("server").unwrap();
+        assert_eq!((server.image, server.ram_size), (BASE_IMAGE, CAMELOT_RAM));
+        let desktop = parse_preset("desktop").unwrap();
+        assert_eq!((desktop.image, desktop.ram_size), (DESKTOP_IMAGE, DESKTOP_RAM));
+        // Both on Camelot's firmware, Avalon's defaults otherwise, no disk yet.
+        let machine = desktop.profile();
+        assert_eq!((machine.bios, machine.ram_size), (camelot_bios(), DESKTOP_RAM));
+        assert_eq!(
+            HardwareProfile {
+                ram_size: avalon_proto::DEFAULT_RAM_SIZE,
+                bios: Bios::None,
+                ..machine
+            },
+            HardwareProfile::default()
+        );
+        assert_eq!(
+            parse_preset("laptop").unwrap_err(),
+            "no profile 'laptop' (server or desktop)"
+        );
+        assert_eq!(preset("Server"), None);
     }
 
     #[test]

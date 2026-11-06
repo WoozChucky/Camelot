@@ -318,15 +318,20 @@ void proc_exec_abandon(struct exec_image *img);
  * can't (no free slot, no memory). */
 struct proc *kproc_create(const char *name, void (*fn)(void), const char **err);
 
-/* Starts the program at `path` (the shell) as the first process, with argv
- * = { name } and the console as its descriptors 0 (for reading), 1 and 2
+/* Starts the program at `path` (init) as the first process, with argv =
+ * { name } and the console as its descriptors 0 (for reading), 1 and 2
  * (for writing), in the root directory if there is a filesystem, and runs
  * the scheduler until no process is left: the first process has exited and
  * so has everything still running when it did. The process loads its
- * program itself (exec.c's exec_init(), which may sleep on the disk).
- * Returns the first process's exit status in *status, or false if it
- * couldn't be started (having said why). */
-bool proc_run_init(const char *path, const char *name, int *status);
+ * program itself (exec.c's exec_init(), which may sleep on the disk); if
+ * it can't, it runs `fallback_path` (the shell) as `fallback_name`, saying
+ * why unless `path` is missing, as Linux falls back on /bin/sh. While the
+ * first process runs `path`, it adopts the orphans: a process whose parent
+ * ends becomes its child, for its wait() to collect. Returns the first
+ * process's exit status in *status, or false if it couldn't be started
+ * (having said why). */
+bool proc_run_init(const char *path, const char *name, const char *fallback_path, const char *fallback_name,
+                   int *status);
 
 /* Runs the threads round robin, one timer tick each for user threads,
  * taking them from the thread table that every hart's scheduler shares.
