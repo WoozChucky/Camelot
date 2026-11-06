@@ -112,7 +112,11 @@ static void for_each_entry(const char *dir, void (*fn)(const char *name, u32 inu
 static void ls_entry(const char *name, u32 inum) {
     struct dinode d;
     dinode(inum, &d);
-    char type = d.type == T_DIR ? 'd' : d.type == T_FILE ? 'f' : d.type == T_DEVICE ? 'c' : '?';
+    char type = d.type == T_DIR      ? 'd'
+                : d.type == T_FILE   ? 'f'
+                : d.type == T_DEVICE ? 'c'
+                : d.type == T_SOCKET ? 's'
+                                     : '?';
     kprintf("%c %4u %2u %7u %s\n", type, inum, d.nlink, d.size, name);
 }
 

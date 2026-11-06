@@ -5,7 +5,7 @@
 
 use crate::{
     contents, dirents, fsck, path_names, read_inode, show_name, superblock, Dinode, Superblock, BSIZE,
-    NO_INODE, ROOT_INODE, T_DEVICE, T_DIR, T_FILE, T_FREE,
+    NO_INODE, ROOT_INODE, T_DEVICE, T_DIR, T_FILE, T_FREE, T_SOCKET,
 };
 
 /// A filesystem image opened for reading.
@@ -31,12 +31,14 @@ impl Entry {
     }
 }
 
-/// The letter `ls` shows for an inode type: `d`, `f`, `c` (device), `?`.
+/// The letter `ls` shows for an inode type: `d`, `f`, `c` (device), `s`
+/// (socket), `?`.
 pub fn type_letter(kind: u16) -> char {
     match kind {
         T_DIR => 'd',
         T_FILE => 'f',
         T_DEVICE => 'c',
+        T_SOCKET => 's',
         _ => '?',
     }
 }

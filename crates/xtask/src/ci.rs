@@ -21,7 +21,8 @@
 //! - processes' system call ABI: results sign-extended, pointers into the
 //!   kernel's half refused, 64-bit values through the calls; memory mappings
 //!   (maptest); the framebuffer and input devices (fbtest, inputtest) and the
-//!   console's escape sequences;
+//!   console's escape sequences; poll on every kind of file (polltest) and
+//!   local sockets passing descriptors (unixtest);
 //! - how Avalon and Lake end connections: bad handshakes, and a server's last
 //!   frame arriving whole though the client sent more (Linux's TCP stack is not
 //!   Windows's here);
@@ -194,7 +195,8 @@ const STEPS: &[Step] = &[
     Step {
         what: "processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
                Linux's start as pid 1, the environment (#216), memory mappings (#179), /dev/fb0, the \
-               input devices and the framebuffer console's escape sequences (#178)",
+               input devices and the framebuffer console's escape sequences (#178), poll and local \
+               sockets (#180)",
         args: &[
             "-p",
             "xtask",
@@ -211,6 +213,8 @@ const STEPS: &[Step] = &[
             "the_input_devices_answer_evdevs_requests",
             "keys_reach_a_reader_as_linux_key_codes",
             "the_framebuffer_console_acts_on_ansis_escape_sequences",
+            "poll_waits_on_every_kind_of_file",
+            "local_sockets_connect_and_pass_descriptors",
         ],
     },
     Step {

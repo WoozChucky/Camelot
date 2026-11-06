@@ -6,6 +6,7 @@
 #include "riscv.h"
 #include "kprintf.h"
 #include "nic.h"
+#include "poll.h"
 #include "proc.h"
 #include "timer.h"
 #include "trap.h"
@@ -143,9 +144,15 @@ void net_sleep(void) {
 }
 
 void net_wakeup(void) {
-    if (sleepers != 0) {
+    /* A thread in poll() may have the channel in its table (net_poll_wait)
+     * without being one of the sleepers. */
+    if (sleepers != 0 || polling_threads != 0) {
         wakeup(&netif);
     }
+}
+
+void net_poll_wait(struct poll_table *pt) {
+    poll_wait(pt, &netif);
 }
 
 u32 net_now(void) {

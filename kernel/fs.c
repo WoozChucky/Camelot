@@ -710,9 +710,9 @@ static void trunc_restart(struct inode *ip) {
  * inode freed is iput()'s to finish first (see there). */
 static bool truncate(struct inode *ip, bool free_inode) {
     ip->size = 0;
-    if (ip->type == T_DEVICE || (ip->root.h.depth == 0 && ip->root.h.entries == 0)) {
-        /* No blocks (a device's root is all zero): only the inode changes,
-         * a block the caller's operation counts already. */
+    if (ip->type == T_DEVICE || ip->type == T_SOCKET || (ip->root.h.depth == 0 && ip->root.h.entries == 0)) {
+        /* No blocks (a device's or a socket's root is all zero): only the
+         * inode changes, a block the caller's operation counts already. */
         ip->flags &= ~(u32)INODE_TRUNCATING;
         if (free_inode) {
             ip->type = T_FREE;
@@ -769,8 +769,8 @@ struct inode *ialloc(u32 dev, u16 type) {
         if (dip->type == T_FREE) {
             memset(dip, 0, sizeof *dip);
             dip->type = type;
-            if (type != T_DEVICE) {
-                ext_init(&dip->root); /* a device's stays all zero */
+            if (type != T_DEVICE && type != T_SOCKET) {
+                ext_init(&dip->root); /* a device's or a socket's stays all zero */
             }
             log_write(b);
             brelse(b);

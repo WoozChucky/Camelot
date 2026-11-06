@@ -129,7 +129,7 @@ static int connected(uint port) {
 }
 
 static void test_sockets(void) {
-    check_eq(socket(1, SOCK_STREAM, 0), -EAFNOSUPPORT, "a socket of family 1");
+    check_eq(socket(10, SOCK_STREAM, 0), -EAFNOSUPPORT, "a socket of family 10 (IPv6)");
     check_eq(socket(AF_INET, 3, 0), -EINVAL, "a socket of type 3");
     check_eq(socket(AF_INET, SOCK_STREAM, IPPROTO_UDP), -EPROTONOSUPPORT, "a stream socket for UDP");
     check_eq(socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP), -EPROTONOSUPPORT, "a datagram socket for TCP");

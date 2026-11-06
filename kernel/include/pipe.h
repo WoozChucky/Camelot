@@ -36,4 +36,12 @@ isize pipewrite(struct pipe *p, pagetable_t pt, uintptr src, usize n);
 /* The bytes waiting in `p` (fstat's size). */
 u32 pipe_bytes(struct pipe *p);
 
+struct poll_table;
+
+/* poll() on an end of `p` (the write end if `writable`): the read end is
+ * ready to read with bytes waiting and hung up (POLLHUP) once the write
+ * end is closed; the write end ready to write with room, and in error
+ * (POLLERR) once the read end is closed, as on Linux. */
+u32 pipe_poll(struct pipe *p, bool writable, struct poll_table *pt);
+
 #endif

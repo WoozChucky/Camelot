@@ -71,12 +71,18 @@
 #define SYS_memfd_create 51  /* memfd_create(name, flags): a descriptor for a new shared-memory object */
 #define SYS_ftruncate 52     /* ftruncate(fd, length): 0, the object's size set */
 #define SYS_ioctl 53         /* ioctl(fd, request, arg): the device's answer */
+#define SYS_poll 54          /* poll(fds, nfds, timeout): the descriptors with events, 0 if the time ran out */
+#define SYS_socketpair 55    /* socketpair(domain, type, protocol, fds): 0, two connected local sockets in fds */
+#define SYS_sendmsg 56       /* sendmsg(fd, msg, flags): bytes sent, descriptors with them */
+#define SYS_recvmsg 57       /* recvmsg(fd, msg, flags): bytes received, descriptors with them */
+#define SYS_stat 58          /* stat(path, st): 0, with *st filled in */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
 #define ENOENT 2        /* no such file or directory */
 #define ESRCH 3         /* kill: no such process; thread_join: no such thread */
 #define EINTR 4         /* a wait ended because the process was killed */
+#define ENXIO 6         /* open: a socket's inode, which only connect() reaches */
 #define E2BIG 7         /* spawn, exec: argument list too long */
 #define ENOEXEC 8       /* spawn, exec: the file is not a valid executable */
 #define EBADF 9         /* not an open file descriptor, or not open for that */
@@ -108,8 +114,9 @@
 #define EMSGSIZE 90     /* a datagram too big for one packet */
 #define ENOPROTOOPT 92  /* setsockopt: an option sockets don't have */
 #define EPROTONOSUPPORT 93 /* socket: a protocol the type doesn't have */
+#define ESOCKTNOSUPPORT 94 /* socket, socketpair: a local socket of a type other than SOCK_STREAM */
 #define EOPNOTSUPP 95   /* listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses */
-#define EAFNOSUPPORT 97 /* an address family other than AF_INET */
+#define EAFNOSUPPORT 97 /* socket: neither AF_INET nor AF_UNIX; a TCP or UDP socket's address not AF_INET */
 #define EADDRINUSE 98   /* a port that is taken */
 #define EADDRNOTAVAIL 99 /* bind: an address that is not this host's */
 #define ENETUNREACH 101 /* no route: no address yet, or no gateway */
@@ -251,9 +258,11 @@ struct ping_reply {
     u32 rtt_us; /* the round trip, in microseconds of mtime */
 };
 
-/* Sockets (docs/camelot-syscalls.md, "Sockets"): Linux's values. */
-#define AF_INET 2     /* IPv4: the only address family */
-#define SOCK_STREAM 1 /* TCP */
+/* Sockets (docs/camelot-syscalls.md, "Sockets" and "Local sockets"):
+ * Linux's values. */
+#define AF_UNIX 1     /* local sockets, named by paths (unix.h) */
+#define AF_INET 2     /* IPv4 */
+#define SOCK_STREAM 1 /* TCP, or a local stream */
 #define SOCK_DGRAM 2  /* UDP */
 #define SHUT_RD 0     /* shutdown: no more reading */
 #define SHUT_WR 1     /* no more sending */
@@ -279,6 +288,51 @@ struct sockaddr_in {
     struct in_addr sin_addr;
     u8 sin_zero[8];
 };
+
+/* A local socket's address, as Linux lays it out (110 bytes): a path,
+ * which here must end with a NUL within sun_path (Camelot's calls take no
+ * address length). */
+#define UNIX_PATH_MAX 108
+
+struct sockaddr_un {
+    u16 sun_family; /* AF_UNIX */
+    char sun_path[UNIX_PATH_MAX];
+};
+
+/* sendmsg's and recvmsg's (Linux's LP64 layouts): the buffers to gather
+ * from or scatter into (16 bytes each), and the message (56 bytes) naming
+ * them, an address and the control messages. */
+struct iovec {
+    uintptr iov_base;
+    usize iov_len;
+};
+
+struct msghdr {
+    uintptr msg_name;      /* an address, or 0 */
+    u32 msg_namelen;       /* its size; recvmsg: what it stored */
+    uintptr msg_iov;       /* the buffers */
+    usize msg_iovlen;      /* how many */
+    uintptr msg_control;   /* the control messages, or 0 */
+    usize msg_controllen;  /* their size; recvmsg: what it stored */
+    int msg_flags;         /* recvmsg: MSG_CTRUNC, MSG_TRUNC */
+};
+
+/* A control message's header (16 bytes); its data follows at the next 8
+ * bytes, and the next message at the next multiple of 8 after it. */
+struct cmsghdr {
+    usize cmsg_len; /* the header and the data */
+    int cmsg_level; /* SOL_SOCKET */
+    int cmsg_type;  /* SCM_RIGHTS */
+};
+
+#define SCM_RIGHTS 1 /* a control message of descriptors (ints) */
+
+/* sendmsg's and recvmsg's flags (Linux's values). */
+#define MSG_CTRUNC 0x8               /* recvmsg: descriptors that did not fit were closed */
+#define MSG_TRUNC 0x20               /* recvmsg: a datagram's end did not fit */
+#define MSG_DONTWAIT 0x40            /* -EAGAIN rather than wait (local sockets) */
+#define MSG_NOSIGNAL 0x4000          /* accepted, and nothing to do: Camelot has no SIGPIPE */
+#define MSG_CMSG_CLOEXEC 0x40000000  /* recvmsg: the descriptors close on exec */
 
 /* spawn's and exec's limits, as execve's: at most MAXARG strings in argv
  * (argv[0] included) and as many in envp (Linux's MAX_ARG_STRINGS bounds

@@ -55,6 +55,7 @@
 #define THREAD_NEW 5      /* taken, not runnable yet */
 
 struct proc;
+struct poll_table;
 
 /* One thread of a process.
  *
@@ -95,6 +96,9 @@ struct thread {
     /* A socket call's reference to the open file it works on (socket.c),
      * which syscall() lets go of once the call is done. */
     struct file *net_file;
+    /* Its poll table (poll.h) while it is in poll(): wakeup() of any of
+     * its channels wakes it. NULL otherwise. */
+    struct poll_table *poll;
     /* Set when another thread ends the process, or replaces its program:
      * the thread ends (proc_killed() says so) the next time it would return
      * to U-mode, and the long waits give up at once, as for kill(). */
@@ -106,7 +110,7 @@ struct thread {
  * register wide (proc at THREAD_PROC, kstack at THREAD_KSTACK). */
 #define THREAD_PROC 8
 #define THREAD_KSTACK 16
-#define THREAD_SIZE 184
+#define THREAD_SIZE 192
 _Static_assert(sizeof(struct thread) == THREAD_SIZE, "the tests index threads[] by THREAD_SIZE");
 _Static_assert(offsetof(struct thread, proc) == THREAD_PROC, "the tests read proc there");
 _Static_assert(offsetof(struct thread, kstack) == THREAD_KSTACK, "the tests read kstack there");
@@ -348,6 +352,20 @@ void sleep(const void *chan, struct spinlock *lk);
  * lock that protects what changed, the one the sleepers passed to
  * sleep(). */
 void wakeup(const void *chan);
+
+/* poll()'s waiting (poll.h, poll.c), on the table `pt` on the caller's
+ * stack. poll_begin() makes it the thread's table, empty; poll_sleep()
+ * sleeps until a wakeup() of one of its channels, unless one came since
+ * the table was last emptied or the process was killed, then empties it
+ * for the next scan; poll_end() takes it away. The table's channels go
+ * in with poll_wait(). */
+void poll_begin(struct poll_table *pt);
+void poll_sleep(struct poll_table *pt);
+void poll_end(void);
+
+/* Threads in poll() now: whoever skips a wakeup() while nobody sleeps on
+ * its channel (net_wakeup) must not skip it while this is non-zero. */
+extern volatile u32 polling_threads;
 
 /* Gives the CPU back to the scheduler; the thread stays runnable. */
 void yield(void);

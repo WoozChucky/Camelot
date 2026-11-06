@@ -23,10 +23,10 @@ together.
 | `printf.c` | `printf`, `fprintf` (to a descriptor), `snprintf`, `puts` |
 | `getline.c` | `getline` (a console line from stdin), `reader_init` and `reader_getline` (lines from any descriptor) |
 | `strerror.c` | `strerror`: a short message for each error number |
-| `stat.c` | `stat`: `fstat` of a path |
 | `spin.c` | `spin`: a busy loop, for tests that need CPU time |
 | `proc.c` | `kill_descendants`: kills what a process started, and theirs (the shell and `shd` hang a session up with it) |
 | `inet.c` | `htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`, `inet_addr`, `inet_ntoa`, `sockaddr_set`: addresses and byte order |
+| `cmsg.c` | `cmsg_nxthdr`, behind `CMSG_NXTHDR`: the next control message of a `struct msghdr` (`sendmsg`, `recvmsg`) |
 | `resolve.c` | `resolve`: a host's address, from its text or by a DNS query (RFC 1035) to the server the network gave; `resolve_error` |
 | `usys.s` | the system call stubs, one per call (`docs/camelot-syscalls.md`): the number in `a7`, `ecall`, `ret` |
 | `atomic.s` | `atomic_swap`, `atomic_add`, `atomic_cas`, `atomic_load`, `atomic_store`; `spin_lock`, `spin_unlock` |
