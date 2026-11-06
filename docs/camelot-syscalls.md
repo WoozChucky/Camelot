@@ -302,10 +302,11 @@ opens:
 - a directory, for reading only: anything else is `-EISDIR`, and so is
   `O_CREAT` on a missing name with a trailing slash (`newf/` names a
   directory, and `open` makes only files);
-- a device node (`/dev/console`), which gives the device itself: the
-  console's reads and writes, in the access mode asked for, also on a
-  read-only filesystem; a node whose major number has no driver is
-  `-ENODEV`.
+- a device node (`/dev/console`, `/dev/fb0`), which gives the device
+  itself, in the access mode asked for, also on a read-only filesystem:
+  the console's reads and writes, the framebuffer's memory to map ("Memory
+  mappings"; its `read` and `write` are `-EINVAL`); a node whose major
+  number has no driver is `-ENODEV`.
 
 A file bigger than the kernel reads or writes, 2^32 - 1 blocks (ext4's
 `s_maxbytes`), is `-EOVERFLOW`: only a damaged inode can be one, as the
@@ -732,9 +733,10 @@ neither written nor taken from the pipe; the calls that fill in a struct
 Besides its program, its heap and its stack, a process may have memory
 mappings: ranges of its address space that `mmap` maps and `munmap` takes
 away, each with its protections (`mprotect`), as Linux's: anonymous memory
-of the process's own, and memory shared with other processes ("Shared
-memory" below). Inside the kernel each mapping is an area
-(`kernel/mmap.c`, the shared objects `kernel/shm.c`;
+of the process's own, memory shared with other processes ("Shared
+memory" below), and a device's memory ("A device's memory" below). Inside
+the kernel each mapping is an area (`kernel/mmap.c`, the shared objects
+`kernel/shm.c`, the framebuffer `kernel/fb.c`;
 `docs/excalibur-spec.md` section 10, "Kernel memory mappings").
 
 **Where they go.** Between the end of the heap and the guard page under the
@@ -751,7 +753,8 @@ program may map far more than the machine has, as long as it doesn't use
 it all. Anonymous memory reads zero at first. A touch the mapping's
 protections don't allow (a write to a read-only mapping, any access to a
 `PROT_NONE` one) is a fault, and kills the program ("exit"), as Linux's
-`SIGSEGV` would; so does a page that can't be had then.
+`SIGSEGV` would; so does a page that can't be had then. A device's
+mapping is the exception: its pages are the device's, all mapped by `mmap`.
 
 The values are Linux's:
 
@@ -793,10 +796,14 @@ otherwise the highest room that fits. Errors:
   private mapping of one is a copy-on-write one on Linux, which Camelot
   doesn't have);
 - `-EBADF`: `fd` is not an open descriptor (without `MAP_ANONYMOUS`);
-- `-EACCES`: `fd` is not open for reading;
+- `-EACCES`: `fd` is not open for reading, or the mapping is writable
+  and writes what `fd` is open on (`MAP_SHARED`, or any mapping of a
+  device) while `fd` is not open for writing;
 - `-ENODEV`: `fd` is not something that can be mapped (only shared-memory
-  objects can be): a regular file, a directory, a pipe, a socket, the
-  console;
+  objects and `/dev/fb0` can be): a regular file, a directory, a pipe, a
+  socket, the console;
+- a device's own errors: for `/dev/fb0`, `-EINVAL` for a range past its
+  memory, `-ENODEV` on a machine without a framebuffer.
 - `-EEXIST`: `MAP_FIXED_NOREPLACE` over a mapping;
 - `-ENOMEM`: no room for it (or, with `MAP_FIXED`, its range is not in the
   mapping room), anonymous memory bigger than the RAM (as `sbrk` fails at
@@ -817,7 +824,9 @@ their pages keep what they hold, a `PROT_NONE` page too. Returns 0 (also
 for `len` 0). Errors: `-EINVAL` if `addr` is not page aligned or `prot`
 has other bits; `-ENOMEM` if part of the range is not a mapping (the
 program, the heap and the stack included), or a mapping has to be cut and
-the kernel's table is full.
+the kernel's table is full; `-EACCES` if `prot` makes writable a mapping
+that writes what a descriptor not open for writing was open on (as
+`mmap` would refuse it).
 
 A mapping's pages are given back when it is unmapped, when the program is
 replaced (`exec`), and when the process ends.
@@ -857,6 +866,18 @@ is open on to `length` bytes. Returns 0. Errors: `-EBADF`; `-EINVAL` if
 `fd` is no shared-memory object (`ftruncate` of a regular file is not
 there yet) or not open for writing, or `length` is negative; `-EFBIG` past
 1 GiB.
+
+**A device's memory.** `/dev/fb0`, the framebuffer's device node on the
+root image, maps the framebuffer's memory (640x480 pixels of 32 bits,
+`docs/excalibur-spec.md` section 9.3), from `offset` on, its last page
+whole: a program draws by writing pixels there, and the screen shows them.
+The pages are the device's, mapped all at once by `mmap` and never freed;
+`MAP_PRIVATE` maps the same pages as `MAP_SHARED` (writes go to the
+device either way, as Linux's framebuffer devices do), so a writable
+mapping of either kind needs the descriptor open for writing. A system
+call's buffer can't be in a device's memory (the kernel copies only to
+and from RAM): `write` from a framebuffer mapping, say, fails with
+`-EFAULT`.
 
 ## Error numbers
 
