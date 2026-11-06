@@ -441,7 +441,7 @@ directory's name before its parent's: a directory's parent is its `..` and
 its name the parent's entry for it, as Camelot keeps no names of its own
 for directories (Linux's dentries). It may be longer than `MAXPATH`, as
 `chdir`s of relative paths may go deeper than any path a call takes, up to
-a page (4096 bytes, Linux's limit; `-ENAMETOOLONG` past it). `-ERANGE` if
+a page (4096 bytes with its NUL, Linux's limit; `-ENAMETOOLONG` past it). `-ERANGE` if
 `size` bytes don't hold it (a `size` of 0 too), `-ENOENT` if the working
 directory has been removed (the path it had names nothing now), `-ENOMEM`
 if the kernel has no page to build it in, `-EFAULT` if `buf` can't take it.
@@ -1404,7 +1404,7 @@ Linux's values for the same conditions.
 | 30 | `EROFS` | the filesystem is read-only |
 | 32 | `EPIPE` | write: a pipe nobody reads any more |
 | 34 | `ERANGE` | getcwd: the buffer is too small for the path |
-| 36 | `ENAMETOOLONG` | a name longer than 14 bytes, or a path longer than `MAXPATH` |
+| 36 | `ENAMETOOLONG` | a name longer than 14 bytes, or a path longer than `MAXPATH`; getcwd: a path longer than a page |
 | 38 | `ENOSYS` | no such system call |
 | 39 | `ENOTEMPTY` | unlink: a directory with entries |
 | 75 | `EOVERFLOW` | open: a file bigger than the kernel's offsets reach; mmap: past the largest object |

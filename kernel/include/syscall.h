@@ -109,7 +109,7 @@
 #define EROFS 30        /* the filesystem is read-only */
 #define EPIPE 32        /* write: a pipe nobody reads any more */
 #define ERANGE 34       /* getcwd: the buffer is too small for the path */
-#define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH */
+#define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH; getcwd: a path longer than a page */
 #define ENOSYS 38       /* no such system call */
 #define ENOTEMPTY 39    /* unlink: a directory with entries */
 #define EOVERFLOW 75    /* open: a file bigger than the kernel's offsets reach; mmap: past the largest object */
