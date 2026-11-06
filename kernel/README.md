@@ -470,8 +470,8 @@ and wakes it with an IPI (the SBI's `send_ipi`). Only hart 0 counts the clock (`
 the network's timer) and takes the devices' interrupts. Taking away a
 mapping (`unmap_pages()`) shoots it down on the harts that may hold it
 (`tlb_shootdown()`) before the page is reused. A panic on one hart stops
-the others at their next byte to the UART (`uart_putc()` checks), so its
-report comes out whole.
+the others with an IPI, and at their next byte to the UART (`uart_putc()`
+checks), so its report comes out whole.
 
 Locks are always taken in this order, so no two holders can wait for each
 other:

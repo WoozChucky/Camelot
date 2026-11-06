@@ -102,6 +102,12 @@ static void halt_after_panic(void) {
  * reports it; another that panics too meanwhile stops where it is, as do
  * the others the next time they write to the UART (uart_putc), so the
  * report comes out whole; and a panic inside the report halts at once.
+ * The first one also interrupts every other running hart, as Linux's
+ * panic() stops the other CPUs (smp_send_stop()): an IPI, whose handler
+ * stops there (ipi_interrupt, and the tick's too), so a hart that has
+ * nothing more to print, back in a process say, stops as well, before the
+ * report is done and the machine halts. A hart running with interrupts
+ * off takes it when it turns them on, or stops at its next byte.
  *
  * Between the swap and the store of panic_hart, `panicking` is set but
  * panic_hart is still PANIC_NO_HART, which is no hart's id: a hart that
@@ -116,6 +122,10 @@ static void panic_begin(void) {
         panic_freeze();
     }
     panic_hart = cpuid();
+    u32 others = harts_running() & ~(1u << cpuid());
+    if (others != 0) {
+        sbi_send_ipi(others, 0);
+    }
 }
 
 void panic_freeze(void) {
@@ -242,6 +252,7 @@ static void clock_tick(u32 n) {
  * took it with the request not yet in sight, still flushes within a tick,
  * and the hart waiting for it isn't left waiting for good. */
 static void timer_interrupt(void) {
+    panic_stop_others();
     clock_tick(timer_next());
     tlb_serve();
 }
@@ -251,8 +262,9 @@ static void timer_interrupt(void) {
  * sret (and finds nothing to do, if this one did it). Then serve what other
  * harts asked for. An IPI that only woke an idle hart (kick_idle(), proc.c)
  * has nothing more to do: the hart's scheduler looks for work once wfi
- * returns. */
+ * returns. One from a hart that panicked stops this one (panic_begin). */
 static void ipi_interrupt(void) {
+    panic_stop_others();
     w_sip(r_sip() & ~SIP_SSIP);
     tlb_serve();
 }
