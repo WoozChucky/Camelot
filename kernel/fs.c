@@ -1165,9 +1165,10 @@ int fs_getcwd(char *buf, u32 size) {
     }
     for (;;) {
         ilock(ip);
-        /* Removed (Linux's d_unlinked): it has no path any more. Only the
-         * working directory itself can be, as a directory with something
-         * in it can't be removed. */
+        /* Removed (Linux's d_unlinked): it has no path any more. The
+         * working directory can be, and while the walk goes on, an
+         * ancestor too, once everything below it is (the working directory
+         * among it, so the answer is -ENOENT either way). */
         if (ip->nlink == 0) {
             iunlockput(ip);
             return -ENOENT;
@@ -1179,9 +1180,16 @@ int fs_getcwd(char *buf, u32 size) {
         u32 inum = ip->inum;
         struct inode *parent = dirlookup(ip, "..", NULL);
         /* Unlocked before the parent is locked, as namex() goes from a
-         * directory to its `..`: never two directories' locks at once. */
-        iunlockput(ip);
+         * directory to its `..`: never two directories' locks at once. But
+         * its reference is kept until the parent has been searched for its
+         * number: a referenced inode is never freed, so the number can't be
+         * given to another while it is looked for (a directory removed and
+         * a new one made in its slot would otherwise lend it its name).
+         * Camelot has no rename and a directory has one name, so the entry
+         * found is its name at that moment. */
+        iunlock(ip);
         if (parent == NULL) {
+            iput(ip);
             return -ENOENT;
         }
         ilock(parent);
@@ -1197,6 +1205,7 @@ int fs_getcwd(char *buf, u32 size) {
             }
         }
         iunlock(parent);
+        iput(ip);
         if (!found) {
             iput(parent);
             return -ENOENT;
