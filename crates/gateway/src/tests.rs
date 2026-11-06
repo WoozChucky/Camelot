@@ -1029,6 +1029,37 @@ fn hostfwd_tcp_reaches_the_guest() {
     });
 }
 
+/// The gateway's own ports, for its end of forwarded connections and clients: from
+/// FIRST_PORT up, in turn, those in use skipped, and round to FIRST_PORT after the
+/// last. A port comes again only in its turn, though its connection is gone, as an
+/// ephemeral port does: so the first forwarded connection has FIRST_PORT, and the next
+/// one the next port, whatever became of the first (#230: a stray connection to a
+/// forwarded port took the first, the guest refusing it).
+#[test]
+fn nat_ports_go_round_from_the_first() {
+    let mut gw = gateway_with(Config {
+        hostfwd: vec![HostFwd::udp(0, 7)],
+        limits: limits(),
+        ..Config::default()
+    });
+    assert_eq!(gw.new_port(), Some(FIRST_PORT));
+    assert_eq!(gw.new_port(), Some(FIRST_PORT + 1));
+    // A forwarded UDP client has the next one: skipped.
+    let client = FwdClient {
+        addr: "127.0.0.1:5000".parse().unwrap(),
+        last_active: Instant::now(),
+        owner: None,
+    };
+    gw.udp_fwd[0].clients.insert(FIRST_PORT + 2, client);
+    assert_eq!(gw.new_port(), Some(FIRST_PORT + 3));
+    // The last, then round to the first, which is free again; the client's still is not.
+    gw.next_port = u16::MAX;
+    assert_eq!(gw.new_port(), Some(u16::MAX));
+    assert_eq!(gw.new_port(), Some(FIRST_PORT));
+    assert_eq!(gw.new_port(), Some(FIRST_PORT + 1));
+    assert_eq!(gw.new_port(), Some(FIRST_PORT + 3));
+}
+
 #[test]
 fn hostfwd_asks_arp_for_an_unknown_guest() {
     let mut gw = Gateway::new(Config {
