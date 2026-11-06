@@ -37,7 +37,7 @@
 
 mod common;
 
-use common::{errors, fixtures, input, inputs, ram, read_ours, run, script, script_file, Load};
+use common::{errors, fixtures, input, inputs, load_images, ram, read_ours, run, script, script_file, Load};
 use grail::{Machine, RunResult};
 use merlin_ld::{Input, Options};
 use std::collections::HashMap;
@@ -625,6 +625,39 @@ fn multiobj_matches_ld_lld_and_runs() {
     let bss = l.section(".bss").unwrap();
     assert_eq!(l.symbol("bytes_written"), Some(bss.addr));
     assert!(l.symbol("puts").unwrap() > l.symbol("_start").unwrap());
+}
+
+/// Archives (fixtures/archive): libdemo.a and libcrt.a, which llvm-ar made,
+/// found by `-L` and `-l` (and `-l:FILE`), linked as ld.lld links them, the
+/// members it needs in the order it takes them: after the objects
+/// (link.ld), before them (first.ld, where crt0.o's exit is extracted
+/// before main.o is read), and the start code in an archive, which only
+/// the entry symbol extracts (entry.ld). In every one the member nobody
+/// needs (unused.o, with a second strlen) and the one only a weak
+/// reference wants (hook.o) stay out.
+#[test]
+fn archives_match_ld_lld_and_run() {
+    let lib = std::fs::read(fixtures().join("archive/libdemo.a")).unwrap();
+    let members = elf::archive::parse(&lib).unwrap();
+    let names: Vec<&str> = members.members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["strlen.o", "unused.o", "puts.o", "putc.o", "exit.o", "hook.o"]
+    );
+    let out = "Linked from libdemo.a\n";
+    for (name, order) in [
+        ("link", ["_start", "main", "puts", "strlen", "putc", "exit"]),
+        ("first", ["_start", "exit", "main", "puts", "strlen", "putc"]),
+        ("entry", ["_start", "main", "puts", "strlen", "putc", "exit"]),
+    ] {
+        let linked = assert_matches_ld_lld_exit(&format!("archive/{name}"), out, 22);
+        let l = &linked.layout;
+        let at: Vec<u64> = order.iter().map(|s| l.symbol(s).unwrap()).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{name}: {order:?} at {at:x?}");
+        for unlinked in ["unused", "hook"] {
+            assert_eq!(l.symbol(unlinked), None, "{name}: {unlinked}");
+        }
+    }
 }
 
 /// Acceptance: every relocation type (relocs/main.S), in both directions
@@ -2017,7 +2050,7 @@ fn library_members_are_linked_only_when_needed() {
         print.clone(),
     ];
     let program = [main.clone()];
-    assert_eq!(merlin_ld::library::needed(&program, &library).unwrap(), [2]);
+    assert_eq!(merlin_ld::library::needed(&program, &library, None).unwrap(), [2]);
     let opts = script(&std::fs::read_to_string(fixtures().join("multiobj/link.ld")).unwrap());
     let linked = merlin_ld::link_with_library(&program, &library, &opts).unwrap();
     let plain = merlin_ld::link(&[main, print], &opts).unwrap();
@@ -2096,6 +2129,50 @@ fn command_line() {
         read_ours(&std::fs::read(&out).unwrap()).loads,
         expected("norelocs/link").loads
     );
+    // -L and -l, as ld has them: every -L counts, the first directory with
+    // libNAME.a wins, and an archive's members are linked as needed.
+    let ar = fixtures().join("archive");
+    let lib_link = |extra: &[String]| {
+        std::process::Command::new(exe)
+            .arg("-o")
+            .arg(&out)
+            .arg("-T")
+            .arg(ar.join("link.ld"))
+            .arg(ar.join("crt0.o"))
+            .arg(ar.join("main.o"))
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let want = std::fs::read(ar.join("link.lld.elf")).unwrap();
+    let (ar_dir, other) = (ar.display().to_string(), fx.display().to_string());
+    let words = |w: &[&str]| -> Vec<String> { w.iter().map(|s| s.to_string()).collect() };
+    for args in [
+        // The -L after the -l counts; norelocs/ has no libdemo.a.
+        words(&["-ldemo", "-L", &other, "-L", &ar_dir]),
+        words(&[&format!("-L{other}"), "--library=demo", "--library-path", &ar_dir]),
+        words(&["-l", ":libdemo.a", &format!("--library-path={ar_dir}")]),
+        words(&[&format!("{ar_dir}/libdemo.a")]),
+    ] {
+        let o = lib_link(&args);
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let elf = std::fs::read(&out).unwrap();
+        assert_eq!(load_images(&elf), load_images(&want), "{args:?}");
+    }
+    let o = lib_link(&words(&["-L", &ar_dir, "-lnope", "-lnone"]));
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&o.stderr),
+        "merlin-ld: error: unable to find library -lnope\n\
+         merlin-ld: error: unable to find library -lnone\n"
+    );
+    let o = lib_link(&words(&["-l"]));
+    assert_eq!(o.status.code(), Some(2));
+
     for bad in [
         &["--end-lib"][..],
         &["--start-lib", "--start-lib"],

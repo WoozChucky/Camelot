@@ -1,6 +1,6 @@
 //! `cargo xtask ld-fixtures`: regenerates merlin-ld's test fixtures in
 //! `crates/merlin-ld/tests/fixtures` ([`FIXTURES`]) with clang, ld.lld,
-//! llvm-readobj and llvm-objdump. The committed files were made by LLVM
+//! llvm-ar, llvm-readobj and llvm-objdump. The committed files were made by LLVM
 //! 23.1.4 (clang and LLD 23.1.4, from the official Windows installer): the
 //! version shows in the `.comment` section of every `.lld.elf` and in the
 //! names of the mapping symbols (`$xrv64i2p1_m2p0_...`), neither of which
@@ -19,7 +19,12 @@
 //!   `llvm-objdump -d` of it in `name.objdump.txt`. The objects are listed in
 //!   the script's first comment, `/* objects: norelocs/start.o layouts/edge.o */`
 //!   (paths relative to [`FIXTURES`]); without one, every `.o` in the
-//!   script's directory is linked, in name order.
+//!   script's directory is linked, in name order. The list may name
+//!   archives too, as files (`archive/libdemo.a`) or as ld finds them
+//!   (`-Larchive -ldemo`, the directory relative to [`FIXTURES`]);
+//! * each `libNAME.members` (a list of the directory's objects) is archived
+//!   by llvm-ar into the committed `libNAME.a`, in that order, after the
+//!   objects are built and before anything is linked ([`MEMBERS_EXT`]).
 //!
 //! merlin-ld's tests link the same objects with the same scripts and compare
 //! section addresses, `PT_LOAD`s and symbol values with `name.expected.txt`,
@@ -73,6 +78,9 @@ pub const FROM_EXAMPLES: &[(&str, &[&str])] = &[
     ("multiobj", &["main.S", "print.S", "link.ld"]),
 ];
 
+/// A list of objects to archive: `libdemo.members` becomes `libdemo.a`.
+pub const MEMBERS_EXT: &str = "members";
+
 /// The default: no `R_RISCV_RELAX` or `R_RISCV_ALIGN` in the object.
 pub const NO_RELAX: &str = "-mno-relax";
 
@@ -103,6 +111,7 @@ pub fn script_objects(script: &str) -> Option<Vec<String>> {
 pub struct Tools {
     pub clang: PathBuf,
     pub lld: PathBuf,
+    pub ar: PathBuf,
     pub readobj: PathBuf,
     pub objdump: PathBuf,
     pub verbose: bool,
@@ -146,10 +155,11 @@ fn file_name(p: &Path) -> OsString {
     p.file_name().unwrap_or_default().to_os_string()
 }
 
-/// Whether a file is a hand-written fixture source (`.S` or `.ld`), as
-/// opposed to an output of [`run`].
+/// Whether a file is a hand-written fixture source (`.S`, `.ld` or a list
+/// of members), as opposed to an output of [`run`].
 fn is_source(p: &Path) -> bool {
-    p.extension().is_some_and(|e| e == "S" || e == "ld")
+    p.extension()
+        .is_some_and(|e| e == "S" || e == "ld" || e == MEMBERS_EXT)
 }
 
 /// Copies the hand-written sources of the fixtures in `from` (every `.S` and
@@ -257,6 +267,21 @@ fn build(fixtures: &Path, xcal: &Path, include: &Path, tools: &Tools) -> Result<
         }
     }
 
+    // Then the archives, in llvm-ar's format for ELF members on any host
+    // (--format=gnu: on Windows it would otherwise pick COFF's when the
+    // first member is not an object), deterministic as it is by default.
+    for dir in &dirs {
+        for list in files(dir, MEMBERS_EXT)? {
+            let text = std::fs::read_to_string(&list).map_err(|e| format!("{}: {e}", list.display()))?;
+            let archive = list.with_extension("a");
+            let _ = std::fs::remove_file(&archive);
+            let mut args: Vec<OsString> = vec!["--format=gnu".into(), "rcs".into(), file_name(&archive)];
+            args.extend(text.split_whitespace().map(OsString::from));
+            tools.exec(&tools.ar, &args, dir)?;
+            written.push(archive);
+        }
+    }
+
     let tmp = std::env::temp_dir().join(format!("xtask-ld-fixtures-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     let result = (|| {
@@ -264,9 +289,23 @@ fn build(fixtures: &Path, xcal: &Path, include: &Path, tools: &Tools) -> Result<
             for script in files(dir, "ld")? {
                 let text =
                     std::fs::read_to_string(&script).map_err(|e| format!("{}: {e}", script.display()))?;
-                let objects: Vec<PathBuf> = match script_objects(&text) {
-                    Some(list) => list.iter().map(|o| root.join(o)).collect(),
-                    None => files(dir, "o")?,
+                // ld.lld runs in the fixtures directory: `-Ldir` and `-lname`
+                // go to it as they are.
+                let objects: Vec<OsString> = match script_objects(&text) {
+                    Some(list) => list
+                        .iter()
+                        .map(|o| {
+                            if o.starts_with('-') {
+                                OsString::from(o)
+                            } else {
+                                root.join(o).into_os_string()
+                            }
+                        })
+                        .collect(),
+                    None => files(dir, "o")?
+                        .into_iter()
+                        .map(PathBuf::into_os_string)
+                        .collect(),
                 };
                 let stem = script
                     .file_stem()
@@ -276,7 +315,7 @@ fn build(fixtures: &Path, xcal: &Path, include: &Path, tools: &Tools) -> Result<
                 let elf = tmp.join(format!("{stem}.elf"));
                 let mut args: Vec<OsString> =
                     vec!["--no-relax".into(), "-T".into(), script.clone().into_os_string()];
-                args.extend(objects.into_iter().map(PathBuf::into_os_string));
+                args.extend(objects);
                 args.extend(["-o".into(), elf.clone().into_os_string()]);
                 tools.exec(&tools.lld, &args, root)?;
                 let args: Vec<OsString> = ["--elf-output-style=GNU", "-S", "-l", "-s"]
@@ -382,6 +421,8 @@ mod tests {
             ("a/x.S", "nop\n"),
             ("a/x.o", "object"),
             ("a/link.ld", "SECTIONS {}\n"),
+            ("a/libx.members", "x.o\n"),
+            ("a/libx.a", "archive"),
             ("a/link.expected.txt", "listing"),
             ("a/link.lld.elf", "elf"),
             ("b/c/y.S", "ret\n"),
@@ -406,7 +447,7 @@ mod tests {
             }
         }
         got.sort();
-        assert_eq!(got, ["a/link.ld", "a/x.S", "b/c/y.S"]);
+        assert_eq!(got, ["a/libx.members", "a/link.ld", "a/x.S", "b/c/y.S"]);
         assert_eq!(std::fs::read_to_string(out.join("b/c/y.S")).unwrap(), "ret\n");
 
         // A directory that is not empty is refused; the fixtures themselves

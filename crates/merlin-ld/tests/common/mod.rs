@@ -63,7 +63,10 @@ pub fn errors(r: Result<impl std::fmt::Debug, Vec<merlin_ld::Error>>) -> Vec<Str
 }
 
 /// The objects a fixture script names in its `/* objects: ... */` comment
-/// (paths relative to the fixtures directory), and the script itself.
+/// (paths relative to the fixtures directory), and the script itself. An
+/// archive is one of them, as a file or found by `-Ldir` and `-lname`
+/// (`merlin_ld::search_library`, the directories relative to the fixtures
+/// too), as `cargo xtask ld-fixtures` gives them to ld.lld.
 pub fn case(script: &str) -> (Vec<Input>, Options) {
     let path = fixtures().join(script);
     let opts = Options {
@@ -77,10 +80,24 @@ pub fn case(script: &str) -> (Vec<Input>, Options) {
         .and_then(|c| c.trim().strip_prefix("/*"))
         .and_then(|c| c.trim().strip_prefix("objects:"));
     let objs = match list {
-        Some(list) => list
-            .split_whitespace()
-            .map(|o| input(&fixtures().join(o)))
-            .collect(),
+        Some(list) => {
+            let dirs: Vec<String> = list
+                .split_whitespace()
+                .filter_map(|w| w.strip_prefix("-L"))
+                .map(|d| fixtures().join(d).display().to_string())
+                .collect();
+            list.split_whitespace()
+                .filter(|w| !w.starts_with("-L"))
+                .map(|w| match w.strip_prefix("-l") {
+                    Some(name) => {
+                        let path = merlin_ld::search_library(name, &dirs, |p| Path::new(p).is_file())
+                            .unwrap_or_else(|e| panic!("{script}: {e}"));
+                        input(Path::new(&path))
+                    }
+                    None => input(&fixtures().join(w)),
+                })
+                .collect()
+        }
         // Without the comment: every object in the script's directory, in
         // name order (as `cargo xtask ld-fixtures` links them).
         None => {
@@ -427,7 +444,9 @@ pub fn assert_same_disassembly(name: &str, linked: &merlin_ld::Linked) {
 /// exit with `exit`.
 pub fn assert_matches_ld_lld_exit(name: &str, output: &str, exit: u32) -> merlin_ld::Linked {
     let (objs, opts) = case(&format!("{name}.ld"));
-    let linked = merlin_ld::link(&objs, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    // As on a command line: an archive gives the members the others need.
+    let files: Vec<(&Input, bool)> = objs.iter().map(|o| (o, false)).collect();
+    let linked = merlin_ld::link_files(&files, &opts).unwrap_or_else(|e| panic!("{name}: {e:?}"));
     assert!(
         linked.layout.warnings.is_empty(),
         "{name}: {:?}",

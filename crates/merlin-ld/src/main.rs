@@ -1,9 +1,10 @@
-//! `merlin-ld [-T script] [-e entry] [-o out.elf] [--Map out.map] [-S] input.o ... [--start-lib lib.o ... --end-lib] [@file]`
+//! `merlin-ld [-T script] [-e entry] [-o out.elf] [--Map out.map] [-S] [-L dir] input.o ... [lib.a] [-lname]
+//! [--start-lib lib.o ... --end-lib] [@file]`
 
 use merlin_ld::{Input, Options, ScriptSource};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: merlin-ld [options] input.o ...
+const USAGE: &str = "usage: merlin-ld [options] input.o ... [lib.a] [-lNAME]
 
   -o FILE        output executable (default: a.out)
   -T FILE        linker script (default: .text at 0x80000000, then .rodata, .data, .bss)
@@ -11,6 +12,10 @@ const USAGE: &str = "usage: merlin-ld [options] input.o ...
   --Map FILE     write a link map
   -S, --strip-debug
                  leave out the debug information (.debug_* sections)
+  -L DIR         look for -l libraries in DIR (every -L, in order)
+  -l NAME        the archive libNAME.a of the first -L directory that has it
+                 (-l:FILE: FILE itself); an archive's members, as the objects
+                 of --start-lib, are linked only if needed
   --start-lib    the objects up to --end-lib are a library: each is linked
                  only if it defines a symbol the others need (like ld.lld's)
   --end-lib      ends a library
@@ -37,9 +42,16 @@ fn expand_response_files(args: impl Iterator<Item = String>) -> Result<Vec<Strin
     Ok(out)
 }
 
+/// An input of the command line: a file, or a library `-l` names.
+enum Arg {
+    File(String),
+    Library(String),
+}
+
 fn main() -> ExitCode {
-    // (file, whether it is a library member)
-    let mut inputs: Vec<(String, bool)> = Vec::new();
+    // (file, or -l's name, whether it is a library member)
+    let mut inputs: Vec<(Arg, bool)> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
     let mut in_lib = false;
     let mut output = "a.out".to_string();
     let mut script = None;
@@ -86,9 +98,19 @@ fn main() -> ExitCode {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
+            "-L" | "--library-path" => value("-L").map(|v| dirs.push(v)),
+            "-l" | "--library" => value("-l").map(|v| inputs.push((Arg::Library(v), in_lib))),
+            f if f.starts_with("-L") => {
+                dirs.push(a[2..].to_string());
+                Ok(())
+            }
+            f if f.starts_with("-l") => {
+                inputs.push((Arg::Library(a[2..].to_string()), in_lib));
+                Ok(())
+            }
             f if f.starts_with('-') && f.len() > 1 => Err(format!("unknown option {f}\n{USAGE}")),
             _ => {
-                inputs.push((a, in_lib));
+                inputs.push((Arg::File(a), in_lib));
                 Ok(())
             }
         };
@@ -106,9 +128,31 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // Every -L counts for every -l, as in ld: the directories are all known
+    // before a library is looked for.
+    let mut missing = false;
+    let mut found = Vec::new();
+    for (arg, lib) in inputs {
+        match arg {
+            Arg::File(name) => found.push((name, lib)),
+            Arg::Library(name) => {
+                match merlin_ld::search_library(&name, &dirs, |p| std::path::Path::new(p).is_file()) {
+                    Ok(path) => found.push((path, lib)),
+                    Err(e) => {
+                        eprintln!("merlin-ld: error: {e}");
+                        missing = true;
+                    }
+                }
+            }
+        }
+    }
+    if missing {
+        return ExitCode::from(1);
+    }
+
     // In command-line order, which ld.lld reads them in, library members too.
     let mut files = Vec::new();
-    for (name, lib) in inputs {
+    for (name, lib) in found {
         match std::fs::read(&name) {
             Ok(data) => files.push((Input { name, data }, lib)),
             Err(e) => {
