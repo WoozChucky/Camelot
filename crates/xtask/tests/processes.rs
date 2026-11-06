@@ -2572,7 +2572,7 @@ fn poll_waits_on_every_kind_of_file() {
     type_line(&tx, "polltest\n");
     step_to_prompt(&mut m, 2);
     let out = printed(&m);
-    assert_eq!(all_checks_pass(&out, "polltest", "polltest"), 83, "{out}");
+    assert_eq!(all_checks_pass(&out, "polltest", "polltest"), 84, "{out}");
 }
 
 #[test]

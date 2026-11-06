@@ -531,6 +531,14 @@ static void shell_checks(void) {
 }
 
 int main(void) {
+    /* Without the root image's /dev/ptmx the checks can't run: some would
+     * wait for programs that only a pty's Ctrl-C ends. */
+    int probe = posix_openpt(O_RDWR);
+    if (probe < 0) {
+        printf("ptytest: no /dev/ptmx (%d): it runs on a root image\n", probe);
+        return 1;
+    }
+    close(probe);
     pair_checks();
     canonical_checks();
     raw_checks();
