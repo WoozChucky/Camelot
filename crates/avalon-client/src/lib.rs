@@ -234,6 +234,10 @@ pub const DESKTOP_IMAGE: &str = "os-desktop";
 /// that draw them, on top of the firmware's 2 MiB.
 pub const DESKTOP_RAM: u64 = 64 << 20;
 
+/// A Camelot desktop's harts: the display server, the panel, the terminals and the
+/// apps run side by side (#185), and the panel shows each one's load.
+pub const DESKTOP_HARTS: u32 = 4;
+
 /// A hardware profile people pick by name: the machine of a kind of Camelot VM and
 /// the Lake image its disk is a copy of. Round Table's `create --profile` and
 /// Pendragon's form offer them ([`PRESETS`]).
@@ -246,14 +250,16 @@ pub struct Preset {
     /// The image its disk is a copy of.
     pub image: &'static str,
     pub ram_size: u64,
+    pub harts: u32,
 }
 
 impl Preset {
-    /// Its machine: Camelot's firmware and its RAM, Avalon's defaults for the rest.
-    /// Its disk is added by [`create_camelot_vm`].
+    /// Its machine: Camelot's firmware, its RAM and harts, Avalon's defaults for the
+    /// rest. Its disk is added by [`create_camelot_vm`].
     pub fn profile(&self) -> HardwareProfile {
         HardwareProfile {
             ram_size: self.ram_size,
+            harts: self.harts,
             bios: camelot_bios(),
             ..HardwareProfile::default()
         }
@@ -261,21 +267,23 @@ impl Preset {
 }
 
 /// The hardware profiles of Camelot VMs: a server (the console's shell and shd,
-/// [`CAMELOT_RAM`]) and a desktop (its display and more RAM, [`DESKTOP_RAM`]). The
-/// guest picks its display mode itself, as a desktop on a real display controller
-/// does; the desktop's RAM has room for the largest.
+/// [`CAMELOT_RAM`]) and a desktop (its display, more RAM, [`DESKTOP_RAM`], and
+/// [`DESKTOP_HARTS`]). The guest picks its display mode itself, as a desktop on a
+/// real display controller does; the desktop's RAM has room for the largest.
 pub const PRESETS: [Preset; 2] = [
     Preset {
         name: "server",
         about: "a Camelot server: the console's shell and shd, its shells over TCP",
         image: BASE_IMAGE,
         ram_size: CAMELOT_RAM,
+        harts: 1,
     },
     Preset {
         name: "desktop",
         about: "a Camelot desktop: its own image, and RAM for the largest display mode",
         image: DESKTOP_IMAGE,
         ram_size: DESKTOP_RAM,
+        harts: DESKTOP_HARTS,
     },
 ];
 
@@ -850,15 +858,25 @@ mod tests {
     #[test]
     fn the_presets() {
         let server = parse_preset("server").unwrap();
-        assert_eq!((server.image, server.ram_size), (BASE_IMAGE, CAMELOT_RAM));
+        assert_eq!(
+            (server.image, server.ram_size, server.harts),
+            (BASE_IMAGE, CAMELOT_RAM, 1)
+        );
         let desktop = parse_preset("desktop").unwrap();
-        assert_eq!((desktop.image, desktop.ram_size), (DESKTOP_IMAGE, DESKTOP_RAM));
+        assert_eq!(
+            (desktop.image, desktop.ram_size, desktop.harts),
+            (DESKTOP_IMAGE, DESKTOP_RAM, DESKTOP_HARTS)
+        );
         // Both on Camelot's firmware, Avalon's defaults otherwise, no disk yet.
         let machine = desktop.profile();
-        assert_eq!((machine.bios, machine.ram_size), (camelot_bios(), DESKTOP_RAM));
+        assert_eq!(
+            (machine.bios, machine.ram_size, machine.harts),
+            (camelot_bios(), DESKTOP_RAM, DESKTOP_HARTS)
+        );
         assert_eq!(
             HardwareProfile {
                 ram_size: avalon_proto::DEFAULT_RAM_SIZE,
+                harts: avalon_proto::DEFAULT_HARTS,
                 bios: Bios::None,
                 ..machine
             },

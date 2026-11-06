@@ -74,7 +74,9 @@ create options:
                   number with an optional unit, Hz, kHz or MHz: 10MHz, 500kHz,
                   1.5MHz, 5Hz. Without it the VM runs at full speed and
                   reports a nominal 10 MHz clock
-  --harts N       harts (cores), 1 to 8 (default 1); each runs at the clock
+  --harts N       harts (cores), 1 to 8 (default 1; a Camelot VM has its
+                  profile's: 1 for a server, 4 for a desktop); each runs at
+                  the clock
   --disk SRC      attach a disk, read-write: the path of an image file on
                   Avalon's host (relative to Avalon's working directory), or
                   lake://ADDR/NAME for the image NAME on a Lake server.
@@ -520,8 +522,8 @@ fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Cre
     if camelot.is_none() && given("--lake").is_some() {
         return Err("'create' takes --lake only with --profile (the Lake that copies the disk)".into());
     }
-    // A Camelot VM's defaults, its profile's: Camelot's firmware, and its RAM (a
-    // server's, the firmware's 2 MiB on top of the platform's 4).
+    // A Camelot VM's defaults, its profile's: Camelot's firmware, its RAM (a
+    // server's, the firmware's 2 MiB on top of the platform's 4) and its harts.
     if let Some(preset) = camelot {
         let machine = preset.profile();
         if given("--bios").is_none() {
@@ -529,6 +531,9 @@ fn parse_create(rest: &[&str], options: &[(&'static str, String)]) -> Result<Cre
         }
         if given("--ram").is_none() {
             profile.ram_size = machine.ram_size;
+        }
+        if given("--harts").is_none() {
+            profile.harts = machine.harts;
         }
     }
     let has_disk = profile.devices.iter().any(|d| matches!(d, DeviceSpec::Disk(_)));
@@ -1077,12 +1082,13 @@ pub fn profile_table(presets: &[Preset]) -> String {
                 p.name.to_string(),
                 p.image.to_string(),
                 format_size(machine.ram_size),
+                machine.harts.to_string(),
                 machine.bios.to_string(),
                 p.about.to_string(),
             ]
         })
         .collect();
-    table(&["NAME", "IMAGE", "RAM", "BIOS", "ABOUT"], &rows)
+    table(&["NAME", "IMAGE", "RAM", "HARTS", "BIOS", "ABOUT"], &rows)
 }
 
 /// `disk list`: one row per image.
@@ -1324,15 +1330,23 @@ mod tests {
         };
         assert_eq!(c.camelot.map(|p| p.image), Some(avalon_client::BASE_IMAGE));
         assert_eq!(c.profile.devices.len(), 1);
-        // A profile by name: the desktop's image and RAM.
+        // A profile by name: the desktop's image, RAM and harts.
         let Command::Create(c) = command("create --name os --profile desktop") else {
             panic!()
         };
         assert_eq!(c.camelot.map(|p| p.image), Some(avalon_client::DESKTOP_IMAGE));
         assert_eq!(
-            (c.profile.bios, c.profile.ram_size),
-            (Bios::Default, avalon_client::DESKTOP_RAM)
+            (c.profile.bios, c.profile.ram_size, c.profile.harts),
+            (
+                Bios::Default,
+                avalon_client::DESKTOP_RAM,
+                avalon_client::DESKTOP_HARTS
+            )
         );
+        let Command::Create(c) = command("create --name os --profile desktop --harts 2") else {
+            panic!()
+        };
+        assert_eq!(c.profile.harts, 2);
         let Command::Create(c) = command("create --name os --profile=server") else {
             panic!()
         };

@@ -642,12 +642,12 @@ ID  NAME  STATE    RAM    CLOCK       DISKS  NETS
     );
     let (status, disks) = http(platform.pendragon, "/api/disks", token);
     assert_eq!(status, 200, "{disks}");
-    // Each profile's image, RAM and firmware, for the new-VM form.
+    // Each profile's image, RAM, harts and firmware, for the new-VM form.
     for profile in [
         r#""name":"server","#,
-        r#""image":"os-base","ram":6,"bios":"default"}"#,
+        r#""image":"os-base","ram":6,"harts":1,"bios":"default"}"#,
         r#""name":"desktop","#,
-        r#""image":"os-desktop","ram":64,"bios":"default"}"#,
+        r#""image":"os-desktop","ram":64,"harts":4,"bios":"default"}"#,
     ] {
         assert!(disks.contains(profile), "{profile} in {disks}");
     }

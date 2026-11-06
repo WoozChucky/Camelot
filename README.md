@@ -499,16 +499,16 @@ created VM 1 (web)
 started VM 1 (web)
 ```
 
-The VM boots Camelot from its copy (`--paging sv39` gives it Sv39 alone, as most RV64 boards have), on Camelot's firmware and with its profile's RAM, a server's 6 MiB and a desktop's 64, unless `--bios` and `--ram` say otherwise: the kernel runs in S-mode only, and the firmware keeps 2 MiB. A desktop's RAM has room for the frames of the display controller's largest mode, 1920x1080; the guest picks the mode itself, as on a real display controller, so the profile has no display setting:
+The VM boots Camelot from its copy (`--paging sv39` gives it Sv39 alone, as most RV64 boards have), on Camelot's firmware and with its profile's RAM and harts, a server's 6 MiB and one hart and a desktop's 64 MiB and 4 harts, unless `--bios`, `--ram` and `--harts` say otherwise: the kernel runs in S-mode only, and the firmware keeps 2 MiB. A desktop's RAM has room for the frames of the display controller's largest mode, 1920x1080; the guest picks the mode itself, as on a real display controller, so the profile has no display setting:
 
 ```
 round-table profiles
 ```
 
 ```
-NAME     IMAGE       RAM     BIOS     ABOUT
-server   os-base     6 MiB   default  a Camelot server: the console's shell and shd, its shells over TCP
-desktop  os-desktop  64 MiB  default  a Camelot desktop: its own image, and RAM for the largest display mode
+NAME     IMAGE       RAM     HARTS  BIOS     ABOUT
+server   os-base     6 MiB   1      default  a Camelot server: the console's shell and shd, its shells over TCP
+desktop  os-desktop  64 MiB  4      default  a Camelot desktop: its own image, and RAM for the largest display mode
 ```
 
 A Lake without the image says so: `the Lake at 127.0.0.1:7401 has no 'os-base' image to copy (start the platform with 'cargo xtask up', which puts it in Lake's images directory)`. A copy whose name is taken is refused (`already exists`), and so is a copy of an image that a VM writes (`busy`); when Avalon refuses the VM (its name is taken, say), the copy is deleted again. Destroying the VM leaves its disk on Lake, with what Camelot wrote to it, until `disk delete NAME-disk0`. A disk is attached to a VM when the VM is created (`--disk lake://127.0.0.1:7401/data`; a missing image, one another VM writes, or a Lake server that cannot be reached is refused as an invalid hardware profile) and detached when the VM's machine ends: when the VM is stopped, its program exits, or it is destroyed. A stopped or exited VM still lists its disks (`list`, `info`), but no longer holds them. `disk list` shows each image's attachments (one writer, or any number of readers), and an attached image cannot be deleted.

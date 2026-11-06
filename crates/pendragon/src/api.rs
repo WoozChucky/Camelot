@@ -923,7 +923,7 @@ fn flag(body: &Json, key: &str) -> Result<bool, Fail> {
 }
 
 /// A hardware profile of Camelot VMs, as `GET /api/disks` lists them: `{"name",
-/// "about", "image", "ram", "bios"}`, `ram` in MiB.
+/// "about", "image", "ram", "harts", "bios"}`, `ram` in MiB.
 fn profile_json(preset: &Preset) -> Json {
     let machine = preset.profile();
     Json::object([
@@ -931,6 +931,7 @@ fn profile_json(preset: &Preset) -> Json {
         ("about", preset.about.into()),
         ("image", preset.image.into()),
         ("ram", (machine.ram_size >> 20).into()),
+        ("harts", machine.harts.into()),
         ("bios", machine.bios.to_string().into()),
     ])
 }
@@ -1044,14 +1045,17 @@ fn parse_create(body: &Json) -> Result<Create, Fail> {
         (None, false) => None,
     };
     let camelot = preset.is_some();
-    // A Camelot VM's RAM and firmware, left empty, are its profile's (a server's 6
-    // MiB: its firmware keeps 2), as Round Table's create --profile without --ram
-    // or --bios; any other VM's firmware is none. The firmware as Round Table's
-    // --bios takes it.
+    // A Camelot VM's RAM, harts and firmware, left empty, are its profile's (a
+    // server's 6 MiB: its firmware keeps 2), as Round Table's create --profile
+    // without --ram, --harts or --bios; any other VM's firmware is none. The
+    // firmware as Round Table's --bios takes it.
     let machine = preset.map(Preset::profile);
     if let Some(machine) = &machine {
         if string(body, "ram")?.is_none_or(|s| s.trim().is_empty()) {
             profile.ram_size = machine.ram_size;
+        }
+        if string(body, "harts")?.is_none_or(|s| s.trim().is_empty()) {
+            profile.harts = machine.harts;
         }
     }
     profile.bios = match string(body, "bios")?.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1424,13 +1428,19 @@ mod tests {
         let c = create(r#"{"name": "os", "camelot": null, "program": null, "disks": [{"source": "d.img"}]}"#)
             .unwrap();
         assert!(c.camelot.is_none() && c.program.is_empty());
-        // A profile by name: its image, RAM and firmware.
+        // A profile by name: its image, RAM, harts and firmware.
         let c = create(r#"{"name": "os", "profile": "desktop"}"#).unwrap();
         assert_eq!(c.camelot.map(|p| p.image), Some(avalon_client::DESKTOP_IMAGE));
         assert_eq!(
-            (c.profile.ram_size, c.profile.bios),
-            (avalon_client::DESKTOP_RAM, Bios::Default)
+            (c.profile.ram_size, c.profile.harts, c.profile.bios),
+            (
+                avalon_client::DESKTOP_RAM,
+                avalon_client::DESKTOP_HARTS,
+                Bios::Default
+            )
         );
+        let c = create(r#"{"name": "os", "profile": "desktop", "harts": "2"}"#).unwrap();
+        assert_eq!(c.profile.harts, 2);
         let c = create(r#"{"name": "os", "profile": "server", "camelot": false, "ram": "8"}"#).unwrap();
         assert_eq!((c.camelot, c.profile.ram_size), (preset("server"), 8 << 20));
         let c = create(r#"{"name": "os", "profile": " ", "disks": [{"source": "d.img"}]}"#).unwrap();
