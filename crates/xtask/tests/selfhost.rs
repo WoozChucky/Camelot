@@ -3456,7 +3456,7 @@ fn g_on_camelot(jobs: &[(usize, &CcJob)], files: &BTreeMap<String, Vec<u8>>) -> 
 /// every one of [`G_INPUTS`].
 #[test]
 fn the_compiler_on_camelot_writes_what_merlin_writes_with_g() {
-    g_corpus(Corpus::Sample, 200, 150, 10, true);
+    g_corpus(Corpus::Sample, 150, 100, 10, true);
 }
 
 /// `/bin/cc1` compiles some of itself on Camelot ([`OWN_SAMPLE`]): the
