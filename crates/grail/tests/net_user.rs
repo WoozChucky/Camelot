@@ -8,7 +8,7 @@
 //! while the test plays the host side with real sockets; every wait polls with a
 //! deadline, so a broken exchange fails instead of hanging.
 
-use gateway::{Config, Gateway, HostFwd, DEFAULT_GUEST_MAC};
+use gateway::{Config, Gateway, HostFwd, DEFAULT_GUEST_MAC, FIRST_PORT};
 use grail::net::MacAddr;
 use grail::{Machine, MachineConfig};
 use std::io::{self, Read, Write};
@@ -146,8 +146,19 @@ fn guest_reaches_the_host_and_the_host_reaches_the_guest() {
     assert_eq!(rest, b"", "the guest closes after the host");
 
     assert_eq!(guest.join().unwrap(), Some(0), "output:\n{}", out.text());
+    // The connection comes from a port of the gateway's own, from FIRST_PORT up, the
+    // next one free (its unit tests check which): not necessarily the first, which
+    // another connection to the forwarded port may have had, any program on the host
+    // being able to make one.
+    let text = out.text();
+    let nat_port = text
+        .split_once("accepted from 10.0.2.2:")
+        .and_then(|(_, rest)| rest.split_once('\n'))
+        .and_then(|(p, _)| p.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("no accepted connection:\n{text}"));
+    assert!(nat_port >= FIRST_PORT, "{text}");
     assert_eq!(
-        out.text(),
+        text,
         format!(
             "{}\
              dhcp: address 10.0.2.15, server 10.0.2.2\n\
@@ -155,7 +166,7 @@ fn guest_reaches_the_host_and_the_host_reaches_the_guest() {
              received: Hello from the host!\n\
              closed\n\
              listen 7\n\
-             accepted from 10.0.2.2:49152\n\
+             accepted from 10.0.2.2:{nat_port}\n\
              echoed 18 bytes\n\
              closed\n",
             CARD_LINE
@@ -163,14 +174,61 @@ fn guest_reaches_the_host_and_the_host_reaches_the_guest() {
     );
 }
 
+/// What another program on the host may do meanwhile, made certain: binds of
+/// 127.0.0.1:0 until a port the system handed out comes again, keeping the one that
+/// gets `port` as a listener, which takes a connection and drops it. Windows hands the
+/// ports out in turn, so a port comes again after all the others have (a round, some
+/// 12,000 binds, a second or so); Linux picks one at random each time. Returns the
+/// listener's thread if it got `port`.
+fn take_ports_round(port: u16) -> Option<std::thread::JoinHandle<()>> {
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = listener.local_addr().unwrap().port();
+        if p == port {
+            return Some(std::thread::spawn(move || drop(listener.accept())));
+        }
+        if !seen.insert(p) {
+            return None;
+        }
+    }
+}
+
+/// A port of 127.0.0.1 that refuses connections, and goes on refusing them while the
+/// value lives. A port bound and closed again does not: the system hands it out again,
+/// to the next socket that binds port 0 once the port comes round, and a listener
+/// there accepts what was meant to be refused (#230). This one stays held by the two
+/// ends of a connection to it, accepted before its listener closed. With no listener
+/// a connection to the port is refused, on Windows as on Linux, and the system does
+/// not hand out a port in use (nor gives it to a connection as its own end), so it
+/// cannot go to anyone else.
+struct RefusedPort {
+    port: u16,
+    _held: (TcpStream, TcpStream),
+}
+
+fn refused_port() -> RefusedPort {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = TcpStream::connect(addr).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    drop(listener);
+    RefusedPort {
+        port: addr.port(),
+        _held: (client, server),
+    }
+}
+
 #[test]
 fn a_refused_connection_is_reported() {
-    // A port nobody listens on: bind one, then close it.
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let refused = refused_port();
+    let port = refused.port;
+    // The race: other ports are handed out meanwhile, and one that gets this one
+    // listens. It is made certain on Windows, which hands ports out in turn, so the
+    // loop goes round all of them; on Linux the kernel's bind rules keep the port, and
+    // the loop is short (it picks at random, and soon picks one twice).
+    let taken = take_ports_round(port);
+    assert!(taken.is_none(), "port {port} was handed out again");
     let (guest, out) = boot(Gateway::new(Config::default()).unwrap(), &format!("c {port}\n"));
     assert_eq!(guest.join().unwrap(), Some(2), "output:\n{}", out.text());
     assert!(
