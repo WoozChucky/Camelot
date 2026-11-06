@@ -10,12 +10,16 @@
  *                        DIR/image.ppm
  *   guitest widgets DIR  a window's widgets, then after input: DIR/widgets.ppm,
  *                        DIR/input.ppm, and the actions printed
+ *   guitest wayland DIR  a display server of a script's worth for guidemo, over
+ *                        /run/wayland-0: its requests printed, its frames in
+ *                        DIR/wayland1.ppm to wayland3.ppm
  *   guitest damage       the damage lists of a sequence of rectangles
  *   guitest keys         the characters of key sequences
  *   guitest utf8         decoding and encoding
  *
  * Exits 0, or 1 with what went wrong. */
 #include "gui.h"
+#include "gui/protocol.h"
 
 #define FONT "/usr/share/fonts/spleen/8x16.psfu"
 
@@ -457,9 +461,447 @@ static void scene_utf8(void) {
     printf("\n");
 }
 
+/* ---- wayland ---- */
+
+/* A display server of a script's worth, for the client half (#184's is the
+ * real one): it listens on /run/wayland-0, starts /bin/guidemo, prints each
+ * request it gets, answers as a server does (the globals, the seat's
+ * capabilities, a configure of 260x220, a buffer released when the next is
+ * committed, frame callbacks done), and writes each frame committed to
+ * DIR/waylandN.ppm. After the first frame it clicks in the name field,
+ * types "Kay" and Enter, and pings; after the second it turns the wheel a
+ * notch over the list and clicks its first line; after the third it closes
+ * the window. It ends when guidemo hangs up, and prints how it exited. */
+
+#define SOCKET "/run/wayland-0"
+#define MAX_OBJECTS 64
+
+struct object {
+    uint id;
+    const char *interface;
+    int offset; /* a wl_buffer's place in its pool, and its shape */
+    int w;
+    int h;
+    int stride;
+};
+
+struct fake {
+    struct gui_wire wire;
+    struct object objects[MAX_OBJECTS];
+    int nobjects;
+    uchar *pool; /* the pool's memory */
+    size_t pool_size;
+    uint wm_base;
+    uint surface;
+    uint xdg_surface;
+    uint toplevel;
+    uint pointer;
+    uint keyboard;
+    uint attached; /* the buffer attached since the last commit */
+    uint shown;    /* the buffer last committed */
+    uint frame;    /* the frame callback asked for */
+    int keymap_fd; /* sent with the next flush, then closed */
+    int configured;
+    int frames;
+    uint serial;
+    const char *dir;
+};
+
+/* The globals: name i + 1 is globals[i]. */
+static const char *const globals[] = {"wl_compositor", "wl_shm", "xdg_wm_base", "wl_seat", "wl_output"};
+static const uint global_versions[] = {4, 1, 2, 5, 3};
+
+static struct object *find(struct fake *s, uint id) {
+    for (int i = 0; i < s->nobjects; i++) {
+        if (s->objects[i].id == id) {
+            return &s->objects[i];
+        }
+    }
+    return NULL;
+}
+
+static struct object *add_object(struct fake *s, uint id, const char *interface) {
+    if (s->nobjects == MAX_OBJECTS) {
+        return NULL;
+    }
+    struct object *o = &s->objects[s->nobjects++];
+    memset(o, 0, sizeof(*o));
+    o->id = id;
+    o->interface = interface;
+    return o;
+}
+
+/* Forgets an object, and tells the client its id is free. */
+static void delete_object(struct fake *s, uint id) {
+    for (int i = 0; i < s->nobjects; i++) {
+        if (s->objects[i].id == id) {
+            s->objects[i] = s->objects[--s->nobjects];
+            break;
+        }
+    }
+    gui_wire_begin(&s->wire, WL_DISPLAY_ID, WL_DISPLAY_DELETE_ID);
+    gui_wire_uint(&s->wire, id);
+    gui_wire_end(&s->wire);
+}
+
+static void event0(struct fake *s, uint id, uint op) {
+    gui_wire_begin(&s->wire, id, op);
+    gui_wire_end(&s->wire);
+}
+
+static void event1(struct fake *s, uint id, uint op, uint a) {
+    gui_wire_begin(&s->wire, id, op);
+    gui_wire_uint(&s->wire, a);
+    gui_wire_end(&s->wire);
+}
+
+/* A wl_pointer enter or motion at x, y (whole pixels, sent as fixed). */
+static void pointer_at(struct fake *s, uint op, int x, int y) {
+    gui_wire_begin(&s->wire, s->pointer, op);
+    if (op == WL_POINTER_ENTER) {
+        gui_wire_uint(&s->wire, ++s->serial);
+        gui_wire_uint(&s->wire, s->surface);
+    } else {
+        gui_wire_uint(&s->wire, 1000); /* the time */
+    }
+    gui_wire_fixed(&s->wire, x * 256);
+    gui_wire_fixed(&s->wire, y * 256);
+    gui_wire_end(&s->wire);
+}
+
+static void pointer_button(struct fake *s, int pressed) {
+    gui_wire_begin(&s->wire, s->pointer, WL_POINTER_BUTTON);
+    gui_wire_uint(&s->wire, ++s->serial);
+    gui_wire_uint(&s->wire, 1000);
+    gui_wire_uint(&s->wire, BTN_LEFT);
+    gui_wire_uint(&s->wire, (uint)pressed);
+    gui_wire_end(&s->wire);
+}
+
+static void key(struct fake *s, uint code, int pressed) {
+    gui_wire_begin(&s->wire, s->keyboard, WL_KEYBOARD_KEY);
+    gui_wire_uint(&s->wire, ++s->serial);
+    gui_wire_uint(&s->wire, 1000);
+    gui_wire_uint(&s->wire, code);
+    gui_wire_uint(&s->wire, (uint)pressed);
+    gui_wire_end(&s->wire);
+}
+
+static void key_tap(struct fake *s, uint code) {
+    key(s, code, 1);
+    key(s, code, 0);
+}
+
+/* The input that follows frame n. */
+static void after_frame(struct fake *s, int n) {
+    if (n == 1) {
+        pointer_at(s, WL_POINTER_ENTER, 120, 38);
+        pointer_button(s, 1);
+        pointer_button(s, 0);
+        gui_wire_begin(&s->wire, s->keyboard, WL_KEYBOARD_ENTER);
+        gui_wire_uint(&s->wire, ++s->serial);
+        gui_wire_uint(&s->wire, s->surface);
+        gui_wire_array(&s->wire, NULL, 0);
+        gui_wire_end(&s->wire);
+        key(s, KEY_LEFTSHIFT, 1);
+        key_tap(s, KEY_K);
+        key(s, KEY_LEFTSHIFT, 0);
+        key_tap(s, KEY_A);
+        key_tap(s, KEY_Y);
+        key_tap(s, KEY_ENTER);
+        event1(s, s->wm_base, XDG_WM_BASE_PING, 77);
+    } else if (n == 2) {
+        pointer_at(s, WL_POINTER_MOTION, 60, 90);
+        gui_wire_begin(&s->wire, s->pointer, WL_POINTER_AXIS);
+        gui_wire_uint(&s->wire, 1000);
+        gui_wire_uint(&s->wire, WL_POINTER_AXIS_VERTICAL_SCROLL);
+        gui_wire_fixed(&s->wire, 10 * 256);
+        gui_wire_end(&s->wire);
+        pointer_at(s, WL_POINTER_MOTION, 60, 66);
+        pointer_button(s, 1);
+        pointer_button(s, 0);
+    } else if (n == 3) {
+        event0(s, s->toplevel, XDG_TOPLEVEL_CLOSE);
+    }
+}
+
+/* The buffer committed, written out as frame s->frames. */
+static void write_frame(struct fake *s, const struct object *b) {
+    if (s->pool == NULL || b->offset < 0 || b->w <= 0 || b->h <= 0 || b->stride < b->w * 4 ||
+        (size_t)b->offset + (size_t)b->stride * (size_t)b->h > s->pool_size) {
+        printf("frame %d: a buffer outside its pool\n", s->frames);
+        return;
+    }
+    struct gui_buffer view;
+    gui_buffer_init(&view, (uint *)(s->pool + b->offset), b->w, b->h, b->stride / 4);
+    char name[16];
+    snprintf(name, sizeof(name), "wayland%d", s->frames);
+    write_ppm(s->dir, name, &view);
+}
+
+static void commit(struct fake *s) {
+    if (!s->configured) {
+        /* The first commit: the window's first configure. */
+        gui_wire_begin(&s->wire, s->toplevel, XDG_TOPLEVEL_CONFIGURE);
+        gui_wire_int(&s->wire, 260);
+        gui_wire_int(&s->wire, 220);
+        gui_wire_array(&s->wire, NULL, 0);
+        gui_wire_end(&s->wire);
+        event1(s, s->xdg_surface, XDG_SURFACE_CONFIGURE, 100);
+        s->configured = 1;
+        return;
+    }
+    if (s->attached != 0) {
+        struct object *b = find(s, s->attached);
+        s->frames++;
+        if (b != NULL) {
+            write_frame(s, b);
+        }
+        if (s->shown != 0 && s->shown != s->attached) {
+            event0(s, s->shown, WL_BUFFER_RELEASE);
+        }
+        s->shown = s->attached;
+        s->attached = 0;
+        after_frame(s, s->frames);
+    }
+    if (s->frame != 0) {
+        event1(s, s->frame, WL_CALLBACK_DONE, 0);
+        delete_object(s, s->frame);
+        s->frame = 0;
+    }
+}
+
+/* Prints a request and answers it: 0, or -1 for one that can't be. */
+static int request(struct fake *s, struct gui_message *m) {
+    struct object *o = m->object == WL_DISPLAY_ID ? NULL : find(s, m->object);
+    const char *in = m->object == WL_DISPLAY_ID ? "wl_display" : o != NULL ? o->interface : NULL;
+    if (in == NULL) {
+        printf("> unknown object %u\n", m->object);
+        return -1;
+    }
+    uint op = m->opcode;
+    printf("> %s@%u.", in, m->object);
+    if (strcmp(in, "wl_display") == 0 && op == WL_DISPLAY_SYNC) {
+        uint id = gui_msg_uint(m);
+        printf("sync %u\n", id);
+        event1(s, id, WL_CALLBACK_DONE, ++s->serial);
+        delete_object(s, id);
+    } else if (strcmp(in, "wl_display") == 0 && op == WL_DISPLAY_GET_REGISTRY) {
+        uint id = gui_msg_uint(m);
+        printf("get_registry %u\n", id);
+        add_object(s, id, "wl_registry");
+        for (int i = 0; i < 5; i++) {
+            gui_wire_begin(&s->wire, id, WL_REGISTRY_GLOBAL);
+            gui_wire_uint(&s->wire, (uint)i + 1);
+            gui_wire_string(&s->wire, globals[i]);
+            gui_wire_uint(&s->wire, global_versions[i]);
+            gui_wire_end(&s->wire);
+        }
+    } else if (strcmp(in, "wl_registry") == 0 && op == WL_REGISTRY_BIND) {
+        uint name = gui_msg_uint(m);
+        const char *interface = gui_msg_string(m);
+        uint version = gui_msg_uint(m);
+        uint id = gui_msg_uint(m);
+        if (m->bad || name < 1 || name > 5 || interface == NULL || strcmp(interface, globals[name - 1]) != 0) {
+            printf("bind: bad\n");
+            return -1;
+        }
+        printf("bind %u %s v%u -> %u\n", name, interface, version, id);
+        add_object(s, id, globals[name - 1]);
+        if (name == 2) {
+            event1(s, id, WL_SHM_FORMAT, WL_SHM_FORMAT_ARGB8888);
+            event1(s, id, WL_SHM_FORMAT, WL_SHM_FORMAT_XRGB8888);
+        } else if (name == 3) {
+            s->wm_base = id;
+        } else if (name == 4) {
+            event1(s, id, WL_SEAT_CAPABILITIES, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
+        }
+    } else if (strcmp(in, "wl_compositor") == 0 && op == WL_COMPOSITOR_CREATE_SURFACE) {
+        uint id = gui_msg_uint(m);
+        printf("create_surface %u\n", id);
+        add_object(s, id, "wl_surface");
+        s->surface = id;
+    } else if (strcmp(in, "wl_shm") == 0 && op == WL_SHM_CREATE_POOL) {
+        uint id = gui_msg_uint(m);
+        int fd = gui_msg_fd(m);
+        int size = gui_msg_int(m);
+        printf("create_pool %u, %d bytes\n", id, size);
+        if (fd < 0 || size <= 0) {
+            return -1;
+        }
+        if (s->pool != NULL) {
+            munmap(s->pool, s->pool_size);
+        }
+        void *mem = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, fd, 0);
+        close(fd);
+        if ((long)mem < 0) {
+            printf("mmap: %s\n", strerror(-(int)(long)mem));
+            return -1;
+        }
+        s->pool = mem;
+        s->pool_size = (size_t)size;
+        add_object(s, id, "wl_shm_pool");
+    } else if (strcmp(in, "wl_shm_pool") == 0 && op == WL_SHM_POOL_CREATE_BUFFER) {
+        uint id = gui_msg_uint(m);
+        int offset = gui_msg_int(m);
+        int w = gui_msg_int(m);
+        int h = gui_msg_int(m);
+        int stride = gui_msg_int(m);
+        uint format = gui_msg_uint(m);
+        printf("create_buffer %u, at %d, %dx%d, stride %d, format %u\n", id, offset, w, h, stride, format);
+        struct object *b = add_object(s, id, "wl_buffer");
+        if (b != NULL) {
+            b->offset = offset;
+            b->w = w;
+            b->h = h;
+            b->stride = stride;
+        }
+    } else if ((strcmp(in, "wl_shm_pool") == 0 && op == WL_SHM_POOL_DESTROY) ||
+               (strcmp(in, "wl_buffer") == 0 && op == WL_BUFFER_DESTROY) ||
+               (strcmp(in, "xdg_surface") == 0 && op == XDG_SURFACE_DESTROY) ||
+               (strcmp(in, "xdg_toplevel") == 0 && op == XDG_TOPLEVEL_DESTROY) ||
+               (strcmp(in, "wl_surface") == 0 && op == WL_SURFACE_DESTROY)) {
+        printf("destroy\n");
+        delete_object(s, m->object);
+    } else if (strcmp(in, "xdg_wm_base") == 0 && op == XDG_WM_BASE_GET_XDG_SURFACE) {
+        uint id = gui_msg_uint(m);
+        uint surface = gui_msg_uint(m);
+        printf("get_xdg_surface %u, surface %u\n", id, surface);
+        add_object(s, id, "xdg_surface");
+        s->xdg_surface = id;
+    } else if (strcmp(in, "xdg_wm_base") == 0 && op == XDG_WM_BASE_PONG) {
+        printf("pong %u\n", gui_msg_uint(m));
+    } else if (strcmp(in, "xdg_surface") == 0 && op == XDG_SURFACE_GET_TOPLEVEL) {
+        uint id = gui_msg_uint(m);
+        printf("get_toplevel %u\n", id);
+        add_object(s, id, "xdg_toplevel");
+        s->toplevel = id;
+    } else if (strcmp(in, "xdg_surface") == 0 && op == XDG_SURFACE_ACK_CONFIGURE) {
+        printf("ack_configure %u\n", gui_msg_uint(m));
+    } else if (strcmp(in, "xdg_toplevel") == 0 && op == XDG_TOPLEVEL_SET_TITLE) {
+        const char *title = gui_msg_string(m);
+        printf("set_title \"%s\"\n", title != NULL ? title : "(null)");
+    } else if (strcmp(in, "wl_surface") == 0 && op == WL_SURFACE_ATTACH) {
+        uint buffer = gui_msg_uint(m);
+        int x = gui_msg_int(m);
+        int y = gui_msg_int(m);
+        printf("attach %u, %d, %d\n", buffer, x, y);
+        s->attached = buffer;
+    } else if (strcmp(in, "wl_surface") == 0 && (op == WL_SURFACE_DAMAGE_BUFFER || op == WL_SURFACE_DAMAGE)) {
+        int x = gui_msg_int(m);
+        int y = gui_msg_int(m);
+        int w = gui_msg_int(m);
+        int h = gui_msg_int(m);
+        printf("%s %d,%d %dx%d\n", op == WL_SURFACE_DAMAGE ? "damage" : "damage_buffer", x, y, w, h);
+    } else if (strcmp(in, "wl_surface") == 0 && op == WL_SURFACE_FRAME) {
+        s->frame = gui_msg_uint(m);
+        printf("frame %u\n", s->frame);
+    } else if (strcmp(in, "wl_surface") == 0 && op == WL_SURFACE_COMMIT) {
+        printf("commit\n");
+        commit(s);
+    } else if (strcmp(in, "wl_seat") == 0 && op == WL_SEAT_GET_POINTER) {
+        s->pointer = gui_msg_uint(m);
+        printf("get_pointer %u\n", s->pointer);
+        add_object(s, s->pointer, "wl_pointer");
+    } else if (strcmp(in, "wl_seat") == 0 && op == WL_SEAT_GET_KEYBOARD) {
+        s->keyboard = gui_msg_uint(m);
+        printf("get_keyboard %u\n", s->keyboard);
+        add_object(s, s->keyboard, "wl_keyboard");
+        /* No keymap: a descriptor all the same, as the event has one. */
+        s->keymap_fd = memfd_create("keymap", MFD_CLOEXEC);
+        gui_wire_begin(&s->wire, s->keyboard, WL_KEYBOARD_KEYMAP);
+        gui_wire_uint(&s->wire, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP);
+        gui_wire_fd(&s->wire, s->keymap_fd);
+        gui_wire_uint(&s->wire, 0);
+        gui_wire_end(&s->wire);
+    } else {
+        printf("request %u\n", op);
+    }
+    if (m->bad) {
+        printf("> a broken request\n");
+        return -1;
+    }
+    return 0;
+}
+
+static void scene_wayland(const char *dir) {
+    struct fake *s = calloc(1, sizeof(struct fake));
+    if (s == NULL) {
+        fail("calloc", -ENOMEM);
+        return;
+    }
+    s->dir = dir;
+    s->keymap_fd = -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    strcpy(a.sun_path, SOCKET);
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    int r = bind(l, &a);
+    if (r == 0) {
+        r = listen(l, 1);
+    }
+    if (r < 0) {
+        fail(SOCKET, r);
+        free(s);
+        return;
+    }
+    char *argv[] = {"guidemo", NULL};
+    int pid = spawn("/bin/guidemo", argv, environ);
+    if (pid < 0) {
+        fail("spawn /bin/guidemo", pid);
+        free(s);
+        return;
+    }
+    struct sockaddr_un peer;
+    int c = accept(l, &peer);
+    if (c < 0) {
+        fail("accept", c);
+    } else {
+        gui_wire_init(&s->wire, c);
+        int stop = 0;
+        while (!stop) {
+            int n = gui_wire_read(&s->wire, 0);
+            if (n <= 0) {
+                if (n < 0) {
+                    fail("recvmsg", n);
+                }
+                break;
+            }
+            struct gui_message m;
+            while (!stop && (r = gui_wire_next(&s->wire, &m)) == 1) {
+                stop = request(s, &m) < 0;
+            }
+            if (r < 0) {
+                printf("> a broken message\n");
+                stop = 1;
+            }
+            if (gui_wire_flush(&s->wire) < 0) {
+                stop = 1;
+            }
+            if (s->keymap_fd >= 0) {
+                close(s->keymap_fd);
+                s->keymap_fd = -1;
+            }
+        }
+        printf("frames: %d\n", s->frames);
+        gui_wire_release(&s->wire);
+        close(c);
+    }
+    int status = -1;
+    wait(pid, &status);
+    printf("guidemo exited %d\n", status);
+    close(l);
+    unlink(SOCKET);
+    if (s->pool != NULL) {
+        munmap(s->pool, s->pool_size);
+    }
+    free(s);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("usage: guitest draw|text|image|widgets DIR, or damage|keys|utf8\n");
+        printf("usage: guitest draw|text|image|widgets|wayland DIR, or damage|keys|utf8\n");
         return 2;
     }
     const char *what = argv[1];
@@ -472,6 +914,8 @@ int main(int argc, char **argv) {
         scene_image(dir);
     } else if (strcmp(what, "widgets") == 0) {
         scene_widgets(dir);
+    } else if (strcmp(what, "wayland") == 0) {
+        scene_wayland(dir);
     } else if (strcmp(what, "damage") == 0) {
         scene_damage();
     } else if (strcmp(what, "keys") == 0) {

@@ -29,7 +29,7 @@ struct Run {
 }
 
 /// The programs in `/bin`, besides the shell.
-const BINS: &[&str] = &["guitest"];
+const BINS: &[&str] = &["guitest", "guidemo"];
 
 /// The commands the shell runs, in order.
 const COMMANDS: &[&str] = &[
@@ -37,16 +37,19 @@ const COMMANDS: &[&str] = &[
     "guitest text /out",
     "guitest image /out",
     "guitest widgets /out",
+    "guitest wayland /out",
     "guitest damage",
     "guitest keys",
     "guitest utf8",
 ];
 
 /// The images the scenes write to `/out`.
-const IMAGES: &[&str] = &["draw", "text", "image", "widgets", "input"];
+const IMAGES: &[&str] = &[
+    "draw", "text", "image", "widgets", "input", "wayland1", "wayland2", "wayland3",
+];
 
 /// An image with `/dev/console`, the shell and [`BINS`] in `/bin`, the
-/// desktop's `/usr/share`, and an empty `/out`.
+/// desktop's `/usr/share`, and an empty `/run` and `/out`.
 fn image() -> Vec<u8> {
     let root = repo_root();
     let share = xtask::fs::share_files(&root).unwrap();
@@ -66,6 +69,7 @@ fn image() -> Vec<u8> {
     }
     fs.mkdir("/usr").unwrap();
     xtask::fs::add_share(&mut fs, &share).unwrap();
+    fs.mkdir("/run").unwrap();
     fs.mkdir("/out").unwrap();
     fs.finish()
 }
@@ -176,12 +180,68 @@ fn the_scenes_draw_the_expected_images() {
     assert!(wrong.is_empty(), "{wrong:#?} (drawn in {})", actual.display());
 }
 
+/// What guidemo asks of guitest's display server (`guitest wayland`): the
+/// registry and the globals bound, the seat's pointer and keyboard (a
+/// second roundtrip), the window, the first commit with no buffer, then
+/// the pool and its two buffers at the configured size, the configure
+/// acknowledged, the first frame all damaged; the ping answered; the
+/// second frame in the other buffer, only the field and the greeting
+/// damaged; the third in the first buffer again (released when the second
+/// was committed), the field and the list; then, closed, everything
+/// destroyed. Ids are reused once the server has deleted them (3, the
+/// first sync's callback, is the surface; 15, the frame callback, each
+/// frame's).
+const WAYLAND_LOG: &str = "\
+> wl_display@1.get_registry 2
+> wl_display@1.sync 3
+> wl_registry@2.bind 1 wl_compositor v4 -> 4
+> wl_registry@2.bind 2 wl_shm v1 -> 5
+> wl_registry@2.bind 3 xdg_wm_base v1 -> 6
+> wl_registry@2.bind 4 wl_seat v1 -> 7
+> wl_display@1.sync 3
+> wl_seat@7.get_pointer 8
+> wl_seat@7.get_keyboard 9
+> wl_compositor@4.create_surface 3
+> xdg_wm_base@6.get_xdg_surface 10, surface 3
+> xdg_surface@10.get_toplevel 11
+> xdg_toplevel@11.set_title \"Camelot\"
+> wl_surface@3.commit
+> wl_shm@5.create_pool 12, 457600 bytes
+> wl_shm_pool@12.create_buffer 13, at 0, 260x220, stride 1040, format 1
+> wl_shm_pool@12.create_buffer 14, at 228800, 260x220, stride 1040, format 1
+> xdg_surface@10.ack_configure 100
+> wl_surface@3.attach 13, 0, 0
+> wl_surface@3.damage_buffer 0,0 260x220
+> wl_surface@3.frame 15
+> wl_surface@3.commit
+> xdg_wm_base@6.pong 77
+> wl_surface@3.attach 14, 0, 0
+> wl_surface@3.damage_buffer 52,30 204x24
+> wl_surface@3.damage_buffer 4,168 252x20
+> wl_surface@3.frame 15
+> wl_surface@3.commit
+> wl_surface@3.attach 13, 0, 0
+> wl_surface@3.damage_buffer 52,30 204x24
+> wl_surface@3.damage_buffer 4,58 252x106
+> wl_surface@3.frame 15
+> wl_surface@3.commit
+> wl_buffer@13.destroy
+> wl_buffer@14.destroy
+> wl_shm_pool@12.destroy
+> xdg_toplevel@11.destroy
+> xdg_surface@10.destroy
+> wl_surface@3.destroy
+frames: 3
+guidemo exited 0
+";
+
 /// The text the scenes print: the widgets' layout, actions and damage
 /// (only what changed is drawn again), the font's size and advance, the
 /// damage lists, the keyboard's characters, UTF-8 decoded and encoded.
 #[test]
 fn the_scenes_print_what_they_did() {
     let run = run();
+    assert_eq!(output(&run.out, "guitest wayland /out"), WAYLAND_LOG);
     assert_eq!(
         output(&run.out, "guitest widgets /out"),
         "list 4,58 180x82, 4 lines; ok 164,144 32x24\n\

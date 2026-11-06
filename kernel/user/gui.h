@@ -387,7 +387,7 @@ struct gui_wire {
     int in_fds[GUI_WIRE_FDS * 2];
     int out_fds[GUI_WIRE_FDS];
     uchar in[GUI_WIRE_MAX * 2];
-    uchar out[GUI_WIRE_MAX];
+    uchar out[GUI_WIRE_MAX * 2];
 };
 
 /* A message received, read an argument at a time: a read past its end, a

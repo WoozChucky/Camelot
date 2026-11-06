@@ -60,7 +60,7 @@ pub const PROFILES_DIR: &str = "kernel/profiles";
 /// The programs of `kernel/user` only the desktop image has: the server
 /// image leaves them out of `/bin`. The desktop's programs join it as they
 /// come (#183-#185).
-pub const DESKTOP_PROGRAMS: &[&str] = &["guitest"];
+pub const DESKTOP_PROGRAMS: &[&str] = &["guidemo", "guitest"];
 /// Where the desktop image puts the fonts, as Linux distributions do.
 pub const FONTS: &str = "/usr/share/fonts";
 /// Where it puts the images the GUI library reads (QOI files).
