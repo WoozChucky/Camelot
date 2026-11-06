@@ -528,6 +528,12 @@ static void test_simple_calls(void) {
     check(pid > 1, "getpid is above the shell's");
     check_eq(getpid(), pid, "getpid again");
     check(uptime() >= 10, "uptime counts the boot ticks");
+    /* The shell starts in the root, and its children with it: "/", with or
+     * without a disk (without one, every process is there). */
+    char cwd[8];
+    check_eq(getcwd(cwd, sizeof cwd), 2, "getcwd: the root's path, its NUL counted");
+    check(strcmp(cwd, "/") == 0, "getcwd: the root is /");
+    check_eq(getcwd(cwd, 1), -ERANGE, "getcwd: not in 1 byte");
     check_eq(yield(), 0, "yield");
     uint before = uptime();
     check_eq(sleep(3), 0, "sleep");
