@@ -183,8 +183,9 @@ bool tty_room(const struct tty *t);
 /* Whether `c` is a VINTR or VQUIT (ISIG) that would kill the foreground
  * process now, which tty_receive() does without keeping it: it needs no
  * room, so a driver whose input is full passes it on anyway, dropping the
- * bytes ahead of it that have none (it throws the input away). Without a
- * foreground it would be dropped, and the bytes ahead of it wait. */
+ * bytes ahead of it that have none, as Linux drops input that overflows
+ * (NOFLSH or not). Without a foreground it would be dropped, and the bytes
+ * ahead of it wait. */
 bool tty_signal_char(const struct tty *t, char c);
 
 /* A byte typed: mapped and added to the input, or acted on (ISIG); wakes

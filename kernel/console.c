@@ -45,8 +45,9 @@ static void cons_echo(struct tty *t, const char *s, u32 n) {
 
 /* Moves the UART's received bytes into the discipline while it has room.
  * When it has none, a Ctrl-C waiting in the ring still goes in (it takes
- * no room), and the bytes ahead of it, which have none, are dropped: it
- * throws the input away anyway. */
+ * no room), and the bytes ahead of it, which have none, are dropped, as
+ * Linux's n_tty drops what overflows its input (and, but with NOFLSH, the
+ * Ctrl-C throws the input away too). */
 static void cons_pull(struct tty *t) {
     char c;
     while (uart_rx_peek(0, &c)) {

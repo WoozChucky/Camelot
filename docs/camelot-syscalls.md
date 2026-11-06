@@ -1291,8 +1291,9 @@ foreground process, or once it has ended, they are dropped. They take
 no room in the input, so they reach a program that doesn't read it:
 when the input is full, a Ctrl-C waiting in the console's UART (128
 bytes) or among the next 256 bytes of a master's write still gets in,
-and the bytes ahead of it, which have no room, are dropped (it throws
-the input away anyway); further back, it waits with them. `VSUSP`
+and the bytes ahead of it, which have no room, are dropped, as Linux
+drops input that overflows (with `NOFLSH` too; without it, the Ctrl-C
+throws the input away besides); further back, it waits with them. `VSUSP`
 (Ctrl-Z) is dropped too: Camelot doesn't stop processes. The foreground
 is a process, set with `tcsetpgrp`, until Camelot has process groups
 (issue #116). The shell sets it on its terminal to each program it waits

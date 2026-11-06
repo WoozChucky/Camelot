@@ -192,7 +192,7 @@ isize ptmx_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
         if (room == 0) {
             /* Ctrl-C takes no room: one among the next bytes gets past
              * input nobody reads, those ahead of it, which have none,
-             * dropped (it throws the input away anyway). */
+             * dropped, as overflowing input (cons_pull in console.c). */
             usize at = next_signal(&p->tty, pt, src, done, n);
             if (at < n) {
                 char c;
