@@ -66,6 +66,7 @@
 #include "log.h"
 #include "memlayout.h"
 #include "mmap.h"
+#include "poll.h"
 #include "riscv.h"
 #include "sbi.h"
 #include "smp.h"
@@ -159,6 +160,7 @@ static void thread_free(struct thread *t) {
     t->frame = NULL;
     t->proc = NULL;
     t->chan = NULL;
+    t->poll = NULL;
     t->state = THREAD_UNUSED;
 }
 
@@ -935,7 +937,20 @@ void sleep(const void *chan, struct spinlock *lk) {
     }
 }
 
-/* wakeup(), with proc_lock held. */
+/* Whether `chan` is one of poll table `pt`'s channels. */
+static bool poll_has(const struct poll_table *pt, const void *chan) {
+    for (u32 i = 0; i < pt->n; i++) {
+        if (pt->chans[i] == chan) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* wakeup(), with proc_lock held. A thread in poll() is woken by any of its
+ * table's channels: asleep, it runs again (it sleeps on the table itself,
+ * which no one else wakes); still scanning its files, it is told to scan
+ * them again (poll_sleep). */
 static void wakeup_locked(const void *chan) {
     u32 woken = 0;
     struct thread *end = &threads[NTHREAD];
@@ -943,6 +958,15 @@ static void wakeup_locked(const void *chan) {
         if (t->state == THREAD_SLEEPING && t->chan == chan) {
             t->state = THREAD_RUNNABLE;
             woken++;
+        } else if (t->poll != NULL && poll_has(t->poll, chan)) {
+            /* Asleep in poll_sleep(), or busy: a hook that sleeps for
+             * something else (a lock) is not woken for this. */
+            if (t->state == THREAD_SLEEPING && t->chan == t->poll) {
+                t->state = THREAD_RUNNABLE;
+                woken++;
+            } else {
+                t->poll->woken = true;
+            }
         }
     }
     if (woken != 0) {
@@ -953,6 +977,52 @@ static void wakeup_locked(const void *chan) {
 void wakeup(const void *chan) {
     acquire(&proc_lock);
     wakeup_locked(chan);
+    release(&proc_lock);
+}
+
+volatile u32 polling_threads;
+
+void poll_begin(struct poll_table *pt) {
+    acquire(&proc_lock);
+    pt->n = 0;
+    pt->woken = false;
+    mythread()->poll = pt;
+    polling_threads++;
+    release(&proc_lock);
+}
+
+void poll_wait(struct poll_table *pt, const void *chan) {
+    acquire(&proc_lock);
+    if (!poll_has(pt, chan)) {
+        if (pt->n == POLL_CHANS) {
+            panic("poll_wait: too many channels");
+        }
+        pt->chans[pt->n] = chan;
+        pt->n++;
+    }
+    release(&proc_lock);
+}
+
+void poll_sleep(struct poll_table *pt) {
+    struct thread *t = mythread();
+    acquire(&proc_lock);
+    /* A wakeup since the scan began, or a kill, and the scan is done
+     * again at once: the file it was for may be ready. */
+    if (!pt->woken && !t->killed && !t->proc->killed) {
+        t->chan = pt;
+        t->state = THREAD_SLEEPING;
+        sched();
+        t->chan = NULL;
+    }
+    pt->n = 0;
+    pt->woken = false;
+    release(&proc_lock);
+}
+
+void poll_end(void) {
+    acquire(&proc_lock);
+    mythread()->poll = NULL;
+    polling_threads--;
     release(&proc_lock);
 }
 

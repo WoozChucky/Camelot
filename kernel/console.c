@@ -13,6 +13,7 @@
  * after cons_lock in the lock order (the echo is printed under both). */
 #include "console.h"
 #include "fbcon.h"
+#include "poll.h"
 #include "proc.h"
 #include "spinlock.h"
 #include "syscall.h"
@@ -125,6 +126,20 @@ static bool edit_line(void) {
         }
     }
     return line_done;
+}
+
+u32 console_poll(struct file *f, struct poll_table *pt) {
+    u32 mask = POLL_READY_OUT;
+    if (!f->readable) {
+        return mask;
+    }
+    poll_wait(pt, line);
+    acquire(&cons_lock);
+    if (edit_line()) {
+        mask |= POLL_READY_IN;
+    }
+    release(&cons_lock);
+    return mask;
 }
 
 isize console_read(struct file *f, pagetable_t pt, uintptr dst, usize n) {

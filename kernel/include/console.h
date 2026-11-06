@@ -47,4 +47,11 @@ void console_input(char c);
  * readable user memory. */
 isize console_write(struct file *f, pagetable_t pt, uintptr src, usize n);
 
+struct poll_table;
+
+/* poll() on the console: always ready to write; ready to read once a line
+ * is complete (or Ctrl-D ends the input), which it edits as a read would,
+ * echoing what was typed ahead, on a file open for reading. */
+u32 console_poll(struct file *f, struct poll_table *pt);
+
 #endif

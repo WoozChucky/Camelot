@@ -16,6 +16,7 @@
 #include "kprintf.h"
 #include "mmap.h"
 #include "net.h"
+#include "poll.h"
 #include "proc.h"
 #include "string.h"
 #include "sysfile.h"
@@ -387,6 +388,9 @@ void syscall(struct trap_frame *f) {
         break;
     case SYS_ioctl:
         ret = sys_ioctl(f);
+        break;
+    case SYS_poll:
+        ret = sys_poll(arg(f, 0), arg(f, 1), (long)arg(f, 2));
         break;
     default:
         ret = -ENOSYS;

@@ -13,6 +13,7 @@
 #include "pipe.h"
 #include "kalloc.h"
 #include "memlayout.h"
+#include "poll.h"
 #include "proc.h"
 #include "spinlock.h"
 
@@ -136,6 +137,32 @@ isize piperead(struct pipe *p, pagetable_t pt, uintptr dst, usize n) {
     wakeup(&p->nwrite);
     release(&p->lock);
     return (isize)count;
+}
+
+u32 pipe_poll(struct pipe *p, bool writable, struct poll_table *pt) {
+    /* Readers sleep on &nread, which writes and the write end's close
+     * wake; writers on &nwrite, which reads and the read end's close
+     * wake. */
+    poll_wait(pt, writable ? (const void *)&p->nwrite : (const void *)&p->nread);
+    acquire(&p->lock);
+    u32 mask = 0;
+    if (writable) {
+        if (p->nwrite - p->nread < PIPESIZE) {
+            mask |= POLL_READY_OUT;
+        }
+        if (!p->readopen) {
+            mask |= POLLERR;
+        }
+    } else {
+        if (p->nwrite != p->nread) {
+            mask |= POLL_READY_IN;
+        }
+        if (!p->writeopen) {
+            mask |= POLLHUP;
+        }
+    }
+    release(&p->lock);
+    return mask;
 }
 
 u32 pipe_bytes(struct pipe *p) {

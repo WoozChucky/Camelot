@@ -55,6 +55,7 @@
 #define FD_SHM 5
 
 struct pipe;
+struct poll_table;
 struct socket;
 struct shm_object;
 
@@ -87,6 +88,9 @@ struct file {
  *   write     write(), the same way
  *   ioctl     ioctl(fd, request, arg): its result, or -ENOTTY for a
  *             request the device doesn't know (and when NULL)
+ *   poll      what the file is ready for now, poll.h's bits, having named
+ *             the channels its waiters sleep on with poll_wait() first;
+ *             NULL: always ready to read and write, as on Linux
  *   mmap      for a device with memory a program may map (Linux's
  *             f_op->mmap): given the mapping's offset into that memory and
  *             its size (whole pages), 0 with the physical address of the
@@ -109,6 +113,7 @@ struct devsw {
     isize (*read)(struct file *f, pagetable_t pt, uintptr dst, usize n);
     isize (*write)(struct file *f, pagetable_t pt, uintptr src, usize n);
     long (*ioctl)(struct file *f, u32 request, uintptr arg);
+    u32 (*poll)(struct file *f, struct poll_table *pt);
     int (*mmap)(struct file *f, u64 offset, usize size, phys_addr_t *pa);
     void (*vm_open)(void);
     void (*vm_close)(void);
@@ -132,6 +137,12 @@ void device_vm_close(u32 major);
 /* ioctl(): `request` with `arg` on `f`, through its device's driver;
  * -ENOTTY for anything but a device, or a request it doesn't know. */
 long fileioctl(struct file *f, u32 request, uintptr arg);
+
+/* poll() on `f` (poll.h): the POLL bits it is ready for, its channels
+ * added to `pt`. A pipe, a socket or a device with a poll hook says; a
+ * file on the disk, a shared-memory object and any other device are
+ * always ready to read and write (Linux's DEFAULT_POLLMASK). */
+u32 filepoll(struct file *f, struct poll_table *pt);
 
 /* Sets up the table's lock. kmain calls it at boot. */
 void file_init(void);

@@ -373,6 +373,26 @@ struct ping_reply {
 #define SOL_SOCKET 1   /* setsockopt: the socket's own options */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait (a struct timeval) */
 
+/* poll(): the descriptors and what to wait for (kernel/include/poll.h,
+ * docs/camelot-syscalls.md "Polling"). Linux's values and layout. */
+#define POLLIN 0x001
+#define POLLPRI 0x002
+#define POLLOUT 0x004
+#define POLLERR 0x008
+#define POLLHUP 0x010
+#define POLLNVAL 0x020
+#define POLLRDNORM 0x040
+#define POLLRDBAND 0x080
+#define POLLWRNORM 0x100
+#define POLLWRBAND 0x200
+#define POLLRDHUP 0x2000
+
+struct pollfd {
+    int fd;        /* a negative one is skipped */
+    short events;  /* what to wait for */
+    short revents; /* what came: of those, and POLLERR, POLLHUP, POLLNVAL */
+};
+
 /* A time: seconds and microseconds, two longs, as Linux's. */
 struct timeval {
     time_t tv_sec;
@@ -592,6 +612,7 @@ int mprotect(void *addr, size_t len, int prot);
 int memfd_create(const char *name, uint flags);
 int ftruncate(int fd, off_t length);
 int ioctl(int fd, unsigned long request, ...);
+int poll(struct pollfd *fds, unsigned long nfds, int timeout);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);

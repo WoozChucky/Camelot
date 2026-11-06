@@ -42,7 +42,7 @@ use xtask::repo_root;
 
 /// `struct thread` (kernel/include/proc.h): its size, and its state, tid,
 /// process and kernel stack (the pointers 8 bytes).
-const THREAD_SIZE: u64 = 184;
+const THREAD_SIZE: u64 = 192;
 const NTHREAD: u64 = 16;
 const THREAD_STATE: u64 = 0;
 const THREAD_TID: u64 = 4;
@@ -591,5 +591,32 @@ fn threads_using_the_filesystem_end_with_their_process_on_one_and_four_harts() {
             (before.free_blocks, before.free_inodes),
             "{harts} harts: the scratch files left something behind"
         );
+    }
+}
+
+#[test]
+fn poll_loses_no_wakeup_on_one_and_four_harts() {
+    // Issue #180: four threads pass a byte round a ring of pipes, each one
+    // waiting for it in poll() on its own pipe and on one nothing is
+    // written to: a wakeup lost would leave the ring stopped, and the
+    // command would never end. On 4 harts the threads run side by side, so
+    // a write's wakeup comes from another hart while its reader may still
+    // be scanning its files.
+    const LINE: &str = "polltest stress 300";
+    let want = "polltest: stress 300 rounds, 0 failed";
+    for harts in [1, 4] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (mut m, elf) = load(harts, rx);
+        step_to_prompt(&mut m);
+        warm_up(&mut m, &tx, LINE, want);
+        let mut side = SideBySide::new(&elf, "polltest", harts);
+        run_command(&mut m, &tx, LINE, |cpu| side.step(cpu));
+        let out = printed(&m);
+        assert_eq!(command_output(&out, LINE), [want], "{harts} harts");
+        check_only_the_shell(&m, &elf);
+        if harts > 1 {
+            assert!(side.most >= 2, "the threads never ran side by side");
+        }
+        exit_shell(&mut m, &tx);
     }
 }

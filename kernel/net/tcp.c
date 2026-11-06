@@ -51,6 +51,7 @@
  * changed, even closed, after each segment it sends, and checks. */
 #include "kalloc.h"
 #include "net.h"
+#include "poll.h"
 #include "proc.h"
 #include "string.h"
 #include "timer.h"
@@ -1194,6 +1195,41 @@ struct tcp_sock *tcp_accept(struct tcp_sock *l, u32 timeout, int *err) {
         }
         net_sleep();
     }
+}
+
+u32 tcp_poll(const struct tcp_sock *s) {
+    if (s->state == TCP_LISTEN) {
+        /* What tcp_accept() would take. */
+        for (u32 i = 0; i < TCP_SOCKETS; i++) {
+            const struct tcp_sock *c = &tcp_socks[i];
+            if (c->used && c->listener == s && c->state != TCP_SYN_RECEIVED) {
+                return POLL_READY_IN;
+            }
+        }
+        return 0;
+    }
+    u32 mask = 0;
+    /* As tcp_recv() and tcp_send() decide whether to wait; but a socket
+     * never connected is not ready to read, as on Linux (whose reset
+     * connections are: they are shut down both ways). */
+    if (s->rlen > 0 || s->fin_rcvd || (s->state == TCP_CLOSED && s->err != 0)) {
+        mask |= POLL_READY_IN;
+    }
+    bool can_send = s->state == TCP_ESTABLISHED || s->state == TCP_CLOSE_WAIT;
+    bool connecting = s->state == TCP_SYN_SENT || s->state == TCP_SYN_RECEIVED;
+    if (s->fin_queued || (!can_send && !connecting) || (can_send && s->slen < TCP_BUF)) {
+        mask |= POLL_READY_OUT;
+    }
+    if (s->fin_rcvd) {
+        mask |= POLLRDHUP;
+    }
+    if (s->state == TCP_CLOSED || (s->fin_queued && s->fin_rcvd)) {
+        mask |= POLLHUP;
+    }
+    if (s->err != 0) {
+        mask |= POLLERR;
+    }
+    return mask;
 }
 
 /* -ENOTCONN, or the error that ended the connection. */

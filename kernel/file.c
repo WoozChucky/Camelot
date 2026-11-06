@@ -13,6 +13,7 @@
 #include "mmap.h"
 #include "net.h"
 #include "pipe.h"
+#include "poll.h"
 #include "shm.h"
 #include "string.h"
 #include "trap.h"
@@ -36,14 +37,19 @@ void file_init(void) {
  * ioctl, fb.h), INPUT the keyboard and the pointer (their events, input.h).
  * A major whose entry is all NULL has no driver. */
 const struct devsw devsw[NDEV] = {
-    [CONSOLE] = {.read = console_read, .write = console_write},
+    [CONSOLE] = {.read = console_read, .write = console_write, .poll = console_poll},
     [FB] = {.open = fb_open,
             .close = fb_close,
             .ioctl = fb_ioctl,
+            .poll = fb_poll,
             .mmap = fb_mmap,
             .vm_open = fb_vm_open,
             .vm_close = fb_vm_close},
-    [INPUT] = {.open = input_open, .close = input_close, .read = input_read, .ioctl = input_ioctl},
+    [INPUT] = {.open = input_open,
+               .close = input_close,
+               .read = input_read,
+               .ioctl = input_ioctl,
+               .poll = input_poll},
 };
 
 bool device_has_driver(u32 major) {
@@ -78,6 +84,19 @@ long fileioctl(struct file *f, u32 request, uintptr arg) {
         return -ENOTTY;
     }
     return devsw[f->major].ioctl(f, request, arg);
+}
+
+u32 filepoll(struct file *f, struct poll_table *pt) {
+    if (f->type == FD_PIPE) {
+        return pipe_poll(f->pipe, f->writable, pt);
+    }
+    if (f->type == FD_SOCKET) {
+        return socket_poll(f->sock, pt);
+    }
+    if (f->type == FD_DEVICE && devsw[f->major].poll != NULL) {
+        return devsw[f->major].poll(f, pt);
+    }
+    return POLL_READY_IN | POLL_READY_OUT;
 }
 
 /* The most a write puts in one transaction: a page, 4 blocks. A chunk

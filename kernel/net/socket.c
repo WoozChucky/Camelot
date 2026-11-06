@@ -25,6 +25,7 @@
  * of once net_lock is free (the last close takes net_lock). */
 #include "file.h"
 #include "net.h"
+#include "poll.h"
 #include "proc.h"
 #include "string.h"
 #include "timer.h"
@@ -264,6 +265,25 @@ bool socket_hung_up(struct socket *s) {
     }
     release(&net_lock);
     return ended;
+}
+
+u32 socket_poll(struct socket *s, struct poll_table *pt) {
+    acquire(&net_lock);
+    net_poll_wait(pt);
+    u32 mask;
+    if (s->type == SOCK_STREAM) {
+        mask = tcp_poll(s->tcp);
+    } else {
+        mask = POLL_READY_OUT;
+        if (s->udp != NULL && udp_pending(s->udp) > 0) {
+            mask |= POLL_READY_IN;
+        }
+    }
+    if (s->rd_shut) {
+        mask |= POLL_READY_IN | POLLRDHUP;
+    }
+    release(&net_lock);
+    return mask;
 }
 
 void socket_close(struct socket *s) {

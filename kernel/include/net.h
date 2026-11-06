@@ -202,6 +202,10 @@ extern struct spinlock net_lock;
 void net_sleep(void);
 /* Wakes every process in net_sleep(): something arrived. */
 void net_wakeup(void);
+struct poll_table;
+/* Adds the channel net_sleep() sleeps on to a poll table, so that
+ * net_wakeup() wakes it too (poll.h). Holding net_lock. */
+void net_poll_wait(struct poll_table *pt);
 
 /* mtime ticks converted to microseconds (for ping's round-trip time). */
 u32 net_usec(u32 mtime_delta);
@@ -536,6 +540,13 @@ int tcp_shutdown(struct tcp_sock *s);
  * on its own before the slot is free again. Never sleeps. */
 void tcp_close(struct tcp_sock *s);
 
+/* poll() on `s` (poll.h's bits), holding net_lock: a listener is ready
+ * to read with a connection to accept; a connection to read when a read
+ * would not wait (data, the peer's FIN, or no connection: the error at
+ * once), to write when a send would not (room, or the send fails at once),
+ * hung up once closed or done both ways, in error once it ended in one. */
+u32 tcp_poll(const struct tcp_sock *s);
+
 /* The two ends of `s`: addresses and ports, 0 where there is none. */
 void tcp_ends(const struct tcp_sock *s, u32 *laddr, u32 *lport, u32 *raddr, u32 *rport);
 
@@ -586,6 +597,10 @@ bool socket_hung_up(struct socket *s);
 /* The last descriptor for the socket was closed: tcp_close() or
  * udp_close(), and the slot is free. */
 void socket_close(struct socket *s);
+/* poll() on a socket: tcp_poll()'s answer, or a UDP socket's (ready to
+ * write always, to read with a datagram waiting); ready to read, the peer
+ * done (POLLRDHUP), once shut down for reading. Takes net_lock. */
+u32 socket_poll(struct socket *s, struct poll_table *pt);
 
 /* The system calls (docs/camelot-syscalls.md, "Sockets"): user addresses
  * are uintptr, lengths usize, and send and receive return the bytes or an

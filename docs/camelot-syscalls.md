@@ -100,6 +100,7 @@ headers and checks each size.
 | `struct input_event` | 24 | an input device's event ("Input devices"): a `struct timeval`, then the type, code and value |
 | `struct input_id` | 8 | `EVIOCGID`'s |
 | `struct input_absinfo` | 24 | `EVIOCGABS`'s |
+| `struct pollfd` | 8 | `poll`'s ("Polling"): an `int` descriptor, then two `short`s, `events` and `revents` |
 
 ## Calls
 
@@ -158,6 +159,7 @@ headers and checks each size.
 | 51 | `memfd_create` | `const char *name, uint flags` | a new descriptor; `-EINVAL`, `-EFAULT`, `-EMFILE`, `-ENFILE` |
 | 52 | `ftruncate` | `int fd, off_t length` | 0; `-EBADF`, `-EINVAL`, `-EFBIG` |
 | 53 | `ioctl` | `int fd, unsigned long request, ...` | the request's result; `-EBADF`, `-ENOTTY`, `-EINVAL`, `-EFAULT`, `-EBUSY`, `-ENOMEM`, `-ENODEV`, `-EINTR` |
+| 54 | `poll` | `struct pollfd *fds, unsigned long nfds, int timeout` | the descriptors with events, 0 if the time ran out; `-EINVAL`, `-EFAULT`, `-EINTR` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -1275,6 +1277,62 @@ finds `argv` right above it and `envp` past `argv`'s null pointer, makes
 calls `main(argc, argv, envp)` and passes its return value to `exit`. A
 program that wants the auxiliary vector walks past `envp`'s null pointer
 to it.
+
+## Polling
+
+`poll(fds, nfds, timeout)` waits until one of `nfds` descriptors is ready,
+as Linux's does: each `struct pollfd` names a descriptor (`fd`; a negative
+one is skipped) and what to wait for (`events`), and the call fills in
+`revents`, what the descriptor is ready for of those, plus `POLLERR`,
+`POLLHUP` and `POLLNVAL`, which come whether asked for or not. It returns
+the number of descriptors whose `revents` is not 0; or 0 once `timeout`
+milliseconds have passed with none, counted in ticks (a tenth of a second)
+as `sleep` counts them, rounded up; a negative `timeout` waits for as long
+as it takes, and 0 not at all. At most 64 descriptors (`-EINVAL` above;
+one may be named several times), and `-EINTR` if the process is killed
+while it waits. The bits are Linux's:
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0x001 | `POLLIN` | a read would not wait |
+| 0x004 | `POLLOUT` | a write would not wait |
+| 0x008 | `POLLERR` | an error: a pipe's reader is gone, a connection ended in one |
+| 0x010 | `POLLHUP` | the other end is gone: a pipe's writer, a closed connection |
+| 0x020 | `POLLNVAL` | not an open descriptor |
+| 0x040 | `POLLRDNORM` | with `POLLIN` |
+| 0x100 | `POLLWRNORM` | with `POLLOUT` |
+| 0x2000 | `POLLRDHUP` | a stream socket's peer will send no more |
+
+`POLLPRI`, `POLLRDBAND` and `POLLWRBAND` are never set. What each kind of
+file says:
+
+- **a pipe**: the read end is ready to read with bytes in it, and hung up
+  once no write end is open; the write end ready to write with room in it,
+  and in error once no read end is open;
+- **a file, a directory or a shared-memory object**: always ready to read
+  and write, as on Linux;
+- **the console**: always ready to write; ready to read once a whole line
+  has been typed, or Ctrl-D, which `poll` edits and echoes as `read` would
+  ("Console input"), on a descriptor open for reading;
+- **a socket** ("Sockets"): a TCP listener is ready to read with a
+  connection to accept; a connection is ready to read with bytes or the
+  peer's FIN (`POLLRDHUP`) waiting, or once it ended in an error, and to
+  write with room in its send buffer; one never connected is ready to write
+  and hung up, as on Linux. A UDP socket is always ready to write, and to
+  read with a datagram waiting;
+- **an input device** ("Input devices"): ready to read with an event
+  waiting;
+- **`/dev/fb0`** ("The framebuffer"): ready to write unless a flip
+  `FBIOPAN_DISPLAY` queued is still waiting for the vertical blank, so a
+  program that queues a flip and polls for `POLLOUT` learns when the frame
+  it no longer shows may be drawn into, as DRM's page-flip event tells it;
+- **any other device**: always ready to read and write.
+
+The descriptors' files are held for the whole call, so one another thread
+closes meanwhile goes on being polled. No change is missed: each file names
+the wait channels of its readers and writers before it is looked at, and a
+wakeup on any of them, from then on, has the call look at every file again
+(spec section 10, "Waiting on several channels").
 
 ## Console input
 

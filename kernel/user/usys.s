@@ -59,6 +59,7 @@
     .equ SYS_memfd_create, 51
     .equ SYS_ftruncate, 52
     .equ SYS_ioctl, 53
+    .equ SYS_poll, 54
 
     .text
 
@@ -434,6 +435,13 @@ ftruncate:
     .globl ioctl
 ioctl:
     li    a7, SYS_ioctl
+    ecall
+    ret
+
+# int poll(struct pollfd *fds, unsigned long nfds, int timeout)
+    .globl poll
+poll:
+    li    a7, SYS_poll
     ecall
     ret
 

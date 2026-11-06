@@ -71,6 +71,7 @@
 #define SYS_memfd_create 51  /* memfd_create(name, flags): a descriptor for a new shared-memory object */
 #define SYS_ftruncate 52     /* ftruncate(fd, length): 0, the object's size set */
 #define SYS_ioctl 53         /* ioctl(fd, request, arg): the device's answer */
+#define SYS_poll 54          /* poll(fds, nfds, timeout): the descriptors with events, 0 if the time ran out */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */

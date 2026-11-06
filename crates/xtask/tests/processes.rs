@@ -2550,3 +2550,79 @@ fn the_calls_take_and_return_64_bit_values() {
     );
     assert_eq!(command_output(&out, "high"), ["high: ok"]);
 }
+
+#[test]
+fn poll_waits_on_every_kind_of_file() {
+    // Issue #180: polltest's checks of poll(): its errors and timeouts,
+    // pipes, files, shared memory, the console, TCP and UDP over loopback,
+    // the keyboard, /dev/fb0's flips, a wakeup from another thread, and a
+    // kill while it waits. A network card, for the sockets.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, _) = load(
+        Setup {
+            disks: vec![root_disk(4096, &[])],
+            nets: vec![NetConfig::user(Vec::new())],
+            ..Setup::default()
+        }
+        .config(),
+        Some(rx),
+    );
+    step_to_prompt(&mut m, 1);
+    type_line(&tx, "polltest\n");
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(all_checks_pass(&out, "polltest", "polltest"), 65, "{out}");
+}
+
+/// Steps `m` until the kernel's tick counter has gone `n` ticks on.
+fn step_ticks(m: &mut Machine, elf: &grail::elf::Elf, n: u32) {
+    let ticks = image_pa(sym(elf, "ticks"));
+    let start = m.cpu.bus.peek(ticks).unwrap();
+    step_until(
+        m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| m.cpu.bus.peek(ticks).unwrap() - start >= n,
+    );
+}
+
+#[test]
+fn poll_wakes_for_a_line_typed_and_a_key_pressed() {
+    // poll() on the console waits for a whole line, which it echoes as a
+    // read would; on the keyboard, for an event. Each sleeps a few ticks
+    // first, before the input comes.
+    let (mut m, elf, tx, _) = root_machine();
+    type_line(&tx, "polltest console\n");
+    step_to_output(&mut m, "polltest: ready\n");
+    step_ticks(&mut m, &elf, 3);
+    type_line(&tx, "hello\n");
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(
+        command_output(&out, "polltest console"),
+        [
+            "polltest: ready",
+            "hello",
+            "polltest: revents 1 (1)",
+            "polltest: line hello"
+        ],
+        "{out}"
+    );
+
+    type_line(&tx, "polltest keys\n");
+    step_to_output(&mut m, "polltest: ready\n");
+    let at = m.cpu.bus.uart.captured.len();
+    step_ticks(&mut m, &elf, 3);
+    assert!(m.key_event(key(b'a', 0x04)));
+    step_to_prompt(&mut m, 3);
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured[at..]).into_owned();
+    assert_eq!(
+        out.strip_suffix(PROMPT)
+            .unwrap_or(&out)
+            .lines()
+            .collect::<Vec<_>>(),
+        ["polltest: revents 1 (1)", "1 30 1"],
+        "{out}"
+    );
+    assert!(!m.cpu.bus.kbd.raw());
+}
