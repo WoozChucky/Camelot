@@ -195,7 +195,7 @@ bool mm_fault(pagetable_t pt, uintptr va, u32 access) {
 /* Splits `a` in two at `at`, strictly inside it, with `b`, a free area:
  * `a` keeps [start, at), `b` takes [at, end) and comes after it in the
  * list, with the same backing from there on (a shared-memory object then
- * has one more mapping, b's). Called holding the process's vm_lock (or on
+ * has one more mapping, b's, and so has a device). Called holding the process's vm_lock (or on
  * a list no fault can see yet). */
 static void area_split(struct vm_area *a, uintptr at, struct vm_area *b) {
     *b = *a;
@@ -206,6 +206,8 @@ static void area_split(struct vm_area *a, uintptr at, struct vm_area *b) {
     a->next = b;
     if (b->kind == AREA_SHM) {
         shm_map(b->shm);
+    } else if (b->kind == AREA_DEVICE) {
+        device_vm_open(b->major);
     }
 }
 
@@ -276,7 +278,7 @@ static void release_pte(pte_t *pte, void *arg) {
 
 /* Frees the areas of list `gone`, which no fault can find any more, with
  * the pages they had in `pt`: freed if anonymous, a shared-memory object's
- * reference dropped, a device's pages left alone. */
+ * reference dropped, a device's pages left alone (and its driver told). */
 static void release_areas(pagetable_t pt, struct vm_area *gone) {
     while (gone != NULL) {
         struct vm_area *a = gone;
@@ -284,6 +286,8 @@ static void release_areas(pagetable_t pt, struct vm_area *gone) {
         each_pte(pt, a->start, a->end, release_pte, a);
         if (a->kind == AREA_SHM) {
             shm_unmap(a->shm);
+        } else if (a->kind == AREA_DEVICE) {
+            device_vm_close(a->major);
         }
         area_free(a);
     }
@@ -346,7 +350,7 @@ static bool can_merge(struct vm_area *a, struct vm_area *b) {
         return a->shm == b->shm && a->pgoff + (a->end - a->start) / PGSIZE == b->pgoff;
     }
     if (a->kind == AREA_DEVICE) {
-        return a->device + (a->end - a->start) == b->device;
+        return a->major == b->major && a->device + (a->end - a->start) == b->device;
     }
     return true;
 }
@@ -365,6 +369,8 @@ static void merge_areas(struct proc *p, uintptr start, uintptr end) {
             if (b->kind == AREA_SHM) {
                 /* Not the object's last reference: `a` holds one too. */
                 shm_unmap(b->shm);
+            } else if (b->kind == AREA_DEVICE) {
+                device_vm_close(b->major);
             }
             area_free(b);
         } else {
@@ -374,10 +380,12 @@ static void merge_areas(struct proc *p, uintptr start, uintptr end) {
 }
 
 /* Lets go of what a mapping that won't be made holds: the reference to
- * its shared-memory object. */
+ * its shared-memory object, or its device's count of mappings. */
 static void drop_backing(struct vm_area *want) {
     if (want->kind == AREA_SHM) {
         shm_unmap(want->shm);
+    } else if (want->kind == AREA_DEVICE) {
+        device_vm_close(want->major);
     }
 }
 

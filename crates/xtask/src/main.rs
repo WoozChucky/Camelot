@@ -568,9 +568,13 @@ fn ld_fixtures(k: LdFixturesArgs) -> ExitCode {
 fn kernel(k: KernelArgs) -> ExitCode {
     let root = repo_root();
     let kernel_dir = root.join("kernel");
-    // The C tools' tables, from the host tools' (c_tables.rs): before
-    // the user programs are built.
-    match xtask::c_tables::write(&root) {
+    // The C tools' tables, from the host tools' (c_tables.rs), and the
+    // console's font (font.rs): before anything is built.
+    let generated = xtask::c_tables::write(&root).and_then(|mut wrote| {
+        wrote.extend(xtask::font::write(&root)?);
+        Ok(wrote)
+    });
+    match generated {
         Ok(wrote) => {
             for file in wrote {
                 eprintln!("wrote {file}");

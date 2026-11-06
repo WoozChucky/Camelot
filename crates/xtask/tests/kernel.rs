@@ -19,8 +19,9 @@
 mod common;
 
 use common::{
-    function, image_pa, kpa, load_with, machine_config, peek, printed, sym, CPU_HARTID, CPU_NOFF,
-    CPU_PAGETABLE, CPU_SIZE, CPU_THREAD, KERNEL_LINK_ADDR, LOAD_ADDR, LOCK_CPU, PROMPT,
+    function, image_pa, kpa, load_with, machine_config, peek, printed, screen, screen_rows_of, screen_text,
+    step_to_frame, sym, ScreenCell, CPU_HARTID, CPU_NOFF, CPU_PAGETABLE, CPU_SIZE, CPU_THREAD,
+    KERNEL_LINK_ADDR, LOAD_ADDR, LOCK_CPU, PROMPT,
 };
 use excalibur::csr::{
     IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE,
@@ -34,7 +35,7 @@ use grail::block::{
 };
 use grail::bus::{BLK_BASE, BLK_SIZE, MAX_DISKS, PLIC_BASE, RAM_BASE, SYSINFO_BASE, SYSINFO_SIZE, UART_BASE};
 use grail::cpu::Mode;
-use grail::devices::{BLK_IRQ, UART_IRQ};
+use grail::devices::{BLK_IRQ, FB_IRQ, KBD_IRQ, PTR_IRQ, UART_IRQ};
 use grail::sysinfo::{DeviceEntry, DeviceType, Sysinfo};
 use grail::sysinfo::{REG_MAGIC, REG_TIMEBASE_HZ};
 use grail::{DiskConfig, Machine, MachineConfig, RunResult};
@@ -114,6 +115,10 @@ fn mode() -> PagingMode {
 /// The kernel stacks' size and slot, and how many slots there are, at the
 /// start of the vmalloc area (vm.h).
 const KSTACK_SIZE: u64 = 16 * 1024;
+
+/// The PLIC sources the kernel enables on every machine of the tests: the
+/// UART's, the keyboard's, the pointer's and the display's vertical blank.
+const BOOT_IRQS: u64 = 1 << UART_IRQ | 1 << KBD_IRQ | 1 << PTR_IRQ | 1 << FB_IRQ;
 const KSTACK_SLOT: u64 = 2 * KSTACK_SIZE;
 const KSTACK_SLOTS: u64 = 64;
 
@@ -132,6 +137,7 @@ kprintf self-test: 33/33 passed
 ram: 8 MiB at 0x80000000
 paging: on (MODE)
 vm self-test: 26/26 passed
+fb: 640x480, 6 modes, irq 16
 timer: 10 Hz tick, 10000000 Hz timebase
 disk: none
 tick 1
@@ -2680,17 +2686,19 @@ fn check_kernel_memory(ram_mib: usize) {
         }
     }
     assert_eq!(fixmap, 2, "the fixmap: sysinfo and the UART");
-    // What the drivers asked for: sysinfo, the UART and the PLIC; not the
-    // CLINT, which is the firmware's, nor the test device or the
-    // framebuffer.
-    for base in [SYSINFO_BASE, UART_BASE, PLIC_BASE] {
+    // What the drivers asked for: sysinfo, the UART, the PLIC and the
+    // display, its registers and VRAM; not the CLINT, which is the
+    // firmware's, nor the test device.
+    for base in [
+        SYSINFO_BASE,
+        UART_BASE,
+        PLIC_BASE,
+        grail::bus::FB_CTRL_BASE,
+        grail::bus::VRAM_BASE,
+    ] {
         assert!(devices.contains(&base), "{base:#x} not mapped: {devices:x?}");
     }
-    for base in [
-        grail::bus::CLINT_BASE,
-        grail::bus::TEST_DEV_BASE,
-        grail::bus::FB_CTRL_BASE,
-    ] {
+    for base in [grail::bus::CLINT_BASE, grail::bus::TEST_DEV_BASE] {
         assert!(
             !devices.iter().any(|&d| (base..base + PAGE).contains(&d)),
             "{base:#x}"
@@ -3062,10 +3070,13 @@ fn plic_routes_the_uart_to_the_kernel() {
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == wfi);
     let mut reg = |addr| m.cpu.bus.read(addr, 4).unwrap();
-    // Source 1 (the UART) at priority 1, enabled for context 1 (S-mode) only,
-    // whose threshold of 0 lets it through.
-    assert_eq!(reg(plic_priority(UART_IRQ)), 1);
-    assert_eq!(reg(plic_enable(1)), 1 << UART_IRQ);
+    // Source 1 (the UART), 2 (the keyboard), 11 (the pointer) and 16 (the
+    // display's vertical blank) at priority 1, enabled for context 1
+    // (S-mode) only, whose threshold of 0 lets them through.
+    for irq in [UART_IRQ, KBD_IRQ, PTR_IRQ, FB_IRQ] {
+        assert_eq!(reg(plic_priority(irq)), 1, "source {irq}");
+    }
+    assert_eq!(reg(plic_enable(1)), BOOT_IRQS);
     assert_eq!(reg(plic_threshold(1)), 0);
     assert_eq!(reg(plic_enable(0)), 0);
     // sie.SEIE on (with the tick's STIE and the IPI's SSIE, and M-mode's
@@ -3080,6 +3091,58 @@ fn plic_routes_the_uart_to_the_kernel() {
     assert_eq!(mie & (1 << IRQ_M_EXT), 0);
     // The UART's receive interrupt is on.
     assert_eq!(m.cpu.bus.read(UART_BASE + UART_IER, 1), Ok(UART_IER_ERBFI));
+}
+
+#[test]
+fn the_framebuffer_console_shows_the_boot_and_the_shell() {
+    // Issue #178: what the kernel prints and what the shell writes are on
+    // the display as on the UART, in the framebuffer console's 80 columns
+    // and 30 rows of Spleen's glyphs (fbcon.h), the last 30 rows of it once
+    // it has scrolled; the cursor an inverse cell after the prompt.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, _) = load_committed_on(config(), Some(rx));
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    for &b in b"echo on the screen\n" {
+        tx.send(b).unwrap();
+    }
+    let tail = format!("\non the screen\n{PROMPT}");
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(&tail));
+    step_to_frame(&mut m);
+    // Less Grail's own line, of the Xcal debug instruction the kprintf
+    // self-test runs: the emulator printed it, not the kernel.
+    let out: String = printed(&m)
+        .split_inclusive('\n')
+        .filter(|l| !l.starts_with("[dbg]"))
+        .collect();
+    let rows = screen_rows_of(&out);
+    assert_eq!(rows.len(), 30, "the boot fills the screen:\n{out}");
+    assert_eq!(screen_text(&m), rows, "{out}");
+    let cells = screen(&m);
+    assert_eq!(
+        cells[29][0],
+        ScreenCell {
+            ch: '$',
+            fg: 0xaaaaaa,
+            bg: 0
+        }
+    );
+    assert_eq!(
+        cells[29][2],
+        ScreenCell {
+            ch: ' ',
+            fg: 0xaaaaaa,
+            bg: 0xaaaaaa
+        },
+        "the cursor"
+    );
+    assert_eq!(
+        cells[29][3],
+        ScreenCell {
+            ch: ' ',
+            fg: 0,
+            bg: 0
+        }
+    );
 }
 
 #[test]
@@ -3104,6 +3167,11 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     // The shell still has its read to make after the prompt: the count starts once
     // the hart first waits, so that a tick that comes on the way (the timing of boot
     // and of the shell's start decides it) is not counted as one it waited for.
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == wfi);
+    // And after the next tick, on which the framebuffer console draws what
+    // the shell printed (fbcon.h): a scroll's worth of pixels moved.
+    let drawn = tick_count(&m) + 1;
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| tick_count(m) == drawn);
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == wfi);
     let start = tick_count(&m);
     let idle_end = start + 50;
@@ -3388,7 +3456,7 @@ fn kernel_boots_without_a_disk_and_says_so() {
     assert!(out.contains("timebase\ndisk: none\ntick 1\n"), "{out}");
     assert!(t.commands.is_empty() && t.sleeps.is_empty(), "{t:?}");
     assert_eq!(t.accesses, 0, "{t:?}");
-    assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(1 << UART_IRQ));
+    assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(BOOT_IRQS));
 }
 
 #[test]
@@ -3412,10 +3480,7 @@ fn disk_blocks_round_trip_through_the_cache_with_interrupts() {
     // The driver set up the disk's completion interrupt.
     assert_eq!(m.cpu.bus.disks[0].ctrl, 1);
     assert_eq!(m.cpu.bus.read(plic_priority(BLK_IRQ), 4), Ok(1));
-    assert_eq!(
-        m.cpu.bus.read(plic_enable(1), 4),
-        Ok(1 << UART_IRQ | 1 << BLK_IRQ)
-    );
+    assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(BOOT_IRQS | 1 << BLK_IRQ));
 
     // One request at a time, each finished by its interrupt: every command
     // was acknowledged in blk_intr before the next, with nothing polled.
@@ -3540,11 +3605,11 @@ fn kernel_processes_give_back_their_pages() {
         |m| printed(m).ends_with(PROMPT),
     );
     assert!(printed(&with_disk).contains(" passed\n"));
-    // But for the disk's registers' mapping: their ioremap() takes a page
-    // for the table it needs.
+    // The disk's registers' mapping takes no page for a table: their
+    // ioremap() comes after the display's, whose last table has room.
     let tables = |m: &Machine| kernel_leaves(m, kernel_pagetable_pa(m, &elf)).1.len() as u32;
     let disk_tables = tables(&with_disk) - tables(&plain);
-    assert_eq!(disk_tables, 1);
+    assert_eq!(disk_tables, 0);
     assert_eq!(
         common::free_pages(&with_disk, &elf) + disk_tables,
         common::free_pages(&plain, &elf)
@@ -3732,7 +3797,7 @@ fn a_disk_entry_without_a_usable_interrupt_is_skipped() {
         assert_eq!(mask(&printed(&m)), halted_output(), "irq {irq}");
         assert_eq!(t.accesses, 0, "irq {irq}: {t:?}");
         assert_eq!(m.cpu.bus.disks[0].ctrl, 0);
-        assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(1 << UART_IRQ));
+        assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(BOOT_IRQS));
     }
 }
 
@@ -3758,7 +3823,7 @@ fn every_disk_is_found_and_disk_0_is_tested() {
     assert_eq!(m.cpu.bus.disks[1].ctrl, 1);
     assert_eq!(
         m.cpu.bus.read(plic_enable(1), 4),
-        Ok(1 << UART_IRQ | 1 << BLK_IRQ | 1 << (BLK_IRQ + 1))
+        Ok(BOOT_IRQS | 1 << BLK_IRQ | 1 << (BLK_IRQ + 1))
     );
     assert_eq!(disk_contents(&mut m, 1), second);
 }
@@ -3931,7 +3996,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 52, "{calls:?}");
+    assert_eq!(calls.len(), 53, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -3960,7 +4025,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 45, "{errors:?}");
+    assert_eq!(errors.len(), 47, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
 
@@ -3987,11 +4052,13 @@ fn the_system_call_document_matches_the_code() {
         }
         // A call that takes a pointer can fail with -EFAULT, and only those,
         // but for the memory mappings' calls: their pointer is an address to
-        // map at or unmap, never memory the kernel reads or writes. Only the
-        // calls that can't fail list no error.
+        // map at or unmap, never memory the kernel reads or writes; ioctl's
+        // `...` is a pointer for most requests. Only the calls that can't
+        // fail list no error.
         let addresses = ["mmap", "munmap", "mprotect"];
+        let takes_pointer = args.contains('*') || name == "ioctl";
         assert_eq!(
-            args.contains('*') && !addresses.contains(&name.as_str()),
+            takes_pointer && !addresses.contains(&name.as_str()),
             returns.contains("`-EFAULT`"),
             "{name}: {returns}"
         );
@@ -4024,13 +4091,13 @@ fn the_system_call_document_matches_the_code() {
             Some((name, cells.get(2)?.parse().ok()?))
         })
         .collect();
-    assert_eq!(sizes.len(), 9, "{sizes:?}");
+    assert_eq!(sizes.len(), 15, "{sizes:?}");
     for (dir, include, headers) in [
         ("kernel/user", None, "#include \"user.h\"\n"),
         (
             "kernel",
             Some("include"),
-            "#include \"syscall.h\"\n#include \"fs.h\"\n",
+            "#include \"syscall.h\"\n#include \"fs.h\"\n#include \"fb.h\"\n#include \"input.h\"\n",
         ),
     ] {
         let mut src = headers.to_string();
@@ -4110,6 +4177,8 @@ fn the_system_call_document_matches_the_code() {
     assert_eq!(console[0].0, u32::from(xtask::fs::CONSOLE_MAJOR));
     let fb = exactly(&read("kernel/include/file.h"), "FB");
     assert_eq!(fb[0].0, u32::from(xtask::fs::FB_MAJOR));
+    let input = exactly(&read("kernel/include/file.h"), "INPUT");
+    assert_eq!(input[0].0, u32::from(xtask::fs::INPUT_MAJOR));
 }
 
 // ---- The clang reference build (ignored: needs LLVM) ----

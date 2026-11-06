@@ -7,6 +7,8 @@
 //! * [`kernel`]: builds `kernel/kernel.elf` and `kernel/kernel-disk.elf` (the same
 //!   kernel without its built-in programs) with merlin + merlin-as +
 //!   merlin-ld, no LLVM, or the clang -O2 + ld.lld reference build.
+//! * [`font`]: the framebuffer console's font, converted to PSF2 and
+//!   generated into `kernel/font.c`.
 //! * [`fs`]: builds the root filesystem image (the user programs and a
 //!   README) with the `camelot-fs` crate's mkfs, bootable with the disk kernel
 //!   ([`fs::IMAGE_SIZE`] blocks in all).
@@ -30,6 +32,7 @@ pub mod boot;
 pub mod c_tables;
 pub mod ci;
 pub mod examples;
+pub mod font;
 pub mod fs;
 pub mod hello;
 pub mod kernel;

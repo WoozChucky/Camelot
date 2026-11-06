@@ -23,6 +23,7 @@ long sys_fcntl(struct trap_frame *f);
 long sys_pipe(struct trap_frame *f);
 long sys_memfd_create(struct trap_frame *f);
 long sys_ftruncate(struct trap_frame *f);
+long sys_ioctl(struct trap_frame *f);
 
 /* Copies the path at user address `va` in `pt` to `buf` (MAXPATH + 1
  * bytes). Returns 0; -EFAULT if a byte up to its NUL is not readable user

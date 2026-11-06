@@ -345,6 +345,111 @@ pub fn exit_shell(m: &mut Machine, tx: &Sender<u8>) {
     );
 }
 
+/// A cell of the framebuffer console's screen (kernel/fbcon.c), read back
+/// from the display's pixels by [`screen`]: its character and colours, as
+/// 0x00RRGGBB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenCell {
+    pub ch: char,
+    pub fg: u32,
+    pub bg: u32,
+}
+
+/// The framebuffer console's grid.
+pub const SCREEN_COLS: u32 = 80;
+pub const SCREEN_ROWS: u32 = 30;
+
+/// The framebuffer console's 80x30 cells as the display's VRAM shows them:
+/// each 8x16 cell's pixels matched against the console's font
+/// (`xtask::font`), with either of its two colours as the ink, so that
+/// reverse video and the cursor read too. A cell of one colour is a space
+/// (`fg` and `bg` that colour); one that is no glyph of printable ASCII is
+/// U+FFFD.
+pub fn screen(m: &Machine) -> Vec<Vec<ScreenCell>> {
+    let font = xtask::font::psf2(&repo_root()).unwrap();
+    let font = xtask::font::parse_psf2(&font).unwrap();
+    let glyphs: std::collections::HashMap<Vec<u8>, char> = (0x21..=0x7e)
+        .map(|c| (font.glyph(c).to_vec(), char::from(c as u8)))
+        .collect();
+    let fb = &m.cpu.bus.fb;
+    let cell = |row: u32, col: u32| {
+        let px = |x: u32, y: u32| fb.pixel(col * 8 + x, row * 16 + y);
+        let first = px(0, 0);
+        let other = (0..16)
+            .flat_map(|y| (0..8).map(move |x| (x, y)))
+            .map(|(x, y)| px(x, y))
+            .find(|&p| p != first);
+        let Some(other) = other else {
+            return ScreenCell {
+                ch: ' ',
+                fg: first,
+                bg: first,
+            };
+        };
+        for (fg, bg) in [(first, other), (other, first)] {
+            let bits: Vec<u8> = (0..16)
+                .map(|y| (0..8).fold(0u8, |b, x| b << 1 | u8::from(px(x, y) == fg)))
+                .collect();
+            if let Some(&ch) = glyphs.get(&bits) {
+                return ScreenCell { ch, fg, bg };
+            }
+        }
+        ScreenCell {
+            ch: '\u{fffd}',
+            fg: first,
+            bg: other,
+        }
+    };
+    (0..SCREEN_ROWS)
+        .map(|r| (0..SCREEN_COLS).map(|c| cell(r, c)).collect())
+        .collect()
+}
+
+/// [`screen`]'s characters: a string a row, without its trailing spaces.
+pub fn screen_text(m: &Machine) -> Vec<String> {
+    screen(m)
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The lines the console shows for `out`, what the UART printed: each line
+/// cut into rows of 80 columns, the last 30 rows (the last one is where the
+/// cursor is, and may be empty). Text without tabs or escape sequences.
+pub fn screen_rows_of(out: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in out.replace('\r', "").split('\n') {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            rows.push(String::new());
+        }
+        for chunk in chars.chunks(SCREEN_COLS as usize) {
+            rows.push(chunk.iter().collect::<String>().trim_end().to_string());
+        }
+    }
+    let skip = rows.len().saturating_sub(SCREEN_ROWS as usize);
+    rows.split_off(skip)
+}
+
+/// Steps `m` until the display shows a new frame: the console's flush on
+/// the next clock tick after it drew (fbcon.h).
+pub fn step_to_frame(m: &mut Machine) {
+    let before = m.cpu.bus.fb.shown();
+    for _ in 0..RUN_MAX_STEPS {
+        if m.cpu.bus.fb.shown() != before {
+            return;
+        }
+        m.cpu.step();
+    }
+    panic!("no new frame:\n{}", printed(m));
+}
+
 /// Watches every hart's locking state: whenever a hart enters U-mode, it
 /// holds no spinlock (no named lock's cpu is its own) and has no push_off()
 /// pending. Other harts may hold locks meanwhile. A lock or a push_off

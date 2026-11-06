@@ -204,6 +204,19 @@ long sys_ftruncate(struct trap_frame *f) {
     return r;
 }
 
+/* ioctl(fd, request, arg): Linux's request numbers, an unsigned int (the
+ * upper half of the register ignored, as Linux's do_vfs_ioctl() takes
+ * it), and `arg` a user address or a value, as the request says. */
+long sys_ioctl(struct trap_frame *f) {
+    struct file *file = fd_get((u32)arg(f, 0));
+    if (file == NULL) {
+        return -EBADF;
+    }
+    long r = fileioctl(file, (u32)arg(f, 1), arg(f, 2));
+    fileclose(file);
+    return r;
+}
+
 long sys_pipe(struct trap_frame *f) {
     pagetable_t pt = myproc()->pagetable;
     uintptr va = arg(f, 0);
@@ -314,11 +327,23 @@ long sys_open(struct trap_frame *f) {
     }
     file->type = ip->type == T_DEVICE ? FD_DEVICE : FD_INODE;
     file->major = ip->major;
+    file->minor = ip->minor;
     file->ip = ip;
     file->readable = readable;
     file->writable = writable;
     iunlock(ip);
     end_op();
+    /* A device's driver opens it (an input device's reader, say), outside
+     * the transaction: it may sleep, or refuse. A refused file goes
+     * without the driver's close, as Linux's does. */
+    if (file->type == FD_DEVICE) {
+        int r = device_open(file);
+        if (r < 0) {
+            file->type = FD_NONE;
+            fileclose(file);
+            return r;
+        }
+    }
     /* Truncated in transactions of its own: freeing a big file's blocks
      * takes several (itrunc), under the file's write lock, which comes
      * before begin_op(). Writers wait for it; a reader meanwhile sees the

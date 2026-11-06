@@ -116,6 +116,10 @@ fn ticks() -> String {
     (1..=10).map(|n| format!("tick {n}\n")).collect()
 }
 
+/// What the kernel says before the timer line of the display Grail's
+/// machines have (kernel/fb.c).
+const FB: &str = "fb: 640x480, 6 modes, irq 16\n";
+
 /// What the kernel says after the timer line when no disk is attached
 /// (kernel/main.c).
 const NO_DISK: &str = "disk: none\n";
@@ -142,7 +146,7 @@ fn kernel_ticks_ten_times_then_starts_the_shell() {
     assert!(out.contains("|_|\n\nCamelot v0.1.0 booting...\n"), "{out}");
     assert!(
         out.ends_with(&format!(
-            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
+            "{}{FB}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
             memory_lines(RAM_MIB),
             ticks(),
             kstack_lines(&out)
@@ -280,7 +284,7 @@ fn kernel_boots_with_paging_on_any_ram_size() {
         let (code, out) = grail_with(&["--ram", mib], &kernel_elf(), b"exit\n");
         assert_eq!(code, Some(0), "--ram {mib}, output:\n{out}");
         let want = format!(
-            "{}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
+            "{}{FB}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
             memory_lines(mib.parse().unwrap()),
             ticks(),
             kstack_lines(&out)

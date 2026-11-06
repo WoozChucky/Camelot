@@ -173,3 +173,79 @@ u32 kfree_pages(void) {
      * would give once it is let go. */
     return nfree;
 }
+
+/* Pages a bitmap page covers: one bit each. */
+#define BITMAP_PAGES (PGSIZE * 8)
+
+/* The free list has no order, so a run of free pages is found with a
+ * bitmap of them: a page borrowed from the list, a bit per page of RAM, for
+ * BITMAP_PAGES pages at a time (128 MiB), filled from the list and searched
+ * from the bottom; a run may go on from one window into the next. Then the
+ * run's pages come off the list. Each window is a walk of the whole list,
+ * under kmem_lock: slow for a big machine, but only a mode change of the
+ * framebuffer asks for this (fb.c). */
+void *kalloc_contig(usize n) {
+    if (n == 0) {
+        return NULL;
+    }
+    usize pages = ram_size / PGSIZE;
+    acquire(&kmem_lock);
+    struct run *bitmap = freelist;
+    if (bitmap == NULL) {
+        release(&kmem_lock);
+        return NULL;
+    }
+    freelist = bitmap->next;
+    nfree--;
+    u64 *bits = (u64 *)bitmap;
+    bool found = false;
+    usize run_start = 0;
+    usize run_len = 0;
+    for (usize base = 0; base < pages && !found; base += BITMAP_PAGES) {
+        memset(bits, 0, PGSIZE);
+        for (struct run *r = freelist; r != NULL; r = r->next) {
+            usize i = (pa(r) - ram_base) / PGSIZE - base;
+            if (i < BITMAP_PAGES) {
+                bits[i / 64] |= 1ull << (i % 64);
+            }
+        }
+        usize window = pages - base < BITMAP_PAGES ? pages - base : BITMAP_PAGES;
+        for (usize i = 0; i < window; i++) {
+            if ((bits[i / 64] >> (i % 64) & 1) == 0) {
+                run_len = 0;
+                continue;
+            }
+            if (run_len == 0) {
+                run_start = base + i;
+            }
+            run_len++;
+            if (run_len == n) {
+                found = true;
+                break;
+            }
+        }
+    }
+    if (found) {
+        phys_addr_t start = ram_base + run_start * PGSIZE;
+        struct run **link = &freelist;
+        while (*link != NULL) {
+            if (in_range(pa(*link), start, n * PGSIZE)) {
+                *link = (*link)->next;
+            } else {
+                link = &(*link)->next;
+            }
+        }
+        nfree -= (u32)n;
+    }
+    bitmap->next = freelist;
+    freelist = bitmap;
+    nfree++;
+    release(&kmem_lock);
+    return found ? va(ram_base + run_start * PGSIZE) : NULL;
+}
+
+void kfree_contig(void *pages, usize n) {
+    for (usize i = 0; i < n; i++) {
+        kfree((u8 *)pages + i * PGSIZE);
+    }
+}
