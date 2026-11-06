@@ -34,11 +34,13 @@ use std::path::{Path, PathBuf};
 /// The kernel installed in a bootable image (under the repository root): the one
 /// without built-in programs (`crate::kernel::disk_kernel`).
 pub const KERNEL: &str = "kernel/kernel-disk.elf";
-/// A bootable image's size by default, in 1 KiB blocks: 4 MiB, the boot block,
-/// the filesystem and the kernel together. The programs in `/bin` take more
-/// than half of the filesystem; the rest is the shell's to write files in
+/// A bootable image's size by default, in 1 KiB blocks: 8 MiB, the boot block,
+/// the filesystem and the kernel together. The programs in `/bin` and what
+/// `/usr` holds take what they need; the rest is the shell's to write files in
 /// (`crates/xtask/tests/boot.rs` checks that at least a fifth is free).
-pub const IMAGE_SIZE: u32 = 4096;
+/// Raised from 4 MiB when the programs outgrew it, with room for the C
+/// compiler (#243) and the desktop's programs to come.
+pub const IMAGE_SIZE: u32 = 8192;
 /// The host directory copied to `/`.
 pub const ROOT_DIR: &str = "kernel/fs";
 /// Where the image goes by default (under the repository root).
