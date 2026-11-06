@@ -38,9 +38,11 @@
 /* Descriptors per process. */
 #define NOFILE 16
 
-/* Device numbers (the major of a device inode). */
+/* Device numbers (the major of a device inode): the console, and the
+ * framebuffer (fb.h). */
 #define CONSOLE 1
-#define NDEV 2
+#define FB 2
+#define NDEV 3
 
 #define FD_NONE 0
 #define FD_PIPE 1

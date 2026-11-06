@@ -3849,6 +3849,8 @@ fn the_system_call_document_matches_the_code() {
     }
     let console = exactly(&read("kernel/include/file.h"), "CONSOLE");
     assert_eq!(console[0].0, u32::from(xtask::fs::CONSOLE_MAJOR));
+    let fb = exactly(&read("kernel/include/file.h"), "FB");
+    assert_eq!(fb[0].0, u32::from(xtask::fs::FB_MAJOR));
 }
 
 // ---- The clang reference build (ignored: needs LLVM) ----

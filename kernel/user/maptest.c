@@ -11,6 +11,7 @@
  *   maptest unmapped     touches a page after munmap: killed
  *   maptest readonly     writes a read-only page: killed
  *   maptest past         touches a page past a shared object's end: killed
+ *   maptest fb           draws into /dev/fb0's memory (a root image's)
  *   maptest child        (shared_checks()'s child) */
 #include "user.h"
 
@@ -327,6 +328,64 @@ static void shared_checks(void) {
     check_eq(munmap(w, PAGE), 0, "munmap the object, its last reference");
 }
 
+/* The framebuffer's VRAM: 640x480 pixels of 32 bits (spec section 9.3). */
+#define FB_WIDTH 640
+#define FB_HEIGHT 480
+#define FB_SIZE (FB_WIDTH * FB_HEIGHT * 4ul)
+
+/* The pixel maptest fb draws at (x, y): red the column, green the row. */
+static uint fb_pixel(uint x, uint y) {
+    return (x & 0xff) << 16 | (y & 0xff) << 8 | 0x5a;
+}
+
+/* `maptest fb`: draws into the framebuffer's memory through a mapping of
+ * /dev/fb0 (a device mapping, the device's own pages), on a root image
+ * that has the node. */
+static void fb_checks(void) {
+    int fd = open("/dev/fb0", O_RDWR);
+    check(fd >= 0, "open /dev/fb0");
+    if (fd < 0) {
+        return;
+    }
+    long m = map(0, FB_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check(m > 0, "map its memory");
+    if (m <= 0) {
+        close(fd);
+        return;
+    }
+    uint *px = (uint *)m;
+    for (uint y = 0; y < FB_HEIGHT; y++) {
+        for (uint x = 0; x < FB_WIDTH; x++) {
+            px[y * FB_WIDTH + x] = fb_pixel(x, y);
+        }
+    }
+    check(px[FB_WIDTH * FB_HEIGHT - 1] == fb_pixel(FB_WIDTH - 1, FB_HEIGHT - 1), "the last pixel");
+    long second = map(0, PAGE, PROT_READ, MAP_PRIVATE, fd, (off_t)PAGE);
+    check(second > 0 && ((uint *)second)[0] == px[PAGE / 4],
+          "a private mapping from its second page shows the same memory");
+    /* The kernel copies only to and from RAM: a system call's buffer in a
+     * device's memory is refused. */
+    check_eq(write_at((uintptr_t)px + 8, 4), -EFAULT, "write() from the framebuffer");
+    check_eq(map(0, FB_SIZE + PAGE, PROT_READ, MAP_SHARED, fd, 0), -EINVAL, "a mapping past its memory");
+    check_eq(map(0, PAGE, PROT_READ, MAP_SHARED, fd, (off_t)FB_SIZE), -EINVAL, "an offset at its end");
+    char buf[4];
+    check_eq(read(fd, buf, 4), -EINVAL, "read() of the device");
+    check_eq(munmap((void *)second, PAGE), 0, "munmap the second");
+    check_eq(munmap(px, FB_SIZE), 0, "munmap the first");
+    close(fd);
+
+    int ro = open("/dev/fb0", O_RDONLY);
+    check_eq(map(0, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, ro, 0), -EACCES,
+             "a writable mapping of a descriptor open for reading");
+    check_eq(map(0, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, ro, 0), -EACCES,
+             "a private one too: the device's memory is the device's");
+    long r = map(0, PAGE, PROT_READ, MAP_SHARED, ro, 0);
+    check(r > 0 && ((uint *)r)[1] == fb_pixel(1, 0), "a read-only one");
+    check_eq(mprotect((void *)r, PAGE, PROT_READ | PROT_WRITE), -EACCES, "made writable");
+    check_eq(munmap((void *)r, PAGE), 0, "munmap it");
+    close(ro);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "child") == 0) {
         return child();
@@ -356,20 +415,25 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
-    if (argc != 1) {
-        printf("usage: maptest [none | unmapped | readonly | past]\n");
+    int fb = argc == 2 && strcmp(argv[1], "fb") == 0;
+    if (argc != 1 && !fb) {
+        printf("usage: maptest [none | unmapped | readonly | past | fb]\n");
         return 1;
     }
     if (pipe(fds) != 0) {
         printf("maptest: no pipe\n");
         return 1;
     }
-    anonymous_checks();
-    error_checks();
-    heap_checks();
-    demand_checks();
-    memfd_checks();
-    shared_checks();
+    if (fb) {
+        fb_checks();
+    } else {
+        anonymous_checks();
+        error_checks();
+        heap_checks();
+        demand_checks();
+        memfd_checks();
+        shared_checks();
+    }
     printf("maptest: %d checks, %d failed\n", checks, failed);
     return failed;
 }

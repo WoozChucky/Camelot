@@ -1097,6 +1097,40 @@ fn memory_mappings_are_mapped_on_demand_and_given_back() {
 const MAPTEST_CHECKS: u32 = 101;
 
 #[test]
+fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
+    // Issue #179's device mappings: `maptest fb` on the root image maps
+    // /dev/fb0, the framebuffer's VRAM, draws a pattern into it and checks
+    // the errors. The display shows what it drew, and no page of RAM went
+    // to it: a device's pages are the device's.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load(
+        Setup {
+            disks: vec![root_disk(4096, &[])],
+            ..Setup::default()
+        }
+        .config(),
+        Some(rx),
+    );
+    step_to_prompt(&mut m, 1);
+    let before = spare_pages(&m, &elf);
+    for b in b"maptest fb\n" {
+        tx.send(*b).unwrap();
+    }
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(spare_pages(&m, &elf), before, "{out}");
+    assert_eq!(all_checks_pass(&out, "maptest fb", "maptest"), 15, "{out}");
+    let fb = &m.cpu.bus.fb;
+    for (x, y) in [(0, 0), (1, 0), (639, 0), (0, 479), (321, 123), (639, 479)] {
+        assert_eq!(
+            fb.pixel(x, y),
+            (x & 0xff) << 16 | (y & 0xff) << 8 | 0x5a,
+            "({x}, {y})"
+        );
+    }
+}
+
+#[test]
 fn bad_pointers_are_refused() {
     // Issue #21's second criterion. badptr hands write and read kernel
     // memory, page 0, a range past the end of user space, the stack's guard

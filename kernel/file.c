@@ -5,6 +5,7 @@
  * bad buffer fails before anything happens. */
 #include "file.h"
 #include "console.h"
+#include "fb.h"
 #include "kalloc.h"
 #include "log.h"
 #include "memlayout.h"
@@ -46,10 +47,11 @@ static isize nodev_write(pagetable_t pt, uintptr src, usize n) {
 }
 
 /* The drivers, by major number: 0 is none, CONSOLE the console (which has
- * no memory to map). */
+ * no memory to map), FB the framebuffer (its memory, for mmap). */
 const struct devsw devsw[NDEV] = {
     {nodev_read, nodev_write, NULL},
     {console_read, console_write, NULL},
+    {fb_read, fb_write, fb_mmap},
 };
 
 bool device_has_driver(u32 major) {

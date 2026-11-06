@@ -6,6 +6,7 @@ camelot-fs crate. Its format is in docs/camelot-fs.md.
 /README         this file
 /bin            the user programs, the same ones the kernel embeds
 /dev/console    the console's device node
+/dev/fb0        the framebuffer's device node (its memory, for mmap)
 
 The kernel mounts it at boot, lists / and runs its shell from /bin/sh.
 Try `ls /bin`, `echo hi > /hi`, `cat /hi | wc`.

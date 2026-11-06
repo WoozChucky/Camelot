@@ -838,9 +838,17 @@ void uvm_free(pagetable_t pt) {
     pagetable_free(pt);
 }
 
+/* Whether `pte` maps a page of RAM: one the direct map holds, so that the
+ * kernel can reach it at va(). A device's memory mapped into a process
+ * (mmap of /dev/fb0) isn't, so a system call can't copy to or from it. */
+static bool pte_in_ram(pte_t pte) {
+    phys_addr_t pa = PTE2PA(pte);
+    return pa >= ram_base && pa - ram_base < ram_size;
+}
+
 /* Whether every byte of [va, va + len) is mapped in `pt` with U and all of
- * `perm`. With `fault`, a page not mapped yet is first offered to
- * mm_fault(): uvm_range_ok(); without, the range as it is now. */
+ * `perm`, in RAM (pte_in_ram). With `fault`, a page not mapped yet is first
+ * offered to mm_fault(): uvm_range_ok(); without, the range as it is now. */
 static bool range_mapped(pagetable_t pt, uintptr va, usize len, u32 perm, bool fault) {
     if (len == 0) {
         return true;
@@ -855,7 +863,7 @@ static bool range_mapped(pagetable_t pt, uintptr va, usize len, u32 perm, bool f
         if (fault && (pte == NULL || (*pte & PTE_V) == 0) && mm_fault(pt, a, perm)) {
             pte = walk(pt, a, false);
         }
-        if (pte == NULL || (*pte & want) != want) {
+        if (pte == NULL || (*pte & want) != want || !pte_in_ram(*pte)) {
             return false;
         }
     }
