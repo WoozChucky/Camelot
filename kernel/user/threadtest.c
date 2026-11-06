@@ -46,7 +46,7 @@
 
 /* Thread slots, for every process together (NTHREAD in
  * kernel/include/proc.h). */
-#define NTHREAD 16
+#define NTHREAD 64
 #define STACK_SIZE 1024
 #define PAGE 4096
 /* Where the heap may grow to (USER_LOAD_TOP in kernel/include/vm.h). */

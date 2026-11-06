@@ -165,8 +165,10 @@ static long sys_run(struct trap_frame *f, bool replace) {
 }
 
 /* procs(buf, max): all of `buf`, `max` entries, must be writable, however
- * many are filled in. The table is built on the kernel stack (NPROC
- * entries, 256 bytes) and copied out. */
+ * many are filled in. The table is built in a page of its own (NPROC
+ * entries of 40 bytes, too many for the kernel stack) and copied out. */
+_Static_assert(NPROC * sizeof(struct procinfo) <= PGSIZE, "procs' table fits a page");
+
 static long sys_procs(struct trap_frame *f) {
     pagetable_t pt = myproc()->pagetable;
     uintptr buf = arg(f, 0);
@@ -174,14 +176,16 @@ static long sys_procs(struct trap_frame *f) {
     if (max > USER_TOP / sizeof(struct procinfo) || !uvm_range_ok(pt, buf, max * sizeof(struct procinfo), PTE_W)) {
         return -EFAULT;
     }
-    struct procinfo info[NPROC];
+    struct procinfo *info = kalloc();
+    if (info == NULL) {
+        return -ENOMEM;
+    }
     int n = proc_list(info, max < NPROC ? (int)max : NPROC);
     u32 filled = (u32)n < max ? (u32)n : max;
     /* Checked above, but another thread may have unmapped it since. */
-    if (copyout(pt, buf, info, filled * sizeof(struct procinfo)) != 0) {
-        return -EFAULT;
-    }
-    return n;
+    long r = copyout(pt, buf, info, filled * sizeof(struct procinfo)) != 0 ? -EFAULT : n;
+    kfree(info);
+    return r;
 }
 
 /* harts(buf, max): as procs, with NCPU entries of 16 bytes. */

@@ -51,9 +51,9 @@
 #include "user.h"
 
 /* Process slots (NPROC in kernel/include/proc.h). */
-#define NPROC 8
+#define NPROC 32
 /* Descriptors per process (NOFILE in kernel/include/file.h). */
-#define NOFILE 32
+#define NOFILE 64
 /* A pipe's buffer (PIPESIZE in kernel/include/pipe.h). */
 #define PIPESIZE 512
 /* The console's device number (CONSOLE in kernel/include/file.h). */
@@ -601,11 +601,13 @@ static void test_spawn_and_wait(void) {
     check_eq(wait(-1, NULL), a, "wait for any, no status");
     check_eq(wait(-1, &status), -ECHILD, "none left");
 
-    /* Fill every process slot: the shell, this and six children. */
+    /* Fill every process slot: the shell, this and NPROC - 2 children,
+     * small ones (sleep, not systest: thirty copies of this would run out
+     * of memory first), asleep until they are all there. */
     int pids[NPROC];
     int n = 0;
     for (;;) {
-        int p = spawn("/bin/systest", (char *[]){"systest", "sleep", "2", NULL}, environ);
+        int p = spawn("/bin/sleep", (char *[]){"sleep", "3", NULL}, environ);
         if (p < 0) {
             check_eq(p, -EAGAIN, "spawn with every slot taken");
             break;

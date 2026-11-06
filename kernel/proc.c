@@ -77,6 +77,11 @@
 
 static struct proc procs[NPROC];
 static struct thread threads[NTHREAD];
+/* The end of the slots ever used: every one from here on is unused. The
+ * loops that run on every tick (pick_next, wakeup_locked) stop there, so
+ * that a machine running a few threads pays for those, not for NTHREAD.
+ * It only grows, under proc_lock. */
+static struct thread *threads_top = threads;
 
 /* Both tables, the pids, the first process's status, and every switch
  * between a thread and a scheduler. */
@@ -94,7 +99,7 @@ static u32 next_pid = INIT_PID + 1;
  * ran last (NULL: slot 0). A pointer rather than an index, like the loops
  * that run on every tick (pick_next, wakeup_locked): merlin's unoptimized
  * code would multiply and divide on every step of an indexed one, and
- * with 16 slots that shows on a tick's cost. */
+ * with many slots that shows on a tick's cost. */
 static struct thread *next_thread;
 
 /* The first process (proc_run_init), the program it runs, the one it falls
@@ -364,6 +369,9 @@ static struct thread *thread_alloc(struct proc *p, int *err) {
         *err = -EAGAIN;
         return NULL;
     }
+    if (t >= threads_top) {
+        threads_top = t + 1;
+    }
     memset(t, 0, sizeof *t);
     t->state = THREAD_NEW;
     t->proc = p;
@@ -554,7 +562,7 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
     if (parent != NULL) {
         acquire(&parent->files_lock);
         for (u32 fd = 0; fd <= FD_STDERR; fd++) {
-            if (parent->ofile[fd] != NULL && (parent->cloexec & (1u << fd)) == 0) {
+            if (parent->ofile[fd] != NULL && (parent->cloexec & (1ul << fd)) == 0) {
                 p->ofile[fd] = filedup(parent->ofile[fd]);
             }
         }
@@ -787,9 +795,9 @@ bool proc_run_init(const char *path, const char *name, const char *fallback_path
 /* The next runnable thread after the last one that ran, or NULL. Called
  * with proc_lock held. */
 static struct thread *pick_next(void) {
-    struct thread *end = &threads[NTHREAD];
-    struct thread *t = next_thread == NULL ? threads : next_thread;
-    for (u32 i = 0; i < NTHREAD; i++) {
+    struct thread *end = threads_top;
+    struct thread *t = next_thread == NULL || next_thread >= end ? threads : next_thread;
+    for (struct thread *n = threads; n != end; n++) {
         if (t->state == THREAD_RUNNABLE) {
             next_thread = t + 1 == end ? threads : t + 1;
             return t;
@@ -987,7 +995,7 @@ static bool poll_has(const struct poll_table *pt, const void *chan) {
  * them again (poll_sleep). */
 static void wakeup_locked(const void *chan) {
     u32 woken = 0;
-    struct thread *end = &threads[NTHREAD];
+    struct thread *end = threads_top;
     for (struct thread *t = threads; t != end; t++) {
         if (t->state == THREAD_SLEEPING && t->chan == chan) {
             t->state = THREAD_RUNNABLE;
@@ -1635,7 +1643,7 @@ int fd_install_from(struct file *f, u32 lowest, bool cloexec) {
             p->ofile[fd] = f;
             /* The bit of a free descriptor is clear (fd_take()). */
             if (cloexec) {
-                p->cloexec |= 1u << fd;
+                p->cloexec |= 1ul << fd;
             }
             r = (int)fd;
             break;
@@ -1653,7 +1661,7 @@ int fd_flags(u32 fd) {
     acquire(&p->files_lock);
     int r = -EBADF;
     if (p->ofile[fd] != NULL) {
-        r = (p->cloexec & (1u << fd)) != 0 ? FD_CLOEXEC : 0;
+        r = (p->cloexec & (1ul << fd)) != 0 ? FD_CLOEXEC : 0;
     }
     release(&p->files_lock);
     return r;
@@ -1668,9 +1676,9 @@ int fd_set_flags(u32 fd, u32 flags) {
     int r = -EBADF;
     if (p->ofile[fd] != NULL) {
         if ((flags & FD_CLOEXEC) != 0) {
-            p->cloexec |= 1u << fd;
+            p->cloexec |= 1ul << fd;
         } else {
-            p->cloexec &= ~(1u << fd);
+            p->cloexec &= ~(1ul << fd);
         }
         r = 0;
     }
@@ -1683,10 +1691,10 @@ void fd_close_on_exec(void) {
     for (u32 fd = 0; fd < NOFILE; fd++) {
         struct file *f = NULL;
         acquire(&p->files_lock);
-        if ((p->cloexec & (1u << fd)) != 0) {
+        if ((p->cloexec & (1ul << fd)) != 0) {
             f = p->ofile[fd];
             p->ofile[fd] = NULL;
-            p->cloexec &= ~(1u << fd);
+            p->cloexec &= ~(1ul << fd);
         }
         release(&p->files_lock);
         /* Not under the spinlock: closing may free an inode, which sleeps. */
@@ -1736,7 +1744,7 @@ struct file *fd_take(u32 fd) {
     acquire(&p->files_lock);
     struct file *f = p->ofile[fd];
     p->ofile[fd] = NULL;
-    p->cloexec &= ~(1u << fd);
+    p->cloexec &= ~(1ul << fd);
     release(&p->files_lock);
     return f;
 }
@@ -1750,7 +1758,7 @@ bool fd_take_if(u32 fd, struct file *f) {
     bool took = p->ofile[fd] == f;
     if (took) {
         p->ofile[fd] = NULL;
-        p->cloexec &= ~(1u << fd);
+        p->cloexec &= ~(1ul << fd);
     }
     release(&p->files_lock);
     return took;

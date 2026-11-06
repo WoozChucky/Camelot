@@ -219,8 +219,10 @@ uintptr ioremap(phys_addr_t p, usize size);
 #define KSTACK_SIZE (_UL(1) << KSTACK_SHIFT)
 #define KSTACK_SLOT (2 * KSTACK_SIZE)
 /* Where the stacks are: KSTACK_SLOTS slots at the start of the vmalloc
- * area (2 MiB; the slot below the first is not the kernel's, and unmapped). */
-#define KSTACK_SLOTS 64
+ * area (4 MiB; the slot below the first is not the kernel's, and unmapped):
+ * one for every thread (NTHREAD), every hart's scheduler and the stacks
+ * the harts keep cached, with room to spare. */
+#define KSTACK_SLOTS 128
 #define KSTACK_AREA VMALLOC_START
 /* How many freed stacks each hart keeps mapped for its next kstack_alloc()
  * (Linux's NR_CACHED_STACKS). */

@@ -289,9 +289,9 @@ envp are `-EFAULT`. Errors:
   `MAXARG`);
 - `-ENOEXEC`: the file is not a valid executable (the kernel also prints why
   on the console: `spawn: PATH: REASON`);
-- `-EAGAIN`: every one of the 8 process slots is taken (zombies count until
+- `-EAGAIN`: every one of the 32 process slots is taken (zombies count until
   they are collected; init, on a root image, holds one), or every one of
-  the 16 thread slots;
+  the 64 thread slots;
 - `-ENOMEM`: not enough free memory;
 - `-EFAULT`: `path`, `argv`, `envp` or one of their strings is not
   readable (a path longer than `MAXPATH` is still read to its NUL).
@@ -383,8 +383,8 @@ format's largest file is one block more (docs/camelot-fs.md, "Inodes"), and
 no filesystem holds anything near it.
 
 Errors: the path's (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`), those above,
-`-ENOSPC` (no free inode or block to make the file with), `-EMFILE` (all 16
-of the caller's descriptors are taken), `-ENFILE` (all 64 of the kernel's
+`-ENOSPC` (no free inode or block to make the file with), `-EMFILE` (all 64
+of the caller's descriptors are taken), `-ENFILE` (all 256 of the kernel's
 open files are), `-EFAULT`. Without a free descriptor and open file nothing
 is made. Making the file is one transaction: a crash leaves it done or
 not. Emptying it takes as many as freeing its blocks does, after the file
@@ -489,7 +489,7 @@ starts without it, and `close` clears it with the descriptor. `cmd` is:
 Errors: `-EBADF` if `fd` is not open, checked before `cmd` (so an unknown
 `cmd` on a closed descriptor is `-EBADF`, as on Linux); `-EINVAL` for
 another `cmd`, for an `arg` of `F_DUPFD` or `F_DUPFD_CLOEXEC` that is
-not a descriptor, 0 to 31 (Linux's answer for one at or past
+not a descriptor, 0 to 63 (Linux's answer for one at or past
 `RLIMIT_NOFILE`), for the seals' commands on anything but a shared-memory
 object, and for a seal Camelot hasn't; `-EMFILE` when no descriptor from
 `arg` up is free; `-EPERM` to add seals to an object sealed with
@@ -897,7 +897,7 @@ several of them at once on a machine of several harts
 (`docs/excalibur-spec.md` section 10, "Kernel threads"). A thread has an
 id, its tid, from the same count as the pids, so no thread has the pid of
 another process as its id; the main thread's tid is the process's pid.
-There are 16 thread slots for all processes together, each process's
+There are 64 thread slots for all processes together, each process's
 main thread included.
 
 **thread_create(entry, arg, stack)** starts a thread in the caller's
@@ -1127,7 +1127,7 @@ Linux). A process that is handed an object sealed with `F_SEAL_SHRINK` knows
 that its pages stay: the display server takes a window's buffers only from
 one ("The display server" in the spec's section 10).
 Errors: `-EFAULT` for a bad `name`, `-EINVAL` for a longer one or another
-flag, `-EMFILE`, `-ENFILE` (no open file left, or none of the kernel's 32
+flag, `-EMFILE`, `-ENFILE` (no open file left, or none of the kernel's 64
 objects).
 
 **ftruncate(fd, length)** sets the size of the shared-memory object `fd`

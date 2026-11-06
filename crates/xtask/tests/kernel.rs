@@ -120,7 +120,7 @@ const KSTACK_SIZE: u64 = 16 * 1024;
 /// UART's, the keyboard's, the pointer's and the display's vertical blank.
 const BOOT_IRQS: u64 = 1 << UART_IRQ | 1 << KBD_IRQ | 1 << PTR_IRQ | 1 << FB_IRQ;
 const KSTACK_SLOT: u64 = 2 * KSTACK_SIZE;
-const KSTACK_SLOTS: u64 = 64;
+const KSTACK_SLOTS: u64 = 128;
 
 /// What the kernel prints before its kstack self-test: the boot up to the
 /// tenth tick, with `xcal.dbg`'s pc masked (`kernel::mask_dbg_pc`), for the

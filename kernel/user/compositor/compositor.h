@@ -21,7 +21,7 @@
 #include "../gui/protocol.h"
 
 /* Descriptors a process has (NOFILE in kernel/include/file.h). */
-#define NOFILE 32
+#define NOFILE 64
 /* Clients at once: each is a process, and a machine has 8 (NPROC), of
  * which the desktop's services take 4 (init, the server, the console's
  * shell and shd). */

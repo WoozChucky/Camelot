@@ -35,8 +35,8 @@
  * 1. */
 #include "user.h"
 
-/* Services at most: a process slot each, of the 8 (NPROC,
- * docs/camelot-syscalls.md) that init's own leaves. */
+/* Services at most: a process slot each (of the 32, NPROC,
+ * docs/camelot-syscalls.md), leaving the rest for what they start. */
 #define MAX_SERVICES 7
 /* Arguments a service has at most, its program's name included. */
 #define MAX_ARGS 8

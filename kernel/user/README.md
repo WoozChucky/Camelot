@@ -168,7 +168,7 @@ host, `herald --tcp 127.0.0.1:2323` gives a shell, once per window.
   to a client that is gone, or after a minute in which nothing moved.
 - **At most MAX sessions** (`-n`, 4 by default): one more is told
   `shd: too many sessions (MAX), try again later` and closed. Every program
-  a session runs takes one of the kernel's 8 process slots too.
+  a session runs takes one of the kernel's 32 process slots too.
 - **Security: for local use only.** There are no users yet (issue #115),
   so every shell runs as whoever started shd, root, with no password asked.
   Forward its port from the host's loopback only (127.0.0.1, as `up --demo`
