@@ -920,7 +920,9 @@ int readi(struct inode *ip, void *dst, u64 off, u32 n) {
         }
         struct buf *b = fs_bread(ip->dev, addr);
         u32 m = MIN(n - done, BSIZE - at);
-        memmove(d, b->data + at, m);
+        /* The caller's buffer is never the cache's: memcpy (which hands
+         * differently aligned offsets to memmove's shifting copy). */
+        memcpy(d, b->data + at, m);
         brelse(b);
         done += m;
         d += m;
@@ -965,7 +967,7 @@ int writei(struct inode *ip, const void *src, u64 off, u32 n) {
         }
         struct buf *b = fs_bread(ip->dev, addr);
         u32 m = MIN(n - done, BSIZE - at);
-        memmove(b->data + at, s, m);
+        memcpy(b->data + at, s, m);
         log_write(b);
         brelse(b);
         done += m;
