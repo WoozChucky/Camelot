@@ -429,17 +429,17 @@ fn booting_drops_into_the_user_shell() {
 
 #[test]
 fn a_program_starts_as_linux_starts_one() {
-    // The first instruction in U-mode is the shell's entry point, crt0's
+    // The first instruction in U-mode is init's entry point, crt0's
     // _start, as pid 1, with Linux's start (docs/camelot-syscalls.md,
     // "Starting a program"): every register zero but sp, which points at
-    // argc, a long, then argv { "sh", NULL }, envp (Linux's environment for
+    // argc, a long, then argv { "init", NULL }, envp (Linux's environment for
     // init, HOME=/ and TERM=linux) and the auxiliary vector, 8 bytes each,
     // under USER_TOP, which depends on the paging mode; the strings, argv's
-    // then envp's, then the path, "/bin/sh", above. Interrupts on, SUM off.
+    // then envp's, then the path, "/bin/init", above. Interrupts on, SUM off.
     // The programs it runs get the same: systest checks its own start, its
     // environment's strings among them, and its children's after a spawn
     // and an exec (the_system_calls_do_what_the_document_says).
-    let sh = user_program("sh");
+    let init = user_program("init");
     for (paging, top) in [
         (grail::Paging::Sv48, 1u64 << 47),
         (grail::Paging::Sv39, 1u64 << 38),
@@ -455,10 +455,17 @@ fn a_program_starts_as_linux_starts_one() {
         step_until(&mut m, MAX_STEPS, |_| {}, |m| m.cpu.mode == Mode::U);
         assert_eq!(m.cpu.pc, USER_TEXT, "{paging:?}");
         let cpus = sym(&elf, "cpus");
-        assert_eq!(current_name(&m.cpu, cpus).as_deref(), Some("sh"));
+        assert_eq!(current_name(&m.cpu, cpus).as_deref(), Some("init"));
         let p = peek64(&m.cpu, cpus + CPU_PROC);
         assert_eq!(common::peek(&m.cpu, p + PROC_PID), 1);
-        common::start::check(&m, top, &sh.elf, "/bin/sh", &["sh"], common::start::INIT_ENV);
+        common::start::check(
+            &m,
+            top,
+            &init.elf,
+            "/bin/init",
+            &["init"],
+            common::start::INIT_ENV,
+        );
         assert_ne!(m.cpu.csr.mstatus & MSTATUS_SIE, 0);
         assert_eq!(m.cpu.csr.mstatus & excalibur::csr::MSTATUS_SUM, 0);
     }
@@ -558,7 +565,8 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
     // Issue #20's first criterion, watched from the hart: two processes in
     // U-mode, each in its own page table, and the CPU only moves between
     // them when a timer tick (or an exit) traps from U-mode. The shell runs
-    // too: it starts ding in the background and waits for dong.
+    // too: it starts ding in the background and waits for dong. (Init runs
+    // first, and execs the shell: there is no /etc/rc.)
     let (mut m, elf) = load_committed(Some(kernel::typed(b"ding & dong\nwait\nexit\n")));
     let (user_vec, cpus) = (sym(&elf, "user_vec"), sym(&elf, "cpus"));
     // The process of each stretch in U-mode, and the last trap from it:
@@ -570,13 +578,13 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
     let r = m.run(Some(RUN_MAX_STEPS), |cpu| {
         if cpu.mode == Mode::U {
             let name = current_name(cpu, cpus).unwrap();
-            if name != "sh" {
+            if name != "sh" && name != "init" {
                 user_steps += 1;
             }
             assert!((USER_TEXT..USER_TOP).contains(&cpu.pc), "U-mode at {:#x}", cpu.pc);
             if stretches.last().map(|s| &s.0) != Some(&name) {
                 if let Some((prev, _)) = stretches.last() {
-                    if prev != "sh" {
+                    if prev != "sh" && prev != "init" {
                         // ding and dong never wait for anything: they leave
                         // the CPU when a tick preempts them, or for good.
                         match last_trap {
@@ -606,7 +614,7 @@ fn ding_and_dong_take_turns_on_timer_ticks() {
         }
     });
     assert_eq!(r, RunResult::Exited(0));
-    let mut satps: Vec<(String, u64)> = stretches.clone();
+    let mut satps: Vec<(String, u64)> = stretches.iter().filter(|s| s.0 != "init").cloned().collect();
     satps.sort();
     satps.dedup();
     let names: Vec<&str> = satps.iter().map(|s| s.0.as_str()).collect();

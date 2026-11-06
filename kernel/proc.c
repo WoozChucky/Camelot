@@ -97,12 +97,18 @@ static u32 next_pid = INIT_PID + 1;
  * with 16 slots that shows on a tick's cost. */
 static struct thread *next_thread;
 
-/* The first process (proc_run_init), the program it runs, and its exit
- * status once it ended. */
+/* The first process (proc_run_init), the program it runs, the one it falls
+ * back on, and its exit status once it ended. */
 static struct proc *init_proc;
 static const char *init_path;
 static const char *init_name;
+static const char *init_fallback_path;
+static const char *init_fallback_name;
 static int init_status;
+/* Whether the first process collects orphans: while it runs the program it
+ * was started with (init), as Linux's init does. Once it runs the fallback
+ * (the shell) or execs another program, orphans are freed as they end. */
+static bool init_reaps;
 
 void proc_init(void) {
     initlock(&proc_lock, "proc");
@@ -637,6 +643,9 @@ int proc_exec_commit(struct exec_image *img, const char *name) {
     if (alone) {
         set_name(p, name);
         p->exiting = false;
+        if (p == init_proc) {
+            init_reaps = false; /* init_start sets it again for init itself */
+        }
     }
     release(&proc_lock);
     if (!alone) {
@@ -703,9 +712,23 @@ static void init_start(void) {
     if (fs_mounted) {
         p->cwd = iget(fs_dev, ROOTINO);
     }
-    int err = exec_init(init_path, init_name);
+    const char *path = init_path;
+    int err = exec_init(path, init_name);
+    if (err < 0 && init_fallback_path != NULL) {
+        /* As Linux's kernel_init tries init, then sh: a missing init is no
+         * error, one that is there and won't start is said. */
+        if (err != -ENOENT) {
+            kprintf("cannot start %s: error %d\n", path, -err);
+        }
+        path = init_fallback_path;
+        err = exec_init(path, init_fallback_name);
+    } else if (err == 0) {
+        acquire(&proc_lock);
+        init_reaps = true;
+        release(&proc_lock);
+    }
     if (err < 0) {
-        kprintf("cannot start %s: error %d\n", init_path, -err);
+        kprintf("cannot start %s: error %d\n", path, -err);
         if (user_program_count == 0) {
             /* The disk kernel (kernel/kernel-disk.elf) has no programs of its
              * own to fall back on, like Linux without an initramfs: without
@@ -723,7 +746,8 @@ static void init_start(void) {
     user_trap_return(mythread()->frame);
 }
 
-bool proc_run_init(const char *path, const char *name, int *status) {
+bool proc_run_init(const char *path, const char *name, const char *fallback_path, const char *fallback_name,
+                   int *status) {
     int err;
     struct thread *t;
     struct proc *p = proc_alloc(&t, &err);
@@ -740,7 +764,10 @@ bool proc_run_init(const char *path, const char *name, int *status) {
     acquire(&proc_lock);
     init_path = path;
     init_name = name;
+    init_fallback_path = fallback_path;
+    init_fallback_name = fallback_name;
     init_proc = p;
+    init_reaps = false;
     release(&proc_lock);
     proc_ready(p, t, name, NULL);
     scheduler();
@@ -1073,6 +1100,15 @@ void proc_exit(int status) {
         if (child->state == PROC_UNUSED || child->parent != p) {
             continue;
         }
+        /* Init adopts it, as on Linux, and collects it with wait(); a
+         * zombie wakes it. */
+        if (init_reaps && init_proc != NULL && p != init_proc) {
+            child->parent = init_proc;
+            if (child->state == PROC_ZOMBIE) {
+                wakeup_locked(init_proc);
+            }
+            continue;
+        }
         /* No one will wait for it now. A zombie can go at once (none of its
          * threads runs, and its page table is in no hart's satp); the
          * scheduler frees the others when they end. */
@@ -1118,8 +1154,8 @@ int proc_kill_pid(int pid) {
         if (p->state == PROC_UNUSED || p->state == PROC_NEW || p->pid != (u32)pid) {
             continue;
         }
-        /* Neither the kernel's own processes nor the first one, the shell,
-         * whose end is Camelot's. */
+        /* Neither the kernel's own processes nor the first one, init (or
+         * the shell), whose end is Camelot's. */
         if (p->kfn != NULL || p == init_proc) {
             r = -EPERM;
             break;
