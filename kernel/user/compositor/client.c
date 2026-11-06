@@ -313,10 +313,12 @@ int client_input(struct client *c) {
         return 0;
     }
     if (n == 0 || n == -ECONNRESET || n == -EPIPE) {
+        gui_wire_release(&c->wire);
         return -1; /* hung up */
     }
     if (n < 0) {
         post_error(c, 1, WL_DISPLAY_ERROR_INVALID_METHOD, "descriptors that can't be matched to messages");
+        gui_wire_release(&c->wire);
         return -1;
     }
     struct gui_message m;

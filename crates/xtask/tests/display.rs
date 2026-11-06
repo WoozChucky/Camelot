@@ -445,6 +445,19 @@ fn a_move_needs_the_press_the_client_was_given() {
     assert!(green.contains(&"pointer 152 252"), "{out}");
     // Let go of outside it, the pointer leaves it then.
     assert_eq!(green[green.len() - 2..], ["button 272 0", "leave"], "{out}");
+
+    // A client with the press is moved for that press's serial, and not
+    // for the one before it.
+    d.run("wltest stale &");
+    d.wait_for("wltest stale: committed\n");
+    d.wait_idle();
+    d.pointer(140, 130, 0);
+    d.pointer(140, 130, BUTTON_RIGHT);
+    let asked = d.wait_for("wltest stale: asked with the serial before\n");
+    assert!(!asked.contains("compositor: moving"), "{}", d.out());
+    d.wait_for("compositor: moving \"stale\"\n");
+    d.pointer(140, 130, 0);
+    d.wait_for("wltest stale: released\n");
 }
 
 #[test]

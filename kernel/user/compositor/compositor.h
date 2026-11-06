@@ -28,8 +28,8 @@
 #define MAX_CLIENTS 4
 /* The pools a client has at once (a window's is one), and the descriptors
  * it may send ahead of the messages that take them. */
-#define MAX_POOLS 4
-#define MAX_QUEUED_FDS 1
+#define MAX_POOLS 3
+#define MAX_QUEUED_FDS 2
 /* The server's own descriptors: the keymap's (0), standard output and
  * error, the listening socket, the framebuffer, the keyboard, the
  * pointer. With each client's socket, pools and descriptors sent ahead,

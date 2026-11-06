@@ -1664,7 +1664,7 @@ Each descriptor is read when it is ready, and each message is acted on in order.
     - `wl_pointer.set_cursor`: the server draws its own arrow.
   - **Not supported.** `xdg_surface.get_popup` is an error (`wl_display`'s `implementation`). A window gets one configure, at its first commit: size 0 by 0 (the client chooses) and no states. It must acknowledge it before it attaches a buffer.
 - **Clients.**
-  - **Limits.** At most 4 clients at once (a machine has 8 processes, and the desktop's services take 4: init, the server, the console's shell and `shd`), each with up to 256 objects, 4 pools and 1 descriptor sent ahead of the message that takes it. These share out the server's 32 descriptors (`NOFILE`): 7 of its own, and a socket, the pools and the descriptor sent ahead for each client, which leaves one free, so the server never runs out of them (a `_Static_assert` checks the sum). `SO_PEERCRED` gives each client's pid.
+  - **Limits.** At most 4 clients at once (a machine has 8 processes, and the desktop's services take 4: init, the server, the console's shell and `shd`), each with up to 256 objects, 3 pools and 2 descriptors sent ahead of the messages that take them. These share out the server's 32 descriptors (`NOFILE`): 7 of its own, and a socket, the pools and the descriptor sent ahead for each client, which leaves one free, so the server never runs out of them (a `_Static_assert` checks the sum). `SO_PEERCRED` gives each client's pid.
   - **Checks.** Nothing from a client is trusted. A message is read whole and checked against the tables before it is acted on:
     - its object is one of the client's;
     - its opcode is one of the interface's, at the version the object was made with;
@@ -1693,7 +1693,7 @@ Each descriptor is read when it is ready, and each message is acted on in order.
   - **Focus.** A click raises the window under the pointer and makes it the active one. The keyboard follows the active window: `wl_keyboard.enter` carries the keys held, and the active window then gets the keys and the modifiers (`wl_keyboard.modifiers`, the GUI library's bits). The keymap is `NO_KEYMAP` (an empty memfd), and repeats are not sent: a client repeats keys itself.
   - **The pointer.** The pointer's events go to the surface under it, in its coordinates (fixed-point): enter, leave, motion, buttons and the wheel (`axis`, 10 a notch). A button held keeps them on that surface until it is let go. Events the device dropped (`SYN_DROPPED`) let go of the buttons and keys it says are up (`EVIOCGKEY`).
   - **Moves.** A window is dragged by its title bar or border, or by `xdg_toplevel.move` (a client that draws its own title bar) naming the serial of the press its surface got, while that button is held and nothing else is being moved; any other `move` does nothing, as on Weston. Its title bar is kept on the screen, and the client sees nothing of the drag.
-  - **Closing.** The close button sends `xdg_toplevel.close`. If the window is still shown 3 seconds later, its client is killed and disconnected; one hidden by then (a commit without a buffer) is closed, and shown again it is asked again.
+  - **Closing.** The close button sends `xdg_toplevel.close`. If the window is still shown 3 seconds later, its client is killed and disconnected; one hidden by then (a commit without a buffer) is taken as closed, and shown again it is asked to close only by another click.
   - **Keys the server keeps.**
     - Alt+Tab raises the lowest window and makes it active. The Tab key never reaches a client; Alt does, as a modifier.
     - The logo key starts the launcher, `-l`'s program, through `compositor -x PROGRAM`, a second process that starts it and ends. The launcher is then init's child, collected by init when it ends, and the server has no child to wait for.
@@ -1702,7 +1702,7 @@ Each descriptor is read when it is ready, and each message is acted on in order.
 
 - On 4 harts, two clients' windows are composited, raised by a click, cycled by Alt+Tab, moved by their title bar and by the client's own `move`, closed by the button and, for one that won't close (`wltest window -n`), killed. The test checks which client got each key and pointer event.
 - Every way `wltest bad KIND` breaks the protocol gets its error and the hang-up, and a well-behaved client after them gets its window: an unknown object or opcode, a size, a new id in use, a string without its NUL, an object of the wrong interface, bytes left over, a descriptor that didn't come, descriptors no request takes, a pool bigger than its memfd, one whose memfd isn't sealed, more pools than a client may have, a buffer past its pool. Then four clients have their windows at once, and a fifth is refused.
-- A client that asks for a move every frame (`wltest window -m`) is never moved, not even while a button is held on another window, whose client goes on getting the pointer.
+- A client that asks for a move every frame (`wltest window -m`) is never moved, not even while a button is held on another window, whose client goes on getting the pointer; and one that has the press (`wltest stale`) is moved only for that press's serial, not the one before.
 - A window that flashes between two colours every frame is sampled four times a frame and is always one colour or the other, never torn.
 
 ## 11. Roadmap

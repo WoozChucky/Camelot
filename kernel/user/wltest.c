@@ -16,6 +16,11 @@
  *       not, as a client shouldn't (the server must ignore it).
  *   wltest probe
  *       the server's globals, "wltest: global NAME INTERFACE VERSION".
+ *   wltest stale
+ *       a window made over the wire itself, which a press of the right
+ *       button asks to move with the serial before the press's, then with
+ *       the press's ("wltest stale: committed", "asked with the serial
+ *       before", "released").
  *   wltest bad KIND
  *       breaks the protocol, one way a KIND, on a connection of its own
  *       (not the GUI library's, which never would), and says what the
@@ -191,6 +196,8 @@ static struct gui_wire wire;
 /* The globals' names, by interface: 0 if the server hasn't it. */
 static uint compositor_name;
 static uint shm_name;
+static uint wm_base_name;
+static uint seat_name;
 
 static int raw_connect(void) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -244,6 +251,10 @@ static int events(uint stop, int print) {
                     compositor_name = global;
                 } else if (strcmp(iface, "wl_shm") == 0) {
                     shm_name = global;
+                } else if (strcmp(iface, "xdg_wm_base") == 0) {
+                    wm_base_name = global;
+                } else if (strcmp(iface, "wl_seat") == 0) {
+                    seat_name = global;
                 }
             } else if (stop != 0 && m.object == stop && m.opcode == WL_CALLBACK_DONE) {
                 return 0;
@@ -362,10 +373,11 @@ static int bad(const char *kind) {
         gui_wire_int(&wire, 4096);
         gui_wire_end(&wire);
     } else if (strcmp(kind, "fds") == 0) {
-        /* wl_display.sync with two descriptors, which it doesn't take */
+        /* wl_display.sync with three descriptors, which it doesn't take */
         int fd = memfd_create("wltest", 0);
         gui_wire_begin(&wire, WL_DISPLAY_ID, WL_DISPLAY_SYNC);
         gui_wire_uint(&wire, 4);
+        gui_wire_fd(&wire, fd);
         gui_wire_fd(&wire, fd);
         gui_wire_fd(&wire, fd);
         gui_wire_end(&wire);
@@ -401,17 +413,115 @@ static int bad(const char *kind) {
     return events(0, 0) == 1 ? 0 : 1;
 }
 
+/* stale: a window of its own making, 64 by 48, titled "stale". A press of
+ * the right button on it asks for a move with the serial before the
+ * press's, which the server must refuse, then (after a roundtrip, so that
+ * the server has acted on the first) with the press's own, which starts
+ * the move; it ends when the button is let go. */
+static void stale_send(uint object, uint opcode, const uint *words, int n) {
+    gui_wire_begin(&wire, object, opcode);
+    for (int i = 0; i < n; i++) {
+        gui_wire_uint(&wire, words[i]);
+    }
+    gui_wire_end(&wire);
+}
+
+static int stale(void) {
+    if (raw_connect() < 0 || registry(0) != 0) {
+        return 1;
+    }
+    /* wl_shm 4, its pool 5 and buffer 9; wl_compositor 6, xdg_wm_base 7,
+     * wl_seat 8, the surface 10, its xdg_surface 11 and toplevel 12, the
+     * pointer 13; sync callbacks from 20. */
+    bind_global(shm_name, "wl_shm", 1, 4);
+    make_pool(5, 64 * 48 * 4, 64 * 48 * 4, 1);
+    uint buffer[6] = {9, 0, 64, 48, 256, WL_SHM_FORMAT_XRGB8888};
+    stale_send(5, WL_SHM_POOL_CREATE_BUFFER, buffer, 6);
+    bind_global(compositor_name, "wl_compositor", 1, 6);
+    bind_global(wm_base_name, "xdg_wm_base", 1, 7);
+    bind_global(seat_name, "wl_seat", 1, 8);
+    send1(6, WL_COMPOSITOR_CREATE_SURFACE, 10);
+    uint xdg[2] = {11, 10};
+    stale_send(7, XDG_WM_BASE_GET_XDG_SURFACE, xdg, 2);
+    send1(11, XDG_SURFACE_GET_TOPLEVEL, 12);
+    gui_wire_begin(&wire, 12, XDG_TOPLEVEL_SET_TITLE);
+    gui_wire_string(&wire, "stale");
+    gui_wire_end(&wire);
+    send0(10, WL_SURFACE_COMMIT);
+    send1(8, WL_SEAT_GET_POINTER, 13);
+    gui_wire_flush(&wire);
+    uint sync = 20;
+    uint waiting = 0; /* the sync after the stale move */
+    uint press = 0;
+    for (;;) {
+        struct gui_message m;
+        int r;
+        while ((r = gui_wire_next(&wire, &m)) == 1) {
+            if (m.object == WL_DISPLAY_ID && m.opcode == WL_DISPLAY_ERROR) {
+                uint object = gui_msg_uint(&m);
+                uint code = gui_msg_uint(&m);
+                const char *msg = gui_msg_string(&m);
+                printf("wltest: error %u %u: %s\n", object, code, msg != NULL ? msg : "");
+            } else if (m.object == 11 && m.opcode == XDG_SURFACE_CONFIGURE) {
+                send1(11, XDG_SURFACE_ACK_CONFIGURE, gui_msg_uint(&m));
+                uint attach[3] = {9, 0, 0};
+                stale_send(10, WL_SURFACE_ATTACH, attach, 3);
+                uint all[4] = {0, 0, 64, 48};
+                stale_send(10, WL_SURFACE_DAMAGE, all, 4);
+                send0(10, WL_SURFACE_COMMIT);
+                gui_wire_flush(&wire);
+                printf("wltest stale: committed\n");
+            } else if (m.object == 13 && m.opcode == WL_POINTER_BUTTON) {
+                uint serial = gui_msg_uint(&m);
+                gui_msg_uint(&m);
+                uint button = gui_msg_uint(&m);
+                uint state = gui_msg_uint(&m);
+                if (button != BTN_RIGHT) {
+                    continue;
+                }
+                if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
+                    printf("wltest stale: released\n");
+                    return 0;
+                }
+                press = serial;
+                uint move[2] = {8, serial - 1};
+                stale_send(12, XDG_TOPLEVEL_MOVE, move, 2);
+                waiting = ++sync;
+                send1(WL_DISPLAY_ID, WL_DISPLAY_SYNC, waiting);
+                gui_wire_flush(&wire);
+            } else if (waiting != 0 && m.object == waiting && m.opcode == WL_CALLBACK_DONE) {
+                waiting = 0;
+                printf("wltest stale: asked with the serial before\n");
+                uint move[2] = {8, press};
+                stale_send(12, XDG_TOPLEVEL_MOVE, move, 2);
+                gui_wire_flush(&wire);
+            }
+        }
+        if (r < 0) {
+            printf("wltest: a message that can't be read\n");
+            return 1;
+        }
+        r = gui_wire_read(&wire, 0);
+        if (r <= 0) {
+            printf("wltest: disconnected\n");
+            return 1;
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     int r = 2;
     if (argc >= 2 && strcmp(argv[1], "window") == 0) {
         r = window(argc - 2, argv + 2);
     } else if (argc == 2 && strcmp(argv[1], "probe") == 0) {
         r = probe();
+    } else if (argc == 2 && strcmp(argv[1], "stale") == 0) {
+        r = stale();
     } else if (argc == 3 && strcmp(argv[1], "bad") == 0) {
         r = bad(argv[2]);
     }
     if (r == 2) {
-        fprintf(2, "usage: wltest window [-n] [-f] [-m] NAME RRGGBB WIDTH HEIGHT | probe | bad KIND\n");
+        fprintf(2, "usage: wltest window [-n] [-f] [-m] NAME RRGGBB WIDTH HEIGHT | probe | stale | bad KIND\n");
     }
     return r;
 }
