@@ -60,7 +60,7 @@ pub const PROFILES_DIR: &str = "kernel/profiles";
 /// The programs of `kernel/user` only the desktop image has: the server
 /// image leaves them out of `/bin`. The desktop's programs join it as they
 /// come (#183-#185).
-pub const DESKTOP_PROGRAMS: &[&str] = &["guidemo", "guitest"];
+pub const DESKTOP_PROGRAMS: &[&str] = &["compositor", "guidemo", "guitest", "wltest"];
 /// Where the desktop image puts the fonts, as Linux distributions do.
 pub const FONTS: &str = "/usr/share/fonts";
 /// Where it puts the images the GUI library reads (QOI files).
@@ -145,6 +145,9 @@ pub const DESKTOP_OUT: &str = "target/camelot-desktop.img";
 pub const BIN: &str = "/bin";
 /// The device nodes' directory.
 pub const DEV: &str = "/dev";
+/// The directory of the sockets services listen on, Linux's `/run`: the
+/// display server's `/run/wayland-0`.
+pub const RUN: &str = "/run";
 /// The console's device number (`CONSOLE` in kernel/include/file.h).
 pub const CONSOLE_MAJOR: u16 = 1;
 /// The framebuffer's device number (`FB` in kernel/include/file.h).
@@ -298,6 +301,7 @@ fn build_image(
     for n in 0..NPTY {
         fs.add_device(&format!("{DEV}/pts/{n}"), PTS_MAJOR, n)?;
     }
+    fs.mkdir(RUN)?;
     fs.mkdir(BIN)?;
     let user = userprogs::user_dir(root);
     let rt = userprogs::build_runtime(&user, cc)?;
