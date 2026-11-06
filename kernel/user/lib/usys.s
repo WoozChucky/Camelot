@@ -64,6 +64,7 @@
     .equ SYS_sendmsg, 56
     .equ SYS_recvmsg, 57
     .equ SYS_stat, 58
+    .equ SYS_getcwd, 59
 
     .text
 
@@ -474,6 +475,13 @@ recvmsg:
     .globl stat
 stat:
     li    a7, SYS_stat
+    ecall
+    ret
+
+# long getcwd(char *buf, size_t size)
+    .globl getcwd
+getcwd:
+    li    a7, SYS_getcwd
     ecall
     ret
 

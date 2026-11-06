@@ -1151,6 +1151,77 @@ static bool is_dot(const char *name) {
     return namecmp(name, ".") == 0 || namecmp(name, "..") == 0;
 }
 
+int fs_getcwd(char *buf, u32 size) {
+    /* Linux's prepend_path builds the path from its end: each directory's
+     * name, then a `/` before it, from the working directory up to the
+     * root. Linux knows each directory's name and parent from its dentry;
+     * Camelot has no dentry cache, so a directory's parent is its `..`, and
+     * its name the parent's entry for its inode. */
+    u32 at = size - 1;
+    buf[at] = 0;
+    struct inode *ip = proc_cwd();
+    if (ip == NULL) {
+        ip = iget(fs_dev, ROOTINO);
+    }
+    for (;;) {
+        ilock(ip);
+        /* Removed (Linux's d_unlinked): it has no path any more. Only the
+         * working directory itself can be, as a directory with something
+         * in it can't be removed. */
+        if (ip->nlink == 0) {
+            iunlockput(ip);
+            return -ENOENT;
+        }
+        if (ip->inum == ROOTINO) {
+            iunlockput(ip);
+            break;
+        }
+        u32 inum = ip->inum;
+        struct inode *parent = dirlookup(ip, "..", NULL);
+        /* Unlocked before the parent is locked, as namex() goes from a
+         * directory to its `..`: never two directories' locks at once. */
+        iunlockput(ip);
+        if (parent == NULL) {
+            return -ENOENT;
+        }
+        ilock(parent);
+        struct dirent de;
+        bool found = false;
+        for (u32 off = 0; off < parent->size; off += sizeof de) {
+            if (readi(parent, &de, off, sizeof de) != sizeof de) {
+                panic("fs_getcwd: short read");
+            }
+            if (de.inum == inum && !is_dot(de.name)) {
+                found = true;
+                break;
+            }
+        }
+        iunlock(parent);
+        if (!found) {
+            iput(parent);
+            return -ENOENT;
+        }
+        /* A name of DIRSIZ bytes has no NUL. */
+        u32 n = 0;
+        while (n < DIRSIZ && de.name[n] != 0) {
+            n++;
+        }
+        if (at < n + 1) {
+            iput(parent);
+            return -ENAMETOOLONG;
+        }
+        at -= n;
+        memmove(buf + at, de.name, n);
+        buf[--at] = '/';
+        ip = parent;
+    }
+    /* The root alone is `/`. */
+    if (at == size - 1) {
+        buf[--at] = '/';
+    }
+    return (int)at;
+}
+
 struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *err) {
     if (fs_readonly) {
         *err = -EROFS;

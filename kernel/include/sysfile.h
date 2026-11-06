@@ -15,6 +15,7 @@ long sys_close(struct trap_frame *f);
 long sys_lseek(struct trap_frame *f);
 long sys_fstat(struct trap_frame *f);
 long sys_stat(struct trap_frame *f);
+long sys_getcwd(struct trap_frame *f);
 long sys_mkdir(struct trap_frame *f);
 long sys_unlink(struct trap_frame *f);
 long sys_link(struct trap_frame *f);

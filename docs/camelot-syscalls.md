@@ -170,6 +170,7 @@ headers and checks each size.
 | 56 | `sendmsg` | `int fd, const struct msghdr *msg, int flags` | bytes sent; `send`'s and `sendto`'s errors, `-EMSGSIZE`, `-EINVAL`, `-EBADF` (a descriptor passed), `-EOPNOTSUPP`, `-EAGAIN`, `-ENOBUFS`, `-EFAULT` |
 | 57 | `recvmsg` | `int fd, struct msghdr *msg, int flags` | bytes received, 0 at the end; `recv`'s errors, `-EMSGSIZE`, `-EOPNOTSUPP`, `-ENOBUFS`, `-EFAULT` |
 | 58 | `stat` | `const char *path, struct stat *st` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EFAULT` |
+| 59 | `getcwd` | `char *buf, size_t size` | the path's length, its NUL counted; `-ERANGE`, `-ENOENT`, `-ENAMETOOLONG`, `-ENOMEM`, `-EFAULT` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -420,6 +421,22 @@ is a directory (a directory has one name, in its parent), `-EEXIST` if
 **chdir(path)** makes the directory `path` the caller's working directory,
 where every path that doesn't start with `/` is looked up from. `-ENOTDIR`
 if it is not a directory; the path's errors; `-EFAULT`.
+
+**getcwd(buf, size)** is Linux's `getcwd` system call: it writes the
+caller's working directory's path, from the root (`/` for the root itself,
+`/ft/d` for `d` in `/ft`), with its NUL, to `buf`, and returns its length,
+the NUL counted. The C library's `getcwd` is the call itself, returning the
+length or the error, where glibc's wraps it to return `buf` and set
+`errno`. The path is built as Linux builds it, from the directory up, each
+directory's name before its parent's: a directory's parent is its `..` and
+its name the parent's entry for it, as Camelot keeps no names of its own
+for directories (Linux's dentries). It may be longer than `MAXPATH`, as
+`chdir`s of relative paths may go deeper than any path a call takes, up to
+a page (4096 bytes, Linux's limit; `-ENAMETOOLONG` past it). `-ERANGE` if
+`size` bytes don't hold it (a `size` of 0 too), `-ENOENT` if the working
+directory has been removed (the path it had names nothing now), `-ENOMEM`
+if the kernel has no page to build it in, `-EFAULT` if `buf` can't take it.
+Without a root filesystem it is `/`.
 
 **dup(fd)** returns a new descriptor, the lowest one free, for the open file
 behind `fd`: both share it, offset included, and it stays open until both
@@ -1347,6 +1364,7 @@ Linux's values for the same conditions.
 | 29 | `ESPIPE` | lseek: a pipe or a device |
 | 30 | `EROFS` | the filesystem is read-only |
 | 32 | `EPIPE` | write: a pipe nobody reads any more |
+| 34 | `ERANGE` | getcwd: the buffer is too small for the path |
 | 36 | `ENAMETOOLONG` | a name longer than 14 bytes, or a path longer than `MAXPATH` |
 | 38 | `ENOSYS` | no such system call |
 | 39 | `ENOTEMPTY` | unlink: a directory with entries |

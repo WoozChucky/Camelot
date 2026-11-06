@@ -442,70 +442,27 @@ static int translate(struct input *in, const char *output, struct options *opts)
     return status;
 }
 
-/* The current directory's path, found as Unix found it before getcwd was a
- * system call (Camelot has none): from `.` up, each directory's name is the
- * entry of its parent (`..`) with its inode, until the root, which is its
- * own parent. NULL if a step fails (a directory removed while in use, say),
- * which merlin's std::env::current_dir reports as an error too. */
+/* The directory cc1 runs in, as merlin's std::env::current_dir finds it:
+ * the getcwd system call, with a buffer that grows until the path fits (a
+ * page is the kernel's limit). NULL if it fails (the directory removed,
+ * say), which merlin reports as an error too. For the whole run: plain
+ * malloc, not the arena, which each translation unit frees. */
 static char *current_dir(void) {
-    /* The names from the current directory up, and the path of the
-     * directory being looked at: ".", "..", "../..", ... */
-    struct vec names;
-    memset(&names, 0, sizeof names);
-    char *here = ".";
-    char *result = NULL;
-    for (;;) {
-        struct stat st;
-        struct stat up;
-        char *parent = strcmp(here, ".") == 0 ? ".." : fmt("%s/..", here);
-        if (stat(here, &st) < 0 || stat(parent, &up) < 0) {
+    for (uint size = 256; size <= 4096; size *= 2) {
+        char *buf = malloc(size);
+        if (buf == NULL) {
+            die("out of memory");
+        }
+        long n = getcwd(buf, size);
+        if (n > 0) {
+            return buf;
+        }
+        free(buf);
+        if (n != -ERANGE) {
             break;
         }
-        if (st.ino == up.ino) {
-            /* The root: the names, outermost first, each after a `/`. */
-            struct buf path;
-            memset(&path, 0, sizeof path);
-            for (uint i = names.n; i > 0; i--) {
-                buf_byte(&path, '/');
-                buf_str(&path, names.v[i - 1]);
-            }
-            if (path.len == 0) {
-                buf_byte(&path, '/');
-            }
-            result = buf_arena(&path);
-            buf_free(&path);
-            break;
-        }
-        int fd = open(parent, O_RDONLY);
-        if (fd < 0) {
-            break;
-        }
-        struct dirent de;
-        char *name = NULL;
-        while (read(fd, &de, sizeof de) == sizeof de) {
-            if (de.inum != st.ino) {
-                continue;
-            }
-            /* A name of DIRSIZ bytes has no NUL. */
-            uint n = 0;
-            while (n < DIRSIZ && de.name[n] != 0) {
-                n++;
-            }
-            if ((n == 1 && de.name[0] == '.') || (n == 2 && de.name[0] == '.' && de.name[1] == '.')) {
-                continue;
-            }
-            name = arena_strndup(de.name, n);
-            break;
-        }
-        close(fd);
-        if (name == NULL) {
-            break;
-        }
-        vec_push(&names, name);
-        here = parent;
     }
-    heap_free(names.v);
-    return result;
+    return NULL;
 }
 
 /* The value of an option written `-I dir` or `-Idir` (the same for -D, -U,
@@ -646,18 +603,7 @@ int main(int argc, char **argv) {
     if (debug) {
         if (comp_dir == NULL) {
             char *cwd = current_dir();
-            comp_dir = ".";
-            if (cwd != NULL) {
-                /* For the whole run: not in the arena, which each
-                 * translation unit frees. */
-                uint n = (uint)strlen(cwd);
-                char *kept = malloc(n + 1);
-                if (kept == NULL) {
-                    die("out of memory");
-                }
-                memcpy(kept, cwd, n + 1);
-                comp_dir = kept;
-            }
+            comp_dir = cwd != NULL ? cwd : ".";
         }
         opts.checksums = 1;
     } else {
