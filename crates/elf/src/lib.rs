@@ -11,17 +11,19 @@
 //!
 //! Shared by Grail (loads executables), merlin-objdump (prints everything),
 //! merlin-ld (reads `.o` files and archives) and merlin-dbg. It reads ELF
-//! files only: merlin-as and merlin-ld write their own output. [`archive`]
+//! files, and writes no executable: merlin-as and merlin-ld write theirs. [`archive`]
 //! reads `ar` archives and writes them too, as `cargo xtask fs` writes the
-//! root image's `libc.a`. Every offset taken from the file is bounds
-//! checked, so a truncated or corrupt file gives an [`Error`], never a
-//! panic.
+//! root image's `libc.a`, and [`strip`] writes an object without its debug
+//! information, as `llvm-strip -g` does. Every offset taken from the file
+//! is bounds checked, so a truncated or corrupt file gives an [`Error`],
+//! never a panic.
 
 use std::fmt;
 
 pub mod archive;
 pub mod dies;
 pub mod lines;
+pub mod strip;
 pub mod units;
 
 // e_type
