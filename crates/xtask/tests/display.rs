@@ -76,6 +76,8 @@ struct Desk {
     tx: Sender<u8>,
     /// Where in the console's output the next wait starts looking.
     seen: usize,
+    /// How long the console's output was at the last input.
+    input: usize,
 }
 
 impl Desk {
@@ -93,7 +95,7 @@ impl Desk {
         m.load_elf(&elf).unwrap();
         let (tx, rx) = channel();
         m.set_uart_input(rx);
-        let mut d = Desk { m, tx, seen: 0 };
+        let mut d = Desk { m, tx, seen: 0, input: 0 };
         d.wait_for("$ ");
         d
     }
@@ -141,6 +143,7 @@ impl Desk {
         } else {
             KeyEvent::key_release(usage)
         };
+        self.input = self.m.cpu.bus.uart.captured.len();
         assert!(self.m.key_event(ev));
         self.settle(2);
     }
@@ -150,10 +153,12 @@ impl Desk {
         self.key(usage, false);
     }
 
+    /// The pointer at x, y with `buttons` held (no event if neither
+    /// changed).
     fn pointer(&mut self, x: i32, y: i32, buttons: u8) {
-        assert!(self
-            .m
-            .pointer_event(PointerInput::move_to(x, y).with_buttons(buttons)));
+        self.input = self.m.cpu.bus.uart.captured.len();
+        self.m
+            .pointer_event(PointerInput::move_to(x, y).with_buttons(buttons));
         self.settle(2);
     }
 
@@ -161,6 +166,32 @@ impl Desk {
         self.pointer(x, y, 0);
         self.pointer(x, y, BUTTON_LEFT);
         self.pointer(x, y, 0);
+    }
+
+    /// Steps until the server has drawn everything it was given: with -v it
+    /// says "compositor: idle" once its last frame is on the screen and
+    /// nothing is left to draw. The line counts if it comes after the last
+    /// input and nothing more of the server's follows it (a line of its
+    /// says it acted on something, which it may draw next).
+    fn wait_idle(&mut self) {
+        const IDLE: &[u8] = b"compositor: idle\n";
+        let mut steps = 0;
+        loop {
+            let captured = &self.m.cpu.bus.uart.captured;
+            let idle = (self.input..captured.len().saturating_sub(IDLE.len() - 1))
+                .rev()
+                .find(|&at| captured[at..].starts_with(IDLE));
+            if let Some(at) = idle {
+                if find(&captured[at + IDLE.len()..], b"compositor: ").is_none() {
+                    return;
+                }
+            }
+            assert!(steps < WAIT_MAX, "the server is never idle:\n{}", self.out());
+            for _ in 0..10_000 {
+                self.m.cpu.step();
+            }
+            steps += 10_000;
+        }
     }
 
     /// The screen as RGB bytes, and its size.
@@ -176,7 +207,7 @@ impl Desk {
 
     /// The screen is `tests/display/NAME.png`.
     fn expect_screen(&mut self, name: &str) {
-        self.settle(4);
+        self.wait_idle();
         let (w, h, rgb) = self.screen();
         let got = png::encode(w, h, &rgb);
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/display");
@@ -220,16 +251,201 @@ fn said<'a>(out: &'a str, who: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// The server started, ready for clients.
+fn start_server(d: &mut Desk, args: &str) {
+    d.run(&format!("compositor -v{args} &"));
+    d.wait_for("compositor: ready on /run/wayland-0 (640x480)\n");
+}
+
 #[test]
 fn windows_are_composited_raised_moved_and_closed() {
+    // Two clients on a machine of four harts: each window drawn where it
+    // was placed, its title bar and close button the server's, the last
+    // one on top with the keyboard (its title bar blue).
     let mut d = Desk::boot(4);
-    d.run("compositor -v &");
-    d.wait_for("compositor: ready on /run/wayland-0 (640x480)\n");
+    start_server(&mut d, "");
     d.run("wltest window red ff0000 160 100 &");
     d.wait_for("wltest red: shown\n");
     d.run("wltest window green 00c000 160 100 &");
     d.wait_for("wltest green: shown\n");
     d.expect_screen("two-windows");
-    let _ = (KEY_A, KEY_ESCAPE, KEY_TAB, KEY_LEFT_ALT, KEY_LEFT_GUI, BUTTON_RIGHT);
-    let _ = said("", "");
+
+    // The keyboard goes to the window on top.
+    let from = d.seen;
+    d.tap(KEY_A);
+    d.wait_for("wltest green: key 30 0\n");
+    assert_eq!(said(&d.out()[from..], "green"), ["key 30 1", "key 30 0"]);
+    assert_eq!(said(&d.out()[from..], "red"), Vec::<&str>::new());
+
+    // The pointer goes to the surface under it, in its coordinates; a
+    // click raises the window under it and gives it the keyboard, and is
+    // the client's.
+    let from = d.seen;
+    d.pointer(60, 100, 0);
+    d.click(60, 100);
+    d.wait_for("wltest red: button 272 0\n");
+    let out = d.out();
+    assert_eq!(
+        said(&out[from..], "red"),
+        ["pointer 12 52", "focus 1", "modifiers 0 0", "button 272 1", "button 272 0"]
+    );
+    assert_eq!(said(&out[from..], "green"), ["focus 0"]);
+    d.expect_screen("raised");
+    let from = d.seen;
+    d.tap(KEY_A);
+    d.wait_for("wltest red: key 30 0\n");
+    assert_eq!(said(&d.out()[from..], "green"), Vec::<&str>::new());
+
+    // Alt+Tab raises the lowest window and gives it the keyboard; Tab
+    // never reaches a client, Alt does, as a modifier (Mod1, 8).
+    let from = d.seen;
+    d.key(KEY_LEFT_ALT, true);
+    d.tap(KEY_TAB);
+    d.key(KEY_LEFT_ALT, false);
+    d.wait_for("wltest green: modifiers 0 0\n");
+    let out = d.out();
+    assert_eq!(
+        said(&out[from..], "red"),
+        ["key 56 1", "modifiers 8 0", "focus 0"]
+    );
+    assert_eq!(
+        said(&out[from..], "green"),
+        ["focus 1", "modifiers 8 0", "key 56 0", "modifiers 0 0"]
+    );
+
+    // A window dragged by its title bar follows the pointer; the client
+    // sees the pointer leave and nothing of the drag.
+    let from = d.seen;
+    d.pointer(150, 70, 0);
+    d.pointer(150, 70, BUTTON_LEFT);
+    d.wait_for("compositor: moving \"green\"\n");
+    d.pointer(220, 150, BUTTON_LEFT);
+    d.pointer(300, 250, BUTTON_LEFT);
+    d.pointer(300, 250, 0);
+    d.expect_screen("moved");
+    let out = d.out();
+    assert_eq!(said(&out[from..], "red"), ["leave"]);
+    assert_eq!(said(&out[from..], "green"), Vec::<&str>::new());
+
+    // The close button asks the client to close its window, which it does.
+    d.click(380, 250);
+    d.wait_for("wltest green: close\n");
+    d.wait_for(") gone\n");
+    d.expect_screen("closed");
+
+    // A client that won't close its window is killed.
+    d.run("wltest window -n blue 0000ff 120 80 &");
+    d.wait_for("wltest blue: shown\n");
+    d.click(222, 102);
+    d.wait_for("wltest blue: close\n");
+    d.wait_for("didn't close its window: killed\n");
+    d.expect_screen("killed");
+
+    // The right button on a window's content asks the server to move it
+    // (xdg_toplevel.move), as a client's own title bar does.
+    d.pointer(100, 100, 0);
+    d.pointer(100, 100, BUTTON_RIGHT);
+    d.wait_for("compositor: moving \"red\"\n");
+    d.pointer(400, 300, BUTTON_RIGHT);
+    d.pointer(400, 300, 0);
+    d.wait_for("wltest red: button 273 0\n");
+    d.expect_screen("client-moved");
+
+    // Escape ends the last client: the background alone.
+    d.tap(KEY_ESCAPE);
+    d.wait_for(") gone\n");
+    d.expect_screen("empty");
+}
+
+#[test]
+fn a_client_that_breaks_the_protocol_is_disconnected() {
+    // Each way of breaking the protocol gets wl_display.error, naming what
+    // was wrong, and the hang-up; the server goes on, and a well-behaved
+    // client after them gets its window.
+    let mut d = Desk::boot(2);
+    start_server(&mut d, "");
+    d.run("wltest probe");
+    let out = d.wait_for("$ ");
+    let globals: Vec<&str> = out.lines().filter(|l| l.starts_with("wltest:")).collect();
+    assert_eq!(
+        globals,
+        [
+            "wltest: global 1 wl_compositor 4",
+            "wltest: global 2 wl_shm 1",
+            "wltest: global 3 wl_seat 1",
+            "wltest: global 4 wl_output 2",
+            "wltest: global 5 xdg_wm_base 1",
+        ]
+    );
+    for (kind, error) in [
+        ("object", "1 0: invalid object 99"),
+        ("opcode", "1 1: invalid method 7 of wl_display@1"),
+        ("size", "1 1: a message of a size that can't be"),
+        ("newid", "1 0: wl_display.get_registry: invalid new id 2"),
+        ("string", "1 1: wl_registry.bind: argument 2 can't be read"),
+        ("type", "1 0: wl_surface.attach: invalid object 2"),
+        ("trailing", "1 1: wl_display.sync: 4 bytes past its arguments"),
+        ("fd", "1 1: wl_shm.create_pool: argument 2 can't be read"),
+        ("pool", "4 2: can't map the pool's memory"),
+        ("buffer", "5 1: the buffer is past the pool's end"),
+    ] {
+        d.run(&format!("wltest bad {kind}"));
+        let out = d.wait_for("$ ");
+        let said: Vec<&str> = out.lines().filter(|l| l.starts_with("wltest:")).collect();
+        assert_eq!(
+            said,
+            [format!("wltest: error {error}").as_str(), "wltest: disconnected"],
+            "{kind}:\n{out}"
+        );
+    }
+    d.run("wltest window fine 808080 100 60 &");
+    d.wait_for("wltest fine: shown\n");
+}
+
+#[test]
+fn frames_flip_at_the_vertical_blank_whole() {
+    // A client that draws a new colour every frame, as fast as the frame
+    // callbacks come: they come once a vertical blank at most, and the
+    // screen only ever shows whole frames, one colour or the other, never
+    // the old one's rows below the new one's.
+    let mut d = Desk::boot(4);
+    start_server(&mut d, " -l /bin/guidemo");
+    d.run("wltest window -f flash ff0000 64 48 &");
+    d.wait_for("wltest flash: frame 16\n");
+    let mut steps = 0u64;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut changes = 0;
+    let mut last = 0;
+    while find(&d.m.cpu.bus.uart.captured[d.seen..], b"wltest flash: frame 48\n").is_none() {
+        for _ in 0..FRAME / 4 {
+            d.m.cpu.step();
+        }
+        steps += FRAME / 4;
+        assert!(steps < 4000 * FRAME, "{}", d.out());
+        let (w, _, rgb) = d.screen();
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 3) as usize;
+            u32::from_be_bytes([0, rgb[i], rgb[i + 1], rgb[i + 2]])
+        };
+        let colour = at(48, 48);
+        for y in 48..48 + 48 {
+            for x in [48, 79, 111] {
+                assert_eq!(at(x, y), colour, "a torn frame at {x}, {y}");
+            }
+        }
+        seen.insert(colour);
+        if colour != last {
+            changes += 1;
+            last = colour;
+        }
+    }
+    d.wait_for("wltest flash: frame 48\n");
+    assert_eq!(seen.into_iter().collect::<Vec<_>>(), [0x00ffff, 0xff0000]);
+    // 32 frames took 32 vertical blanks at least.
+    assert!(steps >= 31 * FRAME, "{steps} steps for 32 frames");
+    assert!(changes > 4, "{changes} changes seen");
+
+    // The logo key starts the launcher, the GUI library's demo here.
+    d.tap(KEY_LEFT_GUI);
+    d.wait_for("compositor: focus \"Camelot\"\n");
 }

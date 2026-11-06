@@ -176,6 +176,7 @@ struct server {
     struct gui_damage damage; /* changed since the last frame drawn */
     struct gui_damage prev;   /* what the last frame drew, which the back frame lacks */
     int repaint;
+    int busy; /* something happened since the server was last idle */
     struct gui_font font;
     int have_font;
     struct gui_buffer cursor;

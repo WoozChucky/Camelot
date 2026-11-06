@@ -259,6 +259,9 @@ void window_move_start(struct window *w) {
     srv.moving = w;
     srv.move_dx = srv.px - w->x;
     srv.move_dy = srv.py - w->y;
+    if (srv.verbose) {
+        printf("compositor: moving \"%s\"\n", w->title);
+    }
 }
 
 static void window_close(struct window *w) {

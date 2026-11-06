@@ -6,7 +6,8 @@
  * takes the display and the input devices and serves Wayland clients at
  * SOCKET (/run/wayland-0) until it is killed. -l names the program the
  * logo key starts (the desktop's /etc/rc gives one); -v says what the
- * clients do (connections, focus). It prints "compositor: ready" once
+ * clients do (connections, focus) and when everything is drawn
+ * ("compositor: idle"). It prints "compositor: ready" once
  * clients can connect. With no framebuffer, or another display server at
  * SOCKET, it exits with EX_CONFIG (78), which init takes as a service this
  * machine can't run.
@@ -201,6 +202,7 @@ int main(int argc, char **argv) {
             if (r == 0) {
                 continue;
             }
+            srv.busy = 1;
             if (who[i] == -1) {
                 accept_client();
             } else if (who[i] == -2) {
@@ -228,6 +230,14 @@ int main(int argc, char **argv) {
         }
         if (srv.repaint && !srv.flip_pending) {
             repaint();
+        } else if (srv.busy && !srv.repaint && !srv.flip_pending) {
+            /* Everything that came is acted on and what it changed is on
+             * the screen: -v says so, which is how a test knows the
+             * screen is final. */
+            srv.busy = 0;
+            if (srv.verbose) {
+                printf("compositor: idle\n");
+            }
         }
     }
 }
