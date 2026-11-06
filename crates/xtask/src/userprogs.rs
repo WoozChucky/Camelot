@@ -72,8 +72,23 @@ pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
 /// over 200 KB, `ld` not much less, nearly half together of what the
 /// smallest machine, 3 MiB, has left once the kernel and the programs it
 /// embeds, a little over 2 MiB, are loaded. `ar` makes and reads archives
-/// for them, files too.
-pub const DISK_ONLY: &[&str] = &["ar", "as", "ld"];
+/// for them, files too, and `cc1`, the C compiler, is bigger than both.
+pub const DISK_ONLY: &[&str] = &["ar", "as", "cc1", "ld"];
+
+/// Programs of several files whose name is not their directory's: (the
+/// directory, the program). `kernel/user/cc` is `/bin/cc1`, the compiler
+/// proper (merlin rewritten in C, #241), as clang's `-cc1` and GCC's `cc1`
+/// are, which the `cc` driver runs (#242).
+pub const RENAMED: &[(&str, &str)] = &[("cc", "cc1")];
+
+/// The name of the program whose source's stem is `stem`: the stem itself,
+/// but for a directory of [`RENAMED`].
+pub fn program_name(stem: &str) -> &str {
+    RENAMED
+        .iter()
+        .find(|(dir, _)| *dir == stem)
+        .map_or(stem, |(_, name)| name)
+}
 
 /// The programs the kernel builds in: all but [`DISK_ONLY`], by name.
 pub fn embedded(programs: &[Program]) -> Vec<&Program> {
@@ -151,6 +166,11 @@ impl Source {
             Lang::AsmCpp => format!("{}.S", self.stem),
             Lang::Dir => format!("{}/", self.stem),
         }
+    }
+
+    /// The name of the program it is, as `/bin` has it ([`program_name`]).
+    pub fn name(&self) -> &str {
+        program_name(&self.stem)
     }
 
     /// The files a program is built from: itself, or, for a [`Lang::Dir`]
@@ -293,21 +313,21 @@ pub fn programs(dir: &Path) -> Result<Vec<Source>, String> {
         }
     }
     for s in &progs {
-        if !valid_name(&s.stem) {
+        if !valid_name(s.name()) {
             return Err(format!(
                 "{}: a program name is 1 to {MAX_NAME} of a-z, 0-9 and _",
                 dir.join(s.file()).display()
             ));
         }
     }
-    progs.sort_by(|a, b| a.stem.cmp(&b.stem));
-    if let Some(w) = progs.windows(2).find(|w| w[0].stem == w[1].stem) {
+    progs.sort_by(|a, b| a.name().cmp(b.name()));
+    if let Some(w) = progs.windows(2).find(|w| w[0].name() == w[1].name()) {
         return Err(format!(
             "{}: both {} and {} define program {}",
             dir.display(),
             w[0].file(),
             w[1].file(),
-            w[0].stem
+            w[0].name()
         ));
     }
     if progs.is_empty() {
@@ -318,7 +338,7 @@ pub fn programs(dir: &Path) -> Result<Vec<Source>, String> {
 
 /// The programs' names in `dir`, in order.
 pub fn program_names(dir: &Path) -> Result<Vec<String>, String> {
-    Ok(programs(dir)?.into_iter().map(|s| s.stem).collect())
+    Ok(programs(dir)?.into_iter().map(|s| s.name().to_string()).collect())
 }
 
 /// The assembly for `src` (in `dir`): the file itself, a `.S` file as merlin
@@ -516,7 +536,7 @@ pub fn link_program(dir: &Path, prog: &Source, cc: CCompiler, rt: &Runtime) -> R
     // otherwise keep).
     let installed = toolchain::link_with(dir, SCRIPT, &rt.installed().link_inputs(own), &prog.stem, clang)?;
     Ok(Program {
-        name: prog.stem.clone(),
+        name: prog.name().to_string(),
         elf: merlin_ld::strip_debug(&installed).map_err(|e| format!("{}: {e}", prog.stem))?,
         debug,
     })
@@ -560,7 +580,7 @@ pub fn build_program(dir: &Path, prog: &Source) -> Result<Program, String> {
 pub fn build_named(dir: &Path, name: &str) -> Result<Program, String> {
     let prog = programs(dir)?
         .into_iter()
-        .find(|s| s.stem == name)
+        .find(|s| s.name() == name)
         .ok_or_else(|| format!("no program called {name} in {}", dir.display()))?;
     build_program(dir, &prog)
 }
@@ -582,7 +602,7 @@ pub fn build_all_with(dir: &Path, cc: CCompiler) -> Result<Vec<Program>, String>
 pub fn embedded_sources(dir: &Path) -> Result<Vec<Source>, String> {
     Ok(programs(dir)?
         .into_iter()
-        .filter(|p| !DISK_ONLY.contains(&p.stem.as_str()))
+        .filter(|p| !DISK_ONLY.contains(&p.name()))
         .collect())
 }
 

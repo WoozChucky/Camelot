@@ -166,8 +166,9 @@ const UNSUPPORTED_KEYWORDS: &[&str] = &["double", "float", "_Complex", "_Imagina
 
 /// Punctuators, longest first so `<<=` wins over `<<` and `<`, `->` over `-`
 /// (`a->b` is never `a - > b`), `...` over `.` and `##` over `#`. `#` and
-/// `##` only mean something to the preprocessor.
-const PUNCTS: &[&str] = &[
+/// `##` only mean something to the preprocessor. (Public for the C
+/// compiler that runs on Camelot, whose tables are made from merlin's.)
+pub const PUNCTS: &[&str] = &[
     "...", "<<=", ">>=", "->", "==", "!=", "<=", ">=", "&&", "||", "++", "--", "+=", "-=", "*=", "/=", "%=",
     "&=", "|=", "^=", "<<", ">>", "##", "(", ")", "{", "}", "[", "]", ";", ",", "=", "+", "-", "*", "/", "%",
     "<", ">", "!", "~", "&", "|", "^", "?", ":", ".", "#",

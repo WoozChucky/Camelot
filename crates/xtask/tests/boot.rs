@@ -441,9 +441,9 @@ fn the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from() 
         let linked = merlin_ld::link_files(&files, &opts).unwrap();
         let stripped = merlin_ld::strip_debug(&linked.elf).unwrap();
         assert!(
-            stripped == read(&format!("/bin/{}", prog.stem)),
+            stripped == read(&format!("/bin/{}", prog.name())),
             "/bin/{} is not the link of /usr/lib's files",
-            prog.stem
+            prog.name()
         );
     }
 }
