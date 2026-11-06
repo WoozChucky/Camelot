@@ -13,42 +13,87 @@ void die(const char *msg) {
 }
 
 /* ---- The arena ----
- * A bump allocator over chunks taken from sbrk: each allocation is the
- * next bytes of the current chunk, 8-aligned; a chunk that has no room
- * left is abandoned for a new one (malloc takes from sbrk too, so two
- * chunks need not be next to each other). Nothing is freed: the
- * compilation's end, the process's exit, frees it all, as compilers that
- * allocate per translation unit do. */
+ * A bump allocator: each allocation is the next bytes of the current chunk,
+ * 8-aligned, and a chunk with no room left for one is followed by a new
+ * chunk (what little is left of the old one, less than BIG bytes, stays
+ * unused). An allocation bigger than BIG gets a block of its own, which
+ * leaves the current chunk as it is. The chunks and blocks come from malloc
+ * (which takes its memory from sbrk) and are freed all together when the
+ * compilation ends (arena_free), as merlin's memory is when a translation
+ * unit is done: nothing in the arena is freed on its own. */
 
 #define CHUNK (256 * 1024)
+#define BIG (CHUNK / 4)
 
-static char *chunk;
-static uint chunk_used;
-static uint chunk_size;
-static uint arena_total;
+/* A chunk or a block of the arena: its header, then its bytes. */
+struct block {
+    struct block *next;
+    uint size;
+    uint used;
+};
+
+#define HEADER ((sizeof(struct block) + 7) & ~7u)
+
+/* The current chunk, the chunks before it after it in the list. */
+static struct block *chunks;
+/* The blocks of the big allocations. */
+static struct block *bigs;
+
+static struct block *new_block(uint size, struct block *next) {
+    if (size > 0xffffffffu - HEADER) {
+        die("out of memory");
+    }
+    struct block *b = malloc(HEADER + size);
+    if (b == NULL) {
+        die("out of memory");
+    }
+    b->next = next;
+    b->size = size;
+    b->used = 0;
+    return b;
+}
 
 void *arena_alloc(uint n) {
-    n = (n + 7) & ~7u;
-    if (chunk == NULL || chunk_size - chunk_used < n) {
-        uint size = n > CHUNK ? n : CHUNK;
-        char *got = sbrk((long)size + 8);
-        if ((long)got < 0) {
-            die("out of memory");
-        }
-        /* sbrk's memory may start anywhere: align it. */
-        chunk = (char *)(((uintptr_t)got + 7) & ~(uintptr_t)7);
-        chunk_used = 0;
-        chunk_size = size;
+    if (n > 0xffffffffu - 7) {
+        die("out of memory");
     }
-    void *r = chunk + chunk_used;
-    chunk_used += n;
-    arena_total += n;
+    n = (n + 7) & ~7u;
+    struct block *b;
+    if (n > BIG) {
+        bigs = new_block(n, bigs);
+        b = bigs;
+    } else {
+        if (chunks == NULL || chunks->size - chunks->used < n) {
+            chunks = new_block(CHUNK, chunks);
+        }
+        b = chunks;
+    }
+    void *r = (char *)b + HEADER + b->used;
+    b->used += n;
     memset(r, 0, n);
     return r;
 }
 
-uint arena_used(void) {
-    return arena_total;
+static void free_blocks(struct block *b) {
+    while (b != NULL) {
+        struct block *next = b->next;
+        free(b);
+        b = next;
+    }
+}
+
+/* The identifiers interned in the arena (see intern). */
+static struct map interned;
+
+void arena_free(void) {
+    free_blocks(chunks);
+    free_blocks(bigs);
+    chunks = NULL;
+    bigs = NULL;
+    /* The interned names were the arena's. */
+    free(interned.keys);
+    free(interned.values);
+    memset(&interned, 0, sizeof interned);
 }
 
 char *arena_strndup(const char *s, uint n) {
@@ -160,6 +205,10 @@ static void vformat(struct buf *b, const char *f, va_list ap) {
             put_decimal(b, wide ? va_arg(ap, uint64_t) : (uint64_t)va_arg(ap, uint));
         } else if (*f == 's') {
             buf_str(b, va_arg(ap, const char *));
+        } else if (*f == 'b') {
+            /* Bytes, which may hold a NUL: a pointer and a length. */
+            const char *s = va_arg(ap, const char *);
+            buf_put(b, s, va_arg(ap, uint));
         } else if (*f == 'c') {
             buf_byte(b, (uchar)va_arg(ap, int));
         } else {
@@ -183,6 +232,19 @@ char *fmt(const char *f, ...) {
     vformat(&b, f, ap);
     va_end(ap);
     char *r = buf_arena(&b);
+    buf_free(&b);
+    return r;
+}
+
+char *fmtn(uint *len, const char *f, ...) {
+    struct buf b;
+    memset(&b, 0, sizeof b);
+    va_list ap;
+    va_start(ap, f);
+    vformat(&b, f, ap);
+    va_end(ap);
+    char *r = buf_arena(&b);
+    *len = b.len;
     buf_free(&b);
     return r;
 }
@@ -275,9 +337,8 @@ int map_remove(struct map *m, const char *key) {
     return 1;
 }
 
-/* The interned identifiers: each text once, the map's value the string. */
-static struct map interned;
-
+/* The interned identifiers (`interned`, above): each text once, the map's
+ * value the string. */
 const char *intern(const char *s, uint len) {
     /* The key to look for must be NUL-terminated: copy short ones to the
      * stack. */
@@ -315,19 +376,6 @@ struct pos pos_at(uint file, uint line, uint col) {
 
 int pos_eq(struct pos a, struct pos b) {
     return a.file == b.file && a.line == b.line && a.col == b.col;
-}
-
-int pos_cmp(struct pos a, struct pos b) {
-    if (a.file != b.file) {
-        return a.file < b.file ? -1 : 1;
-    }
-    if (a.line != b.line) {
-        return a.line < b.line ? -1 : 1;
-    }
-    if (a.col != b.col) {
-        return a.col < b.col ? -1 : 1;
-    }
-    return 0;
 }
 
 /* ---- UTF-8 ---- */

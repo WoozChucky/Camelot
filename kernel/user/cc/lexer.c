@@ -575,10 +575,10 @@ static int digit_value(uint c, uint radix) {
     return v >= 0 && (uint)v < radix ? v : -1;
 }
 
-/* Whether the lower-cased text has c. */
-static int has_lower(const char *text, uint c) {
-    for (; *text; text++) {
-        if (lower((uchar)*text) == c) {
+/* Whether the lower-cased text (len bytes) has c. */
+static int has_lower(const char *text, uint len, uint c) {
+    for (uint i = 0; i < len; i++) {
+        if (lower((uchar)text[i]) == c) {
             return 1;
         }
     }
@@ -591,11 +591,10 @@ static int has_lower(const char *text, uint c) {
  * not right after the digits is `invalid digit '9' in octal constant` (`a`
  * to `f` in a decimal one too), at the digit; anything else after them is
  * `invalid suffix 'abc' on integer constant`, at the suffix. */
-struct diag *lex_integer(const char *text, struct pos pos, struct intlit *out) {
+struct diag *lex_integer(const char *text, uint len, struct pos pos, struct intlit *out) {
     memset(out, 0, sizeof *out);
-    uint len = (uint)strlen(text);
     int hex = len >= 2 && text[0] == '0' && lower((uchar)text[1]) == 'x';
-    if (has_lower(text, '.') || (!hex && has_lower(text, 'e')) || (hex && has_lower(text, 'p'))) {
+    if (has_lower(text, len, '.') || (!hex && has_lower(text, len, 'e')) || (hex && has_lower(text, len, 'p'))) {
         return diag_error(pos, "floating-point literals are not supported");
     }
     /* The leading `0` of an octal constant is one of its digits (`0` and
@@ -658,7 +657,7 @@ struct diag *lex_integer(const char *text, struct pos pos, struct intlit *out) {
     }
     if (lng == 3) {
         return diag_error(pos_at(pos.file, pos.line, pos.col + k),
-                          fmt("invalid suffix '%s' on integer constant", suffix));
+                          fmt("invalid suffix '%b' on integer constant", suffix, slen));
     }
     /* The digits are valid, so the only way to fail is to overflow. */
     uint64_t low64 = 0;
@@ -701,10 +700,11 @@ static int is_hex(uint c) {
  * the one it stops at returned. Characters outside ASCII come out as their
  * UTF-8 bytes; in a character constant (char_const) each is too large for
  * it. *units: how many characters it has, each escape one. */
-static struct diag *decode_units(const char *text, struct pos pos, struct diag **diags, int char_const,
-                                 struct buf *out, uint *units) {
+static struct diag *decode_units(const char *text, uint len, struct pos pos, struct diag **diags,
+                                 int char_const, struct buf *out, uint *units) {
     const uchar *body = (const uchar *)text + 1;
-    uint n = (uint)strlen(text) - 2;
+    /* Between the quotes (which the lexer made sure of). */
+    uint n = len >= 2 ? len - 2 : 0;
     uint k = 0;
     *units = 0;
     while (k < n) {
@@ -859,30 +859,31 @@ static struct diag *decode_units(const char *text, struct pos pos, struct diag *
             }
             continue;
         }
-        default:
-            /* clang: the character itself, and a warning. */
-            diag_append(diags, diag_warning(body_at(pos, start),
-                                            fmt("unknown escape sequence '\\%s'",
-                                                arena_strndup((const char *)body + start + 1, elen)),
-                                            "unknown-escape-sequence"));
+        default: {
+            /* clang: the character itself (a NUL too), and a warning. */
+            uint mlen;
+            const char *msg = fmtn(&mlen, "unknown escape sequence '\\%b'", (const char *)body + start + 1, elen);
+            diag_append(diags, diag_warning_n(body_at(pos, start), msg, mlen, "unknown-escape-sequence"));
             buf_put(out, body + start + 1, elen);
             continue;
+        }
         }
         buf_byte(out, byte);
     }
     return NULL;
 }
 
-struct diag *lex_decode(const char *text, struct pos pos, struct diag **diags, struct buf *out) {
+struct diag *lex_decode(const char *text, uint len, struct pos pos, struct diag **diags, struct buf *out) {
     uint units;
-    return decode_units(text, pos, diags, 0, out, &units);
+    return decode_units(text, len, pos, diags, 0, out, &units);
 }
 
 /* A character constant's value, an int (C99 6.4.4.4): its byte, or for
  * several (`'ab'`) the bytes as the digits of a number in base 256, as
  * clang computes it, keeping the low 32 bits, with clang's warning for each
  * (and one more past four characters, which do not all fit). */
-struct diag *lex_char_constant(const char *text, struct pos pos, struct diag **diags, int64_t *value) {
+struct diag *lex_char_constant(const char *text, uint len, struct pos pos, struct diag **diags,
+                               int64_t *value) {
     /* Where the diagnostics of this constant start. */
     struct diag **mine = diags;
     while (*mine != NULL) {
@@ -891,7 +892,7 @@ struct diag *lex_char_constant(const char *text, struct pos pos, struct diag **d
     struct buf bytes;
     memset(&bytes, 0, sizeof bytes);
     uint chars;
-    struct diag *err = decode_units(text, pos, diags, 1, &bytes, &chars);
+    struct diag *err = decode_units(text, len, pos, diags, 1, &bytes, &chars);
     if (err != NULL) {
         buf_free(&bytes);
         return err;

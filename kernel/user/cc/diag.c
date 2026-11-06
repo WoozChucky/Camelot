@@ -1,32 +1,47 @@
 /* cc1: diagnostics, as clang gives them and prints them (follows merlin's
- * Error, Severity and name_files, in lib.rs and preprocess.rs). */
+ * Error, Severity and name_files, in lib.rs and preprocess.rs). A message
+ * and a file's name are bytes with a length, as Rust's strings are: one
+ * that quotes the source may hold a NUL. */
 #include "cc.h"
 
-static struct diag *diag_new(struct pos pos, const char *msg, int severity, const char *flag) {
+static struct diag *diag_new(struct pos pos, const char *msg, uint len, int severity, const char *flag) {
     struct diag *d = arena_alloc(sizeof *d);
     d->pos = pos;
-    d->msg = (char *)msg;
+    d->msg = msg;
+    d->msglen = len;
     d->severity = severity;
     d->flag = flag;
     return d;
 }
 
 struct diag *diag_error(struct pos pos, const char *msg) {
-    return diag_new(pos, msg, SEV_ERROR, NULL);
+    return diag_new(pos, msg, (uint)strlen(msg), SEV_ERROR, NULL);
+}
+
+struct diag *diag_error_n(struct pos pos, const char *msg, uint len) {
+    return diag_new(pos, msg, len, SEV_ERROR, NULL);
 }
 
 struct diag *diag_warning(struct pos pos, const char *msg, const char *flag) {
-    return diag_new(pos, msg, SEV_WARNING, flag);
+    return diag_new(pos, msg, (uint)strlen(msg), SEV_WARNING, flag);
+}
+
+struct diag *diag_warning_n(struct pos pos, const char *msg, uint len, const char *flag) {
+    return diag_new(pos, msg, len, SEV_WARNING, flag);
 }
 
 /* A warning clang gives with no flag (`character constant too long for its
  * type`). */
 struct diag *diag_warning_unflagged(struct pos pos, const char *msg) {
-    return diag_new(pos, msg, SEV_WARNING, NULL);
+    return diag_new(pos, msg, (uint)strlen(msg), SEV_WARNING, NULL);
 }
 
 struct diag *diag_fatal(struct pos pos, const char *msg) {
-    return diag_new(pos, msg, SEV_FATAL, NULL);
+    return diag_new(pos, msg, (uint)strlen(msg), SEV_FATAL, NULL);
+}
+
+struct diag *diag_fatal_n(struct pos pos, const char *msg, uint len) {
+    return diag_new(pos, msg, len, SEV_FATAL, NULL);
 }
 
 void diag_append(struct diag **list, struct diag *d) {
@@ -37,7 +52,7 @@ void diag_append(struct diag **list, struct diag *d) {
 }
 
 struct diag *diag_note(struct diag *d, struct pos pos, const char *msg) {
-    diag_append(&d->notes, diag_new(pos, msg, SEV_NOTE, NULL));
+    diag_append(&d->notes, diag_new(pos, msg, (uint)strlen(msg), SEV_NOTE, NULL));
     return d;
 }
 
@@ -45,15 +60,91 @@ int diag_is_warning(struct diag *d) {
     return d->severity == SEV_WARNING;
 }
 
+/* The number `n` bytes at s spell, as Rust's usize::from_str reads one (an
+ * optional `+`, then decimal digits, nothing else, no overflow); 0 if they
+ * spell none. */
+static int parse_index(const char *s, uint n, uint64_t *out) {
+    uint i = 0;
+    if (n > 0 && s[0] == '+') {
+        i = 1;
+    }
+    if (i == n) {
+        return 0;
+    }
+    uint64_t v = 0;
+    for (; i < n; i++) {
+        uint d = (uchar)s[i] - '0';
+        if (d > 9 || v > (0xffffffffffffffffull - d) / 10) {
+            return 0;
+        }
+        v = v * 10 + d;
+    }
+    *out = v;
+    return 1;
+}
+
+/* The message with the file of each place in it named (merlin's
+ * name_places): it is split at its FILE_MARKs, and each pair of pieces
+ * after the first, a file's number and what follows it, becomes the
+ * file's name (none for a number no file has), `:` and that; a piece left
+ * without its pair is dropped. */
+static void name_places(struct diag *d, const char **names, const uint *lens, uint nfiles) {
+    /* The pieces: from `start`, up to the next mark or the end. */
+    struct buf b;
+    memset(&b, 0, sizeof b);
+    uint start = 0;
+    uint end = 0;
+    while (end < d->msglen && d->msg[end] != FILE_MARK) {
+        end++;
+    }
+    buf_put(&b, d->msg, end);
+    for (;;) {
+        /* A file's number, then the rest, if both are there. */
+        if (end >= d->msglen) {
+            break;
+        }
+        start = end + 1;
+        uint file_end = start;
+        while (file_end < d->msglen && d->msg[file_end] != FILE_MARK) {
+            file_end++;
+        }
+        if (file_end >= d->msglen) {
+            break;
+        }
+        uint rest = file_end + 1;
+        end = rest;
+        while (end < d->msglen && d->msg[end] != FILE_MARK) {
+            end++;
+        }
+        uint64_t n;
+        if (parse_index(d->msg + start, file_end - start, &n) && n < nfiles) {
+            buf_put(&b, names[n], lens[n]);
+        }
+        buf_byte(&b, ':');
+        buf_put(&b, d->msg + rest, end - rest);
+    }
+    d->msglen = b.len;
+    d->msg = buf_arena(&b);
+    buf_free(&b);
+}
+
 /* A diagnostic in a header names the header (merlin's name_files): the
  * position's file, where it is not 0, the file being compiled, and the
- * diagnostic names none yet. Its notes too. */
-void diag_name_files(struct diag *d, const char **files, uint nfiles) {
+ * diagnostic names none yet; and a message with a FILE_MARK has its
+ * places named. Its notes too. */
+void diag_name_files(struct diag *d, const char **names, const uint *lens, uint nfiles) {
     if (d->pos.file != 0 && d->file == NULL && d->pos.file < nfiles) {
-        d->file = files[d->pos.file];
+        d->file = names[d->pos.file];
+        d->filelen = lens[d->pos.file];
+    }
+    for (uint i = 0; i < d->msglen; i++) {
+        if (d->msg[i] == FILE_MARK) {
+            name_places(d, names, lens, nfiles);
+            break;
+        }
     }
     for (struct diag *n = d->notes; n != NULL; n = n->next) {
-        diag_name_files(n, files, nfiles);
+        diag_name_files(n, names, lens, nfiles);
     }
 }
 
@@ -61,7 +152,12 @@ void diag_name_files(struct diag *d, const char **files, uint nfiles) {
  * error: message`, then ` [-Wflag]` if it has a flag; with no place, the
  * file alone, or nothing at all for a diagnostic of no file. */
 static void print_line(struct diag *d, const char *input) {
-    const char *file = d->file != NULL ? d->file : input;
+    const char *file = input;
+    uint filelen = (uint)strlen(input);
+    if (d->file != NULL) {
+        file = d->file;
+        filelen = d->filelen;
+    }
     const char *what = "error";
     if (d->severity == SEV_FATAL) {
         what = "fatal error";
@@ -73,11 +169,11 @@ static void print_line(struct diag *d, const char *input) {
     struct buf b;
     memset(&b, 0, sizeof b);
     if (d->pos.line > 0) {
-        buf_fmt(&b, "%s:%u:%u: %s: %s", file, d->pos.line, d->pos.col, what, d->msg);
-    } else if (file[0] == 0) {
-        buf_fmt(&b, "%s: %s", what, d->msg);
+        buf_fmt(&b, "%b:%u:%u: %s: %b", file, filelen, d->pos.line, d->pos.col, what, d->msg, d->msglen);
+    } else if (filelen == 0) {
+        buf_fmt(&b, "%s: %b", what, d->msg, d->msglen);
     } else {
-        buf_fmt(&b, "%s: %s: %s", file, what, d->msg);
+        buf_fmt(&b, "%b: %s: %b", file, filelen, what, d->msg, d->msglen);
     }
     if (d->flag != NULL) {
         buf_fmt(&b, " [-W%s]", d->flag);

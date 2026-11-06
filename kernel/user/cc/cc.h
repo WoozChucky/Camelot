@@ -30,17 +30,19 @@
 #include "tables.h"
 
 /* ---- Memory (util.c) ----
- * The arena: one region at the end of the heap, grown with sbrk as it
- * fills, for what lives as long as the compilation (names, token texts,
- * macros, diagnostics). Nothing in it is freed; the process's exit frees
- * it all. What has a shorter life and can be large (a file's tokens while
- * it is read, the lexer's scratch, the output) is malloc'd and freed.
- * Out of memory is fatal. */
+ * The arena, for what lives as long as the compilation of one translation
+ * unit (names, token texts, macros, diagnostics): a bump allocator over
+ * chunks of 256 KiB, a big allocation in a block of its own, nothing in it
+ * freed on its own, and all of it freed when the translation unit is done
+ * (arena_free), as merlin's memory is. What has a shorter life and can be
+ * large (a file's tokens while it is read, the lexer's scratch, the
+ * output) is malloc'd and freed when done with. Out of memory is fatal. */
 void *arena_alloc(uint n);
 char *arena_strdup(const char *s);
 char *arena_strndup(const char *s, uint n);
-/* How many bytes the arena holds. */
-uint arena_used(void);
+/* Frees the arena, the interned names with it: nothing allocated there may
+ * be used after. */
+void arena_free(void);
 /* A growable malloc'd array: grow(ptr, &cap, count + 1, size) makes room. */
 void *grow(void *p, uint *cap, uint need, uint size);
 void die(const char *msg);
@@ -58,10 +60,13 @@ void buf_byte(struct buf *b, uint c);
 char *buf_arena(struct buf *b);
 void buf_free(struct buf *b);
 /* Appends the formatted text: %s %d %u %c %%, %lld %llu for 64-bit
- * numbers. */
+ * numbers, and %b for bytes that may hold a NUL (a pointer and a uint
+ * length). */
 void buf_fmt(struct buf *b, const char *f, ...);
 /* A formatted string in the arena (merlin's format!). */
 char *fmt(const char *f, ...);
+/* The same, with its length in *len, for text that may hold a NUL. */
+char *fmtn(uint *len, const char *f, ...);
 
 /* A map from strings to pointers (open addressing). The keys must live as
  * long as the map (arena strings). */
@@ -103,8 +108,6 @@ struct pos {
 };
 struct pos pos_at(uint file, uint line, uint col);
 int pos_eq(struct pos a, struct pos b);
-/* <0, 0, >0 as a is before, at or after b: by file, line, column. */
-int pos_cmp(struct pos a, struct pos b);
 
 /* ---- Diagnostics (diag.c, merlin's Error) ----
  * An error, which stops the compilation; a fatal one, after which clang
@@ -115,10 +118,15 @@ enum { SEV_ERROR, SEV_FATAL, SEV_WARNING, SEV_NOTE };
 struct diag {
     /* Where the problem is: line 0 when it is tied to no place. */
     struct pos pos;
-    char *msg;
-    /* The file's name when it is not the file being compiled (a header),
-     * set by diag_name_files; "" for a diagnostic of no file at all. */
+    /* The message, msglen bytes: it may hold a NUL, when it quotes the
+     * source (`#error`, a header's name). */
+    const char *msg;
+    uint msglen;
+    /* The file's name (filelen bytes) when it is not the file being
+     * compiled (a header), set by diag_name_files; "" for a diagnostic of
+     * no file at all. */
     const char *file;
+    uint filelen;
     int severity;
     /* clang's -W flag for it, printed after the message, or NULL. */
     const char *flag;
@@ -133,12 +141,25 @@ struct diag *diag_error(struct pos pos, const char *msg);
 struct diag *diag_warning(struct pos pos, const char *msg, const char *flag);
 struct diag *diag_warning_unflagged(struct pos pos, const char *msg);
 struct diag *diag_fatal(struct pos pos, const char *msg);
+/* An error, or a fatal one, whose message is len bytes that may hold a
+ * NUL. */
+struct diag *diag_error_n(struct pos pos, const char *msg, uint len);
+struct diag *diag_fatal_n(struct pos pos, const char *msg, uint len);
+/* A warning of that kind. */
+struct diag *diag_warning_n(struct pos pos, const char *msg, uint len, const char *flag);
 /* Adds a note at pos after the notes d has; d. */
 struct diag *diag_note(struct diag *d, struct pos pos, const char *msg);
 int diag_is_warning(struct diag *d);
-/* Sets the file of d and its notes from `files` (by pos.file), where it is
- * not the file being compiled (merlin's name_files). */
-void diag_name_files(struct diag *d, const char **files, uint nfiles);
+/* merlin's name_files: sets the file of d and its notes from the files'
+ * names (names[i], lens[i] bytes, by pos.file) where it is not the file
+ * being compiled, and names the file of each place a message gives
+ * between two FILE_MARK bytes. */
+void diag_name_files(struct diag *d, const char **names, const uint *lens, uint nfiles);
+/* What stands around a file's number in a message, for its name
+ * (merlin's FILE_MARK, U+0001): sema's places (`struct (unnamed at
+ * t.c:3:1)`) are written so, and a message that quotes the source may
+ * hold one too. */
+#define FILE_MARK 1
 /* Prints d and its notes to stderr as clang does, `input` the name of the
  * file being compiled (merlin's Error::render). */
 void diag_print(struct diag *d, const char *input);
@@ -165,7 +186,8 @@ struct pptok {
     uchar bol;
     /* Whitespace or a comment comes right before it. */
     uchar space;
-    /* The token as written, line splices removed; NUL-terminated. An
+    /* The token as written, line splices removed: len bytes, and a NUL after
+     * them (the source may hold a NUL too, which len counts). An
      * identifier's is interned, a punctuator's is PUNCTS's. */
     const char *text;
     uint len;
@@ -229,15 +251,18 @@ struct intlit {
     /* 1 for `l`, 2 for `ll`. */
     int lng;
 };
-/* Reads the preprocessing number `text` at pos; an error, or NULL. */
-struct diag *lex_integer(const char *text, struct pos pos, struct intlit *out);
+/* Each takes a token's text and its length (a literal may hold a NUL).
+ *
+ * Reads the preprocessing number `text` at pos; an error, or NULL. */
+struct diag *lex_integer(const char *text, uint len, struct pos pos, struct intlit *out);
 /* A character constant's value, as an int (merlin's char_constant), its
  * diagnostics added to *diags (linked by next, in order); an error, or
  * NULL. */
-struct diag *lex_char_constant(const char *text, struct pos pos, struct diag **diags, int64_t *value);
+struct diag *lex_char_constant(const char *text, uint len, struct pos pos, struct diag **diags,
+                               int64_t *value);
 /* The bytes of a string literal as written, escapes decoded (merlin's
  * decode), in *out; its warnings added to *diags; an error, or NULL. */
-struct diag *lex_decode(const char *text, struct pos pos, struct diag **diags, struct buf *out);
+struct diag *lex_decode(const char *text, uint len, struct pos pos, struct diag **diags, struct buf *out);
 
 /* Appends d to the list at *list (in order). */
 void diag_append(struct diag **list, struct diag *d);

@@ -65,11 +65,19 @@ static int lang_of_file(const char *name) {
     return ends_with(name, ".S") || ends_with(name, ".sx") ? LANG_ASM : LANG_C;
 }
 
-/* The whole file, NUL-terminated, or NULL with *err set. */
+/* The whole file, NUL-terminated, or NULL with *err set: a directory is
+ * none (-EISDIR), as Rust's read_to_string refuses one. */
 static char *read_file(const char *path, uint *len, int *err) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         *err = fd;
+        return NULL;
+    }
+    struct stat st;
+    int r = fstat(fd, &st);
+    if (r < 0 || st.type == T_DIR) {
+        close(fd);
+        *err = r < 0 ? r : -EISDIR;
         return NULL;
     }
     struct buf b;
@@ -112,13 +120,15 @@ static int write_file(const char *path, const char *data, uint len) {
     return close(fd);
 }
 
-/* Writes all of data to standard output. */
+/* Writes all of data to standard output. A failure stops cc1 with exit
+ * status 2, as one stops merlin (whose print! gives up the program). */
 static void write_out(const char *data, uint len) {
     uint done = 0;
     while (done < len) {
         int r = write(1, data + done, len - done);
         if (r <= 0) {
-            return;
+            fprintf(2, "cc1: cannot write standard output: %s\n", strerror(r < 0 ? -r : ENOSPC));
+            exit(2);
         }
         done += (uint)r;
     }
@@ -150,6 +160,10 @@ static int translate(struct input *in, const char *output, struct options *opts)
     for (uint i = 0; i < ndiags; i++) {
         diag_print(diags[i], in->name);
     }
+    /* The translation unit is done: its memory goes (the text, malloc'd,
+     * stays for writing it). */
+    free(diags);
+    arena_free();
     free(src);
     if (!ok) {
         buf_free(&text);
