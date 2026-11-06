@@ -2704,8 +2704,8 @@ fn local_sockets_connect_and_pass_descriptors() {
     // Issue #180: unixtest's checks of local sockets: pairs, names on the
     // disk, connections, shutdown and close, SCM_RIGHTS (a pipe, a socket,
     // a memfd), sendmsg and recvmsg on UDP and TCP too, and a memfd shared
-    // with a second process, which both map. A network card, for UDP and
-    // TCP over loopback.
+    // with a second process, which both map; and SO_PEERCRED (#184), the
+    // process at each end. A network card, for UDP and TCP over loopback.
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, _) = load(
         Setup {
@@ -2720,7 +2720,7 @@ fn local_sockets_connect_and_pass_descriptors() {
     type_line(&tx, "unixtest\n");
     step_to_prompt(&mut m, 2);
     let out = printed(&m);
-    assert_eq!(all_checks_pass(&out, "unixtest", "unixtest"), 153, "{out}");
+    assert_eq!(all_checks_pass(&out, "unixtest", "unixtest"), 166, "{out}");
 }
 
 #[test]

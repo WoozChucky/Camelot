@@ -53,7 +53,7 @@ typedef unsigned long long uint64_t;
 
 /* Error numbers: a system call that fails returns minus one of them. They
  * are kernel/include/syscall.h's: a test checks they agree. */
-#define EPERM 1         /* link: not for a directory; kill: a kernel process, or the first process */
+#define EPERM 1         /* link: not for a directory; kill: a kernel process, or the first process; ftruncate, fcntl: a seal */
 #define ENOENT 2        /* no such file or directory */
 #define ESRCH 3         /* kill: no such process; thread_join: no such thread */
 #define EINTR 4         /* a wait ended because the process was killed */
@@ -89,7 +89,7 @@ typedef unsigned long long uint64_t;
 #define ENOTSOCK 88     /* a socket call on a descriptor that is not a socket */
 #define EDESTADDRREQ 89 /* send: a UDP socket with no peer, and no address given */
 #define EMSGSIZE 90     /* a datagram too big for one packet */
-#define ENOPROTOOPT 92  /* setsockopt: an option sockets don't have */
+#define ENOPROTOOPT 92  /* setsockopt, getsockopt: an option sockets don't have */
 #define EPROTONOSUPPORT 93 /* socket: a protocol the type doesn't have */
 #define ESOCKTNOSUPPORT 94 /* socket, socketpair: a local socket of a type other than SOCK_STREAM */
 #define EOPNOTSUPP 95   /* listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses */
@@ -156,7 +156,18 @@ typedef unsigned long long uint64_t;
 #define F_GETFD 1            /* the descriptor's flags */
 #define F_SETFD 2            /* sets them to arg */
 #define F_DUPFD_CLOEXEC 1030 /* F_DUPFD, the copy closing on exec */
+#define F_ADD_SEALS 1033     /* adds arg's seals to a shared-memory object */
+#define F_GET_SEALS 1034     /* its seals */
 #define FD_CLOEXEC 1         /* the descriptor closes on exec */
+
+/* A shared-memory object's seals (memfd_create's MFD_ALLOW_SEALING; Linux's
+ * values): no more seals, no shrinking, no growing. Linux's write seals
+ * are not there. */
+#define F_SEAL_SEAL 0x1
+#define F_SEAL_SHRINK 0x2
+#define F_SEAL_GROW 0x4
+#define F_SEAL_WRITE 0x8
+#define F_SEAL_FUTURE_WRITE 0x10
 
 /* mmap's and mprotect's protections, and mmap's flags (Linux's values;
  * kernel/include/mmap.h). */
@@ -378,6 +389,7 @@ struct ping_reply {
 #define SHUT_WR 1   /* no more sending: TCP sends its FIN */
 #define SHUT_RDWR 2 /* neither */
 #define SOL_SOCKET 1   /* setsockopt: the socket's own options */
+#define SO_PEERCRED 17 /* getsockopt: the peer's process, a struct ucred (local sockets) */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait (a struct timeval) */
 #define SCM_RIGHTS 1   /* a control message of descriptors (ints) */
 
@@ -387,6 +399,14 @@ struct ping_reply {
 #define MSG_DONTWAIT 0x40           /* -EAGAIN rather than wait (local sockets) */
 #define MSG_NOSIGNAL 0x4000         /* nothing to do: Camelot has no SIGPIPE */
 #define MSG_CMSG_CLOEXEC 0x40000000 /* recvmsg: the descriptors close on exec */
+
+/* getsockopt's SO_PEERCRED: the process at a local socket's other end, as
+ * Linux's. Camelot has no users: uid and gid are 0. */
+struct ucred {
+    int pid;
+    uint uid;
+    uint gid;
+};
 
 /* poll(): the descriptors and what to wait for (kernel/include/poll.h,
  * docs/camelot-syscalls.md "Polling"). Linux's values and layout. */
@@ -762,6 +782,7 @@ int shutdown(int fd, int how);
 int getsockname(int fd, void *addr);
 int getpeername(int fd, void *addr);
 int setsockopt(int fd, int level, int option, const void *value, uint len);
+int getsockopt(int fd, int level, int option, void *value, uint *len);
 int thread_create(void (*entry)(void *), void *arg, void *stack);
 void thread_exit(int status);
 int thread_join(int tid, int *status);

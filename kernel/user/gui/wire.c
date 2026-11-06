@@ -25,6 +25,10 @@ void gui_wire_init(struct gui_wire *w, int fd) {
     w->start = -1;
 }
 
+void gui_wire_nonblock(struct gui_wire *w) {
+    w->nonblock = 1;
+}
+
 void gui_wire_release(struct gui_wire *w) {
     for (int i = 0; i < w->nin_fds; i++) {
         close(w->in_fds[i]);
@@ -42,6 +46,11 @@ void gui_wire_begin(struct gui_wire *w, uint object, uint opcode) {
     if (w->out_len > (int)sizeof(w->out) - GUI_WIRE_MAX || w->nout_fds > GUI_WIRE_FDS / 2) {
         gui_wire_flush(w);
         if (w->error < 0) {
+            return;
+        }
+        /* A non-blocking wire's peer reads too slowly to make room. */
+        if (w->out_len > (int)sizeof(w->out) - GUI_WIRE_MAX || w->nout_fds > GUI_WIRE_FDS / 2) {
+            w->error = -ENOBUFS;
             return;
         }
     }
@@ -154,7 +163,13 @@ int gui_wire_flush(struct gui_wire *w) {
             h->cmsg_type = SCM_RIGHTS;
             memcpy(CMSG_DATA(h), w->out_fds, (size_t)w->nout_fds * sizeof(int));
         }
-        ssize_t n = sendmsg(w->fd, &m, 0);
+        ssize_t n = sendmsg(w->fd, &m, w->nonblock ? MSG_DONTWAIT : 0);
+        if (n == -EAGAIN && w->nonblock) {
+            /* The socket is full: keep what it didn't take for later. */
+            memmove(w->out, w->out + sent, (size_t)(w->out_len - sent));
+            w->out_len -= sent;
+            return -EAGAIN;
+        }
         if (n < 0) {
             w->error = (int)n;
             return w->error;

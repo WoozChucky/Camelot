@@ -632,6 +632,18 @@ isize sock_sys_recvmsg(u32 fd, uintptr umsg, u32 flags);
  * (another level or option). Local sockets (net/unix.c) use it too. */
 int sock_opt_rcvtimeo(u32 level, u32 option, uintptr uvalue, u32 len, u32 *ticks);
 
+/* getsockopt() on a TCP or UDP socket: -ENOPROTOOPT for every option, once
+ * the descriptor (-EBADF, -ENOTSOCK) and *ulen (-EFAULT) are checked:
+ * SO_PEERCRED is a local socket's. */
+int sock_sys_getsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, uintptr ulen);
+
+/* getsockopt()'s length and answer, every socket's: sock_opt_len reads
+ * *ulen, the room at `uvalue` (-EFAULT); sock_opt_put stores at most that
+ * much of the `size` bytes of `value` there, as Linux cuts an option short,
+ * and how much it stored in *ulen. 0 or -EFAULT. */
+int sock_opt_len(uintptr ulen, u32 *len);
+int sock_opt_put(uintptr uvalue, uintptr ulen, u32 len, const void *value, u32 size);
+
 /* ---- DHCP (dhcp.c) ---- */
 
 /* Asks for an address, DHCP_TRIES times at most, waiting DHCP_TIMEOUT

@@ -64,7 +64,8 @@
     .equ SYS_sendmsg, 56
     .equ SYS_recvmsg, 57
     .equ SYS_stat, 58
-    .equ SYS_getcwd, 59
+    .equ SYS_getsockopt, 59
+    .equ SYS_getcwd, 60
 
     .text
 
@@ -338,6 +339,13 @@ getpeername:
     .globl setsockopt
 setsockopt:
     li    a7, SYS_setsockopt
+    ecall
+    ret
+
+# int getsockopt(int fd, int level, int option, void *value, uint *len)
+    .globl getsockopt
+getsockopt:
+    li    a7, SYS_getsockopt
     ecall
     ret
 

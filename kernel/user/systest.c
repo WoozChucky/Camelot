@@ -53,7 +53,7 @@
 /* Process slots (NPROC in kernel/include/proc.h). */
 #define NPROC 8
 /* Descriptors per process (NOFILE in kernel/include/file.h). */
-#define NOFILE 16
+#define NOFILE 32
 /* A pipe's buffer (PIPESIZE in kernel/include/pipe.h). */
 #define PIPESIZE 512
 /* The console's device number (CONSOLE in kernel/include/file.h). */
@@ -534,7 +534,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(60, 0, 0, 0), -ENOSYS, "call 60");
+    check_eq(syscall(61, 0, 0, 0), -ENOSYS, "call 61");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
     /* The result is a long, sign-extended in a0: an error is negative
      * whatever the width, as a long and as an ssize_t (read's). */

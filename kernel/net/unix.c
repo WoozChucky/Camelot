@@ -26,7 +26,12 @@
  * one wakes it. User memory is copied under the lock, as a pipe's is
  * (copyin and copyout never sleep). The disk (bind and connect's paths)
  * and closing files (the descriptors of a socket closed) happen without
- * it. Lock order: unix_lock, then proc_lock (sleep, wakeup, poll_wait). */
+ * it. Lock order: unix_lock, then proc_lock (sleep, wakeup, poll_wait).
+ *
+ * SO_PEERCRED, as Linux's: an accepted end's peer is the process that
+ * called connect(), the connecting end's the one that called listen(), and
+ * each of a pair's the process that made it; they stay what they were when
+ * the connection was made, whoever holds the sockets since. */
 #include "unix.h"
 #include "file.h"
 #include "fs.h"
@@ -73,6 +78,8 @@ struct unix_sock {
     u32 shut;  /* RCV_SHUT and SEND_SHUT: shutdown(), the peer's or its close */
     int err;   /* an error for the next read to return: -ECONNRESET */
     u32 rcvtimeo; /* SO_RCVTIMEO, in ticks: 0 waits for as long as it takes */
+    i32 pid;      /* UNIX_LISTENING: the process that called listen() */
+    i32 peerpid;  /* SO_PEERCRED: the peer's process when they connected (0: none) */
     struct unix_sock *peer; /* UNIX_CONNECTED: NULL once the peer is closed */
     struct inode *ip;       /* the socket inode bind() made, with a reference */
     char name[UNIX_PATH_MAX];     /* its path, or the listener's ("": none) */
@@ -604,6 +611,8 @@ int unix_sys_socketpair(u32 domain, u32 type, u32 protocol, uintptr ufds) {
     acquire(&unix_lock);
     a->peer = b;
     b->peer = a;
+    a->peerpid = (i32)myproc()->pid;
+    b->peerpid = a->peerpid;
     release(&unix_lock);
     unix_file(fa, a);
     unix_file(fb, b);
@@ -677,6 +686,7 @@ static int do_listen(struct unix_sock *u, u32 backlog) {
         err = -EINVAL; /* as on Linux: a listener must have a name */
     } else {
         u->state = UNIX_LISTENING;
+        u->pid = (i32)myproc()->pid;
         u->max_backlog = backlog < 1 ? 1 : backlog > UNIX_BACKLOG ? UNIX_BACKLOG : backlog;
         /* A bigger backlog lets waiting connect()s in. */
         wakeup(u);
@@ -798,6 +808,8 @@ static int do_connect(struct unix_sock *u, uintptr uaddr) {
                 memcpy(s->name, l->name, UNIX_PATH_MAX);
                 memcpy(s->peername, u->name, UNIX_PATH_MAX);
                 memcpy(u->peername, l->name, UNIX_PATH_MAX);
+                s->peerpid = (i32)myproc()->pid;
+                u->peerpid = l->pid;
                 l->backlog[l->nbacklog++] = s;
                 s = NULL;
                 wakeup(l);
@@ -1073,6 +1085,27 @@ int unix_sys_setsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, u32 len) 
             acquire(&unix_lock);
             u->rcvtimeo = timeo;
             release(&unix_lock);
+        }
+    }
+    put_file(f);
+    return err;
+}
+
+int unix_sys_getsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, uintptr ulen) {
+    struct file *f;
+    int err;
+    struct unix_sock *u = fd_unix(fd, &f, &err);
+    u32 len;
+    if (u != NULL && (err = sock_opt_len(ulen, &len)) == 0) {
+        if (level != SOL_SOCKET || option != SO_PEERCRED) {
+            err = -ENOPROTOOPT;
+        } else {
+            /* No users: uid and gid 0. */
+            struct ucred cred = {0, 0, 0};
+            acquire(&unix_lock);
+            cred.pid = u->peerpid;
+            release(&unix_lock);
+            err = sock_opt_put(uvalue, ulen, len, &cred, sizeof cred);
         }
     }
     put_file(f);

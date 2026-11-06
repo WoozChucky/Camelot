@@ -4060,7 +4060,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 59, "{calls:?}");
+    assert_eq!(calls.len(), 60, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -4160,7 +4160,7 @@ fn the_system_call_document_matches_the_code() {
             Some((name, cells.get(2)?.parse().ok()?))
         })
         .collect();
-    assert_eq!(sizes.len(), 22, "{sizes:?}");
+    assert_eq!(sizes.len(), 23, "{sizes:?}");
     for (dir, include, headers) in [
         ("kernel/user", None, "#include \"user.h\"\n"),
         (
@@ -4217,11 +4217,12 @@ fn the_system_call_document_matches_the_code() {
     let filetest = read("kernel/user/filetest.c");
     let systest = read("kernel/user/systest.c");
     let socktest = read("kernel/user/socktest.c");
+    let compositor = read("kernel/user/compositor/compositor.h");
     for (header, name, copies) in [
         (
             "kernel/include/file.h",
             "NOFILE",
-            vec![&filetest, &systest, &socktest],
+            vec![&filetest, &systest, &socktest, &compositor],
         ),
         ("kernel/include/file.h", "CONSOLE", vec![&filetest, &systest]),
         ("kernel/include/pipe.h", "PIPESIZE", vec![&systest]),

@@ -233,10 +233,20 @@ const STEPS: &[Step] = &[
         ],
     },
     Step {
+        what: "the Wayland protocol tables are current, and the protocols their releases (#184)",
+        args: &["-p", "xtask", "--test", "protocol"],
+    },
+    Step {
         what: "the GUI library (#183): drawing, text, images and widgets against their expected \
                images, the damage lists, the keyboard, UTF-8, and the Wayland client against a \
                scripted display server",
         args: &["-p", "xtask", "--test", "gui"],
+    },
+    Step {
+        what: "the display server (#184): windows composited, raised, moved and closed with injected \
+               input against their expected images, clients that break the protocol disconnected, \
+               flips whole at the vertical blank",
+        args: &["-p", "xtask", "--test", "display"],
     },
     Step {
         what: "the committed examples, boot programs and hello are current; a boot block and the root \

@@ -22,6 +22,9 @@
 #include "gui.h"
 #include "gui/protocol.h"
 
+/* wl_display, always object 1. */
+#define WL_DISPLAY_ID 1
+
 #define FONT "/usr/share/fonts/spleen/8x16.psfu"
 
 static int failed;

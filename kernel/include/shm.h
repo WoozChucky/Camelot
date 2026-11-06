@@ -30,8 +30,8 @@
 #define NSHM 32
 
 /* memfd_create's flags (Linux's values): the descriptor closes on exec;
- * sealing allowed, which is accepted, though Camelot has no seals. And the
- * longest name it takes, without the NUL (Linux's MFD_NAME_MAX_LEN). */
+ * seals may be added (fcntl's F_ADD_SEALS). And the longest name it takes,
+ * without the NUL (Linux's MFD_NAME_MAX_LEN). */
 #define MFD_CLOEXEC 0x1
 #define MFD_ALLOW_SEALING 0x2
 #define MFD_NAME_MAX 249
@@ -50,6 +50,9 @@ struct shm_object {
     /* The size in bytes, which ftruncate() sets: a mapping's pages past it
      * can't be touched. */
     u64 size;
+    /* Its seals, F_SEAL_ (syscall.h): F_SEAL_SEAL from the start unless
+     * it was made with MFD_ALLOW_SEALING, as on Linux. */
+    u32 seals;
     /* The table of pages: NULL until the first page is made; else a page
      * of SHM_FANOUT physical addresses of the second-level pages, 0 for
      * none, each holding SHM_FANOUT physical addresses of the object's
@@ -60,9 +63,9 @@ struct shm_object {
 /* Sets up shm_lock. kmain calls it at boot. */
 void shm_init(void);
 
-/* A new object, empty (size 0), with one reference, the caller's; NULL if
- * every slot is taken. */
-struct shm_object *shm_create(void);
+/* A new object, empty (size 0), with one reference, the caller's, sealed
+ * against more seals unless `sealing`; NULL if every slot is taken. */
+struct shm_object *shm_create(bool sealing);
 
 /* One more reference to `o`, an area's: shm_map() counts it among the
  * mappings too. */
@@ -78,8 +81,15 @@ void shm_unmap(struct shm_object *o);
  * the last page and frees the pages wholly past the new end, unless the
  * object is mapped: those stay until its last mapping goes, mapped where
  * they were touched already, and read zero again if it grows back over
- * them. 0, or -EFBIG past SHM_MAX_SIZE. */
+ * them. 0, -EFBIG past SHM_MAX_SIZE, or -EPERM for a shrink or a growth
+ * its seals forbid. */
 int shm_truncate(struct shm_object *o, u64 size);
+
+/* fcntl's F_ADD_SEALS: adds `seals` (F_SEAL_SEAL, F_SEAL_SHRINK,
+ * F_SEAL_GROW); 0, or -EPERM once F_SEAL_SEAL is there. And F_GET_SEALS:
+ * the seals. */
+int shm_add_seals(struct shm_object *o, u32 seals);
+u32 shm_seals(struct shm_object *o);
 
 /* The size, for fstat(). */
 u64 shm_size(struct shm_object *o);

@@ -395,7 +395,8 @@ struct gui_wire {
     int out_len;
     int nout_fds;
     int start;    /* the message being built, in `out` */
-    int error;    /* the first error, sticky: -EPROTO, -EMSGSIZE, a socket's */
+    int error;    /* the first error, sticky: -EPROTO, -EMSGSIZE, -ENOBUFS, a socket's */
+    int nonblock; /* gui_wire_nonblock: the display server's end */
     int in_fds[GUI_WIRE_FDS * 2];
     int out_fds[GUI_WIRE_FDS];
     uchar in[GUI_WIRE_MAX * 2];
@@ -415,6 +416,11 @@ struct gui_message {
 };
 
 void gui_wire_init(struct gui_wire *w, int fd);
+/* Makes the wire's sending never wait, as the display server's must: a
+ * flush sends what the socket takes and keeps the rest (-EAGAIN, which is
+ * no error), and a message that finds no room, the peer having read none
+ * of the last GUI_WIRE_MAX bytes and more, is -ENOBUFS. */
+void gui_wire_nonblock(struct gui_wire *w);
 /* Closes the descriptors received and not taken; not w->fd. */
 void gui_wire_release(struct gui_wire *w);
 /* Starts a message (flushing what is queued if it might not fit), adds its
@@ -427,7 +433,8 @@ void gui_wire_string(struct gui_wire *w, const char *s); /* NULL: the null strin
 void gui_wire_array(struct gui_wire *w, const void *data, uint len);
 void gui_wire_fd(struct gui_wire *w, int fd); /* sent (a copy), not closed */
 int gui_wire_end(struct gui_wire *w);
-/* Sends everything queued: 0, or a negative error number. */
+/* Sends everything queued: 0, or a negative error number (-EAGAIN: a
+ * non-blocking wire's socket took only part of it, the rest kept). */
 int gui_wire_flush(struct gui_wire *w);
 /* Receives what has come (waiting for it unless `nowait`): the bytes
  * received, 0 when the peer hung up, or a negative error number (-EAGAIN:
@@ -452,10 +459,11 @@ int gui_msg_fd(struct gui_message *m);
  *
  * A connection to the display server (#184, docs/excalibur-spec.md section
  * 10) at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (/run and wayland-0 when they
- * are unset; a name with a '/' is a path), with the globals it needs bound: wl_compositor, wl_shm,
- * xdg_wm_base and wl_seat. A window is a wl_surface with an xdg_toplevel,
- * drawn into two XRGB8888 buffers of one wl_shm_pool over a memfd: the one
- * being drawn into is made the last frame first (the rectangles the last
+ * are unset; a name with a '/' is a path), with the globals it needs
+ * bound: wl_compositor, wl_shm, xdg_wm_base and wl_seat. A window is a
+ * wl_surface with an xdg_toplevel, drawn into two XRGB8888 buffers of one
+ * wl_shm_pool over a memfd sealed against shrinking (F_SEAL_SHRINK): the
+ * one being drawn into is made the last frame first (the rectangles the last
  * commit damaged copied over), then committed with its damage, and the
  * server releases the other. Events come to the window's handlers, any
  * of which may be NULL. */
