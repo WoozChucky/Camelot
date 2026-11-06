@@ -5,9 +5,11 @@
  *
  *   polltest                the checks: "polltest: N checks, F failed"
  *   polltest stress R       two pairs of threads, each pair passing a byte
- *                           back and forth R times through two pipes, each
- *                           thread waiting for it in poll() on its own pipe
- *                           and on one nothing is written to. A thread
+ *                           back and forth R times, one pair through two
+ *                           pipes and the other through a local socket
+ *                           pair, each thread waiting for it in poll() on
+ *                           its own end and on a pipe nothing is written
+ *                           to. A thread
  *                           writes and polls at once, while the other one,
  *                           on another hart, may already be answering: a
  *                           wakeup lost would stop its pair for good.
@@ -174,6 +176,50 @@ static void udp_checks(void) {
     close(u);
 }
 
+static void unix_checks(void) {
+    int sv[2];
+    check_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0, "a local socket pair");
+    check_eq(poll1(sv[0], ALL, 0), OUT, "connected: room to send, nothing to read");
+    check_eq(write(sv[0], "hi", 2), 2, "a write");
+    check_eq(poll1(sv[1], ALL, 0), IN | OUT, "the bytes came");
+    char buf[256];
+    check_eq(read(sv[1], buf, sizeof buf), 2, "read them");
+    /* A full ring: no room to send until the peer reads. */
+    memset(buf, 'f', sizeof buf);
+    for (int i = 0; i < 8; i++) {
+        write(sv[0], buf, sizeof buf);
+    }
+    check_eq(poll1(sv[0], ALL, 0), 0, "the peer's ring full: no room");
+    check_eq(read(sv[1], buf, sizeof buf), sizeof buf, "the peer reads some");
+    check_eq(poll1(sv[0], OUT, 0), OUT, "room again");
+    check_eq(shutdown(sv[0], SHUT_WR), 0, "shutdown SHUT_WR");
+    check_eq(poll1(sv[1], POLLRDHUP, 0), POLLRDHUP, "the peer done sending");
+    close(sv[0]);
+    check_eq(poll1(sv[1], OUT | POLLRDHUP, 0), OUT | POLLRDHUP | POLLHUP,
+             "the peer gone: hung up, and a write fails at once");
+    close(sv[1]);
+
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    check_eq(poll1(l, ALL, 0), OUT | POLLHUP, "not connected: Linux's POLLOUT | POLLHUP");
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    strcpy(a.sun_path, "/polltest.sock");
+    unlink(a.sun_path);
+    check(bind(l, &a) == 0 && listen(l, 1) == 0, "a local listener");
+    check_eq(poll1(l, ALL, 0), 0, "a listener with nobody to accept");
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    check_eq(connect(c, &a), 0, "connect");
+    check_eq(poll1(l, ALL, 0), IN, "a connection to accept");
+    int s = accept(l, 0);
+    check_eq(poll1(s, ALL, 0), OUT, "accepted");
+    close(c);
+    check_eq(poll1(s, ALL, 0), IN | OUT | POLLRDHUP | POLLHUP, "the client gone");
+    close(s);
+    close(l);
+    unlink(a.sun_path);
+}
+
 static void device_checks(void) {
     int kbd = open("/dev/input/event0", O_RDONLY);
     check(kbd >= 0, "open the keyboard");
@@ -246,11 +292,14 @@ static void kill_checks(void) {
 
 /* ---- stress ---- */
 
-/* Threads 0 and 1 are a pair, 2 and 3 the other: thread i reads its pipe
- * ring[i] and writes its partner's, ring[i ^ 1]. */
+/* Threads 0 and 1 are a pair, 2 and 3 the other: thread i waits on and
+ * reads from[i], and writes to[i], which its partner reads. The first pair
+ * through two pipes, the second through the two ends of a local socket
+ * pair. */
 #define RING 4
 
-static int ring[RING][2];
+static int from[RING];
+static int to[RING];
 static int quiet[2];
 static int rounds;
 static int stress_failed;
@@ -266,7 +315,7 @@ static int passer(void *arg) {
     char c;
     for (int r = 0; r < rounds; r++) {
         struct pollfd fds[1 + QUIET];
-        fds[0].fd = ring[i][0];
+        fds[0].fd = from[i];
         fds[0].events = IN;
         for (int q = 1; q <= QUIET; q++) {
             fds[q].fd = quiet[0];
@@ -279,10 +328,10 @@ static int passer(void *arg) {
         if (bad) {
             atomic_add(&stress_failed, 1);
         }
-        if (read(ring[i][0], &c, 1) != 1) {
+        if (read(from[i], &c, 1) != 1) {
             atomic_add(&stress_failed, 1);
         }
-        write(ring[i ^ 1][1], &c, 1);
+        write(to[i], &c, 1);
     }
     return 0;
 }
@@ -290,17 +339,26 @@ static int passer(void *arg) {
 static int stress(int n) {
     rounds = n;
     pipe(quiet);
-    for (int i = 0; i < RING; i++) {
-        pipe(ring[i]);
-    }
+    int p0[2];
+    int p1[2];
+    pipe(p0);
+    pipe(p1);
+    from[0] = p0[0];
+    to[1] = p0[1];
+    from[1] = p1[0];
+    to[0] = p1[1];
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    from[2] = to[2] = sv[0];
+    from[3] = to[3] = sv[1];
     int tids[RING];
     for (int i = 0; i < RING; i++) {
         tids[i] = thread_start(passer, (void *)(long)i, stacks[i], sizeof stacks[i]);
     }
     /* A byte for each pair: each thread takes R and passes R on, and
      * every byte it waits for comes. */
-    write(ring[0][1], "t", 1);
-    write(ring[2][1], "t", 1);
+    write(to[1], "t", 1);
+    write(to[3], "t", 1);
     for (int i = 0; i < RING; i++) {
         int status;
         thread_join(tids[i], &status);
@@ -371,6 +429,7 @@ int main(int argc, char **argv) {
     file_checks();
     tcp_checks();
     udp_checks();
+    unix_checks();
     device_checks();
     wake_checks();
     kill_checks();

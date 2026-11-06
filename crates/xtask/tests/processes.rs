@@ -2555,6 +2555,7 @@ fn the_calls_take_and_return_64_bit_values() {
 fn poll_waits_on_every_kind_of_file() {
     // Issue #180: polltest's checks of poll(): its errors and timeouts,
     // pipes, files, shared memory, the console, TCP and UDP over loopback,
+    // local sockets (a pair, a listener),
     // the keyboard, /dev/fb0's flips, a wakeup from another thread, and a
     // kill while it waits. A network card, for the sockets.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2571,7 +2572,31 @@ fn poll_waits_on_every_kind_of_file() {
     type_line(&tx, "polltest\n");
     step_to_prompt(&mut m, 2);
     let out = printed(&m);
-    assert_eq!(all_checks_pass(&out, "polltest", "polltest"), 65, "{out}");
+    assert_eq!(all_checks_pass(&out, "polltest", "polltest"), 83, "{out}");
+}
+
+#[test]
+fn local_sockets_connect_and_pass_descriptors() {
+    // Issue #180: unixtest's checks of local sockets: pairs, names on the
+    // disk, connections, shutdown and close, SCM_RIGHTS (a pipe, a socket,
+    // a memfd), sendmsg and recvmsg on UDP and TCP too, and a memfd shared
+    // with a second process, which both map. A network card, for UDP and
+    // TCP over loopback.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, _) = load(
+        Setup {
+            disks: vec![root_disk(4096, &[])],
+            nets: vec![NetConfig::user(Vec::new())],
+            ..Setup::default()
+        }
+        .config(),
+        Some(rx),
+    );
+    step_to_prompt(&mut m, 1);
+    type_line(&tx, "unixtest\n");
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(all_checks_pass(&out, "unixtest", "unixtest"), 148, "{out}");
 }
 
 /// Steps `m` until the kernel's tick counter has gone `n` ticks on.
