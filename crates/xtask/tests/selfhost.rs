@@ -3020,8 +3020,10 @@ const G_UP: &str = "static int up(void) { return 1; }\n";
 /// The main file named `./m.c` or through `..`, headers next to it and in
 /// `-I` directories (one named as the compilation directory), a header
 /// above it, `#line` names (none, the main file's, a header's, one that
-/// is a directory, with control characters, not ASCII and with `\`: the
-/// console takes ASCII only, so a name not ASCII is a `#line`'s), and a
+/// is a directory, with control characters, not ASCII and with `\`: a
+/// main file named `café.c` waits for the console's line discipline to
+/// keep the bytes typed that are not printable ASCII, as Linux's does
+/// (kernel/tty.c's canonical edit() drops them), and a
 /// compilation directory of `.`, `./`, none at all and one with `\`.
 #[allow(clippy::type_complexity)]
 const G_INPUTS: &[(&[(&str, &str)], &[&str], &str)] = &[
