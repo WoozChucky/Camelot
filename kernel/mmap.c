@@ -410,9 +410,13 @@ long mm_mmap(uintptr addr, usize len, u32 prot, u32 flags, int fd, off_t offset)
         return -EINVAL;
     }
     if (type == MAP_SHARED_VALIDATE) {
-        /* MAP_SHARED, but a descriptor's mapping refuses the flags Linux
-         * doesn't know rather than ignore them. */
-        if ((flags & MAP_ANONYMOUS) == 0 && (flags & ~(u32)MAP_VALIDATE_FLAGS) != 0) {
+        /* MAP_SHARED of a descriptor, refusing the flags Linux doesn't
+         * know rather than ignore them. Anonymous memory has no such type
+         * (Linux's do_mmap() too says -EINVAL). */
+        if (flags & MAP_ANONYMOUS) {
+            return -EINVAL;
+        }
+        if ((flags & ~(u32)MAP_VALIDATE_FLAGS) != 0) {
             return -EOPNOTSUPP;
         }
         type = MAP_SHARED;

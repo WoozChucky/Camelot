@@ -771,7 +771,7 @@ The values are Linux's:
 | `PROT_SEM` | 8 | `mprotect` only: accepted, means nothing (every page allows atomics) |
 | `MAP_SHARED` | 0x01 | shared with every other mapping of the same memory |
 | `MAP_PRIVATE` | 0x02 | the process's own |
-| `MAP_SHARED_VALIDATE` | 0x03 | `MAP_SHARED`, but a flag Linux doesn't know is `-EOPNOTSUPP` |
+| `MAP_SHARED_VALIDATE` | 0x03 | `MAP_SHARED` of a descriptor, but a flag Linux doesn't know is `-EOPNOTSUPP` |
 | `MAP_FIXED` | 0x10 | exactly at `addr`, replacing what is mapped there |
 | `MAP_ANONYMOUS` | 0x20 | no file: zeroed memory |
 | `MAP_NORESERVE` | 0x4000 | accepted: nothing is reserved anyway |
@@ -799,7 +799,8 @@ a hint: taken, rounded up to a page, if the room is free there, and
 otherwise the highest room that fits. Errors:
 
 - `-EINVAL`: `len` is 0, `flags`' type (its low four bits) is none of
-  the three, `addr` is not page aligned with `MAP_FIXED` or
+  the three (or `MAP_SHARED_VALIDATE` with `MAP_ANONYMOUS`, as on Linux),
+  `addr` is not page aligned with `MAP_FIXED` or
   `MAP_FIXED_NOREPLACE`, or `offset` is negative or not page aligned for a
   descriptor;
 - `-EOPNOTSUPP`: a descriptor's `MAP_SHARED_VALIDATE` mapping with a flag

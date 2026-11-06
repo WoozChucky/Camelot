@@ -196,6 +196,7 @@ const STEPS: &[Step] = &[
             "the_calls_take_and_return_64_bit_values",
             "a_program_starts_as_linux_starts_one",
             "the_shell_passes_its_environment_on",
+            "memory_mappings_are_mapped_on_demand_and_given_back",
         ],
     },
     Step {

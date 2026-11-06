@@ -158,6 +158,8 @@ static void error_checks(void) {
     }
     check_eq(map(0, PAGE, PROT_READ, MAP_ANONYMOUS, -1, 0), -EINVAL, "neither shared nor private");
     check_eq(map(0, PAGE, PROT_READ, 0x04 | MAP_ANONYMOUS, -1, 0), -EINVAL, "a type that doesn't exist");
+    check_eq(map(0, PAGE, PROT_READ, MAP_SHARED_VALIDATE | MAP_ANONYMOUS, -1, 0), -EINVAL,
+             "MAP_SHARED_VALIDATE of anonymous memory");
     check_eq(map((void *)(PAGE + 1), PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0),
              -EINVAL, "MAP_FIXED at an unaligned address");
     check_eq(map(0, PAGE, PROT_READ, MAP_PRIVATE, 15, 0), -EBADF, "a descriptor that isn't open");
