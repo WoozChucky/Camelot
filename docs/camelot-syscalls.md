@@ -105,14 +105,16 @@ headers and checks each size.
 | `struct iovec` | 16 | a buffer ("Messages"): a pointer and a `size_t` |
 | `struct msghdr` | 56 | `sendmsg`'s and `recvmsg`'s message: an address, buffers, control messages and flags |
 | `struct cmsghdr` | 16 | a control message's header: a `size_t` length, then two `int`s, the level and the type |
+| `struct termios` | 36 | a terminal's modes ("Terminals"): four `unsigned int` flags, the line discipline's number, then 19 control characters, Linux's for `TCGETS` |
+| `struct winsize` | 8 | a terminal's size: four `unsigned short`s, rows, columns and two in pixels |
 
 ## Calls
 
 | Number | Name | Arguments | Returns |
 |---|---|---|---|
 | 1 | `exit` | `int status` | does not return |
-| 2 | `write` | `int fd, const void *buf, size_t len` | bytes written; `-EBADF`, `-EFAULT`, `-EPIPE`, `-ENOSPC`, `-EFBIG`, `-EINVAL`, `-ENOMEM` |
-| 3 | `read` | `int fd, void *buf, size_t len` | bytes read, 0 at the end of the input; `-EBADF`, `-EFAULT`, `-ENOMEM` |
+| 2 | `write` | `int fd, const void *buf, size_t len` | bytes written; `-EBADF`, `-EFAULT`, `-EPIPE`, `-ENOSPC`, `-EFBIG`, `-EINVAL`, `-ENOMEM`, `-EIO`, `-EINTR` |
+| 3 | `read` | `int fd, void *buf, size_t len` | bytes read, 0 at the end of the input; `-EBADF`, `-EFAULT`, `-ENOMEM`, `-EIO`, `-EINTR` |
 | 4 | `getpid` | | the caller's pid |
 | 5 | `yield` | | 0 |
 | 6 | `sleep` | `uint ticks` | 0 |
@@ -120,7 +122,7 @@ headers and checks each size.
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
 | 9 | `sbrk` | `long increment` | the old end of the heap, a pointer; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
-| 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-ENXIO`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
+| 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-ENXIO`, `-EIO`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
 | 12 | `close` | `int fd` | 0; `-EBADF` |
 | 13 | `lseek` | `int fd, off_t offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
 | 14 | `fstat` | `int fd, struct stat *st` | 0; `-EBADF`, `-EFAULT` |
@@ -204,8 +206,10 @@ run past its end; a write that can write nothing fails with what stopped it:
 kernel writes: ext4's, 2^32 - 1 blocks), `-EINVAL` (the offset is past the end of the
 file, which another descriptor has emptied meanwhile), `-ENOMEM` (no page
 free for copying through). To the console, the bytes are printed. To a
-pipe, they wait in it for a reader ("Pipes"); `-EPIPE` if no read end is
-open any more.
+pseudo-terminal, they go to the other end ("Terminals"), a slave's waiting
+for room; `-EIO` once that end is gone, `-EINTR` if the process is killed
+while it waits. To a pipe, they wait in it for a reader ("Pipes");
+`-EPIPE` if no read end is open any more.
 
 **read(fd, buf, len)** reads up to `len` bytes from the open file behind
 `fd` into `buf` and returns how many it read; 0 means the end of the input.
@@ -216,10 +220,12 @@ next datagram). From a file on the disk, the bytes come from the descriptor's
 offset, which moves past them: `len` of them, fewer at the end of the file,
 0 at or past it. A directory reads the same way, as its array of 16-byte
 entries (`struct dirent` in `user.h`, the format in `docs/camelot-fs.md`).
-From the console, a read waits for a whole line ("Console input"). From a
-pipe, it waits while the pipe is empty and a write end is open, then returns
-what is there, up to `len` bytes; 0 once it is empty and no write end is
-left.
+From a terminal, the console or a pseudo-terminal's slave, a read waits as
+the terminal's mode says, for a whole line by default ("Terminals"); from a
+pseudo-terminal's master, for what the slave wrote, `-EIO` once the slave is
+closed; `-EINTR` if the process is killed meanwhile. From a pipe, it waits
+while the pipe is empty and a write end is open, then returns what is
+there, up to `len` bytes; 0 once it is empty and no write end is left.
 
 **getpid()** returns the caller's pid. Pids count from 1 (the shell) and are
 never reused.
@@ -320,12 +326,15 @@ opens:
   `O_CREAT` on a missing name with a trailing slash (`newf/` names a
   directory, and `open` makes only files);
 - a device node (`/dev/console`, `/dev/fb0`, `/dev/input/event0` and
-  `event1`), which gives the device itself, in the access mode asked for,
-  also on a read-only filesystem: the console's reads and writes, the
-  framebuffer's memory to map and its requests ("The framebuffer"; its
-  `read` and `write` are `-EINVAL`), an input device's events ("Input
-  devices"); a node whose major number has no driver, or whose device the
-  machine hasn't (a framebuffer, a keyboard, a pointer), is `-ENODEV`.
+  `event1`, `/dev/ptmx`, `/dev/pts/N`), which gives the device itself, in
+  the access mode asked for, also on a read-only filesystem: the console's
+  reads and writes, the framebuffer's memory to map and its requests ("The
+  framebuffer"; its `read` and `write` are `-EINVAL`), an input device's
+  events ("Input devices"), a new pseudo-terminal's master or a slave
+  ("Terminals": `-ENOSPC` when all 16 are in use, `-ENOMEM`, and a slave
+  `-ENXIO` without its pair, `-EIO` locked or without its master); a node
+  whose major number has no driver, or whose device the machine hasn't (a
+  framebuffer, a keyboard, a pointer), is `-ENODEV`.
 
 A local socket's name (an inode of type `T_SOCKET`, which `bind` makes) is
 not opened: `-ENXIO`, as on Linux; `connect` reaches the socket behind it
@@ -443,12 +452,11 @@ not a descriptor, 0 to 15 (Linux's answer for one at or past
 `fd`, with one argument, a number or a pointer as the request says (its
 number says which, as Linux's `_IOR` and `_IOW` encode it, but the driver
 decides). The devices' requests are in "The framebuffer" and "Input
-devices", at Linux's numbers, with Linux's structures. Returns what the
-request returns, 0 for most. Errors: `-EBADF` if `fd` is not open;
-`-ENOTTY` if it is not a device (a file, a pipe, a socket) or its driver
-doesn't know the request, the console's included, which has none; the
-request's own, `-EFAULT` for a pointer to memory it can't read or write
-among them.
+devices", and the terminals' in "Terminals", at Linux's numbers, with
+Linux's structures. Returns what the request returns, 0 for most. Errors:
+`-EBADF` if `fd` is not open; `-ENOTTY` if it is not a device (a file, a
+pipe, a socket) or its driver doesn't know the request; the request's own,
+`-EFAULT` for a pointer to memory it can't read or write among them.
 
 **pipe(fds)** makes a pipe and stores two new descriptors in `fds[0]` (the
 read end) and `fds[1]` (the write end), the lowest two free ("Pipes").
@@ -1198,6 +1206,113 @@ The requests, at Linux's numbers (`user.h`):
 
 Any other request is `-ENOTTY`, a pointer that isn't writable `-EFAULT`.
 
+## Terminals
+
+A terminal is the console, or a pseudo-terminal's slave: what a program
+reads from it goes through the **line discipline** (`kernel/tty.c`, after
+Linux's `n_tty`), which edits lines, echoes and acts on Ctrl-C, set by the
+terminal's `struct termios`, Linux's. A **pseudo-terminal** (pty) is a pair:
+the slave, a terminal, and the master, the other end of its line, which a
+terminal emulator holds, as on Linux:
+
+- opening `/dev/ptmx` makes a pair and gives its master; `TIOCGPTN` says
+  its number N, and the slave is `/dev/pts/N` (0 to 15: the root image has
+  those nodes, Camelot having no devpts), which opens once `TIOCSPTLCK`
+  has unlocked it. The C library's `posix_openpt`, `grantpt`, `unlockpt`
+  and `ptsname` do this (`user.h`);
+- what the master writes is the slave's input, through the discipline:
+  edited, echoed back to the master, its Ctrl-C acted on; a write waits
+  while the slave's 256-byte input is full, but for a Ctrl-C among the
+  next 256 bytes ("Ctrl-C");
+- what the slave writes is what the master reads, through the output
+  processing (`ONLCR`: a NL as CR NL), from a 2 KiB buffer, a write waiting
+  for room; an echo that finds none is dropped;
+- the pair has one `termios`, window size and foreground, which the
+  requests on either end reach;
+- closing the master hangs the slave up: its reads return what was left
+  (a line typed part way too), then 0, its writes `-EIO`. Once every open slave descriptor is closed,
+  the master reads what was left, then `-EIO`, and its writes are `-EIO`,
+  until a slave is opened again. The pair goes once both ends are.
+
+**The requests**, on a terminal or a master (Linux's,
+`asm-generic/ioctls.h`; `user.h` has them):
+
+| Request | Number | Argument | What |
+|---|---|---|---|
+| `TCGETS` | 0x5401 | `struct termios *` | the modes |
+| `TCSETS` | 0x5402 | `const struct termios *` | sets them (`tcsetattr`'s `TCSANOW`) |
+| `TCSETSW` | 0x5403 | `const struct termios *` | the same, once the output has gone (`TCSADRAIN`): on a slave, once the master has read what it wrote (the console's has always gone) |
+| `TCSETSF` | 0x5404 | `const struct termios *` | the same, and the input thrown away (`TCSAFLUSH`) |
+| `TCFLSH` | 0x540B | a number | throws away the input (`TCIFLUSH`, 0), the output not read yet (`TCOFLUSH`, 1), or both (2) |
+| `TIOCGPGRP` | 0x540F | `int *` | the foreground process, 0 for none (as it was set, even once it has ended) |
+| `TIOCSPGRP` | 0x5410 | `const int *` | sets it, 0 for none (Camelot's: Linux has no such group, `-ESRCH`): `-EINVAL` for less than 0, `-ESRCH` for no such process |
+| `TIOCGWINSZ` | 0x5413 | `struct winsize *` | the size (0 by 0 until set) |
+| `TIOCSWINSZ` | 0x5414 | `const struct winsize *` | sets it |
+| `FIONREAD` | 0x541B | `int *` | the bytes a read would take now: a whole line's in canonical mode; the output waiting, on a master |
+| `TIOCGPTN` | 0x80045430 | `unsigned int *` | a master's N, of `/dev/pts/N` |
+| `TIOCSPTLCK` | 0x40045431 | `const int *` | locks (not 0) or unlocks a master's slave |
+
+`TIOCGPTN` and `TIOCSPTLCK` are the master's (`-ENOTTY` on a slave); any
+other request is `-ENOTTY`.
+
+**The modes.** The flags are kept as set; the discipline acts on these:
+
+- `c_iflag`: `ICRNL` (a CR typed is a NL), `INLCR` (a NL is a CR),
+  `IGNCR` (a CR is dropped);
+- `c_oflag`: `OPOST` with `ONLCR`, a NL written or echoed goes out as CR NL;
+- `c_lflag`: `ICANON` (canonical mode), `ECHO`, `ECHOE` (erasing echoes
+  BS, space, BS; and `VKILL` erases the line so, as with `ECHOKE`), `ECHOK`
+  (otherwise `VKILL` echoes a newline), `ECHONL` (a NL echoed without `ECHO`), `ECHOCTL` (Ctrl-C
+  echoed as `^C`), `ISIG` (Ctrl-C and Ctrl-\ kill the foreground process),
+  `NOFLSH` (and keep the input);
+- `c_cc`: `VINTR`, `VQUIT`, `VERASE`, `VKILL`, `VWERASE`, `VEOF`, `VEOL`,
+  `VSUSP`, `VMIN`, `VTIME` (0 turns a character off).
+
+**Canonical mode** (`ICANON`) edits a line before a read returns it, a
+read taking at most the rest of the line: printable characters
+(0x20-0x7E) are kept, up to 127; `VERASE` and BS (0x08, what Windows
+consoles send) erase one, `VWERASE` the word before the cursor, `VKILL`
+the line; NL, or `VEOL`, ends it and is kept; `VEOF` ends it without one,
+so on an empty line the read returns 0; a NL right after a CR that `ICRNL`
+made a NL is skipped, so CR LF is one line end; other characters,
+control characters and bytes from 0x80 up, are dropped. **Non-canonical
+mode** passes every byte, as Linux's does with `VMIN` and `VTIME` (tenths
+of a second, a tick each): `VMIN` 0 and `VTIME` 0, what there is, maybe
+nothing; `VMIN` 0, up to `VTIME` for a byte, else 0; `VTIME` 0, `VMIN`
+bytes (or `len`, if fewer); both, `VMIN` bytes, or what came once `VTIME`
+has passed since the last byte. Echo, in either mode, happens when a
+program reads (or polls), so input typed ahead is echoed after the prompt
+that asks for it.
+
+**Ctrl-C.** With `ISIG`, `VINTR` (Ctrl-C) and `VQUIT` (Ctrl-\) kill the
+terminal's foreground process as `kill` does (it exits with -1), throw
+away the input unless `NOFLSH`, and echo `^C` and a newline; without a
+foreground process, or once it has ended, they are dropped. They take
+no room in the input, so they reach a program that doesn't read it:
+when the input is full, a Ctrl-C waiting in the console's UART (128
+bytes) or among the next 256 bytes of a master's write still gets in,
+and the bytes ahead of it, which have no room, are dropped, as Linux
+drops input that overflows (with `NOFLSH` too; without it, the Ctrl-C
+throws the input away besides); further back, it waits with them. `VSUSP`
+(Ctrl-Z) is dropped too: Camelot doesn't stop processes. The foreground
+is a process, set with `tcsetpgrp`, until Camelot has process groups
+(issue #116). The shell sets it on its terminal to each program it waits
+for, so Ctrl-C ends the program, not the shell, and at its prompt makes
+it none if it is the foreground itself (a shell run by another, which
+Camelot has no signals for it to ignore); any other program that wants
+Ctrl-C to end what it runs sets it.
+
+**Defaults.** A new pty has Linux's (`tty_std_termios`, the pty driver's
+`c_cflag`): `ICRNL`, `IXON`, `OPOST`, `ONLCR`, `B38400`, `CS8`, `CREAD`,
+`ISIG`, `ICANON`, `ECHO`, `ECHOE`, `ECHOK`, `ECHOCTL`, `ECHOKE`, `IEXTEN`,
+and Linux's control characters (Ctrl-C, Ctrl-\, DEL, Ctrl-U, Ctrl-D,
+Ctrl-W, Ctrl-Z; `VMIN` 1, `VTIME` 0). The console has the same, with
+`HUPCL` as Linux's other terminals, but for what it has always done: no
+output processing (`c_oflag` 0), and no `VKILL` or `VWERASE` ("Console
+input"). Its size is 0 by 0 until a
+program sets it. `cfmakeraw`, in the C library, makes raw mode as glibc's
+does.
+
 ## Error numbers
 
 Linux's values for the same conditions.
@@ -1208,6 +1323,7 @@ Linux's values for the same conditions.
 | 2 | `ENOENT` | no such file or directory |
 | 3 | `ESRCH` | kill: no such process; thread_join: no such thread |
 | 4 | `EINTR` | a wait ended because the process was killed |
+| 5 | `EIO` | a pseudo-terminal whose other end is gone; a locked slave's open |
 | 6 | `ENXIO` | open: a local socket's name, which only `connect` reaches |
 | 7 | `E2BIG` | spawn, exec: argument list too long |
 | 8 | `ENOEXEC` | spawn, exec: the file is not a valid executable |
@@ -1468,9 +1584,15 @@ file says:
   and in error once no read end is open;
 - **a file, a directory or a shared-memory object**: always ready to read
   and write, as on Linux;
-- **the console**: always ready to write; ready to read once a whole line
-  has been typed, or Ctrl-D, which `poll` edits and echoes as `read` would
-  ("Console input"), on a descriptor open for reading;
+- **the console**: always ready to write; ready to read once a read would
+  not wait, by default once a whole line has been typed, or Ctrl-D, which
+  `poll` edits and echoes as `read` would ("Terminals"), on a descriptor
+  open for reading;
+- **a pseudo-terminal** ("Terminals"): the slave is ready to read as the
+  console is, and to write with room for the master; hung up (and ready to
+  read: the end) once the master is closed. The master is ready to read
+  with output waiting, to write with room in the slave's input, and hung
+  up once the slave has been closed;
 - **a socket** ("Sockets"): a TCP listener is ready to read with a
   connection to accept; a connection is ready to read with bytes or the
   peer's FIN (`POLLRDHUP`) waiting, or once it ended in an error, and to
@@ -1500,10 +1622,11 @@ wakeup on any of them, from then on, has the call look at every file again
 
 ## Console input
 
-`read` on stdin returns whole lines, edited as they are typed, like a
-terminal in canonical mode. The kernel echoes the input as a program reads
-it, so input typed ahead appears after the prompt that asks for it rather
-than in the middle of other output:
+The console is a terminal ("Terminals"), whose defaults are what it has
+always done: `read` on stdin returns whole lines, edited as they are typed,
+in canonical mode. The kernel echoes the input as a program reads it, so
+input typed ahead appears after the prompt that asks for it rather than in
+the middle of other output:
 
 - printable characters (0x20-0x7E) are kept and echoed, up to 127 a line;
   the rest of a longer line is dropped, neither echoed nor kept;
@@ -1512,7 +1635,10 @@ than in the middle of other output:
   LF right after a CR is skipped, so raw consoles and piped text both work);
 - Ctrl-D (0x04) ends the line without a newline; on an empty line, the read
   returns 0, the end of the input;
-- other control characters are ignored.
+- Ctrl-C (0x03) kills the foreground process, if one is set (`tcsetpgrp`;
+  the shell sets it to each program it waits for) and still running,
+  echoing `^C` and a newline and throwing away the line; without one it is
+  ignored, as are the other control characters.
 
 A line is at most 128 bytes with its newline, so a 129-byte buffer holds any
 line and its NUL.

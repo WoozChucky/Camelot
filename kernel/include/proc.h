@@ -391,6 +391,9 @@ void proc_kill(struct trap_frame *f);
  * or the first one (the shell). */
 int proc_kill_pid(int pid);
 
+/* Whether a process `pid` is running (neither ended nor being made). */
+bool proc_exists(int pid);
+
 /* Whether the current thread has been killed, or its process. */
 bool proc_killed(void);
 

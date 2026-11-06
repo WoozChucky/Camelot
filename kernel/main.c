@@ -22,6 +22,7 @@
 #include "plic.h"
 #include "mmio.h"
 #include "proc.h"
+#include "pty.h"
 #include "shm.h"
 #include "riscv.h"
 #include "sbi.h"
@@ -374,6 +375,7 @@ int kmain(void) {
      * either can run. */
     proc_init();
     console_init();
+    pty_init();
     file_init();
     mmap_init();
     shm_init();

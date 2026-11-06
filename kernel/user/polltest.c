@@ -239,6 +239,10 @@ static void device_checks(void) {
     check_eq(ioctl(fb, FBIOPUT_VSCREENINFO, &v), 0, "640x480, two frames");
     v.yoffset = 480;
     v.activate = 0;
+    /* Just after a vertical blank, so the next is a frame away: the flip
+     * is still pending when poll looks. */
+    uint32_t crtc = 0;
+    check_eq(ioctl(fb, FBIO_WAITFORVSYNC, &crtc), 0, "a vertical blank");
     check_eq(ioctl(fb, FBIOPAN_DISPLAY, &v), 0, "a flip, not waited for");
     check_eq(poll1(fb, POLLOUT, 0), 0, "pending: not ready");
     check_eq(poll1(fb, OUT, 1000), OUT, "shown at the vertical blank: ready again");
