@@ -707,11 +707,15 @@ fn the_linker_on_camelot_keeps_the_line_tables_as_merlin_ld_does() {
 }
 
 /// The linker's machine: [`machine_config`]'s with 12 MiB of RAM for the
-/// kernel instead of 4. `ld` holds a link's objects and the image it builds
-/// in memory, as merlin-ld does, and cc1's (its objects, some 1.7 MB, and
-/// the program it makes, 1 MB) take more than 8 MiB leaves the program
-/// since the display server's merge (#256): on 8 MiB, which was enough
-/// before it, its mappings' pages run out.
+/// kernel instead of 4. `ld` holds a link's objects, the archives it reads
+/// and the image it builds in memory, as merlin-ld does, and cc1's link is
+/// the biggest: its 18 objects are 1,878,896 bytes (1,677,816 for the 16
+/// before -g's debug.c and md5.c), with libc.a and libgui.a (187,900 bytes;
+/// 149,624 before the display server). Measured by the kernel's free pages
+/// during the link: at the shell's prompt 1806 are free on 8 MiB, 2830 on
+/// 12 (the kernel's own use the same before and after the display server),
+/// and ld's peak is 1807 pages (1404 with the objects before -g, 1789 with
+/// the archives before the display server): one page more than 8 MiB has.
 fn link_machine_config() -> MachineConfig {
     MachineConfig {
         ram_size: (12 << 20) + grail::firmware::FW_SIZE as usize,
