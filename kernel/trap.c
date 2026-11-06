@@ -21,6 +21,7 @@
 #include "net.h"
 #include "nic.h"
 #include "plic.h"
+#include "mmap.h"
 #include "probe.h"
 #include "proc.h"
 #include "riscv.h"
@@ -347,6 +348,31 @@ static bool stack_fault(struct trap_frame *f) {
     return false;
 }
 
+/* Whether `f`, a page fault in U-mode, is the first touch of a page of one
+ * of the process's memory mappings that allows the access, now mapped
+ * (mm_fault(), mmap.h: demand paging). Any other fault in a mapping (an
+ * access its protections don't allow, a page past a shared object's end,
+ * no memory left) is the program's: it kills it, as Linux's SIGSEGV and
+ * SIGBUS would. */
+static bool area_fault(struct trap_frame *f) {
+    u32 access;
+    if (f->scause == CAUSE_LOAD_PAGE_FAULT) {
+        access = PTE_R;
+    } else if (f->scause == CAUSE_STORE_PAGE_FAULT) {
+        access = PTE_W;
+    } else if (f->scause == CAUSE_INSTR_PAGE_FAULT) {
+        access = PTE_X;
+    } else {
+        return false;
+    }
+    if (!mm_fault(myproc()->pagetable, f->stval, access)) {
+        return false;
+    }
+    /* A new mapping only: this hart may have cached the missing one. */
+    sfence_vma();
+    return true;
+}
+
 void user_trap(struct trap_frame *f) {
     /* From here on, a trap is the kernel's own. Interrupts stay off (the trap
      * cleared sstatus.SIE) until the process is back in U-mode. */
@@ -365,6 +391,8 @@ void user_trap(struct trap_frame *f) {
         syscall(f);
     } else if (stack_fault(f)) {
         /* The stack grew to the faulting address: run the instruction again. */
+    } else if (area_fault(f)) {
+        /* A mapping's page, mapped now: run the instruction again. */
     } else {
         /* A fault in U-mode is the program's, not the kernel's. */
         proc_kill(f);

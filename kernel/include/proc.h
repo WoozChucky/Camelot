@@ -119,8 +119,12 @@ _Static_assert(offsetof(struct thread, kstack) == THREAD_KSTACK, "the tests read
  * xstatus, nthreads, killed and exiting. `files_lock` protects the
  * descriptors and the working directory, which any of the process's
  * threads may change (the fd_ functions below). `heap_lock`, a sleep lock,
- * makes sbrk() one thread at a time. The page table and the heap's bounds
- * change only under heap_lock, or while the process has one thread (exec);
+ * makes sbrk(), the stack's growth, mmap, munmap and mprotect one thread at
+ * a time; `vm_lock`, a spinlock, guards the mappings for the page faults
+ * that map their pages (mmap.h). The heap's bounds and the mappings change
+ * only under heap_lock, or while the process has one thread (exec); so does
+ * the page table, but for a fault adding a page of a mapping (under vm_lock
+ * alone, every page the kernel maps for the process being under it);
  * others (ps) read them under proc_lock and may see them just before or
  * after a change. */
 struct proc {
@@ -177,6 +181,14 @@ struct proc {
     /* The descriptors that close on exec (FD_CLOEXEC), bit fd for ofile[fd]:
      * Linux's close_on_exec bitmap. A free descriptor's bit is clear. */
     u32 cloexec;
+    /* Its memory mappings (mmap.h), in address order: changed under both
+     * heap_lock and vm_lock, read under either. */
+    struct vm_area *areas;
+    /* The area list, and every page the kernel maps in user space while
+     * the process runs: a page fault maps an area's page with only this
+     * spinlock, which keeps it from making a page table another mapping
+     * makes at the same time (mmap.h, "Locking"). */
+    struct spinlock vm_lock;
 };
 
 _Static_assert(NOFILE <= 32, "a bit of proc.cloexec for each descriptor");
@@ -184,7 +196,7 @@ _Static_assert(NOFILE <= 32, "a bit of proc.cloexec for each descriptor");
 /* The tests walk procs[] by PROC_SIZE, and read the page table at
  * PROC_PAGETABLE. */
 #define PROC_PAGETABLE 40
-#define PROC_SIZE 304
+#define PROC_SIZE 336
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 _Static_assert(offsetof(struct proc, parent) == 24, "the tests read parent there");
 _Static_assert(offsetof(struct proc, pagetable) == PROC_PAGETABLE, "the tests read pagetable there");

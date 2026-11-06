@@ -21,7 +21,7 @@ mod common;
 
 use common::{
     command_output, image_pa, kpa, peek64, printed, proc_name, spare_pages, sym, LockWatch, CPU_PROC,
-    KSTACK_PAGES, PROC_PID, PROMPT,
+    KSTACK_PAGES, MAPTEST_CHECKS, PROC_PID, PROMPT,
 };
 use excalibur::csr::{IRQ_S_EXT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPP};
 use grail::cpu::Mode;
@@ -1040,6 +1040,94 @@ fn the_user_stack_grows_on_demand_up_to_its_limit() {
 }
 
 #[test]
+fn memory_mappings_are_mapped_on_demand_and_given_back() {
+    // Issue #179: maptest's checks of mmap, munmap and mprotect on
+    // anonymous memory (placement, MAP_FIXED, splits, protections, the
+    // errors, the kernel's copies into pages not touched yet, the heap
+    // kept out of a mapping, 200 MiB mapped on an 8 MiB machine), and of
+    // shared-memory objects (memfd_create, ftruncate, two mappings of one
+    // in a process and in two); then a touch of a PROT_NONE page, of an
+    // unmapped one, a store to a read-only one and a touch past an object's
+    // end, each killing the program: every page is back after each command,
+    // the mappings' and the objects' included.
+    let commands = [
+        "maptest",
+        "maptest none",
+        "maptest unmapped",
+        "maptest readonly",
+        "maptest past",
+        "echo alive",
+    ];
+    let out = run_counting_pages(8, &commands);
+    assert_eq!(
+        all_checks_pass(&out, "maptest", "maptest"),
+        MAPTEST_CHECKS,
+        "{out}"
+    );
+    for (command, fault) in [
+        ("maptest none", "load page fault"),
+        ("maptest unmapped", "load page fault"),
+        ("maptest readonly", "store page fault"),
+        ("maptest past", "load page fault"),
+    ] {
+        let lines = command_output(&out, command);
+        assert!(
+            lines[0].starts_with("pid ") && lines[0].ends_with(&format!(" (maptest) killed: {fault}")),
+            "{command}: {out}"
+        );
+    }
+    assert_eq!(command_output(&out, "echo alive"), ["alive"]);
+
+    // In Sv39's smaller user space too.
+    let out = run(
+        Setup {
+            paging: grail::Paging::Sv39,
+            ..Setup::default()
+        },
+        b"maptest\nexit 0\n",
+    );
+    assert_eq!(
+        all_checks_pass(&out, "maptest", "maptest"),
+        MAPTEST_CHECKS,
+        "{out}"
+    );
+}
+
+#[test]
+fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
+    // Issue #179's device mappings: `maptest fb` on the root image maps
+    // /dev/fb0, the framebuffer's VRAM, draws a pattern into it and checks
+    // the errors. The display shows what it drew, and no page of RAM went
+    // to it: a device's pages are the device's.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load(
+        Setup {
+            disks: vec![root_disk(4096, &[])],
+            ..Setup::default()
+        }
+        .config(),
+        Some(rx),
+    );
+    step_to_prompt(&mut m, 1);
+    let before = spare_pages(&m, &elf);
+    for b in b"maptest fb\n" {
+        tx.send(*b).unwrap();
+    }
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(spare_pages(&m, &elf), before, "{out}");
+    assert_eq!(all_checks_pass(&out, "maptest fb", "maptest"), 15, "{out}");
+    let fb = &m.cpu.bus.fb;
+    for (x, y) in [(0, 0), (1, 0), (639, 0), (0, 479), (321, 123), (639, 479)] {
+        assert_eq!(
+            fb.pixel(x, y),
+            (x & 0xff) << 16 | (y & 0xff) << 8 | 0x5a,
+            "({x}, {y})"
+        );
+    }
+}
+
+#[test]
 fn bad_pointers_are_refused() {
     // Issue #21's second criterion. badptr hands write and read kernel
     // memory, page 0, a range past the end of user space, the stack's guard
@@ -1110,7 +1198,8 @@ fn the_c_library_does_what_user_h_says() {
     // libtest checks the user C library (kernel/user/lib): strings, the
     // memory functions at every alignment of their pointers, numbers
     // (strtol's 64-bit LONG_MAX), snprintf's formats (%ld of 64-bit values,
-    // %p's 16 digits), malloc's 16-byte blocks and free, readers on a pipe
+    // %p's 16 digits), malloc's 16-byte blocks and free (a big block in a
+    // mapping of its own, given back by free), readers on a pipe
     // fed by a child of its own, and addresses (inet.c, and resolve.c on
     // addresses).
     let out = run_processes(b"libtest\nexit 0\n");

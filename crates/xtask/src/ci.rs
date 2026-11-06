@@ -18,7 +18,8 @@
 //!   examples, the boot programs, hello, the disk image; and the kernel boots,
 //!   on 1 to 8 harts, under Sv48 and Sv39, from disk, and panics as it should;
 //! - processes' system call ABI: results sign-extended, pointers into the
-//!   kernel's half refused, 64-bit values through the calls;
+//!   kernel's half refused, 64-bit values through the calls; memory mappings
+//!   (maptest);
 //! - how Avalon and Lake end connections: bad handshakes, and a server's last
 //!   frame arriving whole though the client sent more (Linux's TCP stack is not
 //!   Windows's here);
@@ -186,7 +187,7 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
-               Linux's start as pid 1, the environment (#216)",
+               Linux's start as pid 1, the environment (#216), memory mappings (#179)",
         args: &[
             "-p",
             "xtask",
@@ -198,6 +199,7 @@ const STEPS: &[Step] = &[
             "the_calls_take_and_return_64_bit_values",
             "a_program_starts_as_linux_starts_one",
             "the_shell_passes_its_environment_on",
+            "memory_mappings_are_mapped_on_demand_and_given_back",
         ],
     },
     Step {

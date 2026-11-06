@@ -6,7 +6,7 @@
  * Descriptors that dup() or spawn() copy share one open file, offset and
  * all; it goes when the last of them is closed.
  *
- * Three kinds:
+ * The kinds:
  *
  *   FD_INODE   a file or directory of the filesystem (fs.h): reads and
  *              writes go through readi/writei at `off`, each write in
@@ -17,6 +17,8 @@
  *   FD_PIPE    one end of a pipe (pipe.h)
  *   FD_SOCKET  a TCP or UDP socket (net.h, net/socket.c): reads and writes
  *              are recv() and send()
+ *   FD_SHM     a shared-memory object (memfd_create, shm.h): mapped with
+ *              mmap() and sized with ftruncate(), not read or written
  *
  * Every function here runs in a process's kernel thread (they may sleep,
  * for the disk or a pipe) and takes user addresses in that process's page
@@ -36,18 +38,22 @@
 /* Descriptors per process. */
 #define NOFILE 16
 
-/* Device numbers (the major of a device inode). */
+/* Device numbers (the major of a device inode): the console, and the
+ * framebuffer (fb.h). */
 #define CONSOLE 1
-#define NDEV 2
+#define FB 2
+#define NDEV 3
 
 #define FD_NONE 0
 #define FD_PIPE 1
 #define FD_INODE 2
 #define FD_DEVICE 3
 #define FD_SOCKET 4
+#define FD_SHM 5
 
 struct pipe;
 struct socket;
+struct shm_object;
 
 struct file {
     u32 type;
@@ -56,16 +62,22 @@ struct file {
     bool writable;
     struct pipe *pipe;  /* FD_PIPE */
     struct socket *sock; /* FD_SOCKET */
+    struct shm_object *shm; /* FD_SHM, with a reference the file holds */
     struct inode *ip;   /* FD_INODE, and FD_DEVICE opened by its path */
     u64 off;            /* FD_INODE: at most MAXFILE_BYTES (fs.h) */
     u16 major;          /* FD_DEVICE */
 };
 
 /* A device's driver: read and write on user memory, as console_read() and
- * console_write() do. */
+ * console_write() do; and, for a device with memory a program may map
+ * (Linux's f_op->mmap), `mmap`, NULL for one without: given the mapping's
+ * offset into the device's memory and its size (whole pages), it returns
+ * 0 with the physical address of the first page in *pa, the rest
+ * following it, or -EINVAL if the range is past the device's memory. */
 struct devsw {
     isize (*read)(pagetable_t pt, uintptr dst, usize n);
     isize (*write)(pagetable_t pt, uintptr src, usize n);
+    int (*mmap)(u64 offset, usize size, phys_addr_t *pa);
 };
 
 extern const struct devsw devsw[NDEV];
@@ -121,5 +133,30 @@ off_t filelseek(struct file *f, off_t offset, u32 whence);
 
 /* fstat(): fills *st. */
 void filestat(struct file *f, struct stat *st);
+
+/* memfd_create(): a new open file, readable and writable, for a new empty
+ * shared-memory object (FD_SHM): -ENFILE if the table of files or of
+ * objects is full. */
+struct file *file_shm(int *err);
+
+/* ftruncate(): sets the size of the shared-memory object behind `f`. 0, or
+ * -EINVAL (not a shared-memory object, or not open for writing; `length`
+ * below 0), -EFBIG (past the largest object). */
+int filetruncate(struct file *f, off_t length);
+
+struct vm_area;
+
+/* What a mapping of `f` (mmap() of a descriptor) maps: fills in the
+ * backing of `a` (its kind, its object and offset, or its device's
+ * physical address, and whether mprotect() may make it writable) for
+ * `size` bytes from `offset`, a mapping of type `type` (MAP_SHARED or
+ * MAP_PRIVATE) with protections `prot` (mmap.h). For a shared-memory
+ * object, `a` holds a reference to it from then on, which the area takes
+ * over (or mmap lets go of). 0, or -EACCES (`f` isn't open for reading, or
+ * for writing a writable shared mapping), -EINVAL (a private mapping of a
+ * shared-memory object, or a device range past its memory), -ENODEV (a
+ * file that can't be mapped: a regular file, a directory, a pipe, a
+ * socket, the console). */
+int filemmap(struct file *f, u32 type, u32 prot, u64 offset, usize size, struct vm_area *a);
 
 #endif

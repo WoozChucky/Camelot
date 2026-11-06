@@ -119,8 +119,9 @@ the table's last block past inode `ninodes` - 1 are unused.
   rooted in `i_block`: a header with up to 4 entries. An empty one has a
   header with no entries. A **device** has `size` 0, no blocks, and an
   `i_block` of zeros; `major` and `minor` say which device: the kernel opens
-  major 1 as the console (`/dev/console` on the root image) and has no
-  driver for any other (docs/camelot-syscalls.md). A directory's or file's
+  major 1 as the console (`/dev/console` on the root image) and major 2 as
+  the framebuffer (`/dev/fb0`), and has no driver for any other
+  (docs/camelot-syscalls.md). A directory's or file's
   `major` and `minor` are 0.
 
 ## Extent trees

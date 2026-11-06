@@ -64,6 +64,7 @@
 #include "kprintf.h"
 #include "log.h"
 #include "memlayout.h"
+#include "mmap.h"
 #include "riscv.h"
 #include "sbi.h"
 #include "smp.h"
@@ -165,6 +166,10 @@ static void thread_free(struct thread *t) {
  * in any hart's satp. Called with proc_lock held. */
 static void proc_free(struct proc *p) {
     if (p->pagetable != NULL) {
+        /* The mappings first: uvm_free() frees every page still mapped,
+         * and a shared object's or a device's pages aren't the process's. */
+        mm_release(p->pagetable, p->areas);
+        p->areas = NULL;
         uvm_free(p->pagetable);
         p->pagetable = NULL;
     }
@@ -385,6 +390,7 @@ static struct proc *proc_alloc(struct thread **tp, int *err) {
     release(&proc_lock);
     initsleeplock(&p->heap_lock, "heap");
     initlock(&p->files_lock, "files");
+    initlock(&p->vm_lock, "vm");
     *tp = thread_alloc(p, err);
     if (*tp == NULL) {
         acquire(&proc_lock);
@@ -635,6 +641,10 @@ int proc_exec_commit(struct exec_image *img, const char *name) {
         return -EINTR;
     }
     pagetable_t old = p->pagetable;
+    /* The old program's mappings go with its address space (Linux's exec
+     * starts from an empty mm). */
+    struct vm_area *old_areas = p->areas;
+    p->areas = NULL;
     p->pagetable = img->pagetable;
     p->heap_base = img->heap;
     p->brk = img->heap;
@@ -649,6 +659,7 @@ int proc_exec_commit(struct exec_image *img, const char *name) {
     sfence_vma();
     img->pagetable = NULL;
     if (old != NULL) {
+        mm_release(old, old_areas);
         uvm_free(old);
     }
     /* The old program is gone: the descriptors it marked close-on-exec go
@@ -1182,6 +1193,26 @@ int proc_wait(int pid, uintptr status) {
     }
 }
 
+/* Maps a new zeroed page at user address `a` of `p`, readable and
+ * writable, for the stack or the heap: 0, or -ENOMEM (nothing mapped).
+ * Under vm_lock, as a page fault in a mapping maps its pages: the two may
+ * need the same new page table (mmap.h, "Locking"). Called holding
+ * p->heap_lock. */
+static int map_user_page(struct proc *p, uintptr a) {
+    void *mem = kzalloc();
+    if (mem == NULL) {
+        return -ENOMEM;
+    }
+    acquire(&p->vm_lock);
+    int r = map_pages(p->pagetable, a, pa(mem), PGSIZE, PTE_U | PTE_R | PTE_W);
+    release(&p->vm_lock);
+    if (r != 0) {
+        kfree(mem);
+        return -ENOMEM;
+    }
+    return 0;
+}
+
 int proc_grow_stack(uintptr va) {
     struct proc *p = myproc();
     if (va < USER_STACK_LIMIT || va >= USER_TOP) {
@@ -1197,12 +1228,8 @@ int proc_grow_stack(uintptr va) {
     int r = 0;
     while (p->stack_low > low) {
         uintptr a = p->stack_low - PGSIZE;
-        void *mem = kzalloc();
-        if (mem == NULL || map_pages(p->pagetable, a, pa(mem), PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
+        if (map_user_page(p, a) != 0) {
             /* What was mapped stays: the stack is just shorter. */
-            if (mem != NULL) {
-                kfree(mem);
-            }
             r = -ENOMEM;
             break;
         }
@@ -1239,15 +1266,17 @@ long proc_sbrk(long increment) {
             return -ENOMEM;
         }
         uintptr end = old + grow;
+        uintptr first = PGROUNDUP(old);
+        /* The heap can't grow into a memory mapping (Linux's brk checks
+         * the same): mmap() puts them above it, from the top down. */
+        if (mm_overlaps(p, first, PGROUNDUP(end))) {
+            releasesleep(&p->heap_lock);
+            return -ENOMEM;
+        }
         /* Map the pages from the first one not yet mapped up to the new
          * end; on failure, unmap them again. */
-        uintptr first = PGROUNDUP(old);
         for (uintptr a = first; a < end; a += PGSIZE) {
-            void *mem = kzalloc();
-            if (mem == NULL || map_pages(p->pagetable, a, pa(mem), PGSIZE, PTE_U | PTE_R | PTE_W) != 0) {
-                if (mem != NULL) {
-                    kfree(mem);
-                }
+            if (map_user_page(p, a) != 0) {
                 if (a > first) {
                     unmap_pages(p->pagetable, first, a - first, true);
                 }

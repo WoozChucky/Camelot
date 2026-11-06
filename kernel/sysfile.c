@@ -20,6 +20,7 @@
 #include "log.h"
 #include "pipe.h"
 #include "proc.h"
+#include "shm.h"
 #include "string.h"
 #include "syscall.h"
 
@@ -158,6 +159,49 @@ long sys_fstat(struct trap_frame *f) {
     fileclose(file);
     /* Checked above, but another thread may have unmapped it since. */
     return copyout(pt, arg(f, 1), &st, sizeof st) == 0 ? 0 : -EFAULT;
+}
+
+long sys_memfd_create(struct trap_frame *f) {
+    /* The name only names the object to someone debugging (Linux shows it
+     * in /proc/PID/maps): it is checked as Linux checks it, and dropped. */
+    pagetable_t pt = myproc()->pagetable;
+    char name[MFD_NAME_MAX + 1];
+    int n = copyinstr(pt, name, arg(f, 0), sizeof name);
+    if (n == -1) {
+        return -EFAULT;
+    }
+    if (n == -2) {
+        /* Too long; read to its end all the same, so that a bad pointer is
+         * reported as one. */
+        return skip_string(pt, arg(f, 0) + sizeof name) != 0 ? -EFAULT : -EINVAL;
+    }
+    u32 flags = (u32)arg(f, 1);
+    if ((flags & ~(u32)(MFD_CLOEXEC | MFD_ALLOW_SEALING)) != 0) {
+        return -EINVAL;
+    }
+    if (!fd_available()) {
+        return -EMFILE;
+    }
+    int err;
+    struct file *file = file_shm(&err);
+    if (file == NULL) {
+        return err;
+    }
+    int fd = fd_install_from(file, 0, (flags & MFD_CLOEXEC) != 0);
+    if (fd < 0) {
+        fileclose(file);
+    }
+    return fd;
+}
+
+long sys_ftruncate(struct trap_frame *f) {
+    struct file *file = fd_get((u32)arg(f, 0));
+    if (file == NULL) {
+        return -EBADF;
+    }
+    int r = filetruncate(file, (off_t)arg(f, 1));
+    fileclose(file);
+    return r;
 }
 
 long sys_pipe(struct trap_frame *f) {
