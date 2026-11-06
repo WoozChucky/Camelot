@@ -418,3 +418,462 @@ int valid_utf8(const uchar *s, uint n) {
     }
     return 1;
 }
+
+/* Rust's String::from_utf8_lossy: the bytes as UTF-8, each maximal part of
+ * an ill-formed sequence (as Unicode defines it) replaced by U+FFFD. */
+char *from_utf8_lossy(const uchar *s, uint n) {
+    struct buf b;
+    memset(&b, 0, sizeof b);
+    uint i = 0;
+    while (i < n) {
+        uint c = s[i];
+        if (c < 0x80) {
+            buf_byte(&b, c);
+            i++;
+            continue;
+        }
+        /* How many bytes the sequence has, and the range its second byte
+         * must be in. */
+        uint len = 0;
+        uint lo = 0x80;
+        uint hi = 0xbf;
+        if (c >= 0xc2 && c <= 0xdf) {
+            len = 2;
+        } else if (c >= 0xe0 && c <= 0xef) {
+            len = 3;
+            if (c == 0xe0) {
+                lo = 0xa0;
+            } else if (c == 0xed) {
+                hi = 0x9f;
+            }
+        } else if (c >= 0xf0 && c <= 0xf4) {
+            len = 4;
+            if (c == 0xf0) {
+                lo = 0x90;
+            } else if (c == 0xf4) {
+                hi = 0x8f;
+            }
+        }
+        if (len == 0) {
+            buf_str(&b, "\xef\xbf\xbd");
+            i++;
+            continue;
+        }
+        uint k = 1;
+        while (k < len && i + k < n) {
+            uint d = s[i + k];
+            uint l = k == 1 ? lo : 0x80;
+            uint h = k == 1 ? hi : 0xbf;
+            if (d < l || d > h) {
+                break;
+            }
+            k++;
+        }
+        if (k == len) {
+            buf_put(&b, s + i, len);
+        } else {
+            buf_str(&b, "\xef\xbf\xbd");
+        }
+        i += k;
+    }
+    char *r = buf_arena(&b);
+    buf_free(&b);
+    return r;
+}
+
+/* ---- 128-bit integers ----
+ * Two's complement in two 64-bit halves: adding, subtracting and
+ * multiplying are the same for signed and unsigned numbers, done on the
+ * halves with their carries; the rest look at the sign (the top bit of
+ * hi). */
+
+i128 i128_of(int64_t v) {
+    i128 r;
+    r.lo = (uint64_t)v;
+    r.hi = v < 0 ? ~(uint64_t)0 : 0;
+    return r;
+}
+
+i128 i128_of_u64(uint64_t v) {
+    i128 r;
+    r.lo = v;
+    r.hi = 0;
+    return r;
+}
+
+int i128_is_zero(i128 a) {
+    return a.lo == 0 && a.hi == 0;
+}
+
+int i128_eq(i128 a, i128 b) {
+    return a.lo == b.lo && a.hi == b.hi;
+}
+
+int i128_neg_p(i128 a) {
+    return (a.hi >> 63) != 0;
+}
+
+int i128_cmp(i128 a, i128 b) {
+    /* By the high halves as signed numbers, then the low ones unsigned. */
+    int64_t ah = (int64_t)a.hi;
+    int64_t bh = (int64_t)b.hi;
+    if (ah != bh) {
+        return ah < bh ? -1 : 1;
+    }
+    if (a.lo != b.lo) {
+        return a.lo < b.lo ? -1 : 1;
+    }
+    return 0;
+}
+
+int i128_lt(i128 a, i128 b) {
+    return i128_cmp(a, b) < 0;
+}
+
+int i128_le(i128 a, i128 b) {
+    return i128_cmp(a, b) <= 0;
+}
+
+i128 i128_min(i128 a, i128 b) {
+    return i128_lt(b, a) ? b : a;
+}
+
+i128 i128_max(i128 a, i128 b) {
+    return i128_lt(a, b) ? b : a;
+}
+
+i128 i128_add(i128 a, i128 b) {
+    i128 r;
+    r.lo = a.lo + b.lo;
+    r.hi = a.hi + b.hi + (r.lo < a.lo ? 1 : 0);
+    return r;
+}
+
+i128 i128_not(i128 a) {
+    i128 r;
+    r.lo = ~a.lo;
+    r.hi = ~a.hi;
+    return r;
+}
+
+i128 i128_neg(i128 a) {
+    return i128_add(i128_not(a), i128_of(1));
+}
+
+i128 i128_sub(i128 a, i128 b) {
+    return i128_add(a, i128_neg(b));
+}
+
+/* The 128-bit product of two 64-bit numbers, from their 32-bit halves. */
+static i128 mul_64(uint64_t a, uint64_t b) {
+    uint64_t a0 = a & 0xffffffffu;
+    uint64_t a1 = a >> 32;
+    uint64_t b0 = b & 0xffffffffu;
+    uint64_t b1 = b >> 32;
+    uint64_t p00 = a0 * b0;
+    uint64_t p01 = a0 * b1;
+    uint64_t p10 = a1 * b0;
+    uint64_t p11 = a1 * b1;
+    uint64_t mid = (p00 >> 32) + (p01 & 0xffffffffu) + (p10 & 0xffffffffu);
+    i128 r;
+    r.lo = (p00 & 0xffffffffu) | (mid << 32);
+    r.hi = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+    return r;
+}
+
+i128 i128_mul(i128 a, i128 b) {
+    /* The low 128 bits of the product: the high halves' cross terms only
+     * reach the high half. */
+    i128 r = mul_64(a.lo, b.lo);
+    r.hi += a.lo * b.hi + a.hi * b.lo;
+    return r;
+}
+
+i128 i128_and(i128 a, i128 b) {
+    i128 r;
+    r.lo = a.lo & b.lo;
+    r.hi = a.hi & b.hi;
+    return r;
+}
+
+i128 i128_or(i128 a, i128 b) {
+    i128 r;
+    r.lo = a.lo | b.lo;
+    r.hi = a.hi | b.hi;
+    return r;
+}
+
+i128 i128_xor(i128 a, i128 b) {
+    i128 r;
+    r.lo = a.lo ^ b.lo;
+    r.hi = a.hi ^ b.hi;
+    return r;
+}
+
+i128 i128_shl(i128 a, uint n) {
+    i128 r;
+    if (n == 0) {
+        return a;
+    }
+    if (n >= 64) {
+        r.hi = a.lo << (n - 64);
+        r.lo = 0;
+        return r;
+    }
+    r.hi = a.hi << n | a.lo >> (64 - n);
+    r.lo = a.lo << n;
+    return r;
+}
+
+i128 i128_shr(i128 a, uint n) {
+    i128 r;
+    uint64_t fill = i128_neg_p(a) ? ~(uint64_t)0 : 0;
+    if (n == 0) {
+        return a;
+    }
+    if (n >= 64) {
+        r.lo = n == 64 ? a.hi : (a.hi >> (n - 64)) | (fill << (128 - n));
+        r.hi = fill;
+        return r;
+    }
+    r.lo = a.lo >> n | a.hi << (64 - n);
+    r.hi = a.hi >> n | (fill << (64 - n));
+    return r;
+}
+
+uint i128_leading_zeros(i128 a) {
+    uint n = 0;
+    uint64_t w = a.hi;
+    if (w == 0) {
+        n = 64;
+        w = a.lo;
+        if (w == 0) {
+            return 128;
+        }
+    }
+    while ((w >> 63) == 0) {
+        w <<= 1;
+        n++;
+    }
+    return n;
+}
+
+/* Unsigned division of a by b (not 0), by shifting and subtracting, a bit
+ * at a time; the remainder in *rem. */
+static i128 udivmod(i128 a, i128 b, i128 *rem) {
+    i128 q = i128_of(0);
+    i128 r = i128_of(0);
+    for (int i = 127; i >= 0; i--) {
+        r = i128_shl(r, 1);
+        uint64_t bit = i >= 64 ? (a.hi >> (i - 64)) & 1 : (a.lo >> i) & 1;
+        r.lo |= bit;
+        /* r >= b, unsigned. */
+        if (r.hi > b.hi || (r.hi == b.hi && r.lo >= b.lo)) {
+            r = i128_sub(r, b);
+            if (i >= 64) {
+                q.hi |= (uint64_t)1 << (i - 64);
+            } else {
+                q.lo |= (uint64_t)1 << i;
+            }
+        }
+    }
+    *rem = r;
+    return q;
+}
+
+i128 i128_div(i128 a, i128 b) {
+    int na = i128_neg_p(a);
+    int nb = i128_neg_p(b);
+    i128 rem;
+    i128 q = udivmod(na ? i128_neg(a) : a, nb ? i128_neg(b) : b, &rem);
+    return na != nb ? i128_neg(q) : q;
+}
+
+i128 i128_rem(i128 a, i128 b) {
+    int na = i128_neg_p(a);
+    i128 rem;
+    udivmod(na ? i128_neg(a) : a, i128_neg_p(b) ? i128_neg(b) : b, &rem);
+    /* The remainder has the dividend's sign. */
+    return na ? i128_neg(rem) : rem;
+}
+
+int i128_fits_i64(i128 a) {
+    return a.hi == (((int64_t)a.lo < 0) ? ~(uint64_t)0 : 0);
+}
+
+int i128_fits_u64(i128 a) {
+    return a.hi == 0;
+}
+
+int64_t i128_i64(i128 a) {
+    return (int64_t)a.lo;
+}
+
+void buf_i128(struct buf *b, i128 a) {
+    if (i128_neg_p(a)) {
+        buf_byte(b, '-');
+        a = i128_neg(a);
+    }
+    if (a.hi == 0) {
+        put_decimal(b, a.lo);
+        return;
+    }
+    /* Digits from the last, by dividing by 10. */
+    char digits[48];
+    int n = 0;
+    i128 ten = i128_of(10);
+    while (!i128_is_zero(a)) {
+        i128 rem;
+        a = udivmod(a, ten, &rem);
+        digits[n++] = (char)('0' + rem.lo);
+    }
+    while (n > 0) {
+        buf_byte(b, (uchar)digits[--n]);
+    }
+}
+
+char *i128_str(i128 a) {
+    struct buf b;
+    memset(&b, 0, sizeof b);
+    buf_i128(&b, a);
+    char *r = buf_arena(&b);
+    buf_free(&b);
+    return r;
+}
+
+/* ---- Vectors ---- */
+
+void vec_push(struct vec *l, void *p) {
+    l->v = grow(l->v, &l->cap, l->n + 1, sizeof(void *));
+    l->v[l->n++] = p;
+}
+
+void *vec_last(struct vec *l) {
+    return l->v[l->n - 1];
+}
+
+void *vec_pop(struct vec *l) {
+    return l->v[--l->n];
+}
+
+struct vec vec_take(struct vec *l) {
+    struct vec r = *l;
+    memset(l, 0, sizeof *l);
+    return r;
+}
+
+void vec_extend(struct vec *l, struct vec *from) {
+    for (uint i = 0; i < from->n; i++) {
+        vec_push(l, from->v[i]);
+    }
+}
+
+struct vec vec_split_off(struct vec *l, uint at) {
+    struct vec r;
+    memset(&r, 0, sizeof r);
+    for (uint i = at; i < l->n; i++) {
+        vec_push(&r, l->v[i]);
+    }
+    if (at < l->n) {
+        l->n = at;
+    }
+    return r;
+}
+
+void vec_insert(struct vec *l, uint at, void *p) {
+    vec_push(l, NULL);
+    for (uint i = l->n - 1; i > at; i--) {
+        l->v[i] = l->v[i - 1];
+    }
+    l->v[at] = p;
+}
+
+void *vec_remove(struct vec *l, uint at) {
+    void *p = l->v[at];
+    for (uint i = at; i + 1 < l->n; i++) {
+        l->v[i] = l->v[i + 1];
+    }
+    l->n--;
+    return p;
+}
+
+void vec_truncate(struct vec *l, uint n) {
+    if (n < l->n) {
+        l->n = n;
+    }
+}
+
+/* ---- Position maps ---- */
+
+static uint pos_hash(struct pos p) {
+    uint h = 2166136261u;
+    h = (h ^ p.file) * 16777619u;
+    h = (h ^ p.line) * 16777619u;
+    h = (h ^ p.col) * 16777619u;
+    return h ^ (h >> 15);
+}
+
+static int posmap_slot(struct posmap *m, struct pos key) {
+    if (m->cap == 0) {
+        return -1;
+    }
+    for (uint i = pos_hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
+        if (!m->used[i]) {
+            return -1;
+        }
+        if (pos_eq(m->keys[i], key)) {
+            return (int)i;
+        }
+    }
+}
+
+void *posmap_get(struct posmap *m, struct pos key) {
+    int i = posmap_slot(m, key);
+    return i < 0 ? NULL : m->values[i];
+}
+
+int posmap_has(struct posmap *m, struct pos key) {
+    return posmap_slot(m, key) >= 0;
+}
+
+void posmap_put(struct posmap *m, struct pos key, void *value) {
+    if ((m->count + 1) * 2 > m->cap) {
+        struct posmap old = *m;
+        uint cap = m->cap ? m->cap * 2 : 64;
+        m->keys = calloc(cap, sizeof(struct pos));
+        m->values = calloc(cap, sizeof(void *));
+        m->used = calloc(cap, 1);
+        if (m->keys == NULL || m->values == NULL || m->used == NULL) {
+            die("out of memory");
+        }
+        m->cap = cap;
+        m->count = 0;
+        for (uint i = 0; i < old.cap; i++) {
+            if (old.used[i]) {
+                posmap_put(m, old.keys[i], old.values[i]);
+            }
+        }
+        free(old.keys);
+        free(old.values);
+        free(old.used);
+    }
+    for (uint i = pos_hash(key) & (m->cap - 1);; i = (i + 1) & (m->cap - 1)) {
+        if (!m->used[i]) {
+            m->used[i] = 1;
+            m->keys[i] = key;
+            m->values[i] = value;
+            m->count++;
+            return;
+        }
+        if (pos_eq(m->keys[i], key)) {
+            m->values[i] = value;
+            return;
+        }
+    }
+}
+
+struct pos *pos_box(struct pos p) {
+    struct pos *r = arena_alloc(sizeof *r);
+    *r = p;
+    return r;
+}

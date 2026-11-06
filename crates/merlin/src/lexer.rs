@@ -161,8 +161,9 @@ impl Kw {
 }
 
 /// C keywords that merlin doesn't handle yet. Using one is a clear error rather
-/// than a confusing parse error further on.
-const UNSUPPORTED_KEYWORDS: &[&str] = &["double", "float", "_Complex", "_Imaginary"];
+/// than a confusing parse error further on. (Public for the C compiler that
+/// runs on Camelot, as [`PUNCTS`].)
+pub const UNSUPPORTED_KEYWORDS: &[&str] = &["double", "float", "_Complex", "_Imaginary"];
 
 /// Punctuators, longest first so `<<=` wins over `<<` and `<`, `->` over `-`
 /// (`a->b` is never `a - > b`), `...` over `.` and `##` over `#`. `#` and

@@ -126,6 +126,40 @@ pub const MAX_PARAMS: usize = 127;
 /// runs on a 64 MiB thread). clang's bracket limit is also 256.
 pub const MAX_DEPTH: usize = 256;
 
+/// The keywords clang's typo correction may take an unknown type name for
+/// (`Parser::correct_type`): the type specifiers and qualifiers, in its
+/// order. (Public for the C compiler that runs on Camelot, whose tables are
+/// made from merlin's, as the two below.)
+pub const TYPE_KEYWORDS: [&str; 18] = [
+    "char",
+    "const",
+    "double",
+    "enum",
+    "float",
+    "int",
+    "long",
+    "short",
+    "signed",
+    "struct",
+    "union",
+    "unsigned",
+    "void",
+    "volatile",
+    "_Complex",
+    "_Imaginary",
+    "_Bool",
+    "restrict",
+];
+
+/// The keywords a block's statement may start with, which clang's typo
+/// correction of its first name looks among (`Parser::unknown_statement_name`).
+pub const STATEMENT_KEYWORDS: [&str; 35] = [
+    "char", "const", "double", "enum", "float", "int", "long", "short", "signed", "struct", "union",
+    "unsigned", "void", "volatile", "_Bool", "restrict", "auto", "register", "static", "extern", "typedef",
+    "inline", "if", "else", "for", "while", "do", "switch", "case", "default", "break", "continue", "goto",
+    "return", "sizeof",
+];
+
 /// Parses a translation unit, whose sizes the parser
 /// needs for array bounds, `sizeof` and struct layouts.
 pub fn parse(toks: &[Token]) -> Result<Program, Error> {
@@ -839,26 +873,6 @@ impl Parser<'_> {
     /// a typedef name in scope (where it is declared), or a keyword of a
     /// type specifier or qualifier ([`correction`]).
     fn correct_type(&self, typo: &str) -> Option<(String, Option<Pos>)> {
-        const KEYWORDS: [&str; 18] = [
-            "char",
-            "const",
-            "double",
-            "enum",
-            "float",
-            "int",
-            "long",
-            "short",
-            "signed",
-            "struct",
-            "union",
-            "unsigned",
-            "void",
-            "volatile",
-            "_Complex",
-            "_Imaginary",
-            "_Bool",
-            "restrict",
-        ];
         let mut seen = std::collections::HashSet::new();
         let typedefs = self
             .scopes
@@ -869,7 +883,7 @@ impl Parser<'_> {
                 (seen.insert(n.as_str()) && matches!(what, Name::Typedef(..)))
                     .then_some((n.as_str(), Some(*at)))
             });
-        let keywords = KEYWORDS.iter().map(|k| (*k, None));
+        let keywords = TYPE_KEYWORDS.iter().map(|k| (*k, None));
         let (name, decl) = correction(typo, typedefs.chain(keywords))?;
         Some((name.to_string(), decl))
     }
@@ -1545,12 +1559,6 @@ impl Parser<'_> {
     /// it is declared; a keyword `use of undeclared identifier ... did you
     /// mean`; none, `unknown type name`.
     fn unknown_statement_name(&self, name: &str) -> Error {
-        const KEYWORDS: [&str; 34] = [
-            "char", "const", "double", "enum", "float", "int", "long", "short", "signed", "struct", "union",
-            "unsigned", "void", "volatile", "_Bool", "restrict", "auto", "register", "static", "extern",
-            "typedef", "inline", "if", "else", "for", "while", "do", "switch", "case", "default", "break",
-            "continue", "goto", "return",
-        ];
         let at = self.here();
         let mut seen = std::collections::HashSet::new();
         let names = self
@@ -1562,7 +1570,7 @@ impl Parser<'_> {
                 seen.insert(n.as_str())
                     .then_some((n.as_str(), Some((*decl, matches!(what, Name::Typedef(..))))))
             });
-        let keywords = KEYWORDS.iter().chain(&["sizeof"]).map(|k| (*k, None));
+        let keywords = STATEMENT_KEYWORDS.iter().map(|k| (*k, None));
         match correction(name, names.chain(keywords)) {
             Some((to, Some((decl, true)))) => {
                 Error::new(at, format!("unknown type name '{name}'; did you mean '{to}'?"))

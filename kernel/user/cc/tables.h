@@ -23,4 +23,62 @@ struct predefined {
 extern const struct predefined PREDEFINED_C[];
 extern const struct predefined PREDEFINED_ASM[];
 
+/* The keywords merlin handles, in its order (lexer.rs's Kw and KEYWORDS): KW_ names
+ * each one's index in KEYWORDS. */
+enum {
+    KW_VOID,
+    KW_CHAR,
+    KW_SHORT,
+    KW_INT,
+    KW_LONG,
+    KW_SIGNED,
+    KW_UNSIGNED,
+    KW_BOOL,
+    KW_STRUCT,
+    KW_UNION,
+    KW_ENUM,
+    KW_CONST,
+    KW_VOLATILE,
+    KW_RESTRICT,
+    KW_STATIC,
+    KW_EXTERN,
+    KW_TYPEDEF,
+    KW_REGISTER,
+    KW_AUTO,
+    KW_INLINE,
+    KW_SIZEOF,
+    KW_RETURN,
+    KW_IF,
+    KW_ELSE,
+    KW_WHILE,
+    KW_DO,
+    KW_FOR,
+    KW_BREAK,
+    KW_CONTINUE,
+    KW_SWITCH,
+    KW_CASE,
+    KW_DEFAULT,
+    KW_GOTO,
+    KW_STATIC_ASSERT,
+    NKEYWORDS
+};
+extern const char *const KEYWORDS[NKEYWORDS];
+
+/* The C keywords merlin does not handle (lexer.rs's UNSUPPORTED_KEYWORDS). */
+#define NUNSUPPORTED_KEYWORDS 4
+extern const char *const UNSUPPORTED_KEYWORDS[NUNSUPPORTED_KEYWORDS];
+
+/* What an unknown type name may be corrected to (parser.rs's TYPE_KEYWORDS). */
+#define NTYPE_KEYWORDS 18
+extern const char *const TYPE_KEYWORDS[NTYPE_KEYWORDS];
+
+/* What a statement's first name may be corrected to (parser.rs's STATEMENT_KEYWORDS). */
+#define NSTATEMENT_KEYWORDS 35
+extern const char *const STATEMENT_KEYWORDS[NSTATEMENT_KEYWORDS];
+
+/* How deeply statements and expressions may nest, and how many parameters a
+ * function and arguments a call may have (parser.rs's MAX_DEPTH and MAX_PARAMS). */
+#define MAX_DEPTH 256
+#define MAX_PARAMS 127
+
 #endif

@@ -108,8 +108,63 @@ pub fn generate_cc_h() -> String {
     for (name, _) in predefined_tables() {
         let _ = writeln!(s, "extern const struct predefined {name}[];");
     }
+    s.push_str(
+        "\n/* The keywords merlin handles, in its order (lexer.rs's Kw and KEYWORDS): KW_ names\n \
+         * each one's index in KEYWORDS. */\nenum {\n",
+    );
+    for (k, _) in merlin::lexer::KEYWORDS {
+        let _ = writeln!(s, "    KW_{},", upper_snake(&format!("{k:?}")));
+    }
+    s.push_str("    NKEYWORDS\n};\nextern const char *const KEYWORDS[NKEYWORDS];\n\n");
+    s.push_str("/* The C keywords merlin does not handle (lexer.rs's UNSUPPORTED_KEYWORDS). */\n");
+    let _ = writeln!(
+        s,
+        "#define NUNSUPPORTED_KEYWORDS {}",
+        merlin::lexer::UNSUPPORTED_KEYWORDS.len()
+    );
+    s.push_str("extern const char *const UNSUPPORTED_KEYWORDS[NUNSUPPORTED_KEYWORDS];\n\n");
+    for (name, what, list) in keyword_lists() {
+        let _ = writeln!(s, "/* {what} */");
+        let _ = writeln!(s, "#define N{name} {}", list.len());
+        let _ = writeln!(s, "extern const char *const {name}[N{name}];\n");
+    }
+    s.push_str(
+        "/* How deeply statements and expressions may nest, and how many parameters a\n \
+         * function and arguments a call may have (parser.rs's MAX_DEPTH and MAX_PARAMS). */\n",
+    );
+    let _ = writeln!(s, "#define MAX_DEPTH {}", merlin::parser::MAX_DEPTH);
+    let _ = writeln!(s, "#define MAX_PARAMS {}", merlin::parser::MAX_PARAMS);
     s.push_str("\n#endif\n");
     s
+}
+
+/// `StaticAssert` as `STATIC_ASSERT`: a keyword's name in C.
+fn upper_snake(camel: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in camel.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.push(c.to_ascii_uppercase());
+    }
+    out
+}
+
+/// The parser's lists of keywords for clang's typo correction: (C name,
+/// what it is, the list).
+fn keyword_lists() -> [(&'static str, &'static str, &'static [&'static str]); 2] {
+    [
+        (
+            "TYPE_KEYWORDS",
+            "What an unknown type name may be corrected to (parser.rs's TYPE_KEYWORDS).",
+            &merlin::parser::TYPE_KEYWORDS,
+        ),
+        (
+            "STATEMENT_KEYWORDS",
+            "What a statement's first name may be corrected to (parser.rs's STATEMENT_KEYWORDS).",
+            &merlin::parser::STATEMENT_KEYWORDS,
+        ),
+    ]
 }
 
 /// The text of [`CC_TABLES_C`].
@@ -130,6 +185,22 @@ pub fn generate_cc_c() -> String {
             let _ = writeln!(s, "    {{{}, {}}},", c_string(n), c_string(v));
         }
         s.push_str("    {0, 0},\n};\n");
+    }
+    s.push_str("\nconst char *const KEYWORDS[NKEYWORDS] = {\n");
+    for (_, name) in merlin::lexer::KEYWORDS {
+        let _ = writeln!(s, "    {},", c_string(name));
+    }
+    s.push_str("};\n\nconst char *const UNSUPPORTED_KEYWORDS[NUNSUPPORTED_KEYWORDS] = {\n");
+    for k in merlin::lexer::UNSUPPORTED_KEYWORDS {
+        let _ = writeln!(s, "    {},", c_string(k));
+    }
+    s.push_str("};\n");
+    for (name, _, list) in keyword_lists() {
+        let _ = writeln!(s, "\nconst char *const {name}[N{name}] = {{");
+        for k in list {
+            let _ = writeln!(s, "    {},", c_string(k));
+        }
+        s.push_str("};\n");
     }
     s
 }
