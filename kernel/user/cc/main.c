@@ -1,8 +1,10 @@
 /* cc1: `cc1 [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]]
  * [-U name] [-g] [-x LANG] [-E [-P] | --dump-ast] input.c...`, merlin's
- * command line (follows merlin's main.rs and lib.rs). This stage has the
- * preprocessor: -E, of C and of assembly (`.S`, `-x assembler-with-cpp`).
- * Compiling (and --dump-ast) is refused for now, with a message saying so. */
+ * command line (follows merlin's main.rs and lib.rs): the preprocessor
+ * (-E, of C and of assembly: `.S`, `-x assembler-with-cpp`), the syntax
+ * tree (--dump-ast) and the compiler, C to assembly. -g, the debugging
+ * information, is refused for now when compiling, with a message saying
+ * so: it comes with merlin's debug.rs. */
 #include "cc.h"
 
 static const char USAGE[] = "usage: cc1 [options] input.c...\n"

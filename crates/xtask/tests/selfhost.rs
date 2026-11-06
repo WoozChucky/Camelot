@@ -40,6 +40,16 @@ use xtask::{kernel, repo_root, toolchain, userprogs};
 mod lexer_rows;
 #[path = "../../merlin/tests/diagnostics/preprocessor.rs"]
 mod preprocessor_rows;
+// And those of the rest of the compiler, for `cc1` compiling (#241's second
+// stage): their sources are what counts, compiled by the host's merlin too.
+#[path = "../../merlin/tests/diagnostics/codegen.rs"]
+mod codegen_rows;
+#[path = "../../merlin/tests/diagnostics/parser.rs"]
+mod parser_rows;
+#[path = "../../merlin/tests/diagnostics/sema.rs"]
+mod sema_rows;
+#[path = "../../merlin/tests/diagnostics/warnings.rs"]
+mod warnings_rows;
 
 /// A row of merlin's diagnostics table: a source, the headers it includes
 /// (by name next to it, and text) and its options.
@@ -298,8 +308,20 @@ fn image_of(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)]) -> Vec<u8
 
 /// [`image_of`], with `ninodes` inodes.
 fn image_with_inodes(bins: &[&str], dirs: &[&str], files: &[(String, Vec<u8>)], ninodes: u32) -> Vec<u8> {
+    image_with_room(bins, dirs, files, ninodes, 0)
+}
+
+/// [`image_with_inodes`], with `room` more bytes free (for what the
+/// programs write).
+fn image_with_room(
+    bins: &[&str],
+    dirs: &[&str],
+    files: &[(String, Vec<u8>)],
+    ninodes: u32,
+    room: usize,
+) -> Vec<u8> {
     let bytes: usize = files.iter().map(|(_, t)| t.len()).sum();
-    let blocks = 2048 + 3 * bytes / camelot_fs::BSIZE;
+    let blocks = 2048 + (3 * bytes + room) / camelot_fs::BSIZE;
     let mut fs = Mkfs::new(&Options {
         size: blocks as u32,
         ninodes,
@@ -2392,7 +2414,8 @@ fn the_preprocessor_on_camelot_writes_what_merlin_writes() {
 
 /// cc1's command line is merlin's (main.rs), with `cc1` for `merlin` in its
 /// messages: the usage errors, a file it cannot read, output to standard
-/// output for several inputs, and what this stage refuses (compiling).
+/// output for several inputs, and what this stage refuses (compiling with
+/// `-g`, the next stage's).
 #[test]
 fn cc1_takes_merlins_command_line() {
     let a = "#define A 1\nint a = A;\n";
@@ -2472,4 +2495,250 @@ fn cc1_takes_merlins_command_line() {
     }
     assert_eq!(shell_output(&out, together).replace('\r', ""), both);
     assert!(shell_output(&out, help).replace('\r', "").starts_with(usage));
+}
+
+// ---- The C compiler, stage 2: the compiler, without -g (#241) ----
+
+/// One `cc1 FILE.c -o OUT.s`: the input file (an image path), the options
+/// before it, as cc1 is given them, and as merlin is.
+struct CcJob {
+    input: String,
+    args: Vec<String>,
+    opts: merlin::Options,
+}
+
+impl CcJob {
+    /// `input`, with these `-I` directories and `-D` and `-U` options.
+    fn new(input: String, includes: &[String], macros: &[&str]) -> CcJob {
+        let pp = PpJob::new(input, merlin::Lang::C, includes, macros, true);
+        CcJob {
+            input: pp.input,
+            args: pp.args,
+            opts: pp.opts,
+        }
+    }
+
+    fn command(&self, out: &str) -> String {
+        format!("cc1 {} {} -o {out}", self.args.join(" "), self.input).replace("  ", " ")
+    }
+}
+
+/// What the host's merlin makes of `job`, reading `files` (image path,
+/// contents) for its input and headers: the assembly it writes, if it
+/// compiles, and what it prints on stderr (the warnings of a compilation
+/// that succeeds, every diagnostic of one that fails).
+fn merlin_s(job: &CcJob, files: &BTreeMap<String, Vec<u8>>) -> (Option<String>, String) {
+    let text = |p: &str| files.get(p).and_then(|b| String::from_utf8(b.clone()).ok());
+    // merlin's paths are the host's (`\` on Windows); the image's are `/`.
+    let load = |p: &std::path::Path| text(&p.to_string_lossy().replace('\\', "/"));
+    let src = text(&job.input).unwrap_or_else(|| panic!("{}: no such file", job.input));
+    let render = |errors: &[merlin::Error]| -> String {
+        errors
+            .iter()
+            .map(|e| format!("{}\n", e.render(&job.input)))
+            .collect()
+    };
+    match merlin::compile_warned(&job.input, &src, &job.opts, &load) {
+        Ok((asm, warnings)) => (Some(asm), render(&warnings)),
+        Err(e) => (None, render(&e)),
+    }
+}
+
+/// The compiler's corpus: every C file of the repository but cc1's own,
+/// with the `-I` directories the preprocessor's test gives it, and the
+/// sources of every row of merlin's diagnostics table, each in a directory
+/// of its own (`/d/N/t.c` and its headers); or, if `own`, cc1's own C files
+/// alone ([`cc1_compiles_itself_on_camelot`]'s); and the files they read.
+fn cc_jobs(own: bool) -> (Vec<CcJob>, BTreeMap<String, Vec<u8>>) {
+    let root = repo_root();
+    let sources = repo_sources();
+    let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for rel in &sources {
+        files.insert(image_path(rel), std::fs::read(root.join(rel)).unwrap());
+    }
+    let kernel_include = image_path("kernel/include");
+    let mut jobs = Vec::new();
+    for rel in sources.iter().filter(|r| r.ends_with(".c")) {
+        if rel.starts_with("kernel/user/cc/") != own {
+            continue;
+        }
+        let mut includes = Vec::new();
+        if rel.starts_with("kernel/") && !rel.starts_with("kernel/user/") {
+            includes.push(kernel_include.clone());
+        }
+        if let Some(rest) = rel.strip_prefix("crates/merlin/tests/multi/") {
+            let dir = rest.split('/').next().unwrap();
+            let inc = format!("crates/merlin/tests/multi/{dir}/include");
+            if root.join(&inc).is_dir() {
+                includes.push(image_path(&inc));
+            }
+        }
+        jobs.push(CcJob::new(image_path(rel), &includes, &[]));
+    }
+    if own {
+        return (jobs, files);
+    }
+    let rows: Vec<Case> = lexer_rows::cases()
+        .into_iter()
+        .chain(preprocessor_rows::cases())
+        .chain(parser_rows::cases())
+        .chain(sema_rows::cases())
+        .chain(warnings_rows::cases())
+        .chain(codegen_rows::cases())
+        .collect();
+    for (k, c) in rows.into_iter().enumerate() {
+        let dir = format!("/d/{k}");
+        for (name, text) in &c.files {
+            files.insert(format!("{dir}/{name}"), text.as_bytes().to_vec());
+        }
+        let input = format!("{dir}/t.c");
+        files.insert(input.clone(), c.src.into_bytes());
+        let args: Vec<String> = c.args.iter().map(|a| a.replace("{dir}", &dir)).collect();
+        let (includes, macros): (Vec<&String>, Vec<&String>) = args.iter().partition(|a| a.starts_with("-I"));
+        let includes: Vec<String> = includes.iter().map(|i| i[2..].to_string()).collect();
+        let macros: Vec<&str> = macros.iter().map(|m| m.as_str()).collect();
+        jobs.push(CcJob::new(input, &includes, &macros));
+    }
+    (jobs, files)
+}
+
+/// The machine of the compiler's tests: [`cc1_machine_config`]'s, with the
+/// RAM compiling the biggest files takes (cc1's arena and heap reach some
+/// 30 MiB for its own sema.c).
+fn cc1_compile_config() -> MachineConfig {
+    MachineConfig {
+        ram_size: 128 << 20,
+        ..cc1_machine_config()
+    }
+}
+
+/// Runs `jobs` (each with its number in the whole list, for its output file
+/// `/out/N`) with `/bin/cc1` on a machine whose image holds `files`, and
+/// compares each with the host's merlin ([`merlin_s`]): the assembly it
+/// writes, if it compiles, and what it says. Returns what differs.
+fn compile_on_camelot(jobs: &[(usize, &CcJob)], files: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    let commands: Vec<String> = jobs
+        .iter()
+        .map(|(k, job)| job.command(&format!("/out/{k}")))
+        .collect();
+    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let listed: Vec<(String, Vec<u8>)> = files.iter().map(|(p, d)| (p.clone(), d.clone())).collect();
+    let dirs = dirs_of(files);
+    let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    // What merlin makes of each, and room on the image for as much.
+    let want: Vec<(Option<String>, String)> = jobs.iter().map(|(_, j)| merlin_s(j, files)).collect();
+    let written: usize = want.iter().map(|(t, _)| t.as_ref().map_or(0, String::len)).sum();
+    let ninodes = (listed.len() + dirs.len() + jobs.len() + 64) as u32;
+    let image = image_with_room(&["cc1"], &dirs, &listed, ninodes, 2 * written);
+    let disk = MemDisk::from_image(image).unwrap();
+    let mut m = Machine::with_backends(cc1_compile_config(), vec![Box::new(disk)]).unwrap();
+    m.cpu.bus.uart.capture = true;
+    let elf = std::fs::read(repo_root().join("kernel").join(kernel::DISK_KERNEL)).unwrap();
+    m.load_elf(&elf).unwrap();
+    m.set_uart_input(kernel::typed(input.as_bytes()));
+    let r = m.run(Some(20_000_000_000_000), |_| {});
+    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    assert_eq!(r, RunResult::Exited(0), "{out}");
+    let d = &mut m.cpu.bus.disks[0];
+    let mut data = vec![0; d.capacity() as usize * camelot_fs::SECTOR_SIZE];
+    d.backend().read(0, &mut data).unwrap();
+    let fs = Fs::open(&data).unwrap();
+    let mut wrong = Vec::new();
+    for (i, ((k, _), (text, said))) in jobs.iter().zip(want).enumerate() {
+        let want_said = if text.is_some() {
+            said
+        } else {
+            format!("{said}cc1: exit 1\n")
+        };
+        let got_said = shell_output(&out, &commands[i]).replace('\r', "");
+        let written = fs.read_file(&format!("/out/{k}")).ok();
+        let want_written = text.map(String::into_bytes);
+        if got_said != want_said {
+            wrong.push(format!(
+                "{}: said\n{got_said}\nmerlin says\n{want_said}",
+                commands[i]
+            ));
+        }
+        if written != want_written {
+            let show = |w: &Option<Vec<u8>>| match w {
+                Some(t) => format!("{} bytes", t.len()),
+                None => "(no file)".to_string(),
+            };
+            wrong.push(format!(
+                "{}: wrote {}, merlin writes {}",
+                commands[i],
+                show(&written),
+                show(&want_written)
+            ));
+        }
+    }
+    wrong
+}
+
+/// Machines the compiler's corpus is split over.
+const CC_MACHINES: usize = 12;
+
+/// Runs `jobs` split over `machines` machines, each getting every
+/// `machines`-th job so that the big ones spread out: what differs.
+fn compile_split(jobs: &[CcJob], files: &BTreeMap<String, Vec<u8>>, machines: usize) -> Vec<String> {
+    let numbered: Vec<(usize, &CcJob)> = jobs.iter().enumerate().collect();
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = (0..machines)
+            .map(|m| {
+                let share: Vec<(usize, &CcJob)> =
+                    numbered.iter().copied().skip(m).step_by(machines).collect();
+                scope.spawn(move || compile_on_camelot(&share, files))
+            })
+            .collect();
+        runs.into_iter().flat_map(|r| r.join().unwrap()).collect()
+    })
+}
+
+/// #241's second stage: `/bin/cc1` on Camelot compiles as the host's merlin
+/// does, byte for byte, without `-g`: for every C file of the repository
+/// (merlin's test cases, the kernel's, the user programs', as, ld and ar's)
+/// and the source of every row of merlin's diagnostics table, the assembly
+/// merlin writes, or the diagnostics it gives and its exit status, its
+/// warnings too. The corpus is run once, split over [`CC_MACHINES`]
+/// machines.
+#[test]
+fn the_compiler_on_camelot_writes_what_merlin_writes() {
+    let (jobs, files) = cc_jobs(false);
+    assert!(jobs.len() > 1200, "{}", jobs.len());
+    // The corpus has all three: what compiles, what compiles with
+    // warnings, and what merlin refuses.
+    let results: Vec<(Option<String>, String)> = jobs.iter().map(|j| merlin_s(j, &files)).collect();
+    let compiled = results
+        .iter()
+        .filter(|(t, s)| t.is_some() && s.is_empty())
+        .count();
+    let warned = results
+        .iter()
+        .filter(|(t, s)| t.is_some() && !s.is_empty())
+        .count();
+    let refused = results.iter().filter(|(t, _)| t.is_none()).count();
+    assert!(
+        compiled > 200 && warned > 150 && refused > 500,
+        "{compiled} compiled, {warned} warned, {refused} refused"
+    );
+    let wrong = compile_split(&jobs, &files, CC_MACHINES);
+    assert!(wrong.is_empty(), "{} differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// `/bin/cc1` compiles itself on Camelot: the assembly of each of its C
+/// files (kernel/user/cc) is what the host's merlin writes of it, as the
+/// `.s` merlin builds `/bin/cc1` from.
+#[test]
+fn cc1_compiles_itself_on_camelot() {
+    let (jobs, files) = cc_jobs(true);
+    assert!(jobs.len() >= 14, "{}", jobs.len());
+    for job in &jobs {
+        assert!(
+            merlin_s(job, &files).0.is_some(),
+            "{}: merlin compiles cc1",
+            job.input
+        );
+    }
+    let wrong = compile_split(&jobs, &files, jobs.len());
+    assert!(wrong.is_empty(), "{} differ:\n{}", wrong.len(), wrong.join("\n"));
 }
