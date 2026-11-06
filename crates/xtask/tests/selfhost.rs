@@ -2760,8 +2760,14 @@ fn cc1_takes_merlins_command_line() {
         let name = ["la.c", "lb.c", "lc.c"][k];
         let written = String::from_utf8(fs.read_file(&format!("/out/g{}", k + 8)).unwrap()).unwrap();
         let sum = merlin::md5::hex(&merlin::md5::md5(src.as_bytes()));
-        let file0 = format!("    .file \"{name}\"\n    .file 0 \"{comp_dir}\" \"{name}\" md5 0x{sum}\n");
-        assert!(written.starts_with(&file0), "{name}: {written}");
+        // With nothing described as the module begins, `.file 0` waits for
+        // the first `.loc`, the function's first line.
+        assert!(
+            written.starts_with(&format!("    .file \"{name}\"\n")),
+            "{name}: {written}"
+        );
+        let file0 = format!("\n    .file 0 \"{comp_dir}\" \"{name}\" md5 0x{sum}\n    .loc 0 1 0\n");
+        assert!(written.contains(&file0), "{name}: {written}");
         let loc = format!("\n    {file1}\n    .loc 1 7 5 prologue_end\n");
         assert!(written.contains(&loc), "{name}: {written}");
     }
