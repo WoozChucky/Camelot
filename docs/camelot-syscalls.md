@@ -101,6 +101,10 @@ headers and checks each size.
 | `struct input_id` | 8 | `EVIOCGID`'s |
 | `struct input_absinfo` | 24 | `EVIOCGABS`'s |
 | `struct pollfd` | 8 | `poll`'s ("Polling"): an `int` descriptor, then two `short`s, `events` and `revents` |
+| `struct sockaddr_un` | 110 | a local socket's address ("Local sockets"): the family, then a path of 108 bytes |
+| `struct iovec` | 16 | a buffer ("Messages"): a pointer and a `size_t` |
+| `struct msghdr` | 56 | `sendmsg`'s and `recvmsg`'s message: an address, buffers, control messages and flags |
+| `struct cmsghdr` | 16 | a control message's header: a `size_t` length, then two `int`s, the level and the type |
 
 ## Calls
 
@@ -116,7 +120,7 @@ headers and checks each size.
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
 | 9 | `sbrk` | `long increment` | the old end of the heap, a pointer; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
-| 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
+| 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-ENXIO`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
 | 12 | `close` | `int fd` | 0; `-EBADF` |
 | 13 | `lseek` | `int fd, off_t offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
 | 14 | `fstat` | `int fd, struct stat *st` | 0; `-EBADF`, `-EFAULT` |
@@ -132,18 +136,18 @@ headers and checks each size.
 | 24 | `netinfo` | `struct netinfo *info` | 0; `-ENODEV`, `-EFAULT` |
 | 25 | `netconf` | `uint addr, uint mask, uint gateway` | 0; `-ENODEV`, `-EINVAL` |
 | 26 | `ping` | `uint addr, uint seq, struct ping_reply *reply` | 0; `-ETIMEDOUT`, `-EHOSTUNREACH`, `-ENETUNREACH`, `-ENOBUFS`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
-| 27 | `socket` | `int domain, int type, int protocol` | a new descriptor; `-EAFNOSUPPORT`, `-EPROTONOSUPPORT`, `-EINVAL`, `-ENODEV`, `-EMFILE`, `-ENFILE`, `-ENOBUFS` |
-| 28 | `bind` | `int fd, const struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EADDRNOTAVAIL`, `-EADDRINUSE`, `-EINVAL`, `-ENOBUFS` |
+| 27 | `socket` | `int domain, int type, int protocol` | a new descriptor; `-EAFNOSUPPORT`, `-EPROTONOSUPPORT`, `-ESOCKTNOSUPPORT`, `-EINVAL`, `-ENODEV`, `-EMFILE`, `-ENFILE`, `-ENOBUFS`, `-ENOMEM` |
+| 28 | `bind` | `int fd, const void *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EADDRNOTAVAIL`, `-EADDRINUSE`, `-EINVAL`, `-ENOBUFS`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOSPC`, `-EROFS` |
 | 29 | `listen` | `int fd, int backlog` | 0; `-EBADF`, `-ENOTSOCK`, `-EOPNOTSUPP`, `-EINVAL` |
-| 30 | `accept` | `int fd, struct sockaddr_in *addr` | a new descriptor; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EOPNOTSUPP`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EAGAIN`, `-EINTR` |
-| 31 | `connect` | `int fd, const struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EINVAL`, `-EISCONN`, `-ENETUNREACH`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`, `-ENOBUFS`, `-EADDRINUSE`, `-EINTR` |
+| 30 | `accept` | `int fd, void *addr` | a new descriptor; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EOPNOTSUPP`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EAGAIN`, `-EINTR` |
+| 31 | `connect` | `int fd, const void *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EINVAL`, `-EISCONN`, `-ENETUNREACH`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`, `-ENOBUFS`, `-EADDRINUSE`, `-EINTR`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOMEM` |
 | 32 | `send` | `int fd, const void *buf, size_t len` | bytes sent; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EPIPE`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EDESTADDRREQ`, `-EMSGSIZE`, `-ENETUNREACH`, `-ENOBUFS`, `-EINTR` |
 | 33 | `recv` | `int fd, void *buf, size_t len` | bytes received, 0 at the end; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EINVAL`, `-EAGAIN`, `-EINTR` |
-| 34 | `sendto` | `int fd, const void *buf, size_t len, const struct sockaddr_in *to` | bytes sent; `send`'s errors, `-EFAULT` also for `to`, `-EAFNOSUPPORT`, `-EINVAL`, `-EADDRINUSE` |
-| 35 | `recvfrom` | `int fd, void *buf, size_t len, struct sockaddr_in *from` | bytes received; `recv`'s errors (`-EFAULT` also for `from`) |
+| 34 | `sendto` | `int fd, const void *buf, size_t len, const void *to` | bytes sent; `send`'s errors, `-EFAULT` also for `to`, `-EAFNOSUPPORT`, `-EINVAL`, `-EADDRINUSE`, `-EISCONN`, `-EOPNOTSUPP` |
+| 35 | `recvfrom` | `int fd, void *buf, size_t len, void *from` | bytes received; `recv`'s errors (`-EFAULT` also for `from`) |
 | 36 | `shutdown` | `int fd, int how` | 0; `-EBADF`, `-ENOTSOCK`, `-EINVAL`, `-ENOTCONN`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT` |
-| 37 | `getsockname` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT` |
-| 38 | `getpeername` | `int fd, struct sockaddr_in *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN` |
+| 37 | `getsockname` | `int fd, void *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT` |
+| 38 | `getpeername` | `int fd, void *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN` |
 | 39 | `setsockopt` | `int fd, int level, int option, const void *value, uint len` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EINVAL`, `-ENOPROTOOPT` |
 | 40 | `harts` | `struct hartinfo *buf, uint max` | the number of harts; `-EFAULT` |
 | 41 | `thread_create` | `void (*entry)(void *), void *arg, void *stack` | the new thread's tid; `-EFAULT`, `-EINVAL`, `-EAGAIN`, `-ENOMEM` |
@@ -160,6 +164,10 @@ headers and checks each size.
 | 52 | `ftruncate` | `int fd, off_t length` | 0; `-EBADF`, `-EINVAL`, `-EFBIG` |
 | 53 | `ioctl` | `int fd, unsigned long request, ...` | the request's result; `-EBADF`, `-ENOTTY`, `-EINVAL`, `-EFAULT`, `-EBUSY`, `-ENOMEM`, `-ENODEV`, `-EINTR` |
 | 54 | `poll` | `struct pollfd *fds, unsigned long nfds, int timeout` | the descriptors with events, 0 if the time ran out; `-EINVAL`, `-EFAULT`, `-EINTR` |
+| 55 | `socketpair` | `int domain, int type, int protocol, int *fds` | 0; `-EAFNOSUPPORT`, `-EOPNOTSUPP`, `-EPROTONOSUPPORT`, `-ESOCKTNOSUPPORT`, `-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT` |
+| 56 | `sendmsg` | `int fd, const struct msghdr *msg, int flags` | bytes sent; `send`'s and `sendto`'s errors, `-EMSGSIZE`, `-EINVAL`, `-EBADF` (a descriptor passed), `-EOPNOTSUPP`, `-EAGAIN`, `-ENOBUFS`, `-EFAULT` |
+| 57 | `recvmsg` | `int fd, struct msghdr *msg, int flags` | bytes received, 0 at the end; `recv`'s errors, `-EMSGSIZE`, `-EOPNOTSUPP`, `-ENOBUFS`, `-EFAULT` |
+| 58 | `stat` | `const char *path, struct stat *st` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EFAULT` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -319,6 +327,10 @@ opens:
   devices"); a node whose major number has no driver, or whose device the
   machine hasn't (a framebuffer, a keyboard, a pointer), is `-ENODEV`.
 
+A local socket's name (an inode of type `T_SOCKET`, which `bind` makes) is
+not opened: `-ENXIO`, as on Linux; `connect` reaches the socket behind it
+("Local sockets"), and `stat` says what it is.
+
 A file bigger than the kernel reads or writes, 2^32 - 1 blocks (ext4's
 `s_maxbytes`), is `-EOVERFLOW`: only a damaged inode can be one, as the
 format's largest file is one block more (docs/camelot-fs.md, "Inodes"), and
@@ -362,8 +374,16 @@ ended its side (its FIN came), the connection was reset or timed out, or
 the socket was shut down for reading. With a size of 0 too, a read
 returns at once, the end or the error; so a program that holds a
 connection without reading it can tell the other end hung up (`shd`
-does, for its sessions).
+does, for its sessions). A local socket is `T_SOCKET` too ("Local
+sockets"), and the same: its `ino` 0, its size the bytes waiting in it,
+its `nlink` 0 once its peer has closed or shut its sending down.
 `-EBADF`, or `-EFAULT` if `st` is not writable.
+
+**stat(path, st)** stores in `st` what `fstat` would of the file at `path`
+opened, without opening it, as Linux's `stat` (its `newfstatat`): so it
+looks at what `open` refuses as well, a local socket's name (`T_SOCKET`,
+size 0) or a device node without a driver. Errors: the path's (`-ENOENT`,
+`-ENOTDIR`, `-ENAMETOOLONG`), `-EFAULT`.
 
 **mkdir(path)** makes the directory `path`, with its `.` and `..`. Errors:
 `-EEXIST` (the name is taken, `/` included), the path's, `-ENOENT` also for
@@ -534,7 +554,9 @@ not 16 writable bytes; checked before anything is sent).
 ## Sockets
 
 The socket calls are a subset of BSD's, with Linux's numbers and layouts:
-IPv4 only (`AF_INET`), TCP (`SOCK_STREAM`) and UDP (`SOCK_DGRAM`). A socket
+IPv4 (`AF_INET`), TCP (`SOCK_STREAM`) and UDP (`SOCK_DGRAM`), described
+here, and local stream sockets (`AF_UNIX`), described in "Local sockets"
+below; `sendmsg` and `recvmsg`, every socket's, in "Messages". A socket
 is an open file behind a descriptor, like a pipe end: `read` and `write`
 on it are `recv` and `send`, `dup` and `spawn` share it, `close` ends it
 with its last descriptor, `lseek` is `-ESPIPE` and `fstat` says `T_SOCKET`.
@@ -546,13 +568,15 @@ Addresses are a `struct sockaddr_in` (16 bytes, `user.h`): `sin_family`
 (`AF_INET`, 2), then the port and the address in network byte order
 (big-endian, as on the wire: `htons`, `htonl`), then 8 bytes of zeros. A
 family other than `AF_INET` is `-EAFNOSUPPORT`. The address 0.0.0.0
-(`INADDR_ANY`) means any of this host's.
+(`INADDR_ANY`) means any of this host's. The calls take an address as a
+`void *`, since a local socket's is a `struct sockaddr_un`: Camelot's
+calls have no address length, so each family's is its structure's size.
 
 The checks come in a fixed order, as for the other calls: the descriptor
 first (`-EBADF` if it is not open, `-ENOTSOCK` if it is not a socket),
 then the pointers (`-EFAULT`; an address must be 16 readable or writable
 bytes), then everything else. Without a network card, `socket` fails with
-`-ENODEV`, so no other call ever sees a socket.
+`-ENODEV` for `AF_INET`, so no other call ever sees a TCP or UDP socket.
 
 A call that waits (`accept` for a connection, `connect` for the handshake,
 `send` for room in a full buffer, `recv` for data) sleeps without using the
@@ -562,7 +586,8 @@ socket has a receive timeout (`setsockopt`): then they return `-EAGAIN`
 once it has run out.
 
 **socket(domain, type, protocol)** makes a socket and returns a new
-descriptor for it, the lowest one free. `domain` is `AF_INET`; `type` is
+descriptor for it, the lowest one free. `domain` is `AF_INET`, or
+`AF_UNIX` ("Local sockets"), anything else `-EAFNOSUPPORT`; for `AF_INET`, `type` is
 `SOCK_STREAM` (1, TCP) or `SOCK_DGRAM` (2, UDP), anything else is
 `-EINVAL`; `protocol` is 0 or the type's own (`IPPROTO_TCP` 6, `IPPROTO_UDP`
 17), anything else `-EPROTONOSUPPORT`. Errors also: `-ENODEV` (no network
@@ -661,6 +686,135 @@ whole timer ticks, 0 for no limit (the default). Errors: `-EINVAL` (`len`
 is not the structure's size, or a negative time, or
 `tv_usec` of a second or more), `-EFAULT` (`value` is not readable),
 `-ENOPROTOOPT` (another level or option).
+
+## Local sockets
+
+Local sockets are Linux's `AF_UNIX` stream sockets (`SOCK_STREAM`;
+`SOCK_DGRAM` and `SOCK_SEQPACKET` are `-ESOCKTNOSUPPORT`), between the
+processes of the machine (`kernel/net/unix.c`). They need no network card.
+Each end of a connection is an open file like a TCP socket's: `read`,
+`write`, `poll`, `fstat`, `dup`, `close`; `recv` and `send` are the same
+as `read` and `write`, and `sendmsg` and `recvmsg` pass descriptors
+("Messages"). What one end sends waits in a ring of 2 KiB at the other
+until it is read; a writer waits for room.
+
+Their addresses are a `struct sockaddr_un` (110 bytes): `sun_family`
+(`AF_UNIX`, 1), then `sun_path`, 108 bytes holding a path and its NUL. A
+path that fills them with no NUL, an empty one (Linux's unnamed address,
+or one of its abstract names, which start with a NUL) and a family other
+than `AF_UNIX` are `-EINVAL`.
+
+**socket(AF_UNIX, SOCK_STREAM, protocol)** makes one, not connected:
+`protocol` is 0 (or `AF_UNIX`, Linux's `PF_UNIX`), else
+`-EPROTONOSUPPORT`; `-ENOMEM` if no page is free for it.
+
+**socketpair(domain, type, protocol, fds)** makes two sockets connected to
+each other, as `pipe` makes a pipe's two ends (but either end reads and
+writes), and stores their descriptors in `fds[0]` and `fds[1]`. `domain` is
+`AF_UNIX`: `AF_INET` is `-EOPNOTSUPP`, as on Linux, anything else
+`-EAFNOSUPPORT`; `type` and `protocol` as `socket`'s. Errors also
+`-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT`.
+
+**bind(fd, addr)** names the socket: makes the path an inode of type
+`T_SOCKET` (5) on the filesystem (docs/camelot-fs.md, "Inodes"), which
+`connect` looks up. A name that is there already, a socket's or any other
+file's, is `-EADDRINUSE`; the name stays after the socket is closed, until
+`unlink` removes it, so a server unlinks its path before it binds, as on
+Linux. `-EINVAL` if the socket has a name already; the path's errors
+(`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`), `-ENOSPC`, `-EROFS`.
+
+**listen(fd, backlog)** makes a named socket a listener: at most `backlog`
+connections (taken as 1 to 8) wait to be accepted. `-EINVAL` for a socket
+without a name, or connected.
+
+**connect(fd, addr)** connects to the listener named `addr`, at once, as
+Linux does: the connection waits in the listener's backlog, already
+connected (the caller may send), until `accept` takes it; with the backlog
+full, it waits for room. Errors: the path's (`-ENOENT`...),
+`-ECONNREFUSED` (a file that is not a socket, or a socket's name nobody
+listens on: not yet, or no more), `-EISCONN` (connected already), `-EINVAL`
+(a listener), `-ENOMEM`, `-EINTR`.
+
+**accept(fd, addr)** takes the oldest connection waiting, waiting for one,
+and returns a new descriptor for it; unless `addr` is null, the client's
+name is stored there, or an empty path for a client without one (most).
+Errors as TCP's: `-EINVAL` (not a listener), `-EMFILE`, `-ENFILE`,
+`-EAGAIN` (the receive timeout), `-EINTR`.
+
+**send**, **write**, **recv**, **read**: a write takes what fits in the
+peer's ring, waits for room for the rest, and returns once all of it is in,
+or with what went in if the process is killed (else `-EINTR`). `-EPIPE` once
+this end can send no more (`shutdown` for writing, or the peer closed or
+shut down its reading); `-ENOTCONN` never connected. A read waits for bytes
+and takes what is there, up to `len`; 0 once the peer is done sending and
+everything before was read; `-EINVAL` never connected. If the peer closed
+with bytes it had not read, or before a listener accepted the connection
+(the listener was closed), the next read that finds nothing returns
+`-ECONNRESET`, once, as on Linux. `sendto` with an address is `-EISCONN`
+(connected) or `-EOPNOTSUPP`; `recvfrom` stores the peer's name.
+
+**shutdown(fd, how)** stops this end's reading (`SHUT_RD`: the peer can't
+send any more), sending (`SHUT_WR`: the peer reads the end) or both, on any
+socket, connected or not, as on Linux. `-EINVAL` for another `how`.
+
+**close**: the peer reads the end, and its writes fail with `-EPIPE`. A
+listener closed resets the connections it never accepted.
+
+**getsockname(fd, addr)** stores the socket's name: its path, the
+listener's for an accepted end, or an empty path. **getpeername(fd,
+addr)** stores the peer's, kept once the peer is gone; `-ENOTCONN` never
+connected. **setsockopt** takes `SO_RCVTIMEO` as TCP's does: how long a
+read and `accept` wait.
+
+## Messages
+
+**sendmsg(fd, msg, flags)** and **recvmsg(fd, msg, flags)** are `sendto`
+and `recvfrom` with several buffers, as Linux has them, on any socket, and
+on a local one they pass open files. `msg` is a `struct msghdr` (56 bytes):
+
+| Field | What |
+|---|---|
+| `msg_name`, `msg_namelen` | an address and its size, or NULL: sendto's `to`, recvfrom's `from` |
+| `msg_iov`, `msg_iovlen` | the buffers, `struct iovec`s of a pointer and a length (at most 16: `-EMSGSIZE` above), gathered from in turn or scattered into |
+| `msg_control`, `msg_controllen` | the control messages, or NULL |
+| `msg_flags` | recvmsg's: `MSG_CTRUNC` (0x8), some descriptors were closed for want of room; `MSG_TRUNC` (0x20), a datagram's end did not fit |
+
+`recvmsg` stores, besides the bytes, `msg_namelen` (the address's size: 16
+for a UDP datagram's sender; a local socket's peer's name, 2 bytes and the
+path with its NUL, if it has one; else 0, as for TCP), `msg_controllen`
+(the control messages' bytes) and `msg_flags`.
+
+The control messages are a `struct cmsghdr` each (16 bytes: `cmsg_len`,
+the header's and the data's bytes, then `cmsg_level` and `cmsg_type`),
+followed by its data, the next one 8-byte aligned (`user.h`'s `CMSG_`
+macros are Linux's). The one there is is `SCM_RIGHTS` (1) at level
+`SOL_SOCKET`: an array of `int` descriptors. Messages of other levels are
+skipped, as on Linux; another `SOL_SOCKET` type, a length past the buffer,
+or more than 16 descriptors in all are `-EINVAL`, a descriptor not open
+`-EBADF`.
+
+**Descriptors passed** (`SCM_RIGHTS`, local sockets only: `-EINVAL` on TCP
+and UDP) arrive as new descriptors of the receiver for the same open files,
+whatever they are: a file with its offset, a pipe's end, a socket, a
+shared-memory object (`memfd_create`), a device. They come with the first
+byte the `sendmsg` sent, so it must send one (`-EINVAL` for none), and a
+read stops before the bytes of a `sendmsg` that passed some, so the call
+that takes them takes them with that byte. `recvmsg` gives them the lowest
+free descriptors and stores them as one `SCM_RIGHTS` message; those that
+don't fit in the control buffer, or find no free descriptor, are closed,
+and `MSG_CTRUNC` says so. `read`, `recv` and `recvfrom` have nowhere to
+put them, and close them. Until they arrive they keep their files open; a
+local socket passed over its own connection, or a cycle of them, stays open
+until the machine stops (Linux collects those; Camelot doesn't).
+
+The flags: `MSG_DONTWAIT` (0x40) on a local socket, `-EAGAIN` rather than
+wait; `MSG_NOSIGNAL` (0x4000), accepted, with nothing to do (Camelot has no
+`SIGPIPE`); `MSG_CMSG_CLOEXEC` (0x40000000, `recvmsg`), the descriptors
+close on `exec`. Anything else, and `MSG_DONTWAIT` on TCP and UDP, is
+`-EOPNOTSUPP`. On TCP and UDP the buffers go through a page of the
+kernel's: a datagram is at most that (`-EMSGSIZE`, though UDP's limit is
+smaller), a TCP `recvmsg` takes a page at most, and `-ENOBUFS` if no page
+is free.
 
 ## Threads
 
@@ -1053,6 +1207,7 @@ Linux's values for the same conditions.
 | 2 | `ENOENT` | no such file or directory |
 | 3 | `ESRCH` | kill: no such process; thread_join: no such thread |
 | 4 | `EINTR` | a wait ended because the process was killed |
+| 6 | `ENXIO` | open: a local socket's name, which only `connect` reaches |
 | 7 | `E2BIG` | spawn, exec: argument list too long |
 | 8 | `ENOEXEC` | spawn, exec: the file is not a valid executable |
 | 9 | `EBADF` | not an open descriptor, or not open for that |
@@ -1084,8 +1239,9 @@ Linux's values for the same conditions.
 | 90 | `EMSGSIZE` | a datagram too big for one packet |
 | 92 | `ENOPROTOOPT` | setsockopt: an option sockets don't have |
 | 93 | `EPROTONOSUPPORT` | socket: a protocol the type doesn't have |
+| 94 | `ESOCKTNOSUPPORT` | socket, socketpair: a local socket of a type other than `SOCK_STREAM` |
 | 95 | `EOPNOTSUPP` | listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses |
-| 97 | `EAFNOSUPPORT` | an address family other than `AF_INET` |
+| 97 | `EAFNOSUPPORT` | socket: a family neither `AF_INET` nor `AF_UNIX`; a TCP or UDP socket's address not `AF_INET` |
 | 98 | `EADDRINUSE` | a port that is taken |
 | 99 | `EADDRNOTAVAIL` | bind: an address that is not this host's |
 | 101 | `ENETUNREACH` | no route: the interface has no address, or no gateway |
@@ -1320,6 +1476,13 @@ file says:
   write with room in its send buffer; one never connected is ready to write
   and hung up, as on Linux. A UDP socket is always ready to write, and to
   read with a datagram waiting;
+- **a local socket** ("Local sockets"): connected, it is ready to read
+  with bytes waiting, an error to read (`POLLERR` too) or its peer done
+  sending (`POLLRDHUP`), hung up once neither end will send (its peer
+  closed, or both shut down), and ready to write with room in its peer's
+  ring or once a write would fail at once; one never connected is ready to
+  write and hung up, as on Linux; a listener is ready to read with a
+  connection to accept;
 - **an input device** ("Input devices"): ready to read with an event
   waiting;
 - **`/dev/fb0`** ("The framebuffer"): ready to write unless a flip

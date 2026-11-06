@@ -91,7 +91,7 @@ the table's last block past inode `ninodes` - 1 are unused.
 
 | Offset | Field | Meaning |
 |---|---|---|
-| 0 | `type` (u16) | 0 free, 1 directory, 2 regular file, 3 device |
+| 0 | `type` (u16) | 0 free, 1 directory, 2 regular file, 3 device, 5 socket |
 | 2 | `major` (u16) | device number (type 3 only; 0 otherwise) |
 | 4 | `minor` (u16) | device number (type 3 only; 0 otherwise) |
 | 6 | `nlink` (u16) | directory entries naming this inode (below) |
@@ -123,8 +123,14 @@ the table's last block past inode `ninodes` - 1 are unused.
   the framebuffer (`/dev/fb0`) and major 3 as the input devices (minor 0
   the keyboard, `/dev/input/event0`, and 1 the pointer,
   `/dev/input/event1`), and has no driver for any other
-  (docs/camelot-syscalls.md). A directory's or file's
-  `major` and `minor` are 0.
+  (docs/camelot-syscalls.md). A **socket** is a local socket's name, which
+  the kernel's `bind` makes and `connect` looks up
+  (docs/camelot-syscalls.md, "Local sockets"): it has no contents, as a
+  device (`size` 0, no blocks, an `i_block` of zeros), and no device
+  numbers; the socket itself lives only while it is open, so a name may
+  outlive it, as on Linux. Type 4 is not an inode's: it is the pipe's type
+  that `fstat` gives, and a socket's 5 the same for both. A directory's,
+  file's or socket's `major` and `minor` are 0.
 
 ## Extent trees
 
@@ -430,7 +436,7 @@ A disk is consistent, after replaying the log, when:
 
 1. the superblock follows the rules of its section;
 2. inode 0 is free and inode 1 is a directory;
-3. every inode's type is 0 to 3, and every allocated inode follows the rules
+3. every inode's type is 0 to 3 or 5, and every allocated inode follows the rules
    of "Inodes" and "Extent trees" (its fields, its tree, no holes, no block
    used twice; one with `TRUNCATING` set as "Truncation" says);
 4. the bitmap marks exactly the blocks before `datastart` and the blocks some

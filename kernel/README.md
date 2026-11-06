@@ -302,6 +302,8 @@ parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
 | `inputtest` | checks `/dev/input/event0` and `event1`'s evdev requests and `EVIOCGRAB` (`inputtest: N checks, 0 failed`); `inputtest keys N` and `pointer N` print the next N events, `inputtest grab` two readers and a grab, `inputtest overflow` a reader that falls behind (`SYN_DROPPED`, `EVIOCGKEY`) |
 | `libtest` | checks the C library (`libtest: N checks, 0 failed`) |
 | `nettest`, `socktest` | move known bytes through TCP, for the TCP tests; check the socket calls (`socktest: N checks, 0 failed`) |
+| `polltest` | checks `poll` on every kind of file (`polltest: N checks, 0 failed`); `polltest stress R` passes bytes between threads waiting in `poll` on several harts, which a lost wakeup would stop |
+| `unixtest` | checks local sockets, `SCM_RIGHTS`, and `sendmsg`/`recvmsg` on every socket, and shares a memfd with a second process (`unixtest: N checks, 0 failed`) |
 | `badload` | reads kernel memory: killed by a load page fault |
 | `badstore` | writes to its own read-only data: killed by a store page fault |
 | `badhalt` | executes `xcal.halt`, which is M-mode only: killed by an illegal instruction |
@@ -530,6 +532,7 @@ one process.
 | `keyboard.c` | the keyboard driver: raw mode's HID usages as Linux's key codes while a reader has it, ASCII mode's characters to the console otherwise, or as key codes on a US layout on a keyboard without raw mode |
 | `pointer.c` | the pointer driver: absolute position as `ABS_X`/`ABS_Y`, three buttons, the wheel as `REL_WHEEL`, catching up after an overflow |
 | `pipe.c` | pipes (xv6's): a 512-byte buffer in a page, readers and writers sleeping on each other, end of input when the writers are gone, `-EPIPE` when the readers are |
+| `poll.c` | `poll()` (Linux's `poll_table`): every file's poll hook names its wait channels in the caller's table and says what it is ready for; a wakeup of any of them wakes the thread, or has it scan again, so none is lost (`proc.c`'s `poll_begin`, `poll_wait`, `poll_sleep`) |
 | `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.S`, `usys.s`, `user.h`), the C library (`lib/`) and linker script `user.ld`, built with merlin, merlin-as and merlin-ld and embedded in `kernel.elf` through `userprogs.s`, which the build generates (not a file here: see "Building") |
 | `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo, and the firmware's reserved range, and frees every page of RAM but the image's and the firmware's; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()`; `kalloc_contig()`/`kfree_contig()`, a run of contiguous pages (the framebuffer's buffers) |
 | `vm.c` | page tables (Sv48 or Sv39, with the levels the boot chose): `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on; user address spaces: `uvm_create()`/`uvm_free()`, `uvm_range_ok()`, `copyin()`, `copyout()`, `copyinstr()`; `ioremap()`; the kernel stacks (`kstack_alloc()`: 16 KiB in the vmalloc area with a guard page); `setup_vm()`, the early page table and the `satp` probe |
@@ -544,7 +547,7 @@ one process.
 | `log.c` | the filesystem's write-ahead log (xv6's): `begin_op()`/`end_op()` around each operation, `log_write()` pinning changed buffers, group commit (slots, flush, header, flush, install, flush, empty header, flush), and the replay at mount |
 | `fs.c` | the filesystem (xv6's): `fs_mount()`, the bitmap allocator, the inode cache (`iget`/`ilock`/`iput`, `readi`/`writei`), directories, path lookup (`namei`/`nameiparent`, from the working directory for a relative path), `fs_create()`/`fs_unlink()`/`fs_link()`, `itrunc()` |
 | `fstest.c` | `fs_boot()`: mounts disk 0 in a kernel process, lists `/`, runs the filesystem self-test (and, with `fs_test` patched to 2, its transactions; to 3, filling the disk) |
-| `net/` | the network stack (`docs/camelot-net.md`), a file per layer: `nic.c` (the card driver: descriptor rings, `nic_intr()`, the transmit queue), `pbuf.c` (the buffer pool), `ether.c`, `arp.c` (the cache), `ip.c` (checks, routing, loopback), `icmp.c` (echo, `icmp_ping()`), `udp.c` (the kernel-internal socket API, the echo service), `tcp.c` (connections, retransmission, the kernel-internal socket API), `dhcp.c` (the client), `net.c` (configuration, `net_boot()`, the counters, `net_timer()`, the `netinfo`/`netconf`/`ping` system calls), `socket.c` (the socket system calls: sockets behind file descriptors) |
+| `net/` | the network stack (`docs/camelot-net.md`), a file per layer: `nic.c` (the card driver: descriptor rings, `nic_intr()`, the transmit queue), `pbuf.c` (the buffer pool), `ether.c`, `arp.c` (the cache), `ip.c` (checks, routing, loopback), `icmp.c` (echo, `icmp_ping()`), `udp.c` (the kernel-internal socket API, the echo service), `tcp.c` (connections, retransmission, the kernel-internal socket API), `dhcp.c` (the client), `net.c` (configuration, `net_boot()`, the counters, `net_timer()`, the `netinfo`/`netconf`/`ping` system calls), `socket.c` (the socket system calls: sockets behind file descriptors), `unix.c` (local sockets, `AF_UNIX` streams: names on the disk, connections, descriptors passed), `msg.c` (`sendmsg` and `recvmsg`'s buffers and `SCM_RIGHTS`) |
 | `fs/` | the files `cargo xtask fs` copies to `/` of the root image (a README); the user programs go to `/bin`, and `/dev/console`, `/dev/fb0`, `/dev/input/event0` and `/dev/input/event1` are made too |
 | `boot/` | the bootloader of a bootable disk (`boot.S`, linked by `link.ld` into the committed `boot.elf` with `cargo xtask boot`), the firmware's next stage: the boot block, which loads the kernel ELF stored after the filesystem; `camelot-fs mkfs --boot` installs it |
 | `riscv.S` | S-mode CSR accessors for C (`r_sstatus`, `w_sie`, `w_satp`, ...), `sfence_vma()`, `intr_off()`/`intr_on()`, `wfi()`, the atomics `atomic_swap()`/`atomic_add()`/`atomic_or()`, and `fence_rw()` |
@@ -599,8 +602,9 @@ merlin-ld -T kernel.lds -o kernel.elf bio.c.o blk.c.o blktest.c.o console.c.o el
        exec.c.o fb.c.o fbblit.S.o fbcon.c.o file.c.o font.c.o fs.c.o fstest.c.o input.c.o \
        kalloc.c.o kernelvec.S.o keyboard.c.o kprintf.c.o log.c.o main.c.o memcmp.S.o memcpy.S.o \
        memmove.S.o memset.S.o mmap.c.o net/arp.c.o net/dhcp.c.o net/ether.c.o net/icmp.c.o \
-       net/ip.c.o net/net.c.o net/nic.c.o net/pbuf.c.o net/socket.c.o net/tcp.c.o net/udp.c.o \
-       pipe.c.o plic.c.o pointer.c.o probe.S.o proc.c.o riscv.S.o sbi.c.o sbi_ecall.S.o shm.c.o \
+       net/ip.c.o net/msg.c.o net/net.c.o net/nic.c.o net/pbuf.c.o net/socket.c.o net/tcp.c.o \
+       net/udp.c.o net/unix.c.o pipe.c.o plic.c.o pointer.c.o poll.c.o probe.S.o proc.c.o riscv.S.o \
+       sbi.c.o sbi_ecall.S.o shm.c.o \
        sleeplock.c.o smp.c.o spinlock.c.o spinlock.S.o strcmp.S.o strlen.S.o swtch.S.o syscall.c.o \
        sysfile.c.o sysinfo.c.o timer.c.o trap.c.o uart.c.o \
        userprogs.s.o uservec.S.o vm.c.o vmtest.c.o
