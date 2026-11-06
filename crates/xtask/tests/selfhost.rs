@@ -3020,8 +3020,9 @@ const G_UP: &str = "static int up(void) { return 1; }\n";
 /// The main file named `./m.c` or through `..`, headers next to it and in
 /// `-I` directories (one named as the compilation directory), a header
 /// above it, `#line` names (none, the main file's, a header's, one that
-/// is a directory, with control characters and with `\`), a name not ASCII,
-/// a compilation directory of `.`, `./`, none at all and one with `\`.
+/// is a directory, with control characters, not ASCII and with `\`: the
+/// console takes ASCII only, so a name not ASCII is a `#line`'s), and a
+/// compilation directory of `.`, `./`, none at all and one with `\`.
 #[allow(clippy::type_complexity)]
 const G_INPUTS: &[(&[(&str, &str)], &[&str], &str)] = &[
     (&[("m.c", G_MAIN), ("h.h", G_H), ("inc/o.h", G_O)], &["-Iinc", "-fdebug-compilation-dir=src"], "m.c"),
@@ -3064,7 +3065,6 @@ const G_INPUTS: &[(&[(&str, &str)], &[&str], &str)] = &[
         &["-fdebug-compilation-dir=src"],
         "k1.c",
     ),
-    (&[("caf\u{e9}.c", "int g;\nint f(void) { return g; }\n")], &[], "caf\u{e9}.c"),
     (
         &[("m.c", "int f(void) {\n#line 7 \"a\\tb\\bc\\fd\\re\\\"f\\vg\\ah\\ni~\u{e9}.c\"\n    return 1;\n}\n")],
         &["-fdebug-compilation-dir=src"],
@@ -3255,7 +3255,7 @@ fn g_corpus(corpus: Corpus, jobs: usize, described: usize, headers: usize, every
 /// every one of [`G_INPUTS`].
 #[test]
 fn the_compiler_on_camelot_writes_what_merlin_writes_with_g() {
-    g_corpus(Corpus::Sample, 150, 100, 20, true);
+    g_corpus(Corpus::Sample, 200, 150, 10, true);
 }
 
 /// `/bin/cc1` compiles some of itself on Camelot ([`OWN_SAMPLE`]): the
