@@ -440,7 +440,7 @@ static int translate(struct input *in, const char *output, struct options *opts)
 /* The directory cc1 runs in, as merlin's std::env::current_dir finds it:
  * the getcwd system call, with a buffer that grows until the path fits (a
  * page is the kernel's limit). NULL if it fails (the directory removed,
- * say), which merlin reports as an error too. For the whole run: plain
+ * say): the caller then uses `.`, as merlin does. For the whole run: plain
  * malloc, not the arena, which each translation unit frees. */
 static char *current_dir(void) {
     for (uint size = 256; size <= 4096; size *= 2) {
