@@ -2052,6 +2052,24 @@ static int give(struct giving *g, uint n) {
     return (int)g->nkeys;
 }
 
+/* Numbering the files as LLVM does (merlin's Lines::renumber). LLVM gives
+ * a file its number the first time it needs one (DwarfUnit's
+ * getOrCreateSourceID, for a .loc or an entry's DW_AT_decl_file), and so in
+ * three steps:
+ *
+ * 1. as the module begins, the files of the enums and the types of casts it
+ *    describes then (phase 1 of order()), a type's after those of the types
+ *    it refers to: their .files come right after .file 0;
+ * 2. then each file the code comes from, at its first .loc in the output,
+ *    which is in the order of the module's symbols, not the order the code
+ *    was generated in: its .file right before that .loc;
+ * 3. as the module ends, the files of the other entries, in the order LLVM
+ *    makes them (phases 3 to 6): their .files go with the debug sections.
+ *
+ * LLVM makes the unit as the module begins if it describes something then
+ * or has globals (string literals among them): .file 0 is then the first
+ * line of the output. Otherwise it makes the unit for the first function's
+ * code, and .file 0 comes right before the first .loc. */
 void debug_renumber(struct lines *l, struct buf *text, uint from) {
     /* Arrays count their elements in the type clang names
      * __ARRAY_SIZE_TYPE__. */
@@ -2093,6 +2111,8 @@ void debug_renumber(struct lines *l, struct buf *text, uint from) {
             buf_fmt(&first, "    %s\n", file_directive(l, n, (uint)to));
         }
     }
+    /* Whether LLVM makes the unit as the module begins, .file 0 first (else
+     * .file 0 waits for the first .loc). */
     int unit_first = o->begins || l->globals.n > 0 || l->literals.n > 0;
     /* 2. The files of the code, as the output needs them. The only .file
      * in the text is .file 0. */
@@ -2147,10 +2167,13 @@ void debug_renumber(struct lines *l, struct buf *text, uint from) {
         while (line[space] != ' ') {
             space++;
         }
-        char *from = fmt("%u", (uint)n);
+        uint digits = 1;
+        for (int64_t v = n; v >= 10; v /= 10) {
+            digits++;
+        }
         buf_put(&out, line, space + 1);
         buf_fmt(&out, "%u", (uint)g.map[n]);
-        uint rest = space + 1 + (uint)strlen(from);
+        uint rest = space + 1 + digits;
         buf_put(&out, line + rest, len - rest);
     }
     if (file0 != NULL) {
