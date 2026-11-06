@@ -248,10 +248,13 @@ static struct gui_rect blit_area(struct gui_buffer *b, int x, int y, const struc
 void gui_blit(struct gui_buffer *b, int x, int y, const struct gui_buffer *src, struct gui_rect from) {
     struct gui_rect to;
     struct gui_rect s = blit_area(b, x, y, src, from, &to);
-    /* A copy down the same pixels goes from the bottom row up, so that no
-     * row is overwritten before it is copied; memmove handles the overlap
-     * within a row. */
-    int up = src->pixels == b->pixels && to.y > s.y;
+    /* A copy to higher addresses goes from the bottom row up, so that no
+     * row of the same memory (b and src one buffer, or two views of it) is
+     * overwritten before it is copied; memmove handles the overlap within a
+     * row. Apart, the order makes no difference. */
+    uintptr_t first_to = (uintptr_t)&b->pixels[(long)to.y * b->stride + to.x];
+    uintptr_t first_from = (uintptr_t)&src->pixels[(long)s.y * src->stride + s.x];
+    int up = first_to > first_from;
     for (int n = 0; n < to.h; n++) {
         int j = up ? to.h - 1 - n : n;
         uint *d = &b->pixels[(long)(to.y + j) * b->stride + to.x];

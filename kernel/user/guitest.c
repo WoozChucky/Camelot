@@ -624,8 +624,9 @@ static void scene_utf8(void) {
  * descriptor. */
 static const uint forged[] = {
     5, 28 << 16 | 1, 7, 3, 'h' | 'i' << 8, 2, 0xbbaa,  /* good: 7 "hi" [aa bb] */
-    5, 16 << 16 | 2, 0xfffffff8, 0,                       /* a string 2^32 - 8 bytes long */
-    5, 16 << 16 | 4, 0xfffffffd, 0,                       /* an array that wraps round */
+    5, 16 << 16 | 2, 0xfffffffc, 0,                       /* 2^32 - 4 bytes: pos 4 + that wraps to 0 */
+    5, 16 << 16 | 4, 0xfffffffd, 0,                       /* rounded up to 4, the length wraps round */
+    5, 20 << 16 | 1, 7, 0xfffffff8, 0,                    /* after a uint: pos 8 + 2^32 - 8 wraps to 0 */
     5, 16 << 16 | 3, 4, 'a' | 'b' << 8 | 'c' << 16 | 'd' << 24, /* no NUL */
     5, 16 << 16 | 3, 4, 'a' | 'b' << 16,                  /* a NUL inside */
     5, 8 << 16 | 5,                                       /* a descriptor that did not come */
@@ -817,7 +818,7 @@ static void key_tap(struct fake *s, uint code) {
     key(s, code, 0);
 }
 
-/* The keyboard enters the window, nothing held, or leaves it. */
+/* The keyboard enters the window, no key held, or leaves it. */
 static void keyboard_focus(struct fake *s, int enter) {
     gui_wire_begin(&s->wire, s->keyboard, enter ? WL_KEYBOARD_ENTER : WL_KEYBOARD_LEAVE);
     gui_wire_uint(&s->wire, ++s->serial);
@@ -826,14 +827,16 @@ static void keyboard_focus(struct fake *s, int enter) {
         gui_wire_array(&s->wire, NULL, 0);
     }
     gui_wire_end(&s->wire);
-    if (enter) {
-        gui_wire_begin(&s->wire, s->keyboard, WL_KEYBOARD_MODIFIERS);
-        gui_wire_uint(&s->wire, ++s->serial);
-        for (int i = 0; i < 4; i++) {
-            gui_wire_uint(&s->wire, 0); /* depressed, latched, locked, group */
-        }
-        gui_wire_end(&s->wire);
+}
+
+/* No modifier held or locked, as a server says after an enter. */
+static void no_modifiers(struct fake *s) {
+    gui_wire_begin(&s->wire, s->keyboard, WL_KEYBOARD_MODIFIERS);
+    gui_wire_uint(&s->wire, ++s->serial);
+    for (int i = 0; i < 4; i++) {
+        gui_wire_uint(&s->wire, 0); /* depressed, latched, locked, group */
     }
+    gui_wire_end(&s->wire);
 }
 
 /* The input that follows frame n. */
@@ -843,8 +846,11 @@ static void after_frame(struct fake *s, int n) {
         pointer_button(s, 1);
         pointer_button(s, 0);
         /* Alt goes down, and the keyboard leaves before it comes up: back
-         * in the window, it types again. */
+         * in the window, it types again. No modifiers event after the
+         * second enter, so it is the leave that lets go of Alt (gui_run's
+         * focus handler). */
         keyboard_focus(s, 1);
+        no_modifiers(s);
         key(s, KEY_LEFTALT, 1);
         keyboard_focus(s, 0);
         keyboard_focus(s, 1);
@@ -1117,8 +1123,11 @@ static void scene_wayland(const char *dir) {
             while (!stop && (r = gui_wire_next(&s->wire, &m)) == 1) {
                 stop = request(s, &m) < 0;
             }
-            if (r < 0) {
+            if (r == -EPROTO) {
                 printf("> a broken message\n");
+                stop = 1;
+            } else if (r < 0) {
+                printf("> the connection: %s\n", strerror(-r)); /* a send's error, sticky */
                 stop = 1;
             }
             if (gui_wire_flush(&s->wire) < 0) {

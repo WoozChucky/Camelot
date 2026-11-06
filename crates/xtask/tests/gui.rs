@@ -333,12 +333,14 @@ fn check_output(run: &Run) {
          utf8 2: fffd fffd fffd fffd fffd fffd\n\
          encoded: 41 c3a9 e282ac f09f9880 efbfbd efbfbd\n"
     );
-    // A length near 2^32 is refused, not wrapped round past the message.
+    // A length near 2^32 is refused, not wrapped round past the message
+    // (5.2 and the second 5.1 wrap pos + length to 0 in 32 bits).
     assert_eq!(
         output(&run.out, "guitest wire"),
         "wire 5.1: 7 \"hi\" [aa bb]\n\
          wire 5.2: broken\n\
          wire 5.4: broken\n\
+         wire 5.1: broken\n\
          wire 5.3: broken\n\
          wire 5.3: broken\n\
          wire 5.5: broken\n\

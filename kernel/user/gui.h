@@ -167,9 +167,10 @@ int gui_text_height(const struct gui_font *f, int style);
  *
  * QOI ("the Quite OK Image format", qoiformat.org), as `cargo xtask fs`
  * converts the committed sources of kernel/images into the desktop image's
- * /usr/share/images. The image is an ARGB buffer of its own (an RGB
- * one's pixels opaque). 0, -EINVAL (not QOI, cut short, too big) or
- * -ENOMEM; free it with gui_buffer_free. */
+ * /usr/share/images. The image is an ARGB buffer of its own, its pixels
+ * as the chunks give them whatever the header's channels say, as the
+ * reference decoder does (an RGB encoder's are opaque). 0, -EINVAL (not
+ * QOI, cut short, too big) or -ENOMEM; free it with gui_buffer_free. */
 int gui_qoi_decode(struct gui_buffer *img, const void *data, size_t len);
 int gui_image_load(struct gui_buffer *img, const char *path);
 /* Reads a whole file (16 MiB at most) into memory from malloc: 0 with
