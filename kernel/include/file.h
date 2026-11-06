@@ -38,11 +38,14 @@
 /* Descriptors per process. */
 #define NOFILE 16
 
-/* Device numbers (the major of a device inode): the console, and the
- * framebuffer (fb.h). */
+/* Device numbers (the major of a device inode): the console, the
+ * framebuffer (fb.h) and the input devices (input.h), whose minor says
+ * which: 0 the keyboard, 1 the pointer, as Linux's /dev/input/eventN share
+ * one major. */
 #define CONSOLE 1
 #define FB 2
-#define NDEV 3
+#define INPUT 3
+#define NDEV 4
 
 #define FD_NONE 0
 #define FD_PIPE 1
@@ -66,18 +69,49 @@ struct file {
     struct inode *ip;   /* FD_INODE, and FD_DEVICE opened by its path */
     u64 off;            /* FD_INODE: at most MAXFILE_BYTES (fs.h) */
     u16 major;          /* FD_DEVICE */
+    u16 minor;          /* FD_DEVICE */
+    /* FD_DEVICE: the driver's own, for this open file (Linux's
+     * private_data): an input device's reader, say. Set by its open. */
+    void *priv;
 };
 
-/* A device's driver: read and write on user memory, as console_read() and
- * console_write() do; and, for a device with memory a program may map
- * (Linux's f_op->mmap), `mmap`, NULL for one without: given the mapping's
- * offset into the device's memory and its size (whole pages), it returns
- * 0 with the physical address of the first page in *pa, the rest
- * following it, or -EINVAL if the range is past the device's memory. */
+/* A device's driver, Linux's file_operations for the files of its major,
+ * each function given the open file (whose `minor` and `priv` it may use).
+ * Any may be NULL:
+ *
+ *   open      as open() makes the file, before it has a descriptor: 0, or
+ *             the error open() returns (the file then goes, without a
+ *             close). The first process's console files have none
+ *   close     as the file's last reference goes
+ *   read      read() on user memory, as console_read() does; NULL: -EINVAL
+ *   write     write(), the same way
+ *   ioctl     ioctl(fd, request, arg): its result, or -ENOTTY for a
+ *             request the device doesn't know (and when NULL)
+ *   mmap      for a device with memory a program may map (Linux's
+ *             f_op->mmap): given the mapping's offset into that memory and
+ *             its size (whole pages), 0 with the physical address of the
+ *             first page in *pa, the rest following it, or an error
+ *             (-EINVAL past the memory). NULL: -ENODEV. A mapping it
+ *             gives counts as a vm_open's, taken with the address, so
+ *             that the memory can't change between the two (mmap.c lets
+ *             go of it with a vm_close if the mapping isn't made)
+ *   vm_open   a mapping of the device's memory more, or one fewer: an area
+ *   vm_close  split in two, merged or unmapped (Linux's vm_operations
+ *             open and close), so that the driver knows while its memory
+ *             is mapped. Called holding spinlocks (a process's vm_lock, or
+ *             proc_lock when a process is reaped): they may take only a
+ *             lock under which nothing sleeps or wakes a sleeper (either
+ *             takes proc_lock), and should leave slow work, such as
+ *             freeing memory, for later (fb.c's fb_reclaim) */
 struct devsw {
-    isize (*read)(pagetable_t pt, uintptr dst, usize n);
-    isize (*write)(pagetable_t pt, uintptr src, usize n);
-    int (*mmap)(u64 offset, usize size, phys_addr_t *pa);
+    int (*open)(struct file *f);
+    void (*close)(struct file *f);
+    isize (*read)(struct file *f, pagetable_t pt, uintptr dst, usize n);
+    isize (*write)(struct file *f, pagetable_t pt, uintptr src, usize n);
+    long (*ioctl)(struct file *f, u32 request, uintptr arg);
+    int (*mmap)(struct file *f, u64 offset, usize size, phys_addr_t *pa);
+    void (*vm_open)(void);
+    void (*vm_close)(void);
 };
 
 extern const struct devsw devsw[NDEV];
@@ -85,6 +119,19 @@ extern const struct devsw devsw[NDEV];
 /* Whether `devsw` has a driver for `major`: open() fails with -ENODEV
  * on a device node without one. */
 bool device_has_driver(u32 major);
+
+/* A device file's open, through its driver's hook (devsw), once the file
+ * is set up: 0, or the hook's error. */
+int device_open(struct file *f);
+
+/* devsw's vm_open and vm_close for an area mapping device `major`'s
+ * memory (mmap.c), when the driver has them. */
+void device_vm_open(u32 major);
+void device_vm_close(u32 major);
+
+/* ioctl(): `request` with `arg` on `f`, through its device's driver;
+ * -ENOTTY for anything but a device, or a request it doesn't know. */
+long fileioctl(struct file *f, u32 request, uintptr arg);
 
 /* Sets up the table's lock. kmain calls it at boot. */
 void file_init(void);

@@ -59,6 +59,7 @@
 #include "proc.h"
 #include "elf.h"
 #include "exec.h"
+#include "fb.h"
 #include "file.h"
 #include "kalloc.h"
 #include "kprintf.h"
@@ -875,8 +876,10 @@ void scheduler(void) {
         release(&proc_lock);
         /* The kernel stacks freed holding proc_lock, here or elsewhere, that
          * this hart's cache had no room for: unmapped now that no lock is
-         * held (vm.h). */
+         * held (vm.h). And a framebuffer's buffer in RAM, let go of by a
+         * process reaped with it mapped (fb.h). */
         kstack_reclaim();
+        fb_reclaim();
     }
     intr_on();
 }
@@ -1180,6 +1183,11 @@ int proc_wait(int pid, uintptr status) {
                 }
                 proc_free(child);
                 release(&proc_lock);
+                /* A child that still mapped /dev/fb0 may have left the
+                 * display's buffer to free: free it before the caller goes
+                 * on to make another process. (proc_exit's reaps of its
+                 * zombies are freed by the scheduler it switches to.) */
+                fb_reclaim();
                 return child_pid;
             }
         }

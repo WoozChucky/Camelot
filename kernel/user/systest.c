@@ -534,7 +534,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(53, 0, 0, 0), -ENOSYS, "call 53");
+    check_eq(syscall(54, 0, 0, 0), -ENOSYS, "call 54");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
     /* The result is a long, sign-extended in a0: an error is negative
      * whatever the width, as a long and as an ssize_t (read's). */
@@ -557,6 +557,20 @@ static void test_files(void) {
     check_eq(write(STDOUT, "", 0), 0, "an empty write");
     check_eq(read(STDIN, &c, 0), 0, "an empty read");
     check_eq(write(STDERR, "", 0), 0, "an empty write to stderr");
+}
+
+/* ioctl: the console and a pipe know no request; only a device's driver
+ * answers one (fbtest and inputtest check theirs). */
+static void test_ioctl(void) {
+    int p[2];
+    check_eq(ioctl(9, 0x4600, 0), -EBADF, "ioctl on a closed descriptor");
+    check_eq(ioctl(-1, 0x4600, 0), -EBADF, "ioctl on -1");
+    check_eq(ioctl(STDOUT, 0x5401, 0), -ENOTTY, "the console has no requests (TCGETS)");
+    check_eq(ioctl(STDIN, 0, 0), -ENOTTY, "nor request 0");
+    check_eq(pipe(p), 0, "a pipe");
+    check_eq(ioctl(p[0], 0x4600, 0), -ENOTTY, "ioctl on a pipe");
+    close(p[0]);
+    close(p[1]);
 }
 
 static void test_spawn_and_wait(void) {
@@ -1267,6 +1281,7 @@ int main(int argc, char **argv, char **envp) {
     check_eq(fault, 0, "the program's start: argc, argv, envp and the auxiliary vector on the stack");
     test_simple_calls();
     test_files();
+    test_ioctl();
     test_spawn_and_wait();
     test_sbrk();
     test_descriptors();

@@ -1,5 +1,6 @@
 /* kprintf: the kernel's printf. See kprintf.h for the supported formats. */
 #include "kprintf.h"
+#include "fbcon.h"
 #include "spinlock.h"
 #include "trap.h"
 #include "uart.h"
@@ -164,9 +165,11 @@ int kvformat(kputc_fn put, void *ctx, const char *fmt, va_list ap) {
     return o.count;
 }
 
+/* The UART, and the framebuffer console (fbcon.h). */
 static void uart_sink(char c, void *ctx) {
     (void)ctx;
     uart_putc(c);
+    fbcon_putc(c);
 }
 
 /* The whole message under the UART's lock, so messages from different

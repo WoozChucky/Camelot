@@ -28,6 +28,8 @@ const char *strerror(int err) {
         return "not a regular file";
     case EFAULT:
         return "bad address";
+    case EBUSY:
+        return "device or resource busy";
     case EEXIST:
         return "file exists";
     case ENODEV:
@@ -42,6 +44,8 @@ const char *strerror(int err) {
         return "too many open files in the system";
     case EMFILE:
         return "too many open files";
+    case ENOTTY:
+        return "inappropriate ioctl for device";
     case EFBIG:
         return "file too large";
     case ENOSPC:
