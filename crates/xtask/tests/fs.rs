@@ -38,7 +38,7 @@ const FS_TEST_GROW: u32 = 5;
 /// without a /bin, and the transactions'.
 const READ_CHECKS: u32 = 12;
 const READ_CHECKS_NO_BIN: u32 = 11;
-const WRITE_CHECKS: u32 = 62;
+const WRITE_CHECKS: u32 = 69;
 const FULL_CHECKS: u32 = 8;
 const TREE_CHECKS: u32 = 6;
 const GROW_CHECKS: u32 = 7;
