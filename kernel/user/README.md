@@ -1,7 +1,8 @@
 # Camelot's user programs
 
 Every `X.c` or `X.s` here is a program called `X`, and so is every
-subdirectory `X/` but `lib/` (a program of several files: `as/`). They run in U-mode on
+subdirectory `X/` but `lib/` (a program of several files: `as/`), but
+`cc/`, which is `cc1`, the compiler proper (`userprogs::RENAMED`). They run in U-mode on
 the system calls of `docs/camelot-syscalls.md`, declared in `user.h` with
 the C library of `lib/` (see `lib/README.md`). Built by merlin, merlin-as
 and merlin-ld (`cargo xtask kernel`, which embeds them in the kernel for
@@ -76,6 +77,7 @@ $ wait
 | `as` | `as [-march=ISA] [-o OUT.o] FILE.s` | the assembler, merlin-as rewritten in C (`as/`): the same language, the same object byte for byte (RV64, ELF64; `-march` takes `rv64ima_zicsr_zifencei`, the default), the same error messages (`FILE:LINE: error: ...`), and the same line tables from `.file`/`.loc` (merlin `-g` output). The first step of self-hosting: section 10, "Self-hosting", of the spec. Only in `/bin` of the root image: the kernel does not build it in (it needs files) |
 | `ld` | `ld [-T SCRIPT] [-e ENTRY] [-o OUT] [-S] [-L DIR] FILE.o ... [LIB.a] [-lNAME] [--start-lib LIB.o ... --end-lib] [@ARGS]` | the linker, merlin-ld rewritten in C (`ld/`): the same scripts (`AT` load addresses and `ADDR` included), archives and libraries (`-lNAME` is `libNAME.a` in the first `-L` directory that has it, its members linked only when needed, in ld.lld's order) and messages, the same executable byte for byte (ELF64; an ELF32 object is refused, as merlin-ld refuses it); `@ARGS` reads more arguments from a file, for link lines longer than the shell takes. `as` then `ld` builds a program on Camelot itself, as the host does: `ld -T /usr/lib/user.ld -o PROG /usr/lib/crt0.o PROG.o -L/usr/lib -lc`. Only in `/bin` of the root image, as `as` |
 | `ar` | `ar [-]{r,t,x}[c][s][S][D] ARCHIVE [FILE...] [@ARGS]` | the archiver (`ar/`): `r` puts files in an archive, made if missing (replacing members of their names in place, the others at the end), `t` lists the members, `x` writes them to files; `s` (the default) writes the symbol table, `S` does not, `c` makes the archive without saying so. The archive llvm-ar writes for the same members, byte for byte (the GNU format, deterministic: times and ids 0, mode 644). `ar rcs libx.a a.o b.o`, then `ld ... -L. -lx`. Only in `/bin` of the root image, as `as` |
+| `cc1` | `cc1 -E [-P] [-I DIR] [-D NAME[=VALUE]] [-U NAME] [-x LANG] [-o OUT] FILE...` | the C compiler proper, merlin rewritten in C (`cc/`), landing in stages (#241). This one is merlin's preprocessor: `cc1 -E` writes what `merlin -E` writes, byte for byte, for C and for assembly (a `.S` file, or `-x assembler-with-cpp`: line markers, or none with `-P`), with merlin's diagnostics (`FILE:LINE:COL: error: ...`, clang's words), and takes every option merlin takes; it refuses to compile until merlin's parser comes. Only in `/bin` of the root image, as `as` |
 
 ## Network programs
 
