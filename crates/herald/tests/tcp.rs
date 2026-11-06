@@ -9,6 +9,7 @@ use herald::DETACH_KEY;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -222,6 +223,45 @@ fn piped_input_goes_as_it_is() {
     }
     assert_eq!(join(session), TcpEnd::Left);
     assert_eq!(join(server), b"one\ntwo");
+}
+
+/// Leaving while the far end's data waits unread (#234): closing then would reset the
+/// connection, and the far end could lose what Herald sent just before. A server that
+/// sends without pause, so that something always waits unread when Herald leaves,
+/// gets every byte Herald sent and then a clean end, its own sending never failing.
+#[test]
+fn leaving_with_the_far_ends_data_unread_still_delivers_what_was_sent() {
+    for _ in 0..20 {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flooding = Arc::clone(&stop);
+        let (addr, server) = serve_once(move |mut stream: TcpStream| {
+            let mut writer = stream.try_clone().unwrap();
+            let flood = thread::spawn(move || {
+                let chunk = [b'.'; 4096];
+                while !flooding.load(Ordering::SeqCst) {
+                    writer.write_all(&chunk)?;
+                }
+                // Herald waits for this end's close before it closes its own.
+                writer.shutdown(Shutdown::Write)
+            });
+            let mut got = Vec::new();
+            let read = stream.read_to_end(&mut got).map(|_| got);
+            stop.store(true, Ordering::SeqCst);
+            (read, flood.join().unwrap())
+        });
+        let (keys, out, session) = start_session(addr, false);
+        // The far end's data is coming before anything is sent.
+        let start = Instant::now();
+        while out.0.lock().unwrap().is_empty() {
+            assert!(start.elapsed() < SLOW, "nothing came");
+            thread::yield_now();
+        }
+        type_keys(&keys, b"one\ntwo\x1d");
+        assert_eq!(join(session), TcpEnd::Left);
+        let (read, flood) = join(server);
+        assert_eq!(read.expect("a clean end, not a reset"), b"one\ntwo");
+        flood.expect("the far end's sending ends cleanly too");
+    }
 }
 
 // ---- the binary ----
