@@ -274,6 +274,32 @@ pub fn fake_attach(
     .unwrap();
 }
 
+/// A port of 127.0.0.1 that refuses connections, and goes on refusing them while the
+/// value lives. A port bound and closed again does not: the system hands it out again,
+/// to the next socket that binds port 0 once the port comes round (on Windows after a
+/// round of the others, some 12,000 binds), and a listener there accepts what was
+/// meant to be refused (#230). This one stays held by the two ends of a connection to
+/// it, accepted before its listener closed. With no listener a connection to the port
+/// is refused, on Windows as on Linux, and the system does not hand out a port in use
+/// (nor gives it to a connection as its own end), so it cannot go to anyone else.
+/// Grail's `tests/net_user.rs` has the same, and checks it against a round of binds.
+pub struct RefusedPort {
+    pub port: u16,
+    _held: (TcpStream, TcpStream),
+}
+
+pub fn refused_port() -> RefusedPort {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = TcpStream::connect(addr).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    drop(listener);
+    RefusedPort {
+        port: addr.port(),
+        _held: (client, server),
+    }
+}
+
 /// A fake server's side after an attach, for a client that leaves while the server's
 /// frames are still coming (#234): sends `flood` without pause, so that some always
 /// wait unread on the client's side when it closes, answers `detach` with `Ok` when it

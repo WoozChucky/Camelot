@@ -4,6 +4,8 @@
 //! the sending side down, and the far end closing the connection. Then the binary
 //! itself, through pipes.
 
+mod common;
+
 use herald::tcp::{TcpEnd, TcpSession};
 use herald::DETACH_KEY;
 use std::io::{Read, Write};
@@ -357,12 +359,9 @@ fn the_binary_reports_bad_addresses_and_refused_connections() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains(want), "{args:?}: {err}");
     }
-    // A port nothing listens on.
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // A port nothing listens on, nor can while the test runs.
+    let refused = common::refused_port();
+    let port = refused.port;
     let out = herald()
         .args(["--tcp", &format!("127.0.0.1:{port}")])
         .stdin(Stdio::null())
