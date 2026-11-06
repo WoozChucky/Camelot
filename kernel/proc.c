@@ -187,15 +187,20 @@ static void proc_free(struct proc *p) {
     p->state = PROC_UNUSED;
 }
 
-/* Copies at most PROC_NAME_MAX characters of `name`. Called with proc_lock
- * held, or on a slot nobody else looks at yet. */
+/* Copies at most PROC_NAME_MAX characters of `name`, the rest of the field
+ * zeros, as Linux's __set_task_comm pads with strscpy_pad: a name an exec
+ * shortens ("init" to "sh") keeps nothing of the old one, which procs()
+ * copies whole. Called with proc_lock held, or on a slot nobody else looks
+ * at yet. */
 static void set_name(struct proc *p, const char *name) {
     u32 i = 0;
     while (name[i] != 0 && i < PROC_NAME_MAX) {
         p->name[i] = name[i];
         i++;
     }
-    p->name[i] = 0;
+    while (i <= PROC_NAME_MAX) {
+        p->name[i++] = 0;
+    }
 }
 
 /* ---- The program's start ----
