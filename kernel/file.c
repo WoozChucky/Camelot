@@ -30,32 +30,46 @@ void file_init(void) {
     initlock(&ftable_lock, "ftable");
 }
 
-/* Major 0 has no driver: device_has_driver() says so before anything is
- * opened, and these fail just in case. */
-static isize nodev_read(pagetable_t pt, uintptr dst, usize n) {
-    (void)pt;
-    (void)dst;
-    (void)n;
-    return -ENODEV;
-}
-
-static isize nodev_write(pagetable_t pt, uintptr src, usize n) {
-    (void)pt;
-    (void)src;
-    (void)n;
-    return -ENODEV;
-}
-
-/* The drivers, by major number: 0 is none, CONSOLE the console (which has
- * no memory to map), FB the framebuffer (its memory, for mmap). */
+/* The drivers, by major number: 0 is none, CONSOLE the console (reads and
+ * writes), FB the framebuffer (its memory, for mmap, and its mode through
+ * ioctl). A major whose entry is all NULL has no driver. */
 const struct devsw devsw[NDEV] = {
-    {nodev_read, nodev_write, NULL},
-    {console_read, console_write, NULL},
-    {fb_read, fb_write, fb_mmap},
+    [CONSOLE] = {.read = console_read, .write = console_write},
+    [FB] = {.ioctl = fb_ioctl, .mmap = fb_mmap},
 };
 
 bool device_has_driver(u32 major) {
-    return major != 0 && major < NDEV;
+    if (major >= NDEV) {
+        return false;
+    }
+    const struct devsw *d = &devsw[major];
+    return d->open != NULL || d->read != NULL || d->write != NULL || d->ioctl != NULL || d->mmap != NULL;
+}
+
+int device_open(struct file *f) {
+    if (devsw[f->major].open == NULL) {
+        return 0;
+    }
+    return devsw[f->major].open(f);
+}
+
+void device_vm_open(u32 major) {
+    if (major < NDEV && devsw[major].vm_open != NULL) {
+        devsw[major].vm_open();
+    }
+}
+
+void device_vm_close(u32 major) {
+    if (major < NDEV && devsw[major].vm_close != NULL) {
+        devsw[major].vm_close();
+    }
+}
+
+long fileioctl(struct file *f, u32 request, uintptr arg) {
+    if (f->type != FD_DEVICE || devsw[f->major].ioctl == NULL) {
+        return -ENOTTY;
+    }
+    return devsw[f->major].ioctl(f, request, arg);
 }
 
 /* The most a write puts in one transaction: a page, 4 blocks. A chunk
@@ -120,7 +134,11 @@ void fileclose(struct file *f) {
     } else if (closed.type == FD_SHM) {
         /* The object stays while a mapping holds it. */
         shm_put(closed.shm);
-    } else if (closed.ip != NULL) {
+    }
+    if (closed.type == FD_DEVICE && devsw[closed.major].close != NULL) {
+        devsw[closed.major].close(&closed);
+    }
+    if (closed.ip != NULL) {
         /* The last reference to an unlinked file frees it: a transaction. */
         begin_op();
         iput(closed.ip);
@@ -265,7 +283,10 @@ isize fileread(struct file *f, pagetable_t pt, uintptr dst, usize n) {
         return piperead(f->pipe, pt, dst, n);
     }
     if (f->type == FD_DEVICE) {
-        return devsw[f->major].read(pt, dst, n);
+        if (devsw[f->major].read == NULL) {
+            return -EINVAL;
+        }
+        return devsw[f->major].read(f, pt, dst, n);
     }
     return inode_read(f, pt, dst, n);
 }
@@ -295,7 +316,10 @@ isize filewrite(struct file *f, pagetable_t pt, uintptr src, usize n) {
         return pipewrite(f->pipe, pt, src, n);
     }
     if (f->type == FD_DEVICE) {
-        return devsw[f->major].write(pt, src, n);
+        if (devsw[f->major].write == NULL) {
+            return -EINVAL;
+        }
+        return devsw[f->major].write(f, pt, src, n);
     }
     return inode_write(f, pt, src, n);
 }
@@ -402,11 +426,14 @@ int filemmap(struct file *f, u32 type, u32 prot, u64 offset, usize size, struct 
     if (f->type == FD_DEVICE && devsw[f->major].mmap != NULL) {
         /* A device's memory is the device's whatever the type: a private
          * mapping of it writes it too, as Linux's fbdev maps it. */
-        int r = devsw[f->major].mmap(offset, size, &a->device);
+        int r = devsw[f->major].mmap(f, offset, size, &a->device);
         if (r != 0) {
             return r;
         }
         a->kind = AREA_DEVICE;
+        a->major = f->major;
+        /* The new area, which mmap makes or lets go of (drop_backing). */
+        device_vm_open(f->major);
         a->may_write = f->writable;
         return 0;
     }

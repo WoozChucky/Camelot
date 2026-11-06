@@ -4,21 +4,15 @@
 #include "syscall.h"
 #include "sysinfo.h"
 
-isize fb_read(pagetable_t pt, uintptr dst, usize n) {
-    (void)pt;
-    (void)dst;
-    (void)n;
-    return -EINVAL;
+long fb_ioctl(struct file *f, u32 request, uintptr arg) {
+    (void)f;
+    (void)request;
+    (void)arg;
+    return -ENOTTY;
 }
 
-isize fb_write(pagetable_t pt, uintptr src, usize n) {
-    (void)pt;
-    (void)src;
-    (void)n;
-    return -EINVAL;
-}
-
-int fb_mmap(u64 offset, usize size, phys_addr_t *pa) {
+int fb_mmap(struct file *f, u64 offset, usize size, phys_addr_t *pa) {
+    (void)f;
     /* The VRAM, as the device table lists it (spec section 9.5). */
     u32 n = sysinfo_device_count();
     for (u32 i = 0; i < n; i++) {

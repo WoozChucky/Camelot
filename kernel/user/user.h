@@ -65,6 +65,7 @@ typedef unsigned long long uint64_t;
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping */
 #define EACCES 13       /* spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
+#define EBUSY 16        /* ioctl: the device's memory is mapped, and the request would change it */
 #define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */
 #define ENODEV 19       /* open: a device node with no driver; mmap: a file that can't be mapped */
 #define ENOTDIR 20      /* a name on the way is not a directory */
@@ -72,6 +73,7 @@ typedef unsigned long long uint64_t;
 #define EINVAL 22       /* an argument is out of range */
 #define ENFILE 23       /* every slot of the kernel's open file table is taken */
 #define EMFILE 24       /* every descriptor of the process is taken */
+#define ENOTTY 25       /* ioctl: not a device, or a request the device doesn't know */
 #define EFBIG 27        /* write: past the largest file */
 #define ENOSPC 28       /* no free block or inode on the disk */
 #define ESPIPE 29       /* lseek: not on a pipe or a device */
@@ -373,6 +375,7 @@ int munmap(void *addr, size_t len);
 int mprotect(void *addr, size_t len, int prot);
 int memfd_create(const char *name, uint flags);
 int ftruncate(int fd, off_t length);
+int ioctl(int fd, unsigned long request, ...);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);

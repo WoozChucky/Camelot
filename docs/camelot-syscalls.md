@@ -151,6 +151,7 @@ headers and checks each size.
 | 50 | `mprotect` | `void *addr, size_t len, int prot` | 0; `-EINVAL`, `-ENOMEM`, `-EACCES` |
 | 51 | `memfd_create` | `const char *name, uint flags` | a new descriptor; `-EINVAL`, `-EFAULT`, `-EMFILE`, `-ENFILE` |
 | 52 | `ftruncate` | `int fd, off_t length` | 0; `-EBADF`, `-EINVAL`, `-EFBIG` |
+| 53 | `ioctl` | `int fd, unsigned long request, ...` | the request's result; `-EBADF`, `-ENOTTY`, `-EINVAL`, `-EFAULT`, `-EBUSY` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -915,6 +916,7 @@ Linux's values for the same conditions.
 | 12 | `ENOMEM` | out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping |
 | 13 | `EACCES` | spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that access |
 | 14 | `EFAULT` | a pointer argument is not valid user memory |
+| 16 | `EBUSY` | ioctl: the device's memory is mapped, and the request would change it |
 | 17 | `EEXIST` | the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping |
 | 19 | `ENODEV` | open: a device node with no driver; the network: no network card; mmap: a file that can't be mapped |
 | 20 | `ENOTDIR` | a name on the way is not a directory |
@@ -922,6 +924,7 @@ Linux's values for the same conditions.
 | 22 | `EINVAL` | an argument is out of range |
 | 23 | `ENFILE` | every one of the kernel's open files is taken; memfd_create: every shared-memory object |
 | 24 | `EMFILE` | every descriptor of the process is taken |
+| 25 | `ENOTTY` | ioctl: not a device, or a request the device doesn't know |
 | 27 | `EFBIG` | write: past the largest file; ftruncate: past the largest shared-memory object |
 | 28 | `ENOSPC` | no free block or inode on the disk |
 | 29 | `ESPIPE` | lseek: a pipe or a device |

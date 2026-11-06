@@ -3672,7 +3672,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 52, "{calls:?}");
+    assert_eq!(calls.len(), 53, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -3701,7 +3701,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 45, "{errors:?}");
+    assert_eq!(errors.len(), 47, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     assert_eq!(defines(&user_h, "E"), errors, "user.h");
 
@@ -3728,11 +3728,13 @@ fn the_system_call_document_matches_the_code() {
         }
         // A call that takes a pointer can fail with -EFAULT, and only those,
         // but for the memory mappings' calls: their pointer is an address to
-        // map at or unmap, never memory the kernel reads or writes. Only the
-        // calls that can't fail list no error.
+        // map at or unmap, never memory the kernel reads or writes; ioctl's
+        // `...` is a pointer for most requests. Only the calls that can't
+        // fail list no error.
         let addresses = ["mmap", "munmap", "mprotect"];
+        let takes_pointer = args.contains('*') || name == "ioctl";
         assert_eq!(
-            args.contains('*') && !addresses.contains(&name.as_str()),
+            takes_pointer && !addresses.contains(&name.as_str()),
             returns.contains("`-EFAULT`"),
             "{name}: {returns}"
         );

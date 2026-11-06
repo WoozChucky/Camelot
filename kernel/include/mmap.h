@@ -105,8 +105,11 @@ struct vm_area {
      * object's page at `start` (Linux's vm_pgoff). */
     struct shm_object *shm;
     u64 pgoff;
-    /* AREA_DEVICE: the physical address mapped at `start`. */
+    /* AREA_DEVICE: the physical address mapped at `start`, and the device's
+     * major number, whose driver is told as areas of its memory come and
+     * go (devsw's vm_open and vm_close, file.h). */
     phys_addr_t device;
+    u32 major;
     /* The next area up: a process's are a list in address order. */
     struct vm_area *next;
 };

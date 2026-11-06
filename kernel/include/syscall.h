@@ -70,6 +70,7 @@
 #define SYS_mprotect 50      /* mprotect(addr, len, prot): 0 */
 #define SYS_memfd_create 51  /* memfd_create(name, flags): a descriptor for a new shared-memory object */
 #define SYS_ftruncate 52     /* ftruncate(fd, length): 0, the object's size set */
+#define SYS_ioctl 53         /* ioctl(fd, request, arg): the device's answer */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
@@ -84,6 +85,7 @@
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping */
 #define EACCES 13       /* spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
+#define EBUSY 16        /* ioctl: the device's memory is mapped, and the request would change it */
 #define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */
 #define ENODEV 19       /* open: a device node with no driver; mmap: a file that can't be mapped */
 #define ENOTDIR 20      /* a name on the way is not a directory */
@@ -91,6 +93,7 @@
 #define EINVAL 22       /* an argument is out of range */
 #define ENFILE 23       /* every slot of the kernel's open file table is taken */
 #define EMFILE 24       /* every descriptor of the process is taken */
+#define ENOTTY 25       /* ioctl: not a device, or a request the device doesn't know */
 #define EFBIG 27        /* write: past the largest file */
 #define ENOSPC 28       /* no free block or inode on the disk */
 #define ESPIPE 29       /* lseek: not on a pipe or a device */

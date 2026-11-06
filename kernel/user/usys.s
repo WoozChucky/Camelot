@@ -58,6 +58,7 @@
     .equ SYS_mprotect, 50
     .equ SYS_memfd_create, 51
     .equ SYS_ftruncate, 52
+    .equ SYS_ioctl, 53
 
     .text
 
@@ -425,6 +426,14 @@ memfd_create:
     .globl ftruncate
 ftruncate:
     li    a7, SYS_ftruncate
+    ecall
+    ret
+
+# int ioctl(int fd, unsigned long request, ...): the third argument, a
+# pointer or a value, in a2 as a variadic call passes it.
+    .globl ioctl
+ioctl:
+    li    a7, SYS_ioctl
     ecall
     ret
 

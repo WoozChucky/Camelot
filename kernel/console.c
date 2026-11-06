@@ -93,7 +93,8 @@ static bool edit_line(void) {
     return line_done;
 }
 
-isize console_read(pagetable_t pt, uintptr dst, usize n) {
+isize console_read(struct file *f, pagetable_t pt, uintptr dst, usize n) {
+    (void)f;
     if (!uvm_range_ok(pt, dst, n, PTE_W)) {
         return -EFAULT;
     }
@@ -128,7 +129,8 @@ isize console_read(pagetable_t pt, uintptr dst, usize n) {
     return (isize)count;
 }
 
-isize console_write(pagetable_t pt, uintptr src, usize n) {
+isize console_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
+    (void)f;
     if (!uvm_range_ok(pt, src, n, PTE_R)) {
         return -EFAULT;
     }
