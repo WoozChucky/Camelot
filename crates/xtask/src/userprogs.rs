@@ -155,8 +155,9 @@ pub enum Lang {
 /// library's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
-    /// The file's stem, relative to [`USER_DIR`]: for a program, its name;
-    /// for a library member, `lib/` and its name.
+    /// The file's stem, relative to [`USER_DIR`]: for a program, its file's
+    /// or its directory's name (which [`Source::name`] makes the program's,
+    /// [`RENAMED`] aside); for a library member, `lib/` and its name.
     pub stem: String,
     pub lang: Lang,
 }
@@ -230,7 +231,8 @@ pub enum CCompiler<'a> {
 /// A linked user program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
-    /// The source's stem: what the shell calls it.
+    /// Its name ([`Source::name`]: the source's stem, or a directory's
+    /// [`RENAMED`] name): what the shell calls it.
     pub name: String,
     /// The executable merlin-ld wrote, without its debug information: what
     /// the kernel embeds and `/bin` holds, linked from the installed start

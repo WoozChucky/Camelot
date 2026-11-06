@@ -2157,6 +2157,9 @@ const PP_INPUTS: &[(&str, &[(&str, &str)], &[&str], bool)] = &[
         &[],
         false,
     ),
+    // ... after a backslash: an escape C has not, in a character constant
+    // and in a name #line gives.
+    ("#if '\\\0' == 0\nz\n#endif\n#line 1 \"\\\0\"\nx\n", &[], &[], false),
     // ... in assembly's line markers.
     ("  nop\n#line 5 \"n\0m.S\"\n  nop\n", &[], &[], true),
     // The bytes that stand around a file's number in merlin's messages

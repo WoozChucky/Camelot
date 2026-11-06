@@ -121,7 +121,9 @@ static int write_file(const char *path, const char *data, uint len) {
 }
 
 /* Writes all of data to standard output. A failure stops cc1 with exit
- * status 2, as one stops merlin (whose print! gives up the program). */
+ * status 2, its status for a file it cannot write (-o, as merlin's); there
+ * merlin's print! panics instead, exit status 101, which is Rust's and no
+ * compiler's. */
 static void write_out(const char *data, uint len) {
     uint done = 0;
     while (done < len) {
