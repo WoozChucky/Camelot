@@ -15,6 +15,7 @@
  * request at a time changing the mode or the pan: a new buffer is found and
  * cleared under it, outside fb_lock. */
 #include "fb.h"
+#include "fbcon.h"
 #include "file.h"
 #include "kalloc.h"
 #include "kprintf.h"
@@ -205,6 +206,7 @@ void fb_init(void) {
         plic_enable(irq);
     }
     kprintf("fb: %ux%u, %u modes, irq %u\n", mode_width[0], mode_height[0], nmodes, irq);
+    fbcon_init();
 }
 
 bool fb_intr(u32 source) {
@@ -271,6 +273,7 @@ static void release_display(void) {
         wr(FB_CTRL, CTRL_ENABLE);
         blanked = false;
     }
+    fbcon_resume();
 }
 
 int fb_open(struct file *f) {
@@ -279,6 +282,9 @@ int fb_open(struct file *f) {
         return -ENODEV;
     }
     acquire(&fb_lock);
+    if (opens == 0 && maps == 0) {
+        fbcon_suspend(); /* the display is the program's */
+    }
     opens++;
     release(&fb_lock);
     return 0;

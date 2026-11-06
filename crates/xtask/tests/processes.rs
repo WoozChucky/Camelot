@@ -20,8 +20,9 @@
 mod common;
 
 use common::{
-    command_output, image_pa, kpa, peek64, printed, proc_name, spare_pages, sym, LockWatch, CPU_PROC,
-    KSTACK_PAGES, MAPTEST_CHECKS, PROC_PID, PROMPT,
+    command_output, image_pa, kpa, peek64, printed, proc_name, screen, screen_rows_of, screen_text,
+    spare_pages, step_to_frame, sym, LockWatch, ScreenCell, CPU_PROC, KSTACK_PAGES, MAPTEST_CHECKS, PROC_PID,
+    PROMPT,
 };
 use excalibur::csr::{IRQ_S_EXT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPP};
 use grail::cpu::Mode;
@@ -1097,8 +1098,10 @@ fn memory_mappings_are_mapped_on_demand_and_given_back() {
 fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
     // Issue #179's device mappings: `maptest fb` on the root image maps
     // /dev/fb0, the framebuffer's VRAM, draws a pattern into it and checks
-    // the errors. The display shows what it drew, and no page of RAM went
-    // to it: a device's pages are the device's.
+    // the errors. The display shows what it drew while the program has the
+    // device, and no page of RAM went to it: a device's pages are the
+    // device's. Once it lets go, the framebuffer console (fbcon.h) takes
+    // the screen back and draws its text again.
     let (tx, rx) = std::sync::mpsc::channel();
     let (mut m, elf) = load(
         Setup {
@@ -1110,13 +1113,17 @@ fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
     );
     step_to_prompt(&mut m, 1);
     let before = spare_pages(&m, &elf);
-    for b in b"maptest fb\n" {
-        tx.send(*b).unwrap();
-    }
-    step_to_prompt(&mut m, 2);
-    let out = printed(&m);
-    assert_eq!(spare_pages(&m, &elf), before, "{out}");
-    assert_eq!(all_checks_pass(&out, "maptest fb", "maptest"), 15, "{out}");
+    type_line(&tx, "maptest fb\n");
+    step_to_output(&mut m, "maptest: drawn\n");
+    // Ticks on: the console doesn't draw over it.
+    let ticks = sym(&elf, "ticks");
+    let now = common::peek(&m.cpu, ticks);
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| common::peek(&m.cpu, ticks) >= now + 2,
+    );
     let fb = &m.cpu.bus.fb;
     for (x, y) in [(0, 0), (1, 0), (639, 0), (0, 479), (321, 123), (639, 479)] {
         assert_eq!(
@@ -1125,6 +1132,14 @@ fn a_program_draws_into_the_framebuffer_through_a_mapping_of_dev_fb0() {
             "({x}, {y})"
         );
     }
+    type_line(&tx, "\n");
+    step_to_prompt(&mut m, 2);
+    let out = printed(&m);
+    assert_eq!(spare_pages(&m, &elf), before, "{out}");
+    assert_eq!(all_checks_pass(&out, "maptest fb", "maptest"), 15, "{out}");
+    step_to_frame(&mut m);
+    assert_eq!(screen_text(&m), screen_rows_of(&out), "{out}");
+    assert_eq!(m.cpu.bus.fb.pixel(639, 479), 0);
 }
 
 /// A machine with the root image, booted to its first prompt, and the pages
@@ -1213,7 +1228,12 @@ fn type_line(tx: &std::sync::mpsc::Sender<u8>, line: &str) {
 
 /// Steps `m` until what it printed ends with `tail`.
 fn step_to_output(m: &mut Machine, tail: &str) {
-    step_until(m, RUN_MAX_STEPS, |_| {}, |m| m.cpu.bus.uart.captured.ends_with(tail.as_bytes()));
+    step_until(
+        m,
+        RUN_MAX_STEPS,
+        |_| {},
+        |m| m.cpu.bus.uart.captured.ends_with(tail.as_bytes()),
+    );
 }
 
 /// Runs `command`, an `inputtest` that prints `ready` when it is reading,
@@ -1280,7 +1300,10 @@ fn keys_reach_a_reader_as_linux_key_codes() {
             assert!(m.key_event(key(0, 0xe3))); // Left GUI
         },
     );
-    assert_eq!(out, "1 30 1\n0 0 0\n1 30 0\n0 0 0\n1 42 1\n0 0 0\n1 125 1\n0 0 0\n");
+    assert_eq!(
+        out,
+        "1 30 1\n0 0 0\n1 30 0\n0 0 0\n1 42 1\n0 0 0\n1 125 1\n0 0 0\n"
+    );
     assert!(!m.cpu.bus.kbd.raw());
 }
 
@@ -1291,7 +1314,12 @@ fn a_keyboard_without_raw_mode_gives_key_codes_made_from_ascii() {
     // and Ctrl its bits say pressed (and let go) around it.
     let (_, out) = input_events(
         "inputtest keys 9",
-        |m, elf| m.cpu.bus.load(image_pa(sym(elf, "keyboard_has_raw")), &[0; 4]).unwrap(),
+        |m, elf| {
+            m.cpu
+                .bus
+                .load(image_pa(sym(elf, "keyboard_has_raw")), &[0; 4])
+                .unwrap()
+        },
         |m| {
             assert!(!m.cpu.bus.kbd.raw());
             let shifted = key(b'A', 0x04).with_shift(true);
@@ -1325,7 +1353,116 @@ fn the_console_types_what_the_keyboard_types() {
     }
     step_to_prompt(&mut m, 2);
     let out = printed(&m);
-    assert!(out.ends_with(&format!("{PROMPT}hellp\x08 \x08o\nhello from user mode\n{PROMPT}")), "{out}");
+    assert!(
+        out.ends_with(&format!(
+            "{PROMPT}hellp\x08 \x08o\nhello from user mode\n{PROMPT}"
+        )),
+        "{out}"
+    );
+    // And the framebuffer console shows it, the letter erased gone.
+    step_to_frame(&mut m);
+    let rows = screen_text(&m);
+    let end = rows.iter().rposition(|r| !r.is_empty()).unwrap();
+    assert_eq!(
+        rows[end - 2..=end],
+        ["$ hello", "hello from user mode", "$"],
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn the_framebuffer_console_acts_on_ansis_escape_sequences() {
+    // `fbtest ansi` writes text with the control characters and escape
+    // sequences the console acts on (fbcon.h): colours, bold and reverse
+    // video, a tab, a backspace, the cursor's moves and erasing. Its
+    // layout is in kernel/user/fbtest.c.
+    let (mut m, _, tx, _) = root_machine();
+    type_line(&tx, "fbtest ansi\n");
+    step_to_prompt(&mut m, 2);
+    step_to_frame(&mut m);
+    let rows = screen_text(&m);
+    let mut want = vec![String::new(); 30];
+    for (i, row) in [
+        "plain",
+        "red bold green reverse",
+        "white on blue",
+        "tab     x",
+        "abd",
+        "xxxx",
+        "         at 7,10",
+        "adef",
+        "",
+        "",
+        "",
+        &"w".repeat(80),
+        "wwwww",
+        "fbtest: ansi",
+        "$",
+    ]
+    .iter()
+    .enumerate()
+    {
+        want[i] = row.to_string();
+    }
+    assert_eq!(rows, want, "{}", printed(&m));
+    let cells = screen(&m);
+    let cell = |row: usize, col: usize| cells[row][col];
+    const GREY: u32 = 0xaaaaaa;
+    assert_eq!(
+        cell(0, 0),
+        ScreenCell {
+            ch: 'p',
+            fg: GREY,
+            bg: 0
+        }
+    );
+    assert_eq!(
+        cell(1, 0),
+        ScreenCell {
+            ch: 'r',
+            fg: 0xaa0000,
+            bg: 0
+        },
+        "red"
+    );
+    assert_eq!(
+        cell(1, 4),
+        ScreenCell {
+            ch: 'b',
+            fg: 0x55ff55,
+            bg: 0
+        },
+        "bold: the bright green"
+    );
+    assert_eq!(
+        cell(1, 15),
+        ScreenCell {
+            ch: 'r',
+            fg: 0,
+            bg: GREY
+        },
+        "reverse video"
+    );
+    assert_eq!(
+        cell(2, 0),
+        ScreenCell {
+            ch: 'w',
+            fg: 0xffffff,
+            bg: 0x0000aa
+        },
+        "bright white on blue"
+    );
+    assert_eq!(cell(2, 5).bg, 0x0000aa, "a space in blue");
+    assert_eq!(cell(2, 13).bg, 0, "and none after");
+    // The cursor: an inverse cell after the prompt.
+    assert_eq!(
+        cell(14, 2),
+        ScreenCell {
+            ch: ' ',
+            fg: GREY,
+            bg: GREY
+        }
+    );
 }
 
 #[test]

@@ -7,9 +7,14 @@
  *
  *   fbtest        the checks
  *   fbtest show   800x600 from a double-height buffer, its second frame
- *                 (from row 608, the first on a page) shown by a flip: prints "fbtest: shown" and waits for a
- *                 line before it lets go of the device, for a test to look
- *                 at the display meanwhile */
+ *                 (from row 608, the first on a page) shown by a flip:
+ *                 prints "fbtest: shown" and waits for a line before it
+ *                 lets go of the device, for a test to look at the display
+ *                 meanwhile
+ *   fbtest ansi   writes text with the control characters and escape
+ *                 sequences the framebuffer console acts on (fbcon.h),
+ *                 without opening the device, for a test to read the
+ *                 console's screen: the layout is in ansi() */
 #include "user.h"
 
 #define PAGE 4096ul
@@ -234,7 +239,47 @@ static int show(int fd) {
     return 0;
 }
 
+/* `fbtest ansi`: the console's screen afterwards, from its top row (a
+ * test reads it, crates/xtask/tests/processes.rs):
+ *
+ *   0  plain
+ *   1  red bold green reverse     red, bright green (bold), reverse video
+ *   2  white on blue              bright white on blue, the spaces too
+ *   3  tab     x                  a tab to column 8
+ *   4  abd                        a backspace
+ *   5  xxxx                       erased from column 4 to the end (EL)
+ *   6           at 7,10           placed by CUP at row 7, column 10
+ *   7  adef                       CUB 2, then written over
+ *   8  (empty)                    erased by ED 0 from its start
+ *   11 80 w                       the 81st wraps
+ *   12 wwwww
+ *   13 fbtest: ansi               and the prompt under it
+ *
+ * (Rows 9 and 10 empty.) An escape sequence the console ignores, DEC's
+ * private mode for the cursor and a status report, prints nothing. */
+static void ansi(void) {
+    printf("\033[2J\033[H");
+    printf("plain\033[?25l\033[5n\n");
+    printf("\033[31mred\033[0m \033[1;32mbold green\033[0m \033[7mreverse\033[27m\n");
+    printf("\033[44;97mwhite on blue\033[49;39m\n");
+    printf("tab\tx\n");
+    printf("abc\bd\n");
+    printf("\033[6;1Hxxxxxxxxxx\033[6;5H\033[K");
+    printf("\033[7;10Hat 7,10");
+    printf("\033[8;1Habc\033[2Ddef");
+    printf("\033[9;1Hgone\033[9;1H\033[J");
+    printf("\033[12;1H");
+    for (int i = 0; i < 85; i++) {
+        printf("w");
+    }
+    printf("\033[14;1Hfbtest: ansi\n");
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "ansi") == 0) {
+        ansi();
+        return 0;
+    }
     int fd = open("/dev/fb0", O_RDWR);
     if (fd < 0) {
         printf("fbtest: no /dev/fb0: %d\n", fd);

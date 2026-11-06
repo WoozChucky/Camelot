@@ -11,6 +11,7 @@
  * with it. Output takes the UART's own lock, uart_tx_lock, which comes
  * after cons_lock in the lock order (the echo is printed under both). */
 #include "console.h"
+#include "fbcon.h"
 #include "proc.h"
 #include "spinlock.h"
 #include "syscall.h"
@@ -85,6 +86,7 @@ void console_intr(void) {
 static void echo(const char *s) {
     acquire(&uart_tx_lock);
     uart_puts(s);
+    fbcon_puts(s);
     release(&uart_tx_lock);
 }
 
@@ -176,6 +178,7 @@ isize console_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
         acquire(&uart_tx_lock);
         for (u32 i = 0; i < count; i++) {
             uart_putc(chunk[i]);
+            fbcon_putc(chunk[i]);
         }
         release(&uart_tx_lock);
         done += count;

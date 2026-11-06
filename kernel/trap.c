@@ -18,6 +18,7 @@
 #include "blk.h"
 #include "console.h"
 #include "fb.h"
+#include "fbcon.h"
 #include "input.h"
 #include "kprintf.h"
 #include "net.h"
@@ -98,6 +99,7 @@ const char *trap_cause_name(uintptr cause) {
 }
 
 static void halt_after_panic(void) {
+    fbcon_panic_flush();
     machine_power_off(PANIC_EXIT_CODE);
 }
 
@@ -236,6 +238,7 @@ static void clock_tick(u32 n) {
     wakeup((const void *)&ticks);
     release(&tickslock);
     net_timer();
+    fbcon_flush();
 }
 
 /* The supervisor timer interrupt: this hart's tick. The next one first,

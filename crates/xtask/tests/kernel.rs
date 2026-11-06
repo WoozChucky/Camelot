@@ -19,8 +19,9 @@
 mod common;
 
 use common::{
-    function, image_pa, kpa, load_with, machine_config, peek, printed, sym, CPU_HARTID, CPU_NOFF,
-    CPU_PAGETABLE, CPU_SIZE, CPU_THREAD, KERNEL_LINK_ADDR, LOAD_ADDR, LOCK_CPU, PROMPT,
+    function, image_pa, kpa, load_with, machine_config, peek, printed, screen, screen_rows_of, screen_text,
+    step_to_frame, sym, ScreenCell, CPU_HARTID, CPU_NOFF, CPU_PAGETABLE, CPU_SIZE, CPU_THREAD,
+    KERNEL_LINK_ADDR, LOAD_ADDR, LOCK_CPU, PROMPT,
 };
 use excalibur::csr::{
     IRQ_M_EXT, IRQ_M_SOFT, IRQ_M_TIMER, IRQ_S_EXT, IRQ_S_SOFT, IRQ_S_TIMER, MSTATUS_SIE, MSTATUS_SPIE,
@@ -2834,6 +2835,58 @@ fn plic_routes_the_uart_to_the_kernel() {
 }
 
 #[test]
+fn the_framebuffer_console_shows_the_boot_and_the_shell() {
+    // Issue #178: what the kernel prints and what the shell writes are on
+    // the display as on the UART, in the framebuffer console's 80 columns
+    // and 30 rows of Spleen's glyphs (fbcon.h), the last 30 rows of it once
+    // it has scrolled; the cursor an inverse cell after the prompt.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, _) = load_committed_on(config(), Some(rx));
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    for &b in b"echo on the screen\n" {
+        tx.send(b).unwrap();
+    }
+    let tail = format!("\non the screen\n{PROMPT}");
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(&tail));
+    step_to_frame(&mut m);
+    // Less Grail's own line, of the Xcal debug instruction the kprintf
+    // self-test runs: the emulator printed it, not the kernel.
+    let out: String = printed(&m)
+        .split_inclusive('\n')
+        .filter(|l| !l.starts_with("[dbg]"))
+        .collect();
+    let rows = screen_rows_of(&out);
+    assert_eq!(rows.len(), 30, "the boot fills the screen:\n{out}");
+    assert_eq!(screen_text(&m), rows, "{out}");
+    let cells = screen(&m);
+    assert_eq!(
+        cells[29][0],
+        ScreenCell {
+            ch: '$',
+            fg: 0xaaaaaa,
+            bg: 0
+        }
+    );
+    assert_eq!(
+        cells[29][2],
+        ScreenCell {
+            ch: ' ',
+            fg: 0xaaaaaa,
+            bg: 0xaaaaaa
+        },
+        "the cursor"
+    );
+    assert_eq!(
+        cells[29][3],
+        ScreenCell {
+            ch: ' ',
+            fg: 0,
+            bg: 0
+        }
+    );
+}
+
+#[test]
 fn console_sleeps_until_input_and_never_polls_rbr() {
     // The shell prints its prompt with nothing typed and sleeps in read, so
     // the scheduler idles; then a command arrives. Input only arrives through
@@ -2855,6 +2908,11 @@ fn console_sleeps_until_input_and_never_polls_rbr() {
     // The shell still has its read to make after the prompt: the count starts once
     // the hart first waits, so that a tick that comes on the way (the timing of boot
     // and of the shell's start decides it) is not counted as one it waited for.
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == wfi);
+    // And after the next tick, on which the framebuffer console draws what
+    // the shell printed (fbcon.h): a scroll's worth of pixels moved.
+    let drawn = tick_count(&m) + 1;
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| tick_count(m) == drawn);
     step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| m.cpu.pc == wfi);
     let start = tick_count(&m);
     let idle_end = start + 50;
@@ -3163,10 +3221,7 @@ fn disk_blocks_round_trip_through_the_cache_with_interrupts() {
     // The driver set up the disk's completion interrupt.
     assert_eq!(m.cpu.bus.disks[0].ctrl, 1);
     assert_eq!(m.cpu.bus.read(plic_priority(BLK_IRQ), 4), Ok(1));
-    assert_eq!(
-        m.cpu.bus.read(plic_enable(1), 4),
-        Ok(BOOT_IRQS | 1 << BLK_IRQ)
-    );
+    assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(BOOT_IRQS | 1 << BLK_IRQ));
 
     // One request at a time, each finished by its interrupt: every command
     // was acknowledged in blk_intr before the next, with nothing polled.

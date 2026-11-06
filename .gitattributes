@@ -7,6 +7,8 @@ tests/riscv-tests/rv* binary
 # RV32 riscv-tests, which merlin-objdump still reads.
 crates/merlin-objdump/tests/fixtures/rv32/* binary
 tests/opensbi/*.bin binary
+# The console's font as its release ships it (kernel/fonts/README.md).
+*.psfu binary
 *.S text eol=lf
 *.sh text eol=lf
 *.c text eol=lf
@@ -18,6 +20,8 @@ kernel/kernel.elf.clang-version text eol=lf
 # Built by `cargo xtask kernel`; collapsed in GitHub diffs.
 kernel/kernel.elf binary linguist-generated
 kernel/kernel-disk.elf binary linguist-generated
+# Generated from kernel/fonts/spleen-8x16.psfu by `cargo xtask kernel`.
+kernel/font.c linguist-generated
 # llvm-objdump output, compared line by line (keep LF so it diffs cleanly).
 crates/merlin-objdump/tests/golden/*.txt text eol=lf
 crates/merlin-as/tests/golden/*.txt text eol=lf
