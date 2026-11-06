@@ -1137,6 +1137,18 @@ int proc_kill_pid(int pid) {
     return r;
 }
 
+bool proc_exists(int pid) {
+    bool found = false;
+    acquire(&proc_lock);
+    for (u32 i = 0; i < NPROC && !found; i++) {
+        const struct proc *p = &procs[i];
+        found = p->state != PROC_UNUSED && p->state != PROC_NEW && p->state != PROC_ZOMBIE &&
+                p->pid == (u32)pid;
+    }
+    release(&proc_lock);
+    return found;
+}
+
 bool proc_killed(void) {
     struct thread *t = mythread();
     if (t == NULL) {

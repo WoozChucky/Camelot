@@ -69,6 +69,10 @@ void uart_intr(void);
  * false if the buffer is empty. Never touches RBR. */
 bool uart_rx_pop(char *c);
 
+/* The `i`th byte waiting (0 the oldest) into `*c`, leaving it in the
+ * buffer. Returns false if fewer than i + 1 are waiting. */
+bool uart_rx_peek(u32 i, char *c);
+
 #endif
 
 #endif

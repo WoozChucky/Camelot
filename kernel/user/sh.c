@@ -107,7 +107,7 @@
 #include "user.h"
 
 #define PROMPT "$ "
-/* The console's longest line (CONSOLE_LINE_MAX in kernel/include/console.h),
+/* A terminal's longest line (TTY_LINE_MAX in kernel/include/tty.h),
  * its newline included, and a NUL. */
 #define LINE_SIZE 129
 /* Background programs not collected yet that the shell remembers the names
@@ -662,6 +662,16 @@ static void look_at_input(void) {
     connection_input = got_stat && st.type == T_SOCKET;
 }
 
+/* A shell run by another is its terminal's foreground, which Ctrl-C would
+ * end: at its prompt it makes the foreground none (Camelot has no signals
+ * for a shell to ignore, #116). Checked at every prompt, as the other shell
+ * sets it once this one has started. */
+static void leave_foreground(void) {
+    if (console_input && tcgetpgrp(STDIN) == getpid()) {
+        tcsetpgrp(STDIN, 0);
+    }
+}
+
 /* A copy of descriptor `fd` from SAVED_FD up that closes on exec, or -1
  * having said why there is none. */
 static int save_fd(int fd) {
@@ -874,6 +884,12 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
             remember(pids[i], name);
             continue;
         }
+        /* The program waited for is the terminal's foreground, which
+         * Ctrl-C kills (docs/camelot-syscalls.md, "Terminals"): one
+         * process until Camelot has process groups (#116). */
+        if (console_input) {
+            tcsetpgrp(STDIN, pids[i]);
+        }
         int status;
         if (wait(pids[i], &status) == pids[i]) {
             last_status = status;
@@ -984,6 +1000,7 @@ int main(void) {
     interactive = console_input || connection_input;
     printf("Type help for the list of commands.\n");
     for (;;) {
+        leave_foreground();
         printf(PROMPT);
         int n = console_input ? getline(line, sizeof line) : read_line(line);
         if (n < 0) {

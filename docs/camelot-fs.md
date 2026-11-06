@@ -122,7 +122,9 @@ the table's last block past inode `ninodes` - 1 are unused.
   major 1 as the console (`/dev/console` on the root image), major 2 as
   the framebuffer (`/dev/fb0`) and major 3 as the input devices (minor 0
   the keyboard, `/dev/input/event0`, and 1 the pointer,
-  `/dev/input/event1`), and has no driver for any other
+  `/dev/input/event1`), major 4 as `/dev/ptmx` and major 5 as the
+  pseudo-terminals' slaves (minor N, `/dev/pts/N`), and has no driver for
+  any other
   (docs/camelot-syscalls.md). A **socket** is a local socket's name, which
   the kernel's `bind` makes and `connect` looks up
   (docs/camelot-syscalls.md, "Local sockets"): it has no contents, as a

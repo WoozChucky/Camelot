@@ -43,11 +43,14 @@
 /* Device numbers (the major of a device inode): the console, the
  * framebuffer (fb.h) and the input devices (input.h), whose minor says
  * which: 0 the keyboard, 1 the pointer, as Linux's /dev/input/eventN share
- * one major. */
+ * one major; /dev/ptmx and the pseudo-terminals' slaves (pty.h), whose
+ * minor is N of /dev/pts/N. */
 #define CONSOLE 1
 #define FB 2
 #define INPUT 3
-#define NDEV 4
+#define PTMX 4
+#define PTS 5
+#define NDEV 6
 
 #define FD_NONE 0
 #define FD_PIPE 1
