@@ -1015,7 +1015,8 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
     // The desktop's /etc/rc keeps the console's shell running: one that
     // ends is started again, even at once (but not five times in a row), so
     // two Ctrl-Ds or `exit`s don't lose it. shd can't run on a machine with
-    // no network card: it says so, and init leaves it.
+    // no network card: it says so, and init leaves it. The display server
+    // takes the screen and stays, its socket in /run.
     let root = repo_root();
     let image =
         xtask::fs::build_bootable(&root, xtask::fs::Profile::Desktop, xtask::fs::DESKTOP_IMAGE_SIZE).unwrap();
@@ -1027,9 +1028,13 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
     m.boot_from_disk().unwrap();
     m.cpu.bus.uart.capture = true;
     m.set_uart_input(xtask::kernel::typed(b"exit\nexit\nps\n"));
-    // The machine runs on: run it until the third shell's ps is done.
+    // The machine runs on: run it until the third shell's ps is done and
+    // the display server is ready.
+    const READY: &str = "compositor: ready on /run/wayland-0 (640x480)\n";
     let printed = |m: &Machine| String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-    let done = |out: &str| out.find("$ ps\n").is_some_and(|at| out[at + 5..].contains("$ "));
+    let done = |out: &str| {
+        out.contains(READY) && out.find("$ ps\n").is_some_and(|at| out[at + 5..].contains("$ "))
+    };
     let mut steps = 0;
     while !done(&printed(&m)) {
         assert!(steps < 2 * BOOT_MAX_STEPS, "{}", printed(&m));
@@ -1049,6 +1054,7 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
         "{out}"
     );
     assert_eq!(out.matches("shd: socket: no network card\n").count(), 1, "{out}");
+    assert_eq!(out.matches(READY).count(), 1, "{out}");
     assert!(!out.contains("init: "), "{out}");
     // The third shell is init's child too, pid 1's.
     let ps = &out[out.find("$ ps\n").unwrap_or_else(|| panic!("{out}"))..];
@@ -1062,4 +1068,8 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
         "{out}"
     );
     assert!(processes.iter().any(|w| w[1] == "1" && w[4] == "sh"), "{out}");
+    assert!(
+        processes.iter().any(|w| w[1] == "1" && w[4] == "compositor"),
+        "{out}"
+    );
 }

@@ -1,9 +1,12 @@
 # /etc/rc: the services init starts (kernel/user/init.c), one a line:
 # once|respawn PATH ARGS...
 #
-# The desktop: the display server and the desktop shell join these as they
-# come (#184, #185); a shell on the console, the UART, started again when
-# it ends, and shd, a shell for each TCP connection to port 23. Nothing
-# here ends the machine: it runs until it is stopped.
+# The desktop: the display server, which takes the screen, the keyboard
+# and the pointer and serves Wayland clients at /run/wayland-0, the logo
+# key starting the GUI demo (the desktop shell joins these as it comes,
+# #185); a shell on the console, the UART, started again when it ends, and
+# shd, a shell for each TCP connection to port 23. Nothing here ends the
+# machine: it runs until it is stopped.
+respawn /bin/compositor -l /bin/guidemo
 respawn /bin/sh
 respawn /bin/shd
