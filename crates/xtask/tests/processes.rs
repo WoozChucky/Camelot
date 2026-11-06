@@ -1197,7 +1197,8 @@ fn the_system_calls_do_what_the_document_says() {
 fn the_c_library_does_what_user_h_says() {
     // libtest checks the user C library (kernel/user/lib): strings, numbers
     // (strtol's 64-bit LONG_MAX), snprintf's formats (%ld of 64-bit values,
-    // %p's 16 digits), malloc's 16-byte blocks and free, readers on a pipe
+    // %p's 16 digits), malloc's 16-byte blocks and free (a big block in a
+    // mapping of its own, given back by free), readers on a pipe
     // fed by a child of its own, and addresses (inet.c, and resolve.c on
     // addresses).
     let out = run_processes(b"libtest\nexit 0\n");

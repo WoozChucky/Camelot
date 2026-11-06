@@ -7,8 +7,14 @@
  * block being freed can be merged with a free neighbour on either side.
  * malloc takes the first free block that is big enough (first fit), cutting
  * what it needs off its end; when none is, it asks sbrk for more, at least
- * a page at a time, and frees that into the list. Memory never goes back to
- * the kernel.
+ * a page at a time, and frees that into the list. Heap memory never goes
+ * back to the kernel.
+ *
+ * A block of MMAP_THRESHOLD bytes or more gets a mapping of its own instead
+ * (mmap, anonymous), as glibc's malloc does, and free gives it back to the
+ * kernel at once (munmap): a big buffer used for a while doesn't stay in the
+ * heap for good. Its header says so (`next` is MAPPED); a block of the heap
+ * has NULL there while it is handed out.
  *
  * The threads of a process share the heap, so malloc and free hold a mutex
  * (mutex.c) while they walk and change the list. It costs one atomic
@@ -25,6 +31,13 @@ struct header {
 #define UNIT sizeof(struct header)
 /* The least sbrk is asked for: a page. */
 #define GROW_UNITS (4096 / UNIT)
+/* The size from which a block gets a mapping of its own: glibc's default
+ * (M_MMAP_THRESHOLD, 128 KiB). */
+#define MMAP_THRESHOLD (128 * 1024)
+#define PAGE_SIZE 4096
+/* `next` of a block in a mapping of its own, where no block of the heap
+ * can be. */
+#define MAPPED ((struct header *)1)
 
 /* The free list: a ring through `base`, a block of size 0 that is never
  * handed out, so the list is never empty. `freep` is where the last search
@@ -62,6 +75,11 @@ static void free_locked(void *p) {
 
 void free(void *p) {
     if (p == NULL) {
+        return;
+    }
+    struct header *b = (struct header *)p - 1;
+    if (b->next == MAPPED) {
+        munmap(b, b->units * UNIT);
         return;
     }
     mutex_lock(&heap_lock);
@@ -102,11 +120,32 @@ static struct header *more(size_t units) {
     return freep;
 }
 
+/* A block of `n` bytes in a mapping of its own, whole pages with its
+ * header; NULL if the kernel has no room for it. */
+static void *map_block(size_t n) {
+    size_t bytes = (n + UNIT + PAGE_SIZE - 1) & ~(size_t)(PAGE_SIZE - 1);
+    struct header *b = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((long)b < 0) {
+        return NULL;
+    }
+    b->next = MAPPED;
+    b->units = bytes / UNIT;
+    return b + 1;
+}
+
 void *malloc(size_t n) {
     /* Nothing for 0 bytes; nor for more than a long holds (sbrk's
      * argument), which also keeps the rounding below from wrapping. */
     if (n == 0 || n > (size_t)LONG_MAX - UNIT) {
         return NULL;
+    }
+    /* A big block in a mapping; from the heap if the kernel has no room
+     * for one, as glibc falls back. */
+    if (n >= MMAP_THRESHOLD) {
+        void *p = map_block(n);
+        if (p != NULL) {
+            return p;
+        }
     }
     /* The header, and n bytes rounded up to whole units. */
     size_t units = (n + UNIT - 1) / UNIT + 1;
@@ -129,6 +168,7 @@ void *malloc(size_t n) {
             }
             freep = prev;
             mutex_unlock(&heap_lock);
+            b->next = NULL;
             return b + 1;
         }
         if (b == freep) {
