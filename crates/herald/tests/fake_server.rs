@@ -10,7 +10,7 @@ mod common;
 use avalon_proto::{AttachKind, Error, Frame, Message, VmState};
 use common::*;
 use herald::{End, DETACH_KEY};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::time::{Duration, Instant};
 
 const VM: u32 = 7;
@@ -52,11 +52,16 @@ fn output_in_order_and_a_lost_connection() {
         })
         .unwrap();
         conn.send(&output(b"live")).unwrap();
-        // Input reaches the server as ConsoleInput for this VM.
-        match conn.recv().unwrap() {
-            Message::ConsoleInput { vm: VM, data } => assert_eq!(data, b"key"),
-            other => panic!("{other:?}"),
+        // Input reaches the server as ConsoleInput for this VM: in one burst, or more
+        // when the keys come apart (the test types them one at a time).
+        let mut typed = Vec::new();
+        while typed.len() < 3 {
+            match conn.recv().unwrap() {
+                Message::ConsoleInput { vm: VM, data } => typed.extend(data),
+                other => panic!("{other:?}"),
+            }
         }
+        assert_eq!(typed, b"key");
         // Then the server goes away.
     });
     let mut herald = Herald::attach_at(&addr, avalon_proto::VmRef::Id(VM), |_| {});
@@ -335,4 +340,79 @@ fn detaching_while_the_server_sends_closes_in_order() {
         assert_eq!(herald.end().unwrap(), End::Detached);
         server.join().unwrap();
     }
+}
+
+/// A VM that had ended before the attach ends the session at once, before its reading
+/// thread starts: that close is in order too, while the server's frames keep coming.
+#[test]
+fn a_session_that_ends_at_the_attach_closes_in_order() {
+    for _ in 0..10 {
+        let (addr, server) = fake_server(|mut conn| {
+            fake_attach(&mut conn, VM, VmState::Exited(0), b"last words", &[]);
+            let flood = Message::ConsoleOutput {
+                vm: VM + 1,
+                data: vec![b'.'; 1024],
+            };
+            // Nothing to detach from: Herald just goes.
+            let (got, end, flooding) =
+                flood_until_the_client_closes(conn, flood, Message::ConsoleDetach { vm: VM });
+            assert_eq!(got, []);
+            assert!(matches!(end, Error::Closed), "a clean end, not {end}");
+            flooding.expect("the server's sending ends cleanly too");
+        });
+        let mut herald = Herald::attach_at(&addr, avalon_proto::VmRef::Id(VM), |_| {});
+        assert_eq!(herald.end().unwrap(), End::VmEnded(VmState::Exited(0)));
+        assert_eq!(herald.output.text(), "last words");
+        server.join().unwrap();
+    }
+}
+
+/// A server that answers the detach and then neither sends nor closes is waited for
+/// only [`avalon_proto::LINGER`] (on Windows a shutdown does not wake the reading
+/// thread, blocked on the silent connection: Herald does not wait for it either).
+#[test]
+fn a_server_that_never_closes_is_waited_for_only_so_long() {
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (addr, server) = fake_server(move |mut conn| {
+        fake_attach(&mut conn, VM, VmState::Running, b"", &[]);
+        assert_eq!(conn.recv().unwrap(), Message::ConsoleDetach { vm: VM });
+        conn.send(&Message::Ok).unwrap();
+        // Holds the connection, silent, until the test is done.
+        let _ = held.recv_timeout(SLOW);
+    });
+    let mut herald = Herald::attach_at(&addr, avalon_proto::VmRef::Id(VM), |_| {});
+    let start = Instant::now();
+    herald.type_keys(&[DETACH_KEY]);
+    assert_eq!(herald.end().unwrap(), End::Detached);
+    let took = start.elapsed();
+    assert!(
+        took >= avalon_proto::LINGER,
+        "{took:?}: the server was not waited for"
+    );
+    assert!(took < avalon_proto::LINGER * 3, "{took:?}");
+    release.send(()).unwrap();
+    server.join().unwrap();
+}
+
+/// A frame too large to read ends the session with its body still in the socket,
+/// unread: Herald reads and drops it before it closes, so the close is in order there
+/// too, not a reset.
+#[test]
+fn a_frame_too_large_still_ends_in_order() {
+    let (addr, server) = fake_server(|mut conn| {
+        fake_attach(&mut conn, VM, VmState::Running, b"", &[]);
+        let mut raw = (avalon_proto::MAX_FRAME_LEN + 1).to_le_bytes().to_vec();
+        raw.extend(vec![0u8; 64 * 1024]);
+        conn.get_ref().write_all(&raw).unwrap();
+        match conn.recv() {
+            Err(Error::Closed) => {}
+            other => panic!("a clean end, not {other:?}"),
+        }
+    });
+    let mut herald = Herald::attach_at(&addr, avalon_proto::VmRef::Id(VM), |_| {});
+    match herald.end() {
+        Err(Error::FrameTooLarge(_)) => {}
+        other => panic!("{other:?}"),
+    }
+    server.join().unwrap();
 }

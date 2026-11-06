@@ -26,11 +26,9 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 
-use crate::{close_in_order, DETACH_KEY};
+use crate::{end_connection, is_reset, Reader, DETACH_KEY};
 
 /// Most bytes read from the connection at once.
 const READ_SIZE: usize = 4096;
@@ -282,8 +280,8 @@ impl TcpSession {
         let (tx, events) = mpsc::channel();
         let mut reader = self.stream.try_clone()?;
         let server_tx = tx.clone();
-        let read_all = Arc::new(AtomicBool::new(false));
-        let reader_done = Arc::clone(&read_all);
+        let state = Reader::default();
+        let read_state = state.clone();
         let reading = std::thread::spawn(move || {
             let mut buf = vec![0u8; READ_SIZE];
             loop {
@@ -294,10 +292,12 @@ impl TcpSession {
                     Err(e) if is_reset(&e) => Event::Closed,
                     Err(e) => Event::Failed(e),
                 };
-                let last = !matches!(event, Event::Data(_));
-                if last {
-                    reader_done.store(true, Ordering::SeqCst);
+                match event {
+                    Event::Closed => read_state.at_end(),
+                    Event::Failed(_) => read_state.stopped(),
+                    _ => {}
                 }
+                let last = !matches!(event, Event::Data(_));
                 if server_tx.send(event).is_err() || last {
                     break;
                 }
@@ -306,15 +306,7 @@ impl TcpSession {
         std::thread::spawn(move || forward_input(input, tx));
 
         let result = self.serve(&events, out);
-        // After the far end's close everything has been read; after leaving, a failed
-        // write, or one of `out`, it may still be sending. The input is not looked at.
-        close_in_order(&self.stream, &events, &read_all, |event| {
-            matches!(event, Event::Closed | Event::Failed(_))
-        });
-        // Unblocks the reading thread, if it is still reading (a far end that did not
-        // close in time, or a failure), and closes the connection.
-        let _ = self.stream.shutdown(Shutdown::Both);
-        let _ = reading.join();
+        end_connection(&self.stream, &events, &state, reading);
         result
     }
 
@@ -384,14 +376,6 @@ impl TcpSession {
             }
         }
     }
-}
-
-/// Whether `e` says the far end reset or dropped the connection.
-fn is_reset(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe
-    )
 }
 
 /// Passes input bytes on to the session loop, a burst at a time, then its end.

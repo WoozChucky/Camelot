@@ -266,6 +266,32 @@ fn leaving_with_the_far_ends_data_unread_still_delivers_what_was_sent() {
     }
 }
 
+/// A far end that neither sends nor closes after Herald's FIN is waited for only
+/// [`avalon_proto::LINGER`]: then Herald closes, and the session returns. On Windows a
+/// shutdown does not wake the reading thread, blocked on the silent connection, so
+/// Herald must not wait for that thread either.
+#[test]
+fn a_far_end_that_never_closes_is_waited_for_only_so_long() {
+    let (release, held) = mpsc::channel::<()>();
+    let (addr, server) = serve_once(move |stream: TcpStream| {
+        // Holds the connection, silent, until the test is done.
+        let _ = held.recv_timeout(SLOW);
+        drop(stream);
+    });
+    let (keys, _out, session) = start_session(addr, false);
+    let start = Instant::now();
+    type_keys(&keys, b"bye\x1d");
+    assert_eq!(join(session), TcpEnd::Left);
+    let took = start.elapsed();
+    assert!(
+        took >= avalon_proto::LINGER,
+        "{took:?}: the far end was not waited for"
+    );
+    assert!(took < avalon_proto::LINGER * 3, "{took:?}");
+    release.send(()).unwrap();
+    join(server);
+}
+
 // ---- the binary ----
 
 fn herald() -> Command {

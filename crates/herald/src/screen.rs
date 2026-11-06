@@ -10,7 +10,7 @@
 //! session with a view that is a few vectors, on any platform. The Windows view is
 //! `crate::window`, Grail's own framebuffer window.
 
-use crate::{close_in_order, ended, out_of_step, End};
+use crate::{end_connection, ended, out_of_step, reader_end, End, Reader};
 use avalon_proto::{
     close_gracefully, kind_of, AttachKind, Connection, Cursor, Error, Frame, KeyEvent, Message, MessageKind,
     PointerChange, PointerMotion, Screen, VmRef, VmState, VmSummary, PIXEL_FORMAT_XRGB8888, POINTER_BUTTONS,
@@ -18,10 +18,8 @@ use avalon_proto::{
 };
 use grail::framebuffer::CursorPlane;
 use grail::pointer::Motion;
-use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Longest a session waits for the server before it looks at the view again: the
@@ -157,7 +155,7 @@ impl ScreenSession {
             Err(e) => Some(Err(e)),
         };
         if let Some(result) = early {
-            // In order, as below (`close_in_order`); with no reading thread yet, what
+            // In order, as below (`end_connection`); with no reading thread yet, what
             // the server still sends is read here.
             close_gracefully(self.conn.get_ref(), || false);
             return result;
@@ -166,29 +164,20 @@ impl ScreenSession {
         let (tx, events) = mpsc::channel();
         let mut reader = self.conn.try_clone()?;
         reader.get_ref().set_read_timeout(None)?;
-        let read_all = Arc::new(AtomicBool::new(false));
-        let reader_done = Arc::clone(&read_all);
+        let state = Reader::default();
+        let read_state = state.clone();
         let reading = std::thread::spawn(move || loop {
             let frame = reader.recv_frame();
             let fatal = matches!(&frame, Err(e) if e.is_fatal());
-            if fatal {
-                reader_done.store(true, Ordering::SeqCst);
+            if let (true, Err(e)) = (fatal, &frame) {
+                reader_end(&read_state, e);
             }
             if tx.send(frame).is_err() || fatal {
                 break;
             }
         });
         let result = self.stream(view, &events);
-        close_in_order(
-            self.conn.get_ref(),
-            &events,
-            &read_all,
-            |frame| matches!(frame, Err(e) if e.is_fatal()),
-        );
-        // Unblocks the reading thread, if it is still reading (a server that did not
-        // close in time), and closes the connection.
-        let _ = self.conn.get_ref().shutdown(Shutdown::Both);
-        let _ = reading.join();
+        end_connection(self.conn.get_ref(), &events, &state, reading);
         result
     }
 
