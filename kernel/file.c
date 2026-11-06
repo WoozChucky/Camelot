@@ -192,13 +192,13 @@ void fileclose(struct file *f) {
     }
 }
 
-struct file *file_shm(int *err) {
+struct file *file_shm(bool sealing, int *err) {
     struct file *f = filealloc();
     if (f == NULL) {
         *err = -ENFILE;
         return NULL;
     }
-    struct shm_object *o = shm_create();
+    struct shm_object *o = shm_create(sealing);
     if (o == NULL) {
         fileclose(f); /* nothing set yet: just gives the slot back */
         *err = -ENFILE;

@@ -53,7 +53,7 @@
 /* Process slots (NPROC in kernel/include/proc.h). */
 #define NPROC 8
 /* Descriptors per process (NOFILE in kernel/include/file.h). */
-#define NOFILE 16
+#define NOFILE 32
 /* A pipe's buffer (PIPESIZE in kernel/include/pipe.h). */
 #define PIPESIZE 512
 /* The console's device number (CONSOLE in kernel/include/file.h). */

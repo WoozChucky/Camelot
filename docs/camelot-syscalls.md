@@ -159,12 +159,12 @@ headers and checks each size.
 | 44 | `gettid` | | the caller's thread id |
 | 45 | `futex_wait` | `int *addr, int val` | 0; `-EAGAIN`, `-EINVAL`, `-EINTR`, `-EFAULT` |
 | 46 | `futex_wake` | `int *addr, int n` | the number of threads woken; `-EINVAL`, `-EFAULT` |
-| 47 | `fcntl` | `int fd, int cmd, int arg` | the descriptor's flags, a new descriptor, or 0; `-EBADF`, `-EINVAL`, `-EMFILE` |
+| 47 | `fcntl` | `int fd, int cmd, int arg` | the descriptor's flags, a new descriptor, the seals, or 0; `-EBADF`, `-EINVAL`, `-EMFILE`, `-EPERM` |
 | 48 | `mmap` | `void *addr, size_t len, int prot, int flags, int fd, off_t offset` | the mapping's address, a pointer; `-EINVAL`, `-ENOMEM`, `-EEXIST`, `-EBADF`, `-EACCES`, `-ENODEV`, `-EOVERFLOW`, `-EOPNOTSUPP` |
 | 49 | `munmap` | `void *addr, size_t len` | 0; `-EINVAL`, `-ENOMEM` |
 | 50 | `mprotect` | `void *addr, size_t len, int prot` | 0; `-EINVAL`, `-ENOMEM`, `-EACCES` |
 | 51 | `memfd_create` | `const char *name, uint flags` | a new descriptor; `-EINVAL`, `-EFAULT`, `-EMFILE`, `-ENFILE` |
-| 52 | `ftruncate` | `int fd, off_t length` | 0; `-EBADF`, `-EINVAL`, `-EFBIG` |
+| 52 | `ftruncate` | `int fd, off_t length` | 0; `-EBADF`, `-EINVAL`, `-EFBIG`, `-EPERM` |
 | 53 | `ioctl` | `int fd, unsigned long request, ...` | the request's result; `-EBADF`, `-ENOTTY`, `-EINVAL`, `-EFAULT`, `-EBUSY`, `-ENOMEM`, `-ENODEV`, `-EINTR` |
 | 54 | `poll` | `struct pollfd *fds, unsigned long nfds, int timeout` | the descriptors with events, 0 if the time ran out; `-EINVAL`, `-EFAULT`, `-EINTR` |
 | 55 | `socketpair` | `int domain, int type, int protocol, int *fds` | 0; `-EAFNOSUPPORT`, `-EOPNOTSUPP`, `-EPROTONOSUPPORT`, `-ESOCKTNOSUPPORT`, `-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT` |
@@ -436,8 +436,8 @@ are closed. The new descriptor stays open across `exec`, whatever `fd`'s
 flag: a descriptor's `FD_CLOEXEC` is its own, not the open file's. `-EBADF`,
 or `-EMFILE` if every descriptor is taken.
 
-**fcntl(fd, cmd, arg)** is Linux's for a descriptor's flags and for copies
-of it, with Linux's numbers. Each descriptor has one flag, `FD_CLOEXEC`
+**fcntl(fd, cmd, arg)** is Linux's for a descriptor's flags, for copies
+of it and for a shared-memory object's seals, with Linux's numbers. Each descriptor has one flag, `FD_CLOEXEC`
 (1): it closes when the process `exec`s a new program (and `spawn` passes
 it on to no child). `open` sets it with `O_CLOEXEC`; every other descriptor
 starts without it, and `close` clears it with the descriptor. `cmd` is:
@@ -449,13 +449,23 @@ starts without it, and `close` clears it with the descriptor. `cmd` is:
   program it `exec`s);
 - `F_GETFD` (1): `fd`'s flags, `FD_CLOEXEC` or 0;
 - `F_SETFD` (2): sets them to `arg`, of which only `FD_CLOEXEC` counts;
-  returns 0.
+  returns 0;
+- `F_ADD_SEALS` (1033): adds the seals in `arg` to the shared-memory
+  object `fd` is open on ("Memory mappings", `memfd_create`): `F_SEAL_SEAL`
+  (1: no more seals), `F_SEAL_SHRINK` (2: `ftruncate` can't make it
+  smaller) and `F_SEAL_GROW` (4: nor bigger); returns 0. A seal is never
+  taken off. Linux's `F_SEAL_WRITE` (8) and `F_SEAL_FUTURE_WRITE` (16) are
+  not there;
+- `F_GET_SEALS` (1034): the object's seals.
 
 Errors: `-EBADF` if `fd` is not open, checked before `cmd` (so an unknown
 `cmd` on a closed descriptor is `-EBADF`, as on Linux); `-EINVAL` for
-another `cmd`, or for an `arg` of `F_DUPFD` or `F_DUPFD_CLOEXEC` that is
-not a descriptor, 0 to 15 (Linux's answer for one at or past
-`RLIMIT_NOFILE`); `-EMFILE` when no descriptor from `arg` up is free.
+another `cmd`, for an `arg` of `F_DUPFD` or `F_DUPFD_CLOEXEC` that is
+not a descriptor, 0 to 31 (Linux's answer for one at or past
+`RLIMIT_NOFILE`), for the seals' commands on anything but a shared-memory
+object, and for a seal Camelot hasn't; `-EMFILE` when no descriptor from
+`arg` up is free; `-EPERM` to add seals to an object sealed with
+`F_SEAL_SEAL`, or through a descriptor not open for writing.
 
 **ioctl(fd, request, ...)** is Linux's: a request to the device behind
 `fd`, with one argument, a number or a pointer as the request says (its
@@ -1083,7 +1093,11 @@ returns a descriptor for it, the lowest free one, open for reading and
 writing. `name` only names it to someone debugging (Linux shows it in
 `/proc`): it must be readable, and at most 249 bytes long. `flags` holds
 any of `MFD_CLOEXEC` (1: the descriptor closes on `exec`, as `O_CLOEXEC`)
-and `MFD_ALLOW_SEALING` (2: accepted, though Camelot has no seals).
+and `MFD_ALLOW_SEALING` (2: seals may be added, `fcntl`'s `F_ADD_SEALS`;
+without it the object is sealed with `F_SEAL_SEAL` from the start, as on
+Linux). A process that is handed an object sealed with `F_SEAL_SHRINK` knows
+that its pages stay: the display server takes a window's buffers only from
+one ("The display server" in the spec's section 10).
 Errors: `-EFAULT` for a bad `name`, `-EINVAL` for a longer one or another
 flag, `-EMFILE`, `-ENFILE` (no open file left, or none of the kernel's 32
 objects).
@@ -1092,7 +1106,8 @@ objects).
 is open on to `length` bytes. Returns 0. Errors: `-EBADF`; `-EINVAL` if
 `fd` is no shared-memory object (`ftruncate` of a regular file is not
 there yet) or not open for writing, or `length` is negative; `-EFBIG` past
-1 GiB.
+1 GiB; `-EPERM` for a shrink of an object sealed with `F_SEAL_SHRINK`, or a
+growth of one sealed with `F_SEAL_GROW`.
 
 **A device's memory.** `/dev/fb0`, the framebuffer's device node on the
 root image, maps the framebuffer's memory, the buffer of its mode ("The
@@ -1343,7 +1358,7 @@ Linux's values for the same conditions.
 
 | Number | Name | Meaning |
 |---|---|---|
-| 1 | `EPERM` | link: not for a directory; kill: a kernel process, or the shell |
+| 1 | `EPERM` | link: not for a directory; kill: a kernel process, or the shell; ftruncate, fcntl: a seal |
 | 2 | `ENOENT` | no such file or directory |
 | 3 | `ESRCH` | kill: no such process; thread_join: no such thread |
 | 4 | `EINTR` | a wait ended because the process was killed |
@@ -1400,7 +1415,7 @@ Linux's values for the same conditions.
 
 A descriptor is a small number, 0 to 15, that stands for an open file: a
 file or directory of the filesystem, a device (the console), one end of a
-pipe, or a socket. Each process has its own 16, which all its threads share; they point into the kernel's table of 64
+pipe, or a socket. Each process has its own 32, which all its threads share; they point into the kernel's table of 64
 open files, which is where the access mode (reading, writing or both) and,
 for a file on the disk, the offset live. `dup`, `fcntl`'s `F_DUPFD`, and
 `spawn` for descriptors 0 to 2, make a second descriptor for the same open

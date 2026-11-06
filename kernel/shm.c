@@ -19,13 +19,14 @@ static u64 pages_for(u64 size) {
     return (size + PGSIZE - 1) / PGSIZE;
 }
 
-struct shm_object *shm_create(void) {
+struct shm_object *shm_create(bool sealing) {
     acquire(&shm_lock);
     for (u32 i = 0; i < NSHM; i++) {
         struct shm_object *o = &objects[i];
         if (o->ref == 0) {
             memset(o, 0, sizeof *o);
             o->ref = 1;
+            o->seals = sealing ? 0 : F_SEAL_SEAL;
             release(&shm_lock);
             return o;
         }
@@ -163,6 +164,10 @@ int shm_truncate(struct shm_object *o, u64 size) {
     }
     acquire(&shm_lock);
     u64 old = o->size;
+    if ((size < old && (o->seals & F_SEAL_SHRINK)) || (size > old && (o->seals & F_SEAL_GROW))) {
+        release(&shm_lock);
+        return -EPERM;
+    }
     if (size < old) {
         /* The rest of the new last page reads zero, as Linux's truncate
          * zeroes it; the pages past it go, unless a mapping may hold
@@ -182,6 +187,25 @@ int shm_truncate(struct shm_object *o, u64 size) {
     o->size = size;
     release(&shm_lock);
     return 0;
+}
+
+int shm_add_seals(struct shm_object *o, u32 seals) {
+    acquire(&shm_lock);
+    int r = 0;
+    if (o->seals & F_SEAL_SEAL) {
+        r = -EPERM;
+    } else {
+        o->seals |= seals;
+    }
+    release(&shm_lock);
+    return r;
+}
+
+u32 shm_seals(struct shm_object *o) {
+    acquire(&shm_lock);
+    u32 seals = o->seals;
+    release(&shm_lock);
+    return seals;
 }
 
 u64 shm_size(struct shm_object *o) {

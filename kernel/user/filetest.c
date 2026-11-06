@@ -21,7 +21,7 @@
 #include "user.h"
 
 /* Descriptors per process (NOFILE in kernel/include/file.h). */
-#define NOFILE 16
+#define NOFILE 32
 /* A big file: past the largest of the filesystem's version 1 (268 KiB),
  * which version 2's extent trees have no limit like. */
 #define BIG_FILE_SIZE (300 * 1024)

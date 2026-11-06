@@ -219,6 +219,40 @@ static void demand_checks(void) {
     check_eq(munmap(low, 200 * MIB), 0, "munmap them all at once");
 }
 
+/* Seals (fcntl's F_ADD_SEALS and F_GET_SEALS), as Linux's: an object made
+ * without MFD_ALLOW_SEALING is sealed against seals; the others take
+ * them, and each forbids what it says, for good. */
+static void seal_checks(void) {
+    int fixed = memfd_create("fixed", 0);
+    check_eq(fcntl(fixed, F_GET_SEALS, 0), F_SEAL_SEAL, "an object made without sealing has F_SEAL_SEAL");
+    check_eq(fcntl(fixed, F_ADD_SEALS, F_SEAL_SHRINK), -EPERM, "which takes no seal");
+    close(fixed);
+
+    int fd = memfd_create("sealed", MFD_ALLOW_SEALING);
+    check_eq(fcntl(fd, F_GET_SEALS, 0), 0, "MFD_ALLOW_SEALING: no seals");
+    check_eq(ftruncate(fd, (off_t)(2 * PAGE)), 0, "two pages");
+    check_eq(fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK), 0, "F_SEAL_SHRINK");
+    check_eq(ftruncate(fd, (off_t)PAGE), -EPERM, "no shrink then");
+    check_eq(ftruncate(fd, (off_t)(3 * PAGE)), 0, "but growth");
+    check_eq(fcntl(fd, F_ADD_SEALS, F_SEAL_GROW), 0, "F_SEAL_GROW");
+    check_eq(ftruncate(fd, (off_t)(4 * PAGE)), -EPERM, "no growth then");
+    check_eq(ftruncate(fd, (off_t)(3 * PAGE)), 0, "the same size is no change");
+    check_eq(fcntl(fd, F_GET_SEALS, 0), F_SEAL_SHRINK | F_SEAL_GROW, "both");
+    check_eq(fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE), -EINVAL, "no write seal");
+    check_eq(fcntl(fd, F_ADD_SEALS, 0x100), -EINVAL, "a seal that isn't");
+    check_eq(fcntl(fd, F_ADD_SEALS, F_SEAL_SEAL), 0, "F_SEAL_SEAL");
+    check_eq(fcntl(fd, F_ADD_SEALS, F_SEAL_GROW), -EPERM, "no seal after it, even one there already");
+    check_eq(fcntl(fd, F_GET_SEALS, 0), F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW, "all three");
+    close(fd);
+
+    int fds[2];
+    pipe(fds);
+    check_eq(fcntl(fds[0], F_GET_SEALS, 0), -EINVAL, "F_GET_SEALS of a pipe");
+    check_eq(fcntl(fds[1], F_ADD_SEALS, F_SEAL_SHRINK), -EINVAL, "F_ADD_SEALS to a pipe");
+    close(fds[0]);
+    close(fds[1]);
+}
+
 /* memfd_create and ftruncate, and two mappings of one object in one
  * process. */
 static void memfd_checks(void) {
@@ -296,6 +330,7 @@ static void memfd_checks(void) {
     int longest = memfd_create(name, 0);
     check(longest >= 0, "a name of 249 bytes");
     close(longest);
+    seal_checks();
 }
 
 /* The rounds of shared_checks()' exchange: the parent stores an odd turn

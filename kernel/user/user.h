@@ -53,7 +53,7 @@ typedef unsigned long long uint64_t;
 
 /* Error numbers: a system call that fails returns minus one of them. They
  * are kernel/include/syscall.h's: a test checks they agree. */
-#define EPERM 1         /* link: not for a directory; kill: a kernel process, or the first process */
+#define EPERM 1         /* link: not for a directory; kill: a kernel process, or the first process; ftruncate, fcntl: a seal */
 #define ENOENT 2        /* no such file or directory */
 #define ESRCH 3         /* kill: no such process; thread_join: no such thread */
 #define EINTR 4         /* a wait ended because the process was killed */
@@ -155,7 +155,18 @@ typedef unsigned long long uint64_t;
 #define F_GETFD 1            /* the descriptor's flags */
 #define F_SETFD 2            /* sets them to arg */
 #define F_DUPFD_CLOEXEC 1030 /* F_DUPFD, the copy closing on exec */
+#define F_ADD_SEALS 1033     /* adds arg's seals to a shared-memory object */
+#define F_GET_SEALS 1034     /* its seals */
 #define FD_CLOEXEC 1         /* the descriptor closes on exec */
+
+/* A shared-memory object's seals (memfd_create's MFD_ALLOW_SEALING; Linux's
+ * values): no more seals, no shrinking, no growing. Linux's write seals
+ * are not there. */
+#define F_SEAL_SEAL 0x1
+#define F_SEAL_SHRINK 0x2
+#define F_SEAL_GROW 0x4
+#define F_SEAL_WRITE 0x8
+#define F_SEAL_FUTURE_WRITE 0x10
 
 /* mmap's and mprotect's protections, and mmap's flags (Linux's values;
  * kernel/include/mmap.h). */

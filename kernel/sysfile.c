@@ -126,6 +126,20 @@ long sys_fcntl(struct trap_frame *f) {
     case F_SETFD:
         r = fd_set_flags(fd, a);
         break;
+    case F_ADD_SEALS:
+        /* A shared-memory object's, open for writing, the seals Camelot
+         * has (no write seals). */
+        if (file->type != FD_SHM || (a & ~(u32)(F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW)) != 0) {
+            r = -EINVAL;
+        } else if (!file->writable) {
+            r = -EPERM;
+        } else {
+            r = shm_add_seals(file->shm, a);
+        }
+        break;
+    case F_GET_SEALS:
+        r = file->type == FD_SHM ? (int)shm_seals(file->shm) : -EINVAL;
+        break;
     default:
         r = -EINVAL;
         break;
@@ -215,7 +229,7 @@ long sys_memfd_create(struct trap_frame *f) {
         return -EMFILE;
     }
     int err;
-    struct file *file = file_shm(&err);
+    struct file *file = file_shm((flags & MFD_ALLOW_SEALING) != 0, &err);
     if (file == NULL) {
         return err;
     }
