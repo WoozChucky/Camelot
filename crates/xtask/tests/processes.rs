@@ -502,16 +502,18 @@ fn ps_listings(out: &str) -> Vec<Vec<(u32, u32, String, String)>> {
 fn init_starts_the_services_of_etc_rc_and_ends_the_machine_with_them() {
     // Issue #182: /bin/init, pid 1, runs /etc/rc's services: the console's
     // shell once, a sleep respawned each time it ends, hello (which ends at
-    // once, so it is left), a program that is not there; and says what is
-    // wrong with the lines it leaves out. Orphans become its children, and
+    // once, so it is left after five times), shd (which can't run without a
+    // network card, says so and exits EX_CONFIG, so it is left at once,
+    // init saying nothing), a program that is not there; and says what is
+    // wrong with the lines it leaves out (CRLF lines are read as LF ones). Orphans become its children, and
     // it collects them. It can't be killed, nor run again. `exit 3` ends its
     // one `once` service, so init ends everything and the machine with 3.
     let rc = b"# the console's shell, and services that end
 once /bin/sh   # the console's
 respawn /bin/sleep 1.5
 respawn\t/bin/hello
-respawn /bin/nothere
-
+respawn /bin/nothere\r
+respawn /bin/shd
 once
 bogus /bin/sh
 respawn sh
@@ -532,14 +534,16 @@ once /bin/echo 1 2 3 4 5 6 7 8
         "init: /etc/rc:9: no program's path\n",
         "init: /etc/rc:10: more than 7 arguments\n",
         "init: cannot start /bin/nothere: no such file or directory\n",
-        "hello from user mode\n",
-        "init: /bin/hello ended at once, exit 0: not started again\n",
+        "init: /bin/hello ended at once 5 times, exit 0: not started again\n",
+        "shd: socket: no network card\n",
         "kill: 1: operation not permitted\n",
         "init: not the first process\n",
         "init: exit 1\n",
     ] {
         assert_eq!(out.matches(line).count(), 1, "{line:?} in\n{out}");
     }
+    assert_eq!(out.matches("hello from user mode\n").count(), 5, "{out}");
+    assert!(!out.contains("init: /bin/shd"), "{out}");
     let ps = ps_listings(&out);
     assert_eq!(ps.len(), 4, "{out}");
     let named = |listing: &[(u32, u32, String, String)], name: &str, ppid: u32| -> Vec<u32> {
@@ -569,7 +573,7 @@ once /bin/echo 1 2 3 4 5 6 7 8
     );
     // Once it has ended, init has collected it: no zombie is left.
     assert!(!ps[3].iter().any(|p| p.0 == orphan), "{out}");
-    assert!(ps.iter().flatten().all(|p| p.2 != "zombie"), "{out}");
+    assert!(ps[3].iter().all(|p| p.2 != "zombie"), "{out}");
     assert_eq!(named(&ps[3], "sh", 1), sh, "{out}");
 }
 

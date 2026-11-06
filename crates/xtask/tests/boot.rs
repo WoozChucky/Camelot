@@ -298,16 +298,12 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     );
     assert_eq!(result, RunResult::Exited(0), "{out}");
     // Init ran the server's /etc/rc: the shell, whose exit ends the machine, and
-    // shd, which this machine without a network card does not keep (each line
-    // once, wherever it lands among the shell's).
-    let shd = [
-        "shd: socket: no network card\n",
-        "init: /bin/shd ended at once, exit 1: not started again\n",
-    ];
-    for line in shd {
-        assert_eq!(out.matches(line).count(), 1, "{out}");
-    }
-    let out = shd.iter().fold(out, |out, line| out.replacen(line, "", 1));
+    // shd, which can't run on this machine without a network card, says so
+    // once (wherever its line lands among the shell's) and is left.
+    let shd = "shd: socket: no network card\n";
+    assert_eq!(out.matches(shd).count(), 1, "{out}");
+    assert!(!out.contains("init: /bin/shd"), "{out}");
+    let out = out.replacen(shd, "", 1);
     assert!(
         out.starts_with(&format!(
             "boot: kernel at sector 0x{:08x}\n{}Camelot v0.1.0 booting...\n",
@@ -965,9 +961,9 @@ fn the_profiles_images_differ_in_their_etc_rc_and_fonts() {
 #[test]
 fn the_desktop_image_boots_and_init_starts_its_shell_again() {
     // The desktop's /etc/rc keeps the console's shell running: one that
-    // ends is started again, unless it ended within a second of starting;
-    // with nothing left to run, init ends, and the machine with it (0, no
-    // `once` service). shd ends at once on a machine with no network card.
+    // ends is started again, even at once (but not five times in a row), so
+    // two Ctrl-Ds or `exit`s don't lose it. shd can't run on a machine with
+    // no network card: it says so, and init leaves it.
     let root = repo_root();
     let image =
         xtask::fs::build_bootable(&root, xtask::fs::Profile::Desktop, xtask::fs::DESKTOP_IMAGE_SIZE).unwrap();
@@ -978,23 +974,31 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
     .unwrap();
     m.boot_from_disk().unwrap();
     m.cpu.bus.uart.capture = true;
-    m.set_uart_input(xtask::kernel::typed(b"sleep 1.5\nexit\nps\nexit\n"));
-    let result = m.run(Some(2 * BOOT_MAX_STEPS), |_| {});
-    let out = String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
-    assert_eq!(result, RunResult::Exited(0), "{out}");
+    m.set_uart_input(xtask::kernel::typed(b"exit\nexit\nps\n"));
+    // The machine runs on: run it until the third shell's ps is done.
+    let printed = |m: &Machine| String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
+    let done = |out: &str| out.find("$ ps\n").is_some_and(|at| out[at + 5..].contains("$ "));
+    let mut steps = 0;
+    while !done(&printed(&m)) {
+        assert!(steps < 2 * BOOT_MAX_STEPS, "{}", printed(&m));
+        let result = m.run(Some(1_000_000), |_| {});
+        assert!(
+            !matches!(result, RunResult::Exited(_)),
+            "{result:?}: {}",
+            printed(&m)
+        );
+        steps += 1_000_000;
+    }
+    let out = printed(&m);
     assert!(out.contains("\nram: 64 MiB at 0x80000000\n"), "{out}");
     assert_eq!(
         out.matches("Type help for the list of commands.\n").count(),
-        2,
+        3,
         "{out}"
     );
-    for line in [
-        "init: /bin/shd ended at once, exit 1: not started again\n",
-        "init: /bin/sh ended at once, exit 0: not started again\n",
-    ] {
-        assert_eq!(out.matches(line).count(), 1, "{line:?} in\n{out}");
-    }
-    // The second shell is init's child too, pid 1's.
+    assert_eq!(out.matches("shd: socket: no network card\n").count(), 1, "{out}");
+    assert!(!out.contains("init: "), "{out}");
+    // The third shell is init's child too, pid 1's.
     let ps = &out[out.find("$ ps\n").unwrap_or_else(|| panic!("{out}"))..];
     let processes: Vec<Vec<&str>> = ps
         .lines()

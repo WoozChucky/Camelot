@@ -868,6 +868,9 @@ pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr, timeout: Duration
         }
         read_console(conn, &mut output)?;
     }
+    // The whole output is searched for shd's failure, the scrollback from before
+    // `up` attached too: init's line may come before the prompt. It is all this
+    // boot's: `up` started the VM.
     let prompted = Instant::now();
     let mut typed = false;
     // Until shd listens, the gateway's connection to the VM is refused, and so the
@@ -913,7 +916,7 @@ fn read_console(conn: &mut avalon_proto::Connection<TcpStream>, output: &mut Str
 }
 
 /// The line of a console's output that says `shd` did not start: init's (`init:
-/// cannot start /bin/shd: REASON`, `init: /bin/shd ended at once, ...`), the
+/// cannot start /bin/shd: REASON`, `init: /bin/shd ended at once 5 times, ...`), the
 /// shell's (`sh: shd: REASON`, it could not start the program typed) or shd's own
 /// (`shd: ...`, an error: without -v shd prints nothing else). None while the whole
 /// lines so far say none of these.
@@ -1374,8 +1377,8 @@ mod tests {
             Some("init: cannot start /bin/shd: no such file or directory")
         );
         assert_eq!(
-            shd_failure("init: /bin/shd ended at once, exit 1: not started again\n"),
-            Some("init: /bin/shd ended at once, exit 1: not started again")
+            shd_failure("init: /bin/shd ended at once 5 times, exit 1: not started again\n"),
+            Some("init: /bin/shd ended at once 5 times, exit 1: not started again")
         );
         assert_eq!(shd_failure("init: /bin/shdx ended at once\n"), None);
         assert_eq!(shd_failure("shd &\n[5]\n$ shd"), None);

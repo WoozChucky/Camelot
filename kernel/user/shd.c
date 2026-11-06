@@ -270,7 +270,9 @@ int main(int argc, char **argv) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         fprintf(STDERR, "shd: socket: %s\n", sock == -ENODEV ? "no network card" : strerror(-sock));
-        return 1;
+        /* Without a card it can't run on this machine at all: init, which
+         * starts it at boot, then leaves it. */
+        return sock == -ENODEV ? EX_CONFIG : 1;
     }
     struct sockaddr_in here;
     sockaddr_set(&here, INADDR_ANY, (uint)port);

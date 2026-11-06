@@ -325,7 +325,7 @@ fn cat_pipeline(s: Setup) {
     let reader = marked(&after(&out, "info processes", main_stop));
     assert_ne!(writer, reader);
     // Init, the shell and the two cats, the one stopped running on hart 0
-    // (init's shd ended at once: the machine has no network card).
+    // (init's shd can't run: the machine has no network card).
     let names: Vec<(&str, &str)> = listed
         .iter()
         .map(|p| (p.name.as_str(), p.state.as_str()))

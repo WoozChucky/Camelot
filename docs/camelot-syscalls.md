@@ -284,7 +284,8 @@ envp are `-EFAULT`. Errors:
 - `-ENOEXEC`: the file is not a valid executable (the kernel also prints why
   on the console: `spawn: PATH: REASON`);
 - `-EAGAIN`: every one of the 8 process slots is taken (zombies count until
-  they are collected), or every one of the 16 thread slots;
+  they are collected; init, on a root image, holds one), or every one of
+  the 16 thread slots;
 - `-ENOMEM`: not enough free memory;
 - `-EFAULT`: `path`, `argv`, `envp` or one of their strings is not
   readable (a path longer than `MAXPATH` is still read to its NUL).

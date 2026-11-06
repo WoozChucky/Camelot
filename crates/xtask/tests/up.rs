@@ -95,9 +95,9 @@ fn sized_image_line(name: &str, blocks: u32, attached: &str) -> String {
 }
 
 /// What a Camelot VM without a network card prints once init has started the
-/// shd its `/etc/rc` lists, which ends at once: a VM of [`camelot_profile`]
+/// shd its `/etc/rc` lists, which can't run there: a VM of [`camelot_profile`]
 /// prints it soon after its shell's prompt, or just before.
-const SHD_WITHOUT_NETWORK: &str = "init: /bin/shd ended at once, exit 1: not started again\n";
+const SHD_WITHOUT_NETWORK: &str = "shd: socket: no network card\n";
 
 /// A Camelot VM's hardware, as Round Table's `--camelot` and `up`'s demo make it:
 /// Camelot's firmware, and its 2 MiB on top of the default 4 MiB of RAM.

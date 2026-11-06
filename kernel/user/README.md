@@ -32,7 +32,7 @@ for `grep`, whose 1 means "no line matched".
 
 | Program | Usage | What it does |
 |---|---|---|
-| `init` | `init` (the kernel's, as pid 1) | the first process: starts the services `/etc/rc` lists, `once PATH [ARG...]` or `respawn PATH [ARG...]` a line, restarts the `respawn` ones as they end (but one that ends within a second), ends the machine once the `once` ones have ended, and collects orphans; without `/etc/rc` it execs `/bin/sh` (excalibur-spec section 10, "Init and the shell") |
+| `init` | `init` (the kernel's, as pid 1) | the first process: starts the services `/etc/rc` lists, `once PATH [ARG...]` or `respawn PATH [ARG...]` a line, restarts the `respawn` ones as they end (but one that exits 78, `EX_CONFIG`, or ends within a second five times in a row), ends the machine once the `once` ones have ended, and collects orphans; without `/etc/rc` it execs `/bin/sh` (excalibur-spec section 10, "Init and the shell") |
 | `sh` | `sh` | the shell: commands, `<`, `>`, `\|`, `&`, `NAME=VALUE` assignments, and the built-ins `cd`, `wait`, `exit`, `exec`, `export`, `unset`, `help`; it reads the console a line at a time, any other input (a connection from `shd`, a pipe, a file) a byte at a time, up to each newline |
 | `ls` | `ls [PATH...]` | lists directories (the working directory without arguments): type, inode, links, size, name |
 | `cat` | `cat [FILE...]` | copies files, or its input, to its output; refuses a directory |
@@ -93,7 +93,7 @@ library's resolver asks the DNS server for. Each reports a problem as
 | `nc` | `nc [-u] [-v] HOST PORT`, `nc -l [-u] [-v] PORT` | netcat: connects to HOST, or listens for one connection (UDP: the first datagram), and copies its input to the other end and what comes back to its output, both at once; TCP by default, UDP with `-u`, saying what it does with `-v` |
 | `fetch` | `fetch http://HOST[:PORT][/PATH]` | downloads with HTTP/1.0 to its output; any status but 2xx is an error |
 | `httpd` | `httpd [-p PORT] [-n COUNT] [-t SECONDS] [DIR]` | serves DIR's files (index.html or a listing for a directory) over HTTP/1.0 on PORT (80), a log line per request, for COUNT connections or until killed |
-| `shd` | `shd [-p PORT] [-n MAX] [-v]` | the shell server: each TCP connection to PORT (23) gets a shell of its own, `/bin/sh` with the connection as its input, output and error, at most MAX (4, up to 8) at once; `-v` logs each session; runs until killed (see below) |
+| `shd` | `shd [-p PORT] [-n MAX] [-v]` | the shell server: each TCP connection to PORT (23) gets a shell of its own, `/bin/sh` with the connection as its input, output and error, at most MAX (4, up to 8) at once; `-v` logs each session; runs until killed (see below); exits 78, `EX_CONFIG`, on a machine with no network card, so that init leaves it |
 
 So, with `grail --disk target/camelot-fs.img --net user,hostfwd=tcp::8080-:80`:
 

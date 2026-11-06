@@ -94,7 +94,7 @@ impl Profile {
         Profile::ALL
             .into_iter()
             .find(|p| p.name() == name)
-            .ok_or_else(|| format!("unknown profile {name} (server or desktop)"))
+            .ok_or_else(|| format!("no profile '{name}' (server or desktop)"))
     }
 
     /// Its bootable image's size by default, in 1 KiB blocks: the one place
@@ -154,11 +154,6 @@ pub const NPTY: u16 = 16;
 pub const INCLUDE: &str = "/usr/include";
 /// Where the start code, the C library and the programs' linker script go.
 pub const LIB: &str = "/usr/lib";
-
-/// The default output path.
-pub fn default_out(root: &Path) -> PathBuf {
-    root.join(DEFAULT_OUT)
-}
 
 /// What the root image's `/usr` holds (path, contents): the headers of
 /// [`userprogs::HEADERS`] in [`INCLUDE`], and in [`LIB`] the start code

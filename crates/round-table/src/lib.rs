@@ -1067,7 +1067,6 @@ fn sectors_text(sectors: u64) -> String {
     format!("{}, {sectors} {unit}", format_size(bytes))
 }
 
-/// `disk list`: one row per image.
 /// The hardware profiles of Camelot VMs, as `profiles` prints them.
 pub fn profile_table(presets: &[Preset]) -> String {
     let rows: Vec<Vec<String>> = presets
@@ -1086,6 +1085,7 @@ pub fn profile_table(presets: &[Preset]) -> String {
     table(&["NAME", "IMAGE", "RAM", "BIOS", "ABOUT"], &rows)
 }
 
+/// `disk list`: one row per image.
 pub fn disk_table(disks: &[DiskInfo]) -> String {
     if disks.is_empty() {
         return "no disks\n".into();

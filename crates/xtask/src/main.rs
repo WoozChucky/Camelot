@@ -841,7 +841,7 @@ mod tests {
         );
         assert!(parse(&["--profile", "laptop"])
             .unwrap_err()
-            .contains("unknown profile laptop"));
+            .contains("no profile 'laptop' (server or desktop)"));
         assert!(parse(&["--profile"]).unwrap_err().contains("needs a value"));
         assert!(parse(&["--no-boot"]).unwrap().no_boot);
         assert!(parse(&["--xlen", "64"])

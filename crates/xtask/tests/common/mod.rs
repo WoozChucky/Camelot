@@ -214,12 +214,10 @@ pub fn printed(m: &Machine) -> String {
 }
 
 /// What the server root image prints on a machine without a network card:
-/// the `shd` its init starts (`/etc/rc`'s `respawn /bin/shd`) ends at once,
-/// and init leaves it. The lines land wherever they do among the shell's.
-pub const SHD_WITHOUT_NETWORK: [&str; 2] = [
-    "shd: socket: no network card\n",
-    "init: /bin/shd ended at once, exit 1: not started again\n",
-];
+/// the `shd` its init starts (`/etc/rc`'s `respawn /bin/shd`) can't run,
+/// says so and exits `EX_CONFIG`, and init leaves it. The line lands
+/// wherever it does among the shell's.
+pub const SHD_WITHOUT_NETWORK: [&str; 1] = ["shd: socket: no network card\n"];
 
 /// `out`, what the server root image printed, without
 /// [`SHD_WITHOUT_NETWORK`]'s lines, which must each be there once.

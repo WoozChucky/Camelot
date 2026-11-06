@@ -11,10 +11,14 @@
  * separated by blanks. Every service gets init's descriptors (the console)
  * and environment, and argv[0] is its program's name, the path's last part.
  *
- * - A respawn service that ends is started again, unless it ended less
- *   than a second after it started: then it can't run here (shd with no
- *   network card), and init says so and leaves it, rather than start it
- *   over and over.
+ * - A respawn service that ends is started again. One that exits with
+ *   EX_CONFIG (78, sysexits.h's) can't run with this machine's
+ *   configuration (shd with no network card): it said why, and init leaves
+ *   it. One that ends less than a second after it started, five times in a
+ *   row, is left too, with a line that says so, rather than started over
+ *   and over, as sysvinit stops a service that respawns too fast; a longer
+ *   run starts the count again, so a shell ended at once now and then (by
+ *   Ctrl-D) is not lost.
  * - Once every `once` service has ended (if /etc/rc has any), init shuts
  *   the machine down: it kills every other process, collects them, and
  *   exits with the status of the last one to end. So the server's console
@@ -30,15 +34,18 @@
  * 1. */
 #include "user.h"
 
-/* Services at most: a process slot each (NPROC, docs/camelot-syscalls.md). */
-#define MAX_SERVICES 8
+/* Services at most: a process slot each, of the 8 (NPROC,
+ * docs/camelot-syscalls.md) that init's own leaves. */
+#define MAX_SERVICES 7
 /* Arguments a service has at most, its program's name included. */
 #define MAX_ARGS 8
 /* The longest /etc/rc. */
 #define RC_SIZE 2048
-/* A respawn service that ends sooner than this after it started, in ticks
- * (10 a second), is not started again. */
+/* A run of a respawn service shorter than this, in ticks (10 a second),
+ * is a quick exit... */
 #define RESPAWN_MIN_TICKS 10
+/* ...and after this many in a row it is not started again. */
+#define RESPAWN_MAX_QUICK 5
 
 #define RC "/etc/rc"
 #define SHELL "/bin/sh"
@@ -49,11 +56,13 @@ struct service {
     char *argv[MAX_ARGS + 1];
     int pid;     /* while it runs, else 0 */
     uint started; /* uptime() when it was last started */
+    int quick;   /* quick exits in a row */
 };
 
 static struct service services[MAX_SERVICES];
 static int nservices;
-static char rc[RC_SIZE + 1];
+/* One byte more than an /etc/rc may have, to tell a longer one, and the NUL. */
+static char rc[RC_SIZE + 2];
 
 /* The last part of `path`, after its last '/'. */
 static char *last_part(char *path) {
@@ -72,7 +81,7 @@ static int split(char *line, char **words, int max) {
     int n = 0;
     char *p = line;
     for (;;) {
-        while (*p == ' ' || *p == '\t') {
+        while (*p == ' ' || *p == '\t' || *p == '\r') {
             p++;
         }
         if (*p == 0) {
@@ -82,7 +91,7 @@ static int split(char *line, char **words, int max) {
             return max + 1;
         }
         words[n++] = p;
-        while (*p != 0 && *p != ' ' && *p != '\t') {
+        while (*p != 0 && *p != ' ' && *p != '\t' && *p != '\r') {
             p++;
         }
         if (*p != 0) {
@@ -100,15 +109,20 @@ static int read_rc(void) {
     }
     int len = 0;
     for (;;) {
-        int n = read(fd, rc + len, RC_SIZE - len);
+        int n = read(fd, rc + len, RC_SIZE + 1 - len);
         if (n <= 0) {
             break;
         }
         len += n;
     }
     close(fd);
-    if (len == RC_SIZE) {
+    if (len > RC_SIZE) {
+        /* The rest is left out, and the line it cuts in two too. */
         printf("init: %s: longer than %d bytes, the rest left out\n", RC, RC_SIZE);
+        len = RC_SIZE;
+        while (len > 0 && rc[len - 1] != '\n') {
+            len--;
+        }
     }
     rc[len] = 0;
     char *line = rc;
@@ -189,11 +203,14 @@ static int once_running(void) {
 }
 
 /* The machine's end: every other process killed and collected, then init's
- * own, with `status`. */
+ * own, with `status`. Killed again after each one collected: a process
+ * started after a kill_descendants() snapshot (a session shd started for a
+ * connection just then) is killed by the next, its parent having been
+ * killed by the last. */
 static int shut_down(int status) {
-    kill_descendants(getpid());
-    while (wait(-1, NULL) > 0) {
-    }
+    do {
+        kill_descendants(getpid());
+    } while (wait(-1, NULL) > 0);
     return status;
 }
 
@@ -233,8 +250,15 @@ int main(void) {
             s->pid = 0;
             if (!s->respawn) {
                 last = status;
-            } else if (uptime() - s->started < RESPAWN_MIN_TICKS) {
-                printf("init: %s ended at once, exit %d: not started again\n", s->path, status);
+                break;
+            }
+            if (status == EX_CONFIG) {
+                break; /* it can't run here, and said why */
+            }
+            s->quick = uptime() - s->started < RESPAWN_MIN_TICKS ? s->quick + 1 : 0;
+            if (s->quick == RESPAWN_MAX_QUICK) {
+                printf("init: %s ended at once %d times, exit %d: not started again\n", s->path,
+                       RESPAWN_MAX_QUICK, status);
             } else {
                 start(s); /* one that can't start any more is left */
             }
