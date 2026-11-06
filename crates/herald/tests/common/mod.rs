@@ -273,3 +273,76 @@ pub fn fake_attach(
     }))
     .unwrap();
 }
+
+/// A port of 127.0.0.1 that refuses connections, and goes on refusing them while the
+/// value lives. A port bound and closed again does not: the system hands it out again,
+/// to the next socket that binds port 0 once the port comes round (on Windows after a
+/// round of the others, some 12,000 binds), and a listener there accepts what was
+/// meant to be refused (#230). This one stays held by the two ends of a connection to
+/// it, accepted before its listener closed. With no listener a connection to the port
+/// is refused, on Windows as on Linux, and the system does not hand out a port in use
+/// (nor gives it to a connection as its own end), so it cannot go to anyone else.
+/// Grail's `tests/net_user.rs` has the same, and checks it against a round of binds.
+pub struct RefusedPort {
+    pub port: u16,
+    _held: (TcpStream, TcpStream),
+}
+
+pub fn refused_port() -> RefusedPort {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = TcpStream::connect(addr).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    drop(listener);
+    RefusedPort {
+        port: addr.port(),
+        _held: (client, server),
+    }
+}
+
+/// A fake server's side after an attach, for a client that leaves while the server's
+/// frames are still coming (#234): sends `flood` without pause, so that some always
+/// wait unread on the client's side when it closes, answers `detach` with `Ok` when it
+/// comes, and reads what the client sends until its end. Then it stops flooding and
+/// closes. Returns what it read, how the reading ended (`Error::Closed` is a clean
+/// end, a reset is not), and how the flooding did.
+pub fn flood_until_the_client_closes(
+    mut conn: Connection<TcpStream>,
+    flood: Message,
+    detach: Message,
+) -> (Vec<Message>, avalon_proto::Error, Result<(), avalon_proto::Error>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let detached = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut writer = conn.try_clone().unwrap();
+    let flooding = {
+        let (detached, stop) = (Arc::clone(&detached), Arc::clone(&stop));
+        std::thread::spawn(move || -> Result<(), avalon_proto::Error> {
+            let mut replied = false;
+            while !stop.load(Ordering::SeqCst) {
+                if !replied && detached.load(Ordering::SeqCst) {
+                    writer.send(&Message::Ok)?;
+                    replied = true;
+                }
+                writer.send(&flood)?;
+            }
+            // The client waits for this end's close before it closes its own.
+            writer.get_ref().shutdown(std::net::Shutdown::Write)?;
+            Ok(())
+        })
+    };
+    let mut got = Vec::new();
+    let end = loop {
+        match conn.recv() {
+            Ok(msg) => {
+                if msg == detach {
+                    detached.store(true, Ordering::SeqCst);
+                }
+                got.push(msg);
+            }
+            Err(e) => break e,
+        }
+    };
+    stop.store(true, Ordering::SeqCst);
+    (got, end, flooding.join().unwrap())
+}

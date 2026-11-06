@@ -10,6 +10,13 @@
 //! on an empty line ends the input (Herald shuts its side of the connection down, which
 //! `shd` takes as a hang-up), and Ctrl-] leaves, closing the connection.
 //!
+//! Leaving closes in order, as a lingering close does ([`avalon_proto::close_gracefully`],
+//! which Avalon's servers end with): FIN after what was sent, then what the far end
+//! still sends is read and dropped until it closes too, for at most
+//! [`avalon_proto::LINGER`]. A socket closed with received bytes unread resets the
+//! connection instead of closing it, and a reset can make the far end throw away what
+//! it had received and not yet read: the last line sent before the detach key.
+//!
 //! [`TcpSession`] is the streaming layer, which, like [`crate::Session`], knows nothing
 //! of terminals: input bytes come from a channel and output goes to any `Write`, so the
 //! tests drive it without one. When the input is not a terminal (a pipe), nothing is
@@ -21,7 +28,7 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use crate::DETACH_KEY;
+use crate::{end_connection, is_reset, Reader, DETACH_KEY};
 
 /// Most bytes read from the connection at once.
 const READ_SIZE: usize = 4096;
@@ -42,7 +49,8 @@ const RUB_OUT: &[u8] = b"\x08 \x08";
 /// Why a [`TcpSession`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpEnd {
-    /// The detach key: Herald left, closing the connection.
+    /// The detach key: Herald left, closing the connection (in order: see
+    /// [`TcpSession::run`]).
     Left,
     /// The far end closed the connection (or reset it).
     Closed,
@@ -255,6 +263,15 @@ impl TcpSession {
     /// (with the echo to `out`) if [`TcpSession::edit`] is on. The end of the input
     /// shuts the sending side down, and the session goes on until the far end closes.
     ///
+    /// Leaving (the detach key) closes in order, as every end of a session does. Herald's
+    /// side is shut down first, so that a FIN follows what was sent; then what the far
+    /// end still sends is read, and dropped, until it closes its side, for at most
+    /// [`avalon_proto::LINGER`]. Only then is the socket closed, with nothing unread, so
+    /// the close is not a reset (RFC 1122 4.2.2.13), which could make the far end lose
+    /// what it had not yet read. A far end that never closes is waited for only so
+    /// long: past that, the close may reset after all. When the session ends with the
+    /// far end's close, everything it sent has been read already.
+    ///
     /// A failure to write `out`, or of the connection (other than a reset, which is
     /// its end), is an error. `input` is read on a thread of its own, which stays
     /// blocked on it after the session ends until its next byte or its end (a
@@ -263,6 +280,8 @@ impl TcpSession {
         let (tx, events) = mpsc::channel();
         let mut reader = self.stream.try_clone()?;
         let server_tx = tx.clone();
+        let state = Reader::default();
+        let read_state = state.clone();
         let reading = std::thread::spawn(move || {
             let mut buf = vec![0u8; READ_SIZE];
             loop {
@@ -273,6 +292,11 @@ impl TcpSession {
                     Err(e) if is_reset(&e) => Event::Closed,
                     Err(e) => Event::Failed(e),
                 };
+                match event {
+                    Event::Closed => read_state.at_end(),
+                    Event::Failed(_) => read_state.stopped(),
+                    _ => {}
+                }
                 let last = !matches!(event, Event::Data(_));
                 if server_tx.send(event).is_err() || last {
                     break;
@@ -281,15 +305,13 @@ impl TcpSession {
         });
         std::thread::spawn(move || forward_input(input, tx));
 
-        let result = self.serve(events, out);
-        // Unblocks the reading thread, and closes the connection.
-        let _ = self.stream.shutdown(Shutdown::Both);
-        let _ = reading.join();
+        let result = self.serve(&events, out);
+        end_connection(&self.stream, &events, &state, reading);
         result
     }
 
     /// The session loop.
-    fn serve(&self, events: Receiver<Event>, out: &mut dyn Write) -> io::Result<TcpEnd> {
+    fn serve(&self, events: &Receiver<Event>, out: &mut dyn Write) -> io::Result<TcpEnd> {
         let mut editor = LineEditor {
             detach_key: self.detach_key,
             ..LineEditor::new()
@@ -354,14 +376,6 @@ impl TcpSession {
             }
         }
     }
-}
-
-/// Whether `e` says the far end reset or dropped the connection.
-fn is_reset(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe
-    )
 }
 
 /// Passes input bytes on to the session loop, a burst at a time, then its end.
