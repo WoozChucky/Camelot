@@ -3,8 +3,8 @@
 //! are byte for byte those of a build without debug information, the programs
 //! the kernel embeds and `/bin` holds have none (merlin-ld strips it), and so the
 //! root image holds the same programs and kernel either way. The objects
-//! programs are linked from on Camelot, `/usr/lib/crt0.o` and `libc.a`, are
-//! installed stripped (#240), which leaves none of their line tables; but an
+//! programs are linked from on Camelot, `/usr/lib/crt0.o`, `libc.a` and
+//! `libgui.a`, are installed stripped (#240), which leaves none of their line tables; but an
 //! object compiled with `-g` keeps a section symbol or two its relocations
 //! of the line tables needed (llvm-strip keeps them too), so they are not
 //! the objects of a build without `-g`. The programs linked from either are
@@ -111,7 +111,8 @@ fn debug_information_changes_no_loaded_byte() {
     let paths =
         |f: &camelot_fs::read::Fs| -> Vec<String> { f.walk().unwrap().into_iter().map(|(p, _)| p).collect() };
     assert_eq!(paths(&with), paths(&without));
-    let objects = ["/usr/lib/crt0.o", "/usr/lib/libc.a"];
+    let archives = ["/usr/lib/libc.a", "/usr/lib/libgui.a"];
+    let objects = ["/usr/lib/crt0.o", archives[0], archives[1]];
     for p in paths(&with) {
         if objects.contains(&p.as_str()) || with.read_file(&p).is_err() {
             continue;
@@ -121,8 +122,8 @@ fn debug_information_changes_no_loaded_byte() {
             "{p} differs without -g"
         );
     }
-    let members = |f: &camelot_fs::read::Fs| -> Vec<String> {
-        let a = f.read_file("/usr/lib/libc.a").unwrap();
+    let members = |f: &camelot_fs::read::Fs, archive: &str| -> Vec<String> {
+        let a = f.read_file(archive).unwrap();
         elf::archive::parse(&a)
             .unwrap()
             .members
@@ -130,11 +131,15 @@ fn debug_information_changes_no_loaded_byte() {
             .map(|m| m.name.clone())
             .collect()
     };
-    assert_eq!(members(&with), members(&without));
+    for archive in archives {
+        assert_eq!(members(&with, archive), members(&without, archive));
+    }
     for f in [&with, &without] {
-        let a = f.read_file("/usr/lib/libc.a").unwrap();
-        for m in elf::archive::parse(&a).unwrap().members {
-            assert!(!has_line_table(m.data), "{} has a line table", m.name);
+        for archive in archives {
+            let a = f.read_file(archive).unwrap();
+            for m in elf::archive::parse(&a).unwrap().members {
+                assert!(!has_line_table(m.data), "{archive}: {} has a line table", m.name);
+            }
         }
         assert!(!has_line_table(&f.read_file("/usr/lib/crt0.o").unwrap()));
     }
@@ -145,6 +150,7 @@ fn debug_information_changes_no_loaded_byte() {
         };
         let mut inputs = vec![input("/usr/lib/crt0.o")];
         inputs.extend(prog_objects.clone());
+        inputs.push(input("/usr/lib/libgui.a"));
         inputs.push(input("/usr/lib/libc.a"));
         let files: Vec<(&merlin_ld::Input, bool)> = inputs.iter().map(|i| (i, false)).collect();
         let opts = merlin_ld::Options {

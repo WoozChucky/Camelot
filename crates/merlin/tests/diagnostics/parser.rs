@@ -151,6 +151,10 @@ pub fn cases() -> Vec<Case> {
         case("void f(void) { int a[] = {1;}; }", &["1:28: error: unexpected ';' before '}'"]),
         case("struct s { int x; } v = {1;};", &["1:27: error: unexpected ';' before '}'"]),
         case("int f(void) { if (1;) return 1; return 0; }", &["1:20: error: unexpected ';' before ')'"]),
+        // __builtin_va_arg's `)` is not a bracket clang matches: a plain
+        // `expected ')'`, no note, the `;` not called out.
+        case("int f(int n, ...) { __builtin_va_list ap; return __builtin_va_arg(ap, int;); }", &["1:74: error: expected ')'"]).then(&["1:75: error: expected expression"]),
+        case("int f(int n, ...) { __builtin_va_list ap; return __builtin_va_arg(ap, int x); }", &["1:75: error: expected ')'"]).then(&["1:76: error: expected expression"]),
         // unsupported_constructs
         case("int f() { if (1) int x = 1; }", &["1:18: error: expected expression"]),
         case("int f() { int g(int a); return g(1); }", &[]),

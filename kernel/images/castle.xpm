@@ -1,0 +1,29 @@
+/* XPM */
+/* Camelot's icon (#183): two towers, a wall and a gate, a pennant. */
+static char *castle[] = {
+/* width height colours characters-a-pixel */
+"16 16 6 1",
+". c None",
+"r c #C03030",
+"p c #404040",
+"g c #A0A8B0",
+"d c #505860",
+"k c #303438",
+/* the pixels */
+"..rr............",
+"..rrr...........",
+"..p.............",
+"..p.............",
+"g.g.g......g.g.g",
+"ggggg......ggggg",
+"ggggg......ggggg",
+"ggggg.g.g.gggggg",
+"gggggggggggggggg",
+"ggdggggggggggdgg",
+"gggggggggggggggg",
+"gggggggddggggggg",
+"ggggggddddgggggg",
+"ggggggddddgggggg",
+"ggggggddddgggggg",
+"kkkkkkkkkkkkkkkk"
+};

@@ -22,7 +22,11 @@ void die(const char *msg) {
  * leaves the current chunk as it is. The chunks and blocks come from malloc
  * (which takes its memory from sbrk) and are freed all together when the
  * compilation ends (arena_free), as merlin's memory is when a translation
- * unit is done: nothing in the arena is freed on its own. */
+ * unit is done: nothing in the arena is freed on its own. The one
+ * exception is work whose results are thrown away, the code generator's
+ * first pass over a function: what it puts in the arena is given back when
+ * it is done (arena_mark, then arena_release), since nothing it makes
+ * outlives it. */
 
 #define CHUNK (256 * 1024)
 #define BIG (CHUNK / 4)
