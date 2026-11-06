@@ -964,7 +964,8 @@ int kill_descendants(int pid);
  * tcsetattr: TCGETS, and TCSETS, TCSETSW or TCSETSF as `when` is TCSANOW,
  * TCSADRAIN or TCSAFLUSH; cfmakeraw makes `t` raw mode, as glibc's does.
  * tcgetpgrp and tcsetpgrp: the foreground process (a pid until Camelot has
- * process groups) that Ctrl-C kills, through TIOCGPGRP and TIOCSPGRP.
+ * process groups; 0, none) that Ctrl-C kills, through TIOCGPGRP and
+ * TIOCSPGRP.
  *
  * posix_openpt opens /dev/ptmx with `flags` (O_RDWR) and returns the
  * master's descriptor; grantpt only checks that `fd` is one (Camelot has

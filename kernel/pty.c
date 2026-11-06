@@ -154,6 +154,26 @@ isize ptmx_read(struct file *f, pagetable_t pt, uintptr dst, usize n) {
     return (isize)count;
 }
 
+/* Where the first Ctrl-C (tty_signal_char) is among the next TTY_IN bytes
+ * of [src + from, src + n): its offset from `src`, or n if there is none. */
+static usize next_signal(struct tty *t, pagetable_t pt, uintptr src, usize from, usize n) {
+    char chunk[CHUNK];
+    usize end = n - from > TTY_IN ? from + TTY_IN : n;
+    while (from < end) {
+        u32 count = end - from < CHUNK ? (u32)(end - from) : CHUNK;
+        if (copyin(pt, chunk, src + from, count) != 0) {
+            return n;
+        }
+        for (u32 i = 0; i < count; i++) {
+            if (tty_signal_char(t, chunk[i])) {
+                return from + i;
+            }
+        }
+        from += count;
+    }
+    return n;
+}
+
 isize ptmx_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
     struct pty *p = f->priv;
     if (!uvm_range_ok(pt, src, n, PTE_R)) {
@@ -170,11 +190,15 @@ isize ptmx_write(struct file *f, pagetable_t pt, uintptr src, usize n) {
         }
         u32 room = TTY_IN - (p->tty.in_head - p->tty.in_tail);
         if (room == 0) {
-            /* Ctrl-C takes no room: it gets past input nobody reads. */
-            char c;
-            if (copyin(pt, &c, src + done, 1) == 0 && tty_signal_char(&p->tty, c)) {
+            /* Ctrl-C takes no room: one among the next bytes gets past
+             * input nobody reads, those ahead of it, which have none,
+             * dropped (it throws the input away anyway). */
+            usize at = next_signal(&p->tty, pt, src, done, n);
+            if (at < n) {
+                char c;
+                copyin(pt, &c, src + at, 1);
                 tty_receive(&p->tty, c);
-                done++;
+                done = at + 1;
                 continue;
             }
             if (proc_killed()) {

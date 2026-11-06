@@ -2619,7 +2619,7 @@ fn pseudo_terminals_run_the_shell() {
     type_line(&tx, "ptytest\n");
     step_to_prompt(&mut m, 2);
     let out = printed(&m);
-    assert_eq!(all_checks_pass(&out, "ptytest", "ptytest"), 139, "{out}");
+    assert_eq!(all_checks_pass(&out, "ptytest", "ptytest"), 145, "{out}");
 }
 
 /// Steps `m` until the kernel's tick counter has gone `n` ticks on.

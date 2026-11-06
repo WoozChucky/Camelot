@@ -314,7 +314,10 @@ static void interrupt_checks(void) {
     check(n == 3 && memcmp(buf, "ab\n", 3) == 0, "Ctrl-C dropped without a foreground");
     expect(m, buf, sizeof buf, NULL, 1);
 
-    check_eq(tcsetpgrp(s, 0), -EINVAL, "tcsetpgrp 0");
+    check_eq(tcsetpgrp(s, -1), -EINVAL, "tcsetpgrp -1");
+    check_eq(tcsetpgrp(s, getpid()), 0, "tcsetpgrp");
+    check_eq(tcsetpgrp(s, 0), 0, "tcsetpgrp 0: none (Camelot's)");
+    check_eq(tcgetpgrp(s), 0, "none");
     check_eq(tcsetpgrp(s, 99999), -ESRCH, "tcsetpgrp of no process");
 
     /* A program reading the slave, in the foreground: Ctrl-C kills it,
@@ -361,7 +364,7 @@ static void interrupt_checks(void) {
         write(m, "z", 1);
     }
     check(!(ready(m, POLLOUT) & POLLOUT), "the slave's input is full");
-    check_eq(write(m, "\x03", 1), 1, "Ctrl-C written all the same");
+    check_eq(write(m, "zz\x03", 3), 3, "Ctrl-C written all the same, behind bytes with no room");
     check_eq(wait(pid, &status), pid, "cat ended");
     check_eq(status, -1, "killed");
     check(ready(m, POLLOUT) & POLLOUT, "the input thrown away");
@@ -510,6 +513,16 @@ static void shell_checks(void) {
     write(m, "par\x03", 4);
     expect(m, buf, sizeof buf, "$ ", 50);
     check(strcmp(buf, "^C\r\ncat: exit -1\r\n$ ") == 0, "Ctrl-C kills the shell's foreground");
+    /* A shell in the shell: Ctrl-C at its prompt is dropped. */
+    write(m, "sh\r", 3);
+    expect(m, buf, sizeof buf, "commands.\r\n$ ", 50);
+    check_eq(tcgetpgrp(m), 0, "a shell at its prompt is no foreground");
+    write(m, "\x03" "echo in\r", 9);
+    expect(m, buf, sizeof buf, "$ ", 50);
+    check(strcmp(buf, "echo in\r\nin\r\n$ ") == 0, "Ctrl-C dropped at the inner prompt");
+    write(m, "exit 4\r", 7);
+    expect(m, buf, sizeof buf, "$ ", 50);
+    check(strcmp(buf, "exit 4\r\nsh: exit 4\r\n$ ") == 0, "the inner shell ends");
     write(m, "exit 3\r", 7);
     int status = 0;
     check_eq(wait(pid, &status), pid, "sh ends");

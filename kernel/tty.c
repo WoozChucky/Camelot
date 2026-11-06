@@ -67,7 +67,8 @@ bool tty_room(const struct tty *t) {
 bool tty_signal_char(const struct tty *t, char c) {
     const struct termios *tio = &t->termios;
     return (tio->c_lflag & ISIG) != 0 && c != 0 &&
-           (c == (char)tio->c_cc[VINTR] || c == (char)tio->c_cc[VQUIT] || c == (char)tio->c_cc[VSUSP]);
+           (c == (char)tio->c_cc[VINTR] || c == (char)tio->c_cc[VQUIT]) && t->fg != 0 &&
+           proc_exists(t->fg);
 }
 
 u32 tty_opost(u32 oflag, char c, char out[2]) {
@@ -477,10 +478,10 @@ long tty_ioctl(struct tty *t, u32 request, uintptr arg) {
         if (copyin(pt, &pid, arg, sizeof pid) != 0) {
             return -EFAULT;
         }
-        if (pid <= 0) {
+        if (pid < 0) {
             return -EINVAL;
         }
-        if (!proc_exists(pid)) {
+        if (pid != 0 && !proc_exists(pid)) {
             return -ESRCH;
         }
         t->fg = pid;

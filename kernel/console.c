@@ -43,11 +43,25 @@ static void cons_echo(struct tty *t, const char *s, u32 n) {
     release(&uart_tx_lock);
 }
 
-/* Moves the UART's received bytes into the discipline while it has room,
- * and Ctrl-C even when it has none (it takes none). */
+/* Moves the UART's received bytes into the discipline while it has room.
+ * When it has none, a Ctrl-C waiting in the ring still goes in (it takes
+ * no room), and the bytes ahead of it, which have none, are dropped: it
+ * throws the input away anyway. */
 static void cons_pull(struct tty *t) {
     char c;
-    while (uart_rx_peek(&c) && (tty_room(t) || tty_signal_char(t, c))) {
+    while (uart_rx_peek(0, &c)) {
+        if (!tty_room(t) && !tty_signal_char(t, c)) {
+            u32 i = 1;
+            while (uart_rx_peek(i, &c) && !tty_signal_char(t, c)) {
+                i++;
+            }
+            if (!uart_rx_peek(i, &c)) {
+                return; /* no Ctrl-C: the bytes wait for room */
+            }
+            for (; i > 0; i--) {
+                uart_rx_pop(&c);
+            }
+        }
         uart_rx_pop(&c);
         tty_receive(t, c);
     }

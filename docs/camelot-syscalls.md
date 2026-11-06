@@ -1222,8 +1222,8 @@ terminal emulator holds, as on Linux:
   and `ptsname` do this (`user.h`);
 - what the master writes is the slave's input, through the discipline:
   edited, echoed back to the master, its Ctrl-C acted on; a write waits
-  while the slave's 256-byte input is full, but for a Ctrl-C, which takes
-  no room;
+  while the slave's 256-byte input is full, but for a Ctrl-C among the
+  next 256 bytes ("Ctrl-C");
 - what the slave writes is what the master reads, through the output
   processing (`ONLCR`: a NL as CR NL), from a 2 KiB buffer, a write waiting
   for room; an echo that finds none is dropped;
@@ -1245,7 +1245,7 @@ terminal emulator holds, as on Linux:
 | `TCSETSF` | 0x5404 | `const struct termios *` | the same, and the input thrown away (`TCSAFLUSH`) |
 | `TCFLSH` | 0x540B | a number | throws away the input (`TCIFLUSH`, 0), the output not read yet (`TCOFLUSH`, 1), or both (2) |
 | `TIOCGPGRP` | 0x540F | `int *` | the foreground process, 0 for none (as it was set, even once it has ended) |
-| `TIOCSPGRP` | 0x5410 | `const int *` | sets it: `-EINVAL` for 0 or less, `-ESRCH` for no such process |
+| `TIOCSPGRP` | 0x5410 | `const int *` | sets it, 0 for none (Camelot's: Linux has no such group, `-ESRCH`): `-EINVAL` for less than 0, `-ESRCH` for no such process |
 | `TIOCGWINSZ` | 0x5413 | `struct winsize *` | the size (0 by 0 until set) |
 | `TIOCSWINSZ` | 0x5414 | `const struct winsize *` | sets it |
 | `FIONREAD` | 0x541B | `int *` | the bytes a read would take now: a whole line's in canonical mode; the output waiting, on a master |
@@ -1286,14 +1286,20 @@ that asks for it.
 
 **Ctrl-C.** With `ISIG`, `VINTR` (Ctrl-C) and `VQUIT` (Ctrl-\) kill the
 terminal's foreground process as `kill` does (it exits with -1), throw
-away the input unless `NOFLSH`, and echo `^C` and a newline, even when
-the input is full; without a foreground process, or once it has ended,
-they are dropped. `VSUSP` (Ctrl-Z) is dropped too: Camelot doesn't stop
-processes. The foreground is a process, set with `tcsetpgrp`, until
-Camelot has process groups (issue #116). The shell sets it on its
-terminal to each program it waits for, so Ctrl-C ends the program, not
-the shell; any other program that wants Ctrl-C to end what it runs sets
-it.
+away the input unless `NOFLSH`, and echo `^C` and a newline; without a
+foreground process, or once it has ended, they are dropped. They take
+no room in the input, so they reach a program that doesn't read it:
+when the input is full, a Ctrl-C waiting in the console's UART (128
+bytes) or among the next 256 bytes of a master's write still gets in,
+and the bytes ahead of it, which have no room, are dropped (it throws
+the input away anyway); further back, it waits with them. `VSUSP`
+(Ctrl-Z) is dropped too: Camelot doesn't stop processes. The foreground
+is a process, set with `tcsetpgrp`, until Camelot has process groups
+(issue #116). The shell sets it on its terminal to each program it waits
+for, so Ctrl-C ends the program, not the shell, and at its prompt makes
+it none if it is the foreground itself (a shell run by another, which
+Camelot has no signals for it to ignore); any other program that wants
+Ctrl-C to end what it runs sets it.
 
 **Defaults.** A new pty has Linux's (`tty_std_termios`, the pty driver's
 `c_cflag`): `ICRNL`, `IXON`, `OPOST`, `ONLCR`, `B38400`, `CS8`, `CREAD`,

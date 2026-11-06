@@ -23,8 +23,8 @@
  * second, a tick each). With ISIG, VINTR and VQUIT kill the terminal's
  * foreground process (TIOCSPGRP), discarding the input unless NOFLSH and
  * echoing "^C" and a newline; with no foreground, or one that has ended,
- * they are dropped, and so is VSUSP (Camelot has no stopped processes). OPOST with ONLCR turns
- * NL into CR NL on output.
+ * they are dropped, and so is VSUSP (Camelot has no stopped processes).
+ * OPOST with ONLCR turns NL into CR NL on output.
  *
  * Locking: the functions are called holding the terminal's lock, `lock`,
  * but tty_init() (before anything else can reach the terminal) and
@@ -180,9 +180,11 @@ void tty_init(struct tty *t, struct spinlock *lock, const struct tty_ops *ops, b
 /* Whether the input has room for one byte more. */
 bool tty_room(const struct tty *t);
 
-/* Whether `c` is one tty_receive() acts on at once rather than keeping
- * (ISIG's VINTR, VQUIT, VSUSP): it needs no room, so a driver whose input
- * is full passes it on anyway. */
+/* Whether `c` is a VINTR or VQUIT (ISIG) that would kill the foreground
+ * process now, which tty_receive() does without keeping it: it needs no
+ * room, so a driver whose input is full passes it on anyway, dropping the
+ * bytes ahead of it that have none (it throws the input away). Without a
+ * foreground it would be dropped, and the bytes ahead of it wait. */
 bool tty_signal_char(const struct tty *t, char c);
 
 /* A byte typed: mapped and added to the input, or acted on (ISIG); wakes

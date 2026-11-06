@@ -2954,6 +2954,43 @@ fn a_line_longer_than_the_input_buffers_is_cut_not_stuck() {
 }
 
 #[test]
+fn ctrl_c_gets_past_input_nobody_reads() {
+    // The shell makes `sleep` the console's foreground; 300 bytes typed at
+    // it fill the terminal's input (TTY_IN) and wait in the UART's ring, a
+    // Ctrl-C behind them. It takes no room: it kills `sleep`, the bytes
+    // ahead of it dropped, and the shell reads the next line.
+    let ahead = "z".repeat(300);
+    assert!(ahead.len() > TTY_IN && ahead.len() < TTY_IN + UART_RX_SIZE);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut m, elf) = load_committed_on(config(), Some(rx));
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| printed(m).ends_with(PROMPT));
+    for b in b"sleep 100000\n" {
+        tx.send(*b).unwrap();
+    }
+    // The console's foreground: struct tty's `fg` (kernel/include/tty.h),
+    // after two pointers, the 36-byte termios and the 8-byte winsize.
+    let fg = sym(&elf, "cons") + 8 + 8 + 36 + 8;
+    step_until(&mut m, BOOT_MAX_STEPS, |_| {}, |m| image_u32(m, fg) != 0);
+    // Typed only now, so that the Ctrl-C comes once there is a foreground.
+    for b in format!("{ahead}\x03exit 5\n").bytes() {
+        tx.send(b).unwrap();
+    }
+    assert_eq!(
+        m.run(Some(BOOT_MAX_STEPS), |_| {}),
+        RunResult::Exited(5),
+        "{}",
+        printed(&m)
+    );
+    let out = printed(&m);
+    let want = format!(
+        "{SHELL_BANNER}\
+         {PROMPT}sleep 100000\n^C\nsleep: exit -1\n\
+         {PROMPT}exit 5\n"
+    );
+    assert_eq!(out[out.find(SHELL_BANNER).unwrap()..], want);
+}
+
+#[test]
 fn end_of_input_ends_the_shell() {
     // Ctrl-D on an empty line: the read returns 0, and the shell exits with
     // the last program's status. Mid-line it ends the line without a
