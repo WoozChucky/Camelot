@@ -107,6 +107,7 @@ headers and checks each size.
 | `struct cmsghdr` | 16 | a control message's header: a `size_t` length, then two `int`s, the level and the type |
 | `struct termios` | 36 | a terminal's modes ("Terminals"): four `unsigned int` flags, the line discipline's number, then 19 control characters, Linux's for `TCGETS` |
 | `struct winsize` | 8 | a terminal's size: four `unsigned short`s, rows, columns and two in pixels |
+| `struct ucred` | 12 | `SO_PEERCRED`'s: the peer's pid, then its uid and gid, `unsigned int`s, 0 |
 
 ## Calls
 
@@ -170,6 +171,7 @@ headers and checks each size.
 | 56 | `sendmsg` | `int fd, const struct msghdr *msg, int flags` | bytes sent; `send`'s and `sendto`'s errors, `-EMSGSIZE`, `-EINVAL`, `-EBADF` (a descriptor passed), `-EOPNOTSUPP`, `-EAGAIN`, `-ENOBUFS`, `-EFAULT` |
 | 57 | `recvmsg` | `int fd, struct msghdr *msg, int flags` | bytes received, 0 at the end; `recv`'s errors, `-EMSGSIZE`, `-EOPNOTSUPP`, `-ENOBUFS`, `-EFAULT` |
 | 58 | `stat` | `const char *path, struct stat *st` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EFAULT` |
+| 59 | `getsockopt` | `int fd, int level, int option, void *value, uint *len` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOPROTOOPT` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -704,6 +706,14 @@ is not the structure's size, or a negative time, or
 `tv_usec` of a second or more), `-EFAULT` (`value` is not readable),
 `-ENOPROTOOPT` (another level or option).
 
+**getsockopt(fd, level, option, value, len)** reads an option back, as
+Linux's: `*len` is the room at `value`, and the call stores at most that
+much of the option there, and in `*len` how much it stored. The one there
+is is a local socket's (`-ENOPROTOOPT` on TCP and UDP, and for another
+level or option): `SO_PEERCRED` (17), the process at the other end, a
+`struct ucred` (`pid`, `uid`, `gid`: 12 bytes; Camelot has no users, so
+the two ids are 0). Errors: `-EFAULT` (`len` or `value` not there).
+
 ## Local sockets
 
 Local sockets are Linux's `AF_UNIX` stream sockets (`SOCK_STREAM`;
@@ -781,7 +791,13 @@ listener closed resets the connections it never accepted.
 listener's for an accepted end, or an empty path. **getpeername(fd,
 addr)** stores the peer's, kept once the peer is gone; `-ENOTCONN` never
 connected. **setsockopt** takes `SO_RCVTIMEO` as TCP's does: how long a
-read and `accept` wait.
+read and `accept` wait. **getsockopt(fd, SOL_SOCKET, SO_PEERCRED, ...)**
+gives the pid of the process at the other end as it was when they
+connected, as Linux does: an accepted end's is the process that called
+`connect`, the connecting end's the one that called `listen`, each of a
+`socketpair`'s the process that made it, and 0 for a socket never
+connected. It stays the same once that process is gone, or the socket
+passed on. A display server finds out its clients' processes this way.
 
 ## Messages
 
@@ -1362,7 +1378,7 @@ Linux's values for the same conditions.
 | 88 | `ENOTSOCK` | a socket call on a descriptor that is not a socket |
 | 89 | `EDESTADDRREQ` | send: a UDP socket with no peer, and no address given |
 | 90 | `EMSGSIZE` | a datagram too big for one packet |
-| 92 | `ENOPROTOOPT` | setsockopt: an option sockets don't have |
+| 92 | `ENOPROTOOPT` | setsockopt, getsockopt: an option sockets don't have |
 | 93 | `EPROTONOSUPPORT` | socket: a protocol the type doesn't have |
 | 94 | `ESOCKTNOSUPPORT` | socket, socketpair: a local socket of a type other than `SOCK_STREAM` |
 | 95 | `EOPNOTSUPP` | listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses |

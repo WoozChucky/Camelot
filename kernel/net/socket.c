@@ -588,6 +588,38 @@ int sock_sys_setsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, u32 len) 
     return sock_opt_rcvtimeo(level, option, uvalue, len, &s->rcvtimeo);
 }
 
+int sock_sys_getsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, uintptr ulen) {
+    (void)level;
+    (void)option;
+    (void)uvalue;
+    int err;
+    struct socket *s = fd_sock(fd, &err);
+    if (s == NULL) {
+        return err;
+    }
+    u32 len;
+    err = sock_opt_len(ulen, &len);
+    if (err < 0) {
+        return err;
+    }
+    /* SO_PEERCRED is a local socket's: TCP and UDP have no process at
+     * their other end, and no other option is read back. */
+    return -ENOPROTOOPT;
+}
+
+int sock_opt_len(uintptr ulen, u32 *len) {
+    return copyin(user_pt(), len, ulen, sizeof *len) < 0 ? -EFAULT : 0;
+}
+
+int sock_opt_put(uintptr uvalue, uintptr ulen, u32 len, const void *value, u32 size) {
+    pagetable_t pt = user_pt();
+    u32 n = len < size ? len : size;
+    if (copyout(pt, uvalue, value, n) != 0 || copyout(pt, ulen, &n, sizeof n) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
 /* ---- sendmsg and recvmsg ---- */
 
 isize sock_sys_sendmsg(u32 fd, uintptr umsg, u32 flags) {

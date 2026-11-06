@@ -1,17 +1,18 @@
 /* unixtest: checks local sockets (docs/camelot-syscalls.md, "Local
  * sockets" and "Messages"; kernel/net/unix.c): socketpair, names bound on
  * the disk, connections, shutdown and close, descriptors passed with
- * SCM_RIGHTS, and sendmsg and recvmsg on TCP and UDP too. On a root image
- * it can write to, with a network card (for TCP and UDP over loopback).
+ * SCM_RIGHTS, SO_PEERCRED, and sendmsg and recvmsg on TCP and UDP too. On a
+ * root image it can write to, with a network card (for TCP and UDP over
+ * loopback).
  *
- *   unixtest                the checks: "unixtest: N checks, F failed".
- *                           The last of them share a memfd with a second
- *                           process: this one binds /unixtest.share and
- *                           starts "unixtest client", which connects and
- *                           is sent the object; both map it, and each sees
- *                           what the other wrote
- *   unixtest client PATH    that second process: exits 0 if all went
- *                           well, else 1 */
+ *   unixtest                  the checks: "unixtest: N checks, F failed".
+ *                             The last of them share a memfd with a second
+ *                             process: this one binds /unixtest.share and
+ *                             starts "unixtest client", which connects and
+ *                             is sent the object; both map it, and each
+ *                             sees what the other wrote
+ *   unixtest client PATH PID  that second process, PID the first: exits 0
+ *                             if all went well (its peer is PID), else 1 */
 #include "user.h"
 
 static int checks;
@@ -117,6 +118,18 @@ static int is_open(int fd) {
     return fstat(fd, &st) == 0;
 }
 
+/* SO_PEERCRED's pid of socket `fd`, or the error. */
+static long peer_pid(int fd) {
+    struct ucred cred;
+    memset(&cred, 0x55, sizeof cred);
+    uint len = sizeof cred;
+    int r = getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len);
+    if (r < 0) {
+        return r;
+    }
+    return len == sizeof cred && cred.uid == 0 && cred.gid == 0 ? cred.pid : -1000;
+}
+
 static void pair_checks(void) {
     int sv[2];
     check_eq(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0, "socketpair");
@@ -128,6 +141,22 @@ static void pair_checks(void) {
     check_eq(read(sv[1], buf, sizeof buf), 5, "read the other");
     check(memcmp(buf, "hello", 5) == 0, "the bytes");
     check_eq(send(sv[1], "back", 4), 4, "send the other way");
+
+    /* SO_PEERCRED: each end's peer is the process that made the pair. */
+    check_eq(peer_pid(sv[0]), getpid(), "SO_PEERCRED: the pair's maker");
+    check_eq(peer_pid(sv[1]), getpid(), "at both ends");
+    struct ucred cred;
+    memset(&cred, 0x55, sizeof cred);
+    uint len = 4;
+    check_eq(getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &cred, &len), 0, "SO_PEERCRED cut short");
+    check(len == 4 && cred.pid == getpid() && cred.uid == 0x55555555, "to the pid alone");
+    len = sizeof cred;
+    check_eq(getsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &cred, &len), -ENOPROTOOPT, "no other option");
+    check_eq(getsockopt(sv[0], 99, SO_PEERCRED, &cred, &len), -ENOPROTOOPT, "nor level");
+    check_eq(getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &cred, (uint *)0x10), -EFAULT, "a bad length");
+    check_eq(getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, (void *)0x10, &len), -EFAULT, "a bad value");
+    check_eq(getsockopt(0, SOL_SOCKET, SO_PEERCRED, &cred, &len), -ENOTSOCK, "not a socket");
+    check_eq(getsockopt(99, SOL_SOCKET, SO_PEERCRED, &cred, &len), -EBADF, "no descriptor");
     check_eq(recv(sv[0], buf, sizeof buf), 4, "recv");
 
     /* Nothing waiting: MSG_DONTWAIT says so rather than wait. */
@@ -197,6 +226,7 @@ static void name_checks(void) {
     struct sockaddr_un a;
     struct sockaddr_un got;
     check_eq(getpeername(l, &got), -ENOTCONN, "getpeername: not connected");
+    check_eq(peer_pid(l), 0, "SO_PEERCRED: none, not connected");
     check_eq(listen(l, 1), -EINVAL, "listen before bind");
     check_eq(accept(l, 0), -EINVAL, "accept on a socket not listening");
 
@@ -525,6 +555,9 @@ static void inet_checks(void) {
     int c = socket(AF_INET, SOCK_STREAM, 0);
     check_eq(connect(c, &a), 0, "connect");
     int s = accept(l, 0);
+    struct ucred cred;
+    uint len = sizeof cred;
+    check_eq(getsockopt(s, SOL_SOCKET, SO_PEERCRED, &cred, &len), -ENOPROTOOPT, "TCP has no SO_PEERCRED");
     memset(&msg, 0, sizeof msg);
     msg.msg_iov = out;
     msg.msg_iovlen = 2;
@@ -566,10 +599,13 @@ static void share_checks(void) {
     struct sockaddr_un a;
     set_name(&a, SHARE);
     check(bind(l, &a) == 0 && listen(l, 1) == 0, "a listener for the client");
-    int pid = spawn("/bin/unixtest", (char *[]){"unixtest", "client", SHARE, NULL}, environ);
+    char me[16];
+    snprintf(me, sizeof me, "%d", getpid());
+    int pid = spawn("/bin/unixtest", (char *[]){"unixtest", "client", SHARE, me, NULL}, environ);
     check(pid > 0, "start the client");
     int s = accept(l, 0);
     check(s >= 0, "the client connected");
+    check_eq(peer_pid(s), pid, "SO_PEERCRED: the accepted end's peer is the client");
     int m = memfd_create("shared", 0);
     check_eq(ftruncate(m, 8192), 0, "two pages");
     char *p = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, m, 0);
@@ -589,11 +625,15 @@ static void share_checks(void) {
     check_eq(unlink(SHARE), 0, "unlink its name");
 }
 
-static int client(const char *path) {
+static int client(const char *path, int server) {
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un a;
     set_name(&a, path);
     if (connect(s, &a) != 0) {
+        return 1;
+    }
+    /* The connecting end's peer is the process that called listen(). */
+    if (peer_pid(s) != server) {
         return 1;
     }
     char buf[4];
@@ -616,8 +656,8 @@ static int client(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    if (argc == 3 && strcmp(argv[1], "client") == 0) {
-        return client(argv[2]);
+    if (argc == 4 && strcmp(argv[1], "client") == 0) {
+        return client(argv[2], atoi(argv[3]));
     }
     pair_checks();
     name_checks();

@@ -76,6 +76,7 @@
 #define SYS_sendmsg 56       /* sendmsg(fd, msg, flags): bytes sent, descriptors with them */
 #define SYS_recvmsg 57       /* recvmsg(fd, msg, flags): bytes received, descriptors with them */
 #define SYS_stat 58          /* stat(path, st): 0, with *st filled in */
+#define SYS_getsockopt 59    /* getsockopt(fd, level, option, value, len): 0, the option at value, its size in *len */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process */
@@ -113,7 +114,7 @@
 #define ENOTSOCK 88     /* a socket call on a descriptor that is not a socket */
 #define EDESTADDRREQ 89 /* send: a UDP socket with no peer, and no address given */
 #define EMSGSIZE 90     /* a datagram too big for one packet */
-#define ENOPROTOOPT 92  /* setsockopt: an option sockets don't have */
+#define ENOPROTOOPT 92  /* setsockopt, getsockopt: an option sockets don't have */
 #define EPROTONOSUPPORT 93 /* socket: a protocol the type doesn't have */
 #define ESOCKTNOSUPPORT 94 /* socket, socketpair: a local socket of a type other than SOCK_STREAM */
 #define EOPNOTSUPP 95   /* listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses */
@@ -269,12 +270,21 @@ struct ping_reply {
 #define SHUT_WR 1     /* no more sending */
 #define SHUT_RDWR 2   /* neither */
 #define SOL_SOCKET 1  /* setsockopt: the socket's own options */
+#define SO_PEERCRED 17 /* getsockopt: the peer's process, a struct ucred (local sockets) */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait: a struct timeval */
 
 /* A time: seconds and microseconds, two longs, as Linux's (16 bytes). */
 struct timeval {
     time_t tv_sec;
     long tv_usec;
+};
+
+/* SO_PEERCRED's: the process at a local socket's other end, as Linux's (12
+ * bytes). Camelot has no users: uid and gid are 0. */
+struct ucred {
+    i32 pid;
+    u32 uid;
+    u32 gid;
 };
 
 /* An IPv4 address and port, as Linux lays it out (16 bytes): the port and

@@ -88,7 +88,7 @@ typedef unsigned long long uint64_t;
 #define ENOTSOCK 88     /* a socket call on a descriptor that is not a socket */
 #define EDESTADDRREQ 89 /* send: a UDP socket with no peer, and no address given */
 #define EMSGSIZE 90     /* a datagram too big for one packet */
-#define ENOPROTOOPT 92  /* setsockopt: an option sockets don't have */
+#define ENOPROTOOPT 92  /* setsockopt, getsockopt: an option sockets don't have */
 #define EPROTONOSUPPORT 93 /* socket: a protocol the type doesn't have */
 #define ESOCKTNOSUPPORT 94 /* socket, socketpair: a local socket of a type other than SOCK_STREAM */
 #define EOPNOTSUPP 95   /* listen, accept: not on a UDP socket; mmap: a flag MAP_SHARED_VALIDATE refuses */
@@ -377,6 +377,7 @@ struct ping_reply {
 #define SHUT_WR 1   /* no more sending: TCP sends its FIN */
 #define SHUT_RDWR 2 /* neither */
 #define SOL_SOCKET 1   /* setsockopt: the socket's own options */
+#define SO_PEERCRED 17 /* getsockopt: the peer's process, a struct ucred (local sockets) */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait (a struct timeval) */
 #define SCM_RIGHTS 1   /* a control message of descriptors (ints) */
 
@@ -386,6 +387,14 @@ struct ping_reply {
 #define MSG_DONTWAIT 0x40           /* -EAGAIN rather than wait (local sockets) */
 #define MSG_NOSIGNAL 0x4000         /* nothing to do: Camelot has no SIGPIPE */
 #define MSG_CMSG_CLOEXEC 0x40000000 /* recvmsg: the descriptors close on exec */
+
+/* getsockopt's SO_PEERCRED: the process at a local socket's other end, as
+ * Linux's. Camelot has no users: uid and gid are 0. */
+struct ucred {
+    int pid;
+    uint uid;
+    uint gid;
+};
 
 /* poll(): the descriptors and what to wait for (kernel/include/poll.h,
  * docs/camelot-syscalls.md "Polling"). Linux's values and layout. */
@@ -761,6 +770,7 @@ int shutdown(int fd, int how);
 int getsockname(int fd, void *addr);
 int getpeername(int fd, void *addr);
 int setsockopt(int fd, int level, int option, const void *value, uint len);
+int getsockopt(int fd, int level, int option, void *value, uint *len);
 int thread_create(void (*entry)(void *), void *arg, void *stack);
 void thread_exit(int status);
 int thread_join(int tid, int *status);

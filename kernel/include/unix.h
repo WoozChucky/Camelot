@@ -55,6 +55,7 @@ isize unix_sys_recvfrom(u32 fd, uintptr ubuf, usize len, uintptr uaddr);
 int unix_sys_shutdown(u32 fd, u32 how);
 int unix_sys_name(u32 fd, uintptr uaddr, bool peer);
 int unix_sys_setsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, u32 len);
+int unix_sys_getsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, uintptr ulen);
 isize unix_sys_sendmsg(u32 fd, uintptr umsg, u32 flags);
 isize unix_sys_recvmsg(u32 fd, uintptr umsg, u32 flags);
 
