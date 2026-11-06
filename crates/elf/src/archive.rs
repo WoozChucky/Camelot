@@ -37,9 +37,15 @@
 //!   order of its own symbol table. A symbol is listed if it is global or
 //!   weak and defined (common and absolute ones too): what a member
 //!   *defines* ([`symbols`]). The table's header has time, ids and mode 0;
-//!   its size counts a NUL that makes it even. An archive whose members
-//!   define nothing still has one, as llvm-ar writes it: a count of 0 and
-//!   four NULs for names. An archive with no members is only the magic.
+//!   its size counts a NUL that makes it even. llvm-ar writes the table
+//!   when at least one member is an object (an ELF file): if none of them
+//!   defines anything, a count of 0 and four NULs for names. An archive of
+//!   other files only (text) has no table, and one with no members is only
+//!   the magic.
+//!
+//! A linker reads the members, not the table, as ld.lld does
+//! ([`parse_members`]): a table that is out of date or wrong changes
+//! nothing there. [`parse`] reads and checks it too.
 //!
 //! Every offset read from a file is checked: a truncated or corrupt
 //! archive gives an [`Error`], not a panic.
@@ -48,6 +54,9 @@ use crate::{Elf, Error, SHN_UNDEF, STB_LOCAL};
 
 /// What every archive starts with.
 pub const MAGIC: &[u8; 8] = b"!<arch>\n";
+/// What a thin archive starts with: one whose members are only named, the
+/// files left where they are (`ar rcT`). Not supported.
+pub const THIN_MAGIC: &[u8; 8] = b"!<thin>\n";
 /// A member's header.
 pub const HEADER_SIZE: usize = 60;
 /// The longest name a header holds itself (with the `/` after it, 16).
@@ -56,6 +65,16 @@ pub const MAX_SHORT_NAME: usize = 15;
 /// Whether `data` is an archive.
 pub fn is_archive(data: &[u8]) -> bool {
     data.starts_with(MAGIC)
+}
+
+/// Whether `data` is a thin archive ([`THIN_MAGIC`]).
+pub fn is_thin(data: &[u8]) -> bool {
+    data.starts_with(THIN_MAGIC)
+}
+
+/// Whether a member is an object, for the symbol table: an ELF file.
+fn is_elf(data: &[u8]) -> bool {
+    data.starts_with(b"\x7fELF")
 }
 
 /// A member of an archive.
@@ -105,9 +124,23 @@ fn be32(data: &[u8], at: usize) -> Option<usize> {
 }
 
 /// Reads an archive: its members, their names (long ones through `//`) and
-/// the symbol table (`/`). A 64-bit symbol table (`/SYM64/`, which ar
-/// writes only past 4 GiB) and thin and BSD archives are errors.
+/// the symbol table (`/`), checked against the members. A 64-bit symbol
+/// table (`/SYM64/`, which ar writes only past 4 GiB) and thin and BSD
+/// archives are errors.
 pub fn parse(data: &[u8]) -> Result<Archive<'_>, Error> {
+    read(data, true)
+}
+
+/// [`parse`], but for the symbol table, which is neither read nor checked
+/// ([`Archive::symbols`] is empty): what a linker needs, the members.
+pub fn parse_members(data: &[u8]) -> Result<Archive<'_>, Error> {
+    read(data, false)
+}
+
+fn read(data: &[u8], with_table: bool) -> Result<Archive<'_>, Error> {
+    if is_thin(data) {
+        return bad("thin archives are not supported");
+    }
     if !is_archive(data) {
         return bad("not an archive (no !<arch> magic)");
     }
@@ -149,8 +182,8 @@ pub fn parse(data: &[u8]) -> Result<Archive<'_>, Error> {
     }
     let has_symbol_table = table.is_some();
     let symbols = match table {
-        Some(t) => read_table(t, &members)?,
-        None => Vec::new(),
+        Some(t) if with_table => read_table(t, &members)?,
+        _ => Vec::new(),
     };
     Ok(Archive {
         members,
@@ -215,7 +248,7 @@ fn read_table(t: &[u8], members: &[Member]) -> Result<Vec<(String, usize)>, Erro
 /// symbol table's order; nothing for any other file (llvm-ar and GNU ar
 /// put text files in archives too).
 pub fn symbols(data: &[u8]) -> Result<Vec<String>, Error> {
-    if !data.starts_with(b"\x7fELF") {
+    if !is_elf(data) {
         return Ok(Vec::new());
     }
     let elf = Elf::parse(data)?;
@@ -275,7 +308,8 @@ fn is_long(name: &str) -> bool {
 }
 
 /// Writes an archive of `members`, in order, with a symbol table (`ar
-/// rcs`), byte for byte as llvm-ar does (see the module's description).
+/// rcs`) if a member is an object, byte for byte as llvm-ar does (see the
+/// module's description).
 /// Fails if a member is an ELF file that does not parse, or if the archive
 /// would pass 4 GiB, which a 32-bit symbol table cannot point into.
 pub fn write(members: &[NewMember]) -> Result<Vec<u8>, Error> {
@@ -287,6 +321,7 @@ pub fn write(members: &[NewMember]) -> Result<Vec<u8>, Error> {
 /// names, as llvm-ar writes them (the members' symbols still must parse).
 pub fn write_with(members: &[NewMember], symbol_table: bool) -> Result<Vec<u8>, Error> {
     let mut out = MAGIC.to_vec();
+    let symbol_table = symbol_table && members.iter().any(|m| is_elf(m.data));
     if members.is_empty() {
         return Ok(out);
     }
@@ -408,12 +443,10 @@ mod tests {
             member(long, b"again"),
         ];
         let bytes = write(&files).unwrap();
-        // No symbols: a count of 0 and four NULs.
-        assert_eq!(&bytes[8..24], b"/               ");
-        assert_eq!(&bytes[8 + 48..8 + 58], b"8         ");
-        assert_eq!(&bytes[68..76], &[0; 8]);
+        // No object: no symbol table, the long names first.
+        assert_eq!(&bytes[8..24], b"//              ");
         let a = parse(&bytes).unwrap();
-        assert!(a.has_symbol_table && a.symbols.is_empty());
+        assert!(!a.has_symbol_table && a.symbols.is_empty());
         let got: Vec<(&str, &[u8])> = a.members.iter().map(|m| (m.name.as_str(), m.data)).collect();
         let want: Vec<(&str, &[u8])> = files.iter().map(|m| (m.name, m.data)).collect();
         assert_eq!(got, want);
@@ -431,10 +464,33 @@ mod tests {
         for cut in [9, 70, bytes.len() - 2] {
             assert!(parse(&bytes[..cut]).is_err(), "cut at {cut}");
         }
-        assert!(parse(b"!<thin>\n").is_err());
+        assert_eq!(
+            parse(b"!<thin>\n").unwrap_err().0,
+            "thin archives are not supported"
+        );
         let mut bad_size = bytes.clone();
         bad_size[8 + 48] = b'x';
         assert!(parse(&bad_size).is_err());
+    }
+
+    /// clang's c.o of the fixtures, which defines `zeta`: a table to point.
+    fn defines_f() -> Vec<u8> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/archive/c.o");
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn a_wrong_symbol_table_is_an_error_only_where_it_is_read() {
+        let obj = defines_f();
+        let mut bytes = write(&[member("c.o", &obj), member("t.txt", b"text")]).unwrap();
+        // The first symbol's member offset, two bytes off.
+        bytes[8 + 60 + 7] += 2;
+        let err = parse(&bytes).unwrap_err().0;
+        assert!(err.contains("where no member starts"), "{err}");
+        let a = parse_members(&bytes).unwrap();
+        assert!(a.has_symbol_table && a.symbols.is_empty());
+        let names: Vec<&str> = a.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["c.o", "t.txt"]);
     }
 
     #[test]

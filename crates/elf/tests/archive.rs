@@ -68,6 +68,8 @@ fn the_writer_writes_what_llvm_ar_writes() {
         ],
     );
     check("empty.a", &[]);
+    check("text.a", &["notes.txt", "more.txt"]);
+    assert!(!archive::parse(&read("text.a")).unwrap().has_symbol_table);
     let no_table = read("nosymtab.a");
     assert!(!archive::parse(&no_table).unwrap().has_symbol_table);
     check_with(

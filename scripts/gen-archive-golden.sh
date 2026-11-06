@@ -22,6 +22,7 @@
 #   replaced.a  objs.a after `llvm-ar rcs replaced.a new/a.o c.o`: a.o
 #               replaced in place, c.o added at the end
 #   nosymtab.a  longnames.a's members without a symbol table (rcS)
+#   text.a      notes.txt and more.txt: no object, so no symbol table at all
 #   empty.a     no members
 #
 # Made with LLVM 23.
@@ -44,4 +45,5 @@ cp objs.a replaced.a
 llvm-ar --format=gnu rcs replaced.a new/a.o c.o
 llvm-ar --format=gnu rcS nosymtab.a abcdefghijklm.o abcdefghijklmn.o a_very_long_member_name.o \
     a_very_long_member_name.o
+llvm-ar --format=gnu rcs text.a notes.txt more.txt
 llvm-ar --format=gnu rcs empty.a

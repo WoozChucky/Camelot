@@ -43,7 +43,8 @@ int is_archive(const uchar *data, uint len);
  * *err set if it is corrupt. The members' bytes point into `data`. */
 int archive_read(uchar *data, uint len, struct member **out, uint *count, char **err);
 /* The archive of the n members, in order, with a symbol table if
- * `symtab` (the elf crate's archive::write_with). 0 with *err set if a
+ * `symtab` and a member is an object (the elf crate's
+ * archive::write_with). 0 with *err set if a
  * member is an ELF file that does not parse. */
 int archive_write(struct member *m, uint n, int symtab, struct buf *out, char **err);
 /* ar r: the members an archive that had `old` (nold of them) holds once

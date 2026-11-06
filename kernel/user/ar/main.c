@@ -177,13 +177,15 @@ static char *base_name(char *path) {
 }
 
 /* Whether member `name` is one of the n FILEs (all of them when n is 0),
- * marking it found. */
+ * marking it found. As llvm-ar, each FILE stands for one member, the first
+ * of its name not yet taken: `ar t lib.a p.o` with two p.o lists one, and
+ * `ar x lib.a p.o` writes the first. */
 static int wanted(const char *name, char **files, uint n, uchar *found) {
     if (n == 0) {
         return 1;
     }
     for (uint i = 0; i < n; i++) {
-        if (strcmp(base_name(files[i]), name) == 0) {
+        if (!found[i] && strcmp(base_name(files[i]), name) == 0) {
             found[i] = 1;
             return 1;
         }

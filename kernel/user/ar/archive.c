@@ -151,6 +151,13 @@ int archive_write(struct member *m, uint n, int symtab, struct buf *out, char **
     if (n == 0) {
         return 1;
     }
+    /* As llvm-ar, a symbol table only when a member is an object (an ELF
+     * file): an archive of text files has none. */
+    int object = 0;
+    for (uint i = 0; i < n && !object; i++) {
+        object = m[i].len >= 4 && memcmp(m[i].data, "\177ELF", 4) == 0;
+    }
+    symtab = symtab && object;
     /* The long names, each once, in the order first met; where each
      * member's name is there (-1: in its header). */
     struct buf longs;
