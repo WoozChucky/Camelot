@@ -1734,7 +1734,17 @@ fn sleeping_processes_leave_the_cpu_idle() {
     let ticks = image_pa(sym(&elf, "ticks"));
     step_to_user(&mut m, &elf, "systest");
     let start = m.cpu.bus.peek(ticks).unwrap();
+    // The echo of the command line may have left the framebuffer console a
+    // scroll to do at the next tick (fbcon_flush, some 200,000 steps with
+    // the screen full), which runs after the tick has counted itself: the
+    // steps are counted from the tick after that one.
     let mut user_steps = 0;
+    step_until(
+        &mut m,
+        RUN_MAX_STEPS,
+        |cpu| user_steps += u64::from(cpu.mode == Mode::U),
+        |m| m.cpu.bus.peek(ticks).unwrap() > start + 1,
+    );
     let steps = step_until(
         &mut m,
         RUN_MAX_STEPS,
@@ -1743,7 +1753,10 @@ fn sleeping_processes_leave_the_cpu_idle() {
     );
     let slept = m.cpu.bus.peek(ticks).unwrap() - start;
     assert!((50..=51).contains(&slept), "{slept} ticks");
-    assert!(steps < 50 * 15_000, "{steps} steps for {slept} ticks");
+    assert!(
+        steps < 48 * 15_000,
+        "{steps} steps for {slept} ticks less the first two"
+    );
     assert!(user_steps < 10_000, "{user_steps} steps in U-mode");
     assert_eq!(m.run(Some(RUN_MAX_STEPS), |_| {}), RunResult::Exited(0));
 }
