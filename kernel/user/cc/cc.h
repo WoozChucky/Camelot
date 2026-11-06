@@ -196,11 +196,25 @@ struct lexed {
  * as assembly (asm 1: trigraphs are characters), its positions in file
  * `file` (merlin's lex_pp_in). */
 void lex_pp(const char *src, uint n, uint file, int asm, struct lexed *out);
-/* How `text` (n bytes) lexes, without keeping the tokens: how many tokens
- * it is (up to max, then max), whether it lexed at all (no unterminated
- * comment), and the kind and length of the first. For pasting and the
- * spacing of -E, which only ask that. */
-uint lex_count(const char *text, uint n, int asm, uint max, int *ok, int *kind, uint *len);
+/* How a short text lexes, for pasting and the spacing of -E, which only ask
+ * whether it is one token or two: its first tokens (up to 3), their kinds,
+ * and where each one's text is in `chars`, the text after phases 1 and 2. */
+struct split {
+    /* It lexed (no unterminated comment) as far as it was read. */
+    int ok;
+    uint count;
+    uchar kind[3];
+    uchar punct[3];
+    uint start[3];
+    uint len[3];
+    uchar *chars;
+};
+/* Lexes at most max (up to 3) tokens of text (n bytes), as C or assembly;
+ * s->ok. Free it with lex_split_free. */
+int lex_split(const char *text, uint n, int asm, uint max, struct split *s);
+void lex_split_free(struct split *s);
+/* Whether token k of s is the n bytes at text. */
+int split_is(struct split *s, uint k, const char *text, uint n);
 
 /* An integer constant, as clang's NumericLiteralParser reads one (merlin's
  * lexer::integer). */
