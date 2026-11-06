@@ -3964,7 +3964,7 @@ fn the_kernel_boots_from_disk() {
             let n = xtask::userprogs::embedded_names(&user).unwrap().len();
             format!("\nfs: /bin holds {n} of the kernel's {n} programs\n")
         } else {
-            let n = xtask::userprogs::program_names(&user).unwrap().len();
+            let n = xtask::fs::Profile::Server.programs(&user).unwrap().len();
             format!("\nfs: /bin holds {n} programs, the kernel none\n")
         };
         assert!(out.contains(&holds), "{out}");
