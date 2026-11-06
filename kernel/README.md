@@ -262,11 +262,10 @@ dong 4
 ```
 
 The programs live in `user/`, one `.c` or `.s` file each, all linked with the
-runtime (`user/crt0.S`, which sets `environ` to `envp`, calls `main(argc, argv, envp)` and then `exit`; `user/usys.s`, the
-system call stubs), the C library of `user/lib/` (strings, numbers, `malloc`,
-`printf`, a line reader, `getenv`; declared in `user/user.h`, described in
-`user/lib/README.md`, and linked like an archive, so a program gets only the
-parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
+start code (`user/crt0.S`, which sets `environ` to `envp`, calls `main(argc, argv, envp)` and then `exit`), the C library of `user/lib/`, `libc.a` (strings, numbers, `malloc`,
+`printf`, a line reader, `getenv`, and `usys.s`, the system call stubs;
+declared in `user/user.h`, described in `user/lib/README.md`, an archive, so a
+program gets only the parts it uses) and `user/user.ld`. `user/README.md` has each program's usage:
 
 | Program | What it does |
 |---|---|
@@ -530,7 +529,7 @@ one process.
 | `keyboard.c` | the keyboard driver: raw mode's HID usages as Linux's key codes while a reader has it, ASCII mode's characters to the console otherwise, or as key codes on a US layout on a keyboard without raw mode |
 | `pointer.c` | the pointer driver: absolute position as `ABS_X`/`ABS_Y`, three buttons, the wheel as `REL_WHEEL`, catching up after an overflow |
 | `pipe.c` | pipes (xv6's): a 512-byte buffer in a page, readers and writers sleeping on each other, end of input when the writers are gone, `-EPIPE` when the readers are |
-| `user/` | the user programs (`*.c`, `*.s`), their runtime (`crt0.S`, `usys.s`, `user.h`), the C library (`lib/`) and linker script `user.ld`, built with merlin, merlin-as and merlin-ld and embedded in `kernel.elf` through `userprogs.s`, which the build generates (not a file here: see "Building") |
+| `user/` | the user programs (`*.c`, `*.s`), their start code (`crt0.S`) and header (`user.h`), the C library (`lib/`, `libc.a`, the system call stubs `usys.s` among it) and linker script `user.ld`, built with merlin, merlin-as and merlin-ld and embedded in `kernel.elf` through `userprogs.s`, which the build generates (not a file here: see "Building") |
 | `kalloc.c` | physical page allocator: `kinit()` reads RAM's base and size from sysinfo, and the firmware's reserved range, and frees every page of RAM but the image's and the firmware's; `kalloc()`, `kzalloc()`, `kfree()`, `kfree_pages()`; `kalloc_contig()`/`kfree_contig()`, a run of contiguous pages (the framebuffer's buffers) |
 | `vm.c` | page tables (Sv48 or Sv39, with the levels the boot chose): `walk()`, `map_pages()`, `unmap_pages()`, `pagetable_create()`/`pagetable_free()`; `kvminit()` builds the kernel page table, `kvminithart()` turns paging on; user address spaces: `uvm_create()`/`uvm_free()`, `uvm_range_ok()`, `copyin()`, `copyout()`, `copyinstr()`; `ioremap()`; the kernel stacks (`kstack_alloc()`: 16 KiB in the vmalloc area with a guard page); `setup_vm()`, the early page table and the `satp` probe |
 | `vmtest.c` | the memory self-tests: allocate and free every page, `kzalloc()` and `pagetable_create()` clear a reused dirty page, a second mapping of one page, store page faults on text and rodata, building and freeing a page table |

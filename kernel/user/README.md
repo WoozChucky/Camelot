@@ -11,7 +11,10 @@ the root image). The shell runs `NAME` as `/bin/NAME`.
 Every program is RV64 code, an ELF64 executable (LP64: `long`, `size_t`
 and pointers 8 bytes), and the root image's `/bin` (`cargo xtask fs`'s
 `target/camelot-fs.img`) holds them all, `as` and `ld` writing RV64 objects
-and executables there. Assembly that goes through the C preprocessor is a
+and executables there. Each is linked as a C program is on Linux, the start
+code `crt0.o` first and the C library `libc.a` (`lib/`, an archive) last,
+and the root image's `/usr` holds what they are built from: `user.h` in
+`/usr/include`, and `crt0.o`, `libc.a` and `user.ld` in `/usr/lib`. Assembly that goes through the C preprocessor is a
 `.S` file, with `include/asm.h` for the names Linux's assembly gives a
 register's worth and a pointer (`REG_L`, `SZREG`).
 A program starts as Linux starts one: `main(argc, argv, envp)`, with the
@@ -71,7 +74,8 @@ $ wait
 | Program | Usage | What it does |
 |---|---|---|
 | `as` | `as [-march=ISA] [-o OUT.o] FILE.s` | the assembler, merlin-as rewritten in C (`as/`): the same language, the same object byte for byte (RV64, ELF64; `-march` takes `rv64ima_zicsr_zifencei`, the default), the same error messages (`FILE:LINE: error: ...`), and the same line tables from `.file`/`.loc` (merlin `-g` output). The first step of self-hosting: section 10, "Self-hosting", of the spec. Only in `/bin` of the root image: the kernel does not build it in (it needs files) |
-| `ld` | `ld [-T SCRIPT] [-e ENTRY] [-o OUT] [-S] FILE.o ... [--start-lib LIB.o ... --end-lib] [@ARGS]` | the linker, merlin-ld rewritten in C (`ld/`): the same scripts (`AT` load addresses and `ADDR` included), libraries and messages, the same executable byte for byte (ELF64; an ELF32 object is refused, as merlin-ld refuses it); `@ARGS` reads more arguments from a file, for link lines longer than the shell takes. `as` then `ld` builds a program on Camelot itself. Only in `/bin` of the root image, as `as` |
+| `ld` | `ld [-T SCRIPT] [-e ENTRY] [-o OUT] [-S] [-L DIR] FILE.o ... [LIB.a] [-lNAME] [--start-lib LIB.o ... --end-lib] [@ARGS]` | the linker, merlin-ld rewritten in C (`ld/`): the same scripts (`AT` load addresses and `ADDR` included), archives and libraries (`-lNAME` is `libNAME.a` in the first `-L` directory that has it, its members linked only when needed, in ld.lld's order) and messages, the same executable byte for byte (ELF64; an ELF32 object is refused, as merlin-ld refuses it); `@ARGS` reads more arguments from a file, for link lines longer than the shell takes. `as` then `ld` builds a program on Camelot itself, as the host does: `ld -T /usr/lib/user.ld -o PROG /usr/lib/crt0.o PROG.o -L/usr/lib -lc`. Only in `/bin` of the root image, as `as` |
+| `ar` | `ar [-]{r,t,x}[c][s][S][D] ARCHIVE [FILE...] [@ARGS]` | the archiver (`ar/`): `r` puts files in an archive, made if missing (replacing members of their names in place, the others at the end), `t` lists the members, `x` writes them to files; `s` (the default) writes the symbol table, `S` does not, `c` makes the archive without saying so. The archive llvm-ar writes for the same members, byte for byte (the GNU format, deterministic: times and ids 0, mode 644). `ar rcs libx.a a.o b.o`, then `ld ... -L. -lx`. Only in `/bin` of the root image, as `as` |
 
 ## Network programs
 

@@ -7,7 +7,7 @@ kernel side is `kernel/syscall.c` and `kernel/sysfile.c` (with
 `kernel/console.c`, `kernel/fs.c` and `kernel/vm.c`; the network's calls
 in `kernel/net/net.c` and the sockets' in `kernel/net/socket.c`,
 `docs/camelot-net.md`), the numbers are in
-`kernel/include/syscall.h`; the user side is `kernel/user/usys.s` (one stub
+`kernel/include/syscall.h`; the user side is `kernel/user/lib/usys.s` (one stub
 per call), `kernel/user/user.h` (their C declarations, the error numbers,
 `open`'s flags and `struct stat`) and `kernel/user/crt0.S` (the start-up
 code). How processes, address spaces, the scheduler and open files work
@@ -1344,15 +1344,19 @@ returns its `long` result.
 ## Building programs
 
 Each `kernel/user/X.c`, `X.s` or `X.S` (assembly that goes through the C
-preprocessor first, with `include/asm.h`) is a program called `X`, linked with the
-runtime, `crt0.S` and `usys.s`, and with the members of the library
-(`kernel/user/lib/*.c`) it needs: like an archive's, a member goes in only
-if it defines something the program (or another member that went in)
-refers to and nothing else defines (`crates/merlin-ld/src/library.rs`,
-merlin-ld's `--start-lib`/`--end-lib`). Our own tools build them, with no
-LLVM: merlin compiles each C file (with `-Ikernel/user`), merlin-as
-assembles each source, merlin-ld links each program with `user.ld`, and the
-executables go to `/bin/X` on the root image (`cargo xtask fs`,
+preprocessor first, with `include/asm.h`) is a program called `X`, linked as
+a C program is on Linux: the start code `crt0.S` first, then the program,
+then the C library, `libc.a`, the files of `kernel/user/lib/` (the stubs
+`usys.s` among them) in an archive, of which it gets the members it needs:
+a member goes in only if it defines something the program (or another
+member that went in) refers to and nothing else defines
+(`crates/merlin-ld/src/library.rs`, in ld.lld's order). Our own tools build
+them, with no LLVM: merlin compiles each C file (with `-Ikernel/user`),
+merlin-as assembles each source, merlin-ld links each program with
+`user.ld`, and the executables go to `/bin/X` on the root image (`cargo
+xtask fs`, which puts `user.h` in `/usr/include` and `crt0.o`, `libc.a` and
+`user.ld` in `/usr/lib` too, so that `/bin/as` and `/bin/ld` build a
+program on Camelot as the host does,
 `crates/xtask/src/fs.rs`) and are embedded in the kernel, for when there is
 no disk, through a `userprogs.s` the kernel build generates
 (`crates/xtask/src/userprogs.rs`; not committed).

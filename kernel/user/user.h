@@ -1,4 +1,4 @@
-/* What user programs get: the system calls (usys.s, docs/camelot-syscalls.md)
+/* What user programs get: the system calls (lib/usys.s, camelot-syscalls.md)
  * and a small C library (lib/, described in lib/README.md). No libc:
  * programs are compiled freestanding, with only this header. */
 #ifndef CAMELOT_USER_H
