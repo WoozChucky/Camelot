@@ -4212,11 +4212,12 @@ fn the_system_call_document_matches_the_code() {
     let filetest = read("kernel/user/filetest.c");
     let systest = read("kernel/user/systest.c");
     let socktest = read("kernel/user/socktest.c");
+    let compositor = read("kernel/user/compositor/compositor.h");
     for (header, name, copies) in [
         (
             "kernel/include/file.h",
             "NOFILE",
-            vec![&filetest, &systest, &socktest],
+            vec![&filetest, &systest, &socktest, &compositor],
         ),
         ("kernel/include/file.h", "CONSOLE", vec![&filetest, &systest]),
         ("kernel/include/pipe.h", "PIPESIZE", vec![&systest]),

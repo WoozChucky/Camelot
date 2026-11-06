@@ -21,9 +21,23 @@
 #include "../gui/protocol.h"
 
 /* Descriptors a process has (NOFILE in kernel/include/file.h). */
-#define NOFILE 16
-/* Clients at once: each is a process, and a machine has 8 (NPROC). */
-#define MAX_CLIENTS 6
+#define NOFILE 32
+/* Clients at once: each is a process, and a machine has 8 (NPROC), of
+ * which the desktop's services take 4 (init, the server, the console's
+ * shell and shd). */
+#define MAX_CLIENTS 4
+/* The pools a client has at once (a window's is one), and the descriptors
+ * it may send ahead of the messages that take them. */
+#define MAX_POOLS 4
+#define MAX_QUEUED_FDS 1
+/* The server's own descriptors: the keymap's (0), standard output and
+ * error, the listening socket, the framebuffer, the keyboard, the
+ * pointer. With each client's socket, pools and descriptors sent ahead,
+ * they leave one free, for accept and for a descriptor that comes with a
+ * message, so the server never runs out. */
+#define SERVER_FDS 7
+_Static_assert(SERVER_FDS + MAX_CLIENTS * (1 + MAX_POOLS + MAX_QUEUED_FDS) <= NOFILE - 1,
+               "the descriptors the server may hold");
 /* Objects a client has at once. */
 #define MAX_OBJECTS 256
 /* A request's arguments at most (wl_shm_pool.create_buffer has 6). */
@@ -39,6 +53,8 @@
 /* A window that doesn't go this long (ticks, 10 a second) after it was
  * asked to close has its client killed. */
 #define CLOSE_TICKS 30
+/* How long a connection that couldn't be accepted waits for another try. */
+#define ACCEPT_RETRY_MS 1000
 /* The longest title kept. */
 #define TITLE_MAX 64
 
@@ -87,6 +103,7 @@ struct args {
  * descriptor is kept for wl_shm_pool.resize. The pool object and each of
  * its buffers hold a reference: the last one unmaps it. */
 struct pool {
+    struct client *c; /* whose: it counts among its MAX_POOLS */
     int fd;
     uchar *mem;
     size_t size;
@@ -147,6 +164,12 @@ struct client {
     int pid; /* SO_PEERCRED's: killed when its window won't close */
     int number; /* for messages */
     int dead; /* sent wl_display.error: disconnected once that is flushed */
+    int npools;
+    /* The wl_pointer whose motion is the last event queued, unsent (the
+     * wire's last 20 bytes), or 0: the next motion to it replaces that
+     * one, so a client that reads slowly gets where the pointer is, not
+     * every step it took. */
+    uint motion_tail;
     struct gui_wire wire;
     int nobjects;
     struct object objects[MAX_OBJECTS];
@@ -156,6 +179,7 @@ struct server {
     int verbose;
     const char *launcher;
     int listen_fd;
+    int accept_paused; /* accept failed: the listening socket waits for a descriptor to be freed */
     int fb_fd;
     int kbd_fd;
     int ptr_fd;
@@ -197,6 +221,7 @@ struct server {
     uint consumed; /* held buttons the window manager took */
     struct surface *pointer_surface;
     struct surface *grab;
+    uint grab_serial; /* the button press's that made the grab: a move must name it */
     struct window *moving;
     int move_dx;
     int move_dy;

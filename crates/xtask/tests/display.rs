@@ -390,7 +390,10 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
         ("type", "1 0: wl_surface.attach: invalid object 2"),
         ("trailing", "1 1: wl_display.sync: 4 bytes past its arguments"),
         ("fd", "1 1: wl_shm.create_pool: argument 2 can't be read"),
+        ("fds", "1 1: descriptors no message takes"),
         ("pool", "4 2: can't map the pool's memory"),
+        ("unsealed", "4 2: the pool's memory may shrink"),
+        ("pools", "1 2: too many pools"),
         ("buffer", "5 1: the buffer is past the pool's end"),
     ] {
         d.run(&format!("wltest bad {kind}"));
@@ -404,6 +407,44 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
     }
     d.run("wltest window fine 808080 100 60 &");
     d.wait_for("wltest fine: shown\n");
+
+    // Four clients at once, and no more: the fifth is refused.
+    for name in ["two", "three", "four"] {
+        d.run(&format!("wltest window {name} 808080 60 40 &"));
+        d.wait_for(&format!("wltest {name}: shown\n"));
+    }
+    d.run("wltest window five 808080 60 40");
+    d.wait_for("compositor: too many clients: one refused\n");
+    d.wait_for("wltest five: can't connect");
+}
+
+#[test]
+fn a_move_needs_the_press_the_client_was_given() {
+    // A client that asks for a move every frame, whatever the pointer does:
+    // the server moves it for none of them, not even while a button is
+    // held on another window, which goes on getting the pointer.
+    let mut d = Desk::boot(2);
+    start_server(&mut d, "");
+    d.run("wltest window green 00c000 160 100 &");
+    d.wait_for("wltest green: shown\n");
+    d.run("wltest window -f -m pushy ff00ff 32 32 &");
+    d.wait_for("wltest pushy: frame 16\n");
+    let from = d.seen;
+    d.pointer(60, 130, 0);
+    d.pointer(60, 130, BUTTON_LEFT);
+    d.pointer(130, 200, BUTTON_LEFT);
+    d.pointer(200, 300, BUTTON_LEFT);
+    d.wait_for("wltest pushy: frame 48\n");
+    d.pointer(200, 300, 0);
+    d.wait_for("wltest green: button 272 0\n");
+    let out = d.out();
+    assert!(!out.contains("compositor: moving"), "{out}");
+    let green = said(&out[from..], "green");
+    assert_eq!(green.first(), Some(&"pointer 12 82"), "{out}");
+    assert!(green.contains(&"button 272 1"), "{out}");
+    assert!(green.contains(&"pointer 152 252"), "{out}");
+    // Let go of outside it, the pointer leaves it then.
+    assert_eq!(green[green.len() - 2..], ["button 272 0", "leave"], "{out}");
 }
 
 #[test]

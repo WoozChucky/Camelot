@@ -364,20 +364,33 @@ static void pool_unref(struct pool *p) {
     if (--p->refs == 0) {
         munmap(p->mem, p->size);
         close(p->fd);
+        p->c->npools--;
         free(p);
     }
 }
 
-/* Maps `size` bytes of memfd `fd`, which must have them: the pages are
- * touched now (MAP_POPULATE), so that a client shrinking its memfd later
- * can't make the server touch a page that isn't there. NULL if it can't. */
-static uchar *map_pool(int fd, int size) {
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.size < size) {
+/* Maps `size` bytes of memfd `fd`, which must have them and be sealed
+ * against shrinking (F_SEAL_SHRINK, as libwayland's clients seal theirs):
+ * a client that could shrink it would take away pages the server reads,
+ * and the server's touch of one would kill it (Camelot has no SIGBUS to
+ * survive it, as Linux's compositors do). NULL, with *why, if it can't. */
+static uchar *map_pool(int fd, int size, const char **why) {
+    int seals = fcntl(fd, F_GET_SEALS, 0);
+    if (seals < 0 || !(seals & F_SEAL_SHRINK)) {
+        *why = "the pool's memory may shrink";
         return NULL;
     }
-    void *mem = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
-    return (long)mem < 0 ? NULL : mem;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.size < size) {
+        *why = "can't map the pool's memory";
+        return NULL;
+    }
+    void *mem = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, fd, 0);
+    if ((long)mem < 0) {
+        *why = "can't map the pool's memory";
+        return NULL;
+    }
+    return mem;
 }
 
 void shm_request(struct client *c, struct object *o, uint op, struct args *a) {
@@ -389,15 +402,16 @@ void shm_request(struct client *c, struct object *o, uint op, struct args *a) {
         post_error(c, o->id, WL_SHM_ERROR_INVALID_STRIDE, "invalid pool size");
         return;
     }
-    /* The pool keeps its descriptor (for resize): leave two free, to take
-     * a connection and a descriptor that comes with a message. */
-    if (fd >= NOFILE - 2) {
-        post_error(c, 1, WL_DISPLAY_ERROR_NO_MEMORY, "the server is out of descriptors");
+    /* The pool keeps its descriptor (for resize): MAX_POOLS a client
+     * (compositor.h shares the server's descriptors out). */
+    if (c->npools >= MAX_POOLS) {
+        post_error(c, 1, WL_DISPLAY_ERROR_NO_MEMORY, "too many pools");
         return;
     }
-    uchar *mem = map_pool(fd, size);
+    const char *why;
+    uchar *mem = map_pool(fd, size, &why);
     if (mem == NULL) {
-        post_error(c, o->id, WL_SHM_ERROR_INVALID_FD, "can't map the pool's memory");
+        post_error(c, o->id, WL_SHM_ERROR_INVALID_FD, why);
         return;
     }
     struct pool *p = malloc(sizeof(struct pool));
@@ -406,10 +420,12 @@ void shm_request(struct client *c, struct object *o, uint op, struct args *a) {
         post_error(c, 1, WL_DISPLAY_ERROR_NO_MEMORY, "no memory for a pool");
         return;
     }
+    p->c = c;
     p->fd = fd;
     p->mem = mem;
     p->size = (size_t)size;
     p->refs = 1;
+    c->npools++;
     a->fd[1] = -1;
     if (object_new(c, id, &wl_shm_pool_interface, o->version, p) == NULL) {
         pool_unref(p);
@@ -426,9 +442,10 @@ void pool_request(struct client *c, struct object *o, uint op, struct args *a) {
             post_error(c, o->id, WL_SHM_ERROR_INVALID_STRIDE, "a pool can only grow");
             return;
         }
-        uchar *mem = map_pool(p->fd, size);
+        const char *why;
+        uchar *mem = map_pool(p->fd, size, &why);
         if (mem == NULL) {
-            post_error(c, o->id, WL_SHM_ERROR_INVALID_FD, "can't map the pool's memory");
+            post_error(c, o->id, WL_SHM_ERROR_INVALID_FD, why);
             return;
         }
         munmap(p->mem, p->size);

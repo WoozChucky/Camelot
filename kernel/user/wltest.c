@@ -1,7 +1,7 @@
 /* wltest: a client of the display server (#184; kernel/user/compositor),
  * for crates/xtask/tests/display.rs.
  *
- *   wltest window [-n] [-f] NAME RRGGBB WIDTH HEIGHT
+ *   wltest window [-n] [-f] [-m] NAME RRGGBB WIDTH HEIGHT
  *       a window titled NAME, WIDTH by HEIGHT, of colour RRGGBB (hex),
  *       through the GUI library (gui.h), which says what comes to it, a
  *       line each: "wltest NAME: shown" once its first frame is on the
@@ -11,7 +11,9 @@
  *       (xdg_toplevel.move); Escape ends it. It ends when asked to close,
  *       but with -n, when the server must kill it. With -f each frame is
  *       a new colour, RRGGBB and its inverse in turn, as fast as the
- *       server's frame callbacks come ("frame N" every 16th).
+ *       server's frame callbacks come ("frame N" every 16th); with -m too,
+ *       each frame also asks the server to move the window, a press or
+ *       not, as a client shouldn't (the server must ignore it).
  *   wltest probe
  *       the server's globals, "wltest: global NAME INTERFACE VERSION".
  *   wltest bad KIND
@@ -23,8 +25,10 @@
  *       (a message too short to be one), newid (a new id in use), string
  *       (a string without its NUL), type (an object of the wrong
  *       interface), trailing (bytes past the arguments), fd (a request
- *       without the descriptor it needs), pool (a pool bigger than its
- *       memory), buffer (a buffer past its pool's end).
+ *       without the descriptor it needs), fds (descriptors no request
+ *       takes), pool (a pool bigger than its memory), unsealed (a pool
+ *       whose memory may shrink), pools (more pools than a client may
+ *       have), buffer (a buffer past its pool's end).
  *
  * Exits 0, or 1 when something went otherwise. */
 #include "gui.h"
@@ -38,6 +42,7 @@ static const char *name;
 static uint color;
 static int stubborn;
 static int flashing;
+static int pushy;
 static int quit;
 static int shown;
 static int frames;
@@ -116,6 +121,9 @@ static void on_frame(struct gui_window *w) {
         if (frames % 16 == 0) {
             printf("wltest %s: frame %d\n", name, frames);
         }
+        if (pushy) {
+            gui_window_move(w);
+        }
         draw(w);
     }
 }
@@ -139,6 +147,8 @@ static int window(int argc, char **argv) {
             stubborn = 1;
         } else if (strcmp(argv[i], "-f") == 0) {
             flashing = 1;
+        } else if (strcmp(argv[i], "-m") == 0) {
+            pushy = 1;
         } else {
             return 2;
         }
@@ -283,14 +293,16 @@ static int probe(void) {
     return 0;
 }
 
-/* wl_shm as object 4, and a pool of `size` bytes over a memfd of `mem`
- * bytes as object 5. */
-static void make_pool(int mem, int size) {
-    bind_global(shm_name, "wl_shm", 1, 4);
-    int fd = memfd_create("wltest", 0);
+/* A pool of `size` bytes over a memfd of `mem` bytes, sealed against
+ * shrinking or not, as object `id`, from wl_shm, object 4. */
+static void make_pool(uint id, int mem, int size, int sealed) {
+    int fd = memfd_create("wltest", sealed ? MFD_ALLOW_SEALING : 0);
     ftruncate(fd, mem);
+    if (sealed) {
+        fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK);
+    }
     gui_wire_begin(&wire, 4, WL_SHM_CREATE_POOL);
-    gui_wire_uint(&wire, 5);
+    gui_wire_uint(&wire, id);
     gui_wire_fd(&wire, fd);
     gui_wire_int(&wire, size);
     gui_wire_end(&wire);
@@ -349,10 +361,30 @@ static int bad(const char *kind) {
         gui_wire_uint(&wire, 5);
         gui_wire_int(&wire, 4096);
         gui_wire_end(&wire);
+    } else if (strcmp(kind, "fds") == 0) {
+        /* wl_display.sync with two descriptors, which it doesn't take */
+        int fd = memfd_create("wltest", 0);
+        gui_wire_begin(&wire, WL_DISPLAY_ID, WL_DISPLAY_SYNC);
+        gui_wire_uint(&wire, 4);
+        gui_wire_fd(&wire, fd);
+        gui_wire_fd(&wire, fd);
+        gui_wire_end(&wire);
+        gui_wire_flush(&wire);
+        close(fd);
     } else if (strcmp(kind, "pool") == 0) {
-        make_pool(4096, 65536);
+        bind_global(shm_name, "wl_shm", 1, 4);
+        make_pool(5, 4096, 65536, 1);
+    } else if (strcmp(kind, "unsealed") == 0) {
+        bind_global(shm_name, "wl_shm", 1, 4);
+        make_pool(5, 4096, 4096, 0);
+    } else if (strcmp(kind, "pools") == 0) {
+        bind_global(shm_name, "wl_shm", 1, 4);
+        for (uint id = 5; id < 10; id++) {
+            make_pool(id, 4096, 4096, 1);
+        }
     } else if (strcmp(kind, "buffer") == 0) {
-        make_pool(4096, 4096);
+        bind_global(shm_name, "wl_shm", 1, 4);
+        make_pool(5, 4096, 4096, 1);
         gui_wire_begin(&wire, 5, WL_SHM_POOL_CREATE_BUFFER);
         gui_wire_uint(&wire, 6);
         gui_wire_int(&wire, 0);
@@ -379,7 +411,7 @@ int main(int argc, char **argv) {
         r = bad(argv[2]);
     }
     if (r == 2) {
-        fprintf(2, "usage: wltest window [-n] [-f] NAME RRGGBB WIDTH HEIGHT | probe | bad KIND\n");
+        fprintf(2, "usage: wltest window [-n] [-f] [-m] NAME RRGGBB WIDTH HEIGHT | probe | bad KIND\n");
     }
     return r;
 }

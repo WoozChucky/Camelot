@@ -75,7 +75,7 @@ void xdg_surface_request(struct client *c, struct object *o, uint op, struct arg
         break;
     }
     case XDG_SURFACE_GET_POPUP:
-        post_error(c, o->id, XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT, "popups are not supported");
+        post_error(c, 1, WL_DISPLAY_ERROR_IMPLEMENTATION, "popups are not supported");
         break;
     case XDG_SURFACE_SET_WINDOW_GEOMETRY:
         break; /* the window is the whole surface */
@@ -119,9 +119,12 @@ void toplevel_request(struct client *c, struct object *o, uint op, struct args *
         set_title(w, a->s[0]);
         break;
     case XDG_TOPLEVEL_MOVE:
-        /* With a button held: the window follows the pointer until it is
-         * let go (a client that draws its own title bar). */
-        if (srv.buttons != 0 && w->mapped) {
+        /* With the button held whose press the client got (its serial):
+         * the window follows the pointer until it is let go (a client that
+         * draws its own title bar). Any other is too late or not its to
+         * ask, and does nothing, as on Weston. */
+        if (srv.buttons != 0 && w->mapped && srv.moving == NULL && srv.grab != NULL && srv.grab == w->surface &&
+            a->u[1] == srv.grab_serial) {
             window_move_start(w);
         }
         break;

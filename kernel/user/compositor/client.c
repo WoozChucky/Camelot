@@ -135,6 +135,7 @@ void object_destroy(struct client *c, struct object *o) {
 }
 
 void event_begin(struct client *c, uint object, uint opcode) {
+    c->motion_tail = 0;
     gui_wire_begin(&c->wire, object, opcode);
 }
 
@@ -330,7 +331,16 @@ int client_input(struct client *c) {
         }
         dispatch(c, &m);
     }
-    return c->dead ? -1 : 0;
+    /* Descriptors may come ahead of the message that takes them, but no
+     * more than MAX_QUEUED_FDS: the server's table is shared out. */
+    if (!c->dead && c->wire.nin_fds > MAX_QUEUED_FDS) {
+        post_error(c, 1, WL_DISPLAY_ERROR_INVALID_METHOD, "descriptors no message takes");
+    }
+    if (c->dead) {
+        gui_wire_release(&c->wire); /* at once, for the clients read next */
+        return -1;
+    }
+    return 0;
 }
 
 int client_flush(struct client *c) {

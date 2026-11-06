@@ -111,6 +111,10 @@ static void disconnect(int i) {
 static void accept_client(void) {
     int fd = accept(srv.listen_fd, NULL);
     if (fd < 0) {
+        /* No descriptor or open file to take it with (-EMFILE, -ENFILE):
+         * the connection waits, and the listening socket stays readable,
+         * so it is left out of the poll for a while. */
+        srv.accept_paused = 1;
         return;
     }
     /* A descriptor kept free for one that comes with a message. */
@@ -167,7 +171,9 @@ int main(int argc, char **argv) {
         struct pollfd fds[4 + MAX_CLIENTS];
         int who[4 + MAX_CLIENTS];
         int n = 0;
-        fds[n].fd = srv.listen_fd;
+        int paused = srv.accept_paused;
+        srv.accept_paused = 0;
+        fds[n].fd = paused ? -1 : srv.listen_fd;
         fds[n].events = POLLIN;
         who[n++] = -1;
         fds[n].fd = srv.kbd_fd;
@@ -192,6 +198,9 @@ int main(int argc, char **argv) {
         }
         int ticks = close_deadlines();
         int timeout = ticks < 0 ? -1 : ticks * 100;
+        if (paused && (timeout < 0 || timeout > ACCEPT_RETRY_MS)) {
+            timeout = ACCEPT_RETRY_MS;
+        }
         if (srv.repaint && !srv.flip_pending) {
             timeout = 0;
         }

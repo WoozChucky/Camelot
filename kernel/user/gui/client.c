@@ -152,11 +152,17 @@ static int make_buffers(struct gui_window *w, int width, int height) {
     }
     int stride = width * 4;
     size_t one = (size_t)stride * (size_t)height;
-    w->fd = memfd_create("gui-window", MFD_CLOEXEC);
+    w->fd = memfd_create("gui-window", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (w->fd < 0) {
         return w->fd;
     }
     int r = ftruncate(w->fd, (off_t)(2 * one));
+    if (r < 0) {
+        return r;
+    }
+    /* Never smaller, as libwayland's clients seal theirs: the server
+     * takes the buffers only from memory that stays. */
+    r = fcntl(w->fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_SEAL);
     if (r < 0) {
         return r;
     }

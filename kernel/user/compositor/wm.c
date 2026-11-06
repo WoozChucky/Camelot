@@ -222,6 +222,7 @@ void window_unmap(struct window *w) {
         return;
     }
     w->mapped = 0;
+    w->closing = 0; /* gone as asked: shown again, it is asked again */
     damage(window_frame(w));
     int i = stack_index(w);
     if (i >= 0) {
@@ -312,6 +313,41 @@ static struct surface *surface_at_pointer(void) {
     return NULL;
 }
 
+static void put32(uchar *p, uint v) {
+    p[0] = (uchar)v;
+    p[1] = (uchar)(v >> 8);
+    p[2] = (uchar)(v >> 16);
+    p[3] = (uchar)(v >> 24);
+}
+
+/* wl_pointer.motion to each of the client's pointers: one still queued,
+ * the last event of all, is brought up to date instead (compositor.h's
+ * motion_tail). */
+static void send_motion(struct surface *s, uint time) {
+    struct client *c = s->c;
+    uint x = (uint)local_x(s);
+    uint y = (uint)local_y(s);
+    for (int i = 0; i < c->nobjects; i++) {
+        struct object *o = &c->objects[i];
+        if (o->iface != &wl_pointer_interface) {
+            continue;
+        }
+        if (c->motion_tail == o->id && c->wire.out_len >= 20) {
+            uchar *args = &c->wire.out[c->wire.out_len - 12];
+            put32(args, time);
+            put32(args + 4, x);
+            put32(args + 8, y);
+            continue;
+        }
+        event_begin(c, o->id, WL_POINTER_MOTION);
+        gui_wire_uint(&c->wire, time);
+        gui_wire_uint(&c->wire, x);
+        gui_wire_uint(&c->wire, y);
+        event_end(c);
+        c->motion_tail = o->id;
+    }
+}
+
 /* The pointer moved (or what is under it did): enter, leave, motion. */
 static void pointer_focus(uint time, int moved) {
     struct surface *s = srv.grab != NULL ? srv.grab : surface_at_pointer();
@@ -325,7 +361,7 @@ static void pointer_focus(uint time, int moved) {
             each_pointer(s, WL_POINTER_ENTER, 0, ~0u, 0, 0, 0);
         }
     } else if (s != NULL && moved) {
-        each_pointer(s, WL_POINTER_MOTION, 3, time, (uint)local_x(s), (uint)local_y(s), 0);
+        send_motion(s, time);
     }
 }
 
@@ -414,7 +450,8 @@ static void pointer_button(uint code, int pressed, uint time) {
         }
         srv.grab = s;
         pointer_focus(time, 0);
-        each_pointer(s, WL_POINTER_BUTTON, 4, ~0u, time, code, WL_POINTER_BUTTON_STATE_PRESSED);
+        srv.grab_serial = next_serial();
+        each_pointer(s, WL_POINTER_BUTTON, 4, srv.grab_serial, time, code, WL_POINTER_BUTTON_STATE_PRESSED);
         return;
     }
     if (!(srv.buttons & bit)) {
@@ -486,8 +523,18 @@ void pointer_input(void) {
             pointer_wheel(packet.wheel, time);
             memset(&packet, 0, sizeof(packet));
         } else if (e->type == EV_SYN && e->code == SYN_DROPPED) {
-            /* Events were lost: start the packet again from the next. */
+            /* Events were lost: start the packet again from the next, and
+             * let go of the buttons the device says are up, as the
+             * keyboard's keys (a lost release would keep a grab). */
             memset(&packet, 0, sizeof(packet));
+            uchar bits[KEY_CNT / 8];
+            memset(bits, 0, sizeof(bits));
+            ioctl(srv.ptr_fd, EVIOCGKEY(sizeof(bits)), bits);
+            for (uint code = BTN_LEFT; code <= BTN_MIDDLE; code++) {
+                if (!(bits[code / 8] & (1 << (code % 8)))) {
+                    pointer_button(code, 0, event_ms(e));
+                }
+            }
         }
     }
 }

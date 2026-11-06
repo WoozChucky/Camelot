@@ -459,10 +459,11 @@ int gui_msg_fd(struct gui_message *m);
  *
  * A connection to the display server (#184, docs/excalibur-spec.md section
  * 10) at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (/run and wayland-0 when they
- * are unset; a name with a '/' is a path), with the globals it needs bound: wl_compositor, wl_shm,
- * xdg_wm_base and wl_seat. A window is a wl_surface with an xdg_toplevel,
- * drawn into two XRGB8888 buffers of one wl_shm_pool over a memfd: the one
- * being drawn into is made the last frame first (the rectangles the last
+ * are unset; a name with a '/' is a path), with the globals it needs
+ * bound: wl_compositor, wl_shm, xdg_wm_base and wl_seat. A window is a
+ * wl_surface with an xdg_toplevel, drawn into two XRGB8888 buffers of one
+ * wl_shm_pool over a memfd sealed against shrinking (F_SEAL_SHRINK): the
+ * one being drawn into is made the last frame first (the rectangles the last
  * commit damaged copied over), then committed with its damage, and the
  * server releases the other. Events come to the window's handlers, any
  * of which may be NULL. */
