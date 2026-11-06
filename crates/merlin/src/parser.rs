@@ -126,6 +126,40 @@ pub const MAX_PARAMS: usize = 127;
 /// runs on a 64 MiB thread). clang's bracket limit is also 256.
 pub const MAX_DEPTH: usize = 256;
 
+/// The keywords clang's typo correction may take an unknown type name for
+/// (`Parser::correct_type`): the type specifiers and qualifiers, in its
+/// order. (Public for the C compiler that runs on Camelot, whose tables are
+/// made from merlin's, as the two below.)
+pub const TYPE_KEYWORDS: [&str; 18] = [
+    "char",
+    "const",
+    "double",
+    "enum",
+    "float",
+    "int",
+    "long",
+    "short",
+    "signed",
+    "struct",
+    "union",
+    "unsigned",
+    "void",
+    "volatile",
+    "_Complex",
+    "_Imaginary",
+    "_Bool",
+    "restrict",
+];
+
+/// The keywords a block's statement may start with, which clang's typo
+/// correction of its first name looks among (`Parser::unknown_statement_name`).
+pub const STATEMENT_KEYWORDS: [&str; 35] = [
+    "char", "const", "double", "enum", "float", "int", "long", "short", "signed", "struct", "union",
+    "unsigned", "void", "volatile", "_Bool", "restrict", "auto", "register", "static", "extern", "typedef",
+    "inline", "if", "else", "for", "while", "do", "switch", "case", "default", "break", "continue", "goto",
+    "return", "sizeof",
+];
+
 /// Parses a translation unit, whose sizes the parser
 /// needs for array bounds, `sizeof` and struct layouts.
 pub fn parse(toks: &[Token]) -> Result<Program, Error> {
@@ -163,7 +197,7 @@ pub fn parse_salvaging(toks: &[Token]) -> Result<Program, Box<(Error, Program)>>
         prototype: RefCell::new(Vec::new()),
         folding: Cell::new(false),
         salvaged: RefCell::new(Vec::new()),
-        type_open: Cell::new(Pos::default()),
+        type_open: Cell::new(None),
         undeclared: RefCell::new(Vec::new()),
         partial: RefCell::new(None),
         parens: RefCell::new(None),
@@ -673,8 +707,10 @@ struct Parser<'a> {
     /// The statements of the blocks a syntax error cut short, the innermost
     /// first, and the function they make up so far ([`parse_salvaging`]).
     salvaged: RefCell<Vec<Vec<Stmt>>>,
-    /// Where the `(` around the type name being read is.
-    type_open: Cell<Pos>,
+    /// Where the `(` around the type name being read is, for the note of
+    /// an `expected ')'` inside it; none for `__builtin_va_arg`'s, whose
+    /// `)` clang does not match with its `(`.
+    type_open: Cell<Option<Pos>>,
     /// The names read as expressions that nothing declares (not called:
     /// that is an implicit declaration), in order, kept for a syntax error
     /// in the statement or declaration they are in: clang checks them as
@@ -839,26 +875,6 @@ impl Parser<'_> {
     /// a typedef name in scope (where it is declared), or a keyword of a
     /// type specifier or qualifier ([`correction`]).
     fn correct_type(&self, typo: &str) -> Option<(String, Option<Pos>)> {
-        const KEYWORDS: [&str; 18] = [
-            "char",
-            "const",
-            "double",
-            "enum",
-            "float",
-            "int",
-            "long",
-            "short",
-            "signed",
-            "struct",
-            "union",
-            "unsigned",
-            "void",
-            "volatile",
-            "_Complex",
-            "_Imaginary",
-            "_Bool",
-            "restrict",
-        ];
         let mut seen = std::collections::HashSet::new();
         let typedefs = self
             .scopes
@@ -869,7 +885,7 @@ impl Parser<'_> {
                 (seen.insert(n.as_str()) && matches!(what, Name::Typedef(..)))
                     .then_some((n.as_str(), Some(*at)))
             });
-        let keywords = KEYWORDS.iter().map(|k| (*k, None));
+        let keywords = TYPE_KEYWORDS.iter().map(|k| (*k, None));
         let (name, decl) = correction(typo, typedefs.chain(keywords))?;
         Some((name.to_string(), decl))
     }
@@ -1505,10 +1521,22 @@ impl Parser<'_> {
     }
 
     /// The bracket that closes the one at `open` (`)`, `]` or `}`), or
-    /// clang's error at the token that is there instead, with its note.
+    /// clang's error at the token that is there instead, with its note:
+    /// what clang's `BalancedDelimiterTracker` does where it closes a
+    /// bracket it opened (`consumeClose`, its note `diagnoseMissingClose`'s).
     fn expect_close(&mut self, close: &str, open: Pos) -> Result<Pos, Error> {
         if self.is_punct(close) {
             return Ok(self.advance().pos);
+        }
+        // A `;` right before the closing token: `consumeClose` calls it
+        // out (`f(1;)`, `{1;}`), consumes the `;` and the bracket and goes
+        // on (RAIIObjectsForParser.h). Where clang closes a bracket without
+        // the tracker (`__builtin_va_arg`'s), there is no such rule.
+        if self.is_punct(";") && matches!(self.peek_at(1), Tok::Punct(q) if *q == close) {
+            return Err(Error::new(
+                self.here(),
+                format!("unexpected ';' before '{close}'"),
+            ));
         }
         let opener = match close {
             ")" => "(",
@@ -1545,12 +1573,6 @@ impl Parser<'_> {
     /// it is declared; a keyword `use of undeclared identifier ... did you
     /// mean`; none, `unknown type name`.
     fn unknown_statement_name(&self, name: &str) -> Error {
-        const KEYWORDS: [&str; 34] = [
-            "char", "const", "double", "enum", "float", "int", "long", "short", "signed", "struct", "union",
-            "unsigned", "void", "volatile", "_Bool", "restrict", "auto", "register", "static", "extern",
-            "typedef", "inline", "if", "else", "for", "while", "do", "switch", "case", "default", "break",
-            "continue", "goto", "return",
-        ];
         let at = self.here();
         let mut seen = std::collections::HashSet::new();
         let names = self
@@ -1562,7 +1584,7 @@ impl Parser<'_> {
                 seen.insert(n.as_str())
                     .then_some((n.as_str(), Some((*decl, matches!(what, Name::Typedef(..))))))
             });
-        let keywords = KEYWORDS.iter().chain(&["sizeof"]).map(|k| (*k, None));
+        let keywords = STATEMENT_KEYWORDS.iter().map(|k| (*k, None));
         match correction(name, names.chain(keywords)) {
             Some((to, Some((decl, true)))) => {
                 Error::new(at, format!("unknown type name '{name}'; did you mean '{to}'?"))
@@ -2200,8 +2222,11 @@ impl Parser<'_> {
             (name, pos, inner)
         } else if let Tok::Ident(name) = self.peek().clone() {
             if ctx == Ctx::TypeName {
-                let open = self.type_open.get();
-                return Err(self.expected("')'").note(open, "to match this '('"));
+                let err = self.expected("')'");
+                return Err(match self.type_open.get() {
+                    Some(open) => err.note(open, "to match this '('"),
+                    None => err,
+                });
             }
             self.advance();
             (name, pos, Vec::new())
@@ -2653,19 +2678,20 @@ impl Parser<'_> {
         )
     }
 
-    /// A type name, for casts and `sizeof`: specifiers and a declarator
-    /// without a name (`int`, `char *[4]`, `int (*)(void)`), no compound
-    /// literal's.
-    fn type_name(&mut self, open: Pos) -> Result<Type, Error> {
+    /// A type name, `__builtin_va_arg`'s: specifiers and a declarator
+    /// without a name (`int`, `char *[4]`, `int (*)(void)`), in parentheses
+    /// opened at `open` if clang matches its `)` with that `(`.
+    fn type_name(&mut self, open: Option<Pos>) -> Result<Type, Error> {
         let (d, _) = self.type_name_decl(open)?;
         self.type_name_folded(&d, None);
         Ok(d.ty)
     }
 
     /// A type name's declarator, and how it spelled its base (for `-g`),
-    /// in parentheses opened at `open`. What it folded is for its use to
-    /// say ([`Self::type_name_folded`]).
-    fn type_name_decl(&mut self, open: Pos) -> Result<(Decl, Spelled), Error> {
+    /// in parentheses opened at `open` (if clang matches its `)` with that
+    /// `(`: a cast's, `sizeof`'s and a compound literal's do). What it
+    /// folded is for its use to say ([`Self::type_name_folded`]).
+    fn type_name_decl(&mut self, open: Option<Pos>) -> Result<(Decl, Spelled), Error> {
         self.type_open.set(open);
         let specs = self.specifiers(Ctx::TypeName)?;
         let d = self.declarator(&specs.ty, Ctx::TypeName)?;
@@ -3652,7 +3678,7 @@ impl Parser<'_> {
             }
             Tok::Punct("(") if self.type_name_follows() => {
                 self.advance();
-                let (d, spelled) = self.type_name_decl(pos)?;
+                let (d, spelled) = self.type_name_decl(Some(pos))?;
                 self.expect_close(")", pos)?;
                 let literal = self.is_punct("{");
                 self.type_name_folded(&d, literal.then_some(pos));
@@ -3678,7 +3704,7 @@ impl Parser<'_> {
                 self.advance();
                 if self.is_punct("(") && self.type_name_follows() {
                     let at = self.advance().pos;
-                    let (d, _) = self.type_name_decl(at)?;
+                    let (d, _) = self.type_name_decl(Some(at))?;
                     self.expect_close(")", at)?;
                     let literal = self.is_punct("{");
                     self.type_name_folded(&d, literal.then_some(at));
@@ -3957,8 +3983,13 @@ impl Parser<'_> {
             "__builtin_va_arg" => {
                 self.expect_punct(",")?;
                 let at = self.here();
-                let ty = self.type_name(open)?;
-                self.expect_close(")", open)?;
+                // clang reads the type and its `)` itself, not as a
+                // bracket matched with its `(` (ParseExpr.cpp): no note,
+                // and a `;` before the `)` is not called out.
+                let ty = self.type_name(None)?;
+                if !self.eat_punct(")") {
+                    return Err(self.expected("')'"));
+                }
                 return Ok(Expr {
                     id: ExprId::new(),
                     kind: ExprKind::VaArg(first, at),

@@ -348,6 +348,14 @@ pub fn cases() -> Vec<Case> {
         case("int value; int g(int valeu) { return valu + vaule; }", &["1:38: error: use of undeclared identifier 'valu'", "1:45: error: use of undeclared identifier 'vaule'"]),
         case("struct s { int width; }; int g(struct s *p) { return p->widht + p->wdth; }", &["1:57: error: no member named 'widht' in 'struct s'", "1:68: error: no member named 'wdth' in 'struct s'"]),
         case("int g(void) { int abc = 1; return abd; }", &["1:35: error: use of undeclared identifier 'abd'; did you mean 'abc'?", "1:19: note: 'abc' declared here"]),
+        // The name a typo is corrected to is the one whose declaration a
+        // syntax error in its initializer cut short: corrected once,
+        // reported, no more.
+        case("void f(void) { int head = {heads; }", &["1:28: error: use of undeclared identifier 'heads'; did you mean 'head'?", "1:20: note: 'head' declared here", "1:33: error: unexpected ';' before '}'"]).then(&["1:36: error: expected ';' at end of declaration", "1:36: error: expected '}'", "1:14: note: to match this '{'"]),
+        case("void f(void) { int head = {heads;", &["1:28: error: use of undeclared identifier 'heads'; did you mean 'head'?", "1:20: note: 'head' declared here", "1:33: error: expected '}'", "1:27: note: to match this '{'"]).then(&["1:34: error: expected '}'", "1:14: note: to match this '{'"]),
+        case("int head = {heads;", &["1:13: error: use of undeclared identifier 'heads'; did you mean 'head'?", "1:5: note: 'head' declared here", "1:18: error: expected '}'", "1:12: note: to match this '{'"]),
+        case("void f(void) { int head = heads + ; }", &["1:27: error: use of undeclared identifier 'heads'; did you mean 'head'?", "1:20: note: 'head' declared here", "1:35: error: expected expression"]),
+        case("void f(void) { int head = sizeof(heads) + ; }", &["1:34: error: use of undeclared identifier 'heads'; did you mean 'head'?", "1:20: note: 'head' declared here", "1:43: error: expected expression"]),
         case("typedef int myint; myintt x;", &["1:20: error: unknown type name 'myintt'; did you mean 'myint'?", "1:13: note: 'myint' declared here"]),
         case("int foo(int); int g(void) { return fooo(1); }", &["1:36: error: call to undeclared function 'fooo'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]", "1:36: note: did you mean 'foo'?", "1:5: note: 'foo' declared here"]),
         case("itn x;", &["1:1: error: unknown type name 'itn'"]),

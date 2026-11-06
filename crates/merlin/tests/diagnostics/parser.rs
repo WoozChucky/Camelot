@@ -143,6 +143,18 @@ pub fn cases() -> Vec<Case> {
         case("int a, b; int f() { a ? b; }", &["1:26: error: expected ':'", "1:23: note: to match this '?'"]).then(&["1:26: error: expected expression"]),
         case("int *a; int f() { a[1; }", &["1:22: error: expected ']'", "1:20: note: to match this '['"]),
         case("int a[2] = {1 2};", &["1:15: error: expected '}'", "1:12: note: to match this '{'"]),
+        // A `;` right before the closing bracket: unexpected, no note.
+        case("int f(int x) { return f(1;); }", &["1:26: error: unexpected ';' before ')'"]),
+        case("int a[2;];", &["1:8: error: unexpected ';' before ']'"]),
+        case("int f(void) { return (1;); }", &["1:24: error: unexpected ';' before ')'"]),
+        case("int a[] = {1;};", &["1:13: error: unexpected ';' before '}'"]),
+        case("void f(void) { int a[] = {1;}; }", &["1:28: error: unexpected ';' before '}'"]),
+        case("struct s { int x; } v = {1;};", &["1:27: error: unexpected ';' before '}'"]),
+        case("int f(void) { if (1;) return 1; return 0; }", &["1:20: error: unexpected ';' before ')'"]),
+        // __builtin_va_arg's `)` is not a bracket clang matches: a plain
+        // `expected ')'`, no note, the `;` not called out.
+        case("int f(int n, ...) { __builtin_va_list ap; return __builtin_va_arg(ap, int;); }", &["1:74: error: expected ')'"]).then(&["1:75: error: expected expression"]),
+        case("int f(int n, ...) { __builtin_va_list ap; return __builtin_va_arg(ap, int x); }", &["1:75: error: expected ')'"]).then(&["1:76: error: expected expression"]),
         // unsupported_constructs
         case("int f() { if (1) int x = 1; }", &["1:18: error: expected expression"]),
         case("int f() { int g(int a); return g(1); }", &[]),

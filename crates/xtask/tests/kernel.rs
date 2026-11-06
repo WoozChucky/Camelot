@@ -3890,11 +3890,12 @@ fn every_disk_is_found_and_disk_0_is_tested() {
 /// A bootable disk: the root image's files (kernel/fs, /dev/console, the
 /// programs in /bin, `xtask::fs::build_with`) in the filesystem, the
 /// bootloader in the boot block and the disk kernel after the filesystem,
-/// as `camelot-fs mkfs --boot` makes one.
-fn bootable_image(blocks: u32) -> (Vec<u8>, camelot_fs::boot::BootInfo) {
+/// as `camelot-fs mkfs --boot` makes one, the root image's size
+/// (`xtask::fs::IMAGE_SIZE` blocks): what holds its files.
+fn bootable_image() -> (Vec<u8>, camelot_fs::boot::BootInfo) {
     let root = repo_root();
     let kernel = disk_kernel_under_test();
-    let opts = xtask::fs::bootable_layout(blocks, &kernel).unwrap();
+    let opts = xtask::fs::bootable_layout(xtask::fs::IMAGE_SIZE, &kernel).unwrap();
     // A reference kernel checks that /bin holds the programs it embeds: its
     // own, built from clang's assembly.
     let asm = UNDER_TEST_USER_ASM.with(|a| a.borrow().clone());
@@ -3911,7 +3912,7 @@ fn bootable_image(blocks: u32) -> (Vec<u8>, camelot_fs::boot::BootInfo) {
 #[test]
 fn the_kernel_boots_from_disk() {
     let root = repo_root();
-    let (image, info) = bootable_image(4096);
+    let (image, info) = bootable_image();
     for harts in [1, 4] {
         let mut m = Machine::new(MachineConfig {
             harts,
@@ -3944,7 +3945,11 @@ fn the_kernel_boots_from_disk() {
             out.contains(&format!("\npaging: on ({})\n", mode().name)),
             "{out}"
         );
-        assert!(out.contains("\ndisk 0: 8192 sectors (4096 KiB), irq "), "{out}");
+        let size = xtask::fs::IMAGE_SIZE;
+        assert!(
+            out.contains(&format!("\ndisk 0: {} sectors ({size} KiB), irq ", 2 * size)),
+            "{out}"
+        );
         // The disk driver's DMA (physical addresses of direct-map buffers),
         // the filesystem on it, and their self-tests.
         assert!(out.contains("\nblk self-test: 16/16 passed\n"), "{out}");

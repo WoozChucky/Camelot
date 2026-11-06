@@ -13,6 +13,12 @@
  * came before it (a trigraph, a splice's blanks, a comment that seems to
  * open inside a block comment).
  *
+ * To compile, phase 7 (lex_finish, merlin's finish) turns the tokens the
+ * preprocessor hands on into the parser's: an identifier that is a keyword
+ * becomes one, a preprocessing number an integer constant with its value
+ * and its C type, a character constant its value, and a string literal
+ * its bytes, escapes decoded, with the lexer's diagnostics of each.
+ *
  * merlin works on Rust's chars, Unicode scalar values; this works on the
  * UTF-8 bytes, which comes to the same for everything the lexer compares
  * (only ASCII means anything to C), with three places where it would not:
@@ -143,11 +149,8 @@ static void splice(struct lexer *lx, const uchar *src, uint n, int asm) {
         k = 3;
         col = 4;
     }
-    lx->chars = malloc(n + 1);
-    lx->off = malloc((n + 1) * sizeof(uint));
-    if (lx->chars == NULL || lx->off == NULL) {
-        die("out of memory");
-    }
+    lx->chars = heap_alloc(n + 1);
+    lx->off = heap_alloc((n + 1) * sizeof(uint));
     while (k < n) {
         /* The character here after phase 1, and how many bytes it was
          * written as. */
@@ -472,10 +475,10 @@ static void lexer_start(struct lexer *lx, const char *src, uint n, uint file, in
 }
 
 static void lexer_free(struct lexer *lx) {
-    free(lx->chars);
-    free(lx->off);
-    free(lx->lines);
-    free(lx->marks);
+    heap_free(lx->chars);
+    heap_free(lx->off);
+    heap_free(lx->lines);
+    heap_free(lx->marks);
 }
 
 void lex_pp(const char *src, uint n, uint file, int asm, struct lexed *out) {
@@ -541,7 +544,7 @@ int lex_split(const char *text, uint n, int asm, uint max, struct split *s) {
 }
 
 void lex_split_free(struct split *s) {
-    free(s->chars);
+    heap_free(s->chars);
     s->chars = NULL;
 }
 
@@ -925,4 +928,226 @@ struct diag *lex_char_constant(const char *text, uint len, struct pos pos, struc
     }
     buf_free(&bytes);
     return NULL;
+}
+
+/* ---- Phase 7 (merlin's finish) ---- */
+
+static int keyword(const char *s) {
+    for (int k = 0; k < NKEYWORDS; k++) {
+        if (strcmp(KEYWORDS[k], s) == 0) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+static int unsupported_keyword(const char *s) {
+    for (uint k = 0; k < NUNSUPPORTED_KEYWORDS; k++) {
+        if (strcmp(UNSUPPORTED_KEYWORDS[k], s) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* merlin's Kw::starts_decl: type specifiers and qualifiers, storage
+ * classes and inline. */
+int kw_starts_decl(int k) {
+    switch (k) {
+    case KW_VOID:
+    case KW_CHAR:
+    case KW_SHORT:
+    case KW_INT:
+    case KW_LONG:
+    case KW_SIGNED:
+    case KW_UNSIGNED:
+    case KW_BOOL:
+    case KW_STRUCT:
+    case KW_UNION:
+    case KW_ENUM:
+    case KW_CONST:
+    case KW_VOLATILE:
+    case KW_RESTRICT:
+    case KW_STATIC:
+    case KW_EXTERN:
+    case KW_TYPEDEF:
+    case KW_REGISTER:
+    case KW_AUTO:
+    case KW_INLINE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* An integer constant and its C type, from a preprocessing number (merlin's
+ * number): the first of the candidate types, in C's order (C99 6.4.4.1p5),
+ * that holds the value; `l` starts at long, `ll` at long long. A decimal
+ * one too large for every signed type is an unsigned long long, with
+ * clang's warning. */
+static struct diag *int_constant(const char *text, uint len, struct pos pos, struct vec *diags, i128 *value, int *kind) {
+    struct intlit lit;
+    struct diag *e = lex_integer(text, len, pos, &lit);
+    if (e != NULL) {
+        return e;
+    }
+    static const int signed_decimal[] = {IK_INT, IK_LONG, IK_LLONG};
+    static const int other[] = {IK_INT, IK_UINT, IK_LONG, IK_ULONG, IK_LLONG, IK_ULLONG};
+    static const int unsigned_[] = {IK_UINT, IK_ULONG, IK_ULLONG};
+    const int *all;
+    uint n;
+    if (lit.is_unsigned) {
+        all = unsigned_;
+        n = 3;
+    } else if (lit.decimal) {
+        all = signed_decimal;
+        n = 3;
+    } else {
+        all = other;
+        n = 6;
+    }
+    /* Too large for any type: clang's error, and it goes on with the low 64
+     * bits, an unsigned long long. */
+    if (!lit.fits) {
+        vec_push(diags, diag_error(pos, "integer literal is too large to be represented in any integer type"));
+        *value = i128_of_u64(lit.low);
+        *kind = IK_ULLONG;
+        return NULL;
+    }
+    i128 v = i128_of_u64(lit.value);
+    for (uint i = 0; i < n; i++) {
+        int k = all[i];
+        if (lit.lng == 1 && (k == IK_INT || k == IK_UINT)) {
+            continue;
+        }
+        if (lit.lng == 2 && k != IK_LLONG && k != IK_ULLONG) {
+            continue;
+        }
+        if (i128_le(v, ik_max(k))) {
+            *value = v;
+            *kind = k;
+            return NULL;
+        }
+    }
+    vec_push(diags, diag_warning(pos,
+                                 "integer literal is too large to be represented in a signed integer type, "
+                                 "interpreting as unsigned",
+                                 "implicitly-unsigned-literal"));
+    *value = v;
+    *kind = IK_ULLONG;
+    return NULL;
+}
+
+/* Moves a list of diagnostics (linked by next) to the end of a vector. */
+static void push_list(struct vec *v, struct diag *list) {
+    while (list != NULL) {
+        struct diag *next = list->next;
+        list->next = NULL;
+        vec_push(v, list);
+        list = next;
+    }
+}
+
+/* The preprocessed tokens as the parser's (C99 translation phase 7, merlin's
+ * finish), ended by TK_EOF at `end`: keywords, integer constants with
+ * their C type, the bytes of character constants and string literals. It
+ * goes on after an error as clang does (a literal in error stands as 0, or
+ * the bytes it has; what is no token is a TK_UNKNOWN the parser expects
+ * nowhere); only a keyword merlin has not (float) stops it, returning 0
+ * with the diagnostics before it and that one. */
+int lex_finish(struct pptok *toks, uint n, struct pos end, struct token **out, uint *nout, struct vec *diags) {
+    struct token *t = heap_alloc((n + 1) * sizeof(struct token));
+    uint k = 0;
+    for (uint i = 0; i < n; i++) {
+        struct pptok *p = &toks[i];
+        struct token *o = &t[k];
+        memset(o, 0, sizeof *o);
+        switch (p->kind) {
+        case PP_IDENT: {
+            int kw = keyword(p->text);
+            if (kw >= 0) {
+                o->kind = TK_KW;
+                o->kw = (uchar)kw;
+            } else if (unsupported_keyword(p->text)) {
+                vec_push(diags, diag_error(p->pos, fmt("'%s' is not supported yet", p->text)));
+                heap_free(t);
+                return 0;
+            } else {
+                o->kind = TK_IDENT;
+                o->name = p->text;
+            }
+            break;
+        }
+        case PP_NUMBER: {
+            int kind;
+            struct diag *e = int_constant(p->text, p->len, p->pos, diags, &o->value, &kind);
+            o->kind = TK_NUM;
+            if (e != NULL) {
+                vec_push(diags, e);
+                o->value = i128_of(0);
+                kind = IK_INT;
+            }
+            o->ik = (uchar)kind;
+            break;
+        }
+        case PP_CHAR: {
+            struct diag *list = NULL;
+            int64_t v = 0;
+            struct diag *e = lex_char_constant(p->text, p->len, p->pos, &list, &v);
+            push_list(diags, list);
+            o->kind = TK_NUM;
+            o->ik = IK_INT;
+            o->value = i128_of(v);
+            if (e != NULL) {
+                vec_push(diags, e);
+                o->value = i128_of(0);
+            }
+            break;
+        }
+        case PP_STR: {
+            struct diag *list = NULL;
+            struct buf b;
+            memset(&b, 0, sizeof b);
+            struct diag *e = lex_decode(p->text, p->len, p->pos, &list, &b);
+            push_list(diags, list);
+            o->kind = TK_STR;
+            if (e != NULL) {
+                vec_push(diags, e);
+                b.len = 0;
+            }
+            o->bytes = arena_alloc(b.len + 1);
+            if (b.len > 0) {
+                memcpy(o->bytes, b.data, b.len);
+            }
+            o->len = b.len;
+            buf_free(&b);
+            break;
+        }
+        case PP_PUNCT:
+            o->kind = TK_PUNCT;
+            o->name = PUNCTS[p->punct];
+            break;
+        case PP_INVALID:
+            if (p->msg != NULL) {
+                vec_push(diags, diag_warning(p->pos, p->msg, "invalid-pp-token"));
+            }
+            o->kind = TK_UNKNOWN;
+            break;
+        default:
+            /* A placemarker, a directive passed on: nothing to the parser. */
+            continue;
+        }
+        o->pos = p->pos;
+        o->end = p->end;
+        o->text = p->text;
+        k++;
+    }
+    memset(&t[k], 0, sizeof t[k]);
+    t[k].kind = TK_EOF;
+    t[k].pos = end;
+    t[k].end = end;
+    t[k].text = "";
+    *out = t;
+    *nout = k + 1;
+    return 1;
 }
