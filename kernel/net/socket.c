@@ -543,7 +543,7 @@ int sock_sys_shutdown(u32 fd, u32 how) {
         s->rd_shut = true;
     }
     /* A thread in poll() on it sees the shut side now, not at the next
-     * tick; and so does one blocked reading it. */
+     * tick. */
     net_wakeup();
     return 0;
 }
