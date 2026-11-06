@@ -3832,13 +3832,13 @@ fn the_system_call_document_matches_the_code() {
             Some((name, cells.get(2)?.parse().ok()?))
         })
         .collect();
-    assert_eq!(sizes.len(), 9, "{sizes:?}");
+    assert_eq!(sizes.len(), 15, "{sizes:?}");
     for (dir, include, headers) in [
         ("kernel/user", None, "#include \"user.h\"\n"),
         (
             "kernel",
             Some("include"),
-            "#include \"syscall.h\"\n#include \"fs.h\"\n",
+            "#include \"syscall.h\"\n#include \"fs.h\"\n#include \"fb.h\"\n#include \"input.h\"\n",
         ),
     ] {
         let mut src = headers.to_string();

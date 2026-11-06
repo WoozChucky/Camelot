@@ -94,6 +94,12 @@ headers and checks each size.
 | `struct ping_reply` | 16 | `ping`'s |
 | `struct timeval` | 16 | `SO_RCVTIMEO`'s: two `long`s, `tv_sec` a `time_t` |
 | `struct sockaddr_in` | 16 | an IPv4 address and port |
+| `struct fb_var_screeninfo` | 160 | the framebuffer's mode and the row shown ("The framebuffer") |
+| `struct fb_fix_screeninfo` | 80 | the framebuffer's buffer |
+| `struct fb_bitfield` | 12 | where a colour's bits are in a pixel |
+| `struct input_event` | 24 | an input device's event ("Input devices"): a `struct timeval`, then the type, code and value |
+| `struct input_id` | 8 | `EVIOCGID`'s |
+| `struct input_absinfo` | 24 | `EVIOCGABS`'s |
 
 ## Calls
 
@@ -151,7 +157,7 @@ headers and checks each size.
 | 50 | `mprotect` | `void *addr, size_t len, int prot` | 0; `-EINVAL`, `-ENOMEM`, `-EACCES` |
 | 51 | `memfd_create` | `const char *name, uint flags` | a new descriptor; `-EINVAL`, `-EFAULT`, `-EMFILE`, `-ENFILE` |
 | 52 | `ftruncate` | `int fd, off_t length` | 0; `-EBADF`, `-EINVAL`, `-EFBIG` |
-| 53 | `ioctl` | `int fd, unsigned long request, ...` | the request's result; `-EBADF`, `-ENOTTY`, `-EINVAL`, `-EFAULT`, `-EBUSY` |
+| 53 | `ioctl` | `int fd, unsigned long request, ...` | the request's result; `-EBADF`, `-ENOTTY`, `-EINVAL`, `-EFAULT`, `-EBUSY`, `-ENOMEM`, `-ENODEV`, `-EINTR` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -303,11 +309,13 @@ opens:
 - a directory, for reading only: anything else is `-EISDIR`, and so is
   `O_CREAT` on a missing name with a trailing slash (`newf/` names a
   directory, and `open` makes only files);
-- a device node (`/dev/console`, `/dev/fb0`), which gives the device
-  itself, in the access mode asked for, also on a read-only filesystem:
-  the console's reads and writes, the framebuffer's memory to map ("Memory
-  mappings"; its `read` and `write` are `-EINVAL`); a node whose major
-  number has no driver is `-ENODEV`.
+- a device node (`/dev/console`, `/dev/fb0`, `/dev/input/event0` and
+  `event1`), which gives the device itself, in the access mode asked for,
+  also on a read-only filesystem: the console's reads and writes, the
+  framebuffer's memory to map and its requests ("The framebuffer"; its
+  `read` and `write` are `-EINVAL`), an input device's events ("Input
+  devices"); a node whose major number has no driver, or whose device the
+  machine hasn't (a framebuffer, a keyboard, a pointer), is `-ENODEV`.
 
 A file bigger than the kernel reads or writes, 2^32 - 1 blocks (ext4's
 `s_maxbytes`), is `-EOVERFLOW`: only a damaged inode can be one, as the
@@ -407,6 +415,17 @@ Errors: `-EBADF` if `fd` is not open, checked before `cmd` (so an unknown
 another `cmd`, or for an `arg` of `F_DUPFD` or `F_DUPFD_CLOEXEC` that is
 not a descriptor, 0 to 15 (Linux's answer for one at or past
 `RLIMIT_NOFILE`); `-EMFILE` when no descriptor from `arg` up is free.
+
+**ioctl(fd, request, ...)** is Linux's: a request to the device behind
+`fd`, with one argument, a number or a pointer as the request says (its
+number says which, as Linux's `_IOR` and `_IOW` encode it, but the driver
+decides). The devices' requests are in "The framebuffer" and "Input
+devices", at Linux's numbers, with Linux's structures. Returns what the
+request returns, 0 for most. Errors: `-EBADF` if `fd` is not open;
+`-ENOTTY` if it is not a device (a file, a pipe, a socket) or its driver
+doesn't know the request, the console's included, which has none; the
+request's own, `-EFAULT` for a pointer to memory it can't read or write
+among them.
 
 **pipe(fds)** makes a pipe and stores two new descriptors in `fds[0]` (the
 read end) and `fds[1]` (the write end), the lowest two free ("Pipes").
@@ -887,9 +906,10 @@ there yet) or not open for writing, or `length` is negative; `-EFBIG` past
 1 GiB.
 
 **A device's memory.** `/dev/fb0`, the framebuffer's device node on the
-root image, maps the framebuffer's memory (640x480 pixels of 32 bits,
-`docs/excalibur-spec.md` section 9.3), from `offset` on, its last page
-whole: a program draws by writing pixels there, and the screen shows them.
+root image, maps the framebuffer's memory, the buffer of its mode ("The
+framebuffer": 640x480 pixels of 32 bits in VRAM at first), from `offset`
+on, its last page whole: a program draws by writing pixels there, and the
+screen shows them.
 The pages are the device's, mapped as they are touched and never freed;
 `MAP_PRIVATE` maps the same pages as `MAP_SHARED` (writes go to the
 device either way, as Linux's framebuffer devices do), so a writable
@@ -897,6 +917,122 @@ mapping of either kind needs the descriptor open for writing. A system
 call's buffer can't be in a device's memory (the kernel copies only to
 and from RAM): `write` from a framebuffer mapping, say, fails with
 `-EFAULT`.
+
+## The framebuffer
+
+`/dev/fb0` is Linux's fbdev interface to the display (`docs/excalibur-spec.md`
+section 9.3, the display controller; section 10, "Framebuffer driver"), the
+part a desktop uses: a program maps the screen's memory to draw into
+("Memory mappings", "A device's memory"), and with `ioctl` reads and sets
+the mode, flips between two frames and waits for the vertical blank. The
+requests and structures are Linux's (`include/uapi/linux/fb.h`), in
+`user.h`:
+
+| Request | Number | Argument | What |
+|---|---|---|---|
+| `FBIOGET_VSCREENINFO` | 0x4600 | `struct fb_var_screeninfo *` | the mode, the buffer's size and the row shown |
+| `FBIOPUT_VSCREENINFO` | 0x4601 | `struct fb_var_screeninfo *` | sets them, and stores what was set |
+| `FBIOGET_FSCREENINFO` | 0x4602 | `struct fb_fix_screeninfo *` | the buffer: where, how big, the bytes a row |
+| `FBIOPAN_DISPLAY` | 0x4606 | `struct fb_var_screeninfo *` | shows the buffer from row `yoffset`, at the next vertical blank |
+| `FBIOBLANK` | 0x4611 | a number | 0 shows the picture, 1 to 4 blank it |
+| `FBIO_WAITFORVSYNC` | 0x40044620 | `__u32 *`, 0 | waits for the next vertical blank |
+
+**The mode.** The display starts at 640x480 from its own VRAM, one frame.
+`struct fb_var_screeninfo` gives the mode (`xres`, `yres`), the buffer
+(`xres_virtual`, always `xres`, and `yres_virtual`), the row shown
+(`yoffset`; `xoffset` is 0) and the pixels: 32 bits, XRGB8888 (`red` at bit
+16, `green` 8, `blue` 0, 8 bits each; the top byte ignored). The size in
+millimetres is unknown (`height`, `width` 0xffffffff) and the timings 0.
+`FBIOPUT_VSCREENINFO` takes a mode the display has, by its size (Grail's:
+640x480, 800x600, 1024x768, 1280x720, 1280x1024 and 1920x1080), a
+`bits_per_pixel` of 32 or 0, and a `yres_virtual` of `yres` for one frame
+or more for two, up to room for a second one; it stores the mode as set,
+as `FBIOGET_VSCREENINFO` would give it. `activate`'s `FB_ACTIVATE_TEST`
+checks and changes nothing. A mode other than 640x480 with one frame is a
+buffer in RAM, which the kernel makes (zeroed) and the display scans out;
+the old one goes. `FBIOGET_FSCREENINFO` gives the buffer (`smem_start`, its
+physical address, and `smem_len`), `line_length` (`xres` times 4), `id`
+`grail-fb`, `type` packed pixels, `visual` true colour, and `ypanstep`.
+Errors: `-EINVAL` for a size no mode has, another pixel format, a buffer
+wider than the mode or taller than allowed, or an offset as `FBIOPAN_DISPLAY`
+refuses it; `-EBUSY` if the change needs another buffer while the old one
+is mapped (unmap it first); `-ENOMEM` if there is no room for the buffer.
+
+**Flipping.** A double-height buffer holds two frames: the program draws
+one while the display shows the other, then flips. The display scans out
+from the start of a page, so the frames start on pages: `ypanstep` is the
+fewest rows whose bytes are a whole number of pages (8 at 640 pixels a row,
+32 at 800), and `yoffset` must be a multiple of it. The second frame is at
+row `yres`, but at 800x600, where it is row 608 (`yres_virtual` 1208);
+`yres_virtual` may be up to `yres` rounded up to `ypanstep`, plus `yres`.
+`FBIOPAN_DISPLAY` takes `yoffset` and shows the buffer from that row at the
+next vertical blank, so no frame is shown half drawn; with `FB_ACTIVATE_VBL`
+(16) in `activate` it returns once the display shows it. Errors: `-EINVAL`
+for an `xoffset`, a `yoffset` past the last frame or not a multiple of
+`ypanstep`; `-EINTR` if the process is killed while it waits.
+`FBIO_WAITFORVSYNC` waits for the next vertical blank (60 a second): its
+argument points to 0, the display (`-ENODEV` for another); `-EINTR` if
+killed.
+
+**Who has it.** The display is a program's while it has `/dev/fb0` open or
+mapped; the kernel's console draws nothing meanwhile. When the last
+descriptor and mapping go, the display goes back to 640x480 from VRAM, any
+buffer in RAM is freed, the picture is shown if it was blanked, and the
+console draws its text again.
+
+## Input devices
+
+`/dev/input/event0` is the keyboard and `/dev/input/event1` the pointer, as
+Linux's evdev interface has them (`docs/excalibur-spec.md` sections 9.4 and
+9.7, the devices; section 10, "Input drivers"). Open one for reading and
+`read` its events: whole `struct input_event`s, 24 bytes each,
+
+```c
+struct input_event {
+    struct timeval time;   /* when, since boot */
+    unsigned short type;   /* EV_SYN, EV_KEY, EV_REL, EV_ABS */
+    unsigned short code;   /* a key, an axis */
+    int value;             /* 1 pressed, 0 released; a position; notches */
+};
+```
+
+with the codes of Linux's `input-event-codes.h` (`KEY_A` 30, `BTN_LEFT`
+0x110, `ABS_X` 0, `REL_WHEEL` 8, ...; `user.h` has those Camelot's devices
+give). Each change the device reports is a packet of events ended by
+`EV_SYN` `SYN_REPORT`. A `read` takes as many whole events as fit and are
+there, and waits while there are none; a buffer smaller than an event is
+`-EINVAL`, and `-EINTR` if the process is killed while it waits. Each open
+descriptor gets every event from its `open` on, in a queue of its own of
+128; one that falls a whole queue behind loses what it had not read and
+finds `EV_SYN` `SYN_DROPPED` (3) in its place, then the events from there
+on. `write` is `-EINVAL` (`-EBADF` on a descriptor open for reading),
+`lseek` `-ESPIPE`.
+
+- **The keyboard** gives `EV_KEY` for each key pressed (1) and released (0),
+  Linux's key codes for the keys where they are on the keyboard, as a USB
+  keyboard's: what a key types is the program's to decide. While no
+  descriptor has it open, the keyboard types into the console instead, the
+  characters of the host's layout ("Console input"). On a keyboard that
+  can only give characters (an older Grail), the codes are those of the
+  keys that type them on a US layout, with `KEY_LEFTSHIFT` and
+  `KEY_LEFTCTRL` pressed and released around them as needed.
+- **The pointer** gives where it is on the screen, in pixels of the
+  display's mode: `EV_ABS` `ABS_X` and `ABS_Y` (those that changed), the
+  buttons as `EV_KEY` `BTN_LEFT`, `BTN_RIGHT` and `BTN_MIDDLE`, and the
+  wheel's notches as `EV_REL` `REL_WHEEL`, positive up.
+
+The requests, at Linux's numbers (`user.h`):
+
+| Request | Argument | What |
+|---|---|---|
+| `EVIOCGVERSION` | `int *` | evdev's version, `EV_VERSION` (0x010001) |
+| `EVIOCGID` | `struct input_id *` | `BUS_HOST` (0x19), vendor 0, product 1 (the keyboard) or 2 (the pointer), version 1 |
+| `EVIOCGNAME(len)` | `char *` | the name, `Grail keyboard` or `Grail pointer`, cut to `len` bytes with its NUL; returns the bytes stored |
+| `EVIOCGBIT(type, len)` | `unsigned char *` | for type 0 the event types the device gives, else the codes of `type` it gives, a bit each, cut to `len` bytes; returns the bytes stored; `-EINVAL` for a type evdev has not |
+| `EVIOCGABS(axis)` | `struct input_absinfo *` | the axis's value and range: `ABS_X` from 0 to the width less 1, `ABS_Y` to the height less 1; `-EINVAL` for another axis, or on the keyboard |
+| `EVIOCGRAB` | a number | non-zero: only this descriptor gets the device's events, until it lets go (0) or is closed; `-EBUSY` if a descriptor has the grab already, this one included, `-EINVAL` for letting go of a grab it doesn't have |
+
+Any other request is `-ENOTTY`, a pointer that isn't writable `-EFAULT`.
 
 ## Error numbers
 
@@ -916,9 +1052,9 @@ Linux's values for the same conditions.
 | 12 | `ENOMEM` | out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping |
 | 13 | `EACCES` | spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that access |
 | 14 | `EFAULT` | a pointer argument is not valid user memory |
-| 16 | `EBUSY` | ioctl: the device's memory is mapped, and the request would change it |
+| 16 | `EBUSY` | ioctl: the framebuffer's memory is mapped, and the request would replace it; EVIOCGRAB: the device is grabbed already |
 | 17 | `EEXIST` | the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping |
-| 19 | `ENODEV` | open: a device node with no driver; the network: no network card; mmap: a file that can't be mapped |
+| 19 | `ENODEV` | open: a device node with no driver, or a device the machine hasn't; the network: no network card; mmap: a file that can't be mapped; FBIO_WAITFORVSYNC: a display other than 0 |
 | 20 | `ENOTDIR` | a name on the way is not a directory |
 | 21 | `EISDIR` | open: a directory, for writing |
 | 22 | `EINVAL` | an argument is out of range |

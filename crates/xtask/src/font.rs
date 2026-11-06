@@ -125,7 +125,7 @@ pub fn psf1_to_psf2(psf1: &[u8]) -> Result<Vec<u8>, String> {
     out.extend_from_slice(&psf1[4..glyph_end]);
     // The table: u16s to UTF-8, glyph by glyph.
     let table = &psf1[glyph_end..];
-    if table.len() % 2 != 0 {
+    if !table.len().is_multiple_of(2) {
         return Err("a PSF1 Unicode table of an odd size".into());
     }
     let mut glyph = 0u32;

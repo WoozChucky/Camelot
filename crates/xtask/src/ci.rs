@@ -16,10 +16,12 @@
 //!   `examples/kbd-echo`;
 //! - the committed binaries are what the tools build now: the kernel, the
 //!   examples, the boot programs, hello, the disk image; and the kernel boots,
-//!   on 1 to 8 harts, under Sv48 and Sv39, from disk, and panics as it should;
+//!   on 1 to 8 harts, under Sv48 and Sv39, from disk, and panics as it should,
+//!   its boot and shell on the framebuffer console too;
 //! - processes' system call ABI: results sign-extended, pointers into the
 //!   kernel's half refused, 64-bit values through the calls; memory mappings
-//!   (maptest);
+//!   (maptest); the framebuffer and input devices (fbtest, inputtest) and the
+//!   console's escape sequences;
 //! - how Avalon and Lake end connections: bad handshakes, and a server's last
 //!   frame arriving whole though the client sent more (Linux's TCP stack is not
 //!   Windows's here);
@@ -152,7 +154,7 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "the committed kernel is current, linked high, boots on 1-8 harts, under Sv39 and from \
-               disk, panics as it should, and the shell's built-in statuses are dash's",
+               disk, panics as it should, the shell's built-in statuses are dash's, and the boot and the                shell show on the framebuffer console (#178)",
         args: &[
             "-p",
             "xtask",
@@ -172,6 +174,7 @@ const STEPS: &[Step] = &[
             "the_kernel_falls_back_to_sv39",
             "the_kernel_boots_from_disk",
             "a_failed_builtin_gives_dashs_status",
+            "the_framebuffer_console_shows_the_boot_and_the_shell",
         ],
     },
     Step {
@@ -184,7 +187,7 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
-               Linux's start as pid 1, the environment (#216), memory mappings (#179)",
+               Linux's start as pid 1, the environment (#216), memory mappings (#179), /dev/fb0, the                input devices and the framebuffer console's escape sequences (#178)",
         args: &[
             "-p",
             "xtask",
@@ -197,6 +200,10 @@ const STEPS: &[Step] = &[
             "a_program_starts_as_linux_starts_one",
             "the_shell_passes_its_environment_on",
             "memory_mappings_are_mapped_on_demand_and_given_back",
+            "the_framebuffer_device_answers_linuxs_fbdev_requests",
+            "the_input_devices_answer_evdevs_requests",
+            "keys_reach_a_reader_as_linux_key_codes",
+            "the_framebuffer_console_acts_on_ansis_escape_sequences",
         ],
     },
     Step {
