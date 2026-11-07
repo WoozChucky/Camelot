@@ -493,7 +493,8 @@ fn shell_output<'a>(out: &'a str, command: &str) -> &'a str {
 
 /// What the shell printed after each line of `input`, up to the next line
 /// typed (by its echo after the prompt, not by the prompt alone, which an
-/// output may hold: `$ ` in C or assembly), byte for byte: the console
+/// output may hold: root's `# ` starts every line marker `cc1 -E` prints),
+/// byte for byte: the console
 /// prints what a program writes as it is (its `c_oflag` is 0, kernel/tty.c,
 /// no `\r` added before a `\n`), so a `\r` cc1 writes is compared too.
 fn shell_outputs(out: &str, input: &str) -> Vec<String> {
