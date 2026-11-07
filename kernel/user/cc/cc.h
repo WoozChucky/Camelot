@@ -208,8 +208,20 @@ void diag_name_files(struct diag *d, const char **names, const uint *lens, uint 
  * hold one too. */
 #define FILE_MARK 1
 /* Prints d and its notes to stderr as clang does, `input` the name of the
- * file being compiled (merlin's Error::render). */
+ * file being compiled (merlin's Error::render), under -w and -W: a warning
+ * left out, or made an error (`[-Werror,-WFLAG]`), which sets
+ * diag_failed (main.c fails the translation unit then). */
 void diag_print(struct diag *d, const char *input);
+/* Takes -w or a -W option, in command-line order, which diag_print applies
+ * as clang does (lib/warnings.c's warning_level, merlin::warnings). */
+void diag_take_w(char *opt);
+int diag_option_warnings(void);
+/* Whether a fatal error was said (diag.c): nothing more is. */
+extern int diag_fatal_seen;
+/* Prints d and its notes as they are, -w and -W aside (the command line's
+ * own diagnostics). */
+void diag_print_as_is(struct diag *d, const char *input);
+extern int diag_failed;
 
 /* ---- Preprocessing tokens (lexer.c, merlin's PpToken) ---- */
 enum {
@@ -464,6 +476,16 @@ struct options {
     int line_markers;
     /* Each file read has its MD5 taken, for -g's line table. */
     int checksums;
+    /* C already preprocessed (-x cpp-output, a .i file): every directive
+     * runs, but macros are expanded only in directives, as clang's
+     * SetMacroExpansionOnlyInDirectives has it (merlin's
+     * Options::preprocessed). */
+    int preprocessed;
+    /* The main file's name in the object, if not the one its diagnostics
+     * give it (merlin's Options::main_file_name, clang's -main-file-name):
+     * the .file of its STT_FILE symbol and, with -g, the compile unit's and
+     * .file 0's name. "-" for standard input, <stdin> in diagnostics. */
+    const char *main_file_name;
 };
 
 /* Preprocesses the file `name`, whose text is src (n bytes), for -E: the
@@ -1235,9 +1257,10 @@ void quote(struct buf *b, const char *s, uint n);
 
 /* -g's state for one translation unit (merlin's Lines::new): the
  * compilation directory (-fdebug-compilation-dir), the preprocessor's files
- * (names[i], lens[i] bytes) and their checksums, by pos.file. */
+ * (names[i], lens[i] bytes) and their checksums, by pos.file, and the main
+ * file's name for the compile unit and .file 0 if not names[0] (NULL). */
 struct lines *debug_new(const char *comp_dir, const char **names, const uint *lens, struct checksum *sums,
-                        uint nfiles);
+                        uint nfiles, const char *main_name);
 /* `.file 0 ...`, the first line of the output until debug_renumber puts it
  * where clang has it. */
 char *debug_file0(struct lines *l);

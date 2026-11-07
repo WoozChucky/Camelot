@@ -83,13 +83,16 @@ pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
 /// over 200 KB, `ld` not much less, nearly half together of what the
 /// smallest machine, 3 MiB, has left once the kernel and the programs it
 /// embeds, a little over 2 MiB, are loaded. `ar` makes and reads archives
-/// for them, files too, and `cc1`, the C compiler, is bigger than both.
+/// for them, files too, and `cc1`, the C compiler, is bigger than both;
+/// `cc`, the driver that runs them (#242), is nothing without them, and
+/// without `/usr`.
 /// `guidemo` and `guitest` read the desktop image's fonts and images, and
 /// the display server, `compositor`, and its test client, `wltest`, are its
 /// too (#184), as are the desktop shell's programs (#185).
 pub const DISK_ONLY: &[&str] = &[
     "ar",
     "as",
+    "cc",
     "cc1",
     "compositor",
     "files",

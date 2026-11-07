@@ -339,13 +339,53 @@ long sys_pipe(struct trap_frame *f) {
     return 0;
 }
 
+/* Whether `path` (not empty) ends in a name followed by '/' ("d/"), not
+ * in ".", ".." or the root ("./", "../", "/"): Linux's last component of
+ * type LAST_NORM with a trailing slash. */
+static bool name_with_slash(const char *path) {
+    usize n = strlen(path);
+    if (path[n - 1] != '/') {
+        return false;
+    }
+    while (n > 0 && path[n - 1] == '/') {
+        n--;
+    }
+    if (n == 0) {
+        return false; /* the root */
+    }
+    usize start = n;
+    while (start > 0 && path[start - 1] != '/') {
+        start--;
+    }
+    usize len = n - start;
+    return !(path[start] == '.' && (len == 1 || (len == 2 && path[start + 1] == '.')));
+}
+
 /* The inode `path` names, locked, opening it for open(): made with `mode`
- * if it is missing and `flags` has O_CREAT, which *created then says. In
- * the caller's transaction. NULL with *err. */
+ * if it is missing and `flags` has O_CREAT, which *created then says; with
+ * O_CREAT and O_EXCL, only made: a name that is taken is -EEXIST, as on
+ * Linux (how a program makes a file nobody else has, a temporary one in
+ * /tmp). In the caller's transaction. NULL with *err. */
 static struct inode *open_inode(const char *path, u32 flags, u32 mode, bool *created, int *err) {
     *created = false;
+    bool excl = (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL);
+    if ((flags & O_CREAT) != 0 && name_with_slash(path)) {
+        /* "name/" says a directory, and open() makes only files: with
+         * O_CREAT, -EISDIR before anything else, whether the name is
+         * there or not, as Linux's open_last_lookups has it. "./", "../"
+         * and "/" are looked up as they are (handle_dots), and found:
+         * -EEXIST with O_EXCL, else sys_open's -EISDIR. The path isn't
+         * empty: fetch_path() refused that. */
+        *err = -EISDIR;
+        return NULL;
+    }
     for (;;) {
         struct inode *ip = namei(path, err);
+        if (ip != NULL && excl) {
+            iput(ip);
+            *err = -EEXIST;
+            return NULL;
+        }
         if (ip != NULL) {
             ilock(ip);
             return ip;
@@ -353,16 +393,11 @@ static struct inode *open_inode(const char *path, u32 flags, u32 mode, bool *cre
         if (*err != -ENOENT || (flags & O_CREAT) == 0) {
             return NULL;
         }
-        if (path[strlen(path) - 1] == '/') {
-            /* "name/" says a directory, and open() makes only files (as on
-             * Linux). The path isn't empty: fetch_path() refused that. */
-            *err = -EISDIR;
-            return NULL;
-        }
         ip = fs_create(path, T_FILE, 0, 0, (u16)(mode & S_IALLUGO), err);
         /* -EEXIST: made by another process while namei() slept on the
-         * disk. Look it up again. */
-        if (ip != NULL || *err != -EEXIST) {
+         * disk. Look it up again, but with O_EXCL, where that is the
+         * answer. */
+        if (ip != NULL || *err != -EEXIST || excl) {
             *created = ip != NULL;
             return ip;
         }
@@ -379,7 +414,7 @@ long sys_open(struct trap_frame *f) {
     u32 mode = flags & O_ACCMODE;
     /* The new file's permission bits, with O_CREAT (there is no umask). */
     u32 perm = (u32)arg(f, 2);
-    if ((flags & ~(O_ACCMODE | O_CREAT | O_TRUNC | O_CLOEXEC)) != 0 || mode == O_ACCMODE) {
+    if ((flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC)) != 0 || mode == O_ACCMODE) {
         return -EINVAL;
     }
     if (!fs_mounted) {
@@ -405,7 +440,9 @@ long sys_open(struct trap_frame *f) {
          * opened as asked whatever its mode (Linux's may_open() is skipped
          * for it too: open("f", O_CREAT | O_WRONLY, 0444) writes it). */
         u32 want = (readable ? MAY_READ : 0) | (writable ? MAY_WRITE : 0);
-        if (ip->type == T_DIR && writable) {
+        if (ip->type == T_DIR && (writable || (flags & O_CREAT) != 0)) {
+            /* A directory isn't written through a descriptor, nor opened
+             * with O_CREAT, which asks for a file (Linux's do_open). */
             err = -EISDIR;
         } else if (!created && (err = inode_permission(ip, want)) < 0) {
             /* -EACCES */

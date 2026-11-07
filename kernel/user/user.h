@@ -74,7 +74,7 @@ typedef unsigned long long uint64_t;
 #define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */
 #define ENODEV 19       /* open: a device node with no driver; mmap: a file that can't be mapped */
 #define ENOTDIR 20      /* a name on the way is not a directory */
-#define EISDIR 21       /* open: a directory, for writing */
+#define EISDIR 21       /* open: a directory, for writing or with O_CREAT; name/ with O_CREAT */
 #define EINVAL 22       /* an argument is out of range */
 #define ENFILE 23       /* every slot of the kernel's open file table is taken */
 #define EMFILE 24       /* every descriptor of the process is taken */
@@ -144,12 +144,14 @@ typedef unsigned long long uint64_t;
 #define AT_EXECFN 31 /* the path the program was started with */
 
 /* open's flags: one access mode, plus O_CREAT (make the file if it is
- * missing), O_TRUNC (empty it, when opened for writing) and O_CLOEXEC (the
+ * missing), O_EXCL (with O_CREAT, only make it: -EEXIST if the name is
+ * taken), O_TRUNC (empty it, when opened for writing) and O_CLOEXEC (the
  * descriptor closes on exec). */
 #define O_RDONLY 0x000
 #define O_WRONLY 0x001
 #define O_RDWR 0x002
 #define O_CREAT 0x040
+#define O_EXCL 0x080
 #define O_TRUNC 0x200
 #define O_CLOEXEC 0x80000
 
@@ -1138,6 +1140,55 @@ const char *resolve_error(int err);
  * caller: kill_descendants(getpid()) ends what a program started). Returns
  * how many it killed. One thread at a time (lib/proc.c). */
 int kill_descendants(int pid);
+
+/* Response files (lib/response.c): `@FILE` on a command line stands for
+ * the arguments written in FILE, as clang and LLVM's tools read them, the
+ * toolchain's one way (cc, cc1, ld, ar; merlin and merlin-ld on the host:
+ * excalibur::response). Arguments are separated by blanks, tabs and line
+ * ends; '...' and "..." quote; a backslash takes the next character as it
+ * is; a nested @FILE is expanded; an @FILE whose FILE does not exist is
+ * left as it is. expand_response_files: argv[0..argc) with every @FILE
+ * expanded, argv[0] kept, NULL after the last (*n of them), all from
+ * malloc; or NULL with the message (`cannot not open file 'PATH': REASON`,
+ * LLVM's words, or `recursive expansion of: 'PATH'`) in `error`, `size`
+ * bytes. response_file_text: the text of a response file of args[0..n), as
+ * clang's driver writes one (each argument in double quotes, a backslash
+ * before a `"` or `\`, a blank after it), from malloc, or NULL. */
+char **expand_response_files(int argc, char **argv, int *n, char *error, size_t size);
+char *response_file_text(char **args, int n);
+
+/* -w and the -W options (lib/warnings.c), as clang applies them, the
+ * toolchain's one way (cc1's warnings, the cc driver's; merlin::warnings
+ * on the host). warning_level: what a warning of `flag` (NULL: unflagged)
+ * becomes under `options[0..noptions)`, the -w and -W options in
+ * command-line order, given `groups[0..ngroups)`, a "FLAG GROUP..." line for
+ * each flag (clang's warning groups, generated: cc1's tables.c, cc's
+ * warning_groups.h), as clang's DiagnosticsEngine decides it: -WX shows
+ * X's warnings (X a flag or a group) unless they are errors, -Wno-X leaves
+ * them out, -Werror=X makes them errors, -Wno-error=X makes them shown
+ * again and never errors, -Wno-everything leaves every warning out,
+ * -Weverything changes nothing (`everything` is no group for -Werror=), the
+ * last of -Werror and -Wno-error decides for the rest; -Wfatal-errors=X
+ * makes them fatal (WARNING_FATAL), -Wno-fatal-errors=X takes that back
+ * for good, and the last of -Wfatal-errors and -Wno-fatal-errors makes
+ * every error fatal (warning_error_is_fatal: an error of `flag`, not
+ * taken back); and -w anywhere leaves every warning out.
+ * is_warning_option: whether `a` is -w or -W and a name, none too (not
+ * -Wl, -Wp, -Wa,: no warning's name has a comma).
+ * warning_option_message: clang's warning of the -W option `o` given
+ * names[0..nnames), its warning groups, in buf (size bytes), or NULL if
+ * it has none: `unknown warning option '-Wfoo'` (-Werror= for -Werror=
+ * and -Wno-error= alike, as clang says it), `unknown -Werror warning
+ * specifier: '-Werrorfoo'`; of the flag unknown-warning-option. */
+#define WARNING_IGNORED 0
+#define WARNING_SHOWN 1
+#define WARNING_ERROR 2
+#define WARNING_FATAL 3
+int warning_level(char *const *options, int noptions, const char *flag, const char *const *groups, int ngroups);
+int is_warning_option(const char *a);
+int warning_error_is_fatal(char *const *options, int noptions, const char *flag, const char *const *groups,
+                           int ngroups);
+const char *warning_option_message(const char *o, const char *const *names, int nnames, char *buf, size_t size);
 
 /* Terminals (lib/tty.c), as POSIX has them, but for returning a negative
  * error number rather than -1 and errno.

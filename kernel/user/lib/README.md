@@ -26,6 +26,7 @@ together.
 | `spin.c` | `spin`: a busy loop, for tests that need CPU time |
 | `time.c` | `time`, `gmtime_r`: the date, over `clock_gettime`, and its UTC fields |
 | `proc.c` | `kill_descendants`: kills what a process started, and theirs (the shell and `shd` hang a session up with it) |
+| `response.c` | `expand_response_files`, `response_file_text`: response files (`@FILE`), read and written as clang and LLVM's tools read and write them (quotes, backslashes, nested files; excalibur-spec section 10, "Response files"), for `cc`, `cc1`, `ld` and `ar`; `excalibur::response` is the host's same tokenizer |
 | `inet.c` | `htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`, `inet_addr`, `inet_ntoa`, `sockaddr_set`: addresses and byte order |
 | `tty.c` | `isatty`, `tcgetattr`, `tcsetattr`, `cfmakeraw`, `tcgetpgrp`, `tcsetpgrp`, `posix_openpt`, `grantpt`, `unlockpt`, `ptsname`, `ttyname`: terminals, over `ioctl` and `fstat`; `getpass`, a line read with the echo off |
 | `sha256.c` | `sha256_init`, `sha256_update`, `sha256_final`, `sha256`, `sha256_hex`: SHA-256 (FIPS 180-4); `pw_hash`, `pw_check`: passwords as `/etc/shadow` keeps them, `$sha256$ROUNDS$SALT$HEX`, salted and iterated (a teaching system's hash, not hardened cryptography: excalibur-spec section 10, "Users") |

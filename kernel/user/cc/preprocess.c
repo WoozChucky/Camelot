@@ -1396,7 +1396,9 @@ static struct diag *pp_next(struct pp *pp, struct ptok *out, int *got) {
         t.lead |= pp->carry_lead;
         pp->carry_bol = pp->carry_space = pp->carry_lead = 0;
         struct macro *m = NULL;
-        if (t.t.kind == PP_IDENT && !hidden(t.hide, t.t.text)) {
+        /* Preprocessed C: macros are expanded in directives alone (a
+         * directive's line is expanded isolated). */
+        if (t.t.kind == PP_IDENT && !hidden(t.hide, t.t.text) && (!pp->opts->preprocessed || pp->isolated)) {
             m = map_get(&pp->macros, t.t.text);
         }
         if (m == NULL) {
@@ -3288,9 +3290,9 @@ static struct diag *read_directives(struct pp *pp, const char *name, const char 
     return NULL;
 }
 
-/* merlin's Pp::run: the predefined macros, then -D and -U, as directives
- * of their own files, then the file, every token out as it comes. */
-static struct diag *run(struct pp *pp, const char *src, uint n) {
+/* merlin's Pp::define_builtins: the predefined macros, then -D and -U, as
+ * directives of their own files. */
+static struct diag *define_builtins(struct pp *pp) {
     struct buf b;
     memset(&b, 0, sizeof b);
     const struct predefined *pre = pp->opts->lang == LANG_ASM ? PREDEFINED_ASM : PREDEFINED_C;
@@ -3326,6 +3328,16 @@ static struct diag *run(struct pp *pp, const char *src, uint n) {
         if (e != NULL) {
             return e;
         }
+    }
+    return NULL;
+}
+
+/* merlin's Pp::run: the built-in macros (define_builtins), then the file,
+ * every token out as it comes. */
+static struct diag *run(struct pp *pp, const char *src, uint n) {
+    struct diag *e = define_builtins(pp);
+    if (e != NULL) {
+        return e;
     }
     struct lexed lx;
     lex_pp(src, n, 0, pp->asm, &lx);

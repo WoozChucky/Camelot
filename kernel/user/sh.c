@@ -1,14 +1,32 @@
 /* sh: the Camelot shell, the first process the kernel starts.
  *
- * Reads a line and runs it. The line is a list of jobs separated by '&':
- * each but the last runs in the background, the last in the foreground,
- * and the shell waits for it before the next prompt. A job is a pipeline,
- * commands separated by '|', each one's output going to the next one's
- * input. A command is words separated by blanks, with optional
- * redirections among them: `< FILE` reads the input from FILE, `> FILE`
- * writes the output to FILE (made, or emptied, first). '&', '|', '<' and
- * '>' need no blanks around them. So `ls /bin | wc & cat < a > b` counts
- * the programs in the background and copies a to b in the foreground.
+ * Reads a line and runs it. The line is a list, as POSIX's sh has it:
+ * AND-OR lists separated by ';' or '&', each one followed by '&' running
+ * in the background, the others in the foreground, one after the other,
+ * the shell waiting for each before the next (and for the last before the
+ * next prompt). An AND-OR list is pipelines separated by `&&` or `||`:
+ * the first runs, and each after it only if the last status is 0 (`&&`) or
+ * not 0 (`||`), as POSIX has it, a pipeline left out leaving the status as
+ * it was. So `cc -o hello hello.c && ./hello` runs hello only if it was
+ * built. In the background, an AND-OR list of more than one pipeline runs
+ * in a shell of its own, `sh -c LIST`, since there is no fork to make a
+ * subshell. A pipeline is commands separated by '|', each one's output
+ * going to the next one's input, and its status is the last command's. A
+ * command is words separated by blanks, with optional redirections among
+ * them: `< FILE` reads the input from FILE, `> FILE` writes the output to
+ * FILE (made, or emptied, first). The operators, `;`, '&', `&&`, '|',
+ * `||`, '<' and '>', need no blanks around them. So `ls /bin | wc & cat <
+ * a > b` counts the programs in the background and copies a to b in the
+ * foreground. A command that can't be started has POSIX's status: 127 for
+ * no such program, 126 for one that is there but can't be run, 1 for a
+ * redirection that can't be made; the rest of its pipeline runs, and the
+ * pipeline's status is its last command's. An AND-OR list in the
+ * background has status 0, as POSIX gives an asynchronous list. The whole
+ * line is checked before any of it runs: `a ;; b` says `;` has no command
+ * and runs nothing, as POSIX shells parse a complete command first.
+ *
+ * `sh -c LIST` runs LIST, a line, and ends with the last status, as
+ * POSIX's `sh -c` does; it is not interactive.
  *
  * The first word names a built-in or a program: `NAME` is the program
  * /bin/NAME, and a word with a '/' in it is the program at that path
@@ -141,18 +159,26 @@ static int connection_input;
 
 /* Whether the shell is interactive, as POSIX means it: its input was the
  * console or a connection when it started (see the top; a later `exec <
- * FILE` doesn't change it, as in bash). */
+ * FILE` doesn't change it, as in bash), and it is no `sh -c`. */
 static int interactive;
+
+/* Whether the shell is a `sh -c LIST`: it runs LIST and ends. */
+static int command_mode;
 
 /* Where the shell keeps copies of its descriptors meanwhile: 10 and up, as
  * bash does (POSIX leaves descriptors 0 to 9 to the user). */
 #define SAVED_FD 10
 
-/* A token of a line: a word, or an operator ('&', '|', '<', '>'). */
+/* A token of a line: a word, or an operator: ';', '&', '|', '<', '>', or
+ * AND (`&&`) or OR (`||`). */
 struct token {
     char op; /* 0 for a word */
     char *word;
 };
+
+/* The two operators of two characters, as a token's op. */
+#define AND 'a'
+#define OR 'o'
 
 /* A command: its assignments (NAME=value words, see the top), its words
  * (NULL-terminated) and where its input comes from and its output goes, if
@@ -379,12 +405,34 @@ static int is_blank(char c) {
 }
 
 static int is_op(char c) {
-    return c == '&' || c == '|' || c == '<' || c == '>';
+    return c == ';' || c == '&' || c == '|' || c == '<' || c == '>';
+}
+
+/* How operator `op` is written. */
+static const char *op_text(char op) {
+    switch (op) {
+    case AND:
+        return "&&";
+    case OR:
+        return "||";
+    case ';':
+        return ";";
+    case '&':
+        return "&";
+    case '|':
+        return "|";
+    case '<':
+        return "<";
+    default:
+        return ">";
+    }
 }
 
 /* Splits `s` into tokens in place: each word is NUL-terminated where it
  * ends (an operator right after a word is recorded before its byte is
- * overwritten). Returns how many, or -1 if there are more than `max`. */
+ * overwritten). `&&` and `||` are one operator each, as in POSIX's sh,
+ * which takes the longest operator it can. Returns how many, or -1 if
+ * there are more than `max`. */
 static int tokenize(char *s, struct token *t, int max) {
     int n = 0;
     for (;;) {
@@ -401,6 +449,11 @@ static int tokenize(char *s, struct token *t, int max) {
         if (is_op(*s)) {
             t[n].op = *s;
             t[n].word = NULL;
+            if ((*s == '&' || *s == '|') && s[1] == *s) {
+                t[n].op = *s == '&' ? AND : OR;
+                *s = 0;
+                s++;
+            }
             *s = 0;
             s++;
         } else {
@@ -471,6 +524,9 @@ static void help(void) {
     printf("CMD > FILE      write the output to FILE\n");
     printf("CMD | CMD       send the first command's output to the second one\n");
     printf("CMD & CMD       run the first command in the background\n");
+    printf("CMD ; CMD       run one command, then the other\n");
+    printf("CMD && CMD      run the second command if the first one's status is 0\n");
+    printf("CMD || CMD      run the second command if the first one's status is not 0\n");
 }
 
 /* Whether command `c` is one of the built-ins builtin() runs. `exec` is
@@ -799,6 +855,9 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
     for (int i = 0; i < n; i++) {
         if (n > 1 && is_builtin(&cmds[i])) {
             fprintf(STDERR, "sh: %s: a built-in can't be in a pipeline\n", cmds[i].argv[0]);
+            if (!background) {
+                last_status = 2;
+            }
             return 0;
         }
     }
@@ -812,6 +871,12 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
      * assignments alone, whose status, 0, is the pipeline's. */
     int ends_with_exec = 0;
     int quit = 0;
+    /* The status of the last command if it could not be started (POSIX's
+     * 127, 126 or 1, see the top), the pipeline's then; -1 if it was. A
+     * command before it that can't be started is said and left out, and
+     * the rest of the pipeline runs, as in POSIX shells: what it would
+     * have written, its reader finds empty. */
+    int last_failed = -1;
     /* The read end of the pipe from the previous command, for this one. */
     int from_prev = -1;
     for (int i = 0; i < n; i++) {
@@ -836,7 +901,10 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
         if (open_files(&cmds[i], &file_in, &file_out) < 0) {
             close_if(in);
             close_if(out);
-            break;
+            if (i + 1 == n) {
+                last_failed = 1;
+            }
+            continue;
         }
         if (file_in >= 0) {
             close_if(in);
@@ -869,7 +937,10 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
         int pid = spawn(program_path(cmds[i].argv[0], path), cmds[i].argv, envp);
         if (pid < 0) {
             cannot_start(cmds[i].argv[0], pid);
-            break;
+            if (i + 1 == n) {
+                last_failed = not_found(cmds[i].argv[0], pid) ? 127 : 126;
+            }
+            continue;
         }
         pids[started] = pid;
         names[started] = cmds[i].argv[0];
@@ -890,12 +961,19 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
         }
         /* The program waited for is the terminal's foreground, which
          * Ctrl-C kills (docs/camelot-syscalls.md, "Terminals"): one
-         * process until Camelot has process groups (#116). */
-        if (console_input) {
+         * process until Camelot has process groups (#116). A `sh -c`
+         * passes the terminal on only if it has it (it may be a
+         * background job), and takes it back for its next command. */
+        int hand = console_input && (!command_mode || tcgetpgrp(STDIN) == getpid());
+        if (hand) {
             tcsetpgrp(STDIN, pids[i]);
         }
         int status;
-        if (wait(pids[i], &status) == pids[i]) {
+        int collected_pid = wait(pids[i], &status);
+        if (hand && command_mode) {
+            tcsetpgrp(STDIN, getpid());
+        }
+        if (collected_pid == pids[i]) {
             last_status = status;
             if (status != 0) {
                 printf("%s: exit %d\n", name, status);
@@ -905,54 +983,172 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
     if (ends_with_exec && !background) {
         last_status = 0;
     }
+    if (last_failed >= 0 && !background) {
+        last_status = last_failed;
+    }
+    /* POSIX: "The exit status of an asynchronous list shall be zero." */
+    if (background) {
+        last_status = 0;
+    }
     return quit;
 }
 
-/* Runs a line: its '&'-separated jobs, in order. Returns 1 if the shell
- * should exit. */
+/* The pipeline t[0..n) (not empty) as commands in `cmds` (MAX_PIPE of
+ * them). Returns how many, or -1 having said why it makes no sense. */
+static int parse_pipeline(struct token *t, int n, struct cmd *cmds) {
+    int ncmds = 0;
+    for (int c = 0; c < n;) {
+        int stop = c;
+        while (stop < n && t[stop].op != '|') {
+            stop++;
+        }
+        if (ncmds == MAX_PIPE) {
+            fprintf(STDERR, "sh: too many commands in a pipeline\n");
+            return -1;
+        }
+        if (parse_cmd(&t[c], stop - c, &cmds[ncmds]) < 0) {
+            return -1;
+        }
+        ncmds++;
+        if (stop < n && stop + 1 == n) {
+            fprintf(STDERR, "sh: | with no command\n");
+            return -1;
+        }
+        c = stop + 1;
+    }
+    return ncmds;
+}
+
+/* Where the AND-OR list t[0..n) has its next `&&` or `||` from `start`, or
+ * n if none. */
+static int next_and_or(struct token *t, int n, int start) {
+    int end = start;
+    while (end < n && t[end].op != AND && t[end].op != OR) {
+        end++;
+    }
+    return end;
+}
+
+/* Checks the AND-OR list t[0..n) (not empty): every pipeline in it makes
+ * sense. Returns 0, or -1 having said why not, before anything runs. */
+static int check_and_or(struct token *t, int n) {
+    struct cmd cmds[MAX_PIPE];
+    for (int start = 0;;) {
+        int end = next_and_or(t, n, start);
+        if (end == start || (end < n && end + 1 == n)) {
+            /* `&& b`, `a ||`: an operator with no pipeline on a side. */
+            fprintf(STDERR, "sh: %s with no command\n", op_text(t[end].op));
+            return -1;
+        }
+        if (parse_pipeline(&t[start], end - start, cmds) < 0) {
+            return -1;
+        }
+        if (end == n) {
+            return 0;
+        }
+        start = end + 1;
+    }
+}
+
+/* Runs the AND-OR list t[0..n) in a shell of its own, in the background:
+ * `sh -c LIST`, its words and operators written out again, blanks between
+ * them (there is no quoting to keep). The new shell is the job: `[PID]`,
+ * and `wait` reports it as `sh`. */
+static void run_in_subshell(struct token *t, int n) {
+    size_t size = 0;
+    for (int i = 0; i < n; i++) {
+        size += strlen(t[i].op == 0 ? t[i].word : op_text(t[i].op)) + 1;
+    }
+    char *text = malloc(size);
+    if (text == NULL) {
+        fprintf(STDERR, "sh: out of memory\n");
+        return;
+    }
+    size_t len = 0;
+    for (int i = 0; i < n; i++) {
+        const char *s = t[i].op == 0 ? t[i].word : op_text(t[i].op);
+        size_t k = strlen(s);
+        memcpy(text + len, s, k);
+        len += k;
+        text[len] = i + 1 < n ? ' ' : 0;
+        len++;
+    }
+    char *argv[] = {"sh", "-c", text, NULL};
+    char *envp[MAX_VARS + MAXARG + 1];
+    build_env(NULL, 0, envp);
+    int pid = spawn("/bin/sh", argv, envp);
+    free(text);
+    if (pid < 0) {
+        cannot_start("sh", pid);
+        return;
+    }
+    printf("[%d]\n", pid);
+    remember(pid, "sh");
+    last_status = 0; /* an asynchronous list's status, as POSIX has it */
+}
+
+/* Runs the AND-OR list t[0..n) (see the top, and checked: check_and_or),
+ * in the background or not. Returns 1 if the shell should exit, with the
+ * status in *exit_status. */
+static int run_and_or(struct token *t, int n, int background, int *exit_status) {
+    if (background && next_and_or(t, n, 0) < n) {
+        run_in_subshell(t, n);
+        return 0;
+    }
+    char op = 0;
+    for (int start = 0;;) {
+        int end = next_and_or(t, n, start);
+        /* The first pipeline runs; one after `&&` only if the status is 0,
+         * one after `||` only if it is not. */
+        if (op == 0 || (op == AND) == (last_status == 0)) {
+            struct cmd cmds[MAX_PIPE];
+            int ncmds = parse_pipeline(&t[start], end - start, cmds);
+            if (run_job(cmds, ncmds, background, exit_status)) {
+                return 1;
+            }
+        }
+        if (end == n) {
+            return 0;
+        }
+        op = t[end].op;
+        start = end + 1;
+    }
+}
+
+/* Runs a line: its AND-OR lists, each up to a ';' or a '&' (which runs it
+ * in the background), in order. Returns 1 if the shell should exit. */
 static int run_line(char *line, int *exit_status) {
     struct token t[MAX_TOKENS];
     int n = tokenize(line, t, MAX_TOKENS);
     if (n < 0) {
         fprintf(STDERR, "sh: too many words\n");
+        last_status = 2;
         return 0;
     }
-    int start = 0;
-    while (start < n) {
-        /* The job: up to the next '&' or the end. */
+    /* The whole line is checked before any of it runs, as POSIX shells
+     * parse a complete command first: `a ;; b` runs nothing. */
+    for (int start = 0; start < n;) {
         int end = start;
-        while (end < n && t[end].op != '&') {
+        while (end < n && t[end].op != ';' && t[end].op != '&') {
             end++;
         }
-        struct cmd cmds[MAX_PIPE];
-        int ncmds = 0;
-        int ok = end > start;
-        if (!ok) {
-            fprintf(STDERR, "sh: & with no command\n");
-        }
-        for (int c = start; ok && c < end;) {
-            int stop = c;
-            while (stop < end && t[stop].op != '|') {
-                stop++;
-            }
-            if (ncmds == MAX_PIPE) {
-                fprintf(STDERR, "sh: too many commands in a pipeline\n");
-                ok = 0;
-            } else if (parse_cmd(&t[c], stop - c, &cmds[ncmds]) < 0) {
-                ok = 0;
-            } else {
-                ncmds++;
-                if (stop < end && stop + 1 == end) {
-                    fprintf(STDERR, "sh: | with no command\n");
-                    ok = 0;
-                }
-            }
-            c = stop + 1;
-        }
-        if (!ok) {
+        if (end == start) {
+            fprintf(STDERR, "sh: %s with no command\n", op_text(t[end].op));
+            last_status = 2;
             return 0;
         }
-        if (run_job(cmds, ncmds, end < n, exit_status)) {
+        if (check_and_or(&t[start], end - start) < 0) {
+            last_status = 2;
+            return 0;
+        }
+        start = end + 1;
+    }
+    for (int start = 0; start < n;) {
+        int end = start;
+        while (end < n && t[end].op != ';' && t[end].op != '&') {
+            end++;
+        }
+        if (run_and_or(&t[start], end - start, end < n && t[end].op == '&', exit_status)) {
             return 1;
         }
         start = end + 1;
@@ -997,10 +1193,25 @@ static int read_line(char *buf) {
     return n;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     char line[LINE_SIZE];
     import_env();
     look_at_input();
+    if (argc > 1 && strcmp(argv[1], "-c") == 0) {
+        /* `sh -c LIST`: LIST is the line (its words are split in place,
+         * in this process's own copy of its arguments), and its last
+         * status is the shell's. */
+        if (argc < 3) {
+            fprintf(STDERR, "sh: -c: option requires an argument\n");
+            return 2;
+        }
+        command_mode = 1;
+        int status;
+        if (run_line(argv[2], &status)) {
+            return status;
+        }
+        return last_status;
+    }
     interactive = console_input || connection_input;
     printf("Type help for the list of commands.\n");
     for (;;) {

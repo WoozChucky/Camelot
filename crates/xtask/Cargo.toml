@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+# `cargo xtask`; src/bin/gnu_as.rs is a test's stand-in for GNU as.
+default-run = "xtask"
 
 [dependencies]
 # `cargo xtask up --demo` creates the demo's switch, disk and VM.

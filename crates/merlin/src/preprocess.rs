@@ -147,10 +147,22 @@ pub struct Options {
     /// for text that is no assembly, such as a linker script
     /// ([`Output::print_asm`]).
     pub line_markers: bool,
+    /// Whether the input is C already preprocessed (`-x cpp-output`, a `.i`
+    /// file), as clang's -cc1 takes it: every directive runs and every
+    /// macro is defined (the predefined ones and `-D`'s too), but a macro
+    /// is expanded only in a directive (`#if`, `#include`, `#line`), never
+    /// in the text, as clang's `SetMacroExpansionOnlyInDirectives` has it.
+    pub preprocessed: bool,
+    /// The main file's name in the object, if not the one its diagnostics
+    /// give it, as clang's `-main-file-name`: the `.file` of its `STT_FILE`
+    /// symbol, and with `-g` the compile unit's name and `.file 0`'s, the
+    /// diagnostics' name then a file of the line table of its own. `-` for
+    /// standard input, `<stdin>` in diagnostics.
+    pub main_file_name: Option<String>,
 }
 
 impl Default for Options {
-    /// No `-I`, `-D`, `-g` or `-P`, C.
+    /// No `-I`, `-D`, `-g` or `-P`, C to preprocess.
     fn default() -> Options {
         Options {
             include_dirs: Vec::new(),
@@ -158,6 +170,8 @@ impl Default for Options {
             debug: None,
             lang: Lang::C,
             line_markers: true,
+            preprocessed: false,
+            main_file_name: None,
         }
     }
 }
@@ -1095,8 +1109,21 @@ impl Pp<'_> {
     }
 
     fn run(&mut self, src: &str) -> Result<(Vec<PTok>, Pos), Error> {
-        // The predefined macros, then -D and -U, as directives of their own
-        // files.
+        self.define_builtins()?;
+        let (toks, end) = self.lex(src, 0)?;
+        self.enter(toks, src, 0);
+        let mut out = Vec::new();
+        while let Some(t) = self.next()? {
+            self.last_out = t.t.pos;
+            out.push(t);
+            self.emitted += 1;
+        }
+        Ok((out, end))
+    }
+
+    /// The predefined macros, then -D and -U, as directives of their own
+    /// files.
+    fn define_builtins(&mut self) -> Result<(), Error> {
         let mut builtin: String = predefined(self.opts.lang)
             .iter()
             .map(|(name, value)| format!("#define {name} {value}\n"))
@@ -1120,16 +1147,7 @@ impl Pp<'_> {
         if !cmd.is_empty() {
             self.read_directives("<command line>", &cmd)?;
         }
-
-        let (toks, end) = self.lex(src, 0)?;
-        self.enter(toks, src, 0);
-        let mut out = Vec::new();
-        while let Some(t) = self.next()? {
-            self.last_out = t.t.pos;
-            out.push(t);
-            self.emitted += 1;
-        }
-        Ok((out, end))
+        Ok(())
     }
 
     /// Reads a made-up file holding only directives; its number.
@@ -1384,7 +1402,9 @@ impl Pp<'_> {
             let Some(name) = t.t.ident() else {
                 return Ok(Some(t));
             };
-            if hidden(&t.hide, name) {
+            // Preprocessed C: macros are expanded in directives alone (a
+            // directive's line is expanded isolated).
+            if hidden(&t.hide, name) || (self.opts.preprocessed && !self.isolated) {
                 return Ok(Some(t));
             }
             let Some(m) = self.macros.get(name) else {
@@ -3376,6 +3396,8 @@ puts( "The first, second, and third items." );
             debug: None,
             lang: Lang::C,
             line_markers: true,
+            preprocessed: false,
+            main_file_name: None,
         };
         let src = "#include <d.h>\n#include \"d.h\"\n#include <c.h>\n#define H <b.h>\n#include H";
         let out = run(&files, src, &opts).unwrap();
@@ -3627,6 +3649,8 @@ puts( "The first, second, and third items." );
             debug: None,
             lang: Lang::C,
             line_markers: true,
+            preprocessed: false,
+            main_file_name: None,
         };
         let out = run(&[], "ONE TWO F(3) GONE __merlin__ __STDC_VERSION__", &opts).unwrap();
         assert_eq!(words(&out.tokens), same("1 22 (3+1) GONE __merlin__ 199901L"));
@@ -3645,6 +3669,8 @@ puts( "The first, second, and third items." );
             debug: None,
             lang: Lang::C,
             line_markers: true,
+            preprocessed: false,
+            main_file_name: None,
         };
         assert_eq!(
             run(&[], "", &opts).unwrap_err().render("main.c"),

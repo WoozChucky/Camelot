@@ -464,7 +464,8 @@ fn the_command_line_takes_g() {
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        std::fs::read_to_string(dir.join("-")).unwrap()
+        // `-o -` is standard output, as clang's -cc1 has it.
+        String::from_utf8(out.stdout).unwrap().replace('\r', "")
     };
     let sum = md5(src);
     let here = run(&["-g", "-fdebug-compilation-dir=here"]);
