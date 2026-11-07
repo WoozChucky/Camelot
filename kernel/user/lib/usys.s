@@ -65,8 +65,9 @@
     .equ SYS_recvmsg, 57
     .equ SYS_stat, 58
     .equ SYS_getsockopt, 59
-    .equ SYS_clock_gettime, 60
-    .equ SYS_sysinfo, 61
+    .equ SYS_getcwd, 60
+    .equ SYS_clock_gettime, 61
+    .equ SYS_sysinfo, 62
 
     .text
 
@@ -484,6 +485,13 @@ recvmsg:
     .globl stat
 stat:
     li    a7, SYS_stat
+    ecall
+    ret
+
+# long getcwd(char *buf, size_t size)
+    .globl getcwd
+getcwd:
+    li    a7, SYS_getcwd
     ecall
     ret
 

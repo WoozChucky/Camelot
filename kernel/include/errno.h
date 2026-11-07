@@ -13,8 +13,8 @@
  * SBI_ERR_IO. */
 #define EIO 5 /* the disk failed, or an SBI call's input or output */
 
-/* sbi_err_map_linux_errno()'s (sbi.h): SBI_ERR_BAD_RANGE. */
-#define ERANGE 34 /* out of range */
+/* (ERANGE, sbi_err_map_linux_errno()'s SBI_ERR_BAD_RANGE, is getcwd's
+ * too: syscall.h has it.) */
 
 /* Linux's include/linux/errno.h: "Operation is not supported", the errno
  * Linux maps SBI_ERR_NOT_SUPPORTED and SBI_ERR_FAILED to (and any SBI error

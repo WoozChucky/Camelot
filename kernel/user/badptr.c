@@ -164,10 +164,15 @@ int main(int argc, char **args) {
     expect(open((char *)KERNEL, O_RDONLY), -EFAULT);         /* 85 */
     expect(wait(-1, (int *)0xffffffd600000000ul), -EFAULT);  /* 86 */
     expect(write(STDOUT, (char *)0x100000000ul + 0x1000, 1), -EFAULT); /* 87 */
+    /* Where getcwd stores the path: nowhere, read-only memory, or a
+     * buffer running off the heap (the root's path, "/", is 2 bytes). */
+    expect(getcwd((char *)KERNEL, 100), -EFAULT);            /* 88 */
+    expect(getcwd((char *)msg, 100), -EFAULT);               /* 89 */
+    expect(getcwd(end - 1, 100), -EFAULT);                   /* 90 */
     /* And a good buffer. */
     if (failed_case == 0) {
         size_t len = strlen(msg);
-        expect(write(STDOUT, msg, len), (long)len);          /* 88 */
+        expect(write(STDOUT, msg, len), (long)len);          /* 91 */
     } else {
         printf("badptr: case %d failed\n", failed_case);
     }

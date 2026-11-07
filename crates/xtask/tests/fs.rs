@@ -38,7 +38,7 @@ const FS_TEST_GROW: u32 = 5;
 /// without a /bin, and the transactions'.
 const READ_CHECKS: u32 = 12;
 const READ_CHECKS_NO_BIN: u32 = 11;
-const WRITE_CHECKS: u32 = 62;
+const WRITE_CHECKS: u32 = 69;
 const FULL_CHECKS: u32 = 8;
 const TREE_CHECKS: u32 = 6;
 const GROW_CHECKS: u32 = 7;
@@ -1360,7 +1360,7 @@ const PROMPT: &str = "$ ";
 
 /// Checks `filetest` makes on the root image, its 64-bit off_t's among
 /// them, and `filetest ro` on a read-only one (kernel/user/filetest.c).
-const FILETEST_CHECKS: u32 = 179;
+const FILETEST_CHECKS: u32 = 246;
 const FILETEST_RO_CHECKS: u32 = 14;
 
 /// What the shell printed after reading `command`, up to its next prompt.

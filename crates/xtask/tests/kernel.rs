@@ -4064,7 +4064,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 61, "{calls:?}");
+    assert_eq!(calls.len(), 62, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -4093,7 +4093,7 @@ fn the_system_call_document_matches_the_code() {
     }
 
     let errors = doc_table(&doc, "## Error numbers");
-    assert_eq!(errors.len(), 50, "{errors:?}");
+    assert_eq!(errors.len(), 51, "{errors:?}");
     assert_eq!(defines(&header, "E"), errors, "syscall.h");
     // (Not sysexits.h's exit statuses, EX_CONFIG: no error numbers.)
     let user_errors: Vec<(u32, String)> = defines(&user_h, "E")

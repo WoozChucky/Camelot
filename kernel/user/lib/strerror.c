@@ -58,6 +58,8 @@ const char *strerror(int err) {
         return "read-only filesystem";
     case EPIPE:
         return "broken pipe";
+    case ERANGE:
+        return "result out of range";
     case ENAMETOOLONG:
         return "name too long";
     case ENOSYS:
