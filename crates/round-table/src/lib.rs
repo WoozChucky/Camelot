@@ -41,7 +41,8 @@ VM commands, sent to Avalon:
                   is copied to NAME-disk0, which becomes the VM's first
                   disk. PROFILE is server (image os-base) or desktop
                   (os-desktop); --camelot is --profile server
-  profiles        the hardware profiles of Camelot VMs: image, RAM, firmware
+  profiles        the hardware profiles of Camelot VMs: image, RAM, harts,
+                  firmware
   list            every VM: id, name, state, RAM, clock, disks and cards
   info VM         one VM in detail: hardware, disks, network cards, steps
                   run, devices
