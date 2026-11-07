@@ -2736,9 +2736,16 @@ fn cc1_takes_merlins_command_line() {
         ("/d/la.c".to_string(), la.as_bytes().to_vec()),
         ("/d/lb.c".to_string(), lb.as_bytes().to_vec()),
         ("/d/lc.c".to_string(), lc.as_bytes().to_vec()),
-        // Response files, as the `cc` driver writes them (#242).
-        ("/d/rsp1".to_string(), b"-E\n/d/a.c\n".to_vec()),
-        ("/d/rsp2".to_string(), b"-E @/d/rsp1\n".to_vec()),
+        // Response files, read as clang reads them (#242): quoted, nested,
+        // naming themselves.
+        ("/d/rsp1".to_string(), b"\"-E\"\n'/d/a.c' ".to_vec()),
+        ("/d/rsp2".to_string(), b"@/d/rsp1\n".to_vec()),
+        ("/d/self".to_string(), b"-E @/d/self\n".to_vec()),
+        // A warning, for -w and -W.
+        (
+            "/d/w.c".to_string(),
+            b"int f(void) {\n    return 1 << 40;\n}\n".to_vec(),
+        ),
     ];
     let usage = "usage: cc1 [options] input.c...\n";
     // (command, what it says first, and its exit status).
@@ -2791,15 +2798,43 @@ fn cc1_takes_merlins_command_line() {
             format!("cc1: unknown option -fdebug-compilation-dirs\n{usage}"),
             2,
         ),
+        // A response file that isn't there is an input like any other.
         (
             "cc1 @/d/none",
-            "cc1: cannot read /d/none: no such file or directory\n".to_string(),
+            "cc1: cannot read @/d/none: no such file or directory\n".to_string(),
             2,
         ),
         (
-            "cc1 @/d/rsp2",
-            "cc1: /d/rsp2: a response file cannot name another (@/d/rsp1)\n".to_string(),
+            "cc1 @/d/self",
+            "cc1: recursive expansion of: '/d/self'\n".to_string(),
             2,
+        ),
+        (
+            "cc1 @/d",
+            "cc1: cannot not open file '/d': is a directory\n".to_string(),
+            2,
+        ),
+        // -O and -std=, which clang's -cc1 checks.
+        (
+            "cc1 -E -Ox /d/a.c",
+            "error: invalid integral value 'x' in '-Ox'\n".to_string(),
+            1,
+        ),
+        (
+            "cc1 -E -std=c11 /d/a.c",
+            "error: merlin compiles C99: '-std=c11' is not supported\n".to_string(),
+            1,
+        ),
+        (
+            "cc1 -E -std=foo /d/a.c",
+            "error: invalid value 'foo' in '-std=foo'\n".to_string(),
+            1,
+        ),
+        // -Werror makes the warning an error, and the compilation fails.
+        (
+            "cc1 -Werror -o /out/w1 /d/w.c",
+            "/d/w.c:2:14: error: shift count >= width of type [-Werror,-Wshift-count-overflow]\n".to_string(),
+            1,
         ),
     ];
     // What merlin writes for both files: on standard output, one after the
@@ -2814,10 +2849,18 @@ fn cc1_takes_merlins_command_line() {
     );
     let together = "cc1 -E -g /d/a.c /d/b.S";
     let help = "cc1 --help";
-    // A response file's words, in its place: `cc1 -E /d/a.c`.
+    // A response file's arguments, in its place: `cc1 -E /d/a.c`, the
+    // second through the first.
     let response = "cc1 @/d/rsp1";
+    let nested = "cc1 @/d/rsp2";
+    // Standard input, and standard output for -o -; -w and -Wno-FLAG leave
+    // the warning out; -O, -std=c99 and -ffreestanding change nothing.
+    let stdin = "cc1 -E - < /d/a.c";
+    let quiet = "cc1 -w -O2 -std=c99 -ffreestanding -o /out/w3 /d/w.c";
+    let to_stdout = "cc1 -E -o - /d/a.c";
+    let no_flag = "cc1 -Wno-shift-count-overflow -Wall -o /out/w2 /d/w.c";
     let mut commands: Vec<&str> = cases.iter().map(|(c, ..)| *c).collect();
-    commands.extend([together, help, response]);
+    commands.extend([together, help, response, nested, stdin, to_stdout, quiet, no_flag]);
     // -g: (the directory the shell is in, the command, and the directory
     // merlin is told the names are relative to). The default is the
     // directory cc1 runs in; a name of DIRSIZ bytes has no NUL in its
@@ -2876,8 +2919,18 @@ fn cc1_takes_merlins_command_line() {
     }
     assert_eq!(shell_output(&out, together), both);
     assert!(shell_output(&out, help).starts_with(usage));
-    assert_eq!(shell_output(&out, response), merlin_e(&job_a, &map).0.unwrap());
+    let a_e = merlin_e(&job_a, &map).0.unwrap();
+    for c in [response, nested, stdin, to_stdout] {
+        assert_eq!(shell_output(&out, c), a_e, "{c}");
+    }
+    let w_s = merlin_s(&CcJob::new("/d/w.c".into(), &[], &[]), &map).0.unwrap();
+    assert_eq!(shell_output(&out, quiet), "");
+    assert_eq!(shell_output(&out, no_flag), "");
     let fs = Fs::open(&disk).unwrap();
+    assert!(fs.lookup("/out/w1").is_err(), "-Werror wrote /out/w1");
+    for written in ["/out/w2", "/out/w3"] {
+        assert_eq!(String::from_utf8(fs.read_file(written).unwrap()).unwrap(), w_s);
+    }
     let image: BTreeMap<String, Vec<u8>> = files.iter().cloned().collect();
     for (k, (dir, command, comp_dir)) in debug.iter().enumerate() {
         assert_eq!(shell_output(&out, command), "", "{command}");
@@ -4126,24 +4179,264 @@ fn cc_builds_hello_and_wc_on_camelot_as_the_host_does() {
     assert!(fs.read_file("/src/hello").is_ok());
     assert_eq!(left_in_tmp(&fs), Vec::<String>::new());
 }
+/// The files only the `-###` cases name, besides [`cc_sources`]: a response
+/// file whose argument has a blank, quoted as clang reads it, and C already
+/// preprocessed (a `.i` file).
+fn printed_sources() -> Vec<(String, Vec<u8>)> {
+    vec![
+        ("/src/q.rsp".into(), b"\"-DMSG=a b\" 'a.c'\n".to_vec()),
+        (
+            "/src/p.i".into(),
+            b"# 1 \"p.c\"\nint pi(void) {\n    return 3;\n}\n".to_vec(),
+        ),
+    ]
+}
+
+/// cc's `-###` cases, in `/src`: (cc's arguments, the command lines it
+/// prints after its header, temporary files numbered as [`mask_temps`]
+/// numbers them). What the two drivers have in common of each
+/// ([`stage_summary`]: the stages, and their inputs, outputs and options) is
+/// clang's, `clang --target=riscv64 -fno-integrated-as` (the shape cc
+/// follows: cc1 writes assembly, `as` assembles it), committed in
+/// `tests/cc/clang-stages.txt` and checked against clang by the ignored
+/// [`clang_runs_the_stages_cc_runs`].
+const CC_PRINTED: &[(&str, &[&str])] = &[
+    (
+        "-### -o hello hello.c",
+        &[
+            r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/hello-T1.s" "-x" "c" "hello.c""#,
+            r#" "/bin/as" "-o" "/tmp/hello-T2.o" "/tmp/hello-T1.s""#,
+            r#" "/bin/ld" "-T" "/usr/lib/user.ld" "/usr/lib/crt0.o" "-L/usr/lib" "/tmp/hello-T2.o" "-lc" "-o" "hello""#,
+        ],
+    ),
+    (
+        "-### -c -g -I inc -DX=1 -UY a.c b.S c.s",
+        &[
+            r#" "/bin/cc1" "-g" "-I" "inc" "-I" "/usr/include" "-D" "X=1" "-U" "Y" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
+            r#" "/bin/cc1" "-E" "-g" "-I" "inc" "-I" "/usr/include" "-D" "X=1" "-U" "Y" "-o" "/tmp/b-T2.s" "-x" "assembler-with-cpp" "b.S""#,
+            r#" "/bin/as" "-o" "b.o" "/tmp/b-T2.s""#,
+            r#" "/bin/as" "-o" "c.o" "c.s""#,
+        ],
+    ),
+    (
+        "-### -E -P hello.c b.S",
+        &[
+            r#" "/bin/cc1" "-E" "-P" "-I" "/usr/include" "-o" "-" "-x" "c" "hello.c""#,
+            r#" "/bin/cc1" "-E" "-P" "-I" "/usr/include" "-o" "-" "-x" "assembler-with-cpp" "b.S""#,
+        ],
+    ),
+    (
+        "-### -S -o out.s a.c",
+        &[r#" "/bin/cc1" "-I" "/usr/include" "-o" "out.s" "-x" "c" "a.c""#],
+    ),
+    (
+        "-### -o p a.c d.o -L/l2 -lgui -Wl,-S,-e,main",
+        &[
+            r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/as" "-o" "/tmp/a-T2.o" "/tmp/a-T1.s""#,
+            r#" "/bin/ld" "-T" "/usr/lib/user.ld" "/usr/lib/crt0.o" "-L/l2" "-L/usr/lib" "/tmp/a-T2.o" "d.o" "-lgui" "-S" "-e" "main" "-lc" "-o" "p""#,
+        ],
+    ),
+    // Quoted as clang quotes: a backslash before `"`, `\` and `$`.
+    (
+        r#"-### -c -DQ=a\b$ -fdebug-compilation-dir=/d -g a.c"#,
+        &[
+            r#" "/bin/cc1" "-g" "-fdebug-compilation-dir=/d" "-I" "/usr/include" "-D" "Q=a\\b\$" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
+        ],
+    ),
+    // After `--`, every argument is a file.
+    (
+        "-### -c -- a.c",
+        &[
+            r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
+        ],
+    ),
+    // -O (-O1 for cc1, as clang gives it), -W, -w, -std, -ffreestanding:
+    // cc1's, as they are clang's -cc1's.
+    (
+        "-### -c -O -Wall -w -std=c99 -ffreestanding a.c",
+        &[
+            r#" "/bin/cc1" "-O1" "-I" "/usr/include" "-ffreestanding" "-Wall" "-w" "-std=c99" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
+        ],
+    ),
+    // cc's own response file, quoted as clang reads one: `-DMSG=a b` is one
+    // argument.
+    (
+        "-### -c @q.rsp",
+        &[
+            r#" "/bin/cc1" "-I" "/usr/include" "-D" "MSG=a b" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
+        ],
+    ),
+    // C already preprocessed, and standard input.
+    (
+        "-### -c p.i",
+        &[
+            r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/p-T1.s" "-x" "cpp-output" "p.i""#,
+            r#" "/bin/as" "-o" "p.o" "/tmp/p-T1.s""#,
+        ],
+    ),
+    (
+        "-### -E -",
+        &[r#" "/bin/cc1" "-E" "-I" "/usr/include" "-o" "-" "-x" "c" "-""#],
+    ),
+];
+
+/// The words of a command line as clang's driver prints it with `-###`:
+/// each in double quotes, a backslash before `"`, `\` and `$`.
+fn quoted_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut w = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => w.extend(chars.next()),
+                '"' => break,
+                c => w.push(c),
+            }
+        }
+        words.push(w);
+    }
+    words
+}
+
+/// What cc's and clang's `-###` lines have in common: each stage, `cc1`,
+/// `as` or `ld`, with the words that say what it does, in their order, the
+/// rest (the toolchain's own, which are not the same: clang's -cc1's
+/// target words, its system directories and runtime libraries, cc's
+/// `/usr/include`, script, start code and `-lc`) left out. A temporary
+/// file is `TMP/STEM-TN.EXT`, numbered as it first appears; clang's `-g`
+/// (`-debug-info-kind=...`) is cc's `-g`.
+fn stage_summary(text: &str) -> Vec<String> {
+    let mut temps: Vec<String> = Vec::new();
+    let mut temp = |w: &str| -> String {
+        let base = w.rsplit(['/', '\\']).next().unwrap_or(w);
+        let random = base
+            .rsplit_once('.')
+            .and_then(|(b, _)| b.rsplit_once('-'))
+            .map(|(_, r)| r);
+        let is_temp = (w.contains('/') || w.contains('\\'))
+            && random.is_some_and(|r| r.len() == 6 && r.bytes().all(|b| b.is_ascii_hexdigit()));
+        if !is_temp {
+            return w.to_string();
+        }
+        let (stem_random, ext) = base.rsplit_once('.').unwrap();
+        let stem = stem_random.rsplit_once('-').unwrap().0;
+        let n = temps.iter().position(|t| t == w).unwrap_or_else(|| {
+            temps.push(w.to_string());
+            temps.len() - 1
+        }) + 1;
+        format!("TMP/{stem}-T{n}.{ext}")
+    };
+    let mut out = Vec::new();
+    for line in text.lines().filter(|l| l.starts_with(" \"")) {
+        let words = quoted_words(line);
+        let program = words[0]
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap()
+            .trim_end_matches(".exe");
+        let tool = match program {
+            "clang" if words.get(1).map(String::as_str) == Some("-cc1") => "cc1",
+            "cc1" => "cc1",
+            "as" => "as",
+            "ld" | "ld.lld" => "ld",
+            other => panic!("{other}: no stage of cc's"),
+        };
+        let mut kept: Vec<String> = Vec::new();
+        let args = &words[1..];
+        let mut i = 0;
+        while i < args.len() {
+            let w = args[i].as_str();
+            let next = args.get(i + 1).map(String::as_str).unwrap_or("");
+            match tool {
+                "cc1" => match w {
+                    "-E" | "-P" | "-w" | "-ffreestanding" | "-g" => kept.push(w.into()),
+                    _ if w.starts_with("-debug-info-kind=") => kept.push("-g".into()),
+                    _ if w.starts_with("-O") || w.starts_with("-std=") || w.starts_with("-W") => {
+                        kept.push(w.into())
+                    }
+                    "-I" | "-D" | "-U" | "-o" | "-x" => {
+                        if !(w == "-I" && next == "/usr/include") {
+                            kept.push(format!("{w} {}", temp(next)));
+                        }
+                        i += 1;
+                    }
+                    _ if i + 1 == args.len() => kept.push(temp(w)),
+                    _ => {}
+                },
+                // clang gives GNU `as` `-mabi`, `-march`, the `-I`
+                // directories and, with -g, `-g -gdwarf-5`: cc's has no use
+                // for them.
+                "as" => match w {
+                    "-mabi" | "-march" | "-I" => i += 1,
+                    "-o" => {
+                        kept.push(format!("-o {}", temp(next)));
+                        i += 1;
+                    }
+                    _ if w.starts_with('-') => {}
+                    _ => kept.push(temp(w)),
+                },
+                _ => match w {
+                    "-m" | "-T" => i += 1,
+                    "-Bstatic" | "-X" | "--start-group" | "--end-group" | "-lc" | "-L/usr/lib" => {}
+                    _ if w.ends_with("crt0.o") || w.contains("libclang_rt") => {}
+                    _ if w.starts_with("-L") && w.to_ascii_lowercase().contains("clang") => {}
+                    "-o" => {
+                        kept.push(format!("-o {}", temp(next)));
+                        i += 1;
+                    }
+                    _ => kept.push(temp(w)),
+                },
+            }
+            i += 1;
+        }
+        out.push(format!("{tool} {}", kept.join(" ")));
+    }
+    out
+}
+
+/// The committed summary of clang's stages for each of [`CC_PRINTED`]:
+/// `$ cc ARGS`, then a line a stage.
+const CLANG_STAGES: &str = "tests/cc/clang-stages.txt";
+
+fn summaries_text(summaries: &[(String, Vec<String>)]) -> String {
+    summaries
+        .iter()
+        .map(|(args, lines)| format!("$ cc {args}\n{}\n", lines.join("\n")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// The driver's stages, as clang's driver runs them with
 /// `-fno-integrated-as` (cc1 writes assembly, `as` assembles it, `ld`
-/// links): what `-###` prints (cc's header, then each command line, every
-/// argument quoted), what `-v` prints as it runs them (only the arguments
-/// that need it quoted), command lines too long for exec given in response
-/// files (cc1's with seven macros, ld's with fifteen objects, from cc's own
-/// response file), and every input language and last stage: `-c`, `-S` and
-/// `-E` with `-o`, several inputs, and `.c`, `.S` (preprocessed by `cc1 -E
-/// -x assembler-with-cpp`), `.s` and `.o` files linked together. What the
-/// stages write is what the host's tools write (merlin, merlin-as,
-/// merlin-ld), and the programs run. No temporary file is left.
+/// links): what `-###` prints ([`CC_PRINTED`]: cc's header, then each
+/// command line, every argument quoted), which is clang's in what the two
+/// have in common (`tests/cc/clang-stages.txt`); what `-v` prints as it
+/// runs them (only the arguments that need it quoted); command lines too
+/// long for exec given in response files (cc1's with seven macros, ld's
+/// with fifteen objects, from cc's own response file), written and shown as
+/// clang writes and shows its own; and every input language and last stage:
+/// `-c`, `-S` and `-E` with `-o`, several inputs, and `.c`, `.S`
+/// (preprocessed by `cc1 -E -x assembler-with-cpp`), `.s` and `.o` files
+/// linked together. What the stages write is what the host's tools write
+/// (merlin, merlin-as, merlin-ld), and the programs run. `$TMPDIR` names
+/// where the temporary files go. No temporary file is left.
 #[test]
 fn cc_runs_its_stages_as_clangs_driver_does() {
     use userprogs::CCompiler;
     let dir = userprogs::user_dir(&repo_root());
     let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
     let mut files = cc_sources();
+    files.extend(printed_sources());
     // Many: a C file of seven macros and thirteen assembly files, from a
     // response file.
     files.push((
@@ -4168,54 +4461,7 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
         format!("-o many\n{}\nm.c {}\n", macros.join(" "), s_files.join(" ")).into_bytes(),
     ));
     let header = cc_header();
-    // -###: (command, the command lines it prints).
-    let printed: &[(&str, &[&str])] = &[
-        (
-            "cc -### -o hello hello.c",
-            &[
-                r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/hello-T1.s" "-x" "c" "hello.c""#,
-                r#" "/bin/as" "-o" "/tmp/hello-T2.o" "/tmp/hello-T1.s""#,
-                r#" "/bin/ld" "-T" "/usr/lib/user.ld" "/usr/lib/crt0.o" "-L/usr/lib" "/tmp/hello-T2.o" "-lc" "-o" "hello""#,
-            ],
-        ),
-        (
-            "cc -### -c -g -I inc -DX=1 -UY a.c b.S c.s",
-            &[
-                r#" "/bin/cc1" "-g" "-I" "inc" "-I" "/usr/include" "-D" "X=1" "-U" "Y" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
-                r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
-                r#" "/bin/cc1" "-E" "-g" "-I" "inc" "-I" "/usr/include" "-D" "X=1" "-U" "Y" "-o" "/tmp/b-T2.s" "-x" "assembler-with-cpp" "b.S""#,
-                r#" "/bin/as" "-o" "b.o" "/tmp/b-T2.s""#,
-                r#" "/bin/as" "-o" "c.o" "c.s""#,
-            ],
-        ),
-        (
-            "cc -### -E -P hello.c b.S",
-            &[
-                r#" "/bin/cc1" "-E" "-P" "-I" "/usr/include" "-x" "c" "hello.c""#,
-                r#" "/bin/cc1" "-E" "-P" "-I" "/usr/include" "-x" "assembler-with-cpp" "b.S""#,
-            ],
-        ),
-        (
-            "cc -### -S -o out.s a.c",
-            &[r#" "/bin/cc1" "-I" "/usr/include" "-o" "out.s" "-x" "c" "a.c""#],
-        ),
-        (
-            "cc -### -o p a.c d.o -L/l2 -lgui -Wl,-S,-e,main",
-            &[
-                r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
-                r#" "/bin/as" "-o" "/tmp/a-T2.o" "/tmp/a-T1.s""#,
-                r#" "/bin/ld" "-T" "/usr/lib/user.ld" "/usr/lib/crt0.o" "-L/l2" "-L/usr/lib" "/tmp/a-T2.o" "d.o" "-lgui" "-S" "-e" "main" "-lc" "-o" "p""#,
-            ],
-        ),
-        // Quoted as clang quotes: a backslash before `"`, `\` and `$`.
-        (
-            r#"cc -### -c -DQ=a\b$ -fdebug-compilation-dir=/d -g a.c"#,
-            &[
-                r#" "/bin/cc1" "-g" "-fdebug-compilation-dir=/d" "-I" "/usr/include" "-D" "Q=a\\b\$" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
-                r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
-            ],
-        ),
-    ];
+    let printed: Vec<String> = CC_PRINTED.iter().map(|(args, _)| format!("cc {args}")).collect();
     // -v, as it runs them, then the program.
     let verbose = "cc -v -o vhello hello.c";
     let many = "cc -v @many.rsp";
@@ -4227,13 +4473,17 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
     let asm_cpp_s = "cc -S b.S";
     let several = "cc -c a.c b.S c.s";
     let mixed = "cc -o /out/mix a.c b.S c.s d.o";
+    // $TMPDIR: where the temporary files go (and a directory that isn't
+    // there, which clang can't make them in either).
+    let tmpdir = "TMPDIR=/mytmp cc -### -c a.c";
+    let no_tmpdir = "TMPDIR=/none cc -c a.c";
     let runs = [
         ("./vhello", "hello from user mode\n"),
         ("./many", "28\n"),
         ("/out/mix", "4321\n"),
     ];
     let mut commands: Vec<&str> = vec!["cd /src"];
-    commands.extend(printed.iter().map(|(c, _)| *c));
+    commands.extend(printed.iter().map(String::as_str));
     commands.extend([
         verbose,
         many,
@@ -4244,15 +4494,37 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
         asm_cpp_s,
         several,
         mixed,
+        tmpdir,
+        no_tmpdir,
     ]);
     commands.extend(runs.iter().map(|(c, _)| *c));
     let input = format!("{}\nexit 0\n", commands.join("\n"));
-    let (out, disk) = boot_cc(cc_image(&rt, &[], &files), &input);
+    let (out, disk) = boot_cc(cc_image(&rt, &["/mytmp"], &files), &input);
     let said = |command: &str| mask_temps(shell_output(&out, command));
 
-    for (command, lines) in printed {
+    let clang: Vec<(String, Vec<String>)> =
+        std::fs::read_to_string(repo_root().join("crates/xtask").join(CLANG_STAGES))
+            .unwrap()
+            .replace('\r', "")
+            .split("\n\n")
+            .map(|case| {
+                let mut lines = case.lines();
+                let args = lines.next().unwrap().strip_prefix("$ cc ").unwrap().to_string();
+                (args, lines.map(String::from).collect())
+            })
+            .collect();
+    assert_eq!(clang.len(), CC_PRINTED.len(), "{CLANG_STAGES}");
+    for ((args, lines), (clang_args, clang_lines)) in CC_PRINTED.iter().zip(&clang) {
+        let command = format!("cc {args}");
         let want: String = lines.iter().map(|l| format!("{l}\n")).collect();
-        assert_eq!(said(command), format!("{header}{want}"), "{command}");
+        let got = said(&command);
+        assert_eq!(got, format!("{header}{want}"), "{command}");
+        assert_eq!(args, clang_args, "{CLANG_STAGES}");
+        assert_eq!(
+            &stage_summary(shell_output(&out, &command)),
+            clang_lines,
+            "{command}: not clang's stages"
+        );
     }
     assert_eq!(
         said(verbose),
@@ -4262,8 +4534,10 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
              \"/bin/ld\" -T /usr/lib/user.ld /usr/lib/crt0.o -L/usr/lib /tmp/hello-T2.o -lc -o vhello\n"
         )
     );
-    // cc1's command line: 20 arguments, its response file first (T1), then
+    // cc1's command line: 22 arguments, its response file first (T1), then
     // the assembly (T2); ld's: 22, its response file after the 14 objects.
+    // Each written as clang writes one: every argument quoted, a blank
+    // after it; -v shows it so.
     let mut cc1_args = vec!["-I".to_string(), "/usr/include".to_string()];
     for m in &macros {
         cc1_args.push("-D".into());
@@ -4287,15 +4561,14 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
     }
     let ld_rsp = 4 + s_files.len();
     ld_args.extend(["-lc", "-o", "many"].map(String::from));
-    let rsp = |args: &[String]| -> String { args.iter().map(|a| format!("{a}\n")).collect() };
     assert_eq!(
         said(many),
         format!(
-            "{header} \"/bin/cc1\" @/tmp/res-T1.txt\n Arguments passed via response file:\n{} (end of response \
-             file)\n{as_lines} \"/bin/ld\" @/tmp/res-T{ld_rsp}.txt\n Arguments passed via response file:\n{} (end \
+            "{header} \"/bin/cc1\" @/tmp/res-T1.txt\n Arguments passed via response file:\n{}\n (end of response \
+             file)\n{as_lines} \"/bin/ld\" @/tmp/res-T{ld_rsp}.txt\n Arguments passed via response file:\n{}\n (end \
              of response file)\n",
-            rsp(&cc1_args),
-            rsp(&ld_args)
+            excalibur::response::write(&cc1_args),
+            excalibur::response::write(&ld_args)
         )
     );
     for c in [object, assembly, preprocessed, several, mixed] {
@@ -4304,6 +4577,15 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
     for (run, want) in runs {
         assert_eq!(shell_output(&out, run), want, "{run}");
     }
+    let in_mytmp = shell_output(&out, tmpdir);
+    assert!(
+        in_mytmp.contains("\"-o\" \"/mytmp/a-") && !in_mytmp.contains("/tmp/"),
+        "{in_mytmp}"
+    );
+    assert_eq!(
+        shell_output(&out, no_tmpdir),
+        "cc: error: unable to make temporary file: no such file or directory\ncc: exit 1\n"
+    );
 
     // What the stages wrote: merlin's preprocessing and assembly of a.c
     // (its header from /usr/include), merlin-as's objects, and merlin-ld's
@@ -4372,17 +4654,32 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
     .unwrap();
     assert!(file("/out/mix") == mix, "/out/mix is not merlin-ld's link");
     assert_eq!(left_in_tmp(&fs), Vec::<String>::new());
+    assert!(fs
+        .list("/mytmp")
+        .unwrap()
+        .iter()
+        .all(|e| e.name().starts_with('.')));
 }
 
+/// The header `-v` and `-###` print, as the error cases have it.
+const HEADER: [&str; 4] = [
+    "cc version 0.1.0",
+    "Target: riscv64",
+    "Thread model: posix",
+    "InstalledDir: /bin",
+];
+
 /// The driver's own diagnostics, clang's (#242): (cc's arguments, what it
-/// prints, and its exit status), in `/src` ([`cc_sources`]). Each is
-/// checked on Camelot, where the stages' own messages come before cc's
-/// (merlin's for cc1, merlin-ld's for ld, temporary files as
-/// [`mask_temps`] names them); and those marked so against clang's driver
-/// (`clang --target=riscv64`, the ignored [`clangs_driver_says_what_cc_says`]),
-/// its lines that start with `clang:` read with `cc` for `clang`, and the
-/// compiler's diagnostics, the rest being its tools' (and clang's other
-/// stages are its own: the integrated assembler, ld.lld).
+/// prints, its exit status, and whether clang's driver is held to it), in
+/// `/src` ([`cc_sources`]). Each is checked on Camelot, where the stages'
+/// own messages come before cc's (merlin's for cc1, merlin-ld's for ld,
+/// temporary files as [`mask_temps`] names them); and those marked so
+/// against clang's driver (`clang --target=riscv64 -fno-integrated-as`, the
+/// ignored [`clangs_driver_says_what_cc_says`]), its lines that start with
+/// `clang:` read with `cc` for `clang`, and the compiler's diagnostics, the
+/// rest being its tools' (clang's assembler there is a stand-in for GNU
+/// `as` that assembles with merlin-as, `src/bin/gnu_as.rs`, and its linker
+/// ld.lld).
 const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
     (
         "-c nope.c",
@@ -4405,6 +4702,19 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
         1,
         true,
     ),
+    // An error in the options: -### prints the header, and no stage.
+    (
+        "-### -frobnicate -c hello.c",
+        &[
+            "cc: error: unknown argument: '-frobnicate'",
+            HEADER[0],
+            HEADER[1],
+            HEADER[2],
+            HEADER[3],
+        ],
+        1,
+        true,
+    ),
     (
         "-c hello.c -o",
         &["cc: error: argument to '-o' is missing (expected 1 value)"],
@@ -4412,6 +4722,19 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
         true,
     ),
     ("", &["cc: error: no input files"], 1, true),
+    // -v says no more than the file that isn't there.
+    (
+        "-v nope.c",
+        &[
+            HEADER[0],
+            HEADER[1],
+            HEADER[2],
+            HEADER[3],
+            "cc: error: no such file or directory: 'nope.c'",
+        ],
+        1,
+        true,
+    ),
     (
         "-c -o x2.o hello.c a.c",
         &["cc: error: cannot specify -o when generating multiple output files"],
@@ -4425,6 +4748,31 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
             "cc: error: language not recognized: 'foo'",
             "cc: warning: hello.c: 'linker' input unused [-Wunused-command-line-argument]",
         ],
+        1,
+        true,
+    ),
+    // The -x warning comes first, as clang gives it before the inputs.
+    (
+        "-c nope.c -x foo",
+        &[
+            "cc: warning: '-x foo' after last input file has no effect [-Wunused-command-line-argument]",
+            "cc: error: no such file or directory: 'nope.c'",
+            "cc: error: language not recognized: 'foo'",
+            "cc: error: no input files",
+        ],
+        1,
+        true,
+    ),
+    // After `--`, every argument is a file.
+    (
+        "-c -- hello.c -weird.c",
+        &["cc: error: no such file or directory: '-weird.c'"],
+        1,
+        true,
+    ),
+    (
+        "-c -",
+        &["cc: error: -E or -x required when input is from standard input"],
         1,
         true,
     ),
@@ -4443,6 +4791,22 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
         0,
         true,
     ),
+    // Options rendered as clang renders them, whatever form was typed.
+    (
+        "-c hello.c -L /x -xc",
+        &[
+            "cc: warning: '-x c' after last input file has no effect [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-L/x' [-Wunused-command-line-argument]",
+        ],
+        0,
+        true,
+    ),
+    (
+        "-c hello.c -Wl,,a",
+        &["cc: warning: -Wl,a: 'linker' input unused [-Wunused-command-line-argument]"],
+        0,
+        true,
+    ),
     (
         "-S c.s",
         &["cc: warning: c.s: 'assembler' input unused [-Wunused-command-line-argument]"],
@@ -4458,6 +4822,35 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
     (
         "-c hello.c -x c",
         &["cc: warning: '-x c' after last input file has no effect [-Wunused-command-line-argument]"],
+        0,
+        true,
+    ),
+    // cc1's options, with no cc1 stage to take them.
+    (
+        "-c c.s -DX -UY -P -fdebug-compilation-dir=/d",
+        &[
+            "cc: warning: argument unused during compilation: '-D X' [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-U Y' [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-P' [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-fdebug-compilation-dir=/d' \
+             [-Wunused-command-line-argument]",
+        ],
+        0,
+        true,
+    ),
+    (
+        "-c x.o -g",
+        &[
+            "cc: warning: x.o: 'linker' input unused [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-g' [-Wunused-command-line-argument]",
+        ],
+        0,
+        true,
+    ),
+    // -O levels as clang's driver takes them.
+    (
+        "-c -O4 hello.c",
+        &["cc: warning: -O4 is equivalent to -O3 [-Wdeprecated]"],
         0,
         true,
     ),
@@ -4493,7 +4886,18 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
             "cc: error: assembler command failed with exit code 1 (use -v to see invocation)",
         ],
         1,
-        false,
+        true,
+    ),
+    // Which stages failed is said once they have all run.
+    (
+        "-c bad.s bad.c",
+        &[
+            "bad.s:2: error: usage: addi rd, rs1, imm",
+            "bad.c:2:12: error: use of undeclared identifier 'x'",
+            "cc: error: assembler command failed with exit code 1 (use -v to see invocation)",
+        ],
+        1,
+        true,
     ),
     // cc1 failing otherwise than with 1, its status for diagnostics (2, a
     // file it can't read: clang reads any bytes), is cc's word too, and its
@@ -4507,18 +4911,51 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
         2,
         false,
     ),
+    // A standard cc1 doesn't take: clang compiles C11.
+    (
+        "-c -std=c11 hello.c",
+        &["error: merlin compiles C99: '-std=c11' is not supported"],
+        1,
+        false,
+    ),
+    // cc's own response files, as clang reads them: one that isn't there
+    // is an argument as it is, a directory and one that names itself are
+    // errors, clang's message alone.
+    (
+        "-c @nofile",
+        &[
+            "cc: error: no such file or directory: '@nofile'",
+            "cc: error: no input files",
+        ],
+        1,
+        true,
+    ),
+    (
+        "-c @self.rsp",
+        &["recursive expansion of: '/src/self.rsp'"],
+        1,
+        false,
+    ),
+    (
+        "-c @sub",
+        &["cannot not open file '/src/sub': is a directory"],
+        1,
+        false,
+    ),
 ];
 
 /// The driver's errors and exit statuses on Camelot ([`CC_CASES`]): a
 /// missing file, a compile error, an assembly error, a link error, a bad
-/// option, an unknown language, `-o` for several outputs, inputs that mean
-/// nothing for the last stage, and a cc1 that can't be run (a copy of cc
-/// in a directory without one: clang's `unable to execute command`). A
-/// stage that fails takes the file it was to make for the user with it
-/// (`keep.o`, there before, which `as` was to write), but not one a later
-/// stage was to make (`kept.o`: cc1 failed, and `as` never ran), as clang's
-/// driver does with `-fno-integrated-as`; and the link that needed a failed
-/// stage is not run (no `p`). No temporary file is left.
+/// option, an unknown language, `-o` for several outputs, inputs and
+/// options that mean nothing for the last stage, response files, and a
+/// cc1 that can't be run (a copy of cc in a directory without one: LLVM's
+/// `Executable "..." doesn't exist!`). A stage that fails takes the file it
+/// was to make for the user with it (`keep.o`, there before, which `as` was
+/// to write), but not one a later stage was to make (`kept.o`: cc1 failed,
+/// and `as` never ran), as clang's driver does with `-fno-integrated-as`,
+/// nor one that is no regular file (`-o /dev/console`: clang removes only
+/// those); and the link that needed a failed stage is not run (no `p`). No
+/// temporary file is left.
 #[test]
 fn cc_says_what_clangs_driver_says() {
     use userprogs::CCompiler;
@@ -4528,6 +4965,7 @@ fn cc_says_what_clangs_driver_says() {
     for old in ["/src/keep.o", "/src/kept.o"] {
         files.push((old.into(), b"an old object".to_vec()));
     }
+    files.push(("/src/self.rsp".into(), b"@self.rsp\n".to_vec()));
     let cc = userprogs::build_named(&dir, "cc").unwrap();
     files.push(("/alt/cc".into(), cc.elf));
     let commands: Vec<String> = CC_CASES
@@ -4536,13 +4974,18 @@ fn cc_says_what_clangs_driver_says() {
         .collect();
     let keep = "cc -c -o keep.o bad.s";
     let kept = "cc -c -o kept.o bad.c";
+    let device = "cc -o /dev/console undef.c";
     let alone = "/alt/cc -c hello.c";
     let mut input = "cd /src\n".to_string();
-    for c in commands.iter().map(String::as_str).chain([keep, kept, alone]) {
+    for c in commands
+        .iter()
+        .map(String::as_str)
+        .chain([keep, kept, device, alone])
+    {
         input.push_str(&format!("{c}\n"));
     }
     input.push_str("exit 0\n");
-    let (out, disk) = boot_cc(cc_image(&rt, &["/alt"], &files), &input);
+    let (out, disk) = boot_cc(cc_image(&rt, &["/alt", "/src/sub"], &files), &input);
     let outputs = shell_outputs(&out, &input);
     // The outputs of the lines typed, after `cd /src`.
     for (k, (args, lines, status, _)) in CC_CASES.iter().enumerate() {
@@ -4565,41 +5008,128 @@ fn cc_says_what_clangs_driver_says() {
         "{kept}"
     );
     assert_eq!(
-        outputs[n + 2],
-        "cc: error: unable to execute command: no such file or directory\n\
+        mask_temps(&outputs[n + 2]),
+        "ld: error: /tmp/undef-T1.o: undefined reference to 'f'\n\
+         cc: error: linker command failed with exit code 1 (use -v to see invocation)\ncc: exit 1\n",
+        "{device}"
+    );
+    assert_eq!(
+        outputs[n + 3],
+        "cc: error: unable to execute command: Executable \"/alt/cc1\" doesn't exist!\n\
          cc: error: cc frontend command failed with exit code 1 (use -v to see invocation)\n/alt/cc: exit 1\n",
         "{alone}"
     );
     let fs = Fs::open(&disk).unwrap();
     assert!(fs.lookup("/src/keep.o").is_err(), "keep.o was not removed");
     assert_eq!(fs.read_file("/src/kept.o").unwrap(), b"an old object");
+    assert!(fs.lookup("/dev/console").is_ok(), "/dev/console was removed");
     assert!(fs.lookup("/src/p").is_err(), "p was linked");
     assert_eq!(left_in_tmp(&fs), Vec::<String>::new());
 }
 
+/// A scratch directory with the driver tests' sources ([`cc_sources`],
+/// [`printed_sources`]) and `user.h`, which cc finds in /usr/include, for
+/// clang; and a directory of programs for clang's `PATH`: `as`, the
+/// stand-in for GNU `as` (`src/bin/gnu_as.rs`).
+fn clang_scratch(name: &str) -> (PathBuf, PathBuf) {
+    let scratch = std::env::temp_dir().join(format!("cc-driver-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(scratch.join("sub")).unwrap();
+    for (path, data) in cc_sources().into_iter().chain(printed_sources()) {
+        std::fs::write(scratch.join(path.trim_start_matches("/src/")), data).unwrap();
+    }
+    let user = userprogs::user_dir(&repo_root());
+    std::fs::copy(user.join("user.h"), scratch.join("user.h")).unwrap();
+    let bin = scratch.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(
+        env!("CARGO_BIN_EXE_gnu_as"),
+        bin.join(format!("as{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    (scratch, bin)
+}
+
+/// clang, `--target=riscv64 -fno-integrated-as` and `args`, in `dir`, with
+/// `bin` first on its `PATH`.
+fn run_clang(
+    clang: &std::path::Path,
+    dir: &std::path::Path,
+    bin: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    let path = std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    std::process::Command::new(clang)
+        .arg("--target=riscv64")
+        .arg("-fno-integrated-as")
+        .args(args)
+        .current_dir(dir)
+        .env("PATH", path)
+        .output()
+        .unwrap()
+}
+
+/// clang's driver runs the stages cc runs for each of [`CC_PRINTED`], in
+/// what the two have in common ([`stage_summary`]): the committed
+/// `tests/cc/clang-stages.txt`, which `CC_BLESS=1` writes again. Run with
+/// clang on `PATH` (or LLVM's default directory on Windows): `cargo test
+/// --release -p xtask --test selfhost -- --ignored clang_runs_the_stages`.
+#[test]
+#[ignore]
+fn clang_runs_the_stages_cc_runs() {
+    let clang = xtask::tools::find("clang").expect("clang on PATH");
+    let (scratch, bin) = clang_scratch("stages");
+    let summaries: Vec<(String, Vec<String>)> = CC_PRINTED
+        .iter()
+        .map(|(args, _)| {
+            let words: Vec<&str> = args.split_whitespace().collect();
+            let out = run_clang(&clang, &scratch, &bin, &words);
+            let said = String::from_utf8_lossy(&out.stderr).replace('\r', "");
+            (args.to_string(), stage_summary(&said))
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&scratch);
+    let text = summaries_text(&summaries);
+    let path = repo_root().join("crates/xtask").join(CLANG_STAGES);
+    if std::env::var_os("CC_BLESS").is_some() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &text).unwrap();
+    }
+    let committed = std::fs::read_to_string(&path).unwrap().replace('\r', "");
+    assert_eq!(
+        committed, text,
+        "clang's stages are not {CLANG_STAGES}'s (CC_BLESS=1 writes them)"
+    );
+}
+
 /// clang's driver says, for each of [`CC_CASES`] marked so, what cc says:
 /// the same `clang: error:` and `clang: warning:` lines (with `cc` for
-/// `clang`), the same compiler diagnostics, and the same exit status. Run
-/// with clang on `PATH` (or LLVM's default directory on Windows), in a
-/// scratch directory with the same files: `cargo test --release -p xtask
-/// --test selfhost -- --ignored clangs_driver`.
+/// `clang`), the same compiler diagnostics, and the same exit status, with
+/// `-fno-integrated-as` (its `as` the stand-in, `src/bin/gnu_as.rs`) and
+/// `-nostdlib` (clang has no C library for riscv64 here, so that a link
+/// fails only for what the case is about: `f` undefined). Run with clang
+/// on `PATH` (or LLVM's default directory on Windows): `cargo test
+/// --release -p xtask --test selfhost -- --ignored clangs_driver`.
 #[test]
 #[ignore]
 fn clangs_driver_says_what_cc_says() {
     let clang = xtask::tools::find("clang").expect("clang on PATH");
-    let scratch = std::env::temp_dir().join(format!("cc-driver-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch).unwrap();
-    for (path, data) in cc_sources() {
-        std::fs::write(scratch.join(path.trim_start_matches("/src/")), data).unwrap();
-    }
-    // The header the C files include, which cc finds in /usr/include.
-    let user = userprogs::user_dir(&repo_root());
-    std::fs::copy(user.join("user.h"), scratch.join("user.h")).unwrap();
+    let (scratch, bin) = clang_scratch("says");
     // The language merlin's diagnostics are clang's for (C99,
-    // freestanding), and clang's diagnostics as merlin prints them: clang
-    // only, so its warnings that they go unused are left out.
-    let extra = ["-std=c99", "-ffreestanding", "-fno-caret-diagnostics"];
+    // freestanding), clang's diagnostics as merlin prints them, and no C
+    // library: clang only, so its warnings that they go unused are left
+    // out.
+    let extra = [
+        "-march=rv64ima_zicsr_zifencei",
+        "-mabi=lp64",
+        "-std=c99",
+        "-ffreestanding",
+        "-fno-caret-diagnostics",
+        "-nostdlib",
+    ];
     // The lines both drivers have: theirs, and the compiler's diagnostics.
     let comparable = |line: &str| {
         line.starts_with("cc: ") || {
@@ -4615,13 +5145,9 @@ fn clangs_driver_says_what_cc_says() {
         if !check {
             continue;
         }
-        let out = std::process::Command::new(&clang)
-            .arg("--target=riscv64")
-            .args(extra)
-            .args(args.split_whitespace())
-            .current_dir(&scratch)
-            .output()
-            .unwrap();
+        let mut all: Vec<&str> = extra.to_vec();
+        all.extend(args.split_whitespace());
+        let out = run_clang(&clang, &scratch, &bin, &all);
         let said = String::from_utf8_lossy(&out.stderr).replace('\r', "");
         let got: Vec<String> = said
             .lines()
@@ -4629,14 +5155,22 @@ fn clangs_driver_says_what_cc_says() {
                 l.strip_prefix("clang: ")
                     .map_or(l.to_string(), |r| format!("cc: {r}"))
             })
-            .filter(|l| comparable(l) && !extra.iter().any(|e| l.contains(&format!("'{e}'"))))
+            .filter(|l| {
+                comparable(l)
+                    && !extra
+                        .iter()
+                        .chain(&["-fno-integrated-as"])
+                        .any(|e| l.contains(&format!("'{e}'")))
+            })
             .collect();
         let want: Vec<String> = lines
             .iter()
             .filter(|l| comparable(l))
             .map(|l| l.to_string())
             .collect();
-        if got != want || out.status.code() != Some(*status) {
+        // The link fails for `f` alone.
+        let for_f = !args.contains("undef") || said.contains("undefined symbol: f");
+        if got != want || out.status.code() != Some(*status) || !for_f {
             wrong.push(format!(
                 "cc {args}: clang said (exit {:?}):\n{said}\ncc says (exit {status}):\n{}",
                 out.status.code(),

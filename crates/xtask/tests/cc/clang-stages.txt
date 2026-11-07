@@ -1,0 +1,46 @@
+$ cc -### -o hello hello.c
+cc1 -o TMP/hello-T1.s -x c hello.c
+as -o TMP/hello-T2.o TMP/hello-T1.s
+ld TMP/hello-T2.o -o hello
+
+$ cc -### -c -g -I inc -DX=1 -UY a.c b.S c.s
+cc1 -g -I inc -D X=1 -U Y -o TMP/a-T1.s -x c a.c
+as -o a.o TMP/a-T1.s
+cc1 -E -g -I inc -D X=1 -U Y -o TMP/b-T2.s -x assembler-with-cpp b.S
+as -o b.o TMP/b-T2.s
+as -o c.o c.s
+
+$ cc -### -E -P hello.c b.S
+cc1 -E -P -o - -x c hello.c
+cc1 -E -P -o - -x assembler-with-cpp b.S
+
+$ cc -### -S -o out.s a.c
+cc1 -o out.s -x c a.c
+
+$ cc -### -o p a.c d.o -L/l2 -lgui -Wl,-S,-e,main
+cc1 -o TMP/a-T1.s -x c a.c
+as -o TMP/a-T2.o TMP/a-T1.s
+ld -L/l2 TMP/a-T2.o d.o -lgui -S -e main -o p
+
+$ cc -### -c -DQ=a\b$ -fdebug-compilation-dir=/d -g a.c
+cc1 -g -D Q=a\b$ -o TMP/a-T1.s -x c a.c
+as -o a.o TMP/a-T1.s
+
+$ cc -### -c -- a.c
+cc1 -o TMP/a-T1.s -x c a.c
+as -o a.o TMP/a-T1.s
+
+$ cc -### -c -O -Wall -w -std=c99 -ffreestanding a.c
+cc1 -O1 -ffreestanding -Wall -w -std=c99 -o TMP/a-T1.s -x c a.c
+as -o a.o TMP/a-T1.s
+
+$ cc -### -c @q.rsp
+cc1 -D MSG=a b -o TMP/a-T1.s -x c a.c
+as -o a.o TMP/a-T1.s
+
+$ cc -### -c p.i
+cc1 -o TMP/p-T1.s -x cpp-output p.i
+as -o p.o TMP/p-T1.s
+
+$ cc -### -E -
+cc1 -E -o - -x c -

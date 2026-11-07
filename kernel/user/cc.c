@@ -3,8 +3,8 @@
  * each one's exit status.
  *
  *   cc [-c|-S|-E] [-o OUT] [-g] [-I DIR] [-D NAME[=VALUE]] [-U NAME]
- *      [-L DIR] [-l NAME] [-Wl,ARG,...] [-x LANG] [-P] [-v] [-###]
- *      [@FILE] FILE...
+ *      [-L DIR] [-l NAME] [-Wl,ARG,...] [-x LANG] [-P] [-O LEVEL] [-std=STD]
+ *      [-w] [-W...] [-ffreestanding] [-v] [-###] [@FILE] FILE... [-- FILE...]
  *
  * The stages, in the directory cc itself was started from (/bin):
  *
@@ -17,9 +17,10 @@
  * writes assembly, `as` assembles it, `ld` links. Each input file goes
  * through the stages its language needs, up to the last one asked for
  * (-E preprocess, -S compile, -c assemble, else link): a .c file is C, a
- * .S file assembly to preprocess first (cc1 -E -x assembler-with-cpp), a
- * .s file assembly, and anything else an object or a library for the
- * linker; -x LANG says what the files after it are instead. What a stage
+ * .i file C already preprocessed, a .S file assembly to preprocess first
+ * (cc1 -E -x assembler-with-cpp), a .s file assembly, and anything else an
+ * object or a library for the linker; -x LANG says what the files after it
+ * are instead, and after `--` every argument is a file. What a stage
  * writes for the next one is a temporary file in $TMPDIR (/tmp unless the
  * environment says otherwise), named after its input as clang names them
  * (`hello-1a2b3c.s`), made with O_EXCL so that it is nobody else's, and
@@ -40,16 +41,18 @@
  * (use -v to see invocation)`): with -### it prints the stages' command
  * lines and runs none, with -v it prints each one as it runs it. A stage
  * that fails stops the stages after it that need its output (the link,
- * for one); the others go on, as in clang, and cc exits with the first
- * failure's status. What a failed stage was to make for the user (the -o
- * file) is removed, as clang removes it.
+ * for one); the others go on, as in clang, cc says which failed once they
+ * are done, and exits with the first failure's status. What a failed
+ * stage was to make for the user (its -o file, if a regular file it may
+ * write) is removed, as clang removes it.
  *
  * Camelot's exec takes at most MAXARG (16) arguments of ARG_MAX bytes
  * together, so a stage's command line that is longer is given to it in a
- * response file (`ld @/tmp/response-....txt`, a word a line), as clang's
- * driver does when a command line is too long for the system; cc1 and ld
- * read them. cc reads them too: `@FILE` on its own command line stands for
- * the words of FILE, which is how to give it more than the shell's line
+ * response file (`ld @/tmp/response-....txt`), written as clang's driver
+ * writes one when a command line is too long for the system; cc1 and ld
+ * read them. cc reads them too, as clang does (the C library's
+ * expand_response_files): `@FILE` on its own command line stands for the
+ * arguments of FILE, which is how to give it more than the shell's line
  * takes. */
 #include "user.h"
 
@@ -85,8 +88,12 @@ struct strv {
     int cap;
 };
 
+static void remove_temps(void);
+
+/* Out of memory: what cc made in /tmp goes, then cc. */
 static void oom(void) {
     fprintf(STDERR, "cc: error: out of memory\n");
+    remove_temps();
     exit(1);
 }
 
@@ -151,10 +158,16 @@ static void error(const char *fmt, const char *a) {
     errors++;
 }
 
-static void warning(const char *fmt, const char *a) {
+/* A warning with its flag, clang's: `[-Wunused-command-line-argument]` for
+ * most of the driver's. */
+static void warning_of(const char *flag, const char *fmt, const char *a) {
     fprintf(STDERR, "cc: warning: ");
     fprintf(STDERR, fmt, a);
-    fprintf(STDERR, " [-Wunused-command-line-argument]\n");
+    fprintf(STDERR, " [-W%s]\n", flag);
+}
+
+static void warning(const char *fmt, const char *a) {
+    warning_of("unused-command-line-argument", fmt, a);
 }
 
 /* ---- Paths ---- */
@@ -308,10 +321,10 @@ static const char *temp_dir(void) {
 /* Makes a new, empty temporary file for `prefix` (an input's stem) with
  * extension `suffix`, as clang names them: `DIR/PREFIX-XXXXXX.SUFFIX`, six
  * random hexadecimal digits. A Camelot file name has at most DIRSIZ (14)
- * bytes, so the prefix is cut to fit: `hello-1a2b3c.s`, `respo..` cut to
+ * bytes, so the prefix is cut to fit: `hello-1a2b3c.s`, `response` cut to
  * `res-1a2b3c.txt`. The file is made with O_EXCL, a new name tried while
  * the name is taken, and remembered for removal. Returns its path, or NULL
- * having said why there is none. */
+ * having said why there is none, as clang says it. */
 static char *make_temp(const char *prefix, const char *suffix) {
     const char *dir = temp_dir();
     int room = DIRSIZ - 1 - TEMP_DIGITS - 1 - (int)strlen(suffix);
@@ -347,10 +360,7 @@ static char *make_temp(const char *prefix, const char *suffix) {
             break;
         }
     }
-    char *pattern = concat(dir, "/", prefix);
-    fprintf(STDERR, "cc: error: unable to make temporary file %s: %s\n", pattern, strerror(-err));
-    free(pattern);
-    errors++;
+    error("unable to make temporary file: %s", strerror(-err));
     return NULL;
 }
 
@@ -360,106 +370,6 @@ static void remove_temps(void) {
     }
 }
 
-/* ---- Response files: cc's own ---- */
-
-static int is_white(char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-}
-
-/* The whole of file `path`, NUL-terminated, from malloc; NULL if it can't
- * be read. */
-static char *read_whole(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        return NULL;
-    }
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.type == T_DIR) {
-        close(fd);
-        return NULL;
-    }
-    size_t cap = 1024;
-    size_t len = 0;
-    char *text = malloc(cap);
-    if (text == NULL) {
-        oom();
-    }
-    for (;;) {
-        if (len + 1 == cap) {
-            cap *= 2;
-            text = realloc(text, cap);
-            if (text == NULL) {
-                oom();
-            }
-        }
-        long n = read(fd, text + len, cap - 1 - len);
-        if (n < 0) {
-            close(fd);
-            free(text);
-            return NULL;
-        }
-        if (n == 0) {
-            break;
-        }
-        len += (size_t)n;
-    }
-    close(fd);
-    text[len] = 0;
-    return text;
-}
-
-/* The response files being read, by absolute path, innermost last: one
- * that names itself, directly or through others, can't be expanded. */
-static struct strv expanding;
-
-/* Puts `arg` in `out`, or for `@FILE` the words of FILE, separated by white
- * space (without quoting, as Camelot's tools read a response file: there
- * is no shell quoting to give a word with a blank), each expanded in turn,
- * as clang reads its response files: a file that can't be read leaves the
- * argument as it is (an input file of that name, then), and a nested one
- * is a path from the current directory. Returns 0, or -1 for a file that
- * names itself, having said so as clang does. */
-static int expand_arg(const char *arg, struct strv *out) {
-    if (arg[0] != '@' || arg[1] == 0) {
-        push(out, arg);
-        return 0;
-    }
-    char *text = read_whole(arg + 1);
-    if (text == NULL) {
-        push(out, arg);
-        return 0;
-    }
-    char *path = absolute(arg + 1);
-    for (int i = 0; i < expanding.n; i++) {
-        if (strcmp(expanding.v[i], path) == 0) {
-            fprintf(STDERR, "recursive expansion of: '%s'\n", path);
-            return -1;
-        }
-    }
-    push(&expanding, path);
-    char *p = text;
-    for (;;) {
-        while (*p != 0 && is_white(*p)) {
-            p++;
-        }
-        if (*p == 0) {
-            break;
-        }
-        char *w = p;
-        while (*p != 0 && !is_white(*p)) {
-            p++;
-        }
-        if (*p != 0) {
-            *p++ = 0;
-        }
-        if (expand_arg(w, out) < 0) {
-            return -1;
-        }
-    }
-    expanding.n--;
-    return 0;
-}
-
 /* ---- The command line ---- */
 
 /* The last stage to run: -E, -S, -c, or the link. */
@@ -467,8 +377,9 @@ enum { PREPROCESS, COMPILE, ASSEMBLE, LINK };
 
 /* An input file's language: what clang calls it for -x. LANG_BAD marks
  * the place of a -x whose language cc doesn't know, said with the inputs'
- * errors, in their order. */
-enum { LANG_BAD = -2, LANG_NONE = -1, LANG_C, LANG_ASM, LANG_ASM_CPP, LANG_OBJECT };
+ * errors, in their order. LANG_CPP_OUTPUT is C already preprocessed (a .i
+ * file), which cc1 compiles as C. */
+enum { LANG_BAD = -2, LANG_NONE = -1, LANG_C, LANG_CPP_OUTPUT, LANG_ASM, LANG_ASM_CPP, LANG_OBJECT };
 
 /* An input of the command line, in its order: a file (with its language),
  * or a linker input that is no file, `-lNAME` or `-Wl,ARG,...`. */
@@ -476,31 +387,50 @@ enum { IN_FILE, IN_LIB, IN_WL };
 
 struct input {
     int kind;
-    const char *arg; /* the file; -lNAME as the linker takes it; -Wl,... as given */
+    const char *arg; /* the file; -lNAME as the linker takes it; -Wl,... as clang renders it */
     int lang;
-    int missing;     /* a file that isn't there */
+    int missing; /* a file that isn't there */
+};
+
+/* What clang warns of when nothing runs that it is for (`argument unused
+ * during compilation: '-L/x'`): each option that may go unused, as clang
+ * renders it, and what uses it. */
+enum {
+    FOR_ASSEMBLE, /* -c: a last stage of assembling or linking */
+    FOR_COMPILE,  /* -S: a last stage of compiling or later */
+    FOR_LINK,     /* -L: the link */
+    FOR_CC1,      /* -D, -U, -P, -O, -std, -W, -w, -ffreestanding,
+                     -fdebug-compilation-dir: a cc1 stage */
+    FOR_TOOLS     /* -g, -I: a cc1 or an `as` stage, which clang gives them */
+};
+
+struct claim {
+    const char *rendered;
+    int used_by;
 };
 
 /* What the command line asks for. */
 static int phase = LINK;
 static const char *output;
-static int print_only; /* -### */
-static int verbose;    /* -v */
-static int debug;      /* -g */
-static int no_line_markers; /* -P */
-static const char *comp_dir; /* -fdebug-compilation-dir */
-static struct strv include_dirs;  /* -I, in order */
-static struct strv macros;        /* -D NAME and -U NAME, in order, as "-D" "NAME" pairs */
-static struct strv lib_dirs;      /* -L, as -LDIR */
+static int print_only;             /* -### */
+static int verbose;                /* -v */
+static int debug;                  /* -g */
+static int no_line_markers;        /* -P */
+static const char *comp_dir;       /* -fdebug-compilation-dir */
+static const char *opt_level;      /* the last -O, as given */
+static const char *std;            /* the last -std= */
+static int freestanding;           /* -ffreestanding */
+static struct strv warning_opts;   /* -w and -W..., in order, but -Wl, */
+static struct strv include_dirs;   /* -I, in order */
+static struct strv macros;         /* -D NAME and -U NAME, in order, as "-D" "NAME" pairs */
+static struct strv lib_dirs;       /* -L, as -LDIR */
 static struct input *inputs;
 static int ninputs;
-/* -c, -S and -L as the user wrote them, if given: clang warns of those that
- * mean nothing for the last stage asked for (-c with -S, -L without the
- * link), if nothing else went wrong. */
-static const char *c_arg;
-static const char *s_arg;
-static struct strv l_dir_args;
-/* The last -x (as written) and whether an input came after it. */
+static struct claim *claims;
+static int nclaims;
+/* Errors in the options themselves: with any, -### prints no stage. */
+static int option_errors;
+/* The last -x (as clang renders it) and whether an input came after it. */
 static const char *last_x;
 static int input_after_x;
 
@@ -514,23 +444,29 @@ static void usage(void) {
            "\n"
            "OPTIONS:\n"
            "  -###                    Print (but do not run) the commands to run for this compilation\n"
+           "  --                      Treat every argument after it as an input file\n"
            "  -c                      Only run preprocess, compile, and assemble steps\n"
            "  -D <macro>=<value>      Define <macro> to <value> (or 1 if <value> omitted)\n"
            "  -E                      Only run the preprocessor\n"
            "  -fdebug-compilation-dir=<value>\n"
            "                          The compilation directory to embed in the debug info\n"
+           "  -ffreestanding          Assert that the compilation takes place in a freestanding environment\n"
            "  -g                      Generate source-level debug information\n"
            "  --help                  Display available options\n"
            "  -I <dir>                Add directory to the end of the list of include search paths\n"
            "  -L <dir>                Add directory to library search path\n"
            "  -l <name>               Link with the library lib<name>.a of the library search path\n"
+           "  -O<level>               Optimization level (merlin does not optimize: none changes the code)\n"
            "  -o <file>               Write output to <file>\n"
            "  -P                      Disable linemarker output in -E mode\n"
            "  -S                      Only run preprocess and compilation steps\n"
+           "  -std=<value>            Language standard to compile for (c99, merlin's)\n"
            "  -U <macro>              Undefine macro <macro>\n"
            "  -v                      Show commands to run and use verbose output\n"
            "  --version               Print version information\n"
+           "  -W<warning>             Enable the specified warning\n"
            "  -Wl,<arg>               Pass the comma separated arguments in <arg> to the linker\n"
+           "  -w                      Suppress all warnings\n"
            "  -x <language>           Treat subsequent input files as having type <language>\n"
            "  @<file>                 Read more arguments from <file>\n");
 }
@@ -540,6 +476,9 @@ static void usage(void) {
 static int lang_of(const char *name) {
     if (ends_with(name, ".c")) {
         return LANG_C;
+    }
+    if (ends_with(name, ".i")) {
+        return LANG_CPP_OUTPUT;
     }
     if (ends_with(name, ".s")) {
         return LANG_ASM;
@@ -556,6 +495,9 @@ static int lang_named(const char *name) {
     if (strcmp(name, "c") == 0) {
         return LANG_C;
     }
+    if (strcmp(name, "cpp-output") == 0) {
+        return LANG_CPP_OUTPUT;
+    }
     if (strcmp(name, "assembler") == 0) {
         return LANG_ASM;
     }
@@ -570,21 +512,19 @@ static int lang_named(const char *name) {
 
 /* The value of option `flag` (`-o`, `-I`...) at args[*i]: what follows the
  * flag in the same argument, or the next argument, which *i then moves to.
- * NULL, having said so, if there is none. `*written` is the option as the
- * user wrote it, for the warnings. */
-static const char *value(char **args, int nargs, int *i, const char *flag, const char **written) {
+ * NULL, having said so, if there is none. */
+static const char *value(char **args, int nargs, int *i, const char *flag) {
     const char *a = args[*i];
     size_t k = strlen(flag);
     if (a[k] != 0) {
-        *written = a;
         return a + k;
     }
     if (*i + 1 >= nargs) {
         error("argument to '%s' is missing (expected 1 value)", flag);
+        option_errors++;
         return NULL;
     }
     *i += 1;
-    *written = concat(flag, " ", args[*i]);
     return args[*i];
 }
 
@@ -596,42 +536,115 @@ static void add_input(int kind, const char *arg, int lang) {
     ninputs++;
 }
 
+static void claim(const char *rendered, int used_by) {
+    claims[nclaims].rendered = rendered;
+    claims[nclaims].used_by = used_by;
+    nclaims++;
+}
+
+/* A file input, in the language -x gave (or its name's). */
+static void add_file(const char *a, int lang) {
+    add_input(IN_FILE, a, lang != LANG_NONE ? lang : lang_of(a));
+    input_after_x = 1;
+}
+
+/* `-Wl,a,,b` as clang renders it and passes it on: its values, the empty
+ * ones left out, joined by commas (`-Wl,a,b`). */
+static const char *render_wl(const char *a) {
+    char *joined = concat("-Wl", NULL, NULL);
+    const char *p = a + 4;
+    for (;;) {
+        const char *comma = strchr(p, ',');
+        size_t n = comma != NULL ? (size_t)(comma - p) : strlen(p);
+        if (n > 0) {
+            char *part = copy_n(p, n);
+            char *next = concat(joined, ",", part);
+            free(joined);
+            free(part);
+            joined = next;
+        }
+        if (comma == NULL) {
+            break;
+        }
+        p = comma + 1;
+    }
+    return joined;
+}
+
+/* -OLEVEL as clang's driver gives it to its -cc1: `-O` is -O1, a number
+ * above 3 is -O3 (with clang's warning), -Ofast is deprecated (its warning
+ * too); anything else as it is, for cc1 to check. */
+static const char *opt_for_cc1(const char *a) {
+    const char *level = a + 2;
+    if (level[0] == 0) {
+        return "-O1";
+    }
+    if (strcmp(level, "fast") == 0) {
+        warning_of("deprecated-ofast",
+                   "argument '%s' is deprecated; use '-O3' to enable only conforming optimizations, or "
+                   "consult the documentation for the same behavior",
+                   a);
+        return a;
+    }
+    int digits = 1;
+    for (const char *p = level; *p != 0; p++) {
+        digits &= *p >= '0' && *p <= '9';
+    }
+    if (digits && atoi(level) > 3) {
+        warning_of("deprecated", "%s is equivalent to -O3", a);
+        return "-O3";
+    }
+    return a;
+}
+
 /* Reads the options (args[1..nargs)). Returns 0, or 1 for --help or
  * --version, which have been answered. */
 static int parse(char **args, int nargs) {
     inputs = malloc((size_t)nargs * sizeof(struct input));
-    if (inputs == NULL) {
+    claims = malloc((size_t)nargs * sizeof(struct claim));
+    if (inputs == NULL || claims == NULL) {
         oom();
     }
     int lang = LANG_NONE;
     for (int i = 1; i < nargs; i++) {
         char *a = args[i];
-        const char *written = a;
         const char *v;
         if (a[0] != '-' || a[1] == 0) {
-            /* A file (`-` too, a name like any other here). */
-            add_input(IN_FILE, a, lang != LANG_NONE ? lang : lang_of(a));
-            input_after_x = 1;
+            /* A file; `-` is standard input. */
+            add_file(a, lang);
+        } else if (strcmp(a, "--") == 0) {
+            /* Every argument after it is a file, as in clang. */
+            for (i++; i < nargs; i++) {
+                add_file(args[i], lang);
+            }
         } else if (strcmp(a, "-###") == 0) {
             print_only = 1;
         } else if (strcmp(a, "-v") == 0) {
             verbose = 1;
         } else if (strcmp(a, "-c") == 0) {
-            c_arg = a;
+            claim(a, FOR_ASSEMBLE);
             if (phase > ASSEMBLE) {
                 phase = ASSEMBLE;
             }
         } else if (strcmp(a, "-S") == 0) {
-            s_arg = a;
+            claim(a, FOR_COMPILE);
             if (phase > COMPILE) {
                 phase = COMPILE;
             }
         } else if (strcmp(a, "-E") == 0) {
             phase = PREPROCESS;
         } else if (strcmp(a, "-g") == 0) {
+            claim(a, FOR_TOOLS);
             debug = 1;
         } else if (strcmp(a, "-P") == 0) {
+            claim(a, FOR_CC1);
             no_line_markers = 1;
+        } else if (strcmp(a, "-w") == 0) {
+            claim(a, FOR_CC1);
+            push(&warning_opts, a);
+        } else if (strcmp(a, "-ffreestanding") == 0) {
+            claim(a, FOR_CC1);
+            freestanding = 1;
         } else if (strcmp(a, "--help") == 0 || strcmp(a, "-help") == 0) {
             usage();
             return 1;
@@ -645,15 +658,29 @@ static int parse(char **args, int nargs) {
                 comp_dir = rest + 1;
             } else if (rest[0] != 0) {
                 error("unknown argument: '%s'", a);
-            } else if ((v = value(args, nargs, &i, "-fdebug-compilation-dir", &written)) != NULL) {
+                option_errors++;
+                continue;
+            } else if ((v = value(args, nargs, &i, "-fdebug-compilation-dir")) != NULL) {
                 comp_dir = v;
+            } else {
+                continue;
             }
+            claim(concat("-fdebug-compilation-dir=", comp_dir, NULL), FOR_CC1);
+        } else if (starts_with(a, "-std=")) {
+            claim(a, FOR_CC1);
+            std = a;
+        } else if (a[1] == 'O') {
+            claim(a, FOR_CC1);
+            opt_level = a;
         } else if (starts_with(a, "-Wl,")) {
-            add_input(IN_WL, a, LANG_NONE);
+            add_input(IN_WL, render_wl(a), LANG_NONE);
+        } else if (a[1] == 'W' && a[2] != 0) {
+            claim(a, FOR_CC1);
+            push(&warning_opts, a);
         } else if (a[1] == 'o' || a[1] == 'I' || a[1] == 'D' || a[1] == 'U' || a[1] == 'L' || a[1] == 'l' ||
                    a[1] == 'x') {
             char flag[3] = {'-', a[1], 0};
-            v = value(args, nargs, &i, flag, &written);
+            v = value(args, nargs, &i, flag);
             if (v == NULL) {
                 continue;
             }
@@ -662,16 +689,18 @@ static int parse(char **args, int nargs) {
                 output = v;
                 break;
             case 'I':
+                claim(concat("-I ", v, NULL), FOR_TOOLS);
                 push(&include_dirs, v);
                 break;
             case 'D':
             case 'U':
+                claim(concat(flag, " ", v), FOR_CC1);
                 push(&macros, a[1] == 'D' ? "-D" : "-U");
                 push(&macros, v);
                 break;
             case 'L':
                 push(&lib_dirs, concat("-L", v, NULL));
-                push(&l_dir_args, written);
+                claim(lib_dirs.v[lib_dirs.n - 1], FOR_LINK);
                 break;
             case 'l':
                 add_input(IN_LIB, concat("-l", v, NULL), LANG_NONE);
@@ -685,12 +714,13 @@ static int parse(char **args, int nargs) {
                     lang = LANG_OBJECT;
                     add_input(IN_FILE, v, LANG_BAD);
                 }
-                last_x = written;
+                last_x = concat("-x ", v, NULL);
                 input_after_x = 0;
                 break;
             }
         } else {
             error("unknown argument: '%s'", a);
+            option_errors++;
         }
     }
     return 0;
@@ -719,6 +749,10 @@ struct job {
 
 static struct job *jobs;
 static int njobs;
+/* Whether a cc1 stage and an `as` stage were worked out: what the options
+ * of FOR_CC1 and FOR_TOOLS are for. */
+static int have_cc1;
+static int have_as;
 
 static struct job *new_job(int tool, int input) {
     struct job *j = &jobs[njobs++];
@@ -730,14 +764,30 @@ static struct job *new_job(int tool, int input) {
     return j;
 }
 
+/* The name cc1 knows a language by (`-x`). */
+static const char *cc1_lang(int lang) {
+    return lang == LANG_C ? "c" : lang == LANG_CPP_OUTPUT ? "cpp-output" : "assembler-with-cpp";
+}
+
 /* cc1 on input `in` (of language `lang`), preprocessing only if
- * `preprocess`, writing `out` (standard output if NULL): the options in
- * clang's order, the mode, the debug information, -I with /usr/include
- * after the user's, -D and -U in their order, the output, the language. */
+ * `preprocess`, writing `out` (`-` for standard output): the options in
+ * clang's order, the mode, -O, the debug information, -I with
+ * /usr/include after the user's, -D and -U in their order,
+ * -ffreestanding, the warnings', -std, the output, the language. */
 static void cc1_job(int k, const char *in, int lang, int preprocess, const char *out, const char *result) {
     struct job *j = new_job(CC1, k);
+    have_cc1 = 1;
     if (preprocess) {
         push(&j->argv, "-E");
+    }
+    if (opt_level != NULL) {
+        /* Worked out (and warned of) once, for the first cc1 stage, as
+         * clang's driver does it as it makes its -cc1 job. */
+        static const char *for_cc1;
+        if (for_cc1 == NULL) {
+            for_cc1 = opt_for_cc1(opt_level);
+        }
+        push(&j->argv, for_cc1);
     }
     if (no_line_markers) {
         push(&j->argv, "-P");
@@ -757,18 +807,26 @@ static void cc1_job(int k, const char *in, int lang, int preprocess, const char 
     for (int i = 0; i < macros.n; i++) {
         push(&j->argv, macros.v[i]);
     }
-    if (out != NULL) {
-        push(&j->argv, "-o");
-        push(&j->argv, out);
+    if (freestanding) {
+        push(&j->argv, "-ffreestanding");
     }
+    for (int i = 0; i < warning_opts.n; i++) {
+        push(&j->argv, warning_opts.v[i]);
+    }
+    if (std != NULL) {
+        push(&j->argv, std);
+    }
+    push(&j->argv, "-o");
+    push(&j->argv, out);
     push(&j->argv, "-x");
-    push(&j->argv, lang == LANG_C ? "c" : "assembler-with-cpp");
+    push(&j->argv, cc1_lang(lang));
     push(&j->argv, in);
     j->result = result;
 }
 
 static void as_job(int k, const char *in, const char *out, const char *result) {
     struct job *j = new_job(AS, k);
+    have_as = 1;
     push(&j->argv, "-o");
     push(&j->argv, out);
     push(&j->argv, in);
@@ -776,7 +834,8 @@ static void as_job(int k, const char *in, const char *out, const char *result) {
 }
 
 /* The file the user gets for input `in` at the last stage, by its stem and
- * `ext` in the current directory (`hello.o` of `src/hello.c`), or -o's. */
+ * `ext` in the current directory (`hello.o` of `src/hello.c`, `-.o` of
+ * standard input, as clang names them), or -o's. */
 static const char *result_name(const char *in, const char *ext) {
     if (output != NULL) {
         return output;
@@ -803,18 +862,15 @@ static void build_jobs(void) {
             if (phase != LINK) {
                 warning("%s: 'linker' input unused", in->arg);
             } else if (in->kind == IN_WL) {
-                /* -Wl,a,b: the words between the commas. */
-                const char *p = in->arg + 4;
-                for (;;) {
+                /* -Wl,a,b: the words between the commas (none for a
+                 * bare `-Wl,`, rendered `-Wl`). */
+                const char *p = in->arg + 3;
+                while (*p == ',') {
+                    p++;
                     const char *comma = strchr(p, ',');
                     size_t n = comma != NULL ? (size_t)(comma - p) : strlen(p);
-                    if (n > 0) {
-                        push(&objects, copy_n(p, n));
-                    }
-                    if (comma == NULL) {
-                        break;
-                    }
-                    p = comma + 1;
+                    push(&objects, copy_n(p, n));
+                    p += n;
                 }
             } else {
                 push(&objects, in->arg);
@@ -830,12 +886,12 @@ static void build_jobs(void) {
         /* Preprocessing only: -E, or -S of assembly that is preprocessed
          * (which clang writes to standard output, as -E would). */
         if (phase == PREPROCESS || (phase == COMPILE && in->lang == LANG_ASM_CPP)) {
-            cc1_job(k, file, in->lang, 1, output, output);
+            cc1_job(k, file, in->lang, 1, output != NULL ? output : "-", output);
             continue;
         }
         if (phase == COMPILE) {
             const char *out = result_name(file, ".s");
-            cc1_job(k, file, LANG_C, 0, out, out);
+            cc1_job(k, file, in->lang, 0, out, out);
             continue;
         }
         /* Assembled: from the file itself, or cc1's assembly in a
@@ -955,10 +1011,10 @@ static int write_all(int fd, const char *text, size_t len) {
     return 0;
 }
 
-/* Runs job `j` and returns its exit status, or -1000 if it could not be
- * started, having said why. A command line too long for exec goes in a
- * response file, `@FILE` (cc1 and ld read them), which -v shows as clang
- * does. */
+/* Runs job `j` and returns its exit status, or NOT_STARTED if it could not
+ * be started, having said why as LLVM does. A command line too long for
+ * exec goes in a response file, `@FILE` (cc1 and ld read them), written
+ * and shown with -v as clang's driver writes and shows its own. */
 #define NOT_STARTED (-1000)
 
 static int run(struct job *j) {
@@ -966,34 +1022,21 @@ static int run(struct job *j) {
     char *short_argv[3];
     char *text = NULL;
     if (j->tool != AS && too_long(argv)) {
-        /* A word a line, as Camelot's tools read them. */
-        size_t len = 0;
-        for (int i = 1; argv[i] != NULL; i++) {
-            len += strlen(argv[i]) + 1;
-        }
-        text = malloc(len + 1);
+        text = response_file_text(argv + 1, j->argv.n - 1);
         if (text == NULL) {
             oom();
         }
-        size_t at = 0;
-        for (int i = 1; argv[i] != NULL; i++) {
-            size_t n = strlen(argv[i]);
-            memcpy(text + at, argv[i], n);
-            text[at + n] = '\n';
-            at += n + 1;
-        }
-        text[at] = 0;
         char *rsp = make_temp("response", "txt");
         if (rsp == NULL) {
             return NOT_STARTED;
         }
         int fd = open(rsp, O_WRONLY | O_TRUNC);
-        int r = fd < 0 ? fd : write_all(fd, text, len);
+        int r = fd < 0 ? fd : write_all(fd, text, strlen(text));
         if (fd >= 0) {
             close(fd);
         }
         if (r < 0) {
-            fprintf(STDERR, "cc: error: unable to write response file %s: %s\n", rsp, strerror(-r));
+            error("unable to make temporary file: %s", strerror(-r));
             return NOT_STARTED;
         }
         short_argv[0] = argv[0];
@@ -1004,12 +1047,17 @@ static int run(struct job *j) {
     if (verbose) {
         print_command(argv, 0);
         if (text != NULL) {
-            fprintf(STDERR, " Arguments passed via response file:\n%s (end of response file)\n", text);
+            fprintf(STDERR, " Arguments passed via response file:\n%s\n (end of response file)\n", text);
         }
     }
     int pid = spawn(argv[0], argv, environ);
     if (pid < 0) {
-        fprintf(STDERR, "cc: error: unable to execute command: %s\n", strerror(-pid));
+        /* LLVM's words (sys::Execute on a Unix). */
+        if (pid == -ENOENT) {
+            fprintf(STDERR, "cc: error: unable to execute command: Executable \"%s\" doesn't exist!\n", argv[0]);
+        } else {
+            fprintf(STDERR, "cc: error: unable to execute command: posix_spawn failed: %s\n", strerror(-pid));
+        }
         return NOT_STARTED;
     }
     int status = 0;
@@ -1019,17 +1067,44 @@ static int run(struct job *j) {
     return status;
 }
 
+/* Whether the user may write the file at `path` that is a regular file:
+ * only such a one is removed when the stage that was to make it fails, as
+ * clang's Compilation::CleanupFile leaves anything else (a device, `-o
+ * /dev/null`, a socket's name) where it is. */
+static int removable(const char *path) {
+    struct stat st;
+    if (stat(path, &st) < 0 || st.type != T_FILE) {
+        return 0;
+    }
+    uid_t uid = geteuid();
+    if (uid == 0) {
+        return 1;
+    }
+    if (st.uid == uid) {
+        return (st.mode & 0200) != 0;
+    }
+    if (st.gid == getegid()) {
+        return (st.mode & 0020) != 0;
+    }
+    return (st.mode & 0002) != 0;
+}
+
 /* Runs the stages in order, but none whose input's earlier stage failed
- * (the link if any did), as clang does. Says why a stage failed when its
- * own messages may not (a compiler that exits 1 has said why; the
- * assembler and the linker are always followed by cc's word), removes the
- * file it was to make, and returns the first failure's status (1 for one
- * that could not start or was killed), or 0. */
+ * (the link if any did), as clang does. Removes the file a failed stage
+ * was to make, says why each stage failed once they are all done (as
+ * clang does after running its jobs: a compiler that exits 1 has said why
+ * itself; the assembler and the linker always get cc's word), and returns
+ * the first failure's status (1 for one that could not start or was
+ * killed), or 0. */
 static int run_jobs(void) {
     int status = 0;
     int *failed = calloc((size_t)ninputs + 1, sizeof(int));
+    /* Each failed stage's job and status, in order. */
+    int *failures = calloc((size_t)njobs + 1, sizeof(int));
+    int *statuses = calloc((size_t)njobs + 1, sizeof(int));
+    int nfailures = 0;
     int any_failed = 0;
-    if (failed == NULL) {
+    if (failed == NULL || failures == NULL || statuses == NULL) {
         oom();
     }
     for (int i = 0; i < njobs; i++) {
@@ -1041,19 +1116,10 @@ static int run_jobs(void) {
         if (r == 0) {
             continue;
         }
-        if (r == NOT_STARTED) {
-            fprintf(STDERR, "cc: error: %s command failed with exit code 1 (use -v to see invocation)\n",
-                    tool_name(j->tool));
-        } else if (r < 0) {
-            /* Killed: Camelot's exit status for a process ended from
-             * outside (or by a fault), where Linux has signals. */
-            fprintf(STDERR, "cc: error: %s command failed due to signal (use -v to see invocation)\n",
-                    tool_name(j->tool));
-        } else if (j->tool != CC1 || r != 1) {
-            fprintf(STDERR, "cc: error: %s command failed with exit code %d (use -v to see invocation)\n",
-                    tool_name(j->tool), r);
-        }
-        if (j->result != NULL) {
+        failures[nfailures] = i;
+        statuses[nfailures] = r;
+        nfailures++;
+        if (j->result != NULL && removable(j->result)) {
             unlink(j->result);
         }
         if (j->input >= 0) {
@@ -1064,8 +1130,40 @@ static int run_jobs(void) {
             status = r > 0 ? r : 1;
         }
     }
+    for (int f = 0; f < nfailures; f++) {
+        int tool = jobs[failures[f]].tool;
+        int r = statuses[f];
+        if (r == NOT_STARTED) {
+            fprintf(STDERR, "cc: error: %s command failed with exit code 1 (use -v to see invocation)\n",
+                    tool_name(tool));
+        } else if (r < 0) {
+            /* Killed: Camelot's exit status for a process ended from
+             * outside (or by a fault), where Linux has signals. */
+            fprintf(STDERR, "cc: error: %s command failed due to signal (use -v to see invocation)\n",
+                    tool_name(tool));
+        } else if (tool != CC1 || r != 1) {
+            fprintf(STDERR, "cc: error: %s command failed with exit code %d (use -v to see invocation)\n",
+                    tool_name(tool), r);
+        }
+    }
     free(failed);
+    free(failures);
+    free(statuses);
     return status;
+}
+
+/* Clang's warnings of options nothing ran to use, in their order, if all
+ * else is well. */
+static void warn_unused(void) {
+    for (int i = 0; i < nclaims; i++) {
+        int used_by = claims[i].used_by;
+        int unused = (used_by == FOR_ASSEMBLE && phase < ASSEMBLE) || (used_by == FOR_COMPILE && phase < COMPILE) ||
+                     (used_by == FOR_LINK && phase != LINK) || (used_by == FOR_CC1 && !have_cc1) ||
+                     (used_by == FOR_TOOLS && !have_cc1 && !have_as);
+        if (unused) {
+            warning("argument unused during compilation: '%s'", claims[i].rendered);
+        }
+    }
 }
 
 /* ---- main ---- */
@@ -1080,22 +1178,28 @@ int main(int argc, char **argv, char **envp) {
     }
     installed_dir = dir_of(absolute(execfn));
 
-    struct strv args;
-    memset(&args, 0, sizeof args);
-    for (int i = 0; i < argc; i++) {
-        if (expand_arg(argv[i], &args) < 0) {
-            return 1;
-        }
+    /* @FILE, as clang reads response files: a file that can't be read (a
+     * directory) or that names itself is clang's message alone. */
+    char why[512];
+    int nargs = 0;
+    char **args = expand_response_files(argc, argv, &nargs, why, sizeof why);
+    if (args == NULL) {
+        fprintf(STDERR, "%s\n", why);
+        return 1;
     }
-    if (parse(args.v, args.n)) {
+    if (parse(args, nargs)) {
         return 0;
     }
     if (print_only || verbose) {
         fprintf(STDERR, "cc version %s\nTarget: %s\nThread model: posix\nInstalledDir: %s\n", VERSION, TARGET,
                 installed_dir);
     }
-    /* The inputs: a language -x doesn't know, and files that aren't
-     * there. */
+    /* A -x after the last input says nothing; then the inputs: a language
+     * -x doesn't know, standard input without -E or -x, and files that
+     * aren't there. */
+    if (last_x != NULL && !input_after_x) {
+        warning("'%s' after last input file has no effect", last_x);
+    }
     int files = 0;
     for (int k = 0; k < ninputs; k++) {
         struct input *in = &inputs[k];
@@ -1103,26 +1207,37 @@ int main(int argc, char **argv, char **envp) {
             error("language not recognized: '%s'", in->arg);
             continue;
         }
-        struct stat st;
-        if (in->kind == IN_FILE && stat(in->arg, &st) < 0) {
-            error("no such file or directory: '%s'", in->arg);
-            in->missing = 1;
-            continue;
+        if (in->kind == IN_FILE && strcmp(in->arg, "-") == 0) {
+            /* Standard input: C, as clang takes it, but with no -x clang
+             * preprocesses it only (-E). */
+            if (phase != PREPROCESS && in->lang == LANG_OBJECT) {
+                error("-E or -x required when input is from standard input", NULL);
+            }
+            if (in->lang == LANG_OBJECT) {
+                in->lang = LANG_C;
+            }
+        } else if (in->kind == IN_FILE) {
+            struct stat st;
+            if (stat(in->arg, &st) < 0) {
+                error("no such file or directory: '%s'", in->arg);
+                in->missing = 1;
+                continue;
+            }
         }
         files++;
     }
     if (files == 0) {
-        if (!print_only && !(verbose && ninputs == 0)) {
+        if (!print_only && !verbose) {
             error("no input files", NULL);
         }
         return errors > 0 ? 1 : 0;
     }
-    if (last_x != NULL && !input_after_x) {
-        warning("'%s' after last input file has no effect", last_x);
-    }
     /* The stages, and clang's warnings of inputs that mean nothing for the
-     * last one asked for. */
-    build_jobs();
+     * last one asked for; none with an error in the options themselves, as
+     * clang prints none then. */
+    if (option_errors == 0) {
+        build_jobs();
+    }
     /* -o names one file: with -c, -S or -E, only one input may make one
      * (said once the stages are worked out, as clang does). */
     if (output != NULL && phase != LINK) {
@@ -1138,20 +1253,8 @@ int main(int argc, char **argv, char **envp) {
             error("cannot specify -o when generating multiple output files", NULL);
         }
     }
-    /* Arguments that do nothing for the last stage asked for, if all else
-     * is well. */
     if (errors == 0) {
-        if (c_arg != NULL && phase < ASSEMBLE) {
-            warning("argument unused during compilation: '%s'", c_arg);
-        }
-        if (s_arg != NULL && phase < COMPILE) {
-            warning("argument unused during compilation: '%s'", s_arg);
-        }
-        if (phase != LINK) {
-            for (int i = 0; i < l_dir_args.n; i++) {
-                warning("argument unused during compilation: '%s'", l_dir_args.v[i]);
-            }
-        }
+        warn_unused();
     }
     int status = errors > 0 ? 1 : 0;
     if (print_only) {
