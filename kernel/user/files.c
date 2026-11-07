@@ -6,11 +6,12 @@
  * A window of the GUI library's widgets: the directory's entries in a
  * list, the directories first (with a '/'), then the files and devices
  * with their sizes, each group by name. Select one with the pointer or the
- * arrows; Open goes into a directory or shows a file's text, its lines in
- * the same list (tabs as spaces to the next multiple of 8, the first
- * MAX_TEXT bytes, at most MAX_LINES lines), and Up goes back: from the
- * text to its directory, from a directory to the one above. The line
- * under the list says where it is. Exits 0 when the window is closed, 1
+ * arrows; Open (or Enter, or a click on the entry selected already) goes
+ * into a directory or shows a file's text, its lines in the same list
+ * (tabs as spaces to the next multiple of 8, the first MAX_TEXT bytes, at
+ * most MAX_LINES lines), and Up goes back: from the text to its
+ * directory, from a directory to the one above. The line under the list
+ * says where it is. Exits 0 when the window is closed, 1
  * if it can't start. */
 #include "gui.h"
 
@@ -253,6 +254,9 @@ int main(int argc, char **argv) {
     struct gui_widget *open_button = up_button ? gui_button(&ui, bar, "Open", open_selected) : NULL;
     where = open_button ? gui_label(&ui, bar, "") : NULL;
     list = where ? gui_list(&ui, root, items, 0, 12, NULL) : NULL;
+    if (list != NULL) {
+        list->activate = open_selected; /* Enter, or a second click */
+    }
     status = list ? gui_label(&ui, root, "") : NULL;
     if (status == NULL) {
         fprintf(2, "files: out of memory\n");

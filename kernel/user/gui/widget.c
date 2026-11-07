@@ -877,7 +877,12 @@ static void press(struct gui_ui *ui, struct gui_widget *w) {
     case GUI_LIST: {
         int line = (y - w->rect.y - THEME_EDGE_PAD) / theme_line(ui);
         if (y >= w->rect.y + THEME_EDGE_PAD && line < widget_list_lines(w) && w->top + line < w->count) {
-            list_select(w, w->top + line);
+            int item = w->top + line;
+            if (item == w->selected && w->activate != NULL) {
+                w->activate(w, item);
+            } else {
+                list_select(w, item);
+            }
         }
         break;
     }
@@ -991,6 +996,11 @@ static void list_key(struct gui_widget *w, uint code) {
         break;
     case KEY_END:
         list_select(w, w->count - 1);
+        break;
+    case KEY_ENTER:
+        if (at >= 0 && w->activate != NULL) {
+            w->activate(w, at);
+        }
         break;
     }
 }
