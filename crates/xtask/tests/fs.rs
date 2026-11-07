@@ -1380,7 +1380,7 @@ const PROMPT: &str = "# ";
 
 /// Checks `filetest` makes on the root image, its 64-bit off_t's among
 /// them, and `filetest ro` on a read-only one (kernel/user/filetest.c).
-const FILETEST_CHECKS: u32 = 251;
+const FILETEST_CHECKS: u32 = 254;
 const FILETEST_RO_CHECKS: u32 = 14;
 
 /// What the shell printed after reading `command`, up to its next prompt.
@@ -1574,10 +1574,12 @@ fn the_shell_runs_lists_and_and_or_lists() {
     // pipeline only after a status of 0 and `||` only after one that is not,
     // a pipeline left out keeping the status. A command that can't be
     // started has POSIX's status, 127 for no such program and 1 for a
-    // redirection, which `&&` and `||` go by too. An operator with no
-    // command on a side is said before anything of its AND-OR list runs. In
-    // the background, an AND-OR list runs in a shell of its own, `sh -c
-    // LIST`, which `wait` collects as `sh` with the list's status.
+    // redirection, which `&&` and `||` go by too; the rest of its pipeline
+    // runs, whose status is its last command's. An operator with no command
+    // on a side is said before anything of the line runs, as POSIX shells
+    // parse a whole line first. In the background, an AND-OR list runs in a
+    // shell of its own, `sh -c LIST`, which `wait` collects as `sh` with the
+    // list's status; the background list's own status is 0, POSIX's.
     let run = boot(
         root_image(),
         Boot {
@@ -1589,6 +1591,8 @@ fn the_shell_runs_lists_and_and_or_lists() {
             nosuch || echo after 127\n\
             cat < /missing || echo after 1\n\
             echo first;;echo second\n\
+            echo nothing; && echo b\n\
+            nosuch | wc && echo ok\n\
             && echo b\n\
             echo never &&\n\
             sh -c\n\
@@ -1620,7 +1624,12 @@ fn the_shell_runs_lists_and_and_or_lists() {
         said("cat < /missing || echo after 1"),
         "sh: /missing: no such file or directory\nafter 1\n"
     );
-    assert_eq!(said("echo first;;echo second"), "first\nsh: ; with no command\n");
+    assert_eq!(said("echo first;;echo second"), "sh: ; with no command\n");
+    assert_eq!(said("echo nothing; && echo b"), "sh: && with no command\n");
+    assert_eq!(
+        said("nosuch | wc && echo ok"),
+        "sh: nosuch: no such program\n0 0 0\nok\n"
+    );
     assert_eq!(said("&& echo b"), "sh: && with no command\n");
     assert_eq!(said("echo never &&"), "sh: && with no command\n");
     assert_eq!(said("sh -c"), "sh: -c: option requires an argument\nsh: exit 2\n");
@@ -1655,6 +1664,17 @@ fn the_shell_runs_lists_and_and_or_lists() {
     assert_eq!(fs.read_file("/one").unwrap(), b"one\n");
     assert_eq!(fs.read_file("/two").unwrap(), b"two\n");
     assert!(fs.lookup("/no").is_err());
+
+    // A background list's status is 0, which `exit` then gives.
+    let run = boot(
+        root_image(),
+        Boot {
+            input: b"systest exit 3; echo x > /x &\nexit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
 }
 
 #[test]

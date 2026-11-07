@@ -2947,7 +2947,9 @@ fn a_line_longer_than_the_input_buffers_is_cut_not_stuck() {
     let long = "x".repeat(500);
     assert!(long.len() > UART_RX_SIZE + TTY_IN);
     let (r, out) = run_shell(format!("{long}\nexit\n").as_bytes());
-    assert_eq!(r, RunResult::Exited(0), "{out}");
+    // `exit` ends the shell with the last status: 127, POSIX's for no such
+    // program.
+    assert_eq!(r, RunResult::Exited(127), "{out}");
     let kept = "x".repeat(127);
     let want = format!(
         "{SHELL_BANNER}\

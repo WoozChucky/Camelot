@@ -19,7 +19,11 @@
  * a > b` counts the programs in the background and copies a to b in the
  * foreground. A command that can't be started has POSIX's status: 127 for
  * no such program, 126 for one that is there but can't be run, 1 for a
- * redirection that can't be made.
+ * redirection that can't be made; the rest of its pipeline runs, and the
+ * pipeline's status is its last command's. An AND-OR list in the
+ * background has status 0, as POSIX gives an asynchronous list. The whole
+ * line is checked before any of it runs: `a ;; b` says `;` has no command
+ * and runs nothing, as POSIX shells parse a complete command first.
  *
  * `sh -c LIST` runs LIST, a line, and ends with the last status, as
  * POSIX's `sh -c` does; it is not interactive.
@@ -867,10 +871,12 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
      * assignments alone, whose status, 0, is the pipeline's. */
     int ends_with_exec = 0;
     int quit = 0;
-    /* The status of a command that could not be started (POSIX's 127, 126
-     * or 1, see the top), which stops the pipeline there and is its
-     * status; -1 if none failed. */
-    int failed = -1;
+    /* The status of the last command if it could not be started (POSIX's
+     * 127, 126 or 1, see the top), the pipeline's then; -1 if it was. A
+     * command before it that can't be started is said and left out, and
+     * the rest of the pipeline runs, as in POSIX shells: what it would
+     * have written, its reader finds empty. */
+    int last_failed = -1;
     /* The read end of the pipe from the previous command, for this one. */
     int from_prev = -1;
     for (int i = 0; i < n; i++) {
@@ -895,8 +901,10 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
         if (open_files(&cmds[i], &file_in, &file_out) < 0) {
             close_if(in);
             close_if(out);
-            failed = 1;
-            break;
+            if (i + 1 == n) {
+                last_failed = 1;
+            }
+            continue;
         }
         if (file_in >= 0) {
             close_if(in);
@@ -929,8 +937,10 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
         int pid = spawn(program_path(cmds[i].argv[0], path), cmds[i].argv, envp);
         if (pid < 0) {
             cannot_start(cmds[i].argv[0], pid);
-            failed = not_found(cmds[i].argv[0], pid) ? 127 : 126;
-            break;
+            if (i + 1 == n) {
+                last_failed = not_found(cmds[i].argv[0], pid) ? 127 : 126;
+            }
+            continue;
         }
         pids[started] = pid;
         names[started] = cmds[i].argv[0];
@@ -973,8 +983,12 @@ static int run_job(struct cmd *cmds, int n, int background, int *exit_status) {
     if (ends_with_exec && !background) {
         last_status = 0;
     }
-    if (failed >= 0 && !background) {
-        last_status = failed;
+    if (last_failed >= 0 && !background) {
+        last_status = last_failed;
+    }
+    /* POSIX: "The exit status of an asynchronous list shall be zero." */
+    if (background) {
+        last_status = 0;
     }
     return quit;
 }
@@ -1070,15 +1084,13 @@ static void run_in_subshell(struct token *t, int n) {
     }
     printf("[%d]\n", pid);
     remember(pid, "sh");
+    last_status = 0; /* an asynchronous list's status, as POSIX has it */
 }
 
-/* Runs the AND-OR list t[0..n) (see the top), in the background or not.
- * Returns 1 if the shell should exit, with the status in *exit_status. */
+/* Runs the AND-OR list t[0..n) (see the top, and checked: check_and_or),
+ * in the background or not. Returns 1 if the shell should exit, with the
+ * status in *exit_status. */
 static int run_and_or(struct token *t, int n, int background, int *exit_status) {
-    if (check_and_or(t, n) < 0) {
-        last_status = 2;
-        return 0;
-    }
     if (background && next_and_or(t, n, 0) < n) {
         run_in_subshell(t, n);
         return 0;
@@ -1110,10 +1122,12 @@ static int run_line(char *line, int *exit_status) {
     int n = tokenize(line, t, MAX_TOKENS);
     if (n < 0) {
         fprintf(STDERR, "sh: too many words\n");
+        last_status = 2;
         return 0;
     }
-    int start = 0;
-    while (start < n) {
+    /* The whole line is checked before any of it runs, as POSIX shells
+     * parse a complete command first: `a ;; b` runs nothing. */
+    for (int start = 0; start < n;) {
         int end = start;
         while (end < n && t[end].op != ';' && t[end].op != '&') {
             end++;
@@ -1122,6 +1136,17 @@ static int run_line(char *line, int *exit_status) {
             fprintf(STDERR, "sh: %s with no command\n", op_text(t[end].op));
             last_status = 2;
             return 0;
+        }
+        if (check_and_or(&t[start], end - start) < 0) {
+            last_status = 2;
+            return 0;
+        }
+        start = end + 1;
+    }
+    for (int start = 0; start < n;) {
+        int end = start;
+        while (end < n && t[end].op != ';' && t[end].op != '&') {
+            end++;
         }
         if (run_and_or(&t[start], end - start, end < n && t[end].op == '&', exit_status)) {
             return 1;
