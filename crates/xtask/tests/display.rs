@@ -539,6 +539,17 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
         ("unsealed", "4 2: the pool's memory may shrink"),
         ("pools", "1 2: too many pools"),
         ("buffer", "5 1: the buffer is past the pool's end"),
+        ("role", "6 0: the surface has a role already"),
+        ("layer", "6 1: invalid layer"),
+        ("constructed", "6 2: the surface has a buffer already"),
+        ("layersize", "7 1: too big"),
+        ("zerosize", "7 1: a size of 0 without both its edges"),
+        ("anchor", "7 2: invalid anchor"),
+        ("keyboard", "7 3: invalid value"),
+        ("serial", "7 0: a serial no configure had"),
+        ("unacked", "7 0: a buffer before the configure was acked"),
+        ("source", "12 1: offer after the source was used"),
+        ("usedsource", "14 1: a source used already"),
     ] {
         d.run(&format!("wltest bad {kind}"));
         let out = d.wait_for("$ ");
@@ -738,6 +749,33 @@ fn terminals_resize_and_share_the_clipboard() {
     d.type_text("\n");
     d.term_drawn("two", "$ ");
     d.expect_screen("term-pasted");
+
+    // A selection whose source never answers: the paste gives up after a
+    // while and the terminal goes on; destroyed, the selection is none,
+    // and a paste asks nobody.
+    d.run("wltest clip &");
+    d.wait_for("wltest clip: set\n");
+    // On its title bar: a click in the text would select.
+    d.click(200, 70);
+    d.wait_for("compositor: focus \"two\"\n");
+    let paste = |d: &mut Desk| {
+        d.key(KEY_LEFT_CTRL, true);
+        d.key(KEY_LEFT_SHIFT, true);
+        d.tap(0x19); // V
+        d.key(KEY_LEFT_SHIFT, false);
+        d.key(KEY_LEFT_CTRL, false);
+    };
+    paste(&mut d);
+    d.wait_for("wltest clip: asked\n");
+    d.term_command("two", "echo alive");
+    paste(&mut d);
+    d.wait_for("wltest clip: destroyed\n");
+    d.term_command("two", "echo still");
+    paste(&mut d);
+    d.term_command("two", "echo and on");
+    let out = d.out();
+    assert_eq!(out.matches("wltest clip: asked").count(), 1, "{out}");
+    assert!(!out.contains("wltest clip: disconnected"), "{out}");
 }
 
 /// How many pixels of the screen are mostly `channel` (0 red, 1 green, 2
@@ -817,10 +855,23 @@ fn the_panel_launches_lists_and_focuses_windows() {
     }
 
     // A button for each window (the first terminal, the files and the
-    // second terminal, whose prompt a second is plenty for), the one with
-    // the keyboard lit; a click on one raises its window and gives it the
+    // second terminal, once its prompt is on the screen: the panel starts
+    // it without -v, and it is resized to fit first), the one with the
+    // keyboard lit; a click on one raises its window and gives it the
     // keyboard.
-    d.settle(60);
+    let prompt_drawn = |d: &Desk| {
+        // The prompt's '$', in the second row of the window under the first.
+        let (w, _, rgb) = d.screen();
+        (111..123).any(|y: usize| (3..11).any(|x: usize| rgb[(y * w as usize + x) * 3] > 0x80))
+    };
+    for _ in 0..100 {
+        if prompt_drawn(&d) {
+            break;
+        }
+        d.settle(10);
+    }
+    assert!(prompt_drawn(&d), "{}", d.out());
+    d.wait_idle();
     d.since_here();
     d.expect_screen_but("panel-windows", &[PANEL_METERS]);
     d.click(120, 12);
