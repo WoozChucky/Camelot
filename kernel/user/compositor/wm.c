@@ -249,6 +249,12 @@ void window_focus(struct window *w) {
     }
 }
 
+/* The largest content that fits the work area with its frame. */
+static void work_max(int *width, int *height) {
+    *width = srv.work.w - 2 * BORDER;
+    *height = srv.work.h - TITLE_H - 2 * BORDER;
+}
+
 void window_map(struct window *w) {
     if (w->mapped) {
         return;
@@ -286,6 +292,15 @@ void window_map(struct window *w) {
     damage(window_frame(w));
     window_focus(w);
     toplevel_announce(w);
+    /* Too big for the work area (a terminal of 80 columns on a screen of
+     * 640): asked for the size that fits, as it is placed at the top
+     * left, so the frame, the close button and the edges are on it. */
+    int max_w;
+    int max_h;
+    work_max(&max_w, &max_h);
+    if (c.w > max_w || c.h > max_h) {
+        toplevel_configure(w, c.w > max_w ? max_w : c.w, c.h > max_h ? max_h : c.h, 0);
+    }
 }
 
 void window_unmap(struct window *w) {
@@ -336,6 +351,7 @@ void wm_forget_surface(struct surface *s) {
 }
 
 void window_move_start(struct window *w) {
+    w->keep_edges = 0; /* moved: the edges a resize kept are elsewhere */
     srv.moving = w;
     srv.move_dx = srv.px - w->x;
     srv.move_dy = srv.py - w->y;
@@ -352,7 +368,10 @@ void window_resize_start(struct window *w, uint edges) {
     srv.resize_y0 = srv.py;
     srv.resize_w0 = c.w;
     srv.resize_h0 = c.h;
-    srv.resize_right = c.x + c.w;
+    w->keep_edges = edges & (XDG_TOPLEVEL_RESIZE_EDGE_LEFT | XDG_TOPLEVEL_RESIZE_EDGE_TOP);
+    w->keep_right = c.x + c.w;
+    w->keep_bottom = c.y + c.h;
+    w->keep_until = 0;
     w->pending_w = w->cfg_w;
     w->pending_h = w->cfg_h;
     if (srv.verbose) {
@@ -379,8 +398,9 @@ static void resize_motion(void) {
     } else if (e & XDG_TOPLEVEL_RESIZE_EDGE_TOP) {
         height -= dy;
     }
-    int max_w = srv.work.w - 2 * BORDER;
-    int max_h = srv.work.h - TITLE_H - 2 * BORDER;
+    int max_w;
+    int max_h;
+    work_max(&max_w, &max_h);
     width = width > max_w ? max_w : width;
     height = height > max_h ? max_h : height;
     width = width < MIN_WIDTH ? MIN_WIDTH : width;
@@ -401,12 +421,35 @@ static void resize_end(void) {
     srv.resizing = NULL;
     if (w->mapped && w->pending_w > 0 && w->pending_h > 0) {
         toplevel_configure(w, w->pending_w, w->pending_h, 0);
+        w->keep_until = w->configure_serial;
+    } else {
+        w->keep_edges = 0;
     }
 }
 
 void window_resized(struct window *w) {
-    if (srv.resizing == w && (srv.resize_edges & XDG_TOPLEVEL_RESIZE_EDGE_LEFT)) {
-        w->x = srv.resize_right - window_content(w).w;
+    if (w->layer >= 0) {
+        layers_arrange();
+        return;
+    }
+    struct gui_rect c = window_content(w);
+    if (w->keep_edges & XDG_TOPLEVEL_RESIZE_EDGE_LEFT) {
+        w->x = w->keep_right - c.w;
+    }
+    if (w->keep_edges & XDG_TOPLEVEL_RESIZE_EDGE_TOP) {
+        w->y = w->keep_bottom - c.h;
+    }
+    if (w->x < srv.work.x + BORDER) {
+        w->x = srv.work.x + BORDER;
+    }
+    if (w->y < srv.work.y + TITLE_H + BORDER) {
+        w->y = srv.work.y + TITLE_H + BORDER;
+    }
+}
+
+void window_committed(struct window *w) {
+    if (w->keep_edges != 0 && w->keep_until != 0 && w->acked_serial >= w->keep_until) {
+        w->keep_edges = 0;
     }
 }
 
@@ -578,6 +621,11 @@ static void pointer_button(uint code, int pressed, uint time) {
             if (w->keyboard) {
                 window_focus(w);
             }
+        } else if (first && srv.grab == NULL && w == NULL && srv.focus != NULL && srv.focus->layer >= 0) {
+            /* A click on the bare background takes the keyboard from a
+             * layer surface (the panel's menu closes), back to the top
+             * window. */
+            window_focus(srv.nstack > 0 ? srv.stack[srv.nstack - 1] : NULL);
         } else if (first && srv.grab == NULL && w != NULL) {
             window_focus(w);
             if (gui_rect_contains(window_close_button(w), srv.px, srv.py)) {

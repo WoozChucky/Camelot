@@ -289,6 +289,9 @@ static void commit(struct client *c, struct surface *s) {
     } else if (w != NULL && s->has_content) {
         window_map(w);
     }
+    if (w != NULL && w->layer < 0) {
+        window_committed(w);
+    }
     /* The frame callbacks wait for the next frame drawn; one the last
      * frames haven't taken yet is done at once. */
     for (int i = 0; i < s->nframes; i++) {

@@ -190,6 +190,7 @@ void layers_arrange(void) {
     for (int i = 0; i < srv.nlayers; i++) {
         struct window *w = srv.layers[i];
         struct gui_rect before = window_frame(w);
+        layer_configure(w); /* a size of 0 follows the work area */
         layer_place(w);
         struct gui_rect after = window_frame(w);
         if (before.x != after.x || before.y != after.y) {
@@ -318,7 +319,7 @@ int layer_commit(struct window *w, int new_buffer) {
     int both_v = (w->anchor & ANCHOR_V) == ANCHOR_V;
     if ((w->req_w == 0 && !both_h) || (w->req_h == 0 && !both_v)) {
         post_error(c, w->layer_id, ZWLR_LAYER_SURFACE_V1_ERROR_INVALID_SIZE,
-                   "a size of 0 needs the two edges it stretches between");
+                   "a size of 0 without both its edges");
         return -1;
     }
     if (new_buffer && w->acked_serial == 0) {
@@ -667,8 +668,8 @@ int shell_object_free(struct client *c, struct object *o) {
         if (srv.selection == s) {
             srv.selection = NULL;
             offers_stale();
-            if (srv.focus != NULL && srv.focus->c != c) {
-                selection_offer(srv.focus->c);
+            if (srv.focus != NULL) {
+                selection_offer(srv.focus->c); /* none now, the source's own client too */
             }
         }
         free(s);

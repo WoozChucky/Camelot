@@ -190,6 +190,15 @@ struct window {
     int mapped;
     int x; /* the content's top left on the screen */
     int y;
+    /* What an interactive resize from the left or the top keeps: those
+     * edges (xdg_toplevel's resize_edge bits), and the content's right
+     * and bottom when it started. Kept until the client commits after
+     * acking the configure that ended it (`keep_until`; 0 while the
+     * resize goes on), since the last sizes come after the button. */
+    uint keep_edges;
+    int keep_right;
+    int keep_bottom;
+    uint keep_until;
     char title[TITLE_MAX];
     int closing;
     uint close_deadline;
@@ -281,15 +290,13 @@ struct server {
     int move_dx;
     int move_dy;
     /* A window being resized: its edges (xdg_toplevel's resize_edge), the
-     * pointer and the content's size where it started, and the content's
-     * right edge then (a resize from the left keeps it). */
+     * pointer and the content's size where it started. */
     struct window *resizing;
     uint resize_edges;
     int resize_x0;
     int resize_y0;
     int resize_w0;
     int resize_h0;
-    int resize_right;
 
     /* The keyboard: its modifiers, the keys held, and those the window
      * manager took (their releases are its too). */
@@ -372,8 +379,11 @@ int shell_object_free(struct client *c, struct object *o);
 int layer_commit(struct window *w, int new_buffer);
 void layer_map(struct window *w);
 void layer_unmap(struct window *w);
-/* The work area from the layer surfaces shown, and each placed again. */
+/* The work area from the layer surfaces shown, and each configured (a
+ * size of 0 follows the area) and placed again. */
 void layers_arrange(void);
+/* A layer surface's configure, if its size is not the last one sent. */
+void layer_configure(struct window *w);
 /* The foreign toplevel managers: one bound (each window announced to
  * it), a window shown, changed (title, activated) or gone. */
 void toplevels_bound(struct client *c, struct object *m);
@@ -412,9 +422,13 @@ void window_focus(struct window *w);
 void window_move_start(struct window *w);
 /* An interactive resize of `edges` (xdg_toplevel's resize_edge). */
 void window_resize_start(struct window *w, uint edges);
-/* The window's content changed size: a resize from the left keeps its
- * right edge where it was. */
+/* The window's content changed size: a resize from the left or the top
+ * keeps the edge across from it where it was, and a layer surface is
+ * placed again. */
 void window_resized(struct window *w);
+/* A toplevel's commit is done: a resize's kept edges are let go once the
+ * size that ended it has come. */
+void window_committed(struct window *w);
 /* Asks the window's client to close it (killed if it doesn't). */
 void window_close(struct window *w);
 /* A surface or a client is going: the pointer and keyboard forget it. */
