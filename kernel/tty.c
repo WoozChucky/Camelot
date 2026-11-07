@@ -486,6 +486,10 @@ long tty_ioctl(struct tty *t, u32 request, uintptr arg) {
         /* Only a process the caller could kill() may be made the
          * foreground one: Ctrl-C kills it with the kernel's authority. */
         if (pid != 0) {
+            /* A zombie, which has ended, is no foreground process. */
+            if (!proc_exists(pid)) {
+                return -ESRCH;
+            }
             int err = proc_may_signal(pid, myproc());
             if (err < 0) {
                 return err;
