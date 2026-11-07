@@ -2109,9 +2109,12 @@ fn image_path(rel: &str) -> String {
 /// switch, goto, the initializers clang copies from a constant,
 /// designators, strings, static locals, the preprocessor), one of each
 /// other directory of merlin's tests (`cases-merlin`, `multi`, `abi`), a
-/// file of the kernel's, a user program, the GUI library's drawing and a
-/// program of it; and, for `-E`, the kernel's linker script, its entry,
-/// the start code and an example's assembly.
+/// file of the kernel's, one of its network stack's (every header found
+/// through `-I ../include`), a user program, one of the C library's (given
+/// `-I ..`), the GUI library's drawing and a program of it: a whole
+/// program with each form of [`program_includes`]'s directories; and, for
+/// `-E`, the kernel's linker script, its entry, the start code and an
+/// example's assembly.
 const SAMPLED: &[&str] = &[
     "crates/merlin/tests/cases/structs.c",
     "crates/merlin/tests/cases/unions.c",
@@ -2131,7 +2134,9 @@ const SAMPLED: &[&str] = &[
     "crates/merlin/tests/multi/modules/main.c",
     "crates/merlin/tests/abi/merlin_side.c",
     "kernel/pipe.c",
+    "kernel/net/udp.c",
     "kernel/user/cat.c",
+    "kernel/user/lib/getenv.c",
     "kernel/user/gui/draw.c",
     "kernel/user/guidemo.c",
     "kernel/kernel.lds.S",
