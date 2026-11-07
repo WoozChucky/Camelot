@@ -3768,7 +3768,7 @@ fn cc1_compiles_itself_on_camelot() {
 /// every row; and `cc1` compiling every file of its own; then all of that
 /// merlin compiles with `-g` ([`g_corpus`]), [`G_INPUTS`] among it; and
 /// `cc1 --dump-ast` on every C file and row, its own files too. About
-/// MINUTES minutes on 2 machines: run before a change to cc1 is called
+/// 130 minutes on 2 machines: run before a change to cc1 is called
 /// ready (README.md).
 #[test]
 #[ignore]
