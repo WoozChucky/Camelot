@@ -6,7 +6,7 @@
  * A window of the GUI library's widgets: the directory's entries in a
  * list, the directories first (with a '/'), then the files and devices
  * with their sizes, each group by name. Select one with the pointer or the
- * arrows; Open (or Enter, or a click on the entry selected already) goes
+ * arrows; Open (or Enter, or a second click on an entry) goes
  * into a directory or shows a file's text, its lines in the same list
  * (tabs as spaces to the next multiple of 8, the first MAX_TEXT bytes, at
  * most MAX_LINES lines), and Up goes back: from the text to its

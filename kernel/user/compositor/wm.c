@@ -432,18 +432,20 @@ void window_resized(struct window *w) {
         layers_arrange();
         return;
     }
+    /* Only a kept edge moves the window, and then into the work area: one
+     * dragged partly off the screen stays where it was put. */
     struct gui_rect c = window_content(w);
     if (w->keep_edges & XDG_TOPLEVEL_RESIZE_EDGE_LEFT) {
         w->x = w->keep_right - c.w;
+        if (w->x < srv.work.x + BORDER) {
+            w->x = srv.work.x + BORDER;
+        }
     }
     if (w->keep_edges & XDG_TOPLEVEL_RESIZE_EDGE_TOP) {
         w->y = w->keep_bottom - c.h;
-    }
-    if (w->x < srv.work.x + BORDER) {
-        w->x = srv.work.x + BORDER;
-    }
-    if (w->y < srv.work.y + TITLE_H + BORDER) {
-        w->y = srv.work.y + TITLE_H + BORDER;
+        if (w->y < srv.work.y + TITLE_H + BORDER) {
+            w->y = srv.work.y + TITLE_H + BORDER;
+        }
     }
 }
 

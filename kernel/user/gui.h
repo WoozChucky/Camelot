@@ -278,9 +278,11 @@ struct gui_widget {
     struct gui_widget *next;
     const char *text;     /* a label's, a button's, a menu's title */
     gui_action action;
-    /* a list's, if set: its item opened (Enter, or a click on the item
-     * selected already), as `action` is its item selected */
+    /* a list's, if set: its item opened (Enter, or a click on the item a
+     * click selected already, `clicked`), as `action` is its item
+     * selected */
     gui_action activate;
+    int clicked; /* -1: none, or the keys moved since */
     void *data;           /* the program's */
     /* rows and columns */
     int spacing;
