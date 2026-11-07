@@ -460,7 +460,14 @@ fn shell_output<'a>(out: &'a str, command: &str) -> &'a str {
         .find(&typed)
         .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"))
         + typed.len();
-    let end = out[start..].find(PROMPT).map_or(out.len(), |e| start + e);
+    // Up to the next prompt: root's `# `, which a line marker that `cc1 -E`
+    // prints (`# 1 "file"`) also starts with, but no command the tests type
+    // starts with a digit.
+    let end = out[start..]
+        .match_indices(PROMPT)
+        .map(|(e, _)| start + e)
+        .find(|&e| !out[e + PROMPT.len()..].starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or(out.len());
     &out[start..end]
 }
 
