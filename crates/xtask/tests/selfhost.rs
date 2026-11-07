@@ -29,6 +29,13 @@
 //! holds to clang's warnings named as merlin's test names it, from its own
 //! directory (a name longer than a Camelot directory entry's 14 bytes is
 //! shortened on the image, so those programs carry another).
+//!
+//! The driver (#242, `kernel/user/cc.c`, `/bin/cc`) runs cc1, `as` and `ld`
+//! as clang's driver runs its stages: in a Camelot shell `cc -o hello
+//! hello.c && ./hello` builds and runs hello, and `cc -o wc wc.c` makes
+//! `/bin/wc` byte for byte; its stages, `-v` and `-###` are clang's, and
+//! so are its messages and exit statuses ([`CC_CASES`], which an ignored
+//! test holds clang's own driver to).
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
