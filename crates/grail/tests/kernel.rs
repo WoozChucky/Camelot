@@ -210,6 +210,9 @@ fn shell_accepts_windows_line_ends() {
          CMD > FILE      write the output to FILE\n\
          CMD | CMD       send the first command's output to the second one\n\
          CMD & CMD       run the first command in the background\n\
+         CMD ; CMD       run one command, then the other\n\
+         CMD && CMD      run the second command if the first one's status is 0\n\
+         CMD || CMD      run the second command if the first one's status is not 0\n\
          {PROMPT}nope\n\
          sh: nope: no such program\n\
          {PROMPT}echo a b\n\

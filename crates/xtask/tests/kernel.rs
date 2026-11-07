@@ -2845,6 +2845,9 @@ CMD < FILE      read the input from FILE
 CMD > FILE      write the output to FILE
 CMD | CMD       send the first command's output to the second one
 CMD & CMD       run the first command in the background
+CMD ; CMD       run one command, then the other
+CMD && CMD      run the second command if the first one's status is 0
+CMD || CMD      run the second command if the first one's status is not 0
 ";
 
 /// `out` with the number after each `ticks: ` replaced by `N`, after checking
