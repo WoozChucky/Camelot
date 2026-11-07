@@ -378,6 +378,28 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         },
         camelot_profile()
     );
+    // And the desktop beside it: the desktop profile's hardware, on its copy of
+    // os-desktop, without a network card.
+    let desktop = platform.desktop.expect("the demo's desktop");
+    let info = avalon.vm_info(&VmRef::Id(desktop)).unwrap();
+    assert_eq!(info.vm.name, "desktop");
+    assert_eq!(
+        (info.vm.profile.ram_size, info.vm.profile.harts),
+        (avalon_client::DESKTOP_RAM, avalon_client::DESKTOP_HARTS)
+    );
+    assert_eq!(info.vm.profile.devices.len(), 1, "{:?}", info.vm.profile.devices);
+    // It boots: its console's shell, which its /etc/rc keeps beside the desktop.
+    let mut console = Console::attach(platform.avalon, desktop);
+    console.wait_for("ram: 64 MiB at 0x80000000\n");
+    console.wait_for(PROMPT);
+    drop(console);
+    assert!(
+        out.lines()
+            .iter()
+            .any(|l| l.starts_with("up: demo: created disk desktop-disk0, a copy of os-desktop")),
+        "{:#?}",
+        out.lines()
+    );
     let switches = avalon.list_switches().unwrap();
     assert_eq!(switches.len(), 1);
     assert_eq!(switches[0].name, "nat");
@@ -422,7 +444,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     two.type_line("ls /");
     two.wait_for_end(PROMPT);
     let vms = avalon.list_vms().unwrap();
-    assert_eq!(vms.len(), 2);
+    assert_eq!(vms.len(), 3);
     assert!(vms.iter().all(|vm| vm.state == VmState::Running), "{vms:?}");
     let disks = lake.list_disks().unwrap();
     let writer = |name: &str| disks.iter().find(|d| d.name == name).map(|d| d.writer);
@@ -432,10 +454,19 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     // Nothing is named after the OS.
     let mut names: Vec<&str> = disks.iter().map(|d| d.name.as_str()).collect();
     names.sort();
-    assert_eq!(names, ["os-base", "os-desktop", "second-disk0", "vm001-disk0"]);
+    assert_eq!(
+        names,
+        [
+            "desktop-disk0",
+            "os-base",
+            "os-desktop",
+            "second-disk0",
+            "vm001-disk0"
+        ]
+    );
     let mut names: Vec<String> = vms.iter().map(|vm| vm.name.clone()).collect();
     names.sort();
-    assert_eq!(names, ["second", "vm001"]);
+    assert_eq!(names, ["desktop", "second", "vm001"]);
     drop((avalon, lake, one, two));
 
     let summary = platform.summary(true);
@@ -445,11 +476,15 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         platform.avalon
     )));
     assert!(summary.contains(&format!("cargo run --release -p herald -- --tcp {shd}")));
+    assert!(summary.contains(&format!(
+        "cargo run --release -p herald -- --server {} --screen desktop",
+        platform.avalon
+    )));
     assert!(
         summary.contains("create --name web --camelot --start\n"),
         "{summary}"
     );
-    check_summary(&summary, 4);
+    check_summary(&summary, 5);
 
     // Ctrl-C: the flag `up`'s handler sets.
     let stop = AtomicBool::new(true);
@@ -500,12 +535,18 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         "{:#?}",
         out.lines()
     );
+    assert!(
+        out.lines()
+            .contains(&"up: demo: using disk desktop-disk0 from an earlier run".to_string()),
+        "{:#?}",
+        out.lines()
+    );
     let mut one = Console::attach(platform.avalon, id);
     one.wait_for_end(PROMPT);
     one.type_line("cat /kept");
     one.wait_for_end("kept\n$ ");
     drop(one);
-    check_summary(&platform.summary(true), 4);
+    check_summary(&platform.summary(true), 5);
     check_summary(&platform.summary(false), 3);
     platform.stop(log);
 }
@@ -790,7 +831,7 @@ fn a_taken_shd_address_leaves_the_demo_without_shd() {
     all_answer(&platform);
     let summary = platform.summary(true);
     assert!(!tells_of_shd(&summary), "{summary}");
-    check_summary(&summary, 3);
+    check_summary(&summary, 4);
 
     // start_shd with nobody's shell at the address it is given (the listener, which
     // accepts and says nothing): it gives up when its time is out, before its grace
@@ -861,7 +902,7 @@ fn a_disk_without_shd_leaves_the_demo_without_shd() {
     assert!(platform.shd.is_some());
     let summary = platform.summary(true);
     assert!(!tells_of_shd(&summary), "{summary}");
-    check_summary(&summary, 3);
+    check_summary(&summary, 4);
     // The platform carries on.
     let mut console = Console::attach(platform.avalon, id);
     console.type_line("echo still up");
@@ -1122,6 +1163,21 @@ fn a_new_image_says_the_demo_disk_is_older() {
              running (what the VM wrote there goes with it)",
             options.images.join("vm001-disk0").display()
         )
+    );
+    // The desktop's likewise: a new os-desktop and the demo desktop's old disk.
+    std::fs::write(options.images.join("desktop-disk0"), [0; 512]).unwrap();
+    up::seed(&options.images, "os-desktop", &[0; 512]).unwrap();
+    up::prepare(&options, log).unwrap();
+    let lines = out.lines();
+    assert_eq!(
+        lines.last().unwrap(),
+        &format!(
+            "up: note: the demo VM's disk desktop-disk0 is a copy of the image os-desktop from before \
+             this build, and the demo boots it as it is; to boot the new build, delete {} while up is \
+             not running (what the VM wrote there goes with it)",
+            options.images.join("desktop-disk0").display()
+        ),
+        "{lines:#?}"
     );
 }
 

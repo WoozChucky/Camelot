@@ -18,7 +18,7 @@ You need [Rust](https://rustup.rs) and nothing else: no crates to download, no L
 cargo xtask up --demo
 ```
 
-This builds the platform in release mode (a few minutes the first time), builds the Camelot root images (the kernel and its programs on a bootable disk) of both profiles, the server's (`target/camelot-fs.img`) and the desktop's (`target/camelot-desktop.img`), and puts them in Lake's images directory, `target/platform/images`, as the images `os-base` and `os-desktop`. Then it runs Lake, Avalon and Pendragon, with their output in this terminal, each line prefixed by its server. `--demo` also creates a switch `nat` with a NAT gateway, and a VM `vm001` with a Camelot VM's hardware (Camelot's firmware and 6 MiB of RAM, the firmware's 2 on top of the default 4) that boots Camelot from `vm001-disk0`, its own copy of the image, plugged into the switch. The gateway forwards 127.0.0.1:2323 to the VM's port 23, where `shd`, Camelot's shell server, listens: the image's init starts it at boot, with the console's shell (`up` checks that it answers, and types `shd &` on the console of an old disk whose init does not). Once everything is up, `up` says where it is:
+This builds the platform in release mode (a few minutes the first time), builds the Camelot root images (the kernel and its programs on a bootable disk) of both profiles, the server's (`target/camelot-fs.img`) and the desktop's (`target/camelot-desktop.img`), and puts them in Lake's images directory, `target/platform/images`, as the images `os-base` and `os-desktop`. Then it runs Lake, Avalon and Pendragon, with their output in this terminal, each line prefixed by its server. `--demo` also creates a switch `nat` with a NAT gateway, and a VM `vm001` with a Camelot VM's hardware (Camelot's firmware and 6 MiB of RAM, the firmware's 2 on top of the default 4) that boots Camelot from `vm001-disk0`, its own copy of the image, plugged into the switch. The gateway forwards 127.0.0.1:2323 to the VM's port 23, where `shd`, Camelot's shell server, listens: the image's init starts it at boot, with the console's shell (`up` checks that it answers, and types `shd &` on the console of an old disk whose init does not). It then starts a Camelot desktop beside it, the VM `desktop`, with the desktop profile's hardware (64 MiB and 4 harts) and `desktop-disk0`, its own copy of `os-desktop`, without a network card: it boots to the panel with a terminal running the shell, and `herald --screen desktop` (on Windows) or its page in Pendragon shows it. Once everything is up, `up` says where it is:
 
 ```
 The Avalon platform is up.
@@ -29,7 +29,7 @@ The Avalon platform is up.
   Lake       127.0.0.1:7401, images in C:\...\Camelot\target\platform\images
 ```
 
-Open the Pendragon URL in a browser. Its **New VM** page creates a VM: give it a name and leave *Camelot (boot from disk)* chosen, as a server, and the VM gets a disk of its own, `NAME-disk0`, copied from the image `os-base`, and boots from it (as a desktop, from `os-desktop`, with 64 MiB of RAM and 4 harts); its page shows the console, where Camelot's shell waits (`ls /bin`, `echo hi > /hi`, `cat /hi`), and a desktop's page its screen too: the panel along the top, whose launcher starts a terminal, a file browser, a system monitor and gears, and a terminal running the shell. The demo's VM is in the VM list already.
+Open the Pendragon URL in a browser. Its **New VM** page creates a VM: give it a name and leave *Camelot (boot from disk)* chosen, as a server, and the VM gets a disk of its own, `NAME-disk0`, copied from the image `os-base`, and boots from it (as a desktop, from `os-desktop`, with 64 MiB of RAM and 4 harts); its page shows the console, where Camelot's shell waits (`ls /bin`, `echo hi > /hi`, `cat /hi`), and a desktop's page its screen too: the panel along the top, whose launcher starts a terminal, a file browser, a system monitor and gears, and a terminal running the shell. The demo's VMs, `vm001` and `desktop`, are in the VM list already.
 
 Or, from a second terminal, Round Table creates the VM and Herald attaches the terminal to its console:
 
@@ -40,6 +40,7 @@ cargo run --release -p round-table -- create --name desk --profile desktop --sta
 cargo run --release -p round-table -- list
 cargo run --release -p herald -- web
 cargo run --release -p herald -- vm001
+cargo run --release -p herald -- --screen desktop
 cargo run --release -p herald -- --screen desk
 cargo run --release -p herald -- --tcp 127.0.0.1:2323
 ```
