@@ -48,6 +48,10 @@ cc1 -O2 -E -ffreestanding -g -v -P -I inc -D X -Wall -w -std=c99 -o - -x c a.c
 $ cc -### -E -
 cc1 -E -o - -x c -
 
+$ cc -### -c p.i -DX -Iinc
+cc1 -o TMP/p-T1.s -x cpp-output p.i
+as -o p.o TMP/p-T1.s
+
 $ cc -### -c -DX -Iinc -UY -I j2 -Wp,-DFOO=1,,-UZ -Wa,-march=rv64ima_zicsr_zifencei a.c c.s
 cc1 -D X -I inc -U Y -I j2 -DFOO=1 -UZ -o TMP/a-T1.s -x c a.c
 as -march=rv64ima_zicsr_zifencei -o a.o TMP/a-T1.s

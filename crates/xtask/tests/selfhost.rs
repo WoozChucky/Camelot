@@ -2780,6 +2780,20 @@ fn cc1_takes_merlins_command_line() {
                 .collect(),
         ),
         ("/d/nul".to_string(), b"-E\0junk /d/a.c\n".to_vec()),
+        // UTF-16 LLVM can't convert: an odd length, a surrogate alone.
+        ("/d/odd16".to_string(), b"\xff\xfea\0 \0b\0c".to_vec()),
+        ("/d/lone16".to_string(), b"\xff\xfea\0\0\xd8b\0".to_vec()),
+        // C preprocessed: every directive runs, its macros expanded.
+        ("/d/if0.i".to_string(), b"#if 0\nint a = ;\n#endif\nint b;\n".to_vec()),
+        (
+            "/d/ifx.i".to_string(),
+            b"#define X 0\n#if X\nint a = ;\n#endif\nint b;\n".to_vec(),
+        ),
+        ("/d/err.i".to_string(), b"#error boom\nint b;\n".to_vec()),
+        ("/d/inc.i".to_string(), b"#include \"nope.h\"\nint b;\n".to_vec()),
+        // #warning, of the group cpp; an unflagged warning.
+        ("/d/hw.c".to_string(), b"#warning hello\nint x;\n".to_vec()),
+        ("/d/u.c".to_string(), b"int h = 'abcde';\n".to_vec()),
         // A response file in a directory deeper than 127 bytes, which names
         // itself: named by its whole path.
         (format!("{DEEP}/self"), b"@self\n".to_vec()),
@@ -2902,8 +2916,8 @@ fn cc1_takes_merlins_command_line() {
                 .to_string(),
             1,
         ),
-        // C preprocessed: no directive but line markers, #line and #pragma
-        // runs, no macro is expanded.
+        // C preprocessed: macros are defined but expanded in directives
+        // alone, as clang's -cc1 has it.
         (
             "cc1 -o /out/pp /d/pp.i",
             "orig.c:2:9: error: use of undeclared identifier 'X'\n\
@@ -2912,6 +2926,27 @@ fn cc1_takes_merlins_command_line() {
                 .to_string(),
             1,
         ),
+        ("cc1 -o /out/err /d/err.i", "/d/err.i:1:2: error: boom\n".to_string(), 1),
+        (
+            "cc1 -o /out/inc /d/inc.i",
+            "/d/inc.i:1:10: fatal error: 'nope.h' file not found\n".to_string(),
+            1,
+        ),
+        // #warnings is in clang's group cpp; an unflagged warning made an
+        // error is marked [-Werror].
+        (
+            "cc1 -Werror=cpp -o /out/hw /d/hw.c",
+            "/d/hw.c:1:2: error: hello [-Werror,-W#warnings]\n".to_string(),
+            1,
+        ),
+        (
+            "cc1 -Wno-multichar -Werror -o /out/u /d/u.c",
+            "/d/u.c:1:9: error: character constant too long for its type [-Werror]\n".to_string(),
+            1,
+        ),
+        // UTF-16 LLVM can't convert, LLVM's message.
+        ("cc1 @/d/odd16", "Could not convert UTF16 to UTF8\n".to_string(), 1),
+        ("cc1 @/d/lone16", "Could not convert UTF16 to UTF8\n".to_string(), 1),
         (
             "cc1 -E -std=c11 /d/a.c",
             "error: merlin compiles C99: '-std=c11' is not supported\n".to_string(),
@@ -2965,10 +3000,24 @@ fn cc1_takes_merlins_command_line() {
     // ld and ar read response files the same way, and say what they can't
     // read the same way: ld.lld's and llvm-ar's message alone, exit 1.
     let (ld_self, ar_dir) = ("ld @/d/self", "ar rcs /out/x.a @/d");
+    // C preprocessed whose directives keep code out; each warning's state
+    // as clang keeps it (-Wno-X then -WX gives a warning, the earlier
+    // -Werror=X gone); #warning left out with its group; only the last -O
+    // and -std= judged, -O04 not clang's -O4; standard input with -g, `-`
+    // for the compile unit and .file 0, its code <stdin>'s, file 1.
+    let (if0, ifx) = ("cc1 -o /out/if0 /d/if0.i", "cc1 -o /out/ifx /d/ifx.i");
+    let rewarn = "cc1 -Werror=return-type -Wno-return-type -Wreturn-type -o /out/w6 /d/g.c";
+    let no_cpp = "cc1 -Wno-cpp -o /out/hw2 /d/hw.c";
+    let (last_o, last_std, o04) = (
+        "cc1 -E -O9 -O2 /d/a.c",
+        "cc1 -E -std=foo -std=c99 /d/a.c",
+        "cc1 -E -O04 /d/a.c",
+    );
+    let stdin_g = "cc1 -g -fdebug-compilation-dir=/d - < /d/w.c";
     let mut commands: Vec<&str> = cases.iter().map(|(c, ..)| *c).collect();
     commands.extend([
         together, help, response, nested, stdin, to_stdout, quiet, no_flag, verbose, o9, stdin_s, dot_i, bom,
-        u16, nul, ld_self, ar_dir,
+        u16, nul, ld_self, ar_dir, if0, ifx, rewarn, no_cpp, last_o, last_std, o04, stdin_g,
     ]);
     // -g: (the directory the shell is in, the command, and the directory
     // merlin is told the names are relative to). The default is the
@@ -3071,6 +3120,37 @@ fn cc1_takes_merlins_command_line() {
         "{w_stdin}"
     );
     assert_eq!(shell_output(&out, dot_i), "");
+    for c in [if0, ifx, no_cpp] {
+        assert_eq!(shell_output(&out, c), "", "{c}");
+    }
+    assert_eq!(
+        shell_output(&out, rewarn),
+        "/d/g.c:1:35: warning: result of comparison of constant 300 with expression of type 'unsigned char' \
+         is always false [-Wtautological-constant-out-of-range-compare]\n\
+         /d/g.c:2:33: warning: non-void function does not return a value in all control paths [-Wreturn-type]\n"
+    );
+    for c in [last_o, last_std] {
+        assert_eq!(shell_output(&out, c), a_e, "{c}");
+    }
+    assert_eq!(
+        shell_output(&out, o04),
+        format!("warning: optimization level '-O04' is not supported; using '-O3' instead\n{a_e}")
+    );
+    // Its assembly holds `# ` comments, which shell_output takes for a
+    // prompt: up to the next line typed, the first `cd` of the -g cases.
+    let typed = format!("{PROMPT}{stdin_g}\n");
+    let start = out.find(&typed).expect("stdin_g typed") + typed.len();
+    let end = start + out[start..].find(&format!("{PROMPT}cd ")).expect("a cd after it");
+    let g_stdin = &out[start..end];
+    let md5 = format!("md5 0x{}", merlin::md5::hex(&merlin::md5::md5(&map["/d/w.c"])));
+    assert!(g_stdin.contains("    .file \"-\"\n"), "{g_stdin}");
+    assert!(
+        g_stdin.contains(&format!(
+            "    .file 0 \"/d\" \"-\" {md5}\n    .file 1 \"<stdin>\" {md5}\n"
+        )),
+        "{g_stdin}"
+    );
+    assert!(g_stdin.contains("    .asciz \"-\"\n"), "{g_stdin}");
     let w_s = merlin_s(&CcJob::new("/d/w.c".into(), &[], &[]), &map).0.unwrap();
     assert_eq!(shell_output(&out, quiet), "");
     assert_eq!(shell_output(&out, no_flag), "");
@@ -4439,7 +4519,7 @@ const CC_PRINTED: &[(&str, &[&str])] = &[
     (
         "-### -c p.i",
         &[
-            r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/p-T1.s" "-x" "cpp-output" "p.i""#,
+            r#" "/bin/cc1" "-o" "/tmp/p-T1.s" "-x" "cpp-output" "p.i""#,
             r#" "/bin/as" "-o" "p.o" "/tmp/p-T1.s""#,
         ],
     ),
@@ -4454,6 +4534,15 @@ const CC_PRINTED: &[(&str, &[&str])] = &[
     (
         "-### -E -",
         &[r#" "/bin/cc1" "-E" "-I" "/usr/include" "-o" "-" "-x" "c" "-""#],
+    ),
+    // C preprocessed gets no -I, -D, -U, -Wp, or /usr/include, as clang
+    // gives its -cc1 none for cpp-output (as uses -I; -D is claimed).
+    (
+        "-### -c p.i -DX -Iinc",
+        &[
+            r#" "/bin/cc1" "-o" "/tmp/p-T1.s" "-x" "cpp-output" "p.i""#,
+            r#" "/bin/as" "-o" "p.o" "/tmp/p-T1.s""#,
+        ],
     ),
     // -I, -D and -U in their order, as clang gives them, /usr/include
     // after them; -Wp,'s arguments are cc1's, after them (the empty one
@@ -5109,7 +5198,23 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
     // -Wp,'s arguments are cc1's, -Wa,'s the assembler's.
     ("-c wp.c -Wp,-DFOO=1", &[], 0, true),
     ("-c c.s -Wa,-march=rv64ima_zicsr_zifencei", &[], 0, true),
-    // C preprocessed already: with -E, nothing to do.
+    // C preprocessed already: -U, -Wp, and (with no `as`) -I unused, as
+    // clang has them; with -E, nothing to do.
+    (
+        "-S p.i -DX -UY -P",
+        &["cc: warning: argument unused during compilation: '-U Y' [-Wunused-command-line-argument]"],
+        0,
+        true,
+    ),
+    (
+        "-S p.i -DX -Iinc -Wp,-DQ",
+        &[
+            "cc: warning: argument unused during compilation: '-I inc' [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-Wp,-DQ' [-Wunused-command-line-argument]",
+        ],
+        0,
+        true,
+    ),
     (
         "-E p.i",
         &["cc: warning: p.i: previously preprocessed input [-Wunused-command-line-argument]"],

@@ -413,16 +413,21 @@ struct input {
  * during compilation: '-L/x'`): each option that may go unused, as clang
  * renders it, and what uses it. A command line that only links (its
  * inputs objects and libraries) uses the compiler's options without a
- * word, FOR_CC1's and FOR_TOOLS', as clang's driver claims them then.
+ * word, FOR_CC1's, FOR_CPP's, FOR_TOOLS' and FOR_CPP_TOOLS', as clang's
+ * driver claims them then.
  * Never said: -std= (clang claims it whatever runs) and -w (which leaves
  * every warning out, this one too). */
 enum {
     FOR_ASSEMBLE, /* -c: a last stage of assembling or linking */
     FOR_COMPILE,  /* -S: a last stage of compiling or later */
     FOR_LINK,     /* -L: the link */
-    FOR_CC1,      /* -D, -U, -P, -O, -W, -Wp,, -ffreestanding,
+    FOR_CC1,      /* -D, -P, -O, -W, -ffreestanding,
                      -fdebug-compilation-dir: a cc1 stage */
-    FOR_TOOLS,    /* -g, -I: a cc1 or an `as` stage, which clang gives them */
+    FOR_CPP,      /* -U, -Wp,: a cc1 stage that preprocesses (not of C
+                     preprocessed already, which clang gives none of them;
+                     -D it claims for that one too) */
+    FOR_TOOLS,    /* -g: a cc1 or an `as` stage, which clang gives it */
+    FOR_CPP_TOOLS, /* -I: a cc1 stage that preprocesses, or an `as` one */
     FOR_AS_ARGS   /* -Wa,: a cc1 or an `as` stage, on a line that only
                      links too (it is not one of the compiler's options) */
 };
@@ -704,7 +709,7 @@ static int parse(char **args, int nargs) {
             add_input(IN_WL, render_comma(a, NULL), LANG_NONE);
         } else if (starts_with(a, "-Wp,")) {
             /* For cc1, as options of its own (`-Wp,-DX` is -DX). */
-            claim(render_comma(a, &wp_args), FOR_CC1);
+            claim(render_comma(a, &wp_args), FOR_CPP);
         } else if (starts_with(a, "-Wa,")) {
             /* For `as`, after clang's own options for it. */
             claim(render_comma(a, &wa_args), FOR_AS_ARGS);
@@ -724,13 +729,13 @@ static int parse(char **args, int nargs) {
                 output = v;
                 break;
             case 'I':
-                claim(concat("-I ", v, NULL), FOR_TOOLS);
+                claim(concat("-I ", v, NULL), FOR_CPP_TOOLS);
                 push(&cpp_opts, "-I");
                 push(&cpp_opts, v);
                 break;
             case 'D':
             case 'U':
-                claim(concat(flag, " ", v), FOR_CC1);
+                claim(concat(flag, " ", v), a[1] == 'D' ? FOR_CC1 : FOR_CPP);
                 push(&cpp_opts, a[1] == 'D' ? "-D" : "-U");
                 push(&cpp_opts, v);
                 break;
@@ -786,8 +791,10 @@ struct job {
 static struct job *jobs;
 static int njobs;
 /* Whether a cc1 stage and an `as` stage were worked out: what the options
- * of FOR_CC1 and FOR_TOOLS are for. */
+ * of FOR_CC1 and FOR_TOOLS are for; and a cc1 stage that preprocesses,
+ * FOR_CPP's. */
 static int have_cc1;
+static int have_cpp_cc1;
 static int have_as;
 
 static struct job *new_job(int tool, int input) {
@@ -814,6 +821,10 @@ static const char *cc1_lang(int lang) {
 static void cc1_job(int k, const char *in, int lang, int preprocess, const char *out, const char *result) {
     struct job *j = new_job(CC1, k);
     have_cc1 = 1;
+    /* C already preprocessed is given no -I, -D, -U, -Wp, or
+     * /usr/include, as clang gives its -cc1 none for cpp-output. */
+    int cpp = lang != LANG_CPP_OUTPUT;
+    have_cpp_cc1 |= cpp;
     if (opt_level != NULL) {
         /* Worked out (and warned of) once, for the first cc1 stage, as
          * clang's driver does it as it makes its -cc1 job. */
@@ -844,15 +855,18 @@ static void cc1_job(int k, const char *in, int lang, int preprocess, const char 
         push(&j->argv, "-P");
     }
     /* -I, -D and -U in their order, -Wp,'s arguments, then /usr/include,
-     * where clang gives its system directories. */
-    for (int i = 0; i < cpp_opts.n; i++) {
-        push(&j->argv, cpp_opts.v[i]);
+     * where clang gives its system directories; none for C preprocessed
+     * already. */
+    if (cpp) {
+        for (int i = 0; i < cpp_opts.n; i++) {
+            push(&j->argv, cpp_opts.v[i]);
+        }
+        for (int i = 0; i < wp_args.n; i++) {
+            push(&j->argv, wp_args.v[i]);
+        }
+        push(&j->argv, "-I");
+        push(&j->argv, INCLUDE_DIR);
     }
-    for (int i = 0; i < wp_args.n; i++) {
-        push(&j->argv, wp_args.v[i]);
-    }
-    push(&j->argv, "-I");
-    push(&j->argv, INCLUDE_DIR);
     /* The -W options in their order, then -w, as clang gives them. */
     for (int i = 0; i < warning_opts.n; i++) {
         push(&j->argv, warning_opts.v[i]);
@@ -1219,12 +1233,15 @@ static int run_jobs(void) {
 static void warn_unused(void) {
     /* Only a link: the compiler's options are claimed, said nothing of. */
     int link_only = phase == LINK && !have_cc1 && !have_as;
+    int cpp_tools = have_cpp_cc1 || have_as;
     for (int i = 0; i < nclaims; i++) {
         int used_by = claims[i].used_by;
         int tools = have_cc1 || have_as;
         int unused = (used_by == FOR_ASSEMBLE && phase < ASSEMBLE) || (used_by == FOR_COMPILE && phase < COMPILE) ||
                      (used_by == FOR_LINK && phase != LINK) || (used_by == FOR_CC1 && !have_cc1 && !link_only) ||
-                     (used_by == FOR_TOOLS && !tools && !link_only) || (used_by == FOR_AS_ARGS && !tools);
+                     (used_by == FOR_CPP && !have_cpp_cc1 && !link_only) ||
+                     (used_by == FOR_TOOLS && !tools && !link_only) ||
+                     (used_by == FOR_CPP_TOOLS && !cpp_tools && !link_only) || (used_by == FOR_AS_ARGS && !tools);
         if (unused) {
             warning("argument unused during compilation: '%s'", claims[i].rendered);
         }
