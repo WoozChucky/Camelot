@@ -134,6 +134,11 @@ int main(int argc, char **argv) {
     uid_t caller = getuid();
     char name[FIELD_MAX + 1];
     if (argc == 2) {
+        /* Never cut short to another account's name. */
+        if (strlen(argv[1]) > FIELD_MAX) {
+            fprintf(STDERR, "passwd: user %s does not exist\n", argv[1]);
+            return 1;
+        }
         snprintf(name, sizeof name, "%s", argv[1]);
     } else {
         struct passwd *me = getpwuid(caller);

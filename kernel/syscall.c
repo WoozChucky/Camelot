@@ -355,7 +355,7 @@ void syscall(struct trap_frame *f) {
         ret = sys_run(f, true);
         break;
     case SYS_kill:
-        ret = proc_kill_pid((int)arg(f, 0));
+        ret = proc_kill_pid((int)arg(f, 0), myproc());
         break;
     case SYS_procs:
         ret = sys_procs(f);

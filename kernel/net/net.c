@@ -3,6 +3,7 @@
  * system calls the ifconfig and ping programs use (netinfo, netconf, ping;
  * docs/camelot-syscalls.md). The socket calls are in socket.c. */
 #include "net.h"
+#include "fs.h"
 #include "riscv.h"
 #include "kprintf.h"
 #include "nic.h"
@@ -204,6 +205,10 @@ int net_sys_info(uintptr uinfo) {
 }
 
 int net_sys_conf(u32 addr, u32 mask, u32 gateway) {
+    /* The machine's address is root's to change (Linux's CAP_NET_ADMIN). */
+    if (!capable()) {
+        return -EPERM;
+    }
     if (!netif.present) {
         return -ENODEV;
     }

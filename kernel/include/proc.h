@@ -407,10 +407,14 @@ void proc_exit(int status);
 void proc_kill(struct trap_frame *f);
 
 /* kill(): marks the process `pid` killed (see `killed` in struct proc) and
- * wakes its threads that sleep. 0 (also for a zombie, which has already
- * ended), -ESRCH if there is no such process, -EPERM for a kernel process
- * or the first one (the shell). */
-int proc_kill_pid(int pid);
+ * wakes its threads that sleep. `by` is the process asking (the kill
+ * system call's caller), whose real or effective uid must be the target's
+ * real one unless it is root, or NULL for the kernel itself (a terminal's
+ * Ctrl-C, from an interrupt), which may kill any. 0 (also for a zombie,
+ * which has already ended), -ESRCH if there is no such process, -EPERM for
+ * a kernel process, the first one (init, or the shell), or another user's
+ * process. */
+int proc_kill_pid(int pid, const struct proc *by);
 
 /* Whether a process `pid` is running (neither ended nor being made). */
 bool proc_exists(int pid);

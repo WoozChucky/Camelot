@@ -60,8 +60,13 @@ static int password_ok(const char *name, const char *password) {
     return sp != NULL && pw_check(password, sp->sp_pwdp);
 }
 
-/* Becomes `pw`'s user and runs its shell; returns only if that fails. */
+/* Becomes `pw`'s user and runs its shell; returns, still root, if the
+ * account's home or shell is missing, so that the caller asks again. */
 static void become(struct passwd *pw) {
+    struct stat st;
+    if (stat(pw->pw_dir, &st) < 0 || st.type != T_DIR || stat(pw->pw_shell, &st) < 0 || st.type != T_FILE) {
+        return;
+    }
     if (setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
         printf("login: cannot become %s\n", pw->pw_name);
         return;

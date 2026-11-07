@@ -865,7 +865,10 @@ mod tests {
         assert!(parse(&["--size", "1M"]).unwrap_err().contains("bad size"));
         assert!(parse(&["-v"]).unwrap_err().contains("unknown option"));
         let p = parse(&["--root-password", "secret", "--user-password", "mine"]).unwrap();
-        assert_eq!((p.passwords.root.as_str(), p.passwords.user.as_str()), ("secret", "mine"));
+        assert_eq!(
+            (p.passwords.root.as_str(), p.passwords.user.as_str()),
+            ("secret", "mine")
+        );
         assert_eq!(parse(&["--user-password", "x"]).unwrap().passwords.root, "root");
         assert!(parse(&["--root-password", ""])
             .unwrap_err()

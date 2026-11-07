@@ -40,24 +40,45 @@ static void mode_string(const struct stat *st, char *out) {
     out[10] = 0;
 }
 
-/* The user's or the group's name of `id` in `buf`: its name, or the
- * number if it has none. */
-static const char *user_name(uint id, char *buf) {
-    struct passwd *pw = getpwuid(id);
-    if (pw != NULL) {
-        return pw->pw_name;
+/* A name looked up, kept for the next line: a directory's files mostly
+ * have one owner, and each lookup reads /etc/passwd or /etc/group through. */
+struct name_cache {
+    int valid;
+    uint id;
+    char name[64];
+};
+
+static struct name_cache users;
+static struct name_cache groups;
+
+/* `name` (NULL: none) as `id`'s in `c`, or the number if it has none. */
+static const char *remember(struct name_cache *c, uint id, const char *name) {
+    c->valid = 1;
+    c->id = id;
+    if (name != NULL) {
+        snprintf(c->name, sizeof c->name, "%s", name);
+    } else {
+        snprintf(c->name, sizeof c->name, "%u", id);
     }
-    snprintf(buf, 12, "%u", id);
-    return buf;
+    return c->name;
 }
 
-static const char *group_name(uint id, char *buf) {
-    struct group *gr = getgrgid(id);
-    if (gr != NULL) {
-        return gr->gr_name;
+/* The user's or the group's name of `id`: its name, or the number if it
+ * has none. */
+static const char *user_name(uint id) {
+    if (users.valid && users.id == id) {
+        return users.name;
     }
-    snprintf(buf, 12, "%u", id);
-    return buf;
+    struct passwd *pw = getpwuid(id);
+    return remember(&users, id, pw != NULL ? pw->pw_name : NULL);
+}
+
+static const char *group_name(uint id) {
+    if (groups.valid && groups.id == id) {
+        return groups.name;
+    }
+    struct group *gr = getgrgid(id);
+    return remember(&groups, id, gr != NULL ? gr->gr_name : NULL);
 }
 
 static void line(const struct stat *st, const char *name) {
@@ -66,12 +87,9 @@ static void line(const struct stat *st, const char *name) {
         return;
     }
     char mode[11];
-    char ubuf[12];
-    char gbuf[12];
     mode_string(st, mode);
-    /* getpwuid's record is good until the next call: print it first. */
-    printf("%s %2u %-8s ", mode, st->nlink, user_name(st->uid, ubuf));
-    printf("%-8s %7ld %s\n", group_name(st->gid, gbuf), st->size, name);
+    printf("%s %2u %-8s %-8s %7ld %s\n", mode, st->nlink, user_name(st->uid), group_name(st->gid), st->size,
+           name);
 }
 
 /* Lists `path`. Returns 0, or 1 if it can't. */

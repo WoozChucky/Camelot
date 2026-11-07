@@ -139,7 +139,7 @@ headers and checks each size.
 | 22 | `kill` | `int pid` | 0; `-ESRCH`, `-EPERM` |
 | 23 | `procs` | `struct procinfo *buf, uint max` | the number of processes; `-EFAULT`, `-ENOMEM` |
 | 24 | `netinfo` | `struct netinfo *info` | 0; `-ENODEV`, `-EFAULT` |
-| 25 | `netconf` | `uint addr, uint mask, uint gateway` | 0; `-ENODEV`, `-EINVAL` |
+| 25 | `netconf` | `uint addr, uint mask, uint gateway` | 0; `-EPERM`, `-ENODEV`, `-EINVAL` |
 | 26 | `ping` | `uint addr, uint seq, struct ping_reply *reply` | 0; `-ETIMEDOUT`, `-EHOSTUNREACH`, `-ENETUNREACH`, `-ENOBUFS`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
 | 27 | `socket` | `int domain, int type, int protocol` | a new descriptor; `-EAFNOSUPPORT`, `-EPROTONOSUPPORT`, `-ESOCKTNOSUPPORT`, `-EINVAL`, `-ENODEV`, `-EMFILE`, `-ENFILE`, `-ENOBUFS`, `-ENOMEM` |
 | 28 | `bind` | `int fd, const void *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EACCES`, `-EADDRNOTAVAIL`, `-EADDRINUSE`, `-EINVAL`, `-ENOBUFS`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOSPC`, `-EROFS` |
@@ -645,7 +645,8 @@ is reachable). The ARP cache is emptied. `-EINVAL`, changing nothing, if
 `mask` is not ones then zeros (at least one of each), if `addr` is not an
 ordinary unicast address (0.0.0.0/8, 127.0.0.0/8 and 224.0.0.0 up are not)
 or is its subnet's network or broadcast address, or if `gateway` is not
-another such address on the subnet.
+another such address on the subnet. Only root changes the address: anyone
+else gets `-EPERM`, before anything is checked.
 
 **ping(addr, seq, reply)** sends an ICMP echo request with 56 bytes of data
 to `addr`, with the caller's tid as its identifier (its pid, in a
@@ -1568,12 +1569,14 @@ owner. Both fail as a path does (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`,
 effective uid is the target's real one, or the caller is root (`-EPERM`).
 **Ports.** `bind` to a TCP or UDP port below 1024 (`IPPORT_RESERVED`)
 needs root (`-EACCES`), as Unix's privileged ports do: `shd`'s 23 is a
-service init starts as root, and `httpd -p 80` is root's to run.
+service init starts as root, and `httpd -p 80` is root's to run; so is
+`netconf`, the machine's address (`-EPERM`).
 
 What the kernel leaves out of Unix's: supplementary groups, saved ids, a
 umask, access control lists, and clearing a program's set-ID bits when
 someone other than root writes to it.
 
+## File descriptors
 
 A descriptor is a small number, 0 to 15, that stands for an open file: a
 file or directory of the filesystem, a device (the console), one end of a

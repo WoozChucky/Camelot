@@ -33,6 +33,13 @@ pub const RUN_MAX_STEPS: u64 = 150_000_000;
 pub const MAPTEST_CHECKS: u32 = 125;
 pub const MAPTEST_THREADS_CHECKS: u32 = 15;
 
+/// permtest's checks (kernel/user/permtest.c): the root part's (the user
+/// part's result one of them) and the user part's, without a network to
+/// bind on; with one, the user part makes [`PERMTEST_PORT_CHECKS`] more.
+pub const PERMTEST_CHECKS: u32 = 64;
+pub const PERMTEST_USER_CHECKS: u32 = 71;
+pub const PERMTEST_PORT_CHECKS: u32 = 2;
+
 /// Where the kernel image is linked (its symbols' addresses) and where it is
 /// loaded (where its bytes are in RAM).
 pub const KERNEL_LINK_ADDR: u64 = 0xffff_ffff_8000_0000;

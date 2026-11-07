@@ -30,7 +30,9 @@ int main(int argc, char **argv) {
         fprintf(STDERR, "su: not set-user-ID root (chmod 4755 /bin/su as root)\n");
         return 1;
     }
-    struct passwd *pw = getpwnam(name);
+    /* A name longer than any account's is no account's (never cut short to
+     * one that is). */
+    struct passwd *pw = strlen(name) <= NAME_LEN ? getpwnam(name) : NULL;
     if (pw == NULL) {
         fprintf(STDERR, "su: user %s does not exist\n", name);
         return 1;

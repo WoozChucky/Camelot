@@ -1151,8 +1151,9 @@ int kill_descendants(int pid);
  *
  * posix_openpt opens /dev/ptmx with `flags` (O_RDWR) and returns the
  * master's descriptor; grantpt only checks that `fd` is one (the slaves'
- * nodes are the image's, root's with mode 0666, not the opener's, as
- * Camelot has no devpts to make them), and unlockpt unlocks its slave (TIOCSPTLCK), both 0
+ * nodes are the image's, root's with mode 0600, not the opener's, as
+ * Camelot has no devpts to make them: only root uses pseudo-terminals),
+ * and unlockpt unlocks its slave (TIOCSPTLCK), both 0
  * or an error (-ENOTTY for anything but a master); ptsname is
  * the slave's path, "/dev/pts/N", in a buffer of its own overwritten by
  * the next call, or NULL. ttyname is the path of the terminal `fd` is,

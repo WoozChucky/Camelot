@@ -623,7 +623,14 @@ grep -c sha256 /etc/shadow\ncat notes\nchown root:root notes\nls -l notes\nexit\
     let defaults = xtask::accounts::Passwords::default().accounts();
     let first = xtask::accounts::shadow(&defaults);
     assert_eq!(shadow.lines().next(), first.lines().next(), "{shadow}");
-    let hash = shadow.lines().nth(1).unwrap().strip_prefix("user:").unwrap().strip_suffix(':').unwrap();
+    let hash = shadow
+        .lines()
+        .nth(1)
+        .unwrap()
+        .strip_prefix("user:")
+        .unwrap()
+        .strip_suffix(':')
+        .unwrap();
     let fields: Vec<&str> = hash.split('$').collect();
     assert_eq!(fields[..3], ["", "sha256", "1000"], "{hash}");
     assert_eq!(

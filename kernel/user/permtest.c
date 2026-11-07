@@ -26,6 +26,11 @@
 static int checks;
 static int failures;
 static const char *part = "permtest";
+/* The local sockets the root part listens on while the user part runs:
+ * one whose name is 0700 (connecting needs write on it), one 0777. */
+#define SHUT_SOCKET "/pt/sockshut"
+#define OPEN_SOCKET "/pt/sockopen"
+static int listeners[2] = {-1, -1};
 
 static void check(int ok, const char *what) {
     checks++;
@@ -208,6 +213,28 @@ static void as_user(int root_pid) {
     /* Other users' processes. */
     check_eq(kill(root_pid), -EPERM, "kill a root process");
 
+    /* A local socket's name: connecting needs write on it. */
+    struct sockaddr_un un;
+    memset(&un, 0, sizeof un);
+    un.sun_family = AF_UNIX;
+    strcpy(un.sun_path, SHUT_SOCKET);
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    check_eq(connect(c, &un), -EACCES, "connect to root's 0700 socket");
+    strcpy(un.sun_path, OPEN_SOCKET);
+    check_eq(connect(c, &un), 0, "connect to a 0777 one");
+    close(c);
+
+    /* The devices: the console, the screen and the input are root's, so
+     * that nobody reads another's keys (a session keeps the console it was
+     * given open). */
+    check_eq(try_open("/dev/console", O_RDONLY), -EACCES, "open the console");
+    check_eq(try_open("/dev/input/event0", O_RDONLY), -EACCES, "open the keyboard");
+    check_eq(try_open("/dev/fb0", O_RDWR), -EACCES, "open the framebuffer");
+    check_eq(try_open("/dev/pts/0", O_RDWR), -EACCES, "open a terminal's slave");
+
+    /* The machine's address is root's, network card or not. */
+    check_eq(netconf(0x0a00020f, 0xffffff00, 0), -EPERM, "netconf");
+
     /* The privileged ports, if there is a network to bind on. */
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     if (s >= 0) {
@@ -268,6 +295,18 @@ static void set_up(void) {
     check_eq(chmod("/pt/nothing", 0644), -ENOENT, "chmod a missing file");
     check_eq(chmod("/pt/secret", 0170600), 0, "chmod ignores bits past 07777");
     check_eq(owner_of("/pt/secret"), owner(0, 0, 0600), "they are dropped");
+    /* Two listening local sockets, for the user part to connect to. */
+    const char *names[2] = {SHUT_SOCKET, OPEN_SOCKET};
+    for (int i = 0; i < 2; i++) {
+        struct sockaddr_un un;
+        memset(&un, 0, sizeof un);
+        un.sun_family = AF_UNIX;
+        strcpy(un.sun_path, names[i]);
+        listeners[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+        check_eq(bind(listeners[i], &un), 0, "bind a local socket");
+        check_eq(listen(listeners[i], 1), 0, "listen on it");
+    }
+    check_eq(chmod(SHUT_SOCKET, 0700), 0, "a 0700 socket");
 }
 
 /* Root reads, writes and searches anything; it runs only what has an x. */
@@ -305,7 +344,7 @@ static const char *const made[] = {
     "/pt/secret", "/pt/other", "/pt/public", "/pt/group", "/pt/mine", "/pt/rootdir/f", "/pt/rootdir",
     "/pt/closed/f", "/pt/closed/prog", "/pt/closed", "/pt/listonly/f", "/pt/listonly", "/pt/searchonly/f",
     "/pt/searchonly", "/pt/home", "/pt/tmp/r", "/pt/tmp", "/pt/open", "/pt/noexec", "/pt/rootonly",
-    "/pt/suid", "/pt/cleared", "/pt/none", "/pt/userx", "/pt",
+    "/pt/suid", "/pt/cleared", "/pt/none", "/pt/userx", SHUT_SOCKET, OPEN_SOCKET, "/pt",
 };
 
 int main(int argc, char **argv) {
@@ -339,6 +378,8 @@ int main(int argc, char **argv) {
     snprintf(pid, sizeof pid, "%d", getpid());
     int user_failures = status_of(spawn("/bin/permtest", (char *[]){"permtest", "user", pid, NULL}, environ));
     check_eq(user_failures, 0, "the user part");
+    close(listeners[0]);
+    close(listeners[1]);
     for (uint i = 0; i < sizeof made / sizeof made[0]; i++) {
         int r = unlink(made[i]);
         if (r < 0) {

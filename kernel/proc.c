@@ -1172,7 +1172,7 @@ void proc_kill(struct trap_frame *f) {
     proc_exit(-1);
 }
 
-int proc_kill_pid(int pid) {
+int proc_kill_pid(int pid, const struct proc *by) {
     int r = -ESRCH;
     acquire(&proc_lock);
     for (u32 i = 0; i < NPROC; i++) {
@@ -1188,9 +1188,10 @@ int proc_kill_pid(int pid) {
         }
         /* Another user's process is out of reach but to root: Linux's
          * kill_ok_by_cred(), the caller's real or effective uid against
-         * the target's real one. */
-        struct proc *me = myproc();
-        if (me->euid != 0 && me->euid != p->uid && me->uid != p->uid) {
+         * the target's real one. The terminal's Ctrl-C (`by` NULL) acts
+         * with the kernel's authority, as Linux's tty layer does: it runs
+         * in an interrupt, on whatever hart and process it lands. */
+        if (by != NULL && by->euid != 0 && by->euid != p->uid && by->uid != p->uid) {
             r = -EPERM;
             break;
         }

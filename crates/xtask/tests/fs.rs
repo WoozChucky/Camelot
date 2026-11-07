@@ -668,7 +668,10 @@ fn a_disk_that_cannot_be_mounted_is_left_alone() {
             broken(&|i| set_u32(i, 1, 4, camelot_fs::VERSION - 1)),
             "an older version of the format: rebuild the image",
         ),
-        (broken(&|i| set_u32(i, 1, 4, camelot_fs::VERSION + 1)), "unknown version"),
+        (
+            broken(&|i| set_u32(i, 1, 4, camelot_fs::VERSION + 1)),
+            "unknown version",
+        ),
         (broken(&|i| set_u32(i, 1, 20, 1)), "bad log size"),
         (broken(&|i| set_u32(i, 1, 16, 1)), "bad inode count"),
         (
@@ -1379,10 +1382,6 @@ const PROMPT: &str = "# ";
 /// them, and `filetest ro` on a read-only one (kernel/user/filetest.c).
 const FILETEST_CHECKS: u32 = 246;
 const FILETEST_RO_CHECKS: u32 = 14;
-/// permtest's checks: the root part's (the user part's result one of them)
-/// and the user part's, without a network to bind on.
-const PERMTEST_CHECKS: u32 = 59;
-const PERMTEST_USER_CHECKS: u32 = 64;
 
 /// What the shell printed after reading `command`, up to its next prompt.
 fn shell_output<'a>(out: &'a str, command: &str) -> &'a str {
@@ -1791,8 +1790,9 @@ fn permtest_passes_on_the_root_image_and_leaves_it_as_it_was() {
     // Users and permissions (kernel/user/permtest.c): root's bypass, then
     // uid 1000's every refusal (reading another's 0600 file, writing into
     // a directory not its own, /bin among them, searching, running, the
-    // sticky bit, chmod, chown, setuid, kill), a set-user-ID program, and
-    // the disk back as it was.
+    // sticky bit, chmod, chown, setuid, kill, connecting to a local
+    // socket, opening the console, the screen, the input and a terminal's
+    // slave), a set-user-ID program, and the disk back as it was.
     let image = root_image();
     let run = boot(
         image.clone(),
@@ -1806,7 +1806,9 @@ fn permtest_passes_on_the_root_image_and_leaves_it_as_it_was() {
     let out = shell_output(&run.out, "permtest");
     assert!(
         out.ends_with(&format!(
-            "permtest user: {PERMTEST_USER_CHECKS} checks, 0 failed\npermtest: {PERMTEST_CHECKS} checks, 0 failed\n"
+            "permtest user: {} checks, 0 failed\npermtest: {} checks, 0 failed\n",
+            common::PERMTEST_USER_CHECKS,
+            common::PERMTEST_CHECKS
         )),
         "{out}"
     );

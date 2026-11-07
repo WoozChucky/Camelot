@@ -24,6 +24,7 @@
  * stays, and leaves it in the thread's `net_file` for syscall() to let go
  * of once net_lock is free (the last close takes net_lock). */
 #include "file.h"
+#include "fs.h"
 #include "kalloc.h"
 #include "msg.h"
 #include "net.h"
@@ -355,7 +356,7 @@ int sock_sys_bind(u32 fd, uintptr uaddr) {
     /* The ports below 1024 are root's, as Unix's privileged ports are
      * (Linux's inet_prot_sock and CAP_NET_BIND_SERVICE): a service on one
      * was started by the machine's administrator. */
-    if (port != 0 && port < IPPORT_RESERVED && myproc()->euid != 0) {
+    if (port != 0 && port < IPPORT_RESERVED && !capable()) {
         return -EACCES;
     }
     if (s->type == SOCK_STREAM) {

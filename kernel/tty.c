@@ -129,7 +129,9 @@ static void interrupt(struct tty *t, char c) {
         }
         echo_str(t, "\n");
     }
-    proc_kill_pid(t->fg);
+    /* The kernel's own kill (NULL): this may be an interrupt's, with no
+     * process of the terminal's running. */
+    proc_kill_pid(t->fg, NULL);
 }
 
 bool tty_receive(struct tty *t, char c) {

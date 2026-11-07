@@ -4,7 +4,8 @@
  *   chown USER[:GROUP] FILE...
  *
  * USER and GROUP are names (from /etc/passwd and /etc/group) or numbers;
- * without GROUP the group stays as it is. Only root may give a file away.
+ * without GROUP the group stays as it is, and `USER:`, an empty GROUP, is
+ * USER's login group (its /etc/passwd line's). Only root may give a file away.
  * Says which files it could not change and exits 1 if there was one. */
 #include "user.h"
 
@@ -29,23 +30,39 @@ int main(int argc, char **argv) {
         return 2;
     }
     char owner[64];
+    if (strlen(argv[1]) >= sizeof owner) {
+        fprintf(STDERR, "chown: %s: no such user\n", argv[1]);
+        return 2;
+    }
     snprintf(owner, sizeof owner, "%s", argv[1]);
     char *group = strchr(owner, ':');
     if (group != NULL) {
         *group++ = 0;
     }
     long uid = number(owner);
+    /* The login group, for `USER:`: the account's, or -1 for a number with
+     * none. */
+    long login_gid = -1;
+    struct passwd *pw = uid < 0 ? getpwnam(owner) : getpwuid((uid_t)uid);
     if (uid < 0) {
-        struct passwd *pw = getpwnam(owner);
         if (pw == NULL) {
             fprintf(STDERR, "chown: %s: no such user\n", owner);
             return 2;
         }
         uid = pw->pw_uid;
     }
+    if (pw != NULL) {
+        login_gid = pw->pw_gid;
+    }
     /* -1: the group as it is. */
     long gid = -1;
-    if (group != NULL) {
+    if (group != NULL && *group == 0) {
+        if (login_gid < 0) {
+            fprintf(STDERR, "chown: %s: no login group\n", owner);
+            return 2;
+        }
+        gid = login_gid;
+    } else if (group != NULL) {
         gid = number(group);
         if (gid < 0) {
             struct group *gr = getgrnam(group);

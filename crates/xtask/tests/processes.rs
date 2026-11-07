@@ -267,7 +267,9 @@ fn echoed_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
         .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"))
         + line.len();
     let rest = &out[at..];
-    rest[..rest.find(PROMPT).unwrap_or_else(|| panic!("`{command}` never ended:\n{out}"))]
+    rest[..rest
+        .find(PROMPT)
+        .unwrap_or_else(|| panic!("`{command}` never ended:\n{out}"))]
         .lines()
         .collect()
 }
@@ -2603,7 +2605,7 @@ fn files_pipes_and_64_bit_offsets_on_a_disk() {
     // filetest on the root filesystem: every file system call and its
     // errors, and lseek's 64-bit off_t (an offset past the end, past the
     // largest file or LONG_MAX fails with -EINVAL whatever its low 32 bits)
-    // and stat's 24 bytes.
+    // and stat's 32 bytes.
     let out = run(
         Setup {
             disks: vec![root_disk(&[])],
@@ -2612,6 +2614,33 @@ fn files_pipes_and_64_bit_offsets_on_a_disk() {
         b"filetest\nexit 0\n",
     );
     all_checks_pass(&out, "filetest", "filetest");
+}
+
+#[test]
+fn only_root_binds_the_ports_below_1024() {
+    // permtest with a network card: its user part also binds port 80
+    // (-EACCES) and 1024 (allowed), and the rest of its checks pass as on
+    // a machine without one.
+    let out = run(
+        Setup {
+            disks: vec![root_disk(&[])],
+            nets: vec![NetConfig::user(Vec::new())],
+            ..Setup::default()
+        },
+        b"permtest\nexit 0\n",
+    );
+    let lines = command_output(&out, "permtest");
+    assert_eq!(
+        lines,
+        [
+            format!(
+                "permtest user: {} checks, 0 failed",
+                common::PERMTEST_USER_CHECKS + common::PERMTEST_PORT_CHECKS
+            ),
+            format!("permtest: {} checks, 0 failed", common::PERMTEST_CHECKS),
+        ],
+        "{out}"
+    );
 }
 
 #[test]

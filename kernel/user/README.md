@@ -47,7 +47,7 @@ for `grep`, whose 1 means "no line matched".
 | `id` | `id` | `uid=1000(user) gid=1000(user)`, and `euid=`/`egid=` when they differ |
 | `whoami` | `whoami` | the effective user's name |
 | `chmod` | `chmod MODE FILE...` | sets files' permission bits (octal, at most 7777); the owner's or root's |
-| `chown` | `chown USER[:GROUP] FILE...` | gives files to USER (and GROUP): names or numbers; root's alone |
+| `chown` | `chown USER[:GROUP] FILE...` | gives files to USER (and GROUP): names or numbers, `USER:` USER's login group; root's alone |
 | `cat` | `cat [FILE...]` | copies files, or its input, to its output; refuses a directory |
 | `echo` | `echo [-n] [ARG...]` | prints its arguments, with a newline unless `-n` |
 | `mkdir` | `mkdir DIR...` | makes directories |
@@ -212,7 +212,7 @@ shd: [7] 10.0.2.2:49152 ended, exit 0
 | `data` | exits with 0 only if its stack and `.bss` start zeroed and its `.data` holds its initial value and takes stores |
 | `badptr` | hands the system calls bad pointers, which must all fail with `-EFAULT` |
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
-| `permtest` | checks users and permissions on a writable root filesystem (`permtest: N checks, 0 failed`): root's bypass, then as uid 1000 every refusal, set-user-ID programs, `chmod`, `chown`, `setuid`, `kill` |
+| `permtest` | checks users and permissions on a writable root filesystem (`permtest: N checks, 0 failed`): root's bypass, then as uid 1000 every refusal, set-user-ID programs, `chmod`, `chown`, `setuid`, `kill`, `netconf`, a 0700 local socket, the devices, and with a network card port 80 |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
 | `stress` | many processes at once: pages, the console, a shared pipe and files under timer preemption (`stress: W workers, R rounds, N bytes: ok`) |
 | `threads` | `threads [THREADS [ROUNDS]]`: THREADS threads (4, at most 8) of one process each add 1 to a counter ROUNDS (500) times under a mutex, and to another under a spinlock, by reading, working and writing back, which loses updates without the lock; then joins them and checks both totals (`threads: T threads, R rounds: counter N, spun N: ok`) |
