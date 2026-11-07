@@ -1,6 +1,8 @@
 /* The file system calls (docs/camelot-syscalls.md), after xv6's sysfile.c:
  * descriptors (read, write, close, dup, fcntl, lseek, fstat), pipes, and the
- * calls that take paths (open, mkdir, unlink, link, chdir).
+ * calls that take paths (open, mkdir, unlink, link, chdir, chmod, chown).
+ * Who may do what is fs.c's inode_permission() ("Users and
+ * permissions").
  *
  * Every change to the disk happens inside one transaction (begin_op() to
  * end_op(), log.h), so a crash leaves all of a call or none of it: open's
@@ -337,10 +339,11 @@ long sys_pipe(struct trap_frame *f) {
     return 0;
 }
 
-/* The inode `path` names, locked, opening it for open(): made if it is
- * missing and `flags` has O_CREAT. In the caller's transaction. NULL with
- * *err. */
-static struct inode *open_inode(const char *path, u32 flags, int *err) {
+/* The inode `path` names, locked, opening it for open(): made with `mode`
+ * if it is missing and `flags` has O_CREAT, which *created then says. In
+ * the caller's transaction. NULL with *err. */
+static struct inode *open_inode(const char *path, u32 flags, u32 mode, bool *created, int *err) {
+    *created = false;
     for (;;) {
         struct inode *ip = namei(path, err);
         if (ip != NULL) {
@@ -356,10 +359,11 @@ static struct inode *open_inode(const char *path, u32 flags, int *err) {
             *err = -EISDIR;
             return NULL;
         }
-        ip = fs_create(path, T_FILE, 0, 0, err);
+        ip = fs_create(path, T_FILE, 0, 0, (u16)(mode & S_IALLUGO), err);
         /* -EEXIST: made by another process while namei() slept on the
          * disk. Look it up again. */
         if (ip != NULL || *err != -EEXIST) {
+            *created = ip != NULL;
             return ip;
         }
     }
@@ -373,6 +377,8 @@ long sys_open(struct trap_frame *f) {
     }
     u32 flags = (u32)arg(f, 1);
     u32 mode = flags & O_ACCMODE;
+    /* The new file's permission bits, with O_CREAT (there is no umask). */
+    u32 perm = (u32)arg(f, 2);
     if ((flags & ~(O_ACCMODE | O_CREAT | O_TRUNC | O_CLOEXEC)) != 0 || mode == O_ACCMODE) {
         return -EINVAL;
     }
@@ -391,11 +397,18 @@ long sys_open(struct trap_frame *f) {
         return -EMFILE;
     }
     begin_op();
-    struct inode *ip = open_inode(path, flags, &err);
+    bool created;
+    struct inode *ip = open_inode(path, flags, perm, &created, &err);
     if (ip != NULL) {
         err = 0; /* namei()'s -ENOENT, if fs_create() made it */
+        /* What the file allows, but for the file this call made, which is
+         * opened as asked whatever its mode (Linux's may_open() is skipped
+         * for it too: open("f", O_CREAT | O_WRONLY, 0444) writes it). */
+        u32 want = (readable ? MAY_READ : 0) | (writable ? MAY_WRITE : 0);
         if (ip->type == T_DIR && writable) {
             err = -EISDIR;
+        } else if (!created && (err = inode_permission(ip, want)) < 0) {
+            /* -EACCES */
         } else if (ip->type == T_SOCKET) {
             err = -ENXIO; /* a socket's name is for connect(), as on Linux */
         } else if (ip->type == T_DEVICE && !device_has_driver(ip->major)) {
@@ -465,8 +478,9 @@ long sys_mkdir(struct trap_frame *f) {
     if (!fs_mounted) {
         return -ENOENT;
     }
+    u32 mode = (u32)arg(f, 1);
     begin_op();
-    struct inode *ip = fs_create(path, T_DIR, 0, 0, &err);
+    struct inode *ip = fs_create(path, T_DIR, 0, 0, (u16)(mode & S_IALLUGO), &err);
     if (ip != NULL) {
         iunlockput(ip);
     }
@@ -536,6 +550,13 @@ long sys_chdir(struct trap_frame *f) {
         end_op();
         return -ENOTDIR;
     }
+    /* Working in a directory means searching it. */
+    err = inode_permission(ip, MAY_EXEC);
+    if (err < 0) {
+        iunlockput(ip);
+        end_op();
+        return err;
+    }
     iunlock(ip);
     struct inode *old = proc_set_cwd(ip);
     if (old != NULL) {
@@ -543,4 +564,34 @@ long sys_chdir(struct trap_frame *f) {
     }
     end_op();
     return 0;
+}
+
+long sys_chmod(struct trap_frame *f) {
+    char path[MAXPATH + 1];
+    int err = fetch_path(myproc()->pagetable, arg(f, 0), path);
+    if (err < 0) {
+        return err;
+    }
+    if (!fs_mounted) {
+        return -ENOENT;
+    }
+    begin_op();
+    err = fs_chmod(path, (u32)arg(f, 1));
+    end_op();
+    return err;
+}
+
+long sys_chown(struct trap_frame *f) {
+    char path[MAXPATH + 1];
+    int err = fetch_path(myproc()->pagetable, arg(f, 0), path);
+    if (err < 0) {
+        return err;
+    }
+    if (!fs_mounted) {
+        return -ENOENT;
+    }
+    begin_op();
+    err = fs_chown(path, (u32)arg(f, 1), (u32)arg(f, 2));
+    end_op();
+    return err;
 }

@@ -414,12 +414,12 @@ on the socket calls and the `netinfo`, `netconf` and `ping` calls. Each
 says what went wrong as `NAME: REASON` and exits with 1.
 
 ```
-$ ping 10.0.2.2 2
+# ping 10.0.2.2 2
 PING 10.0.2.2: 56 data bytes
 64 bytes from 10.0.2.2: seq=1 ttl=64 time=1.211 ms
 64 bytes from 10.0.2.2: seq=2 ttl=64 time=0.723 ms
 2 sent, 2 received
-$ ifconfig
+# ifconfig
 net0: mac 52:54:00:12:34:56, link up
   inet 10.0.2.15 netmask 255.255.255.0 gateway 10.0.2.2 dns 10.0.2.3 (dhcp)
   rx 5 frames, 922 bytes; tx 5 frames, 922 bytes
@@ -586,7 +586,7 @@ any UDP client to 127.0.0.1:5555). A web server for the root filesystem:
 
 ```
 grail --disk target/camelot-fs.img --net user,hostfwd=tcp::8080-:80 kernel/kernel.elf
-$ httpd &
+# httpd &
 ```
 
 then `http://127.0.0.1:8080/` on the host. Machines on one hub (in one

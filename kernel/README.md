@@ -59,11 +59,11 @@ tick 10
 kstack self-test: 3/3 passed
 kstack: 880 of 16384 bytes used at most
 Type help for the list of commands.
-$ hello
+# hello
 hello from user mode
-$ echo a  b   c
+# echo a  b   c
 a b c
-$ exit
+# exit
 ```
 
 With disks attached (`--disk IMG`, `--disk-ro IMG`, spec section 9.6), the
@@ -131,16 +131,23 @@ d    3  1      48 dev
 d    5  1     640 bin
 fs: /bin holds 38 programs, the kernel none
 fs self-test: 12/12 passed
+login: root
+Password:
 Type help for the list of commands.
-$ echo hello world > hello.txt
-$ cat hello.txt | wc
+# echo hello world > hello.txt
+# cat hello.txt | wc
 1 2 12
-$ mkdir notes
-$ cd notes
-$ ls /bin | wc > count
-$ cat < count
+# mkdir notes
+# cd notes
+# ls /bin | wc > count
+# cat < count
 40 200 943
 ```
+
+The root image's init runs `login` on the console: root's password is
+`root`, and `user`'s (uid 1000, home `/home/user`) is `user`, unless `cargo
+xtask fs --root-password`/`--user-password` gave others. Root's prompt is
+`# `, anyone else's `$ ` (excalibur-spec section 10, "Users").
 
 With `kernel.elf` given as the program instead, the kernel checks that each
 program in `/bin` is byte for byte its own copy (`fs: /bin holds 38 of the
@@ -169,7 +176,7 @@ tick 1
 tick 10
 net: 10.0.2.15/24, gateway 10.0.2.2, dns 10.0.2.3 (dhcp)
 Type help for the list of commands.
-$ ping 10.0.2.2 1
+# ping 10.0.2.2 1
 PING 10.0.2.2: 56 data bytes
 64 bytes from 10.0.2.2: seq=1 ttl=64 time=1.211 ms
 1 sent, 1 received
@@ -189,13 +196,13 @@ cargo run --release -p grail -- --harts 4 kernel/kernel.elf
 tick 10
 smp: 4 harts running
 Type help for the list of commands.
-$ primes 4 40000
+# primes 4 40000
 primes [0, 10000): 1229
 primes [10000, 20000): 1033
 primes [20000, 30000): 983
 primes [30000, 40000): 958
 primes: 4203 below 40000, 4 workers
-$ harts
+# harts
 HART   PID    TICKS     IDLE SWITCHES
    0     1       20        9        9
    1     7       10        2       14
@@ -215,7 +222,7 @@ A process may have several threads (spec section 10, "Kernel threads";
 spinlock from the C library, and checks the totals:
 
 ```
-$ threads 4 500
+# threads 4 500
 threads: 4 threads, 500 rounds: counter 2000, spun 2000: ok
 ```
 
@@ -245,7 +252,7 @@ running.
 Programs side by side, and one the kernel kills:
 
 ```
-$ ding & dong & badload
+# ding & dong & badload
 [2]
 [3]
 ding 1
@@ -256,7 +263,7 @@ pid 4 (badload) killed: load page fault
   scause 0x0000000d  sepc 0x00001018  stval 0x80000000
   va 0x80000000 maps to pa 0x80000000, pte 0x2000004b -A--X-RV
 badload: exit -1
-$ wait
+# wait
 ding 3
 ding 4
 dong 3
@@ -277,7 +284,10 @@ program gets only the parts it uses) and `user/user.ld`. `user/README.md` has ea
 | `sh` | the shell |
 | `hello` | prints a line and exits |
 | `echo` | prints its arguments (`-n`: without the newline) |
-| `ls` | lists directories (the working directory without arguments) |
+| `ls` | lists directories (the working directory without arguments); `-l` with modes and owners |
+| `login`, `su`, `passwd` | log in, run a shell as another user, change a password |
+| `id`, `whoami` | print the user and group ids, or the user's name |
+| `chmod`, `chown` | change files' permission bits and owner |
 | `cat` | copies files, or its input, to its output |
 | `wc` | counts the lines, words and bytes of files, or of its input (`-l`, `-w`, `-c`) |
 | `mkdir`, `rm`, `ln` | make directories, remove names, link a second name to a file |
@@ -298,6 +308,7 @@ program gets only the parts it uses) and `user/user.ld`. `user/README.md` has ea
 | `badptr` | hands the system calls bad pointers, which must all fail with `-EFAULT` |
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
+| `permtest` | checks users and permissions on a writable root filesystem (`permtest: N checks, 0 failed`) |
 | `stress` | many processes at once: pages, the console, a shared pipe and files under timer preemption (`stress: W workers, R rounds, N bytes: ok`) |
 | `threads` | threads of one process adding to shared counters under a mutex and a spinlock (`threads: T threads, R rounds: counter N, spun N: ok`) |
 | `threadtest` | checks the thread and futex calls, and processes with threads that exit, exec, fault or are killed (`threadtest: N checks, 0 failed`); `threadtest fs` does the same with threads in file calls, on the root filesystem |
@@ -423,8 +434,16 @@ grail --ram 8 --paging sv39 --harts 4 kernel/kernel.elf
   disk (through `boot/boot.S`'s bootloader), then init (`user/init.c`, a
   64-bit program), as the first process, pid 1, Linux's init: it starts
   the services of the image's `/etc/rc` (the root image's profiles,
-  `profiles/`) and collects orphans; without `/bin/init` the shell is
-  the first process, and init without `/etc/rc` execs it.
+  `profiles/`: `login` on the console and `shd`) and collects orphans;
+  without `/bin/init` the shell is the first process, and init without
+  `/etc/rc` runs `login` again and again if there are accounts
+  (`/etc/passwd`), and execs the shell if not.
+- Users and permissions (#115): every process has real and effective user
+  and group ids, every inode an owner and a mode (CMFS version 3), and
+  `open`, `exec`, path lookup and the calls that change a directory check
+  them (`fs.c`'s `inode_permission`); root passes but for running a file
+  no one may run. `chmod`, `chown`, the set-ID bits, `kill`'s and `bind`'s
+  rules: `docs/camelot-syscalls.md`, "Users and permissions".
 - User space is the lower half (#155): below `USER_TOP`, 2^47 in Sv48 and
   2^38 in Sv39, Linux's `TASK_SIZE`, with the stack under it and the
   program at 0x1000. Every process's root table copies the kernel's
@@ -442,7 +461,7 @@ kstack self-test: 3/3 passed
 smp: 4 harts running
 kstack: 880 of 16384 bytes used at most
 Type help for the list of commands.
-$ ps
+# ps
   PID  PPID STATE      SIZE NAME
     1     0 sleep     40960 sh
    34     1 run       20480 ps

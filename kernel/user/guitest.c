@@ -39,7 +39,7 @@ static void fail(const char *what, int err) {
 static void write_ppm(const char *dir, const char *name, const struct gui_buffer *b) {
     char path[MAXPATH + 1];
     snprintf(path, sizeof(path), "%s/%s.ppm", dir, name);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         fail(path, fd);
         return;

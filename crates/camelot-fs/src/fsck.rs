@@ -14,7 +14,7 @@ use crate::extent::{self, empty_root};
 use crate::{
     block, block_mut, contents, dirents, no_contents, read_inode, show_name, superblock, valid_kind,
     valid_name, write_inode, Dinode, LogHeader, Superblock, BITS_PER_BLOCK, BSIZE, DIRENT_SIZE,
-    MAX_FILE_SIZE, NO_INODE, ROOT_INODE, TRUNCATING, T_DEVICE, T_DIR, T_FILE, T_FREE, T_SOCKET,
+    MAX_FILE_SIZE, MODE_BITS, NO_INODE, ROOT_INODE, TRUNCATING, T_DEVICE, T_DIR, T_FILE, T_FREE, T_SOCKET,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -246,6 +246,9 @@ impl Checker<'_> {
                     "inode {inum}: reserved byte {} is not 0",
                     crate::RESERVED_AT + i
                 ));
+            }
+            if d.mode & !MODE_BITS != 0 {
+                self.problem(format!("inode {inum}: mode {:#o} has undefined bits", d.mode));
             }
             if d.flags & !TRUNCATING != 0 {
                 self.problem(format!("inode {inum}: flags {:#x} has undefined bits", d.flags));
@@ -646,7 +649,11 @@ mod tests {
         });
         broken("reserved byte 127 is not 0", |img, sb| {
             let i = inode_of(img, "/README");
-            edit_inode(img, sb, i, |d| d.reserved[47] = 1)
+            edit_inode(img, sb, i, |d| d.reserved[37] = 1)
+        });
+        broken("mode 0o10644 has undefined bits", |img, sb| {
+            let i = inode_of(img, "/README");
+            edit_inode(img, sb, i, |d| d.mode = 0o10644)
         });
         broken("flags 0x2 has undefined bits", |img, sb| {
             let i = inode_of(img, "/README");

@@ -129,7 +129,9 @@ static void interrupt(struct tty *t, char c) {
         }
         echo_str(t, "\n");
     }
-    proc_kill_pid(t->fg);
+    /* The kernel's own kill (NULL): this may be an interrupt's, with no
+     * process of the terminal's running. */
+    proc_kill_pid(t->fg, NULL);
 }
 
 bool tty_receive(struct tty *t, char c) {
@@ -481,8 +483,17 @@ long tty_ioctl(struct tty *t, u32 request, uintptr arg) {
         if (pid < 0) {
             return -EINVAL;
         }
-        if (pid != 0 && !proc_exists(pid)) {
-            return -ESRCH;
+        /* Only a process the caller could kill() may be made the
+         * foreground one: Ctrl-C kills it with the kernel's authority. */
+        if (pid != 0) {
+            /* A zombie, which has ended, is no foreground process. */
+            if (!proc_exists(pid)) {
+                return -ESRCH;
+            }
+            int err = proc_may_signal(pid, myproc());
+            if (err < 0) {
+                return err;
+            }
         }
         t->fg = pid;
         return 0;

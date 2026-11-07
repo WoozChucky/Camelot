@@ -20,7 +20,7 @@ use std::sync::mpsc::{channel, Sender};
 /// Steps a machine runs per turn, and at most in all.
 const SLICE: u64 = 2_000;
 const MAX_STEPS: u64 = 400_000_000;
-const PROMPT: &str = "$ ";
+const PROMPT: &str = "# ";
 
 /// A Camelot machine with one card on the switch, its console captured and fed
 /// through `input`.

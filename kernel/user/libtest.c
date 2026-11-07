@@ -364,7 +364,7 @@ static void test_snprintf(void) {
     check_str(buf, "9223372036854775807 10000000000", "int64_t and uint64_t");
     /* z: a size_t (or ssize_t), a long's width. */
     snprintf(buf, sizeof buf, "%zu %zd %zx", sizeof(struct stat), (ssize_t)-5, (size_t)0xff);
-    check_str(buf, "24 -5 ff", "%z: size_t and ssize_t");
+    check_str(buf, "32 -5 ff", "%z: size_t and ssize_t");
     snprintf(buf, sizeof buf, "%zu", SIZE_MAX);
     check_str(buf, "18446744073709551615", "%zu of SIZE_MAX");
     snprintf(buf, sizeof buf, "%q %");
@@ -822,6 +822,76 @@ static void test_env(void) {
     environ = start;
 }
 
+/* The hex digest of `data`, `len` bytes, against `want`; and the same
+ * message given in pieces of `piece` bytes. */
+static void check_sha256(const void *data, size_t len, size_t piece, const char *want, const char *what) {
+    uint8_t digest[SHA256_SIZE];
+    char hex[2 * SHA256_SIZE + 1];
+    sha256(data, len, digest);
+    sha256_hex(digest, hex);
+    check_str(hex, want, what);
+    struct sha256 s;
+    sha256_init(&s);
+    for (size_t at = 0; at < len; at += piece) {
+        sha256_update(&s, (const char *)data + at, len - at < piece ? len - at : piece);
+    }
+    sha256_final(&s, digest);
+    sha256_hex(digest, hex);
+    check_str(hex, want, "in pieces");
+}
+
+static void test_sha256(void) {
+    /* FIPS 180-4's examples (NIST's SHA256.pdf), the empty message, and a
+     * message of 64 bytes, a whole block and its padding a block more. */
+    check_sha256("abc", 3, 1, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha256 of abc");
+    check_sha256("", 0, 1, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "sha256 of nothing");
+    const char *two = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    check_sha256(two, strlen(two), 7, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+                 "sha256 of two blocks");
+    char block[64];
+    memset(block, 'a', sizeof block);
+    check_sha256(block, sizeof block, 13, "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+                 "sha256 of a block");
+    /* A thousand a's, many blocks, in pieces that cut them anywhere (FIPS's
+     * million a's are crates/xtask/src/accounts.rs's to check: here they
+     * would take the emulator too long). */
+    char thousand[1000];
+    memset(thousand, 'a', sizeof thousand);
+    check_sha256(thousand, sizeof thousand, 77, "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3",
+                 "sha256 of a thousand a's");
+
+    /* pw_hash: one round is SHA-256 of the salt and the password, and two
+     * of that digest, the salt and the password again; the hashes
+     * crates/xtask/src/accounts.rs makes (its tests compute the same). */
+    char hash[PW_HASH_MAX + 1];
+    check_eq(pw_hash("bc", "a", hash, sizeof hash), 0, "pw_hash");
+    /* pw_hash takes PW_ROUNDS rounds: that hash has 1000. */
+    check(strncmp(hash, "$sha256$1000$a$", 15) == 0 && strlen(hash) == 15 + 64, "pw_hash's format");
+    /* The checks take the rounds a hash names: one or two here, as 1000
+     * take the emulator long (login's are checked end to end by
+     * crates/xtask/tests/boot.rs, against hashes xtask made). */
+    check(!pw_check("bd", "$sha256$1$a$ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+          "pw_check of another password");
+    check(!pw_check("b", "$sha256$1$a$ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+          "pw_check of a prefix");
+    check(pw_check("bc", "$sha256$1$a$ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+          "one round is the salt and the password");
+    check(pw_check("bc", "$sha256$2$a$3043d048d0d28ecf94e6eb021f76e69b76a1ead7d7a0d1392696bb2c09c261f1"),
+          "two rounds");
+    check(!pw_check("bc", "$sha256$1$a$BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"),
+          "the hex digits in lower case");
+    check(!pw_check("", "!"), "a locked account");
+    check(!pw_check("", ""), "an empty hash");
+    check(!pw_check("bc", "$sha256$0$a$ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+          "no rounds");
+    check(!pw_check("bc", "$md5$1$a$ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+          "another algorithm");
+    check_eq(pw_hash("x", "", hash, sizeof hash), -EINVAL, "an empty salt");
+    check_eq(pw_hash("x", "a$b", hash, sizeof hash), -EINVAL, "a salt with a $");
+    check_eq(pw_hash("x", "0123456789abcdef0", hash, sizeof hash), -EINVAL, "a salt too long");
+    check_eq(pw_hash("x", "a", hash, 20), -ERANGE, "no room");
+}
+
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "getenv") == 0) {
         return getenv_child(argv[2], argv[3]);
@@ -853,6 +923,7 @@ int main(int argc, char **argv) {
     test_reader();
     test_kill_descendants();
     test_env();
+    test_sha256();
     printf("libtest: %d checks, %d failed\n", checks, failures);
     return failures;
 }

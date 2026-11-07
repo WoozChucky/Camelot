@@ -1,5 +1,5 @@
-/* Terminals (user.h): termios, the foreground, and pseudo-terminals, over
- * ioctl and fstat, as glibc's are over the same requests. */
+/* Terminals (user.h): termios, the foreground, pseudo-terminals and
+ * getpass, over ioctl and fstat, as glibc's are over the same requests. */
 #include "../user.h"
 
 /* The device numbers of the console and of the ptys' slaves
@@ -39,6 +39,42 @@ void cfmakeraw(struct termios *t) {
     t->c_cc[VTIME] = 0;
 }
 
+char *getpass(const char *prompt) {
+    static char buf[PASS_MAX + 1];
+    printf("%s", prompt);
+    struct termios saved;
+    int tty = tcgetattr(STDIN, &saved) == 0;
+    if (tty) {
+        struct termios quiet = saved;
+        quiet.c_lflag &= ~(uint)ECHO;
+        tcsetattr(STDIN, TCSANOW, &quiet);
+    }
+    /* A byte at a time, so that nothing after the line is taken from
+     * whoever reads next. */
+    int n = 0;
+    int ended = 0;
+    for (;;) {
+        char c;
+        if (read(STDIN, &c, 1) <= 0) {
+            ended = n == 0;
+            break;
+        }
+        if (c == '\n') {
+            break;
+        }
+        if (c != '\r' && n < PASS_MAX) {
+            buf[n++] = c;
+        }
+    }
+    buf[n] = 0;
+    if (tty) {
+        tcsetattr(STDIN, TCSANOW, &saved);
+        /* The Enter, which wasn't echoed. */
+        printf("\n");
+    }
+    return ended ? NULL : buf;
+}
+
 int tcgetpgrp(int fd) {
     int pid;
     int r = ioctl(fd, TIOCGPGRP, &pid);
@@ -54,8 +90,9 @@ int posix_openpt(int flags) {
 }
 
 int grantpt(int fd) {
-    /* The slave's owner and mode are glibc's to set; Camelot has neither.
-     * Only a master is accepted, as glibc checks. */
+    /* The slave's owner and mode are glibc's to set; Camelot's slaves are
+     * the image's nodes, which keep theirs. Only a master is accepted, as
+     * glibc checks. */
     uint n;
     return ioctl(fd, TIOCGPTN, &n);
 }

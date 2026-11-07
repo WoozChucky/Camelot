@@ -252,6 +252,28 @@ fn step_until(
     panic!("gave up after {max} steps; output:\n{}", printed(m));
 }
 
+/// What the shell printed for `command`, its last run: the lines after its
+/// echo, up to the next prompt. Background programs of the line before may
+/// still print between the prompt and the echo (the console echoes a line as
+/// the shell reads it), so the echo is found after a prompt or at the start of
+/// a line, and never in the middle of a longer line ending the same way.
+fn echoed_output<'a>(out: &'a str, command: &str) -> Vec<&'a str> {
+    let line = format!("{command}\n");
+    let at = out
+        .match_indices(&line)
+        .map(|(at, _)| at)
+        .filter(|&at| out[..at].ends_with(PROMPT) || out[..at].ends_with('\n'))
+        .last()
+        .unwrap_or_else(|| panic!("no `{command}` in:\n{out}"))
+        + line.len();
+    let rest = &out[at..];
+    rest[..rest
+        .find(PROMPT)
+        .unwrap_or_else(|| panic!("`{command}` never ended:\n{out}"))]
+        .lines()
+        .collect()
+}
+
 /// Steps `m` until the kernel has printed its `n`th prompt since boot, at
 /// most `RUN_MAX_STEPS` steps. Only the bytes printed since the last step are
 /// looked at, so a kernel that never gets there fails in seconds rather than
@@ -1561,7 +1583,7 @@ fn the_console_types_what_the_keyboard_types() {
     let end = rows.iter().rposition(|r| !r.is_empty()).unwrap();
     assert_eq!(
         rows[end - 2..=end],
-        ["$ hello", "hello from user mode", "$"],
+        ["# hello", "hello from user mode", "#"],
         "{rows:#?}"
     );
 }
@@ -1593,7 +1615,7 @@ fn the_framebuffer_console_acts_on_ansis_escape_sequences() {
         &"w".repeat(80),
         "wwwww",
         "fbtest: ansi",
-        "$",
+        "#",
     ]
     .iter()
     .enumerate()
@@ -1954,11 +1976,12 @@ fn processes_give_back_every_page() {
     // Every program on its own: the ones that exit, the ones that are
     // killed, and systest, which spawns children, makes pipes and grows its
     // heap. (sh, cat and wc would read the next lines themselves: see
-    // a_shell_runs_inside_the_shell. Without a disk, the file programs only
-    // fail.)
+    // a_shell_runs_inside_the_shell; so would login, which without
+    // /etc/passwd becomes a root shell, and su and passwd ask for a
+    // password. Without a disk, the file programs only fail.)
     let names: Vec<String> = program_names()
         .into_iter()
-        .filter(|n| !["sh", "cat", "wc"].contains(&n.as_str()))
+        .filter(|n| !["sh", "cat", "wc", "login", "su", "passwd"].contains(&n.as_str()))
         .collect();
     for name in &names {
         command(&mut m, &format!("{name}\n"));
@@ -1978,14 +2001,14 @@ fn processes_give_back_every_page() {
         let hellos = ["hello"; NPROC][..n].join(" & ");
         command(&mut m, &format!("{hellos} &\n"));
         let out = printed(&m);
-        refused |= command_output(&out, &format!("{hellos} &")).contains(&"sh: hello: no free process slot");
+        refused |= echoed_output(&out, &format!("{hellos} &")).contains(&"sh: hello: no free process slot");
     }
     command(&mut m, "wait\n");
     let out = printed(&m);
     assert!(refused, "{out}");
     // The hellos run while the shell starts the others and waits for its
     // next line; wait collects them.
-    let waited = command_output(&out, "wait");
+    let waited = echoed_output(&out, "wait");
     let collected = waited.iter().filter(|l| l.ends_with("] hello: exit 0")).count();
     let greetings = out[start..]
         .lines()
@@ -2174,7 +2197,7 @@ fn killing_stress_workers_mid_run_leaves_no_lock_held() {
                 .bus
                 .uart
                 .captured
-                .ends_with(format!("[{FIRST_PID}] stress: exit 1\n$ ").as_bytes())
+                .ends_with(format!("[{FIRST_PID}] stress: exit 1\n# ").as_bytes())
         },
     );
     let out = printed(&m);
@@ -2582,7 +2605,7 @@ fn files_pipes_and_64_bit_offsets_on_a_disk() {
     // filetest on the root filesystem: every file system call and its
     // errors, and lseek's 64-bit off_t (an offset past the end, past the
     // largest file or LONG_MAX fails with -EINVAL whatever its low 32 bits)
-    // and stat's 24 bytes.
+    // and stat's 32 bytes.
     let out = run(
         Setup {
             disks: vec![root_disk(&[])],
@@ -2591,6 +2614,33 @@ fn files_pipes_and_64_bit_offsets_on_a_disk() {
         b"filetest\nexit 0\n",
     );
     all_checks_pass(&out, "filetest", "filetest");
+}
+
+#[test]
+fn only_root_binds_the_ports_below_1024() {
+    // permtest with a network card: its user part also binds port 80
+    // (-EACCES) and 1024 (allowed), and the rest of its checks pass as on
+    // a machine without one.
+    let out = run(
+        Setup {
+            disks: vec![root_disk(&[])],
+            nets: vec![NetConfig::user(Vec::new())],
+            ..Setup::default()
+        },
+        b"permtest\nexit 0\n",
+    );
+    let lines = command_output(&out, "permtest");
+    assert_eq!(
+        lines,
+        [
+            format!(
+                "permtest user: {} checks, 0 failed",
+                common::PERMTEST_USER_CHECKS + common::PERMTEST_PORT_CHECKS
+            ),
+            format!("permtest: {} checks, 0 failed", common::PERMTEST_CHECKS),
+        ],
+        "{out}"
+    );
 }
 
 #[test]

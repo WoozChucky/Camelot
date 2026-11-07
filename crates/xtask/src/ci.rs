@@ -209,7 +209,8 @@ const STEPS: &[Step] = &[
         what: "processes: the LP64 system call ABI, sign-extended results, the kernel half refused, \
                Linux's start as pid 1, the environment (#216), memory mappings (#179), /dev/fb0, the \
                input devices and the framebuffer console's escape sequences (#178), poll and local \
-               sockets (#180), pseudo-terminals (#181), init and /etc/rc (#182)",
+               sockets (#180), pseudo-terminals (#181), init and /etc/rc (#182), users' permissions with \
+               a network card (#115)",
         args: &[
             "-p",
             "xtask",
@@ -230,6 +231,7 @@ const STEPS: &[Step] = &[
             "local_sockets_connect_and_pass_descriptors",
             "pseudo_terminals_run_the_shell",
             "init_starts_the_services_of_etc_rc_and_ends_the_machine_with_them",
+            "only_root_binds_the_ports_below_1024",
         ],
     },
     Step {
@@ -250,7 +252,8 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "the committed examples, boot programs and hello are current; a boot block and the root \
-               images of both profiles boot, its /usr what the programs are linked from",
+               images of both profiles boot, its /usr what the programs are linked from, and users log in \
+               and meet the permissions there",
         args: &[
             "-p",
             "xtask",
@@ -268,6 +271,7 @@ const STEPS: &[Step] = &[
             "the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from",
             "the_profiles_images_differ_in_their_etc_rc_and_fonts",
             "the_desktop_image_boots_and_init_starts_its_shell_again",
+            "users_log_in_su_and_meet_the_permissions_on_the_root_image",
             "hello",
         ],
     },

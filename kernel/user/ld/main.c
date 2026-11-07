@@ -63,7 +63,7 @@ static uchar *read_file(const char *path, uint *len, int *err) {
 }
 
 static int write_file(const char *path, const uchar *data, uint len) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (fd < 0) {
         return fd;
     }

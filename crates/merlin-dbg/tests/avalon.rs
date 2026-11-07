@@ -150,7 +150,7 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
         .request_ok(&Message::StartVm { vm: VmRef::Id(id) })
         .unwrap();
     let herald = Herald::attach(&server, VmRef::Name("vm001".into()));
-    herald.wait_for("$ ", 1);
+    herald.wait_for("# ", 1);
 
     // The debugger attaches, the VM stops for it; what is typed meanwhile waits.
     let mut dbg = Command::new(env!("CARGO_BIN_EXE_merlin-dbg"))
@@ -202,7 +202,7 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
 
     // Left alone, the VM runs on: the shell answers, and goes on answering.
     herald.wait_for("camelot\n", 1);
-    herald.wait_for("$ ", 2);
+    herald.wait_for("# ", 2);
     let start = Instant::now();
     while state(&mut control, id) != VmState::Running {
         assert!(start.elapsed() < SLOW, "the VM is not running again");
@@ -210,11 +210,11 @@ fn debugging_a_vm_on_avalon_with_herald_attached() {
     }
     herald.type_keys(b"echo again\r");
     herald.wait_for("again\n", 1);
-    herald.wait_for("$ ", 3);
+    herald.wait_for("# ", 3);
     // Herald saw the console as if nobody had debugged it, and the state changes.
     let console = herald.output.text();
     assert!(
-        console.contains("$ echo camelot\ncamelot\n$ echo again\nagain\n$ "),
+        console.contains("# echo camelot\ncamelot\n# echo again\nagain\n# "),
         "{console:?}"
     );
     // Paused for the debugger as it attached (QEMU's run states); the run states its

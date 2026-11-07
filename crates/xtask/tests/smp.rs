@@ -685,7 +685,9 @@ fn the_disk_kernel_runs_programs_from_bin_on_four_harts() {
     .unwrap();
     m.boot_from_disk().unwrap();
     m.cpu.bus.uart.capture = true;
-    m.set_uart_input(kernel::typed(b"harts\nstress 5 3\nexit\n"));
+    // The server image's console logs in first, as root (xtask::accounts).
+    let input = [&xtask::accounts::root_login()[..], b"harts\nstress 5 3\nexit\n"].concat();
+    m.set_uart_input(kernel::typed(&input));
     let r = m.run(Some(3 * RUN_MAX_STEPS), |_| {});
     let out = printed(&m);
     assert_eq!(r, RunResult::Exited(0), "{out}");

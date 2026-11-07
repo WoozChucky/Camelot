@@ -73,6 +73,10 @@ static u32 div_ceil(u32 a, u32 b) {
 /* Checks the superblock's rules (docs/camelot-fs.md, "Superblock"); NULL if
  * they hold, else what is wrong. */
 static const char *check_superblock(const struct superblock *sb, u32 disk_sectors) {
+    if (sb->version < FS_VERSION) {
+        /* Images are built, never kept: an old one is rebuilt. */
+        return "an older version of the format: rebuild the image";
+    }
     if (sb->version != FS_VERSION) {
         return "unknown version";
     }
@@ -760,6 +764,35 @@ bool inode_too_big(const struct inode *ip) {
     return ip->size > MAXFILE_BYTES;
 }
 
+/* ---- Permissions ---- */
+
+bool capable(void) {
+    struct proc *p = myproc();
+    return p == NULL || p->euid == 0;
+}
+
+int inode_permission(struct inode *ip, u32 mask) {
+    mask &= MAY_READ | MAY_WRITE | MAY_EXEC;
+    if (capable()) {
+        /* Root's bypass, Linux's CAP_DAC_OVERRIDE: everything but running
+         * a file no one may run. */
+        if ((mask & MAY_EXEC) == 0 || ip->type == T_DIR || (ip->mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0) {
+            return 0;
+        }
+        return -EACCES;
+    }
+    struct proc *p = myproc();
+    u32 bits;
+    if (p->euid == ip->uid) {
+        bits = ip->mode >> 6;
+    } else if (p->egid == ip->gid) {
+        bits = ip->mode >> 3;
+    } else {
+        bits = ip->mode;
+    }
+    return (bits & mask) == mask ? 0 : -EACCES;
+}
+
 /* ---- Inodes ---- */
 
 struct inode *ialloc(u32 dev, u16 type) {
@@ -792,6 +825,9 @@ void iupdate(struct inode *ip) {
     dip->size_hi = (u32)(ip->size >> 32);
     memmove(&dip->root, &ip->root, sizeof ip->root);
     dip->flags = ip->flags;
+    dip->uid = ip->uid;
+    dip->gid = ip->gid;
+    dip->mode = ip->mode;
     log_write(b);
     brelse(b);
 }
@@ -845,6 +881,9 @@ void ilock(struct inode *ip) {
         ip->size = (u64)dip->size_hi << 32 | dip->size;
         memmove(&ip->root, &dip->root, sizeof ip->root);
         ip->flags = dip->flags;
+        ip->uid = dip->uid;
+        ip->gid = dip->gid;
+        ip->mode = dip->mode;
         brelse(b);
         ip->valid = true;
         if (ip->type == T_FREE) {
@@ -1104,9 +1143,18 @@ static struct inode *namex(const char *path, bool parent, char *name, int *err) 
             return NULL;
         }
         if (parent && *path == 0) {
-            /* The last name: stop here. */
+            /* The last name: stop here. The caller checks what it needs
+             * of the directory (fs_create, fs_unlink, fs_link: writing and
+             * searching). */
             iunlock(ip);
             return ip;
+        }
+        /* Looking a name up in a directory is searching it. */
+        int denied = inode_permission(ip, MAY_EXEC);
+        if (denied < 0) {
+            iunlockput(ip);
+            *err = denied;
+            return NULL;
         }
         if (ip->nlink == 0 && namecmp(name, ".") != 0) {
             /* A removed directory (still some process's working directory):
@@ -1231,7 +1279,7 @@ int fs_getcwd(char *buf, u32 size) {
     return (int)at;
 }
 
-struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *err) {
+struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, u16 mode, int *err) {
     if (fs_readonly) {
         *err = -EROFS;
         return NULL;
@@ -1253,11 +1301,23 @@ struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *e
         *err = -ENOENT;
         return NULL;
     }
-    struct inode *ip = dirlookup(dp, name, NULL);
+    /* Linux's may_create(): searching the directory for the name, which
+     * comes first (a name taken is -EEXIST only to who may see it), and
+     * writing the entry. */
+    int denied = inode_permission(dp, MAY_EXEC);
+    struct inode *ip = denied < 0 ? NULL : dirlookup(dp, name, NULL);
     if (ip != NULL) {
         iunlockput(dp);
         iput(ip);
         *err = -EEXIST;
+        return NULL;
+    }
+    if (denied == 0) {
+        denied = inode_permission(dp, MAY_WRITE);
+    }
+    if (denied < 0) {
+        iunlockput(dp);
+        *err = denied;
         return NULL;
     }
     ip = ialloc(dp->dev, type);
@@ -1269,6 +1329,12 @@ struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *e
     ilock(ip);
     ip->major = major;
     ip->minor = minor;
+    /* The maker's, as Linux's inode_init_owner() without set-group-ID
+     * directories (whose new entries would take the directory's group). */
+    struct proc *p = myproc();
+    ip->uid = p->euid;
+    ip->gid = p->egid;
+    ip->mode = mode & S_IALLUGO;
     /* Its entry in dp. */
     ip->nlink = 1;
     iupdate(ip);
@@ -1329,6 +1395,12 @@ int fs_unlink(const char *path) {
         iunlockput(dp);
         return -EINVAL;
     }
+    /* Linux's may_delete(): searching the directory and writing it. */
+    int denied = inode_permission(dp, MAY_WRITE | MAY_EXEC);
+    if (denied < 0) {
+        iunlockput(dp);
+        return denied;
+    }
     u32 off;
     struct inode *ip = dirlookup(dp, name, &off);
     if (ip == NULL) {
@@ -1338,6 +1410,15 @@ int fs_unlink(const char *path) {
     ilock(ip);
     if (ip->nlink < 1) {
         panic("fs_unlink: no links");
+    }
+    /* A sticky directory (/tmp) lets only the entry's owner, the
+     * directory's or root remove it, whoever else may write there:
+     * Linux's check_sticky(). */
+    if ((dp->mode & S_ISVTX) != 0 && !capable() && myproc()->euid != ip->uid &&
+        myproc()->euid != dp->uid) {
+        iunlockput(ip);
+        iunlockput(dp);
+        return -EPERM;
     }
     if (ip->type == T_DIR && !dir_empty(ip)) {
         iunlockput(ip);
@@ -1394,7 +1475,10 @@ int fs_link(const char *old, const char *new) {
     }
     ilock(dp);
     ilock(ip);
-    if (dp->nlink == 0 || ip->nlink == 0) {
+    int denied = inode_permission(dp, MAY_WRITE | MAY_EXEC);
+    if (denied < 0) {
+        err = denied;
+    } else if (dp->nlink == 0 || ip->nlink == 0) {
         /* A directory removed meanwhile; a file whose last name went
          * meanwhile, which Linux refuses to link back too. */
         err = -ENOENT;
@@ -1413,4 +1497,65 @@ int fs_link(const char *old, const char *new) {
     iunlockput(dp);
     iput(ip);
     return err;
+}
+
+/* The inode `path` names, locked, for fs_chmod() and fs_chown(); NULL with
+ * *err. In the caller's transaction. */
+static struct inode *attr_inode(const char *path, int *err) {
+    if (fs_readonly) {
+        *err = -EROFS;
+        return NULL;
+    }
+    struct inode *ip = namei(path, err);
+    if (ip != NULL) {
+        ilock(ip);
+    }
+    return ip;
+}
+
+int fs_chmod(const char *path, u32 mode) {
+    int err;
+    struct inode *ip = attr_inode(path, &err);
+    if (ip == NULL) {
+        return err;
+    }
+    struct proc *p = myproc();
+    if (!capable() && p->euid != ip->uid) {
+        iunlockput(ip);
+        return -EPERM;
+    }
+    mode &= S_IALLUGO;
+    /* Linux's setattr_should_drop_sgid(): someone not in the file's group
+     * can't make a program that runs as it. */
+    if (!capable() && p->egid != ip->gid) {
+        mode &= ~(u32)S_ISGID;
+    }
+    ip->mode = (u16)mode;
+    iupdate(ip);
+    iunlockput(ip);
+    return 0;
+}
+
+int fs_chown(const char *path, u32 uid, u32 gid) {
+    int err;
+    struct inode *ip = attr_inode(path, &err);
+    if (ip == NULL) {
+        return err;
+    }
+    if (!capable()) {
+        iunlockput(ip);
+        return -EPERM;
+    }
+    if (uid != NO_ID) {
+        ip->uid = uid;
+    }
+    if (gid != NO_ID) {
+        ip->gid = gid;
+    }
+    if (ip->type != T_DIR) {
+        ip->mode &= (u16) ~(S_ISUID | S_ISGID);
+    }
+    iupdate(ip);
+    iunlockput(ip);
+    return 0;
 }

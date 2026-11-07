@@ -32,7 +32,7 @@ pub const SECTOR_SIZE: usize = 512;
 /// The superblock's `magic`: the bytes `C M F S`.
 pub const MAGIC: u32 = 0x5346_4d43;
 /// The format version this crate reads and writes.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// The boot block, which the filesystem leaves alone.
 pub const BOOT_BLOCK: u32 = 0;
@@ -50,11 +50,27 @@ pub const ROOT_INODE: u32 = 1;
 pub const INODE_SIZE: usize = 128;
 pub const INODES_PER_BLOCK: u32 = (BSIZE / INODE_SIZE) as u32;
 /// Where the inode's fields are: `i_block`, the extent tree's root, then
-/// `flags`, then the reserved bytes to the end.
+/// `flags`, the owner's `uid` and `gid`, the `mode`, then the reserved
+/// bytes to the end.
 pub const IBLOCK_AT: usize = 16;
 pub const FLAGS_AT: usize = IBLOCK_AT + extent::ROOT_SIZE;
-pub const RESERVED_AT: usize = FLAGS_AT + 4;
+pub const UID_AT: usize = FLAGS_AT + 4;
+pub const GID_AT: usize = UID_AT + 4;
+pub const MODE_AT: usize = GID_AT + 4;
+pub const RESERVED_AT: usize = MODE_AT + 2;
 pub const RESERVED_SIZE: usize = INODE_SIZE - RESERVED_AT;
+/// `mode`'s bits, Unix's (Linux's `S_I*` without the type, which is the
+/// inode's `type`): read, write and execute (search, for a directory) for
+/// the owner (0o700), the group (0o070) and everyone else (0o007), and
+/// above them set-user-ID, set-group-ID and sticky. No other bit is
+/// defined.
+pub const S_ISUID: u16 = 0o4000;
+pub const S_ISGID: u16 = 0o2000;
+pub const S_ISVTX: u16 = 0o1000;
+pub const MODE_BITS: u16 = 0o7777;
+/// The superuser's user and group ids, which own what mkfs makes.
+pub const ROOT_UID: u32 = 0;
+pub const ROOT_GID: u32 = 0;
 /// `flags`: the inode's blocks are being freed ("Truncation"). No other bit
 /// is defined.
 pub const TRUNCATING: u32 = 1;
@@ -102,6 +118,39 @@ pub fn valid_kind(kind: u16) -> bool {
 /// size is 0 and `i_block` all zeros.
 pub fn no_contents(kind: u16) -> bool {
     kind == T_DEVICE || kind == T_SOCKET
+}
+
+/// The mode mkfs gives a new inode of `kind`: 0o755 for a directory, 0o644
+/// for a file (0o755 for an executable: `Mkfs::add_file`), 0o666 for a
+/// device, 0o777 for a socket (Linux's with no umask).
+pub fn default_mode(kind: u16) -> u16 {
+    match kind {
+        T_DIR => 0o755,
+        T_DEVICE => 0o666,
+        T_SOCKET => 0o777,
+        _ => 0o644,
+    }
+}
+
+/// `mode` as `ls -l` shows it, after the type's letter: `rwxr-xr-x`, with
+/// `s`/`S` for set-user-ID and set-group-ID and `t`/`T` for sticky in the
+/// execute places (lower case when the execute bit is set too), as
+/// coreutils' `ls` shows them.
+pub fn mode_string(mode: u16) -> String {
+    let mut s = String::new();
+    for (shift, special, letter) in [(6, S_ISUID, 's'), (3, S_ISGID, 's'), (0, S_ISVTX, 't')] {
+        let bits = (mode >> shift) & 7;
+        s.push(if bits & 4 != 0 { 'r' } else { '-' });
+        s.push(if bits & 2 != 0 { 'w' } else { '-' });
+        let x = bits & 1 != 0;
+        s.push(match (mode & special != 0, x) {
+            (true, true) => letter,
+            (true, false) => letter.to_ascii_uppercase(),
+            (false, true) => 'x',
+            (false, false) => '-',
+        });
+    }
+    s
 }
 
 /// `ceil(a / b)`.
@@ -245,7 +294,14 @@ impl Superblock {
             return Err(format!("no filesystem (magic {:#010x})", self.magic));
         }
         if self.version != VERSION {
-            return Err(format!("version {} (this reads version {VERSION})", self.version));
+            return Err(if self.version < VERSION {
+                format!(
+                    "version {}, an older format (this reads version {VERSION}): rebuild the image",
+                    self.version
+                )
+            } else {
+                format!("version {} (this reads version {VERSION})", self.version)
+            });
         }
         let want = Superblock::layout(self.size, self.ninodes, self.nlog)?;
         if *self != want {
@@ -298,6 +354,11 @@ pub struct Dinode {
     pub root: [u8; extent::ROOT_SIZE],
     /// `TRUNCATING`, or 0.
     pub flags: u32,
+    /// The owner: a user and a group id.
+    pub uid: u32,
+    pub gid: u32,
+    /// The permission bits ([`MODE_BITS`]).
+    pub mode: u16,
     /// The reserved bytes, which must be 0 (kept to check that they are).
     pub reserved: [u8; RESERVED_SIZE],
 }
@@ -313,6 +374,9 @@ impl Default for Dinode {
             size: 0,
             root: [0; extent::ROOT_SIZE],
             flags: 0,
+            uid: 0,
+            gid: 0,
+            mode: 0,
             reserved: [0; RESERVED_SIZE],
         }
     }
@@ -320,10 +384,14 @@ impl Default for Dinode {
 
 impl Dinode {
     /// A new inode of `kind`, empty: a directory or file with an empty
-    /// extent tree, a device or a socket with an `i_block` of zeros.
+    /// extent tree, a device or a socket with an `i_block` of zeros; root's,
+    /// with the kind's default mode.
     pub fn new(kind: u16) -> Dinode {
         Dinode {
             kind,
+            uid: ROOT_UID,
+            gid: ROOT_GID,
+            mode: default_mode(kind),
             root: if no_contents(kind) {
                 [0; extent::ROOT_SIZE]
             } else {
@@ -346,6 +414,9 @@ impl Dinode {
             size: u64::from(u32_at(b, 8)) | (u64::from(u32_at(b, 12)) << 32),
             root,
             flags: u32_at(b, FLAGS_AT),
+            uid: u32_at(b, UID_AT),
+            gid: u32_at(b, GID_AT),
+            mode: u16_at(b, MODE_AT),
             reserved,
         }
     }
@@ -359,6 +430,9 @@ impl Dinode {
         put_u32(b, 12, (self.size >> 32) as u32);
         b[IBLOCK_AT..FLAGS_AT].copy_from_slice(&self.root);
         put_u32(b, FLAGS_AT, self.flags);
+        put_u32(b, UID_AT, self.uid);
+        put_u32(b, GID_AT, self.gid);
+        put_u16(b, MODE_AT, self.mode);
         b[RESERVED_AT..INODE_SIZE].copy_from_slice(&self.reserved);
     }
 
@@ -609,7 +683,7 @@ mod tests {
         assert!(bad
             .validate(300)
             .unwrap_err()
-            .contains("version 1 (this reads version 2)"));
+            .contains("version 1, an older format (this reads version 3): rebuild the image"));
         let mut bad = sb;
         bad.datastart += 1;
         assert!(bad.validate(300).unwrap_err().contains("misplaced"));
@@ -627,6 +701,9 @@ mod tests {
             nlink: 2,
             size: 0x0506_0708_0102_0304,
             flags: TRUNCATING,
+            uid: 1000,
+            gid: 0x0102_0304,
+            mode: 0o4755,
             ..Dinode::new(T_FILE)
         };
         d.reserved[RESERVED_SIZE - 1] = 9;
@@ -638,6 +715,7 @@ mod tests {
         );
         assert_eq!(&b[16..18], &[0x0a, 0xf3], "i_block's header");
         assert_eq!(&b[76..80], &[1, 0, 0, 0]);
+        assert_eq!(&b[80..90], &[0xe8, 3, 0, 0, 4, 3, 2, 1, 0xed, 9]);
         assert_eq!(b[127], 9);
         assert_eq!(Dinode::decode(&b), d);
         assert_eq!(
@@ -645,8 +723,24 @@ mod tests {
             0x0506_0708_0102_0304u64.div_ceil(BSIZE as u64)
         );
         assert_eq!(Dinode::new(T_DEVICE).root, [0; extent::ROOT_SIZE]);
-        assert_eq!((FLAGS_AT, RESERVED_AT, RESERVED_SIZE), (76, 80, 48));
+        assert_eq!(
+            (FLAGS_AT, UID_AT, GID_AT, MODE_AT, RESERVED_AT, RESERVED_SIZE),
+            (76, 80, 84, 88, 90, 38)
+        );
+        let new = Dinode::new(T_DIR);
+        assert_eq!((new.uid, new.gid, new.mode), (0, 0, 0o755));
         assert_eq!(MAX_FILE_SIZE, 1 << 42);
+    }
+
+    #[test]
+    fn modes_read_as_ls_shows_them() {
+        assert_eq!(mode_string(0o755), "rwxr-xr-x");
+        assert_eq!(mode_string(0o600), "rw-------");
+        assert_eq!(mode_string(0o4755), "rwsr-xr-x");
+        assert_eq!(mode_string(0o2644), "rw-r-Sr--");
+        assert_eq!(mode_string(0o1777), "rwxrwxrwt");
+        assert_eq!(mode_string(0o1666), "rw-rw-rwT");
+        assert_eq!(mode_string(0), "---------");
     }
 
     #[test]

@@ -80,6 +80,14 @@
 #define SYS_getcwd 60        /* getcwd(buf, size): the working directory's path's length, its NUL counted */
 #define SYS_clock_gettime 61 /* clock_gettime(clock, ts): 0, the clock's time in *ts */
 #define SYS_sysinfo 62       /* sysinfo(info): 0, the memory, processes and uptime in *info */
+#define SYS_getuid 63        /* getuid(): the real user id */
+#define SYS_geteuid 64       /* geteuid(): the effective user id */
+#define SYS_getgid 65        /* getgid(): the real group id */
+#define SYS_getegid 66       /* getegid(): the effective group id */
+#define SYS_setuid 67        /* setuid(uid): 0; root sets both user ids, others the effective one to the real one */
+#define SYS_setgid 68        /* setgid(gid): 0; likewise for the group ids */
+#define SYS_chmod 69         /* chmod(path, mode): 0; the owner or root */
+#define SYS_chown 70         /* chown(path, uid, gid): 0; root only */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process; ftruncate, fcntl: a seal */
@@ -94,7 +102,7 @@
 #define ECHILD 10       /* wait: no such child */
 #define EAGAIN 11       /* spawn, thread_create: every slot is taken; futex_wait: not the value; a socket's receive timeout ran out */
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping */
-#define EACCES 13       /* spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that */
+#define EACCES 13       /* permission denied: the mode refuses it, or exec of no regular file; mmap, mprotect: not open for that */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
 #define EBUSY 16        /* ioctl: the device's memory is mapped, and the request would change it */
 #define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */
@@ -190,10 +198,34 @@ struct stat {
     off_t size;
     u16 major;
     u16 minor;
+    u32 mode; /* the permission bits, S_IRWXU... */
+    u32 uid;  /* the owner */
+    u32 gid;
 };
 
 #define T_PIPE 4
 #define T_SOCKET 5
+
+/* A file's permission bits (struct stat's mode, chmod, open and mkdir's
+ * mode), Linux's: read, write and execute (search, for a directory) for
+ * the owner, the group and everyone else, then set-user-ID, set-group-ID
+ * and sticky (docs/camelot-syscalls.md, "Users and permissions"). */
+#define S_ISUID 04000
+#define S_ISGID 02000
+#define S_ISVTX 01000
+#define S_IRWXU 0700
+#define S_IRUSR 0400
+#define S_IWUSR 0200
+#define S_IXUSR 0100
+#define S_IRWXG 070
+#define S_IRGRP 040
+#define S_IWGRP 020
+#define S_IXGRP 010
+#define S_IRWXO 07
+#define S_IROTH 04
+#define S_IWOTH 02
+#define S_IXOTH 01
+#define S_IALLUGO 07777 /* every bit there is */
 
 /* What procs stores for each process: 40 bytes, where `size`, an address,
  * is 64-bit (and 8-byte aligned). `state` is one of the
@@ -287,6 +319,7 @@ struct ping_reply {
 #define SHUT_WR 1     /* no more sending */
 #define SHUT_RDWR 2   /* neither */
 #define SOL_SOCKET 1  /* setsockopt: the socket's own options */
+#define IPPORT_RESERVED 1024 /* bind: the ports below it are root's */
 #define SO_PEERCRED 17 /* getsockopt: the peer's process, a struct ucred (local sockets) */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait: a struct timeval */
 

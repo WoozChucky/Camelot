@@ -371,7 +371,7 @@ static bool holds_pattern(const char *p, u32 len, u32 seed) {
  * in `buf`, in the caller's operation. */
 static void make_file(const char *p, u32 len, u32 seed, u8 *buf) {
     int err;
-    struct inode *ip = fs_create(p, T_FILE, 0, 0, &err);
+    struct inode *ip = fs_create(p, T_FILE, 0, 0, 0644, &err);
     check(ip != NULL, "create a file");
     if (ip == NULL) {
         return;
@@ -652,7 +652,7 @@ static void write_test(void) {
 
     /* T1: a directory and a file in it. */
     begin_op();
-    struct inode *ip = fs_create("/fstest", T_DIR, 0, 0, &err);
+    struct inode *ip = fs_create("/fstest", T_DIR, 0, 0, 0755, &err);
     check(ip != NULL, "make /fstest");
     if (ip != NULL) {
         iunlockput(ip);
@@ -679,7 +679,7 @@ static void write_test(void) {
      * written CHUNK bytes at a time, each in its own transaction (as the
      * write system call will). The reference outlives the transactions. */
     begin_op();
-    struct inode *big = fs_create("/fstest/big", T_FILE, 0, 0, &err);
+    struct inode *big = fs_create("/fstest/big", T_FILE, 0, 0, 0644, &err);
     check(big != NULL, "make /fstest/big");
     if (big != NULL) {
         iunlock(big);
@@ -734,7 +734,7 @@ static void write_test(void) {
 
     /* An empty directory, made and removed: /fstest's link count follows. */
     begin_op();
-    ip = fs_create("/fstest/d", T_DIR, 0, 0, &err);
+    ip = fs_create("/fstest/d", T_DIR, 0, 0, 0755, &err);
     check(ip != NULL, "make /fstest/d");
     if (ip != NULL) {
         iunlockput(ip);
@@ -777,11 +777,11 @@ static void write_test(void) {
     begin_op();
     ip = namei("/fstest/a", &err);
     check(ip == NULL && err == -ENOENT, "/fstest/a is gone");
-    check(fs_create("/fstest/b", T_FILE, 0, 0, &err) == NULL && err == -EEXIST, "create: the name is taken");
-    check(fs_create("/nowhere/x", T_FILE, 0, 0, &err) == NULL && err == -ENOENT, "create: no such directory");
-    check(fs_create("/fstest/b/x", T_FILE, 0, 0, &err) == NULL && err == -ENOTDIR,
+    check(fs_create("/fstest/b", T_FILE, 0, 0, 0644, &err) == NULL && err == -EEXIST, "create: the name is taken");
+    check(fs_create("/nowhere/x", T_FILE, 0, 0, 0644, &err) == NULL && err == -ENOENT, "create: no such directory");
+    check(fs_create("/fstest/b/x", T_FILE, 0, 0, 0644, &err) == NULL && err == -ENOTDIR,
           "create: a file is not a directory");
-    check(fs_create("/fstest/abcdefghijklmno", T_FILE, 0, 0, &err) == NULL && err == -ENAMETOOLONG,
+    check(fs_create("/fstest/abcdefghijklmno", T_FILE, 0, 0, 0644, &err) == NULL && err == -ENAMETOOLONG,
           "create: a name too long");
     check(fs_unlink("/fstest") == -ENOTEMPTY, "unlink: a directory with entries");
     check(fs_unlink("/fstest/..") == -EINVAL && fs_unlink("/") == -EINVAL, "unlink: . and .. and /");
@@ -833,11 +833,11 @@ static void write_test(void) {
 static void full_test(void) {
     int err;
     begin_op();
-    struct inode *full = fs_create("/full", T_FILE, 0, 0, &err);
+    struct inode *full = fs_create("/full", T_FILE, 0, 0, 0644, &err);
     if (full != NULL) {
         iunlock(full);
     }
-    struct inode *pad = fs_create("/pad", T_FILE, 0, 0, &err);
+    struct inode *pad = fs_create("/pad", T_FILE, 0, 0, 0644, &err);
     if (pad != NULL) {
         iunlock(pad);
     }
@@ -987,15 +987,15 @@ static void grow_test(void) {
     int err;
     struct inode *g[2];
     begin_op();
-    g[0] = fs_create("/g1", T_FILE, 0, 0, &err);
+    g[0] = fs_create("/g1", T_FILE, 0, 0, 0644, &err);
     if (g[0] != NULL) {
         iunlock(g[0]);
     }
-    g[1] = fs_create("/g2", T_FILE, 0, 0, &err);
+    g[1] = fs_create("/g2", T_FILE, 0, 0, 0644, &err);
     if (g[1] != NULL) {
         iunlock(g[1]);
     }
-    struct inode *pad = fs_create("/pad", T_FILE, 0, 0, &err);
+    struct inode *pad = fs_create("/pad", T_FILE, 0, 0, 0644, &err);
     if (pad != NULL) {
         iunlock(pad);
     }

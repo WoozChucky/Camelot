@@ -1,17 +1,95 @@
-/* ls [PATH...]: lists each directory, or describes each file, named (the
- * working directory without one). A line per entry, as the kernel's boot
- * listing and `camelot-fs ls` print them: the type (d directory, f file, c
- * device, s socket), the inode, the links, the size and the name. Exits 1
- * if a path, or an entry of a directory, can't be looked at (it says why),
- * else 0. */
+/* ls [-l] [PATH...]: lists each directory, or describes each file, named
+ * (the working directory without one). A line per entry, as the kernel's
+ * boot listing and `camelot-fs ls` print them: the type (d directory, f
+ * file, c device, s socket), the inode, the links, the size and the name.
+ *
+ * With -l, the line is coreutils' long one: the type and the mode
+ * (`drwxr-xr-x`: - file, d directory, c device, s socket, then read,
+ * write and run for the owner, the group and everyone else, `s`/`S` for
+ * the set-user-ID and set-group-ID bits and `t`/`T` for the sticky bit,
+ * the small letter when the x under it is set too), the links, the owner's
+ * and the group's names (/etc/passwd's and /etc/group's, the number when
+ * there is none), the size and the name.
+ *
+ * Exits 1 if a path, or an entry of a directory, can't be looked at (it
+ * says why), else 0. */
 #include "user.h"
+
+static int long_form;
 
 static char type_letter(int type) {
     return type == T_DIR ? 'd' : type == T_FILE ? 'f' : type == T_DEVICE ? 'c' : type == T_SOCKET ? 's' : '?';
 }
 
+/* `st`'s type and mode as `ls -l` shows them, in `out` (11 bytes). */
+static void mode_string(const struct stat *st, char *out) {
+    out[0] = st->type == T_DIR ? 'd' : st->type == T_DEVICE ? 'c' : st->type == T_SOCKET ? 's' : '-';
+    const char *rwx = "rwxrwxrwx";
+    for (int i = 0; i < 9; i++) {
+        out[1 + i] = (st->mode & (0400u >> i)) != 0 ? rwx[i] : '-';
+    }
+    /* The special bits over the x's: the owner's, the group's, everyone's. */
+    uint special[3] = {S_ISUID, S_ISGID, S_ISVTX};
+    char letter[3] = {'s', 's', 't'};
+    for (int i = 0; i < 3; i++) {
+        if ((st->mode & special[i]) != 0) {
+            char *x = &out[3 + 3 * i];
+            *x = *x == 'x' ? letter[i] : (char)(letter[i] - 'a' + 'A');
+        }
+    }
+    out[10] = 0;
+}
+
+/* A name looked up, kept for the next line: a directory's files mostly
+ * have one owner, and each lookup reads /etc/passwd or /etc/group through. */
+struct name_cache {
+    int valid;
+    uint id;
+    char name[64];
+};
+
+static struct name_cache users;
+static struct name_cache groups;
+
+/* `name` (NULL: none) as `id`'s in `c`, or the number if it has none. */
+static const char *remember(struct name_cache *c, uint id, const char *name) {
+    c->valid = 1;
+    c->id = id;
+    if (name != NULL) {
+        snprintf(c->name, sizeof c->name, "%s", name);
+    } else {
+        snprintf(c->name, sizeof c->name, "%u", id);
+    }
+    return c->name;
+}
+
+/* The user's or the group's name of `id`: its name, or the number if it
+ * has none. */
+static const char *user_name(uint id) {
+    if (users.valid && users.id == id) {
+        return users.name;
+    }
+    struct passwd *pw = getpwuid(id);
+    return remember(&users, id, pw != NULL ? pw->pw_name : NULL);
+}
+
+static const char *group_name(uint id) {
+    if (groups.valid && groups.id == id) {
+        return groups.name;
+    }
+    struct group *gr = getgrgid(id);
+    return remember(&groups, id, gr != NULL ? gr->gr_name : NULL);
+}
+
 static void line(const struct stat *st, const char *name) {
-    printf("%c %4u %2u %7ld %s\n", type_letter(st->type), st->ino, st->nlink, st->size, name);
+    if (!long_form) {
+        printf("%c %4u %2u %7ld %s\n", type_letter(st->type), st->ino, st->nlink, st->size, name);
+        return;
+    }
+    char mode[11];
+    mode_string(st, mode);
+    printf("%s %2u %-8s %-8s %7ld %s\n", mode, st->nlink, user_name(st->uid), group_name(st->gid), st->size,
+           name);
 }
 
 /* Lists `path`. Returns 0, or 1 if it can't. */
@@ -67,11 +145,16 @@ static int ls(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
+    int first = 1;
+    if (argc > 1 && strcmp(argv[1], "-l") == 0) {
+        long_form = 1;
+        first = 2;
+    }
+    if (argc <= first) {
         return ls(".");
     }
     int status = 0;
-    for (int i = 1; i < argc; i++) {
+    for (int i = first; i < argc; i++) {
         status |= ls(argv[i]);
     }
     return status;

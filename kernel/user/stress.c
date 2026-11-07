@@ -80,7 +80,7 @@ static int file_round(uint id, uint round) {
     static uchar back[FILE_BYTES];
     char name[16];
     snprintf(name, sizeof name, "stress.%u", id);
-    int fd = open(name, O_CREAT | O_TRUNC | O_RDWR);
+    int fd = open(name, O_CREAT | O_TRUNC | O_RDWR, 0644);
     if (fd == -ENOENT) {
         return 1;
     }

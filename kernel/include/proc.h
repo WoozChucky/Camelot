@@ -193,6 +193,20 @@ struct proc {
      * spinlock, which keeps it from making a page table another mapping
      * makes at the same time (mmap.h, "Locking"). */
     struct spinlock vm_lock;
+    /* Who it runs as (docs/camelot-syscalls.md, "Users and permissions"):
+     * the real user and group ids, who started it, and the effective ones,
+     * which the permission checks use (fs.c's inode_permission). They are
+     * the same but in a program whose file has the set-user-ID or
+     * set-group-ID bit, which exec() gives the file's owner's or group's
+     * as its effective ids. 0 is root. The first process and the kernel's
+     * are root; spawn() gives the child its parent's. setuid() and
+     * setgid() change them, from any of the process's threads: each is a
+     * word that the others read without a lock, so a check made at the
+     * same moment sees the ids from just before or just after. */
+    u32 uid;
+    u32 euid;
+    u32 gid;
+    u32 egid;
 };
 
 _Static_assert(NOFILE <= 64, "a bit of proc.cloexec for each descriptor");
@@ -200,7 +214,7 @@ _Static_assert(NOFILE <= 64, "a bit of proc.cloexec for each descriptor");
 /* The tests walk procs[] by PROC_SIZE, and read the page table at
  * PROC_PAGETABLE. */
 #define PROC_PAGETABLE 40
-#define PROC_SIZE 720
+#define PROC_SIZE 736
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 _Static_assert(offsetof(struct proc, parent) == 24, "the tests read parent there");
 _Static_assert(offsetof(struct proc, pagetable) == PROC_PAGETABLE, "the tests read pagetable there");
@@ -287,6 +301,8 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
 struct exec_image {
     pagetable_t pagetable;
     uintptr heap;
+    u32 euid; /* the effective ids it runs with (elf_file's) */
+    u32 egid;
     struct trap_frame frame;
 };
 
@@ -391,10 +407,20 @@ void proc_exit(int status);
 void proc_kill(struct trap_frame *f);
 
 /* kill(): marks the process `pid` killed (see `killed` in struct proc) and
- * wakes its threads that sleep. 0 (also for a zombie, which has already
- * ended), -ESRCH if there is no such process, -EPERM for a kernel process
- * or the first one (the shell). */
-int proc_kill_pid(int pid);
+ * wakes its threads that sleep. `by` is the process asking (the kill
+ * system call's caller), whose real or effective uid must be the target's
+ * real one unless it is root, or NULL for the kernel itself (a terminal's
+ * Ctrl-C, from an interrupt), which may kill any. 0 (also for a zombie,
+ * which has already ended), -ESRCH if there is no such process, -EPERM for
+ * a kernel process, the first one (init, or the shell), or another user's
+ * process. */
+int proc_kill_pid(int pid, const struct proc *by);
+
+/* Whether `by` (NULL: the kernel) may signal process `pid`, by kill's
+ * rule: 0, -ESRCH if there is no such process, -EPERM if it is another
+ * user's and `by` isn't root. TIOCSPGRP's check, as a terminal's Ctrl-C
+ * kills its foreground process with the kernel's authority. */
+int proc_may_signal(int pid, const struct proc *by);
 
 /* Whether a process `pid` is running (neither ended nor being made). */
 bool proc_exists(int pid);
@@ -518,6 +544,14 @@ struct file *fd_take(u32 fd);
  * now the caller's. For taking back a descriptor just installed, which
  * another thread may have closed (or reused) meanwhile. */
 bool fd_take_if(u32 fd, struct file *f);
+
+/* setuid(id) and setgid(id), Linux's without the saved ids: root (an
+ * effective uid of 0) sets both the real and the effective id; any other
+ * process may only set its effective id to its real one (giving up what a
+ * set-user-ID program gave it). 0 or -EPERM; -EINVAL for -1, which is no
+ * id. */
+long proc_setuid(u32 id);
+long proc_setgid(u32 id);
 
 /* The working directory, with a reference of the caller's own (idup), or
  * NULL if there is none. */

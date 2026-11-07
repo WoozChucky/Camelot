@@ -15,6 +15,9 @@ typedef unsigned long size_t;
 typedef long ssize_t;
 typedef long off_t;
 typedef long time_t;
+typedef unsigned int uid_t; /* a user id, 0 for root */
+typedef unsigned int gid_t; /* a group id */
+typedef unsigned int mode_t; /* a file's permission bits */
 typedef long intptr_t;
 typedef unsigned long uintptr_t;
 
@@ -65,7 +68,7 @@ typedef unsigned long long uint64_t;
 #define ECHILD 10       /* wait: no such child */
 #define EAGAIN 11       /* spawn, thread_create: every slot is taken; futex_wait: not the value; a socket's receive timeout ran out */
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping */
-#define EACCES 13       /* spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that */
+#define EACCES 13       /* permission denied: the mode refuses it, or exec of no regular file; mmap, mprotect: not open for that */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
 #define EBUSY 16        /* ioctl: the device's memory is mapped, and the request would change it */
 #define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */
@@ -282,7 +285,7 @@ struct fb_fix_screeninfo {
 #define T_PIPE 4
 #define T_SOCKET 5
 
-/* 24 bytes (the size a 64-bit off_t). */
+/* 32 bytes (the size a 64-bit off_t). */
 struct stat {
     uint ino;     /* the inode; 0 for a pipe or the shell's console */
     ushort type;  /* T_DIR, T_FILE, T_DEVICE, T_PIPE or T_SOCKET */
@@ -290,7 +293,29 @@ struct stat {
     off_t size;   /* bytes; for a pipe, those waiting to be read */
     ushort major; /* a device's numbers */
     ushort minor;
+    mode_t mode;  /* the permission bits (S_IRWXU...): 0600 for a pipe or a socket */
+    uid_t uid;    /* the owner; a pipe's or a socket's maker */
+    gid_t gid;
 };
+
+/* The permission bits (docs/camelot-syscalls.md, "Users and permissions"):
+ * read, write and execute (search, for a directory) for the owner, the
+ * group and everyone else, then set-user-ID, set-group-ID and sticky. */
+#define S_ISUID 04000
+#define S_ISGID 02000
+#define S_ISVTX 01000
+#define S_IRWXU 0700
+#define S_IRUSR 0400
+#define S_IWUSR 0200
+#define S_IXUSR 0100
+#define S_IRWXG 070
+#define S_IRGRP 040
+#define S_IWGRP 020
+#define S_IXGRP 010
+#define S_IRWXO 07
+#define S_IROTH 04
+#define S_IWOTH 02
+#define S_IXOTH 01
 
 /* What reading a directory returns: one of these per slot, inum 0 for a
  * free one. A name of DIRSIZ bytes has no NUL. */
@@ -390,6 +415,7 @@ struct ping_reply {
 #define SHUT_WR 1   /* no more sending: TCP sends its FIN */
 #define SHUT_RDWR 2 /* neither */
 #define SOL_SOCKET 1   /* setsockopt: the socket's own options */
+#define IPPORT_RESERVED 1024 /* bind: the ports below it are root's */
 #define SO_PEERCRED 17 /* getsockopt: the peer's process, a struct ucred (local sockets) */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait (a struct timeval) */
 #define SCM_RIGHTS 1   /* a control message of descriptors (ints) */
@@ -785,11 +811,13 @@ int spawn(const char *path, char *const argv[], char *const envp[]);
 int wait(int pid, int *status);
 void *sbrk(long increment);
 uint uptime(void);
-int open(const char *path, int flags);
+/* With O_CREAT, a third argument gives the new file's permission bits (a
+ * mode_t, 0644 say); the kernel has no umask. */
+int open(const char *path, int flags, ...);
 int close(int fd);
 off_t lseek(int fd, off_t offset, int whence);
 int fstat(int fd, struct stat *st);
-int mkdir(const char *path);
+int mkdir(const char *path, mode_t mode);
 int unlink(const char *path);
 int link(const char *old, const char *new);
 int chdir(const char *path);
@@ -844,6 +872,21 @@ int stat(const char *path, struct stat *st);
 long getcwd(char *buf, size_t size);
 int clock_gettime(int clock, struct timespec *ts);
 int sysinfo(struct sysinfo *info);
+/* Who the process runs as (docs/camelot-syscalls.md, "Users and
+ * permissions"): the real ids, who started it, and the effective ones, which
+ * the permission checks use (a set-user-ID program's owner's). 0 is root. */
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
+/* Root sets the real and effective ids both; anyone else may only set the
+ * effective id back to the real one. 0, -EPERM, or -EINVAL for -1. */
+int setuid(uid_t uid);
+int setgid(gid_t gid);
+/* The owner or root sets a file's permission bits; root alone gives it
+ * away (-1 keeps the uid or the gid as it is). 0, or an error. */
+int chmod(const char *path, mode_t mode);
+int chown(const char *path, uid_t uid, gid_t gid);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);
@@ -957,6 +1000,75 @@ int snprintf(char *buf, size_t size, const char *fmt, ...);
 /* `s` and a newline on stdout. */
 int puts(const char *s);
 
+/* SHA-256 (FIPS 180-4) and passwords (lib/sha256.c). sha256_init,
+ * sha256_update and sha256_final hash a message given in pieces; sha256
+ * hashes one buffer; sha256_hex writes a digest's 64 hex digits and a NUL.
+ *
+ * pw_hash hashes `password` with `salt` (1 to PW_SALT_MAX bytes, no `$`,
+ * `:` or newline: -EINVAL) into `out` (`size` bytes, at least
+ * PW_HASH_MAX + 1: -ERANGE) as /etc/shadow keeps it:
+ *
+ *   $sha256$ROUNDS$SALT$HEX
+ *
+ * HEX the digest after ROUNDS rounds, the first of the salt and the
+ * password, each other of the digest before it, the salt and the password.
+ * pw_check says whether `password` is the one `hash` was made from (1 or
+ * 0), with the hash's own rounds and salt. A teaching system's hash
+ * (docs/excalibur-spec.md, "Users"), not hardened cryptography. */
+#define SHA256_SIZE 32
+#define PW_ROUNDS 1000
+#define PW_ROUNDS_MAX 100000
+#define PW_SALT_MAX 16
+/* "$sha256$" 6 digits "$" a salt "$" 64 hex digits. */
+#define PW_HASH_MAX (8 + 6 + 1 + PW_SALT_MAX + 1 + 2 * SHA256_SIZE)
+struct sha256 {
+    uint32_t h[8];
+    uint64_t len;
+    uint8_t buf[64];
+    uint32_t n;
+};
+void sha256_init(struct sha256 *s);
+void sha256_update(struct sha256 *s, const void *data, size_t len);
+void sha256_final(struct sha256 *s, uint8_t digest[SHA256_SIZE]);
+void sha256(const void *data, size_t len, uint8_t digest[SHA256_SIZE]);
+void sha256_hex(const uint8_t digest[SHA256_SIZE], char hex[2 * SHA256_SIZE + 1]);
+int pw_hash(const char *password, const char *salt, char *out, size_t size);
+int pw_check(const char *password, const char *hash);
+
+/* The accounts (lib/pwd.c, docs/excalibur-spec.md "Users"): /etc/passwd,
+ * /etc/group and /etc/shadow (root's alone), lines of `:`-separated
+ * fields. getpwnam and getpwuid find a user by name or id, getgrnam and
+ * getgrgid a group, getspnam a user's password hash; NULL if there is none
+ * or the file can't be read. Each returns a record in a buffer of its own,
+ * good until the next call of the same family (POSIX's, not for several
+ * threads at once). */
+#define PASSWD_FILE "/etc/passwd"
+#define GROUP_FILE "/etc/group"
+#define SHADOW_FILE "/etc/shadow"
+struct passwd {
+    char *pw_name;
+    char *pw_passwd; /* "x": the hash is in /etc/shadow */
+    uid_t pw_uid;
+    gid_t pw_gid;
+    char *pw_gecos;  /* a description */
+    char *pw_dir;    /* the home directory */
+    char *pw_shell;
+};
+struct group {
+    char *gr_name;
+    char *gr_passwd;
+    gid_t gr_gid;
+};
+struct spwd {
+    char *sp_namp;
+    char *sp_pwdp; /* the hash, pw_hash's; `!` or `*` for none that works */
+};
+struct passwd *getpwnam(const char *name);
+struct passwd *getpwuid(uid_t uid);
+struct group *getgrnam(const char *name);
+struct group *getgrgid(gid_t gid);
+struct spwd *getspnam(const char *name);
+
 /* Line input (lib/getline.c).
  *
  * getline reads a line from stdin into `buf` (`size` bytes, at least 2)
@@ -1038,16 +1150,28 @@ int kill_descendants(int pid);
  * TIOCSPGRP.
  *
  * posix_openpt opens /dev/ptmx with `flags` (O_RDWR) and returns the
- * master's descriptor; grantpt only checks that `fd` is one (Camelot has
- * no owners to set), and unlockpt unlocks its slave (TIOCSPTLCK), both 0
+ * master's descriptor; grantpt only checks that `fd` is one (the slaves'
+ * nodes are the image's, root's with mode 0600, not the opener's, as
+ * Camelot has no devpts to make them: only root uses pseudo-terminals),
+ * and unlockpt unlocks its slave (TIOCSPTLCK), both 0
  * or an error (-ENOTTY for anything but a master); ptsname is
  * the slave's path, "/dev/pts/N", in a buffer of its own overwritten by
  * the next call, or NULL. ttyname is the path of the terminal `fd` is,
- * "/dev/console" or "/dev/pts/N", the same way, or NULL for anything else. */
+ * "/dev/console" or "/dev/pts/N", the same way, or NULL for anything else.
+ *
+ * getpass writes `prompt` and reads a line from stdin, a byte at a time
+ * (nothing after it is read), with the terminal's echo off if stdin is
+ * one (ECHO cleared, then the modes put back and the unechoed newline
+ * printed): a password, without its newline, at most PASS_MAX bytes (the
+ * rest of a longer line left out), in a buffer of its own overwritten by
+ * the next call, or NULL at the end of the input. glibc's, which login,
+ * su and passwd use. */
+#define PASS_MAX 64
 int isatty(int fd);
 int tcgetattr(int fd, struct termios *t);
 int tcsetattr(int fd, int when, const struct termios *t);
 void cfmakeraw(struct termios *t);
+char *getpass(const char *prompt);
 int tcgetpgrp(int fd);
 int tcsetpgrp(int fd, int pid);
 int posix_openpt(int flags);

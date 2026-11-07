@@ -698,7 +698,7 @@ static int writes_file(void *arg) {
     while (atomic_load(&io_go) == 0) {
         yield();
     }
-    int fd = open(TMP_WRITE, O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = open(TMP_WRITE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     for (;;) {
         lseek(fd, 0, SEEK_SET);
         write(fd, wbuf, WRITE_SIZE);
@@ -830,7 +830,7 @@ static void test_fs(void) {
     /* close of a descriptor other threads read and write: their calls
      * under way finish on the file they hold; the next ones find no
      * descriptor. */
-    shared_fd = open(TMP_CLOSE, O_RDWR | O_CREAT | O_TRUNC);
+    shared_fd = open(TMP_CLOSE, O_RDWR | O_CREAT | O_TRUNC, 0644);
     check(shared_fd >= 0, "open a file to share");
     check_eq(write(shared_fd, wbuf, 100), 100, "write it");
     int r = start(reads_fd, NULL, 0);

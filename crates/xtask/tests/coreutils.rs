@@ -21,7 +21,7 @@ use xtask::kernel::BOOT_MAX_STEPS;
 use xtask::repo_root;
 use xtask::userprogs::CCompiler;
 
-const PROMPT: &str = "$ ";
+const PROMPT: &str = "# ";
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
 /// RAM for the machine: less than the default, so it boots faster.
 const RAM: usize = 16 << 20;
@@ -561,7 +561,7 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
     );
     assert_eq!(
         s.run("env /bin"),
-        format!("env: /bin: not a regular file\n{}", exit_line("env", 126))
+        format!("env: /bin: permission denied\n{}", exit_line("env", 126))
     );
     assert_eq!(s.run("printenv TERM HOME"), "linux\n/\n");
     assert_eq!(s.run("printenv"), "HOME=/\nTERM=linux\n");

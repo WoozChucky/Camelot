@@ -120,12 +120,12 @@ static void put_at(int fd, int from) {
 /* Starts a shell on the connection `fd`. Returns its pid, or an error. */
 static int spawn_shell(int fd) {
     char *argv[2];
-    argv[0] = "sh";
+    argv[0] = "login";
     argv[1] = NULL;
     for (int i = 0; i < 3; i++) {
         put_at(i, fd);
     }
-    int pid = spawn("/bin/sh", argv, environ);
+    int pid = spawn("/bin/login", argv, environ);
     for (int i = 0; i < 3; i++) {
         put_at(i, own[i]);
     }

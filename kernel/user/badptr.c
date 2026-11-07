@@ -81,8 +81,8 @@ int main(int argc, char **args) {
      * heap among them. */
     expect(open((char *)KERNEL, O_RDONLY), -EFAULT);         /* 24 */
     expect(open(end - 10, O_RDONLY), -EFAULT);               /* 25 */
-    expect(open(end - 200, O_RDONLY | O_CREAT), -EFAULT);    /* 26: past MAXPATH */
-    expect(mkdir((char *)KERNEL), -EFAULT);                  /* 27 */
+    expect(open(end - 200, O_RDONLY | O_CREAT, 0644), -EFAULT); /* 26: past MAXPATH */
+    expect(mkdir((char *)KERNEL, 0755), -EFAULT);               /* 27 */
     expect(unlink((char *)0), -EFAULT);                      /* 28 */
     expect(chdir((char *)KERNEL), -EFAULT);                  /* 29 */
     expect(link((char *)KERNEL, "/x"), -EFAULT);             /* 30 */

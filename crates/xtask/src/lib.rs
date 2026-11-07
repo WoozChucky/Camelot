@@ -15,6 +15,9 @@
 //!   README) with the `camelot-fs` crate's mkfs, bootable with the disk kernel
 //!   ([`fs::IMAGE_SIZE`] blocks in all), of a profile ([`fs::Profile`]: the
 //!   server's, or the desktop's of [`fs::DESKTOP_IMAGE_SIZE`] blocks).
+//! * [`accounts`]: the accounts a root image's profiles have, `/etc/passwd`,
+//!   `/etc/group` and `/etc/shadow`, root's and `user`'s, with their hashed
+//!   passwords.
 //! * [`boot`]: builds the boot ROM's disk loader and Camelot's bootloader
 //!   with merlin-as + merlin-ld.
 //! * [`toolchain`]: merlin, merlin-as and merlin-ld as libraries, for the
@@ -32,6 +35,7 @@
 //!   and generates the assembly that embeds them in the kernel (`userprogs.s`,
 //!   made at build time, not committed).
 
+pub mod accounts;
 pub mod boot;
 pub mod c_tables;
 pub mod ci;

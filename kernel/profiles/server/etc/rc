@@ -1,8 +1,8 @@
 # /etc/rc: the services init starts (kernel/user/init.c), one a line:
 # once|respawn PATH ARGS...
 #
-# The server: a shell on the console, whose end (exit, or Ctrl-D on an
-# empty line) stops the machine, and shd, a shell for each TCP connection
-# to port 23, started again if it ends.
-once /bin/sh
+# The server: a login on the console, whose session's end (exit, or
+# Ctrl-D on an empty line) stops the machine, and shd, a login and a shell
+# for each TCP connection to port 23, started again if it ends.
+once /bin/login
 respawn /bin/shd

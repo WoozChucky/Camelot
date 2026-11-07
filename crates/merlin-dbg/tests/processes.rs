@@ -28,8 +28,10 @@ fn path(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
 }
 
-/// What the shell is given: the pipeline, then `exit`, which halts the kernel.
-const INPUT: &[u8] = b"cat /README /README /README | cat\nexit\n";
+/// What the console is given: root's name and password for `login`
+/// (`xtask::accounts::root_login`, the image's default), then, for the shell,
+/// the pipeline and `exit`, which halts the kernel.
+const INPUT: &[u8] = b"root\nroot\ncat /README /README /README | cat\nexit\n";
 
 /// The machine a run boots: its harts' paging, and the MODE field of satp `info
 /// processes` shows for every process.

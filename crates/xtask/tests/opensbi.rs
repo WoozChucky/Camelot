@@ -24,7 +24,7 @@ use std::sync::mpsc::{self, Sender};
 use xtask::kernel::{BOOT_MAX_STEPS, KERNEL_ELF};
 use xtask::repo_root;
 
-const PROMPT: &str = "$ ";
+const PROMPT: &str = "# ";
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
 /// The kernel's first line, where its output starts after the firmware's.
 const KERNEL_BANNER: &str = "Camelot v0.1.0 booting...\n";

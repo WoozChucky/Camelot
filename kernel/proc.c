@@ -570,7 +570,13 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
             p->cwd = idup(parent->cwd);
         }
         release(&parent->files_lock);
+        /* And who it runs as: the parent's real ids, and the effective
+         * ones the program gives (exec.c: a set-ID program's file's). */
+        p->uid = parent->uid;
+        p->gid = parent->gid;
     }
+    p->euid = prog->euid;
+    p->egid = prog->egid;
     return proc_ready(p, t, name, parent);
 }
 
@@ -636,6 +642,8 @@ int proc_exec_load(const struct elf_file *prog, const char *path, const struct p
     /* The new registers go to the image: the old program's stay in the
      * frame until it is certain the new one replaces it. */
     img->pagetable = build_space(prog, "exec", path, args, &img->frame, &img->heap, &err);
+    img->euid = prog->euid;
+    img->egid = prog->egid;
     return img->pagetable == NULL ? err : 0;
 }
 
@@ -672,6 +680,9 @@ int proc_exec_commit(struct exec_image *img, const char *name) {
     p->areas = NULL;
     p->pagetable = img->pagetable;
     p->heap_base = img->heap;
+    /* Who the new program runs as: a set-ID program's file's. */
+    p->euid = img->euid;
+    p->egid = img->egid;
     p->brk = img->heap;
     p->stack_low = USER_STACK;
     *mythread()->frame = img->frame;
@@ -1161,7 +1172,28 @@ void proc_kill(struct trap_frame *f) {
     proc_exit(-1);
 }
 
-int proc_kill_pid(int pid) {
+/* Whether `by` may signal `p`: Linux's kill_ok_by_cred(), root, or the
+ * caller's real or effective uid the target's real one. NULL is the kernel
+ * itself, which may signal anyone. */
+static bool may_signal(const struct proc *by, const struct proc *p) {
+    return by == NULL || by->euid == 0 || by->euid == p->uid || by->uid == p->uid;
+}
+
+int proc_may_signal(int pid, const struct proc *by) {
+    int r = -ESRCH;
+    acquire(&proc_lock);
+    for (u32 i = 0; i < NPROC; i++) {
+        const struct proc *p = &procs[i];
+        if (p->state != PROC_UNUSED && p->state != PROC_NEW && p->pid == (u32)pid) {
+            r = may_signal(by, p) ? 0 : -EPERM;
+            break;
+        }
+    }
+    release(&proc_lock);
+    return r;
+}
+
+int proc_kill_pid(int pid, const struct proc *by) {
     int r = -ESRCH;
     acquire(&proc_lock);
     for (u32 i = 0; i < NPROC; i++) {
@@ -1172,6 +1204,15 @@ int proc_kill_pid(int pid) {
         /* Neither the kernel's own processes nor the first one, init (or
          * the shell), whose end is Camelot's. */
         if (p->kfn != NULL || p == init_proc) {
+            r = -EPERM;
+            break;
+        }
+        /* Another user's process is out of reach but to root. The
+         * terminal's Ctrl-C (`by` NULL) acts with the kernel's authority,
+         * as Linux's tty layer does: it runs in an interrupt, on whatever
+         * hart and process it lands, and TIOCSPGRP checked that whoever
+         * made its target the foreground could signal it. */
+        if (!may_signal(by, p)) {
             r = -EPERM;
             break;
         }
@@ -1763,6 +1804,40 @@ bool fd_take_if(u32 fd, struct file *f) {
     }
     release(&p->files_lock);
     return took;
+}
+
+long proc_setuid(u32 id) {
+    struct proc *p = myproc();
+    if (id == NO_ID) {
+        return -EINVAL;
+    }
+    if (p->euid == 0) {
+        p->uid = id;
+        p->euid = id;
+        return 0;
+    }
+    if (id != p->uid) {
+        return -EPERM;
+    }
+    p->euid = id;
+    return 0;
+}
+
+long proc_setgid(u32 id) {
+    struct proc *p = myproc();
+    if (id == NO_ID) {
+        return -EINVAL;
+    }
+    if (p->euid == 0) {
+        p->gid = id;
+        p->egid = id;
+        return 0;
+    }
+    if (id != p->gid) {
+        return -EPERM;
+    }
+    p->egid = id;
+    return 0;
 }
 
 struct inode *proc_cwd(void) {

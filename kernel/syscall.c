@@ -355,7 +355,7 @@ void syscall(struct trap_frame *f) {
         ret = sys_run(f, true);
         break;
     case SYS_kill:
-        ret = proc_kill_pid((int)arg(f, 0));
+        ret = proc_kill_pid((int)arg(f, 0), myproc());
         break;
     case SYS_procs:
         ret = sys_procs(f);
@@ -423,6 +423,30 @@ void syscall(struct trap_frame *f) {
         break;
     case SYS_sysinfo:
         ret = sys_sysinfo(f);
+        break;
+    case SYS_getuid:
+        ret = myproc()->uid;
+        break;
+    case SYS_geteuid:
+        ret = myproc()->euid;
+        break;
+    case SYS_getgid:
+        ret = myproc()->gid;
+        break;
+    case SYS_getegid:
+        ret = myproc()->egid;
+        break;
+    case SYS_setuid:
+        ret = proc_setuid((u32)arg(f, 0));
+        break;
+    case SYS_setgid:
+        ret = proc_setgid((u32)arg(f, 0));
+        break;
+    case SYS_chmod:
+        ret = sys_chmod(f);
+        break;
+    case SYS_chown:
+        ret = sys_chown(f);
         break;
     case SYS_socketpair:
         ret = unix_sys_socketpair((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3));

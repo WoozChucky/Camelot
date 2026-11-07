@@ -664,7 +664,14 @@ fn a_disk_that_cannot_be_mounted_is_left_alone() {
     };
     let not_mounted = |why: &str| format!("fs: disk 0 not mounted: {why}\n");
     for (image, why) in [
-        (broken(&|i| set_u32(i, 1, 4, 1)), "unknown version"),
+        (
+            broken(&|i| set_u32(i, 1, 4, camelot_fs::VERSION - 1)),
+            "an older version of the format: rebuild the image",
+        ),
+        (
+            broken(&|i| set_u32(i, 1, 4, camelot_fs::VERSION + 1)),
+            "unknown version",
+        ),
         (broken(&|i| set_u32(i, 1, 20, 1)), "bad log size"),
         (broken(&|i| set_u32(i, 1, 16, 1)), "bad inode count"),
         (
@@ -1320,6 +1327,19 @@ fn the_format_document_matches_the_kernel_and_the_host() {
     assert!(doc.contains(&format!("(1024 - 12) / 12 = {}", extent::BLOCK_MAX)));
     assert!(doc.contains("blocks it maps, 1 to 32 768"));
     assert!(doc.contains(&format!("{} bytes, 8 per block", camelot_fs::INODE_SIZE)));
+    // The owner and mode, where the inode table puts them.
+    for (at, field) in [
+        (camelot_fs::UID_AT, "| `uid` (u32) |"),
+        (camelot_fs::GID_AT, "| `gid` (u32) |"),
+        (camelot_fs::MODE_AT, "| `mode` (u16) |"),
+    ] {
+        assert!(doc.contains(&format!("| {at} {field}")), "{field}");
+    }
+    assert!(doc.contains(&format!(
+        "| {} | reserved ({} bytes) | 0 |",
+        camelot_fs::RESERVED_AT,
+        camelot_fs::RESERVED_SIZE
+    )));
     assert_eq!(
         define(&fs_h, "INODE_TRUNCATING"),
         camelot_fs::TRUNCATING.to_string()
@@ -1356,7 +1376,7 @@ fn the_format_document_matches_the_kernel_and_the_host() {
 const SHELL_MAX_STEPS: u64 = 400_000_000;
 
 /// The shell's prompt.
-const PROMPT: &str = "$ ";
+const PROMPT: &str = "# ";
 
 /// Checks `filetest` makes on the root image, its 64-bit off_t's among
 /// them, and `filetest ro` on a read-only one (kernel/user/filetest.c).
@@ -1680,12 +1700,12 @@ fn a_failed_exec_ends_only_a_shell_that_is_not_interactive() {
     for (script, printed) in [
         (
             "sh < /s1",
-            "$ before\n$ sh: nosuch: no such program\nsh: exit 127\n",
+            "# before\n# sh: nosuch: no such program\nsh: exit 127\n",
         ),
-        ("sh < /s2", "$ sh: /bin: not a regular file\nsh: exit 126\n"),
+        ("sh < /s2", "# sh: /bin: permission denied\nsh: exit 126\n"),
         (
             "sh < /s3",
-            "$ sh: /missing: no such file or directory\nsh: exit 1\n",
+            "# sh: /missing: no such file or directory\nsh: exit 1\n",
         ),
     ] {
         let want = format!("{SHELL_BANNER}{printed}{PROMPT}");
@@ -1748,12 +1768,12 @@ fn a_failed_special_builtin_ends_only_a_shell_that_is_not_interactive() {
         &out[at + typed.len()..]
     };
     for (script, printed) in [
-        ("sh < /s1", "$ sh: export: 1B: bad variable name\nsh: exit 2\n"),
-        ("sh < /s2", "$ sh: unset: 1A: bad variable name\nsh: exit 2\n"),
-        ("sh < /s3", "$ $ sh: B14=1: too many variables\nsh: exit 2\n"),
+        ("sh < /s1", "# sh: export: 1B: bad variable name\nsh: exit 2\n"),
+        ("sh < /s2", "# sh: unset: 1A: bad variable name\nsh: exit 2\n"),
+        ("sh < /s3", "# # sh: B14=1: too many variables\nsh: exit 2\n"),
         (
             "sh < /s4",
-            "$ sh: cd: /nope: no such file or directory\n$ $ sh: cd: /nope: no such file or directory\n$ sh: exit 2\n",
+            "# sh: cd: /nope: no such file or directory\n# # sh: cd: /nope: no such file or directory\n# sh: exit 2\n",
         ),
     ] {
         let want = format!("{SHELL_BANNER}{printed}{PROMPT}");
@@ -1763,6 +1783,38 @@ fn a_failed_special_builtin_ends_only_a_shell_that_is_not_interactive() {
     let fs = Fs::open(&run.disk).unwrap();
     assert!(fs.lookup("/not-run").is_err());
     assert_eq!(fs.read_file("/ran").unwrap(), b"run\n");
+}
+
+#[test]
+fn permtest_passes_on_the_root_image_and_leaves_it_as_it_was() {
+    // Users and permissions (kernel/user/permtest.c): root's bypass, then
+    // uid 1000's every refusal (reading another's 0600 file, writing into
+    // a directory not its own, /bin among them, searching, running, the
+    // sticky bit, chmod, chown, setuid, kill, connecting to a local
+    // socket, opening the console, the screen, the input and a terminal's
+    // slave), a set-user-ID program, and the disk back as it was.
+    let image = root_image();
+    let run = boot(
+        image.clone(),
+        Boot {
+            input: b"permtest\nexit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    let out = shell_output(&run.out, "permtest");
+    assert!(
+        out.ends_with(&format!(
+            "permtest user: {} checks, 0 failed\npermtest: {} checks, 0 failed\n",
+            common::PERMTEST_USER_CHECKS,
+            common::PERMTEST_CHECKS
+        )),
+        "{out}"
+    );
+    let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    assert_eq!((after.replayed, after.orphans), (0, 0));
+    assert_eq!(state(&run.disk), state(&image));
 }
 
 #[test]
