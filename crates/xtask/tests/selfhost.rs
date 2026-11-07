@@ -3335,31 +3335,55 @@ fn compile_on_camelot(jobs: &[(usize, &CcJob)], files: &BTreeMap<String, Vec<u8>
 
 /// How many jobs a corpus must hold at least: in all, that merlin compiles
 /// (or dumps) without a word, with warnings, and refuses, and whole
-/// programs (the repository's files) merlin says something of.
+/// programs (the repository's files) merlin compiles with warnings; and
+/// the whole programs merlin refuses, by path from the root: exactly
+/// those, so that a program that fails to compile for want of a header
+/// (a wrong `-I`, which merlin and cc1 would agree on) fails the test
+/// rather than counting as a refusal.
 struct Least {
     jobs: usize,
     quiet: usize,
     warned: usize,
     refused: usize,
-    programs_said: usize,
+    programs_warned: usize,
+    programs_refused: &'static [&'static str],
 }
 
-/// Asserts that `all` holds at least what `least` says.
+/// The whole programs of the repository merlin refuses: clang's own
+/// fixtures, which are not C99 (an implicit `int`).
+const REFUSED_PROGRAMS: &[&str] = &[
+    "crates/elf/tests/llvm/prog.c",
+    "crates/merlin-objdump/tests/fixtures/units.c",
+];
+
+/// Asserts that `all` holds at least what `least` says, and that the whole
+/// programs merlin refuses are its `programs_refused`.
 fn assert_least(all: &[CcJob], least: Least) {
     let count = |f: &dyn Fn(&CcJob) -> bool| all.iter().filter(|j| f(j)).count();
     let quiet = count(&|j| j.want.0.is_some() && j.want.1.is_empty());
     let warned = count(&|j| j.want.0.is_some() && !j.want.1.is_empty());
     let refused = count(&|j| j.want.0.is_none());
-    let programs_said = count(&|j| j.dir.is_some() && !j.want.1.is_empty());
+    let programs_warned = count(&|j| j.dir.is_some() && j.want.0.is_some() && !j.want.1.is_empty());
     assert!(
         all.len() >= least.jobs
             && quiet >= least.quiet
             && warned >= least.warned
             && refused >= least.refused
-            && programs_said >= least.programs_said,
+            && programs_warned >= least.programs_warned,
         "{} jobs: {quiet} without a word, {warned} warned, {refused} refused, \
-         {programs_said} programs with diagnostics",
+         {programs_warned} programs with warnings",
         all.len()
+    );
+    let programs_refused: BTreeMap<String, &str> = all
+        .iter()
+        .filter(|j| j.want.0.is_none())
+        .filter_map(|j| Some((format!("{}/{}", j.dir.as_ref()?, j.input), j.want.1.as_str())))
+        .collect();
+    let want: BTreeSet<String> = least.programs_refused.iter().map(|p| image_path(p)).collect();
+    let got: BTreeSet<String> = programs_refused.keys().cloned().collect();
+    assert!(
+        got == want,
+        "merlin refuses these programs, not {want:?}:\n{programs_refused:#?}"
     );
 }
 
@@ -3388,7 +3412,8 @@ fn the_compiler_on_camelot_writes_what_merlin_writes() {
             quiet: 20,
             warned: 100,
             refused: 250,
-            programs_said: 2,
+            programs_warned: 2,
+            programs_refused: &[],
         },
     );
 }
@@ -3419,7 +3444,8 @@ fn the_compiler_on_camelot_dumps_what_merlin_dumps() {
             quiet: 30,
             warned: 100,
             refused: 250,
-            programs_said: 2,
+            programs_warned: 2,
+            programs_refused: &[],
         },
     );
 }
@@ -3750,7 +3776,8 @@ fn cc1_compiles_itself_on_camelot() {
         quiet: OWN_SAMPLE.len(),
         warned: 0,
         refused: 0,
-        programs_said: 0,
+        programs_warned: 0,
+        programs_refused: &[],
     };
     compile_corpus(Corpus::OwnSample, quiet);
     g_corpus(
@@ -3779,14 +3806,16 @@ fn cc1_on_camelot_takes_the_whole_corpus() {
         quiet: 300,
         warned: 240,
         refused: 700,
-        programs_said: 20,
+        programs_warned: 18,
+        programs_refused: REFUSED_PROGRAMS,
     };
     let own = || Least {
         jobs: 18,
         quiet: 18,
         warned: 0,
         refused: 0,
-        programs_said: 0,
+        programs_warned: 0,
+        programs_refused: &[],
     };
     compile_corpus(Corpus::Full, full());
     compile_corpus(Corpus::Own, own());
