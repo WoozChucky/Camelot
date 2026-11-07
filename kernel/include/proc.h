@@ -193,6 +193,20 @@ struct proc {
      * spinlock, which keeps it from making a page table another mapping
      * makes at the same time (mmap.h, "Locking"). */
     struct spinlock vm_lock;
+    /* Who it runs as (docs/camelot-syscalls.md, "Users and permissions"):
+     * the real user and group ids, who started it, and the effective ones,
+     * which the permission checks use (fs.c's inode_permission). They are
+     * the same but in a program whose file has the set-user-ID or
+     * set-group-ID bit, which exec() gives the file's owner's or group's
+     * as its effective ids. 0 is root. The first process and the kernel's
+     * are root; spawn() gives the child its parent's. setuid() and
+     * setgid() change them, from any of the process's threads: each is a
+     * word that the others read without a lock, so a check made at the
+     * same moment sees the ids from just before or just after. */
+    u32 uid;
+    u32 euid;
+    u32 gid;
+    u32 egid;
 };
 
 _Static_assert(NOFILE <= 64, "a bit of proc.cloexec for each descriptor");
@@ -200,7 +214,7 @@ _Static_assert(NOFILE <= 64, "a bit of proc.cloexec for each descriptor");
 /* The tests walk procs[] by PROC_SIZE, and read the page table at
  * PROC_PAGETABLE. */
 #define PROC_PAGETABLE 40
-#define PROC_SIZE 720
+#define PROC_SIZE 736
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 _Static_assert(offsetof(struct proc, parent) == 24, "the tests read parent there");
 _Static_assert(offsetof(struct proc, pagetable) == PROC_PAGETABLE, "the tests read pagetable there");
@@ -518,6 +532,14 @@ struct file *fd_take(u32 fd);
  * now the caller's. For taking back a descriptor just installed, which
  * another thread may have closed (or reused) meanwhile. */
 bool fd_take_if(u32 fd, struct file *f);
+
+/* setuid(id) and setgid(id), Linux's without the saved ids: root (an
+ * effective uid of 0) sets both the real and the effective id; any other
+ * process may only set its effective id to its real one (giving up what a
+ * set-user-ID program gave it). 0 or -EPERM; -EINVAL for -1, which is no
+ * id. */
+long proc_setuid(u32 id);
+long proc_setgid(u32 id);
 
 /* The working directory, with a reference of the caller's own (idup), or
  * NULL if there is none. */

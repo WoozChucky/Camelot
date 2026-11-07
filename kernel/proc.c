@@ -570,6 +570,11 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
             p->cwd = idup(parent->cwd);
         }
         release(&parent->files_lock);
+        /* And who it runs as. */
+        p->uid = parent->uid;
+        p->euid = parent->euid;
+        p->gid = parent->gid;
+        p->egid = parent->egid;
     }
     return proc_ready(p, t, name, parent);
 }
@@ -1763,6 +1768,43 @@ bool fd_take_if(u32 fd, struct file *f) {
     }
     release(&p->files_lock);
     return took;
+}
+
+/* The id -1 stands for no id (Linux's setuid refuses it too). */
+#define NO_ID 0xffffffffu
+
+long proc_setuid(u32 id) {
+    struct proc *p = myproc();
+    if (id == NO_ID) {
+        return -EINVAL;
+    }
+    if (p->euid == 0) {
+        p->uid = id;
+        p->euid = id;
+        return 0;
+    }
+    if (id != p->uid) {
+        return -EPERM;
+    }
+    p->euid = id;
+    return 0;
+}
+
+long proc_setgid(u32 id) {
+    struct proc *p = myproc();
+    if (id == NO_ID) {
+        return -EINVAL;
+    }
+    if (p->euid == 0) {
+        p->gid = id;
+        p->egid = id;
+        return 0;
+    }
+    if (id != p->gid) {
+        return -EPERM;
+    }
+    p->egid = id;
+    return 0;
 }
 
 struct inode *proc_cwd(void) {

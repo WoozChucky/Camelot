@@ -424,6 +424,24 @@ void syscall(struct trap_frame *f) {
     case SYS_sysinfo:
         ret = sys_sysinfo(f);
         break;
+    case SYS_getuid:
+        ret = myproc()->uid;
+        break;
+    case SYS_geteuid:
+        ret = myproc()->euid;
+        break;
+    case SYS_getgid:
+        ret = myproc()->gid;
+        break;
+    case SYS_getegid:
+        ret = myproc()->egid;
+        break;
+    case SYS_setuid:
+        ret = proc_setuid((u32)arg(f, 0));
+        break;
+    case SYS_setgid:
+        ret = proc_setgid((u32)arg(f, 0));
+        break;
     case SYS_socketpair:
         ret = unix_sys_socketpair((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3));
         break;

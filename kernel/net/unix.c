@@ -30,8 +30,9 @@
  *
  * SO_PEERCRED, as Linux's: an accepted end's peer is the process that
  * called connect(), the connecting end's the one that called listen(), and
- * each of a pair's the process that made it; they stay what they were when
- * the connection was made, whoever holds the sockets since. */
+ * each of a pair's the process that made it, with its effective user and
+ * group ids at that moment; they stay what they were when the connection
+ * was made, whoever holds the sockets since. */
 #include "unix.h"
 #include "file.h"
 #include "fs.h"
@@ -78,8 +79,8 @@ struct unix_sock {
     u32 shut;  /* RCV_SHUT and SEND_SHUT: shutdown(), the peer's or its close */
     int err;   /* an error for the next read to return: -ECONNRESET */
     u32 rcvtimeo; /* SO_RCVTIMEO, in ticks: 0 waits for as long as it takes */
-    i32 pid;      /* UNIX_LISTENING: the process that called listen() */
-    i32 peerpid;  /* SO_PEERCRED: the peer's process when they connected (0: none) */
+    struct ucred cred;     /* UNIX_LISTENING: the process that called listen() */
+    struct ucred peercred; /* SO_PEERCRED: the peer's process when they connected (pid 0: none) */
     struct unix_sock *peer; /* UNIX_CONNECTED: NULL once the peer is closed */
     struct inode *ip;       /* the socket inode bind() made, with a reference */
     char name[UNIX_PATH_MAX];     /* its path, or the listener's ("": none) */
@@ -112,6 +113,16 @@ void unix_init(void) {
 
 static pagetable_t user_pt(void) {
     return myproc()->pagetable;
+}
+
+/* The calling process as SO_PEERCRED gives it: its pid and effective ids. */
+static struct ucred my_cred(void) {
+    struct proc *p = myproc();
+    struct ucred c;
+    c.pid = (i32)p->pid;
+    c.uid = p->euid;
+    c.gid = p->egid;
+    return c;
 }
 
 static u32 min32(u32 a, u32 b) {
@@ -611,8 +622,8 @@ int unix_sys_socketpair(u32 domain, u32 type, u32 protocol, uintptr ufds) {
     acquire(&unix_lock);
     a->peer = b;
     b->peer = a;
-    a->peerpid = (i32)myproc()->pid;
-    b->peerpid = a->peerpid;
+    a->peercred = my_cred();
+    b->peercred = a->peercred;
     release(&unix_lock);
     unix_file(fa, a);
     unix_file(fb, b);
@@ -686,7 +697,7 @@ static int do_listen(struct unix_sock *u, u32 backlog) {
         err = -EINVAL; /* as on Linux: a listener must have a name */
     } else {
         u->state = UNIX_LISTENING;
-        u->pid = (i32)myproc()->pid;
+        u->cred = my_cred();
         u->max_backlog = backlog < 1 ? 1 : backlog > UNIX_BACKLOG ? UNIX_BACKLOG : backlog;
         /* A bigger backlog lets waiting connect()s in. */
         wakeup(u);
@@ -808,8 +819,8 @@ static int do_connect(struct unix_sock *u, uintptr uaddr) {
                 memcpy(s->name, l->name, UNIX_PATH_MAX);
                 memcpy(s->peername, u->name, UNIX_PATH_MAX);
                 memcpy(u->peername, l->name, UNIX_PATH_MAX);
-                s->peerpid = (i32)myproc()->pid;
-                u->peerpid = l->pid;
+                s->peercred = my_cred();
+                u->peercred = l->cred;
                 l->backlog[l->nbacklog++] = s;
                 s = NULL;
                 wakeup(l);
@@ -1100,10 +1111,8 @@ int unix_sys_getsockopt(u32 fd, u32 level, u32 option, uintptr uvalue, uintptr u
         if (level != SOL_SOCKET || option != SO_PEERCRED) {
             err = -ENOPROTOOPT;
         } else {
-            /* No users: uid and gid 0. */
-            struct ucred cred = {0, 0, 0};
             acquire(&unix_lock);
-            cred.pid = u->peerpid;
+            struct ucred cred = u->peercred;
             release(&unix_lock);
             err = sock_opt_put(uvalue, ulen, len, &cred, sizeof cred);
         }

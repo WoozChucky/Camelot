@@ -535,12 +535,21 @@ static void test_simple_calls(void) {
     check(strcmp(cwd, "/") == 0, "getcwd: the root is /");
     check_eq(getcwd(cwd, 1), -ERANGE, "getcwd: not in 1 byte");
     check_eq(yield(), 0, "yield");
+    /* The first process and everything it starts are root. */
+    check_eq(getuid(), 0, "getuid: root");
+    check_eq(geteuid(), 0, "geteuid: root");
+    check_eq(getgid(), 0, "getgid: root");
+    check_eq(getegid(), 0, "getegid: root");
+    check_eq(setuid(0), 0, "setuid to root's own id");
+    check_eq(setgid(0), 0, "setgid to root's own id");
+    check_eq(setuid(-1), -EINVAL, "setuid -1");
+    check_eq(setgid(-1), -EINVAL, "setgid -1");
     uint before = uptime();
     check_eq(sleep(3), 0, "sleep");
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(63, 0, 0, 0), -ENOSYS, "call 63");
+    check_eq(syscall(71, 0, 0, 0), -ENOSYS, "call 71");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
     /* The result is a long, sign-extended in a0: an error is negative
      * whatever the width, as a long and as an ssize_t (read's). */

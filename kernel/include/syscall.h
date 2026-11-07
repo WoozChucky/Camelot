@@ -80,6 +80,12 @@
 #define SYS_getcwd 60        /* getcwd(buf, size): the working directory's path's length, its NUL counted */
 #define SYS_clock_gettime 61 /* clock_gettime(clock, ts): 0, the clock's time in *ts */
 #define SYS_sysinfo 62       /* sysinfo(info): 0, the memory, processes and uptime in *info */
+#define SYS_getuid 63        /* getuid(): the real user id */
+#define SYS_geteuid 64       /* geteuid(): the effective user id */
+#define SYS_getgid 65        /* getgid(): the real group id */
+#define SYS_getegid 66       /* getegid(): the effective group id */
+#define SYS_setuid 67        /* setuid(uid): 0; root sets both user ids, others the effective one to the real one */
+#define SYS_setgid 68        /* setgid(gid): 0; likewise for the group ids */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process; ftruncate, fcntl: a seal */

@@ -68,6 +68,12 @@
     .equ SYS_getcwd, 60
     .equ SYS_clock_gettime, 61
     .equ SYS_sysinfo, 62
+    .equ SYS_getuid, 63
+    .equ SYS_geteuid, 64
+    .equ SYS_getgid, 65
+    .equ SYS_getegid, 66
+    .equ SYS_setuid, 67
+    .equ SYS_setgid, 68
 
     .text
 
@@ -506,6 +512,48 @@ clock_gettime:
     .globl sysinfo
 sysinfo:
     li    a7, SYS_sysinfo
+    ecall
+    ret
+
+# uid_t getuid(void)
+    .globl getuid
+getuid:
+    li    a7, SYS_getuid
+    ecall
+    ret
+
+# uid_t geteuid(void)
+    .globl geteuid
+geteuid:
+    li    a7, SYS_geteuid
+    ecall
+    ret
+
+# gid_t getgid(void)
+    .globl getgid
+getgid:
+    li    a7, SYS_getgid
+    ecall
+    ret
+
+# gid_t getegid(void)
+    .globl getegid
+getegid:
+    li    a7, SYS_getegid
+    ecall
+    ret
+
+# int setuid(uid_t uid)
+    .globl setuid
+setuid:
+    li    a7, SYS_setuid
+    ecall
+    ret
+
+# int setgid(gid_t gid)
+    .globl setgid
+setgid:
+    li    a7, SYS_setgid
     ecall
     ret
 

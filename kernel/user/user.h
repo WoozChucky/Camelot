@@ -15,6 +15,8 @@ typedef unsigned long size_t;
 typedef long ssize_t;
 typedef long off_t;
 typedef long time_t;
+typedef unsigned int uid_t; /* a user id, 0 for root */
+typedef unsigned int gid_t; /* a group id */
 typedef long intptr_t;
 typedef unsigned long uintptr_t;
 
@@ -844,6 +846,17 @@ int stat(const char *path, struct stat *st);
 long getcwd(char *buf, size_t size);
 int clock_gettime(int clock, struct timespec *ts);
 int sysinfo(struct sysinfo *info);
+/* Who the process runs as (docs/camelot-syscalls.md, "Users and
+ * permissions"): the real ids, who started it, and the effective ones, which
+ * the permission checks use (a set-user-ID program's owner's). 0 is root. */
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
+/* Root sets the real and effective ids both; anyone else may only set the
+ * effective id back to the real one. 0, -EPERM, or -EINVAL for -1. */
+int setuid(uid_t uid);
+int setgid(gid_t gid);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);

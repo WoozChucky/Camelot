@@ -109,7 +109,7 @@ headers and checks each size.
 | `struct cmsghdr` | 16 | a control message's header: a `size_t` length, then two `int`s, the level and the type |
 | `struct termios` | 36 | a terminal's modes ("Terminals"): four `unsigned int` flags, the line discipline's number, then 19 control characters, Linux's for `TCGETS` |
 | `struct winsize` | 8 | a terminal's size: four `unsigned short`s, rows, columns and two in pixels |
-| `struct ucred` | 12 | `SO_PEERCRED`'s: the peer's pid, then its uid and gid, `unsigned int`s, 0 |
+| `struct ucred` | 12 | `SO_PEERCRED`'s: the peer's pid, then its effective uid and gid, `unsigned int`s |
 
 ## Calls
 
@@ -177,6 +177,12 @@ headers and checks each size.
 | 60 | `getcwd` | `char *buf, size_t size` | the path's length, its NUL counted; `-ERANGE`, `-ENOENT`, `-ENAMETOOLONG`, `-ENOMEM`, `-EFAULT` |
 | 61 | `clock_gettime` | `int clock, struct timespec *ts` | 0; `-EINVAL`, `-EFAULT` |
 | 62 | `sysinfo` | `struct sysinfo *info` | 0; `-EFAULT` |
+| 63 | `getuid` | | the real user id |
+| 64 | `geteuid` | | the effective user id |
+| 65 | `getgid` | | the real group id |
+| 66 | `getegid` | | the effective group id |
+| 67 | `setuid` | `uid_t uid` | 0; `-EPERM`, `-EINVAL` |
+| 68 | `setgid` | `gid_t gid` | 0; `-EPERM`, `-EINVAL` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -772,8 +778,9 @@ Linux's: `*len` is the room at `value`, and the call stores at most that
 much of the option there, and in `*len` how much it stored. The one there
 is is a local socket's (`-ENOPROTOOPT` on TCP and UDP, and for another
 level or option): `SO_PEERCRED` (17), the process at the other end, a
-`struct ucred` (`pid`, `uid`, `gid`: 12 bytes; Camelot has no users, so
-the two ids are 0). Errors: `-EFAULT` (`len` or `value` not there).
+`struct ucred` (`pid`, `uid`, `gid`: 12 bytes, the effective ids the
+process had when the connection was made, "Users and permissions").
+Errors: `-EFAULT` (`len` or `value` not there).
 
 ## Local sockets
 
@@ -1463,7 +1470,31 @@ Linux's values for the same conditions.
 
 `strerror` in `kernel/user/lib/strerror.c` has a short message for each.
 
-## File descriptors
+## Users and permissions
+
+The kernel knows users and groups by number only, as Unix's does: names,
+passwords and logging in are the user programs' business (`/etc/passwd`,
+`login`; docs/excalibur-spec.md, "Users"). A process runs as a user id
+(uid) and a group id (gid), each of them twice:
+
+- the **real** ids, who started it: `getuid`, `getgid`;
+- the **effective** ids, which the permission checks use: `geteuid`,
+  `getegid`.
+
+They are the same but in a set-user-ID or set-group-ID program (below),
+which runs with its file's owner or group as its effective id. 0 is
+**root**, the superuser. The first process (init, or the shell without
+one) and the kernel's processes are root, uid and gid 0; `spawn` gives a
+child its parent's four ids, and `exec` keeps them. There are no
+supplementary groups and no saved ids.
+
+**setuid(uid)** and **setgid(gid)** change them, Linux's calls without
+the saved ids: root (an effective uid of 0) sets the real and the effective
+id both, for good, which is how `login` becomes the user who logged in; any
+other process may only set its effective id to its real one, giving up
+what a set-user-ID program gave it (`-EPERM` for any other id). `-1` is no
+id (`-EINVAL`). setgid needs an effective uid of 0 too, not a gid.
+
 
 A descriptor is a small number, 0 to 15, that stands for an open file: a
 file or directory of the filesystem, a device (the console), one end of a
