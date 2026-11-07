@@ -86,6 +86,8 @@
 #define SYS_getegid 66       /* getegid(): the effective group id */
 #define SYS_setuid 67        /* setuid(uid): 0; root sets both user ids, others the effective one to the real one */
 #define SYS_setgid 68        /* setgid(gid): 0; likewise for the group ids */
+#define SYS_chmod 69         /* chmod(path, mode): 0; the owner or root */
+#define SYS_chown 70         /* chown(path, uid, gid): 0; root only */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process; ftruncate, fcntl: a seal */
@@ -196,6 +198,9 @@ struct stat {
     off_t size;
     u16 major;
     u16 minor;
+    u32 mode; /* the permission bits, S_IRWXU... */
+    u32 uid;  /* the owner */
+    u32 gid;
 };
 
 #define T_PIPE 4
@@ -314,6 +319,7 @@ struct ping_reply {
 #define SHUT_WR 1     /* no more sending */
 #define SHUT_RDWR 2   /* neither */
 #define SOL_SOCKET 1  /* setsockopt: the socket's own options */
+#define IPPORT_RESERVED 1024 /* bind: the ports below it are root's */
 #define SO_PEERCRED 17 /* getsockopt: the peer's process, a struct ucred (local sockets) */
 #define SO_RCVTIMEO 20 /* how long recv and accept wait: a struct timeval */
 

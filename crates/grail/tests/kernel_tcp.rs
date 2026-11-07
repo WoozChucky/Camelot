@@ -1002,7 +1002,7 @@ fn a_listener_handles_the_handshake_resets_syns_and_a_full_backlog() {
             "10.0.9.1:40001 > 10.0.9.2:7000: echoed 5, hash {:08x}\n\
          nettest: connection reset\n",
             fnv1a(b"hello")
-        )) && out.ends_with("] nettest: exit 1\n$ "),
+        )) && out.ends_with("] nettest: exit 1\n# "),
         "{out}"
     );
     // The connection is gone: a segment for it gets a reset, and so does a SYN now
@@ -1103,7 +1103,7 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
     let out = finish(&mut vm, &mut host, prompts);
     assert!(
         out.ends_with(&format!(
-            "10.0.9.2:49152 > 10.0.9.1:80: sent 100, received 3, hash {:08x}\n$ ",
+            "10.0.9.2:49152 > 10.0.9.1:80: sent 100, received 3, hash {:08x}\n# ",
             fnv1a(b"bye")
         )),
         "{out}"
@@ -1134,7 +1134,7 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
     let out = finish(&mut vm, &mut host, prompts);
     assert!(
         out.ends_with(&format!(
-            "10.0.9.2:49153 > 10.0.9.1:80: sent 100, received 0, hash {empty:08x}\n$ "
+            "10.0.9.2:49153 > 10.0.9.1:80: sent 100, received 0, hash {empty:08x}\n# "
         )),
         "{out}"
     );
@@ -1147,7 +1147,7 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
     assert!(
         out.ends_with(&format!(
             "10.0.9.2:49154 > 10.0.9.1:80: sent 0, received 0, hash {empty:08x}\n\
-         nettest: connection refused\nnettest: exit 1\n$ "
+         nettest: connection refused\nnettest: exit 1\n# "
         )),
         "{out}"
     );
@@ -1162,7 +1162,7 @@ fn connections_close_from_either_side_or_both_and_can_be_refused_or_reset() {
     assert!(
         out.ends_with(&format!(
             "10.0.9.2:49155 > 10.0.9.1:80: sent 100, received 0, hash {empty:08x}\n\
-         nettest: connection reset\nnettest: exit 1\n$ "
+         nettest: connection reset\nnettest: exit 1\n# "
         )),
         "{out}"
     );
@@ -1203,7 +1203,7 @@ fn unanswered_segments_are_sent_again_then_given_up() {
     assert!(
         vm.out().ends_with(
             "10.0.9.2:49152 > 10.0.9.1:81: sent 0, received 0, hash 811c9dc5\n\
-         nettest: timed out\nnettest: exit 1\n$ "
+         nettest: timed out\nnettest: exit 1\n# "
         ),
         "{}",
         vm.out()
@@ -1249,7 +1249,7 @@ fn unanswered_segments_are_sent_again_then_given_up() {
     assert!(
         vm.out().ends_with(
             "10.0.9.2:49153 > 10.0.9.1:80: sent 100, received 0, hash 811c9dc5\n\
-         nettest: timed out\nnettest: exit 1\n$ "
+         nettest: timed out\nnettest: exit 1\n# "
         ),
         "{}",
         vm.out()
@@ -1316,7 +1316,7 @@ fn a_zero_window_is_probed_until_it_opens() {
     send(&mut vm, &mut host, &h(5001, FIN | ACK), 1);
     let out = finish(&mut vm, &mut host, prompts);
     assert!(
-        out.ends_with("10.0.9.2:49152 > 10.0.9.1:80: sent 3000, received 0, hash 811c9dc5\n$ "),
+        out.ends_with("10.0.9.2:49152 > 10.0.9.1:80: sent 3000, received 0, hash 811c9dc5\n# "),
         "{out}"
     );
     let ifconfig = command(&mut [&mut vm], 0, Some(&mut host), "ifconfig");
@@ -1357,7 +1357,7 @@ fn a_socket_closed_into_a_window_that_stays_shut_is_given_up() {
     });
     assert!(
         vm.out().ends_with(&format!(
-            "10.0.9.1:40001 > 10.0.9.2:7000: echoed 5, hash {:08x}\n$ ",
+            "10.0.9.1:40001 > 10.0.9.2:7000: echoed 5, hash {:08x}\n# ",
             fnv1a(b"hello")
         )),
         "{}",
@@ -1473,7 +1473,7 @@ fn sequence_numbers_wrap_around_both_ways() {
     let out = finish(&mut vm, &mut host, prompts);
     assert!(
         out.ends_with(&format!(
-            "10.0.9.1:40001 > 10.0.9.2:7000: echoed 8192, hash {:08x}\n$ ",
+            "10.0.9.1:40001 > 10.0.9.2:7000: echoed 8192, hash {:08x}\n# ",
             fnv1a(&data)
         )),
         "{out}"
@@ -1674,7 +1674,7 @@ fn silly_windows_are_avoided_both_ways() {
     host.send(frame(&seg(80, 49152, 5001, 0, RST, b"")));
     let out = finish(&mut vm, &mut host, prompts);
     assert!(
-        out.ends_with("nettest: connection reset\nnettest: exit 1\n$ "),
+        out.ends_with("nettest: connection reset\nnettest: exit 1\n# "),
         "{out}"
     );
 
@@ -1715,7 +1715,7 @@ fn silly_windows_are_avoided_both_ways() {
     let out = finish(&mut vm, &mut host, prompts);
     assert!(
         out.ends_with(&format!(
-            "10.0.9.2:49153 > 10.0.9.1:80: sent 0, received 4096, hash {:08x}\n$ ",
+            "10.0.9.2:49153 > 10.0.9.1:80: sent 0, received 4096, hash {:08x}\n# ",
             fnv1a(&data)
         )),
         "{out}"

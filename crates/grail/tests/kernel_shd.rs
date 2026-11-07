@@ -21,7 +21,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 /// What each session's shell prints first.
-const GREETING: &str = "Type help for the list of commands.\n$ ";
+const GREETING: &str = "Type help for the list of commands.\n# ";
 
 /// A machine on the user-mode gateway (DHCP gives it 10.0.2.15) with a host port
 /// forwarded to its port 23, booted to its prompt; and that host port.
@@ -336,7 +336,7 @@ fn sessions_run_side_by_side_and_end_with_their_connections() {
     run(&mut vm, &mut clients, |_, c| {
         c[1].text()[before..].matches(PROMPT).count() == 2
     });
-    assert_eq!(&clients[1].text()[before..], "first\n$ second\n$ ");
+    assert_eq!(&clients[1].text()[before..], "first\n# second\n# ");
     // A program reads the same connection: what follows its line is its input, none of
     // it taken by the shell. It is killed from the console.
     let before = clients[1].got.len();
@@ -350,7 +350,7 @@ fn sessions_run_side_by_side_and_end_with_their_connections() {
     run(&mut vm, &mut [&mut a, &mut b], |_, c| {
         c[1].got.ends_with(PROMPT.as_bytes())
     });
-    assert_eq!(&b.text()[before..], "for cat\ncat: exit -1\n$ ");
+    assert_eq!(&b.text()[before..], "for cat\ncat: exit -1\n# ");
 
     // The console is unaffected throughout.
     assert_eq!(console(&mut vm, "echo console"), "console\n");
@@ -384,7 +384,7 @@ fn sessions_run_side_by_side_and_end_with_their_connections() {
     job_pid(&job);
     d.send(b"exit 3\n");
     run(&mut vm, &mut [&mut d], |_, d| d[0].closed);
-    assert_eq!(d.text(), format!("{GREETING}{job}$ "));
+    assert_eq!(d.text(), format!("{GREETING}{job}# "));
     wait_console(&mut vm, &mut [], " ended, exit 3\n", 1);
 
     assert_eq!(

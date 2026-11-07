@@ -579,6 +579,6 @@ fn nc_talks_to_host_programs_both_ways() {
     assert_eq!(lines[0], "echo from guest | nc -lv 7000", "{out}");
     assert_eq!(lines[1], "listening on port 7000", "{out}");
     assert!(lines[2].starts_with("connection from 10.0.2.2:"), "{out}");
-    assert_eq!(lines[3..], ["from host", "$ "], "{out}");
+    assert_eq!(lines[3..], ["from host", "# "], "{out}");
     leave(&mut vm);
 }

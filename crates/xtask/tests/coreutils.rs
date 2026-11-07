@@ -21,7 +21,7 @@ use xtask::kernel::BOOT_MAX_STEPS;
 use xtask::repo_root;
 use xtask::userprogs::CCompiler;
 
-const PROMPT: &str = "$ ";
+const PROMPT: &str = "# ";
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
 /// RAM for the machine: less than the default, so it boots faster.
 const RAM: usize = 16 << 20;

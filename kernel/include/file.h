@@ -82,6 +82,11 @@ struct file {
     /* FD_DEVICE: the driver's own, for this open file (Linux's
      * private_data): an input device's reader, say. Set by its open. */
     void *priv;
+    /* The effective ids of the process that made it (filealloc), which
+     * fstat gives as the owner of what has no inode: a pipe, a socket, a
+     * memfd, the first process's console. */
+    u32 uid;
+    u32 gid;
 };
 
 /* A device's driver, Linux's file_operations for the files of its major,

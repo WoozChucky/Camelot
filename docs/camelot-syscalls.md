@@ -85,7 +85,7 @@ headers and checks each size.
 
 | Structure | Bytes | What |
 |-----------|-------|------|
-| `struct stat` | 24 | `fstat`'s: `size` is an `off_t` |
+| `struct stat` | 32 | `fstat`'s: `size` is an `off_t`, then the mode, the uid and the gid, `unsigned int`s |
 | `struct dirent` | 16 | a directory's entries, as `read` gives them |
 | `struct procinfo` | 40 | `procs`': `size` is a `size_t` |
 | `struct hartinfo` | 20 | `harts`' |
@@ -125,14 +125,14 @@ headers and checks each size.
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
 | 9 | `sbrk` | `long increment` | the old end of the heap, a pointer; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
-| 11 | `open` | `const char *path, int flags` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EISDIR`, `-ENODEV`, `-ENXIO`, `-EIO`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
+| 11 | `open` | `const char *path, int flags, ...` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EISDIR`, `-ENODEV`, `-ENXIO`, `-EIO`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
 | 12 | `close` | `int fd` | 0; `-EBADF` |
 | 13 | `lseek` | `int fd, off_t offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
 | 14 | `fstat` | `int fd, struct stat *st` | 0; `-EBADF`, `-EFAULT` |
-| 15 | `mkdir` | `const char *path` | 0; `-EEXIST`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOSPC`, `-EROFS`, `-EFAULT` |
-| 16 | `unlink` | `const char *path` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EINVAL`, `-ENOTEMPTY`, `-EROFS`, `-EFAULT` |
-| 17 | `link` | `const char *old, const char *new` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EPERM`, `-EEXIST`, `-ENOSPC`, `-EROFS`, `-EFAULT` |
-| 18 | `chdir` | `const char *path` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EFAULT` |
+| 15 | `mkdir` | `const char *path, mode_t mode` | 0; `-EEXIST`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-ENOSPC`, `-EROFS`, `-EFAULT` |
+| 16 | `unlink` | `const char *path` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EPERM`, `-EINVAL`, `-ENOTEMPTY`, `-EROFS`, `-EFAULT` |
+| 17 | `link` | `const char *old, const char *new` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EPERM`, `-EEXIST`, `-ENOSPC`, `-EROFS`, `-EFAULT` |
+| 18 | `chdir` | `const char *path` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EFAULT` |
 | 19 | `dup` | `int fd` | the new descriptor; `-EBADF`, `-EMFILE` |
 | 20 | `pipe` | `int *fds` | 0; `-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT` |
 | 21 | `exec` | `const char *path, char *const argv[], char *const envp[]` | does not return; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-ENOMEM`, `-EFAULT` |
@@ -142,10 +142,10 @@ headers and checks each size.
 | 25 | `netconf` | `uint addr, uint mask, uint gateway` | 0; `-ENODEV`, `-EINVAL` |
 | 26 | `ping` | `uint addr, uint seq, struct ping_reply *reply` | 0; `-ETIMEDOUT`, `-EHOSTUNREACH`, `-ENETUNREACH`, `-ENOBUFS`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
 | 27 | `socket` | `int domain, int type, int protocol` | a new descriptor; `-EAFNOSUPPORT`, `-EPROTONOSUPPORT`, `-ESOCKTNOSUPPORT`, `-EINVAL`, `-ENODEV`, `-EMFILE`, `-ENFILE`, `-ENOBUFS`, `-ENOMEM` |
-| 28 | `bind` | `int fd, const void *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EADDRNOTAVAIL`, `-EADDRINUSE`, `-EINVAL`, `-ENOBUFS`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOSPC`, `-EROFS` |
+| 28 | `bind` | `int fd, const void *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EACCES`, `-EADDRNOTAVAIL`, `-EADDRINUSE`, `-EINVAL`, `-ENOBUFS`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOSPC`, `-EROFS` |
 | 29 | `listen` | `int fd, int backlog` | 0; `-EBADF`, `-ENOTSOCK`, `-EOPNOTSUPP`, `-EINVAL` |
 | 30 | `accept` | `int fd, void *addr` | a new descriptor; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EOPNOTSUPP`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EAGAIN`, `-EINTR` |
-| 31 | `connect` | `int fd, const void *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EINVAL`, `-EISCONN`, `-ENETUNREACH`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`, `-ENOBUFS`, `-EADDRINUSE`, `-EINTR`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-ENOMEM` |
+| 31 | `connect` | `int fd, const void *addr` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EAFNOSUPPORT`, `-EINVAL`, `-EISCONN`, `-ENETUNREACH`, `-ECONNREFUSED`, `-ECONNRESET`, `-ETIMEDOUT`, `-ENOBUFS`, `-EADDRINUSE`, `-EINTR`, `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-ENOMEM` |
 | 32 | `send` | `int fd, const void *buf, size_t len` | bytes sent; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-EPIPE`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EDESTADDRREQ`, `-EMSGSIZE`, `-ENETUNREACH`, `-ENOBUFS`, `-EINTR` |
 | 33 | `recv` | `int fd, void *buf, size_t len` | bytes received, 0 at the end; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOTCONN`, `-ECONNRESET`, `-ETIMEDOUT`, `-EINVAL`, `-EAGAIN`, `-EINTR` |
 | 34 | `sendto` | `int fd, const void *buf, size_t len, const void *to` | bytes sent; `send`'s errors, `-EFAULT` also for `to`, `-EAFNOSUPPORT`, `-EINVAL`, `-EADDRINUSE`, `-EISCONN`, `-EOPNOTSUPP` |
@@ -172,7 +172,7 @@ headers and checks each size.
 | 55 | `socketpair` | `int domain, int type, int protocol, int *fds` | 0; `-EAFNOSUPPORT`, `-EOPNOTSUPP`, `-EPROTONOSUPPORT`, `-ESOCKTNOSUPPORT`, `-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT` |
 | 56 | `sendmsg` | `int fd, const struct msghdr *msg, int flags` | bytes sent; `send`'s and `sendto`'s errors, `-EMSGSIZE`, `-EINVAL`, `-EBADF` (a descriptor passed), `-EOPNOTSUPP`, `-EAGAIN`, `-ENOBUFS`, `-EFAULT` |
 | 57 | `recvmsg` | `int fd, struct msghdr *msg, int flags` | bytes received, 0 at the end; `recv`'s errors, `-EMSGSIZE`, `-EOPNOTSUPP`, `-ENOBUFS`, `-EFAULT` |
-| 58 | `stat` | `const char *path, struct stat *st` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EFAULT` |
+| 58 | `stat` | `const char *path, struct stat *st` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EFAULT` |
 | 59 | `getsockopt` | `int fd, int level, int option, void *value, uint *len` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOPROTOOPT` |
 | 60 | `getcwd` | `char *buf, size_t size` | the path's length, its NUL counted; `-ERANGE`, `-ENOENT`, `-ENAMETOOLONG`, `-ENOMEM`, `-EFAULT` |
 | 61 | `clock_gettime` | `int clock, struct timespec *ts` | 0; `-EINVAL`, `-EFAULT` |
@@ -183,6 +183,8 @@ headers and checks each size.
 | 66 | `getegid` | | the effective group id |
 | 67 | `setuid` | `uid_t uid` | 0; `-EPERM`, `-EINVAL` |
 | 68 | `setgid` | `gid_t gid` | 0; `-EPERM`, `-EINVAL` |
+| 69 | `chmod` | `const char *path, mode_t mode` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EPERM`, `-EROFS`, `-EFAULT` |
+| 70 | `chown` | `const char *path, uid_t uid, gid_t gid` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EPERM`, `-EROFS`, `-EFAULT` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -355,10 +357,13 @@ processes, as `procs(NULL, 0)` counts them. The load averages, `sharedram`,
 `bufferram`, the swap and the high memory are 0. `-EFAULT` if `info` is
 not 112 writable bytes.
 
-**open(path, flags)** opens the file at `path` and returns a new descriptor
+**open(path, flags, mode)** opens the file at `path` and returns a new descriptor
 for it, the lowest one free. `flags` is one access mode, `O_RDONLY` (0),
 `O_WRONLY` (1) or `O_RDWR` (2), plus any of `O_CREAT` (0x40: make the file,
-empty, if `path` names nothing; open it as it is if it exists),
+empty, if `path` names nothing, with the permission bits `mode`, the caller's
+effective uid and gid its owner; open it as it is if it exists; `mode`, the
+third argument (`...` in user.h, as POSIX declares `open`), is read only
+with `O_CREAT`, and there is no umask),
 `O_TRUNC` (0x200: empty a file opened for writing; ignored for reading and
 for devices) and `O_CLOEXEC` (0x80000: the new descriptor closes on
 `exec`, its `FD_CLOEXEC` set; see `fcntl`); anything else is `-EINVAL`. The offset starts at 0. What it
@@ -389,7 +394,13 @@ A file bigger than the kernel reads or writes, 2^32 - 1 blocks (ext4's
 format's largest file is one block more (docs/camelot-fs.md, "Inodes"), and
 no filesystem holds anything near it.
 
-Errors: the path's (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`), those above,
+The access mode asked for must be one the file allows the caller
+("Users and permissions": reading, writing, or both), and making a file
+needs writing and searching its directory: `-EACCES` otherwise. A file
+`open` makes is opened as asked whatever `mode` says, as on Linux
+(`open("f", O_CREAT | O_WRONLY, 0444)` writes the read-only file it made).
+
+Errors: the path's (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`), those above,
 `-ENOSPC` (no free inode or block to make the file with), `-EMFILE` (all 64
 of the caller's descriptors are taken), `-ENFILE` (all 256 of the kernel's
 open files are), `-EFAULT`. Without a free descriptor and open file nothing
@@ -415,12 +426,16 @@ file is too: the whole `off_t` counts, so on RV64 2^32 + 100 is past the
 end of a small file, not 100.
 
 **fstat(fd, st)** stores what the open file behind `fd` is in the `struct
-stat` at `st` (24 bytes, `user.h`): `ino` (its inode, 0 for a pipe and for
+stat` at `st` (32 bytes, `user.h`): `ino` (its inode, 0 for a pipe and for
 the console the kernel gave the shell), `type` (`T_DIR` 1, `T_FILE` 2,
 `T_DEVICE` 3, `T_PIPE` 4), `nlink` (the names it has; 0 for a file whose
 last name was removed while it is open), `size` (bytes; for a pipe, the
 bytes waiting in it; 0 for a device), `major` and `minor` (a device's
-numbers, 1 and 0 for the console). A socket is `T_SOCKET` (5), with the
+numbers, 1 and 0 for the console), and `mode`, `uid` and `gid`, its
+permission bits and owner ("Users and permissions"). What has no inode, a
+pipe, a socket, a memory object or the console the kernel gave the first
+process, is its maker's: `mode` 0600, `uid` and `gid` the effective ids
+of the process that made it. A socket is `T_SOCKET` (5), with the
 bytes waiting to be received as its size (for UDP, the datagrams' bytes),
 and an `nlink` of 1, or 0 once nothing more will arrive: the other end
 ended its side (its FIN came), the connection was reset or timed out, or
@@ -436,13 +451,16 @@ its sending down, or the socket was shut down for reading.
 **stat(path, st)** stores in `st` what `fstat` would of the file at `path`
 opened, without opening it, as Linux's `stat` (its `newfstatat`): so it
 looks at what `open` refuses as well, a local socket's name (`T_SOCKET`,
-size 0) or a device node without a driver. Errors: the path's (`-ENOENT`,
-`-ENOTDIR`, `-ENAMETOOLONG`), `-EFAULT`.
+size 0) or a device node without a driver. It needs searching the
+directories on the way, nothing of the file itself. Errors: the path's
+(`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`), `-EFAULT`.
 
-**mkdir(path)** makes the directory `path`, with its `.` and `..`. Errors:
+**mkdir(path, mode)** makes the directory `path`, with its `.` and `..`,
+the permission bits `mode` and the caller's effective ids its owner. Its
+parent must be writable and searchable by the caller. Errors:
 `-EEXIST` (the name is taken, `/` included), the path's, `-ENOENT` also for
 a directory to make it in that has been removed (a working directory, say),
-`-ENOSPC`, `-EROFS`, `-EFAULT`.
+`-EACCES`, `-ENOSPC`, `-EROFS`, `-EFAULT`.
 
 **unlink(path)** removes the name `path`. A file loses a link; once it has
 none, it is freed as soon as no descriptor has it open (until then it can
@@ -451,6 +469,9 @@ still be read and written through them). A directory must be empty (but for
 directory is removed even so: nothing can be made in it any more, and
 nothing but `.` is found in it (looking up its `..` is `-ENOENT`: the parent
 may be gone too, its inode freed or reused).
+The directory must be writable and searchable by the caller (`-EACCES`),
+and in a sticky one (`/tmp`) only the entry's owner, the directory's or
+root may remove it (`-EPERM`).
 `-EINVAL` for `.`, `..` and `/`; the path's errors; `-EROFS`; `-EFAULT`.
 
 **link(old, new)** gives the file `old` another name, `new`: a hard link,
@@ -458,12 +479,14 @@ the same file under both, with one more link. Errors: the paths'
 (`-ENOENT` also for a removed directory to put `new` in, and for a file
 whose last name another process removed meanwhile, which cannot be linked
 back, as on Linux), `-EPERM` if `old`
-is a directory (a directory has one name, in its parent), `-EEXIST` if
+is a directory (a directory has one name, in its parent), `-EACCES` if
+`new`'s directory isn't writable and searchable by the caller, `-EEXIST` if
 `new` is taken (`/` included), `-ENOSPC`, `-EROFS`, `-EFAULT`.
 
 **chdir(path)** makes the directory `path` the caller's working directory,
 where every path that doesn't start with `/` is looked up from. `-ENOTDIR`
-if it is not a directory; the path's errors; `-EFAULT`.
+if it is not a directory, `-EACCES` if the caller may not search it; the
+path's errors; `-EFAULT`.
 
 **getcwd(buf, size)** is Linux's `getcwd` system call: it writes the
 caller's working directory's path, from the root (`/` for the root itself,
@@ -1494,6 +1517,62 @@ id both, for good, which is how `login` becomes the user who logged in; any
 other process may only set its effective id to its real one, giving up
 what a set-user-ID program gave it (`-EPERM` for any other id). `-1` is no
 id (`-EINVAL`). setgid needs an effective uid of 0 too, not a gid.
+
+**Files.** Every file, directory, device node and socket name has an owner,
+a uid and a gid, and permission bits (docs/camelot-fs.md, "Inodes"),
+Unix's: read (4), write (2) and execute (1) for the owner (`S_IRWXU`,
+0700), the group (`S_IRWXG`, 070) and everyone else (`S_IRWXO`, 07). The
+kernel checks a process's effective ids against them, as Linux's
+`generic_permission` does: the owner's bits if the effective uid owns the
+file, else the group's if the effective gid is the file's, else the
+others'; every bit the call needs must be set there, or the call fails
+with `-EACCES`. What needs what:
+
+| Bit | On a file | On a directory |
+|---|---|---|
+| read | `open` for reading | `open` (to list it) |
+| write | `open` for writing (and `O_TRUNC`) | making or removing an entry in it: `open` with `O_CREAT`, `mkdir`, `unlink`, `link`'s new name, `bind`'s socket name (with execute too) |
+| execute | `spawn`, `exec` | searching it: every directory a path goes through, `chdir` |
+
+A local socket's name needs write for `connect` ("Local sockets").
+**Root** (an effective uid of 0) skips every check but one: it may read
+and write anything and search any directory, but run only a file with at
+least one of its three execute bits set (Linux's `CAP_DAC_OVERRIDE`).
+
+Above the nine bits are three more. **Set-user-ID** (`S_ISUID`, 04000) on
+a program makes `spawn` and `exec` give it its file's owner as its
+effective uid, whoever starts it (the real uid stays the caller's), and
+**set-group-ID** (`S_ISGID`, 02000) its file's group as its effective gid:
+so `su` and `passwd`, root's with mode 4755, run as root for anyone and
+check themselves what the caller may do. **Sticky** (`S_ISVTX`, 01000) on a
+directory lets only an entry's owner, the directory's or root remove it
+(`-EPERM`), however writable the directory is: `/tmp`, 1777, where everyone
+makes files and nobody removes anyone else's.
+
+`open` and `mkdir` give a new file the caller's effective uid and gid as
+its owner and the bits they are given (`S_IALLUGO`'s, 07777); there is no
+umask. What has no inode is its maker's alone (`fstat`: mode 0600).
+
+**chmod(path, mode)** sets `path`'s permission bits to `mode`'s (07777 of
+them): its owner (by effective uid) or root only, `-EPERM` for anyone
+else. A caller not in the file's group and not root can't set its
+set-group-ID bit, which is dropped (Linux's rule). **chown(path, uid,
+gid)** gives `path` the owner `uid` and the group `gid`, either `-1` to
+keep it: root only (`-EPERM`), as on Linux, where giving a file away could
+dodge a quota. A file (not a directory) loses its set-user-ID and
+set-group-ID bits, so that a program given away doesn't run as its new
+owner. Both fail as a path does (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`,
+`-EACCES`), with `-EROFS` on a read-only filesystem and `-EFAULT`.
+
+**Processes.** `kill` reaches another process only if the caller's real or
+effective uid is the target's real one, or the caller is root (`-EPERM`).
+**Ports.** `bind` to a TCP or UDP port below 1024 (`IPPORT_RESERVED`)
+needs root (`-EACCES`), as Unix's privileged ports do: `shd`'s 23 and
+`httpd`'s 80 are services init starts as root.
+
+What the kernel leaves out of Unix's: supplementary groups, saved ids, a
+umask, access control lists, and clearing a program's set-ID bits when
+someone other than root writes to it.
 
 
 A descriptor is a small number, 0 to 15, that stands for an open file: a

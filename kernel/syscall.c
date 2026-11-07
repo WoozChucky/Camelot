@@ -442,6 +442,12 @@ void syscall(struct trap_frame *f) {
     case SYS_setgid:
         ret = proc_setgid((u32)arg(f, 0));
         break;
+    case SYS_chmod:
+        ret = sys_chmod(f);
+        break;
+    case SYS_chown:
+        ret = sys_chown(f);
+        break;
     case SYS_socketpair:
         ret = unix_sys_socketpair((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3));
         break;

@@ -111,10 +111,10 @@ static int status_of(int pid) {
 
 static void test_open_errors(void) {
     check_eq(open("nofile", O_RDONLY), -ENOENT, "open a missing file");
-    check_eq(open("/ft/nodir/x", O_WRONLY | O_CREAT), -ENOENT, "create in a missing directory");
+    check_eq(open("/ft/nodir/x", O_WRONLY | O_CREAT, 0644), -ENOENT, "create in a missing directory");
     check_eq(open("", O_RDONLY), -ENOENT, "open the empty path");
     check_eq(open("abcdefghijklmno", O_RDONLY), -ENAMETOOLONG, "a name of 15 bytes");
-    check_eq(open("abcdefghijklmno", O_WRONLY | O_CREAT), -ENAMETOOLONG, "create a name of 15 bytes");
+    check_eq(open("abcdefghijklmno", O_WRONLY | O_CREAT, 0644), -ENAMETOOLONG, "create a name of 15 bytes");
     char path[MAXPATH + 2];
     memset(path, 'a', sizeof path - 1);
     path[sizeof path - 1] = 0;
@@ -125,18 +125,18 @@ static void test_open_errors(void) {
     path[MAXPATH] = 0;
     check_eq(open(path, O_RDONLY), -ENOENT, "a path of MAXPATH bytes is looked up");
     check_eq(open("/ft", O_WRONLY), -EISDIR, "a directory for writing");
-    check_eq(open("/ft", O_RDWR | O_CREAT), -EISDIR, "a directory for reading and writing");
+    check_eq(open("/ft", O_RDWR | O_CREAT, 0644), -EISDIR, "a directory for reading and writing");
     check_eq(open(".", O_RDWR | O_TRUNC), -EISDIR, "a directory to empty");
-    check_eq(open("newf/", O_WRONLY | O_CREAT), -EISDIR, "create a name ending in /: a directory's");
+    check_eq(open("newf/", O_WRONLY | O_CREAT, 0644), -EISDIR, "create a name ending in /: a directory's");
     check_eq(unlink("newf"), -ENOENT, "which makes nothing");
 }
 
 static void test_read_write_seek(void) {
     struct stat st;
-    int fd = open("a", O_RDWR | O_CREAT);
+    int fd = open("a", O_RDWR | O_CREAT, 0644);
     check_eq(fd, 3, "create a file: the lowest free descriptor");
     check_eq(open("a/x", O_RDONLY), -ENOTDIR, "a path through a file");
-    check_eq(mkdir("a/x"), -ENOTDIR, "mkdir through a file");
+    check_eq(mkdir("a/x", 0755), -ENOTDIR, "mkdir through a file");
     /* More than a transaction takes: several of them. */
     check_eq(write_pattern(fd, 5000, 1), 5000, "write 5000 bytes");
     check_eq(fstat(fd, &st), 0, "fstat on a file");
@@ -155,7 +155,7 @@ static void test_read_write_seek(void) {
      * past the largest file too (2^32 blocks of 1 KiB, 2^42 bytes), and
      * fails the same way, never as the offset's low 32 bits would: 2^32 +
      * 100 is not 100. */
-    check(sizeof(off_t) == 8 && sizeof(st.size) == 8 && sizeof(struct stat) == 24, "a 64-bit off_t");
+    check(sizeof(off_t) == 8 && sizeof(st.size) == 8 && sizeof(struct stat) == 32, "a 64-bit off_t");
     check_eq(lseek(fd, 0x100000000l + 100, SEEK_SET), -EINVAL, "2^32 + 100 is past the end, not 100");
     check_eq(lseek(fd, 0x40000000000l + 1, SEEK_SET), -EINVAL, "past the largest file");
     check_eq(lseek(fd, LONG_MAX, SEEK_SET), -EINVAL, "LONG_MAX");
@@ -188,7 +188,7 @@ static void test_read_write_seek(void) {
     close(fd);
     /* O_CREAT on a file that exists opens it; O_TRUNC empties it, if it is
      * opened for writing. */
-    fd = open("a", O_WRONLY | O_CREAT);
+    fd = open("a", O_WRONLY | O_CREAT, 0644);
     check(fd >= 0 && size_of("a") == 5000, "O_CREAT opens a file that exists, as it is");
     close(fd);
     fd = open("a", O_RDONLY | O_TRUNC);
@@ -223,7 +223,7 @@ static void test_read_write_seek(void) {
     }
     check_eq(n, NOFILE - 3, "files until the table is full");
     check_eq(open("a", O_RDONLY), -EMFILE, "open with every descriptor taken");
-    check_eq(open("new", O_WRONLY | O_CREAT), -EMFILE, "nor creating one");
+    check_eq(open("new", O_WRONLY | O_CREAT, 0644), -EMFILE, "nor creating one");
     for (int i = 3; i < NOFILE; i++) {
         close(i);
     }
@@ -261,12 +261,12 @@ static int dir_has(const char *path, const char *name, uint inum) {
 
 static void test_directories(void) {
     struct stat st;
-    check_eq(mkdir("d"), 0, "mkdir");
-    check_eq(mkdir("d"), -EEXIST, "mkdir of a name taken");
-    check_eq(mkdir("a"), -EEXIST, "mkdir of a file's name");
-    check_eq(mkdir("/"), -EEXIST, "mkdir /");
-    check_eq(mkdir("/ft/nodir/d"), -ENOENT, "mkdir in a missing directory");
-    check_eq(mkdir("abcdefghijklmnop"), -ENAMETOOLONG, "mkdir of a name too long");
+    check_eq(mkdir("d", 0755), 0, "mkdir");
+    check_eq(mkdir("d", 0755), -EEXIST, "mkdir of a name taken");
+    check_eq(mkdir("a", 0755), -EEXIST, "mkdir of a file's name");
+    check_eq(mkdir("/", 0755), -EEXIST, "mkdir /");
+    check_eq(mkdir("/ft/nodir/d", 0755), -ENOENT, "mkdir in a missing directory");
+    check_eq(mkdir("abcdefghijklmnop", 0755), -ENAMETOOLONG, "mkdir of a name too long");
     check_eq(stat("d", &st), 0, "stat a directory");
     check(st.type == T_DIR && st.nlink == 1 && st.size == 32, "an empty directory: . and ..");
     check_eq(links_of("."), 2, "its parent gains a link, for its ..");
@@ -338,8 +338,8 @@ static void test_getcwd(void) {
     check_eq(getcwd(cwd, 1), -ERANGE, "not in 1");
     check_eq(getcwd(cwd, 0), -ERANGE, "nor in none");
     check_eq(chdir("ft"), 0, "chdir ft");
-    check_eq(mkdir("n"), 0, "mkdir n");
-    check_eq(mkdir("n/abcdefghijklmn"), 0, "mkdir a name of DIRSIZ bytes");
+    check_eq(mkdir("n", 0755), 0, "mkdir n");
+    check_eq(mkdir("n/abcdefghijklmn", 0755), 0, "mkdir a name of DIRSIZ bytes");
     check_eq(chdir("n/abcdefghijklmn"), 0, "chdir into it");
     check_cwd("/ft/n/abcdefghijklmn", "getcwd two levels down, a full name");
     check_eq(chdir(".."), 0, "chdir ..");
@@ -355,7 +355,7 @@ static void test_getcwd(void) {
                                "/abcdefghijklmn/abcdefghijklmn/abcdefghijklmn/abcdefghijklmn/abcdefghijklmn";
     for (int i = 0; i < 9; i++) {
         if (i > 0) {
-            check_eq(mkdir("abcdefghijklmn"), 0, "mkdir a level deeper");
+            check_eq(mkdir("abcdefghijklmn", 0755), 0, "mkdir a level deeper");
         }
         check_eq(chdir("abcdefghijklmn"), 0, "chdir a level deeper");
     }
@@ -378,7 +378,7 @@ static void test_working_directory(void) {
     struct stat st;
     test_getcwd();
     check_eq(chdir("d"), 0, "chdir");
-    int fd = open("c", O_WRONLY | O_CREAT);
+    int fd = open("c", O_WRONLY | O_CREAT, 0644);
     check(fd >= 0, "create a file there");
     close(fd);
     check_eq(stat("/ft/d/c", &st), 0, "it is in that directory");
@@ -395,14 +395,14 @@ static void test_working_directory(void) {
     check_eq(links_of("."), 1, "and the parent's link for its ..");
 
     /* A working directory removed while in use: nothing more goes in. */
-    check_eq(mkdir("gone"), 0, "mkdir gone");
+    check_eq(mkdir("gone", 0755), 0, "mkdir gone");
     check_eq(chdir("gone"), 0, "chdir gone");
     check_eq(unlink("/ft/gone"), 0, "remove it while it is the working directory");
     char cwd[MAXPATH + 1];
     check_eq(getcwd(cwd, sizeof cwd), -ENOENT, "it has no path");
     check_eq(getcwd(cwd, 1), -ENOENT, "whatever the buffer");
-    check_eq(open("x", O_WRONLY | O_CREAT), -ENOENT, "no file can be made in it");
-    check_eq(mkdir("y"), -ENOENT, "nor a directory");
+    check_eq(open("x", O_WRONLY | O_CREAT, 0644), -ENOENT, "no file can be made in it");
+    check_eq(mkdir("y", 0755), -ENOENT, "nor a directory");
     check_eq(link("/bin/sh", "z"), -ENOENT, "nor a link");
     check_eq(stat(".", &st), 0, "it can still be looked at");
     check(st.nlink == 0 && st.type == T_DIR, "with no links");
@@ -411,8 +411,8 @@ static void test_working_directory(void) {
     /* Its .. leads nowhere, even once the parent is gone too: the parent's
      * inode is freed (and may be reused), so following it would panic or
      * land in some other directory. */
-    check_eq(mkdir("pa"), 0, "mkdir pa");
-    check_eq(mkdir("pa/b"), 0, "mkdir pa/b");
+    check_eq(mkdir("pa", 0755), 0, "mkdir pa");
+    check_eq(mkdir("pa/b", 0755), 0, "mkdir pa/b");
     check_eq(chdir("pa/b"), 0, "chdir pa/b");
     check_eq(unlink("/ft/pa/b"), 0, "remove the working directory");
     check_eq(chdir(".."), -ENOENT, "its .. is not found while the parent is there");
@@ -421,7 +421,7 @@ static void test_working_directory(void) {
     check_eq(getcwd(cwd, sizeof cwd), -ENOENT, "nor after that");
     check_eq(chdir(".."), -ENOENT, "chdir .. after that");
     check_eq(open("..", O_RDONLY), -ENOENT, "open .. after that");
-    check_eq(mkdir("/ft/pc"), 0, "a new directory, maybe in the parent's old inode");
+    check_eq(mkdir("/ft/pc", 0755), 0, "a new directory, maybe in the parent's old inode");
     check_eq(chdir("../pc"), -ENOENT, "still not reached through ..");
     check_eq(stat(".", &st), 0, "the working directory is unchanged");
     check(st.nlink == 0 && st.type == T_DIR, "still the removed one");
@@ -429,13 +429,14 @@ static void test_working_directory(void) {
     check_eq(unlink("pc"), 0, "remove pc");
 }
 
-/* Copies the file at `from` to a new file at `to`. Returns 0 or an error. */
+/* Copies the file at `from` to a new file at `to`, which may be run.
+ * Returns 0 or an error. */
 static int copy_file(const char *from, const char *to) {
     int in = open(from, O_RDONLY);
     if (in < 0) {
         return in;
     }
-    int out = open(to, O_WRONLY | O_CREAT | O_TRUNC);
+    int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (out < 0) {
         close(in);
         return out;
@@ -489,7 +490,7 @@ static void test_programs(void) {
     check(run_captured("myecho", (char *[]){"myecho", "relative", NULL}, out, sizeof out, &status) > 0,
           "spawn by a relative path");
     check(strcmp(out, "relative\n") == 0, "and it runs too");
-    int fd = open("notelf", O_WRONLY | O_CREAT);
+    int fd = open("notelf", O_WRONLY | O_CREAT, 0755);
     write(fd, "#!/bin/sh\n", 10);
     close(fd);
     /* The kernel prints why: "spawn: /ft/notelf: not an ELF file". */
@@ -536,7 +537,7 @@ static int hold(char tag) {
     int opened = 0;
     int r;
     for (;;) {
-        r = open(name, O_RDWR | O_CREAT);
+        r = open(name, O_RDWR | O_CREAT, 0644);
         if (r < 0) {
             break;
         }
@@ -545,7 +546,7 @@ static int hold(char tag) {
     char c = 'X';
     if (r == -EMFILE) {
         c = 'M';
-    } else if (r == -ENFILE && open(other, O_RDWR | O_CREAT) == -ENFILE && unlink(other) == -ENOENT) {
+    } else if (r == -ENFILE && open(other, O_RDWR | O_CREAT, 0644) == -ENFILE && unlink(other) == -ENOENT) {
         c = 'N';
     }
     write(STDOUT, &c, 1);
@@ -592,7 +593,7 @@ static void test_open_file_table(void) {
     dup(out);
     close(out);
     check(c == 'N', "a child's open fails with -ENFILE, making nothing");
-    check_eq(open("full", O_WRONLY | O_CREAT), -ENFILE, "so does the parent's");
+    check_eq(open("full", O_WRONLY | O_CREAT, 0644), -ENFILE, "so does the parent's");
     check_eq(unlink("full"), -ENOENT, "which makes nothing either");
     int p[2];
     check_eq(pipe(p), -ENFILE, "and pipe");
@@ -608,14 +609,14 @@ static void test_open_file_table(void) {
     close(hold_pipe[0]);
     close(ready[0]);
     close(ready[1]);
-    int fd = open("full", O_WRONLY | O_CREAT);
+    int fd = open("full", O_WRONLY | O_CREAT, 0644);
     check(fd >= 0, "once they are closed, open works again");
     close(fd);
     check_eq(unlink("full"), 0, "remove it");
 }
 
 static void test_big_file(void) {
-    int fd = open("big", O_WRONLY | O_CREAT);
+    int fd = open("big", O_WRONLY | O_CREAT, 0644);
     check_eq(write_pattern(fd, BIG_FILE_SIZE, 2), BIG_FILE_SIZE, "write a file past 268 KiB");
     check_eq(size_of("big"), BIG_FILE_SIZE, "its size");
     close(fd);
@@ -647,14 +648,14 @@ static int ops(void) {
         printf("filetest: ops: %s failed\n", what);                                                          \
         return 1;                                                                                            \
     }
-    STEP(mkdir("/ops"), "mkdir /ops");
-    STEP(fd = open("/ops/a", O_WRONLY | O_CREAT), "create /ops/a");
+    STEP(mkdir("/ops", 0755), "mkdir /ops");
+    STEP(fd = open("/ops/a", O_WRONLY | O_CREAT, 0644), "create /ops/a");
     STEP(write_pattern(fd, 5000, 11) - 5000, "write /ops/a");
     close(fd);
     STEP(link("/ops/a", "/ops/b"), "link /ops/b");
-    STEP(mkdir("/ops/d"), "mkdir /ops/d");
+    STEP(mkdir("/ops/d", 0755), "mkdir /ops/d");
     STEP(chdir("/ops/d"), "chdir /ops/d");
-    STEP(fd = open("c", O_WRONLY | O_CREAT), "create c");
+    STEP(fd = open("c", O_WRONLY | O_CREAT, 0644), "create c");
     STEP(write_pattern(fd, 100, 12) - 100, "write c");
     close(fd);
     STEP(chdir("/"), "chdir /");
@@ -667,7 +668,7 @@ static int ops(void) {
     STEP(close(fd), "close the orphan");
     STEP(unlink("/ops/d/c"), "unlink /ops/d/c");
     STEP(unlink("/ops/d"), "unlink /ops/d");
-    STEP(fd = open("/ops/e", O_WRONLY | O_CREAT), "create /ops/e");
+    STEP(fd = open("/ops/e", O_WRONLY | O_CREAT, 0644), "create /ops/e");
     close(fd);
 #undef STEP
     printf("filetest: ops done\n");
@@ -679,13 +680,13 @@ static int read_only(void) {
     struct stat st;
     check_eq(open("/README", O_WRONLY), -EROFS, "no writing a file");
     check_eq(open("/README", O_RDWR | O_TRUNC), -EROFS, "nor emptying it");
-    check_eq(open("/new", O_WRONLY | O_CREAT), -EROFS, "nor making one");
-    check_eq(mkdir("/new"), -EROFS, "nor a directory");
+    check_eq(open("/new", O_WRONLY | O_CREAT, 0644), -EROFS, "nor making one");
+    check_eq(mkdir("/new", 0755), -EROFS, "nor a directory");
     check_eq(unlink("/README"), -EROFS, "nor removing one");
     check_eq(link("/README", "/new"), -EROFS, "nor linking one");
     check_eq(open("/nodir/x", O_RDONLY), -ENOENT, "a missing file is still missing");
     check_eq(open("/dev/nodriver", O_RDONLY), -ENODEV, "a device node with no driver");
-    int fd = open("/README", O_RDONLY | O_CREAT);
+    int fd = open("/README", O_RDONLY | O_CREAT, 0644);
     check(fd >= 0, "reading still works, O_CREAT on a file that exists too");
     check_eq(fstat(fd, &st), 0, "fstat it");
     check(st.size > 0 && read(fd, buf, sizeof buf) == (int)st.size, "read it whole");
@@ -715,7 +716,7 @@ int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[1], "hold") == 0) {
         return hold(argv[2][0]);
     }
-    int r = mkdir("/ft");
+    int r = mkdir("/ft", 0755);
     if (r < 0 || chdir("/ft") < 0) {
         printf("filetest: cannot make /ft: %s\n", strerror(-r));
         return 1;

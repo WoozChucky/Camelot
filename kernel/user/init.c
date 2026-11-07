@@ -29,10 +29,12 @@
  * - The kernel gives init every process whose parent ends (an orphan), and
  *   init collects them as they end, as Linux's init does.
  *
- * Without /etc/rc (or with no service in it), init becomes the shell: it
- * execs /bin/sh, which is then pid 1, as with no init at all. Run by
- * anything but the kernel, init says it isn't the first process and exits
- * 1. */
+ * Without /etc/rc (or with no service in it), init runs `respawn
+ * /bin/login` if /etc/passwd lists accounts (docs/excalibur-spec.md,
+ * "Users"): a login on the console, started again after each session.
+ * Without accounts either it becomes the shell: it execs /bin/sh, which is
+ * then pid 1 and root, as with no init at all. Run by anything but the
+ * kernel, init says it isn't the first process and exits 1. */
 #include "user.h"
 
 /* Services at most: a process slot each (of the 32, NPROC,
@@ -50,6 +52,7 @@
 
 #define RC "/etc/rc"
 #define SHELL "/bin/sh"
+#define LOGIN "/bin/login"
 
 struct service {
     int respawn; /* start it again when it ends */
@@ -220,7 +223,16 @@ int main(void) {
         fprintf(STDERR, "init: not the first process\n");
         return 1;
     }
-    if (!read_rc() || nservices == 0) {
+    struct stat st;
+    if ((!read_rc() || nservices == 0) && stat(PASSWD_FILE, &st) == 0) {
+        static char login[] = LOGIN;
+        services[0].respawn = 1;
+        services[0].path = login;
+        services[0].argv[0] = last_part(login);
+        services[0].argv[1] = NULL;
+        nservices = 1;
+    }
+    if (nservices == 0) {
         char *argv[] = {"sh", NULL};
         int err = exec(SHELL, argv, environ);
         printf("init: cannot run %s: %s\n", SHELL, strerror(-err));

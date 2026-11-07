@@ -22,7 +22,7 @@ use std::ops::Range;
 use std::sync::mpsc::{Receiver, Sender};
 use xtask::repo_root;
 
-pub const PROMPT: &str = "$ ";
+pub const PROMPT: &str = "# ";
 
 /// Enough steps for a boot and a few programs. Each step runs every hart
 /// one instruction.

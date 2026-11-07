@@ -355,7 +355,7 @@ fn grail(args: &[&str], stdin: &[u8]) -> (Option<i32>, String, String) {
     (out.status.code(), stdout, stderr)
 }
 
-const SHELL: &str = "Type help for the list of commands.\n$ ";
+const SHELL: &str = "Type help for the list of commands.\n# ";
 
 /// `grail --disk IMG` with no program: the firmware, the command's default, boots the
 /// disk's bootloader, which loads the kernel. 8 MiB: the kernel loads at 0x8020_0000,

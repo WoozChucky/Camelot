@@ -115,6 +115,11 @@ struct elf_file {
     bool (*read)(const struct elf_file *f, void *dst, u64 off, u32 n);
     const u8 *image;     /* an image in memory */
     struct inode *inode; /* a file, locked */
+    /* The effective ids the program runs with (exec.c): the caller's, or
+     * the file's owner's or group's for a set-user-ID or set-group-ID
+     * program. */
+    u32 euid;
+    u32 egid;
 };
 
 /* What elf_load() tells about a program it loaded: where it starts and

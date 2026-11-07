@@ -34,7 +34,9 @@ tasks:
                /usr/share (default server; desktop: target/camelot-desktop.img, {desktop_size});
                -o PATH: output file; --size N: the image's size in blocks (1 KiB each, default
                {image_size}), the filesystem filling what the kernel leaves;
-               --no-boot: the filesystem alone, N blocks (the same default)
+               --no-boot: the filesystem alone, N blocks (the same default);
+               --root-password P, --user-password P: the accounts' passwords (default
+               root's root and user's user; see docs/excalibur-spec.md, \"Users\")
   boot         build the boot ROM's disk loader (crates/grail/rom/diskboot.elf), Camelot's
                firmware (crates/grail/rom/firmware.elf) and Camelot's bootloader
                (kernel/boot/boot.elf) with merlin-as + merlin-ld
@@ -179,6 +181,7 @@ struct FsArgs {
     out: Option<PathBuf>,
     size: Option<u32>,
     no_boot: bool,
+    passwords: xtask::accounts::Passwords,
 }
 
 impl Default for FsArgs {
@@ -188,6 +191,7 @@ impl Default for FsArgs {
             out: None,
             size: None,
             no_boot: false,
+            passwords: xtask::accounts::Passwords::default(),
         }
     }
 }
@@ -205,6 +209,15 @@ fn parse_fs_args(args: &[String]) -> Result<FsArgs, String> {
                 f.size = Some(v.parse().map_err(|_| format!("bad size {v} (blocks)"))?);
             }
             "--no-boot" => f.no_boot = true,
+            "--root-password" | "--user-password" => {
+                let v = value(a)?;
+                xtask::accounts::check_password(a, &v)?;
+                if a == "--root-password" {
+                    f.passwords.root = v;
+                } else {
+                    f.passwords.user = v;
+                }
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -469,9 +482,9 @@ fn build_fs(f: FsArgs) -> ExitCode {
             size,
             ..camelot_fs::mkfs::Options::default()
         };
-        xtask::fs::build_profile(&root, &opts, f.profile)
+        xtask::fs::build_profile_with(&root, &opts, f.profile, &f.passwords)
     } else {
-        xtask::fs::build_bootable(&root, f.profile, size)
+        xtask::fs::build_bootable_with(&root, f.profile, size, &f.passwords)
     };
     let image = match built {
         Ok(image) => image,
@@ -834,7 +847,7 @@ mod tests {
                 profile: xtask::fs::Profile::Server,
                 out: Some("d.img".into()),
                 size: Some(512),
-                no_boot: false,
+                ..FsArgs::default()
             }
         );
         assert_eq!(
@@ -851,6 +864,13 @@ mod tests {
             .contains("unknown option --xlen"));
         assert!(parse(&["--size", "1M"]).unwrap_err().contains("bad size"));
         assert!(parse(&["-v"]).unwrap_err().contains("unknown option"));
+        let p = parse(&["--root-password", "secret", "--user-password", "mine"]).unwrap();
+        assert_eq!((p.passwords.root.as_str(), p.passwords.user.as_str()), ("secret", "mine"));
+        assert_eq!(parse(&["--user-password", "x"]).unwrap().passwords.root, "root");
+        assert!(parse(&["--root-password", ""])
+            .unwrap_err()
+            .contains("--root-password: a password is 1 to 64 bytes"));
+        assert!(parse(&["--user-password"]).unwrap_err().contains("needs a value"));
     }
 
     #[test]

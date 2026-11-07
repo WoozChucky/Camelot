@@ -292,12 +292,15 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     // The default machine's 4 MiB of RAM, and the firmware's 2 MiB.
     assert_eq!(MachineConfig::default().ram_size, 4 << 20);
     assert_eq!(avalon_client::CAMELOT_RAM, 6 << 20);
-    let (result, out, disk, m) = boot_image(
-        image,
+    let input = [
+        &xtask::accounts::root_login()[..],
         b"echo from the disk\nls /bin | wc > /count\ncat /count\nexit\n",
-    );
+    ]
+    .concat();
+    let (result, out, disk, m) = boot_image(image, &input);
     assert_eq!(result, RunResult::Exited(0), "{out}");
-    // Init ran the server's /etc/rc: the shell, whose exit ends the machine, and
+    // Init ran the server's /etc/rc: a login on the console, root's shell
+    // after it (with the prompt `# `), whose exit ends the machine, and
     // shd, which can't run on this machine without a network card, says so
     // once (wherever its line lands among the shell's) and is left.
     let shd = "shd: socket: no network card\n";
@@ -335,7 +338,9 @@ fn the_root_image_boots_from_disk_and_runs_programs_from_bin() {
     );
     assert!(
         out.ends_with(&format!(
-            "$ echo from the disk\nfrom the disk\n$ ls /bin | wc > /count\n$ cat /count\n{written}$ exit\n"
+            "{}Type help for the list of commands.\n# echo from the disk\nfrom the disk\n# ls /bin | wc > \
+             /count\n# cat /count\n{written}# exit\n",
+            xtask::accounts::ROOT_LOGIN_SHOWN
         )),
         "{out}"
     );
@@ -608,6 +613,8 @@ fn the_disk_kernel_panics_without_a_shell() {
     .unwrap();
     fs.mkdir("/bin").unwrap();
     fs.add_file("/bin/sh", b"#!/not/an/elf\n").unwrap();
+    // Runnable, or the kernel refuses it before reading it (-EACCES).
+    fs.chmod("/bin/sh", 0o755).unwrap();
     let mut image = fs.finish();
     boot::install(&mut image, &boot, &kernel).unwrap();
     let (result, out, _, _) = boot_image(image, b"exit\n");
@@ -1012,9 +1019,9 @@ fn the_profiles_images_differ_in_their_etc_rc_and_fonts() {
 
 #[test]
 fn the_desktop_image_boots_and_init_starts_its_shell_again() {
-    // The desktop's /etc/rc keeps the console's shell running: one that
-    // ends is started again, even at once (but not five times in a row), so
-    // two Ctrl-Ds or `exit`s don't lose it. shd can't run on a machine with
+    // The desktop's /etc/rc keeps the console's login running: a session
+    // that ends is followed by another, even at once (but not five times in
+    // a row), so two Ctrl-Ds or `exit`s don't lose it. shd can't run on a machine with
     // no network card: it says so, and init leaves it. The display server
     // takes the screen and stays, its socket in /run; the panel comes up
     // on it and starts a terminal, which runs a shell (#185).
@@ -1028,13 +1035,15 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
     .unwrap();
     m.boot_from_disk().unwrap();
     m.cpu.bus.uart.capture = true;
-    m.set_uart_input(xtask::kernel::typed(b"exit\nexit\nsleep 5\nps\n"));
+    let login = xtask::accounts::root_login();
+    let input = [&login[..], b"exit\n", &login, b"exit\n", &login, b"sleep 5\nps\n"].concat();
+    m.set_uart_input(xtask::kernel::typed(&input));
     // The machine runs on: run it until the third shell's ps is done and
     // the display server is ready.
     const READY: &str = "compositor: ready on /run/wayland-0 (640x480)\n";
     let printed = |m: &Machine| String::from_utf8_lossy(&m.cpu.bus.uart.captured).into_owned();
     let done =
-        |out: &str| out.contains(READY) && out.find("$ ps\n").is_some_and(|at| out[at + 5..].contains("$ "));
+        |out: &str| out.contains(READY) && out.find("# ps\n").is_some_and(|at| out[at + 5..].contains("# "));
     let mut steps = 0;
     while !done(&printed(&m)) {
         assert!(steps < 2 * BOOT_MAX_STEPS, "{}", printed(&m));
@@ -1056,8 +1065,10 @@ fn the_desktop_image_boots_and_init_starts_its_shell_again() {
     assert_eq!(out.matches("shd: socket: no network card\n").count(), 1, "{out}");
     assert_eq!(out.matches(READY).count(), 1, "{out}");
     assert!(!out.contains("init: "), "{out}");
-    // The third shell is init's child too, pid 1's.
-    let ps = &out[out.find("$ ps\n").unwrap_or_else(|| panic!("{out}"))..];
+    // Three logins, each the session's shell after it; the third shell is
+    // init's child too, pid 1's (login execs it).
+    assert_eq!(out.matches(xtask::accounts::ROOT_LOGIN_SHOWN).count(), 3, "{out}");
+    let ps = &out[out.find("# ps\n").unwrap_or_else(|| panic!("{out}"))..];
     let processes: Vec<Vec<&str>> = ps
         .lines()
         .map(|l| l.split_whitespace().collect::<Vec<_>>())

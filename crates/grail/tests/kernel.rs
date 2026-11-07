@@ -130,7 +130,7 @@ const RTC: &str = "rtc: 2026-01-01 00:00 UTC\n";
 /// What the shell prints before its first prompt, and the prompt
 /// (kernel/user/sh.c).
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
-const PROMPT: &str = "$ ";
+const PROMPT: &str = "# ";
 
 /// `out` from the shell's banner on.
 fn shell_output(out: &str) -> &str {

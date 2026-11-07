@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 use userprogs::CCompiler;
 use xtask::{kernel, png, repo_root, userprogs};
 
-const PROMPT: &str = "$ ";
+const PROMPT: &str = "# ";
 
 /// What the scenes' run printed, and its disk afterwards.
 struct Run {

@@ -83,8 +83,11 @@ pub const DEMO_GUEST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 1
 
 /// The first line of a Camelot shell's greeting.
 const SHELL_BANNER: &str = "Type help for the list of commands.\n";
-/// A Camelot shell's prompt.
-const PROMPT: &str = "$ ";
+/// A Camelot shell's prompts: root's, and anyone else's.
+const PROMPTS: [&str; 2] = ["# ", "$ "];
+/// What `login` asks first: the server image's console and each of its `shd`
+/// connections log in (docs/excalibur-spec.md, "Users").
+const LOGIN_PROMPT: &str = "login: ";
 
 /// The demo's switch and VM.
 pub const DEMO_SWITCH: &str = "nat";
@@ -904,11 +907,12 @@ pub const SHD_TIMEOUT: Duration = Duration::from_secs(60);
 /// once the console's shell has its prompt, before it types `shd &` itself.
 pub const SHD_GRACE: Duration = Duration::from_secs(5);
 
-/// Makes sure `shd` runs in VM `vm` on the Avalon server at `avalon`: waits for the
-/// shell's prompt on its console, then until a shell answers at `shd`, the forwarded
-/// port (and leaves it with `exit`). The server image's init starts `shd` (its
-/// `/etc/rc`); a disk from before init, which doesn't, gets `shd &` typed on its
-/// console once no shell has answered for [`SHD_GRACE`]. Fails if no shell answers
+/// Makes sure `shd` runs in VM `vm` on the Avalon server at `avalon`: waits for its
+/// console's `login: ` (or a shell's prompt, on a disk without accounts), then until
+/// `shd` answers at `shd`, the forwarded port, with `login: ` or a shell (and leaves
+/// it). The server image's init starts `shd` (its `/etc/rc`); a disk from before
+/// init, which doesn't, gets `shd &` typed on its console's shell once nothing has
+/// answered for [`SHD_GRACE`]. Fails if nothing answers
 /// within `timeout` (`up` gives [`SHD_TIMEOUT`]), and as soon as the console says it
 /// went wrong: init or the shell finding no `/bin/shd` (`sh: shd: no such program`,
 /// an older disk), or `shd` itself giving up (`shd: port 23: address in use`, say).
@@ -925,7 +929,8 @@ pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr, timeout: Duration
         .map_err(|e| e.to_string())?;
     let mut output = String::from_utf8_lossy(&scrollback).into_owned();
     // The prompt, which init's lines about shd may follow (or come before).
-    while !output.contains(&format!("\n{PROMPT}")) {
+    let at_shell = |output: &str| PROMPTS.iter().any(|p| output.contains(&format!("\n{p}")));
+    while !output.contains(&format!("\n{LOGIN_PROMPT}")) && !at_shell(&output) {
         if let Some(failure) = shd_failure(&output) {
             return Err(failure.to_string());
         }
@@ -951,7 +956,9 @@ pub fn start_shd(avalon: SocketAddr, vm: u32, shd: SocketAddr, timeout: Duration
         if Instant::now() > deadline {
             return Err(format!("no shell answered at {shd}"));
         }
-        if !typed && prompted.elapsed() >= SHD_GRACE {
+        // Only a shell can be told to start shd: a console that asks to log in
+        // has an init, which starts it.
+        if !typed && prompted.elapsed() >= SHD_GRACE && !output.contains(LOGIN_PROMPT) && at_shell(&output) {
             conn.send(&Message::ConsoleInput {
                 vm: id,
                 data: b"shd &\n".to_vec(),
@@ -992,7 +999,10 @@ fn shd_failure(output: &str) -> Option<&str> {
     whole
         .lines()
         // A background shd's error comes after the prompt that followed its line.
-        .map(|l| l.trim_end_matches('\r').trim_start_matches(PROMPT))
+        .map(|l| {
+            let l = l.trim_end_matches('\r');
+            PROMPTS.iter().find_map(|p| l.strip_prefix(p)).unwrap_or(l)
+        })
         .find(|l| {
             l.starts_with("sh: shd: ")
                 || l.starts_with("shd: ")
@@ -1001,8 +1011,9 @@ fn shd_failure(output: &str) -> Option<&str> {
         })
 }
 
-/// Whether a Camelot shell greets a connection to `addr` before `deadline`; if one
-/// does, it is left with `exit`.
+/// Whether `shd` answers a connection to `addr` before `deadline`: `login` asks for a
+/// name (left by hanging up, which ends it), or, on a disk without accounts, a Camelot
+/// shell greets it (left with `exit`).
 fn shell_answers(addr: SocketAddr, deadline: Instant) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, POLL * 10) else {
         return false;
@@ -1015,7 +1026,12 @@ fn shell_answers(addr: SocketAddr, deadline: Instant) -> bool {
             Ok(0) => return false,
             Ok(n) => {
                 got.extend_from_slice(&buf[..n]);
-                if String::from_utf8_lossy(&got).starts_with(SHELL_BANNER) && got.ends_with(b"$ ") {
+                if got.ends_with(LOGIN_PROMPT.as_bytes()) {
+                    return true;
+                }
+                if String::from_utf8_lossy(&got).starts_with(SHELL_BANNER)
+                    && PROMPTS.iter().any(|p| got.ends_with(p.as_bytes()))
+                {
                     let _ = stream.write_all(b"exit\n");
                     return true;
                 }
@@ -1426,17 +1442,22 @@ mod tests {
     #[test]
     fn what_says_shd_did_not_start() {
         // The console's echo of the line, the job's pid and the prompt: nothing wrong.
-        assert_eq!(shd_failure("shd &\r\n[5]\r\n$ "), None);
+        assert_eq!(shd_failure("shd &\r\n[5]\r\n# "), None);
         assert_eq!(
-            shd_failure("shd &\r\nsh: shd: no such program\r\n$ "),
+            shd_failure("shd &\r\nsh: shd: no such program\r\n# "),
             Some("sh: shd: no such program")
+        );
+        // Root's prompt or anyone else's.
+        assert_eq!(
+            shd_failure("shd &\n[5]\n# shd: port 23: address in use\n"),
+            Some("shd: port 23: address in use")
         );
         assert_eq!(
             shd_failure("shd &\n[5]\n$ shd: port 23: address in use\n"),
             Some("shd: port 23: address in use")
         );
         // Only a whole line counts.
-        assert_eq!(shd_failure("shd &\n[5]\n$ shd: port 23: addr"), None);
+        assert_eq!(shd_failure("shd &\n[5]\n# shd: port 23: addr"), None);
         // Init's, for the shd /etc/rc lists.
         assert_eq!(
             shd_failure("init: cannot start /bin/shd: no such file or directory\nType help"),
@@ -1447,7 +1468,9 @@ mod tests {
             Some("init: /bin/shd ended at once 5 times, exit 1: not started again")
         );
         assert_eq!(shd_failure("init: /bin/shdx ended at once\n"), None);
-        assert_eq!(shd_failure("shd &\n[5]\n$ shd"), None);
+        assert_eq!(shd_failure("shd &\n[5]\n# shd"), None);
+        // login's prompt is no failure.
+        assert_eq!(shd_failure("Camelot\nlogin: "), None);
     }
 
     #[test]

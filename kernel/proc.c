@@ -570,12 +570,13 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
             p->cwd = idup(parent->cwd);
         }
         release(&parent->files_lock);
-        /* And who it runs as. */
+        /* And who it runs as: the parent's real ids, and the effective
+         * ones the program gives (exec.c: a set-ID program's file's). */
         p->uid = parent->uid;
-        p->euid = parent->euid;
         p->gid = parent->gid;
-        p->egid = parent->egid;
     }
+    p->euid = prog->euid;
+    p->egid = prog->egid;
     return proc_ready(p, t, name, parent);
 }
 
@@ -641,6 +642,8 @@ int proc_exec_load(const struct elf_file *prog, const char *path, const struct p
     /* The new registers go to the image: the old program's stay in the
      * frame until it is certain the new one replaces it. */
     img->pagetable = build_space(prog, "exec", path, args, &img->frame, &img->heap, &err);
+    img->euid = prog->euid;
+    img->egid = prog->egid;
     return img->pagetable == NULL ? err : 0;
 }
 
@@ -677,6 +680,9 @@ int proc_exec_commit(struct exec_image *img, const char *name) {
     p->areas = NULL;
     p->pagetable = img->pagetable;
     p->heap_base = img->heap;
+    /* Who the new program runs as: a set-ID program's file's. */
+    p->euid = img->euid;
+    p->egid = img->egid;
     p->brk = img->heap;
     p->stack_low = USER_STACK;
     *mythread()->frame = img->frame;
@@ -1177,6 +1183,14 @@ int proc_kill_pid(int pid) {
         /* Neither the kernel's own processes nor the first one, init (or
          * the shell), whose end is Camelot's. */
         if (p->kfn != NULL || p == init_proc) {
+            r = -EPERM;
+            break;
+        }
+        /* Another user's process is out of reach but to root: Linux's
+         * kill_ok_by_cred(), the caller's real or effective uid against
+         * the target's real one. */
+        struct proc *me = myproc();
+        if (me->euid != 0 && me->euid != p->uid && me->uid != p->uid) {
             r = -EPERM;
             break;
         }
@@ -1769,9 +1783,6 @@ bool fd_take_if(u32 fd, struct file *f) {
     release(&p->files_lock);
     return took;
 }
-
-/* The id -1 stands for no id (Linux's setuid refuses it too). */
-#define NO_ID 0xffffffffu
 
 long proc_setuid(u32 id) {
     struct proc *p = myproc();

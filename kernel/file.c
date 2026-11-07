@@ -14,6 +14,7 @@
 #include "net.h"
 #include "pipe.h"
 #include "poll.h"
+#include "proc.h"
 #include "pty.h"
 #include "shm.h"
 #include "string.h"
@@ -139,6 +140,11 @@ struct file *filealloc(void) {
             memset(f, 0, sizeof *f);
             f->ref = 1;
             release(&ftable_lock);
+            struct proc *p = myproc();
+            if (p != NULL) {
+                f->uid = p->euid;
+                f->gid = p->egid;
+            }
             return f;
         }
     }
@@ -410,6 +416,11 @@ off_t filelseek(struct file *f, off_t offset, u32 whence) {
 
 void filestat(struct file *f, struct stat *st) {
     memset(st, 0, sizeof *st);
+    /* What has no inode is its maker's, for it alone to read and write, as
+     * Linux's pipes and sockets are (0600). */
+    st->mode = S_IRUSR | S_IWUSR;
+    st->uid = f->uid;
+    st->gid = f->gid;
     if (f->type == FD_PIPE) {
         st->type = T_PIPE;
         st->size = pipe_bytes(f->pipe);
@@ -452,6 +463,9 @@ void inode_stat(struct inode *ip, struct stat *st) {
     st->size = ip->size;
     st->major = ip->major;
     st->minor = ip->minor;
+    st->mode = ip->mode;
+    st->uid = ip->uid;
+    st->gid = ip->gid;
 }
 
 int filemmap(struct file *f, u32 type, u32 prot, u64 offset, usize size, struct vm_area *a) {

@@ -28,7 +28,7 @@ pub const SLICE: u64 = 2_000;
 pub const MAX_STEPS: u64 = 400_000_000;
 
 pub const SHELL_BANNER: &str = "Type help for the list of commands.\n";
-pub const PROMPT: &str = "$ ";
+pub const PROMPT: &str = "# ";
 
 /// The committed kernel, as a path from the repository root.
 pub fn kernel_path() -> &'static str {

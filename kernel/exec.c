@@ -6,6 +6,7 @@
 #include "fs.h"
 #include "kalloc.h"
 #include "log.h"
+#include "proc.h"
 #include "string.h"
 
 /* elf_file's read() for a file: the inode is locked for the whole load. */
@@ -38,12 +39,15 @@ static const struct user_program *embedded(const char *path) {
  * filesystem unless `from_kernel`, in a transaction and with the inode
  * locked until prog_close(); else from the kernel image. 0 or an error. */
 static int prog_open(const char *path, bool from_kernel, struct elf_file *f) {
+    struct proc *p = myproc();
     if (from_kernel) {
         const struct user_program *prog = embedded(path);
         if (prog == NULL) {
             return -ENOENT;
         }
         elf_from_memory(f, prog->elf, prog->size);
+        f->euid = p->euid;
+        f->egid = p->egid;
         return 0;
     }
     begin_op();
@@ -54,11 +58,19 @@ static int prog_open(const char *path, bool from_kernel, struct elf_file *f) {
         return err;
     }
     ilock(ip);
-    if (ip->type != T_FILE) {
+    /* A regular file that the caller may run (root too needs an execute
+     * bit: inode_permission). */
+    int denied = ip->type != T_FILE ? -EACCES : inode_permission(ip, MAY_EXEC);
+    if (denied < 0) {
         iunlockput(ip);
         end_op();
-        return -EACCES;
+        return denied;
     }
+    /* A set-user-ID program runs as its owner, a set-group-ID one with its
+     * group, whoever starts it (Linux's bprm_fill_uid()); the real ids
+     * stay the caller's. */
+    f->euid = (ip->mode & S_ISUID) != 0 ? ip->uid : p->euid;
+    f->egid = (ip->mode & S_ISGID) != 0 ? ip->gid : p->egid;
     f->size = ip->size;
     f->read = read_inode;
     f->image = NULL;

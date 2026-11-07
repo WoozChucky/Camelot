@@ -789,12 +789,17 @@ static int do_connect(struct unix_sock *u, uintptr uaddr) {
     }
     ilock(ip);
     bool socket_inode = ip->type == T_SOCKET;
+    /* Connecting writes to the socket: Linux's unix_find_bsd() asks for
+     * MAY_WRITE on its name. */
+    int denied = socket_inode ? inode_permission(ip, MAY_WRITE) : 0;
     iunlock(ip);
     end_op();
     /* The accepting end, made now: the listener's backlog holds it. */
     struct unix_sock *s = NULL;
     if (!socket_inode) {
         err = -ECONNREFUSED; /* as on Linux, for a file that isn't a socket */
+    } else if (denied < 0) {
+        err = denied;
     } else if ((s = us_new(UNIX_CONNECTED)) == NULL) {
         err = -ENOMEM;
     }

@@ -8,7 +8,7 @@ int main(int argc, char **argv) {
     }
     int status = 0;
     for (int i = 1; i < argc; i++) {
-        int r = mkdir(argv[i]);
+        int r = mkdir(argv[i], 0755);
         if (r < 0) {
             fprintf(STDERR, "mkdir: %s: %s\n", argv[i], strerror(-r));
             status = 1;

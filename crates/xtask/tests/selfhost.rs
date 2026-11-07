@@ -142,7 +142,7 @@ impl Case {
     }
 }
 
-const PROMPT: &str = "$ ";
+const PROMPT: &str = "# ";
 
 /// The corpus: (name on the image, text); `big` adds merlin's assembly for
 /// the shell and the kernel's vm.c. A `.S` source (the examples, the boot

@@ -106,6 +106,9 @@
  * parent, and nothing tells whose they were. */
 #include "user.h"
 
+/* The prompt: `# ` for root (an effective uid of 0), `$ ` for anyone else,
+ * as Unix shells have it. */
+#define ROOT_PROMPT "# "
 #define PROMPT "$ "
 /* A terminal's longest line (TTY_LINE_MAX in kernel/include/tty.h),
  * its newline included, and a NUL. */
@@ -614,7 +617,7 @@ static int open_files(struct cmd *c, int *in, int *out) {
         *in = fd;
     }
     if (c->out != NULL) {
-        int fd = open(c->out, O_WRONLY | O_CREAT | O_TRUNC);
+        int fd = open(c->out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) {
             fprintf(STDERR, "sh: %s: %s\n", c->out, strerror(-fd));
             if (c->in != NULL) {
@@ -1002,7 +1005,7 @@ int main(void) {
     printf("Type help for the list of commands.\n");
     for (;;) {
         leave_foreground();
-        printf(PROMPT);
+        printf(geteuid() == 0 ? ROOT_PROMPT : PROMPT);
         int n = console_input ? getline(line, sizeof line) : read_line(line);
         if (n < 0) {
             if (connection_input) {

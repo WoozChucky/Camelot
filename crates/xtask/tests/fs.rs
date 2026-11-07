@@ -1373,12 +1373,16 @@ fn the_format_document_matches_the_kernel_and_the_host() {
 const SHELL_MAX_STEPS: u64 = 400_000_000;
 
 /// The shell's prompt.
-const PROMPT: &str = "$ ";
+const PROMPT: &str = "# ";
 
 /// Checks `filetest` makes on the root image, its 64-bit off_t's among
 /// them, and `filetest ro` on a read-only one (kernel/user/filetest.c).
 const FILETEST_CHECKS: u32 = 246;
 const FILETEST_RO_CHECKS: u32 = 14;
+/// permtest's checks: the root part's (the user part's result one of them)
+/// and the user part's, without a network to bind on.
+const PERMTEST_CHECKS: u32 = 59;
+const PERMTEST_USER_CHECKS: u32 = 64;
 
 /// What the shell printed after reading `command`, up to its next prompt.
 fn shell_output<'a>(out: &'a str, command: &str) -> &'a str {
@@ -1697,12 +1701,12 @@ fn a_failed_exec_ends_only_a_shell_that_is_not_interactive() {
     for (script, printed) in [
         (
             "sh < /s1",
-            "$ before\n$ sh: nosuch: no such program\nsh: exit 127\n",
+            "# before\n# sh: nosuch: no such program\nsh: exit 127\n",
         ),
-        ("sh < /s2", "$ sh: /bin: not a regular file\nsh: exit 126\n"),
+        ("sh < /s2", "# sh: /bin: not a regular file\nsh: exit 126\n"),
         (
             "sh < /s3",
-            "$ sh: /missing: no such file or directory\nsh: exit 1\n",
+            "# sh: /missing: no such file or directory\nsh: exit 1\n",
         ),
     ] {
         let want = format!("{SHELL_BANNER}{printed}{PROMPT}");
@@ -1765,12 +1769,12 @@ fn a_failed_special_builtin_ends_only_a_shell_that_is_not_interactive() {
         &out[at + typed.len()..]
     };
     for (script, printed) in [
-        ("sh < /s1", "$ sh: export: 1B: bad variable name\nsh: exit 2\n"),
-        ("sh < /s2", "$ sh: unset: 1A: bad variable name\nsh: exit 2\n"),
-        ("sh < /s3", "$ $ sh: B14=1: too many variables\nsh: exit 2\n"),
+        ("sh < /s1", "# sh: export: 1B: bad variable name\nsh: exit 2\n"),
+        ("sh < /s2", "# sh: unset: 1A: bad variable name\nsh: exit 2\n"),
+        ("sh < /s3", "# # sh: B14=1: too many variables\nsh: exit 2\n"),
         (
             "sh < /s4",
-            "$ sh: cd: /nope: no such file or directory\n$ $ sh: cd: /nope: no such file or directory\n$ sh: exit 2\n",
+            "# sh: cd: /nope: no such file or directory\n# # sh: cd: /nope: no such file or directory\n# sh: exit 2\n",
         ),
     ] {
         let want = format!("{SHELL_BANNER}{printed}{PROMPT}");
@@ -1780,6 +1784,35 @@ fn a_failed_special_builtin_ends_only_a_shell_that_is_not_interactive() {
     let fs = Fs::open(&run.disk).unwrap();
     assert!(fs.lookup("/not-run").is_err());
     assert_eq!(fs.read_file("/ran").unwrap(), b"run\n");
+}
+
+#[test]
+fn permtest_passes_on_the_root_image_and_leaves_it_as_it_was() {
+    // Users and permissions (kernel/user/permtest.c): root's bypass, then
+    // uid 1000's every refusal (reading another's 0600 file, writing into
+    // a directory not its own, /bin among them, searching, running, the
+    // sticky bit, chmod, chown, setuid, kill), a set-user-ID program, and
+    // the disk back as it was.
+    let image = root_image();
+    let run = boot(
+        image.clone(),
+        Boot {
+            input: b"permtest\nexit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
+    let out = shell_output(&run.out, "permtest");
+    assert!(
+        out.ends_with(&format!(
+            "permtest user: {PERMTEST_USER_CHECKS} checks, 0 failed\npermtest: {PERMTEST_CHECKS} checks, 0 failed\n"
+        )),
+        "{out}"
+    );
+    let after = fsck::check(&run.disk).unwrap_or_else(|p| panic!("{p:#?}"));
+    assert_eq!((after.replayed, after.orphans), (0, 0));
+    assert_eq!(state(&run.disk), state(&image));
 }
 
 #[test]

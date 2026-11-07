@@ -324,6 +324,39 @@ struct inode *nameiparent(const char *path, char *name, int *err);
  * looked at, which may free one removed meanwhile). */
 int fs_getcwd(char *buf, u32 size);
 
+/* ---- Permissions (docs/camelot-syscalls.md, "Users and permissions") ---- */
+
+/* What inode_permission() is asked for, Linux's MAY_ bits: they are the
+ * mode's rwx bits, for the owner, the group or the others alike. */
+#define MAY_EXEC 1  /* run a file; search a directory (look a name up in it) */
+#define MAY_WRITE 2 /* write a file; add or remove a directory's entries */
+#define MAY_READ 4  /* read a file; list a directory */
+
+/* Whether the calling process may use locked inode `ip` as `mask` (MAY_
+ * bits) says: 0 or -EACCES. Linux's generic_permission(): the owner's
+ * bits if the process's effective uid owns the inode, else the group's if
+ * its effective gid is the inode's, else the others'; every bit asked for
+ * must be set there. Root (an effective uid of 0) may read and write
+ * anything and search any directory, but run a file only if one of its
+ * three execute bits is set. */
+int inode_permission(struct inode *ip, u32 mask);
+
+/* Whether the calling process runs as root: an effective uid of 0. */
+bool capable(void);
+
+/* chmod(): sets `path`'s permission bits to `mode` (S_IALLUGO's bits).
+ * Its owner or root only (-EPERM); someone else's group's set-group-ID bit
+ * is dropped, as Linux drops it, when they are not root. chown(): gives
+ * `path` the owner `uid` and group `gid`, either NO_ID to keep it; root
+ * only, and a file (not a directory) loses its set-user-ID and
+ * set-group-ID bits, so that a program given away doesn't run as its new
+ * owner. 0, or the path's errors, -EPERM, -EROFS. In a transaction. */
+int fs_chmod(const char *path, u32 mode);
+int fs_chown(const char *path, u32 uid, u32 gid);
+
+/* An id that stands for none (chown's "keep it", setuid's error): -1. */
+#define NO_ID 0xffffffffu
+
 /* Makes `path` a new inode of `type` (T_FILE, T_DIR with its `.` and `..`,
  * T_DEVICE with `major`/`minor`, or T_SOCKET) with the permission bits
  * `mode` (S_IRWXU... and the set-ID and sticky bits; the rest ignored),
@@ -331,7 +364,8 @@ int fs_getcwd(char *buf, u32 size);
  * locked, with a reference;
  * NULL with *err: -EEXIST (`/` included), -ENOENT/-ENOTDIR/-ENAMETOOLONG
  * (the path; -ENOENT also for a directory that has been removed while still
- * in use, as a working directory), -ENOSPC, -EROFS. In a transaction. */
+ * in use, as a working directory), -EACCES (the directory isn't writable
+ * and searchable by the caller), -ENOSPC, -EROFS. In a transaction. */
 struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, u16 mode, int *err);
 
 /* Removes the entry `path`: a file loses a link (and is freed once it has

@@ -1,5 +1,7 @@
-/* cp SRC DST, cp SRC... DIR: copies file SRC to DST (made, or emptied
- * first), or each SRC into the directory DIR under its own last name.
+/* cp SRC DST, cp SRC... DIR: copies file SRC to DST (made with SRC's
+ * permission bits but the set-ID ones, as coreutils' cp makes it, or
+ * emptied first), or each SRC into the directory DIR under its own last
+ * name.
  * Directories are not copied. Exits 1 if a file can't be copied (it says
  * why and goes on with the next), else 0. */
 #include "user.h"
@@ -40,7 +42,7 @@ static int copy(const char *src, const char *dst) {
         close(in);
         return 1;
     }
-    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, from.mode & 0777);
     if (out < 0) {
         fprintf(STDERR, "cp: %s: %s\n", dst, strerror(-out));
         close(in);

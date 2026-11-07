@@ -1561,7 +1561,7 @@ fn the_console_types_what_the_keyboard_types() {
     let end = rows.iter().rposition(|r| !r.is_empty()).unwrap();
     assert_eq!(
         rows[end - 2..=end],
-        ["$ hello", "hello from user mode", "$"],
+        ["# hello", "hello from user mode", "#"],
         "{rows:#?}"
     );
 }
@@ -2174,7 +2174,7 @@ fn killing_stress_workers_mid_run_leaves_no_lock_held() {
                 .bus
                 .uart
                 .captured
-                .ends_with(format!("[{FIRST_PID}] stress: exit 1\n$ ").as_bytes())
+                .ends_with(format!("[{FIRST_PID}] stress: exit 1\n# ").as_bytes())
         },
     );
     let out = printed(&m);

@@ -78,7 +78,7 @@ fn the_kernel_shell() {
     let server = server();
     let id = start_kernel_vm(&server, "vm001");
     let mut herald = Herald::attach(&server, VmRef::Name("vm001".into()));
-    herald.wait_for("Type help for the list of commands.\n$ ");
+    herald.wait_for("Type help for the list of commands.\n# ");
     herald.type_keys(b"ticks\r");
     herald.wait_for("ticks: ");
     herald.type_keys(&[DETACH_KEY]);
@@ -86,7 +86,7 @@ fn the_kernel_shell() {
 
     let mut again = Herald::attach(&server, VmRef::Id(id));
     let scrollback = String::from_utf8_lossy(&again.scrollback).into_owned();
-    assert!(scrollback.contains("$ ticks"), "{scrollback}");
+    assert!(scrollback.contains("# ticks"), "{scrollback}");
     assert!(scrollback.contains("ticks: "), "{scrollback}");
     again.type_keys(b"help\r");
     again.wait_for("leave the shell");

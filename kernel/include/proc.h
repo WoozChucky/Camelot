@@ -301,6 +301,8 @@ int proc_create(const struct elf_file *prog, const char *path, const char *name,
 struct exec_image {
     pagetable_t pagetable;
     uintptr heap;
+    u32 euid; /* the effective ids it runs with (elf_file's) */
+    u32 egid;
     struct trap_frame frame;
 };
 

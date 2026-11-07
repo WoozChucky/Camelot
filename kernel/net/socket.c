@@ -352,6 +352,12 @@ int sock_sys_bind(u32 fd, uintptr uaddr) {
     if (!bindable(addr)) {
         return -EADDRNOTAVAIL;
     }
+    /* The ports below 1024 are root's, as Unix's privileged ports are
+     * (Linux's inet_prot_sock and CAP_NET_BIND_SERVICE): a service on one
+     * was started by the machine's administrator. */
+    if (port != 0 && port < IPPORT_RESERVED && myproc()->euid != 0) {
+        return -EACCES;
+    }
     if (s->type == SOCK_STREAM) {
         return tcp_bind(s->tcp, port);
     }

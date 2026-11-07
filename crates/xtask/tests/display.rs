@@ -191,7 +191,7 @@ impl Desk {
             seen: 0,
             input: 0,
         };
-        d.wait_for("$ ");
+        d.wait_for("# ");
         d
     }
 
@@ -281,9 +281,9 @@ impl Desk {
     /// its next prompt is drawn.
     fn term_command(&mut self, title: &str, command: &str) {
         self.type_text(command);
-        self.term_drawn(title, &format!("$ {command}"));
+        self.term_drawn(title, &format!("# {command}"));
         self.type_text("\n");
-        self.term_drawn(title, "$ ");
+        self.term_drawn(title, "# ");
     }
 
     /// The pointer at x, y with `buttons` held (no event if neither
@@ -511,7 +511,7 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
     let mut d = Desk::boot(2);
     start_server(&mut d, "");
     d.run("wltest probe");
-    let out = d.wait_for("$ ");
+    let out = d.wait_for("# ");
     let globals: Vec<&str> = out.lines().filter(|l| l.starts_with("wltest:")).collect();
     assert_eq!(
         globals,
@@ -553,7 +553,7 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
         ("usedsource", "14 1: a source used already"),
     ] {
         d.run(&format!("wltest bad {kind}"));
-        let out = d.wait_for("$ ");
+        let out = d.wait_for("# ");
         let said: Vec<&str> = out.lines().filter(|l| l.starts_with("wltest:")).collect();
         assert_eq!(
             said,
@@ -672,7 +672,7 @@ fn the_terminal_runs_a_shell() {
     start_server(&mut d, "");
     d.run("term -v &");
     d.wait_for("compositor: focus \"Terminal\"\n");
-    d.term_drawn("Terminal", "$ ");
+    d.term_drawn("Terminal", "# ");
     // (`ls /test`, not /bin, whose sizes change with every program; the
     // primes' total alone, the workers' lines coming in any order.)
     for command in ["echo hello | wc -c", "ls /test", "primes 4 40000 | grep below"] {
@@ -696,7 +696,7 @@ fn the_terminal_draws_escapes_and_scrolls_back() {
     let mut d = Desk::boot(4);
     start_server(&mut d, "");
     d.run("term -v &");
-    d.term_drawn("Terminal", "$ ");
+    d.term_drawn("Terminal", "# ");
     d.term_command("Terminal", "cat /test/escapes");
     d.expect_screen("term-escapes");
 
@@ -705,10 +705,10 @@ fn the_terminal_draws_escapes_and_scrolls_back() {
     d.key(KEY_LEFT_SHIFT, true);
     d.tap(KEY_PAGE_UP);
     d.key(KEY_LEFT_SHIFT, false);
-    d.term_drawn("Terminal", "$ ");
+    d.term_drawn("Terminal", "# ");
     d.expect_screen("term-scrolled-back");
     d.tap(KEY_A);
-    d.term_drawn("Terminal", "$ a");
+    d.term_drawn("Terminal", "# a");
     d.expect_screen("term-back-down");
 }
 
@@ -719,7 +719,7 @@ fn terminals_resize_and_share_the_clipboard() {
     let mut d = Desk::boot(4);
     start_server(&mut d, "");
     d.run("term -v -T one &");
-    d.term_drawn("one", "$ ");
+    d.term_drawn("one", "# ");
     d.term_command("one", "stty size");
     d.pointer(300, 439, 0);
     d.pointer(300, 439, BUTTON_LEFT);
@@ -741,15 +741,15 @@ fn terminals_resize_and_share_the_clipboard() {
     d.pointer(x1, y, 0);
     d.run("term -v -T two &");
     d.wait_for("compositor: focus \"two\"\n");
-    d.term_drawn("two", "$ ");
+    d.term_drawn("two", "# ");
     d.key(KEY_LEFT_CTRL, true);
     d.key(KEY_LEFT_SHIFT, true);
     d.tap(0x19); // V
     d.key(KEY_LEFT_SHIFT, false);
     d.key(KEY_LEFT_CTRL, false);
-    d.term_drawn("two", "$ camelot");
+    d.term_drawn("two", "# camelot");
     d.type_text("\n");
-    d.term_drawn("two", "$ ");
+    d.term_drawn("two", "# ");
     d.expect_screen("term-pasted");
 
     // A selection whose source never answers: the paste gives up after a
@@ -798,7 +798,7 @@ fn the_panel_launches_lists_and_focuses_windows() {
     d.run("panel -v term -v &");
     d.wait_for("panel: ready, 4 applications\n");
     d.wait_for("panel: started term\n");
-    d.term_drawn("Terminal", "$ ");
+    d.term_drawn("Terminal", "# ");
     d.expect_screen_but("panel", &[PANEL_METERS]);
     // The menu takes the keyboard once it is shown.
     d.click(40, 12);

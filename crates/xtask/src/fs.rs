@@ -4,19 +4,25 @@
 //! built with merlin, merlin-as and merlin-ld exactly as the kernel embeds them, in
 //! `/bin`, the device nodes, `/dev/console`, `/dev/fb0`,
 //! `/dev/input/event0` and `event1`, `/dev/ptmx` and the pseudo-terminals'
-//! `/dev/pts/0` to `15`, and what a C program is built from
-//! ([`usr_files`]): the header in `/usr/include`, and in `/usr/lib` the
+//! `/dev/pts/0` to `15`, [`TMP`] (mode 1777), and what a C program is built
+//! from ([`usr_files`]): the header in `/usr/include`, and in `/usr/lib` the
 //! start code `crt0.o`, the C library `libc.a` and the linker script
 //! `user.ld`, the very files the programs of `/bin` were linked from. No
-//! LLVM needed.
+//! LLVM needed. Everything is root's, the programs mode 0755 (but
+//! [`SETUID_PROGRAMS`], 4755), the other files 0644 and the directories
+//! 0755 (`camelot_fs::default_mode`).
 //!
 //! `--profile` chooses what the image is for ([`Profile`]): its directory of
 //! `kernel/profiles/` goes over `kernel/fs/`, with the `/etc/rc` init runs
 //! (excalibur-spec section 10, "Init and the shell"). The server's, the
 //! default, runs the console's shell and `shd`; the desktop's
 //! (`target/camelot-desktop.img`, [`DESKTOP_IMAGE_SIZE`] blocks) keeps them
-//! running and has the fonts in `/usr/share/fonts`. [`build`], the tests'
-//! images, has no profile, so no `/etc/rc`: the shell is the first process.
+//! running and has the fonts in `/usr/share/fonts`. Both have the accounts
+//! ([`add_accounts`]: `/etc/passwd`, `/etc/group`, `/etc/shadow` and the
+//! home directories, root's and `user`'s, `--root-password` and
+//! `--user-password` giving their passwords), so init's services start with
+//! `login`. [`build`], the tests' images, has no profile, so no `/etc/rc`
+//! and no accounts: the shell, as root, is the first process.
 //!
 //! The image is bootable ([`build_bootable`]): Camelot's bootloader
 //! (`kernel/boot/boot.s`, built with merlin-as + merlin-ld) in the boot
@@ -35,6 +41,7 @@
 //! cargo run --release -p grail -- --ram 8 --disk target/camelot-fs.img kernel/kernel.elf
 //! ```
 
+use crate::accounts::Passwords;
 use crate::userprogs::{self, CCompiler};
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::BSIZE;
@@ -163,6 +170,19 @@ pub const DEV: &str = "/dev";
 /// The directory of the sockets services listen on, Linux's `/run`: the
 /// display server's `/run/wayland-0`.
 pub const RUN: &str = "/run";
+/// Where anyone may make files: mode 1777, the sticky bit letting only a
+/// file's owner (or root) remove or rename it.
+pub const TMP: &str = "/tmp";
+/// The programs installed set-user-ID root, mode 4755: `su` and `passwd`
+/// read `/etc/shadow` (and `passwd` writes it), and `su` changes its ids.
+pub const SETUID_PROGRAMS: &[&str] = &["su", "passwd"];
+/// The accounts' files (excalibur-spec section 10, "Users"): everyone's
+/// to read, but `/etc/shadow`, root's alone (mode 0600).
+pub const PASSWD: &str = "/etc/passwd";
+pub const GROUP: &str = "/etc/group";
+pub const SHADOW: &str = "/etc/shadow";
+/// The ordinary users' home directories' directory.
+pub const HOME: &str = "/home";
 /// The console's device number (`CONSOLE` in kernel/include/file.h).
 pub const CONSOLE_MAJOR: u16 = 1;
 /// The framebuffer's device number (`FB` in kernel/include/file.h).
@@ -292,8 +312,9 @@ pub fn add_usr(fs: &mut Mkfs, files: &[(String, Vec<u8>)]) -> Result<(), String>
 /// `kernel/fs/` at `/`, the server's programs in `/bin` (the desktop's need
 /// its `/usr/share`), `/dev/console`, `/dev/fb0`,
 /// `/dev/input/event0` and `event1`, `/dev/ptmx` and `/dev/pts/0` to `15`,
-/// and `/usr` ([`usr_files`]). No `/etc/rc`: its init runs the shell, as
-/// pid 1, as if there were no init (the tests' images).
+/// [`TMP`] and `/usr` ([`usr_files`]). No `/etc/rc` and no accounts: its
+/// init runs the shell, as root and pid 1, as if there were no init (the
+/// tests' images).
 pub fn build(root: &Path, opts: &Options) -> Result<Vec<u8>, String> {
     build_with(root, opts, CCompiler::Merlin)
 }
@@ -306,18 +327,53 @@ pub fn build_with(root: &Path, opts: &Options, cc: CCompiler) -> Result<Vec<u8>,
 }
 
 /// [`build`] for `profile`: its programs in `/bin`, its tree
-/// ([`Profile::dir`]: `/etc/rc`) over `kernel/fs/`'s, and, on the desktop,
-/// the fonts in [`FONTS`].
+/// ([`Profile::dir`]: `/etc/rc`) over `kernel/fs/`'s, the accounts with
+/// the default passwords ([`add_accounts`]), and, on the desktop, the fonts
+/// in [`FONTS`].
 pub fn build_profile(root: &Path, opts: &Options, profile: Profile) -> Result<Vec<u8>, String> {
-    build_image(root, opts, CCompiler::Merlin, Some(profile))
+    build_profile_with(root, opts, profile, &Passwords::default())
+}
+
+/// [`build_profile`], the accounts with `passwords`.
+pub fn build_profile_with(
+    root: &Path,
+    opts: &Options,
+    profile: Profile,
+    passwords: &Passwords,
+) -> Result<Vec<u8>, String> {
+    build_image(root, opts, CCompiler::Merlin, Some((profile, passwords)))
+}
+
+/// Adds the accounts of `passwords` ([`Passwords::accounts`]): [`PASSWD`]
+/// and [`GROUP`] (mode 0644), [`SHADOW`] (0600, root's alone), and each
+/// account's home directory, its own: root's `/root` mode 0700, the others
+/// 0755 under [`HOME`]. `/etc` must be there (a profile's `/etc/rc` is).
+pub fn add_accounts(fs: &mut Mkfs, passwords: &Passwords) -> Result<(), String> {
+    use crate::accounts;
+    let all = passwords.accounts();
+    fs.add_file(PASSWD, accounts::passwd(&all).as_bytes())?;
+    fs.add_file(GROUP, accounts::group(&all).as_bytes())?;
+    fs.add_file(SHADOW, accounts::shadow(&all).as_bytes())?;
+    fs.chmod(SHADOW, 0o600)?;
+    fs.mkdir(HOME)?;
+    for a in &all {
+        fs.mkdir(a.home)?;
+        fs.chown(a.home, a.uid, a.gid)?;
+        if a.uid == 0 {
+            fs.chmod(a.home, 0o700)?;
+        }
+    }
+    Ok(())
 }
 
 fn build_image(
     root: &Path,
     opts: &Options,
     cc: CCompiler,
-    profile: Option<Profile>,
+    profile: Option<(Profile, &Passwords)>,
 ) -> Result<Vec<u8>, String> {
+    let passwords = profile.map(|(_, p)| p);
+    let profile = profile.map(|(p, _)| p);
     let mut fs = Mkfs::new(opts)?;
     fs.add_host_dir(&root.join(ROOT_DIR), "/")?;
     if let Some(p) = profile {
@@ -335,14 +391,23 @@ fn build_image(
         fs.add_device(&format!("{DEV}/pts/{n}"), PTS_MAJOR, n)?;
     }
     fs.mkdir(RUN)?;
+    fs.mkdir(TMP)?;
+    fs.chmod(TMP, 0o1777)?;
     fs.mkdir(BIN)?;
     let user = userprogs::user_dir(root);
     let rt = userprogs::build_runtime(&user, cc)?;
     for prog in userprogs::programs(&user)? {
         let prog = userprogs::link_program(&user, &prog, cc, &rt)?;
         if profile.unwrap_or(Profile::Server).has_program(&prog.name) {
-            fs.add_file(&format!("{BIN}/{}", prog.name), &prog.elf)?;
+            let path = format!("{BIN}/{}", prog.name);
+            fs.add_file(&path, &prog.elf)?;
+            if SETUID_PROGRAMS.contains(&prog.name.as_str()) {
+                fs.chmod(&path, 0o4755)?;
+            }
         }
+    }
+    if let Some(passwords) = passwords {
+        add_accounts(&mut fs, passwords)?;
     }
     add_usr(&mut fs, &usr_files(&user, &rt)?)?;
     if profile == Some(Profile::Desktop) {
@@ -378,11 +443,22 @@ pub fn bootable_layout(size: u32, kernel: &[u8]) -> Result<Options, String> {
 /// (`camelot_fs::boot::install`), and the filesystem as big as the rest
 /// ([`bootable_layout`]). Fails, saying so, when the files do not fit.
 pub fn build_bootable(root: &Path, profile: Profile, size: u32) -> Result<Vec<u8>, String> {
+    build_bootable_with(root, profile, size, &Passwords::default())
+}
+
+/// [`build_bootable`], the accounts with `passwords`
+/// (`cargo xtask fs --root-password`, `--user-password`).
+pub fn build_bootable_with(
+    root: &Path,
+    profile: Profile,
+    size: u32,
+    passwords: &Passwords,
+) -> Result<Vec<u8>, String> {
     let kernel_path = root.join(KERNEL);
     let kernel =
         std::fs::read(&kernel_path).map_err(|e| format!("cannot read {}: {e}", kernel_path.display()))?;
     let opts = bootable_layout(size, &kernel)?;
-    let mut image = build_profile(root, &opts, profile).map_err(|e| {
+    let mut image = build_profile_with(root, &opts, profile, passwords).map_err(|e| {
         // Only running out of blocks or inodes is cured by a bigger image;
         // anything else (a missing file, a program that does not compile, a
         // size too big for a filesystem) is reported as it is.

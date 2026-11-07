@@ -74,6 +74,8 @@
     .equ SYS_getegid, 66
     .equ SYS_setuid, 67
     .equ SYS_setgid, 68
+    .equ SYS_chmod, 69
+    .equ SYS_chown, 70
 
     .text
 
@@ -147,7 +149,7 @@ uptime:
     ecall
     ret
 
-# int open(const char *path, int flags)
+# int open(const char *path, int flags, ...)
     .globl open
 open:
     li    a7, SYS_open
@@ -175,7 +177,7 @@ fstat:
     ecall
     ret
 
-# int mkdir(const char *path)
+# int mkdir(const char *path, mode_t mode)
     .globl mkdir
 mkdir:
     li    a7, SYS_mkdir
@@ -554,6 +556,20 @@ setuid:
     .globl setgid
 setgid:
     li    a7, SYS_setgid
+    ecall
+    ret
+
+# int chmod(const char *path, mode_t mode)
+    .globl chmod
+chmod:
+    li    a7, SYS_chmod
+    ecall
+    ret
+
+# int chown(const char *path, uid_t uid, gid_t gid)
+    .globl chown
+chown:
+    li    a7, SYS_chown
     ecall
     ret
 

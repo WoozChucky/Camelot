@@ -236,6 +236,18 @@ impl Console {
         }
     }
 
+    /// Logs in as root at the console's `login: ` with the image's default password
+    /// (`cargo xtask fs`'s), and waits for the shell's prompt. `login: ` may be
+    /// followed by a line of init's (shd's, on a VM without a network card), so it
+    /// is looked for anywhere in the output.
+    fn log_in(&mut self) {
+        self.wait_for("login: ");
+        self.type_line("root");
+        self.wait_for("Password: ");
+        self.type_line(xtask::accounts::ROOT_PASSWORD);
+        self.wait_for_end(PROMPT);
+    }
+
     fn type_line(&mut self, line: &str) {
         self.conn
             .send(&Message::ConsoleInput {
@@ -246,8 +258,8 @@ impl Console {
     }
 }
 
-/// Camelot's shell prompt.
-const PROMPT: &str = "$ ";
+/// Camelot's shell prompt, root's.
+const PROMPT: &str = "# ";
 
 /// A shell from the demo VM's `shd`, over a TCP connection to the forwarded port.
 struct Shell {
@@ -256,7 +268,9 @@ struct Shell {
 }
 
 impl Shell {
-    /// Connects and reads until the shell's greeting and prompt.
+    /// Connects, logs in as root (shd's sessions start with `login`, which has no
+    /// terminal to turn the echo off on, and so asks without a newline after the
+    /// password) and reads until the shell's greeting and prompt.
     fn connect(addr: SocketAddr) -> Shell {
         let stream = TcpStream::connect(addr).unwrap();
         stream.set_read_timeout(Some(SLOW)).unwrap();
@@ -264,7 +278,12 @@ impl Shell {
             stream,
             output: Vec::new(),
         };
-        shell.read_until(b"Type help for the list of commands.\n$ ");
+        shell.read_until(b"login: ");
+        shell.stream.write_all(b"root\n").unwrap();
+        shell.read_until(b"Password: ");
+        let password = format!("{}\n", xtask::accounts::ROOT_PASSWORD);
+        shell.stream.write_all(password.as_bytes()).unwrap();
+        shell.read_until(b"Type help for the list of commands.\n# ");
         shell
     }
 
@@ -388,10 +407,10 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         (avalon_client::DESKTOP_RAM, avalon_client::DESKTOP_HARTS)
     );
     assert_eq!(info.vm.profile.devices.len(), 1, "{:?}", info.vm.profile.devices);
-    // It boots: its console's shell, which its /etc/rc keeps beside the desktop.
+    // It boots: its console's login, which its /etc/rc keeps beside the desktop.
     let mut console = Console::attach(platform.avalon, desktop);
     console.wait_for("ram: 64 MiB at 0x80000000\n");
-    console.wait_for(PROMPT);
+    console.wait_for("login: ");
     drop(console);
     assert!(
         out.lines()
@@ -405,7 +424,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     assert_eq!(switches[0].name, "nat");
     assert!(switches[0].nat.is_some());
     let mut one = Console::attach(platform.avalon, id);
-    one.wait_for_end(PROMPT);
+    one.log_in();
     assert!(one.output.contains("Camelot v"), "{}", one.output);
     assert!(
         one.output.contains("\nram: 6 MiB at 0x80000000\n"),
@@ -414,12 +433,12 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     );
     assert!(one.output.contains(", the kernel none\n"), "{}", one.output);
     one.type_line("echo up from its own disk");
-    one.wait_for_end("up from its own disk\n$ ");
+    one.wait_for_end("up from its own disk\n# ");
     // A shell of its own through the forwarded port, beside the console's.
     let mut shell = Shell::connect(shd);
     shell.command("echo through shd", "through shd\n");
     one.type_line("echo the console still");
-    one.wait_for_end("the console still\n$ ");
+    one.wait_for_end("the console still\n# ");
     shell.command("ps | grep -c shd", "1\n");
     shell.leave();
     // Something for the next run to find on the disk.
@@ -441,6 +460,7 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
     avalon.start_vm(&VmRef::Id(two_id)).unwrap();
     let mut two = Console::attach(platform.avalon, two_id);
     two.wait_for(SHD_WITHOUT_NETWORK);
+    two.log_in();
     two.type_line("ls /");
     two.wait_for_end(PROMPT);
     let vms = avalon.list_vms().unwrap();
@@ -542,9 +562,9 @@ fn the_platform_comes_up_boots_camelot_and_stops() {
         out.lines()
     );
     let mut one = Console::attach(platform.avalon, id);
-    one.wait_for_end(PROMPT);
+    one.log_in();
     one.type_line("cat /kept");
-    one.wait_for_end("kept\n$ ");
+    one.wait_for_end("kept\n# ");
     drop(one);
     check_summary(&platform.summary(true), 5);
     check_summary(&platform.summary(false), 3);
@@ -708,7 +728,7 @@ ID  NAME  STATE    RAM    CLOCK       DISKS  NETS
     let switches = avalon.list_switches().unwrap();
     for (name, id, switch, paging) in vms {
         let mut console = Console::attach(platform.avalon, id);
-        console.wait_for_end(PROMPT);
+        console.log_in();
         for line in [
             "Camelot v",
             "p=0x0000000080000000 ",
@@ -725,7 +745,7 @@ ID  NAME  STATE    RAM    CLOCK       DISKS  NETS
         console.type_line(&format!("echo kept by {name} > /kept"));
         console.wait_for_end(PROMPT);
         console.type_line("cat /kept");
-        console.wait_for_end(&format!("kept by {name}\n$ "));
+        console.wait_for_end(&format!("kept by {name}\n# "));
         drop(console);
 
         // The screen: served from the first frame, the whole screen in the mode a
@@ -823,11 +843,11 @@ fn a_taken_shd_address_leaves_the_demo_without_shd() {
     let switches = avalon.list_switches().unwrap();
     assert_eq!(switches.len(), 1);
     assert_eq!(switches[0].nat.as_ref().map(|n| n.hostfwd.len()), Some(0));
-    // The platform carries on: the VM boots to its shell, the servers answer.
+    // The platform carries on: the VM boots to its login, the servers answer.
     let mut console = Console::attach(platform.avalon, id);
-    console.wait_for_end(PROMPT);
+    console.log_in();
     console.type_line("echo no shd");
-    console.wait_for_end("no shd\n$ ");
+    console.wait_for_end("no shd\n# ");
     all_answer(&platform);
     let summary = platform.summary(true);
     assert!(!tells_of_shd(&summary), "{summary}");
@@ -842,7 +862,7 @@ fn a_taken_shd_address_leaves_the_demo_without_shd() {
     assert_eq!(e, format!("no shell answered at {taken_addr}"));
     assert!(start.elapsed() < SLOW, "{:?}", start.elapsed());
     console.type_line("ps | grep -c shd");
-    console.wait_for_end("\n1\n$ ");
+    console.wait_for_end("\n1\n# ");
     assert!(!console.output.contains("shd &"), "{}", console.output);
     drop((console, taken));
     platform.stop(log);
@@ -878,8 +898,9 @@ fn a_disk_without_shd_leaves_the_demo_without_shd() {
     avalon.start_vm(&VmRef::Id(old)).unwrap();
     let mut console = Console::attach(platform.avalon, old);
     console.wait_for(SHD_WITHOUT_NETWORK);
+    console.log_in();
     console.type_line("rm /bin/shd");
-    console.wait_for_end("rm /bin/shd\n$ ");
+    console.wait_for_end("rm /bin/shd\n# ");
     drop(console);
     avalon.stop_vm(&VmRef::Id(old)).unwrap();
     avalon.destroy_vm(&VmRef::Id(old)).unwrap();
@@ -905,8 +926,9 @@ fn a_disk_without_shd_leaves_the_demo_without_shd() {
     check_summary(&summary, 4);
     // The platform carries on.
     let mut console = Console::attach(platform.avalon, id);
+    console.log_in();
     console.type_line("echo still up");
-    console.wait_for_end("still up\n$ ");
+    console.wait_for_end("still up\n# ");
     all_answer(&platform);
     drop((console, avalon, lake));
     platform.stop(log);
