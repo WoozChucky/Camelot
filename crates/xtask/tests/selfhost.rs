@@ -3703,7 +3703,7 @@ fn g_corpus(corpus: Corpus, jobs: usize, described: usize, headers: usize, every
         all.len()
     );
     let files = &files;
-    let wrong = on_machines(&all, |share| one_by_one_on_camelot(&share, files));
+    let wrong = on_machines(&all, |share| g_on_camelot(&share, files));
     assert!(wrong.is_empty(), "{} differ:\n{}", wrong.len(), wrong.join("\n"));
 }
 
@@ -3725,22 +3725,24 @@ fn shell_input<'a>(commands: impl Iterator<Item = (&'a str, &'a str)>) -> String
     input
 }
 
-/// Runs `jobs` (each with its number in the whole list, for its output file
-/// `/out/N`) with `/bin/cc1` on a machine whose image holds `files`, one
-/// `cc1` each, in its directory (`/d` for a row: what `-g` names the files
+/// Runs `-g`'s `jobs` (each with its number in the whole list, for its
+/// output file `/out/N`; every one compiles, [`g_corpus`] checks) with
+/// `/bin/cc1` on a machine whose image holds `files`, one `cc1` each, in
+/// its directory ([`g_jobs`] gives every job one: what `-g` names the files
 /// after), and compares each with the host's merlin (the job's `want`): the
-/// assembly it writes, and what it says, with its exit status when merlin
-/// refuses it. Returns what differs.
-fn one_by_one_on_camelot(jobs: &[(usize, &CcJob)], files: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+/// assembly it writes, and its warnings. Returns what differs.
+fn g_on_camelot(jobs: &[(usize, &CcJob)], files: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
     let commands: Vec<String> = jobs
         .iter()
         .map(|(k, job)| job.command(&format!("/out/{k}")))
         .collect();
-    let input = shell_input(
-        jobs.iter()
-            .zip(&commands)
-            .map(|((_, job), command)| (job.dir.as_deref().unwrap_or("/d"), command.as_str())),
-    );
+    let input = shell_input(jobs.iter().zip(&commands).map(|((_, job), command)| {
+        let dir = job.dir.as_deref();
+        (
+            dir.unwrap_or_else(|| panic!("{}: no directory", job.input)),
+            command.as_str(),
+        )
+    }));
     let listed: Vec<(String, Vec<u8>)> = files.iter().map(|(p, d)| (p.clone(), d.clone())).collect();
     let dirs = dirs_of(files);
     let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
@@ -3755,11 +3757,7 @@ fn one_by_one_on_camelot(jobs: &[(usize, &CcJob)], files: &BTreeMap<String, Vec<
     let mut wrong = Vec::new();
     for (i, (k, job)) in jobs.iter().enumerate() {
         let (text, said) = &job.want;
-        let said = match text {
-            Some(_) => said.clone(),
-            None => format!("{said}cc1: exit 1\n"),
-        };
-        let got_said = shell_output(&out, &commands[i]).replace('\r', "");
+        let got_said = shell_output(&out, &commands[i]);
         if got_said != said {
             wrong.push(format!("{}: said\n{got_said}\nmerlin says\n{said}", commands[i]));
         }
