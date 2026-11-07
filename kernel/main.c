@@ -25,6 +25,7 @@
 #include "pty.h"
 #include "shm.h"
 #include "riscv.h"
+#include "rtc.h"
 #include "sbi.h"
 #include "smp.h"
 #include "spinlock.h"
@@ -391,6 +392,7 @@ int kmain(void) {
     input_init();
     trap_init();
     kprintf("timer: %u Hz tick, %u Hz timebase\n", TICK_HZ, timebase_hz());
+    rtc_init();
     blk_init();
     binit();
     fs_init();

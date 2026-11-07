@@ -30,6 +30,8 @@ usize dtb_size;
 static struct spinlock kmem_lock;
 static struct run *freelist;
 static u32 nfree;
+/* The pages kinit() put on the free list. */
+static u32 ntotal;
 
 /* Whether physical address `a` is in the `size` bytes from `base`: compared
  * as an offset, so that a range ending at the top of the address space
@@ -129,6 +131,7 @@ void kinit(void) {
         freelist = r;
         nfree++;
     }
+    ntotal = nfree;
     release(&kmem_lock);
 }
 
@@ -166,6 +169,10 @@ void kfree(void *page) {
     freelist = r;
     nfree++;
     release(&kmem_lock);
+}
+
+u32 ktotal_pages(void) {
+    return ntotal;
 }
 
 u32 kfree_pages(void) {

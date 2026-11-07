@@ -308,12 +308,13 @@ struct procinfo {
     char name[16];
 };
 
-/* What harts stores for each hart: 16 bytes. */
+/* What harts stores for each hart: 20 bytes. */
 struct hartinfo {
     uint hart;     /* its id, 0 to the number of harts - 1 */
     uint pid;      /* the process it runs (the caller, on the caller's hart), 0 while idle */
     uint ticks;    /* timer ticks it has taken */
     uint switches; /* processes it has switched to */
+    uint idle;     /* the ticks that came while it ran no process: busy is ticks - idle */
 };
 
 #define PROC_RUNNABLE 1 /* waiting for its turn */
@@ -432,6 +433,38 @@ struct pollfd {
 struct timeval {
     time_t tv_sec;
     long tv_usec;
+};
+
+/* A time: seconds and nanoseconds, two longs, as Linux's (16 bytes):
+ * clock_gettime's. */
+struct timespec {
+    time_t tv_sec;
+    long tv_nsec;
+};
+
+/* clock_gettime's clocks, Linux's numbers: the date, and the time since
+ * boot. */
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+
+/* What sysinfo stores, Linux's struct sysinfo on LP64 (112 bytes): the
+ * time since boot in seconds, the memory in units of mem_unit bytes (1),
+ * and the number of processes. Camelot has no load average, swap or high
+ * memory: those are 0. */
+struct sysinfo {
+    long uptime;
+    unsigned long loads[3];
+    unsigned long totalram;
+    unsigned long freeram;
+    unsigned long sharedram;
+    unsigned long bufferram;
+    unsigned long totalswap;
+    unsigned long freeswap;
+    unsigned short procs;
+    unsigned short pad;
+    unsigned long totalhigh;
+    unsigned long freehigh;
+    uint mem_unit;
 };
 
 /* Terminals: the console and the pseudo-terminals, /dev/ptmx and
@@ -809,6 +842,8 @@ int stat(const char *path, struct stat *st);
  * can't take it. Where glibc's getcwd() returns buf and sets errno, this
  * one returns the length or the error, as the rest of this library does. */
 long getcwd(char *buf, size_t size);
+int clock_gettime(int clock, struct timespec *ts);
+int sysinfo(struct sysinfo *info);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);
@@ -1020,6 +1055,25 @@ int grantpt(int fd);
 int unlockpt(int fd);
 char *ptsname(int fd);
 char *ttyname(int fd);
+
+/* The date (lib/time.c), as C has it, in UTC: time() the seconds since
+ * 1970-01-01 00:00:00 UTC (CLOCK_REALTIME), also stored at `t` unless it
+ * is NULL, or -1 if the clock can't be read; gmtime_r() the time `*t`
+ * broken into its fields, in `tm`, which it returns (NULL for a time
+ * before 1970). */
+struct tm {
+    int tm_sec;   /* 0 to 59 */
+    int tm_min;   /* 0 to 59 */
+    int tm_hour;  /* 0 to 23 */
+    int tm_mday;  /* 1 to 31 */
+    int tm_mon;   /* 0 to 11 */
+    int tm_year;  /* years since 1900 */
+    int tm_wday;  /* days since Sunday, 0 to 6 */
+    int tm_yday;  /* days since 1 January, 0 to 365 */
+    int tm_isdst; /* 0: UTC has no daylight saving */
+};
+time_t time(time_t *t);
+struct tm *gmtime_r(const time_t *t, struct tm *tm);
 
 /* Busy-waits for about `n` iterations of a short loop, a few instructions
  * each: CPU time, as opposed to sleep() (lib/spin.c). */

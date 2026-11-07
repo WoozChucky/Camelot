@@ -112,7 +112,7 @@ fn scenario(name: &str) -> Scenario {
              RAM      4 MiB at 0x0000000080000000\n\
              CPU      10000000 Hz (nominal)\n\
              timebase 10000000 Hz\n\
-             9 devices:\n  \
+             10 devices:\n  \
              test      0x0000000000100000 + 0x0000000000001000\n  \
              CLINT     0x0000000002000000 + 0x0000000000010000\n  \
              PLIC      0x000000000c000000 + 0x0000000004000000\n  \
@@ -121,6 +121,7 @@ fn scenario(name: &str) -> Scenario {
              keyboard  0x0000000030001000 + 0x0000000000001000  irq 2\n  \
              sysinfo   0x0000000030002000 + 0x0000000000001000\n  \
              pointer   0x0000000030003000 + 0x0000000000001000  irq 11\n  \
+             rtc       0x0000000030004000 + 0x0000000000001000  irq 17\n  \
              fb-vram   0x0000000031000000 + 0x000000000012c000\n",
             0,
         ),

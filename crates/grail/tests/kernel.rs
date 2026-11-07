@@ -60,8 +60,9 @@ fn grail(elf: &Path, stdin: &[u8]) -> (Option<i32>, String) {
 
 /// [`grail`] with extra command-line `args` before the image.
 fn grail_with(args: &[&str], elf: &Path, stdin: &[u8]) -> (Option<i32>, String) {
+    // The clock at a fixed date, so the boot's `rtc:` line is the same on every run.
     let mut child = Command::new(env!("CARGO_BIN_EXE_grail"))
-        .args(["--max-steps", MAX_STEPS])
+        .args(["--max-steps", MAX_STEPS, "--rtc", "2026-01-01"])
         .args(args)
         .arg(elf)
         .stdin(Stdio::piped())
@@ -123,6 +124,8 @@ const FB: &str = "fb: 640x480, 6 modes, irq 16\n";
 /// What the kernel says after the timer line when no disk is attached
 /// (kernel/main.c).
 const NO_DISK: &str = "disk: none\n";
+/// The kernel's line for the real-time clock, which `grail_with` starts at 2026-01-01.
+const RTC: &str = "rtc: 2026-01-01 00:00 UTC\n";
 
 /// What the shell prints before its first prompt, and the prompt
 /// (kernel/user/sh.c).
@@ -146,7 +149,7 @@ fn kernel_ticks_ten_times_then_starts_the_shell() {
     assert!(out.contains("|_|\n\nCamelot v0.1.0 booting...\n"), "{out}");
     assert!(
         out.ends_with(&format!(
-            "{}{FB}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
+            "{}{FB}timer: 10 Hz tick, 10000000 Hz timebase\n{RTC}{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
             memory_lines(RAM_MIB),
             ticks(),
             kstack_lines(&out)
@@ -284,7 +287,7 @@ fn kernel_boots_with_paging_on_any_ram_size() {
         let (code, out) = grail_with(&["--ram", mib], &kernel_elf(), b"exit\n");
         assert_eq!(code, Some(0), "--ram {mib}, output:\n{out}");
         let want = format!(
-            "{}{FB}timer: 10 Hz tick, 10000000 Hz timebase\n{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
+            "{}{FB}timer: 10 Hz tick, 10000000 Hz timebase\n{RTC}{NO_DISK}{}{}{SHELL_BANNER}{PROMPT}exit\n",
             memory_lines(mib.parse().unwrap()),
             ticks(),
             kstack_lines(&out)
@@ -534,7 +537,7 @@ fn kernel_tests_an_image_file_disk_and_leaves_it_as_it_was() {
     let (code, out) = grail_with(&["--disk", path.to_str().unwrap()], &kernel_elf(), b"exit\n");
     assert_eq!(code, Some(0), "output:\n{out}");
     assert!(
-        out.contains("timebase\ndisk 0: 128 sectors (64 KiB), irq 3\ntick 1\n"),
+        out.contains("timebase\nrtc: 2026-01-01 00:00 UTC\ndisk 0: 128 sectors (64 KiB), irq 3\ntick 1\n"),
         "{out}"
     );
     // After the ticks, before the shell, and before the kernel looks for a
@@ -564,6 +567,7 @@ fn kernel_lists_every_disk_and_leaves_a_read_only_one_alone() {
     assert!(
         out.contains(
             "timebase\n\
+             rtc: 2026-01-01 00:00 UTC\n\
              disk 0: 64 sectors (32 KiB), irq 3, read-only\n\
              disk 1: 8 sectors (4 KiB), irq 4\n\
              tick 1\n"

@@ -7,6 +7,10 @@
 //! Network cards: a Grail config plugs a card into an in-process hub, a profile into
 //! one of the server's switches, by name. The two are the same idea (a network the
 //! card is on), so here a hub stands for the switch of the same name.
+//!
+//! The real-time clock's start has no wire form: a VM's clock starts at its host's
+//! time, as `grail`'s does (Avalon builds it with `Rtc::Host`), so a config comes back
+//! from the wire with that.
 
 use avalon_proto::{
     DeviceEntry, DeviceSpec, DiskSpec, HardwareProfile, KeyEvent, Message, NetSpec, PIXEL_FORMAT_XRGB8888,
@@ -67,6 +71,7 @@ fn profile_from(config: &MachineConfig, switches: Switches) -> Result<HardwarePr
         nets,
         paging,
         bios,
+        rtc: _,
     } = config.clone();
     let mut devices: Vec<DeviceSpec> = disks.iter().map(disk_spec_from).collect::<Result<_, _>>()?;
     for net in &nets {
@@ -161,6 +166,7 @@ fn config_from(profile: &HardwareProfile, switches: Switches) -> Result<MachineC
         nets,
         paging: paging_to(profile.paging),
         bios: bios_to(&profile.bios),
+        rtc: grail::Rtc::Host,
     };
     config.validate()?;
     Ok(config)
@@ -237,6 +243,7 @@ fn configs_survive_the_wire() {
             nets: Vec::new(),
             paging: grail::Paging::Sv48,
             bios: grail::Bios::None,
+            rtc: grail::Rtc::Host,
         },
         MachineConfig {
             ram_size: 4096,
@@ -247,6 +254,7 @@ fn configs_survive_the_wire() {
             nets: Vec::new(),
             paging: grail::Paging::Sv48,
             bios: grail::Bios::None,
+            rtc: grail::Rtc::At(0),
         },
         MachineConfig {
             disks: vec![
@@ -271,7 +279,11 @@ fn configs_survive_the_wire() {
     for config in configs {
         let profile = through_the_wire(profile_from(&config, &switches).unwrap());
         assert_eq!(profile.cpu_hz(), config.cpu_hz());
-        assert_eq!(config_from(&profile, &switches).unwrap(), config);
+        let back = MachineConfig {
+            rtc: grail::Rtc::Host,
+            ..config
+        };
+        assert_eq!(config_from(&profile, &switches).unwrap(), back);
     }
     // What has no wire form.
     let captured = MachineConfig {

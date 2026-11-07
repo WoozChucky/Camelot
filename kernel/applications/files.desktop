@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+Comment=Browse the files and read them
+Exec=files
+Icon=files

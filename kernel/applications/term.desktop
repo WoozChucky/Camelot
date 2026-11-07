@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Comment=A shell in a window
+Exec=term
+Icon=term

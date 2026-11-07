@@ -4,10 +4,8 @@
  *
  *   stress [WORKERS [ROUNDS]]      (default 4 workers, 4 rounds)
  *
- * starts WORKERS copies of itself (`stress worker ID ROUNDS`, at most 6, so
- * that with the shell and stress there are 8 processes, NPROC; 5 on a root
- * image, whose init takes a slot too), each of
- * which, in each round:
+ * starts WORKERS copies of itself (`stress worker ID ROUNDS`, at most 6), each
+ * of which, in each round:
  *
  *   - grows its heap by PAGES pages (sbrk: the page allocator), fills every
  *     word with a pattern of its own, spins for a while (so timer ticks

@@ -109,6 +109,8 @@ pub fn machine_config(profile: &HardwareProfile) -> Result<MachineConfig, String
             avalon_proto::Paging::Sv39 => grail::Paging::Sv39,
         },
         bios: machine_bios(bios),
+        // A VM's clock starts at the host's time, as `grail`'s does.
+        rtc: grail::Rtc::Host,
     };
     config.validate()?;
     if config.bios.is_some() {
@@ -175,11 +177,15 @@ mod tests {
                 nets: Vec::new(),
                 paging: grail::Paging::Sv39,
                 bios: grail::Bios::Default,
+                rtc: grail::Rtc::Host,
             }
         );
         assert_eq!(
             machine_config(&HardwareProfile::default()).unwrap(),
-            MachineConfig::default()
+            MachineConfig {
+                rtc: grail::Rtc::Host,
+                ..MachineConfig::default()
+            }
         );
     }
 

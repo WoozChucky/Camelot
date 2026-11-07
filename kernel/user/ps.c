@@ -12,7 +12,7 @@
 
 /* Process slots (NPROC in kernel/include/proc.h): procs says if there are
  * more. */
-#define MAX_PROCS 8
+#define MAX_PROCS 32
 
 static const char *state_name(uint state) {
     if (state == PROC_RUNNING) {

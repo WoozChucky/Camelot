@@ -260,9 +260,9 @@ fn the_profiles_and_a_desktop() {
     assert_eq!(
         rt(&["profiles"]).unwrap(),
         "\
-NAME     IMAGE       RAM     BIOS     ABOUT
-server   os-base     6 MiB   default  a Camelot server: the console's shell and shd, its shells over TCP
-desktop  os-desktop  64 MiB  default  a Camelot desktop: its own image, and RAM for the largest display mode
+NAME     IMAGE       RAM     HARTS  BIOS     ABOUT
+server   os-base     6 MiB   1      default  a Camelot server: the console's shell and shd, its shells over TCP
+desktop  os-desktop  64 MiB  4      default  a Camelot desktop: its own image, and RAM for the largest display mode
 "
     );
     let desktop = avalon_client::DESKTOP_IMAGE;

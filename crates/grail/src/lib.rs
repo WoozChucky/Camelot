@@ -27,6 +27,7 @@ pub mod mmio;
 pub mod net;
 pub mod pointer;
 pub mod ram;
+pub mod rtc;
 pub mod sysinfo;
 pub mod trap;
 /// Hand-written Win32 declarations, shared with the other Windows programs of the
@@ -40,8 +41,8 @@ pub mod window;
 use block::{BlockBackend, BlockDevice};
 use bus::{Bus, Exit, MAX_DISKS, MAX_NETS};
 pub use config::{
-    parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_size, Bios, DiskConfig,
-    MachineConfig, NetConfig, Paging, DEFAULT_RAM_SIZE, MAX_HARTS, MAX_RAM_SIZE,
+    parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_rtc, parse_size, Bios,
+    DiskConfig, MachineConfig, NetConfig, Paging, Rtc, DEFAULT_RAM_SIZE, MAX_HARTS, MAX_RAM_SIZE,
 };
 use cpu::Cpu;
 use keyboard::KeyEvent;

@@ -15,7 +15,14 @@
  * back), after the rectangles the last frame damaged are copied into it
  * from the other: then it is the last frame, and only what changes needs
  * drawing. Committing attaches it, sends its damage (wl_surface.
- * damage_buffer), asks for a frame callback, and commits. */
+ * damage_buffer), asks for a frame callback, and commits.
+ *
+ * A layer surface (wlroots' layer shell) is a window without its
+ * xdg_surface and xdg_toplevel: the zwlr_layer_surface_v1 is configured and
+ * acknowledged as they are, and its buffers are a window's. The foreign
+ * toplevel manager's handles are kept in a list as they are announced, and
+ * the clipboard is a wl_data_device: the selection's wl_data_offer, and a
+ * wl_data_source when this client sets it. */
 #include "../gui.h"
 #include "protocol.h"
 
@@ -25,6 +32,15 @@
 #define WL_SHM_VERSION 1
 #define XDG_WM_BASE_VERSION 1
 #define WL_SEAT_VERSION 1
+#define LAYER_SHELL_VERSION 1
+#define TOPLEVEL_MANAGER_VERSION 1
+#define DATA_DEVICE_MANAGER_VERSION 1
+
+/* The clipboard's types: UTF-8 text first. */
+#define MIME_UTF8 "text/plain;charset=utf-8"
+#define MIME_TEXT "text/plain"
+/* How long a read of the clipboard waits for its source, ms. */
+#define CLIPBOARD_WAIT 2000
 
 /* wl_display, always object 1. */
 #define WL_DISPLAY_ID 1
@@ -47,6 +63,8 @@ struct gui_window {
     uint surface;
     uint xdg_surface;
     uint toplevel;
+    uint layer; /* a layer surface's zwlr_layer_surface_v1 (no xdg_surface, no toplevel), or 0 */
+    int opened; /* gui_window_open has returned it: configures go to its handler */
     uint pool;
     uint frame; /* the frame callback asked for, 0 if none */
     struct shm_buffer bufs[2];
@@ -82,6 +100,24 @@ struct gui_display {
     uint sync;
     int synced;
     uint button_serial; /* the last button press's, for a move */
+    uint input_serial;  /* the last input event's, for the clipboard */
+    uint layer_shell;
+    uint toplevel_manager;
+    struct gui_toplevel toplevels[GUI_TOPLEVELS];
+    int ntoplevels;
+    int toplevels_changed;
+    uint data_manager;
+    uint data_device;
+    /* The selection's offer and the one being announced: whether each has
+     * text (2: UTF-8, 1: plain). */
+    uint offer;
+    int offer_text;
+    uint new_offer;
+    int new_offer_text;
+    /* The selection this client set, while it is the source. */
+    uint source;
+    char *source_text;
+    size_t source_len;
     struct gui_window *windows;
     struct gui_window *pointer_focus;
     struct gui_window *keyboard_focus;
@@ -240,6 +276,12 @@ static void registry_event(struct gui_display *d, struct gui_message *m) {
         bind_global(d, name, interface, lower(version, XDG_WM_BASE_VERSION), &d->wm_base);
     } else if (strcmp(interface, "wl_seat") == 0 && d->seat == 0) {
         bind_global(d, name, interface, lower(version, WL_SEAT_VERSION), &d->seat);
+    } else if (strcmp(interface, "zwlr_layer_shell_v1") == 0 && d->layer_shell == 0) {
+        bind_global(d, name, interface, lower(version, LAYER_SHELL_VERSION), &d->layer_shell);
+    } else if (strcmp(interface, "zwlr_foreign_toplevel_manager_v1") == 0 && d->toplevel_manager == 0) {
+        bind_global(d, name, interface, lower(version, TOPLEVEL_MANAGER_VERSION), &d->toplevel_manager);
+    } else if (strcmp(interface, "wl_data_device_manager") == 0 && d->data_manager == 0) {
+        bind_global(d, name, interface, lower(version, DATA_DEVICE_MANAGER_VERSION), &d->data_manager);
     }
 }
 
@@ -304,6 +346,7 @@ static void pointer_event(struct gui_display *d, struct gui_message *m) {
         if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
             d->button_serial = serial;
         }
+        d->input_serial = serial;
         if (w != NULL && w->h->button != NULL) {
             w->h->button(w, button, state == WL_POINTER_BUTTON_STATE_PRESSED);
         }
@@ -339,7 +382,7 @@ static void keyboard_event(struct gui_display *d, struct gui_message *m) {
         break;
     }
     case WL_KEYBOARD_ENTER: {
-        gui_msg_uint(m);
+        d->input_serial = gui_msg_uint(m);
         uint surface = gui_msg_uint(m);
         w = window_of_surface(d, surface);
         d->keyboard_focus = w;
@@ -355,7 +398,7 @@ static void keyboard_event(struct gui_display *d, struct gui_message *m) {
         }
         break;
     case WL_KEYBOARD_KEY: {
-        gui_msg_uint(m);
+        d->input_serial = gui_msg_uint(m);
         gui_msg_uint(m);
         uint key = gui_msg_uint(m);
         uint state = gui_msg_uint(m);
@@ -380,16 +423,334 @@ static void keyboard_event(struct gui_display *d, struct gui_message *m) {
     }
 }
 
+/* A configure came: the window's handler hears its size, once the window
+ * is open. */
+static void configured(struct gui_window *w) {
+    if (w->opened && w->h->configure != NULL) {
+        w->h->configure(w, gui_window_width(w), gui_window_height(w));
+    }
+}
+
+/* ---- The foreign toplevel list ---- */
+
+static struct gui_toplevel *toplevel_of(struct gui_display *d, uint handle) {
+    for (int i = 0; i < d->ntoplevels; i++) {
+        if (d->toplevels[i].handle == handle) {
+            return &d->toplevels[i];
+        }
+    }
+    return NULL;
+}
+
+static void manager_event(struct gui_display *d, struct gui_message *m) {
+    if (m->opcode == ZWLR_FOREIGN_TOPLEVEL_MANAGER_V1_TOPLEVEL) {
+        uint handle = gui_msg_uint(m);
+        if (m->bad) {
+            return;
+        }
+        if (d->ntoplevels == GUI_TOPLEVELS) {
+            request0(d, handle, ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_DESTROY); /* no room: not followed */
+            return;
+        }
+        struct gui_toplevel *t = &d->toplevels[d->ntoplevels++];
+        memset(t, 0, sizeof(*t));
+        t->handle = handle;
+    } else if (m->opcode == ZWLR_FOREIGN_TOPLEVEL_MANAGER_V1_FINISHED) {
+        d->toplevel_manager = 0;
+    }
+}
+
+/* An event for one of the toplevel handles; 0 if it is none of theirs. */
+static int handle_event(struct gui_display *d, struct gui_message *m) {
+    struct gui_toplevel *t = toplevel_of(d, m->object);
+    if (t == NULL) {
+        return 0;
+    }
+    switch (m->opcode) {
+    case ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_TITLE: {
+        const char *s = gui_msg_string(m);
+        if (s != NULL) {
+            snprintf(t->title, sizeof(t->title), "%s", s);
+        }
+        break;
+    }
+    case ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE: {
+        uint len;
+        const uint *states = gui_msg_array(m, &len);
+        t->activated = 0;
+        for (uint i = 0; states != NULL && i < len / 4; i++) {
+            if (states[i] == ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_ACTIVATED) {
+                t->activated = 1;
+            }
+        }
+        break;
+    }
+    case ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_DONE:
+        d->toplevels_changed = 1;
+        break;
+    case ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_CLOSED: {
+        request0(d, t->handle, ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_DESTROY);
+        int i = (int)(t - d->toplevels);
+        memmove(t, t + 1, (size_t)(d->ntoplevels - 1 - i) * sizeof(*t));
+        d->ntoplevels--;
+        d->toplevels_changed = 1;
+        break;
+    }
+    default:
+        break; /* app_id, the outputs */
+    }
+    return 1;
+}
+
+int gui_has_toplevels(struct gui_display *d) {
+    return d->toplevel_manager != 0;
+}
+
+int gui_toplevels(struct gui_display *d, const struct gui_toplevel **list) {
+    *list = d->toplevels;
+    return d->ntoplevels;
+}
+
+int gui_toplevels_changed(struct gui_display *d) {
+    int changed = d->toplevels_changed;
+    d->toplevels_changed = 0;
+    return changed;
+}
+
+void gui_toplevel_activate(struct gui_display *d, uint handle) {
+    if (toplevel_of(d, handle) == NULL || d->seat == 0) {
+        return;
+    }
+    request1(d, handle, ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_ACTIVATE, d->seat);
+    gui_wire_flush(&d->wire);
+}
+
+void gui_toplevel_close(struct gui_display *d, uint handle) {
+    if (toplevel_of(d, handle) == NULL) {
+        return;
+    }
+    request0(d, handle, ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_CLOSE);
+    gui_wire_flush(&d->wire);
+}
+
+/* ---- The clipboard ---- */
+
+/* How much text a type is: 2 UTF-8, 1 plain, 0 none. */
+static int text_kind(const char *mime) {
+    if (mime == NULL) {
+        return 0;
+    }
+    if (strcmp(mime, MIME_UTF8) == 0) {
+        return 2;
+    }
+    return strcmp(mime, MIME_TEXT) == 0 ? 1 : 0;
+}
+
+static void drop_source(struct gui_display *d) {
+    if (d->source != 0) {
+        request0(d, d->source, WL_DATA_SOURCE_DESTROY);
+        d->source = 0;
+    }
+    free(d->source_text);
+    d->source_text = NULL;
+    d->source_len = 0;
+}
+
+static void data_device_event(struct gui_display *d, struct gui_message *m) {
+    if (m->opcode == WL_DATA_DEVICE_DATA_OFFER) {
+        uint id = gui_msg_uint(m);
+        if (m->bad) {
+            return;
+        }
+        if (d->new_offer != 0) {
+            request0(d, d->new_offer, WL_DATA_OFFER_DESTROY); /* announced, never the selection */
+        }
+        d->new_offer = id;
+        d->new_offer_text = 0;
+    } else if (m->opcode == WL_DATA_DEVICE_SELECTION) {
+        uint id = gui_msg_uint(m);
+        if (m->bad) {
+            return;
+        }
+        if (d->offer != 0 && d->offer != id) {
+            request0(d, d->offer, WL_DATA_OFFER_DESTROY);
+        }
+        d->offer_text = id == 0 ? 0 : id == d->new_offer ? d->new_offer_text : d->offer_text;
+        if (id == d->new_offer) {
+            d->new_offer = 0;
+        }
+        d->offer = id;
+    }
+    /* enter, leave, motion, drop: dragging, which no one here does. */
+}
+
+/* An event for an offer or the source; 0 if it is neither. */
+static int clipboard_event(struct gui_display *d, struct gui_message *m) {
+    if (m->object == d->new_offer && d->new_offer != 0) {
+        if (m->opcode == WL_DATA_OFFER_OFFER) {
+            int k = text_kind(gui_msg_string(m));
+            if (k > d->new_offer_text) {
+                d->new_offer_text = k;
+            }
+        }
+        return 1;
+    }
+    if (m->object == d->offer && d->offer != 0) {
+        if (m->opcode == WL_DATA_OFFER_OFFER) {
+            int k = text_kind(gui_msg_string(m));
+            if (k > d->offer_text) {
+                d->offer_text = k;
+            }
+        }
+        return 1;
+    }
+    if (m->object == d->source && d->source != 0) {
+        if (m->opcode == WL_DATA_SOURCE_SEND) {
+            gui_msg_string(m);
+            int fd = gui_msg_fd(m);
+            if (fd >= 0) {
+                size_t done = 0;
+                while (done < d->source_len) {
+                    long n = write(fd, d->source_text + done, d->source_len - done);
+                    if (n <= 0) {
+                        break;
+                    }
+                    done += (size_t)n;
+                }
+                close(fd);
+            }
+        } else if (m->opcode == WL_DATA_SOURCE_CANCELLED) {
+            drop_source(d); /* another client's selection now */
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int gui_clipboard_set(struct gui_display *d, const char *text, size_t len) {
+    if (d->data_device == 0) {
+        return -EOPNOTSUPP;
+    }
+    char *copy = malloc(len + 1);
+    if (copy == NULL) {
+        return -ENOMEM;
+    }
+    memcpy(copy, text, len);
+    copy[len] = 0;
+    drop_source(d);
+    d->source = new_id(d);
+    d->source_text = copy;
+    d->source_len = len;
+    request1(d, d->data_manager, WL_DATA_DEVICE_MANAGER_CREATE_DATA_SOURCE, d->source);
+    gui_wire_begin(&d->wire, d->source, WL_DATA_SOURCE_OFFER);
+    gui_wire_string(&d->wire, MIME_UTF8);
+    msg_end(d);
+    gui_wire_begin(&d->wire, d->source, WL_DATA_SOURCE_OFFER);
+    gui_wire_string(&d->wire, MIME_TEXT);
+    msg_end(d);
+    gui_wire_begin(&d->wire, d->data_device, WL_DATA_DEVICE_SET_SELECTION);
+    gui_wire_uint(&d->wire, d->source);
+    gui_wire_uint(&d->wire, d->input_serial);
+    msg_end(d);
+    int r = gui_wire_flush(&d->wire);
+    return r < 0 ? r : d->error;
+}
+
+int gui_clipboard_get(struct gui_display *d, char **text, size_t *len) {
+    *text = NULL;
+    *len = 0;
+    if (d->source != 0) {
+        /* This client's own: no pipe to itself, which would wait for it. */
+        char *copy = malloc(d->source_len + 1);
+        if (copy == NULL) {
+            return -ENOMEM;
+        }
+        memcpy(copy, d->source_text, d->source_len + 1);
+        *text = copy;
+        *len = d->source_len;
+        return 0;
+    }
+    if (d->offer == 0 || d->offer_text == 0) {
+        return -ENOENT;
+    }
+    int p[2];
+    int r = pipe(p);
+    if (r < 0) {
+        return r;
+    }
+    gui_wire_begin(&d->wire, d->offer, WL_DATA_OFFER_RECEIVE);
+    gui_wire_string(&d->wire, d->offer_text == 2 ? MIME_UTF8 : MIME_TEXT);
+    gui_wire_fd(&d->wire, p[1]);
+    msg_end(d);
+    r = gui_wire_flush(&d->wire);
+    close(p[1]);
+    if (r < 0) {
+        close(p[0]);
+        return r;
+    }
+    size_t cap = 256;
+    size_t n = 0;
+    char *buf = malloc(cap);
+    while (buf != NULL) {
+        struct pollfd pf;
+        pf.fd = p[0];
+        pf.events = POLLIN;
+        pf.revents = 0;
+        if (poll(&pf, 1, CLIPBOARD_WAIT) <= 0) {
+            break; /* its source doesn't answer: what came */
+        }
+        if (n + 1 == cap) {
+            char *bigger = realloc(buf, cap * 2);
+            if (bigger == NULL) {
+                break;
+            }
+            buf = bigger;
+            cap *= 2;
+        }
+        long got = read(p[0], buf + n, cap - 1 - n);
+        if (got <= 0) {
+            break;
+        }
+        n += (size_t)got;
+    }
+    close(p[0]);
+    if (buf == NULL) {
+        return -ENOMEM;
+    }
+    buf[n] = 0;
+    *text = buf;
+    *len = n;
+    return 0;
+}
+
 /* An event for a window's objects; 0 if it is none of theirs. */
 static int window_event(struct gui_display *d, struct gui_message *m) {
     for (struct gui_window *w = d->windows; w != NULL; w = w->next) {
-        if (m->object == w->xdg_surface && m->opcode == XDG_SURFACE_CONFIGURE) {
+        if (w->xdg_surface != 0 && m->object == w->xdg_surface && m->opcode == XDG_SURFACE_CONFIGURE) {
             w->serial = gui_msg_uint(m);
             w->configured = 1;
             w->acked = 0;
+            configured(w);
             return 1;
         }
-        if (m->object == w->toplevel) {
+        if (w->layer != 0 && m->object == w->layer) {
+            if (m->opcode == ZWLR_LAYER_SURFACE_V1_CONFIGURE) {
+                w->serial = gui_msg_uint(m);
+                w->want_w = (int)gui_msg_uint(m);
+                w->want_h = (int)gui_msg_uint(m);
+                if (w->want_w < 0 || w->want_h < 0) {
+                    w->want_w = 0;
+                    w->want_h = 0;
+                }
+                w->configured = 1;
+                w->acked = 0;
+                configured(w);
+            } else if (m->opcode == ZWLR_LAYER_SURFACE_V1_CLOSED && w->h->close != NULL) {
+                w->h->close(w);
+            }
+            return 1;
+        }
+        if (w->toplevel != 0 && m->object == w->toplevel) {
             if (m->opcode == XDG_TOPLEVEL_CONFIGURE) {
                 w->want_w = gui_msg_int(m);
                 w->want_h = gui_msg_int(m);
@@ -459,6 +820,12 @@ static void handle(struct gui_display *d, struct gui_message *m) {
         pointer_event(d, m);
     } else if (m->object == d->keyboard && d->keyboard != 0) {
         keyboard_event(d, m);
+    } else if (m->object == d->toplevel_manager && d->toplevel_manager != 0) {
+        manager_event(d, m);
+    } else if (m->object == d->data_device && d->data_device != 0) {
+        data_device_event(d, m);
+    } else if (handle_event(d, m) || clipboard_event(d, m)) {
+        /* a toplevel handle's, the clipboard's */
     } else {
         /* wl_shm.format, and events for objects already destroyed. */
         window_event(d, m);
@@ -594,6 +961,15 @@ struct gui_display *gui_connect(const char *name, int *err) {
     if (r == 0) {
         r = gui_roundtrip(d);
     }
+    if (r == 0 && d->data_manager != 0 && d->seat != 0) {
+        /* The clipboard's device: its selection comes as the keyboard
+         * enters this client's windows. */
+        d->data_device = new_id(d);
+        gui_wire_begin(&d->wire, d->data_manager, WL_DATA_DEVICE_MANAGER_GET_DATA_DEVICE);
+        gui_wire_uint(&d->wire, d->data_device);
+        gui_wire_uint(&d->wire, d->seat);
+        msg_end(d);
+    }
     if (r == 0 && (d->compositor == 0 || d->shm == 0 || d->wm_base == 0)) {
         fprintf(2, "gui: the display server lacks wl_compositor, wl_shm or xdg_wm_base\n");
         r = -ENOENT;
@@ -611,6 +987,7 @@ void gui_disconnect(struct gui_display *d) {
     while (d->windows != NULL) {
         gui_window_destroy(d->windows);
     }
+    drop_source(d);
     gui_wire_flush(&d->wire);
     gui_wire_release(&d->wire);
     close(d->wire.fd);
@@ -623,8 +1000,9 @@ int gui_display_fd(struct gui_display *d) {
 
 /* ---- Windows ---- */
 
-struct gui_window *gui_window_open(struct gui_display *d, const char *title, int width, int height,
-                                   const struct gui_window_handlers *h, void *data) {
+/* A window's state and its surface, not yet a role. */
+static struct gui_window *window_new(struct gui_display *d, int width, int height, const struct gui_window_handlers *h,
+                                     void *data) {
     struct gui_window *w = calloc(1, sizeof(struct gui_window));
     if (w == NULL) {
         return NULL;
@@ -641,18 +1019,13 @@ struct gui_window *gui_window_open(struct gui_display *d, const char *title, int
     d->windows = w;
     w->surface = new_id(d);
     request1(d, d->compositor, WL_COMPOSITOR_CREATE_SURFACE, w->surface);
-    w->xdg_surface = new_id(d);
-    gui_wire_begin(&d->wire, d->wm_base, XDG_WM_BASE_GET_XDG_SURFACE);
-    gui_wire_uint(&d->wire, w->xdg_surface);
-    gui_wire_uint(&d->wire, w->surface);
-    msg_end(d);
-    w->toplevel = new_id(d);
-    request1(d, w->xdg_surface, XDG_SURFACE_GET_TOPLEVEL, w->toplevel);
-    gui_wire_begin(&d->wire, w->toplevel, XDG_TOPLEVEL_SET_TITLE);
-    gui_wire_string(&d->wire, title);
-    msg_end(d);
-    /* The first commit, with no buffer: the server answers with the first
-     * configure, which a buffer must wait for. */
+    return w;
+}
+
+/* The first commit, with no buffer: the server answers with the first
+ * configure, which a buffer must wait for. The window, or NULL (gone). */
+static struct gui_window *window_configure(struct gui_window *w) {
+    struct gui_display *d = w->d;
     request0(d, w->surface, WL_SURFACE_COMMIT);
     while (!w->configured && d->error == 0) {
         if (gui_dispatch(d, -1) < 0) {
@@ -663,11 +1036,75 @@ struct gui_window *gui_window_open(struct gui_display *d, const char *title, int
         gui_window_destroy(w);
         return NULL;
     }
-    if (w->want_w > 0 && w->want_h > 0) {
+    if (w->want_w > 0) {
         w->width = w->want_w;
+    }
+    if (w->want_h > 0) {
         w->height = w->want_h;
     }
+    w->opened = 1;
     return w;
+}
+
+int gui_has_layers(struct gui_display *d) {
+    return d->layer_shell != 0;
+}
+
+struct gui_window *gui_layer_open(struct gui_display *d, const char *name, int layer, uint anchor, int exclusive,
+                                  int keyboard, int width, int height, const struct gui_window_handlers *h,
+                                  void *data) {
+    if (d->layer_shell == 0) {
+        return NULL;
+    }
+    struct gui_window *w = window_new(d, width, height, h, data);
+    if (w == NULL) {
+        return NULL;
+    }
+    w->layer = new_id(d);
+    gui_wire_begin(&d->wire, d->layer_shell, ZWLR_LAYER_SHELL_V1_GET_LAYER_SURFACE);
+    gui_wire_uint(&d->wire, w->layer);
+    gui_wire_uint(&d->wire, w->surface);
+    gui_wire_uint(&d->wire, 0); /* the output: the server's one */
+    gui_wire_uint(&d->wire, (uint)layer);
+    gui_wire_string(&d->wire, name);
+    msg_end(d);
+    gui_wire_begin(&d->wire, w->layer, ZWLR_LAYER_SURFACE_V1_SET_SIZE);
+    gui_wire_uint(&d->wire, (uint)width);
+    gui_wire_uint(&d->wire, (uint)height);
+    msg_end(d);
+    request1(d, w->layer, ZWLR_LAYER_SURFACE_V1_SET_ANCHOR, anchor);
+    request1(d, w->layer, ZWLR_LAYER_SURFACE_V1_SET_EXCLUSIVE_ZONE, (uint)exclusive);
+    request1(d, w->layer, ZWLR_LAYER_SURFACE_V1_SET_KEYBOARD_INTERACTIVITY, (uint)keyboard);
+    return window_configure(w);
+}
+
+struct gui_window *gui_window_open(struct gui_display *d, const char *title, int width, int height,
+                                   const struct gui_window_handlers *h, void *data) {
+    struct gui_window *w = window_new(d, width, height, h, data);
+    if (w == NULL) {
+        return NULL;
+    }
+    w->xdg_surface = new_id(d);
+    gui_wire_begin(&d->wire, d->wm_base, XDG_WM_BASE_GET_XDG_SURFACE);
+    gui_wire_uint(&d->wire, w->xdg_surface);
+    gui_wire_uint(&d->wire, w->surface);
+    msg_end(d);
+    w->toplevel = new_id(d);
+    request1(d, w->xdg_surface, XDG_SURFACE_GET_TOPLEVEL, w->toplevel);
+    gui_wire_begin(&d->wire, w->toplevel, XDG_TOPLEVEL_SET_TITLE);
+    gui_wire_string(&d->wire, title);
+    msg_end(d);
+    return window_configure(w);
+}
+
+void gui_window_set_title(struct gui_window *w, const char *title) {
+    if (w->toplevel == 0) {
+        return;
+    }
+    gui_wire_begin(&w->d->wire, w->toplevel, XDG_TOPLEVEL_SET_TITLE);
+    gui_wire_string(&w->d->wire, title);
+    msg_end(w->d);
+    gui_wire_flush(&w->d->wire);
 }
 
 void gui_window_destroy(struct gui_window *w) {
@@ -676,8 +1113,12 @@ void gui_window_destroy(struct gui_window *w) {
     if (w->frame != 0) {
         w->frame = 0; /* its done, if it comes, is for no one */
     }
-    request0(d, w->toplevel, XDG_TOPLEVEL_DESTROY);
-    request0(d, w->xdg_surface, XDG_SURFACE_DESTROY);
+    if (w->layer != 0) {
+        request0(d, w->layer, ZWLR_LAYER_SURFACE_V1_DESTROY);
+    } else {
+        request0(d, w->toplevel, XDG_TOPLEVEL_DESTROY);
+        request0(d, w->xdg_surface, XDG_SURFACE_DESTROY);
+    }
     request0(d, w->surface, WL_SURFACE_DESTROY);
     gui_wire_flush(&d->wire);
     for (struct gui_window **p = &d->windows; *p != NULL; p = &(*p)->next) {
@@ -761,7 +1202,11 @@ int gui_window_commit(struct gui_window *w) {
         return -EINVAL;
     }
     if (!w->acked) {
-        request1(d, w->xdg_surface, XDG_SURFACE_ACK_CONFIGURE, w->serial);
+        if (w->layer != 0) {
+            request1(d, w->layer, ZWLR_LAYER_SURFACE_V1_ACK_CONFIGURE, w->serial);
+        } else {
+            request1(d, w->xdg_surface, XDG_SURFACE_ACK_CONFIGURE, w->serial);
+        }
         w->acked = 1;
     }
     struct shm_buffer *b = &w->bufs[w->drawing];
@@ -801,7 +1246,7 @@ int gui_window_commit(struct gui_window *w) {
 
 void gui_window_move(struct gui_window *w) {
     struct gui_display *d = w->d;
-    if (d->seat == 0) {
+    if (d->seat == 0 || w->toplevel == 0) {
         return;
     }
     gui_wire_begin(&d->wire, w->toplevel, XDG_TOPLEVEL_MOVE);

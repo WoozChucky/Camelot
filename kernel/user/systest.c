@@ -51,9 +51,9 @@
 #include "user.h"
 
 /* Process slots (NPROC in kernel/include/proc.h). */
-#define NPROC 8
+#define NPROC 32
 /* Descriptors per process (NOFILE in kernel/include/file.h). */
-#define NOFILE 32
+#define NOFILE 64
 /* A pipe's buffer (PIPESIZE in kernel/include/pipe.h). */
 #define PIPESIZE 512
 /* The console's device number (CONSOLE in kernel/include/file.h). */
@@ -540,7 +540,7 @@ static void test_simple_calls(void) {
     check(uptime() - before >= 3, "sleep lasts its ticks");
     check_eq(sleep(0), 0, "sleep 0");
     check_eq(syscall(0, 0, 0, 0), -ENOSYS, "call 0");
-    check_eq(syscall(61, 0, 0, 0), -ENOSYS, "call 61");
+    check_eq(syscall(63, 0, 0, 0), -ENOSYS, "call 63");
     check_eq(syscall(-1, 0, 0, 0), -ENOSYS, "call -1");
     /* The result is a long, sign-extended in a0: an error is negative
      * whatever the width, as a long and as an ssize_t (read's). */
@@ -607,11 +607,13 @@ static void test_spawn_and_wait(void) {
     check_eq(wait(-1, NULL), a, "wait for any, no status");
     check_eq(wait(-1, &status), -ECHILD, "none left");
 
-    /* Fill every process slot: the shell, this and six children. */
+    /* Fill every process slot: the shell, this and NPROC - 2 children,
+     * small ones (sleep, not systest: thirty copies of this would run out
+     * of memory first), asleep until they are all there. */
     int pids[NPROC];
     int n = 0;
     for (;;) {
-        int p = spawn("/bin/systest", (char *[]){"systest", "sleep", "2", NULL}, environ);
+        int p = spawn("/bin/sleep", (char *[]){"sleep", "3", NULL}, environ);
         if (p < 0) {
             check_eq(p, -EAGAIN, "spawn with every slot taken");
             break;
@@ -1251,6 +1253,57 @@ static void test_harts(void) {
     check_eq(harts(info, 0x40000000u), -EFAULT, "harts to a buffer past user space");
 }
 
+/* gmtime_r's fields of `t`, as "YYYY-MM-DD HH:MM:SS wday yday". */
+static void check_date(time_t t, const char *want) {
+    struct tm tm;
+    char got[40];
+    if (gmtime_r(&t, &tm) == NULL) {
+        check(0, want);
+        return;
+    }
+    snprintf(got, sizeof got, "%d-%02d-%02d %02d:%02d:%02d %d %d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, tm.tm_wday, tm.tm_yday);
+    check(strcmp(got, want) == 0, want);
+}
+
+/* The clocks: the time since boot, and the date, from the real-time clock
+ * (the tests' machines start it at 2026-01-01, a host's at its time, which
+ * is later); and sysinfo. */
+static void test_clocks(void) {
+    struct timespec a;
+    struct timespec b;
+    check_eq(clock_gettime(CLOCK_MONOTONIC, &a), 0, "clock_gettime CLOCK_MONOTONIC");
+    check(a.tv_sec >= 1 && a.tv_nsec >= 0 && a.tv_nsec < 1000000000, "a second since boot at least");
+    check_eq(sleep(2), 0, "sleep between two readings");
+    check_eq(clock_gettime(CLOCK_MONOTONIC, &b), 0, "clock_gettime again");
+    long ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+    /* Not a tick's length at least: a hart that took its ticks late counts
+     * the ones it missed at once, so a sleep may end sooner. */
+    check(ms > 0 && ms < 2000, "the monotonic clock counts the sleep");
+    struct timespec r;
+    check_eq(clock_gettime(CLOCK_REALTIME, &r), 0, "clock_gettime CLOCK_REALTIME");
+    check(r.tv_sec >= 1767225600, "the date is 2026 or later");
+    check(r.tv_nsec >= 0 && r.tv_nsec < 1000000000, "nanoseconds below a second");
+    check(time(NULL) - r.tv_sec <= 1, "time() is CLOCK_REALTIME's seconds");
+    check_eq(clock_gettime(2, &r), -EINVAL, "another clock");
+    check_eq(clock_gettime(CLOCK_REALTIME, (struct timespec *)0x10), -EFAULT, "clock_gettime to unmapped memory");
+    check_date(0, "1970-01-01 00:00:00 4 0");
+    check_date(951827696, "2000-02-29 12:34:56 2 59");
+    check_date(1767225600, "2026-01-01 00:00:00 4 0");
+    check_date(1735689599, "2024-12-31 23:59:59 2 365");
+    check_date(1793966400, "2026-11-06 12:00:00 5 309");
+
+    struct sysinfo info;
+    check_eq(sizeof info, 112, "struct sysinfo is Linux's");
+    check_eq(sysinfo(&info), 0, "sysinfo");
+    check(info.totalram > info.freeram && info.freeram > 0, "free memory, less than all of it");
+    check_eq(info.totalram % PAGE, 0, "memory in pages");
+    check_eq(info.mem_unit, 1, "in bytes");
+    check(info.procs >= 2 && info.procs <= procs(NULL, 0), "the processes, this one and its parent");
+    check(info.uptime >= b.tv_sec && info.uptime <= b.tv_sec + 1, "uptime in seconds");
+    check_eq(sysinfo((struct sysinfo *)0x10), -EFAULT, "sysinfo to unmapped memory");
+}
+
 /* The network's calls on a machine without a card (the tests run systest
  * on one): -ENODEV, after the pointer checks; for socket(), after its
  * arguments'. kernel_net.rs in
@@ -1297,6 +1350,7 @@ int main(int argc, char **argv, char **envp) {
     test_environment();
     test_procs_and_kill();
     test_harts();
+    test_clocks();
     test_network_without_a_card();
     printf("systest: %d checks, %d failed\n", checks, failures);
     return failures;

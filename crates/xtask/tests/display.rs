@@ -1,7 +1,9 @@
-//! The display server (#184, `kernel/user/compositor`): Grail boots the
-//! disk kernel on an image with the server, its test client `wltest`
-//! (`kernel/user/wltest.c`) and the desktop's `/usr/share`, on several
-//! harts; the shell starts the server and the clients in the background.
+//! The display server (#184, `kernel/user/compositor`) and the desktop
+//! shell (#185: the panel, the terminal and the apps): Grail boots the disk
+//! kernel on an image with the server, its test client `wltest`
+//! (`kernel/user/wltest.c`), the shell's programs and the desktop's
+//! `/usr/share`, on several harts; the shell starts the server and the
+//! clients in the background.
 //! The tests type and click with Grail's keyboard and pointer, read what
 //! the clients say they received, and compare the screen with its expected
 //! image, `tests/display/NAME.png`.
@@ -21,8 +23,46 @@ use std::sync::mpsc::{channel, Sender};
 use userprogs::CCompiler;
 use xtask::{kernel, png, repo_root, userprogs};
 
-/// The programs in `/bin`, besides the shell.
-const BINS: &[&str] = &["compositor", "wltest", "guidemo"];
+/// The programs in `/bin`, besides the shell: the server, its clients, and
+/// what the terminal's shell runs.
+const BINS: &[&str] = &[
+    "compositor",
+    "wltest",
+    "guidemo",
+    "term",
+    "ls",
+    "cat",
+    "echo",
+    "wc",
+    "primes",
+    "grep",
+    "stty",
+    "panel",
+    "files",
+    "sysmon",
+    "gears",
+];
+
+/// What `/test/escapes` holds, for the terminal to draw: colours and
+/// attributes, erasing, inserting and deleting, the cursor saved, moved and
+/// restored, and UTF-8.
+const ESCAPES: &[u8] = b"\x1b[1;31mbold red\x1b[0m \x1b[30;42mblack on green\x1b[0m \x1b[7mreverse\x1b[27m \
+\x1b[4munderlined\x1b[24m \x1b[94mbright blue\x1b[0m\n\
+1234567890ABCDEFGHIJ\x1b[10D\x1b[K <- erased to the end\n\
+abcdef\x1b[3D\x1b[2P <- two deleted\n\
+abcdef\x1b[3D\x1b[2@XY <- two inserted\n\
+\x1b7\x1b[12;50H\x1b[46m at 12, 50 \x1b[0m\x1b8saved and restored\n\
+caf\xc3\xa9 \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x90 \xc2\xb1\xc2\xb0\n";
+
+/// Where the machines' clock starts, the time the panel shows: noon of
+/// Grail's default day (Thursday 1 January 2026), so that it shows "12:00"
+/// for a minute and more of the machine's time.
+const NOON: u64 = grail::rtc::DEFAULT_RTC_TIME + 12 * 3600;
+
+/// Where the panel's hart meters are on a machine of four (x, y, width,
+/// height): how busy the harts were depends on how long everything took,
+/// so screens with the panel leave them out of the comparison.
+const PANEL_METERS: (u32, u32, u32, u32) = (476, 0, 36, 24);
 
 /// Steps a frame takes, 60 a second at Grail's clock.
 const FRAME: u64 = 166_667;
@@ -33,11 +73,50 @@ const WAIT_MAX: u64 = 3_000_000_000;
 const KEY_A: u16 = 0x04;
 const KEY_ESCAPE: u16 = 0x29;
 const KEY_TAB: u16 = 0x2b;
+const KEY_PAGE_UP: u16 = 0x4b;
+const KEY_LEFT_CTRL: u16 = 0xe0;
+const KEY_LEFT_SHIFT: u16 = 0xe1;
 const KEY_LEFT_ALT: u16 = 0xe2;
 const KEY_LEFT_GUI: u16 = 0xe3;
 
-/// An image with `/dev`'s console, framebuffer and input devices, the shell
-/// and [`BINS`] in `/bin`, the desktop's `/usr/share`, and an empty `/run`.
+/// The HID usage of the key that types ASCII `c` on a US keyboard, and
+/// whether Shift is held for it.
+fn usage_of(c: char) -> (u16, bool) {
+    const SHIFTED: &str = "!@#$%^&*()";
+    match c {
+        'a'..='z' => (0x04 + (c as u16 - 'a' as u16), false),
+        'A'..='Z' => (0x04 + (c as u16 - 'A' as u16), true),
+        '1'..='9' => (0x1e + (c as u16 - '1' as u16), false),
+        '0' => (0x27, false),
+        '\n' => (0x28, false),
+        ' ' => (0x2c, false),
+        '-' => (0x2d, false),
+        '_' => (0x2d, true),
+        '=' => (0x2e, false),
+        '+' => (0x2e, true),
+        '\\' => (0x31, false),
+        '|' => (0x31, true),
+        ';' => (0x33, false),
+        ':' => (0x33, true),
+        '\'' => (0x34, false),
+        '"' => (0x34, true),
+        ',' => (0x36, false),
+        '<' => (0x36, true),
+        '.' => (0x37, false),
+        '>' => (0x37, true),
+        '/' => (0x38, false),
+        '?' => (0x38, true),
+        _ => match SHIFTED.find(c) {
+            Some(9) => (0x27, true),
+            Some(i) => (0x1e + i as u16, true),
+            None => panic!("no key types {c:?}"),
+        },
+    }
+}
+
+/// An image with `/dev`'s console, framebuffer, input devices and
+/// pseudo-terminals, the shell and [`BINS`] in `/bin`, the terminal's text
+/// in `/test`, the desktop's `/usr/share`, and an empty `/run`.
 fn image() -> Vec<u8> {
     let root = repo_root();
     let share = xtask::fs::share_files(&root).unwrap();
@@ -55,6 +134,12 @@ fn image() -> Vec<u8> {
         .unwrap();
     fs.add_device("/dev/input/event1", xtask::fs::INPUT_MAJOR, 1)
         .unwrap();
+    fs.add_device("/dev/ptmx", xtask::fs::PTMX_MAJOR, 0).unwrap();
+    fs.mkdir("/dev/pts").unwrap();
+    for n in 0..xtask::fs::NPTY {
+        fs.add_device(&format!("/dev/pts/{n}"), xtask::fs::PTS_MAJOR, n)
+            .unwrap();
+    }
     fs.mkdir("/bin").unwrap();
     let user = userprogs::user_dir(&root);
     let rt = userprogs::build_runtime(&user, CCompiler::Merlin).unwrap();
@@ -64,6 +149,10 @@ fn image() -> Vec<u8> {
         let prog = userprogs::link_program(&user, src, CCompiler::Merlin, &rt).unwrap();
         fs.add_file(&format!("/bin/{name}"), &prog.elf).unwrap();
     }
+    fs.mkdir("/test").unwrap();
+    fs.add_file("/test/escapes", ESCAPES).unwrap();
+    let lines: String = (1..=60).map(|n| format!("line {n}\n")).collect();
+    fs.add_file("/test/lines", lines.as_bytes()).unwrap();
     fs.mkdir("/usr").unwrap();
     xtask::fs::add_share(&mut fs, &share).unwrap();
     fs.mkdir("/run").unwrap();
@@ -86,6 +175,7 @@ impl Desk {
             harts,
             bios: grail::Bios::Default,
             ram_size: 32 * 1024 * 1024 + grail::firmware::FW_SIZE as usize,
+            rtc: grail::Rtc::At(NOON),
             ..MachineConfig::default()
         };
         let disk = MemDisk::from_image(image()).unwrap();
@@ -158,6 +248,44 @@ impl Desk {
         self.key(usage, false);
     }
 
+    /// Types `text` on the keyboard, a key at a time.
+    fn type_text(&mut self, text: &str) {
+        for c in text.chars() {
+            let (usage, shift) = usage_of(c);
+            if shift {
+                self.key(KEY_LEFT_SHIFT, true);
+            }
+            self.tap(usage);
+            if shift {
+                self.key(KEY_LEFT_SHIFT, false);
+            }
+        }
+    }
+
+    /// Steps until the terminal `title`, started with -v, has committed a
+    /// frame with `line` on the cursor's line up to the cursor: what came
+    /// before it is on the screen once the server is idle after it.
+    fn term_drawn(&mut self, title: &str, line: &str) {
+        self.wait_for(&format!("term \"{title}\": drawn \"{line}\"\n"));
+        self.since_here();
+    }
+
+    /// The next screen waits for the server to be idle after what was
+    /// printed so far, not just after the last input: a client's line says
+    /// it sent something, which the server may not have drawn yet.
+    fn since_here(&mut self) {
+        self.input = self.seen;
+    }
+
+    /// Types a command line at the terminal `title`'s shell and steps until
+    /// its next prompt is drawn.
+    fn term_command(&mut self, title: &str, command: &str) {
+        self.type_text(command);
+        self.term_drawn(title, &format!("$ {command}"));
+        self.type_text("\n");
+        self.term_drawn(title, "$ ");
+    }
+
     /// The pointer at x, y with `buttons` held (no event if neither
     /// changed).
     fn pointer(&mut self, x: i32, y: i32, buttons: u8) {
@@ -209,8 +337,22 @@ impl Desk {
 
     /// The screen is `tests/display/NAME.png`.
     fn expect_screen(&mut self, name: &str) {
+        self.expect_screen_but(name, &[]);
+    }
+
+    /// The screen is `tests/display/NAME.png`, but for the rectangles
+    /// (x, y, width, height) in `masked`, painted magenta in both.
+    fn expect_screen_but(&mut self, name: &str, masked: &[(u32, u32, u32, u32)]) {
         self.wait_idle();
-        let (w, h, rgb) = self.screen();
+        let (w, h, mut rgb) = self.screen();
+        for &(mx, my, mw, mh) in masked {
+            for y in my..(my + mh).min(h) {
+                for x in mx..(mx + mw).min(w) {
+                    let i = ((y * w + x) * 3) as usize;
+                    rgb[i..i + 3].copy_from_slice(&[0xff, 0x00, 0xff]);
+                }
+            }
+        }
         let got = png::encode(w, h, &rgb);
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/display");
         let path = dir.join(format!("{name}.png"));
@@ -379,6 +521,9 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
             "wltest: global 3 wl_seat 1",
             "wltest: global 4 wl_output 2",
             "wltest: global 5 xdg_wm_base 1",
+            "wltest: global 6 wl_data_device_manager 1",
+            "wltest: global 7 zwlr_layer_shell_v1 1",
+            "wltest: global 8 zwlr_foreign_toplevel_manager_v1 1",
         ]
     );
     for (kind, error) in [
@@ -395,6 +540,17 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
         ("unsealed", "4 2: the pool's memory may shrink"),
         ("pools", "1 2: too many pools"),
         ("buffer", "5 1: the buffer is past the pool's end"),
+        ("role", "6 0: the surface has a role already"),
+        ("layer", "6 1: invalid layer"),
+        ("constructed", "6 2: the surface has a buffer already"),
+        ("layersize", "7 1: too big"),
+        ("zerosize", "7 1: a size of 0 without both its edges"),
+        ("anchor", "7 2: invalid anchor"),
+        ("keyboard", "7 3: invalid value"),
+        ("serial", "7 0: a serial no configure had"),
+        ("unacked", "7 0: a buffer before the configure was acked"),
+        ("source", "12 1: offer after the source was used"),
+        ("usedsource", "14 1: a source used already"),
     ] {
         d.run(&format!("wltest bad {kind}"));
         let out = d.wait_for("$ ");
@@ -408,14 +564,14 @@ fn a_client_that_breaks_the_protocol_is_disconnected() {
     d.run("wltest window fine 808080 100 60 &");
     d.wait_for("wltest fine: shown\n");
 
-    // Four clients at once, and no more: the fifth is refused.
-    for name in ["two", "three", "four"] {
+    // Eight clients at once, and no more: the ninth is refused.
+    for name in ["two", "three", "four", "five", "six", "seven", "eight"] {
         d.run(&format!("wltest window {name} 808080 60 40 &"));
         d.wait_for(&format!("wltest {name}: shown\n"));
     }
-    d.run("wltest window five 808080 60 40");
+    d.run("wltest window nine 808080 60 40");
     d.wait_for("compositor: too many clients: one refused\n");
-    d.wait_for("wltest five: can't connect");
+    d.wait_for("wltest nine: can't connect");
 }
 
 #[test]
@@ -506,4 +662,237 @@ fn frames_flip_at_the_vertical_blank_whole() {
     // The logo key starts the launcher, the GUI library's demo here.
     d.tap(KEY_LEFT_GUI);
     d.wait_for("compositor: focus \"Camelot\"\n");
+}
+
+#[test]
+fn the_terminal_runs_a_shell() {
+    // The terminal emulator (kernel/user/term.c): a window with the shell
+    // on a pseudo-terminal, typed at with the keyboard.
+    let mut d = Desk::boot(4);
+    start_server(&mut d, "");
+    d.run("term -v &");
+    d.wait_for("compositor: focus \"Terminal\"\n");
+    d.term_drawn("Terminal", "$ ");
+    // (`ls /test`, not /bin, whose sizes change with every program; the
+    // primes' total alone, the workers' lines coming in any order.)
+    for command in ["echo hello | wc -c", "ls /test", "primes 4 40000 | grep below"] {
+        d.term_command("Terminal", command);
+    }
+    d.expect_screen("term-shell");
+}
+
+/// Where the middle of the terminal's cell at `col`, `row` is on the
+/// screen, its window where the server puts the first (its content's top
+/// left at 1, 48, the grid 2 pixels in, cells of 8 x 16).
+fn cell(col: i32, row: i32) -> (i32, i32) {
+    (1 + 2 + col * 8 + 4, 48 + 2 + row * 16 + 8)
+}
+
+#[test]
+fn the_terminal_draws_escapes_and_scrolls_back() {
+    // The VT100's and ANSI's sequences programs write, and the lines that
+    // went off the top, read back with Shift+PageUp; a key brings the view
+    // back down.
+    let mut d = Desk::boot(4);
+    start_server(&mut d, "");
+    d.run("term -v &");
+    d.term_drawn("Terminal", "$ ");
+    d.term_command("Terminal", "cat /test/escapes");
+    d.expect_screen("term-escapes");
+
+    d.term_command("Terminal", "cat /test/lines");
+    d.expect_screen("term-lines");
+    d.key(KEY_LEFT_SHIFT, true);
+    d.tap(KEY_PAGE_UP);
+    d.key(KEY_LEFT_SHIFT, false);
+    d.term_drawn("Terminal", "$ ");
+    d.expect_screen("term-scrolled-back");
+    d.tap(KEY_A);
+    d.term_drawn("Terminal", "$ a");
+    d.expect_screen("term-back-down");
+}
+
+#[test]
+fn terminals_resize_and_share_the_clipboard() {
+    // A window made shorter by its bottom edge: the grid follows it, and
+    // the shell's terminal says its new size (TIOCSWINSZ).
+    let mut d = Desk::boot(4);
+    start_server(&mut d, "");
+    d.run("term -v -T one &");
+    d.term_drawn("one", "$ ");
+    d.term_command("one", "stty size");
+    d.pointer(300, 439, 0);
+    d.pointer(300, 439, BUTTON_LEFT);
+    d.wait_for("compositor: resizing \"one\"\n");
+    d.pointer(300, 359, BUTTON_LEFT);
+    d.pointer(300, 279, BUTTON_LEFT);
+    d.pointer(300, 279, 0);
+    d.term_command("one", "stty size");
+    d.term_command("one", "echo camelot");
+    d.expect_screen("term-resized");
+
+    // Text selected in one terminal with the pointer is pasted in another
+    // with Ctrl+Shift+V.
+    let (x0, y) = cell(0, 6);
+    let (x1, _) = cell(6, 6);
+    d.pointer(x0 - 3, y, 0);
+    d.pointer(x0 - 3, y, BUTTON_LEFT);
+    d.pointer(x1, y, BUTTON_LEFT);
+    d.pointer(x1, y, 0);
+    d.run("term -v -T two &");
+    d.wait_for("compositor: focus \"two\"\n");
+    d.term_drawn("two", "$ ");
+    d.key(KEY_LEFT_CTRL, true);
+    d.key(KEY_LEFT_SHIFT, true);
+    d.tap(0x19); // V
+    d.key(KEY_LEFT_SHIFT, false);
+    d.key(KEY_LEFT_CTRL, false);
+    d.term_drawn("two", "$ camelot");
+    d.type_text("\n");
+    d.term_drawn("two", "$ ");
+    d.expect_screen("term-pasted");
+
+    // A selection whose source never answers: the paste gives up after a
+    // while and the terminal goes on; destroyed, the selection is none,
+    // and a paste asks nobody.
+    d.run("wltest clip &");
+    d.wait_for("wltest clip: set\n");
+    // On its title bar: a click in the text would select.
+    d.click(200, 70);
+    d.wait_for("compositor: focus \"two\"\n");
+    let paste = |d: &mut Desk| {
+        d.key(KEY_LEFT_CTRL, true);
+        d.key(KEY_LEFT_SHIFT, true);
+        d.tap(0x19); // V
+        d.key(KEY_LEFT_SHIFT, false);
+        d.key(KEY_LEFT_CTRL, false);
+    };
+    paste(&mut d);
+    d.wait_for("wltest clip: asked\n");
+    d.term_command("two", "echo alive");
+    paste(&mut d);
+    d.wait_for("wltest clip: destroyed\n");
+    d.term_command("two", "echo still");
+    paste(&mut d);
+    d.term_command("two", "echo and on");
+    let out = d.out();
+    assert_eq!(out.matches("wltest clip: asked").count(), 1, "{out}");
+    assert!(!out.contains("wltest clip: disconnected"), "{out}");
+}
+
+/// How many pixels of the screen are mostly `channel` (0 red, 1 green, 2
+/// blue): bright in it and dim in the others.
+fn pixels_of(rgb: &[u8], channel: usize) -> usize {
+    rgb.chunks(3)
+        .filter(|p| p[channel] > 0x60 && (0..3).all(|c| c == channel || p[c] < p[channel] / 2))
+        .count()
+}
+
+#[test]
+fn the_panel_launches_lists_and_focuses_windows() {
+    // The panel (kernel/user/panel.c) along the top: it starts the program
+    // it is given, a terminal, which is placed under it; its launcher's
+    // menu lists /usr/share/applications.
+    let mut d = Desk::boot(4);
+    start_server(&mut d, "");
+    d.run("panel -v term -v &");
+    d.wait_for("panel: ready, 4 applications\n");
+    d.wait_for("panel: started term\n");
+    d.term_drawn("Terminal", "$ ");
+    d.expect_screen_but("panel", &[PANEL_METERS]);
+    // The menu takes the keyboard once it is shown.
+    d.click(40, 12);
+    d.wait_for("panel: menu shown\n");
+    d.wait_for("compositor: focus \"launcher\"\n");
+    d.since_here();
+    d.expect_screen_but("panel-menu", &[PANEL_METERS]);
+
+    // The launcher starts every application, each a window with the
+    // keyboard. The gears turn (glxgears' red, green and blue) until
+    // Escape; the system monitor goes with Escape too.
+    let apps = [
+        ("files", "Files"),
+        ("gears", "Gears"),
+        ("sysmon", "System Monitor"),
+        ("term", "Terminal"),
+    ];
+    for (i, (name, title)) in apps.into_iter().enumerate() {
+        if i > 0 {
+            d.click(40, 12);
+            d.wait_for("panel: menu shown\n");
+            d.wait_for("compositor: focus \"launcher\"\n");
+        }
+        d.click(60, 24 + 2 + 24 * i as i32 + 12);
+        d.wait_for(&format!("panel: started {name}\n"));
+        d.wait_for("panel: menu closed\n");
+        d.wait_for(&format!("compositor: focus \"{title}\"\n"));
+        match name {
+            "gears" => {
+                let fps = d.wait_for(" FPS\n");
+                eprintln!("gears: {}", fps.lines().last().unwrap_or(""));
+                let (w, h, rgb) = d.screen();
+                for channel in 0..3 {
+                    let n = pixels_of(&rgb, channel);
+                    if n <= 1500 {
+                        let actual = repo_root().join("target/display-actual");
+                        std::fs::create_dir_all(&actual).unwrap();
+                        std::fs::write(actual.join("gears.png"), png::encode(w, h, &rgb)).unwrap();
+                        panic!(
+                            "{n} pixels of channel {channel} (drawn in {}):\n{}",
+                            actual.display(),
+                            d.out()
+                        );
+                    }
+                }
+                d.tap(KEY_ESCAPE);
+                d.wait_for(") gone\n");
+            }
+            "sysmon" => {
+                d.settle(30);
+                d.tap(KEY_ESCAPE);
+                d.wait_for(") gone\n");
+            }
+            _ => {}
+        }
+    }
+
+    // A button for each window (the first terminal, the files and the
+    // second terminal, once its prompt is on the screen: the panel starts
+    // it without -v, and it is resized to fit first), the one with the
+    // keyboard lit; a click on one raises its window and gives it the
+    // keyboard.
+    let prompt_drawn = |d: &Desk| {
+        // The prompt's '$', in the second row of the window under the first.
+        let (w, _, rgb) = d.screen();
+        (111..123).any(|y: usize| (3..11).any(|x: usize| rgb[(y * w as usize + x) * 3] > 0x80))
+    };
+    for _ in 0..100 {
+        if prompt_drawn(&d) {
+            break;
+        }
+        d.settle(10);
+    }
+    assert!(prompt_drawn(&d), "{}", d.out());
+    d.wait_idle();
+    d.since_here();
+    d.expect_screen_but("panel-windows", &[PANEL_METERS]);
+    d.click(120, 12);
+    d.wait_for("compositor: focus \"Terminal\"\n");
+    // The panel lights the button once the server tells it (`activated`):
+    // its first button, blue, right of its title.
+    let lit = |d: &Desk| {
+        let (w, _, rgb) = d.screen();
+        let p = &rgb[(4 * w as usize + 200) * 3..][..3];
+        p[2] > 0xa0 && p[0] < 0x80
+    };
+    for _ in 0..100 {
+        if lit(&d) {
+            break;
+        }
+        d.settle(10);
+    }
+    assert!(lit(&d), "{}", d.out());
+    d.wait_idle();
+    d.since_here();
+    d.expect_screen_but("panel-focused", &[PANEL_METERS]);
 }

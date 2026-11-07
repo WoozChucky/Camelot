@@ -22,7 +22,7 @@
 #include "user.h"
 
 /* Descriptors per process (NOFILE in kernel/include/file.h). */
-#define NOFILE 32
+#define NOFILE 64
 /* A big file: past the largest of the filesystem's version 1 (268 KiB),
  * which version 2's extent trees have no limit like. */
 #define BIG_FILE_SIZE (300 * 1024)
@@ -521,34 +521,37 @@ static void test_devices(void) {
 }
 
 /* `filetest hold T`, a child of test_open_file_table(), in /ft with a pipe
- * at 0 and 1: opens new files hT00, hT01... until open fails, writes 'M' to
- * 1 if that was -EMFILE (its descriptors ran out), 'N' if -ENFILE (the
- * kernel's open files did) and the file was not made, 'X' otherwise; then
- * holds them until 0 reaches its end, removes them, and exits with how many
- * it opened. */
+ * at 0 and 1: opens its file hT again and again (each open a new open file
+ * of the kernel's, all of one inode: the image's inodes are fewer than the
+ * kernel's open files) until open fails, writes 'M' to 1 if that was
+ * -EMFILE (its descriptors ran out), 'N' if -ENFILE (the kernel's open
+ * files did) and a new file hTn could not be made either, 'X' otherwise;
+ * then holds them until 0 reaches its end, removes hT, and exits with how
+ * many it opened. */
 static int hold(char tag) {
-    char name[] = "hT00";
+    char name[] = "hT";
+    char other[] = "hTn";
     name[1] = tag;
+    other[1] = tag;
     int opened = 0;
     int r;
     for (;;) {
-        name[2] = (char)('0' + opened / 10);
-        name[3] = (char)('0' + opened % 10);
         r = open(name, O_RDWR | O_CREAT);
         if (r < 0) {
             break;
         }
         opened++;
     }
-    char c = r == -EMFILE ? 'M' : r == -ENFILE && unlink(name) == -ENOENT ? 'N' : 'X';
+    char c = 'X';
+    if (r == -EMFILE) {
+        c = 'M';
+    } else if (r == -ENFILE && open(other, O_RDWR | O_CREAT) == -ENFILE && unlink(other) == -ENOENT) {
+        c = 'N';
+    }
     write(STDOUT, &c, 1);
     while (read(STDIN, &c, 1) > 0) {
     }
-    for (int i = 0; i < opened; i++) {
-        name[2] = (char)('0' + i / 10);
-        name[3] = (char)('0' + i % 10);
-        unlink(name);
-    }
+    unlink(name);
     return opened;
 }
 
@@ -565,7 +568,8 @@ static void test_open_file_table(void) {
     dup(hold_pipe[0]);
     close(STDOUT);
     dup(ready[1]);
-    /* At most 6: with the shell and filetest, NPROC (8) processes. */
+    /* At most 6: the open files run out before (NFILE, 256: four
+     * children's 61 each, and the fifth's fewer). */
     int pids[6];
     int children = 0;
     char c = 'M';

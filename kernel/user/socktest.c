@@ -18,8 +18,8 @@
 #include "user.h"
 
 /* Descriptors per process (NOFILE in kernel/include/file.h). */
-#define NOFILE 32
-#define NPROC 8
+#define NOFILE 64
+#define NPROC 32
 /* Sockets of each kind (TCP_SOCKETS, UDP_SOCKETS in kernel/include/net.h). */
 #define TCP_SOCKETS 16
 #define UDP_SOCKETS 8

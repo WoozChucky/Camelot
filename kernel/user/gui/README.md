@@ -23,7 +23,7 @@ members it uses. The root image installs it as `/usr/lib/libgui.a` with
 | `theme.h` | the widgets' colours and sizes, and what `layout.c` and `widget.c` share (private) |
 | `layout.c` | measuring and arranging the widget tree: rows, columns, `GUI_GROW` (`gui_ui_layout`) |
 | `widget.c` | the widgets (label, button, field, list, scroll bar, menu), focus, hit-testing, input (`gui_ui_pointer`, `gui_ui_button`, `gui_ui_scroll`, `gui_ui_key`) and drawing what changed (`gui_ui_draw`) |
-| `protocol.h` | the Wayland interfaces' opcodes and enums the library uses, from `wayland.xml` 1.23 and `xdg-shell.xml` 1.38 (private, but `guitest`'s display server includes it too) |
+| `protocol.h` | the Wayland interfaces' opcodes and enums the library uses, from `wayland.xml` 1.23, `xdg-shell.xml` 1.38 and wlroots' layer shell and foreign toplevel management (private, but `guitest`'s display server includes it too) |
 | `wire.c` | the Wayland wire format, either end of a connection: messages and their arguments, descriptors in `SCM_RIGHTS` (`gui_wire_*`, `gui_msg_*`) |
 | `client.c` | the Wayland client: the connection and its globals, windows over `wl_shm` buffers in a memfd, events to handlers, and `gui_run`, a ui in a window |
 

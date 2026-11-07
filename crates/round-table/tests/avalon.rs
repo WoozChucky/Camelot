@@ -12,7 +12,7 @@ use std::time::Duration;
 
 /// The device table of Grail's machine without disks, as `info` shows it.
 const DEVICES: &str = "\
-devices  9
+devices  10
   test      0x00100000 + 0x00001000
   CLINT     0x02000000 + 0x00010000
   PLIC      0x0c000000 + 0x04000000
@@ -21,6 +21,7 @@ devices  9
   keyboard  0x30001000 + 0x00001000  irq 2
   sysinfo   0x30002000 + 0x00001000
   pointer   0x30003000 + 0x00001000  irq 11
+  rtc       0x30004000 + 0x00001000  irq 17
   fb-vram   0x31000000 + 0x0012c000
 ";
 
@@ -162,7 +163,7 @@ fn disks_are_attached_at_create() {
     let info = ok(addr, &["info", "disky"]);
     assert!(
         info.contains(&format!(
-            "\ndisks    {image} (read-write)\nnets     none\ndevices  10\n"
+            "\ndisks    {image} (read-write)\nnets     none\ndevices  11\n"
         )),
         "{info}"
     );
@@ -186,7 +187,7 @@ fn disks_are_attached_at_create() {
     let info = ok(addr, &["info", "two"]);
     assert!(
         info.contains(&format!(
-            "\ndisks    {image} (read-only)\n         {image} (read-only)\nnets     none\ndevices  11\n"
+            "\ndisks    {image} (read-only)\n         {image} (read-only)\nnets     none\ndevices  12\n"
         )),
         "{info}"
     );

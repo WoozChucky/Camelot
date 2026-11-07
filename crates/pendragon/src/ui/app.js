@@ -399,6 +399,9 @@ function newVmPage(main, ctx, disk) {
   // boots through), else none, as the server chooses when it is left empty.
   let biosTyped = false;
   bios.addEventListener("input", () => { biosTyped = true; });
+  // And the harts: the profile's (a desktop's 4), else one.
+  let hartsTyped = false;
+  harts.addEventListener("input", () => { hartsTyped = true; });
   const showBoot = () => {
     programField.hidden = bootCamelot.checked;
     profileChoice.disabled = !bootCamelot.checked;
@@ -408,6 +411,9 @@ function newVmPage(main, ctx, disk) {
     }
     if (profile && !biosTyped) {
       bios.value = bootCamelot.checked ? profile.bios : "none";
+    }
+    if (profile && !hartsTyped) {
+      harts.value = String(bootCamelot.checked ? profile.harts : 1);
     }
     if (profile) {
       const image = profile.image;

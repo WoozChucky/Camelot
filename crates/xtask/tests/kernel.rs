@@ -120,7 +120,7 @@ const KSTACK_SIZE: u64 = 16 * 1024;
 /// UART's, the keyboard's, the pointer's and the display's vertical blank.
 const BOOT_IRQS: u64 = 1 << UART_IRQ | 1 << KBD_IRQ | 1 << PTR_IRQ | 1 << FB_IRQ;
 const KSTACK_SLOT: u64 = 2 * KSTACK_SIZE;
-const KSTACK_SLOTS: u64 = 64;
+const KSTACK_SLOTS: u64 = 128;
 
 /// What the kernel prints before its kstack self-test: the boot up to the
 /// tenth tick, with `xcal.dbg`'s pc masked (`kernel::mask_dbg_pc`), for the
@@ -139,6 +139,7 @@ paging: on (MODE)
 vm self-test: 26/26 passed
 fb: 640x480, 6 modes, irq 16
 timer: 10 Hz tick, 10000000 Hz timebase
+rtc: 2026-01-01 00:00 UTC
 disk: none
 tick 1
 tick 2
@@ -3512,7 +3513,10 @@ fn kernel_boots_without_a_disk_and_says_so() {
     assert_eq!(r, RunResult::Exited(0));
     let out = mask(&printed(&m));
     assert_eq!(out, halted_output());
-    assert!(out.contains("timebase\ndisk: none\ntick 1\n"), "{out}");
+    assert!(
+        out.contains("timebase\nrtc: 2026-01-01 00:00 UTC\ndisk: none\ntick 1\n"),
+        "{out}"
+    );
     assert!(t.commands.is_empty() && t.sleeps.is_empty(), "{t:?}");
     assert_eq!(t.accesses, 0, "{t:?}");
     assert_eq!(m.cpu.bus.read(plic_enable(1), 4), Ok(BOOT_IRQS));
@@ -4060,7 +4064,7 @@ fn the_system_call_document_matches_the_code() {
     let user_h = read("kernel/user/user.h");
 
     let calls = doc_table(&doc, "## Calls");
-    assert_eq!(calls.len(), 60, "{calls:?}");
+    assert_eq!(calls.len(), 62, "{calls:?}");
     let sys = |table: &[(u32, String)]| -> Vec<(u32, String)> {
         table
             .iter()
@@ -4160,7 +4164,7 @@ fn the_system_call_document_matches_the_code() {
             Some((name, cells.get(2)?.parse().ok()?))
         })
         .collect();
-    assert_eq!(sizes.len(), 23, "{sizes:?}");
+    assert_eq!(sizes.len(), 25, "{sizes:?}");
     for (dir, include, headers) in [
         ("kernel/user", None, "#include \"user.h\"\n"),
         (

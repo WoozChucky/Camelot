@@ -18,6 +18,9 @@ static const struct {
     {&wl_seat_interface, 1},
     {&wl_output_interface, 2},
     {&xdg_wm_base_interface, 1},
+    {&wl_data_device_manager_interface, 1},
+    {&zwlr_layer_shell_v1_interface, 1},
+    {&zwlr_foreign_toplevel_manager_v1_interface, 1},
 };
 
 #define NGLOBALS ((int)(sizeof(globals) / sizeof(globals[0])))
@@ -63,6 +66,8 @@ static void bound(struct client *c, struct object *o) {
         event_begin(c, o->id, WL_SEAT_CAPABILITIES);
         gui_wire_uint(&c->wire, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
         event_end(c);
+    } else if (o->iface == &zwlr_foreign_toplevel_manager_v1_interface) {
+        toplevels_bound(c, o);
     } else if (o->iface == &wl_output_interface) {
         event_begin(c, o->id, WL_OUTPUT_GEOMETRY);
         gui_wire_int(&c->wire, 0);
@@ -194,13 +199,20 @@ static int copy_buffer(struct surface *s, struct buffer *b) {
     return 0;
 }
 
-static void send_configure(struct window *w) {
+void toplevel_configure(struct window *w, int width, int height, int resizing) {
     struct client *c = w->c;
+    uint states[1];
+    uint n = 0;
+    if (resizing) {
+        states[n++] = XDG_TOPLEVEL_STATE_RESIZING;
+    }
     event_begin(c, w->toplevel_id, XDG_TOPLEVEL_CONFIGURE);
-    gui_wire_int(&c->wire, 0); /* the client chooses its size */
-    gui_wire_int(&c->wire, 0);
-    gui_wire_array(&c->wire, NULL, 0);
+    gui_wire_int(&c->wire, width);
+    gui_wire_int(&c->wire, height);
+    gui_wire_array(&c->wire, states, n * 4);
     event_end(c);
+    w->cfg_w = width;
+    w->cfg_h = height;
     w->configure_serial = next_serial();
     w->acked = 0;
     event_begin(c, w->xdg_id, XDG_SURFACE_CONFIGURE);
@@ -208,19 +220,40 @@ static void send_configure(struct window *w) {
     event_end(c);
 }
 
+/* An xdg_surface's or a layer surface's ack_configure of `serial`: 0, or
+ * -1 when no configure the client has yet to ack had it. */
+int ack_configure(struct window *w, uint serial) {
+    if (serial <= w->acked_serial || serial > w->configure_serial) {
+        return -1;
+    }
+    w->acked_serial = serial;
+    w->acked = serial == w->configure_serial;
+    return 0;
+}
+
 static void commit(struct client *c, struct surface *s) {
     struct window *w = s->window;
     int new_buffer = s->attached && s->buffer != NULL;
-    if (w != NULL && w->toplevel_id == 0) {
-        post_error(c, w->xdg_id, XDG_SURFACE_ERROR_NOT_CONSTRUCTED, "a commit before the xdg_surface has a role");
-        return;
-    }
-    if (w != NULL && new_buffer && (w->configure_serial == 0 || !w->acked)) {
-        post_error(c, w->xdg_id, XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER, "a buffer before the configure was acked");
-        return;
-    }
-    if (w != NULL && w->configure_serial == 0) {
-        send_configure(w); /* the first commit: the window's first configure */
+    if (w != NULL && w->layer >= 0) {
+        if (layer_commit(w, new_buffer) < 0) {
+            return;
+        }
+    } else if (w != NULL) {
+        if (w->toplevel_id == 0) {
+            post_error(c, w->xdg_id, XDG_SURFACE_ERROR_NOT_CONSTRUCTED,
+                       "a commit before the xdg_surface has a role");
+            return;
+        }
+        if (new_buffer && w->acked_serial == 0) {
+            post_error(c, w->xdg_id, XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER,
+                       "a buffer before the configure was acked");
+            return;
+        }
+        if (w->configure_serial == 0) {
+            /* The first commit: the window's first configure, of 0 by 0
+             * (the client chooses its size). */
+            toplevel_configure(w, 0, 0, 0);
+        }
     }
     struct gui_rect before = w != NULL && w->mapped ? window_frame(w) : gui_rect(0, 0, 0, 0);
     if (new_buffer) {
@@ -241,6 +274,8 @@ static void commit(struct client *c, struct surface *s) {
         } else {
             struct gui_rect after = window_frame(w);
             if (after.w != before.w || after.h != before.h) {
+                window_resized(w);
+                after = window_frame(w);
                 damage(before);
                 damage(after);
             } else {
@@ -253,6 +288,9 @@ static void commit(struct client *c, struct surface *s) {
         }
     } else if (w != NULL && s->has_content) {
         window_map(w);
+    }
+    if (w != NULL && w->layer < 0) {
+        window_committed(w);
     }
     /* The frame callbacks wait for the next frame drawn; one the last
      * frames haven't taken yet is done at once. */
@@ -558,6 +596,10 @@ void output_request(struct client *c, struct object *o, uint op, struct args *a)
 /* ---- Freeing, and frame callbacks ---- */
 
 void object_free(struct client *c, struct object *o) {
+    if (shell_object_free(c, o)) {
+        o->data = NULL;
+        return;
+    }
     if (o->iface == &wl_surface_interface) {
         surface_free(o->data);
     } else if (o->iface == &wl_shm_pool_interface) {

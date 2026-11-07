@@ -88,11 +88,13 @@ headers and checks each size.
 | `struct stat` | 24 | `fstat`'s: `size` is an `off_t` |
 | `struct dirent` | 16 | a directory's entries, as `read` gives them |
 | `struct procinfo` | 40 | `procs`': `size` is a `size_t` |
-| `struct hartinfo` | 16 | `harts`' |
+| `struct hartinfo` | 20 | `harts`' |
 | `struct net_stats` | 108 | the network's counters |
 | `struct netinfo` | 132 | `netinfo`'s |
 | `struct ping_reply` | 16 | `ping`'s |
 | `struct timeval` | 16 | `SO_RCVTIMEO`'s: two `long`s, `tv_sec` a `time_t` |
+| `struct timespec` | 16 | `clock_gettime`'s: two `long`s, `tv_sec` a `time_t`, then `tv_nsec` |
+| `struct sysinfo` | 112 | `sysinfo`'s, Linux's: `long`s and `unsigned long`s, two `unsigned short`s and an `unsigned int` |
 | `struct sockaddr_in` | 16 | an IPv4 address and port |
 | `struct fb_var_screeninfo` | 160 | the framebuffer's mode and the row shown ("The framebuffer") |
 | `struct fb_fix_screeninfo` | 80 | the framebuffer's buffer |
@@ -135,7 +137,7 @@ headers and checks each size.
 | 20 | `pipe` | `int *fds` | 0; `-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT` |
 | 21 | `exec` | `const char *path, char *const argv[], char *const envp[]` | does not return; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-ENOMEM`, `-EFAULT` |
 | 22 | `kill` | `int pid` | 0; `-ESRCH`, `-EPERM` |
-| 23 | `procs` | `struct procinfo *buf, uint max` | the number of processes; `-EFAULT` |
+| 23 | `procs` | `struct procinfo *buf, uint max` | the number of processes; `-EFAULT`, `-ENOMEM` |
 | 24 | `netinfo` | `struct netinfo *info` | 0; `-ENODEV`, `-EFAULT` |
 | 25 | `netconf` | `uint addr, uint mask, uint gateway` | 0; `-ENODEV`, `-EINVAL` |
 | 26 | `ping` | `uint addr, uint seq, struct ping_reply *reply` | 0; `-ETIMEDOUT`, `-EHOSTUNREACH`, `-ENETUNREACH`, `-ENOBUFS`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
@@ -173,6 +175,8 @@ headers and checks each size.
 | 58 | `stat` | `const char *path, struct stat *st` | 0; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EFAULT` |
 | 59 | `getsockopt` | `int fd, int level, int option, void *value, uint *len` | 0; `-EBADF`, `-ENOTSOCK`, `-EFAULT`, `-ENOPROTOOPT` |
 | 60 | `getcwd` | `char *buf, size_t size` | the path's length, its NUL counted; `-ERANGE`, `-ENOENT`, `-ENAMETOOLONG`, `-ENOMEM`, `-EFAULT` |
+| 61 | `clock_gettime` | `int clock, struct timespec *ts` | 0; `-EINVAL`, `-EFAULT` |
+| 62 | `sysinfo` | `struct sysinfo *info` | 0; `-EFAULT` |
 
 **exit(status)** ends the caller, every one of its threads ("Threads"
 below): the others are stopped wherever they are, as by `kill`, and the
@@ -286,9 +290,9 @@ envp are `-EFAULT`. Errors:
   `MAXARG`);
 - `-ENOEXEC`: the file is not a valid executable (the kernel also prints why
   on the console: `spawn: PATH: REASON`);
-- `-EAGAIN`: every one of the 8 process slots is taken (zombies count until
+- `-EAGAIN`: every one of the 32 process slots is taken (zombies count until
   they are collected; init, on a root image, holds one), or every one of
-  the 16 thread slots;
+  the 64 thread slots;
 - `-ENOMEM`: not enough free memory;
 - `-EFAULT`: `path`, `argv`, `envp` or one of their strings is not
   readable (a path longer than `MAXPATH` is still read to its NUL).
@@ -320,6 +324,30 @@ returns those addresses whole.
 
 **uptime()** returns the timer ticks since boot (10 a second at the nominal
 clock), as an unsigned number.
+
+**clock_gettime(clock, ts)** stores the time of `clock` at `ts`, a
+`struct timespec` (16 bytes: seconds, then nanoseconds, below 10^9), as
+Linux's: `CLOCK_MONOTONIC` (1) the time since boot, counted by `time`
+(the CLINT's `mtime`) at the timebase, to the nanosecond the timebase
+allows, and `CLOCK_REALTIME` (0) the date, the time since 1970-01-01
+00:00:00 UTC. The kernel reads the real-time clock once, at boot
+(`docs/excalibur-spec.md` section 9.9; it prints `rtc: 2026-01-01 00:00
+UTC`), and the date runs on the monotonic clock from there, as Linux
+keeps its system time; without a real-time clock (`rtc: none`) the date
+is the time since boot, from 1970. Grail starts the clock at the host's
+time, or a test's machine at a fixed date (`--rtc`). Another clock is
+`-EINVAL`; `ts` not 16 writable bytes `-EFAULT`. There is no
+`clock_settime`. The C library's `time` and `gmtime_r` (UTC only: there
+are no time zones) are built on it, and `date` prints it.
+
+**sysinfo(info)** stores Linux's `struct sysinfo` (112 bytes, `user.h`) at
+`info`, with what Camelot has: `uptime`, the seconds since boot;
+`totalram`, the memory the kernel's page allocator manages (RAM less the
+kernel's image, the firmware's and the device tree's), and `freeram`, what
+of it is free, both in bytes (`mem_unit` is 1); and `procs`, the number of
+processes, as `procs(NULL, 0)` counts them. The load averages, `sharedram`,
+`bufferram`, the swap and the high memory are 0. `-EFAULT` if `info` is
+not 112 writable bytes.
 
 **open(path, flags)** opens the file at `path` and returns a new descriptor
 for it, the lowest one free. `flags` is one access mode, `O_RDONLY` (0),
@@ -356,8 +384,8 @@ format's largest file is one block more (docs/camelot-fs.md, "Inodes"), and
 no filesystem holds anything near it.
 
 Errors: the path's (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`), those above,
-`-ENOSPC` (no free inode or block to make the file with), `-EMFILE` (all 16
-of the caller's descriptors are taken), `-ENFILE` (all 64 of the kernel's
+`-ENOSPC` (no free inode or block to make the file with), `-EMFILE` (all 64
+of the caller's descriptors are taken), `-ENFILE` (all 256 of the kernel's
 open files are), `-EFAULT`. Without a free descriptor and open file nothing
 is made. Making the file is one transaction: a crash leaves it done or
 not. Emptying it takes as many as freeing its blocks does, after the file
@@ -478,7 +506,7 @@ starts without it, and `close` clears it with the descriptor. `cmd` is:
 Errors: `-EBADF` if `fd` is not open, checked before `cmd` (so an unknown
 `cmd` on a closed descriptor is `-EBADF`, as on Linux); `-EINVAL` for
 another `cmd`, for an `arg` of `F_DUPFD` or `F_DUPFD_CLOEXEC` that is
-not a descriptor, 0 to 31 (Linux's answer for one at or past
+not a descriptor, 0 to 63 (Linux's answer for one at or past
 `RLIMIT_NOFILE`), for the seals' commands on anything but a shared-memory
 object, and for a seal Camelot hasn't; `-EMFILE` when no descriptor from
 `arg` up is free; `-EPERM` to add seals to an object sealed with
@@ -546,10 +574,11 @@ stack page), 0 for a kernel process; and `name`, NUL-terminated (the last
 name of the path it was started from, at most 15 characters). A process
 that `spawn` is still loading is not listed. All of `buf`, `max` entries,
 must be writable, however many are stored, or it is `-EFAULT` and nothing
-is.
+is; the table is made in a page of the kernel's first, `-ENOMEM` when there
+is none.
 
 **harts(buf, max)** describes the harts the kernel runs on, from hart 0
-up, in the array of `max` `struct hartinfo` (16 bytes each, `user.h`) at
+up, in the array of `max` `struct hartinfo` (20 bytes each, `user.h`) at
 `buf`, and returns how many there are: 1 on a one-hart machine, else every
 hart Grail has (`--harts`; `docs/excalibur-spec.md` section 10, "Kernel
 SMP"). As for `procs`, only the first `max` are stored, `harts(NULL, 0)`
@@ -557,8 +586,13 @@ just counts them, and all of `buf`, `max` entries, must be writable, or it
 is `-EFAULT`. Each entry holds `hart`, its id (0 to the count - 1); `pid`,
 the process it is running, which on the caller's own hart is the caller,
 or 0 while it idles; `ticks`, the timer ticks it has taken since it
-started (each hart has its own timer: hart 0's are `uptime`'s); and
-`switches`, the times it has switched to a process since it started. A
+started (each hart has its own timer: hart 0's are `uptime`'s);
+`switches`, the times it has switched to a process since it started; and
+`idle`, those of its ticks that came while it ran no process (in the
+scheduler, or waiting for an interrupt), so that how busy a hart was
+between two calls is the ticks that were not idle, over the ticks, as
+Linux's idle time in `/proc/stat` gives it (the panel's and the system
+monitor's meters). A
 process runs on one hart at a time, but not always the same one.
 
 The network's calls are what the `ifconfig` and `ping` programs use;
@@ -886,7 +920,7 @@ several of them at once on a machine of several harts
 (`docs/excalibur-spec.md` section 10, "Kernel threads"). A thread has an
 id, its tid, from the same count as the pids, so no thread has the pid of
 another process as its id; the main thread's tid is the process's pid.
-There are 16 thread slots for all processes together, each process's
+There are 64 thread slots for all processes together, each process's
 main thread included.
 
 **thread_create(entry, arg, stack)** starts a thread in the caller's
@@ -1116,7 +1150,7 @@ Linux). A process that is handed an object sealed with `F_SEAL_SHRINK` knows
 that its pages stay: the display server takes a window's buffers only from
 one ("The display server" in the spec's section 10).
 Errors: `-EFAULT` for a bad `name`, `-EINVAL` for a longer one or another
-flag, `-EMFILE`, `-ENFILE` (no open file left, or none of the kernel's 32
+flag, `-EMFILE`, `-ENFILE` (no open file left, or none of the kernel's 64
 objects).
 
 **ftruncate(fd, length)** sets the size of the shared-memory object `fd`
