@@ -211,9 +211,15 @@ int vm_selftest(void) {
 static void kstack_noop(void) {
 }
 
-/* NPROC kernel processes at once, run until all have ended. */
+/* Kernel processes kstack_round() starts at once: more than a hart caches
+ * stacks for (NR_CACHED_STACKS), few enough that a boot whose ticks come
+ * fast (the kernel tests') still gets through them. */
+#define KSTACK_ROUND 8
+_Static_assert(KSTACK_ROUND > NR_CACHED_STACKS && KSTACK_ROUND <= NPROC, "a round of kernel processes");
+
+/* KSTACK_ROUND kernel processes at once, run until all have ended. */
 static void kstack_round(void) {
-    for (u32 i = 0; i < NPROC; i++) {
+    for (u32 i = 0; i < KSTACK_ROUND; i++) {
         const char *err;
         if (kproc_create("kstack", kstack_noop, &err) == NULL) {
             check(false, "start a kernel process");

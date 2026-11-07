@@ -66,9 +66,11 @@ struct cpu {
      * tlb_shootdown() reads it (without a lock: smp.c says why that is
      * enough) to find the harts that may hold stale translations. */
     pagetable_t pagetable;
-    /* Timer ticks this hart has taken, and processes it has switched to,
-     * for the harts system call. Written only by the hart itself. */
+    /* Timer ticks this hart has taken, those of them that came while it
+     * ran no thread (idle), and processes it has switched to, for the
+     * harts system call. Written only by the hart itself. */
     u32 ticks;
+    u32 idle_ticks;
     u32 switches;
     /* Set by the scheduler, under proc_lock, when it found nothing to run
      * and is about to wait in wfi; cleared when it looks again, or by the

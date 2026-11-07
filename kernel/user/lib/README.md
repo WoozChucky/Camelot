@@ -24,6 +24,7 @@ together.
 | `getline.c` | `getline` (a console line from stdin), `reader_init` and `reader_getline` (lines from any descriptor) |
 | `strerror.c` | `strerror`: a short message for each error number |
 | `spin.c` | `spin`: a busy loop, for tests that need CPU time |
+| `time.c` | `time`, `gmtime_r`: the date, over `clock_gettime`, and its UTC fields |
 | `proc.c` | `kill_descendants`: kills what a process started, and theirs (the shell and `shd` hang a session up with it) |
 | `inet.c` | `htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`, `inet_addr`, `inet_ntoa`, `sockaddr_set`: addresses and byte order |
 | `tty.c` | `isatty`, `tcgetattr`, `tcsetattr`, `cfmakeraw`, `tcgetpgrp`, `tcsetpgrp`, `posix_openpt`, `grantpt`, `unlockpt`, `ptsname`, `ttyname`: terminals, over `ioctl` and `fstat` |

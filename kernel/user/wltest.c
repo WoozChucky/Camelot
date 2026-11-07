@@ -21,6 +21,12 @@
  *       button asks to move with the serial before the press's, then with
  *       the press's ("wltest stale: committed", "asked with the serial
  *       before", "released").
+ *   wltest clip
+ *       a selection whose source never answers: asked for it, it keeps
+ *       the descriptor and writes nothing ("wltest clip: asked"), and the
+ *       second time it is asked it destroys the source instead
+ *       ("wltest clip: destroyed"). It has the keyboard first, a layer
+ *       surface of 8 by 8, to set the selection ("wltest clip: set").
  *   wltest bad KIND
  *       breaks the protocol, one way a KIND, on a connection of its own
  *       (not the GUI library's, which never would), and says what the
@@ -33,7 +39,14 @@
  *       without the descriptor it needs), fds (descriptors no request
  *       takes), pool (a pool bigger than its memory), unsealed (a pool
  *       whose memory may shrink), pools (more pools than a client may
- *       have), buffer (a buffer past its pool's end).
+ *       have), buffer (a buffer past its pool's end); the layer shell's:
+ *       role (a layer surface for a surface with a role), layer (no such
+ *       layer), constructed (a surface with a buffer), layersize (too
+ *       big), zerosize (a size of 0 without both its edges), anchor (no
+ *       such edges), keyboard (no such interactivity), serial (an ack no
+ *       configure had), unacked (a buffer before the configure was
+ *       acked); the clipboard's: source (an offer from a source in use),
+ *       usedsource (a source in use set again).
  *
  * Exits 0, or 1 when something went otherwise. */
 #include "gui.h"
@@ -198,6 +211,8 @@ static uint compositor_name;
 static uint shm_name;
 static uint wm_base_name;
 static uint seat_name;
+static uint layer_shell_name;
+static uint data_manager_name;
 
 static int raw_connect(void) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -255,6 +270,10 @@ static int events(uint stop, int print) {
                     wm_base_name = global;
                 } else if (strcmp(iface, "wl_seat") == 0) {
                     seat_name = global;
+                } else if (strcmp(iface, "zwlr_layer_shell_v1") == 0) {
+                    layer_shell_name = global;
+                } else if (strcmp(iface, "wl_data_device_manager") == 0) {
+                    data_manager_name = global;
                 }
             } else if (stop != 0 && m.object == stop && m.opcode == WL_CALLBACK_DONE) {
                 return 0;
@@ -321,11 +340,206 @@ static void make_pool(uint id, int mem, int size, int sealed) {
     close(fd);
 }
 
+/* The layer shell's kinds: wl_compositor 4 and its surface 5, the layer
+ * shell 6 and the layer surface 7 on the surface (with `layer`); wl_shm 8,
+ * a pool 9 and a buffer 10 of 8 by 8, which `attach` attaches to the
+ * surface first. */
+static void layer_surface(uint layer) {
+    gui_wire_begin(&wire, 6, ZWLR_LAYER_SHELL_V1_GET_LAYER_SURFACE);
+    gui_wire_uint(&wire, 7);
+    gui_wire_uint(&wire, 5);
+    gui_wire_uint(&wire, 0);
+    gui_wire_uint(&wire, layer);
+    gui_wire_string(&wire, "bad");
+    gui_wire_end(&wire);
+}
+
+static void small_buffer(void) {
+    bind_global(shm_name, "wl_shm", 1, 8);
+    gui_wire_flush(&wire);
+    /* make_pool's wl_shm is object 4: this one is 8 */
+    int fd = memfd_create("wltest", MFD_ALLOW_SEALING);
+    ftruncate(fd, 4096);
+    fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK);
+    gui_wire_begin(&wire, 8, WL_SHM_CREATE_POOL);
+    gui_wire_uint(&wire, 9);
+    gui_wire_fd(&wire, fd);
+    gui_wire_int(&wire, 4096);
+    gui_wire_end(&wire);
+    gui_wire_flush(&wire);
+    close(fd);
+    gui_wire_begin(&wire, 9, WL_SHM_POOL_CREATE_BUFFER);
+    gui_wire_uint(&wire, 10);
+    gui_wire_int(&wire, 0);
+    gui_wire_int(&wire, 8);
+    gui_wire_int(&wire, 8);
+    gui_wire_int(&wire, 32);
+    gui_wire_uint(&wire, WL_SHM_FORMAT_XRGB8888);
+    gui_wire_end(&wire);
+}
+
+static void attach_small(void) {
+    gui_wire_begin(&wire, 5, WL_SURFACE_ATTACH);
+    gui_wire_uint(&wire, 10);
+    gui_wire_int(&wire, 0);
+    gui_wire_int(&wire, 0);
+    gui_wire_end(&wire);
+}
+
+/* The layer surface's first configure's serial, or 0 (an error, or the
+ * hang-up). */
+static uint layer_configured(void) {
+    gui_wire_flush(&wire);
+    for (;;) {
+        struct gui_message m;
+        int r;
+        while ((r = gui_wire_next(&wire, &m)) == 1) {
+            if (m.object == WL_DISPLAY_ID && m.opcode == WL_DISPLAY_ERROR) {
+                uint object = gui_msg_uint(&m);
+                uint code = gui_msg_uint(&m);
+                const char *msg = gui_msg_string(&m);
+                printf("wltest: error %u %u: %s\n", object, code, msg != NULL ? msg : "");
+            } else if (m.object == 7 && m.opcode == ZWLR_LAYER_SURFACE_V1_CONFIGURE) {
+                return gui_msg_uint(&m);
+            }
+        }
+        if (r < 0 || gui_wire_read(&wire, 0) <= 0) {
+            printf("wltest: disconnected\n");
+            return 0;
+        }
+    }
+}
+
+/* A layer surface of 8 by 8 with the keyboard (which it gets when it is
+ * shown), then the clipboard's: wl_data_device_manager 11, a source 12
+ * offering text, wl_seat 13 and its data device 14, the source set as the
+ * selection: 0, or -1 if it went otherwise. */
+static int selection_set(void) {
+    bind_global(compositor_name, "wl_compositor", 4, 4);
+    send1(4, WL_COMPOSITOR_CREATE_SURFACE, 5);
+    bind_global(layer_shell_name, "zwlr_layer_shell_v1", 1, 6);
+    layer_surface(ZWLR_LAYER_SHELL_V1_LAYER_TOP);
+    gui_wire_begin(&wire, 7, ZWLR_LAYER_SURFACE_V1_SET_SIZE);
+    gui_wire_uint(&wire, 8);
+    gui_wire_uint(&wire, 8);
+    gui_wire_end(&wire);
+    send1(7, ZWLR_LAYER_SURFACE_V1_SET_KEYBOARD_INTERACTIVITY, 1);
+    send0(5, WL_SURFACE_COMMIT);
+    uint serial = layer_configured();
+    if (serial == 0) {
+        return -1;
+    }
+    send1(7, ZWLR_LAYER_SURFACE_V1_ACK_CONFIGURE, serial);
+    small_buffer();
+    attach_small();
+    send0(5, WL_SURFACE_COMMIT);
+    bind_global(data_manager_name, "wl_data_device_manager", 1, 11);
+    send1(11, WL_DATA_DEVICE_MANAGER_CREATE_DATA_SOURCE, 12);
+    gui_wire_begin(&wire, 12, WL_DATA_SOURCE_OFFER);
+    gui_wire_string(&wire, "text/plain");
+    gui_wire_end(&wire);
+    bind_global(seat_name, "wl_seat", 1, 13);
+    gui_wire_begin(&wire, 11, WL_DATA_DEVICE_MANAGER_GET_DATA_DEVICE);
+    gui_wire_uint(&wire, 14);
+    gui_wire_uint(&wire, 13);
+    gui_wire_end(&wire);
+    gui_wire_begin(&wire, 14, WL_DATA_DEVICE_SET_SELECTION);
+    gui_wire_uint(&wire, 12);
+    gui_wire_uint(&wire, 0);
+    gui_wire_end(&wire);
+    return 0;
+}
+
+/* The layer shell's kinds: 1 if kind was one, its request sent. */
+static int bad_layer(const char *kind) {
+    if (strcmp(kind, "source") == 0 || strcmp(kind, "usedsource") == 0) {
+        if (selection_set() < 0) {
+            return -1;
+        }
+        if (strcmp(kind, "source") == 0) {
+            gui_wire_begin(&wire, 12, WL_DATA_SOURCE_OFFER);
+            gui_wire_string(&wire, "text/html");
+            gui_wire_end(&wire);
+        } else {
+            gui_wire_begin(&wire, 14, WL_DATA_DEVICE_SET_SELECTION);
+            gui_wire_uint(&wire, 12);
+            gui_wire_uint(&wire, 0);
+            gui_wire_end(&wire);
+        }
+        return 1;
+    }
+    static const char *const kinds[] = {"role", "layer", "constructed", "layersize", "zerosize",
+                                        "anchor", "keyboard", "serial", "unacked"};
+    int k = -1;
+    for (int i = 0; i < 9; i++) {
+        if (strcmp(kind, kinds[i]) == 0) {
+            k = i;
+        }
+    }
+    if (k < 0) {
+        return 0;
+    }
+    bind_global(compositor_name, "wl_compositor", 4, 4);
+    send1(4, WL_COMPOSITOR_CREATE_SURFACE, 5);
+    bind_global(layer_shell_name, "zwlr_layer_shell_v1", 1, 6);
+    if (k == 0) {
+        /* an xdg_surface first: xdg_wm_base 8, the xdg_surface 9 */
+        bind_global(wm_base_name, "xdg_wm_base", 1, 8);
+        gui_wire_begin(&wire, 8, XDG_WM_BASE_GET_XDG_SURFACE);
+        gui_wire_uint(&wire, 9);
+        gui_wire_uint(&wire, 5);
+        gui_wire_end(&wire);
+        layer_surface(ZWLR_LAYER_SHELL_V1_LAYER_TOP);
+        return 1;
+    }
+    if (k == 1) {
+        layer_surface(9);
+        return 1;
+    }
+    if (k == 2) {
+        small_buffer();
+        attach_small();
+        layer_surface(ZWLR_LAYER_SHELL_V1_LAYER_TOP);
+        return 1;
+    }
+    layer_surface(ZWLR_LAYER_SHELL_V1_LAYER_TOP);
+    if (k == 3) {
+        gui_wire_begin(&wire, 7, ZWLR_LAYER_SURFACE_V1_SET_SIZE);
+        gui_wire_uint(&wire, 100000);
+        gui_wire_uint(&wire, 8);
+        gui_wire_end(&wire);
+    } else if (k == 4) {
+        send0(5, WL_SURFACE_COMMIT);
+    } else if (k == 5) {
+        send1(7, ZWLR_LAYER_SURFACE_V1_SET_ANCHOR, 16);
+    } else if (k == 6) {
+        send1(7, ZWLR_LAYER_SURFACE_V1_SET_KEYBOARD_INTERACTIVITY, 2);
+    } else if (k == 7) {
+        send1(7, ZWLR_LAYER_SURFACE_V1_ACK_CONFIGURE, 99999);
+    } else {
+        gui_wire_begin(&wire, 7, ZWLR_LAYER_SURFACE_V1_SET_SIZE);
+        gui_wire_uint(&wire, 8);
+        gui_wire_uint(&wire, 8);
+        gui_wire_end(&wire);
+        send0(5, WL_SURFACE_COMMIT);
+        small_buffer();
+        attach_small();
+        send0(5, WL_SURFACE_COMMIT);
+    }
+    return 1;
+}
+
 static int bad(const char *kind) {
     if (raw_connect() < 0 || registry(0) != 0) {
         return 1;
     }
-    if (strcmp(kind, "object") == 0) {
+    int layer = bad_layer(kind);
+    if (layer < 0) {
+        return 1;
+    }
+    if (layer == 1) {
+        /* sent */
+    } else if (strcmp(kind, "object") == 0) {
         send0(99, 0);
     } else if (strcmp(kind, "opcode") == 0) {
         send0(WL_DISPLAY_ID, 7);
@@ -509,6 +723,54 @@ static int stale(void) {
     }
 }
 
+/* clip: a source that never answers, then goes (see the top). */
+static int clip(void) {
+    if (raw_connect() < 0 || registry(0) != 0 || selection_set() < 0) {
+        return 1;
+    }
+    send1(WL_DISPLAY_ID, WL_DISPLAY_SYNC, 15);
+    gui_wire_flush(&wire);
+    int asked = 0;
+    int held[2];
+    for (;;) {
+        struct gui_message m;
+        int r;
+        while ((r = gui_wire_next(&wire, &m)) == 1) {
+            if (m.object == WL_DISPLAY_ID && m.opcode == WL_DISPLAY_ERROR) {
+                uint object = gui_msg_uint(&m);
+                uint code = gui_msg_uint(&m);
+                const char *msg = gui_msg_string(&m);
+                printf("wltest: error %u %u: %s\n", object, code, msg != NULL ? msg : "");
+            } else if (m.object == 15 && m.opcode == WL_CALLBACK_DONE) {
+                printf("wltest clip: set\n");
+            } else if (m.object == 12 && m.opcode == WL_DATA_SOURCE_SEND) {
+                gui_msg_string(&m);
+                int fd = gui_msg_fd(&m);
+                if (asked < 2) {
+                    held[asked] = fd; /* kept open, nothing written */
+                }
+                asked++;
+                if (asked == 1) {
+                    printf("wltest clip: asked\n");
+                } else if (asked == 2) {
+                    send0(12, WL_DATA_SOURCE_DESTROY);
+                    gui_wire_flush(&wire);
+                    printf("wltest clip: destroyed\n");
+                }
+            } else if (m.object == 12 && m.opcode == WL_DATA_SOURCE_CANCELLED) {
+                printf("wltest clip: cancelled\n");
+            }
+        }
+        if (r < 0 || gui_wire_read(&wire, 0) <= 0) {
+            printf("wltest clip: disconnected\n");
+            for (int i = 0; i < asked && i < 2; i++) {
+                close(held[i]);
+            }
+            return 1;
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     int r = 2;
     if (argc >= 2 && strcmp(argv[1], "window") == 0) {
@@ -517,11 +779,13 @@ int main(int argc, char **argv) {
         r = probe();
     } else if (argc == 2 && strcmp(argv[1], "stale") == 0) {
         r = stale();
+    } else if (argc == 2 && strcmp(argv[1], "clip") == 0) {
+        r = clip();
     } else if (argc == 3 && strcmp(argv[1], "bad") == 0) {
         r = bad(argv[2]);
     }
     if (r == 2) {
-        fprintf(2, "usage: wltest window [-n] [-f] [-m] NAME RRGGBB WIDTH HEIGHT | probe | stale | bad KIND\n");
+        fprintf(2, "usage: wltest window [-n] [-f] [-m] NAME RRGGBB WIDTH HEIGHT | probe | stale | clip | bad KIND\n");
     }
     return r;
 }

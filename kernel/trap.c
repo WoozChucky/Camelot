@@ -268,13 +268,18 @@ static bool probe_fixup(struct trap_frame *f) {
 }
 
 /* `n` timer ticks on this hart (more than 1 if some were missed). Every
- * hart counts its own (for the harts system call); hart 0's are the clock:
+ * hart counts its own (for the harts system call), and those that came
+ * while it ran no thread, in the scheduler or waiting in wfi, as idle
+ * (how busy it is, Linux's idle time in /proc/stat); hart 0's are the clock:
  * `ticks`, on which processes in the sleep system call wait (with
  * tickslock), and the network's timer, which comes after, without
  * tickslock: it takes the network's lock. */
 static void clock_tick(u32 n) {
     struct cpu *c = mycpu();
     c->ticks = c->ticks + n;
+    if (c->thread == NULL) {
+        c->idle_ticks = c->idle_ticks + n;
+    }
     if (c->hartid != 0) {
         return;
     }

@@ -634,7 +634,7 @@ fn sysinfo_lists_the_cards() {
         .unwrap();
     assert_eq!(m.run(Some(1_000_000), |_| {}), RunResult::Exited(0));
     let out = output(&mut m);
-    let devices = out.split_once("13 devices:\n").expect(&out).1;
+    let devices = out.split_once("14 devices:\n").expect(&out).1;
     assert_eq!(
         devices,
         "  test      0x0000000000100000 + 0x0000000000001000
@@ -649,6 +649,7 @@ fn sysinfo_lists_the_cards() {
   keyboard  0x0000000030001000 + 0x0000000000001000  irq 2
   sysinfo   0x0000000030002000 + 0x0000000000001000
   pointer   0x0000000030003000 + 0x0000000000001000  irq 11
+  rtc       0x0000000030004000 + 0x0000000000001000  irq 17
   fb-vram   0x0000000031000000 + 0x000000000012c000
 "
     );

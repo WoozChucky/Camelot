@@ -35,10 +35,10 @@
 
 /* Open files in the kernel: enough for every process to use most of its
  * descriptors on files of its own. */
-#define NFILE 64
+#define NFILE 256
 
 /* Descriptors per process. */
-#define NOFILE 32
+#define NOFILE 64
 
 /* Device numbers (the major of a device inode): the console, the
  * framebuffer (fb.h) and the input devices (input.h), whose minor says

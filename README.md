@@ -18,7 +18,7 @@ You need [Rust](https://rustup.rs) and nothing else: no crates to download, no L
 cargo xtask up --demo
 ```
 
-This builds the platform in release mode (a few minutes the first time), builds the Camelot root images (the kernel and its programs on a bootable disk) of both profiles, the server's (`target/camelot-fs.img`) and the desktop's (`target/camelot-desktop.img`), and puts them in Lake's images directory, `target/platform/images`, as the images `os-base` and `os-desktop`. Then it runs Lake, Avalon and Pendragon, with their output in this terminal, each line prefixed by its server. `--demo` also creates a switch `nat` with a NAT gateway, and a VM `vm001` with a Camelot VM's hardware (Camelot's firmware and 6 MiB of RAM, the firmware's 2 on top of the default 4) that boots Camelot from `vm001-disk0`, its own copy of the image, plugged into the switch. The gateway forwards 127.0.0.1:2323 to the VM's port 23, where `shd`, Camelot's shell server, listens: the image's init starts it at boot, with the console's shell (`up` checks that it answers, and types `shd &` on the console of an old disk whose init does not). Once everything is up, `up` says where it is:
+This builds the platform in release mode (a few minutes the first time), builds the Camelot root images (the kernel and its programs on a bootable disk) of both profiles, the server's (`target/camelot-fs.img`) and the desktop's (`target/camelot-desktop.img`), and puts them in Lake's images directory, `target/platform/images`, as the images `os-base` and `os-desktop`. Then it runs Lake, Avalon and Pendragon, with their output in this terminal, each line prefixed by its server. `--demo` also creates a switch `nat` with a NAT gateway, and a VM `vm001` with a Camelot VM's hardware (Camelot's firmware and 6 MiB of RAM, the firmware's 2 on top of the default 4) that boots Camelot from `vm001-disk0`, its own copy of the image, plugged into the switch. The gateway forwards 127.0.0.1:2323 to the VM's port 23, where `shd`, Camelot's shell server, listens: the image's init starts it at boot, with the console's shell (`up` checks that it answers, and types `shd &` on the console of an old disk whose init does not). It then starts a Camelot desktop beside it, the VM `desktop`, with the desktop profile's hardware (64 MiB and 4 harts) and `desktop-disk0`, its own copy of `os-desktop`, without a network card: it boots to the panel with a terminal running the shell, and `herald --screen desktop` (on Windows) or its page in Pendragon shows it. Once everything is up, `up` says where it is:
 
 ```
 The Avalon platform is up.
@@ -29,7 +29,7 @@ The Avalon platform is up.
   Lake       127.0.0.1:7401, images in C:\...\Camelot\target\platform\images
 ```
 
-Open the Pendragon URL in a browser. Its **New VM** page creates a VM: give it a name and leave *Camelot (boot from disk)* chosen, as a server, and the VM gets a disk of its own, `NAME-disk0`, copied from the image `os-base`, and boots from it (as a desktop, from `os-desktop`, with 64 MiB of RAM); its page shows the console, where Camelot's shell waits (`ls /bin`, `echo hi > /hi`, `cat /hi`). The demo's VM is in the VM list already.
+Open the Pendragon URL in a browser. Its **New VM** page creates a VM: give it a name and leave *Camelot (boot from disk)* chosen, as a server, and the VM gets a disk of its own, `NAME-disk0`, copied from the image `os-base`, and boots from it (as a desktop, from `os-desktop`, with 64 MiB of RAM and 4 harts); its page shows the console, where Camelot's shell waits (`ls /bin`, `echo hi > /hi`, `cat /hi`), and a desktop's page its screen too: the panel along the top, whose launcher starts a terminal, a file browser, a system monitor and gears, and a terminal running the shell. The demo's VMs, `vm001` and `desktop`, are in the VM list already.
 
 Or, from a second terminal, Round Table creates the VM and Herald attaches the terminal to its console:
 
@@ -40,10 +40,12 @@ cargo run --release -p round-table -- create --name desk --profile desktop --sta
 cargo run --release -p round-table -- list
 cargo run --release -p herald -- web
 cargo run --release -p herald -- vm001
+cargo run --release -p herald -- --screen desktop
+cargo run --release -p herald -- --screen desk
 cargo run --release -p herald -- --tcp 127.0.0.1:2323
 ```
 
-Ctrl-] leaves Herald, and the VM carries on. The console is one for the whole VM: every Herald attached to it shares its input and output, so while the shell there runs `sleep 5000`, nobody gets a prompt. The last command is different: `herald --tcp` connects straight to the demo VM's `shd` (not through Avalon), and each connection is a shell of its own, beside the console's and the other connections', so one busy session never holds up another. There Herald edits the line (Backspace, Ctrl-U, Ctrl-W) and sends it with Enter; Ctrl-D on an empty line ends the session, and so does `exit`. If the gateway cannot take the forward's address (another program has it) or `shd` does not start in the VM, `up` says which and carries on, and its summary leaves `herald --tcp` out: then `--shd ADDR` picks another address next time, and typing `shd &` on the VM's console starts the shell server by hand. **`shd` is for local use only:** until Camelot has users, its shells run as root with no password, so keep the forward on 127.0.0.1 (`--shd ADDR` picks another address). Without `--demo`, a Camelot VM plugged into a NAT switch with a forward to its port 23 (`round-table switch create nat --nat --hostfwd tcp::2323-:23`) has one too, its init's. **Ctrl-C** in the first terminal stops Pendragon, Avalon and Lake. The images stay in `target/platform/images`, so a VM's disk keeps what it wrote: the next `cargo xtask up` serves them again (the VMs themselves end with Avalon; `--demo` creates its VM again on its old disk). `up` replaces the images `os-base` and `os-desktop` when a build has changed them, and leaves every other image alone, so a disk copied from one before keeps the old build: `--demo` still boots `vm001-disk0` as it is (and says so). Delete `target/platform/images/vm001-disk0` while `up` is not running to have the demo copy the new image.
+Ctrl-] leaves Herald, and the VM carries on. `--screen` shows a VM's screen in a window instead (on Windows), the desktop's panel and terminal, and passes the keyboard and the pointer to it. The console is one for the whole VM: every Herald attached to it shares its input and output, so while the shell there runs `sleep 5000`, nobody gets a prompt. The last command is different: `herald --tcp` connects straight to the demo VM's `shd` (not through Avalon), and each connection is a shell of its own, beside the console's and the other connections', so one busy session never holds up another. There Herald edits the line (Backspace, Ctrl-U, Ctrl-W) and sends it with Enter; Ctrl-D on an empty line ends the session, and so does `exit`. If the gateway cannot take the forward's address (another program has it) or `shd` does not start in the VM, `up` says which and carries on, and its summary leaves `herald --tcp` out: then `--shd ADDR` picks another address next time, and typing `shd &` on the VM's console starts the shell server by hand. **`shd` is for local use only:** until Camelot has users, its shells run as root with no password, so keep the forward on 127.0.0.1 (`--shd ADDR` picks another address). Without `--demo`, a Camelot VM plugged into a NAT switch with a forward to its port 23 (`round-table switch create nat --nat --hostfwd tcp::2323-:23`) has one too, its init's. **Ctrl-C** in the first terminal stops Pendragon, Avalon and Lake. The images stay in `target/platform/images`, so a VM's disk keeps what it wrote: the next `cargo xtask up` serves them again (the VMs themselves end with Avalon; `--demo` creates its VM again on its old disk). `up` replaces the images `os-base` and `os-desktop` when a build has changed them, and leaves every other image alone, so a disk copied from one before keeps the old build: `--demo` still boots `vm001-disk0` as it is (and says so). Delete `target/platform/images/vm001-disk0` while `up` is not running to have the demo copy the new image.
 
 `cargo xtask up --help` lists the options: `--images DIR` for another images directory, `--lake ADDR`, `--avalon ADDR`, `--pendragon ADDR` and `--shd ADDR` for other addresses, `--no-build` to start what is already built. To run the servers one by one instead, see [The Avalon platform](#the-avalon-platform); for Grail on its own, [Running](#running).
 
@@ -134,7 +136,7 @@ sysinfo v2
 RAM      64 MiB at 0x0000000080000000
 CPU      2000000 Hz (real time)
 timebase 2000000 Hz
-9 devices:
+10 devices:
   test      0x0000000000100000 + 0x0000000000001000
   CLINT     0x0000000002000000 + 0x0000000000010000
 ...
@@ -447,7 +449,7 @@ harts    1
 steps    8726
 disks    none
 nets     none
-devices  9
+devices  10
   test      0x00100000 + 0x00001000
   CLINT     0x02000000 + 0x00010000
   PLIC      0x0c000000 + 0x04000000
@@ -456,6 +458,7 @@ devices  9
   keyboard  0x30001000 + 0x00001000  irq 2
   sysinfo   0x30002000 + 0x00001000
   pointer   0x30003000 + 0x00001000  irq 11
+  rtc       0x30004000 + 0x00001000  irq 17
   fb-vram   0x31000000 + 0x0012c000
 ```
 
@@ -498,16 +501,16 @@ created VM 1 (web)
 started VM 1 (web)
 ```
 
-The VM boots Camelot from its copy (`--paging sv39` gives it Sv39 alone, as most RV64 boards have), on Camelot's firmware and with its profile's RAM, a server's 6 MiB and a desktop's 64, unless `--bios` and `--ram` say otherwise: the kernel runs in S-mode only, and the firmware keeps 2 MiB. A desktop's RAM has room for the frames of the display controller's largest mode, 1920x1080; the guest picks the mode itself, as on a real display controller, so the profile has no display setting:
+The VM boots Camelot from its copy (`--paging sv39` gives it Sv39 alone, as most RV64 boards have), on Camelot's firmware and with its profile's RAM and harts, a server's 6 MiB and one hart and a desktop's 64 MiB and 4 harts, unless `--bios`, `--ram` and `--harts` say otherwise: the kernel runs in S-mode only, and the firmware keeps 2 MiB. A desktop's RAM has room for the frames of the display controller's largest mode, 1920x1080; the guest picks the mode itself, as on a real display controller, so the profile has no display setting:
 
 ```
 round-table profiles
 ```
 
 ```
-NAME     IMAGE       RAM     BIOS     ABOUT
-server   os-base     6 MiB   default  a Camelot server: the console's shell and shd, its shells over TCP
-desktop  os-desktop  64 MiB  default  a Camelot desktop: its own image, and RAM for the largest display mode
+NAME     IMAGE       RAM     HARTS  BIOS     ABOUT
+server   os-base     6 MiB   1      default  a Camelot server: the console's shell and shd, its shells over TCP
+desktop  os-desktop  64 MiB  4      default  a Camelot desktop: its own image, and RAM for the largest display mode
 ```
 
 A Lake without the image says so: `the Lake at 127.0.0.1:7401 has no 'os-base' image to copy (start the platform with 'cargo xtask up', which puts it in Lake's images directory)`. A copy whose name is taken is refused (`already exists`), and so is a copy of an image that a VM writes (`busy`); when Avalon refuses the VM (its name is taken, say), the copy is deleted again. Destroying the VM leaves its disk on Lake, with what Camelot wrote to it, until `disk delete NAME-disk0`. A disk is attached to a VM when the VM is created (`--disk lake://127.0.0.1:7401/data`; a missing image, one another VM writes, or a Lake server that cannot be reached is refused as an invalid hardware profile) and detached when the VM's machine ends: when the VM is stopped, its program exits, or it is destroyed. A stopped or exited VM still lists its disks (`list`, `info`), but no longer holds them. `disk list` shows each image's attachments (one writer, or any number of readers), and an attached image cannot be deleted.

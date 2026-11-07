@@ -66,6 +66,8 @@
     .equ SYS_stat, 58
     .equ SYS_getsockopt, 59
     .equ SYS_getcwd, 60
+    .equ SYS_clock_gettime, 61
+    .equ SYS_sysinfo, 62
 
     .text
 
@@ -490,6 +492,20 @@ stat:
     .globl getcwd
 getcwd:
     li    a7, SYS_getcwd
+    ecall
+    ret
+
+# int clock_gettime(int clock, struct timespec *ts)
+    .globl clock_gettime
+clock_gettime:
+    li    a7, SYS_clock_gettime
+    ecall
+    ret
+
+# int sysinfo(struct sysinfo *info)
+    .globl sysinfo
+sysinfo:
+    li    a7, SYS_sysinfo
     ecall
     ret
 

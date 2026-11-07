@@ -59,4 +59,7 @@ void kfree_contig(void *pages, usize n);
 /* Number of pages on the free list. */
 u32 kfree_pages(void);
 
+/* The pages kinit() gave the allocator: every one it may hand out. */
+u32 ktotal_pages(void);
+
 #endif

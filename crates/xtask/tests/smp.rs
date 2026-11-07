@@ -43,6 +43,7 @@ paging: on (Sv48)
 vm self-test: 26/26 passed
 fb: 640x480, 6 modes, irq 16
 timer: 10 Hz tick, 10000000 Hz timebase
+rtc: 2026-01-01 00:00 UTC
 disk: none
 tick 1
 tick 2
@@ -69,24 +70,29 @@ fn running(cpu: &Cpu, cpus: u64) -> u64 {
     peek64(cpu, cpus + u64::from(cpu.id) * CPU_SIZE + CPU_PROC)
 }
 
-/// One line of the `harts` program: hart, pid (None while idle), ticks and
-/// switches.
-type HartLine = (u32, Option<u32>, u32, u32);
+/// One line of the `harts` program: hart, pid (None while idle), ticks,
+/// idle ticks and switches.
+type HartLine = (u32, Option<u32>, u32, u32, u32);
 
 /// Parses the `harts` program's output (kernel/user/harts.c).
 fn parse_harts(lines: &[&str]) -> Vec<HartLine> {
-    assert_eq!(lines.first(), Some(&"HART   PID    TICKS SWITCHES"), "{lines:#?}");
+    assert_eq!(
+        lines.first(),
+        Some(&"HART   PID    TICKS     IDLE SWITCHES"),
+        "{lines:#?}"
+    );
     lines[1..]
         .iter()
         .map(|l| {
             let f: Vec<&str> = l.split_whitespace().collect();
-            assert_eq!(f.len(), 4, "{l:?}");
+            assert_eq!(f.len(), 5, "{l:?}");
             let pid = (f[1] != "-").then(|| f[1].parse().unwrap());
             (
                 f[0].parse().unwrap(),
                 pid,
                 f[2].parse().unwrap(),
                 f[3].parse().unwrap(),
+                f[4].parse().unwrap(),
             )
         })
         .collect()
@@ -96,7 +102,8 @@ fn parse_harts(lines: &[&str]) -> Vec<HartLine> {
 /// its first tick: every hart listed once, in order, each taking timer
 /// ticks; hart 0 has taken one every `TICK_INTERVAL` (give or take a few
 /// that came while interrupts were off), and the others no more, as they
-/// started later.
+/// started later. Some of them came while a hart idled (the shell slept,
+/// and on several harts most have nothing to do), never more than it took.
 fn check_harts(lines: &[HartLine], n: u32, mtime: u64) {
     assert_eq!(lines.len() as u32, n, "{lines:?}");
     let expected = 1 + (mtime / TICK_INTERVAL) as u32;
@@ -105,10 +112,12 @@ fn check_harts(lines: &[HartLine], n: u32, mtime: u64) {
         hart0 <= expected && hart0 + 3 >= expected,
         "hart 0: {hart0} ticks in {mtime} after the first"
     );
-    for (i, &(hart, _, ticks, _)) in lines.iter().enumerate() {
+    for (i, &(hart, _, ticks, idle, _)) in lines.iter().enumerate() {
         assert_eq!(hart, i as u32, "{lines:?}");
         assert!(ticks > 0 && ticks <= hart0 + 1, "{lines:?}");
+        assert!(idle <= ticks, "{lines:?}");
     }
+    assert!(lines.iter().any(|l| l.3 > 0), "{lines:?}");
     // harts itself runs on one of them (and the shell, which just started
     // it, may still be on another, on its way to wait for it).
     assert!(lines.iter().any(|l| l.1.is_some()), "{lines:?}");

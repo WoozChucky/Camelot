@@ -173,6 +173,7 @@ struct gui_widget *gui_list(struct gui_ui *ui, struct gui_widget *parent, const 
     w->count = count;
     w->rows = rows < 1 ? 1 : rows;
     w->action = action;
+    w->clicked = -1;
     w->flags |= GUI_FOCUSABLE | GUI_GROW;
     struct gui_widget *bar = gui_scrollbar(ui, row, count, w->rows, NULL);
     if (bar == NULL) {
@@ -330,6 +331,7 @@ void gui_list_set(struct gui_widget *w, const char *const *items, int count) {
     w->items = items;
     w->count = count;
     w->top = 0;
+    w->clicked = -1;
     if (w->selected >= count) {
         w->selected = -1;
     }
@@ -877,7 +879,16 @@ static void press(struct gui_ui *ui, struct gui_widget *w) {
     case GUI_LIST: {
         int line = (y - w->rect.y - THEME_EDGE_PAD) / theme_line(ui);
         if (y >= w->rect.y + THEME_EDGE_PAD && line < widget_list_lines(w) && w->top + line < w->count) {
-            list_select(w, w->top + line);
+            /* A second click on an item opens it; the first, or one on an
+             * item the keys or the program selected, selects it. */
+            int item = w->top + line;
+            if (item == w->selected && item == w->clicked && w->activate != NULL) {
+                w->clicked = -1;
+                w->activate(w, item);
+            } else {
+                list_select(w, item);
+                w->clicked = item;
+            }
         }
         break;
     }
@@ -973,6 +984,7 @@ static void menu_key(struct gui_ui *ui, uint code) {
 static void list_key(struct gui_widget *w, uint code) {
     int lines = widget_list_lines(w);
     int at = w->selected;
+    w->clicked = -1;
     switch (code) {
     case KEY_UP:
         list_select(w, at < 0 ? 0 : at - 1);
@@ -991,6 +1003,11 @@ static void list_key(struct gui_widget *w, uint code) {
         break;
     case KEY_END:
         list_select(w, w->count - 1);
+        break;
+    case KEY_ENTER:
+        if (at >= 0 && w->activate != NULL) {
+            w->activate(w, at);
+        }
         break;
     }
 }

@@ -50,12 +50,15 @@ const ILLEGAL_INSTRUCTION: u64 = grail::trap::Exception::IllegalInstr as u64;
 /// The exit system call's number (`SYS_exit`, kernel/include/syscall.h).
 const SYS_EXIT: u64 = 1;
 /// Process slots (`NPROC`, kernel/include/proc.h).
-const NPROC: usize = 8;
+const NPROC: usize = 32;
+/// Kernel processes a round of the boot's kernel-stack self-test starts
+/// (`KSTACK_ROUND`, kernel/vmtest.c).
+const KSTACK_ROUND: usize = 8;
 /// The pid of the shell's first child: the shell is pid 1, as Linux's init
 /// (kernel/proc.c's INIT_PID), and the pids after it went to the kernel
-/// processes of the boot's kernel-stack self-test, four rounds of NPROC
+/// processes of the boot's kernel-stack self-test, four rounds
 /// (kernel/vmtest.c).
-const FIRST_PID: usize = 2 + 4 * NPROC;
+const FIRST_PID: usize = 2 + 4 * KSTACK_ROUND;
 
 const PAGE: u64 = 4096;
 /// The top of user space, by paging mode (kernel/include/vm.h): the lower
@@ -604,6 +607,26 @@ fn the_shell_runs_64_bit_programs() {
     let ps = command_output(&out, "ps");
     assert_eq!(ps[0], "  PID  PPID STATE      SIZE NAME", "{out}");
     assert!(ps[1].ends_with(" sh") && ps[2].ends_with(" ps"), "{out}");
+}
+
+#[test]
+fn date_prints_the_real_time_clock() {
+    // The machine's clock starts at 2026-01-01 00:00:00 UTC (MachineConfig's
+    // default), and the kernel's date runs on from there: the shell's first
+    // commands come seconds in.
+    let out = run(Setup::default(), b"date\ndate -s\ndate now\nexit 0\n");
+    let date = command_output(&out, "date");
+    assert_eq!(date.len(), 1, "{out}");
+    assert!(
+        date[0].starts_with("Thu Jan  1 00:00:") && date[0].ends_with(" UTC 2026"),
+        "{out}"
+    );
+    let secs: u64 = command_output(&out, "date -s")[0].parse().unwrap();
+    assert!((1_767_225_600..1_767_225_660).contains(&secs), "{out}");
+    assert_eq!(
+        command_output(&out, "date now"),
+        ["usage: date [-s]", "date: exit 2"]
+    );
 }
 
 #[test]
@@ -1946,23 +1969,27 @@ fn processes_give_back_every_page() {
     command(&mut m, &format!("{} &\n", some.join(" & ")));
     command(&mut m, "wait\n");
     assert_eq!(spare_pages(&m, &elf), before);
-    // More than there are slots: the shell has one, and the eighth hello
-    // can't start. Exited children keep their slots until collected.
-    let hellos = ["hello"; NPROC].join(" & ");
-    command(&mut m, &format!("{hellos} &\n"));
-    let out = printed(&m);
-    let lines = command_output(&out, &format!("{hellos} &"));
-    assert!(lines.contains(&"sh: hello: no free process slot"), "{out}");
+    // More than there are slots, over three lines (a terminal's line is
+    // at most 127 bytes, TTY_LINE_MAX): the shell has one, and the last
+    // hello can't start. Exited children keep their slots until collected.
+    let start = printed(&m).len();
+    let mut refused = false;
+    for n in [14, 15, NPROC - 29] {
+        let hellos = ["hello"; NPROC][..n].join(" & ");
+        command(&mut m, &format!("{hellos} &\n"));
+        let out = printed(&m);
+        refused |= command_output(&out, &format!("{hellos} &")).contains(&"sh: hello: no free process slot");
+    }
     command(&mut m, "wait\n");
     let out = printed(&m);
+    assert!(refused, "{out}");
     // The hellos run while the shell starts the others and waits for its
     // next line; wait collects them.
     let waited = command_output(&out, "wait");
     let collected = waited.iter().filter(|l| l.ends_with("] hello: exit 0")).count();
-    let greetings = lines
-        .iter()
-        .chain(&waited)
-        .filter(|l| **l == "hello from user mode")
+    let greetings = out[start..]
+        .lines()
+        .filter(|l| l.ends_with("hello from user mode"))
         .count();
     assert_eq!((collected, greetings), (NPROC - 1, NPROC - 1), "{out}");
     assert_eq!(spare_pages(&m, &elf), before);

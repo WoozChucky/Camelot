@@ -52,7 +52,7 @@ fn ping_and_pong_on_a_switch() {
     }
     let info = ok(addr, &["info", "pong"]);
     assert!(
-        info.contains("\ndisks    none\nnets     02:ca:00:00:00:02 on switch lan\ndevices  10\n"),
+        info.contains("\ndisks    none\nnets     02:ca:00:00:00:02 on switch lan\ndevices  11\n"),
         "{info}"
     );
     assert!(

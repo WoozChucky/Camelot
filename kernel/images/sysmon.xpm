@@ -1,0 +1,28 @@
+/* XPM */
+/* The system monitor's icon (#185): a chart of bars in a frame. */
+static char *sysmon[] = {
+/* width height colours characters-a-pixel */
+"16 16 5 1",
+". c None",
+"f c #8890A0",
+"k c #182028",
+"g c #40C060",
+"b c #4080E0",
+/* the pixels */
+"ffffffffffffffff",
+"fkkkkkkkkkkkkkkf",
+"fkkkkkkkkkkbbkkf",
+"fkkkkkkkkkkbbkkf",
+"fkkkkggkkkkbbkkf",
+"fkkkkggkkkkbbkkf",
+"fkkkkggkkkkbbkkf",
+"fkkkkggkkggbbkkf",
+"fkbbkggkkggbbkkf",
+"fkbbkggkkggbbkkf",
+"fkbbkggbbggbbggf",
+"fkbbkggbbggbbggf",
+"fkbbkggbbggbbggf",
+"fkkkkkkkkkkkkkkf",
+"ffffffffffffffff",
+"................"
+};

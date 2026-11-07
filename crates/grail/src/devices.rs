@@ -142,6 +142,8 @@ pub const NET_IRQ: u32 = 12;
 /// PLIC interrupt source of the framebuffer's vertical blank (spec section 9.3): the
 /// first one after the network cards' (12 to 15).
 pub const FB_IRQ: u32 = 16;
+/// PLIC interrupt source of the real-time clock's alarm (spec section 9.9).
+pub const RTC_IRQ: u32 = 17;
 
 /// Interrupt sources 1..=31 exist; source 0 means "no interrupt".
 pub const PLIC_SOURCES: u32 = 32;

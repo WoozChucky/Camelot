@@ -3,10 +3,12 @@
 #
 # The desktop: the display server, which takes the screen, the keyboard
 # and the pointer and serves Wayland clients at /run/wayland-0, the logo
-# key starting the GUI demo (the desktop shell joins these as it comes,
-# #185); a shell on the console, the UART, started again when it ends, and
-# shd, a shell for each TCP connection to port 23. Nothing here ends the
-# machine: it runs until it is stopped.
-respawn /bin/compositor -l /bin/guidemo
+# key starting a terminal; the panel along the top of the screen, which
+# starts a terminal running the shell when no window is shown (#185); a
+# shell on the console, the UART, started again when it ends, and shd, a
+# shell for each TCP connection to port 23. Nothing here ends the machine:
+# it runs until it is stopped.
+respawn /bin/compositor -l /bin/term
+respawn /bin/panel /bin/term
 respawn /bin/sh
 respawn /bin/shd

@@ -1,8 +1,8 @@
 /* kill_descendants: ends what a process started, and what that started. */
 #include "../user.h"
 
-/* Processes the snapshot holds: more than the kernel has (NPROC, 8). */
-#define MAX_PROCS 16
+/* Processes the snapshot holds: as many as the kernel has (NPROC, 32). */
+#define MAX_PROCS 32
 
 /* One snapshot for every caller: a program kills its tree from one thread
  * at a time. Static, so it costs the caller's one-page stack nothing. */

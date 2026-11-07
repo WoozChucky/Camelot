@@ -27,7 +27,7 @@
  *   the console.
  * - At most MAX sessions (4 by default, 8 at most) run at once: one more is
  *   told so and closed. Every process the sessions start takes one of the
- *   kernel's 8 process slots too.
+ *   kernel's 32 process slots too.
  * - shd waits for connections half a second at a time (SO_RCVTIMEO) and in
  *   between looks after its sessions (`procs`): it collects each shell that
  *   ended and ends its connection (shutdown, so that a background program

@@ -4,8 +4,7 @@
  *
  *   primes [WORKERS [LIMIT]]      (default 4 workers, below 20000)
  *
- * starts WORKERS copies of itself (`primes worker FROM TO`, at most 6, so
- * that with the shell and primes there are 8 processes, NPROC), the range
+ * starts WORKERS copies of itself (`primes worker FROM TO`, at most 6), the range
  * [0, LIMIT) cut into equal slices (the last one also takes what is left
  * over). Each counts the primes in its slice, prints `primes [FROM, TO): N`
  * and exits with N. primes waits for all of them, adds their counts up and

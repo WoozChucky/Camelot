@@ -1,0 +1,28 @@
+/* XPM */
+/* The terminal's icon (#185): a screen with a prompt and a cursor. */
+static char *term[] = {
+/* width height colours characters-a-pixel */
+"16 16 5 1",
+". c None",
+"f c #8890A0",
+"k c #101418",
+"g c #40D060",
+"d c #505860",
+/* the pixels */
+"................",
+"ffffffffffffffff",
+"fkkkkkkkkkkkkkkf",
+"fkkkkkkkkkkkkkkf",
+"fkgkkkkkkkkkkkkf",
+"fkkgkkkkkkkkkkkf",
+"fkkkgkkkkkkkkkkf",
+"fkkgkkkkkkkkkkkf",
+"fkgkkggggkkkkkkf",
+"fkkkkkkkkkkkkkkf",
+"fkkkkkkkkkkkkkkf",
+"fkkkkkkkkkkkkkkf",
+"ffffffffffffffff",
+"......dddd......",
+"....dddddddd....",
+"................"
+};

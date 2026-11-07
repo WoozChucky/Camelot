@@ -191,7 +191,7 @@ struct inode {
  * enough for every open file, working directory and call in progress at
  * once (fs.c checks: NFILE + NPROC + NTHREAD * 3, as every thread may be
  * in a call). */
-#define NINODE 120
+#define NINODE 480
 
 /* The mounted filesystem: its disk, superblock, and whether it is
  * read-only (then nothing writes to it): because the disk is, or because

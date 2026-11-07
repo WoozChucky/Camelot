@@ -14,6 +14,7 @@
 #include "string.h"
 #include "trap.h"
 #include "uart.h"
+#include "vt.h"
 
 /* The glyphs: 8 pixels wide, a byte a row, the leftmost pixel the top bit. */
 #define GLYPH_W 8
@@ -43,13 +44,6 @@ static const u32 palette[16] = {
     0x000000, 0xaa0000, 0x00aa00, 0xaa5500, 0x0000aa, 0xaa00aa, 0x00aaaa, 0xaaaaaa,
     0x555555, 0xff5555, 0x55ff55, 0xffff55, 0x5555ff, 0xff55ff, 0x55ffff, 0xffffff,
 };
-
-/* The parser's states: text, after ESC, and in a control sequence (ESC [). */
-#define ST_TEXT 0
-#define ST_ESC 1
-#define ST_CSI 2
-#define MAX_PARAMS 8
-#define PARAM_MAX 9999
 
 static bool active;     /* fbcon_init found a display to draw on */
 static bool suspended;  /* a program has the display */
@@ -85,10 +79,9 @@ static u32 bg = BG_DEFAULT;
 static bool bold;
 static bool reverse;
 
-static u32 state = ST_TEXT;
-static u32 params[MAX_PARAMS];
-static u32 nparams;
-static bool private_seq; /* ESC [ ?: DEC's private modes, ignored */
+/* The escape sequence parser, vt.c, which the desktop's terminal shares. */
+static struct vt_parser vt;
+static bool vt_ready;
 
 /* A glyph row's nibble as 4 pixels, two to a u64, for one foreground and
  * background: drawing a row of 8 pixels is 4 stores. Made again when the
@@ -334,17 +327,14 @@ static void erase(u32 r, u32 from, u32 to) {
 }
 
 static u32 param(u32 i, u32 dflt) {
-    return i < nparams && params[i] != 0 ? params[i] : dflt;
+    return vt_param(&vt, (int)i, dflt);
 }
 
 /* SGR: the colours and attributes of what is written from now on. */
 static void sgr(void) {
-    if (nparams == 0) {
-        nparams = 1;
-        params[0] = 0;
-    }
+    u32 nparams = vt.nparams > 0 ? (u32)vt.nparams : 1;
     for (u32 i = 0; i < nparams; i++) {
-        u32 p = params[i];
+        u32 p = vt.params[i];
         if (p == 0) {
             fg = FG_DEFAULT;
             bg = BG_DEFAULT;
@@ -376,8 +366,8 @@ static void sgr(void) {
 
 /* A control sequence's final byte. */
 static void csi(u8 final) {
-    if (private_seq) {
-        return;
+    if (vt.marker != 0 || vt.intermediate != 0) {
+        return; /* DEC's private modes and the like: none acted on */
     }
     u32 n;
     switch (final) {
@@ -416,7 +406,7 @@ static void csi(u8 final) {
         break;
     case 'J': {
         u32 c = col < FBCON_COLS ? col : FBCON_COLS - 1;
-        n = nparams > 0 ? params[0] : 0;
+        n = vt.params[0];
         if (n == 0) {
             erase(row, c, FBCON_COLS);
             for (u32 r = row + 1; r < FBCON_ROWS; r++) {
@@ -436,7 +426,7 @@ static void csi(u8 final) {
     }
     case 'K': {
         u32 c = col < FBCON_COLS ? col : FBCON_COLS - 1;
-        n = nparams > 0 ? params[0] : 0;
+        n = vt.params[0];
         if (n == 0) {
             erase(row, c, FBCON_COLS);
         } else if (n == 1) {
@@ -457,45 +447,28 @@ void fbcon_putc(char c) {
     if (!grid_ready) {
         init_grid();
     }
-    if (state == ST_ESC) {
-        if (ch == '[') {
-            state = ST_CSI;
-            nparams = 0;
-            private_seq = false;
-            for (u32 i = 0; i < MAX_PARAMS; i++) {
-                params[i] = 0;
-            }
-        } else {
-            state = ST_TEXT; /* ESC and one other byte: none we act on */
-        }
+    if (!vt_ready) {
+        vt_init(&vt);
+        vt_ready = true;
+    }
+    int action;
+    if (vt.state == VT_GROUND && ch < 0x7f && ch != 0x1b && ch != 0x18 && ch != 0x1a) {
+        /* Text and the controls between sequences, most of what is
+         * printed: vt_parse's answer, without the call. */
+        action = ch >= 0x20 ? VT_PRINT : VT_EXECUTE;
+    } else {
+        action = vt_parse(&vt, ch);
+    }
+    if (action == VT_CSI) {
+        csi(ch);
         return;
     }
-    if (state == ST_CSI) {
-        if (ch >= '0' && ch <= '9') {
-            if (nparams == 0) {
-                nparams = 1;
-            }
-            u32 *p = &params[nparams - 1];
-            *p = *p * 10 + (ch - '0');
-            if (*p > PARAM_MAX) {
-                *p = PARAM_MAX;
-            }
-        } else if (ch == ';') {
-            if (nparams == 0) {
-                nparams = 1;
-            }
-            if (nparams < MAX_PARAMS) {
-                nparams++;
-            }
-        } else if (ch == '?' || ch == '>' || ch == '=' || ch == '<') {
-            private_seq = true;
-        } else if (ch >= 0x40 && ch <= 0x7e) {
-            state = ST_TEXT;
-            csi(ch);
-        } else if (ch < 0x20 || ch > 0x7e) {
-            state = ST_TEXT; /* not a sequence after all */
-        }
+    if (action == VT_PRINT) {
+        put_char(ch); /* a byte past ASCII is drawn as '?' */
         return;
+    }
+    if (action != VT_EXECUTE) {
+        return; /* part of a sequence, or ESC and a byte: none acted on */
     }
     switch (ch) {
     case '\n':
@@ -526,16 +499,8 @@ void fbcon_putc(char c) {
         }
         dirty = true;
         break;
-    case 0x1b:
-        state = ST_ESC;
-        break;
     default:
-        /* Any other control character (C0, DEL) does nothing, as on
-         * Linux's VT;
-         * a byte past ASCII is drawn as '?'. */
-        if (ch >= 0x20 && ch != 0x7f) {
-            put_char(ch);
-        }
+        /* Any other control character does nothing, as on Linux's VT. */
         break;
     }
 }

@@ -1,8 +1,11 @@
 /* xdg-shell's requests (protocols/xdg-shell.xml), version 1: xdg_wm_base,
  * xdg_surface and xdg_toplevel, the windows; xdg_positioner is taken and
- * not used, and popups are not had. A window's size is its client's:
- * the server sends one configure, the first, of 0 by 0 (the client
- * chooses), and the window is shown once a buffer comes after its ack. */
+ * not used, and popups are not had. A window's size is its client's: the
+ * first configure is of 0 by 0 (the client chooses), and the window is
+ * shown once a buffer comes after its ack. A resize (its edges dragged,
+ * or xdg_toplevel.resize) configures the size the pointer makes, in the
+ * resizing state, one configure at a time: the next waits for the ack of
+ * the last (wm.c). */
 #include "compositor.h"
 
 void wm_base_request(struct client *c, struct object *o, uint op, struct args *a) {
@@ -32,6 +35,7 @@ void wm_base_request(struct client *c, struct object *o, uint op, struct args *a
         memset(w, 0, sizeof(struct window));
         w->c = c;
         w->surface = s;
+        w->layer = -1;
         w->xdg_id = id;
         if (object_new(c, id, &xdg_surface_interface, o->version, w) == NULL) {
             free(w);
@@ -80,11 +84,14 @@ void xdg_surface_request(struct client *c, struct object *o, uint op, struct arg
     case XDG_SURFACE_SET_WINDOW_GEOMETRY:
         break; /* the window is the whole surface */
     case XDG_SURFACE_ACK_CONFIGURE:
-        if (w->configure_serial == 0 || a->u[0] != w->configure_serial) {
+        if (ack_configure(w, a->u[0]) < 0) {
             post_error(c, o->id, XDG_SURFACE_ERROR_INVALID_SERIAL, "a serial no configure had");
             return;
         }
-        w->acked = 1;
+        /* A resize the pointer went on with meanwhile: its size now. */
+        if (srv.resizing == w && (w->pending_w != w->cfg_w || w->pending_h != w->cfg_h)) {
+            toplevel_configure(w, w->pending_w, w->pending_h, 1);
+        }
         break;
     }
 }
@@ -102,6 +109,7 @@ static void set_title(struct window *w, const char *s) {
     w->title[n] = 0;
     if (w->mapped) {
         damage(window_title(w));
+        toplevel_changed(w);
     }
 }
 
@@ -128,8 +136,15 @@ void toplevel_request(struct client *c, struct object *o, uint op, struct args *
             window_move_start(w);
         }
         break;
+    case XDG_TOPLEVEL_RESIZE:
+        /* As move: with the button held whose press the client got. */
+        if (srv.buttons != 0 && w->mapped && srv.moving == NULL && srv.resizing == NULL && srv.grab != NULL &&
+            srv.grab == w->surface && a->u[1] == srv.grab_serial && a->u[2] != XDG_TOPLEVEL_RESIZE_EDGE_NONE) {
+            window_resize_start(w, a->u[2]);
+        }
+        break;
     default:
-        /* set_parent, set_app_id, show_window_menu, resize, the sizes,
+        /* set_parent, set_app_id, show_window_menu, the sizes,
          * maximized, fullscreen, minimized: taken, and the window stays as
          * it is, which a client must expect of any of them. */
         break;

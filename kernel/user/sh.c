@@ -111,12 +111,13 @@
  * its newline included, and a NUL. */
 #define LINE_SIZE 129
 /* Background programs not collected yet that the shell remembers the names
- * of: one per process slot is plenty. */
-#define MAX_JOBS 8
+ * of: one per process slot (NPROC, 32), and more are collected without
+ * one. */
+#define MAX_JOBS 32
 #define NAME_SIZE 16
 /* Words and operators in a line: a line of 128 bytes can't have more. */
 #define MAX_TOKENS 128
-/* Commands in a pipeline: there are only 8 process slots. */
+/* Commands in a pipeline at most. */
 #define MAX_PIPE 8
 
 struct job {

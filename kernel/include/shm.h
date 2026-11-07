@@ -27,7 +27,7 @@
 
 /* Objects, every process's together. memfd_create() fails with -ENFILE
  * when none is free. */
-#define NSHM 32
+#define NSHM 64
 
 /* memfd_create's flags (Linux's values): the descriptor closes on exec;
  * seals may be added (fcntl's F_ADD_SEALS). And the longest name it takes,

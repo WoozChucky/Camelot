@@ -22,7 +22,10 @@
 //! 4. **Demo** (`--demo`, [`Platform::demo`]): a switch `nat` with a NAT gateway, and a
 //!    VM `vm001` with a Camelot VM's hardware (Camelot's firmware and 6 MiB of RAM,
 //!    `avalon_client::CAMELOT_RAM`) that boots from `vm001-disk0`,
-//!    its own copy of the image, plugged into it and started. The gateway forwards
+//!    its own copy of the image, plugged into it and started; then a Camelot desktop,
+//!    the VM `desktop` with the desktop profile's hardware (64 MiB and 4 harts) on
+//!    `desktop-disk0`, a copy of `os-desktop`, without a network card, started too:
+//!    its screen is `herald --screen desktop`'s, or Pendragon's. The gateway forwards
 //!    127.0.0.1:2323 (`--shd`) to the VM's port 23, where `shd` listens, the shell
 //!    server the image's init starts, which gives each connection (`herald --tcp
 //!    127.0.0.1:2323`) a shell of its own, beside the console's. `up` checks that a
@@ -86,6 +89,8 @@ const PROMPT: &str = "$ ";
 /// The demo's switch and VM.
 pub const DEMO_SWITCH: &str = "nat";
 pub const DEMO_VM: &str = "vm001";
+/// The demo's desktop VM.
+pub const DEMO_DESKTOP: &str = "desktop";
 
 /// How long a server may take to say it is listening.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -116,7 +121,9 @@ prefixed by server.
   --demo             also create a switch nat with a NAT gateway and a VM vm001
                      that boots from its own copy of the image, vm001-disk0,
                      plugged into it, and start it, with shd, its shell server,
-                     running: herald --tcp 127.0.0.1:2323 gives a shell of its own
+                     running: herald --tcp 127.0.0.1:2323 gives a shell of its own;
+                     and a Camelot desktop, the VM desktop, on its own copy of
+                     os-desktop, desktop-disk0: herald --screen desktop shows it
   --shd ADDR         where the demo's gateway forwards to the VM's shd (port 23;
                      default 127.0.0.1:2323). IPv4 only. shd's shells run as
                      root with no password: keep it on loopback
@@ -360,14 +367,18 @@ fn seed_one(
                 "up: image {name} in {}: {what}",
                 options.images.display()
             ));
-            let demo_disk = options.images.join(vm_disk(DEMO_VM));
-            if profile == Profile::Server && seeded == Seeded::Replaced && options.demo && demo_disk.is_file()
-            {
+            // The demo's VM of this profile, on a copy of the image from before.
+            let vm = match profile {
+                Profile::Server => DEMO_VM,
+                Profile::Desktop => DEMO_DESKTOP,
+            };
+            let demo_disk = options.images.join(vm_disk(vm));
+            if seeded == Seeded::Replaced && options.demo && demo_disk.is_file() {
                 log(&format!(
-                    "up: note: the demo VM's disk {} is a copy of the image {BASE_IMAGE} from \
+                    "up: note: the demo VM's disk {} is a copy of the image {name} from \
                      before this build, and the demo boots it as it is; to boot the new build, \
                      delete {} while up is not running (what the VM wrote there goes with it)",
-                    vm_disk(DEMO_VM),
+                    vm_disk(vm),
                     demo_disk.display()
                 ));
             }
@@ -437,6 +448,8 @@ pub struct Platform {
     /// Whether [`Platform::demo`] started `shd` in its VM: only then does the summary
     /// say how to reach it.
     shd_running: bool,
+    /// The demo's desktop VM, once [`Platform::demo`] has started it.
+    pub desktop: Option<u32>,
 }
 
 impl Platform {
@@ -465,6 +478,7 @@ impl Platform {
             shd_listen: options.shd,
             shd: None,
             shd_running: false,
+            desktop: None,
         };
         let images = platform.images.to_string_lossy().into_owned();
         let lake = platform.spawn(
@@ -658,9 +672,15 @@ impl Platform {
     }
 
     /// `--demo`: a switch [`DEMO_SWITCH`] with a NAT gateway, and a VM [`DEMO_VM`]
-    /// that boots from its own copy of the image, plugged into the switch and started.
-    /// An existing copy (from an earlier run on the same images directory) is used
-    /// again, with what the VM wrote to it. Returns the VM's id.
+    /// that boots from its own copy of the image, plugged into the switch and started;
+    /// then the desktop VM [`DEMO_DESKTOP`] on its copy of the desktop's image
+    /// ([`Platform::desktop`]). An existing copy (from an earlier run on the same
+    /// images directory) is used again, with what the VM wrote to it. Returns the
+    /// server VM's id.
+    ///
+    /// The desktop has no network card: on one switch, it could take the address
+    /// the gateway forwards to (the first its DHCP gives) from the server VM. Its
+    /// failing (no desktop image in Lake, say) fails nothing: `up` says so.
     ///
     /// The gateway forwards `--shd`'s address to the VM's port 23 ([`Platform::shd`]
     /// is where, as bound), and `shd` is started in the VM ([`start_shd`]). Neither
@@ -724,41 +744,15 @@ impl Platform {
             })],
             ..HardwareProfile::default()
         };
-        let disk = vm_disk(DEMO_VM);
-        let id = match create_camelot_vm(
+        let id = demo_vm(
             &mut avalon,
             &mut lake,
             &lake_addr,
             DEMO_VM,
             BASE_IMAGE,
-            profile.clone(),
-        ) {
-            Ok((id, _)) => {
-                log(&format!("up: demo: created disk {disk}, a copy of {BASE_IMAGE}"));
-                id
-            }
-            Err(CamelotError::Lake { cause, .. }) if cause.code() == Some(ErrorCode::AlreadyExists) => {
-                // Its disk from an earlier run.
-                let source = DiskSource::parse(&format!("{}{lake_addr}/{disk}", avalon_proto::LAKE_SCHEME))
-                    .map_err(|e| format!("demo: {e}"))?;
-                let mut profile = profile;
-                profile.devices.insert(
-                    0,
-                    DeviceSpec::Disk(DiskSpec {
-                        source,
-                        read_only: false,
-                    }),
-                );
-                log(&format!("up: demo: using disk {disk} from an earlier run"));
-                avalon
-                    .create_vm(DEMO_VM, profile, Vec::new())
-                    .map_err(|e| format!("demo: cannot create VM {DEMO_VM}: {e}"))?
-            }
-            Err(e) => return Err(format!("demo: cannot create VM {DEMO_VM}: {e}")),
-        };
-        avalon
-            .start_vm(&VmRef::Id(id))
-            .map_err(|e| format!("demo: cannot start VM {DEMO_VM}: {e}"))?;
+            profile,
+            log,
+        )?;
         log(&format!(
             "up: demo: started VM {id} ({DEMO_VM}) on switch {DEMO_SWITCH}"
         ));
@@ -775,6 +769,28 @@ impl Platform {
                     "up: demo: could not start shd in VM {id} ({e}); type shd & on its console"
                 )),
             }
+        }
+        // The desktop, once the server VM has its address.
+        let desktop = avalon_client::preset("desktop")
+            .expect("the desktop profile")
+            .profile();
+        match demo_vm(
+            &mut avalon,
+            &mut lake,
+            &lake_addr,
+            DEMO_DESKTOP,
+            DESKTOP_IMAGE,
+            desktop,
+            log,
+        ) {
+            Ok(desktop) => {
+                self.desktop = Some(desktop);
+                log(&format!(
+                    "up: demo: started VM {desktop} ({DEMO_DESKTOP}), a Camelot desktop: its screen \
+                     is herald --screen {DEMO_DESKTOP}'s and Pendragon's"
+                ));
+            }
+            Err(e) => log(&format!("up: demo: no desktop ({e})")),
         }
         Ok(id)
     }
@@ -800,6 +816,13 @@ impl Platform {
             }
             _ => String::new(),
         };
+        let desktop = match self.desktop {
+            Some(_) if demo => format!(
+                "\x20 cargo run --release -p herald -- {server}--screen {DEMO_DESKTOP}      \
+                 (the desktop's screen, in a window: Windows)\n"
+            ),
+            _ => String::new(),
+        };
         format!(
             "\nThe Avalon platform is up.\n\
              \n  Pendragon  {}\n             open it in a browser (the token changes at every launch)\
@@ -809,6 +832,7 @@ impl Platform {
              \x20 cargo run --release -p round-table -- {server}list\n\
              \x20 cargo run --release -p herald -- {server}{vm}      (Ctrl-] detaches)\n\
              {shell}\
+             {desktop}\
              \nCtrl-C stops Pendragon, Avalon and Lake.\n",
             self.url,
             self.avalon,
@@ -816,6 +840,48 @@ impl Platform {
             self.images.display()
         )
     }
+}
+
+/// One of the demo's VMs, `name`, on its own copy of the image `image` (made now, or
+/// from an earlier run), with `profile`'s hardware, started: its id.
+fn demo_vm(
+    avalon: &mut Client,
+    lake: &mut Client,
+    lake_addr: &str,
+    name: &str,
+    image: &str,
+    profile: HardwareProfile,
+    log: Log,
+) -> Result<u32, String> {
+    let disk = vm_disk(name);
+    let id = match create_camelot_vm(avalon, lake, lake_addr, name, image, profile.clone()) {
+        Ok((id, _)) => {
+            log(&format!("up: demo: created disk {disk}, a copy of {image}"));
+            id
+        }
+        Err(CamelotError::Lake { cause, .. }) if cause.code() == Some(ErrorCode::AlreadyExists) => {
+            // Its disk from an earlier run.
+            let source = DiskSource::parse(&format!("{}{lake_addr}/{disk}", avalon_proto::LAKE_SCHEME))
+                .map_err(|e| format!("demo: {e}"))?;
+            let mut profile = profile;
+            profile.devices.insert(
+                0,
+                DeviceSpec::Disk(DiskSpec {
+                    source,
+                    read_only: false,
+                }),
+            );
+            log(&format!("up: demo: using disk {disk} from an earlier run"));
+            avalon
+                .create_vm(name, profile, Vec::new())
+                .map_err(|e| format!("demo: cannot create VM {name}: {e}"))?
+        }
+        Err(e) => return Err(format!("demo: cannot create VM {name}: {e}")),
+    };
+    avalon
+        .start_vm(&VmRef::Id(id))
+        .map_err(|e| format!("demo: cannot start VM {name}: {e}"))?;
+    Ok(id)
 }
 
 impl Drop for Platform {

@@ -19,6 +19,7 @@
 #include "net.h"
 #include "poll.h"
 #include "proc.h"
+#include "rtc.h"
 #include "string.h"
 #include "sysfile.h"
 #include "unix.h"
@@ -164,8 +165,10 @@ static long sys_run(struct trap_frame *f, bool replace) {
 }
 
 /* procs(buf, max): all of `buf`, `max` entries, must be writable, however
- * many are filled in. The table is built on the kernel stack (NPROC
- * entries, 256 bytes) and copied out. */
+ * many are filled in. The table is built in a page of its own (NPROC
+ * entries of 40 bytes, too many for the kernel stack) and copied out. */
+_Static_assert(NPROC * sizeof(struct procinfo) <= PGSIZE, "procs' table fits a page");
+
 static long sys_procs(struct trap_frame *f) {
     pagetable_t pt = myproc()->pagetable;
     uintptr buf = arg(f, 0);
@@ -173,17 +176,19 @@ static long sys_procs(struct trap_frame *f) {
     if (max > USER_TOP / sizeof(struct procinfo) || !uvm_range_ok(pt, buf, max * sizeof(struct procinfo), PTE_W)) {
         return -EFAULT;
     }
-    struct procinfo info[NPROC];
+    struct procinfo *info = kalloc();
+    if (info == NULL) {
+        return -ENOMEM;
+    }
     int n = proc_list(info, max < NPROC ? (int)max : NPROC);
     u32 filled = (u32)n < max ? (u32)n : max;
     /* Checked above, but another thread may have unmapped it since. */
-    if (copyout(pt, buf, info, filled * sizeof(struct procinfo)) != 0) {
-        return -EFAULT;
-    }
-    return n;
+    long r = copyout(pt, buf, info, filled * sizeof(struct procinfo)) != 0 ? -EFAULT : n;
+    kfree(info);
+    return r;
 }
 
-/* harts(buf, max): as procs, with NCPU entries of 16 bytes. */
+/* harts(buf, max): as procs, with NCPU entries of 20 bytes. */
 static long sys_harts(struct trap_frame *f) {
     pagetable_t pt = myproc()->pagetable;
     uintptr buf = arg(f, 0);
@@ -199,6 +204,43 @@ static long sys_harts(struct trap_frame *f) {
         return -EFAULT;
     }
     return n;
+}
+
+/* clock_gettime(clock, ts): the date or the time since boot (rtc.h), in
+ * seconds and nanoseconds. */
+static long sys_clock_gettime(struct trap_frame *f) {
+    u32 clock = (u32)arg(f, 0);
+    u64 ns;
+    if (clock == CLOCK_REALTIME) {
+        ns = clock_realtime_ns();
+    } else if (clock == CLOCK_MONOTONIC) {
+        ns = clock_monotonic_ns();
+    } else {
+        return -EINVAL;
+    }
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ns / NSEC_PER_SEC);
+    ts.tv_nsec = (long)(ns % NSEC_PER_SEC);
+    if (copyout(myproc()->pagetable, arg(f, 1), &ts, sizeof ts) != 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+/* sysinfo(info): Linux's, with what Camelot has: the uptime, the pages the
+ * allocator manages and has free, and the processes. */
+static long sys_sysinfo(struct trap_frame *f) {
+    struct sysinfo info;
+    memset(&info, 0, sizeof info);
+    info.uptime = (long)(clock_monotonic_ns() / NSEC_PER_SEC);
+    info.totalram = (unsigned long)ktotal_pages() * PGSIZE;
+    info.freeram = (unsigned long)kfree_pages() * PGSIZE;
+    info.procs = (u16)proc_list(NULL, 0);
+    info.mem_unit = 1;
+    if (copyout(myproc()->pagetable, arg(f, 0), &info, sizeof info) != 0) {
+        return -EFAULT;
+    }
+    return 0;
 }
 
 /* Whether call `num` goes into the network stack: netinfo to setsockopt,
@@ -375,6 +417,12 @@ void syscall(struct trap_frame *f) {
     case SYS_getsockopt:
         ret = local ? unix_sys_getsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), arg(f, 4))
                     : sock_sys_getsockopt((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3), arg(f, 4));
+        break;
+    case SYS_clock_gettime:
+        ret = sys_clock_gettime(f);
+        break;
+    case SYS_sysinfo:
+        ret = sys_sysinfo(f);
         break;
     case SYS_socketpair:
         ret = unix_sys_socketpair((u32)arg(f, 0), (u32)arg(f, 1), (u32)arg(f, 2), arg(f, 3));

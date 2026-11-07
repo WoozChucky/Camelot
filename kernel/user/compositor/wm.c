@@ -6,7 +6,12 @@
  *   On its title bar the window follows the pointer until the button is
  *   let go; on its close button the client is asked to close it
  *   (xdg_toplevel.close), and killed if it hasn't within CLOSE_TICKS; on
- *   its content the click is the client's.
+ *   its border, or just outside it (RESIZE_GRIP), left, right or below,
+ *   it is resized with the pointer; on its content the click is the
+ *   client's. A click on a layer surface is its client's, and gives it
+ *   the keyboard if it takes it.
+ * - Windows are placed and moved in the work area, the screen less the
+ *   layer surfaces' exclusive zones (the panel's bar).
  * - The pointer's events go to the surface under it, or to the one a
  *   button was pressed on while any is held (the implicit grab), in its
  *   own coordinates; enter and leave as it changes.
@@ -150,14 +155,50 @@ static void each_pointer(struct surface *s, uint opcode, int nwords, uint w0, ui
 
 /* ---- Windows ---- */
 
-/* The topmost window whose frame is at x, y, or NULL. */
+/* A window's frame and the grip around it (none above: the title bar
+ * moves it). */
+static struct gui_rect grip_rect(const struct window *w) {
+    struct gui_rect r = window_frame(w);
+    return gui_rect(r.x - RESIZE_GRIP, r.y, r.w + 2 * RESIZE_GRIP, r.h + RESIZE_GRIP);
+}
+
+/* The topmost window or layer surface at x, y, or NULL: the layers over
+ * the windows, the windows (their grips too), the layers under them. */
 static struct window *window_at(int x, int y) {
+    for (int i = srv.nlayers - 1; i >= 0; i--) {
+        struct window *l = srv.layers[i];
+        if (l->layer >= ZWLR_LAYER_SHELL_V1_LAYER_TOP && gui_rect_contains(window_frame(l), x, y)) {
+            return l;
+        }
+    }
     for (int i = srv.nstack - 1; i >= 0; i--) {
-        if (gui_rect_contains(window_frame(srv.stack[i]), x, y)) {
+        if (gui_rect_contains(grip_rect(srv.stack[i]), x, y)) {
             return srv.stack[i];
         }
     }
+    for (int i = srv.nlayers - 1; i >= 0; i--) {
+        struct window *l = srv.layers[i];
+        if (l->layer < ZWLR_LAYER_SHELL_V1_LAYER_TOP && gui_rect_contains(window_frame(l), x, y)) {
+            return l;
+        }
+    }
     return NULL;
+}
+
+/* The edges of window w the pointer at x, y would resize it by
+ * (xdg_toplevel's resize_edge), or 0: in the content or the title bar. */
+static uint resize_edges_at(struct window *w, int x, int y) {
+    struct gui_rect c = window_content(w);
+    uint edges = 0;
+    if (x < c.x) {
+        edges |= XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
+    } else if (x >= c.x + c.w) {
+        edges |= XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
+    }
+    if (y >= c.y + c.h) {
+        edges |= XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
+    }
+    return edges;
 }
 
 static int stack_index(struct window *w) {
@@ -184,37 +225,82 @@ void window_focus(struct window *w) {
     if (srv.focus == w) {
         return;
     }
-    if (srv.focus != NULL) {
-        each_keyboard_leave(srv.focus);
-        damage(window_title(srv.focus));
+    struct window *old = srv.focus;
+    if (old != NULL) {
+        each_keyboard_leave(old);
+        damage(window_title(old));
     }
     srv.focus = w;
+    if (old != NULL && old->layer < 0 && old->mapped) {
+        toplevel_changed(old);
+    }
     if (w != NULL) {
         each_keyboard_enter(w);
         damage(window_title(w));
+        if (w->layer < 0) {
+            toplevel_changed(w);
+        }
+        if (old == NULL || old->c != w->c) {
+            selection_offer(w->c); /* the clipboard goes with the keyboard */
+        }
         if (srv.verbose) {
             printf("compositor: focus \"%s\"\n", w->title);
         }
     }
 }
 
+/* The largest content that fits the work area with its frame. */
+static void work_max(int *width, int *height) {
+    *width = srv.work.w - 2 * BORDER;
+    *height = srv.work.h - TITLE_H - 2 * BORDER;
+}
+
 void window_map(struct window *w) {
     if (w->mapped) {
+        return;
+    }
+    if (w->layer >= 0) {
+        layer_map(w);
         return;
     }
     if (srv.nstack == MAX_WINDOWS) {
         post_error(w->c, 1, WL_DISPLAY_ERROR_NO_MEMORY, "too many windows");
         return;
     }
-    /* Each window down and to the right of the last, back to the top
-     * left corner every eight. */
+    /* Each window down and to the right of the last in the work area,
+     * back to its top left corner every eight; one that would go past
+     * its right or bottom edge goes back in, as far as it can. */
     int n = srv.placed++ % 8;
-    w->x = 48 + n * 32;
-    w->y = 48 + n * 32;
+    struct gui_rect c = window_content(w);
+    struct gui_rect work = srv.work;
+    w->x = work.x + 48 + n * 32;
+    w->y = work.y + 48 + n * 32;
+    if (w->x + c.w + BORDER > work.x + work.w) {
+        w->x = work.x + work.w - c.w - BORDER;
+    }
+    if (w->y + c.h + BORDER > work.y + work.h) {
+        w->y = work.y + work.h - c.h - BORDER;
+    }
+    if (w->x < work.x + BORDER) {
+        w->x = work.x + BORDER;
+    }
+    if (w->y < work.y + TITLE_H + BORDER) {
+        w->y = work.y + TITLE_H + BORDER;
+    }
     w->mapped = 1;
     srv.stack[srv.nstack++] = w;
     damage(window_frame(w));
     window_focus(w);
+    toplevel_announce(w);
+    /* Too big for the work area (a terminal of 80 columns on a screen of
+     * 640): asked for the size that fits, as it is placed at the top
+     * left, so the frame, the close button and the edges are on it. */
+    int max_w;
+    int max_h;
+    work_max(&max_w, &max_h);
+    if (c.w > max_w || c.h > max_h) {
+        toplevel_configure(w, c.w > max_w ? max_w : c.w, c.h > max_h ? max_h : c.h, 0);
+    }
 }
 
 void window_unmap(struct window *w) {
@@ -231,6 +317,14 @@ void window_unmap(struct window *w) {
     }
     if (srv.moving == w) {
         srv.moving = NULL;
+    }
+    if (srv.resizing == w) {
+        srv.resizing = NULL;
+    }
+    if (w->layer >= 0) {
+        layer_unmap(w);
+    } else {
+        toplevel_closed(w);
     }
     if (w->surface != NULL) {
         wm_forget_surface(w->surface);
@@ -257,6 +351,7 @@ void wm_forget_surface(struct surface *s) {
 }
 
 void window_move_start(struct window *w) {
+    w->keep_edges = 0; /* moved: the edges a resize kept are elsewhere */
     srv.moving = w;
     srv.move_dx = srv.px - w->x;
     srv.move_dy = srv.py - w->y;
@@ -265,7 +360,102 @@ void window_move_start(struct window *w) {
     }
 }
 
-static void window_close(struct window *w) {
+void window_resize_start(struct window *w, uint edges) {
+    struct gui_rect c = window_content(w);
+    srv.resizing = w;
+    srv.resize_edges = edges;
+    srv.resize_x0 = srv.px;
+    srv.resize_y0 = srv.py;
+    srv.resize_w0 = c.w;
+    srv.resize_h0 = c.h;
+    w->keep_edges = edges & (XDG_TOPLEVEL_RESIZE_EDGE_LEFT | XDG_TOPLEVEL_RESIZE_EDGE_TOP);
+    w->keep_right = c.x + c.w;
+    w->keep_bottom = c.y + c.h;
+    w->keep_until = 0;
+    w->pending_w = w->cfg_w;
+    w->pending_h = w->cfg_h;
+    if (srv.verbose) {
+        printf("compositor: resizing \"%s\"\n", w->title);
+    }
+}
+
+/* The size the pointer makes of the window being resized: configured now,
+ * or once the last configure is acked. */
+static void resize_motion(void) {
+    struct window *w = srv.resizing;
+    uint e = srv.resize_edges;
+    int dx = srv.px - srv.resize_x0;
+    int dy = srv.py - srv.resize_y0;
+    int width = srv.resize_w0;
+    int height = srv.resize_h0;
+    if (e & XDG_TOPLEVEL_RESIZE_EDGE_RIGHT) {
+        width += dx;
+    } else if (e & XDG_TOPLEVEL_RESIZE_EDGE_LEFT) {
+        width -= dx;
+    }
+    if (e & XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM) {
+        height += dy;
+    } else if (e & XDG_TOPLEVEL_RESIZE_EDGE_TOP) {
+        height -= dy;
+    }
+    int max_w;
+    int max_h;
+    work_max(&max_w, &max_h);
+    width = width > max_w ? max_w : width;
+    height = height > max_h ? max_h : height;
+    width = width < MIN_WIDTH ? MIN_WIDTH : width;
+    height = height < MIN_HEIGHT ? MIN_HEIGHT : height;
+    if (width == w->pending_w && height == w->pending_h) {
+        return;
+    }
+    w->pending_w = width;
+    w->pending_h = height;
+    if (w->acked) {
+        toplevel_configure(w, width, height, 1);
+    }
+}
+
+/* The button let go: the last size, out of the resizing state. */
+static void resize_end(void) {
+    struct window *w = srv.resizing;
+    srv.resizing = NULL;
+    if (w->mapped && w->pending_w > 0 && w->pending_h > 0) {
+        toplevel_configure(w, w->pending_w, w->pending_h, 0);
+        w->keep_until = w->configure_serial;
+    } else {
+        w->keep_edges = 0;
+    }
+}
+
+void window_resized(struct window *w) {
+    if (w->layer >= 0) {
+        layers_arrange();
+        return;
+    }
+    /* Only a kept edge moves the window, and then into the work area: one
+     * dragged partly off the screen stays where it was put. */
+    struct gui_rect c = window_content(w);
+    if (w->keep_edges & XDG_TOPLEVEL_RESIZE_EDGE_LEFT) {
+        w->x = w->keep_right - c.w;
+        if (w->x < srv.work.x + BORDER) {
+            w->x = srv.work.x + BORDER;
+        }
+    }
+    if (w->keep_edges & XDG_TOPLEVEL_RESIZE_EDGE_TOP) {
+        w->y = w->keep_bottom - c.h;
+        if (w->y < srv.work.y + TITLE_H + BORDER) {
+            w->y = srv.work.y + TITLE_H + BORDER;
+        }
+    }
+}
+
+void window_committed(struct window *w) {
+    if (w->keep_edges != 0 && w->keep_until != 0 && w->acked_serial >= w->keep_until) {
+        w->keep_edges = 0;
+    }
+}
+
+void window_close(struct window *w) {
     if (w->closing) {
         return;
     }
@@ -366,7 +556,7 @@ static void pointer_focus(uint time, int moved) {
 }
 
 void pointer_repick(void) {
-    if (srv.moving == NULL) {
+    if (srv.moving == NULL && srv.resizing == NULL) {
         pointer_focus(now_ms(), 0);
     }
 }
@@ -391,14 +581,18 @@ static void pointer_motion(int x, int y, uint time) {
     srv.px = x;
     srv.py = y;
     damage(cursor_rect());
+    if (srv.resizing != NULL) {
+        resize_motion();
+        return;
+    }
     if (srv.moving != NULL) {
         struct window *w = srv.moving;
         damage(window_frame(w));
         w->x = srv.px - srv.move_dx;
         w->y = srv.py - srv.move_dy;
-        /* The title bar stays on the screen, to be taken again. */
-        if (w->y < TITLE_H + BORDER) {
-            w->y = TITLE_H + BORDER;
+        /* The title bar stays in the work area, to be taken again. */
+        if (w->y < srv.work.y + TITLE_H + BORDER) {
+            w->y = srv.work.y + TITLE_H + BORDER;
         }
         if (w->y > srv.height - 1) {
             w->y = srv.height - 1;
@@ -425,11 +619,26 @@ static void pointer_button(uint code, int pressed, uint time) {
         int first = srv.buttons == 0;
         srv.buttons |= bit;
         struct window *w = window_at(srv.px, srv.py);
-        if (first && srv.grab == NULL && w != NULL) {
+        if (first && srv.grab == NULL && w != NULL && w->layer >= 0) {
+            if (w->keyboard) {
+                window_focus(w);
+            }
+        } else if (first && srv.grab == NULL && w == NULL && srv.focus != NULL && srv.focus->layer >= 0) {
+            /* A click on the bare background takes the keyboard from a
+             * layer surface (the panel's menu closes), back to the top
+             * window. */
+            window_focus(srv.nstack > 0 ? srv.stack[srv.nstack - 1] : NULL);
+        } else if (first && srv.grab == NULL && w != NULL) {
             window_focus(w);
             if (gui_rect_contains(window_close_button(w), srv.px, srv.py)) {
                 srv.consumed |= bit;
                 window_close(w);
+                return;
+            }
+            uint edges = resize_edges_at(w, srv.px, srv.py);
+            if (edges != 0) {
+                srv.consumed |= bit;
+                window_resize_start(w, edges);
                 return;
             }
             if (gui_rect_contains(window_title(w), srv.px, srv.py) ||
@@ -439,7 +648,7 @@ static void pointer_button(uint code, int pressed, uint time) {
                 return;
             }
         }
-        if (srv.moving != NULL) {
+        if (srv.moving != NULL || srv.resizing != NULL) {
             srv.consumed |= bit;
             return;
         }
@@ -465,6 +674,9 @@ static void pointer_button(uint code, int pressed, uint time) {
     }
     if (srv.buttons == 0) {
         srv.moving = NULL;
+        if (srv.resizing != NULL) {
+            resize_end();
+        }
         srv.grab = NULL;
         pointer_focus(time, 0); /* the pointer may be over another surface now */
     }
@@ -472,7 +684,7 @@ static void pointer_button(uint code, int pressed, uint time) {
 
 static void pointer_wheel(int notches, uint time) {
     struct surface *s = srv.pointer_surface;
-    if (s == NULL || notches == 0 || srv.moving != NULL) {
+    if (s == NULL || notches == 0 || srv.moving != NULL || srv.resizing != NULL) {
         return;
     }
     /* REL_WHEEL is positive up, wl_pointer.axis positive down; a notch is

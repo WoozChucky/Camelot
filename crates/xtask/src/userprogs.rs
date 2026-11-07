@@ -86,15 +86,21 @@ pub const ASM_INCLUDE_DIRS: &[&str] = &["../../include"];
 /// for them, files too, and `cc1`, the C compiler, is bigger than both.
 /// `guidemo` and `guitest` read the desktop image's fonts and images, and
 /// the display server, `compositor`, and its test client, `wltest`, are its
-/// too (#184).
+/// too (#184), as are the desktop shell's programs (#185).
 pub const DISK_ONLY: &[&str] = &[
     "ar",
     "as",
     "cc1",
     "compositor",
+    "files",
+    "gears",
     "guidemo",
     "guitest",
     "ld",
+    "panel",
+    "stty",
+    "sysmon",
+    "term",
     "wltest",
 ];
 

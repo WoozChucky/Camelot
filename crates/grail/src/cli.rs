@@ -5,8 +5,8 @@
 use crate::config::DiskSource;
 use crate::net::Hub;
 use crate::{
-    parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, Bios, DiskConfig, Machine,
-    MachineConfig, NetConfig,
+    parse_bios, parse_clock, parse_harts, parse_paging, parse_ram_size, parse_rtc, Bios, DiskConfig, Machine,
+    MachineConfig, NetConfig, Rtc,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,6 +43,10 @@ with --bios none the program, or the boot ROM's disk loader, starts in M-mode.
                   and bare-metal programs linked at 0x80000000). The firmware has
                   the first 2 MiB of RAM and the program loads at 0x80200000;
                   Grail passes it a device tree of the machine
+  --rtc TIME      where the real-time clock starts (spec section 9.9): host (the
+                  default: the host's time now), seconds since 1970, or a UTC date,
+                  YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS. It then runs with mtime, so a
+                  machine at full speed sees time pass as fast as its timer does
   --harts N       N harts (cores), 1 to 8 (default 1). They share memory and
                   devices and take turns, one instruction each per step, so
                   with --clock each runs at FREQ. Hart 0 starts the program;
@@ -128,10 +132,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
         max_steps: None,
         // Camelot's firmware unless --bios says otherwise, and 128 MiB unless --ram
         // does: QEMU's `virt` machine boots OpenSBI unless told `-bios none`, in 128 MiB
-        // unless told `-m`.
+        // unless told `-m`. The clock starts at the host's time, as QEMU's does.
         config: MachineConfig {
             bios: Bios::Default,
             ram_size: COMMAND_RAM_SIZE,
+            rtc: Rtc::Host,
             ..MachineConfig::default()
         },
         program: None,
@@ -167,6 +172,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, Error> {
             "--harts" => config.harts = parsed("--harts", value("--harts")?, parse_harts)?,
             "--paging" => config.paging = parsed("--paging", value("--paging")?, parse_paging)?,
             "--bios" => config.bios = parsed("--bios", value("--bios")?, parse_bios)?,
+            "--rtc" => config.rtc = parsed("--rtc", value("--rtc")?, parse_rtc)?,
             "--disk" | "--disk-ro" => {
                 let disk = parsed(&a, value(&a)?, DiskConfig::parse)?;
                 config.disks.push(disk.with_read_only(a == "--disk-ro"));
@@ -338,6 +344,10 @@ mod tests {
             "the firmware, as QEMU's virt machine"
         );
         assert_eq!(parse(args("--bios none p.elf")).unwrap().config.bios, Bios::None);
+        assert_eq!(o.config.rtc, Rtc::Host, "the clock at the host's time, as QEMU's");
+        let o = parse(args("--rtc 2026-11-06T12:00:00 p.elf")).unwrap();
+        assert_eq!(o.config.rtc, Rtc::At(1_793_966_400));
+        assert!(parse(args("--rtc yesterday p.elf")).is_err());
         // Every machine is RV64: there is no width to choose.
         assert_eq!(
             parse(args("--xlen 64 p.elf")).err(),

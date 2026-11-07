@@ -43,7 +43,7 @@ use xtask::repo_root;
 /// `struct thread` (kernel/include/proc.h): its size, and its state, tid,
 /// process and kernel stack (the pointers 8 bytes).
 const THREAD_SIZE: u64 = 192;
-const NTHREAD: u64 = 16;
+const NTHREAD: u64 = 64;
 const THREAD_STATE: u64 = 0;
 const THREAD_TID: u64 = 4;
 const THREAD_PROC: u64 = 8;
@@ -53,8 +53,8 @@ const THREAD_UNUSED: u32 = 0;
 const THREAD_ZOMBIE: u32 = 3;
 /// `struct proc`: its size and state (its name and page table are in
 /// common/mod.rs).
-const PROC_SIZE: u64 = 464;
-const NPROC: u64 = 8;
+const PROC_SIZE: u64 = 720;
+const NPROC: u64 = 32;
 const PROC_STATE: u64 = 0;
 
 /// The slots of the thread table in use, as (state, tid, process, kernel

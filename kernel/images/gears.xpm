@@ -1,0 +1,26 @@
+/* XPM */
+/* The gears demo's icon (#185): a gear, its teeth and its hole. */
+static char *gears[] = {
+/* width height colours characters-a-pixel */
+"16 16 3 1",
+". c None",
+"r c #C83030",
+"d c #801818",
+/* the pixels */
+"......rrrr......",
+"......rrrr......",
+"..rr.rrrrrr.rr..",
+"..rrrrrrrrrrrr..",
+"...rrrrrrrrrr...",
+"rrrrrrrddrrrrrrr",
+"rrrrrrd..drrrrrr",
+"rrrrrd....drrrrr",
+"rrrrrd....drrrrr",
+"rrrrrrd..drrrrrr",
+"rrrrrrrddrrrrrrr",
+"...rrrrrrrrrr...",
+"..rrrrrrrrrrrr..",
+"..rr.rrrrrr.rr..",
+"......rrrr......",
+"......rrrr......"
+};

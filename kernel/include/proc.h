@@ -25,13 +25,13 @@
 #include "vm.h"
 
 /* Process slots. */
-#define NPROC 8
+#define NPROC 32
 
 /* Thread slots, for every process together: each process's main thread,
  * and as many more. A thread costs a slot and, while it runs, a page (its
  * kernel stack and trap frame); an ended one waiting for thread_join() only
  * its slot. */
-#define NTHREAD 16
+#define NTHREAD 64
 
 /* Longest process name, without the NUL. */
 #define PROC_NAME_MAX 15
@@ -184,7 +184,7 @@ struct proc {
     struct inode *cwd;
     /* The descriptors that close on exec (FD_CLOEXEC), bit fd for ofile[fd]:
      * Linux's close_on_exec bitmap. A free descriptor's bit is clear. */
-    u32 cloexec;
+    u64 cloexec;
     /* Its memory mappings (mmap.h), in address order: changed under both
      * heap_lock and vm_lock, read under either. */
     struct vm_area *areas;
@@ -195,12 +195,12 @@ struct proc {
     struct spinlock vm_lock;
 };
 
-_Static_assert(NOFILE <= 32, "a bit of proc.cloexec for each descriptor");
+_Static_assert(NOFILE <= 64, "a bit of proc.cloexec for each descriptor");
 
 /* The tests walk procs[] by PROC_SIZE, and read the page table at
  * PROC_PAGETABLE. */
 #define PROC_PAGETABLE 40
-#define PROC_SIZE 464
+#define PROC_SIZE 720
 _Static_assert(sizeof(struct proc) == PROC_SIZE, "the tests index procs[] by PROC_SIZE");
 _Static_assert(offsetof(struct proc, parent) == 24, "the tests read parent there");
 _Static_assert(offsetof(struct proc, pagetable) == PROC_PAGETABLE, "the tests read pagetable there");
