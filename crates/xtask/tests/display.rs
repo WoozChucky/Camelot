@@ -35,6 +35,7 @@ const BINS: &[&str] = &[
     "echo",
     "wc",
     "primes",
+    "grep",
     "stty",
     "panel",
     "files",
@@ -672,8 +673,9 @@ fn the_terminal_runs_a_shell() {
     d.run("term -v &");
     d.wait_for("compositor: focus \"Terminal\"\n");
     d.term_drawn("Terminal", "$ ");
-    // (`ls /test`, not /bin, whose sizes change with every program.)
-    for command in ["echo hello | wc -c", "ls /test", "primes 4 40000"] {
+    // (`ls /test`, not /bin, whose sizes change with every program; the
+    // primes' total alone, the workers' lines coming in any order.)
+    for command in ["echo hello | wc -c", "ls /test", "primes 4 40000 | grep below"] {
         d.term_command("Terminal", command);
     }
     d.expect_screen("term-shell");
@@ -876,6 +878,21 @@ fn the_panel_launches_lists_and_focuses_windows() {
     d.expect_screen_but("panel-windows", &[PANEL_METERS]);
     d.click(120, 12);
     d.wait_for("compositor: focus \"Terminal\"\n");
+    // The panel lights the button once the server tells it (`activated`):
+    // its first button, blue, right of its title.
+    let lit = |d: &Desk| {
+        let (w, _, rgb) = d.screen();
+        let p = &rgb[(4 * w as usize + 200) * 3..][..3];
+        p[2] > 0xa0 && p[0] < 0x80
+    };
+    for _ in 0..100 {
+        if lit(&d) {
+            break;
+        }
+        d.settle(10);
+    }
+    assert!(lit(&d), "{}", d.out());
+    d.wait_idle();
     d.since_here();
     d.expect_screen_but("panel-focused", &[PANEL_METERS]);
 }

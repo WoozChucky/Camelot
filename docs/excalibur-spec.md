@@ -1755,7 +1755,7 @@ The desktop's user space (#185) is a panel, a terminal emulator and a few applic
 
 **Tests** (`crates/xtask/tests/display.rs`, on 4 harts, the desktop shell's programs and `stty` on the image, with `/test/escapes` and `/test/lines`):
 
-- A terminal runs the shell: what is typed comes back, a pipeline's output (`echo | wc`), a directory's listing and `primes`' output are drawn, and the screen matches.
+- A terminal runs the shell: what is typed comes back, a pipeline's output (`echo | wc`), a directory's listing and `primes`' total (its workers' lines come in any order, so through `grep`) are drawn, and the screen matches.
 - A terminal draws `/test/escapes`, colours and attributes, erasing, inserting and deleting, the cursor saved, moved and restored, and UTF-8, and the screen matches; `/test/lines`' 60 lines scroll the first into the scrollback, Shift+PageUp shows them and a key brings the view back.
 - Two terminals: one is resized by its bottom edge, and `stty size` in it says its new rows and columns; text selected in it by dragging is pasted into the other with Ctrl+Shift+V. Then a selection whose source never answers (`wltest clip`): the paste gives up after 2 seconds and the terminal goes on; the source destroyed, a paste asks nobody.
 - The panel: its bar (the menu's button, the windows, the clock at noon), the menu, each application started from it (Files, Gears turning, the System Monitor, a terminal), the windows' buttons, and a click on one giving that window the keyboard. The hart meters, which show how long things took, are left out of the comparison.

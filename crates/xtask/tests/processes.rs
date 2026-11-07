@@ -51,11 +51,14 @@ const ILLEGAL_INSTRUCTION: u64 = grail::trap::Exception::IllegalInstr as u64;
 const SYS_EXIT: u64 = 1;
 /// Process slots (`NPROC`, kernel/include/proc.h).
 const NPROC: usize = 32;
+/// Kernel processes a round of the boot's kernel-stack self-test starts
+/// (`KSTACK_ROUND`, kernel/vmtest.c).
+const KSTACK_ROUND: usize = 8;
 /// The pid of the shell's first child: the shell is pid 1, as Linux's init
 /// (kernel/proc.c's INIT_PID), and the pids after it went to the kernel
-/// processes of the boot's kernel-stack self-test, four rounds of NPROC
+/// processes of the boot's kernel-stack self-test, four rounds
 /// (kernel/vmtest.c).
-const FIRST_PID: usize = 2 + 4 * NPROC;
+const FIRST_PID: usize = 2 + 4 * KSTACK_ROUND;
 
 const PAGE: u64 = 4096;
 /// The top of user space, by paging mode (kernel/include/vm.h): the lower
