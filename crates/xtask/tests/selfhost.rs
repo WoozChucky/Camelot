@@ -21,7 +21,9 @@
 //! merlin writes, and gives merlin's diagnostics, for every C and `.S` file
 //! of the repository, the diagnostics table's rows of the lexer and the
 //! preprocessor, and inputs of every directive and macro form
-//! (`PP_INPUTS`).
+//! (`PP_INPUTS`). The second is the compiler, `cc1 FILE.c`, the third its
+//! `-g`: the same assembly as the host's merlin, line tables and DWARF
+//! compile unit included (`G_INPUTS` names files every way `-g` does).
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
@@ -704,14 +706,19 @@ fn the_linker_on_camelot_keeps_the_line_tables_as_merlin_ld_does() {
     link_every_program(&|_| true);
 }
 
-/// The linker's machine: [`machine_config`]'s with 8 MiB of RAM for the
-/// kernel instead of 4. `ld` holds a link's objects and the image it builds
-/// in memory, as merlin-ld does, and cc1's (1.7 MB of objects, a 1 MB
-/// program) take more than 4 MiB leaves the program: on 6 MiB its
-/// mappings' pages run out.
+/// The linker's machine: [`machine_config`]'s with 12 MiB of RAM for the
+/// kernel instead of 4. `ld` holds a link's objects, the archives it reads
+/// and the image it builds in memory, as merlin-ld does, and cc1's link is
+/// the biggest: its 18 objects are 1,878,896 bytes (1,677,816 for the 16
+/// before -g's debug.c and md5.c), with libc.a and libgui.a (187,900 bytes;
+/// 149,624 before the display server). Measured by the kernel's free pages
+/// during the link: at the shell's prompt 1806 are free on 8 MiB, 2830 on
+/// 12 (the kernel's own use the same before and after the display server),
+/// and ld's peak is 1807 pages (1404 with the objects before -g, 1789 with
+/// the archives before the display server): one page more than 8 MiB has.
 fn link_machine_config() -> MachineConfig {
     MachineConfig {
-        ram_size: (8 << 20) + grail::firmware::FW_SIZE as usize,
+        ram_size: (12 << 20) + grail::firmware::FW_SIZE as usize,
         ..machine_config()
     }
 }
@@ -2561,15 +2568,24 @@ fn the_preprocessor_on_camelot_writes_what_merlin_writes() {
 
 /// cc1's command line is merlin's (main.rs), with `cc1` for `merlin` in its
 /// messages: the usage errors, a file it cannot read, output to standard
-/// output for several inputs, and what this stage refuses (compiling with
-/// `-g`, the next stage's).
+/// output for several inputs; and `-g`, its compilation directory given
+/// both ways or, by default, the directory cc1 runs in (one whose name
+/// fills a directory entry among them).
 #[test]
 fn cc1_takes_merlins_command_line() {
-    let a = "#define A 1\nint a = A;\n";
+    let a = "#define A 1\nint a = A;\nint f(void) {\n    return a;\n}\n";
     let b = "  .word __LINE__\n";
+    // Code from absolute names `#line` gives (`clang_file`'s other cases):
+    // one split where it leaves the compilation directory, one that shares
+    // only the root with it, and a network name.
+    let line = |name: &str| format!("int f(void) {{\n#line 7 \"{name}\"\n    return 1;\n}}\n");
+    let (la, lb, lc) = (line("/abs/m.c"), line("/abs/x/m.c"), line("//net/x/m.c"));
     let files = [
         ("/d/a.c".to_string(), a.as_bytes().to_vec()),
         ("/d/b.S".to_string(), b.as_bytes().to_vec()),
+        ("/d/la.c".to_string(), la.as_bytes().to_vec()),
+        ("/d/lb.c".to_string(), lb.as_bytes().to_vec()),
+        ("/d/lc.c".to_string(), lc.as_bytes().to_vec()),
     ];
     let usage = "usage: cc1 [options] input.c...\n";
     // (command, what it says first, and its exit status).
@@ -2613,8 +2629,13 @@ fn cc1_takes_merlins_command_line() {
         // A directory is no file to read, as merlin finds.
         ("cc1 -E /d", "cc1: cannot read /d: is a directory\n".to_string(), 2),
         (
-            "cc1 -g /d/a.c",
-            "cc1: -g is not here yet: debug information comes with merlin's debug.rs\n".to_string(),
+            "cc1 -g /d/a.c -fdebug-compilation-dir",
+            format!("cc1: -fdebug-compilation-dir needs a directory\n{usage}"),
+            2,
+        ),
+        (
+            "cc1 -g -fdebug-compilation-dirs /d/a.c",
+            format!("cc1: unknown option -fdebug-compilation-dirs\n{usage}"),
             2,
         ),
     ];
@@ -2632,8 +2653,54 @@ fn cc1_takes_merlins_command_line() {
     let help = "cc1 --help";
     let mut commands: Vec<&str> = cases.iter().map(|(c, ..)| *c).collect();
     commands.extend([together, help]);
-    let input = format!("{}\nexit 0\n", commands.join("\n"));
-    let (out, _) = boot_cc1(image_of(&["cc1"], &["/d"], &files), &input, 20_000_000_000);
+    // -g: (the directory the shell is in, the command, and the directory
+    // merlin is told the names are relative to). The default is the
+    // directory cc1 runs in; a name of DIRSIZ bytes has no NUL in its
+    // directory entry.
+    let fill = "/d/abcdefghijklmn";
+    assert_eq!(fill.len() - "/d/".len(), DIRSIZ);
+    let debug: &[(&str, &str, &str)] = &[
+        ("/d", "cc1 -g a.c -o /out/g1", "/d"),
+        ("/d", "cc1 -g -fdebug-compilation-dir=here a.c -o /out/g2", "here"),
+        (
+            "/d",
+            "cc1 -fdebug-compilation-dir there -g a.c -o /out/g3",
+            "there",
+        ),
+        ("/d", "cc1 -g -fdebug-compilation-dir= a.c -o /out/g4", ""),
+        (fill, "cc1 -g ../a.c -o /out/g5", fill),
+        ("/", "cc1 -g d/a.c -o /out/g6", "/"),
+        // Absolute names, split where they leave the compilation directory,
+        // as clang on Linux and on Camelot splits them (`clang_file`): the
+        // main file's, then those of `#line`.
+        ("/", "cc1 -g -fdebug-compilation-dir=/d /d/a.c -o /out/g7", "/d"),
+        (
+            "/d",
+            "cc1 -g -fdebug-compilation-dir=/abs la.c -o /out/g8",
+            "/abs",
+        ),
+        (
+            "/d",
+            "cc1 -g -fdebug-compilation-dir=/other lb.c -o /out/g9",
+            "/other",
+        ),
+        (
+            "/d",
+            "cc1 -g -fdebug-compilation-dir=//net/x lc.c -o /out/g10",
+            "//net/x",
+        ),
+    ];
+    // Those with absolute names, from g7 on: merlin takes a name as its host
+    // does, and on Windows none that starts with `/` is absolute. On a POSIX
+    // host merlin's is compared; on every host, the lines worked out by hand
+    // from debug.rs's rules below.
+    let absolute = 6;
+    let mut input = commands.join("\n");
+    for (dir, command, _) in debug {
+        input.push_str(&format!("\ncd {dir}\n{command}"));
+    }
+    input.push_str("\nexit 0\n");
+    let (out, disk) = boot_cc1(image_of(&["cc1"], &["/d", fill], &files), &input, 40_000_000_000);
     for (command, said, status) in cases {
         let got = shell_output(&out, command).replace('\r', "");
         assert!(got.starts_with(said.as_str()), "{command}: {got}");
@@ -2644,16 +2711,83 @@ fn cc1_takes_merlins_command_line() {
     }
     assert_eq!(shell_output(&out, together).replace('\r', ""), both);
     assert!(shell_output(&out, help).replace('\r', "").starts_with(usage));
+    let fs = Fs::open(&disk).unwrap();
+    let image: BTreeMap<String, Vec<u8>> = files.iter().cloned().collect();
+    for (k, (dir, command, comp_dir)) in debug.iter().enumerate() {
+        assert_eq!(shell_output(&out, command).replace('\r', ""), "", "{command}");
+        let written = String::from_utf8(fs.read_file(&format!("/out/g{}", k + 1)).unwrap()).unwrap();
+        let name = command.split(' ').rev().nth(2).unwrap();
+        let job = CcJob {
+            dir: Some(dir.to_string()),
+            ..CcJob::with_g(name.to_string(), &[], &[], Some(comp_dir))
+        };
+        let (want, said) = merlin_s(&job, &image);
+        assert_eq!(said, "", "{command}");
+        if k < absolute || cfg!(unix) {
+            assert_eq!(Some(&written), want.as_ref(), "{command}");
+        }
+        assert!(
+            written.contains("\n    .loc ") && written.contains("DW_TAG_subprogram: f\n"),
+            "{command}: {written}"
+        );
+    }
+    // The absolute name, on any host: the main file's code is in `a.c`, of
+    // the compilation directory, whose name is not the compile unit's
+    // (`/d/a.c`), so it is a file of its own.
+    let sum = merlin::md5::hex(&merlin::md5::md5(a.as_bytes()));
+    let g7 = String::from_utf8(fs.read_file("/out/g7").unwrap()).unwrap();
+    assert!(
+        g7.starts_with(&format!(
+            "    .file \"a.c\"\n    .file 0 \"/d\" \"/d/a.c\" md5 0x{sum}\n"
+        )),
+        "{g7}"
+    );
+    assert!(
+        g7.contains(&format!("\n    .file 1 \"a.c\" md5 0x{sum}\n    .loc 1 3 0\n")),
+        "{g7}"
+    );
+    // The names `#line` gives, which have no checksum, so none is the main
+    // file. `/abs/m.c` in `/abs` is `m.c` there, which the assembler files in
+    // the compilation directory: `m.c`. `/abs/x/m.c` shares only the root
+    // with `/other`: the DIFile is the whole name in no directory, which the
+    // assembler splits into `/abs/x` and `m.c`. `//net/x/m.c` in `//net/x`
+    // (a root name, then the root directory, then `x`) is `m.c` there, as
+    // the first. Each `.file` comes right before the first `.loc` of its
+    // code, `return 1;` at line 7, column 5, where the prologue ends.
+    for (k, (src, comp_dir, file1)) in [
+        (&la, "/abs", ".file 1 \"m.c\""),
+        (&lb, "/other", ".file 1 \"/abs/x\" \"m.c\""),
+        (&lc, "//net/x", ".file 1 \"m.c\""),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = ["la.c", "lb.c", "lc.c"][k];
+        let written = String::from_utf8(fs.read_file(&format!("/out/g{}", k + 8)).unwrap()).unwrap();
+        let sum = merlin::md5::hex(&merlin::md5::md5(src.as_bytes()));
+        // With nothing described as the module begins, `.file 0` waits for
+        // the first `.loc`, the function's first line.
+        assert!(
+            written.starts_with(&format!("    .file \"{name}\"\n")),
+            "{name}: {written}"
+        );
+        let file0 = format!("\n    .file 0 \"{comp_dir}\" \"{name}\" md5 0x{sum}\n    .loc 0 1 0\n");
+        assert!(written.contains(&file0), "{name}: {written}");
+        let loc = format!("\n    {file1}\n    .loc 1 7 5 prologue_end\n");
+        assert!(written.contains(&loc), "{name}: {written}");
+    }
 }
 
 // ---- The C compiler, stage 2: the compiler, without -g (#241) ----
 
 /// One input of `cc1`: the input file (an image path, or for a row of the
-/// diagnostics table one relative to `/d`, where the rows are compiled),
+/// diagnostics table one relative to `/d`, where the rows are compiled; or
+/// for `-g`'s one relative to `dir`, the directory the shell runs it in),
 /// the options before it, as cc1 is given them, and as merlin is; and what
 /// the host's merlin makes of it ([`merlin_s`]), worked out once, by
-/// [`cc_jobs`].
+/// [`cc_jobs`] (or [`g_jobs`]).
 struct CcJob {
+    dir: Option<String>,
     input: String,
     args: Vec<String>,
     opts: merlin::Options,
@@ -2665,11 +2799,37 @@ impl CcJob {
     fn new(input: String, includes: &[String], macros: &[&str]) -> CcJob {
         let pp = PpJob::new(input, merlin::Lang::C, includes, macros, true);
         CcJob {
+            dir: None,
             input: pp.input,
             args: pp.args,
             opts: pp.opts,
             want: (None, String::new()),
         }
+    }
+
+    /// The same with `-g`, and `-fdebug-compilation-dir=DIR` if `comp_dir`
+    /// says so; merlin is told the directory (else, as cc1 finds it, the
+    /// one it runs in: set `dir` too, or it is the root).
+    fn with_g(input: String, includes: &[String], macros: &[&str], comp_dir: Option<&str>) -> CcJob {
+        let mut job = CcJob::new(input, includes, macros);
+        job.args.insert(0, "-g".to_string());
+        if let Some(d) = comp_dir {
+            job.args.insert(1, format!("-fdebug-compilation-dir={d}"));
+        }
+        job.opts.debug = Some(merlin::DebugInfo {
+            comp_dir: comp_dir.unwrap_or("/").to_string(),
+        });
+        job
+    }
+
+    /// [`Self::with_g`] run in `dir`, the compilation directory by default.
+    fn with_g_in(dir: &str, input: String, includes: &[String], macros: &[&str]) -> CcJob {
+        let mut job = CcJob::with_g(input, includes, macros, None);
+        job.opts.debug = Some(merlin::DebugInfo {
+            comp_dir: dir.to_string(),
+        });
+        job.dir = Some(dir.to_string());
+        job
     }
 
     fn command(&self, out: &str) -> String {
@@ -2682,12 +2842,13 @@ impl CcJob {
 /// compiles, and what it prints on stderr (the warnings of a compilation
 /// that succeeds, every diagnostic of one that fails).
 fn merlin_s(job: &CcJob, files: &BTreeMap<String, Vec<u8>>) -> (Option<String>, String) {
-    // A path relative to `/d`, the directory the rows are compiled in.
+    // A path relative to the job's directory, or to `/d`, the directory the
+    // rows are compiled in.
     let text = |p: &str| {
-        let path = if p.starts_with('/') {
-            p.to_string()
-        } else {
-            format!("/d/{p}")
+        let path = match &job.dir {
+            _ if p.starts_with('/') => normalize(p),
+            Some(d) => normalize(&format!("{d}/{p}")),
+            None => format!("/d/{p}"),
         };
         files.get(&path).and_then(|b| String::from_utf8(b.clone()).ok())
     };
@@ -2704,6 +2865,22 @@ fn merlin_s(job: &CcJob, files: &BTreeMap<String, Vec<u8>>) -> (Option<String>, 
         Ok((asm, warnings)) => (Some(asm), render(&warnings)),
         Err(e) => (None, render(&e)),
     }
+}
+
+/// An image path without its `.` components, each `..` taking away the one
+/// before it (as the kernel resolves one).
+fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 /// What the compiler's tests compile ([`cc_jobs`]).
@@ -3027,27 +3204,329 @@ fn the_compiler_on_camelot_writes_what_merlin_writes() {
     compile_corpus(Corpus::Sample, 420, 20, 100, 250);
 }
 
+// ---- The C compiler, stage 3: -g (#241) ----
+
+/// A header and a main file that includes it and one in `inc`, for
+/// [`G_INPUTS`].
+const G_H: &str = "static int twice(int x) {\n    return 2 * x;\n}\n";
+const G_O: &str = "static int thrice(int x) {\n    return 3 * x;\n}\n";
+const G_MAIN: &str =
+    "#include \"h.h\"\n#include <o.h>\nint main(void) {\n    return twice(2) + thrice(1);\n}\n";
+const G_Q: &str = "static int hq(int a) { return a + 1; }\n";
+const G_UP: &str = "static int up(void) { return 1; }\n";
+
+/// Files named every way `-g` names them (debug.c's "File names", merlin's
+/// `files_are_named_as_clang_names_them`): each case's files (by name from
+/// its directory, `/g/N/w`), its options (`-I` directories, and the
+/// compilation directory, else the directory cc1 runs in) and its input.
+/// The main file named `./m.c` or through `..`, headers next to it and in
+/// `-I` directories (one named as the compilation directory), a header
+/// above it, `#line` names (none, the main file's, a header's, one that
+/// is a directory, with control characters, not ASCII and with `\`: a
+/// main file named `café.c` waits for the console's line discipline to
+/// keep the bytes typed that are not printable ASCII, as Linux's does
+/// (kernel/tty.c's canonical edit() drops them), and a
+/// compilation directory of `.`, `./`, none at all and one with `\`.
+#[allow(clippy::type_complexity)]
+const G_INPUTS: &[(&[(&str, &str)], &[&str], &str)] = &[
+    (&[("m.c", G_MAIN), ("h.h", G_H), ("inc/o.h", G_O)], &["-Iinc", "-fdebug-compilation-dir=src"], "m.c"),
+    (&[("m.c", G_MAIN), ("h.h", G_H), ("inc/o.h", G_O)], &["-Iinc", "-fdebug-compilation-dir=src"], "./m.c"),
+    (&[("m.c", G_MAIN), ("h.h", G_H), ("inc/o.h", G_O)], &["-Iinc"], "./m.c"),
+    (&[("m.c", G_MAIN), ("h.h", G_H), ("inc/o.h", G_O)], &["-Iinc", "-fdebug-compilation-dir=."], "./m.c"),
+    (&[("m.c", G_MAIN), ("h.h", G_H), ("inc/o.h", G_O)], &["-I./inc", "-fdebug-compilation-dir=./"], "m.c"),
+    (&[("m.c", G_MAIN), ("h.h", G_H), ("inc/o.h", G_O)], &["-Iinc/", "-fdebug-compilation-dir=a\\b"], "m.c"),
+    (&[("m.c", G_MAIN), ("h.h", G_H), ("inc/o.h", G_O)], &["-Iinc", "-fdebug-compilation-dir="], "m.c"),
+    (&[("sub/m.c", G_MAIN), ("sub/h.h", G_H), ("inc/o.h", G_O)], &["-Iinc", "-fdebug-compilation-dir=sub"], "sub/m.c"),
+    (&[("sub/m.c", G_MAIN), ("sub/h.h", G_H), ("inc/o.h", G_O)], &["-Isub/../inc"], "sub/../sub/m.c"),
+    (
+        &[("m.c", "#include <h.h>\nint main(void) {\n    return twice(2);\n}\n"), ("src/h.h", G_H)],
+        &["-Isrc", "-fdebug-compilation-dir=src"],
+        "m.c",
+    ),
+    (&[("m.c", "int f(void) {\n#line 7 \"gen/y.c\"\n    return 1;\n}\n")], &["-fdebug-compilation-dir=src"], "m.c"),
+    (&[("m.c", "int f(void) {\n#line 7 \"\"\n    return 1;\n}\nint g;\n")], &[], "m.c"),
+    (&[("m.c", "int f(void) {\n#line 7 \"m.c\"\n    return 1;\n}\n")], &[], "m.c"),
+    (&[("m.c", "int f(void) {\n#line 7 \"./m.c\"\n    return 1;\n}\n")], &["-fdebug-compilation-dir=src"], "m.c"),
+    (&[("m.c", "int f(void) {\n#line 7 \"src/m.c\"\n    return 1;\n}\n")], &["-fdebug-compilation-dir=src"], "m.c"),
+    (
+        &[("m.c", "int f(void) {\n#line 7 \"a/\"\n    return 1;\n#line 9 \"/\"\n    return 2;\n}\n")],
+        &["-fdebug-compilation-dir=a"],
+        "m.c",
+    ),
+    (
+        &[
+            ("k1.c", "#include \"inc/q.h\"\nint f(int a) { return hq(a); }\n#line 1 \"./inc/q.h\"\nint g(int a) { return a; }\n"),
+            ("inc/q.h", G_Q),
+        ],
+        &["-fdebug-compilation-dir=src"],
+        "k1.c",
+    ),
+    (
+        &[
+            ("k1.c", "#line 1 \"./inc/q.h\"\nint g(int a) { return a; }\n#include \"inc/q.h\"\nint f(int a) { return hq(a); }\n"),
+            ("inc/q.h", G_Q),
+        ],
+        &["-fdebug-compilation-dir=src"],
+        "k1.c",
+    ),
+    (
+        &[("m.c", "int f(void) {\n#line 7 \"a\\tb\\bc\\fd\\re\\\"f\\vg\\ah\\ni~\u{e9}.c\"\n    return 1;\n}\n")],
+        &["-fdebug-compilation-dir=src"],
+        "m.c",
+    ),
+    (&[("m.c", "int f(void) {\n#line 7 \"a\\\\b\\\\c.c\"\n    return 1;\n}\n")], &[], "m.c"),
+    (&[("m.c", "#include \"../up.h\"\nint main(void) { return up(); }\n"), ("../up.h", G_UP)], &[], "m.c"),
+    (&[("d/m.c", "#include \"../up.h\"\nint main(void) { return up(); }\n"), ("up.h", G_UP)], &["-fdebug-compilation-dir=d"], "d/m.c"),
+    (&[("m.c", "static int s;\nint *p = &s;\n")], &[], "m.c"),
+];
+
+/// `-g`'s corpus: every input of the compiler's `corpus` ([`cc_jobs`]) that
+/// merlin compiles, with `-g`, named from the directory cc1 runs in: the
+/// repository's from `/r` (the compilation directory cc1 finds itself), the
+/// diagnostics table's rows from `/d` (given it), cc1's own as `cargo xtask
+/// kernel` builds `/bin/cc1` (`cc/main.c` from `kernel/user`, which is the
+/// compilation directory given, `userprogs::USER_DIR`: what `/bin/cc1` is
+/// assembled from); and, but for cc1's own, [`G_INPUTS`], each in a
+/// directory of its own; the files they read. What the host's merlin makes
+/// of each is worked out here.
+fn g_jobs(corpus: Corpus) -> (Vec<CcJob>, BTreeMap<String, Vec<u8>>) {
+    let (plain, mut files) = cc_jobs(corpus);
+    let user = image_path(userprogs::USER_DIR);
+    let mut jobs = Vec::new();
+    for job in &plain {
+        if job.want.0.is_none() {
+            continue;
+        }
+        if let Some(part) = job.input.strip_prefix(&format!("{user}/cc/")) {
+            jobs.push(CcJob {
+                dir: Some(user.clone()),
+                ..CcJob::with_g(format!("cc/{part}"), &[], &[], Some(userprogs::USER_DIR))
+            });
+            continue;
+        }
+        // A row's names are relative to `/d` already.
+        let dir = if job.input.starts_with("/r/") { REPO } else { "/d" };
+        let rel = |p: &str| match p.strip_prefix(&format!("{dir}/")) {
+            Some(r) => r.to_string(),
+            None => p.to_string(),
+        };
+        let input = rel(&job.input);
+        let includes: Vec<String> = job
+            .opts
+            .include_dirs
+            .iter()
+            .map(|d| rel(&d.to_string_lossy()))
+            .collect();
+        let macros: Vec<&str> = job
+            .args
+            .iter()
+            .filter(|a| a.starts_with("-D") || a.starts_with("-U"))
+            .map(String::as_str)
+            .collect();
+        jobs.push(if dir == "/d" {
+            CcJob {
+                dir: Some(dir.to_string()),
+                ..CcJob::with_g(input, &includes, &macros, Some(dir))
+            }
+        } else {
+            CcJob::with_g_in(dir, input, &includes, &macros)
+        });
+    }
+    if !matches!(corpus, Corpus::Own | Corpus::OwnSample) {
+        for (k, (named, args, input)) in G_INPUTS.iter().enumerate() {
+            let dir = format!("/g/{k}/w");
+            for (name, text) in named.iter() {
+                files.insert(normalize(&format!("{dir}/{name}")), text.as_bytes().to_vec());
+            }
+            let includes: Vec<String> = args
+                .iter()
+                .filter_map(|a| a.strip_prefix("-I"))
+                .map(str::to_string)
+                .collect();
+            let comp_dir = args
+                .iter()
+                .find_map(|a| a.strip_prefix("-fdebug-compilation-dir="));
+            jobs.push(match comp_dir {
+                Some(c) => CcJob {
+                    dir: Some(dir.clone()),
+                    ..CcJob::with_g(input.to_string(), &includes, &[], Some(c))
+                },
+                None => CcJob::with_g_in(&dir, input.to_string(), &includes, &[]),
+            });
+        }
+    }
+    for job in &mut jobs {
+        job.want = merlin_s(job, &files);
+    }
+    (jobs, files)
+}
+
+/// #241's third stage: `/bin/cc1 -g` on Camelot writes what the host's
+/// `merlin -g` writes, byte for byte, line tables and DWARF compile unit
+/// included, for every job of [`g_jobs`]'s `corpus`, split over
+/// [`test_machines`] machines. Every job compiles; at least `described`
+/// describe a function, with a prologue's end, and at least `headers` of
+/// those from the compiler's corpus (not [`G_INPUTS`], which are made to
+/// have them) have a header in their line table (a numbered file with a
+/// checksum, which a name `#line` gives has not); between them they have
+/// every kind of entry merlin writes, if `every_tag`.
+fn g_corpus(corpus: Corpus, jobs: usize, described: usize, headers: usize, every_tag: bool) {
+    let (all, files) = g_jobs(corpus);
+    for j in &all {
+        assert!(j.want.0.is_some(), "{}: {}", j.input, j.want.1);
+    }
+    let asm: Vec<&String> = all.iter().filter_map(|j| j.want.0.as_ref()).collect();
+    if every_tag {
+        for tag in [
+            "array_type",
+            "enumeration_type",
+            "formal_parameter",
+            "label",
+            "lexical_block",
+            "member",
+            "pointer_type",
+            "compile_unit",
+            "structure_type",
+            "subroutine_type",
+            "typedef",
+            "union_type",
+            "unspecified_parameters",
+            "subrange_type",
+            "base_type",
+            "const_type",
+            "enumerator",
+            "subprogram",
+            "variable",
+            "volatile_type",
+        ] {
+            let n = asm
+                .iter()
+                .filter(|a| a.contains(&format!("DW_TAG_{tag}: ")))
+                .count();
+            assert!(n > 0, "no DW_TAG_{tag}");
+        }
+    }
+    let got_described = asm
+        .iter()
+        .filter(|a| a.contains("DW_TAG_subprogram: ") && a.contains(" prologue_end\n"))
+        .count();
+    let header = |l: &str| {
+        l.strip_prefix("    .file ")
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_some_and(|n| n >= 1)
+            && l.contains(" md5 0x")
+    };
+    let got_headers = all
+        .iter()
+        .filter(|j| !j.dir.as_deref().is_some_and(|d| d.starts_with("/g/")))
+        .filter(|j| j.want.0.as_ref().is_some_and(|a| a.lines().any(header)))
+        .count();
+    assert!(
+        all.len() >= jobs && got_described >= described && got_headers >= headers,
+        "{} jobs: {got_described} with functions, {got_headers} with headers",
+        all.len()
+    );
+    let files = &files;
+    let wrong = on_machines(&all, |share| g_on_camelot(&share, files));
+    assert!(wrong.is_empty(), "{} differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Runs `-g`'s `jobs` (each with its number in the whole list, for its
+/// output file `/out/N`) with `/bin/cc1` on a machine whose image holds
+/// `files`, one `cc1` each, after a `cd` to its directory when the shell is
+/// in another (what `-g` names the files after), and compares each with the
+/// host's merlin (the job's `want`): the assembly it writes, and its
+/// warnings. Returns what differs.
+fn g_on_camelot(jobs: &[(usize, &CcJob)], files: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    let commands: Vec<String> = jobs
+        .iter()
+        .map(|(k, job)| job.command(&format!("/out/{k}")))
+        .collect();
+    let mut input = String::new();
+    let mut here = "/";
+    for ((_, job), command) in jobs.iter().zip(&commands) {
+        let dir = job.dir.as_deref().unwrap_or("/");
+        if dir != here {
+            input.push_str(&format!("cd {dir}\n"));
+            here = dir;
+        }
+        input.push_str(command);
+        input.push('\n');
+    }
+    input.push_str("exit 0\n");
+    let listed: Vec<(String, Vec<u8>)> = files.iter().map(|(p, d)| (p.clone(), d.clone())).collect();
+    let dirs = dirs_of(files);
+    let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+    let written: usize = jobs
+        .iter()
+        .map(|(_, j)| j.want.0.as_ref().map_or(0, String::len))
+        .sum();
+    let ninodes = (listed.len() + dirs.len() + jobs.len() + 64) as u32;
+    let image = image_with_room(&["cc1"], &dirs, &listed, ninodes, 2 * written);
+    let (out, data) = boot_on(cc1_compile_config(), image, &input, 20_000_000_000_000);
+    let fs = Fs::open(&data).unwrap();
+    let mut wrong = Vec::new();
+    for (i, (k, job)) in jobs.iter().enumerate() {
+        let (text, said) = &job.want;
+        let got_said = shell_output(&out, &commands[i]).replace('\r', "");
+        if &got_said != said {
+            wrong.push(format!("{}: said\n{got_said}\nmerlin says\n{said}", commands[i]));
+        }
+        let written = fs.read_file(&format!("/out/{k}")).ok();
+        if written.as_deref() != text.as_ref().map(String::as_bytes) {
+            let len = |w: Option<usize>| w.map_or("(no file)".to_string(), |n| format!("{n} bytes"));
+            wrong.push(format!(
+                "{}: wrote {}, merlin writes {}",
+                commands[i],
+                len(written.as_ref().map(Vec::len)),
+                len(text.as_ref().map(String::len))
+            ));
+        }
+    }
+    wrong
+}
+
+/// [`g_corpus`]'s sample: what merlin compiles of the compiler's sample, and
+/// every one of [`G_INPUTS`].
+#[test]
+fn the_compiler_on_camelot_writes_what_merlin_writes_with_g() {
+    g_corpus(Corpus::Sample, 150, 100, 4, true);
+}
+
 /// `/bin/cc1` compiles some of itself on Camelot ([`OWN_SAMPLE`]): the
 /// assembly of each of those C files (kernel/user/cc) is what the host's
-/// merlin writes of it without `-g` (the code `/bin/cc1` is built from,
-/// less its debug information).
+/// merlin writes of it, without `-g` and with it as `cargo xtask kernel`
+/// builds `/bin/cc1` (`cc/abi.c` from `kernel/user`, the compilation
+/// directory given): the assembly `/bin/cc1` is made of.
 #[test]
 fn cc1_compiles_itself_on_camelot() {
     compile_corpus(Corpus::OwnSample, OWN_SAMPLE.len(), OWN_SAMPLE.len(), 0, 0);
+    g_corpus(
+        Corpus::OwnSample,
+        OWN_SAMPLE.len(),
+        OWN_SAMPLE.len(),
+        OWN_SAMPLE.len(),
+        false,
+    );
 }
 
 /// Everything: `cc1 -E` on every C and `.S` file of the repository, every
 /// row of the lexer's and the preprocessor's tables and [`PP_INPUTS`]; `cc1`
 /// compiling every C file of the repository and every row of merlin's
-/// diagnostics table; and `cc1` compiling every file of its own. About an
-/// hour on 2 machines: run before a change to cc1 is called ready
-/// (README.md).
+/// diagnostics table; and `cc1` compiling every file of its own; then all
+/// of that merlin compiles with `-g` ([`g_corpus`]), [`G_INPUTS`] among it.
+/// About 75 minutes on 2 machines, `-g` included: run before a change to cc1
+/// is called ready (README.md).
 #[test]
 #[ignore]
 fn cc1_on_camelot_takes_the_whole_corpus() {
     preprocess_corpus(true, 401, 41, 21);
     compile_corpus(Corpus::Full, 1201, 201, 151, 501);
-    compile_corpus(Corpus::Own, 16, 16, 0, 0);
+    compile_corpus(Corpus::Own, 18, 18, 0, 0);
+    g_corpus(Corpus::Full, 450, 400, 130, true);
+    // tables.c has no function.
+    g_corpus(Corpus::Own, 18, 17, 16, false);
 }
 
 /// cc1's outputs as merlin's main.rs writes them, on Camelot: `--dump-ast`

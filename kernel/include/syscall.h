@@ -77,6 +77,7 @@
 #define SYS_recvmsg 57       /* recvmsg(fd, msg, flags): bytes received, descriptors with them */
 #define SYS_stat 58          /* stat(path, st): 0, with *st filled in */
 #define SYS_getsockopt 59    /* getsockopt(fd, level, option, value, len): 0, the option at value, its size in *len */
+#define SYS_getcwd 60        /* getcwd(buf, size): the working directory's path's length, its NUL counted */
 
 /* Error numbers (Linux's values); a call returns minus one of them. */
 #define EPERM 1         /* link: not for a directory; kill: not a kernel process; ftruncate, fcntl: a seal */
@@ -107,7 +108,8 @@
 #define ESPIPE 29       /* lseek: not on a pipe or a device */
 #define EROFS 30        /* the filesystem is read-only */
 #define EPIPE 32        /* write: a pipe nobody reads any more */
-#define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH */
+#define ERANGE 34       /* getcwd: the buffer is too small for the path */
+#define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH; getcwd: a path longer than a page */
 #define ENOSYS 38       /* no such system call */
 #define ENOTEMPTY 39    /* unlink: a directory with entries */
 #define EOVERFLOW 75    /* open: a file bigger than the kernel's offsets reach; mmap: past the largest object */

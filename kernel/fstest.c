@@ -21,7 +21,9 @@
  *   /fstest/big (13 KiB + 100 bytes) 3 KiB per transaction, removing x
  *   while holding a reference to it (an inode with no links until the next
  *   transaction frees it) part way, after which big goes on growing next to
- *   its last block rather than in x's freed one; make and remove /fstest/d;
+ *   its last block rather than in x's freed one; make /fstest/d, take its
+ *   path with fs_getcwd() (getcwd's) into buffers that fit it with room to
+ *   spare, exactly or not at all, and remove it;
  *   have two kernel processes make /fstest/p1 and p2 at once (their
  *   operations share one transaction: group commit), then more processes
  *   make begin_op() wait for room in the log and for a commit; read
@@ -600,6 +602,46 @@ static u32 nlink(const char *p) {
     return n;
 }
 
+/* fs_getcwd() with buffers too small for a page-long path, which the root
+ * image's inodes can't reach (getcwd's limit, Linux's: a page, its NUL
+ * counted): this kernel process's working directory made /fstest/d, whose
+ * path "/fstest/d" and its NUL take 10 bytes. It is built at the end of
+ * the buffer: 13 bytes leave 3 before it, 10 fit it exactly, 9 are
+ * -ENAMETOOLONG; the root's "/" fits 2. And every reference fs_getcwd()
+ * took is put back, the paths that fail too. */
+static void getcwd_test(void) {
+    int err;
+    begin_op();
+    struct inode *d = namei("/fstest/d", &err);
+    struct inode *parent = namei("/fstest", &err);
+    end_op();
+    check(d != NULL && parent != NULL, "find /fstest/d for getcwd");
+    if (d == NULL || parent == NULL) {
+        return;
+    }
+    /* The working directory takes the reference namei() gave. */
+    struct inode *old = proc_set_cwd(d);
+    u32 d_ref = d->ref;
+    u32 parent_ref = parent->ref;
+    char buf[16];
+    begin_op();
+    int at13 = fs_getcwd(buf, 13);
+    check(at13 == 3 && strcmp(buf + 3, "/fstest/d") == 0, "getcwd: /fstest/d at the end of 13 bytes");
+    int at10 = fs_getcwd(buf, 10);
+    check(at10 == 0 && strcmp(buf, "/fstest/d") == 0, "getcwd: /fstest/d and its NUL fit 10 bytes");
+    check(fs_getcwd(buf, 9) == -ENAMETOOLONG, "getcwd: not 9");
+    check(fs_getcwd(buf, 2) == -ENAMETOOLONG, "getcwd: nor 2");
+    end_op();
+    check(d->ref == d_ref && parent->ref == parent_ref, "getcwd puts back what it took");
+    begin_op();
+    struct inode *mine = proc_set_cwd(old);
+    iput(mine);
+    int at_root = fs_getcwd(buf, 2);
+    check(at_root == 0 && strcmp(buf, "/") == 0, "getcwd: the root's / fits 2 bytes");
+    iput(parent);
+    end_op();
+}
+
 static void write_test(void) {
     u32 blocks0;
     u32 inodes0;
@@ -699,6 +741,7 @@ static void write_test(void) {
     }
     end_op();
     check(nlink("/fstest") == 2 && nlink("/fstest/d") == 1, "a subdirectory links to its parent");
+    getcwd_test();
     begin_op();
     check(fs_unlink("/fstest/d") == 0, "remove the empty /fstest/d");
     end_op();

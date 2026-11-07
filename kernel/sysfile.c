@@ -17,7 +17,9 @@
 #include "sysfile.h"
 #include "file.h"
 #include "fs.h"
+#include "kalloc.h"
 #include "log.h"
+#include "memlayout.h"
 #include "pipe.h"
 #include "proc.h"
 #include "shm.h"
@@ -205,6 +207,45 @@ long sys_stat(struct trap_frame *f) {
     end_op();
     /* Checked above, but another thread may have unmapped it since. */
     return copyout(pt, arg(f, 1), &st, sizeof st) == 0 ? 0 : -EFAULT;
+}
+
+long sys_getcwd(struct trap_frame *f) {
+    /* Linux's getcwd: the path, built in a page (Linux's limit, longer
+     * than MAXPATH: a directory reached by relative chdir()s may be deeper
+     * than any path a call takes), then copied out with its NUL if it fits,
+     * the length returned with the NUL counted. */
+    pagetable_t pt = myproc()->pagetable;
+    uintptr buf = arg(f, 0);
+    u64 size = arg(f, 1);
+    char *page = kalloc();
+    if (page == NULL) {
+        return -ENOMEM;
+    }
+    int at;
+    if (!fs_mounted) {
+        /* No disk: the root, where every process is. */
+        at = PGSIZE - 2;
+        page[at] = '/';
+        page[at + 1] = 0;
+    } else {
+        /* A transaction for iput(), which frees an inode removed
+         * meanwhile. */
+        begin_op();
+        at = fs_getcwd(page, PGSIZE);
+        end_op();
+    }
+    long ret = at;
+    if (at >= 0) {
+        /* The path's length, its NUL counted. */
+        u64 len = PGSIZE - (u64)at;
+        if (len > size) {
+            ret = -ERANGE;
+        } else {
+            ret = copyout(pt, buf, page + at, len) == 0 ? (long)len : -EFAULT;
+        }
+    }
+    kfree(page);
+    return ret;
 }
 
 long sys_memfd_create(struct trap_frame *f) {

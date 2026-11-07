@@ -436,6 +436,9 @@ void syscall(struct trap_frame *f) {
     case SYS_stat:
         ret = sys_stat(f);
         break;
+    case SYS_getcwd:
+        ret = sys_getcwd(f);
+        break;
     default:
         ret = -ENOSYS;
         break;

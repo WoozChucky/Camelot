@@ -81,7 +81,8 @@ typedef unsigned long long uint64_t;
 #define ESPIPE 29       /* lseek: not on a pipe or a device */
 #define EROFS 30        /* the filesystem is read-only */
 #define EPIPE 32        /* write: a pipe nobody reads any more */
-#define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH */
+#define ERANGE 34       /* getcwd: the buffer is too small for the path */
+#define ENAMETOOLONG 36 /* a name longer than DIRSIZ, or a path longer than MAXPATH; getcwd: a path longer than a page */
 #define ENOSYS 38       /* no such system call */
 #define ENOTEMPTY 39    /* unlink: a directory with entries */
 #define EOVERFLOW 75    /* open: a file bigger than the kernel's offsets reach; mmap: past the largest object */
@@ -800,6 +801,14 @@ int socketpair(int domain, int type, int protocol, int *fds);
 ssize_t sendmsg(int fd, const struct msghdr *msg, int flags);
 ssize_t recvmsg(int fd, struct msghdr *msg, int flags);
 int stat(const char *path, struct stat *st);
+/* The working directory's path, written to buf with its NUL (Linux's
+ * getcwd system call): returns its length, the NUL counted, or -ERANGE if
+ * size bytes don't hold it, -ENOENT if the directory was removed,
+ * -ENAMETOOLONG if the path is longer than a page (4096 bytes with its
+ * NUL), -ENOMEM if the kernel has no page to build it in, -EFAULT if buf
+ * can't take it. Where glibc's getcwd() returns buf and sets errno, this
+ * one returns the length or the error, as the rest of this library does. */
+long getcwd(char *buf, size_t size);
 /* Any call by number (for tests): its result, a long, as the kernel left
  * it in a0. */
 long syscall(long number, long a0, long a1, long a2);

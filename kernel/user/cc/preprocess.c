@@ -341,6 +341,9 @@ struct file {
     /* For #pragma once and for finding the files it includes (never a
      * NUL: a header's name with one is no file). */
     const char *path;
+    /* Its contents' MD5, for -g (merlin's File::md5): none for a name
+     * #line gives, or when options.checksums does not ask for it. */
+    struct checksum sum;
 };
 
 /* A file being read. */
@@ -652,11 +655,20 @@ static void report_all(struct pp *pp, struct diag *list) {
     }
 }
 
-static uint new_file(struct pp *pp, const char *name, uint namelen, const char *path) {
+/* A new file, its number: text (len bytes) is what was read of it, whose
+ * MD5 -g's line table gives (NULL for a name #line gives, which has
+ * none). */
+static uint new_file(struct pp *pp, const char *name, uint namelen, const char *path, const char *text, uint len) {
     pp->files = grow(pp->files, &pp->capfiles, pp->nfiles + 1, sizeof(struct file));
-    pp->files[pp->nfiles].name = name;
-    pp->files[pp->nfiles].namelen = namelen;
-    pp->files[pp->nfiles].path = path;
+    struct file *f = &pp->files[pp->nfiles];
+    f->name = name;
+    f->namelen = namelen;
+    f->path = path;
+    memset(&f->sum, 0, sizeof f->sum);
+    if (text != NULL && pp->opts->checksums) {
+        f->sum.has = 1;
+        md5((const uchar *)text, len, f->sum.sum);
+    }
     return pp->nfiles++;
 }
 
@@ -2482,7 +2494,7 @@ static struct diag *include(struct pp *pp, struct pptok *dir, struct pptok *args
         heap_free(text);
         return diag_error(pos, "#include nested too deeply");
     }
-    uint id = new_file(pp, name, namelen, path);
+    uint id = new_file(pp, name, namelen, path, text, len);
     struct lexed lx;
     lex_pp(text, len, id, pp->asm, &lx);
     if (lx.error != NULL) {
@@ -2600,7 +2612,7 @@ static void renumber(struct pp *pp, struct pptok *dir, uint n, const char *renam
     if (rename != NULL) {
         /* A name #line gives has no checksum, as clang's: its contents are
          * not what is read. */
-        uint id = new_file(pp, rename, renamelen, pp->files[c->file].path);
+        uint id = new_file(pp, rename, renamelen, pp->files[c->file].path, NULL, 0);
         c = top(pp);
         c->file = id;
     }
@@ -3256,7 +3268,7 @@ static void emit(struct pp *pp, struct ptok *t) {
 /* Reads a made-up file holding only directives (the predefined macros, the
  * command line's); its number in *id. */
 static struct diag *read_directives(struct pp *pp, const char *name, const char *text, uint *id) {
-    *id = new_file(pp, name, (uint)strlen(name), name);
+    *id = new_file(pp, name, (uint)strlen(name), name, text, (uint)strlen(text));
     struct lexed lx;
     lex_pp(text, (uint)strlen(text), *id, 0, &lx);
     if (lx.error != NULL) {
@@ -3377,9 +3389,11 @@ static void pp_free(struct pp *pp) {
 static void file_names(struct pp *pp, struct pp_output *out) {
     out->files = heap_alloc((pp->nfiles + 1) * sizeof(char *));
     out->lens = heap_alloc((pp->nfiles + 1) * sizeof(uint));
+    out->sums = heap_alloc((pp->nfiles + 1) * sizeof(struct checksum));
     for (uint i = 0; i < pp->nfiles; i++) {
         out->files[i] = pp->files[i].name;
         out->lens[i] = pp->files[i].namelen;
+        out->sums[i] = pp->files[i].sum;
     }
     out->nfiles = pp->nfiles;
 }
@@ -3396,7 +3410,7 @@ int preprocess_unit(const char *name, const char *src, uint n, struct options *o
     pp->opts = opts;
     pp->asm = opts->lang == LANG_ASM;
     pp->collect = 1;
-    new_file(pp, name, (uint)strlen(name), normalize(name));
+    new_file(pp, name, (uint)strlen(name), normalize(name), src, n);
     struct diag *e = run(pp, src, n);
     memset(out, 0, sizeof *out);
     file_names(pp, out);
@@ -3431,7 +3445,7 @@ int preprocess_text(const char *name, const char *src, uint n, struct options *o
     struct pp *pp = heap_calloc(1, sizeof(struct pp));
     pp->opts = opts;
     pp->asm = opts->lang == LANG_ASM;
-    new_file(pp, name, (uint)strlen(name), normalize(name));
+    new_file(pp, name, (uint)strlen(name), normalize(name), src, n);
     pp->print.out = out;
     pp->print.line = 1;
     pp->print.entered = 1;

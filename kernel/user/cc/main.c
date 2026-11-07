@@ -1,10 +1,9 @@
 /* cc1: `cc1 [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]]
- * [-U name] [-g] [-x LANG] [-E [-P] | --dump-ast] input.c...`, merlin's
- * command line (follows merlin's main.rs and lib.rs): the preprocessor
- * (-E, of C and of assembly: `.S`, `-x assembler-with-cpp`), the syntax
- * tree (--dump-ast) and the compiler, C to assembly. -g, the debugging
- * information, is refused for now when compiling, with a message saying
- * so: it comes with merlin's debug.rs. */
+ * [-U name] [-g [-fdebug-compilation-dir=DIR]] [-x LANG] [-E [-P] |
+ * --dump-ast] input.c...`, merlin's command line (follows merlin's main.rs
+ * and lib.rs): the preprocessor (-E, of C and of assembly: `.S`, `-x
+ * assembler-with-cpp`), the syntax tree (--dump-ast) and the compiler, C to
+ * assembly, with -g its debugging information (debug.c). */
 #include "cc.h"
 
 static const char USAGE[] = "usage: cc1 [options] input.c...\n"
@@ -290,92 +289,6 @@ static int check(struct pp_output *pp, struct program *prog, struct vec *errors)
     return 0;
 }
 
-/* The base name of the file being compiled, as LLVM's sys::path::filename
- * has it (POSIX style, merlin-as's dwarf::file_name): the last component,
- * a trailing `/` being the component `.`, a root directory alone `/`. */
-static uint root_dir_start(const char *p, int *has) {
-    uint n = (uint)strlen(p);
-    *has = 0;
-    if (n > 3 && p[0] == '/' && p[1] == '/' && p[2] != '/') {
-        const char *s = strchr(p + 2, '/');
-        if (s == NULL) {
-            return 0;
-        }
-        *has = 1;
-        return (uint)(s - p);
-    }
-    if (n > 0 && p[0] == '/') {
-        *has = 1;
-    }
-    return 0;
-}
-
-static uint filename_pos(const char *p, uint n) {
-    if (n > 0 && p[n - 1] == '/') {
-        return n - 1;
-    }
-    int last = -1;
-    for (uint i = 0; i < n; i++) {
-        if (p[i] == '/') {
-            last = (int)i;
-        }
-    }
-    if (last < 0) {
-        return 0;
-    }
-    if (last == 1 && p[0] == '/') {
-        return 0;
-    }
-    return (uint)last + 1;
-}
-
-static const char *file_name(const char *p) {
-    uint n = (uint)strlen(p);
-    int has_root;
-    uint root = root_dir_start(p, &has_root);
-    /* Skip the trailing separators, unless one is the root directory. */
-    uint end = n;
-    while (end > 0 && !(has_root && end - 1 == root) && p[end - 1] == '/') {
-        end--;
-    }
-    if (n > 0 && p[n - 1] == '/' && (!has_root || end > root + 1)) {
-        return ".";
-    }
-    uint start = filename_pos(p, end);
-    return arena_strndup(p + start, end - start);
-}
-
-/* A string as the assembler reads one, quoted (merlin's debug::quoted). */
-static void quoted(struct buf *b, const char *s) {
-    buf_byte(b, '"');
-    for (; *s; s++) {
-        uint c = (uchar)*s;
-        if (c == '"') {
-            buf_str(b, "\\\"");
-        } else if (c == '\\') {
-            buf_str(b, "\\\\");
-        } else if (c >= 0x20 && c <= 0x7e) {
-            buf_byte(b, c);
-        } else if (c == 8) {
-            buf_str(b, "\\b");
-        } else if (c == 12) {
-            buf_str(b, "\\f");
-        } else if (c == '\n') {
-            buf_str(b, "\\n");
-        } else if (c == '\r') {
-            buf_str(b, "\\r");
-        } else if (c == '\t') {
-            buf_str(b, "\\t");
-        } else {
-            buf_byte(b, '\\');
-            buf_byte(b, '0' + (c >> 6));
-            buf_byte(b, '0' + (c >> 3 & 7));
-            buf_byte(b, '0' + (c & 7));
-        }
-    }
-    buf_byte(b, '"');
-}
-
 /* Prints a list of diagnostics, as clang does. */
 static void print_all(struct vec *ds, const char *input) {
     for (uint i = 0; i < ds->n; i++) {
@@ -385,8 +298,10 @@ static void print_all(struct vec *ds, const char *input) {
 
 /* Compiles (or dumps) one translation unit (merlin's compile_warned and
  * parse_with): 1 and the text in *text with its warnings printed, or 0
- * with every diagnostic printed. */
-static int compile_unit(const char *name, const char *src, uint n, struct options *opts, int dump, struct buf *text) {
+ * with every diagnostic printed. comp_dir: with -g, the compilation
+ * directory; else NULL. */
+static int compile_unit(const char *name, const char *src, uint n, struct options *opts, int dump,
+                        const char *comp_dir, struct buf *text) {
     struct pp_output pp;
     if (!preprocess_unit(name, src, n, opts, &pp)) {
         for (uint i = 0; i < pp.ndiags; i++) {
@@ -407,14 +322,24 @@ static int compile_unit(const char *name, const char *src, uint n, struct option
         print_all(&prog.warnings, name);
         return 1;
     }
-    /* `.file "NAME"`, the first line of the assembly, as clang writes it:
-     * the base name of the file being compiled (merlin's file_directive);
-     * the code generator's text after it. */
+    /* `.file "NAME"`, the first line of the assembly, as clang writes it with
+     * or without -g: the base name of the file being compiled (merlin's
+     * file_directive), whatever #line says; the code generator's text after
+     * it. The assembler makes it the object's STT_FILE symbol; it has
+     * nothing to do with the numbered .files of a line table. */
+    uint base_len;
+    const char *base = path_file_name(name, (uint)strlen(name), &base_len);
     buf_str(text, "    .file ");
-    quoted(text, file_name(name));
+    quote(text, base, base_len);
     buf_byte(text, '\n');
+    /* -g: the files the preprocessor read, what the .file directives say
+     * of them. */
+    struct lines *debug = NULL;
+    if (comp_dir != NULL) {
+        debug = debug_new(comp_dir, pp.files, pp.lens, pp.sums, pp.nfiles);
+    }
     struct diag *error;
-    if (!codegen_generate(&prog, text, &error)) {
+    if (!codegen_generate(&prog, debug, text, &error)) {
         diag_name_files(error, pp.files, pp.lens, pp.nfiles);
         print_all(&prog.warnings, name);
         diag_print(error, name);
@@ -459,7 +384,7 @@ static int write_output(const char *output, struct buf *text) {
 
 /* Compiles or dumps one input file (merlin's translate): 0, or the exit
  * status of a failure. */
-static int compile_file(struct input *in, const char *output, struct options *opts, int dump) {
+static int compile_file(struct input *in, const char *output, struct options *opts, int dump, const char *comp_dir) {
     uint len = 0;
     char *src = read_input(in, &len);
     if (src == NULL) {
@@ -469,7 +394,7 @@ static int compile_file(struct input *in, const char *output, struct options *op
     struct buf text;
     memset(&text, 0, sizeof text);
     int status = 1;
-    if (compile_unit(in->name, src, len, opts, dump, &text)) {
+    if (compile_unit(in->name, src, len, opts, dump, comp_dir, &text)) {
         /* Without -o: the input with .s for .c (or added), or for
          * --dump-ast standard output. */
         const char *out = output;
@@ -512,6 +437,29 @@ static int translate(struct input *in, const char *output, struct options *opts)
     return status;
 }
 
+/* The directory cc1 runs in, as merlin's std::env::current_dir finds it:
+ * the getcwd system call, with a buffer that grows until the path fits (a
+ * page is the kernel's limit). NULL if it fails (the directory removed,
+ * say): the caller then uses `.`, as merlin does. For the whole run: plain
+ * malloc, not the arena, which each translation unit frees. */
+static char *current_dir(void) {
+    for (uint size = 256; size <= 4096; size *= 2) {
+        char *buf = malloc(size);
+        if (buf == NULL) {
+            die("out of memory");
+        }
+        long n = getcwd(buf, size);
+        if (n > 0) {
+            return buf;
+        }
+        free(buf);
+        if (n != -ERANGE) {
+            break;
+        }
+    }
+    return NULL;
+}
+
 /* The value of an option written `-I dir` or `-Idir` (the same for -D, -U,
  * -o and -x): what follows the flag in the argument, or the next argument;
  * NULL if there is none. */
@@ -545,6 +493,7 @@ int main(int argc, char **argv) {
     }
     const char *abi = NULL;
     int debug = 0;
+    const char *comp_dir = NULL;
     /* -x LANG applies to the inputs after it, as in clang; -1 goes by each
      * file's name. */
     int lang = -1;
@@ -563,8 +512,11 @@ int main(int argc, char **argv) {
                     return usage_error("-fdebug-compilation-dir needs a directory");
                 }
                 i++;
+                comp_dir = argv[i];
             } else if (*v != '=') {
                 return usage_error(fmt("unknown option %s", a));
+            } else {
+                comp_dir = v + 1;
             }
         } else if (strcmp(a, "--dump-ast") == 0) {
             mode = MODE_DUMP_AST;
@@ -640,16 +592,22 @@ int main(int argc, char **argv) {
                                    inputs[i].name));
         }
     }
-    /* -g is merlin's debug information, which comes with the next stage of
-     * cc1 (#241); it changes nothing -E writes. */
-    if (debug && mode == MODE_COMPILE) {
-        fprintf(2, "cc1: -g is not here yet: debug information comes with merlin's debug.rs\n");
-        return 2;
+    /* -g: the compilation directory, by default the directory cc1 runs in
+     * (or `.` if it cannot be found). Each file read has its MD5 taken, for
+     * the line table. (It changes nothing -E or --dump-ast writes.) */
+    if (debug) {
+        if (comp_dir == NULL) {
+            char *cwd = current_dir();
+            comp_dir = cwd != NULL ? cwd : ".";
+        }
+        opts.checksums = 1;
+    } else {
+        comp_dir = NULL;
     }
     int status = 0;
     for (uint i = 0; i < ninputs; i++) {
         int r = mode == MODE_PREPROCESS ? translate(&inputs[i], output, &opts)
-                                        : compile_file(&inputs[i], output, &opts, mode == MODE_DUMP_AST);
+                                        : compile_file(&inputs[i], output, &opts, mode == MODE_DUMP_AST, comp_dir);
         if (r != 0) {
             status = r;
         }

@@ -16,7 +16,8 @@
  *                     fails with -EROFS and reading still works; prints
  *                     "filetest: N checks, F failed" too
  *   filetest incwd    a child: exits 0 if its working directory holds a
- *                     file `c` (its parent's working directory: inherited)
+ *                     file `c` and getcwd says it is /ft/d (its parent's
+ *                     working directory: inherited)
  *   filetest hold T   a child: holds files open (see hold()) */
 #include "user.h"
 
@@ -315,8 +316,67 @@ static void test_directories(void) {
     check_eq(close(fd), 0, "close it: it goes");
 }
 
+/* Whether getcwd() says the working directory is `want`: the length, its
+ * NUL counted, and the path. */
+static void check_cwd(const char *want, const char *what) {
+    char cwd[MAXPATH + 1];
+    memset(cwd, 'x', sizeof cwd);
+    long n = getcwd(cwd, sizeof cwd);
+    check_eq(n, (long)strlen(want) + 1, what);
+    check(n > 0 && strcmp(cwd, want) == 0, what);
+}
+
+/* getcwd(), Linux's: the path from the root, its length with its NUL; the
+ * root's is "/"; -ERANGE for a buffer too small for it, NUL included, and
+ * -ENOENT once the directory is removed (test_working_directory). */
+static void test_getcwd(void) {
+    check_cwd("/ft", "getcwd in /ft");
+    check_eq(chdir("/"), 0, "chdir /");
+    check_cwd("/", "getcwd at the root");
+    char cwd[8];
+    check_eq(getcwd(cwd, 2), 2, "the root's path in 2 bytes");
+    check_eq(getcwd(cwd, 1), -ERANGE, "not in 1");
+    check_eq(getcwd(cwd, 0), -ERANGE, "nor in none");
+    check_eq(chdir("ft"), 0, "chdir ft");
+    check_eq(mkdir("n"), 0, "mkdir n");
+    check_eq(mkdir("n/abcdefghijklmn"), 0, "mkdir a name of DIRSIZ bytes");
+    check_eq(chdir("n/abcdefghijklmn"), 0, "chdir into it");
+    check_cwd("/ft/n/abcdefghijklmn", "getcwd two levels down, a full name");
+    check_eq(chdir(".."), 0, "chdir ..");
+    check_cwd("/ft/n", "getcwd after ..");
+    check_eq(getcwd(cwd, 6), 6, "the path in its length and NUL");
+    check(strcmp(cwd, "/ft/n") == 0, "all of it");
+    memset(cwd, 'x', sizeof cwd);
+    check_eq(getcwd(cwd, 5), -ERANGE, "not without room for the NUL");
+    check(cwd[0] == 'x', "nothing written then");
+    /* Deeper than any path a call takes (MAXPATH): relative chdir()s get
+     * there, and getcwd() still gives the path. */
+    static const char deep[] = "/ft/n/abcdefghijklmn/abcdefghijklmn/abcdefghijklmn/abcdefghijklmn"
+                               "/abcdefghijklmn/abcdefghijklmn/abcdefghijklmn/abcdefghijklmn/abcdefghijklmn";
+    for (int i = 0; i < 9; i++) {
+        if (i > 0) {
+            check_eq(mkdir("abcdefghijklmn"), 0, "mkdir a level deeper");
+        }
+        check_eq(chdir("abcdefghijklmn"), 0, "chdir a level deeper");
+    }
+    char long_cwd[256];
+    check(sizeof deep - 1 > MAXPATH, "deeper than MAXPATH");
+    check_eq(getcwd(long_cwd, sizeof long_cwd), (long)sizeof deep, "getcwd past MAXPATH");
+    check(strcmp(long_cwd, deep) == 0, "the whole path");
+    check_eq(getcwd(long_cwd, sizeof deep - 1), -ERANGE, "one byte short");
+    for (int i = 0; i < 8; i++) {
+        check_eq(chdir(".."), 0, "chdir .. back up");
+        check_eq(unlink("abcdefghijklmn"), 0, "remove a level");
+    }
+    check_eq(chdir("/ft"), 0, "chdir /ft");
+    check_eq(unlink("n/abcdefghijklmn"), 0, "remove n/abcdefghijklmn");
+    check_eq(unlink("n"), 0, "remove n");
+    check_cwd("/ft", "getcwd in /ft again");
+}
+
 static void test_working_directory(void) {
     struct stat st;
+    test_getcwd();
     check_eq(chdir("d"), 0, "chdir");
     int fd = open("c", O_WRONLY | O_CREAT);
     check(fd >= 0, "create a file there");
@@ -338,6 +398,9 @@ static void test_working_directory(void) {
     check_eq(mkdir("gone"), 0, "mkdir gone");
     check_eq(chdir("gone"), 0, "chdir gone");
     check_eq(unlink("/ft/gone"), 0, "remove it while it is the working directory");
+    char cwd[MAXPATH + 1];
+    check_eq(getcwd(cwd, sizeof cwd), -ENOENT, "it has no path");
+    check_eq(getcwd(cwd, 1), -ENOENT, "whatever the buffer");
     check_eq(open("x", O_WRONLY | O_CREAT), -ENOENT, "no file can be made in it");
     check_eq(mkdir("y"), -ENOENT, "nor a directory");
     check_eq(link("/bin/sh", "z"), -ENOENT, "nor a link");
@@ -353,7 +416,9 @@ static void test_working_directory(void) {
     check_eq(chdir("pa/b"), 0, "chdir pa/b");
     check_eq(unlink("/ft/pa/b"), 0, "remove the working directory");
     check_eq(chdir(".."), -ENOENT, "its .. is not found while the parent is there");
+    check_eq(getcwd(cwd, sizeof cwd), -ENOENT, "nor its path");
     check_eq(unlink("/ft/pa"), 0, "remove its parent: it goes");
+    check_eq(getcwd(cwd, sizeof cwd), -ENOENT, "nor after that");
     check_eq(chdir(".."), -ENOENT, "chdir .. after that");
     check_eq(open("..", O_RDONLY), -ENOENT, "open .. after that");
     check_eq(mkdir("/ft/pc"), 0, "a new directory, maybe in the parent's old inode");
@@ -639,7 +704,9 @@ int main(int argc, char **argv) {
     }
     if (argc > 1 && strcmp(argv[1], "incwd") == 0) {
         struct stat st;
-        return stat("c", &st) == 0 ? 0 : 1;
+        char cwd[MAXPATH + 1];
+        int there = getcwd(cwd, sizeof cwd) == 6 && strcmp(cwd, "/ft/d") == 0;
+        return stat("c", &st) == 0 && there ? 0 : 1;
     }
     if (argc > 2 && strcmp(argv[1], "hold") == 0) {
         return hold(argv[2][0]);
