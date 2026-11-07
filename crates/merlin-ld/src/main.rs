@@ -42,8 +42,9 @@ fn main() -> ExitCode {
     let mut args = match excalibur::response::expand(std::env::args().skip(1)) {
         Ok(args) => args.into_iter(),
         Err(e) => {
-            eprintln!("merlin-ld: {e}");
-            return ExitCode::from(2);
+            // LLVM's tools say it alone, and exit 1.
+            eprintln!("{e}");
+            return ExitCode::from(1);
         }
     };
     while let Some(a) = args.next() {

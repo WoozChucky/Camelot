@@ -2242,9 +2242,9 @@ fn command_line() {
         .arg(format!("@{}", args.display()))
         .output()
         .unwrap();
-    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(o.status.code(), Some(1));
     assert!(
-        String::from_utf8_lossy(&o.stderr).contains("recursive expansion of: '"),
+        String::from_utf8_lossy(&o.stderr).starts_with("recursive expansion of: '"),
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );

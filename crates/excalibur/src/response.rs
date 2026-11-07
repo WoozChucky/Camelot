@@ -32,9 +32,46 @@ fn is_separator(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
 
+/// A response file's text as LLVM reads it: a UTF-8 byte-order mark left
+/// out, and UTF-16 with one (either byte order) made UTF-8.
+pub fn decode(bytes: &[u8]) -> Vec<u8> {
+    let utf16 = |be: bool| {
+        let units: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| {
+                if be {
+                    u16::from_be_bytes(c)
+                } else {
+                    u16::from_le_bytes(c)
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&units).into_bytes()
+    };
+    match bytes {
+        [0xef, 0xbb, 0xbf, rest @ ..] => rest.to_vec(),
+        [0xff, 0xfe, ..] => utf16(false),
+        [0xfe, 0xff, ..] => utf16(true),
+        _ => bytes.to_vec(),
+    }
+}
+
 /// The arguments the text of a response file holds, by LLVM's GNU rules
-/// (see the module's).
+/// (see the module's). An argument ends at a NUL byte in it, as LLVM's,
+/// which are C strings, end there; the reading goes on after it.
 pub fn tokenize(text: &[u8]) -> Vec<Vec<u8>> {
+    let mut args = raw_tokens(text);
+    for a in &mut args {
+        if let Some(nul) = a.iter().position(|&b| b == 0) {
+            a.truncate(nul);
+        }
+    }
+    args
+}
+
+fn raw_tokens(text: &[u8]) -> Vec<Vec<u8>> {
     let mut args = Vec::new();
     let mut arg: Vec<u8> = Vec::new();
     // Whether an argument has started: `""` makes an empty one.
@@ -103,7 +140,7 @@ pub fn absolute(path: &Path) -> PathBuf {
 
 /// `args` with every `@FILE` replaced by the arguments of FILE, expanded in
 /// turn, by the rules of the module. The error is LLVM's message (see the
-/// module's), for the tool to print after its name.
+/// module's), which a tool prints alone and exits 1 for, as LLVM's do.
 pub fn expand(args: impl IntoIterator<Item = String>) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut open: Vec<PathBuf> = Vec::new();
@@ -114,11 +151,18 @@ pub fn expand(args: impl IntoIterator<Item = String>) -> Result<Vec<String>, Str
 }
 
 fn expand_into(arg: String, out: &mut Vec<String>, open: &mut Vec<PathBuf>) -> Result<(), String> {
-    let Some(file) = arg.strip_prefix('@').filter(|f| !f.is_empty()) else {
+    let Some(file) = arg.strip_prefix('@') else {
         out.push(arg);
         return Ok(());
     };
+    // `@` alone names the working directory, as LLVM's name for it does
+    // (its name appended to the working directory): a directory, an error.
     let path = absolute(Path::new(file));
+    let file = if file.is_empty() {
+        path.as_path()
+    } else {
+        Path::new(file)
+    };
     let text = match std::fs::metadata(file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             out.push(arg);
@@ -136,7 +180,7 @@ fn expand_into(arg: String, out: &mut Vec<String>, open: &mut Vec<PathBuf>) -> R
         return Err(format!("recursive expansion of: '{}'", path.display()));
     }
     open.push(path);
-    for word in tokenize(&text) {
+    for word in tokenize(&decode(&text)) {
         expand_into(String::from_utf8_lossy(&word).into_owned(), out, open)?;
     }
     open.pop();
@@ -218,10 +262,24 @@ mod tests {
             expand([at("a"), "z".into()]).unwrap(),
             ["-x", "b 1", "b2", "-y", "z"]
         );
+        assert_eq!(expand([at("missing")]).unwrap(), [at("missing")]);
+        let cwd = absolute(Path::new("")).display().to_string();
         assert_eq!(
-            expand([at("missing"), "@".into()]).unwrap(),
-            [at("missing"), "@".to_string()]
+            expand(["@".to_string()]).unwrap_err(),
+            format!("cannot not open file '{cwd}': is a directory")
         );
+        // A UTF-8 byte-order mark left out, UTF-16 read, a NUL ending an
+        // argument.
+        std::fs::write(dir.join("bom"), b"\xef\xbb\xbf-DBOM=1 x").unwrap();
+        assert_eq!(expand([at("bom")]).unwrap(), ["-DBOM=1", "x"]);
+        let utf16: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain("-Da b".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        std::fs::write(dir.join("u16"), utf16).unwrap();
+        assert_eq!(expand([at("u16")]).unwrap(), ["-Da", "b"]);
+        std::fs::write(dir.join("nulbyte"), b"a\0b c").unwrap();
+        assert_eq!(expand([at("nulbyte")]).unwrap(), ["a", "c"]);
         let abs = |name: &str| absolute(&dir.join(name)).display().to_string();
         assert_eq!(
             expand([at("sub")]).unwrap_err(),

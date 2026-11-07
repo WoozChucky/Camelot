@@ -82,13 +82,14 @@ static int write_file(const char *path, const uchar *data, uint len) {
 
 /* The arguments after argv[0], each @FILE replaced by the arguments of
  * FILE (the C library's expand_response_files, as ld.lld reads them: how
- * a link line longer than the shell takes is given). 0 after a message. */
+ * a link line longer than the shell takes is given). 0 after the message,
+ * said alone, as ld.lld says it (and exits 1). */
 static int expand(int argc, char **argv, char ***out, uint *n) {
     char error[512];
     int count = 0;
     char **all = expand_response_files(argc, argv, &count, error, sizeof error);
     if (all == NULL) {
-        fprintf(2, "ld: %s\n", error);
+        fprintf(2, "%s\n", error);
         return 0;
     }
     *out = all + 1;
@@ -140,7 +141,7 @@ int main(int argc, char **argv) {
     char **args;
     uint nargs;
     if (!expand(argc, argv, &args, &nargs)) {
-        return 2;
+        return 1;
     }
     struct arg_input *names = xcalloc((nargs + 1) * sizeof(struct arg_input));
     uint nnames = 0;

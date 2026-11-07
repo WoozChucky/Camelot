@@ -121,13 +121,14 @@ static int write_file(const char *path, const uchar *data, uint len) {
 
 /* The arguments after argv[0], each @FILE replaced by the arguments of
  * FILE (the C library's expand_response_files, as llvm-ar reads them: for
- * more members than the shell takes). 0 after a message. */
+ * more members than the shell takes). 0 after the message, said alone, as
+ * llvm-ar says it. */
 static int expand(int argc, char **argv, char ***out, uint *n) {
     char error[512];
     int count = 0;
     char **all = expand_response_files(argc, argv, &count, error, sizeof error);
     if (all == NULL) {
-        fprintf(2, "ar: error: %s\n", error);
+        fprintf(2, "%s\n", error);
         return 0;
     }
     *out = all + 1;
