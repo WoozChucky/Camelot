@@ -2730,6 +2730,15 @@ fn cc1_takes_merlins_command_line() {
     // only the root with it, and a network name.
     let line = |name: &str| format!("int f(void) {{\n#line 7 \"{name}\"\n    return 1;\n}}\n");
     let (la, lb, lc) = (line("/abs/m.c"), line("/abs/x/m.c"), line("//net/x/m.c"));
+    // A directory 137 bytes deep, nine names of DIRSIZ bytes under /d.
+    const DEEP: &str = "/d/abcdefghijkl01/abcdefghijkl02/abcdefghijkl03/abcdefghijkl04/abcdefghijkl05\
+                        /abcdefghijkl06/abcdefghijkl07/abcdefghijkl08/abcdefghijkl09";
+    let deep_dirs: Vec<&str> = DEEP
+        .match_indices('/')
+        .skip(2)
+        .map(|(i, _)| &DEEP[..i])
+        .chain([DEEP])
+        .collect();
     let files = [
         ("/d/a.c".to_string(), a.as_bytes().to_vec()),
         ("/d/b.S".to_string(), b.as_bytes().to_vec()),
@@ -2746,6 +2755,34 @@ fn cc1_takes_merlins_command_line() {
             "/d/w.c".to_string(),
             b"int f(void) {\n    return 1 << 40;\n}\n".to_vec(),
         ),
+        // Two, for clang's warning groups.
+        (
+            "/d/g.c".to_string(),
+            b"int f(unsigned char c) { return c > 300; }\nint g(int x) { if (x) return 1; }\n".to_vec(),
+        ),
+        // C preprocessed, with directives that are not run.
+        (
+            "/d/pp.i".to_string(),
+            b"# 1 \"orig.c\"\n#define X 1\nint a = X;\nint __riscv = 2;\n#pragma once\n#line 40 \"z.c\"\nint b = Y;\n"
+                .to_vec(),
+        ),
+        // C preprocessed, compiled to p.s without -o.
+        ("/d/p.i".to_string(), a.replace("#define A 1\n", "").replace("= A", "= 1").into_bytes()),
+        // Response files as LLVM reads them: a UTF-8 byte-order mark left
+        // out, UTF-16 made UTF-8, a NUL ending an argument (`-E`, then
+        // `/d/a.c`, the rest read on).
+        ("/d/bom".to_string(), b"\xef\xbb\xbf-E /d/a.c\n".to_vec()),
+        (
+            "/d/u16".to_string(),
+            [0xffu8, 0xfe]
+                .into_iter()
+                .chain("-E /d/a.c\n".encode_utf16().flat_map(u16::to_le_bytes))
+                .collect(),
+        ),
+        ("/d/nul".to_string(), b"-E\0junk /d/a.c\n".to_vec()),
+        // A response file in a directory deeper than 127 bytes, which names
+        // itself: named by its whole path.
+        (format!("{DEEP}/self"), b"@self\n".to_vec()),
     ];
     let usage = "usage: cc1 [options] input.c...\n";
     // (command, what it says first, and its exit status).
@@ -2804,20 +2841,75 @@ fn cc1_takes_merlins_command_line() {
             "cc1: cannot read @/d/none: no such file or directory\n".to_string(),
             2,
         ),
+        // A response file that can't be read, said alone, exit 1, as
+        // LLVM's tools say it; `@` alone names the working directory (/).
         (
             "cc1 @/d/self",
-            "cc1: recursive expansion of: '/d/self'\n".to_string(),
-            2,
+            "recursive expansion of: '/d/self'\n".to_string(),
+            1,
         ),
         (
             "cc1 @/d",
-            "cc1: cannot not open file '/d': is a directory\n".to_string(),
-            2,
+            "cannot not open file '/d': is a directory\n".to_string(),
+            1,
         ),
+        (
+            "cc1 @",
+            "cannot not open file '/': is a directory\n".to_string(),
+            1,
+        ),
+        // The driver's -Wp, (and -Wa, -Wl,) are no warning options.
+        ("cc1 -E -Wp,-DX /d/a.c", format!("cc1: unknown option -Wp,-DX\n{usage}"), 2),
         // -O and -std=, which clang's -cc1 checks.
         (
             "cc1 -E -Ox /d/a.c",
             "error: invalid integral value 'x' in '-Ox'\n".to_string(),
+            1,
+        ),
+        (
+            "cc1 -E -O99999999999 /d/a.c",
+            "error: invalid integral value '99999999999' in '-O99999999999'\n".to_string(),
+            1,
+        ),
+        (
+            "cc1 -E -std=cl1.2 /d/a.c",
+            "error: invalid argument '-std=cl1.2' not allowed with 'C'\n".to_string(),
+            1,
+        ),
+        // An error in the options: cc1 never starts, so -v says nothing.
+        (
+            "cc1 -v -E -std=bar /d/a.c",
+            "error: invalid value 'bar' in '-std=bar'\n\
+             note: use 'c89', 'c90', or 'iso9899:1990' for 'ISO C 1990' standard\n"
+                .to_string(),
+            1,
+        ),
+        // clang's warning groups, in command-line order: -Werror=X turns X
+        // on again.
+        (
+            "cc1 -Wno-return-type -Werror=return-type -o /out/w4 /d/g.c",
+            "/d/g.c:1:35: warning: result of comparison of constant 300 with expression of type 'unsigned \
+             char' is always false [-Wtautological-constant-out-of-range-compare]\n\
+             /d/g.c:2:33: error: non-void function does not return a value in all control paths \
+             [-Werror,-Wreturn-type]\n"
+                .to_string(),
+            1,
+        ),
+        (
+            "cc1 -Werror=tautological-compare -Wno-return-type -o /out/w5 /d/g.c",
+            "/d/g.c:1:35: error: result of comparison of constant 300 with expression of type 'unsigned \
+             char' is always false [-Werror,-Wtautological-constant-out-of-range-compare]\n"
+                .to_string(),
+            1,
+        ),
+        // C preprocessed: no directive but line markers, #line and #pragma
+        // runs, no macro is expanded.
+        (
+            "cc1 -o /out/pp /d/pp.i",
+            "orig.c:2:9: error: use of undeclared identifier 'X'\n\
+             orig.c:4:9: warning: #pragma once in main file [-Wpragma-once-outside-header]\n\
+             z.c:40:9: error: use of undeclared identifier 'Y'\n"
+                .to_string(),
             1,
         ),
         (
@@ -2862,9 +2954,21 @@ fn cc1_takes_merlins_command_line() {
     // -v: the version, then the #include search list, as clang's -cc1 -v
     // says them (merlin's cli.rs holds the lines to clang's).
     let verbose = "cc1 -v -I /d -I /nope -I /d/../d -I /d/abcdefghijklmn -o /out/v /d/a.c";
+    // The options' warning first, before -v's version line, and whatever
+    // -w and -Werror say, as clang's -cc1 gives it.
+    let o9 = "cc1 -v -w -Werror -O9 -o /out/o9 /d/a.c";
+    // Standard input without -o: standard output, its `.file` `-`; a .i
+    // file without -o: its .s.
+    let stdin_s = "cc1 - < /d/w.c";
+    let dot_i = "cc1 /d/p.i";
+    let (bom, u16, nul) = ("cc1 @/d/bom", "cc1 @/d/u16", "cc1 @/d/nul");
+    // ld and ar read response files the same way, and say what they can't
+    // read the same way: ld.lld's and llvm-ar's message alone, exit 1.
+    let (ld_self, ar_dir) = ("ld @/d/self", "ar rcs /out/x.a @/d");
     let mut commands: Vec<&str> = cases.iter().map(|(c, ..)| *c).collect();
     commands.extend([
-        together, help, response, nested, stdin, to_stdout, quiet, no_flag, verbose,
+        together, help, response, nested, stdin, to_stdout, quiet, no_flag, verbose, o9, stdin_s, dot_i, bom,
+        u16, nul, ld_self, ar_dir,
     ]);
     // -g: (the directory the shell is in, the command, and the directory
     // merlin is told the names are relative to). The default is the
@@ -2912,8 +3016,18 @@ fn cc1_takes_merlins_command_line() {
     for (dir, command, _) in debug {
         input.push_str(&format!("\ncd {dir}\n{command}"));
     }
+    // A console line holds 127 characters: DEEP in two steps.
+    let deep_self = "cc1 @self";
+    let (upper, lower) = DEEP.split_at(DEEP.match_indices('/').nth(5).unwrap().0);
+    input.push_str(&format!("\ncd {upper}\ncd {}\n{deep_self}", &lower[1..]));
     input.push_str("\nexit 0\n");
-    let (out, disk) = boot_cc1(image_of(&["cc1"], &["/d", fill], &files), &input, 40_000_000_000);
+    let mut dirs = vec!["/d", fill];
+    dirs.extend(&deep_dirs);
+    let (out, disk) = boot_cc1(
+        image_of(&["cc1", "ld", "ar"], &dirs, &files),
+        &input,
+        40_000_000_000,
+    );
     for (command, said, status) in cases {
         let got = shell_output(&out, command);
         assert!(got.starts_with(said.as_str()), "{command}: {got}");
@@ -2922,12 +3036,41 @@ fn cc1_takes_merlins_command_line() {
             "{command}: {got}"
         );
     }
+    assert!(!shell_output(&out, "cc1 -v -E -std=bar /d/a.c").contains("cc1 version"));
     assert_eq!(shell_output(&out, together), both);
     assert!(shell_output(&out, help).starts_with(usage));
     let a_e = merlin_e(&job_a, &map).0.unwrap();
-    for c in [response, nested, stdin, to_stdout] {
+    for c in [response, nested, stdin, to_stdout, bom, u16, nul] {
         assert_eq!(shell_output(&out, c), a_e, "{c}");
     }
+    assert_eq!(
+        shell_output(&out, deep_self),
+        format!("recursive expansion of: '{DEEP}/self'\ncc1: exit 1\n")
+    );
+    assert_eq!(
+        shell_output(&out, ld_self),
+        "recursive expansion of: '/d/self'\nld: exit 1\n"
+    );
+    assert_eq!(
+        shell_output(&out, ar_dir),
+        "cannot not open file '/d': is a directory\nar: exit 1\n"
+    );
+    assert!(
+        shell_output(&out, o9).starts_with(&format!(
+            "warning: optimization level '-O9' is not supported; using '-O3' instead\ncc1 version {} ",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{}",
+        shell_output(&out, o9)
+    );
+    let w_stdin = shell_output(&out, stdin_s);
+    assert!(
+        w_stdin.starts_with(
+            "<stdin>:2:14: warning: shift count >= width of type [-Wshift-count-overflow]\n    .file \"-\"\n"
+        ),
+        "{w_stdin}"
+    );
+    assert_eq!(shell_output(&out, dot_i), "");
     let w_s = merlin_s(&CcJob::new("/d/w.c".into(), &[], &[]), &map).0.unwrap();
     assert_eq!(shell_output(&out, quiet), "");
     assert_eq!(shell_output(&out, no_flag), "");
@@ -2944,6 +3087,8 @@ fn cc1_takes_merlins_command_line() {
     );
     let fs = Fs::open(&disk).unwrap();
     assert!(fs.lookup("/out/w1").is_err(), "-Werror wrote /out/w1");
+    assert!(fs.lookup("/d/p.s").is_ok(), "cc1 /d/p.i wrote no /d/p.s");
+    assert!(fs.lookup("/d/p.i.s").is_err(), "cc1 /d/p.i wrote /d/p.i.s");
     for written in ["/out/w2", "/out/w3"] {
         assert_eq!(String::from_utf8(fs.read_file(written).unwrap()).unwrap(), w_s);
     }
@@ -4205,6 +4350,8 @@ fn printed_sources() -> Vec<(String, Vec<u8>)> {
             "/src/p.i".into(),
             b"# 1 \"p.c\"\nint pi(void) {\n    return 3;\n}\n".to_vec(),
         ),
+        // FOO comes from -Wp,-DFOO=1.
+        ("/src/wp.c".into(), b"int v = FOO;\n".to_vec()),
     ]
 }
 
@@ -4228,9 +4375,9 @@ const CC_PRINTED: &[(&str, &[&str])] = &[
     (
         "-### -c -g -I inc -DX=1 -UY a.c b.S c.s",
         &[
-            r#" "/bin/cc1" "-g" "-I" "inc" "-I" "/usr/include" "-D" "X=1" "-U" "Y" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/cc1" "-g" "-I" "inc" "-D" "X=1" "-U" "Y" "-I" "/usr/include" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
             r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
-            r#" "/bin/cc1" "-E" "-g" "-I" "inc" "-I" "/usr/include" "-D" "X=1" "-U" "Y" "-o" "/tmp/b-T2.s" "-x" "assembler-with-cpp" "b.S""#,
+            r#" "/bin/cc1" "-E" "-g" "-I" "inc" "-D" "X=1" "-U" "Y" "-I" "/usr/include" "-o" "/tmp/b-T2.s" "-x" "assembler-with-cpp" "b.S""#,
             r#" "/bin/as" "-o" "b.o" "/tmp/b-T2.s""#,
             r#" "/bin/as" "-o" "c.o" "c.s""#,
         ],
@@ -4258,7 +4405,7 @@ const CC_PRINTED: &[(&str, &[&str])] = &[
     (
         r#"-### -c -DQ=a\b$ -fdebug-compilation-dir=/d -g a.c"#,
         &[
-            r#" "/bin/cc1" "-g" "-fdebug-compilation-dir=/d" "-I" "/usr/include" "-D" "Q=a\\b\$" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/cc1" "-g" "-fdebug-compilation-dir=/d" "-D" "Q=a\\b\$" "-I" "/usr/include" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
             r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
         ],
     ),
@@ -4284,7 +4431,7 @@ const CC_PRINTED: &[(&str, &[&str])] = &[
     (
         "-### -c @q.rsp",
         &[
-            r#" "/bin/cc1" "-I" "/usr/include" "-D" "MSG=a b" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/cc1" "-D" "MSG=a b" "-I" "/usr/include" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
             r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
         ],
     ),
@@ -4301,12 +4448,23 @@ const CC_PRINTED: &[(&str, &[&str])] = &[
     (
         "-### -v -E -w -O2 -g -P -I inc -DX -ffreestanding -std=c99 -Wall a.c",
         &[
-            r#" "/bin/cc1" "-O2" "-E" "-ffreestanding" "-g" "-v" "-P" "-I" "inc" "-I" "/usr/include" "-D" "X" "-Wall" "-w" "-std=c99" "-o" "-" "-x" "c" "a.c""#,
+            r#" "/bin/cc1" "-O2" "-E" "-ffreestanding" "-g" "-v" "-P" "-I" "inc" "-D" "X" "-I" "/usr/include" "-Wall" "-w" "-std=c99" "-o" "-" "-x" "c" "a.c""#,
         ],
     ),
     (
         "-### -E -",
         &[r#" "/bin/cc1" "-E" "-I" "/usr/include" "-o" "-" "-x" "c" "-""#],
+    ),
+    // -I, -D and -U in their order, as clang gives them, /usr/include
+    // after them; -Wp,'s arguments are cc1's, after them (the empty one
+    // left out), and -Wa,'s the assembler's.
+    (
+        "-### -c -DX -Iinc -UY -I j2 -Wp,-DFOO=1,,-UZ -Wa,-march=rv64ima_zicsr_zifencei a.c c.s",
+        &[
+            r#" "/bin/cc1" "-D" "X" "-I" "inc" "-U" "Y" "-I" "j2" "-DFOO=1" "-UZ" "-I" "/usr/include" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/as" "-march=rv64ima_zicsr_zifencei" "-o" "a.o" "/tmp/a-T1.s""#,
+            r#" "/bin/as" "-march=rv64ima_zicsr_zifencei" "-o" "c.o" "c.s""#,
+        ],
     ),
 ];
 
@@ -4396,6 +4554,8 @@ fn stage_summary(text: &str) -> Vec<String> {
                         }
                         i += 1;
                     }
+                    // -Wp,'s, as they were given.
+                    _ if w.starts_with("-D") || w.starts_with("-U") => kept.push(w.into()),
                     _ if i + 1 == args.len() => kept.push(temp(w)),
                     _ => {}
                 },
@@ -4408,7 +4568,9 @@ fn stage_summary(text: &str) -> Vec<String> {
                         kept.push(format!("-o {}", temp(next)));
                         i += 1;
                     }
-                    _ if w.starts_with('-') => {}
+                    "-g" | "-gdwarf-5" => {}
+                    // -Wa,'s, as they were given.
+                    _ if w.starts_with('-') => kept.push(w.into()),
                     _ => kept.push(temp(w)),
                 },
                 _ => match w {
@@ -4571,12 +4733,12 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
     // the assembly (T2); ld's: 22, its response file after the 14 objects.
     // Each written as clang writes one: every argument quoted, a blank
     // after it; -v shows it so.
-    let mut cc1_args = vec!["-v".to_string(), "-I".to_string(), "/usr/include".to_string()];
+    let mut cc1_args = vec!["-v".to_string()];
     for m in &macros {
         cc1_args.push("-D".into());
         cc1_args.push(m["-D".len()..].to_string());
     }
-    cc1_args.extend(["-o", "/tmp/m-T2.s", "-x", "c", "m.c"].map(String::from));
+    cc1_args.extend(["-I", "/usr/include", "-o", "/tmp/m-T2.s", "-x", "c", "m.c"].map(String::from));
     let mut ld_args: Vec<String> = [
         "-T",
         "/usr/lib/user.ld",
@@ -4880,10 +5042,77 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
         0,
         true,
     ),
-    // -O levels as clang's driver takes them.
+    // On a line that only links, the compiler's options are claimed
+    // without a word; -std= is never said to go unused, nor -w; -Wa, is
+    // the assembler's, said to go unused with no `as` or cc1 stage.
+    (
+        "-### -o p2 x.o -O2 -Wall -g -Iinc -DX -P -ffreestanding -std=c99 -Wp,-DZ -Wa,-march=rv64ima_zicsr_zifencei",
+        &[
+            HEADER[0],
+            HEADER[1],
+            HEADER[2],
+            HEADER[3],
+            "cc: warning: argument unused during compilation: '-Wa,-march=rv64ima_zicsr_zifencei' \
+             [-Wunused-command-line-argument]",
+            r#" "/bin/ld" "-T" "/usr/lib/user.ld" "/usr/lib/crt0.o" "-L/usr/lib" "x.o" "-lc" "-o" "p2""#,
+        ],
+        0,
+        true,
+    ),
+    ("-c c.s -std=c99", &[], 0, true),
+    // -w and the -W options, in their order, apply to cc's own warnings as
+    // to the compiler's: none under -w or -Wno-FLAG, an error under
+    // -Werror, which runs no stage.
+    ("-w -c hello.c -L/x", &[], 0, true),
+    ("-Wno-unused-command-line-argument -c c.s -DX", &[], 0, true),
+    // (The -W options are cc1's: with no cc1 stage, unused too.)
+    (
+        "-Werror -c c.s -DX",
+        &[
+            "cc: error: argument unused during compilation: '-Werror' [-Werror,-Wunused-command-line-argument]",
+            "cc: error: argument unused during compilation: '-D X' [-Werror,-Wunused-command-line-argument]",
+        ],
+        1,
+        true,
+    ),
+    (
+        "-Werror -Wno-error=unused-command-line-argument -c c.s -DX",
+        &[
+            "cc: warning: argument unused during compilation: '-Werror' [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-Wno-error=unused-command-line-argument' \
+             [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-D X' [-Wunused-command-line-argument]",
+        ],
+        0,
+        true,
+    ),
+    // -O levels as clang's driver takes them: -O4 alone is the driver's
+    // (-O3), any other cc1's to judge.
     (
         "-c -O4 hello.c",
         &["cc: warning: -O4 is equivalent to -O3 [-Wdeprecated]"],
+        0,
+        true,
+    ),
+    (
+        "-Werror -c -O4 hello.c",
+        &["cc: error: -O4 is equivalent to -O3 [-Werror,-Wdeprecated]"],
+        1,
+        true,
+    ),
+    (
+        "-c -O9 hello.c",
+        &["warning: optimization level '-O9' is not supported; using '-O3' instead"],
+        0,
+        true,
+    ),
+    // -Wp,'s arguments are cc1's, -Wa,'s the assembler's.
+    ("-c wp.c -Wp,-DFOO=1", &[], 0, true),
+    ("-c c.s -Wa,-march=rv64ima_zicsr_zifencei", &[], 0, true),
+    // C preprocessed already: with -E, nothing to do.
+    (
+        "-E p.i",
+        &["cc: warning: p.i: previously preprocessed input [-Wunused-command-line-argument]"],
         0,
         true,
     ),
@@ -4995,6 +5224,7 @@ fn cc_says_what_clangs_driver_says() {
     let dir = userprogs::user_dir(&repo_root());
     let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
     let mut files = cc_sources();
+    files.extend(printed_sources());
     for old in ["/src/keep.o", "/src/kept.o"] {
         files.push((old.into(), b"an old object".to_vec()));
     }
@@ -5048,8 +5278,7 @@ fn cc_says_what_clangs_driver_says() {
     );
     assert_eq!(
         outputs[n + 3],
-        "cc: error: unable to execute command: Executable \"/alt/cc1\" doesn't exist!\n\
-         cc: error: cc frontend command failed with exit code 1 (use -v to see invocation)\n/alt/cc: exit 1\n",
+        "cc: error: unable to execute command: Executable \"/alt/cc1\" doesn't exist!\n/alt/cc: exit 1\n",
         "{alone}"
     );
     let fs = Fs::open(&disk).unwrap();
