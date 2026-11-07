@@ -32,13 +32,20 @@ fn is_separator(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
 
+/// What LLVM says of UTF-16 it can't convert.
+pub const BAD_UTF16: &str = "Could not convert UTF16 to UTF8";
+
 /// A response file's text as LLVM reads it: a UTF-8 byte-order mark left
-/// out, and UTF-16 with one (either byte order) made UTF-8.
-pub fn decode(bytes: &[u8]) -> Vec<u8> {
+/// out, and UTF-16 with one (either byte order) made UTF-8, strictly, as
+/// `convertUTF16ToUTF8String`: an odd number of bytes or a surrogate
+/// without its pair is [`BAD_UTF16`].
+pub fn decode(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
     let utf16 = |be: bool| {
-        let units: Vec<u16> = bytes[2..]
-            .as_chunks::<2>()
-            .0
+        let (units, odd) = bytes[2..].as_chunks::<2>();
+        if !odd.is_empty() {
+            return Err(BAD_UTF16);
+        }
+        let units: Vec<u16> = units
             .iter()
             .map(|&c| {
                 if be {
@@ -48,13 +55,15 @@ pub fn decode(bytes: &[u8]) -> Vec<u8> {
                 }
             })
             .collect();
-        String::from_utf16_lossy(&units).into_bytes()
+        String::from_utf16(&units)
+            .map(String::into_bytes)
+            .map_err(|_| BAD_UTF16)
     };
     match bytes {
-        [0xef, 0xbb, 0xbf, rest @ ..] => rest.to_vec(),
+        [0xef, 0xbb, 0xbf, rest @ ..] => Ok(rest.to_vec()),
         [0xff, 0xfe, ..] => utf16(false),
         [0xfe, 0xff, ..] => utf16(true),
-        _ => bytes.to_vec(),
+        _ => Ok(bytes.to_vec()),
     }
 }
 
@@ -180,7 +189,7 @@ fn expand_into(arg: String, out: &mut Vec<String>, open: &mut Vec<PathBuf>) -> R
         return Err(format!("recursive expansion of: '{}'", path.display()));
     }
     open.push(path);
-    for word in tokenize(&decode(&text)) {
+    for word in tokenize(&decode(&text)?) {
         expand_into(String::from_utf8_lossy(&word).into_owned(), out, open)?;
     }
     open.pop();
@@ -278,6 +287,13 @@ mod tests {
             .collect();
         std::fs::write(dir.join("u16"), utf16).unwrap();
         assert_eq!(expand([at("u16")]).unwrap(), ["-Da", "b"]);
+        // UTF-16 of an odd length, or with a surrogate alone: LLVM's error.
+        std::fs::write(dir.join("odd16"), b"\xff\xfea\0 \0b\0c").unwrap();
+        assert_eq!(expand([at("odd16")]).unwrap_err(), BAD_UTF16);
+        std::fs::write(dir.join("lone16"), b"\xff\xfea\0\0\xd8b\0").unwrap();
+        assert_eq!(expand([at("lone16")]).unwrap_err(), BAD_UTF16);
+        std::fs::write(dir.join("low16"), b"\xfe\xff\0a\xdc\0").unwrap();
+        assert_eq!(expand([at("low16")]).unwrap_err(), BAD_UTF16);
         std::fs::write(dir.join("nulbyte"), b"a\0b c").unwrap();
         assert_eq!(expand([at("nulbyte")]).unwrap(), ["a", "c"]);
         let abs = |name: &str| absolute(&dir.join(name)).display().to_string();

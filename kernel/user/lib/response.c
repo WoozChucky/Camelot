@@ -14,8 +14,9 @@
  * is left as it is; a FILE that can't be read (a directory, as `@` alone
  * names the working directory) is an error, and so is one that names
  * itself, directly or through others. A file's UTF-8 byte-order mark is
- * left out and UTF-16 text (with its byte-order mark) made UTF-8; a NUL
- * byte ends the argument it is in, and the reading goes on after it. */
+ * left out and UTF-16 text (with its byte-order mark) made UTF-8, or, if
+ * LLVM can't convert it, its error; a NUL byte ends the argument it is in,
+ * and the reading goes on after it. */
 #include "../user.h"
 
 /* A growing argument list, NULL after the last. */
@@ -235,10 +236,16 @@ static size_t utf8(unsigned c, char *out) {
     return 4;
 }
 
+/* decode's answer for UTF-16 LLVM can't convert: `Could not convert UTF16
+ * to UTF8`, its message. */
+#define BAD_UTF16 1
+
 /* A response file's text as LLVM reads it (excalibur::response::decode): a
  * UTF-8 byte-order mark left out, and UTF-16 with one (either byte order)
- * made UTF-8, a lone surrogate U+FFFD. The text in *text and *len, which
- * may be a new one (from malloc, the old freed); 0, or -ENOMEM. */
+ * made UTF-8, strictly, as LLVM's convertUTF16ToUTF8String: an odd number
+ * of bytes, or a surrogate without its pair, is BAD_UTF16. The text in *text
+ * and *len, which may be a new one (from malloc, the old freed); 0,
+ * BAD_UTF16 or -ENOMEM. */
 static int decode(char **text, size_t *len) {
     unsigned char *b = (unsigned char *)*text;
     size_t n = *len;
@@ -252,6 +259,9 @@ static int decode(char **text, size_t *len) {
     if (!le && !be) {
         return 0;
     }
+    if (n % 2 != 0) {
+        return BAD_UTF16;
+    }
     /* At most 3 bytes of UTF-8 for each 2 of UTF-16. */
     char *out = malloc(n * 2 + 1);
     if (out == NULL) {
@@ -263,14 +273,15 @@ static int decode(char **text, size_t *len) {
         unsigned c = u;
         if (u >= 0xd800 && u < 0xdc00 && i + 3 < n) {
             unsigned lo = le ? (unsigned)(b[i + 2] | b[i + 3] << 8) : (unsigned)(b[i + 2] << 8 | b[i + 3]);
-            if (lo >= 0xdc00 && lo < 0xe000) {
-                c = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00);
-                i += 2;
-            } else {
-                c = 0xfffd;
+            if (lo < 0xdc00 || lo >= 0xe000) {
+                free(out);
+                return BAD_UTF16;
             }
+            c = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00);
+            i += 2;
         } else if (u >= 0xd800 && u < 0xe000) {
-            c = 0xfffd;
+            free(out);
+            return BAD_UTF16;
         }
         o += utf8(c, out + o);
     }
@@ -341,7 +352,12 @@ static int expand(char *arg, struct list *out, struct list *reading, char *error
     }
     struct list words;
     memset(&words, 0, sizeof words);
-    if (decode(&text, &len) < 0 || list_push(reading, path) < 0 || tokenize(text, len, &words) < 0) {
+    int r = decode(&text, &len);
+    if (r == BAD_UTF16) {
+        snprintf(error, size, "Could not convert UTF16 to UTF8");
+        return -1;
+    }
+    if (r < 0 || list_push(reading, path) < 0 || tokenize(text, len, &words) < 0) {
         snprintf(error, size, "out of memory");
         return -1;
     }
