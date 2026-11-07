@@ -376,8 +376,10 @@ opens:
 - a file, in the access mode asked for; on a read-only filesystem, writing
   (or creating) is `-EROFS`;
 - a directory, for reading only: anything else is `-EISDIR`, and so is
-  `O_CREAT` on a missing name with a trailing slash (`newf/` names a
-  directory, and `open` makes only files);
+  `O_CREAT` on a name with a trailing slash (`newf/` names a directory,
+  and `open` makes only files), whether the name is there or not and with
+  `O_EXCL` or not, before anything else, as Linux's `open_last_lookups`
+  has it;
 - a device node (`/dev/console`, `/dev/fb0`, `/dev/input/event0` and
   `event1`, `/dev/ptmx`, `/dev/pts/N`), which gives the device itself, in
   the access mode asked for, also on a read-only filesystem: the console's

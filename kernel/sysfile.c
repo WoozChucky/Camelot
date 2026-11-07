@@ -347,6 +347,14 @@ long sys_pipe(struct trap_frame *f) {
 static struct inode *open_inode(const char *path, u32 flags, u32 mode, bool *created, int *err) {
     *created = false;
     bool excl = (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL);
+    if ((flags & O_CREAT) != 0 && path[strlen(path) - 1] == '/') {
+        /* "name/" says a directory, and open() makes only files: with
+         * O_CREAT, -EISDIR before anything else, whether the name is
+         * there or not, as Linux's open_last_lookups has it. The path
+         * isn't empty: fetch_path() refused that. */
+        *err = -EISDIR;
+        return NULL;
+    }
     for (;;) {
         struct inode *ip = namei(path, err);
         if (ip != NULL && excl) {
@@ -359,12 +367,6 @@ static struct inode *open_inode(const char *path, u32 flags, u32 mode, bool *cre
             return ip;
         }
         if (*err != -ENOENT || (flags & O_CREAT) == 0) {
-            return NULL;
-        }
-        if (path[strlen(path) - 1] == '/') {
-            /* "name/" says a directory, and open() makes only files (as on
-             * Linux). The path isn't empty: fetch_path() refused that. */
-            *err = -EISDIR;
             return NULL;
         }
         ip = fs_create(path, T_FILE, 0, 0, (u16)(mode & S_IALLUGO), err);

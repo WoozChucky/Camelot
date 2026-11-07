@@ -200,6 +200,14 @@ static void test_read_write_seek(void) {
     check(fd >= 0 && size_of("excl") == 0, "O_EXCL makes a file that is missing");
     close(fd);
     check_eq(unlink("excl"), 0, "which goes again");
+    /* A trailing slash with O_CREAT says a directory, which open never
+     * makes: -EISDIR first, the name there or not, O_EXCL or not, as on
+     * Linux; and O_EXCL without O_CREAT means nothing. */
+    check_eq(open("./", O_RDONLY | O_CREAT | O_EXCL, 0644), -EISDIR, "O_CREAT | O_EXCL: a directory's name/");
+    check_eq(open("./", O_RDONLY | O_CREAT, 0644), -EISDIR, "O_CREAT: a directory's name/");
+    fd = open("a", O_RDONLY | O_EXCL);
+    check(fd >= 0, "O_EXCL without O_CREAT opens a file that exists");
+    close(fd);
     fd = open("a", O_RDONLY | O_TRUNC);
     check(fd >= 0 && size_of("a") == 5000, "O_TRUNC does nothing for reading");
     close(fd);
