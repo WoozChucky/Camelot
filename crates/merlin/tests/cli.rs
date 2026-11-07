@@ -348,6 +348,45 @@ fn preprocessor_options() {
     assert!(err.contains("defs.h:1:12: error:"), "{err}");
 }
 
+/// `@FILE` stands for the words of FILE, separated by white space and not
+/// quoted (merlin-ld's response files): how Camelot's `cc` driver passes
+/// cc1, merlin in C, more arguments than `exec` takes. One cannot name
+/// another, and one that can't be read is a usage error.
+#[test]
+fn response_files() {
+    let t = TempSrc::new("rsp", "main.c", "int main() { return VALUE; }\n");
+    let args = t.dir.join("args");
+    std::fs::write(&args, format!("-E\n  -DVALUE=40\t{}\n", t.file.display())).unwrap();
+    let at = |p: &Path| PathBuf::from(format!("@{}", p.display()));
+    let out = merlin(&[&at(&args)]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.contains("int main() { return 40; }"), "{text}");
+    // Among other arguments, in its place: -U after it undefines VALUE.
+    let out = merlin(&[&at(&args), Path::new("-UVALUE")]);
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.contains("return VALUE;"), "{text}");
+    let nested = t.dir.join("nested");
+    std::fs::write(&nested, format!("-E {}\n", at(&args).display())).unwrap();
+    let out = merlin(&[&at(&nested)]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "merlin: {}: a response file cannot name another ({})\n",
+            nested.display(),
+            at(&args).display()
+        )
+    );
+    let out = merlin(&[&at(&t.dir.join("missing"))]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).starts_with("merlin: cannot read "),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// A `.S` file (or `-x assembler-with-cpp`) is preprocessed as assembly with
 /// -E (`__riscv_xlen` is 64), and is never compiled.
 #[test]

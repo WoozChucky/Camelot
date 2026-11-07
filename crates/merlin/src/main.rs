@@ -1,4 +1,4 @@
-//! `merlin [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-x LANG] [-E [-P] | --dump-ast] input.c...`
+//! `merlin [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-x LANG] [-E [-P] | --dump-ast] [@file] input.c...`
 
 use merlin::{CmdMacro, Lang, Options};
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ const USAGE: &str = "usage: merlin [options] input.c...
                     (assembly for merlin-as, only preprocessed: -E); without
                     it, .S files are assembler-with-cpp and the rest C
   --dump-ast        print the checked syntax tree to stdout instead of compiling
+  @FILE             more arguments, read from FILE (separated by white space)
 
 Each input is a translation unit, compiled to its own assembly file. A .S
 file is preprocessed (-E) as clang -E -x assembler-with-cpp does, with
@@ -55,6 +56,29 @@ enum Mode {
     DumpAst,
 }
 
+/// The arguments with each `@FILE` replaced by the words of FILE, as clang
+/// reads a response file (but without its quoting), and as merlin-ld reads
+/// one: how the `cc` driver on Camelot gives cc1 a command line longer than
+/// `exec` takes (16 arguments), as clang's driver gives its `-cc1` one when a
+/// command line is too long for the system.
+fn expand_response_files(args: impl Iterator<Item = String>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for a in args {
+        let Some(file) = a.strip_prefix('@').filter(|f| !f.is_empty()) else {
+            out.push(a);
+            continue;
+        };
+        let text = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+        for word in text.split_whitespace() {
+            if word.starts_with('@') {
+                return Err(format!("{file}: a response file cannot name another ({word})"));
+            }
+            out.push(word.to_string());
+        }
+    }
+    Ok(out)
+}
+
 fn usage_error(msg: &str) -> ExitCode {
     eprintln!("merlin: {msg}\n{USAGE}");
     ExitCode::from(2)
@@ -71,7 +95,13 @@ fn run() -> ExitCode {
     // `-x LANG` applies to the inputs after it, as in clang; `None` goes by
     // each file's name.
     let mut lang: Option<Lang> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = match expand_response_files(std::env::args().skip(1)) {
+        Ok(args) => args.into_iter(),
+        Err(e) => {
+            eprintln!("merlin: {e}");
+            return ExitCode::from(2);
+        }
+    };
     while let Some(a) = args.next() {
         // `-I dir` or `-Idir`, and the same for -D, -U and -o.
         let mut value = |flag: &str| -> Option<String> {

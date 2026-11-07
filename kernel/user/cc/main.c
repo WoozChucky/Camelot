@@ -1,6 +1,6 @@
 /* cc1: `cc1 [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]]
  * [-U name] [-g [-fdebug-compilation-dir=DIR]] [-x LANG] [-E [-P] |
- * --dump-ast] input.c...`, merlin's command line (follows merlin's main.rs
+ * --dump-ast] [@file] input.c...`, merlin's command line (follows merlin's main.rs
  * and lib.rs): the preprocessor (-E, of C and of assembly: `.S`, `-x
  * assembler-with-cpp`), the syntax tree (--dump-ast) and the compiler, C to
  * assembly, with -g its debugging information (debug.c). */
@@ -31,6 +31,7 @@ static const char USAGE[] = "usage: cc1 [options] input.c...\n"
                             "                    (assembly for merlin-as, only preprocessed: -E); without\n"
                             "                    it, .S files are assembler-with-cpp and the rest C\n"
                             "  --dump-ast        print the checked syntax tree to stdout instead of compiling\n"
+                            "  @FILE             more arguments, read from FILE (separated by white space)\n"
                             "\n"
                             "Each input is a translation unit, compiled to its own assembly file. A .S\n"
                             "file is preprocessed (-E) as clang -E -x assembler-with-cpp does, with\n"
@@ -475,7 +476,99 @@ static char *value(char **argv, int argc, int *i, uint flag_len) {
     return argv[*i];
 }
 
+/* Whether `c` separates the words of a response file: ASCII white space,
+ * what Rust's split_whitespace splits at in merlin's. */
+static int is_white(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+/* The arguments so far of expand_response_files, in plain malloc'd memory:
+ * they live for the whole run, past every translation unit's heap. */
+struct args {
+    char **v;
+    uint n;
+    uint cap;
+};
+
+static void push_arg(struct args *a, char *s) {
+    if (a->n + 1 >= a->cap) {
+        a->cap = a->cap == 0 ? 16 : 2 * a->cap;
+        a->v = realloc(a->v, a->cap * sizeof(char *));
+        if (a->v == NULL) {
+            die("out of memory");
+        }
+    }
+    a->v[a->n++] = s;
+    a->v[a->n] = NULL;
+}
+
+/* The arguments argv[0..argc) with each `@FILE` replaced by the words of
+ * FILE (merlin's expand_response_files): how the `cc` driver gives cc1 a
+ * command line longer than exec takes (MAXARG arguments), as clang's
+ * driver gives its -cc1 one when a command line is too long for the
+ * system. Words are separated by white space, with no quoting, and a
+ * response file cannot name another. Returns the new arguments, argv[0]
+ * first and NULL after the last, their number in *n, or NULL having said
+ * why not. */
+static char **expand_response_files(int argc, char **argv, int *n) {
+    struct args out;
+    memset(&out, 0, sizeof out);
+    for (int i = 0; i < argc; i++) {
+        char *a = argv[i];
+        if (i == 0 || a[0] != '@' || a[1] == 0) {
+            push_arg(&out, a);
+            continue;
+        }
+        const char *file = a + 1;
+        uint len = 0;
+        int err = 0;
+        char *read = read_file(file, &len, &err);
+        if (read == NULL) {
+            fprintf(2, "cc1: cannot read %s: %s\n", file, strerror(-err));
+            return NULL;
+        }
+        /* Off the translation unit's heap, which the first one frees. */
+        char *text = malloc(len + 1);
+        if (text == NULL) {
+            die("out of memory");
+        }
+        memcpy(text, read, len);
+        text[len] = 0;
+        heap_free(read);
+        char *p = text;
+        for (;;) {
+            while (*p != 0 && is_white(*p)) {
+                p++;
+            }
+            if (*p == 0) {
+                break;
+            }
+            char *w = p;
+            while (*p != 0 && !is_white(*p)) {
+                p++;
+            }
+            if (*p != 0) {
+                *p++ = 0;
+            }
+            if (w[0] == '@') {
+                fprintf(2, "cc1: %s: a response file cannot name another (%s)\n", file, w);
+                return NULL;
+            }
+            push_arg(&out, w);
+        }
+    }
+    *n = (int)out.n;
+    return out.v;
+}
+
 int main(int argc, char **argv) {
+    int nargs = 0;
+    char **args = expand_response_files(argc, argv, &nargs);
+    if (args == NULL) {
+        return 2;
+    }
+    argc = nargs;
+    argv = args;
     uint ninputs = 0;
     const char *output = NULL;
     int mode = MODE_COMPILE;
