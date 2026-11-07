@@ -27,7 +27,9 @@ together.
 | `time.c` | `time`, `gmtime_r`: the date, over `clock_gettime`, and its UTC fields |
 | `proc.c` | `kill_descendants`: kills what a process started, and theirs (the shell and `shd` hang a session up with it) |
 | `inet.c` | `htons`, `ntohs`, `htonl`, `ntohl`, `inet_aton`, `inet_addr`, `inet_ntoa`, `sockaddr_set`: addresses and byte order |
-| `tty.c` | `isatty`, `tcgetattr`, `tcsetattr`, `cfmakeraw`, `tcgetpgrp`, `tcsetpgrp`, `posix_openpt`, `grantpt`, `unlockpt`, `ptsname`, `ttyname`: terminals, over `ioctl` and `fstat` |
+| `tty.c` | `isatty`, `tcgetattr`, `tcsetattr`, `cfmakeraw`, `tcgetpgrp`, `tcsetpgrp`, `posix_openpt`, `grantpt`, `unlockpt`, `ptsname`, `ttyname`: terminals, over `ioctl` and `fstat`; `getpass`, a line read with the echo off |
+| `sha256.c` | `sha256_init`, `sha256_update`, `sha256_final`, `sha256`, `sha256_hex`: SHA-256 (FIPS 180-4); `pw_hash`, `pw_check`: passwords as `/etc/shadow` keeps them, `$sha256$ROUNDS$SALT$HEX`, salted and iterated (a teaching system's hash, not hardened cryptography: excalibur-spec section 10, "Users") |
+| `pwd.c` | `getpwnam`, `getpwuid`, `getgrnam`, `getgrgid`, `getspnam`: `/etc/passwd`, `/etc/group` and `/etc/shadow`'s records, each good until the next call |
 | `cmsg.c` | `cmsg_nxthdr`, behind `CMSG_NXTHDR`: the next control message of a `struct msghdr` (`sendmsg`, `recvmsg`) |
 | `resolve.c` | `resolve`: a host's address, from its text or by a DNS query (RFC 1035) to the server the network gave; `resolve_error` |
 | `usys.s` | the system call stubs, one per call (`docs/camelot-syscalls.md`): the number in `a7`, `ecall`, `ret` |

@@ -250,7 +250,8 @@ const STEPS: &[Step] = &[
     },
     Step {
         what: "the committed examples, boot programs and hello are current; a boot block and the root \
-               images of both profiles boot, its /usr what the programs are linked from",
+               images of both profiles boot, its /usr what the programs are linked from, and users log in \
+               and meet the permissions there",
         args: &[
             "-p",
             "xtask",
@@ -268,6 +269,7 @@ const STEPS: &[Step] = &[
             "the_root_image_holds_the_header_crt0_and_libc_the_programs_are_linked_from",
             "the_profiles_images_differ_in_their_etc_rc_and_fonts",
             "the_desktop_image_boots_and_init_starts_its_shell_again",
+            "users_log_in_su_and_meet_the_permissions_on_the_root_image",
             "hello",
         ],
     },

@@ -3181,7 +3181,7 @@ fn the_framebuffer_console_shows_the_boot_and_the_shell() {
     assert_eq!(
         cells[29][0],
         ScreenCell {
-            ch: '$',
+            ch: '#',
             fg: 0xaaaaaa,
             bg: 0
         }

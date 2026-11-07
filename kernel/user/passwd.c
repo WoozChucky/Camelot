@@ -19,6 +19,8 @@
 #define FIELD_MAX 64
 /* The most bytes of /etc/shadow, as the library reads it. */
 #define SHADOW_MAX 4096
+/* Ticks to wait after a wrong password (10 a second), as login does. */
+#define FAIL_PAUSE 10
 /* The salt's length: hex digits of a hash of the time and the pid. */
 #define SALT_LEN 16
 
@@ -162,7 +164,7 @@ int main(int argc, char **argv) {
         int ok = sp != NULL && pw_check(current, sp->sp_pwdp);
         memset(current, 0, sizeof current);
         if (!ok) {
-            sleep(10);
+            sleep(FAIL_PAUSE);
             fprintf(STDERR, "passwd: Authentication failure\n");
             return 1;
         }

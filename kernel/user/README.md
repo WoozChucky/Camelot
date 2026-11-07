@@ -38,9 +38,16 @@ for `grep`, whose 1 means "no line matched".
 
 | Program | Usage | What it does |
 |---|---|---|
-| `init` | `init` (the kernel's, as pid 1) | the first process: starts the services `/etc/rc` lists, `once PATH [ARG...]` or `respawn PATH [ARG...]` a line, restarts the `respawn` ones as they end (but one that exits 78, `EX_CONFIG`, within a second of starting, or ends within a second five times in a row), ends the machine once the `once` ones have ended, and collects orphans; without `/etc/rc` it execs `/bin/sh` (excalibur-spec section 10, "Init and the shell") |
+| `init` | `init` (the kernel's, as pid 1) | the first process: starts the services `/etc/rc` lists, `once PATH [ARG...]` or `respawn PATH [ARG...]` a line, restarts the `respawn` ones as they end (but one that exits 78, `EX_CONFIG`, within a second of starting, or ends within a second five times in a row), ends the machine once the `once` ones have ended, and collects orphans; without `/etc/rc` it runs `respawn /bin/login` if `/etc/passwd` exists, else execs `/bin/sh` (excalibur-spec section 10, "Init and the shell") |
 | `sh` | `sh` | the shell: commands, `<`, `>`, `\|`, `&`, `NAME=VALUE` assignments, and the built-ins `cd`, `wait`, `exit`, `exec`, `export`, `unset`, `help`; it reads the console a line at a time, any other input (a connection from `shd`, a pipe, a file) a byte at a time, up to each newline |
-| `ls` | `ls [PATH...]` | lists directories (the working directory without arguments): type, inode, links, size, name |
+| `ls` | `ls [-l] [PATH...]` | lists directories (the working directory without arguments): type, inode, links, size, name; with `-l` the mode (`drwxr-xr-x`), links, owner, group, size and name |
+| `login` | `login` | asks `login: ` and `Password: ` (the echo off), checks `/etc/shadow`, and becomes the user: `setgid`, `setuid`, the home directory, `HOME`, `USER`, `LOGNAME`, `SHELL`, then execs the account's shell; `Login incorrect` after a second for a wrong one; without `/etc/passwd`, execs `/bin/sh` as root (spec section 10, "Users") |
+| `su` | `su [USER]` | a shell as USER (root by default), after USER's password unless the caller is root; set-user-ID root |
+| `passwd` | `passwd [USER]` | changes a password, the caller's own (after the current one) or, for root, anyone's: a new salt, the line of `/etc/shadow` rewritten; set-user-ID root |
+| `id` | `id` | `uid=1000(user) gid=1000(user)`, and `euid=`/`egid=` when they differ |
+| `whoami` | `whoami` | the effective user's name |
+| `chmod` | `chmod MODE FILE...` | sets files' permission bits (octal, at most 7777); the owner's or root's |
+| `chown` | `chown USER[:GROUP] FILE...` | gives files to USER (and GROUP): names or numbers; root's alone |
 | `cat` | `cat [FILE...]` | copies files, or its input, to its output; refuses a directory |
 | `echo` | `echo [-n] [ARG...]` | prints its arguments, with a newline unless `-n` |
 | `mkdir` | `mkdir DIR...` | makes directories |
@@ -62,19 +69,19 @@ for `grep`, whose 1 means "no line matched".
 So, on the root image:
 
 ```
-$ cat /README | grep Camelot | wc -l
+# cat /README | grep Camelot | wc -l
 1
-$ cp /README /r
-$ mv /r /notes
-$ sleep 100 &
+# cp /README /r
+# mv /r /notes
+# sleep 100 &
 [12]
-$ ps
+# ps
   PID  PPID STATE      SIZE NAME
     6     0 sleep     36864 sh
    12     6 sleep     20480 sleep
    13     6 run       20480 ps
-$ kill 12
-$ wait
+# kill 12
+# wait
 [12] sleep: exit -1
 ```
 
@@ -107,12 +114,12 @@ library's resolver asks the DNS server for. Each reports a problem as
 So, with `grail --disk target/camelot-fs.img --net user,hostfwd=tcp::8080-:80`:
 
 ```
-$ ping 10.0.2.2 1
+# ping 10.0.2.2 1
 PING 10.0.2.2: 56 data bytes
 64 bytes from 10.0.2.2: seq=1 ttl=64 time=1.211 ms
 1 sent, 1 received
-$ fetch http://10.0.2.2:8000/notes.txt > notes.txt
-$ httpd -n 1 &
+# fetch http://10.0.2.2:8000/notes.txt > notes.txt
+# httpd -n 1 &
 [9]
 httpd: serving / on port 80
 10.0.2.2:49153 GET /README 200 1325
@@ -132,9 +139,9 @@ without init, start it in the background from the console, with the
 machine's port 23 forwarded from the host:
 
 ```
-$ shd &
+# shd &
 [5]
-$
+#
 ```
 
 (`cargo xtask up --demo` forwards 127.0.0.1:2323 to its VM's, and types
@@ -171,11 +178,13 @@ host, `herald --tcp 127.0.0.1:2323` gives a shell, once per window.
 - **At most MAX sessions** (`-n`, 4 by default): one more is told
   `shd: too many sessions (MAX), try again later` and closed. Every program
   a session runs takes one of the kernel's 32 process slots too.
-- **Security: for local use only.** There are no users yet (issue #115),
-  so every shell runs as whoever started shd, root, with no password asked.
+- **Security: for local use only.** Each connection starts with `login`
+  (excalibur-spec section 10, "Users"), so a shell needs an account's
+  password, but the passwords travel in clear text (there is no TLS), the
+  image's defaults are documented, and the hash is a teaching system's.
   Forward its port from the host's loopback only (127.0.0.1, as `up --demo`
   and `hostfwd`'s default do), never from an address other machines can
-  reach. Once Camelot has users, shd will run `login` for each connection.
+  reach. On a disk without accounts, `login` runs a root shell at once.
 
 With `-v`, shd logs on its output (the console) a line per event:
 
@@ -203,6 +212,7 @@ shd: [7] 10.0.2.2:49152 ended, exit 0
 | `data` | exits with 0 only if its stack and `.bss` start zeroed and its `.data` holds its initial value and takes stores |
 | `badptr` | hands the system calls bad pointers, which must all fail with `-EFAULT` |
 | `systest` | checks every system call, its results and its errors (`systest: N checks, 0 failed`) |
+| `permtest` | checks users and permissions on a writable root filesystem (`permtest: N checks, 0 failed`): root's bypass, then as uid 1000 every refusal, set-user-ID programs, `chmod`, `chown`, `setuid`, `kill` |
 | `filetest` | checks the file system calls on a writable root filesystem (`filetest: N checks, 0 failed`) |
 | `stress` | many processes at once: pages, the console, a shared pipe and files under timer preemption (`stress: W workers, R rounds, N bytes: ok`) |
 | `threads` | `threads [THREADS [ROUNDS]]`: THREADS threads (4, at most 8) of one process each add 1 to a counter ROUNDS (500) times under a mutex, and to another under a spinlock, by reading, working and writing back, which loses updates without the lock; then joins them and checks both totals (`threads: T threads, R rounds: counter N, spun N: ok`) |

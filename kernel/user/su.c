@@ -15,6 +15,11 @@
  * nothing else of its caller's. */
 #include "user.h"
 
+/* An account's name at most, as login reads it. */
+#define NAME_LEN 64
+/* Ticks to wait after a wrong password (10 a second), as login does. */
+#define FAIL_PAUSE 10
+
 int main(int argc, char **argv) {
     if (argc > 2) {
         fprintf(STDERR, "usage: su [user]\n");
@@ -35,7 +40,7 @@ int main(int argc, char **argv) {
     gid_t gid = pw->pw_gid;
     char home[128];
     char shell[128];
-    char user[PASS_MAX + 1];
+    char user[NAME_LEN + 1];
     snprintf(home, sizeof home, "%s", pw->pw_dir);
     snprintf(shell, sizeof shell, "%s", pw->pw_shell);
     snprintf(user, sizeof user, "%s", pw->pw_name);
@@ -48,7 +53,7 @@ int main(int argc, char **argv) {
         int ok = sp != NULL && pw_check(password, sp->sp_pwdp);
         memset(password, 0, strlen(password));
         if (!ok) {
-            sleep(10);
+            sleep(FAIL_PAUSE);
             fprintf(STDERR, "su: Authentication failure\n");
             return 1;
         }

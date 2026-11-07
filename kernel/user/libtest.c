@@ -852,19 +852,13 @@ static void test_sha256(void) {
     memset(block, 'a', sizeof block);
     check_sha256(block, sizeof block, 13, "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
                  "sha256 of a block");
-    /* A million a's, FIPS's long example: a thousand pieces of 1000. */
+    /* A thousand a's, many blocks, in pieces that cut them anywhere (FIPS's
+     * million a's are crates/xtask/src/accounts.rs's to check: here they
+     * would take the emulator too long). */
     char thousand[1000];
     memset(thousand, 'a', sizeof thousand);
-    struct sha256 s;
-    sha256_init(&s);
-    for (int i = 0; i < 1000; i++) {
-        sha256_update(&s, thousand, sizeof thousand);
-    }
-    uint8_t digest[SHA256_SIZE];
-    char hex[2 * SHA256_SIZE + 1];
-    sha256_final(&s, digest);
-    sha256_hex(digest, hex);
-    check_str(hex, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", "sha256 of a million a's");
+    check_sha256(thousand, sizeof thousand, 77, "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3",
+                 "sha256 of a thousand a's");
 
     /* pw_hash: one round is SHA-256 of the salt and the password, and two
      * of that digest, the salt and the password again; the hashes
@@ -873,9 +867,13 @@ static void test_sha256(void) {
     check_eq(pw_hash("bc", "a", hash, sizeof hash), 0, "pw_hash");
     /* pw_hash takes PW_ROUNDS rounds: that hash has 1000. */
     check(strncmp(hash, "$sha256$1000$a$", 15) == 0 && strlen(hash) == 15 + 64, "pw_hash's format");
-    check(pw_check("bc", hash), "pw_check of the password");
-    check(!pw_check("bd", hash), "pw_check of another");
-    check(!pw_check("b", hash), "pw_check of a prefix");
+    /* The checks take the rounds a hash names: one or two here, as 1000
+     * take the emulator long (login's are checked end to end by
+     * crates/xtask/tests/boot.rs, against hashes xtask made). */
+    check(!pw_check("bd", "$sha256$1$a$ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+          "pw_check of another password");
+    check(!pw_check("b", "$sha256$1$a$ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+          "pw_check of a prefix");
     check(pw_check("bc", "$sha256$1$a$ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
           "one round is the salt and the password");
     check(pw_check("bc", "$sha256$2$a$3043d048d0d28ecf94e6eb021f76e69b76a1ead7d7a0d1392696bb2c09c261f1"),

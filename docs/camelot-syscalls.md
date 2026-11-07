@@ -1567,8 +1567,8 @@ owner. Both fail as a path does (`-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`,
 **Processes.** `kill` reaches another process only if the caller's real or
 effective uid is the target's real one, or the caller is root (`-EPERM`).
 **Ports.** `bind` to a TCP or UDP port below 1024 (`IPPORT_RESERVED`)
-needs root (`-EACCES`), as Unix's privileged ports do: `shd`'s 23 and
-`httpd`'s 80 are services init starts as root.
+needs root (`-EACCES`), as Unix's privileged ports do: `shd`'s 23 is a
+service init starts as root, and `httpd -p 80` is root's to run.
 
 What the kernel leaves out of Unix's: supplementary groups, saved ids, a
 umask, access control lists, and clearing a program's set-ID bits when
