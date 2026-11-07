@@ -12,7 +12,10 @@
  * - Keys go to the master as a VT100's (xterm's, for the keys it lacks):
  *   characters as UTF-8, Ctrl+letter as its control character, Alt as an
  *   ESC before it, the arrows and the editing keys as their sequences.
- *   The display server sends no repeats: a held key repeats here.
+ *   The display server sends no repeats: a held key repeats here. What
+ *   goes to the program is written by a thread of its own (input_ring),
+ *   so a paste the program is slow to read never stops its output being
+ *   read.
  * - Lines that scroll off the top go into the scrollback (SCROLLBACK lines),
  *   read back with the wheel or Shift+PageUp/PageDown; anything typed
  *   comes back to the bottom.
@@ -97,6 +100,21 @@ static int hist_start;
 static int nhist;
 /* How many lines up from the bottom the view is (0: the screen). */
 static int view;
+
+/* What goes to the program (keys, pastes, answers) waits in a ring for
+ * the writer thread, which writes it to the master: a write sleeps while
+ * the pty's input is full, until the program reads, and the program may
+ * itself be waiting for its output to be read, which the main loop goes
+ * on doing meanwhile. Bytes that find the ring full are dropped, as a
+ * terminal's overflowing input is. `input_seq` changes with each lot
+ * queued (the writer sleeps on it). */
+#define INPUT_RING 16384
+static char input_ring[INPUT_RING];
+static int input_tail;
+static int input_len;
+static int input_seq;
+static struct mutex input_lock;
+static uchar writer_stack[8192];
 
 /* The cursor; col == cols after the last column was written: the next
  * character wraps first (a VT100's deferred wrap). */
@@ -208,15 +226,15 @@ static void push_history(struct line *l) {
     if (nhist < SCROLLBACK) {
         slot = (hist_start + nhist) % SCROLLBACK;
         nhist++;
-        if (view > 0) {
-            view++; /* the view stays on the lines it shows */
-        }
     } else {
+        /* Full: the oldest line goes, and every other is one older. */
         slot = hist_start;
         hist_start = (hist_start + 1) % SCROLLBACK;
     }
-    if (view > nhist) {
-        view = nhist;
+    /* A view scrolled back stays on the lines it shows, one further up;
+     * at the top already, it stays there, on what is the top now. */
+    if (view > 0 && view < nhist) {
+        view++;
     }
     hist[slot] = *l;
 }
@@ -371,9 +389,45 @@ static void erase(int r, int from, int to) {
     changed(r);
 }
 
+/* Queues n bytes for the program. */
+static void send_input(const char *s, size_t n) {
+    mutex_lock(&input_lock);
+    for (size_t i = 0; i < n && input_len < INPUT_RING; i++) {
+        input_ring[(input_tail + input_len) % INPUT_RING] = s[i];
+        input_len++;
+    }
+    atomic_add(&input_seq, 1);
+    mutex_unlock(&input_lock);
+    futex_wake(&input_seq, 1);
+}
+
+/* The writer thread: what is queued, to the master, until the program
+ * has gone. */
+static int writer(void *arg) {
+    (void)arg;
+    char chunk[256];
+    for (;;) {
+        mutex_lock(&input_lock);
+        int n = 0;
+        while (n < (int)sizeof(chunk) && input_len > 0) {
+            chunk[n++] = input_ring[input_tail];
+            input_tail = (input_tail + 1) % INPUT_RING;
+            input_len--;
+        }
+        int seen = atomic_load(&input_seq);
+        mutex_unlock(&input_lock);
+        if (n == 0) {
+            futex_wait(&input_seq, seen);
+        } else if (write(master, chunk, (size_t)n) < 0) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
 /* What the terminal answers (DSR, DA) goes to the program. */
 static void reply(const char *s) {
-    write(master, s, strlen(s));
+    send_input(s, strlen(s));
 }
 
 static void private_mode(int set) {
@@ -762,11 +816,21 @@ static void say_drawn(void) {
     fprintf(2, "term \"%s\": drawn \"%s\"\n", title, text);
 }
 
+/* The window's size the grid was last laid out for (resize). */
+static int laid_w;
+static int laid_h;
+static void resize(int width, int height);
+
 static void draw(void) {
     struct gui_buffer *b = gui_window_buffer(win);
     if (b == NULL) {
         quit = 1;
         return;
+    }
+    /* A configure that came while it waited for a free buffer has the
+     * buffer at the new size: the grid follows first, all of it drawn. */
+    if (b->width != laid_w || b->height != laid_h) {
+        resize(b->width, b->height);
     }
     if (all_dirty) {
         gui_fill(b, gui_rect(0, 0, b->width, PAD), GUI_RGB(0, 0, 0));
@@ -800,6 +864,8 @@ static void draw(void) {
 /* The window is `width` x `height` pixels: the grid fits it, and the
  * program is told. */
 static void resize(int width, int height) {
+    laid_w = width;
+    laid_h = height;
     int c = (width - 2 * PAD) / font.width;
     int r = (height - 2 * PAD) / font.height;
     c = clamp(c, 2, MAX_COLS);
@@ -927,7 +993,7 @@ static void paste(void) {
             s[i] = '\r';
         }
     }
-    write(master, s, len);
+    send_input(s, len);
     free(s);
     if (view != 0) {
         view = 0;
@@ -938,7 +1004,7 @@ static void paste(void) {
 /* ---- Input ---- */
 
 static void type(const char *s) {
-    write(master, s, strlen(s));
+    send_input(s, strlen(s));
     if (view != 0) {
         view = 0;
         dirty_all();
@@ -1057,7 +1123,7 @@ static void key_press(uint code) {
     } else {
         n += gui_utf8_put(buf + n, ch);
     }
-    write(master, buf, (size_t)n);
+    send_input(buf, (size_t)n);
     if (view != 0) {
         view = 0;
         dirty_all();
@@ -1292,6 +1358,12 @@ int main(int argc, char **argv) {
         fprintf(2, "term: can't start %s: %s\n", path, strerror(-master));
         return 1;
     }
+    int tid = thread_start(writer, NULL, writer_stack, sizeof(writer_stack));
+    if (tid < 0) {
+        fprintf(2, "term: can't start its writer: %s\n", strerror(-tid));
+        kill(child);
+        return 1;
+    }
     win = gui_window_open(display, title, COLS * font.width + 2 * PAD, ROWS * font.height + 2 * PAD,
                           &handlers, NULL);
     if (win == NULL) {
@@ -1300,15 +1372,11 @@ int main(int argc, char **argv) {
         return 1;
     }
     resize(gui_window_width(win), gui_window_height(win));
-    int laid_w = gui_window_width(win);
-    int laid_h = gui_window_height(win);
     while (!quit) {
         int w = gui_window_width(win);
         int h = gui_window_height(win);
         if (w != laid_w || h != laid_h) {
             resize(w, h);
-            laid_w = w;
-            laid_h = h;
         }
         int something = all_dirty || cur_row + view != drawn_row || cur_col != drawn_col;
         for (int r = 0; r < rows && !something; r++) {
