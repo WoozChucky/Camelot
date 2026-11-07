@@ -1168,8 +1168,11 @@ char *response_file_text(char **args, int n);
  * them out, -Werror=X makes them errors, -Wno-error=X makes them shown
  * again and never errors, -Wno-everything leaves every warning out,
  * -Weverything changes nothing (`everything` is no group for -Werror=), the
- * last of -Werror and -Wno-error decides for the rest, and -w anywhere
- * leaves every warning out.
+ * last of -Werror and -Wno-error decides for the rest; -Wfatal-errors=X
+ * makes them fatal (WARNING_FATAL), -Wno-fatal-errors=X takes that back
+ * for good, and the last of -Wfatal-errors and -Wno-fatal-errors makes
+ * every error fatal (warning_error_is_fatal: an error of `flag`, not
+ * taken back); and -w anywhere leaves every warning out.
  * is_warning_option: whether `a` is -w or -W and a name, none too (not
  * -Wl, -Wp, -Wa,: no warning's name has a comma).
  * warning_option_message: clang's warning of the -W option `o` given
@@ -1180,8 +1183,11 @@ char *response_file_text(char **args, int n);
 #define WARNING_IGNORED 0
 #define WARNING_SHOWN 1
 #define WARNING_ERROR 2
+#define WARNING_FATAL 3
 int warning_level(char *const *options, int noptions, const char *flag, const char *const *groups, int ngroups);
 int is_warning_option(const char *a);
+int warning_error_is_fatal(char *const *options, int noptions, const char *flag, const char *const *groups,
+                           int ngroups);
 const char *warning_option_message(const char *o, const char *const *names, int nnames, char *buf, size_t size);
 
 /* Terminals (lib/tty.c), as POSIX has them, but for returning a negative

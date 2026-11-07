@@ -134,6 +134,40 @@ pub enum Level {
     Warning,
     /// Made an error: `error: ... [-Werror,-WFLAG]`, which fails what gave it.
     Error,
+    /// Made a fatal error: `fatal error: ... [-WFLAG]`, after which nothing
+    /// more is said.
+    Fatal,
+}
+
+/// The name a `-W` option gives `-Wfatal-errors=` (or GCC's
+/// `-Wfatal-errors-`), as clang reads it: `None` for anything else.
+fn fatal_errors_of(w: &str) -> Option<&str> {
+    let rest = w.strip_prefix("fatal-errors")?;
+    rest.strip_prefix('=')
+        .or_else(|| rest.strip_prefix('-'))
+        .filter(|n| !n.is_empty())
+}
+
+/// Whether an error of `flag` (`None`: unflagged) is made fatal under
+/// `options`: under the last of `-Wfatal-errors` and `-Wno-fatal-errors`,
+/// unless a `-Wno-fatal-errors=X` names it, as clang's
+/// `DiagnosticsEngine` decides it.
+pub fn error_is_fatal(options: &[String], flag: Option<&str>) -> bool {
+    let mut fatal = false;
+    let mut no_fatal = false;
+    for o in options {
+        match o.strip_prefix("-W") {
+            Some("fatal-errors") => fatal = true,
+            Some("no-fatal-errors") => fatal = false,
+            Some(w) => {
+                if let Some(x) = w.strip_prefix("no-").and_then(fatal_errors_of) {
+                    no_fatal |= names(x, flag);
+                }
+            }
+            None => {}
+        }
+    }
+    fatal && !no_fatal
 }
 
 /// Whether `a` is an option this module takes: `-w`, or `-W` and a name,
@@ -152,13 +186,20 @@ pub fn is_option(a: &str) -> bool {
 /// overrides an error); `-Wno-X` leaves it out; `-Werror=X` makes it an
 /// error; `-Wno-error=X` makes an error a warning again and marks it;
 /// `-Wno-everything` leaves out every warning, and `-Weverything` turns on
-/// only those off by default. At the end, under the last of `-Werror` and
-/// `-Wno-error`, a warning not marked is an error; and `-w`, wherever it
-/// is, leaves every warning out.
+/// only those off by default; `-Wfatal-errors=X` makes it a fatal error
+/// (whatever it was), and `-Wno-fatal-errors=X` makes a fatal one an error
+/// and marks it "not fatal" (`-Wno-error=X` makes it a warning, and `-WX`
+/// leaves it fatal). At the end, under the last of `-Werror` and
+/// `-Wno-error`, a warning not marked is an error, and an error, under the
+/// last of `-Wfatal-errors` and `-Wno-fatal-errors`, fatal unless marked;
+/// and `-w`, wherever it is, leaves every warning out, whatever it was
+/// made.
 pub fn level(options: &[String], flag: Option<&str>) -> Level {
     let mut severity = Level::Warning;
     let mut no_werror = false;
     let mut werror = false;
+    let mut no_fatal = false;
+    let mut fatal = false;
     for o in options {
         if o == "-w" {
             return Level::Ignored;
@@ -180,14 +221,28 @@ pub fn level(options: &[String], flag: Option<&str>) -> Level {
             "no-error" | "no-error=" => werror = false,
             "everything" => {}
             "no-everything" => severity = Level::Ignored,
+            "fatal-errors" => fatal = true,
+            "no-fatal-errors" => fatal = false,
             _ => {
-                if let Some(x) = w.strip_prefix("error=") {
+                let error = matches!(severity, Level::Error | Level::Fatal);
+                if let Some(x) = fatal_errors_of(w) {
+                    if names(x, flag) {
+                        severity = Level::Fatal;
+                    }
+                } else if let Some(x) = w.strip_prefix("no-").and_then(fatal_errors_of) {
+                    if names(x, flag) {
+                        if severity == Level::Fatal {
+                            severity = Level::Error;
+                        }
+                        no_fatal = true;
+                    }
+                } else if let Some(x) = w.strip_prefix("error=") {
                     if names(x, flag) {
                         severity = Level::Error;
                     }
                 } else if let Some(x) = w.strip_prefix("no-error=") {
                     if names(x, flag) {
-                        if severity == Level::Error {
+                        if error {
                             severity = Level::Warning;
                         }
                         no_werror = true;
@@ -196,34 +251,40 @@ pub fn level(options: &[String], flag: Option<&str>) -> Level {
                     if names(x, flag) {
                         severity = Level::Ignored;
                     }
-                } else if names(w, flag) && severity != Level::Error {
+                } else if names(w, flag) && !error {
                     severity = Level::Warning;
                 }
             }
         }
     }
     if severity == Level::Warning && werror && !no_werror {
-        Level::Error
-    } else {
-        severity
+        severity = Level::Error;
     }
+    if severity == Level::Error && fatal && !no_fatal {
+        severity = Level::Fatal;
+    }
+    severity
 }
 
 /// `diags` under `options` ([`level`]): warnings left out, or made errors
-/// (`[-Werror,-WFLAG]`, an unflagged one `[-Werror]`, as clang marks them). Errors and notes
-/// are as they were: an error clang makes of a warning by default
-/// (`-Wint-conversion`) stays one, which merlin can't compile otherwise.
-/// Also whether a warning was made an error, which fails what gave it.
+/// (`[-Werror,-WFLAG]`, an unflagged one `[-Werror]`, as clang marks them)
+/// or fatal errors (`[-WFLAG]`, as clang marks them); an error made fatal
+/// under `-Wfatal-errors` ([`error_is_fatal`]). Notes are as they were, and
+/// so is an error clang makes of a warning by default (`-Wint-conversion`),
+/// which merlin can't compile otherwise, but for `-Wfatal-errors`. After a
+/// fatal error (its notes kept) nothing more is said, as in clang. Also
+/// whether a warning was made an error, which fails what gave it.
 pub fn apply(options: &[String], diags: Vec<crate::Error>) -> (Vec<crate::Error>, bool) {
+    use crate::Severity;
     let mut failed = false;
     let mut out = Vec::new();
     for mut d in diags {
-        if d.severity == crate::Severity::Warning {
-            match level(options, d.flag) {
+        match d.severity {
+            Severity::Warning => match level(options, d.flag) {
                 Level::Ignored => continue,
                 Level::Warning => {}
                 Level::Error => {
-                    d.severity = crate::Severity::Error;
+                    d.severity = Severity::Error;
                     // A flag is a 'static str, as merlin's are: this one
                     // lives as long as the process, as it would anyway.
                     d.flag = Some(match d.flag {
@@ -232,9 +293,19 @@ pub fn apply(options: &[String], diags: Vec<crate::Error>) -> (Vec<crate::Error>
                     });
                     failed = true;
                 }
-            }
+                Level::Fatal => {
+                    d.severity = Severity::Fatal;
+                    failed = true;
+                }
+            },
+            Severity::Error if error_is_fatal(options, d.flag) => d.severity = Severity::Fatal,
+            _ => {}
         }
+        let fatal = d.severity == Severity::Fatal;
         out.push(d);
+        if fatal {
+            break;
+        }
     }
     (out, failed)
 }
@@ -327,6 +398,79 @@ mod tests {
         assert!(table().iter().any(|(f, _)| *f == "unused-command-line-argument"));
         assert_eq!(level(&opts(&["-Werror="]), r), Level::Error);
         assert_eq!(level(&opts(&["-Werror", "-Wno-error="]), r), Level::Warning);
+    }
+
+    #[test]
+    fn fatal_errors_are_clangs() {
+        let s = Some("shift-count-overflow");
+        assert_eq!(level(&opts(&["-Wfatal-errors"]), s), Level::Warning);
+        assert_eq!(level(&opts(&["-Werror", "-Wfatal-errors"]), s), Level::Fatal);
+        assert_eq!(
+            level(&opts(&["-Werror", "-Wfatal-errors", "-Wno-fatal-errors"]), s),
+            Level::Error
+        );
+        assert_eq!(
+            level(&opts(&["-Wfatal-errors=shift-count-overflow"]), s),
+            Level::Fatal
+        );
+        assert_eq!(
+            level(
+                &opts(&["-Wno-shift-count-overflow", "-Wfatal-errors-shift-count-overflow"]),
+                s
+            ),
+            Level::Fatal
+        );
+        assert_eq!(
+            level(
+                &opts(&["-Wfatal-errors=shift-count-overflow", "-Wshift-count-overflow"]),
+                s
+            ),
+            Level::Fatal
+        );
+        assert_eq!(
+            level(
+                &opts(&[
+                    "-Wfatal-errors=shift-count-overflow",
+                    "-Wno-fatal-errors=shift-count-overflow"
+                ]),
+                s
+            ),
+            Level::Error
+        );
+        assert_eq!(
+            level(
+                &opts(&[
+                    "-Wfatal-errors=shift-count-overflow",
+                    "-Wno-error=shift-count-overflow"
+                ]),
+                s
+            ),
+            Level::Warning
+        );
+        assert_eq!(
+            level(
+                &opts(&[
+                    "-Wno-fatal-errors=shift-count-overflow",
+                    "-Werror",
+                    "-Wfatal-errors"
+                ]),
+                s
+            ),
+            Level::Error
+        );
+        assert_eq!(
+            level(&opts(&["-Wfatal-errors=shift-count-overflow", "-w"]), s),
+            Level::Ignored
+        );
+        assert!(error_is_fatal(&opts(&["-Wfatal-errors"]), None));
+        assert!(!error_is_fatal(
+            &opts(&["-Wfatal-errors", "-Wno-fatal-errors"]),
+            None
+        ));
+        assert!(error_is_fatal(
+            &opts(&["-Wno-fatal-errors", "-Wfatal-errors"]),
+            None
+        ));
     }
 
     #[test]

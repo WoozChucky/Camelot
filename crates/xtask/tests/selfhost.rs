@@ -2794,6 +2794,12 @@ fn cc1_takes_merlins_command_line() {
         // #warning, of the group cpp; an unflagged warning.
         ("/d/hw.c".to_string(), b"#warning hello\nint x;\n".to_vec()),
         ("/d/u.c".to_string(), b"int h = 'abcde';\n".to_vec()),
+        // Errors and warnings, for -Wfatal-errors.
+        ("/d/fe.c".to_string(), b"int f(int);\nint f(char);\nint h = z;\n".to_vec()),
+        (
+            "/d/fm.c".to_string(),
+            b"int a = 1 << 40;\n#warning hey\nint b = q;\nint c = 1 << 40;\n".to_vec(),
+        ),
         // A response file in a directory deeper than 127 bytes, which names
         // itself: named by its whole path.
         (format!("{DEEP}/self"), b"@self\n".to_vec()),
@@ -2955,6 +2961,44 @@ fn cc1_takes_merlins_command_line() {
             "cc1 -Werror -Wno-error=everything -o /out/z2 /d/a.c",
             "error: unknown warning option '-Werror=everything' [-Werror,-Wunknown-warning-option]\n"
                 .to_string(),
+            1,
+        ),
+        // -Wfatal-errors: the first error fatal, its notes, nothing after;
+        // -Wno-fatal-errors takes it back; a warning made an error is
+        // fatal too, with its flag alone; -Wno-fatal-errors=X makes a
+        // warning -Wfatal-errors=X made fatal an error.
+        (
+            "cc1 -Wfatal-errors -o /out/fe /d/fe.c",
+            "/d/fe.c:2:5: fatal error: conflicting types for 'f'\n\
+             /d/fe.c:1:5: note: previous declaration is here\n"
+                .to_string(),
+            1,
+        ),
+        (
+            "cc1 -Wfatal-errors -Wno-fatal-errors -o /out/fe2 /d/fe.c",
+            "/d/fe.c:2:5: error: conflicting types for 'f'\n\
+             /d/fe.c:1:5: note: previous declaration is here\n\
+             /d/fe.c:3:9: error: use of undeclared identifier 'z'\n"
+                .to_string(),
+            1,
+        ),
+        (
+            "cc1 -Werror -Wfatal-errors -o /out/fm /d/fm.c",
+            "/d/fm.c:1:11: fatal error: shift count >= width of type [-Wshift-count-overflow]\n".to_string(),
+            1,
+        ),
+        (
+            "cc1 -Wfatal-errors=shift-count-overflow -Wno-fatal-errors=shift-count-overflow -o /out/fm2 /d/fm.c",
+            "/d/fm.c:1:11: error: shift count >= width of type [-Werror,-Wshift-count-overflow]\n\
+             /d/fm.c:2:2: warning: hey [-W#warnings]\n\
+             /d/fm.c:3:9: error: use of undeclared identifier 'q'\n\
+             /d/fm.c:4:11: error: shift count >= width of type [-Werror,-Wshift-count-overflow]\n"
+                .to_string(),
+            1,
+        ),
+        (
+            "cc1 -Wfatal-errors -Werror -Wzzqqxxyy -O9 -o /out/fz /d/a.c",
+            "fatal error: unknown warning option '-Wzzqqxxyy' [-Wunknown-warning-option]\n".to_string(),
             1,
         ),
         // UTF-16 LLVM can't convert, LLVM's message.

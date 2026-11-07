@@ -53,17 +53,32 @@ static int names(const char *name, const char *flag, const char *const *groups, 
     return 0;
 }
 
+/* The name -Wfatal-errors=NAME (or GCC's -Wfatal-errors-NAME) gives, `w`
+ * what follows -W; NULL for anything else. */
+static const char *fatal_errors_of(const char *w) {
+    if (strncmp(w, "fatal-errors", 12) != 0 || (w[12] != '=' && w[12] != '-') || w[13] == 0) {
+        return NULL;
+    }
+    return w + 13;
+}
+
 /* As clang's DiagnosticsEngine decides it (merlin::warnings::level): the
- * warning's severity, shown at first, and its "no -Werror" mark. -WX shows
- * it unless it is an error; -Wno-X leaves it out; -Werror=X makes it an
- * error; -Wno-error=X makes an error shown again and marks it;
- * -Wno-everything leaves out every warning, -Weverything changes none of
- * these. At the end, under the last of -Werror and -Wno-error, a shown
- * warning not marked is an error; -w anywhere leaves every warning out. */
+ * warning's severity, shown at first, and its "no -Werror" and "not fatal"
+ * marks. -WX shows it unless it is an error or fatal; -Wno-X leaves it
+ * out; -Werror=X makes it an error; -Wno-error=X makes an error (or a
+ * fatal one) shown again and marks it; -Wfatal-errors=X makes it fatal,
+ * -Wno-fatal-errors=X a fatal one an error, and marks it; -Wno-everything
+ * leaves out every warning, -Weverything changes none of these. At the
+ * end, under the last of -Werror and -Wno-error, a shown warning not
+ * marked is an error, and an error, under the last of -Wfatal-errors and
+ * -Wno-fatal-errors, fatal unless marked; -w anywhere leaves every warning
+ * out. */
 int warning_level(char *const *options, int noptions, const char *flag, const char *const *groups, int ngroups) {
     int severity = WARNING_SHOWN;
     int no_werror = 0;
     int werror = 0;
+    int no_fatal = 0;
+    int fatal = 0;
     for (int i = 0; i < noptions; i++) {
         const char *o = options[i];
         if (strcmp(o, "-w") == 0) {
@@ -82,6 +97,8 @@ int warning_level(char *const *options, int noptions, const char *flag, const ch
         } else if (strcmp(w, "no-error-implicit-function-declaration") == 0) {
             w = "no-error=implicit-function-declaration";
         }
+        int error = severity == WARNING_ERROR || severity == WARNING_FATAL;
+        const char *x;
         /* -Werror= with no name is -Werror, as in clang. */
         if (strcmp(w, "error") == 0 || strcmp(w, "error=") == 0) {
             werror = 1;
@@ -91,13 +108,28 @@ int warning_level(char *const *options, int noptions, const char *flag, const ch
             /* Turns on what is off by default: nothing here. */
         } else if (strcmp(w, "no-everything") == 0) {
             severity = WARNING_IGNORED;
+        } else if (strcmp(w, "fatal-errors") == 0) {
+            fatal = 1;
+        } else if (strcmp(w, "no-fatal-errors") == 0) {
+            fatal = 0;
+        } else if ((x = fatal_errors_of(w)) != NULL) {
+            if (names(x, flag, groups, ngroups)) {
+                severity = WARNING_FATAL;
+            }
+        } else if (strncmp(w, "no-", 3) == 0 && (x = fatal_errors_of(w + 3)) != NULL) {
+            if (names(x, flag, groups, ngroups)) {
+                if (severity == WARNING_FATAL) {
+                    severity = WARNING_ERROR;
+                }
+                no_fatal = 1;
+            }
         } else if (strncmp(w, "error=", 6) == 0) {
             if (names(w + 6, flag, groups, ngroups)) {
                 severity = WARNING_ERROR;
             }
         } else if (strncmp(w, "no-error=", 9) == 0) {
             if (names(w + 9, flag, groups, ngroups)) {
-                if (severity == WARNING_ERROR) {
+                if (error) {
                     severity = WARNING_SHOWN;
                 }
                 no_werror = 1;
@@ -106,14 +138,35 @@ int warning_level(char *const *options, int noptions, const char *flag, const ch
             if (names(w + 3, flag, groups, ngroups)) {
                 severity = WARNING_IGNORED;
             }
-        } else if (names(w, flag, groups, ngroups) && severity != WARNING_ERROR) {
+        } else if (names(w, flag, groups, ngroups) && !error) {
             severity = WARNING_SHOWN;
         }
     }
     if (severity == WARNING_SHOWN && werror && !no_werror) {
-        return WARNING_ERROR;
+        severity = WARNING_ERROR;
+    }
+    if (severity == WARNING_ERROR && fatal && !no_fatal) {
+        severity = WARNING_FATAL;
     }
     return severity;
+}
+
+int warning_error_is_fatal(char *const *options, int noptions, const char *flag, const char *const *groups,
+                           int ngroups) {
+    int fatal = 0;
+    int no_fatal = 0;
+    for (int i = 0; i < noptions; i++) {
+        const char *o = options[i];
+        const char *x;
+        if (strcmp(o, "-Wfatal-errors") == 0) {
+            fatal = 1;
+        } else if (strcmp(o, "-Wno-fatal-errors") == 0) {
+            fatal = 0;
+        } else if (strncmp(o, "-Wno-", 5) == 0 && (x = fatal_errors_of(o + 5)) != NULL) {
+            no_fatal |= names(x, flag, groups, ngroups);
+        }
+    }
+    return fatal && !no_fatal;
 }
 
 int is_warning_option(const char *a) {

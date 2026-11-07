@@ -148,11 +148,13 @@ void diag_name_files(struct diag *d, const char **names, const uint *lens, uint 
     }
 }
 
-/* The diagnostic's own line (merlin's Error::first_line): `file:line:col:
- * error: message`, then ` [-Wflag]` if it has a flag; with no place, the
- * file alone, or nothing at all for a diagnostic of no file. A warning
- * -Werror made an error (`promoted`) says `error` and `[-Werror,-Wflag]`. */
-static void print_line(struct diag *d, const char *input, int promoted) {
+/* The diagnostic's own line (merlin's Error::first_line), as of
+ * `severity`: `file:line:col: error: message`, then ` [-Wflag]` if it has
+ * a flag; with no place, the file alone, or nothing at all for a
+ * diagnostic of no file. A warning -Werror made an error (`promoted`) says
+ * `[-Werror,-Wflag]` (`[-Werror]` with no flag); one made fatal its flag
+ * alone, as clang marks them. */
+static void print_line(struct diag *d, const char *input, int severity, int promoted) {
     const char *file = input;
     uint filelen = (uint)strlen(input);
     if (d->file != NULL) {
@@ -160,11 +162,11 @@ static void print_line(struct diag *d, const char *input, int promoted) {
         filelen = d->filelen;
     }
     const char *what = "error";
-    if (d->severity == SEV_FATAL) {
+    if (severity == SEV_FATAL) {
         what = "fatal error";
-    } else if (d->severity == SEV_WARNING && !promoted) {
+    } else if (severity == SEV_WARNING) {
         what = "warning";
-    } else if (d->severity == SEV_NOTE) {
+    } else if (severity == SEV_NOTE) {
         what = "note";
     }
     struct buf b;
@@ -193,6 +195,7 @@ static void print_line(struct diag *d, const char *input, int promoted) {
 static char **w_options;
 static int nw_options;
 int diag_failed;
+int diag_fatal_seen;
 
 void diag_take_w(char *opt) {
     w_options = realloc(w_options, (size_t)(nw_options + 1) * sizeof(char *));
@@ -225,34 +228,50 @@ int diag_option_warnings(void) {
         failed |= diag_failed;
     }
     diag_failed = 0;
-    return failed;
+    return failed || diag_fatal_seen;
 }
 
 /* merlin's Error::render as it is, -w and -W aside: the command line's own
  * diagnostics (-O's, -std='s), which clang gives before it applies them. */
 void diag_print_as_is(struct diag *d, const char *input) {
-    print_line(d, input, 0);
+    print_line(d, input, d->severity, 0);
     for (struct diag *n = d->notes; n != NULL; n = n->next) {
-        print_line(n, input, 0);
+        print_line(n, input, n->severity, 0);
     }
 }
 
 /* merlin's Error::render, then the newline eprintln! ends it with: the
- * diagnostic's line, then a line for each note; under -w and -W, a warning
- * is left out, notes and all, or made an error (an error clang makes of a
- * warning by default stays as it is). */
+ * diagnostic's line, then a line for each note; under -w and -W
+ * (merlin's warnings::apply), a warning is left out, notes and all, or
+ * made an error or a fatal one, and an error made fatal under
+ * -Wfatal-errors (an error clang makes of a warning by default stays as it
+ * is otherwise). After a fatal error (its notes said) nothing more is
+ * said, as in clang: diag_fatal_seen. */
 void diag_print(struct diag *d, const char *input) {
+    if (diag_fatal_seen) {
+        return;
+    }
+    int severity = d->severity;
     int promoted = 0;
-    if (d->severity == SEV_WARNING) {
+    if (severity == SEV_WARNING) {
         int level = warning_level(w_options, nw_options, d->flag, WARNING_GROUPS, NWARNING_GROUPS);
         if (level == WARNING_IGNORED) {
             return;
         }
-        promoted = level == WARNING_ERROR;
-        diag_failed |= promoted;
+        if (level == WARNING_ERROR) {
+            severity = SEV_ERROR;
+            promoted = 1;
+        } else if (level == WARNING_FATAL) {
+            severity = SEV_FATAL;
+        }
+        diag_failed |= level == WARNING_ERROR || level == WARNING_FATAL;
+    } else if (severity == SEV_ERROR &&
+               warning_error_is_fatal(w_options, nw_options, d->flag, WARNING_GROUPS, NWARNING_GROUPS)) {
+        severity = SEV_FATAL;
     }
-    print_line(d, input, promoted);
+    print_line(d, input, severity, promoted);
     for (struct diag *n = d->notes; n != NULL; n = n->next) {
-        print_line(n, input, 0);
+        print_line(n, input, n->severity, 0);
     }
+    diag_fatal_seen = severity == SEV_FATAL;
 }

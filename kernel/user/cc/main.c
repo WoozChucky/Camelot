@@ -856,13 +856,17 @@ int main(int argc, char **argv) {
      * reads its command line (and as they are: -w and -W are not applied to
      * them); an error stops it there. */
     options_failed = diag_option_warnings();
+    /* One made a fatal error (-Wfatal-errors): no diagnostic follows, -O's
+     * and -std='s neither, and nothing is compiled, but -v's lines are
+     * said, as clang's -cc1 says them (they are no diagnostics). */
+    int options_fatal = diag_fatal_seen;
     if (std_value != NULL) {
         check_std(std_value);
     }
     if (opt != NULL) {
         check_opt(opt);
     }
-    for (uint i = 0; i < nsaid; i++) {
+    for (uint i = 0; i < nsaid && !options_fatal; i++) {
         diag_print_as_is(said[i], "");
     }
     if (said_error) {
@@ -897,6 +901,13 @@ int main(int argc, char **argv) {
         if (verbose) {
             print_search_list(&opts);
         }
+        if (options_fatal) {
+            status = 1;
+            continue;
+        }
+        /* Each input is a translation unit of its own, as each is a -cc1
+         * of clang's: a fatal error in one says nothing of the next. */
+        diag_fatal_seen = 0;
         int r = mode == MODE_PREPROCESS ? translate(&inputs[i], output, &opts)
                                         : compile_file(&inputs[i], output, &opts, mode == MODE_DUMP_AST, comp_dir);
         if (r != 0) {

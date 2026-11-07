@@ -399,6 +399,12 @@ fn run() -> ExitCode {
     for d in &option_warnings {
         eprintln!("{}", d.render(""));
     }
+    // One made a fatal error (-Wfatal-errors): no diagnostic follows, -O's
+    // and -std='s neither, and nothing is compiled, but -v's lines are
+    // said, as clang's -cc1 says them (they are no diagnostics).
+    let options_fatal = option_warnings
+        .iter()
+        .any(|d| d.severity == merlin::Severity::Fatal);
     // The last -std='s and the last -O's diagnostics, in that order, as
     // clang's -cc1 gives them as it reads its command line (and as they are:
     // -w and -W are not applied to them); an error stops it there.
@@ -408,7 +414,7 @@ fn run() -> ExitCode {
         .into_iter()
         .chain(opt.as_deref().and_then(check_opt))
         .collect();
-    for d in &said {
+    for d in said.iter().filter(|_| !options_fatal) {
         eprintln!("{}", d.render(""));
     }
     if said.iter().any(|d| d.severity == merlin::Severity::Error) {
@@ -441,6 +447,10 @@ fn run() -> ExitCode {
         };
         if verbose {
             eprint!("{}", search_list(&opts.include_dirs));
+        }
+        if options_fatal {
+            status = ExitCode::from(1);
+            continue;
         }
         if let Err(code) = translate(input, output.as_deref(), mode, &opts, &warnings, options_failed) {
             status = code;

@@ -216,6 +216,8 @@ void diag_print(struct diag *d, const char *input);
  * as clang does (lib/warnings.c's warning_level, merlin::warnings). */
 void diag_take_w(char *opt);
 int diag_option_warnings(void);
+/* Whether a fatal error was said (diag.c): nothing more is. */
+extern int diag_fatal_seen;
 /* Prints d and its notes as they are, -w and -W aside (the command line's
  * own diagnostics). */
 void diag_print_as_is(struct diag *d, const char *input);

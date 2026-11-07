@@ -799,6 +799,147 @@ fn unknown_warning_options_are_clangs() {
     assert_eq!((e.0, e.2), (Some(1), true));
 }
 
+/// `-Wfatal-errors` makes the first error fatal: `fatal error:`, its notes,
+/// and nothing after it, a later warning neither; `-Wno-fatal-errors`
+/// takes it back, the last of the two holding; `-Wfatal-errors=X` makes
+/// X's warnings fatal (marked with their flag alone), `-Wno-fatal-errors=X`
+/// makes them errors again. These are clang 23's answers (`clang -cc1
+/// -fno-caret-diagnostics`).
+#[test]
+fn fatal_errors_are_clangs() {
+    let conflict = TempSrc::new("fatal1", "f.c", "int f(int);\nint f(char);\nint h = z;\n");
+    let mixed = TempSrc::new(
+        "fatal2",
+        "m.c",
+        "int a = 1 << 40;\n#warning hey\nint b = q;\nint c = 1 << 40;\n",
+    );
+    let said = |t: &TempSrc, args: &[&str]| {
+        let mut all: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+        all.extend([PathBuf::from("-o"), PathBuf::from("-"), t.file.clone()]);
+        let refs: Vec<&Path> = all.iter().map(PathBuf::as_path).collect();
+        let out = merlin(&refs);
+        (out.status.code(), stderr(&out))
+    };
+    let f = conflict.file.display().to_string();
+    let m = mixed.file.display().to_string();
+    let conflicting = |what: &str| {
+        format!("{f}:2:5: {what}: conflicting types for 'f'\n{f}:1:5: note: previous declaration is here\n")
+    };
+    let shift = |line: u32, what: &str, flag: &str| {
+        format!("{m}:{line}:11: {what}: shift count >= width of type [{flag}-Wshift-count-overflow]\n")
+    };
+    let hey = format!("{m}:2:2: warning: hey [-W#warnings]\n");
+    let q = |what: &str| format!("{m}:3:9: {what}: use of undeclared identifier 'q'\n");
+    let both = format!(
+        "{}{f}:3:9: error: use of undeclared identifier 'z'\n",
+        conflicting("error")
+    );
+    for (t, args, text) in [
+        (&conflict, &["-Wfatal-errors"][..], conflicting("fatal error")),
+        (&conflict, &["-Wfatal-errors", "-Wno-fatal-errors"], both.clone()),
+        (
+            &conflict,
+            &["-Wno-fatal-errors", "-Wfatal-errors"],
+            conflicting("fatal error"),
+        ),
+        (&conflict, &["-w", "-Wfatal-errors"], conflicting("fatal error")),
+        (
+            &mixed,
+            &["-Wfatal-errors"],
+            format!("{}{hey}{}", shift(1, "warning", ""), q("fatal error")),
+        ),
+        (
+            &mixed,
+            &["-Wfatal-errors", "-Wno-fatal-errors"],
+            format!(
+                "{}{hey}{}{}",
+                shift(1, "warning", ""),
+                q("error"),
+                shift(4, "warning", "")
+            ),
+        ),
+        // A warning -Werror made an error is fatal too, marked with its
+        // flag alone.
+        (
+            &mixed,
+            &["-Werror", "-Wfatal-errors"],
+            shift(1, "fatal error", ""),
+        ),
+        (
+            &mixed,
+            &["-Wfatal-errors=return-type"],
+            format!(
+                "{}{hey}{}{}",
+                shift(1, "warning", ""),
+                q("error"),
+                shift(4, "warning", "")
+            ),
+        ),
+        // -Wfatal-errors=X makes X's warnings fatal; -Wno-fatal-errors=X
+        // makes them errors again, -Wno-error=X warnings.
+        (
+            &mixed,
+            &["-Wfatal-errors=shift-count-overflow"],
+            shift(1, "fatal error", ""),
+        ),
+        (
+            &mixed,
+            &[
+                "-Wfatal-errors=shift-count-overflow",
+                "-Wno-fatal-errors=shift-count-overflow",
+            ],
+            format!(
+                "{}{hey}{}{}",
+                shift(1, "error", "-Werror,"),
+                q("error"),
+                shift(4, "error", "-Werror,")
+            ),
+        ),
+        (
+            &mixed,
+            &[
+                "-Wno-fatal-errors=shift-count-overflow",
+                "-Werror",
+                "-Wfatal-errors",
+            ],
+            format!(
+                "{}{m}:2:2: fatal error: hey [-W#warnings]\n",
+                shift(1, "error", "-Werror,")
+            ),
+        ),
+        (
+            &mixed,
+            &[
+                "-Wfatal-errors=shift-count-overflow",
+                "-Wno-error=shift-count-overflow",
+            ],
+            format!(
+                "{}{hey}{}{}",
+                shift(1, "warning", ""),
+                q("error"),
+                shift(4, "warning", "")
+            ),
+        ),
+        (
+            &mixed,
+            &["-Wfatal-errors-shift-count-overflow"],
+            shift(1, "fatal error", ""),
+        ),
+        (&mixed, &["-Wfatal-errors=shift-count-overflow", "-w"], q("error")),
+    ] {
+        assert_eq!(said(t, args), (Some(1), text), "{args:?}");
+    }
+    // An -W option's warning made fatal: nothing more is said, -O's
+    // warning neither, and nothing is compiled.
+    assert_eq!(
+        said(&conflict, &["-Wfatal-errors", "-Werror", "-Wzzqqxxyy", "-O9"]),
+        (
+            Some(1),
+            "fatal error: unknown warning option '-Wzzqqxxyy' [-Wunknown-warning-option]\n".to_string()
+        )
+    );
+}
+
 /// `-o -` writes to standard output, as clang's `-cc1` does, and `-` is
 /// standard input, named `<stdin>` in diagnostics and `-` in the assembly
 /// (its STT_FILE symbol, clang's `-main-file-name -`); without -o, standard
