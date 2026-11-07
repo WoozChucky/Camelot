@@ -2944,6 +2944,19 @@ fn cc1_takes_merlins_command_line() {
             "/d/u.c:1:9: error: character constant too long for its type [-Werror]\n".to_string(),
             1,
         ),
+        // A -W option that names no group of clang's: its warning, before
+        // any other, under -Werror an error that fails the compilation.
+        (
+            "cc1 -Werror -Wzzqqxxyy -o /out/z /d/a.c",
+            "error: unknown warning option '-Wzzqqxxyy' [-Werror,-Wunknown-warning-option]\n".to_string(),
+            1,
+        ),
+        (
+            "cc1 -Werror -Wno-error=everything -o /out/z2 /d/a.c",
+            "error: unknown warning option '-Werror=everything' [-Werror,-Wunknown-warning-option]\n"
+                .to_string(),
+            1,
+        ),
         // UTF-16 LLVM can't convert, LLVM's message.
         ("cc1 @/d/odd16", "Could not convert UTF16 to UTF8\n".to_string(), 1),
         ("cc1 @/d/lone16", "Could not convert UTF16 to UTF8\n".to_string(), 1),
@@ -3014,10 +3027,37 @@ fn cc1_takes_merlins_command_line() {
         "cc1 -E -O04 /d/a.c",
     );
     let stdin_g = "cc1 -g -fdebug-compilation-dir=/d - < /d/w.c";
+    let unknown = "cc1 -E -Wzzqqxxyy -Wno-error=zzqq -Werrorzz -W -Wall /d/a.c";
+    let unknown_quiet = "cc1 -E -Wzzqqxxyy -Wno-unknown-warning-option /d/a.c";
     let mut commands: Vec<&str> = cases.iter().map(|(c, ..)| *c).collect();
     commands.extend([
-        together, help, response, nested, stdin, to_stdout, quiet, no_flag, verbose, o9, stdin_s, dot_i, bom,
-        u16, nul, ld_self, ar_dir, if0, ifx, rewarn, no_cpp, last_o, last_std, o04, stdin_g,
+        together,
+        help,
+        response,
+        nested,
+        stdin,
+        to_stdout,
+        quiet,
+        no_flag,
+        verbose,
+        o9,
+        stdin_s,
+        dot_i,
+        bom,
+        u16,
+        nul,
+        ld_self,
+        ar_dir,
+        if0,
+        ifx,
+        rewarn,
+        no_cpp,
+        last_o,
+        last_std,
+        o04,
+        stdin_g,
+        unknown,
+        unknown_quiet,
     ]);
     // -g: (the directory the shell is in, the command, and the directory
     // merlin is told the names are relative to). The default is the
@@ -3129,7 +3169,15 @@ fn cc1_takes_merlins_command_line() {
          is always false [-Wtautological-constant-out-of-range-compare]\n\
          /d/g.c:2:33: warning: non-void function does not return a value in all control paths [-Wreturn-type]\n"
     );
-    for c in [last_o, last_std] {
+    assert_eq!(
+        shell_output(&out, unknown),
+        format!(
+            "warning: unknown warning option '-Wzzqqxxyy' [-Wunknown-warning-option]\n\
+             warning: unknown warning option '-Werror=zzqq' [-Wunknown-warning-option]\n\
+             warning: unknown -Werror warning specifier: '-Werrorzz' [-Wunknown-warning-option]\n{a_e}"
+        )
+    );
+    for c in [last_o, last_std, unknown_quiet] {
         assert_eq!(shell_output(&out, c), a_e, "{c}");
     }
     assert_eq!(
@@ -5171,6 +5219,30 @@ const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
             "cc: warning: argument unused during compilation: '-Wno-error=unused-command-line-argument' \
              [-Wunused-command-line-argument]",
             "cc: warning: argument unused during compilation: '-D X' [-Wunused-command-line-argument]",
+        ],
+        0,
+        true,
+    ),
+    // A -W option that names no group of clang's: cc1's warning (the
+    // driver says nothing of it), under -Werror an error that fails cc1;
+    // with no cc1, unused, -W alone too.
+    (
+        "-c hello.c -Wzzqqxxyy",
+        &["warning: unknown warning option '-Wzzqqxxyy' [-Wunknown-warning-option]"],
+        0,
+        true,
+    ),
+    (
+        "-Werror -c hello.c -Wzzqqxxyy",
+        &["error: unknown warning option '-Wzzqqxxyy' [-Werror,-Wunknown-warning-option]"],
+        1,
+        true,
+    ),
+    (
+        "-c c.s -Wzzqqxxyy -W",
+        &[
+            "cc: warning: argument unused during compilation: '-Wzzqqxxyy' [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-W' [-Wunused-command-line-argument]",
         ],
         0,
         true,

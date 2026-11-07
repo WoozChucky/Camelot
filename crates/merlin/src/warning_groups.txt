@@ -82,6 +82,7 @@ typedef-redefinition:
 undef:
 unevaluated-expression: CL4 all most unused unused-value
 unknown-escape-sequence:
+unknown-warning-option:
 unsequenced: sequence-point
 unused-command-line-argument:
 unused-comparison: CL4 all most unused unused-value

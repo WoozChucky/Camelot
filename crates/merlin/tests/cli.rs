@@ -655,13 +655,23 @@ fn warning_groups_and_order() {
         ),
         (&["-Wno-everything", "-Weverything"], 0, String::new()),
         (&["-Wno-everything", "-Wreturn-type"], 0, returns(false)),
-        // `everything` is no group for -Werror= or -Wno-error= (clang warns
-        // of an unknown option, which merlin leaves out).
-        (&["-Werror=everything"], 0, both.clone()),
+        // `everything` is no group for -Werror= or -Wno-error=: clang's
+        // unknown warning option, named -Werror= for both.
+        (
+            &["-Werror=everything"],
+            0,
+            format!(
+                "warning: unknown warning option '-Werror=everything' [-Wunknown-warning-option]\n{both}"
+            ),
+        ),
         (
             &["-Werror", "-Wno-error=everything"],
             1,
-            format!("{}{}", compare(true), returns(true)),
+            format!(
+                "error: unknown warning option '-Werror=everything' [-Werror,-Wunknown-warning-option]\n{}{}",
+                compare(true),
+                returns(true)
+            ),
         ),
     ] {
         assert_eq!(said(args), (Some(code), text), "{args:?}");
@@ -696,6 +706,97 @@ fn warning_groups_and_order() {
             format!("{long}{file}:2:2: error: hello [-Werror,-W#warnings]\n")
         )
     );
+}
+
+/// A `-W` option that names none of clang's warning groups is clang's
+/// warning, before any other diagnostic, once for each, under -w and -W as
+/// any warning; made an error, it fails the compilation (no output, but
+/// -E's text). These are clang 23's answers (`clang -cc1`), but for its
+/// `did you mean` suggestion, which merlin does not give (the names here
+/// have none).
+#[test]
+fn unknown_warning_options_are_clangs() {
+    let t = TempSrc::new("unknown", "c.c", "int f(void) {\n    return 1;\n}\n");
+    let said = |args: &[&str]| {
+        let mut all: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+        all.extend([PathBuf::from("-o"), PathBuf::from("-"), t.file.clone()]);
+        let refs: Vec<&Path> = all.iter().map(PathBuf::as_path).collect();
+        let out = merlin(&refs);
+        (out.status.code(), stderr(&out), !out.stdout.is_empty())
+    };
+    let unknown = |o: &str| format!("warning: unknown warning option '{o}' [-Wunknown-warning-option]\n");
+    for (args, code, text, output) in [
+        (&["-Wzzqqxxyy"][..], 0, unknown("-Wzzqqxxyy"), true),
+        (&["-Wno-zzqqxxyy"], 0, unknown("-Wno-zzqqxxyy"), true),
+        (&["-Wno-error=zzqq"], 0, unknown("-Werror=zzqq"), true),
+        (
+            &["-Wzzqqxxyy", "-Wzzqqxxyy"],
+            0,
+            unknown("-Wzzqqxxyy").repeat(2),
+            true,
+        ),
+        (
+            &["-Werrorzz", "-Wfatal-errors=zzqq"],
+            0,
+            format!(
+                "warning: unknown -Werror warning specifier: '-Werrorzz' [-Wunknown-warning-option]\n{}",
+                unknown("-Wfatal-errors=zzqq")
+            ),
+            true,
+        ),
+        // Known: groups, -W alone, -Werror=, and clang's special names.
+        (
+            &[
+                "-W",
+                "-Wall",
+                "-WCL4",
+                "-Werror=",
+                "-Wno-error",
+                "-Wformat=0",
+                "-Wsystem-headers",
+            ],
+            0,
+            String::new(),
+            true,
+        ),
+        (&["-w", "-Wzzqqxxyy"], 0, String::new(), true),
+        (
+            &["-Wzzqqxxyy", "-Wno-unknown-warning-option"],
+            0,
+            String::new(),
+            true,
+        ),
+        (
+            &["-Werror", "-Wzzqqxxyy"],
+            1,
+            "error: unknown warning option '-Wzzqqxxyy' [-Werror,-Wunknown-warning-option]\n".to_string(),
+            false,
+        ),
+        // Before -O's warning and -std='s error.
+        (
+            &["-O9", "-Wzzqqxxyy"],
+            0,
+            format!(
+                "{}warning: optimization level '-O9' is not supported; using '-O3' instead\n",
+                unknown("-Wzzqqxxyy")
+            ),
+            true,
+        ),
+    ] {
+        assert_eq!(said(args), (Some(code), text, output), "{args:?}");
+    }
+    let std = said(&["-std=foo", "-Wzzqqxxyy"]);
+    assert!(
+        std.1.starts_with(&format!(
+            "{}error: invalid value 'foo' in '-std=foo'\n",
+            unknown("-Wzzqqxxyy")
+        )),
+        "{}",
+        std.1
+    );
+    // -E's text is written all the same.
+    let e = said(&["-E", "-Werror", "-Wzzqqxxyy"]);
+    assert_eq!((e.0, e.2), (Some(1), true));
 }
 
 /// `-o -` writes to standard output, as clang's `-cc1` does, and `-` is
@@ -1084,10 +1185,11 @@ fn v_says_what_clang_cc1_says() {
             .output()
             .unwrap()
     };
-    let o9 = opts(&["-O9"]);
+    let o9 = opts(&["-O9", "-Wzzqqxxyy"]);
     assert!(o9.status.success());
     assert!(stderr(&o9).starts_with(&format!(
-        "warning: optimization level '-O9' is not supported; using '-O3' instead\nmerlin version {} ",
+        "warning: unknown warning option '-Wzzqqxxyy' [-Wunknown-warning-option]\n\
+         warning: optimization level '-O9' is not supported; using '-O3' instead\nmerlin version {} ",
         env!("CARGO_PKG_VERSION")
     )));
     let std = opts(&["-std=foo"]);

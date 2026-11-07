@@ -202,6 +202,32 @@ void diag_take_w(char *opt) {
     w_options[nw_options++] = opt;
 }
 
+/* merlin's warnings::option_warnings, printed as merlin's main prints
+ * them: the warning of each -W option that names no group of clang's
+ * (warning_option_message, tables.c's WARNING_OPTIONS), in order, a
+ * diagnostic of no file under -w and -W as any warning. Whether one was
+ * made an error, which fails every input. */
+int diag_option_warnings(void) {
+    struct pos none;
+    memset(&none, 0, sizeof none);
+    int failed = 0;
+    for (int i = 0; i < nw_options; i++) {
+        char buf[256];
+        const char *msg = warning_option_message(w_options[i], WARNING_OPTIONS, NWARNING_OPTIONS, buf, sizeof buf);
+        if (msg == NULL) {
+            continue;
+        }
+        struct diag *d = diag_warning(none, fmt("%s", msg), "unknown-warning-option");
+        d->file = "";
+        d->filelen = 0;
+        diag_failed = 0;
+        diag_print(d, "");
+        failed |= diag_failed;
+    }
+    diag_failed = 0;
+    return failed;
+}
+
 /* merlin's Error::render as it is, -w and -W aside: the command line's own
  * diagnostics (-O's, -std='s), which clang gives before it applies them. */
 void diag_print_as_is(struct diag *d, const char *input) {

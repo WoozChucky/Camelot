@@ -1170,13 +1170,19 @@ char *response_file_text(char **args, int n);
  * -Weverything changes nothing (`everything` is no group for -Werror=), the
  * last of -Werror and -Wno-error decides for the rest, and -w anywhere
  * leaves every warning out.
- * is_warning_option: whether `a` is -w or -W and a name (not -Wl, -Wp,
- * -Wa,: no warning's name has a comma). */
+ * is_warning_option: whether `a` is -w or -W and a name, none too (not
+ * -Wl, -Wp, -Wa,: no warning's name has a comma).
+ * warning_option_message: clang's warning of the -W option `o` given
+ * names[0..nnames), its warning groups, in buf (size bytes), or NULL if
+ * it has none: `unknown warning option '-Wfoo'` (-Werror= for -Werror=
+ * and -Wno-error= alike, as clang says it), `unknown -Werror warning
+ * specifier: '-Werrorfoo'`; of the flag unknown-warning-option. */
 #define WARNING_IGNORED 0
 #define WARNING_SHOWN 1
 #define WARNING_ERROR 2
 int warning_level(char *const *options, int noptions, const char *flag, const char *const *groups, int ngroups);
 int is_warning_option(const char *a);
+const char *warning_option_message(const char *o, const char *const *names, int nnames, char *buf, size_t size);
 
 /* Terminals (lib/tty.c), as POSIX has them, but for returning a negative
  * error number rather than -1 and errno.

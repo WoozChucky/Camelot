@@ -576,6 +576,25 @@ static int write_output(const char *output, struct buf *text) {
     return 0;
 }
 
+/* Whether a -W option's warning (an unknown one) was made an error: every
+ * input fails, its diagnostics given all the same, with no output file
+ * (clang erases its outputs after an error) and no code, but -E's and
+ * --dump-ast's text on standard output. */
+static int options_failed;
+
+/* Writes `text` as an input's output, `out` (standard output for NULL or
+ * `-`), unless options_failed, which writes only standard output's and
+ * fails: 0, or the exit status of a failure. */
+static int write_result(const char *out, struct buf *text, int code) {
+    if (!options_failed) {
+        return write_output(out, text);
+    }
+    if (code && (out == NULL || strcmp(out, "-") == 0)) {
+        write_output(out, text);
+    }
+    return 1;
+}
+
 /* Compiles or dumps one input file (merlin's translate): 0, or the exit
  * status of a failure. */
 static int compile_file(struct input *in, const char *output, struct options *opts, int dump, const char *comp_dir) {
@@ -605,7 +624,7 @@ static int compile_file(struct input *in, const char *output, struct options *op
                       ? fmt("%s.s", arena_strndup(in->name, n - 2))
                       : fmt("%s.s", in->name);
         }
-        status = write_output(out, &text);
+        status = options_failed && !dump ? 1 : write_result(out, &text, dump);
     }
     /* The translation unit is done: its memory goes, the arena and the
      * heap (its source, tokens, tree, assembly and diagnostics). */
@@ -635,7 +654,7 @@ static int translate(struct input *in, const char *output, struct options *opts)
     for (uint i = 0; i < ndiags; i++) {
         diag_print(diags[i], in->name);
     }
-    int status = ok && !diag_failed ? write_output(output, &text) : 1;
+    int status = ok && !diag_failed ? write_result(output, &text, 1) : 1;
     /* The translation unit is done: its memory goes, the arena and the
      * heap (its source, the text and the diagnostics). */
     arena_free();
@@ -830,10 +849,13 @@ int main(int argc, char **argv) {
     if (output != NULL && ninputs > 1) {
         return usage_error("-o needs a single input file");
     }
-    /* The last -std='s and the last -O's diagnostics, in that order, before
-     * anything else, as clang's -cc1 gives them as it reads its command line
-     * (and as they are: -w and -W are not applied yet); an error stops it
-     * there. */
+    /* First the warnings of the -W options themselves (an unknown one),
+     * under -w and -W as any warning, as clang's -cc1 gives them when its
+     * diagnostics are set up (diag.c). Then the last -std='s and the last
+     * -O's diagnostics, in that order, as clang's -cc1 gives them as it
+     * reads its command line (and as they are: -w and -W are not applied to
+     * them); an error stops it there. */
+    options_failed = diag_option_warnings();
     if (std_value != NULL) {
         check_std(std_value);
     }

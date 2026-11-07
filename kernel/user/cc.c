@@ -713,7 +713,10 @@ static int parse(char **args, int nargs) {
         } else if (starts_with(a, "-Wa,")) {
             /* For `as`, after clang's own options for it. */
             claim(render_comma(a, &wa_args), FOR_AS_ARGS);
-        } else if (a[1] == 'W' && a[2] != 0) {
+        } else if (a[1] == 'W') {
+            /* A warning option, -W alone too, for cc1 (which warns of one
+             * that names no group of clang's, as clang's -cc1 does: the
+             * driver says nothing of it). */
             claim(a, FOR_CC1);
             push(&warning_opts, a);
             push(&diag_opts, a);

@@ -183,6 +183,13 @@ pub fn generate_cc_h() -> String {
          extern const char *const WARNING_GROUPS[NWARNING_GROUPS];",
         warning_group_lines(|f| !DRIVER_WARNINGS.contains(&f)).len()
     );
+    let _ = writeln!(
+        s,
+        "\n/* Every clang warning group, the names a -W option may give (merlin::warnings::OPTIONS,\n \
+         * from clang's `diagtool tree`): another is clang's `unknown warning option`. */\n\
+         #define NWARNING_OPTIONS {}\nextern const char *const WARNING_OPTIONS[NWARNING_OPTIONS];",
+        warning_options().len()
+    );
     s.push_str("\n#endif\n");
     s
 }
@@ -260,8 +267,20 @@ pub fn generate_cc_c() -> String {
     for line in warning_group_lines(|f| !DRIVER_WARNINGS.contains(&f)) {
         let _ = writeln!(s, "    {},", c_string(&line));
     }
+    s.push_str("};\n\nconst char *const WARNING_OPTIONS[NWARNING_OPTIONS] = {\n");
+    for name in warning_options() {
+        let _ = writeln!(s, "    {},", c_string(name));
+    }
     s.push_str("};\n");
     s
+}
+
+/// clang's warning groups' names (merlin::warnings::OPTIONS), in order.
+fn warning_options() -> Vec<&'static str> {
+    merlin::warnings::OPTIONS
+        .lines()
+        .filter(|l| !l.starts_with("//") && !l.is_empty())
+        .collect()
 }
 
 /// The relocation types the elf crate names, by number.

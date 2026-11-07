@@ -390,10 +390,18 @@ fn run() -> ExitCode {
     if output.is_some() && inputs.len() > 1 {
         return usage_error("-o needs a single input file");
     }
-    // The last -std='s and the last -O's diagnostics, in that order, before
-    // anything else, as clang's -cc1 gives them as it reads its command line
-    // (and as they are: -w and -W are not applied yet); an error stops it
-    // there.
+    // First the warnings of the -W options themselves (an unknown one),
+    // under -w and -W as any warning, as clang's -cc1 gives them when its
+    // diagnostics are set up: made errors, they fail every input, whose
+    // diagnostics still come (and -E's text), but no output file.
+    let (option_warnings, options_failed) =
+        merlin::warnings::apply(&warnings, merlin::warnings::option_warnings(&warnings));
+    for d in &option_warnings {
+        eprintln!("{}", d.render(""));
+    }
+    // The last -std='s and the last -O's diagnostics, in that order, as
+    // clang's -cc1 gives them as it reads its command line (and as they are:
+    // -w and -W are not applied to them); an error stops it there.
     let said: Vec<merlin::Error> = std_value
         .as_deref()
         .and_then(check_std)
@@ -434,7 +442,7 @@ fn run() -> ExitCode {
         if verbose {
             eprint!("{}", search_list(&opts.include_dirs));
         }
-        if let Err(code) = translate(input, output.as_deref(), mode, &opts, &warnings) {
+        if let Err(code) = translate(input, output.as_deref(), mode, &opts, &warnings, options_failed) {
             status = code;
         }
     }
@@ -483,6 +491,7 @@ fn translate(
     mode: Mode,
     opts: &Options,
     warnings: &[String],
+    options_failed: bool,
 ) -> Result<(), ExitCode> {
     let read = if input == "-" {
         let mut s = String::new();
@@ -531,6 +540,17 @@ fn translate(
             return Err(ExitCode::from(1));
         }
     };
+    // An -W option's warning made an error fails it too: no code is
+    // generated, and no file written, as clang erases its outputs after an
+    // error; -E's text on standard output is printed as it is.
+    if options_failed && mode == Mode::Compile {
+        return Err(ExitCode::from(1));
+    }
+    let done = if options_failed {
+        Err(ExitCode::from(1))
+    } else {
+        Ok(())
+    };
     // Without -o: the input's name with `.s` for its `.c` or `.i` (or
     // added), as clang's -cc1 names it, and standard output for standard
     // input.
@@ -545,9 +565,12 @@ fn translate(
         (_, Some(o)) if o != "-" => o.to_string(),
         _ => {
             print!("{text}");
-            return Ok(());
+            return done;
         }
     };
+    if options_failed {
+        return done;
+    }
     if let Err(e) = std::fs::write(Path::new(&output), text) {
         eprintln!("merlin: cannot write {output}: {e}");
         return Err(ExitCode::from(2));
