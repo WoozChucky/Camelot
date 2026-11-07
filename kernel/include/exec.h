@@ -19,7 +19,8 @@
 /* spawn(): starts the program at `path` with `args` (its arguments and
  * environment, copied in from the caller's argv and envp) as a child of the
  * current process. Returns its pid, or -ENOENT/-ENOTDIR/-ENAMETOOLONG (the
- * path), -EACCES (not a regular file), or proc_create()'s errors. */
+ * path), -EACCES (not a regular file, or one the caller may not run), or
+ * proc_create()'s errors. */
 int exec_spawn(const char *path, const struct proc_args *args);
 
 /* exec(): replaces the current process's program with the one at `path`.

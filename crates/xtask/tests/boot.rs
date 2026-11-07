@@ -571,6 +571,73 @@ fn the_image_size_is_the_whole_image_and_too_small_is_refused() {
     );
 }
 
+#[test]
+fn users_log_in_su_and_meet_the_permissions_on_the_root_image() {
+    // #115 end to end, on the server image as `cargo xtask fs` builds it:
+    // login refuses a wrong password and takes `user`'s, whose session has
+    // the user's ids and home; the user can't read /etc/shadow, write into
+    // /bin or give a file away, but changes their own file's mode and their
+    // own password; su with root's password gives a root shell, which can.
+    let root = repo_root();
+    let image = xtask::fs::build_bootable(&root, xtask::fs::Profile::Server, xtask::fs::IMAGE_SIZE).unwrap();
+    let input = b"user\nwrong\nuser\nuser\nid\nwhoami\nprintenv HOME\ncat /etc/shadow\necho x > /bin/x\n\
+echo mine > notes\nchmod 600 notes\nls -l notes\nchown root notes\npasswd\nuser\nsecret\nsecret\nsu\nroot\nid\n\
+grep -c sha256 /etc/shadow\ncat notes\nchown root:root notes\nls -l notes\nexit\ncat notes\nexit 0\n";
+    let (result, out, disk, _) = boot_image(image, input);
+    // The session's end is the console's `once` service's: the machine stops.
+    assert_eq!(result, RunResult::Exited(0), "{out}");
+    // A wrong password waits and is refused; the right one is a session as
+    // the user, in their home, with `$ ` for a prompt. The passwords typed
+    // are not echoed (login, su and passwd turn the echo off).
+    let session = "login: user\nPassword: \nLogin incorrect\nlogin: user\nPassword: \n\
+        Type help for the list of commands.\n\
+        $ id\nuid=1000(user) gid=1000(user)\n\
+        $ whoami\nuser\n\
+        $ printenv HOME\n/home/user\n\
+        $ cat /etc/shadow\ncat: /etc/shadow: permission denied\ncat: exit 1\n\
+        $ echo x > /bin/x\nsh: /bin/x: permission denied\n\
+        $ echo mine > notes\n\
+        $ chmod 600 notes\n\
+        $ ls -l notes\n-rw-------  1 user     user           5 notes\n\
+        $ chown root notes\nchown: notes: operation not permitted\nchown: exit 1\n\
+        $ passwd\nChanging password for user\nCurrent password: \nNew password: \nRetype new password: \n\
+        passwd: password changed\n\
+        $ su\nPassword: \nType help for the list of commands.\n\
+        # id\nuid=0(root) gid=0(root)\n\
+        # grep -c sha256 /etc/shadow\n2\n\
+        # cat notes\nmine\n\
+        # chown root:root notes\n\
+        # ls -l notes\n-rw-------  1 root     root           5 notes\n\
+        # exit\n\
+        $ cat notes\ncat: notes: permission denied\ncat: exit 1\n\
+        $ exit 0\n";
+    let at = out.find("login: ").unwrap_or_else(|| panic!("{out}"));
+    // shd's line about the missing network card may land anywhere.
+    let rest = out[at..].replacen("shd: socket: no network card\n", "", 1);
+    assert_eq!(rest, session, "{out}");
+
+    // On the disk: the user's new password, with a salt of its own, root's
+    // as it was; the file root's now, mode 0600; /etc/shadow still root's.
+    let fs = Fs::open(&disk).unwrap();
+    let shadow = String::from_utf8(fs.read_file(xtask::fs::SHADOW).unwrap()).unwrap();
+    let defaults = xtask::accounts::Passwords::default().accounts();
+    let first = xtask::accounts::shadow(&defaults);
+    assert_eq!(shadow.lines().next(), first.lines().next(), "{shadow}");
+    let hash = shadow.lines().nth(1).unwrap().strip_prefix("user:").unwrap().strip_suffix(':').unwrap();
+    let fields: Vec<&str> = hash.split('$').collect();
+    assert_eq!(fields[..3], ["", "sha256", "1000"], "{hash}");
+    assert_eq!(
+        xtask::accounts::pw_hash("secret", fields[3], xtask::accounts::PW_ROUNDS),
+        hash
+    );
+    assert_ne!(Some(shadow.lines().nth(1).unwrap()), first.lines().nth(1));
+    let notes = fs.inode(fs.lookup("/home/user/notes").unwrap()).unwrap();
+    assert_eq!((notes.uid, notes.gid, notes.mode), (0, 0, 0o600));
+    let shadow_inode = fs.inode(fs.lookup(xtask::fs::SHADOW).unwrap()).unwrap();
+    assert_eq!((shadow_inode.uid, shadow_inode.mode), (0, 0o600));
+    assert!(fs.lookup("/bin/x").is_err());
+}
+
 /// The disk kernel has no programs of its own: with no shell in `/bin`, or no
 /// root filesystem at all, it has nothing to run, and says so.
 #[test]

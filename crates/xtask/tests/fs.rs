@@ -1703,7 +1703,7 @@ fn a_failed_exec_ends_only_a_shell_that_is_not_interactive() {
             "sh < /s1",
             "# before\n# sh: nosuch: no such program\nsh: exit 127\n",
         ),
-        ("sh < /s2", "# sh: /bin: not a regular file\nsh: exit 126\n"),
+        ("sh < /s2", "# sh: /bin: permission denied\nsh: exit 126\n"),
         (
             "sh < /s3",
             "# sh: /missing: no such file or directory\nsh: exit 1\n",

@@ -561,7 +561,7 @@ fn coreutils_session(image: Vec<u8>, same_programs: bool) {
     );
     assert_eq!(
         s.run("env /bin"),
-        format!("env: /bin: not a regular file\n{}", exit_line("env", 126))
+        format!("env: /bin: permission denied\n{}", exit_line("env", 126))
     );
     assert_eq!(s.run("printenv TERM HOME"), "linux\n/\n");
     assert_eq!(s.run("printenv"), "HOME=/\nTERM=linux\n");

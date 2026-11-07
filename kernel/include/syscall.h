@@ -102,7 +102,7 @@
 #define ECHILD 10       /* wait: no such child */
 #define EAGAIN 11       /* spawn, thread_create: every slot is taken; futex_wait: not the value; a socket's receive timeout ran out */
 #define ENOMEM 12       /* out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping */
-#define EACCES 13       /* spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that */
+#define EACCES 13       /* permission denied: the mode refuses it, or exec of no regular file; mmap, mprotect: not open for that */
 #define EFAULT 14       /* a pointer argument is not valid user memory */
 #define EBUSY 16        /* ioctl: the device's memory is mapped, and the request would change it */
 #define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */

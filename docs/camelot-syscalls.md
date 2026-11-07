@@ -1451,7 +1451,7 @@ Linux's values for the same conditions.
 | 10 | `ECHILD` | wait: no such child |
 | 11 | `EAGAIN` | spawn, thread_create: every slot is taken; futex_wait: the word is not the value; a socket's receive timeout ran out |
 | 12 | `ENOMEM` | out of memory, or the heap would reach the stack or a mapping; mmap: no room; mprotect: not a mapping |
-| 13 | `EACCES` | spawn, exec: not a regular file; mmap, mprotect: the descriptor isn't open for that access |
+| 13 | `EACCES` | permission denied: a file's mode refuses the access ("Users and permissions"); spawn, exec: also not a regular file; bind: a port below 1024 without root; mmap, mprotect: the descriptor isn't open for that access |
 | 14 | `EFAULT` | a pointer argument is not valid user memory |
 | 16 | `EBUSY` | ioctl: the framebuffer's memory is mapped, and the request would replace it; EVIOCGRAB: the device is grabbed already |
 | 17 | `EEXIST` | the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping |

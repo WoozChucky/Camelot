@@ -27,7 +27,7 @@ const char *strerror(int err) {
     case ENOMEM:
         return "out of memory";
     case EACCES:
-        return "not a regular file";
+        return "permission denied";
     case EFAULT:
         return "bad address";
     case EBUSY:
