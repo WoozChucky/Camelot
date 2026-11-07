@@ -2729,6 +2729,9 @@ fn cc1_takes_merlins_command_line() {
         ("/d/la.c".to_string(), la.as_bytes().to_vec()),
         ("/d/lb.c".to_string(), lb.as_bytes().to_vec()),
         ("/d/lc.c".to_string(), lc.as_bytes().to_vec()),
+        // Response files, as the `cc` driver writes them (#242).
+        ("/d/rsp1".to_string(), b"-E\n/d/a.c\n".to_vec()),
+        ("/d/rsp2".to_string(), b"-E @/d/rsp1\n".to_vec()),
     ];
     let usage = "usage: cc1 [options] input.c...\n";
     // (command, what it says first, and its exit status).
@@ -2781,6 +2784,16 @@ fn cc1_takes_merlins_command_line() {
             format!("cc1: unknown option -fdebug-compilation-dirs\n{usage}"),
             2,
         ),
+        (
+            "cc1 @/d/none",
+            "cc1: cannot read /d/none: no such file or directory\n".to_string(),
+            2,
+        ),
+        (
+            "cc1 @/d/rsp2",
+            "cc1: /d/rsp2: a response file cannot name another (@/d/rsp1)\n".to_string(),
+            2,
+        ),
     ];
     // What merlin writes for both files: on standard output, one after the
     // other.
@@ -2794,8 +2807,10 @@ fn cc1_takes_merlins_command_line() {
     );
     let together = "cc1 -E -g /d/a.c /d/b.S";
     let help = "cc1 --help";
+    // A response file's words, in its place: `cc1 -E /d/a.c`.
+    let response = "cc1 @/d/rsp1";
     let mut commands: Vec<&str> = cases.iter().map(|(c, ..)| *c).collect();
-    commands.extend([together, help]);
+    commands.extend([together, help, response]);
     // -g: (the directory the shell is in, the command, and the directory
     // merlin is told the names are relative to). The default is the
     // directory cc1 runs in; a name of DIRSIZ bytes has no NUL in its
@@ -2854,6 +2869,7 @@ fn cc1_takes_merlins_command_line() {
     }
     assert_eq!(shell_output(&out, together), both);
     assert!(shell_output(&out, help).starts_with(usage));
+    assert_eq!(shell_output(&out, response), merlin_e(&job_a, &map).0.unwrap());
     let fs = Fs::open(&disk).unwrap();
     let image: BTreeMap<String, Vec<u8>> = files.iter().cloned().collect();
     for (k, (dir, command, comp_dir)) in debug.iter().enumerate() {
@@ -3915,4 +3931,712 @@ fn cc1_writes_its_outputs_as_merlin_does() {
     assert_eq!(said(several), format!("{w_warnings}{c_warnings}"));
     assert_eq!(file("/d/w.s"), w_asm);
     assert_eq!(file("/d/c.s"), c_asm);
+}
+
+// ---- The C compiler driver, `cc` (#242) ----
+
+/// What `/bin` has for the driver's tests, besides the shell: the driver and
+/// the stages it runs.
+const CC_BINS: &[&str] = &["cc", "cc1", "as", "ld"];
+
+/// The sources of the driver's tests, in `/src`, where the shell runs `cc`:
+/// a program of a C file, a preprocessed assembly file, an assembly file
+/// and an object ([`D_S`], assembled on the host), and the files the errors
+/// come from (a compile error, an assembly error, a link error, a file that
+/// is not UTF-8).
+const A_C: &str = "#include \"user.h\"\n\
+                   #define ONE 1\n\
+                   int b_fn(void);\n\
+                   int c_fn(void);\n\
+                   int d_fn(void);\n\
+                   int main(void) {\n    \
+                   printf(\"%d\\n\", ONE + b_fn() + c_fn() + d_fn());\n    \
+                   return 0;\n\
+                   }\n";
+const B_S: &str = "#define VALUE 20\n    .text\n    .globl b_fn\nb_fn:\n    li a0, VALUE\n    ret\n";
+const C_S: &str = "    .text\n    .globl c_fn\nc_fn:\n    li a0, 300\n    ret\n";
+const D_S: &str = "    .text\n    .globl d_fn\nd_fn:\n    li a0, 4000\n    ret\n";
+const BAD_C: &str = "int main(void) {\n    return x;\n}\n";
+const BAD_S: &str = "    .text\n    addi a0, a0\n";
+const UNDEF_C: &str = "int f(void);\nint main(void) {\n    return f();\n}\n";
+
+/// The files of `/src` ([`A_C`]...), `hello.c` and `wc.c` from
+/// `kernel/user`, and `x.o`, an object the errors' cases name.
+fn cc_sources() -> Vec<(String, Vec<u8>)> {
+    let dir = userprogs::user_dir(&repo_root());
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    let d_o = toolchain::assemble("d.s", D_S).unwrap();
+    let mut latin1 = b"int caf\xe9;\n".to_vec();
+    latin1.extend_from_slice(b"\n");
+    [
+        ("hello.c", read("hello.c")),
+        ("wc.c", read("wc.c")),
+        ("words", b"one two\nthree\n".to_vec()),
+        ("a.c", A_C.as_bytes().to_vec()),
+        ("b.S", B_S.as_bytes().to_vec()),
+        ("c.s", C_S.as_bytes().to_vec()),
+        ("d.o", d_o.clone()),
+        ("x.o", d_o),
+        ("bad.c", BAD_C.as_bytes().to_vec()),
+        ("bad.s", BAD_S.as_bytes().to_vec()),
+        ("undef.c", UNDEF_C.as_bytes().to_vec()),
+        ("latin1.c", latin1),
+    ]
+    .into_iter()
+    .map(|(name, data)| (format!("/src/{name}"), data))
+    .collect()
+}
+
+/// An image for the driver: the shell, [`CC_BINS`], the root image's `/usr`
+/// for the runtime `rt`, `/tmp` for the temporary files, `/src` and the
+/// other `dirs`, and `files`; room for what the stages write.
+fn cc_image(rt: &userprogs::Runtime, dirs: &[&str], files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut all = usr_image_files(rt);
+    all.extend(files.iter().cloned());
+    let dirs = [USR_DIRS, &["/tmp", "/src"], dirs].concat();
+    image_with_room(CC_BINS, &dirs, &all, Options::default().ninodes, 4 << 20)
+}
+
+/// The machine of the driver's tests: cc1's.
+fn boot_cc(image: Vec<u8>, input: &str) -> (String, Vec<u8>) {
+    boot_on(cc1_machine_config(), image, input, 200_000_000_000)
+}
+
+/// `text` with each temporary file's random part (`/tmp/hello-1a2b3c.s`)
+/// replaced by its number, `T1` for the first name it holds, `T2` for the
+/// next other one (`/tmp/hello-T1.s`), so that a run reads the same every
+/// time. Checks each name is as clang makes them, fitting a directory
+/// entry: the input's stem (cut to fit), `-`, six hexadecimal digits, `.`
+/// and the extension.
+fn mask_temps(text: &str) -> String {
+    let mut out = String::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("/tmp/") {
+        out.push_str(&rest[..at + 5]);
+        rest = &rest[at + 5..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'))
+            .unwrap_or(rest.len());
+        let name = &rest[..end];
+        rest = &rest[end..];
+        assert!(
+            name.len() <= DIRSIZ,
+            "{name}: longer than a directory entry's name"
+        );
+        let (base, ext) = name
+            .rsplit_once('.')
+            .unwrap_or_else(|| panic!("{name}: no extension"));
+        let (stem, random) = base.rsplit_once('-').unwrap_or_else(|| panic!("{name}: no -"));
+        assert!(
+            random.len() == 6
+                && random
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{name}: not six hexadecimal digits"
+        );
+        let n = match seen.iter().position(|s| s == name) {
+            Some(k) => k + 1,
+            None => {
+                seen.push(name.to_string());
+                seen.len()
+            }
+        };
+        out.push_str(&format!("{stem}-T{n}.{ext}"));
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What `-v` and `-###` say first: cc's version (the workspace's), the
+/// target, the thread model and the directory the stages are in.
+fn cc_header() -> String {
+    format!(
+        "cc version {}\nTarget: riscv64\nThread model: posix\nInstalledDir: /bin\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The temporary files left in `/tmp`: none, once `cc` is done.
+fn left_in_tmp(fs: &Fs) -> Vec<String> {
+    fs.list("/tmp")
+        .unwrap()
+        .iter()
+        .map(|e| e.name())
+        .filter(|n| n != "." && n != "..")
+        .collect()
+}
+
+/// #242's acceptance: in a Camelot shell, `cc -o hello hello.c && ./hello`
+/// builds hello and runs it, and `cc -o wc wc.c` builds the first coreutil
+/// on Camelot: the host's `/bin/wc`, byte for byte (the program the host
+/// installs, linked from the root image's `/usr/lib`: [`installed_link`]),
+/// which then counts. With `-g` and the compilation directory the host
+/// gives (`-fdebug-compilation-dir=kernel/user`, the header next to the
+/// source as in `kernel/user`), it is the host's link with the program's
+/// own line tables; `-g -Wl,-S` leaves them out again, `/bin/wc` once
+/// more. No temporary file is left in `/tmp`.
+#[test]
+fn cc_builds_hello_and_wc_on_camelot_as_the_host_does() {
+    use userprogs::CCompiler;
+    let dir = userprogs::user_dir(&repo_root());
+    let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
+    let progs = userprogs::programs(&dir).unwrap();
+    let wc = progs.iter().find(|p| p.name() == "wc").unwrap();
+    let want = installed_link(&dir, wc, &rt);
+    let mut files = cc_sources();
+    for name in ["wc.c", "user.h"] {
+        files.push((format!("/k/{name}"), std::fs::read(dir.join(name)).unwrap()));
+    }
+    let hello = "cc -o hello hello.c && ./hello";
+    let build = "cc -o /out/wc wc.c";
+    let run = "/out/wc words";
+    let debug = "cc -g -fdebug-compilation-dir=kernel/user -o /out/wc.g wc.c";
+    let stripped = "cc -g -Wl,-S -o /out/wcs wc.c";
+    let commands = ["cd /src", hello, build, run, "cd /k", debug, stripped];
+    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let (out, disk) = boot_cc(cc_image(&rt, &["/k"], &files), &input);
+    assert_eq!(shell_output(&out, hello), "hello from user mode\n");
+    for c in [build, debug, stripped] {
+        assert_eq!(shell_output(&out, c), "", "{c}");
+    }
+    assert_eq!(shell_output(&out, run), "2 3 14 words\n");
+    let fs = Fs::open(&disk).unwrap();
+    for (file, want, what) in [
+        ("/out/wc", &want.elf, "/bin/wc"),
+        ("/out/wcs", &want.elf, "/bin/wc"),
+        ("/out/wc.g", &want.debug, "wc with its line tables"),
+    ] {
+        let got = fs.read_file(file).unwrap();
+        assert!(
+            got == *want,
+            "{file} is {} bytes, {what} {} (first difference at {:?})",
+            got.len(),
+            want.len(),
+            got.iter().zip(want.iter()).position(|(a, b)| a != b)
+        );
+    }
+    assert!(fs.read_file("/src/hello").is_ok());
+    assert_eq!(left_in_tmp(&fs), Vec::<String>::new());
+}
+
+/// The driver's stages, as clang's driver runs them with
+/// `-fno-integrated-as` (cc1 writes assembly, `as` assembles it, `ld`
+/// links): what `-###` prints (cc's header, then each command line, every
+/// argument quoted), what `-v` prints as it runs them (only the arguments
+/// that need it quoted), command lines too long for exec given in response
+/// files (cc1's with seven macros, ld's with fifteen objects, from cc's own
+/// response file), and every input language and last stage: `-c`, `-S` and
+/// `-E` with `-o`, several inputs, and `.c`, `.S` (preprocessed by `cc1 -E
+/// -x assembler-with-cpp`), `.s` and `.o` files linked together. What the
+/// stages write is what the host's tools write (merlin, merlin-as,
+/// merlin-ld), and the programs run. No temporary file is left.
+#[test]
+fn cc_runs_its_stages_as_clangs_driver_does() {
+    use userprogs::CCompiler;
+    let dir = userprogs::user_dir(&repo_root());
+    let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
+    let mut files = cc_sources();
+    // Many: a C file of seven macros and thirteen assembly files, from a
+    // response file.
+    files.push((
+        "/src/m.c".into(),
+        b"#include \"user.h\"\nint main(void) {\n    printf(\"%d\\n\", A + B + C + D + E + F + G);\n    return 0;\n}\n"
+            .to_vec(),
+    ));
+    let s_files: Vec<String> = (1..=13).map(|k| format!("s{k}.s")).collect();
+    for (k, s) in s_files.iter().enumerate() {
+        files.push((
+            format!("/src/{s}"),
+            format!("    .text\n    .globl s{k}\ns{k}:\n    ret\n").into_bytes(),
+        ));
+    }
+    let macros: Vec<String> = ["A", "B", "C", "D", "E", "F", "G"]
+        .iter()
+        .enumerate()
+        .map(|(k, m)| format!("-D{m}={}", k + 1))
+        .collect();
+    files.push((
+        "/src/many.rsp".into(),
+        format!("-o many\n{}\nm.c {}\n", macros.join(" "), s_files.join(" ")).into_bytes(),
+    ));
+    let header = cc_header();
+    // -###: (command, the command lines it prints).
+    let printed: &[(&str, &[&str])] = &[
+        (
+            "cc -### -o hello hello.c",
+            &[
+                r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/hello-T1.s" "-x" "c" "hello.c""#,
+                r#" "/bin/as" "-o" "/tmp/hello-T2.o" "/tmp/hello-T1.s""#,
+                r#" "/bin/ld" "-T" "/usr/lib/user.ld" "/usr/lib/crt0.o" "-L/usr/lib" "/tmp/hello-T2.o" "-lc" "-o" "hello""#,
+            ],
+        ),
+        (
+            "cc -### -c -g -I inc -DX=1 -UY a.c b.S c.s",
+            &[
+                r#" "/bin/cc1" "-g" "-I" "inc" "-I" "/usr/include" "-D" "X=1" "-U" "Y" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+                r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
+                r#" "/bin/cc1" "-E" "-g" "-I" "inc" "-I" "/usr/include" "-D" "X=1" "-U" "Y" "-o" "/tmp/b-T2.s" "-x" "assembler-with-cpp" "b.S""#,
+                r#" "/bin/as" "-o" "b.o" "/tmp/b-T2.s""#,
+                r#" "/bin/as" "-o" "c.o" "c.s""#,
+            ],
+        ),
+        (
+            "cc -### -E -P hello.c b.S",
+            &[
+                r#" "/bin/cc1" "-E" "-P" "-I" "/usr/include" "-x" "c" "hello.c""#,
+                r#" "/bin/cc1" "-E" "-P" "-I" "/usr/include" "-x" "assembler-with-cpp" "b.S""#,
+            ],
+        ),
+        (
+            "cc -### -S -o out.s a.c",
+            &[r#" "/bin/cc1" "-I" "/usr/include" "-o" "out.s" "-x" "c" "a.c""#],
+        ),
+        (
+            "cc -### -o p a.c d.o -L/l2 -lgui -Wl,-S,-e,main",
+            &[
+                r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+                r#" "/bin/as" "-o" "/tmp/a-T2.o" "/tmp/a-T1.s""#,
+                r#" "/bin/ld" "-T" "/usr/lib/user.ld" "/usr/lib/crt0.o" "-L/l2" "-L/usr/lib" "/tmp/a-T2.o" "d.o" "-lgui" "-S" "-e" "main" "-lc" "-o" "p""#,
+            ],
+        ),
+        // Quoted as clang quotes: a backslash before `"`, `\` and `$`.
+        (
+            r#"cc -### -c -DQ=a\b$ -fdebug-compilation-dir=/d -g a.c"#,
+            &[
+                r#" "/bin/cc1" "-g" "-fdebug-compilation-dir=/d" "-I" "/usr/include" "-D" "Q=a\\b\$" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+                r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
+            ],
+        ),
+    ];
+    // -v, as it runs them, then the program.
+    let verbose = "cc -v -o vhello hello.c";
+    let many = "cc -v @many.rsp";
+    // Every last stage, and every language.
+    let object = "cc -c -o /out/a.o a.c";
+    let assembly = "cc -S -o /out/a.s a.c";
+    let preprocessed = "cc -E -o /out/a.i a.c";
+    let asm_cpp = "cc -E b.S";
+    let asm_cpp_s = "cc -S b.S";
+    let several = "cc -c a.c b.S c.s";
+    let mixed = "cc -o /out/mix a.c b.S c.s d.o";
+    let runs = [
+        ("./vhello", "hello from user mode\n"),
+        ("./many", "28\n"),
+        ("/out/mix", "4321\n"),
+    ];
+    let mut commands: Vec<&str> = vec!["cd /src"];
+    commands.extend(printed.iter().map(|(c, _)| *c));
+    commands.extend([
+        verbose,
+        many,
+        object,
+        assembly,
+        preprocessed,
+        asm_cpp,
+        asm_cpp_s,
+        several,
+        mixed,
+    ]);
+    commands.extend(runs.iter().map(|(c, _)| *c));
+    let input = format!("{}\nexit 0\n", commands.join("\n"));
+    let (out, disk) = boot_cc(cc_image(&rt, &[], &files), &input);
+    let said = |command: &str| mask_temps(shell_output(&out, command));
+
+    for (command, lines) in printed {
+        let want: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        assert_eq!(said(command), format!("{header}{want}"), "{command}");
+    }
+    assert_eq!(
+        said(verbose),
+        format!(
+            "{header} \"/bin/cc1\" -I /usr/include -o /tmp/hello-T1.s -x c hello.c\n \
+             \"/bin/as\" -o /tmp/hello-T2.o /tmp/hello-T1.s\n \
+             \"/bin/ld\" -T /usr/lib/user.ld /usr/lib/crt0.o -L/usr/lib /tmp/hello-T2.o -lc -o vhello\n"
+        )
+    );
+    // cc1's command line: 20 arguments, its response file first (T1), then
+    // the assembly (T2); ld's: 22, its response file after the 14 objects.
+    let mut cc1_args = vec!["-I".to_string(), "/usr/include".to_string()];
+    for m in &macros {
+        cc1_args.push("-D".into());
+        cc1_args.push(m["-D".len()..].to_string());
+    }
+    cc1_args.extend(["-o", "/tmp/m-T2.s", "-x", "c", "m.c"].map(String::from));
+    let mut ld_args: Vec<String> = [
+        "-T",
+        "/usr/lib/user.ld",
+        "/usr/lib/crt0.o",
+        "-L/usr/lib",
+        "/tmp/m-T3.o",
+    ]
+    .map(String::from)
+    .to_vec();
+    let mut as_lines = " \"/bin/as\" -o /tmp/m-T3.o /tmp/m-T2.s\n".to_string();
+    for (k, s) in s_files.iter().enumerate() {
+        let o = format!("/tmp/s{}-T{}.o", k + 1, k + 4);
+        as_lines.push_str(&format!(" \"/bin/as\" -o {o} {s}\n"));
+        ld_args.push(o);
+    }
+    let ld_rsp = 4 + s_files.len();
+    ld_args.extend(["-lc", "-o", "many"].map(String::from));
+    let rsp = |args: &[String]| -> String { args.iter().map(|a| format!("{a}\n")).collect() };
+    assert_eq!(
+        said(many),
+        format!(
+            "{header} \"/bin/cc1\" @/tmp/res-T1.txt\n Arguments passed via response file:\n{} (end of response \
+             file)\n{as_lines} \"/bin/ld\" @/tmp/res-T{ld_rsp}.txt\n Arguments passed via response file:\n{} (end \
+             of response file)\n",
+            rsp(&cc1_args),
+            rsp(&ld_args)
+        )
+    );
+    for c in [object, assembly, preprocessed, several, mixed] {
+        assert_eq!(said(c), "", "{c}");
+    }
+    for (run, want) in runs {
+        assert_eq!(shell_output(&out, run), want, "{run}");
+    }
+
+    // What the stages wrote: merlin's preprocessing and assembly of a.c
+    // (its header from /usr/include), merlin-as's objects, and merlin-ld's
+    // link of them with the installed start code and library.
+    // The image's files, those of /src by their names there too, where cc1
+    // runs (merlin_e reads them so, merlin_s from the job's directory).
+    let image: BTreeMap<String, Vec<u8>> = usr_image_files(&rt)
+        .into_iter()
+        .chain(files.iter().cloned())
+        .chain(
+            files
+                .iter()
+                .map(|(p, d)| (p.trim_start_matches("/src/").to_string(), d.clone())),
+        )
+        .collect();
+    let usr_include = ["/usr/include".to_string()];
+    let a_c = CcJob {
+        dir: Some("/src".into()),
+        ..CcJob::new("a.c".into(), &usr_include, &[])
+    };
+    let a_s = merlin_s(&a_c, &image).0.unwrap();
+    let pp = |input: &str, lang| {
+        let job = PpJob::new(input.into(), lang, &usr_include, &[], true);
+        merlin_e(&job, &image).0.unwrap()
+    };
+    let b_s = pp("b.S", merlin::Lang::AssemblerWithCpp);
+    assert_eq!(said(asm_cpp), b_s);
+    assert_eq!(said(asm_cpp_s), b_s);
+    let fs = Fs::open(&disk).unwrap();
+    let file = |path: &str| fs.read_file(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    assert_eq!(
+        String::from_utf8(file("/out/a.i")).unwrap(),
+        pp("a.c", merlin::Lang::C)
+    );
+    assert_eq!(String::from_utf8(file("/out/a.s")).unwrap(), a_s);
+    let objects = [
+        ("a.o", toolchain::assemble("a.s", &a_s).unwrap()),
+        ("b.o", toolchain::assemble("b.s", &b_s).unwrap()),
+        ("c.o", toolchain::assemble("c.s", C_S).unwrap()),
+    ];
+    assert!(file("/out/a.o") == objects[0].1, "/out/a.o is not merlin-as's");
+    for (name, want) in &objects {
+        assert!(
+            file(&format!("/src/{name}")) == *want,
+            "/src/{name} is not merlin-as's"
+        );
+    }
+    let mut own: Vec<merlin_ld::Input> = objects
+        .iter()
+        .map(|(name, data)| merlin_ld::Input {
+            name: name.to_string(),
+            data: data.clone(),
+        })
+        .collect();
+    own.push(merlin_ld::Input {
+        name: "d.o".into(),
+        data: file("/src/d.o"),
+    });
+    let mix = toolchain::link_with(
+        &dir,
+        userprogs::SCRIPT,
+        &rt.installed().link_inputs(own),
+        "mix",
+        false,
+    )
+    .unwrap();
+    assert!(file("/out/mix") == mix, "/out/mix is not merlin-ld's link");
+    assert_eq!(left_in_tmp(&fs), Vec::<String>::new());
+}
+
+/// The driver's own diagnostics, clang's (#242): (cc's arguments, what it
+/// prints, and its exit status), in `/src` ([`cc_sources`]). Each is
+/// checked on Camelot, where the stages' own messages come before cc's
+/// (merlin's for cc1, merlin-ld's for ld, temporary files as
+/// [`mask_temps`] names them); and those marked so against clang's driver
+/// (`clang --target=riscv64`, the ignored [`clangs_driver_says_what_cc_says`]),
+/// its lines that start with `clang:` read with `cc` for `clang`, and the
+/// compiler's diagnostics, the rest being its tools' (and clang's other
+/// stages are its own: the integrated assembler, ld.lld).
+const CC_CASES: &[(&str, &[&str], i32, bool)] = &[
+    (
+        "-c nope.c",
+        &[
+            "cc: error: no such file or directory: 'nope.c'",
+            "cc: error: no input files",
+        ],
+        1,
+        true,
+    ),
+    (
+        "-c nope.c hello.c",
+        &["cc: error: no such file or directory: 'nope.c'"],
+        1,
+        true,
+    ),
+    (
+        "-frobnicate -c hello.c",
+        &["cc: error: unknown argument: '-frobnicate'"],
+        1,
+        true,
+    ),
+    (
+        "-c hello.c -o",
+        &["cc: error: argument to '-o' is missing (expected 1 value)"],
+        1,
+        true,
+    ),
+    ("", &["cc: error: no input files"], 1, true),
+    (
+        "-c -o x2.o hello.c a.c",
+        &["cc: error: cannot specify -o when generating multiple output files"],
+        1,
+        true,
+    ),
+    // The files after a language cc doesn't know are the linker's.
+    (
+        "-x foo -c hello.c",
+        &[
+            "cc: error: language not recognized: 'foo'",
+            "cc: warning: hello.c: 'linker' input unused [-Wunused-command-line-argument]",
+        ],
+        1,
+        true,
+    ),
+    (
+        "-c hello.c x.o",
+        &["cc: warning: x.o: 'linker' input unused [-Wunused-command-line-argument]"],
+        0,
+        true,
+    ),
+    (
+        "-c -lfoo -L/x hello.c",
+        &[
+            "cc: warning: -lfoo: 'linker' input unused [-Wunused-command-line-argument]",
+            "cc: warning: argument unused during compilation: '-L/x' [-Wunused-command-line-argument]",
+        ],
+        0,
+        true,
+    ),
+    (
+        "-S c.s",
+        &["cc: warning: c.s: 'assembler' input unused [-Wunused-command-line-argument]"],
+        0,
+        true,
+    ),
+    (
+        "-S -c hello.c",
+        &["cc: warning: argument unused during compilation: '-c' [-Wunused-command-line-argument]"],
+        0,
+        true,
+    ),
+    (
+        "-c hello.c -x c",
+        &["cc: warning: '-x c' after last input file has no effect [-Wunused-command-line-argument]"],
+        0,
+        true,
+    ),
+    // A compile error: the compiler said it, and cc says no more.
+    (
+        "-c bad.c",
+        &["bad.c:2:12: error: use of undeclared identifier 'x'"],
+        1,
+        true,
+    ),
+    // The other input is compiled and assembled all the same; the link,
+    // which needs both, is not run.
+    (
+        "-o p bad.c hello.c",
+        &["bad.c:2:12: error: use of undeclared identifier 'x'"],
+        1,
+        true,
+    ),
+    // A link error, and an assembly error: the tool's message, then cc's.
+    (
+        "-o undef undef.c",
+        &[
+            "ld: error: /tmp/undef-T1.o: undefined reference to 'f'",
+            "cc: error: linker command failed with exit code 1 (use -v to see invocation)",
+        ],
+        1,
+        true,
+    ),
+    (
+        "-c bad.s",
+        &[
+            "bad.s:2: error: usage: addi rd, rs1, imm",
+            "cc: error: assembler command failed with exit code 1 (use -v to see invocation)",
+        ],
+        1,
+        false,
+    ),
+    // cc1 failing otherwise than with 1, its status for diagnostics (2, a
+    // file it can't read: clang reads any bytes), is cc's word too, and its
+    // status cc's.
+    (
+        "-c latin1.c",
+        &[
+            "cc1: cannot read latin1.c: stream did not contain valid UTF-8",
+            "cc: error: cc frontend command failed with exit code 2 (use -v to see invocation)",
+        ],
+        2,
+        false,
+    ),
+];
+
+/// The driver's errors and exit statuses on Camelot ([`CC_CASES`]): a
+/// missing file, a compile error, an assembly error, a link error, a bad
+/// option, an unknown language, `-o` for several outputs, inputs that mean
+/// nothing for the last stage, and a cc1 that can't be run (a copy of cc
+/// in a directory without one: clang's `unable to execute command`). A
+/// stage that fails takes the file it was to make for the user with it
+/// (`keep.o`, there before, which `as` was to write), but not one a later
+/// stage was to make (`kept.o`: cc1 failed, and `as` never ran), as clang's
+/// driver does with `-fno-integrated-as`; and the link that needed a failed
+/// stage is not run (no `p`). No temporary file is left.
+#[test]
+fn cc_says_what_clangs_driver_says() {
+    use userprogs::CCompiler;
+    let dir = userprogs::user_dir(&repo_root());
+    let rt = userprogs::build_runtime(&dir, CCompiler::Merlin).unwrap();
+    let mut files = cc_sources();
+    for old in ["/src/keep.o", "/src/kept.o"] {
+        files.push((old.into(), b"an old object".to_vec()));
+    }
+    let cc = userprogs::build_named(&dir, "cc").unwrap();
+    files.push(("/alt/cc".into(), cc.elf));
+    let commands: Vec<String> = CC_CASES
+        .iter()
+        .map(|(args, ..)| format!("cc {args}").trim_end().to_string())
+        .collect();
+    let keep = "cc -c -o keep.o bad.s";
+    let kept = "cc -c -o kept.o bad.c";
+    let alone = "/alt/cc -c hello.c";
+    let mut input = "cd /src\n".to_string();
+    for c in commands.iter().map(String::as_str).chain([keep, kept, alone]) {
+        input.push_str(&format!("{c}\n"));
+    }
+    input.push_str("exit 0\n");
+    let (out, disk) = boot_cc(cc_image(&rt, &["/alt"], &files), &input);
+    let outputs = shell_outputs(&out, &input);
+    // The outputs of the lines typed, after `cd /src`.
+    for (k, (args, lines, status, _)) in CC_CASES.iter().enumerate() {
+        let mut want: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        if *status != 0 {
+            want.push_str(&format!("cc: exit {status}\n"));
+        }
+        assert_eq!(mask_temps(&outputs[k + 1]), want, "cc {args}");
+    }
+    let n = CC_CASES.len() + 1;
+    assert_eq!(
+        outputs[n],
+        "bad.s:2: error: usage: addi rd, rs1, imm\n\
+         cc: error: assembler command failed with exit code 1 (use -v to see invocation)\ncc: exit 1\n",
+        "{keep}"
+    );
+    assert_eq!(
+        outputs[n + 1],
+        "bad.c:2:12: error: use of undeclared identifier 'x'\ncc: exit 1\n",
+        "{kept}"
+    );
+    assert_eq!(
+        outputs[n + 2],
+        "cc: error: unable to execute command: no such file or directory\n\
+         cc: error: cc frontend command failed with exit code 1 (use -v to see invocation)\n/alt/cc: exit 1\n",
+        "{alone}"
+    );
+    let fs = Fs::open(&disk).unwrap();
+    assert!(fs.lookup("/src/keep.o").is_err(), "keep.o was not removed");
+    assert_eq!(fs.read_file("/src/kept.o").unwrap(), b"an old object");
+    assert!(fs.lookup("/src/p").is_err(), "p was linked");
+    assert_eq!(left_in_tmp(&fs), Vec::<String>::new());
+}
+
+/// clang's driver says, for each of [`CC_CASES`] marked so, what cc says:
+/// the same `clang: error:` and `clang: warning:` lines (with `cc` for
+/// `clang`), the same compiler diagnostics, and the same exit status. Run
+/// with clang on `PATH` (or LLVM's default directory on Windows), in a
+/// scratch directory with the same files: `cargo test --release -p xtask
+/// --test selfhost -- --ignored clangs_driver`.
+#[test]
+#[ignore]
+fn clangs_driver_says_what_cc_says() {
+    let clang = xtask::tools::find("clang").expect("clang on PATH");
+    let scratch = std::env::temp_dir().join(format!("cc-driver-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+    for (path, data) in cc_sources() {
+        std::fs::write(scratch.join(path.trim_start_matches("/src/")), data).unwrap();
+    }
+    // The header the C files include, which cc finds in /usr/include.
+    let user = userprogs::user_dir(&repo_root());
+    std::fs::copy(user.join("user.h"), scratch.join("user.h")).unwrap();
+    // The language merlin's diagnostics are clang's for (C99,
+    // freestanding), and clang's diagnostics as merlin prints them: clang
+    // only, so its warnings that they go unused are left out.
+    let extra = ["-std=c99", "-ffreestanding", "-fno-caret-diagnostics"];
+    // The lines both drivers have: theirs, and the compiler's diagnostics.
+    let comparable = |line: &str| {
+        line.starts_with("cc: ") || {
+            let mut parts = line.splitn(4, ':');
+            let (_, l, c) = (parts.next(), parts.next(), parts.next());
+            let digits =
+                |s: Option<&str>| s.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            digits(l) && digits(c)
+        }
+    };
+    let mut wrong = Vec::new();
+    for (args, lines, status, check) in CC_CASES {
+        if !check {
+            continue;
+        }
+        let out = std::process::Command::new(&clang)
+            .arg("--target=riscv64")
+            .args(extra)
+            .args(args.split_whitespace())
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stderr).replace('\r', "");
+        let got: Vec<String> = said
+            .lines()
+            .map(|l| {
+                l.strip_prefix("clang: ")
+                    .map_or(l.to_string(), |r| format!("cc: {r}"))
+            })
+            .filter(|l| comparable(l) && !extra.iter().any(|e| l.contains(&format!("'{e}'"))))
+            .collect();
+        let want: Vec<String> = lines
+            .iter()
+            .filter(|l| comparable(l))
+            .map(|l| l.to_string())
+            .collect();
+        if got != want || out.status.code() != Some(*status) {
+            wrong.push(format!(
+                "cc {args}: clang said (exit {:?}):\n{said}\ncc says (exit {status}):\n{}",
+                out.status.code(),
+                want.join("\n")
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
 }
