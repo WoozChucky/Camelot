@@ -188,7 +188,7 @@ static long sys_procs(struct trap_frame *f) {
     return r;
 }
 
-/* harts(buf, max): as procs, with NCPU entries of 16 bytes. */
+/* harts(buf, max): as procs, with NCPU entries of 20 bytes. */
 static long sys_harts(struct trap_frame *f) {
     pagetable_t pt = myproc()->pagetable;
     uintptr buf = arg(f, 0);

@@ -137,7 +137,7 @@ headers and checks each size.
 | 20 | `pipe` | `int *fds` | 0; `-EMFILE`, `-ENFILE`, `-ENOMEM`, `-EFAULT` |
 | 21 | `exec` | `const char *path, char *const argv[], char *const envp[]` | does not return; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-E2BIG`, `-ENOEXEC`, `-ENOMEM`, `-EFAULT` |
 | 22 | `kill` | `int pid` | 0; `-ESRCH`, `-EPERM` |
-| 23 | `procs` | `struct procinfo *buf, uint max` | the number of processes; `-EFAULT` |
+| 23 | `procs` | `struct procinfo *buf, uint max` | the number of processes; `-EFAULT`, `-ENOMEM` |
 | 24 | `netinfo` | `struct netinfo *info` | 0; `-ENODEV`, `-EFAULT` |
 | 25 | `netconf` | `uint addr, uint mask, uint gateway` | 0; `-ENODEV`, `-EINVAL` |
 | 26 | `ping` | `uint addr, uint seq, struct ping_reply *reply` | 0; `-ETIMEDOUT`, `-EHOSTUNREACH`, `-ENETUNREACH`, `-ENOBUFS`, `-ENODEV`, `-EINVAL`, `-EFAULT` |
@@ -557,7 +557,8 @@ stack page), 0 for a kernel process; and `name`, NUL-terminated (the last
 name of the path it was started from, at most 15 characters). A process
 that `spawn` is still loading is not listed. All of `buf`, `max` entries,
 must be writable, however many are stored, or it is `-EFAULT` and nothing
-is.
+is; the table is made in a page of the kernel's first, `-ENOMEM` when there
+is none.
 
 **harts(buf, max)** describes the harts the kernel runs on, from hart 0
 up, in the array of `max` `struct hartinfo` (20 bytes each, `user.h`) at

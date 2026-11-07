@@ -57,6 +57,7 @@ for `grep`, whose 1 means "no line matched".
 | `printenv` | `printenv [NAME...]` | prints the value of each NAME (`getenv`), a line each, or the whole environment without a NAME; exits 1 if a NAME has no value |
 | `kill` | `kill PID...` | ends processes (`kill`): they exit with status -1; not the shell, whose end is Camelot's |
 | `sleep` | `sleep SECONDS` | waits, `0.5` for half a second (the clock ticks 10 times a second) |
+| `date` | `date [-s]` | prints the date and time in UTC as `date -u` does (`Thu Jan  1 00:00:05 UTC 2026`), from the real-time clock (`CLOCK_REALTIME`); `-s` the seconds since 1970 |
 
 So, on the root image:
 
