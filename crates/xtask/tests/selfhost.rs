@@ -485,8 +485,9 @@ fn shell_output<'a>(out: &'a str, command: &str) -> &'a str {
 
 /// What the shell printed after each line of `input`, up to the next line
 /// typed (by its echo after the prompt, not by the prompt alone, which an
-/// output may hold: `$ ` in C or assembly), its `\r`s gone (the console's,
-/// before each `\n`).
+/// output may hold: `$ ` in C or assembly), byte for byte: the console
+/// prints what a program writes as it is (its `c_oflag` is 0, kernel/tty.c,
+/// no `\r` added before a `\n`), so a `\r` cc1 writes is compared too.
 fn shell_outputs(out: &str, input: &str) -> Vec<String> {
     let typed: Vec<String> = input.lines().map(|l| format!("{PROMPT}{l}\n")).collect();
     let mut starts = Vec::new();
@@ -502,7 +503,7 @@ fn shell_outputs(out: &str, input: &str) -> Vec<String> {
     (0..typed.len())
         .map(|i| {
             let end = starts.get(i + 1).map_or(out.len(), |s| s.0);
-            out[starts[i].1..end].replace('\r', "")
+            out[starts[i].1..end].to_string()
         })
         .collect()
 }
@@ -2822,19 +2823,19 @@ fn cc1_takes_merlins_command_line() {
     input.push_str("\nexit 0\n");
     let (out, disk) = boot_cc1(image_of(&["cc1"], &["/d", fill], &files), &input, 40_000_000_000);
     for (command, said, status) in cases {
-        let got = shell_output(&out, command).replace('\r', "");
+        let got = shell_output(&out, command);
         assert!(got.starts_with(said.as_str()), "{command}: {got}");
         assert!(
             got.ends_with(&format!("cc1: exit {status}\n")),
             "{command}: {got}"
         );
     }
-    assert_eq!(shell_output(&out, together).replace('\r', ""), both);
-    assert!(shell_output(&out, help).replace('\r', "").starts_with(usage));
+    assert_eq!(shell_output(&out, together), both);
+    assert!(shell_output(&out, help).starts_with(usage));
     let fs = Fs::open(&disk).unwrap();
     let image: BTreeMap<String, Vec<u8>> = files.iter().cloned().collect();
     for (k, (dir, command, comp_dir)) in debug.iter().enumerate() {
-        assert_eq!(shell_output(&out, command).replace('\r', ""), "", "{command}");
+        assert_eq!(shell_output(&out, command), "", "{command}");
         let written = String::from_utf8(fs.read_file(&format!("/out/g{}", k + 1)).unwrap()).unwrap();
         let name = command.split(' ').rev().nth(2).unwrap();
         let job = CcJob {
@@ -3875,7 +3876,7 @@ fn cc1_writes_its_outputs_as_merlin_does() {
     let listed: Vec<(String, Vec<u8>)> = files.iter().map(|(p, d)| (p.clone(), d.clone())).collect();
     let image = image_with_room(&["cc1"], &["/d"], &listed, 64, 1 << 20);
     let (out, disk) = boot_on(cc1_compile_config(), image, &input, 2_000_000_000_000);
-    let said = |command: &str| shell_output(&out, command).replace('\r', "");
+    let said = |command: &str| shell_output(&out, command);
     let fs = Fs::open(&disk).unwrap();
     let file = |path: &str| String::from_utf8(fs.read_file(path).unwrap()).unwrap();
     // The tree on standard output, its warnings on stderr: the console has
