@@ -210,8 +210,11 @@ static void as_user(int root_pid) {
     pid = spawn("/pt/cleared", (char *[]){"cleared", "euid", NULL}, environ);
     check_eq(status_of(pid), 1, "chown cleared a program's set-user-ID bit");
 
-    /* Other users' processes. */
+    /* Other users' processes: not killed, nor made the terminal's
+     * foreground process, which Ctrl-C would kill. */
     check_eq(kill(root_pid), -EPERM, "kill a root process");
+    int fg = root_pid;
+    check_eq(ioctl(STDIN, TIOCSPGRP, &fg), -EPERM, "make a root process the console's foreground");
 
     /* A local socket's name: connecting needs write on it. */
     struct sockaddr_un un;
@@ -231,6 +234,7 @@ static void as_user(int root_pid) {
     check_eq(try_open("/dev/input/event0", O_RDONLY), -EACCES, "open the keyboard");
     check_eq(try_open("/dev/fb0", O_RDWR), -EACCES, "open the framebuffer");
     check_eq(try_open("/dev/pts/0", O_RDWR), -EACCES, "open a terminal's slave");
+    check_eq(try_open("/dev/ptmx", O_RDWR), -EACCES, "open a pseudo-terminal");
 
     /* The machine's address is root's, network card or not. */
     check_eq(netconf(0x0a00020f, 0xffffff00, 0), -EPERM, "netconf");

@@ -416,6 +416,12 @@ void proc_kill(struct trap_frame *f);
  * process. */
 int proc_kill_pid(int pid, const struct proc *by);
 
+/* Whether `by` (NULL: the kernel) may signal process `pid`, by kill's
+ * rule: 0, -ESRCH if there is no such process, -EPERM if it is another
+ * user's and `by` isn't root. TIOCSPGRP's check, as a terminal's Ctrl-C
+ * kills its foreground process with the kernel's authority. */
+int proc_may_signal(int pid, const struct proc *by);
+
 /* Whether a process `pid` is running (neither ended nor being made). */
 bool proc_exists(int pid);
 

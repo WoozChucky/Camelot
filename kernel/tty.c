@@ -483,8 +483,13 @@ long tty_ioctl(struct tty *t, u32 request, uintptr arg) {
         if (pid < 0) {
             return -EINVAL;
         }
-        if (pid != 0 && !proc_exists(pid)) {
-            return -ESRCH;
+        /* Only a process the caller could kill() may be made the
+         * foreground one: Ctrl-C kills it with the kernel's authority. */
+        if (pid != 0) {
+            int err = proc_may_signal(pid, myproc());
+            if (err < 0) {
+                return err;
+            }
         }
         t->fg = pid;
         return 0;

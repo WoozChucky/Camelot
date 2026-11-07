@@ -8,8 +8,8 @@
 //! from ([`usr_files`]): the header in `/usr/include`, and in `/usr/lib` the
 //! start code `crt0.o`, the C library `libc.a` and the linker script
 //! `user.ld`, the very files the programs of `/bin` were linked from. No
-//! LLVM needed. Everything is root's, the device nodes mode 0600 (but
-//! `/dev/ptmx`, 0666: [`PRIVATE_DEVICE_MODE`]), the programs mode 0755 (but
+//! LLVM needed. Everything is root's, the device nodes mode 0600
+//! ([`DEVICE_MODE`]), the programs mode 0755 (but
 //! [`SETUID_PROGRAMS`], 4755), the other files 0644 and the directories
 //! 0755 (`camelot_fs::default_mode`).
 //!
@@ -199,12 +199,12 @@ pub const PTS_MAJOR: u16 = 5;
 /// The slaves' nodes the image has, `/dev/pts/0` up (`NPTY` in
 /// kernel/include/pty.h): Camelot has no devpts to make them as they come.
 pub const NPTY: u16 = 16;
-/// The mode of the devices that carry someone's input or screen, root's
-/// alone: the console, the framebuffer, the input devices and the
-/// pseudo-terminals' slaves (a session keeps the descriptors it was given;
-/// with no devpts, a slave can't be given to whoever opened its master, so
-/// ordinary users have no pseudo-terminals). `/dev/ptmx` stays 0666.
-pub const PRIVATE_DEVICE_MODE: u16 = 0o600;
+/// The device nodes' mode, root's alone: the console, the framebuffer and
+/// the input devices carry someone's screen and keys (a session keeps the
+/// descriptors it was given), and with no devpts a pseudo-terminal's slave
+/// can't be given to whoever opened its master, so ordinary users have no
+/// pseudo-terminals, `/dev/ptmx` included.
+pub const DEVICE_MODE: u16 = 0o600;
 /// Where the headers go, as on Linux: a compiler on Camelot looks there.
 pub const INCLUDE: &str = "/usr/include";
 /// Where the start code, the C library and the programs' linker script go.
@@ -397,12 +397,12 @@ fn build_image(
     for n in 0..NPTY {
         fs.add_device(&format!("{DEV}/pts/{n}"), PTS_MAJOR, n)?;
     }
-    let private = ["console", "fb0", "input/event0", "input/event1"].map(|d| format!("{DEV}/{d}"));
-    for path in private
+    let devices = ["console", "fb0", "input/event0", "input/event1", "ptmx"].map(|d| format!("{DEV}/{d}"));
+    for path in devices
         .into_iter()
         .chain((0..NPTY).map(|n| format!("{DEV}/pts/{n}")))
     {
-        fs.chmod(&path, PRIVATE_DEVICE_MODE)?;
+        fs.chmod(&path, DEVICE_MODE)?;
     }
     fs.mkdir(RUN)?;
     fs.mkdir(TMP)?;

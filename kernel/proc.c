@@ -1172,6 +1172,27 @@ void proc_kill(struct trap_frame *f) {
     proc_exit(-1);
 }
 
+/* Whether `by` may signal `p`: Linux's kill_ok_by_cred(), root, or the
+ * caller's real or effective uid the target's real one. NULL is the kernel
+ * itself, which may signal anyone. */
+static bool may_signal(const struct proc *by, const struct proc *p) {
+    return by == NULL || by->euid == 0 || by->euid == p->uid || by->uid == p->uid;
+}
+
+int proc_may_signal(int pid, const struct proc *by) {
+    int r = -ESRCH;
+    acquire(&proc_lock);
+    for (u32 i = 0; i < NPROC; i++) {
+        const struct proc *p = &procs[i];
+        if (p->state != PROC_UNUSED && p->state != PROC_NEW && p->pid == (u32)pid) {
+            r = may_signal(by, p) ? 0 : -EPERM;
+            break;
+        }
+    }
+    release(&proc_lock);
+    return r;
+}
+
 int proc_kill_pid(int pid, const struct proc *by) {
     int r = -ESRCH;
     acquire(&proc_lock);
@@ -1186,12 +1207,12 @@ int proc_kill_pid(int pid, const struct proc *by) {
             r = -EPERM;
             break;
         }
-        /* Another user's process is out of reach but to root: Linux's
-         * kill_ok_by_cred(), the caller's real or effective uid against
-         * the target's real one. The terminal's Ctrl-C (`by` NULL) acts
-         * with the kernel's authority, as Linux's tty layer does: it runs
-         * in an interrupt, on whatever hart and process it lands. */
-        if (by != NULL && by->euid != 0 && by->euid != p->uid && by->uid != p->uid) {
+        /* Another user's process is out of reach but to root. The
+         * terminal's Ctrl-C (`by` NULL) acts with the kernel's authority,
+         * as Linux's tty layer does: it runs in an interrupt, on whatever
+         * hart and process it lands, and TIOCSPGRP checked that whoever
+         * made its target the foreground could signal it. */
+        if (!may_signal(by, p)) {
             r = -EPERM;
             break;
         }

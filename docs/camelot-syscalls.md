@@ -1366,7 +1366,7 @@ terminal emulator holds, as on Linux:
 | `TCSETSF` | 0x5404 | `const struct termios *` | the same, and the input thrown away (`TCSAFLUSH`) |
 | `TCFLSH` | 0x540B | a number | throws away the input (`TCIFLUSH`, 0), the output not read yet (`TCOFLUSH`, 1), or both (2) |
 | `TIOCGPGRP` | 0x540F | `int *` | the foreground process, 0 for none (as it was set, even once it has ended) |
-| `TIOCSPGRP` | 0x5410 | `const int *` | sets it, 0 for none (Camelot's: Linux has no such group, `-ESRCH`): `-EINVAL` for less than 0, `-ESRCH` for no such process |
+| `TIOCSPGRP` | 0x5410 | `const int *` | sets it, 0 for none (Camelot's: Linux has no such group, `-ESRCH`): `-EINVAL` for less than 0, `-ESRCH` for no such process, `-EPERM` for one the caller couldn't `kill` (Ctrl-C kills it with the kernel's authority) |
 | `TIOCGWINSZ` | 0x5413 | `struct winsize *` | the size (0 by 0 until set) |
 | `TIOCSWINSZ` | 0x5414 | `const struct winsize *` | sets it |
 | `FIONREAD` | 0x541B | `int *` | the bytes a read would take now: a whole line's in canonical mode; the output waiting, on a master |

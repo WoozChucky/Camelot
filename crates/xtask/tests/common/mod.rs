@@ -37,7 +37,7 @@ pub const MAPTEST_THREADS_CHECKS: u32 = 15;
 /// part's result one of them) and the user part's, without a network to
 /// bind on; with one, the user part makes [`PERMTEST_PORT_CHECKS`] more.
 pub const PERMTEST_CHECKS: u32 = 64;
-pub const PERMTEST_USER_CHECKS: u32 = 71;
+pub const PERMTEST_USER_CHECKS: u32 = 73;
 pub const PERMTEST_PORT_CHECKS: u32 = 2;
 
 /// Where the kernel image is linked (its symbols' addresses) and where it is
