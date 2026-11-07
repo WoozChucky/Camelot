@@ -1,5 +1,5 @@
 //! `merlin [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]] [-U name] [-g] [-x LANG] [-O LEVEL]
-//! [-std=c99] [-w] [-W...] [-ffreestanding] [-E [-P] | --dump-ast] [@file] input.c...`
+//! [-std=c99] [-v] [-w] [-W...] [-ffreestanding] [-E [-P] | --dump-ast] [@file] input.c...`
 
 use merlin::{CmdMacro, Lang, Options};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,8 @@ const USAGE: &str = "usage: merlin [options] input.c...
                     takes them; merlin does not optimize, so every level
                     compiles the same code
   -std=STD          the language: c99 (or gnu99, iso9899:1999), the only one
+  -v                say the version and the #include search list, as clang
+                    -cc1 -v does
   -w                no warnings
   -Wno-FLAG         no warnings of -WFLAG; -WFLAG (and -Wall...) changes nothing,
                     every warning merlin gives being clang's default
@@ -221,6 +223,7 @@ fn run() -> ExitCode {
     // each file's name.
     let mut lang: Option<Lang> = None;
     let mut warnings = Warnings::default();
+    let mut verbose = false;
     // What -O and -std= say, clang's diagnostics of no file.
     let mut said: Vec<merlin::Error> = Vec::new();
     // `@FILE`: how the `cc` driver on Camelot gives cc1, merlin in C, a
@@ -261,6 +264,7 @@ fn run() -> ExitCode {
             }
             "--dump-ast" => mode = Mode::DumpAst,
             "-w" => warnings.none = true,
+            "-v" => verbose = true,
             "-ffreestanding" => {}
             _ if a.starts_with("-O") => match check_opt(&a[2..]) {
                 Ok(None) => {}
@@ -339,6 +343,13 @@ fn run() -> ExitCode {
     if output.is_some() && inputs.len() > 1 {
         return usage_error("-o needs a single input file");
     }
+    // -v: the version first, as clang's -cc1 says it as it starts.
+    if verbose {
+        eprintln!(
+            "merlin version {} default target riscv64",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
     // -O's and -std='s diagnostics, before the inputs', as clang's -cc1
     // gives them; an error stops it there.
     let (said, _) = warnings.apply(said);
@@ -362,11 +373,48 @@ fn run() -> ExitCode {
             lang: *lang,
             ..opts.clone()
         };
+        if verbose {
+            eprint!("{}", search_list(&opts.include_dirs));
+        }
         if let Err(code) = translate(input, output.as_deref(), mode, &opts, &warnings) {
             status = code;
         }
     }
     status
+}
+
+/// What -v says of the `#include` search list before a translation unit,
+/// as clang's -cc1 -v says it: the `-I` directories that are not there and
+/// those given twice left out (and said so), then the list. merlin
+/// searches a quoted name in the including file's directory first, which
+/// clang's list does not show either, then the `-I` directories in order,
+/// as it searches an angled one: they are both lists' (clang's `-iquote`
+/// directories, which merlin has none of, would be the first's alone).
+/// What it leaves out changes no search: a directory that isn't there has
+/// no file, and one given again has none the first did not.
+fn search_list(dirs: &[PathBuf]) -> String {
+    let mut missing = String::new();
+    let mut twice = String::new();
+    let mut kept: Vec<(&PathBuf, PathBuf)> = Vec::new();
+    for d in dirs {
+        match std::fs::canonicalize(d) {
+            Ok(real) if real.is_dir() => {
+                if kept.iter().any(|(_, k)| *k == real) {
+                    twice.push_str(&format!("ignoring duplicate directory \"{}\"\n", d.display()));
+                } else {
+                    kept.push((d, real));
+                }
+            }
+            _ => missing.push_str(&format!("ignoring nonexistent directory \"{}\"\n", d.display())),
+        }
+    }
+    let mut out = missing + &twice;
+    out.push_str("#include \"...\" search starts here:\n#include <...> search starts here:\n");
+    for (d, _) in kept {
+        out.push_str(&format!(" {}\n", d.display()));
+    }
+    out.push_str("End of search list.\n");
+    out
 }
 
 /// Compiles (or preprocesses, or dumps) one input file: `-` is standard

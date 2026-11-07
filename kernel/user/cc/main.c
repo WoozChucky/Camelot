@@ -1,6 +1,6 @@
 /* cc1: `cc1 [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]]
  * [-U name] [-g [-fdebug-compilation-dir=DIR]] [-x LANG] [-O LEVEL]
- * [-std=c99] [-w] [-W...] [-ffreestanding] [-E [-P] | --dump-ast] [@file]
+ * [-std=c99] [-v] [-w] [-W...] [-ffreestanding] [-E [-P] | --dump-ast] [@file]
  * input.c...`, merlin's command line (follows merlin's main.rs
  * and lib.rs): the preprocessor (-E, of C and of assembly: `.S`, `-x
  * assembler-with-cpp`), the syntax tree (--dump-ast) and the compiler, C to
@@ -38,6 +38,8 @@ static const char USAGE[] = "usage: cc1 [options] input.c...\n"
                             "                    takes them; merlin does not optimize, so every level\n"
                             "                    compiles the same code\n"
                             "  -std=STD          the language: c99 (or gnu99, iso9899:1999), the only one\n"
+                            "  -v                say the version and the #include search list, as clang\n"
+                            "                    -cc1 -v does\n"
                             "  -w                no warnings\n"
                             "  -Wno-FLAG         no warnings of -WFLAG; -WFLAG (and -Wall...) changes nothing,\n"
                             "                    every warning merlin gives being clang's default\n"
@@ -126,6 +128,61 @@ static char *read_file(const char *path, uint *len, int *err) {
     char *text = read_fd(fd, len, err);
     close(fd);
     return text;
+}
+
+/* cc1's version, merlin's (the workspace's: a test checks they agree). */
+#define VERSION "0.1.0"
+
+/* Whether -v was given. */
+static int verbose;
+
+/* What -v says of the #include search list before a translation unit, as
+ * clang's -cc1 -v says it (merlin's search_list): the -I directories that
+ * are not there and those given twice (the same inode) left out, and said
+ * so, then the list. cc1 searches a quoted name in the including file's
+ * directory first, which clang's list does not show either, then the -I
+ * directories in order, as it searches an angled one: they are both
+ * lists'. What it leaves out changes no search. */
+static void print_search_list(struct options *opts) {
+    struct buf missing;
+    struct buf twice;
+    struct buf list;
+    memset(&missing, 0, sizeof missing);
+    memset(&twice, 0, sizeof twice);
+    memset(&list, 0, sizeof list);
+    uint *inodes = malloc((opts->ninclude_dirs + 1) * sizeof(uint));
+    if (inodes == NULL) {
+        die("out of memory");
+    }
+    uint nkept = 0;
+    for (uint i = 0; i < opts->ninclude_dirs; i++) {
+        const char *d = opts->include_dirs[i];
+        struct stat st;
+        if (stat(d, &st) < 0 || st.type != T_DIR) {
+            buf_fmt(&missing, "ignoring nonexistent directory \"%s\"\n", d);
+            continue;
+        }
+        int seen = 0;
+        for (uint k = 0; k < nkept; k++) {
+            seen |= inodes[k] == st.ino;
+        }
+        if (seen) {
+            buf_fmt(&twice, "ignoring duplicate directory \"%s\"\n", d);
+            continue;
+        }
+        inodes[nkept++] = st.ino;
+        buf_fmt(&list, " %s\n", d);
+    }
+    /* All of it in one write: the missing, the twice given, the list. */
+    buf_put(&missing, twice.data, twice.len);
+    buf_str(&missing, "#include \"...\" search starts here:\n#include <...> search starts here:\n");
+    buf_put(&missing, list.data, list.len);
+    buf_str(&missing, "End of search list.\n");
+    write(2, missing.data, missing.len);
+    buf_free(&missing);
+    buf_free(&twice);
+    buf_free(&list);
+    free(inodes);
 }
 
 /* What -O and -std= said (main), clang's diagnostics of no file, and
@@ -629,6 +686,8 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(a, "--dump-ast") == 0) {
             mode = MODE_DUMP_AST;
+        } else if (strcmp(a, "-v") == 0) {
+            verbose = 1;
         } else if (strcmp(a, "-w") == 0) {
             diag_take_w(NULL);
         } else if (strcmp(a, "-ffreestanding") == 0) {
@@ -707,6 +766,10 @@ int main(int argc, char **argv) {
     if (output != NULL && ninputs > 1) {
         return usage_error("-o needs a single input file");
     }
+    /* -v: the version first, as clang's -cc1 says it as it starts. */
+    if (verbose) {
+        fprintf(2, "cc1 version %s default target riscv64\n", VERSION);
+    }
     /* -O's and -std='s diagnostics, before the inputs', as clang's -cc1
      * gives them; an error stops it there. */
     diag_failed = 0;
@@ -738,6 +801,9 @@ int main(int argc, char **argv) {
     }
     int status = 0;
     for (uint i = 0; i < ninputs; i++) {
+        if (verbose) {
+            print_search_list(&opts);
+        }
         int r = mode == MODE_PREPROCESS ? translate(&inputs[i], output, &opts)
                                         : compile_file(&inputs[i], output, &opts, mode == MODE_DUMP_AST, comp_dir);
         if (r != 0) {

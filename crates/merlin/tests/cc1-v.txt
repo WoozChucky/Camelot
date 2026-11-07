@@ -1,0 +1,8 @@
+VERSION
+ignoring nonexistent directory "nope"
+ignoring duplicate directory "inc"
+#include "..." search starts here:
+#include <...> search starts here:
+ inc
+ inc2
+End of search list.

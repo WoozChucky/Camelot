@@ -42,5 +42,8 @@ $ cc -### -c p.i
 cc1 -o TMP/p-T1.s -x cpp-output p.i
 as -o p.o TMP/p-T1.s
 
+$ cc -### -v -E -w -O2 -g -P -I inc -DX -ffreestanding -std=c99 -Wall a.c
+cc1 -O2 -E -ffreestanding -g -v -P -I inc -D X -Wall -w -std=c99 -o - -x c a.c
+
 $ cc -### -E -
 cc1 -E -o - -x c -

@@ -420,7 +420,8 @@ static const char *comp_dir;       /* -fdebug-compilation-dir */
 static const char *opt_level;      /* the last -O, as given */
 static const char *std;            /* the last -std= */
 static int freestanding;           /* -ffreestanding */
-static struct strv warning_opts;   /* -w and -W..., in order, but -Wl, */
+static struct strv warning_opts;   /* -W..., in order, but -Wl, */
+static int no_warnings;            /* -w */
 static struct strv include_dirs;   /* -I, in order */
 static struct strv macros;         /* -D NAME and -U NAME, in order, as "-D" "NAME" pairs */
 static struct strv lib_dirs;       /* -L, as -LDIR */
@@ -641,7 +642,7 @@ static int parse(char **args, int nargs) {
             no_line_markers = 1;
         } else if (strcmp(a, "-w") == 0) {
             claim(a, FOR_CC1);
-            push(&warning_opts, a);
+            no_warnings = 1;
         } else if (strcmp(a, "-ffreestanding") == 0) {
             claim(a, FOR_CC1);
             freestanding = 1;
@@ -771,15 +772,13 @@ static const char *cc1_lang(int lang) {
 
 /* cc1 on input `in` (of language `lang`), preprocessing only if
  * `preprocess`, writing `out` (`-` for standard output): the options in
- * clang's order, the mode, -O, the debug information, -I with
- * /usr/include after the user's, -D and -U in their order,
- * -ffreestanding, the warnings', -std, the output, the language. */
+ * clang's order (tests/cc/clang-stages.txt holds it): -O, the mode,
+ * -ffreestanding, the debug information, -v, -P, -I with /usr/include
+ * after the user's, -D and -U in their order, the warnings', -std, the
+ * output, the language. */
 static void cc1_job(int k, const char *in, int lang, int preprocess, const char *out, const char *result) {
     struct job *j = new_job(CC1, k);
     have_cc1 = 1;
-    if (preprocess) {
-        push(&j->argv, "-E");
-    }
     if (opt_level != NULL) {
         /* Worked out (and warned of) once, for the first cc1 stage, as
          * clang's driver does it as it makes its -cc1 job. */
@@ -789,14 +788,25 @@ static void cc1_job(int k, const char *in, int lang, int preprocess, const char 
         }
         push(&j->argv, for_cc1);
     }
-    if (no_line_markers) {
-        push(&j->argv, "-P");
+    if (preprocess) {
+        push(&j->argv, "-E");
+    }
+    if (freestanding) {
+        push(&j->argv, "-ffreestanding");
     }
     if (debug) {
         push(&j->argv, "-g");
     }
     if (comp_dir != NULL) {
         push(&j->argv, concat("-fdebug-compilation-dir=", comp_dir, NULL));
+    }
+    /* -v: cc1 says its version and its #include search list too, as
+     * clang's -cc1 does. */
+    if (verbose) {
+        push(&j->argv, "-v");
+    }
+    if (no_line_markers) {
+        push(&j->argv, "-P");
     }
     for (int i = 0; i < include_dirs.n; i++) {
         push(&j->argv, "-I");
@@ -807,11 +817,12 @@ static void cc1_job(int k, const char *in, int lang, int preprocess, const char 
     for (int i = 0; i < macros.n; i++) {
         push(&j->argv, macros.v[i]);
     }
-    if (freestanding) {
-        push(&j->argv, "-ffreestanding");
-    }
+    /* The -W options in their order, then -w, as clang gives them. */
     for (int i = 0; i < warning_opts.n; i++) {
         push(&j->argv, warning_opts.v[i]);
+    }
+    if (no_warnings) {
+        push(&j->argv, "-w");
     }
     if (std != NULL) {
         push(&j->argv, std);

@@ -691,3 +691,93 @@ fn the_target_is_lp64() {
         assert!(ast.contains("Num 16 : unsigned long"), "{args:?}: {ast}");
     }
 }
+
+/// What clang's `-cc1 -v` says, committed (`tests/cc1-v.txt`) for the case
+/// `-v_says_what_clang_cc1_says` runs: its lines but for clang's version
+/// (`VERSION`) and its own system directories (the resource directory,
+/// `/usr/include`), which merlin has none of.
+const CC1_V: &str = "tests/cc1-v.txt";
+
+/// The directories of `-v`'s case, in `dir`: `inc` and `inc2` there,
+/// `nope` not, `inc` given twice.
+fn v_case(dir: &Path) -> Vec<String> {
+    std::fs::create_dir_all(dir.join("inc")).unwrap();
+    std::fs::create_dir_all(dir.join("inc2")).unwrap();
+    std::fs::write(dir.join("v.c"), "int x;\n").unwrap();
+    ["-v", "-I", "inc", "-I", "nope", "-I", "inc", "-I", "inc2", "v.c"]
+        .map(String::from)
+        .to_vec()
+}
+
+/// `text` with its first line, the version, as `VERSION`, and clang's
+/// system directories' lines left out.
+fn v_lines(text: &str) -> String {
+    let mut lines = text.lines();
+    let mut out = vec!["VERSION".to_string()];
+    lines.next();
+    for l in lines {
+        let system = l.contains("/usr/local/include")
+            || l.contains("\"/usr/include\"")
+            || (l.starts_with(' ') && l.to_ascii_lowercase().contains("clang"));
+        if !system {
+            out.push(l.to_string());
+        }
+    }
+    out.join("\n") + "\n"
+}
+
+/// `-v` says merlin's version, then before each input the `#include` search
+/// list as clang's `-cc1 -v` says it: the `-I` directories that are not
+/// there, then those given again, left out and said so, then the two
+/// lists, the quoted one with nothing of its own (merlin searches the
+/// including file's directory first, which clang does not list either, and
+/// has no `-iquote`), the angled one the `-I` directories in order. The
+/// lines are clang's (`tests/cc1-v.txt`, which the ignored
+/// `clang_cc1_v_says_what_merlin_says` holds clang to).
+#[test]
+fn v_says_what_clang_cc1_says() {
+    let t = TempSrc::new("v", "unused.c", "");
+    let args = v_case(&t.dir);
+    let out = Command::new(env!("CARGO_BIN_EXE_merlin"))
+        .args(&args)
+        .args(["-o", "-"])
+        .current_dir(&t.dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(
+        said.starts_with(&format!(
+            "merlin version {} default target riscv64\n",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{said}"
+    );
+    let want = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(CC1_V))
+        .unwrap()
+        .replace('\r', "");
+    assert_eq!(v_lines(&said), want);
+}
+
+/// clang's `-cc1 -v` says, for `-v`'s case, what `tests/cc1-v.txt` holds
+/// (`MERLIN_BLESS=1` writes it). Needs clang on the PATH: `cargo test -p
+/// merlin --test cli -- --ignored clang_cc1_v`.
+#[test]
+#[ignore]
+fn clang_cc1_v_says_what_merlin_says() {
+    let t = TempSrc::new("clang-v", "unused.c", "");
+    let args = v_case(&t.dir);
+    let out = Command::new("clang")
+        .args(["-cc1", "-triple", "riscv64", "-fsyntax-only"])
+        .args(&args)
+        .current_dir(&t.dir)
+        .output()
+        .expect("clang on the PATH");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = v_lines(&stderr(&out));
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(CC1_V);
+    if std::env::var_os("MERLIN_BLESS").is_some() {
+        std::fs::write(&path, &said).unwrap();
+    }
+    assert_eq!(said, std::fs::read_to_string(&path).unwrap().replace('\r', ""));
+}

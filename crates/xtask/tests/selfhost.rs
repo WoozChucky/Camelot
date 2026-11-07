@@ -2859,8 +2859,13 @@ fn cc1_takes_merlins_command_line() {
     let quiet = "cc1 -w -O2 -std=c99 -ffreestanding -o /out/w3 /d/w.c";
     let to_stdout = "cc1 -E -o - /d/a.c";
     let no_flag = "cc1 -Wno-shift-count-overflow -Wall -o /out/w2 /d/w.c";
+    // -v: the version, then the #include search list, as clang's -cc1 -v
+    // says them (merlin's cli.rs holds the lines to clang's).
+    let verbose = "cc1 -v -I /d -I /nope -I /d/../d -I /d/abcdefghijklmn -o /out/v /d/a.c";
     let mut commands: Vec<&str> = cases.iter().map(|(c, ..)| *c).collect();
-    commands.extend([together, help, response, nested, stdin, to_stdout, quiet, no_flag]);
+    commands.extend([
+        together, help, response, nested, stdin, to_stdout, quiet, no_flag, verbose,
+    ]);
     // -g: (the directory the shell is in, the command, and the directory
     // merlin is told the names are relative to). The default is the
     // directory cc1 runs in; a name of DIRSIZ bytes has no NUL in its
@@ -2926,6 +2931,17 @@ fn cc1_takes_merlins_command_line() {
     let w_s = merlin_s(&CcJob::new("/d/w.c".into(), &[], &[]), &map).0.unwrap();
     assert_eq!(shell_output(&out, quiet), "");
     assert_eq!(shell_output(&out, no_flag), "");
+    assert_eq!(
+        shell_output(&out, verbose),
+        format!(
+            "cc1 version {} default target riscv64\n\
+             ignoring nonexistent directory \"/nope\"\n\
+             ignoring duplicate directory \"/d/../d\"\n\
+             #include \"...\" search starts here:\n\
+             #include <...> search starts here:\n /d\n /d/abcdefghijklmn\nEnd of search list.\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
     let fs = Fs::open(&disk).unwrap();
     assert!(fs.lookup("/out/w1").is_err(), "-Werror wrote /out/w1");
     for written in ["/out/w2", "/out/w3"] {
@@ -4259,7 +4275,7 @@ const CC_PRINTED: &[(&str, &[&str])] = &[
     (
         "-### -c -O -Wall -w -std=c99 -ffreestanding a.c",
         &[
-            r#" "/bin/cc1" "-O1" "-I" "/usr/include" "-ffreestanding" "-Wall" "-w" "-std=c99" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
+            r#" "/bin/cc1" "-O1" "-ffreestanding" "-I" "/usr/include" "-Wall" "-w" "-std=c99" "-o" "/tmp/a-T1.s" "-x" "c" "a.c""#,
             r#" "/bin/as" "-o" "a.o" "/tmp/a-T1.s""#,
         ],
     ),
@@ -4278,6 +4294,14 @@ const CC_PRINTED: &[(&str, &[&str])] = &[
         &[
             r#" "/bin/cc1" "-I" "/usr/include" "-o" "/tmp/p-T1.s" "-x" "cpp-output" "p.i""#,
             r#" "/bin/as" "-o" "p.o" "/tmp/p-T1.s""#,
+        ],
+    ),
+    // Every option cc1 takes, in clang's order: -O, the mode,
+    // -ffreestanding, -g, -v, -P, -I, -D, the -W options then -w, -std.
+    (
+        "-### -v -E -w -O2 -g -P -I inc -DX -ffreestanding -std=c99 -Wall a.c",
+        &[
+            r#" "/bin/cc1" "-O2" "-E" "-ffreestanding" "-g" "-v" "-P" "-I" "inc" "-I" "/usr/include" "-D" "X" "-Wall" "-w" "-std=c99" "-o" "-" "-x" "c" "a.c""#,
         ],
     ),
     (
@@ -4359,7 +4383,9 @@ fn stage_summary(text: &str) -> Vec<String> {
             let next = args.get(i + 1).map(String::as_str).unwrap_or("");
             match tool {
                 "cc1" => match w {
-                    "-E" | "-P" | "-w" | "-ffreestanding" | "-g" => kept.push(w.into()),
+                    // clang's ISA, feature by feature (`-v` among them).
+                    "-target-feature" => i += 1,
+                    "-E" | "-P" | "-w" | "-v" | "-ffreestanding" | "-g" => kept.push(w.into()),
                     _ if w.starts_with("-debug-info-kind=") => kept.push("-g".into()),
                     _ if w.starts_with("-O") || w.starts_with("-std=") || w.starts_with("-W") => {
                         kept.push(w.into())
@@ -4526,19 +4552,26 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
             "{command}: not clang's stages"
         );
     }
+    // With -v, cc1 says its version and #include search list, as clang's
+    // -cc1 -v does.
+    let cc1_v = format!(
+        "cc1 version {} default target riscv64\n#include \"...\" search starts here:\n\
+         #include <...> search starts here:\n /usr/include\nEnd of search list.\n",
+        env!("CARGO_PKG_VERSION")
+    );
     assert_eq!(
         said(verbose),
         format!(
-            "{header} \"/bin/cc1\" -I /usr/include -o /tmp/hello-T1.s -x c hello.c\n \
+            "{header} \"/bin/cc1\" -v -I /usr/include -o /tmp/hello-T1.s -x c hello.c\n{cc1_v} \
              \"/bin/as\" -o /tmp/hello-T2.o /tmp/hello-T1.s\n \
              \"/bin/ld\" -T /usr/lib/user.ld /usr/lib/crt0.o -L/usr/lib /tmp/hello-T2.o -lc -o vhello\n"
         )
     );
-    // cc1's command line: 22 arguments, its response file first (T1), then
+    // cc1's command line: 23 arguments, its response file first (T1), then
     // the assembly (T2); ld's: 22, its response file after the 14 objects.
     // Each written as clang writes one: every argument quoted, a blank
     // after it; -v shows it so.
-    let mut cc1_args = vec!["-I".to_string(), "/usr/include".to_string()];
+    let mut cc1_args = vec!["-v".to_string(), "-I".to_string(), "/usr/include".to_string()];
     for m in &macros {
         cc1_args.push("-D".into());
         cc1_args.push(m["-D".len()..].to_string());
@@ -4565,7 +4598,7 @@ fn cc_runs_its_stages_as_clangs_driver_does() {
         said(many),
         format!(
             "{header} \"/bin/cc1\" @/tmp/res-T1.txt\n Arguments passed via response file:\n{}\n (end of response \
-             file)\n{as_lines} \"/bin/ld\" @/tmp/res-T{ld_rsp}.txt\n Arguments passed via response file:\n{}\n (end \
+             file)\n{cc1_v}{as_lines} \"/bin/ld\" @/tmp/res-T{ld_rsp}.txt\n Arguments passed via response file:\n{}\n (end \
              of response file)\n",
             excalibur::response::write(&cc1_args),
             excalibur::response::write(&ld_args)
