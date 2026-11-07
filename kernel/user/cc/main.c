@@ -1,6 +1,7 @@
 /* cc1: `cc1 [-march=ISA] [-mabi=ABI] [-o out.s] [-I dir] [-D name[=value]]
- * [-U name] [-g [-fdebug-compilation-dir=DIR]] [-x LANG] [-E [-P] |
- * --dump-ast] [@file] input.c...`, merlin's command line (follows merlin's main.rs
+ * [-U name] [-g [-fdebug-compilation-dir=DIR]] [-x LANG] [-O LEVEL]
+ * [-std=c99] [-w] [-W...] [-ffreestanding] [-E [-P] | --dump-ast] [@file]
+ * input.c...`, merlin's command line (follows merlin's main.rs
  * and lib.rs): the preprocessor (-E, of C and of assembly: `.S`, `-x
  * assembler-with-cpp`), the syntax tree (--dump-ast) and the compiler, C to
  * assembly, with -g its debugging information (debug.c). */
@@ -11,7 +12,8 @@ static const char USAGE[] = "usage: cc1 [options] input.c...\n"
                             "  -march=ISA        rv64ima_zicsr_zifencei, the only one (and the default)\n"
                             "  -mabi=ABI         lp64, the only one (merlin has no floating point)\n"
                             "  -o FILE           output file (default: each input with a .s extension;\n"
-                            "                    with -E, standard output); needs a single input\n"
+                            "                    with -E, standard output; `-` is standard output); needs\n"
+                            "                    a single input\n"
                             "  -I DIR            look for #include files in DIR (after the including\n"
                             "                    file's own directory for #include \"...\"); repeatable\n"
                             "  -D NAME[=VALUE]   define a macro, as #define NAME VALUE (VALUE is 1 if\n"
@@ -27,15 +29,29 @@ static const char USAGE[] = "usage: cc1 [options] input.c...\n"
                             "  -E                preprocess only: print the tokens after preprocessing\n"
                             "  -P                with -E, no line markers in preprocessed assembly (for a\n"
                             "                    linker script: kernel/kernel.lds.S); C's -E has none\n"
-                            "  -x LANG           what the inputs after it are: c, or assembler-with-cpp\n"
+                            "  -x LANG           what the inputs after it are: c (or cpp-output, C\n"
+                            "                    already preprocessed: a .i file), or assembler-with-cpp\n"
                             "                    (assembly for merlin-as, only preprocessed: -E); without\n"
-                            "                    it, .S files are assembler-with-cpp and the rest C\n"
+                            "                    it, .S files are assembler-with-cpp, .i files C, and the\n"
+                            "                    rest C\n"
+                            "  -O LEVEL          -O0, -O1, -O2, -O3, -Os, -Oz, -Og or -Ofast, as clang\n"
+                            "                    takes them; merlin does not optimize, so every level\n"
+                            "                    compiles the same code\n"
+                            "  -std=STD          the language: c99 (or gnu99, iso9899:1999), the only one\n"
+                            "  -w                no warnings\n"
+                            "  -Wno-FLAG         no warnings of -WFLAG; -WFLAG (and -Wall...) changes nothing,\n"
+                            "                    every warning merlin gives being clang's default\n"
+                            "  -Werror[=FLAG]    warnings (of FLAG) are errors; -Wno-error[=FLAG] undoes it\n"
+                            "  -ffreestanding    changes nothing: merlin compiles for a freestanding\n"
+                            "                    implementation (__STDC_HOSTED__ is 0)\n"
                             "  --dump-ast        print the checked syntax tree to stdout instead of compiling\n"
-                            "  @FILE             more arguments, read from FILE (separated by white space)\n"
+                            "  @FILE             more arguments, read from FILE (quoted as clang reads them:\n"
+                            "                    excalibur::response)\n"
                             "\n"
                             "Each input is a translation unit, compiled to its own assembly file. A .S\n"
                             "file is preprocessed (-E) as clang -E -x assembler-with-cpp does, with\n"
-                            "__ASSEMBLER__ and the target's __riscv_xlen defined, for merlin-as.";
+                            "__ASSEMBLER__ and the target's __riscv_xlen defined, for merlin-as. An input\n"
+                            "`-` is standard input, named <stdin>.";
 
 /* The ISA merlin compiles for, as clang spells it for -march= (MARCH),
  * and the ABI, as -mabi= names it (ABI). */
@@ -44,10 +60,12 @@ static const char ABI[] = "lp64";
 
 enum { MODE_COMPILE, MODE_PREPROCESS, MODE_DUMP_AST };
 
-/* An input file and its language. */
+/* An input file and its language; standard input (`-`) is named
+ * <stdin>, as clang names it. */
 struct input {
     const char *name;
     int lang;
+    int from_stdin;
 };
 
 static int usage_error(const char *msg) {
@@ -67,6 +85,29 @@ static int lang_of_file(const char *name) {
     return ends_with(name, ".S") || ends_with(name, ".sx") ? LANG_ASM : LANG_C;
 }
 
+/* All that descriptor `fd` gives until its end, NUL-terminated, or NULL
+ * with *err set: a file's text, or standard input's (`-`). */
+static char *read_fd(int fd, uint *len, int *err) {
+    struct buf b;
+    memset(&b, 0, sizeof b);
+    char chunk[4096];
+    for (;;) {
+        int n = read(fd, chunk, sizeof chunk);
+        if (n < 0) {
+            buf_free(&b);
+            *err = n;
+            return NULL;
+        }
+        if (n == 0) {
+            break;
+        }
+        buf_put(&b, chunk, (uint)n);
+    }
+    buf_put(&b, "", 0);
+    *len = b.len;
+    return b.data;
+}
+
 /* The whole file, NUL-terminated, or NULL with *err set: a directory is
  * none (-EISDIR), as Rust's read_to_string refuses one. */
 static char *read_file(const char *path, uint *len, int *err) {
@@ -82,26 +123,76 @@ static char *read_file(const char *path, uint *len, int *err) {
         *err = r < 0 ? r : -EISDIR;
         return NULL;
     }
-    struct buf b;
-    memset(&b, 0, sizeof b);
-    char chunk[4096];
-    for (;;) {
-        int n = read(fd, chunk, sizeof chunk);
-        if (n < 0) {
-            close(fd);
-            buf_free(&b);
-            *err = n;
-            return NULL;
-        }
-        if (n == 0) {
-            break;
-        }
-        buf_put(&b, chunk, (uint)n);
-    }
+    char *text = read_fd(fd, len, err);
     close(fd);
-    buf_put(&b, "", 0);
-    *len = b.len;
-    return b.data;
+    return text;
+}
+
+/* What -O and -std= said (main), clang's diagnostics of no file, and
+ * whether one is an error. */
+static struct diag *said[8];
+static uint nsaid;
+static int said_error;
+
+static void say(struct diag *d) {
+    d->file = "";
+    d->filelen = 0;
+    if (nsaid < 8) {
+        said[nsaid++] = d;
+    }
+    said_error |= d->severity == SEV_ERROR;
+}
+
+/* -OLEVEL, as clang's -cc1 takes it (merlin's check_opt): a level it takes
+ * says nothing, a number above 3 is 3 with a warning, anything else an
+ * error. merlin does not optimize: no level changes the code. */
+static void check_opt(const char *level) {
+    static const char *const LEVELS[] = {"", "0", "1", "2", "3", "s", "z", "g", "fast"};
+    for (uint i = 0; i < sizeof LEVELS / sizeof LEVELS[0]; i++) {
+        if (strcmp(level, LEVELS[i]) == 0) {
+            return;
+        }
+    }
+    struct pos none;
+    memset(&none, 0, sizeof none);
+    int digits = level[0] != 0;
+    for (const char *p = level; *p != 0; p++) {
+        digits &= *p >= '0' && *p <= '9';
+    }
+    if (digits) {
+        say(diag_warning_unflagged(none, fmt("optimization level '-O%s' is not supported; using '-O3' instead", level)));
+    } else {
+        say(diag_error(none, fmt("invalid integral value '%s' in '-O%s'", level, level)));
+    }
+}
+
+/* -std=VALUE, as clang's -cc1 takes it for C (merlin's check_std): C99's
+ * names say nothing; merlin refuses the other C standards, and clang's
+ * errors are for C++'s and for what is none. */
+static void check_std(const char *value) {
+    static const char *const C99[] = {"c99", "c9x", "iso9899:1999", "iso9899:199x", "gnu99", "gnu9x"};
+    static const char *const OTHER_C[] = {
+        "c89", "c90", "iso9899:1990", "iso9899:199409", "gnu89", "gnu90", "c11", "c1x", "iso9899:2011",
+        "iso9899:201x", "gnu11", "gnu1x", "c17", "iso9899:2017", "c18", "iso9899:2018", "gnu17", "gnu18", "c23",
+        "c2x", "iso9899:2024", "gnu23", "gnu2x", "c2y", "gnu2y"};
+    for (uint i = 0; i < sizeof C99 / sizeof C99[0]; i++) {
+        if (strcmp(value, C99[i]) == 0) {
+            return;
+        }
+    }
+    struct pos none;
+    memset(&none, 0, sizeof none);
+    for (uint i = 0; i < sizeof OTHER_C / sizeof OTHER_C[0]; i++) {
+        if (strcmp(value, OTHER_C[i]) == 0) {
+            say(diag_error(none, fmt("merlin compiles C99: '-std=%s' is not supported", value)));
+            return;
+        }
+    }
+    if (strncmp(value, "c++", 3) == 0 || strncmp(value, "gnu++", 5) == 0) {
+        say(diag_error(none, fmt("invalid argument '-std=%s' not allowed with 'C'", value)));
+    } else {
+        say(diag_error(none, fmt("invalid value '%s' in '-std=%s'", value, value)));
+    }
 }
 
 static int write_file(const char *path, const char *data, uint len) {
@@ -355,7 +446,7 @@ static int compile_unit(const char *name, const char *src, uint n, struct option
  * (Rust's read_to_string reads only that). */
 static char *read_input(struct input *in, uint *len) {
     int err = 0;
-    char *src = read_file(in->name, len, &err);
+    char *src = in->from_stdin ? read_fd(0, len, &err) : read_file(in->name, len, &err);
     if (src == NULL) {
         fprintf(2, "cc1: cannot read %s: %s\n", in->name, strerror(-err));
         return NULL;
@@ -371,7 +462,7 @@ static char *read_input(struct input *in, uint *len) {
 /* Writes a translation unit's output: to `output`, or standard output if
  * NULL. 0, or 2 for a file it cannot write. */
 static int write_output(const char *output, struct buf *text) {
-    if (output == NULL) {
+    if (output == NULL || strcmp(output, "-") == 0) {
         write_out(text->data, text->len);
         return 0;
     }
@@ -395,7 +486,9 @@ static int compile_file(struct input *in, const char *output, struct options *op
     struct buf text;
     memset(&text, 0, sizeof text);
     int status = 1;
-    if (compile_unit(in->name, src, len, opts, dump, comp_dir, &text)) {
+    /* A warning -Werror makes an error fails it too (diag.c). */
+    diag_failed = 0;
+    if (compile_unit(in->name, src, len, opts, dump, comp_dir, &text) && !diag_failed) {
         /* Without -o: the input with .s for .c (or added), or for
          * --dump-ast standard output. */
         const char *out = output;
@@ -424,6 +517,7 @@ static int translate(struct input *in, const char *output, struct options *opts)
     memset(&text, 0, sizeof text);
     struct diag **diags = NULL;
     uint ndiags = 0;
+    diag_failed = 0;
     int ok = preprocess_text(in->name, src, len, opts, &text, &diags, &ndiags);
     /* Diagnostics as clang prints them, on stderr: the warnings of a
      * preprocessing that succeeds, or every diagnostic of one that fails;
@@ -431,7 +525,7 @@ static int translate(struct input *in, const char *output, struct options *opts)
     for (uint i = 0; i < ndiags; i++) {
         diag_print(diags[i], in->name);
     }
-    int status = ok ? write_output(output, &text) : 1;
+    int status = ok && !diag_failed ? write_output(output, &text) : 1;
     /* The translation unit is done: its memory goes, the arena and the
      * heap (its source, the text and the diagnostics). */
     arena_free();
@@ -476,95 +570,17 @@ static char *value(char **argv, int argc, int *i, uint flag_len) {
     return argv[*i];
 }
 
-/* Whether `c` separates the words of a response file: ASCII white space,
- * what Rust's split_whitespace splits at in merlin's. */
-static int is_white(char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-}
-
-/* The arguments so far of expand_response_files, in plain malloc'd memory:
- * they live for the whole run, past every translation unit's heap. */
-struct args {
-    char **v;
-    uint n;
-    uint cap;
-};
-
-static void push_arg(struct args *a, char *s) {
-    if (a->n + 1 >= a->cap) {
-        a->cap = a->cap == 0 ? 16 : 2 * a->cap;
-        a->v = realloc(a->v, a->cap * sizeof(char *));
-        if (a->v == NULL) {
-            die("out of memory");
-        }
-    }
-    a->v[a->n++] = s;
-    a->v[a->n] = NULL;
-}
-
-/* The arguments argv[0..argc) with each `@FILE` replaced by the words of
- * FILE (merlin's expand_response_files): how the `cc` driver gives cc1 a
- * command line longer than exec takes (MAXARG arguments), as clang's
- * driver gives its -cc1 one when a command line is too long for the
- * system. Words are separated by white space, with no quoting, and a
- * response file cannot name another. Returns the new arguments, argv[0]
- * first and NULL after the last, their number in *n, or NULL having said
- * why not. */
-static char **expand_response_files(int argc, char **argv, int *n) {
-    struct args out;
-    memset(&out, 0, sizeof out);
-    for (int i = 0; i < argc; i++) {
-        char *a = argv[i];
-        if (i == 0 || a[0] != '@' || a[1] == 0) {
-            push_arg(&out, a);
-            continue;
-        }
-        const char *file = a + 1;
-        uint len = 0;
-        int err = 0;
-        char *read = read_file(file, &len, &err);
-        if (read == NULL) {
-            fprintf(2, "cc1: cannot read %s: %s\n", file, strerror(-err));
-            return NULL;
-        }
-        /* Off the translation unit's heap, which the first one frees. */
-        char *text = malloc(len + 1);
-        if (text == NULL) {
-            die("out of memory");
-        }
-        memcpy(text, read, len);
-        text[len] = 0;
-        heap_free(read);
-        char *p = text;
-        for (;;) {
-            while (*p != 0 && is_white(*p)) {
-                p++;
-            }
-            if (*p == 0) {
-                break;
-            }
-            char *w = p;
-            while (*p != 0 && !is_white(*p)) {
-                p++;
-            }
-            if (*p != 0) {
-                *p++ = 0;
-            }
-            if (w[0] == '@') {
-                fprintf(2, "cc1: %s: a response file cannot name another (%s)\n", file, w);
-                return NULL;
-            }
-            push_arg(&out, w);
-        }
-    }
-    *n = (int)out.n;
-    return out.v;
-}
-
 int main(int argc, char **argv) {
+    /* @FILE: how the `cc` driver gives cc1 a command line longer than exec
+     * takes (MAXARG arguments), as clang's driver gives its -cc1 one when a
+     * command line is too long for the system; read as clang reads them
+     * (the C library's expand_response_files, merlin's
+     * excalibur::response). For the whole run: plain malloc. */
+    char error[512];
     int nargs = 0;
-    char **args = expand_response_files(argc, argv, &nargs);
+    char **args = expand_response_files(argc, argv, &nargs, error, sizeof error);
     if (args == NULL) {
+        fprintf(2, "cc1: %s\n", error);
         return 2;
     }
     argc = nargs;
@@ -613,6 +629,16 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(a, "--dump-ast") == 0) {
             mode = MODE_DUMP_AST;
+        } else if (strcmp(a, "-w") == 0) {
+            diag_take_w(NULL);
+        } else if (strcmp(a, "-ffreestanding") == 0) {
+            /* merlin is freestanding (__STDC_HOSTED__ 0) already. */
+        } else if (a[1] == 'O') {
+            check_opt(a + 2);
+        } else if (strncmp(a, "-std=", 5) == 0) {
+            check_std(a + 5);
+        } else if (a[1] == 'W' && a[2] != 0) {
+            diag_take_w(a + 2);
         } else if (strncmp(a, "-march=", 7) == 0) {
             /* -march=ISA and -mabi=ABI only, as clang takes them. */
             if (strcmp(a + 7, MARCH) != 0) {
@@ -651,18 +677,22 @@ int main(int argc, char **argv) {
             }
             if (strcmp(l, "none") == 0) {
                 lang = -1;
-            } else if (strcmp(l, "c") == 0) {
+            } else if (strcmp(l, "c") == 0 || strcmp(l, "cpp-output") == 0) {
+                /* cpp-output: C already preprocessed, which cc1
+                 * preprocesses again (its line markers are taken). */
                 lang = LANG_C;
             } else if (strcmp(l, "assembler-with-cpp") == 0) {
                 lang = LANG_ASM;
             } else {
                 return usage_error(fmt("language not recognized: '%s'", l));
             }
-        } else if (a[0] == '-') {
+        } else if (a[0] == '-' && a[1] != 0) {
             return usage_error(fmt("unknown option %s", a));
         } else {
-            inputs[ninputs].name = a;
+            int from_stdin = strcmp(a, "-") == 0;
+            inputs[ninputs].name = from_stdin ? "<stdin>" : a;
             inputs[ninputs].lang = lang >= 0 ? lang : lang_of_file(a);
+            inputs[ninputs].from_stdin = from_stdin;
             ninputs++;
         }
     }
@@ -676,6 +706,15 @@ int main(int argc, char **argv) {
     }
     if (output != NULL && ninputs > 1) {
         return usage_error("-o needs a single input file");
+    }
+    /* -O's and -std='s diagnostics, before the inputs', as clang's -cc1
+     * gives them; an error stops it there. */
+    diag_failed = 0;
+    for (uint i = 0; i < nsaid; i++) {
+        diag_print(said[i], "");
+    }
+    if (said_error || diag_failed) {
+        return 1;
     }
     /* Assembly is only preprocessed: merlin-as assembles it. */
     for (uint i = 0; i < ninputs; i++) {

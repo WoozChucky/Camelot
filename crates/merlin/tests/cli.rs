@@ -348,43 +348,198 @@ fn preprocessor_options() {
     assert!(err.contains("defs.h:1:12: error:"), "{err}");
 }
 
-/// `@FILE` stands for the words of FILE, separated by white space and not
-/// quoted (merlin-ld's response files): how Camelot's `cc` driver passes
-/// cc1, merlin in C, more arguments than `exec` takes. One cannot name
-/// another, and one that can't be read is a usage error.
+/// `@FILE` stands for the arguments of FILE, read as clang reads a response
+/// file (excalibur::response): separated by blanks, tabs and line ends,
+/// quoted with `'` or `"`, a backslash taking the character after it; a
+/// nested `@FILE` is expanded, a missing one is an argument as it is (an
+/// input that can't be read, here). How Camelot's `cc` driver passes cc1,
+/// merlin in C, more arguments than `exec` takes. One that names itself is
+/// an error.
 #[test]
 fn response_files() {
-    let t = TempSrc::new("rsp", "main.c", "int main() { return VALUE; }\n");
-    let args = t.dir.join("args");
-    std::fs::write(&args, format!("-E\n  -DVALUE=40\t{}\n", t.file.display())).unwrap();
+    let t = TempSrc::new("rsp", "main.c", "int main() { return VALUE + OTHER; }\n");
+    let esc = |p: &Path| p.display().to_string().replace('\\', "\\\\");
     let at = |p: &Path| PathBuf::from(format!("@{}", p.display()));
+    let more = t.dir.join("more");
+    std::fs::write(&more, "'-DOTHER=(1 + 1)'\n").unwrap();
+    let args = t.dir.join("args");
+    std::fs::write(
+        &args,
+        format!("-E\n  \"-DVALUE=40\"\t\"{}\" @{}\n", esc(&t.file), esc(&more)),
+    )
+    .unwrap();
     let out = merlin(&[&at(&args)]);
     assert!(out.status.success(), "{}", stderr(&out));
     let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
-    assert!(text.contains("int main() { return 40; }"), "{text}");
+    assert!(text.contains("int main() { return 40 + (1 + 1); }"), "{text}");
     // Among other arguments, in its place: -U after it undefines VALUE.
     let out = merlin(&[&at(&args), Path::new("-UVALUE")]);
     let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
-    assert!(text.contains("return VALUE;"), "{text}");
-    let nested = t.dir.join("nested");
-    std::fs::write(&nested, format!("-E {}\n", at(&args).display())).unwrap();
-    let out = merlin(&[&at(&nested)]);
+    assert!(text.contains("return VALUE + (1 + 1);"), "{text}");
+    // One that names itself, through another.
+    let a = t.dir.join("a");
+    let b = t.dir.join("b");
+    std::fs::write(&a, format!("@{}", esc(&b))).unwrap();
+    std::fs::write(&b, format!("@{}", esc(&a))).unwrap();
+    let out = merlin(&[&at(&a)]);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(
         stderr(&out),
         format!(
-            "merlin: {}: a response file cannot name another ({})\n",
-            nested.display(),
-            at(&args).display()
+            "merlin: recursive expansion of: '{}'\n",
+            excalibur::response::absolute(&a).display()
         )
     );
-    let out = merlin(&[&at(&t.dir.join("missing"))]);
+    // A missing one is an input like any other.
+    let missing = at(&t.dir.join("missing"));
+    let out = merlin(&[&missing]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        stderr(&out).starts_with("merlin: cannot read "),
+        stderr(&out).starts_with(&format!("merlin: cannot read {}", missing.display())),
         "{}",
         stderr(&out)
     );
+}
+
+/// The options clang's `-cc1` takes that change nothing merlin compiles:
+/// `-O` levels (merlin does not optimize), `-std=` C99, `-ffreestanding`;
+/// what clang says of a level or a standard it doesn't take; and `-w` and
+/// `-W`, which leave warnings out or make them errors as clang does.
+#[test]
+fn optimization_standard_and_warning_options() {
+    let t = TempSrc::new("opts", "w.c", "int f(void) {\n    return 1 << 40;\n}\n");
+    let flag = |s: &'static str| PathBuf::from(s);
+    let plain = merlin(&[&flag("-o"), &flag("-"), &t.file]);
+    assert!(plain.status.success(), "{}", stderr(&plain));
+    let warning = stderr(&plain);
+    assert!(
+        warning.contains("warning: shift count >= width of type [-Wshift-count-overflow]"),
+        "{warning}"
+    );
+    for opts in [
+        &["-O2"][..],
+        &["-O0", "-Os", "-Oz", "-Og", "-O"],
+        &["-std=c99", "-ffreestanding"],
+        &["-std=gnu99"],
+    ] {
+        let mut args: Vec<PathBuf> = opts.iter().map(PathBuf::from).collect();
+        args.extend([flag("-o"), flag("-"), t.file.clone()]);
+        let refs: Vec<&Path> = args.iter().map(PathBuf::as_path).collect();
+        let out = merlin(&refs);
+        assert!(out.status.success(), "{opts:?}: {}", stderr(&out));
+        assert_eq!(out.stdout, plain.stdout, "{opts:?}");
+        assert_eq!(stderr(&out), warning, "{opts:?}");
+    }
+    let said = |args: &[&str]| {
+        let mut all: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+        all.extend([flag("-o"), flag("-"), t.file.clone()]);
+        let refs: Vec<&Path> = all.iter().map(PathBuf::as_path).collect();
+        let out = merlin(&refs);
+        (out.status.code(), stderr(&out), out.stdout.is_empty())
+    };
+    let file = t.file.display().to_string();
+    assert_eq!(
+        said(&["-Ox"]),
+        (
+            Some(1),
+            "error: invalid integral value 'x' in '-Ox'\n".into(),
+            true
+        )
+    );
+    let o9 = said(&["-O9"]);
+    assert_eq!(o9.0, Some(0));
+    assert!(o9
+        .1
+        .starts_with("warning: optimization level '-O9' is not supported; using '-O3' instead\n"));
+    assert_eq!(
+        said(&["-std=foo"]),
+        (Some(1), "error: invalid value 'foo' in '-std=foo'\n".into(), true)
+    );
+    assert_eq!(
+        said(&["-std=c++11"]),
+        (
+            Some(1),
+            "error: invalid argument '-std=c++11' not allowed with 'C'\n".into(),
+            true
+        )
+    );
+    assert_eq!(
+        said(&["-std=c11"]),
+        (
+            Some(1),
+            "error: merlin compiles C99: '-std=c11' is not supported\n".into(),
+            true
+        )
+    );
+    // -w and -Wno-FLAG leave the warning out; -WFLAG and -Wall change
+    // nothing; -Werror makes it an error, which fails the compilation (no
+    // output), and -Wno-error, or -Wno-error=FLAG, undoes it.
+    for (args, said_text) in [
+        (&["-w"][..], String::new()),
+        (&["-Wno-shift-count-overflow"], String::new()),
+        (&["-Wall", "-Wextra", "-Wshift-count-overflow"], warning.clone()),
+        (&["-Werror", "-Wno-error"], warning.clone()),
+        (&["-Werror", "-Wno-error=shift-count-overflow"], warning.clone()),
+        (
+            &["-Wno-shift-count-overflow", "-Wshift-count-overflow"],
+            warning.clone(),
+        ),
+    ] {
+        assert_eq!(said(args), (Some(0), said_text, false), "{args:?}");
+    }
+    let error =
+        format!("{file}:2:14: error: shift count >= width of type [-Werror,-Wshift-count-overflow]\n");
+    assert_eq!(said(&["-Werror"]), (Some(1), error.clone(), true));
+    assert_eq!(said(&["-Werror=shift-count-overflow"]), (Some(1), error, true));
+    assert_eq!(said(&["-w", "-Werror"]), (Some(0), String::new(), false));
+}
+
+/// `-o -` writes to standard output, as clang's `-cc1` does, and `-` is
+/// standard input, named `<stdin>`; `-x cpp-output` (and a `.i` file) is C
+/// already preprocessed, its line markers taken.
+#[test]
+fn standard_input_and_output_and_preprocessed_c() {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_merlin"))
+        .args(["-o", "-", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"int f(void) {\n    return 1 << 40;\n}\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.starts_with("    .file \"<stdin>\"\n"), "{text}");
+    assert_eq!(
+        stderr(&out),
+        "<stdin>:2:14: warning: shift count >= width of type [-Wshift-count-overflow]\n"
+    );
+    let t = TempSrc::new(
+        "cppout",
+        "p.i",
+        "# 1 \"orig.c\"\nint f(void) {\n    return 1 << 40;\n}\n",
+    );
+    for args in [
+        vec![t.file.clone()],
+        vec![PathBuf::from("-xcpp-output"), t.file.clone()],
+    ] {
+        let mut all = vec![PathBuf::from("-o"), PathBuf::from("-")];
+        all.extend(args);
+        let refs: Vec<&Path> = all.iter().map(PathBuf::as_path).collect();
+        let out = merlin(&refs);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(
+            stderr(&out),
+            "orig.c:2:14: warning: shift count >= width of type [-Wshift-count-overflow]\n"
+        );
+    }
 }
 
 /// A `.S` file (or `-x assembler-with-cpp`) is preprocessed as assembly with

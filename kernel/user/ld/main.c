@@ -22,7 +22,7 @@ static const char USAGE[] =
     "  --start-lib    the objects up to --end-lib are a library: each is linked\n"
     "                 only if it defines a symbol the others need (like ld.lld's)\n"
     "  --end-lib      ends a library\n"
-    "  @FILE          more arguments, read from FILE (separated by white space)";
+    "  @FILE          more arguments, read from FILE (quoted as ld.lld reads them)";
 
 /* The whole file, or NULL with *err set (a negative error number). */
 static uchar *read_file(const char *path, uint *len, int *err) {
@@ -80,55 +80,19 @@ static int write_file(const char *path, const uchar *data, uint len) {
     return close(fd);
 }
 
-static int is_space(int c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
-}
-
-/* The arguments, each @FILE replaced by the words of FILE, as GNU ld and
- * ld.lld read response files (without their quoting): how a link line
- * longer than the shell takes is given. 0 after a message. */
+/* The arguments after argv[0], each @FILE replaced by the arguments of
+ * FILE (the C library's expand_response_files, as ld.lld reads them: how
+ * a link line longer than the shell takes is given). 0 after a message. */
 static int expand(int argc, char **argv, char ***out, uint *n) {
-    uint cap = 0;
-    *out = NULL;
-    *n = 0;
-    for (int i = 1; i < argc; i++) {
-        char *a = argv[i];
-        if (a[0] != '@' || a[1] == 0) {
-            *out = grow(*out, &cap, *n + 1, sizeof(char *));
-            (*out)[(*n)++] = a;
-            continue;
-        }
-        char *file = a + 1;
-        uint len;
-        int err;
-        char *text = (char *)read_file(file, &len, &err);
-        if (text == NULL) {
-            fprintf(2, "ld: cannot read %s: %s\n", file, strerror(-err));
-            return 0;
-        }
-        char *p = text;
-        for (;;) {
-            while (*p && is_space((uchar)*p)) {
-                p++;
-            }
-            if (*p == 0) {
-                break;
-            }
-            char *w = p;
-            while (*p && !is_space((uchar)*p)) {
-                p++;
-            }
-            if (*p) {
-                *p++ = 0;
-            }
-            if (w[0] == '@') {
-                fprintf(2, "ld: %s: a response file cannot name another (%s)\n", file, w);
-                return 0;
-            }
-            *out = grow(*out, &cap, *n + 1, sizeof(char *));
-            (*out)[(*n)++] = w;
-        }
+    char error[512];
+    int count = 0;
+    char **all = expand_response_files(argc, argv, &count, error, sizeof error);
+    if (all == NULL) {
+        fprintf(2, "ld: %s\n", error);
+        return 0;
     }
+    *out = all + 1;
+    *n = (uint)(count - 1);
     return 1;
 }
 

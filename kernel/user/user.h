@@ -1141,6 +1141,22 @@ const char *resolve_error(int err);
  * how many it killed. One thread at a time (lib/proc.c). */
 int kill_descendants(int pid);
 
+/* Response files (lib/response.c): `@FILE` on a command line stands for
+ * the arguments written in FILE, as clang and LLVM's tools read them, the
+ * toolchain's one way (cc, cc1, ld, ar; merlin and merlin-ld on the host:
+ * excalibur::response). Arguments are separated by blanks, tabs and line
+ * ends; '...' and "..." quote; a backslash takes the next character as it
+ * is; a nested @FILE is expanded; an @FILE whose FILE does not exist is
+ * left as it is. expand_response_files: argv[0..argc) with every @FILE
+ * expanded, argv[0] kept, NULL after the last (*n of them), all from
+ * malloc; or NULL with the message (`cannot not open file 'PATH': REASON`,
+ * LLVM's words, or `recursive expansion of: 'PATH'`) in `error`, `size`
+ * bytes. response_file_text: the text of a response file of args[0..n), as
+ * clang's driver writes one (each argument in double quotes, a backslash
+ * before a `"` or `\`, a blank after it), from malloc, or NULL. */
+char **expand_response_files(int argc, char **argv, int *n, char *error, size_t size);
+char *response_file_text(char **args, int n);
+
 /* Terminals (lib/tty.c), as POSIX has them, but for returning a negative
  * error number rather than -1 and errno.
  *

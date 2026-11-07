@@ -150,8 +150,9 @@ void diag_name_files(struct diag *d, const char **names, const uint *lens, uint 
 
 /* The diagnostic's own line (merlin's Error::first_line): `file:line:col:
  * error: message`, then ` [-Wflag]` if it has a flag; with no place, the
- * file alone, or nothing at all for a diagnostic of no file. */
-static void print_line(struct diag *d, const char *input) {
+ * file alone, or nothing at all for a diagnostic of no file. A warning
+ * -Werror made an error (`promoted`) says `error` and `[-Werror,-Wflag]`. */
+static void print_line(struct diag *d, const char *input, int promoted) {
     const char *file = input;
     uint filelen = (uint)strlen(input);
     if (d->file != NULL) {
@@ -161,7 +162,7 @@ static void print_line(struct diag *d, const char *input) {
     const char *what = "error";
     if (d->severity == SEV_FATAL) {
         what = "fatal error";
-    } else if (d->severity == SEV_WARNING) {
+    } else if (d->severity == SEV_WARNING && !promoted) {
         what = "warning";
     } else if (d->severity == SEV_NOTE) {
         what = "note";
@@ -176,18 +177,89 @@ static void print_line(struct diag *d, const char *input) {
         buf_fmt(&b, "%b: %s: %b", file, filelen, what, d->msg, d->msglen);
     }
     if (d->flag != NULL) {
-        buf_fmt(&b, " [-W%s]", d->flag);
+        buf_fmt(&b, promoted ? " [-Werror,-W%s]" : " [-W%s]", d->flag);
     }
     buf_byte(&b, '\n');
     write(2, b.data, b.len);
     buf_free(&b);
 }
 
+/* -w and the -W options (merlin's Warnings): whether every warning is left
+ * out, whether -Werror is on, and the flags -Wno-FLAG / -WFLAG and
+ * -Werror=FLAG / -Wno-error=FLAG set, the last word for each. */
+#define MAX_W_FLAGS 64
+
+struct w_flag {
+    const char *flag;
+    int on;
+};
+
+static int no_warnings;
+static int all_errors;
+static struct w_flag off[MAX_W_FLAGS];
+static uint noff;
+static struct w_flag errors_of[MAX_W_FLAGS];
+static uint nerrors_of;
+int diag_failed;
+
+static void set_flag(struct w_flag *list, uint *n, const char *flag, int on) {
+    for (uint i = 0; i < *n; i++) {
+        if (strcmp(list[i].flag, flag) == 0) {
+            list[i].on = on;
+            return;
+        }
+    }
+    if (*n < MAX_W_FLAGS) {
+        list[*n].flag = flag;
+        list[*n].on = on;
+        *n += 1;
+    }
+}
+
+/* The word for `flag` in `list`: 1, 0, or -1 if it has none. */
+static int flag_word(struct w_flag *list, uint n, const char *flag) {
+    for (uint i = 0; i < n; i++) {
+        if (strcmp(list[i].flag, flag) == 0) {
+            return list[i].on;
+        }
+    }
+    return -1;
+}
+
+void diag_take_w(const char *opt) {
+    if (opt == NULL) {
+        no_warnings = 1;
+    } else if (strcmp(opt, "error") == 0) {
+        all_errors = 1;
+    } else if (strcmp(opt, "no-error") == 0) {
+        all_errors = 0;
+    } else if (strncmp(opt, "error=", 6) == 0) {
+        set_flag(errors_of, &nerrors_of, opt + 6, 1);
+    } else if (strncmp(opt, "no-error=", 9) == 0) {
+        set_flag(errors_of, &nerrors_of, opt + 9, 0);
+    } else if (strncmp(opt, "no-", 3) == 0) {
+        set_flag(off, &noff, opt + 3, 1);
+    } else {
+        set_flag(off, &noff, opt, 0);
+    }
+}
+
 /* merlin's Error::render, then the newline eprintln! ends it with: the
- * diagnostic's line, then a line for each note. */
+ * diagnostic's line, then a line for each note; under -w and -W, a warning
+ * is left out, notes and all, or made an error (an error clang makes of a
+ * warning by default stays as it is). */
 void diag_print(struct diag *d, const char *input) {
-    print_line(d, input);
+    int promoted = 0;
+    if (d->severity == SEV_WARNING) {
+        if (no_warnings || (d->flag != NULL && flag_word(off, noff, d->flag) == 1)) {
+            return;
+        }
+        int error = d->flag != NULL ? flag_word(errors_of, nerrors_of, d->flag) : -1;
+        promoted = error >= 0 ? error : all_errors;
+        diag_failed |= promoted;
+    }
+    print_line(d, input, promoted);
     for (struct diag *n = d->notes; n != NULL; n = n->next) {
-        print_line(n, input);
+        print_line(n, input, 0);
     }
 }

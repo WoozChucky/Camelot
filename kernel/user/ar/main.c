@@ -12,9 +12,9 @@
  * and the modifiers c (no "creating" message when r makes the archive), s
  * (write the symbol table: the default), S (do not), D (deterministic:
  * times and ids 0, mode 644, the default and the only mode). An argument
- * @FILE is replaced by the words of FILE, as llvm-ar reads response files
- * (without their quoting): the shell passes a program 16 arguments at
- * most, fewer than a library has members. Errors go to stderr as
+ * @FILE is replaced by the arguments of FILE, as llvm-ar reads response
+ * files (quotes and backslashes too: lib/response.c): the shell passes a
+ * program 16 arguments at most, fewer than a library has members. Errors go to stderr as
  * `ar: error: ...`, and the status is 1. */
 #include "ar.h"
 
@@ -119,54 +119,19 @@ static int write_file(const char *path, const uchar *data, uint len) {
     return close(fd);
 }
 
-static int is_space(int c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
-}
-
-/* The arguments, each @FILE replaced by the words of FILE. 0 after a
- * message. */
+/* The arguments after argv[0], each @FILE replaced by the arguments of
+ * FILE (the C library's expand_response_files, as llvm-ar reads them: for
+ * more members than the shell takes). 0 after a message. */
 static int expand(int argc, char **argv, char ***out, uint *n) {
-    uint cap = 0;
-    *out = NULL;
-    *n = 0;
-    for (int i = 1; i < argc; i++) {
-        char *a = argv[i];
-        if (a[0] != '@' || a[1] == 0) {
-            *out = grow(*out, &cap, *n + 1, sizeof(char *));
-            (*out)[(*n)++] = a;
-            continue;
-        }
-        uint len;
-        int err;
-        char *text = (char *)read_file(a + 1, &len, &err);
-        if (text == NULL) {
-            fprintf(2, "ar: error: '%s': %s\n", a + 1, strerror(-err));
-            return 0;
-        }
-        text[len] = 0;
-        char *p = text;
-        for (;;) {
-            while (*p && is_space((uchar)*p)) {
-                p++;
-            }
-            if (*p == 0) {
-                break;
-            }
-            char *w = p;
-            while (*p && !is_space((uchar)*p)) {
-                p++;
-            }
-            if (*p) {
-                *p++ = 0;
-            }
-            if (w[0] == '@') {
-                fprintf(2, "ar: error: %s: a response file cannot name another (%s)\n", a + 1, w);
-                return 0;
-            }
-            *out = grow(*out, &cap, *n + 1, sizeof(char *));
-            (*out)[(*n)++] = w;
-        }
+    char error[512];
+    int count = 0;
+    char **all = expand_response_files(argc, argv, &count, error, sizeof error);
+    if (all == NULL) {
+        fprintf(2, "ar: error: %s\n", error);
+        return 0;
     }
+    *out = all + 1;
+    *n = (uint)(count - 1);
     return 1;
 }
 

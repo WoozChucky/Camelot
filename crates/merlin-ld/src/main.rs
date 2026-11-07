@@ -19,28 +19,7 @@ const USAGE: &str = "usage: merlin-ld [options] input.o ... [lib.a] [-lNAME]
   --start-lib    the objects up to --end-lib are a library: each is linked
                  only if it defines a symbol the others need (like ld.lld's)
   --end-lib      ends a library
-  @FILE          more arguments, read from FILE (separated by white space)";
-
-/// The arguments with each `@FILE` replaced by the words of FILE, as GNU ld
-/// and ld.lld read response files (without their quoting): how a link
-/// line longer than a shell takes is given, on Camelot as on the host.
-fn expand_response_files(args: impl Iterator<Item = String>) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    for a in args {
-        let Some(file) = a.strip_prefix('@').filter(|f| !f.is_empty()) else {
-            out.push(a);
-            continue;
-        };
-        let text = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
-        for word in text.split_whitespace() {
-            if word.starts_with('@') {
-                return Err(format!("{file}: a response file cannot name another ({word})"));
-            }
-            out.push(word.to_string());
-        }
-    }
-    Ok(out)
-}
+  @FILE          more arguments, read from FILE (quoted as ld.lld reads them)";
 
 /// An input of the command line: a file, or a library `-l` names.
 enum Arg {
@@ -58,7 +37,9 @@ fn main() -> ExitCode {
     let mut map = None;
     let mut strip = false;
     let mut opts = Options::default();
-    let mut args = match expand_response_files(std::env::args().skip(1)) {
+    // `@FILE`: a link line longer than a shell takes, on Camelot as on the
+    // host, read as ld.lld reads it.
+    let mut args = match excalibur::response::expand(std::env::args().skip(1)) {
         Ok(args) => args.into_iter(),
         Err(e) => {
             eprintln!("merlin-ld: {e}");

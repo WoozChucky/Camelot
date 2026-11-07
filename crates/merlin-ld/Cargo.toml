@@ -10,9 +10,10 @@ name = "merlin_ld"
 
 [dependencies]
 elf = { path = "../elf" }
+# Response files, read as every tool of the toolchain reads them.
+excalibur = { path = "../excalibur" }
 
 [dev-dependencies]
-excalibur = { path = "../excalibur" }
 grail = { path = "../grail" }
 merlin-as = { path = "../merlin-as" }
 # The examples are .S files: merlin preprocesses them for each width.

@@ -208,8 +208,15 @@ void diag_name_files(struct diag *d, const char **names, const uint *lens, uint 
  * hold one too. */
 #define FILE_MARK 1
 /* Prints d and its notes to stderr as clang does, `input` the name of the
- * file being compiled (merlin's Error::render). */
+ * file being compiled (merlin's Error::render), under -w and -W: a warning
+ * left out, or made an error (`[-Werror,-WFLAG]`), which sets
+ * diag_failed (main.c fails the translation unit then). */
 void diag_print(struct diag *d, const char *input);
+/* Takes -w (NULL) or a -W option (what follows -W), as merlin's Warnings
+ * does: -Wno-FLAG leaves FLAG's warnings out, -Werror[=FLAG] makes them
+ * errors, -Wno-error[=FLAG] undoes it; any other -W changes nothing. */
+void diag_take_w(const char *opt);
+extern int diag_failed;
 
 /* ---- Preprocessing tokens (lexer.c, merlin's PpToken) ---- */
 enum {
