@@ -184,63 +184,27 @@ static void print_line(struct diag *d, const char *input, int promoted) {
     buf_free(&b);
 }
 
-/* -w and the -W options (merlin's Warnings): whether every warning is left
- * out, whether -Werror is on, and the flags -Wno-FLAG / -WFLAG and
- * -Werror=FLAG / -Wno-error=FLAG set, the last word for each. */
-#define MAX_W_FLAGS 64
-
-struct w_flag {
-    const char *flag;
-    int on;
-};
-
-static int no_warnings;
-static int all_errors;
-static struct w_flag off[MAX_W_FLAGS];
-static uint noff;
-static struct w_flag errors_of[MAX_W_FLAGS];
-static uint nerrors_of;
+/* -w and the -W options, in command-line order (merlin's), which
+ * warning_level (lib/warnings.c) applies to each warning with clang's
+ * warning groups (tables.c's WARNING_GROUPS). */
+static char **w_options;
+static int nw_options;
 int diag_failed;
 
-static void set_flag(struct w_flag *list, uint *n, const char *flag, int on) {
-    for (uint i = 0; i < *n; i++) {
-        if (strcmp(list[i].flag, flag) == 0) {
-            list[i].on = on;
-            return;
-        }
+void diag_take_w(char *opt) {
+    w_options = realloc(w_options, (size_t)(nw_options + 1) * sizeof(char *));
+    if (w_options == NULL) {
+        die("out of memory");
     }
-    if (*n < MAX_W_FLAGS) {
-        list[*n].flag = flag;
-        list[*n].on = on;
-        *n += 1;
-    }
+    w_options[nw_options++] = opt;
 }
 
-/* The word for `flag` in `list`: 1, 0, or -1 if it has none. */
-static int flag_word(struct w_flag *list, uint n, const char *flag) {
-    for (uint i = 0; i < n; i++) {
-        if (strcmp(list[i].flag, flag) == 0) {
-            return list[i].on;
-        }
-    }
-    return -1;
-}
-
-void diag_take_w(const char *opt) {
-    if (opt == NULL) {
-        no_warnings = 1;
-    } else if (strcmp(opt, "error") == 0) {
-        all_errors = 1;
-    } else if (strcmp(opt, "no-error") == 0) {
-        all_errors = 0;
-    } else if (strncmp(opt, "error=", 6) == 0) {
-        set_flag(errors_of, &nerrors_of, opt + 6, 1);
-    } else if (strncmp(opt, "no-error=", 9) == 0) {
-        set_flag(errors_of, &nerrors_of, opt + 9, 0);
-    } else if (strncmp(opt, "no-", 3) == 0) {
-        set_flag(off, &noff, opt + 3, 1);
-    } else {
-        set_flag(off, &noff, opt, 0);
+/* merlin's Error::render as it is, -w and -W aside: the command line's own
+ * diagnostics (-O's, -std='s), which clang gives before it applies them. */
+void diag_print_as_is(struct diag *d, const char *input) {
+    print_line(d, input, 0);
+    for (struct diag *n = d->notes; n != NULL; n = n->next) {
+        print_line(n, input, 0);
     }
 }
 
@@ -251,11 +215,11 @@ void diag_take_w(const char *opt) {
 void diag_print(struct diag *d, const char *input) {
     int promoted = 0;
     if (d->severity == SEV_WARNING) {
-        if (no_warnings || (d->flag != NULL && flag_word(off, noff, d->flag) == 1)) {
+        int level = warning_level(w_options, nw_options, d->flag, WARNING_GROUPS, NWARNING_GROUPS);
+        if (level == WARNING_IGNORED) {
             return;
         }
-        int error = d->flag != NULL ? flag_word(errors_of, nerrors_of, d->flag) : -1;
-        promoted = error >= 0 ? error : all_errors;
+        promoted = level == WARNING_ERROR;
         diag_failed |= promoted;
     }
     print_line(d, input, promoted);

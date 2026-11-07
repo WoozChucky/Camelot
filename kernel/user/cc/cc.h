@@ -212,10 +212,12 @@ void diag_name_files(struct diag *d, const char **names, const uint *lens, uint 
  * left out, or made an error (`[-Werror,-WFLAG]`), which sets
  * diag_failed (main.c fails the translation unit then). */
 void diag_print(struct diag *d, const char *input);
-/* Takes -w (NULL) or a -W option (what follows -W), as merlin's Warnings
- * does: -Wno-FLAG leaves FLAG's warnings out, -Werror[=FLAG] makes them
- * errors, -Wno-error[=FLAG] undoes it; any other -W changes nothing. */
-void diag_take_w(const char *opt);
+/* Takes -w or a -W option, in command-line order, which diag_print applies
+ * as clang does (lib/warnings.c's warning_level, merlin::warnings). */
+void diag_take_w(char *opt);
+/* Prints d and its notes as they are, -w and -W aside (the command line's
+ * own diagnostics). */
+void diag_print_as_is(struct diag *d, const char *input);
 extern int diag_failed;
 
 /* ---- Preprocessing tokens (lexer.c, merlin's PpToken) ---- */
@@ -471,6 +473,10 @@ struct options {
     int line_markers;
     /* Each file read has its MD5 taken, for -g's line table. */
     int checksums;
+    /* C already preprocessed (-x cpp-output, a .i file): no macro is
+     * defined or expanded, and of the directives only line markers, #line
+     * and #pragma act (merlin's Options::preprocessed). */
+    int preprocessed;
 };
 
 /* Preprocesses the file `name`, whose text is src (n bytes), for -E: the

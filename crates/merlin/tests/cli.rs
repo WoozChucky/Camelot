@@ -382,11 +382,11 @@ fn response_files() {
     std::fs::write(&a, format!("@{}", esc(&b))).unwrap();
     std::fs::write(&b, format!("@{}", esc(&a))).unwrap();
     let out = merlin(&[&at(&a)]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         stderr(&out),
         format!(
-            "merlin: recursive expansion of: '{}'\n",
+            "recursive expansion of: '{}'\n",
             excalibur::response::absolute(&a).display()
         )
     );
@@ -416,9 +416,12 @@ fn optimization_standard_and_warning_options() {
         warning.contains("warning: shift count >= width of type [-Wshift-count-overflow]"),
         "{warning}"
     );
+    // -O takes what clang's -cc1 takes silently: 0 to 4 (as a 32-bit
+    // number, `00` and `03` too), s, z, g and nothing.
     for opts in [
         &["-O2"][..],
         &["-O0", "-Os", "-Oz", "-Og", "-O"],
+        &["-O4", "-O00", "-O03"],
         &["-std=c99", "-ffreestanding"],
         &["-std=gnu99"],
     ] {
@@ -438,31 +441,73 @@ fn optimization_standard_and_warning_options() {
         (out.status.code(), stderr(&out), out.stdout.is_empty())
     };
     let file = t.file.display().to_string();
-    assert_eq!(
-        said(&["-Ox"]),
-        (
-            Some(1),
-            "error: invalid integral value 'x' in '-Ox'\n".into(),
-            true
-        )
+    // Anything but a 32-bit number is clang's error; a number it has no
+    // level for its warning, which comes before the source's.
+    for bad in ["x", "+3", "3x", "99999999999"] {
+        assert_eq!(
+            said(&[format!("-O{bad}").as_str()]),
+            (
+                Some(1),
+                format!("error: invalid integral value '{bad}' in '-O{bad}'\n"),
+                true
+            )
+        );
+    }
+    for odd in ["9", "-1"] {
+        let o = said(&[format!("-O{odd}").as_str()]);
+        assert_eq!(o.0, Some(0));
+        assert_eq!(
+            o.1,
+            format!("warning: optimization level '-O{odd}' is not supported; using '-O3' instead\n{warning}")
+        );
+    }
+    // A warning given as the options are read, before -w and -W apply, as
+    // clang's -cc1 gives it.
+    let clean = TempSrc::new("opts-clean", "c.c", "int f(void) {\n    return 1;\n}\n");
+    for args in [&["-w", "-O9"][..], &["-Werror", "-O9"]] {
+        let mut all: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+        all.extend([flag("-o"), flag("-"), clean.file.clone()]);
+        let refs: Vec<&Path> = all.iter().map(PathBuf::as_path).collect();
+        let out = merlin(&refs);
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert_eq!(
+            stderr(&out),
+            "warning: optimization level '-O9' is not supported; using '-O3' instead\n",
+            "{args:?}"
+        );
+    }
+    // -std=: an unknown standard is clang's error and its notes, one for
+    // each C standard it knows; another language's, its other error.
+    let foo = said(&["-std=foo"]);
+    let notes: Vec<&str> = foo.1.lines().skip(1).collect();
+    assert_eq!((foo.0, foo.2), (Some(1), true));
+    assert!(
+        foo.1.starts_with("error: invalid value 'foo' in '-std=foo'\n"),
+        "{}",
+        foo.1
     );
-    let o9 = said(&["-O9"]);
-    assert_eq!(o9.0, Some(0));
-    assert!(o9
+    assert_eq!(notes.len(), 13, "{}", foo.1);
+    assert_eq!(
+        notes[0],
+        "note: use 'c89', 'c90', or 'iso9899:1990' for 'ISO C 1990' standard"
+    );
+    assert_eq!(
+        notes[12],
+        "note: use 'gnu2y' for 'Working Draft for ISO C2y with GNU extensions' standard"
+    );
+    assert!(said(&["-std=cuda"])
         .1
-        .starts_with("warning: optimization level '-O9' is not supported; using '-O3' instead\n"));
-    assert_eq!(
-        said(&["-std=foo"]),
-        (Some(1), "error: invalid value 'foo' in '-std=foo'\n".into(), true)
-    );
-    assert_eq!(
-        said(&["-std=c++11"]),
-        (
-            Some(1),
-            "error: invalid argument '-std=c++11' not allowed with 'C'\n".into(),
-            true
-        )
-    );
+        .starts_with("error: invalid value 'cuda' in '-std=cuda'\nnote: "));
+    for other in ["c++11", "cl1.2", "clc++", "CL2.0", "hlsl2021"] {
+        assert_eq!(
+            said(&[format!("-std={other}").as_str()]),
+            (
+                Some(1),
+                format!("error: invalid argument '-std={other}' not allowed with 'C'\n"),
+                true
+            )
+        );
+    }
     assert_eq!(
         said(&["-std=c11"]),
         (
@@ -494,33 +539,108 @@ fn optimization_standard_and_warning_options() {
     assert_eq!(said(&["-w", "-Werror"]), (Some(0), String::new(), false));
 }
 
+/// A -W option names a warning's flag or one of clang's groups that hold
+/// it (crates/merlin/src/warning_groups.txt, from `diagtool tree`), and the
+/// options apply in command-line order, as clang's do: these are clang
+/// 23's answers (`clang -cc1 -fno-caret-diagnostics`).
+#[test]
+fn warning_groups_and_order() {
+    let t = TempSrc::new(
+        "groups",
+        "w.c",
+        "int f(unsigned char c) { return c > 300; }\nint g(int x) { if (x) return 1; }\n",
+    );
+    let file = t.file.display().to_string();
+    let compare = |error: bool| {
+        format!(
+            "{file}:1:35: {}: result of comparison of constant 300 with expression of type 'unsigned char' \
+             is always false [{}-Wtautological-constant-out-of-range-compare]\n",
+            if error { "error" } else { "warning" },
+            if error { "-Werror," } else { "" }
+        )
+    };
+    let returns = |error: bool| {
+        format!(
+            "{file}:2:33: {}: non-void function does not return a value in all control paths [{}-Wreturn-type]\n",
+            if error { "error" } else { "warning" },
+            if error { "-Werror," } else { "" }
+        )
+    };
+    let said = |args: &[&str]| {
+        let mut all: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+        all.extend([PathBuf::from("-o"), PathBuf::from("-"), t.file.clone()]);
+        let refs: Vec<&Path> = all.iter().map(PathBuf::as_path).collect();
+        let out = merlin(&refs);
+        (out.status.code(), stderr(&out))
+    };
+    let both = format!("{}{}", compare(false), returns(false));
+    for (args, code, text) in [
+        (&[][..], 0, both.clone()),
+        // A group and the flag in it.
+        (&["-Wno-tautological-compare"], 0, returns(false)),
+        (
+            &["-Werror=tautological-compare"],
+            1,
+            format!("{}{}", compare(true), returns(false)),
+        ),
+        (&["-Wno-everything"], 0, String::new()),
+        (
+            &["-Wall", "-Wno-error", "-Werror=all"],
+            1,
+            format!("{}{}", compare(true), returns(true)),
+        ),
+        // In order: -Werror=X turns X on again, and -Wno-X after it off.
+        (
+            &["-Wno-return-type", "-Werror=return-type"],
+            1,
+            format!("{}{}", compare(false), returns(true)),
+        ),
+        (&["-Werror=return-type", "-Wno-return-type"], 0, compare(false)),
+        (
+            &["-Werror", "-Wno-error=return-type"],
+            1,
+            format!("{}{}", compare(true), returns(false)),
+        ),
+    ] {
+        assert_eq!(said(args), (Some(code), text), "{args:?}");
+    }
+}
+
 /// `-o -` writes to standard output, as clang's `-cc1` does, and `-` is
-/// standard input, named `<stdin>`; `-x cpp-output` (and a `.i` file) is C
-/// already preprocessed, its line markers taken.
+/// standard input, named `<stdin>` in diagnostics and `-` in the assembly
+/// (its STT_FILE symbol, clang's `-main-file-name -`); without -o, standard
+/// input's assembly goes to standard output and a file's to the file with
+/// `.s` for its `.c` or `.i`. `-x cpp-output` (and a `.i` file) is C
+/// already preprocessed: its line markers, `#line` and `#pragma` are taken,
+/// and no other directive runs nor any macro (a predefined one too) is
+/// expanded, as clang's -cc1 takes it.
 #[test]
 fn standard_input_and_output_and_preprocessed_c() {
     use std::io::Write;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_merlin"))
-        .args(["-o", "-", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"int f(void) {\n    return 1 << 40;\n}\n")
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success());
-    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
-    assert!(text.starts_with("    .file \"<stdin>\"\n"), "{text}");
-    assert_eq!(
-        stderr(&out),
-        "<stdin>:2:14: warning: shift count >= width of type [-Wshift-count-overflow]\n"
-    );
+    for args in [&["-o", "-", "-"][..], &["-"]] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_merlin"))
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"int f(void) {\n    return 1 << 40;\n}\n")
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{args:?}");
+        let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+        assert!(text.starts_with("    .file \"-\"\n"), "{args:?}: {text}");
+        assert_eq!(
+            stderr(&out),
+            "<stdin>:2:14: warning: shift count >= width of type [-Wshift-count-overflow]\n",
+            "{args:?}"
+        );
+    }
     let t = TempSrc::new(
         "cppout",
         "p.i",
@@ -540,6 +660,26 @@ fn standard_input_and_output_and_preprocessed_c() {
             "orig.c:2:14: warning: shift count >= width of type [-Wshift-count-overflow]\n"
         );
     }
+    // p.i without -o: p.s, as clang names it.
+    let out = merlin(&[&t.file]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(t.dir.join("p.s").exists());
+    assert!(!t.dir.join("p.i.s").exists());
+    // Directives but line markers, #line and #pragma are not run, and
+    // macros are not expanded: X is undeclared, __riscv an identifier.
+    let pre = TempSrc::new(
+        "cppdirs",
+        "pp.i",
+        "# 1 \"orig.c\"\n#define X 1\nint a = X;\nint __riscv = 2;\n#pragma once\n#line 40 \"z.c\"\nint b = Y;\n",
+    );
+    let out = merlin(&[Path::new("-o"), Path::new("-"), &pre.file]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "orig.c:2:9: error: use of undeclared identifier 'X'\n\
+         orig.c:4:9: warning: #pragma once in main file [-Wpragma-once-outside-header]\n\
+         z.c:40:9: error: use of undeclared identifier 'Y'\n"
+    );
 }
 
 /// A `.S` file (or `-x assembler-with-cpp`) is preprocessed as assembly with
@@ -611,6 +751,18 @@ fn usage_errors() {
     let out = merlin(&[Path::new("--bogus")]);
     assert_eq!(out.status.code(), Some(2));
     assert!(stderr(&out).starts_with("merlin: unknown option --bogus"));
+
+    // The driver's -Wp, -Wa, and -Wl, are no warning options: merlin, as
+    // clang's -cc1, is given what they hold, never them.
+    for opt in ["-Wp,-DFOO=1", "-Wa,--noexecstack", "-Wl,-S"] {
+        let out = merlin(&[Path::new(opt), Path::new("a.c")]);
+        assert_eq!(out.status.code(), Some(2), "{opt}");
+        assert!(
+            stderr(&out).starts_with(&format!("merlin: unknown option {opt}")),
+            "{}",
+            stderr(&out)
+        );
+    }
 
     let out = merlin(&[
         Path::new("-o"),
@@ -757,6 +909,29 @@ fn v_says_what_clang_cc1_says() {
         .unwrap()
         .replace('\r', "");
     assert_eq!(v_lines(&said), want);
+
+    // The options' own diagnostics come first, as clang's -cc1 gives them
+    // as it reads its command line; an error there and it never starts, so
+    // there is no version line.
+    let opts = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_merlin"))
+            .args(["-v"])
+            .args(extra)
+            .args(["-o", "-", "v.c"])
+            .current_dir(&t.dir)
+            .output()
+            .unwrap()
+    };
+    let o9 = opts(&["-O9"]);
+    assert!(o9.status.success());
+    assert!(stderr(&o9).starts_with(&format!(
+        "warning: optimization level '-O9' is not supported; using '-O3' instead\nmerlin version {} ",
+        env!("CARGO_PKG_VERSION")
+    )));
+    let std = opts(&["-std=foo"]);
+    assert_eq!(std.status.code(), Some(1));
+    assert!(stderr(&std).starts_with("error: invalid value 'foo' in '-std=foo'\n"));
+    assert!(!stderr(&std).contains("merlin version"));
 }
 
 /// clang's `-cc1 -v` says, for `-v`'s case, what `tests/cc1-v.txt` holds

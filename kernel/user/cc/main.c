@@ -68,6 +68,8 @@ struct input {
     const char *name;
     int lang;
     int from_stdin;
+    /* C already preprocessed: -x cpp-output, a .i file. */
+    int preprocessed;
 };
 
 static int usage_error(const char *msg) {
@@ -200,38 +202,70 @@ static void say(struct diag *d) {
     said_error |= d->severity == SEV_ERROR;
 }
 
-/* -OLEVEL, as clang's -cc1 takes it (merlin's check_opt): a level it takes
- * says nothing, a number above 3 is 3 with a warning, anything else an
- * error. merlin does not optimize: no level changes the code. */
+/* -OLEVEL, as clang's -cc1 takes it (merlin's check_opt): s, z, g, fast or
+ * a level of 0 to 4 say nothing (-O4 is clang's -O3, without a word);
+ * another level, a 32-bit decimal number (a '-' but no '+' before it), is
+ * clang's warning that it is not supported; anything else its error.
+ * merlin does not optimize: no level changes the code. */
 static void check_opt(const char *level) {
-    static const char *const LEVELS[] = {"", "0", "1", "2", "3", "s", "z", "g", "fast"};
-    for (uint i = 0; i < sizeof LEVELS / sizeof LEVELS[0]; i++) {
-        if (strcmp(level, LEVELS[i]) == 0) {
+    static const char *const NAMES[] = {"", "s", "z", "g", "fast"};
+    for (uint i = 0; i < sizeof NAMES / sizeof NAMES[0]; i++) {
+        if (strcmp(level, NAMES[i]) == 0) {
             return;
         }
     }
     struct pos none;
     memset(&none, 0, sizeof none);
-    int digits = level[0] != 0;
-    for (const char *p = level; *p != 0; p++) {
-        digits &= *p >= '0' && *p <= '9';
+    const char *p = level[0] == '-' ? level + 1 : level;
+    /* The number, as Rust's i32 parse takes it: in range, or none. */
+    int number = *p != 0;
+    long long value = 0;
+    for (; *p != 0 && number; p++) {
+        number = *p >= '0' && *p <= '9';
+        value = value * 10 + (*p - '0');
+        if (value > 2147483648LL) {
+            number = 0;
+        }
     }
-    if (digits) {
-        say(diag_warning_unflagged(none, fmt("optimization level '-O%s' is not supported; using '-O3' instead", level)));
-    } else {
+    if (number && level[0] == '-') {
+        value = -value;
+    }
+    if (!number || value > 2147483647LL) {
         say(diag_error(none, fmt("invalid integral value '%s' in '-O%s'", level, level)));
+    } else if (value < 0 || value > 4) {
+        say(diag_warning_unflagged(none, fmt("optimization level '-O%s' is not supported; using '-O3' instead", level)));
     }
 }
 
 /* -std=VALUE, as clang's -cc1 takes it for C (merlin's check_std): C99's
- * names say nothing; merlin refuses the other C standards, and clang's
- * errors are for C++'s and for what is none. */
+ * names say nothing; merlin refuses the other C standards; another
+ * language's (C++'s, OpenCL's, HLSL's) is clang's `not allowed with 'C'`,
+ * and what is none clang's `invalid value`, with its notes naming the C
+ * standards. */
 static void check_std(const char *value) {
     static const char *const C99[] = {"c99", "c9x", "iso9899:1999", "iso9899:199x", "gnu99", "gnu9x"};
     static const char *const OTHER_C[] = {
         "c89", "c90", "iso9899:1990", "iso9899:199409", "gnu89", "gnu90", "c11", "c1x", "iso9899:2011",
         "iso9899:201x", "gnu11", "gnu1x", "c17", "iso9899:2017", "c18", "iso9899:2018", "gnu17", "gnu18", "c23",
         "c2x", "iso9899:2024", "gnu23", "gnu2x", "c2y", "gnu2y"};
+    static const char *const OTHER_LANGUAGES[] = {
+        "cl", "CL", "cl1.0", "CL1.0", "cl1.1", "CL1.1", "cl1.2", "CL1.2", "cl2.0", "CL2.0", "cl3.0", "CL3.0",
+        "clc++", "CLC++", "clc++1.0", "CLC++1.0", "clc++2021", "CLC++2021", "hlsl", "hlsl2015", "hlsl2016",
+        "hlsl2017", "hlsl2018", "hlsl2021", "hlsl202x", "hlsl202y"};
+    static const char *const NOTES[] = {
+        "use 'c89', 'c90', or 'iso9899:1990' for 'ISO C 1990' standard",
+        "use 'iso9899:199409' for 'ISO C 1990 with amendment 1' standard",
+        "use 'gnu89' or 'gnu90' for 'ISO C 1990 with GNU extensions' standard",
+        "use 'c99' or 'iso9899:1999' for 'ISO C 1999' standard",
+        "use 'gnu99' for 'ISO C 1999 with GNU extensions' standard",
+        "use 'c11' or 'iso9899:2011' for 'ISO C 2011' standard",
+        "use 'gnu11' for 'ISO C 2011 with GNU extensions' standard",
+        "use 'c17', 'iso9899:2017', 'c18', or 'iso9899:2018' for 'ISO C 2017' standard",
+        "use 'gnu17' or 'gnu18' for 'ISO C 2017 with GNU extensions' standard",
+        "use 'c23' or 'iso9899:2024' for 'ISO C 2023' standard",
+        "use 'gnu23' for 'ISO C 2023 with GNU extensions' standard",
+        "use 'c2y' for 'Working Draft for ISO C2y' standard",
+        "use 'gnu2y' for 'Working Draft for ISO C2y with GNU extensions' standard"};
     for (uint i = 0; i < sizeof C99 / sizeof C99[0]; i++) {
         if (strcmp(value, C99[i]) == 0) {
             return;
@@ -245,11 +279,19 @@ static void check_std(const char *value) {
             return;
         }
     }
-    if (strncmp(value, "c++", 3) == 0 || strncmp(value, "gnu++", 5) == 0) {
-        say(diag_error(none, fmt("invalid argument '-std=%s' not allowed with 'C'", value)));
-    } else {
-        say(diag_error(none, fmt("invalid value '%s' in '-std=%s'", value, value)));
+    int other = strncmp(value, "c++", 3) == 0 || strncmp(value, "gnu++", 5) == 0;
+    for (uint i = 0; i < sizeof OTHER_LANGUAGES / sizeof OTHER_LANGUAGES[0]; i++) {
+        other |= strcmp(value, OTHER_LANGUAGES[i]) == 0;
     }
+    if (other) {
+        say(diag_error(none, fmt("invalid argument '-std=%s' not allowed with 'C'", value)));
+        return;
+    }
+    struct diag *e = diag_error(none, fmt("invalid value '%s' in '-std=%s'", value, value));
+    for (uint i = 0; i < sizeof NOTES / sizeof NOTES[0]; i++) {
+        diag_note(e, none, NOTES[i]);
+    }
+    say(e);
 }
 
 static int write_file(const char *path, const char *data, uint len) {
@@ -540,18 +582,33 @@ static int compile_file(struct input *in, const char *output, struct options *op
         return 2;
     }
     opts->lang = in->lang;
+    opts->preprocessed = in->preprocessed;
     struct buf text;
     memset(&text, 0, sizeof text);
     int status = 1;
     /* A warning -Werror makes an error fails it too (diag.c). */
     diag_failed = 0;
     if (compile_unit(in->name, src, len, opts, dump, comp_dir, &text) && !diag_failed) {
-        /* Without -o: the input with .s for .c (or added), or for
-         * --dump-ast standard output. */
+        /* Standard input's assembly is named `-` (its STT_FILE symbol), as
+         * clang's -main-file-name names it; its diagnostics <stdin>. */
+        static const char STDIN_FILE[] = "    .file \"<stdin>\"\n";
+        uint k = (uint)strlen(STDIN_FILE);
+        if (in->from_stdin && !dump && text.len >= k && memcmp(text.data, STDIN_FILE, k) == 0) {
+            struct buf named;
+            memset(&named, 0, sizeof named);
+            buf_str(&named, "    .file \"-\"\n");
+            buf_put(&named, text.data + k, text.len - k);
+            text = named;
+        }
+        /* Without -o: the input with .s for its .c or .i (or added), as
+         * clang's -cc1 names it; for standard input, and for --dump-ast,
+         * standard output. */
         const char *out = output;
-        if (out == NULL && !dump) {
-            out = ends_with(in->name, ".c") ? fmt("%s.s", arena_strndup(in->name, (uint)strlen(in->name) - 2))
-                                             : fmt("%s.s", in->name);
+        if (out == NULL && !dump && !in->from_stdin) {
+            uint n = (uint)strlen(in->name);
+            out = ends_with(in->name, ".c") || ends_with(in->name, ".i")
+                      ? fmt("%s.s", arena_strndup(in->name, n - 2))
+                      : fmt("%s.s", in->name);
         }
         status = write_output(out, &text);
     }
@@ -570,6 +627,7 @@ static int translate(struct input *in, const char *output, struct options *opts)
         return 2;
     }
     opts->lang = in->lang;
+    opts->preprocessed = in->preprocessed;
     struct buf text;
     memset(&text, 0, sizeof text);
     struct diag **diags = NULL;
@@ -637,8 +695,9 @@ int main(int argc, char **argv) {
     int nargs = 0;
     char **args = expand_response_files(argc, argv, &nargs, error, sizeof error);
     if (args == NULL) {
-        fprintf(2, "cc1: %s\n", error);
-        return 2;
+        /* LLVM's tools say it alone, and exit 1. */
+        fprintf(2, "%s\n", error);
+        return 1;
     }
     argc = nargs;
     argv = args;
@@ -663,6 +722,8 @@ int main(int argc, char **argv) {
     /* -x LANG applies to the inputs after it, as in clang; -1 goes by each
      * file's name. */
     int lang = -1;
+    /* Whether -x cpp-output gave the language. */
+    int preprocessed = 0;
     for (int i = 1; i < argc; i++) {
         char *a = argv[i];
         if (strcmp(a, "-E") == 0) {
@@ -688,16 +749,16 @@ int main(int argc, char **argv) {
             mode = MODE_DUMP_AST;
         } else if (strcmp(a, "-v") == 0) {
             verbose = 1;
-        } else if (strcmp(a, "-w") == 0) {
-            diag_take_w(NULL);
         } else if (strcmp(a, "-ffreestanding") == 0) {
             /* merlin is freestanding (__STDC_HOSTED__ 0) already. */
         } else if (a[1] == 'O') {
             check_opt(a + 2);
         } else if (strncmp(a, "-std=", 5) == 0) {
             check_std(a + 5);
-        } else if (a[1] == 'W' && a[2] != 0) {
-            diag_take_w(a + 2);
+        } else if (is_warning_option(a)) {
+            /* -w, and -W but for -Wl, -Wp, and -Wa, (the driver's, which
+             * cc1, as clang's -cc1, does not take). */
+            diag_take_w(a);
         } else if (strncmp(a, "-march=", 7) == 0) {
             /* -march=ISA and -mabi=ABI only, as clang takes them. */
             if (strcmp(a + 7, MARCH) != 0) {
@@ -734,12 +795,17 @@ int main(int argc, char **argv) {
             if (l == NULL) {
                 return usage_error("-x needs a language");
             }
+            preprocessed = 0;
             if (strcmp(l, "none") == 0) {
                 lang = -1;
-            } else if (strcmp(l, "c") == 0 || strcmp(l, "cpp-output") == 0) {
-                /* cpp-output: C already preprocessed, which cc1
-                 * preprocesses again (its line markers are taken). */
+            } else if (strcmp(l, "c") == 0) {
                 lang = LANG_C;
+            } else if (strcmp(l, "cpp-output") == 0) {
+                /* C already preprocessed (a .i file): no directive but line
+                 * markers runs, and no macro is expanded, as clang's -cc1
+                 * takes it. */
+                lang = LANG_C;
+                preprocessed = 1;
             } else if (strcmp(l, "assembler-with-cpp") == 0) {
                 lang = LANG_ASM;
             } else {
@@ -752,6 +818,7 @@ int main(int argc, char **argv) {
             inputs[ninputs].name = from_stdin ? "<stdin>" : a;
             inputs[ninputs].lang = lang >= 0 ? lang : lang_of_file(a);
             inputs[ninputs].from_stdin = from_stdin;
+            inputs[ninputs].preprocessed = lang >= 0 ? preprocessed : ends_with(a, ".i");
             ninputs++;
         }
     }
@@ -766,18 +833,18 @@ int main(int argc, char **argv) {
     if (output != NULL && ninputs > 1) {
         return usage_error("-o needs a single input file");
     }
-    /* -v: the version first, as clang's -cc1 says it as it starts. */
+    /* -O's and -std='s diagnostics, before anything else, as clang's -cc1
+     * gives them as it reads its command line (and as they are: -w and -W
+     * are not applied yet); an error stops it there. */
+    for (uint i = 0; i < nsaid; i++) {
+        diag_print_as_is(said[i], "");
+    }
+    if (said_error) {
+        return 1;
+    }
+    /* -v: the version, as clang's -cc1 says it once it starts. */
     if (verbose) {
         fprintf(2, "cc1 version %s default target riscv64\n", VERSION);
-    }
-    /* -O's and -std='s diagnostics, before the inputs', as clang's -cc1
-     * gives them; an error stops it there. */
-    diag_failed = 0;
-    for (uint i = 0; i < nsaid; i++) {
-        diag_print(said[i], "");
-    }
-    if (said_error || diag_failed) {
-        return 1;
     }
     /* Assembly is only preprocessed: merlin-as assembles it. */
     for (uint i = 0; i < ninputs; i++) {

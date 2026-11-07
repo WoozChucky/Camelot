@@ -74,79 +74,6 @@ enum Mode {
     DumpAst,
 }
 
-/// What `-w` and the `-W` options make of merlin's warnings, as clang's
-/// make of the same warnings (merlin gives clang's default warnings only,
-/// so turning one on changes nothing): left out, or made errors.
-#[derive(Default)]
-struct Warnings {
-    /// `-w`: none at all.
-    none: bool,
-    /// `-Werror` (true) or `-Wno-error` (false), the last given.
-    all_errors: bool,
-    /// The flags `-Wno-FLAG` turned off (true) or `-WFLAG` on again
-    /// (false), the last given for each.
-    off: Vec<(String, bool)>,
-    /// `-Werror=FLAG` (true) and `-Wno-error=FLAG` (false), the last given
-    /// for each: over `-Werror`'s word.
-    errors: Vec<(String, bool)>,
-}
-
-impl Warnings {
-    /// Takes `-W` option `a` (after `-W`); every other `-W` changes nothing.
-    fn take(&mut self, a: &str) {
-        let set = |list: &mut Vec<(String, bool)>, flag: &str, v: bool| {
-            list.retain(|(f, _)| f != flag);
-            list.push((flag.to_string(), v));
-        };
-        if a == "error" {
-            self.all_errors = true;
-        } else if a == "no-error" {
-            self.all_errors = false;
-        } else if let Some(f) = a.strip_prefix("error=") {
-            set(&mut self.errors, f, true);
-        } else if let Some(f) = a.strip_prefix("no-error=") {
-            set(&mut self.errors, f, false);
-        } else if let Some(f) = a.strip_prefix("no-") {
-            set(&mut self.off, f, true);
-        } else {
-            set(&mut self.off, a, false);
-        }
-    }
-
-    /// `diags` as clang gives them under these options: warnings left out,
-    /// or made errors (`error: ... [-Werror,-WFLAG]`). Errors and notes are
-    /// as they were: an error clang makes of a warning by default
-    /// (`-Wint-conversion`) stays one, which merlin can't compile otherwise.
-    /// Also whether one was made an error, which fails the compilation.
-    fn apply(&self, diags: Vec<merlin::Error>) -> (Vec<merlin::Error>, bool) {
-        let mut failed = false;
-        let mut out = Vec::new();
-        for mut d in diags {
-            if d.severity == merlin::Severity::Warning {
-                let word = |list: &[(String, bool)]| {
-                    d.flag
-                        .and_then(|flag| list.iter().find(|(f, _)| f == flag))
-                        .map(|(_, v)| *v)
-                };
-                if self.none || word(&self.off) == Some(true) {
-                    continue;
-                }
-                if word(&self.errors).unwrap_or(self.all_errors) {
-                    d.severity = merlin::Severity::Error;
-                    // A flag is a 'static str, as merlin's are: this one
-                    // lives as long as the process, as it would anyway.
-                    if let Some(flag) = d.flag {
-                        d.flag = Some(Box::leak(format!("error,-W{flag}").into_boxed_str()));
-                    }
-                    failed = true;
-                }
-            }
-            out.push(d);
-        }
-        (out, failed)
-    }
-}
-
 /// The `-std=` values merlin takes: C99's names, as clang spells them.
 const C99: &[&str] = &["c99", "c9x", "iso9899:1999", "iso9899:199x", "gnu99", "gnu9x"];
 
@@ -180,31 +107,122 @@ const OTHER_C: &[&str] = &[
     "gnu2y",
 ];
 
-/// What `-std=VALUE` says, as clang's `-cc1` says it for a C input: nothing
-/// for C99, else the error.
-fn check_std(value: &str) -> Option<String> {
-    if C99.contains(&value) {
-        None
-    } else if OTHER_C.contains(&value) {
-        Some(format!("merlin compiles C99: '-std={value}' is not supported"))
-    } else if value.starts_with("c++") || value.starts_with("gnu++") {
-        Some(format!("invalid argument '-std={value}' not allowed with 'C'"))
-    } else {
-        Some(format!("invalid value '{value}' in '-std={value}'"))
+/// The standards of the other languages clang's `-cc1` knows by name but
+/// not for C: OpenCL's and HLSL's (C++'s are every `c++` and `gnu++`).
+const OTHER_LANGUAGES: &[&str] = &[
+    "cl",
+    "CL",
+    "cl1.0",
+    "CL1.0",
+    "cl1.1",
+    "CL1.1",
+    "cl1.2",
+    "CL1.2",
+    "cl2.0",
+    "CL2.0",
+    "cl3.0",
+    "CL3.0",
+    "clc++",
+    "CLC++",
+    "clc++1.0",
+    "CLC++1.0",
+    "clc++2021",
+    "CLC++2021",
+    "hlsl",
+    "hlsl2015",
+    "hlsl2016",
+    "hlsl2017",
+    "hlsl2018",
+    "hlsl2021",
+    "hlsl202x",
+    "hlsl202y",
+];
+
+/// The notes clang's `-cc1` gives after `invalid value 'X' in '-std=X'`: the
+/// C standards, by name.
+const STD_NOTES: &[&str] = &[
+    "use 'c89', 'c90', or 'iso9899:1990' for 'ISO C 1990' standard",
+    "use 'iso9899:199409' for 'ISO C 1990 with amendment 1' standard",
+    "use 'gnu89' or 'gnu90' for 'ISO C 1990 with GNU extensions' standard",
+    "use 'c99' or 'iso9899:1999' for 'ISO C 1999' standard",
+    "use 'gnu99' for 'ISO C 1999 with GNU extensions' standard",
+    "use 'c11' or 'iso9899:2011' for 'ISO C 2011' standard",
+    "use 'gnu11' for 'ISO C 2011 with GNU extensions' standard",
+    "use 'c17', 'iso9899:2017', 'c18', or 'iso9899:2018' for 'ISO C 2017' standard",
+    "use 'gnu17' or 'gnu18' for 'ISO C 2017 with GNU extensions' standard",
+    "use 'c23' or 'iso9899:2024' for 'ISO C 2023' standard",
+    "use 'gnu23' for 'ISO C 2023 with GNU extensions' standard",
+    "use 'c2y' for 'Working Draft for ISO C2y' standard",
+    "use 'gnu2y' for 'Working Draft for ISO C2y with GNU extensions' standard",
+];
+
+/// A diagnostic of no file (`error: ...`, `warning: ...`, `note: ...`), as
+/// clang's `-cc1` gives one of its command line.
+fn unplaced(severity: merlin::Severity, msg: impl Into<String>) -> merlin::Error {
+    merlin::Error {
+        severity,
+        ..merlin::Error::new(merlin::Pos::default(), msg).unplaced()
     }
 }
 
-/// What `-OLEVEL` says, as clang's `-cc1` says it: nothing for a level it
-/// takes, a warning for a number above 3 (which is 3), else the error.
-fn check_opt(level: &str) -> Result<Option<String>, String> {
-    match level {
-        "" | "0" | "1" | "2" | "3" | "s" | "z" | "g" | "fast" => Ok(None),
-        n if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(format!(
-            "optimization level '-O{n}' is not supported; using '-O3' instead"
-        ))),
-        n => Err(format!("invalid integral value '{n}' in '-O{n}'")),
+/// What `-std=VALUE` says, as clang's `-cc1` says it for a C input: nothing
+/// for C99; merlin's own error for another C standard; clang's for another
+/// language's (C++, OpenCL, HLSL) and, with its notes naming the C
+/// standards, for what is none.
+fn check_std(value: &str) -> Option<merlin::Error> {
+    use merlin::Severity::{Error, Note};
+    if C99.contains(&value) {
+        return None;
+    }
+    if OTHER_C.contains(&value) {
+        return Some(unplaced(
+            Error,
+            format!("merlin compiles C99: '-std={value}' is not supported"),
+        ));
+    }
+    if value.starts_with("c++") || value.starts_with("gnu++") || OTHER_LANGUAGES.contains(&value) {
+        return Some(unplaced(
+            Error,
+            format!("invalid argument '-std={value}' not allowed with 'C'"),
+        ));
+    }
+    let mut e = unplaced(Error, format!("invalid value '{value}' in '-std={value}'"));
+    e.notes = STD_NOTES.iter().map(|n| unplaced(Note, *n)).collect();
+    Some(e)
+}
+
+/// What `-OLEVEL` says, as clang's `-cc1` says it: nothing for `s`, `z`, `g`,
+/// `fast` or a level of 0 to 4 (`-O4` is clang's -O3, without a word); for
+/// another level, a 32-bit decimal number (a `-` but no `+` before it), the
+/// warning that it is not supported; else the error. merlin does not
+/// optimize, so no level changes the code.
+fn check_opt(level: &str) -> Option<merlin::Error> {
+    use merlin::Severity::{Error, Warning};
+    if matches!(level, "" | "s" | "z" | "g" | "fast") {
+        return None;
+    }
+    let digits = level.strip_prefix('-').unwrap_or(level);
+    let number = if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        level.parse::<i32>().ok()
+    } else {
+        None
+    };
+    match number {
+        Some(0..=4) => None,
+        Some(_) => Some(unplaced(
+            Warning,
+            format!("optimization level '-O{level}' is not supported; using '-O3' instead"),
+        )),
+        None => Some(unplaced(
+            Error,
+            format!("invalid integral value '{level}' in '-O{level}'"),
+        )),
     }
 }
+
+/// An input's language and whether it is preprocessed already: C
+/// preprocessed (`-x cpp-output`, a `.i` file).
+const CPP_OUTPUT: (Lang, bool) = (Lang::C, true);
 
 fn usage_error(msg: &str) -> ExitCode {
     eprintln!("merlin: {msg}\n{USAGE}");
@@ -221,8 +239,9 @@ fn run() -> ExitCode {
     let mut abi = None;
     // `-x LANG` applies to the inputs after it, as in clang; `None` goes by
     // each file's name.
-    let mut lang: Option<Lang> = None;
-    let mut warnings = Warnings::default();
+    let mut lang: Option<(Lang, bool)> = None;
+    // -w and the -W options, in their order (merlin::warnings).
+    let mut warnings: Vec<String> = Vec::new();
     let mut verbose = false;
     // What -O and -std= say, clang's diagnostics of no file.
     let mut said: Vec<merlin::Error> = Vec::new();
@@ -233,8 +252,9 @@ fn run() -> ExitCode {
     let mut args = match excalibur::response::expand(std::env::args().skip(1)) {
         Ok(args) => args.into_iter(),
         Err(e) => {
-            eprintln!("merlin: {e}");
-            return ExitCode::from(2);
+            // LLVM's tools say it alone, and exit 1.
+            eprintln!("{e}");
+            return ExitCode::from(1);
         }
     };
     while let Some(a) = args.next() {
@@ -263,22 +283,13 @@ fn run() -> ExitCode {
                 }
             }
             "--dump-ast" => mode = Mode::DumpAst,
-            "-w" => warnings.none = true,
             "-v" => verbose = true,
             "-ffreestanding" => {}
-            _ if a.starts_with("-O") => match check_opt(&a[2..]) {
-                Ok(None) => {}
-                Ok(Some(w)) => {
-                    said.push(merlin::Error::warning_unflagged(merlin::Pos::default(), w).unplaced())
-                }
-                Err(e) => said.push(merlin::Error::new(merlin::Pos::default(), e).unplaced()),
-            },
-            _ if a.starts_with("-std=") => {
-                if let Some(e) = check_std(&a["-std=".len()..]) {
-                    said.push(merlin::Error::new(merlin::Pos::default(), e).unplaced());
-                }
-            }
-            _ if a.starts_with("-W") && a.len() > 2 => warnings.take(&a[2..]),
+            _ if a.starts_with("-O") => said.extend(check_opt(&a[2..])),
+            _ if a.starts_with("-std=") => said.extend(check_std(&a["-std=".len()..])),
+            // -w, and -W but for -Wl, -Wp, and -Wa, (the driver's, which
+            // merlin, as clang's -cc1, does not take).
+            _ if merlin::warnings::is_option(&a) => warnings.push(a.clone()),
             // `-march=ISA` and `-mabi=ABI` only, as clang takes them.
             _ if a.starts_with("-march=") => match merlin::parse_march(&a["-march=".len()..]) {
                 Ok(()) => {}
@@ -307,18 +318,25 @@ fn run() -> ExitCode {
             },
             _ if a.starts_with("-x") => match value("-x") {
                 Some(l) if l == "none" => lang = None,
-                // C already preprocessed, which merlin preprocesses again:
-                // its line markers are taken, and its macros are gone.
-                Some(l) if l == "cpp-output" => lang = Some(Lang::C),
+                // C already preprocessed (a .i file): no directive but line
+                // markers run, and no macro is expanded, as clang's -cc1
+                // takes it.
+                Some(l) if l == "cpp-output" => lang = Some(CPP_OUTPUT),
                 Some(l) => match Lang::from_name(&l) {
-                    Some(l) => lang = Some(l),
+                    Some(l) => lang = Some((l, false)),
                     None => return usage_error(&format!("language not recognized: '{l}'")),
                 },
                 None => return usage_error("-x needs a language"),
             },
             _ if a.starts_with('-') && a != "-" => return usage_error(&format!("unknown option {a}")),
             _ => {
-                let l = lang.unwrap_or_else(|| Lang::of_file(&a));
+                let l = lang.unwrap_or_else(|| {
+                    if a.ends_with(".i") {
+                        CPP_OUTPUT
+                    } else {
+                        (Lang::of_file(&a), false)
+                    }
+                });
                 inputs.push((a, l));
             }
         }
@@ -343,24 +361,24 @@ fn run() -> ExitCode {
     if output.is_some() && inputs.len() > 1 {
         return usage_error("-o needs a single input file");
     }
-    // -v: the version first, as clang's -cc1 says it as it starts.
-    if verbose {
-        eprintln!(
-            "merlin version {} default target riscv64",
-            env!("CARGO_PKG_VERSION")
-        );
-    }
-    // -O's and -std='s diagnostics, before the inputs', as clang's -cc1
-    // gives them; an error stops it there.
-    let (said, _) = warnings.apply(said);
+    // -O's and -std='s diagnostics, before anything else, as clang's -cc1
+    // gives them as it reads its command line (and as they are: -w and -W
+    // are not applied yet); an error stops it there.
     for d in &said {
         eprintln!("{}", d.render(""));
     }
     if said.iter().any(|d| d.severity == merlin::Severity::Error) {
         return ExitCode::from(1);
     }
+    // -v: the version, as clang's -cc1 says it once it starts.
+    if verbose {
+        eprintln!(
+            "merlin version {} default target riscv64",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
     // Assembly is only preprocessed: merlin-as assembles it.
-    if let Some((a, _)) = inputs.iter().find(|(_, l)| *l == Lang::AssemblerWithCpp) {
+    if let Some((a, _)) = inputs.iter().find(|(_, (l, _))| *l == Lang::AssemblerWithCpp) {
         if mode != Mode::Preprocess {
             return usage_error(&format!(
                 "{a}: assembler-with-cpp input is only preprocessed (-E); merlin-as assembles the output"
@@ -368,9 +386,10 @@ fn run() -> ExitCode {
         }
     }
     let mut status = ExitCode::SUCCESS;
-    for (input, lang) in &inputs {
+    for (input, (lang, preprocessed)) in &inputs {
         let opts = Options {
             lang: *lang,
+            preprocessed: *preprocessed,
             ..opts.clone()
         };
         if verbose {
@@ -424,7 +443,7 @@ fn translate(
     output: Option<&str>,
     mode: Mode,
     opts: &Options,
-    warnings: &Warnings,
+    warnings: &[String],
 ) -> Result<(), ExitCode> {
     let read = if input == "-" {
         let mut s = String::new();
@@ -439,7 +458,8 @@ fn translate(
             return Err(ExitCode::from(2));
         }
     };
-    let input = if input == "-" { "<stdin>" } else { input };
+    let stdin = input == "-";
+    let input = if stdin { "<stdin>" } else { input };
     // The text, and the warnings of a compilation that succeeds (those of
     // one that fails come with its errors).
     let result = match mode {
@@ -456,7 +476,7 @@ fn translate(
     // -w and -W leave warnings out or make them errors, which fail it.
     let text = match result {
         Ok((t, said)) => {
-            let (said, failed) = warnings.apply(said);
+            let (said, failed) = merlin::warnings::apply(warnings, said);
             for w in &said {
                 eprintln!("{}", w.render(input));
             }
@@ -466,15 +486,28 @@ fn translate(
             t
         }
         Err(errors) => {
-            for e in &warnings.apply(errors).0 {
+            for e in &merlin::warnings::apply(warnings, errors).0 {
                 eprintln!("{}", e.render(input));
             }
             return Err(ExitCode::from(1));
         }
     };
+    // Standard input's assembly is named `-` (its STT_FILE symbol), as
+    // clang's -main-file-name names it; its diagnostics `<stdin>`.
+    let text = if stdin && mode == Mode::Compile {
+        text.replacen("    .file \"<stdin>\"\n", "    .file \"-\"\n", 1)
+    } else {
+        text
+    };
+    // Without -o: the input's name with `.s` for its `.c` or `.i` (or
+    // added), as clang's -cc1 names it, and standard output for standard
+    // input.
     let output = match (mode, output) {
-        (Mode::Compile, None) => {
-            let stem = input.strip_suffix(".c").unwrap_or(input);
+        (Mode::Compile, None) if !stdin => {
+            let stem = input
+                .strip_suffix(".c")
+                .or_else(|| input.strip_suffix(".i"))
+                .unwrap_or(input);
             format!("{stem}.s")
         }
         (_, Some(o)) if o != "-" => o.to_string(),
