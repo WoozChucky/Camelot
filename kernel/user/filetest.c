@@ -200,11 +200,16 @@ static void test_read_write_seek(void) {
     check(fd >= 0 && size_of("excl") == 0, "O_EXCL makes a file that is missing");
     close(fd);
     check_eq(unlink("excl"), 0, "which goes again");
-    /* A trailing slash with O_CREAT says a directory, which open never
-     * makes: -EISDIR first, the name there or not, O_EXCL or not, as on
-     * Linux; and O_EXCL without O_CREAT means nothing. */
-    check_eq(open("./", O_RDONLY | O_CREAT | O_EXCL, 0644), -EISDIR, "O_CREAT | O_EXCL: a directory's name/");
-    check_eq(open("./", O_RDONLY | O_CREAT, 0644), -EISDIR, "O_CREAT: a directory's name/");
+    /* "./", "../" and "/" are found as they are, as Linux finds them
+     * (a name with a trailing slash is below, with d): with O_EXCL a name
+     * taken, -EEXIST; with O_CREAT alone a directory, which open with
+     * O_CREAT never opens, -EISDIR. And O_EXCL without O_CREAT means
+     * nothing. */
+    check_eq(open("./", O_RDONLY | O_CREAT | O_EXCL, 0644), -EEXIST, "O_CREAT | O_EXCL: ./");
+    check_eq(open("../", O_RDONLY | O_CREAT | O_EXCL, 0644), -EEXIST, "O_CREAT | O_EXCL: ../");
+    check_eq(open("/", O_RDONLY | O_CREAT | O_EXCL, 0644), -EEXIST, "O_CREAT | O_EXCL: /");
+    check_eq(open("./", O_RDONLY | O_CREAT, 0644), -EISDIR, "O_CREAT: ./");
+    check_eq(open(".", O_RDONLY | O_CREAT, 0644), -EISDIR, "O_CREAT: a directory");
     fd = open("a", O_RDONLY | O_EXCL);
     check(fd >= 0, "O_EXCL without O_CREAT opens a file that exists");
     close(fd);
@@ -284,6 +289,16 @@ static void test_directories(void) {
     check_eq(mkdir("/", 0755), -EEXIST, "mkdir /");
     check_eq(mkdir("/ft/nodir/d", 0755), -ENOENT, "mkdir in a missing directory");
     check_eq(mkdir("abcdefghijklmnop", 0755), -ENAMETOOLONG, "mkdir of a name too long");
+    /* A name with a trailing slash and O_CREAT says a directory, which
+     * open never makes: -EISDIR first, the name there or not, O_EXCL or
+     * not, as Linux's open_last_lookups has it. A directory's name without
+     * one is found: -EEXIST with O_EXCL, else -EISDIR. */
+    check_eq(open("d/", O_RDONLY | O_CREAT | O_EXCL, 0644), -EISDIR, "O_CREAT | O_EXCL: a directory's name/");
+    check_eq(open("d/", O_RDONLY | O_CREAT, 0644), -EISDIR, "O_CREAT: a directory's name/");
+    check_eq(open("newf/", O_RDONLY | O_CREAT, 0644), -EISDIR, "O_CREAT: a missing name/");
+    check_eq(open("newf", O_RDONLY), -ENOENT, "which is not made");
+    check_eq(open("d", O_RDONLY | O_CREAT | O_EXCL, 0644), -EEXIST, "O_CREAT | O_EXCL: a directory's name");
+    check_eq(open("d", O_RDONLY | O_CREAT, 0644), -EISDIR, "O_CREAT: a directory's name");
     check_eq(stat("d", &st), 0, "stat a directory");
     check(st.type == T_DIR && st.nlink == 1 && st.size == 32, "an empty directory: . and ..");
     check_eq(links_of("."), 2, "its parent gains a link, for its ..");

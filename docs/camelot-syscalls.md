@@ -375,11 +375,14 @@ opens:
 
 - a file, in the access mode asked for; on a read-only filesystem, writing
   (or creating) is `-EROFS`;
-- a directory, for reading only: anything else is `-EISDIR`, and so is
-  `O_CREAT` on a name with a trailing slash (`newf/` names a directory,
-  and `open` makes only files), whether the name is there or not and with
-  `O_EXCL` or not, before anything else, as Linux's `open_last_lookups`
-  has it;
+- a directory, for reading only and without `O_CREAT` (which asks for a
+  file): anything else is `-EISDIR`, after `O_EXCL`'s `-EEXIST`, as
+  Linux's `do_open` has it. A name with a trailing slash and `O_CREAT`
+  is `-EISDIR` too (`newf/` names a directory, and `open` makes only
+  files), whether the name is there or not and with `O_EXCL` or not,
+  before anything else, as Linux's `open_last_lookups` has it; `./`,
+  `../` and `/` are not names but found as they are (`-EEXIST` with
+  `O_CREAT | O_EXCL`, `-EISDIR` with `O_CREAT` alone);
 - a device node (`/dev/console`, `/dev/fb0`, `/dev/input/event0` and
   `event1`, `/dev/ptmx`, `/dev/pts/N`), which gives the device itself, in
   the access mode asked for, also on a read-only filesystem: the console's
@@ -1464,7 +1467,7 @@ Linux's values for the same conditions.
 | 17 | `EEXIST` | the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping |
 | 19 | `ENODEV` | open: a device node with no driver, or a device the machine hasn't; the network: no network card; mmap: a file that can't be mapped; FBIO_WAITFORVSYNC: a display other than 0 |
 | 20 | `ENOTDIR` | a name on the way is not a directory |
-| 21 | `EISDIR` | open: a directory, for writing |
+| 21 | `EISDIR` | open: a directory, for writing or with `O_CREAT`; a name with a trailing slash, with `O_CREAT` |
 | 22 | `EINVAL` | an argument is out of range |
 | 23 | `ENFILE` | every one of the kernel's open files is taken; memfd_create: every shared-memory object |
 | 24 | `EMFILE` | every descriptor of the process is taken |

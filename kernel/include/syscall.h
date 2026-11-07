@@ -108,7 +108,7 @@
 #define EEXIST 17       /* the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping */
 #define ENODEV 19       /* open: a device node with no driver; mmap: a file that can't be mapped */
 #define ENOTDIR 20      /* a name on the way is not a directory */
-#define EISDIR 21       /* open: a directory, for writing */
+#define EISDIR 21       /* open: a directory, for writing or with O_CREAT; name/ with O_CREAT */
 #define EINVAL 22       /* an argument is out of range */
 #define ENFILE 23       /* every slot of the kernel's open file table is taken */
 #define EMFILE 24       /* every descriptor of the process is taken */
