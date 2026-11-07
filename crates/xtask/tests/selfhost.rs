@@ -27,7 +27,8 @@
 //! fourth holds the whole of merlin's diagnostics to it: every row of every
 //! table preprocessed, compiled and dumped, and every whole program merlin
 //! holds to clang's warnings named as merlin's test names it, from its own
-//! directory.
+//! directory (a name longer than a Camelot directory entry's 14 bytes is
+//! shortened on the image, so those programs carry another).
 
 use camelot_fs::mkfs::{Mkfs, Options};
 use camelot_fs::read::Fs;
@@ -2072,8 +2073,11 @@ const REPO: &str = "/r";
 const DIRSIZ: usize = 14;
 
 /// A name of a path on the image: the repository's, or for one longer than
-/// [`DIRSIZ`] (merlin's test cases have some) its first 9 bytes, `_` and 4
-/// hex digits of its hash. No file includes one of those by name.
+/// [`DIRSIZ`] (merlin's test cases have some) a shorter one, which a test
+/// names it by instead: as many of its first bytes as fit, `_`, 4 hex
+/// digits of its hash and its suffix (`constant_aggregates.c` is
+/// `constan_XXXX.c`), so that a C file is still read as C by its name. No
+/// file includes one of those by name.
 fn image_name(name: &str) -> String {
     if name.len() <= DIRSIZ {
         return name.to_string();
@@ -2081,7 +2085,13 @@ fn image_name(name: &str) -> String {
     let hash = name
         .bytes()
         .fold(2166136261u32, |h, b| (h ^ u32::from(b)).wrapping_mul(16777619));
-    format!("{}_{:04x}", &name[..9], hash & 0xffff)
+    let suffix = name
+        .rfind('.')
+        .map(|dot| &name[dot..])
+        .filter(|s| s.len() <= 4)
+        .unwrap_or("");
+    let kept = DIRSIZ - "_XXXX".len() - suffix.len();
+    format!("{}_{:04x}{suffix}", &name[..kept], hash & 0xffff)
 }
 
 /// The image path of `rel`, a path relative to the repository's root.
@@ -3082,7 +3092,9 @@ fn ast_snapshots() -> Vec<String> {
 /// The compiler's corpus ([`Corpus`]), compiled, or with `dump` given to
 /// `--dump-ast`: the C files, each named from its own directory (the shell
 /// goes there first) with [`program_includes`]'s `-I` directories, as
-/// merlin's diagnostics test names the whole programs, and the sources of
+/// merlin's diagnostics test names the whole programs (but for a name
+/// longer than a directory entry's 14 bytes, which the image shortens,
+/// [`image_name`]: those carry another), and the sources of
 /// the rows, each in a directory of its own (`/d/N/t.c` and its headers,
 /// named `N/t.c` from `/d`, where [`compile_on_camelot`] compiles them
 /// several at a time); and the files they read. The sample's `--dump-ast`
@@ -3093,7 +3105,9 @@ fn cc_jobs(corpus: Corpus, dump: bool) -> (Vec<CcJob>, BTreeMap<String, Vec<u8>>
     let sources = repo_sources();
     let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for rel in &sources {
-        files.insert(image_path(rel), std::fs::read(root.join(rel)).unwrap());
+        let path = image_path(rel);
+        assert!(!files.contains_key(&path), "{rel}: two files at {path}");
+        files.insert(path, std::fs::read(root.join(rel)).unwrap());
     }
     let own = matches!(corpus, Corpus::Own | Corpus::OwnSample);
     let snapshots = if dump { ast_snapshots() } else { Vec::new() };
