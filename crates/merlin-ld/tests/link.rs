@@ -2195,8 +2195,9 @@ fn command_line() {
         assert_eq!(o.status.code(), Some(2), "{bad:?}");
     }
 
-    // A response file: the same link, its arguments read from a file (any
-    // white space between them), mixed with ones on the command line.
+    // A response file: the same link, its arguments read from a file (blanks,
+    // tabs and line ends between them, quoted as ld.lld reads them:
+    // excalibur::response), mixed with ones on the command line.
     let args = dir.join("link.args");
     let words = [
         fx.join("start.o"),
@@ -2207,7 +2208,12 @@ fn command_line() {
     let words: Vec<String> = words.iter().map(|w| w.display().to_string()).collect();
     std::fs::write(
         &args,
-        format!("{}\n\t{}  {}\n", words[0], words[1], words[2..].join(" ")),
+        format!(
+            "\"{}\"\n\t'{}'  {}\n",
+            words[0].replace('\\', "\\\\"),
+            words[1].replace('\\', "\\\\"),
+            words[2..].join(" ").replace('\\', "\\\\")
+        ),
     )
     .unwrap();
     let out2 = dir.join("out2.elf");
@@ -2229,18 +2235,29 @@ fn command_line() {
         .unwrap();
     assert!(first.success());
     assert_eq!(std::fs::read(&out2).unwrap(), std::fs::read(&out).unwrap());
-    std::fs::write(&args, "@other.args\n").unwrap();
+    // A response file that names itself is an error; one that does not
+    // exist is an argument as it is, an input file the link can't read.
+    std::fs::write(&args, format!("@{}\n", args.display()).replace('\\', "\\\\")).unwrap();
     let o = std::process::Command::new(exe)
         .arg(format!("@{}", args.display()))
         .output()
         .unwrap();
-    assert_eq!(o.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("cannot name another"));
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).starts_with("recursive expansion of: '"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     let o = std::process::Command::new(exe)
         .arg("@no-such-file")
         .output()
         .unwrap();
-    assert_eq!(o.status.code(), Some(2));
+    assert!(!o.status.success());
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("@no-such-file"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
 
     let o = std::process::Command::new(exe).arg("--bogus").output().unwrap();
     assert_eq!(o.status.code(), Some(2));

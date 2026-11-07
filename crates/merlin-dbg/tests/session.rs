@@ -459,7 +459,7 @@ fn stepping_through_a_user_program() {
     // the program sh alone, stops: init's code is at the same addresses.
     let sh = xtask::userprogs::build_named(&path("kernel/user"), "sh").unwrap();
     let elf = TempFile::new("sh.elf", &sh.debug);
-    let main = line_of("kernel/user/sh.c", "int main(void) {");
+    let main = line_of("kernel/user/sh.c", "int main(int argc, char **argv) {");
     let out = connected(
         "kernel/kernel.elf",
         1,

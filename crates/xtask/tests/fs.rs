@@ -1380,7 +1380,7 @@ const PROMPT: &str = "# ";
 
 /// Checks `filetest` makes on the root image, its 64-bit off_t's among
 /// them, and `filetest ro` on a read-only one (kernel/user/filetest.c).
-const FILETEST_CHECKS: u32 = 246;
+const FILETEST_CHECKS: u32 = 263;
 const FILETEST_RO_CHECKS: u32 = 14;
 
 /// What the shell printed after reading `command`, up to its next prompt.
@@ -1566,6 +1566,115 @@ fn the_shell_runs_programs_from_bin_and_redirects_through_files_and_pipes() {
     assert_eq!(fs.inode(echo).unwrap().nlink, 2);
     let disk_blocks = (run.disk.len() / BSIZE) as u32;
     assert!(check_commits(&run.record.ops, &after.sb, disk_blocks) > 0);
+}
+
+#[test]
+fn the_shell_runs_lists_and_and_or_lists() {
+    // POSIX's lists: `;` runs one command after the other, `&&` the next
+    // pipeline only after a status of 0 and `||` only after one that is not,
+    // a pipeline left out keeping the status. A command that can't be
+    // started has POSIX's status, 127 for no such program and 1 for a
+    // redirection, which `&&` and `||` go by too; the rest of its pipeline
+    // runs, whose status is its last command's. An operator with no command
+    // on a side is said before anything of the line runs, as POSIX shells
+    // parse a whole line first. In the background, an AND-OR list runs in a
+    // shell of its own, `sh -c LIST`, which `wait` collects as `sh` with the
+    // list's status; the background list's own status is 0, POSIX's.
+    let run = boot(
+        root_image(),
+        Boot {
+            input: b"echo a; echo b ;echo c\n\
+            systest exit 3 && echo not run\n\
+            systest exit 3 || echo run\n\
+            echo x && systest exit 4 || echo y\n\
+            nosuch && echo not run\n\
+            nosuch || echo after 127\n\
+            cat < /missing || echo after 1\n\
+            echo first;;echo second\n\
+            echo nothing; && echo b\n\
+            nosuch | wc && echo ok\n\
+            && echo b\n\
+            echo never &&\n\
+            sh -c\n\
+            echo one > /one && echo two > /two & wait\n\
+            systest exit 2 && echo no > /no & wait\n\
+            systest exit 6 || nosuch\n\
+            exit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    // The last status, 127, is the shell's.
+    assert_eq!(run.result, RunResult::Exited(127), "{}", run.out);
+    let out = &run.out;
+    let said = |command: &str| shell_output(out, command).replace('\r', "");
+    assert_eq!(said("echo a; echo b ;echo c"), "a\nb\nc\n");
+    assert_eq!(said("systest exit 3 && echo not run"), "systest: exit 3\n");
+    assert_eq!(said("systest exit 3 || echo run"), "systest: exit 3\nrun\n");
+    assert_eq!(
+        said("echo x && systest exit 4 || echo y"),
+        "x\nsystest: exit 4\ny\n"
+    );
+    assert_eq!(said("nosuch && echo not run"), "sh: nosuch: no such program\n");
+    assert_eq!(
+        said("nosuch || echo after 127"),
+        "sh: nosuch: no such program\nafter 127\n"
+    );
+    assert_eq!(
+        said("cat < /missing || echo after 1"),
+        "sh: /missing: no such file or directory\nafter 1\n"
+    );
+    assert_eq!(said("echo first;;echo second"), "sh: ; with no command\n");
+    assert_eq!(said("echo nothing; && echo b"), "sh: && with no command\n");
+    assert_eq!(
+        said("nosuch | wc && echo ok"),
+        "sh: nosuch: no such program\n0 0 0\nok\n"
+    );
+    assert_eq!(said("&& echo b"), "sh: && with no command\n");
+    assert_eq!(said("echo never &&"), "sh: && with no command\n");
+    assert_eq!(said("sh -c"), "sh: -c: option requires an argument\nsh: exit 2\n");
+    // The background shell's pid (`[PID]`), and what it and `wait` said, in
+    // some order (the shell says `[PID]` as the other one starts).
+    let lines = |command: &str| {
+        let mut l: Vec<String> = said(command)
+            .lines()
+            .map(|l| match (l.find('['), l.find(']')) {
+                (Some(0), Some(e)) if l[1..e].bytes().all(|b| b.is_ascii_digit()) => {
+                    format!("[PID]{}", &l[e + 1..])
+                }
+                _ => l.to_string(),
+            })
+            .collect();
+        l.sort();
+        l
+    };
+    assert_eq!(
+        lines("echo one > /one && echo two > /two & wait"),
+        ["[PID]", "[PID] sh: exit 0"]
+    );
+    assert_eq!(
+        lines("systest exit 2 && echo no > /no & wait"),
+        ["[PID]", "[PID] sh: exit 2", "systest: exit 2"]
+    );
+    assert_eq!(
+        said("systest exit 6 || nosuch"),
+        "systest: exit 6\nsh: nosuch: no such program\n"
+    );
+    let fs = Fs::open(&run.disk).unwrap();
+    assert_eq!(fs.read_file("/one").unwrap(), b"one\n");
+    assert_eq!(fs.read_file("/two").unwrap(), b"two\n");
+    assert!(fs.lookup("/no").is_err());
+
+    // A background list's status is 0, which `exit` then gives.
+    let run = boot(
+        root_image(),
+        Boot {
+            input: b"systest exit 3; echo x > /x &\nexit\n",
+            max_steps: SHELL_MAX_STEPS,
+            ..READ
+        },
+    );
+    assert_eq!(run.result, RunResult::Exited(0), "{}", run.out);
 }
 
 #[test]

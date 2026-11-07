@@ -39,6 +39,7 @@ pub mod preprocess;
 pub mod sema;
 pub mod sequence;
 pub mod types;
+pub mod warnings;
 
 pub use debug::DebugInfo;
 pub use preprocess::{CmdMacro, Lang, Loader, Options};

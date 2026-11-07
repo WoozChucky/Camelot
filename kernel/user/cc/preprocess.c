@@ -2887,6 +2887,11 @@ static struct diag *directive_line(struct pp *pp, struct pptok *hash, struct ppt
     const char *d = first->kind == PP_IDENT ? first->text : "";
     struct cond *c;
     struct diag *e;
+    /* Preprocessed C: line markers, #line and #pragma alone act. */
+    if (pp->opts->preprocessed && first->kind != PP_NUMBER && strcmp(d, "line") != 0 &&
+        strcmp(d, "pragma") != 0) {
+        return NULL;
+    }
     if (strcmp(d, "define") == 0) {
         return define(pp, first, args, nargs);
     }
@@ -3288,9 +3293,10 @@ static struct diag *read_directives(struct pp *pp, const char *name, const char 
     return NULL;
 }
 
-/* merlin's Pp::run: the predefined macros, then -D and -U, as directives
- * of their own files, then the file, every token out as it comes. */
-static struct diag *run(struct pp *pp, const char *src, uint n) {
+/* merlin's Pp::define_builtins: the predefined macros, then -D and -U, as
+ * directives of their own files: C to preprocess has them, C preprocessed
+ * already none. */
+static struct diag *define_builtins(struct pp *pp) {
     struct buf b;
     memset(&b, 0, sizeof b);
     const struct predefined *pre = pp->opts->lang == LANG_ASM ? PREDEFINED_ASM : PREDEFINED_C;
@@ -3323,6 +3329,19 @@ static struct diag *run(struct pp *pp, const char *src, uint n) {
         uint id;
         e = read_directives(pp, "<command line>", buf_arena(&b), &id);
         buf_free(&b);
+        if (e != NULL) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/* merlin's Pp::run: the built-in macros (define_builtins), then the file,
+ * every token out as it comes. */
+static struct diag *run(struct pp *pp, const char *src, uint n) {
+    struct diag *e;
+    if (!pp->opts->preprocessed) {
+        e = define_builtins(pp);
         if (e != NULL) {
             return e;
         }

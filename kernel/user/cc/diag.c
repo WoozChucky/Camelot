@@ -150,8 +150,9 @@ void diag_name_files(struct diag *d, const char **names, const uint *lens, uint 
 
 /* The diagnostic's own line (merlin's Error::first_line): `file:line:col:
  * error: message`, then ` [-Wflag]` if it has a flag; with no place, the
- * file alone, or nothing at all for a diagnostic of no file. */
-static void print_line(struct diag *d, const char *input) {
+ * file alone, or nothing at all for a diagnostic of no file. A warning
+ * -Werror made an error (`promoted`) says `error` and `[-Werror,-Wflag]`. */
+static void print_line(struct diag *d, const char *input, int promoted) {
     const char *file = input;
     uint filelen = (uint)strlen(input);
     if (d->file != NULL) {
@@ -161,7 +162,7 @@ static void print_line(struct diag *d, const char *input) {
     const char *what = "error";
     if (d->severity == SEV_FATAL) {
         what = "fatal error";
-    } else if (d->severity == SEV_WARNING) {
+    } else if (d->severity == SEV_WARNING && !promoted) {
         what = "warning";
     } else if (d->severity == SEV_NOTE) {
         what = "note";
@@ -176,18 +177,53 @@ static void print_line(struct diag *d, const char *input) {
         buf_fmt(&b, "%b: %s: %b", file, filelen, what, d->msg, d->msglen);
     }
     if (d->flag != NULL) {
-        buf_fmt(&b, " [-W%s]", d->flag);
+        buf_fmt(&b, promoted ? " [-Werror,-W%s]" : " [-W%s]", d->flag);
     }
     buf_byte(&b, '\n');
     write(2, b.data, b.len);
     buf_free(&b);
 }
 
-/* merlin's Error::render, then the newline eprintln! ends it with: the
- * diagnostic's line, then a line for each note. */
-void diag_print(struct diag *d, const char *input) {
-    print_line(d, input);
+/* -w and the -W options, in command-line order (merlin's), which
+ * warning_level (lib/warnings.c) applies to each warning with clang's
+ * warning groups (tables.c's WARNING_GROUPS). */
+static char **w_options;
+static int nw_options;
+int diag_failed;
+
+void diag_take_w(char *opt) {
+    w_options = realloc(w_options, (size_t)(nw_options + 1) * sizeof(char *));
+    if (w_options == NULL) {
+        die("out of memory");
+    }
+    w_options[nw_options++] = opt;
+}
+
+/* merlin's Error::render as it is, -w and -W aside: the command line's own
+ * diagnostics (-O's, -std='s), which clang gives before it applies them. */
+void diag_print_as_is(struct diag *d, const char *input) {
+    print_line(d, input, 0);
     for (struct diag *n = d->notes; n != NULL; n = n->next) {
-        print_line(n, input);
+        print_line(n, input, 0);
+    }
+}
+
+/* merlin's Error::render, then the newline eprintln! ends it with: the
+ * diagnostic's line, then a line for each note; under -w and -W, a warning
+ * is left out, notes and all, or made an error (an error clang makes of a
+ * warning by default stays as it is). */
+void diag_print(struct diag *d, const char *input) {
+    int promoted = 0;
+    if (d->severity == SEV_WARNING) {
+        int level = warning_level(w_options, nw_options, d->flag, WARNING_GROUPS, NWARNING_GROUPS);
+        if (level == WARNING_IGNORED) {
+            return;
+        }
+        promoted = level == WARNING_ERROR;
+        diag_failed |= promoted;
+    }
+    print_line(d, input, promoted);
+    for (struct diag *n = d->notes; n != NULL; n = n->next) {
+        print_line(n, input, 0);
     }
 }

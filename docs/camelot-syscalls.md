@@ -125,7 +125,7 @@ headers and checks each size.
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
 | 9 | `sbrk` | `long increment` | the old end of the heap, a pointer; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
-| 11 | `open` | `const char *path, int flags, ...` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EISDIR`, `-ENODEV`, `-ENXIO`, `-EIO`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
+| 11 | `open` | `const char *path, int flags, ...` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EEXIST`, `-EISDIR`, `-ENODEV`, `-ENXIO`, `-EIO`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
 | 12 | `close` | `int fd` | 0; `-EBADF` |
 | 13 | `lseek` | `int fd, off_t offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
 | 14 | `fstat` | `int fd, struct stat *st` | 0; `-EBADF`, `-EFAULT` |
@@ -364,6 +364,10 @@ empty, if `path` names nothing, with the permission bits `mode`, the caller's
 effective uid and gid its owner; open it as it is if it exists; `mode`, the
 third argument (`...` in user.h, as POSIX declares `open`), is read only
 with `O_CREAT`, and there is no umask),
+`O_EXCL` (0x80: with `O_CREAT`, make the file only: a name that is taken,
+a file's, a directory's or anything else's, is `-EEXIST`, as on Linux, so
+that a program makes a file nobody else has, a temporary one in `/tmp`; it
+means nothing without `O_CREAT`),
 `O_TRUNC` (0x200: empty a file opened for writing; ignored for reading and
 for devices) and `O_CLOEXEC` (0x80000: the new descriptor closes on
 `exec`, its `FD_CLOEXEC` set; see `fcntl`); anything else is `-EINVAL`. The offset starts at 0. What it
@@ -371,9 +375,14 @@ opens:
 
 - a file, in the access mode asked for; on a read-only filesystem, writing
   (or creating) is `-EROFS`;
-- a directory, for reading only: anything else is `-EISDIR`, and so is
-  `O_CREAT` on a missing name with a trailing slash (`newf/` names a
-  directory, and `open` makes only files);
+- a directory, for reading only and without `O_CREAT` (which asks for a
+  file): anything else is `-EISDIR`, after `O_EXCL`'s `-EEXIST`, as
+  Linux's `do_open` has it. A name with a trailing slash and `O_CREAT`
+  is `-EISDIR` too (`newf/` names a directory, and `open` makes only
+  files), whether the name is there or not and with `O_EXCL` or not,
+  before anything else, as Linux's `open_last_lookups` has it; `./`,
+  `../` and `/` are not names but found as they are (`-EEXIST` with
+  `O_CREAT | O_EXCL`, `-EISDIR` with `O_CREAT` alone);
 - a device node (`/dev/console`, `/dev/fb0`, `/dev/input/event0` and
   `event1`, `/dev/ptmx`, `/dev/pts/N`), which gives the device itself, in
   the access mode asked for, also on a read-only filesystem: the console's
@@ -1458,7 +1467,7 @@ Linux's values for the same conditions.
 | 17 | `EEXIST` | the name is taken; mmap: MAP_FIXED_NOREPLACE over a mapping |
 | 19 | `ENODEV` | open: a device node with no driver, or a device the machine hasn't; the network: no network card; mmap: a file that can't be mapped; FBIO_WAITFORVSYNC: a display other than 0 |
 | 20 | `ENOTDIR` | a name on the way is not a directory |
-| 21 | `EISDIR` | open: a directory, for writing |
+| 21 | `EISDIR` | open: a directory, for writing or with `O_CREAT`; a name with a trailing slash, with `O_CREAT` |
 | 22 | `EINVAL` | an argument is out of range |
 | 23 | `ENFILE` | every one of the kernel's open files is taken; memfd_create: every shared-memory object |
 | 24 | `EMFILE` | every descriptor of the process is taken |

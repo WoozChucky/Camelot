@@ -19,6 +19,7 @@ pub mod csr;
 mod decode;
 mod disasm;
 pub mod reg;
+pub mod response;
 
 pub use decode::decode;
 
