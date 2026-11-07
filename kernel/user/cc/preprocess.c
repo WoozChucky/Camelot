@@ -1396,7 +1396,9 @@ static struct diag *pp_next(struct pp *pp, struct ptok *out, int *got) {
         t.lead |= pp->carry_lead;
         pp->carry_bol = pp->carry_space = pp->carry_lead = 0;
         struct macro *m = NULL;
-        if (t.t.kind == PP_IDENT && !hidden(t.hide, t.t.text)) {
+        /* Preprocessed C: macros are expanded in directives alone (a
+         * directive's line is expanded isolated). */
+        if (t.t.kind == PP_IDENT && !hidden(t.hide, t.t.text) && (!pp->opts->preprocessed || pp->isolated)) {
             m = map_get(&pp->macros, t.t.text);
         }
         if (m == NULL) {
@@ -2887,11 +2889,6 @@ static struct diag *directive_line(struct pp *pp, struct pptok *hash, struct ppt
     const char *d = first->kind == PP_IDENT ? first->text : "";
     struct cond *c;
     struct diag *e;
-    /* Preprocessed C: line markers, #line and #pragma alone act. */
-    if (pp->opts->preprocessed && first->kind != PP_NUMBER && strcmp(d, "line") != 0 &&
-        strcmp(d, "pragma") != 0) {
-        return NULL;
-    }
     if (strcmp(d, "define") == 0) {
         return define(pp, first, args, nargs);
     }
@@ -3294,8 +3291,7 @@ static struct diag *read_directives(struct pp *pp, const char *name, const char 
 }
 
 /* merlin's Pp::define_builtins: the predefined macros, then -D and -U, as
- * directives of their own files: C to preprocess has them, C preprocessed
- * already none. */
+ * directives of their own files. */
 static struct diag *define_builtins(struct pp *pp) {
     struct buf b;
     memset(&b, 0, sizeof b);
@@ -3339,12 +3335,9 @@ static struct diag *define_builtins(struct pp *pp) {
 /* merlin's Pp::run: the built-in macros (define_builtins), then the file,
  * every token out as it comes. */
 static struct diag *run(struct pp *pp, const char *src, uint n) {
-    struct diag *e;
-    if (!pp->opts->preprocessed) {
-        e = define_builtins(pp);
-        if (e != NULL) {
-            return e;
-        }
+    struct diag *e = define_builtins(pp);
+    if (e != NULL) {
+        return e;
     }
     struct lexed lx;
     lex_pp(src, n, 0, pp->asm, &lx);

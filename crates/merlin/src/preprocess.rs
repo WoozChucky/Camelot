@@ -148,10 +148,17 @@ pub struct Options {
     /// ([`Output::print_asm`]).
     pub line_markers: bool,
     /// Whether the input is C already preprocessed (`-x cpp-output`, a `.i`
-    /// file), as clang's -cc1 takes it: no macro is defined or expanded, not
-    /// even the predefined ones, and of the directives only line markers,
-    /// `#line` and `#pragma` act; any other is left out, its line and all.
+    /// file), as clang's -cc1 takes it: every directive runs and every
+    /// macro is defined (the predefined ones and `-D`'s too), but a macro
+    /// is expanded only in a directive (`#if`, `#include`, `#line`), never
+    /// in the text, as clang's `SetMacroExpansionOnlyInDirectives` has it.
     pub preprocessed: bool,
+    /// The main file's name in the object, if not the one its diagnostics
+    /// give it, as clang's `-main-file-name`: the `.file` of its `STT_FILE`
+    /// symbol, and with `-g` the compile unit's name and `.file 0`'s, the
+    /// diagnostics' name then a file of the line table of its own. `-` for
+    /// standard input, `<stdin>` in diagnostics.
+    pub main_file_name: Option<String>,
 }
 
 impl Default for Options {
@@ -164,6 +171,7 @@ impl Default for Options {
             lang: Lang::C,
             line_markers: true,
             preprocessed: false,
+            main_file_name: None,
         }
     }
 }
@@ -1101,9 +1109,7 @@ impl Pp<'_> {
     }
 
     fn run(&mut self, src: &str) -> Result<(Vec<PTok>, Pos), Error> {
-        if !self.opts.preprocessed {
-            self.define_builtins()?;
-        }
+        self.define_builtins()?;
         let (toks, end) = self.lex(src, 0)?;
         self.enter(toks, src, 0);
         let mut out = Vec::new();
@@ -1116,7 +1122,7 @@ impl Pp<'_> {
     }
 
     /// The predefined macros, then -D and -U, as directives of their own
-    /// files: C to preprocess has them, C preprocessed already none.
+    /// files.
     fn define_builtins(&mut self) -> Result<(), Error> {
         let mut builtin: String = predefined(self.opts.lang)
             .iter()
@@ -1396,7 +1402,9 @@ impl Pp<'_> {
             let Some(name) = t.t.ident() else {
                 return Ok(Some(t));
             };
-            if hidden(&t.hide, name) {
+            // Preprocessed C: macros are expanded in directives alone (a
+            // directive's line is expanded isolated).
+            if hidden(&t.hide, name) || (self.opts.preprocessed && !self.isolated) {
                 return Ok(Some(t));
             }
             let Some(m) = self.macros.get(name) else {
@@ -1759,13 +1767,6 @@ impl Pp<'_> {
             return Ok(()); // `#` alone: the null directive
         };
         let args = &line[1..];
-        // Preprocessed C: line markers, `#line` and `#pragma` alone act.
-        if self.opts.preprocessed
-            && first.kind != PpKind::Number
-            && !matches!(first.ident(), Some("line" | "pragma"))
-        {
-            return Ok(());
-        }
         match first.ident().unwrap_or("") {
             "define" => self.define(first, args),
             "undef" => self.undef(first, args),
@@ -3396,6 +3397,7 @@ puts( "The first, second, and third items." );
             lang: Lang::C,
             line_markers: true,
             preprocessed: false,
+            main_file_name: None,
         };
         let src = "#include <d.h>\n#include \"d.h\"\n#include <c.h>\n#define H <b.h>\n#include H";
         let out = run(&files, src, &opts).unwrap();
@@ -3648,6 +3650,7 @@ puts( "The first, second, and third items." );
             lang: Lang::C,
             line_markers: true,
             preprocessed: false,
+            main_file_name: None,
         };
         let out = run(&[], "ONE TWO F(3) GONE __merlin__ __STDC_VERSION__", &opts).unwrap();
         assert_eq!(words(&out.tokens), same("1 22 (3+1) GONE __merlin__ 199901L"));
@@ -3667,6 +3670,7 @@ puts( "The first, second, and third items." );
             lang: Lang::C,
             line_markers: true,
             preprocessed: false,
+            main_file_name: None,
         };
         assert_eq!(
             run(&[], "", &opts).unwrap_err().render("main.c"),

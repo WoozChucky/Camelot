@@ -89,7 +89,7 @@ extern const char *const REG_NAMES[32];
 /* The clang warning groups that hold each flag merlin gives a warning of, a "FLAG
  * GROUP..." line for each (merlin::warnings, from clang's `diagtool tree`), for
  * warning_level (lib/warnings.c). */
-#define NWARNING_GROUPS 84
+#define NWARNING_GROUPS 86
 extern const char *const WARNING_GROUPS[NWARNING_GROUPS];
 
 #endif

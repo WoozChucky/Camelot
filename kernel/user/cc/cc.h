@@ -473,10 +473,16 @@ struct options {
     int line_markers;
     /* Each file read has its MD5 taken, for -g's line table. */
     int checksums;
-    /* C already preprocessed (-x cpp-output, a .i file): no macro is
-     * defined or expanded, and of the directives only line markers, #line
-     * and #pragma act (merlin's Options::preprocessed). */
+    /* C already preprocessed (-x cpp-output, a .i file): every directive
+     * runs, but macros are expanded only in directives, as clang's
+     * SetMacroExpansionOnlyInDirectives has it (merlin's
+     * Options::preprocessed). */
     int preprocessed;
+    /* The main file's name in the object, if not the one its diagnostics
+     * give it (merlin's Options::main_file_name, clang's -main-file-name):
+     * the .file of its STT_FILE symbol and, with -g, the compile unit's and
+     * .file 0's name. "-" for standard input, <stdin> in diagnostics. */
+    const char *main_file_name;
 };
 
 /* Preprocesses the file `name`, whose text is src (n bytes), for -E: the
@@ -1248,9 +1254,10 @@ void quote(struct buf *b, const char *s, uint n);
 
 /* -g's state for one translation unit (merlin's Lines::new): the
  * compilation directory (-fdebug-compilation-dir), the preprocessor's files
- * (names[i], lens[i] bytes) and their checksums, by pos.file. */
+ * (names[i], lens[i] bytes) and their checksums, by pos.file, and the main
+ * file's name for the compile unit and .file 0 if not names[0] (NULL). */
 struct lines *debug_new(const char *comp_dir, const char **names, const uint *lens, struct checksum *sums,
-                        uint nfiles);
+                        uint nfiles, const char *main_name);
 /* `.file 0 ...`, the first line of the output until debug_renumber puts it
  * where clang has it. */
 char *debug_file0(struct lines *l);

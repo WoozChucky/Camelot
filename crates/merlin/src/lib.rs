@@ -323,13 +323,20 @@ pub fn compile_warned(
         let sources = debug::Sources {
             names: &pp.files,
             md5: &pp.checksums,
+            main: opts.main_file_name.as_deref(),
         };
         (d, sources)
     });
     let prog = check(&pp).map_err(|errors| pp.name_files(errors))?;
     let warnings = pp.name_files(prog.warnings.clone());
     match codegen::generate_with(&prog, debug) {
-        Ok(asm) => Ok((format!("{}\n{asm}", file_directive(name)), warnings)),
+        Ok(asm) => Ok((
+            format!(
+                "{}\n{asm}",
+                file_directive(opts.main_file_name.as_deref().unwrap_or(name))
+            ),
+            warnings,
+        )),
         Err(e) => Err(warnings.into_iter().chain(pp.name_files(vec![e])).collect()),
     }
 }

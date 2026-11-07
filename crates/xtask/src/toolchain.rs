@@ -53,6 +53,7 @@ pub fn compile_c(dir: &Path, file: &str, include_dirs: &[&str], comp_dir: &str) 
         lang: merlin::Lang::C,
         line_markers: true,
         preprocessed: false,
+        main_file_name: None,
     };
     let load = |p: &Path| std::fs::read_to_string(dir.join(p)).ok();
     merlin::compile_with(file, &src, &opts, &load).map_err(|errors| {

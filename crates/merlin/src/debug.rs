@@ -132,6 +132,10 @@ pub struct Sources<'a> {
     pub names: &'a [String],
     /// Each file's MD5 checksum.
     pub md5: &'a [Option<[u8; 16]>],
+    /// The main file's name for the compile unit and `.file 0`, if not
+    /// `names[0]` (clang's `-main-file-name`: `-` for standard input, whose
+    /// code is then in a file of its own, `<stdin>`).
+    pub main: Option<&'a str>,
 }
 
 /// A path separator: merlin's names use `/` ([`Lines::name`]).
@@ -719,7 +723,7 @@ impl Lines {
             type_ids: HashMap::new(),
             keep: Vec::new(),
         };
-        lines.root = root_name(&lines.name(0));
+        lines.root = root_name(&sources.main.map_or_else(|| lines.name(0), str::to_string));
         lines
     }
 

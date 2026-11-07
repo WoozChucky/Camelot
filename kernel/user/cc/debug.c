@@ -845,7 +845,7 @@ struct lines {
 };
 
 struct lines *debug_new(const char *comp_dir, const char **names, const uint *lens, struct checksum *sums,
-                        uint nfiles) {
+                        uint nfiles, const char *main_name) {
     struct lines *l = arena_alloc(sizeof *l);
     memset(l, 0, sizeof *l);
     l->comp_dir_given = comp_dir;
@@ -874,7 +874,7 @@ struct lines *debug_new(const char *comp_dir, const char **names, const uint *le
     for (uint i = 0; i <= nfiles; i++) {
         l->numbers[i] = -1;
     }
-    l->root = root_name(nfiles > 0 ? l->names[0] : str_c("<unknown>"));
+    l->root = root_name(main_name != NULL ? str_c(main_name) : nfiles > 0 ? l->names[0] : str_c("<unknown>"));
     return l;
 }
 

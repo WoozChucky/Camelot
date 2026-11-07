@@ -320,6 +320,7 @@ const char *const REG_NAMES[32] = {
 };
 
 const char *const WARNING_GROUPS[NWARNING_GROUPS] = {
+    "#warnings cpp",
     "array-bounds",
     "backslash-newline-escape",
     "builtin-macro-redefined pedantic-macros",
@@ -329,6 +330,7 @@ const char *const WARNING_GROUPS[NWARNING_GROUPS] = {
     "conditional-type-mismatch",
     "constant-conversion non-gcc conversion",
     "constant-logical-operand",
+    "cpp",
     "dangling-else CL4 all parentheses",
     "deprecated-non-prototype strict-prototypes",
     "division-by-zero div-by-zero",

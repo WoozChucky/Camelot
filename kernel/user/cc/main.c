@@ -202,13 +202,14 @@ static void say(struct diag *d) {
     said_error |= d->severity == SEV_ERROR;
 }
 
-/* -OLEVEL, as clang's -cc1 takes it (merlin's check_opt): s, z, g, fast or
- * a level of 0 to 4 say nothing (-O4 is clang's -O3, without a word);
- * another level, a 32-bit decimal number (a '-' but no '+' before it), is
- * clang's warning that it is not supported; anything else its error.
- * merlin does not optimize: no level changes the code. */
+/* -OLEVEL, as clang's -cc1 takes it (merlin's check_opt): s, z, g, fast, a
+ * level of 0 to 3 (00, 03 too) or 4 itself (clang's -O4 option, its -O3)
+ * say nothing; another level, a 32-bit decimal number (a '-' but no '+'
+ * before it; 04 too), is clang's warning that it is not supported;
+ * anything else its error. merlin does not optimize: no level changes the
+ * code. */
 static void check_opt(const char *level) {
-    static const char *const NAMES[] = {"", "s", "z", "g", "fast"};
+    static const char *const NAMES[] = {"", "s", "z", "g", "fast", "4"};
     for (uint i = 0; i < sizeof NAMES / sizeof NAMES[0]; i++) {
         if (strcmp(level, NAMES[i]) == 0) {
             return;
@@ -232,7 +233,7 @@ static void check_opt(const char *level) {
     }
     if (!number || value > 2147483647LL) {
         say(diag_error(none, fmt("invalid integral value '%s' in '-O%s'", level, level)));
-    } else if (value < 0 || value > 4) {
+    } else if (value < 0 || value > 3) {
         say(diag_warning_unflagged(none, fmt("optimization level '-O%s' is not supported; using '-O3' instead", level)));
     }
 }
@@ -249,7 +250,8 @@ static void check_std(const char *value) {
         "iso9899:201x", "gnu11", "gnu1x", "c17", "iso9899:2017", "c18", "iso9899:2018", "gnu17", "gnu18", "c23",
         "c2x", "iso9899:2024", "gnu23", "gnu2x", "c2y", "gnu2y"};
     static const char *const OTHER_LANGUAGES[] = {
-        "cl", "CL", "cl1.0", "CL1.0", "cl1.1", "CL1.1", "cl1.2", "CL1.2", "cl2.0", "CL2.0", "cl3.0", "CL3.0",
+        "c++98", "c++03", "gnu++98", "gnu++03", "c++0x", "c++11", "gnu++0x", "gnu++11", "c++1y", "c++14", "gnu++1y", "gnu++14", "c++1z", "c++17", "gnu++1z", "gnu++17", "c++2a", "c++20", "gnu++2a", "gnu++20", "c++2b", "c++23", "gnu++2b", "gnu++23", "c++2c", "c++26", "gnu++2c", "gnu++26",
+        "cl", "CL", "cl1.0", "cl1.1", "CL1.1", "cl1.2", "CL1.2", "cl2.0", "CL2.0", "cl3.0", "CL3.0",
         "clc++", "CLC++", "clc++1.0", "CLC++1.0", "clc++2021", "CLC++2021", "hlsl", "hlsl2015", "hlsl2016",
         "hlsl2017", "hlsl2018", "hlsl2021", "hlsl202x", "hlsl202y"};
     static const char *const NOTES[] = {
@@ -279,7 +281,7 @@ static void check_std(const char *value) {
             return;
         }
     }
-    int other = strncmp(value, "c++", 3) == 0 || strncmp(value, "gnu++", 5) == 0;
+    int other = 0;
     for (uint i = 0; i < sizeof OTHER_LANGUAGES / sizeof OTHER_LANGUAGES[0]; i++) {
         other |= strcmp(value, OTHER_LANGUAGES[i]) == 0;
     }
@@ -518,8 +520,9 @@ static int compile_unit(const char *name, const char *src, uint n, struct option
      * file_directive), whatever #line says; the code generator's text after
      * it. The assembler makes it the object's STT_FILE symbol; it has
      * nothing to do with the numbered .files of a line table. */
+    const char *main_name = opts->main_file_name != NULL ? opts->main_file_name : name;
     uint base_len;
-    const char *base = path_file_name(name, (uint)strlen(name), &base_len);
+    const char *base = path_file_name(main_name, (uint)strlen(main_name), &base_len);
     buf_str(text, "    .file ");
     quote(text, base, base_len);
     buf_byte(text, '\n');
@@ -527,7 +530,7 @@ static int compile_unit(const char *name, const char *src, uint n, struct option
      * of them. */
     struct lines *debug = NULL;
     if (comp_dir != NULL) {
-        debug = debug_new(comp_dir, pp.files, pp.lens, pp.sums, pp.nfiles);
+        debug = debug_new(comp_dir, pp.files, pp.lens, pp.sums, pp.nfiles, opts->main_file_name);
     }
     struct diag *error;
     if (!codegen_generate(&prog, debug, text, &error)) {
@@ -583,23 +586,15 @@ static int compile_file(struct input *in, const char *output, struct options *op
     }
     opts->lang = in->lang;
     opts->preprocessed = in->preprocessed;
+    /* Standard input is `-` in the object, as clang's driver gives its
+     * -cc1 `-main-file-name -`; <stdin> in diagnostics. */
+    opts->main_file_name = in->from_stdin ? "-" : NULL;
     struct buf text;
     memset(&text, 0, sizeof text);
     int status = 1;
     /* A warning -Werror makes an error fails it too (diag.c). */
     diag_failed = 0;
     if (compile_unit(in->name, src, len, opts, dump, comp_dir, &text) && !diag_failed) {
-        /* Standard input's assembly is named `-` (its STT_FILE symbol), as
-         * clang's -main-file-name names it; its diagnostics <stdin>. */
-        static const char STDIN_FILE[] = "    .file \"<stdin>\"\n";
-        uint k = (uint)strlen(STDIN_FILE);
-        if (in->from_stdin && !dump && text.len >= k && memcmp(text.data, STDIN_FILE, k) == 0) {
-            struct buf named;
-            memset(&named, 0, sizeof named);
-            buf_str(&named, "    .file \"-\"\n");
-            buf_put(&named, text.data + k, text.len - k);
-            text = named;
-        }
         /* Without -o: the input with .s for its .c or .i (or added), as
          * clang's -cc1 names it; for standard input, and for --dump-ast,
          * standard output. */
@@ -719,6 +714,9 @@ int main(int argc, char **argv) {
     const char *abi = NULL;
     int debug = 0;
     const char *comp_dir = NULL;
+    /* The last -O's level and the last -std='s value: the ones judged. */
+    const char *opt = NULL;
+    const char *std_value = NULL;
     /* -x LANG applies to the inputs after it, as in clang; -1 goes by each
      * file's name. */
     int lang = -1;
@@ -752,9 +750,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(a, "-ffreestanding") == 0) {
             /* merlin is freestanding (__STDC_HOSTED__ 0) already. */
         } else if (a[1] == 'O') {
-            check_opt(a + 2);
+            opt = a + 2;
         } else if (strncmp(a, "-std=", 5) == 0) {
-            check_std(a + 5);
+            std_value = a + 5;
         } else if (is_warning_option(a)) {
             /* -w, and -W but for -Wl, -Wp, and -Wa, (the driver's, which
              * cc1, as clang's -cc1, does not take). */
@@ -801,9 +799,8 @@ int main(int argc, char **argv) {
             } else if (strcmp(l, "c") == 0) {
                 lang = LANG_C;
             } else if (strcmp(l, "cpp-output") == 0) {
-                /* C already preprocessed (a .i file): no directive but line
-                 * markers runs, and no macro is expanded, as clang's -cc1
-                 * takes it. */
+                /* C already preprocessed (a .i file): macros expanded in
+                 * directives alone, as clang's -cc1 takes it. */
                 lang = LANG_C;
                 preprocessed = 1;
             } else if (strcmp(l, "assembler-with-cpp") == 0) {
@@ -833,9 +830,16 @@ int main(int argc, char **argv) {
     if (output != NULL && ninputs > 1) {
         return usage_error("-o needs a single input file");
     }
-    /* -O's and -std='s diagnostics, before anything else, as clang's -cc1
-     * gives them as it reads its command line (and as they are: -w and -W
-     * are not applied yet); an error stops it there. */
+    /* The last -std='s and the last -O's diagnostics, in that order, before
+     * anything else, as clang's -cc1 gives them as it reads its command line
+     * (and as they are: -w and -W are not applied yet); an error stops it
+     * there. */
+    if (std_value != NULL) {
+        check_std(std_value);
+    }
+    if (opt != NULL) {
+        check_opt(opt);
+    }
     for (uint i = 0; i < nsaid; i++) {
         diag_print_as_is(said[i], "");
     }

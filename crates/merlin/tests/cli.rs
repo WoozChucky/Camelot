@@ -453,7 +453,8 @@ fn optimization_standard_and_warning_options() {
             )
         );
     }
-    for odd in ["9", "-1"] {
+    // (4 alone is clang's -O4 option; `04` its -O with a number to judge.)
+    for odd in ["9", "-1", "04", "004"] {
         let o = said(&[format!("-O{odd}").as_str()]);
         assert_eq!(o.0, Some(0));
         assert_eq!(
@@ -498,7 +499,7 @@ fn optimization_standard_and_warning_options() {
     assert!(said(&["-std=cuda"])
         .1
         .starts_with("error: invalid value 'cuda' in '-std=cuda'\nnote: "));
-    for other in ["c++11", "cl1.2", "clc++", "CL2.0", "hlsl2021"] {
+    for other in ["c++11", "gnu++26", "c++2c", "cl1.2", "clc++", "CL2.0", "hlsl2021"] {
         assert_eq!(
             said(&[format!("-std={other}").as_str()]),
             (
@@ -508,6 +509,32 @@ fn optimization_standard_and_warning_options() {
             )
         );
     }
+    // Not clang's names: `c++` alone, a C++ standard it has none of, and
+    // `CL1.0` (`cl1.0` is OpenCL's).
+    for none in ["c++", "c++29", "CL1.0"] {
+        let s = said(&[format!("-std={none}").as_str()]);
+        assert!(
+            s.1.starts_with(&format!("error: invalid value '{none}' in '-std={none}'\nnote: ")),
+            "{}",
+            s.1
+        );
+    }
+    // Only the last -O and the last -std= are judged, the -std= first.
+    assert_eq!(said(&["-O9", "-O2"]), (Some(0), warning.clone(), false));
+    assert_eq!(said(&["-Ofoo", "-O2"]), (Some(0), warning.clone(), false));
+    assert_eq!(said(&["-std=foo", "-std=c99"]), (Some(0), warning.clone(), false));
+    assert_eq!(said(&["-std=c11", "-std=c99"]), (Some(0), warning.clone(), false));
+    let both = said(&["-O9", "-std=c++11"]);
+    assert_eq!(
+        both,
+        (
+            Some(1),
+            "error: invalid argument '-std=c++11' not allowed with 'C'\n\
+             warning: optimization level '-O9' is not supported; using '-O3' instead\n"
+                .into(),
+            true
+        )
+    );
     assert_eq!(
         said(&["-std=c11"]),
         (
@@ -601,9 +628,74 @@ fn warning_groups_and_order() {
             1,
             format!("{}{}", compare(true), returns(false)),
         ),
+        // Each warning's state, as clang keeps it: -WX does not undo an
+        // error, but after -Wno-X it gives a warning again; -Wno-error=X
+        // holds against a later -Werror; -Weverything turns on nothing
+        // merlin gives (each is on by default) and undoes no -Wno-.
+        (
+            &["-Werror=return-type", "-Wreturn-type"],
+            1,
+            format!("{}{}", compare(false), returns(true)),
+        ),
+        (
+            &["-Werror=return-type", "-Wno-return-type", "-Wreturn-type"],
+            0,
+            both.clone(),
+        ),
+        (
+            &[
+                "-Wno-error=return-type",
+                "-Werror=return-type",
+                "-Wno-return-type",
+                "-Wreturn-type",
+                "-Werror",
+            ],
+            1,
+            format!("{}{}", compare(true), returns(false)),
+        ),
+        (&["-Wno-everything", "-Weverything"], 0, String::new()),
+        (&["-Wno-everything", "-Wreturn-type"], 0, returns(false)),
+        // `everything` is no group for -Werror= or -Wno-error= (clang warns
+        // of an unknown option, which merlin leaves out).
+        (&["-Werror=everything"], 0, both.clone()),
+        (
+            &["-Werror", "-Wno-error=everything"],
+            1,
+            format!("{}{}", compare(true), returns(true)),
+        ),
     ] {
         assert_eq!(said(args), (Some(code), text), "{args:?}");
     }
+    // An unflagged warning made an error is marked `[-Werror]`, as clang
+    // marks it; #warning's flag, `#warnings`, is in clang's group `cpp`.
+    let other = TempSrc::new("unflagged", "u.c", "int h = 'abcde';\n#warning hello\n");
+    let file = other.file.display().to_string();
+    let said = |args: &[&str]| {
+        let mut all = vec![PathBuf::from("-Wno-multichar")];
+        all.extend(args.iter().map(PathBuf::from));
+        all.extend([PathBuf::from("-o"), PathBuf::from("-"), other.file.clone()]);
+        let refs: Vec<&Path> = all.iter().map(PathBuf::as_path).collect();
+        let out = merlin(&refs);
+        (out.status.code(), stderr(&out))
+    };
+    let long = format!("{file}:1:9: warning: character constant too long for its type\n");
+    let hello = format!("{file}:2:2: warning: hello [-W#warnings]\n");
+    assert_eq!(said(&[]), (Some(0), format!("{long}{hello}")));
+    assert_eq!(
+        said(&["-Werror", "-Wno-error=cpp"]),
+        (
+            Some(1),
+            format!("{file}:1:9: error: character constant too long for its type [-Werror]\n{hello}")
+        )
+    );
+    assert_eq!(said(&["-Wno-cpp"]), (Some(0), long.clone()));
+    assert_eq!(
+        said(&["-Werror=cpp"]),
+        (
+            Some(1),
+            format!("{long}{file}:2:2: error: hello [-Werror,-W#warnings]\n")
+        )
+    );
 }
 
 /// `-o -` writes to standard output, as clang's `-cc1` does, and `-` is
@@ -611,9 +703,10 @@ fn warning_groups_and_order() {
 /// (its STT_FILE symbol, clang's `-main-file-name -`); without -o, standard
 /// input's assembly goes to standard output and a file's to the file with
 /// `.s` for its `.c` or `.i`. `-x cpp-output` (and a `.i` file) is C
-/// already preprocessed: its line markers, `#line` and `#pragma` are taken,
-/// and no other directive runs nor any macro (a predefined one too) is
-/// expanded, as clang's -cc1 takes it.
+/// already preprocessed, as clang's -cc1 takes it: every directive runs,
+/// but macros (the predefined ones too) are expanded only in directives
+/// (clang's `SetMacroExpansionOnlyInDirectives`). With -g, standard input
+/// is `-` for the compile unit and `.file 0`, its code `<stdin>`'s, file 1.
 #[test]
 fn standard_input_and_output_and_preprocessed_c() {
     use std::io::Write;
@@ -641,6 +734,34 @@ fn standard_input_and_output_and_preprocessed_c() {
             "{args:?}"
         );
     }
+    // With -g: the compile unit and `.file 0` are `-`, the code in file 1,
+    // `<stdin>`, with the same checksum, as clang's (`clang -S -g -x c -`).
+    let mut child = Command::new(env!("CARGO_BIN_EXE_merlin"))
+        .args(["-g", "-fdebug-compilation-dir=/d", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"int f(int x) {\n    return x + 1;\n}\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    let md5 = "md5 0x35f70dd2f583fcb55046dff5372666f4";
+    assert!(text.starts_with("    .file \"-\"\n"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "    .file 0 \"/d\" \"-\" {md5}\n    .file 1 \"<stdin>\" {md5}\n"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("    .loc 1 1 0\n"), "{text}");
+    assert!(text.contains("    .asciz \"-\"\n"), "{text}");
     let t = TempSrc::new(
         "cppout",
         "p.i",
@@ -665,8 +786,8 @@ fn standard_input_and_output_and_preprocessed_c() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(t.dir.join("p.s").exists());
     assert!(!t.dir.join("p.i.s").exists());
-    // Directives but line markers, #line and #pragma are not run, and
-    // macros are not expanded: X is undeclared, __riscv an identifier.
+    // Macros are defined, the predefined ones too, but expanded only in
+    // directives: X is undeclared in the text, __riscv an identifier.
     let pre = TempSrc::new(
         "cppdirs",
         "pp.i",
@@ -680,6 +801,47 @@ fn standard_input_and_output_and_preprocessed_c() {
          orig.c:4:9: warning: #pragma once in main file [-Wpragma-once-outside-header]\n\
          z.c:40:9: error: use of undeclared identifier 'Y'\n"
     );
+    // Every directive runs, its macros expanded, as clang's -cc1 runs them
+    // in a preprocessed file: these are clang 23's answers.
+    for (src, code, said) in [
+        ("#if 0\nint a = ;\n#endif\nint b;\n", 0, String::new()),
+        (
+            "#define X 0\n#if X\nint a = ;\n#endif\nint b;\n",
+            0,
+            String::new(),
+        ),
+        (
+            "#define F(x) x\n#if F(0)\nint a = ;\n#endif\n#line F(30) \"q.c\"\nint b = F;\n",
+            1,
+            "q.c:30:9: error: use of undeclared identifier 'F'\n".to_string(),
+        ),
+        (
+            "#if __riscv\nint a = ;\n#endif\nint b;\n",
+            1,
+            "{}:2:9: error: expected expression\n".to_string(),
+        ),
+        (
+            "#include \"nope.h\"\nint b;\n",
+            1,
+            "{}:1:10: fatal error: 'nope.h' file not found\n".to_string(),
+        ),
+        ("#error boom\nint b;\n", 1, "{}:1:2: error: boom\n".to_string()),
+        (
+            "#warning boom\nint b;\n",
+            0,
+            "{}:1:2: warning: boom [-W#warnings]\n".to_string(),
+        ),
+        (
+            "#foo\nint b;\n",
+            1,
+            "{}:1:2: error: invalid preprocessing directive\n".to_string(),
+        ),
+    ] {
+        let t = TempSrc::new("cppdirect", "d.i", src);
+        let out = merlin(&[Path::new("-o"), Path::new("-"), &t.file]);
+        let want = said.replace("{}", &t.file.display().to_string());
+        assert_eq!((out.status.code(), stderr(&out)), (Some(code), want), "{src}");
+    }
 }
 
 /// A `.S` file (or `-x assembler-with-cpp`) is preprocessed as assembly with

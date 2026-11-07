@@ -1163,10 +1163,13 @@ char *response_file_text(char **args, int n);
  * becomes under `options[0..noptions)`, the -w and -W options in
  * command-line order, given `groups[0..ngroups)`, a "FLAG GROUP..." line for
  * each flag (clang's warning groups, generated: cc1's tables.c, cc's
- * warning_groups.h); `everything` holds every warning. -WX turns X's
- * warnings (X a flag or a group) on, -Wno-X off, -Werror=X on and makes
- * them errors, -Wno-error=X takes that back, -Werror and -Wno-error decide
- * for the rest, and -w anywhere leaves every warning out.
+ * warning_groups.h), as clang's DiagnosticsEngine decides it: -WX shows
+ * X's warnings (X a flag or a group) unless they are errors, -Wno-X leaves
+ * them out, -Werror=X makes them errors, -Wno-error=X makes them shown
+ * again and never errors, -Wno-everything leaves every warning out,
+ * -Weverything changes nothing (`everything` is no group for -Werror=), the
+ * last of -Werror and -Wno-error decides for the rest, and -w anywhere
+ * leaves every warning out.
  * is_warning_option: whether `a` is -w or -W and a name (not -Wl, -Wp,
  * -Wa,: no warning's name has a comma). */
 #define WARNING_IGNORED 0

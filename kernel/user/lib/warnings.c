@@ -3,9 +3,12 @@
  * and the cc driver of its own. A -W option names a warning flag or a
  * group of them, clang's groups, which the callers' generated tables give
  * (crates/merlin/src/warning_groups.txt, from clang's `diagtool tree`):
- * a line "FLAG GROUP..." for each flag, the groups that hold it;
- * `everything` holds every warning, an unflagged one too. The options apply
- * in command-line order, as clang's ProcessWarningOptions applies them. */
+ * a line "FLAG GROUP..." for each flag, the groups that hold it.
+ * -Wno-everything turns off every warning, an unflagged one too, and
+ * -Weverything turns on those off by default (none of the toolchain's);
+ * `everything` is no group for -Werror= and -Wno-error=, which take it for
+ * an unknown one, as clang's do. The options apply in command-line order,
+ * as clang's ProcessWarningOptions applies them, to each warning's state. */
 #include "../user.h"
 
 /* Whether `word`, `n` bytes, is one of the blank-separated words of
@@ -28,11 +31,9 @@ static int has_word(const char *list, const char *word, size_t n) {
 }
 
 /* Whether option name `name` (what follows -W, -Wno-, -Werror=...) names
- * `flag` (NULL: unflagged) or a group that holds it. */
+ * `flag` (NULL: unflagged, which no name names) or a group that holds
+ * it. */
 static int names(const char *name, const char *flag, const char *const *groups, int ngroups) {
-    if (strcmp(name, "everything") == 0) {
-        return 1;
-    }
     if (flag == NULL) {
         return 0;
     }
@@ -49,10 +50,17 @@ static int names(const char *name, const char *flag, const char *const *groups, 
     return 0;
 }
 
+/* As clang's DiagnosticsEngine decides it (merlin::warnings::level): the
+ * warning's severity, shown at first, and its "no -Werror" mark. -WX shows
+ * it unless it is an error; -Wno-X leaves it out; -Werror=X makes it an
+ * error; -Wno-error=X makes an error shown again and marks it;
+ * -Wno-everything leaves out every warning, -Weverything changes none of
+ * these. At the end, under the last of -Werror and -Wno-error, a shown
+ * warning not marked is an error; -w anywhere leaves every warning out. */
 int warning_level(char *const *options, int noptions, const char *flag, const char *const *groups, int ngroups) {
-    int on = 1;
-    int error_of = -1; /* -W[no-]error=X's word, -1 for none */
-    int all_errors = 0;
+    int severity = WARNING_SHOWN;
+    int no_werror = 0;
+    int werror = 0;
     for (int i = 0; i < noptions; i++) {
         const char *o = options[i];
         if (strcmp(o, "-w") == 0) {
@@ -63,30 +71,36 @@ int warning_level(char *const *options, int noptions, const char *flag, const ch
         }
         const char *w = o + 2;
         if (strcmp(w, "error") == 0) {
-            all_errors = 1;
+            werror = 1;
         } else if (strcmp(w, "no-error") == 0) {
-            all_errors = 0;
+            werror = 0;
+        } else if (strcmp(w, "everything") == 0) {
+            /* Turns on what is off by default: nothing here. */
+        } else if (strcmp(w, "no-everything") == 0) {
+            severity = WARNING_IGNORED;
         } else if (strncmp(w, "error=", 6) == 0) {
             if (names(w + 6, flag, groups, ngroups)) {
-                on = 1;
-                error_of = 1;
+                severity = WARNING_ERROR;
             }
         } else if (strncmp(w, "no-error=", 9) == 0) {
             if (names(w + 9, flag, groups, ngroups)) {
-                error_of = 0;
+                if (severity == WARNING_ERROR) {
+                    severity = WARNING_SHOWN;
+                }
+                no_werror = 1;
             }
         } else if (strncmp(w, "no-", 3) == 0) {
             if (names(w + 3, flag, groups, ngroups)) {
-                on = 0;
+                severity = WARNING_IGNORED;
             }
-        } else if (names(w, flag, groups, ngroups)) {
-            on = 1;
+        } else if (names(w, flag, groups, ngroups) && severity != WARNING_ERROR) {
+            severity = WARNING_SHOWN;
         }
     }
-    if (!on) {
-        return WARNING_IGNORED;
+    if (severity == WARNING_SHOWN && werror && !no_werror) {
+        return WARNING_ERROR;
     }
-    return (error_of >= 0 ? error_of : all_errors) ? WARNING_ERROR : WARNING_SHOWN;
+    return severity;
 }
 
 int is_warning_option(const char *a) {

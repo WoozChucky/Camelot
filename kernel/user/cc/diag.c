@@ -178,6 +178,9 @@ static void print_line(struct diag *d, const char *input, int promoted) {
     }
     if (d->flag != NULL) {
         buf_fmt(&b, promoted ? " [-Werror,-W%s]" : " [-W%s]", d->flag);
+    } else if (promoted) {
+        /* An unflagged warning made an error, as clang marks it. */
+        buf_str(&b, " [-Werror]");
     }
     buf_byte(&b, '\n');
     write(2, b.data, b.len);
