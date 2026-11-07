@@ -191,6 +191,15 @@ static void test_read_write_seek(void) {
     fd = open("a", O_WRONLY | O_CREAT, 0644);
     check(fd >= 0 && size_of("a") == 5000, "O_CREAT opens a file that exists, as it is");
     close(fd);
+    /* With O_EXCL it only makes one: a name that is taken, a file's or a
+     * directory's, is -EEXIST, and the file is left as it was. */
+    check_eq(open("a", O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0644), -EEXIST, "O_EXCL: a file that exists");
+    check(size_of("a") == 5000, "and stays as it is");
+    check_eq(open(".", O_RDONLY | O_CREAT | O_EXCL, 0644), -EEXIST, "O_EXCL: a directory");
+    fd = open("excl", O_RDWR | O_CREAT | O_EXCL, 0600);
+    check(fd >= 0 && size_of("excl") == 0, "O_EXCL makes a file that is missing");
+    close(fd);
+    check_eq(unlink("excl"), 0, "which goes again");
     fd = open("a", O_RDONLY | O_TRUNC);
     check(fd >= 0 && size_of("a") == 5000, "O_TRUNC does nothing for reading");
     close(fd);

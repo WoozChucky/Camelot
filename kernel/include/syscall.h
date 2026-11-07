@@ -148,13 +148,15 @@
 #define FD_STDOUT 1
 #define FD_STDERR 2
 
-/* open's flags (Linux's values): one access mode, plus O_CREAT, O_TRUNC
- * and O_CLOEXEC (the new descriptor closes on exec). */
+/* open's flags (Linux's values): one access mode, plus O_CREAT, O_EXCL
+ * (with O_CREAT, -EEXIST for a name that is taken), O_TRUNC and O_CLOEXEC
+ * (the new descriptor closes on exec). */
 #define O_RDONLY 0x000
 #define O_WRONLY 0x001
 #define O_RDWR 0x002
 #define O_ACCMODE 0x003
 #define O_CREAT 0x040
+#define O_EXCL 0x080
 #define O_TRUNC 0x200
 #define O_CLOEXEC 0x80000
 

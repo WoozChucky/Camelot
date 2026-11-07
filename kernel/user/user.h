@@ -144,12 +144,14 @@ typedef unsigned long long uint64_t;
 #define AT_EXECFN 31 /* the path the program was started with */
 
 /* open's flags: one access mode, plus O_CREAT (make the file if it is
- * missing), O_TRUNC (empty it, when opened for writing) and O_CLOEXEC (the
+ * missing), O_EXCL (with O_CREAT, only make it: -EEXIST if the name is
+ * taken), O_TRUNC (empty it, when opened for writing) and O_CLOEXEC (the
  * descriptor closes on exec). */
 #define O_RDONLY 0x000
 #define O_WRONLY 0x001
 #define O_RDWR 0x002
 #define O_CREAT 0x040
+#define O_EXCL 0x080
 #define O_TRUNC 0x200
 #define O_CLOEXEC 0x80000
 

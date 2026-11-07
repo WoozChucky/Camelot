@@ -125,7 +125,7 @@ headers and checks each size.
 | 8 | `wait` | `int pid, int *status` | the pid of the child collected; `-ECHILD`, `-EFAULT` |
 | 9 | `sbrk` | `long increment` | the old end of the heap, a pointer; `-ENOMEM`, `-EINVAL` |
 | 10 | `uptime` | | timer ticks since boot |
-| 11 | `open` | `const char *path, int flags, ...` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EISDIR`, `-ENODEV`, `-ENXIO`, `-EIO`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
+| 11 | `open` | `const char *path, int flags, ...` | a new descriptor; `-ENOENT`, `-ENOTDIR`, `-ENAMETOOLONG`, `-EACCES`, `-EEXIST`, `-EISDIR`, `-ENODEV`, `-ENXIO`, `-EIO`, `-EROFS`, `-EOVERFLOW`, `-ENOSPC`, `-ENOMEM`, `-EINVAL`, `-EMFILE`, `-ENFILE`, `-EFAULT` |
 | 12 | `close` | `int fd` | 0; `-EBADF` |
 | 13 | `lseek` | `int fd, off_t offset, int whence` | the new offset; `-EBADF`, `-ESPIPE`, `-EINVAL` |
 | 14 | `fstat` | `int fd, struct stat *st` | 0; `-EBADF`, `-EFAULT` |
@@ -364,6 +364,10 @@ empty, if `path` names nothing, with the permission bits `mode`, the caller's
 effective uid and gid its owner; open it as it is if it exists; `mode`, the
 third argument (`...` in user.h, as POSIX declares `open`), is read only
 with `O_CREAT`, and there is no umask),
+`O_EXCL` (0x80: with `O_CREAT`, make the file only: a name that is taken,
+a file's, a directory's or anything else's, is `-EEXIST`, as on Linux, so
+that a program makes a file nobody else has, a temporary one in `/tmp`; it
+means nothing without `O_CREAT`),
 `O_TRUNC` (0x200: empty a file opened for writing; ignored for reading and
 for devices) and `O_CLOEXEC` (0x80000: the new descriptor closes on
 `exec`, its `FD_CLOEXEC` set; see `fcntl`); anything else is `-EINVAL`. The offset starts at 0. What it

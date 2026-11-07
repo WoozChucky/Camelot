@@ -340,12 +340,20 @@ long sys_pipe(struct trap_frame *f) {
 }
 
 /* The inode `path` names, locked, opening it for open(): made with `mode`
- * if it is missing and `flags` has O_CREAT, which *created then says. In
- * the caller's transaction. NULL with *err. */
+ * if it is missing and `flags` has O_CREAT, which *created then says; with
+ * O_CREAT and O_EXCL, only made: a name that is taken is -EEXIST, as on
+ * Linux (how a program makes a file nobody else has, a temporary one in
+ * /tmp). In the caller's transaction. NULL with *err. */
 static struct inode *open_inode(const char *path, u32 flags, u32 mode, bool *created, int *err) {
     *created = false;
+    bool excl = (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL);
     for (;;) {
         struct inode *ip = namei(path, err);
+        if (ip != NULL && excl) {
+            iput(ip);
+            *err = -EEXIST;
+            return NULL;
+        }
         if (ip != NULL) {
             ilock(ip);
             return ip;
@@ -361,8 +369,9 @@ static struct inode *open_inode(const char *path, u32 flags, u32 mode, bool *cre
         }
         ip = fs_create(path, T_FILE, 0, 0, (u16)(mode & S_IALLUGO), err);
         /* -EEXIST: made by another process while namei() slept on the
-         * disk. Look it up again. */
-        if (ip != NULL || *err != -EEXIST) {
+         * disk. Look it up again, but with O_EXCL, where that is the
+         * answer. */
+        if (ip != NULL || *err != -EEXIST || excl) {
             *created = ip != NULL;
             return ip;
         }
@@ -379,7 +388,7 @@ long sys_open(struct trap_frame *f) {
     u32 mode = flags & O_ACCMODE;
     /* The new file's permission bits, with O_CREAT (there is no umask). */
     u32 perm = (u32)arg(f, 2);
-    if ((flags & ~(O_ACCMODE | O_CREAT | O_TRUNC | O_CLOEXEC)) != 0 || mode == O_ACCMODE) {
+    if ((flags & ~(O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_CLOEXEC)) != 0 || mode == O_ACCMODE) {
         return -EINVAL;
     }
     if (!fs_mounted) {
