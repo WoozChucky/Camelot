@@ -26,7 +26,7 @@
 #include "types.h"
 
 #define FS_MAGIC 0x53464d43 /* "CMFS" */
-#define FS_VERSION 2
+#define FS_VERSION 3
 
 #define ROOTINO 1 /* the root directory's inode; inode 0 is never used */
 #define SUPERBLOCK_NO 1
@@ -138,7 +138,10 @@ struct dinode {
     u32 size_hi;             /* and the high half */
     struct ext_node root;    /* i_block: the extent tree's root (zeros for a device) */
     u32 flags;               /* INODE_TRUNCATING, or 0 */
-    u8 reserved[48];         /* 0 */
+    u32 uid;                 /* the owner's user id */
+    u32 gid;                 /* and group id */
+    u16 mode;                /* the permission bits, S_IRWXU... (syscall.h) */
+    u8 reserved[38];         /* 0 */
 };
 
 _Static_assert(sizeof(struct ext_header) == 12 && sizeof(struct ext_extent) == 12 &&
@@ -185,6 +188,9 @@ struct inode {
     u64 size; /* the dinode's size and size_hi */
     struct ext_node root;
     u32 flags;
+    u32 uid;
+    u32 gid;
+    u16 mode;
 };
 
 /* Inodes in the cache. iget() panics if every one is in use, so there are
@@ -319,12 +325,14 @@ struct inode *nameiparent(const char *path, char *name, int *err);
 int fs_getcwd(char *buf, u32 size);
 
 /* Makes `path` a new inode of `type` (T_FILE, T_DIR with its `.` and `..`,
- * T_DEVICE with `major`/`minor`, or T_SOCKET) and returns it locked, with a
- * reference;
+ * T_DEVICE with `major`/`minor`, or T_SOCKET) with the permission bits
+ * `mode` (S_IRWXU... and the set-ID and sticky bits; the rest ignored),
+ * owned by the caller's effective user and group ids, and returns it
+ * locked, with a reference;
  * NULL with *err: -EEXIST (`/` included), -ENOENT/-ENOTDIR/-ENAMETOOLONG
  * (the path; -ENOENT also for a directory that has been removed while still
  * in use, as a working directory), -ENOSPC, -EROFS. In a transaction. */
-struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *err);
+struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, u16 mode, int *err);
 
 /* Removes the entry `path`: a file loses a link (and is freed once it has
  * none and nobody uses it), a directory must be empty. 0, -ENOENT,

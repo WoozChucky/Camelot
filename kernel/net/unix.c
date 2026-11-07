@@ -665,7 +665,7 @@ static int do_bind(struct unix_sock *u, uintptr uaddr) {
      * One that is there already, a socket's or anything else, is taken:
      * the name stays after the socket is closed, until it is unlinked. */
     begin_op();
-    struct inode *ip = fs_create(path, T_SOCKET, 0, 0, &err);
+    struct inode *ip = fs_create(path, T_SOCKET, 0, 0, 0777, &err);
     if (ip == NULL) {
         end_op();
         return err == -EEXIST ? -EADDRINUSE : err;

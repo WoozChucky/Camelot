@@ -201,6 +201,27 @@ struct stat {
 #define T_PIPE 4
 #define T_SOCKET 5
 
+/* A file's permission bits (struct stat's mode, chmod, open and mkdir's
+ * mode), Linux's: read, write and execute (search, for a directory) for
+ * the owner, the group and everyone else, then set-user-ID, set-group-ID
+ * and sticky (docs/camelot-syscalls.md, "Users and permissions"). */
+#define S_ISUID 04000
+#define S_ISGID 02000
+#define S_ISVTX 01000
+#define S_IRWXU 0700
+#define S_IRUSR 0400
+#define S_IWUSR 0200
+#define S_IXUSR 0100
+#define S_IRWXG 070
+#define S_IRGRP 040
+#define S_IWGRP 020
+#define S_IXGRP 010
+#define S_IRWXO 07
+#define S_IROTH 04
+#define S_IWOTH 02
+#define S_IXOTH 01
+#define S_IALLUGO 07777 /* every bit there is */
+
 /* What procs stores for each process: 40 bytes, where `size`, an address,
  * is 64-bit (and 8-byte aligned). `state` is one of the
  * PROC_ values (proc.h), `ppid` 0 for a process without a parent, `size`

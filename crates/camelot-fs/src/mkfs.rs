@@ -4,6 +4,12 @@
 //! returns the image. Nothing else uses the image while it is built, so mkfs
 //! writes blocks in place, without the log.
 //!
+//! Everything mkfs makes belongs to root (uid and gid 0), with the mode
+//! [`crate::default_mode`] gives its type: 0o755 for a directory, 0o644 for a
+//! file, but 0o755 for an executable program ([`is_executable`]), 0o666 for a
+//! device. [`Mkfs::chmod`] and [`Mkfs::chown`] change them after, as the
+//! commands do on a running system.
+//!
 //! Inodes are handed out in order from 2 (1 is the root) and blocks in order
 //! from `datastart`, so the same inputs always give the same bytes. Files
 //! grow as the kernel grows them (`extent::append`, the format document's
@@ -16,7 +22,7 @@ use crate::extent::{self, Blocks};
 use crate::{
     block, block_mut, contents, dirents, path_names, read_inode, show_name, valid_name, write_inode, Dinode,
     Dirent, Superblock, BSIZE, DEFAULT_INODES, DEFAULT_LOG, DEFAULT_SIZE, DIRENT_SIZE, MAX_FILE_SIZE,
-    ROOT_INODE, SUPER_BLOCK, T_DEVICE, T_DIR, T_FILE,
+    MODE_BITS, ROOT_INODE, SUPER_BLOCK, T_DEVICE, T_DIR, T_FILE,
 };
 use std::path::Path;
 
@@ -262,7 +268,42 @@ impl Mkfs {
         self.append(inum, data).map_err(|e| format!("{path}: {e}"))?;
         self.link(parent, name, inum)?;
         self.set_nlink(inum, 1);
+        if is_executable(data) {
+            self.set_mode(inum, 0o755);
+        }
         Ok(inum)
+    }
+
+    fn set_mode(&mut self, inum: u32, mode: u16) {
+        let mut d = self.inode(inum);
+        d.mode = mode;
+        write_inode(&mut self.image, &self.sb, inum, &d);
+    }
+
+    /// The inode `path` names, or an error saying there is none.
+    fn existing(&self, path: &str) -> Result<u32, String> {
+        self.lookup(path)?
+            .ok_or_else(|| format!("{path}: no such file or directory"))
+    }
+
+    /// Sets the permission bits of `path` (at most [`MODE_BITS`]).
+    pub fn chmod(&mut self, path: &str, mode: u16) -> Result<(), String> {
+        if mode & !MODE_BITS != 0 {
+            return Err(format!("{path}: mode {mode:#o} has bits beyond {MODE_BITS:#o}"));
+        }
+        let inum = self.existing(path)?;
+        self.set_mode(inum, mode);
+        Ok(())
+    }
+
+    /// Gives `path` the owner `uid` and the group `gid`.
+    pub fn chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), String> {
+        let inum = self.existing(path)?;
+        let mut d = self.inode(inum);
+        d.uid = uid;
+        d.gid = gid;
+        write_inode(&mut self.image, &self.sb, inum, &d);
+        Ok(())
     }
 
     /// Makes the device node `path` for device `major`, `minor`.
@@ -355,6 +396,14 @@ impl Blocks for Mkfs {
 }
 
 /// A new directory's first two entries: `.` (itself) and `..` (its parent).
+/// Whether `data` is a program the kernel runs: an ELF executable
+/// (`ET_EXEC`), which mkfs makes executable (0o755) where any other file,
+/// an object or an archive among them, is 0o644. A host directory has no
+/// Unix modes on Windows, so this is how mkfs tells.
+pub fn is_executable(data: &[u8]) -> bool {
+    data.len() >= 18 && data[..4] == *b"\x7fELF" && u16::from_le_bytes([data[16], data[17]]) == 2
+}
+
 fn dot_entries(me: u32, parent: u32) -> Vec<u8> {
     let mut v = Vec::with_capacity(2 * DIRENT_SIZE);
     v.extend_from_slice(&Dirent::new(me as u16, b".").encode());
@@ -532,6 +581,43 @@ mod tests {
             .unwrap_err()
             .contains("not a regular file"));
         assert!(r.read_file("/dev").unwrap_err().contains("is a directory"));
+    }
+
+    #[test]
+    fn owners_and_modes() {
+        let mut fs = Mkfs::new(&small()).unwrap();
+        fs.mkdir("/bin").unwrap();
+        fs.mkdir("/home").unwrap();
+        fs.mkdir("/home/user").unwrap();
+        fs.mkdir("/dev").unwrap();
+        fs.add_device("/dev/console", 1, 0).unwrap();
+        // An ELF executable, an ELF object and anything else.
+        let mut exec = b"\x7fELF".to_vec();
+        exec.resize(64, 0);
+        exec[16] = 2;
+        let mut object = exec.clone();
+        object[16] = 1;
+        fs.add_file("/bin/prog", &exec).unwrap();
+        fs.add_file("/crt0.o", &object).unwrap();
+        fs.add_file("/secret", b"x").unwrap();
+        fs.chmod("/secret", 0o600).unwrap();
+        fs.chown("/home/user", 1000, 1000).unwrap();
+        fs.chmod("/bin/prog", 0o4755).unwrap();
+        assert!(fs.chmod("/secret", 0o10000).unwrap_err().contains("bits beyond"));
+        assert!(fs.chmod("/missing", 0o644).unwrap_err().contains("no such file"));
+        assert!(fs.chown("/missing", 0, 0).unwrap_err().contains("no such file"));
+        let r = Fs::open(&fs.finish()).unwrap();
+        let owner = |path: &str| {
+            let d = r.inode(r.lookup(path).unwrap()).unwrap();
+            (d.uid, d.gid, d.mode)
+        };
+        assert_eq!(owner("/"), (0, 0, 0o755));
+        assert_eq!(owner("/bin"), (0, 0, 0o755));
+        assert_eq!(owner("/home/user"), (1000, 1000, 0o755));
+        assert_eq!(owner("/dev/console"), (0, 0, 0o666));
+        assert_eq!(owner("/bin/prog"), (0, 0, 0o4755));
+        assert_eq!(owner("/crt0.o"), (0, 0, 0o644));
+        assert_eq!(owner("/secret"), (0, 0, 0o600));
     }
 
     #[test]

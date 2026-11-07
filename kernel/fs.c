@@ -73,6 +73,10 @@ static u32 div_ceil(u32 a, u32 b) {
 /* Checks the superblock's rules (docs/camelot-fs.md, "Superblock"); NULL if
  * they hold, else what is wrong. */
 static const char *check_superblock(const struct superblock *sb, u32 disk_sectors) {
+    if (sb->version < FS_VERSION) {
+        /* Images are built, never kept: an old one is rebuilt. */
+        return "an older version of the format: rebuild the image";
+    }
     if (sb->version != FS_VERSION) {
         return "unknown version";
     }
@@ -792,6 +796,9 @@ void iupdate(struct inode *ip) {
     dip->size_hi = (u32)(ip->size >> 32);
     memmove(&dip->root, &ip->root, sizeof ip->root);
     dip->flags = ip->flags;
+    dip->uid = ip->uid;
+    dip->gid = ip->gid;
+    dip->mode = ip->mode;
     log_write(b);
     brelse(b);
 }
@@ -845,6 +852,9 @@ void ilock(struct inode *ip) {
         ip->size = (u64)dip->size_hi << 32 | dip->size;
         memmove(&ip->root, &dip->root, sizeof ip->root);
         ip->flags = dip->flags;
+        ip->uid = dip->uid;
+        ip->gid = dip->gid;
+        ip->mode = dip->mode;
         brelse(b);
         ip->valid = true;
         if (ip->type == T_FREE) {
@@ -1231,7 +1241,7 @@ int fs_getcwd(char *buf, u32 size) {
     return (int)at;
 }
 
-struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *err) {
+struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, u16 mode, int *err) {
     if (fs_readonly) {
         *err = -EROFS;
         return NULL;
@@ -1269,6 +1279,12 @@ struct inode *fs_create(const char *path, u16 type, u16 major, u16 minor, int *e
     ilock(ip);
     ip->major = major;
     ip->minor = minor;
+    /* The maker's, as Linux's inode_init_owner() without set-group-ID
+     * directories (whose new entries would take the directory's group). */
+    struct proc *p = myproc();
+    ip->uid = p->euid;
+    ip->gid = p->egid;
+    ip->mode = mode & S_IALLUGO;
     /* Its entry in dp. */
     ip->nlink = 1;
     iupdate(ip);

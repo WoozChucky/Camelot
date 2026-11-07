@@ -1,4 +1,4 @@
-# The Camelot filesystem (CMFS), version 2
+# The Camelot filesystem (CMFS), version 3
 
 The on-disk format of Camelot's filesystem, precise enough to write a second
 implementation. There are two today, written from this document and checked
@@ -98,7 +98,10 @@ the table's last block past inode `ninodes` - 1 are unused.
 | 8 | `size` (u64) | length of the contents in bytes |
 | 16 | `i_block` (60 bytes) | the root of the extent tree mapping the contents (below), ext4's `i_block` |
 | 76 | `flags` (u32) | bit 0, `TRUNCATING`: the inode's blocks are being freed (see "Truncation"). The other bits are 0 |
-| 80 | reserved (48 bytes) | 0 |
+| 80 | `uid` (u32) | the owner's user id (0 is root) |
+| 84 | `gid` (u32) | the owner's group id |
+| 88 | `mode` (u16) | the permission bits (below); the bits above `0o7777` are 0 |
+| 90 | reserved (38 bytes) | 0 |
 
 - Inode 0 is never used: a directory entry with inode number 0 is a free
   slot. Its `type` is 0.
@@ -110,6 +113,19 @@ the table's last block past inode `ninodes` - 1 are unused.
 - The reserved bytes are 0, and readers check them: they are where a later
   version puts what this one leaves out (timestamps, say), as ext4's inode
   grew beyond ext2's.
+- **Owner and mode.** Every allocated inode has an owner, a user and a
+  group id, and Unix's permission bits, Linux's `i_mode` without the type
+  (which is `type`): read (4), write (2) and execute (1), for the owner
+  (`0o700`), the group (`0o070`) and everyone else (`0o007`), and above
+  them set-user-ID (`0o4000`), set-group-ID (`0o2000`) and sticky
+  (`0o1000`). What they allow is the kernel's business
+  (docs/camelot-syscalls.md, "Users and permissions"); the format only
+  stores them. The kernel gives a new inode the effective ids of the
+  process that makes it and the mode the call asked for. mkfs makes
+  everything root's (0 and 0), a directory `0o755`, a file `0o644` (but an
+  ELF executable, `ET_EXEC`, `0o755`, as a host directory on Windows has no
+  modes to copy) and a device `0o666`; `cargo xtask fs` then changes what
+  the root image needs (docs/excalibur-spec.md, "Users").
 - **Size.** A file is at most 2^32 blocks (its logical block numbers are
   u32), 4 TiB, and in practice no bigger than the filesystem. The kernel,
   whose `off_t` is 64-bit, reads and writes files of up to 2^32 - 1
@@ -549,7 +565,10 @@ prints one line, `boot: kernel at sector 0x...`.
 
 Version 1 was the first. A change to anything above is a new version
 number; a reader refuses a version it was not written for, and there are no
-version 1 disks to keep (images are built, never committed).
+older disks to keep (images are built, never committed): the kernel says
+`an older version of the format: rebuild the image` for one, and the
+`camelot-fs` command `version 2, an older format (this reads version 3):
+rebuild the image`.
 
 **Version 2** maps files with ext4's extent trees in a 128-byte inode
 (8 per block) with a 64-bit `size`, a `flags` word and reserved bytes,
@@ -563,3 +582,10 @@ pointer per block, and there is no fixed limit. Truncation became
 restartable (`TRUNCATING`, "Truncation"), since freeing a big file no longer
 fits one transaction, and `MAXOPBLOCKS`, `LOGSIZE` and mkfs's default log
 grew with the worst case of an operation ("Limits on transactions").
+
+**Version 3** gives every inode an owner and permission bits (`uid`,
+`gid` and `mode`, in 10 of the reserved bytes), for users and permissions
+(#115): before it, every process could read, write and remove every file.
+They are Unix's, as ext2 had them from its start: a 32-bit user and group
+id each, as Linux's `i_uid` and `i_gid` became, and the 12 permission bits
+of `i_mode`, whose 4 type bits Camelot keeps in `type`.

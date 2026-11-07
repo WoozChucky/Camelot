@@ -356,7 +356,7 @@ static struct inode *open_inode(const char *path, u32 flags, int *err) {
             *err = -EISDIR;
             return NULL;
         }
-        ip = fs_create(path, T_FILE, 0, 0, err);
+        ip = fs_create(path, T_FILE, 0, 0, 0644, err);
         /* -EEXIST: made by another process while namei() slept on the
          * disk. Look it up again. */
         if (ip != NULL || *err != -EEXIST) {
@@ -466,7 +466,7 @@ long sys_mkdir(struct trap_frame *f) {
         return -ENOENT;
     }
     begin_op();
-    struct inode *ip = fs_create(path, T_DIR, 0, 0, &err);
+    struct inode *ip = fs_create(path, T_DIR, 0, 0, 0755, &err);
     if (ip != NULL) {
         iunlockput(ip);
     }

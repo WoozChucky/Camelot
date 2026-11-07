@@ -664,7 +664,11 @@ fn a_disk_that_cannot_be_mounted_is_left_alone() {
     };
     let not_mounted = |why: &str| format!("fs: disk 0 not mounted: {why}\n");
     for (image, why) in [
-        (broken(&|i| set_u32(i, 1, 4, 1)), "unknown version"),
+        (
+            broken(&|i| set_u32(i, 1, 4, camelot_fs::VERSION - 1)),
+            "an older version of the format: rebuild the image",
+        ),
+        (broken(&|i| set_u32(i, 1, 4, camelot_fs::VERSION + 1)), "unknown version"),
         (broken(&|i| set_u32(i, 1, 20, 1)), "bad log size"),
         (broken(&|i| set_u32(i, 1, 16, 1)), "bad inode count"),
         (
@@ -1320,6 +1324,19 @@ fn the_format_document_matches_the_kernel_and_the_host() {
     assert!(doc.contains(&format!("(1024 - 12) / 12 = {}", extent::BLOCK_MAX)));
     assert!(doc.contains("blocks it maps, 1 to 32 768"));
     assert!(doc.contains(&format!("{} bytes, 8 per block", camelot_fs::INODE_SIZE)));
+    // The owner and mode, where the inode table puts them.
+    for (at, field) in [
+        (camelot_fs::UID_AT, "| `uid` (u32) |"),
+        (camelot_fs::GID_AT, "| `gid` (u32) |"),
+        (camelot_fs::MODE_AT, "| `mode` (u16) |"),
+    ] {
+        assert!(doc.contains(&format!("| {at} {field}")), "{field}");
+    }
+    assert!(doc.contains(&format!(
+        "| {} | reserved ({} bytes) | 0 |",
+        camelot_fs::RESERVED_AT,
+        camelot_fs::RESERVED_SIZE
+    )));
     assert_eq!(
         define(&fs_h, "INODE_TRUNCATING"),
         camelot_fs::TRUNCATING.to_string()
